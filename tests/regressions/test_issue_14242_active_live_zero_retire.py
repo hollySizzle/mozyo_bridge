@@ -322,9 +322,14 @@ class ActiveRetireCasMatrix(unittest.TestCase):
                     DISPOSITION_ACTIVE,
                 )
 
-    def test_completed_release_that_never_advanced_disposition_is_admitted(self):
-        # A release that finished but left the row `active` is still terminalizable (also
-        # forced, for the same reachability reason).
+    def test_released_on_an_active_row_is_refused_as_unreachable(self):
+        # Review j#85219 F2. An earlier revision ADMITTED `released` here, reasoning it was the
+        # residue of a completed release. It is not reachable: `request_release` refuses an
+        # active row (`unexpected_state`) and `record_release_outcome` refuses
+        # (`action_generation_mismatch`) — both measured in
+        # `test_active_row_cannot_reach_released_through_public_transitions`. An unreachable
+        # shape is a corrupted row, and a surface premised on having NO release witness must not
+        # grant extra permission to one. Fail closed.
         path = Path(self.tmp.name) / "lc_released.sqlite"
         _seed_active_bound(path=path, key=_key())
         rec = LaneLifecycleStore(path=path).get(_key())
@@ -336,7 +341,28 @@ class ActiveRetireCasMatrix(unittest.TestCase):
             worktree_identity=_BOUND_WT,
             decision=_decision(),
         )
-        self.assertTrue(out.applied, out.reason)
+        self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+        self.assertEqual(
+            LaneLifecycleStore(path=path).get(_key()).lane_disposition, DISPOSITION_ACTIVE
+        )
+
+    def test_active_row_cannot_reach_released_through_public_transitions(self):
+        # The reachability measurement F2 turns on, pinned so a future transition change that
+        # DOES make `active + released` legitimate is noticed here.
+        _seed_active_bound(path=self.path, key=_key())
+        lifecycle = LaneLifecycleStore(path=self.path)
+        rec = lifecycle.get(_key())
+        req = lifecycle.request_release(
+            _key(), expected_revision=rec.revision, action_id="rel-1",
+            pins=[ReleasePin("gateway", "codex-mzb1", "w2X:p3Q")],
+        )
+        self.assertFalse(req.applied)
+        rec = lifecycle.get(_key())
+        rec_out = lifecycle.record_release_outcome(
+            _key(), action_id="rel-1", expected_revision=rec.revision, target=RELEASE_RELEASED
+        )
+        self.assertFalse(rec_out.applied)
+        self.assertEqual(lifecycle.get(_key()).process_release, "not_requested")
 
     def test_empty_issue_or_worktree_token_raises(self):
         _seed_active_bound(path=self.path, key=_key())
@@ -351,6 +377,73 @@ class ActiveRetireCasMatrix(unittest.TestCase):
                         worktree_identity=wt,
                         decision=_decision(),
                     )
+
+
+# ---------------------------------------------------------------------------
+# 1b. The OPEN launch race (Redmine #14242 review j#85219 F1).
+# ---------------------------------------------------------------------------
+
+
+class LaunchRaceIsNotYetClosed(unittest.TestCase):
+    """The invariant F1 requires, written as an executable expectation.
+
+    Measured facts (see `test_relaunch_does_not_advance_the_lifecycle_revision`): a process
+    launch does not mutate the lifecycle row, so the CAS's `expected_revision` fence cannot see
+    it. A pair that starts between the caller's live-zero read and the terminal write therefore
+    leaves the lane recorded as `retired` while it is live.
+
+    The desired behaviour is expressed as an `expectedFailure` rather than omitted, so the
+    invariant is executable and reviewable now. When the launch-exclusion design lands, this
+    test will pass — and because unittest reports an unexpected success as a FAILED run, the run
+    itself will demand the decorator be removed. It is deliberately not inverted into a test that
+    asserts the defective behaviour: that would pin the bug as contract.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "lifecycle.sqlite"
+
+    def test_relaunch_does_not_advance_the_lifecycle_revision(self):
+        # The measurement F1 turns on. This one PASSES: it records why the fence is blind.
+        _seed_active_bound(path=self.path, key=_key())
+        lifecycle = LaneLifecycleStore(path=self.path)
+        before = lifecycle.get(_key()).revision
+        # The declaration writes a launch path performs against an existing row:
+        declared = lifecycle.declare_active(
+            _key(), decision=_decision(), issue_id=_ISSUE, worktree_identity=_BOUND_WT
+        )
+        self.assertFalse(declared.applied)
+        LaneDeclarationStore(path=self.path).declare_lane(
+            _key(), decision=_decision(), issue_id=_ISSUE,
+            declared_slots=_pins(), worktree_identity=_BOUND_WT,
+        )
+        self.assertEqual(
+            lifecycle.get(_key()).revision, before,
+            "a relaunch-shaped declaration must not be assumed to advance the revision",
+        )
+
+    @unittest.expectedFailure
+    def test_pair_appearing_after_the_zero_read_must_be_zero_write(self):
+        # The invariant #14242 Acceptance requires ("action-time positive zero", "revision race
+        # is zero-write"), currently UNMET.
+        _seed_active_bound(path=self.path, key=_key())
+        lifecycle = LaneLifecycleStore(path=self.path)
+        measured_revision = lifecycle.get(_key()).revision  # live-zero read happened here
+        # ... a pair starts. It touches herdr, not the lifecycle row, so revision is unchanged.
+        self.assertEqual(lifecycle.get(_key()).revision, measured_revision)
+        out = LaneActiveRetireStore(path=self.path).retire_active_live_zero(
+            _key(),
+            expected_revision=measured_revision,
+            issue_id=_ISSUE,
+            worktree_identity=_BOUND_WT,
+            decision=_decision(),
+        )
+        self.assertFalse(out.applied, "a lane whose pair started after the zero read must not terminalize")
+        self.assertEqual(
+            lifecycle.get(_key()).lane_disposition, DISPOSITION_ACTIVE,
+            "the lane must remain active while its pair is live",
+        )
 
 
 # ---------------------------------------------------------------------------

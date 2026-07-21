@@ -31,8 +31,18 @@ be refused explicitly, and the CAS's expected-revision fence has to carry the ra
 - a locator-less expected row is "cannot resolve", never "absent", unless the shared liveness
   contract positively calls it dead;
 - a foreign occupant in a targeted unit means a real process is still running there;
-- and the revision the zero read was measured against is passed to the CAS, so a pair relaunched
-  between the read and the write loses to ``CAS_STALE_REVISION`` instead of being clobbered.
+- and the revision the zero read was measured against is passed to the CAS.
+
+.. warning::
+   **Known open window (Redmine #14242 review j#85219 F1).** That revision fence does NOT close
+   the read -> write race for a *process relaunch*: a launch does not mutate the lifecycle row
+   (``declare_active`` on an existing row is ``CAS_ALREADY_DECLARED`` zero-write, ``declare_lane``
+   is idempotent), so ``revision`` is unchanged and the terminal write applies — recording a lane
+   as ``retired`` while its pair is live. A second inventory read would not help; the same window
+   simply moves. Closing it requires an exclusion the launch / resume / adopt admission path
+   participates in, which is a cross-surface design decision raised as a design consultation on
+   #14242. Until it is resolved this surface must not be run against a lane that could be
+   relaunched concurrently.
 
 Gate order mirrors #13845 deliberately, so an operator reads one vocabulary across every retire
 intent and a reviewer can diff the two surfaces line for line.
@@ -512,8 +522,9 @@ def run_active_live_zero_retire(
     try:
         outcome = store.retire_active_live_zero(
             key,
-            # The revision the live-zero read above was measured against: a pair relaunched
-            # between that read and this write loses to CAS_STALE_REVISION.
+            # The revision the live-zero read above was measured against. NOTE (review j#85219
+            # F1): this catches a concurrent lifecycle-row mutation, NOT a process relaunch —
+            # that window is still open, see the module warning.
             expected_revision=record.revision,
             issue_id=issue,
             worktree_identity=metadata_token,
