@@ -16,6 +16,7 @@ fake raises); it never falls back to a real backend.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -38,34 +39,65 @@ def _state_path() -> Path:
     return Path(raw)
 
 
+@contextlib.contextmanager
+def _state_lock(state_path: Path):
+    """Serialize the read->mutate->write cycle across concurrent adapter invocations.
+
+    The standard-rail turn-start choreography ARMS its ``wait agent-status`` (a non-blocking
+    background invocation of this adapter) and THEN injects (``pane send-text`` / ``send-keys``,
+    further invocations) — so two adapter processes hold the SAME state file at once. Without a
+    lock their read-modify-write cycles interleave and one clobbers the other (a stale snapshot
+    restores a just-consumed armed transition, so the confirmed turn-start intermittently reads
+    ``uncertain``): the exact non-determinism a deterministic harness must not have (Redmine
+    #14097). An exclusive advisory lock on a sibling lock file makes each cycle atomic. Degrades to
+    a no-op where ``fcntl`` is unavailable (non-POSIX) rather than failing the smoke.
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - POSIX-only; the smoke runs on Linux/macOS CI
+        yield
+        return
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def main(argv: list[str]) -> int:
     state_path = _state_path()
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        sys.stderr.write(f"fake_herdr_cli: unreadable state {state_path}: {exc}\n")
-        return 2
-    fake = FakeHerdr.from_state(state)
-    # The turn-start wait rail (``wait agent-status``) is the canonical fake's POPEN seam, not its
-    # run seam — model it here so the installed CLI's delivery confirmation observes an armed
-    # transition (Redmine #14097 Design Consultation j#84712). Any other argv replays through run.
-    if argv[:2] == ["wait", "agent-status"]:
-        proc = fake.popen([sys.argv[0], *argv])
-        out, err = proc.communicate()
-        state_path.write_text(json.dumps(fake.to_state()), encoding="utf-8")
-        if out:
-            sys.stdout.write(out)
-        if err:
-            sys.stderr.write(err)
-        return int(proc.returncode or 0)
-    # ``fake.run`` takes the full argv (binary + command); replay exactly this invocation.
-    result = fake.run([sys.argv[0], *argv])
-    # Persist any mutation (pane close / agent start) so a later invocation sees it.
-    try:
-        state_path.write_text(json.dumps(fake.to_state()), encoding="utf-8")
-    except OSError as exc:  # pragma: no cover - a temp write failure is a smoke infra fault
-        sys.stderr.write(f"fake_herdr_cli: could not persist state: {exc}\n")
-        return 2
+    # One atomic read->mutate->write cycle: a concurrently-armed ``wait`` and an injecting ``send``
+    # can no longer lose each other's writes (the intermittent-uncertain race above).
+    with _state_lock(state_path):
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            sys.stderr.write(f"fake_herdr_cli: unreadable state {state_path}: {exc}\n")
+            return 2
+        fake = FakeHerdr.from_state(state)
+        # The turn-start wait rail (``wait agent-status``) is the canonical fake's POPEN seam, not
+        # its run seam — model it here so the installed CLI's delivery confirmation observes an
+        # armed transition (Redmine #14097 Design Consultation j#84712). Any other argv replays
+        # through run.
+        if argv[:2] == ["wait", "agent-status"]:
+            proc = fake.popen([sys.argv[0], *argv])
+            out, err = proc.communicate()
+            state_path.write_text(json.dumps(fake.to_state()), encoding="utf-8")
+            if out:
+                sys.stdout.write(out)
+            if err:
+                sys.stderr.write(err)
+            return int(proc.returncode or 0)
+        # ``fake.run`` takes the full argv (binary + command); replay exactly this invocation.
+        result = fake.run([sys.argv[0], *argv])
+        # Persist any mutation (pane close / agent start) so a later invocation sees it.
+        try:
+            state_path.write_text(json.dumps(fake.to_state()), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - a temp write failure is a smoke infra fault
+            sys.stderr.write(f"fake_herdr_cli: could not persist state: {exc}\n")
+            return 2
     if result.stdout:
         sys.stdout.write(result.stdout)
     if result.stderr:

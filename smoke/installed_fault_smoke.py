@@ -49,7 +49,8 @@ SHAPE_ENTRYPOINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 #: F1): F2 recover-stale close/resume, F3 session-rollback replay, F4 callback exactly-once are
 #: the accepted-finding critical paths, alongside the callback-lease + stale-projection paths.
 REQUIRED_REPRESENTATIVE: tuple[str, ...] = (
-    "callback_lease", "sublane_list", "recover_stale", "session_rollback", "callback_exactly_once",
+    "callback_lease", "sublane_list", "recover_stale", "recover_stale_negative",
+    "session_rollback", "callback_exactly_once",
 )
 
 
