@@ -350,6 +350,27 @@ class InstalledFaultHarness:
         """Dispatch ``workflow callback-lease`` (status when no flag) through the public CLI."""
         return self.run_cli(["workflow", "callback-lease", *flags])
 
+    def write_redmine_snapshot(self, issue: str, journal: str, gate: str) -> Path:
+        """Write an offline issue-detail snapshot carrying one callback-required gate journal.
+
+        The ``--ingest`` classifier reads this instead of the live credential-gated Redmine API,
+        so the harness never touches the network / a real ticket.
+        """
+        import json as _json
+
+        path = self._tmp / f"redmine_{issue}_{journal}.json"
+        path.write_text(
+            _json.dumps({"issue": {"id": issue, "journals": [
+                {"id": journal, "notes": f"gate [mozyo:workflow-event:gate={gate}]"}
+            ]}}),
+            encoding="utf-8",
+        )
+        return path
+
+    def callbacks_cli(self, *flags: str) -> CliResult:
+        """Dispatch ``workflow callbacks`` (the callback-outbox pipeline) through the public CLI."""
+        return self.run_cli(["workflow", "callbacks", *flags])
+
     def run_lease_apply_with_failing_backup_cleanup(self, fingerprint: str) -> CliResult:
         """Drive the public lease apply with a mid-backup mutation + a failing backup cleanup.
 
