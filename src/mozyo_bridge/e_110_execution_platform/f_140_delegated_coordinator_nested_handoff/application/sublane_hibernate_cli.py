@@ -41,11 +41,24 @@ def format_hibernate_text(outcome: HibernateOutcome) -> str:
     ]
     if outcome.already_hibernated:
         lines.append("  lane already hibernated (idempotent resume)")
+    if outcome.composer_ghost_observed:
+        # Redmine #14230: a safe, non-blocking observation -- never itself a block reason.
+        lines.append(
+            "  observed: composer_ghost_empty (provider-declared placeholder, not a "
+            "real pending input)"
+        )
     if outcome.is_blocked:
         # Redmine #13843: render the release-boundary reasons alongside the preflight ones.
         lines.append(
             "  -> fail-closed blocked: " + ", ".join(outcome.blocked_reasons)
         )
+        # Redmine #14230 review j#84793 R1-F2: an actionable, secret-free next-action
+        # instruction per fired release-boundary reason (never just the coarse summary).
+        next_actions = outcome.next_actions
+        if next_actions.actions:
+            lines.append(f"  next action: {next_actions.primary}")
+            for action in next_actions.actions:
+                lines.append(f"    - {action}: {next_actions.details[action]}")
         if outcome.transition is not None and not outcome.transition.applied:
             lines.append(f"  commit refused: {outcome.transition.reason}")
         return "\n".join(lines)

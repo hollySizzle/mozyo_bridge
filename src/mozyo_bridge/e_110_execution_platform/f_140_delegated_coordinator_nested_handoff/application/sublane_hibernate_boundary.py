@@ -318,12 +318,16 @@ class LaneActivityObservation:
     ``readable`` fails closed by default: an un-observed activity state is treated as a
     divergence, never as "quiescent". ``worker_busy`` is any managed slot running a turn;
     ``composer_pending`` is a pending composer input (ghost-empty-refined so an idle
-    placeholder does not false-positive).
+    placeholder does not false-positive). ``composer_ghost_observed`` (Redmine #14230) is a
+    SAFE, secret-free, non-blocking sibling observation: a raw composer read that DID carry
+    pending content but was recognised and excluded as a provider-declared ghost placeholder
+    (Redmine #14065) — surfaced for operator diagnosis, never itself a divergence signal.
     """
 
     readable: bool = False
     worker_busy: bool = False
     composer_pending: bool = False
+    composer_ghost_observed: bool = False
 
 
 def read_activity(
@@ -415,6 +419,7 @@ def read_live_lane_activity(
 
     worker_busy = False
     composer_pending = False
+    composer_ghost_observed = False
     for _role, (_assigned_name, locator) in slots.items():
         try:
             state = state_reader.read_agent_state(locator)
@@ -446,8 +451,16 @@ def read_live_lane_activity(
         )
         if effective_pending is True:
             composer_pending = True
+        elif observation.has_pending:
+            # Raw read carried pending content, but the ghost-empty gate excluded it (Redmine
+            # #14065 provider-declared placeholder) — a safe, non-blocking observation distinct
+            # from `composer_pending`, never itself treated as evidence of a real input.
+            composer_ghost_observed = True
     return LaneActivityObservation(
-        readable=True, worker_busy=worker_busy, composer_pending=composer_pending
+        readable=True,
+        worker_busy=worker_busy,
+        composer_pending=composer_pending,
+        composer_ghost_observed=composer_ghost_observed,
     )
 
 
@@ -484,18 +497,23 @@ def revalidate_boundary(
     lane: str,
     project_scope: str,
 ) -> tuple[
-    Sequence[Mapping[str, object]], WorktreeMutationFingerprint, tuple[str, ...]
+    Sequence[Mapping[str, object]], WorktreeMutationFingerprint, tuple[str, ...], bool
 ]:
     """Release-boundary (T1) fresh re-read + full exact-generation re-validation (#13843).
 
     On ONE fresh snapshot, re-reads and re-validates every action-time dimension IR j#83536
     item 2 names, comparing to the preflight (T0) capture. Returns ``(rows_boundary,
-    fingerprint_boundary, reasons)``; a non-empty ``reasons`` means the caller performs zero
-    lifecycle transition / zero process close. Dimensions:
+    fingerprint_boundary, reasons, composer_ghost_observed)``; a non-empty ``reasons`` means
+    the caller performs zero lifecycle transition / zero process close. Dimensions:
 
     - **worktree fingerprint + live activity** — the fresh worktree fingerprint with the live
-      worker-busy / pending-composer flags folded in; any divergence / running mutation /
-      pending composer / unreadable is a :func:`revalidate_release_boundary` block.
+      worker-busy / pending-composer flags folded in; per Redmine #14230 the pure gate reports
+      worktree-content-change / worker-busy / real-pending-composer / worktree-unreadable /
+      runtime-unreadable-or-unknown as DISTINCT typed reasons (see
+      :func:`.sublane_hibernate_toctou.revalidate_release_boundary`), no longer collapsed into
+      one coarse token. ``composer_ghost_observed`` is a separate SAFE, non-blocking
+      observation (Redmine #14065's ghost-empty placeholder was recognised at the boundary) —
+      never itself a reason.
     - **live managed-slot set** — a changed ``assigned_name -> locator`` map is generation
       drift.
     - **lifecycle revision** — a revision that advanced since the preflight read (another
@@ -512,20 +530,24 @@ def revalidate_boundary(
     activity = read_activity(ops, workspace_id, lane, rows1)
     # Fold the live activity into the boundary fingerprint (worker-busy / pending-composer are
     # absolute-at-boundary signals; an unreadable activity read makes the fingerprint
-    # unreadable -> the pure gate blocks).
+    # unreadable -> the pure gate blocks). `fingerprint_worktree.readable` is ALSO passed
+    # separately to the pure gate below (Redmine #14230) so it can tell a worktree-probe
+    # failure apart from an activity-probe failure, which this fold alone cannot.
     fingerprint_boundary = replace(
         fingerprint_worktree,
         mutation_in_flight=activity.worker_busy,
         pending_composer=activity.composer_pending,
         readable=fingerprint_worktree.readable and activity.readable,
     )
+    composer_ghost_observed = activity.composer_ghost_observed
     if not readable1:
-        return rows1, fingerprint_boundary, (BLOCK_INVENTORY_UNREADABLE,)
+        return rows1, fingerprint_boundary, (BLOCK_INVENTORY_UNREADABLE,), composer_ghost_observed
 
     reasons: list[str] = list(
         revalidate_release_boundary(
             fingerprint_preflight=fingerprint_preflight,
             fingerprint_boundary=fingerprint_boundary,
+            fingerprint_worktree_readable=fingerprint_worktree.readable,
             slots_preflight=unit_slots(rows0, workspace_id, lane),
             slots_boundary=unit_slots(rows1, workspace_id, lane),
         ).reasons
@@ -551,7 +573,7 @@ def revalidate_boundary(
             rows1, workspace_id, lane, _attestation_reader(ops)
         ):
             reasons.append(BLOCK_RELEASE_BOUNDARY_ATTESTATION_DRIFT)
-    return rows1, fingerprint_boundary, tuple(reasons)
+    return rows1, fingerprint_boundary, tuple(reasons), composer_ghost_observed
 
 
 def _attestation_reader(ops: object) -> Callable[[str], object]:
