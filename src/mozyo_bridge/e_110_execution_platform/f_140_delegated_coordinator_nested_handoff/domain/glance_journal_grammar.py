@@ -92,7 +92,7 @@ already consume — so the glance does not invent a second state machine.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Sequence, Tuple
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
@@ -102,6 +102,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MARKER_CHANNEL_WORKFLOW_EVENT,
     RedmineJournalEntry,
     extract_markers,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_integration_disposition import (
+    IntegrationDispositionFacts,
+    fold_integration_disposition,
+    fold_work_unit,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
     correlated_review_request_journal,
@@ -139,7 +144,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 # occupancy, never a stop reason). The list is the governed template's lifecycle gates
 # (j#74307 point 5): dispatch, implementation_done, review_request, audit review,
 # owner_close_approval, blocked, close/retire. The integration disposition is read separately
-# from a ``## Integration disposition: <value>`` line (see :func:`_integration_disposition`).
+# (and typed) by :mod:`...domain.glance_integration_disposition`; it is NOT a lifecycle gate.
 # ---------------------------------------------------------------------------
 
 _HEADING_GATE: dict[str, str] = {
@@ -166,31 +171,6 @@ _HEADING_GATE: dict[str, str] = {
     "retire": GATE_CLOSE,
     "retirement": GATE_CLOSE,
 }
-
-#: Integration-disposition values (the ``<value>`` of a ``## Integration disposition: <value>``
-#: heading — the canonical governed form, e.g. #13446 j#74290 ``explicit_deferral``). Only a
-#: *completion* disposition marks the work integrated (``integration_recorded=True``); a
-#: *deferral* explicitly does NOT — the lane stays integration_waiting until it is actually
-#: merged (Redmine #13435 re-audit j#74323 Finding 1). An unrecognized value asserts neither.
-_INTEGRATION_COMPLETE_VALUES: frozenset[str] = frozenset(
-    {
-        "merged",
-        "integrated",
-        "integration_complete",
-        "ff_push",
-        "ff_pushed",
-        "pushed",
-        "complete",
-        "completed",
-        "no_commit",
-        "no_commits",
-        "patch_equivalent",
-        "cherry_picked",
-    }
-)
-_INTEGRATION_DEFERRAL_VALUES: frozenset[str] = frozenset(
-    {"explicit_deferral", "deferral", "deferred", "defer", "deferred_disposition"}
-)
 
 #: Collision-prone canonical headings that are **explicitly not** the gate they resemble
 #: (j#74307 point 3). Exact-matching already keeps them out of :data:`_HEADING_GATE`; this
@@ -335,14 +315,6 @@ _CORRELATION_ISSUE = "0"
 _MARKER_ABSENT = "absent"
 _MARKER_CANONICAL = "canonical"
 _MARKER_SHADOW = "shadow"
-
-# A line-anchored ``## Integration disposition: <value>`` heading (the canonical governed
-# form; a ``## Gate: Integration disposition:`` variant is also accepted). ``<value>`` is the
-# first identifier token; classified against the completion / deferral vocabularies above.
-_INTEGRATION_DISPOSITION_RE = re.compile(
-    r"^\s{0,3}#{2,}\s*(?:Gate\s*[:：]\s*)?Integration[ _]disposition\s*[:：]\s*(?P<value>[A-Za-z_]+)",
-    re.MULTILINE | re.IGNORECASE,
-)
 
 # An explicit commit-hash field on a gate journal (``commit`` / ``commit_or_diff`` /
 # ``commit_hash`` / ``target_commit`` … : <hex>). Markdown emphasis / list markers tolerated.
@@ -621,24 +593,6 @@ def _int_journal(journal_id) -> Optional[int]:
         return None
 
 
-def _integration_disposition(notes: str) -> Optional[bool]:
-    """Classify a ``## Integration disposition:`` line: True=complete, False=deferral, None=absent.
-
-    A *completion* disposition (merged / ff-pushed / no-commit …) marks the work integrated; a
-    *deferral* (``explicit_deferral`` …) explicitly does not; an absent or unrecognized-value
-    line asserts neither (returns None). Redmine #13435 re-audit j#74323 Finding 1.
-    """
-    match = _INTEGRATION_DISPOSITION_RE.search(notes or "")
-    if not match:
-        return None
-    value = match.group("value").strip().lower()
-    if value in _INTEGRATION_COMPLETE_VALUES:
-        return True
-    if value in _INTEGRATION_DEFERRAL_VALUES:
-        return False
-    return None
-
-
 @dataclass(frozen=True)
 class GateFacts:
     """The durable gate facts folded from one issue's canonical ``## Gate:`` journals.
@@ -646,11 +600,19 @@ class GateFacts:
     ``latest_gate`` is the most-recent recognized gate (the max journal id; ties inside a
     combined heading broken by :data:`_GATE_PRECEDENCE`). ``latest_gate_journal`` is that
     journal id. ``review_conclusion`` is meaningful only when ``latest_gate`` is
-    :data:`GATE_REVIEW`. ``commit_bearing`` / ``integration_recorded`` are sticky facts
+    :data:`GATE_REVIEW`. ``commit_bearing`` is a sticky fact
     accumulated across the recognized gate journals; ``blocker_recorded`` is true when the
     latest gate is :data:`GATE_BLOCKED`, or when the latest gate is an audit review that
     concluded :data:`REVIEW_OUTCOME_BLOCKER` (a concluded audit that says the lane cannot
     proceed is a recorded blocker, not an audit still owed).
+
+    ``integration`` is the LATEST typed integration disposition (Redmine #14213) — the
+    coordinator's post-review decision plus its structured reason / unlock / next-owner.
+    ``integration_recorded`` remains as the derived boolean "this disposition means
+    integrated", but it is no longer the whole truth: a recorded ``explicit_deferral`` leaves
+    it False *and* records the pending disposition, which is what keeps an approved-but-
+    unmerged lane out of owner-close guidance. ``work_unit`` is the governed granularity the
+    durable record declares (``leaf_issue`` / ``user_story``), or ``""`` when undeclared.
     """
 
     latest_gate: str
@@ -659,6 +621,10 @@ class GateFacts:
     commit_bearing: bool = False
     integration_recorded: bool = False
     blocker_recorded: bool = False
+    integration: IntegrationDispositionFacts = field(
+        default_factory=IntegrationDispositionFacts
+    )
+    work_unit: str = ""
 
 
 @dataclass(frozen=True)
@@ -683,20 +649,19 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
     template) rather than a fabricated state.
     """
     recognized: list[_RecognizedJournal] = []
-    integration_recorded = False
     # Redmine #13952 R4: the review-generation correlation reads the WHOLE issue's markers (a
     # review_result correlates to its review_request in the same history), so extract them once.
     issue_markers = _issue_markers(journals or ())
+    # Redmine #14213: the integration disposition and the work-unit declaration are issue-wide,
+    # latest-wins authority facts that can each stand in their OWN journal (no gate heading), so
+    # they are folded across the whole history rather than accumulated per recognized gate.
+    integration = fold_integration_disposition(journals or ())
+    work_unit = fold_work_unit(journals or ())
 
     for journal_id, notes in journals or ():
         jint = _int_journal(journal_id)
         if jint is None:
             continue
-        # An integration disposition can stand in its own journal (no gate heading): a
-        # *completion* disposition marks the work integrated; a *deferral* explicitly does
-        # not (the lane stays integration_waiting) — never conflate the two.
-        if _integration_disposition(notes) is True:
-            integration_recorded = True
         gates: set[str] = set()
         review_qualifier = ""
         for part, qualifier in _gate_heading_parts(notes):
@@ -757,8 +722,10 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         latest_gate_journal=str(latest.journal_id),
         review_conclusion=latest.review_conclusion if latest.gate == GATE_REVIEW else REVIEW_PENDING,
         commit_bearing=any(r.commit_bearing for r in recognized),
-        integration_recorded=integration_recorded,
+        integration_recorded=integration.complete,
         blocker_recorded=(latest.gate == GATE_BLOCKED or latest.blocker),
+        integration=integration,
+        work_unit=work_unit,
     )
 
 
@@ -785,6 +752,9 @@ def lane_signal_from_gate_facts(
         integration_recorded=facts.integration_recorded,
         issue_open=issue_open,
         blocker_recorded=facts.blocker_recorded,
+        # Redmine #14213: the TYPED disposition is what lets the classifier tell "integrated"
+        # from "explicitly deferred / blocked" at the approved-review step.
+        integration_disposition=facts.integration.validated().disposition,
     )
 
 

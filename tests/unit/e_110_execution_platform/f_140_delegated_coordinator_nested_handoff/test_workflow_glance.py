@@ -46,6 +46,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DELIVERY_SOURCE_NONE,
     DELIVERY_SOURCE_RUNTIME_OBSERVATION,
     OWNER_AUDITOR,
+    OWNER_IMPLEMENTATION_GATEWAY,
     OWNER_COORDINATOR,
     OWNER_WORKER,
     RECEIVE_CALLBACK,
@@ -98,7 +99,7 @@ class FoldNonRollbackTest(unittest.TestCase):
         row = fold_glance_row(_snap("13435", GATE_REVIEW_REQUEST))
         self.assertEqual(row.workflow_state, "review_waiting")
         self.assertEqual(row.state_class, row.workflow_state)
-        self.assertEqual(row.next_owner, OWNER_AUDITOR)
+        self.assertEqual(row.next_owner, OWNER_IMPLEMENTATION_GATEWAY)
         self.assertEqual(row.delivery_anomaly, ANOMALY_NONE)
         self.assertFalse(row.has_active_anomaly)
 
@@ -189,7 +190,7 @@ class MotivatingScenarioFixtureTest(unittest.TestCase):
         self.assertEqual(row.workflow_state, "review_waiting")
         self.assertTrue(row.delivery_anomaly_stale)
         self.assertFalse(row.has_active_anomaly)
-        self.assertEqual(row.next_owner, OWNER_AUDITOR)  # durable state owner, not coordinator
+        self.assertEqual(row.next_owner, OWNER_IMPLEMENTATION_GATEWAY)  # durable state owner, not coordinator
 
 
 class VocabularyFailClosedTest(unittest.TestCase):
@@ -846,7 +847,7 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
         # F1: a review_result marker with an out-of-vocabulary conclusion must NOT let the body
         # ``結論: 承認`` promote the lane — the marker's presence forbids the fallback.
         facts, state, owner = self._fold(_review("bogus", body="- 結論: 承認"))
-        self.assertEqual((facts.review_conclusion, state, owner), (REVIEW_PENDING, "review_waiting", OWNER_AUDITOR))
+        self.assertEqual((facts.review_conclusion, state, owner), (REVIEW_PENDING, "review_waiting", OWNER_IMPLEMENTATION_GATEWAY))
 
     def test_marker_missing_head_is_not_authoritative(self):
         # F2: no head -> shape identity fails -> shadow (pending) even with a correlated request.
@@ -873,7 +874,7 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
         # A correlated review whose marker speaks no conclusion (and no field) is fail-closed to
         # pending — the audit is still owed, never guessed.
         facts, state, owner = self._fold(_review(None))
-        self.assertEqual((facts.review_conclusion, state, owner), (REVIEW_PENDING, "review_waiting", OWNER_AUDITOR))
+        self.assertEqual((facts.review_conclusion, state, owner), (REVIEW_PENDING, "review_waiting", OWNER_IMPLEMENTATION_GATEWAY))
 
     def test_conflicting_markers_on_one_journal_fail_closed(self):
         # Two review_result markers on one journal disagree -> ambiguous -> pending.
@@ -981,7 +982,7 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
         ]
         facts, state, owner = self._fold(journals)
         self.assertEqual(facts.latest_gate_journal, "110")
-        self.assertEqual((facts.latest_gate, state, owner), (GATE_REVIEW_REQUEST, "review_waiting", OWNER_AUDITOR))
+        self.assertEqual((facts.latest_gate, state, owner), (GATE_REVIEW_REQUEST, "review_waiting", OWNER_IMPLEMENTATION_GATEWAY))
 
     def test_newer_malformed_review_request_still_supersedes(self):
         # F6: even a head-less / malformed newer review_request means the round restarted — the old
@@ -1056,7 +1057,7 @@ class StructuredMarkerAuthorityTest(unittest.TestCase):
         ]
         facts, state, owner = self._fold(journals)
         self.assertEqual((facts.latest_gate_journal, facts.latest_gate), ("110", GATE_REVIEW_REQUEST))
-        self.assertEqual((state, owner), ("review_waiting", OWNER_AUDITOR))
+        self.assertEqual((state, owner), ("review_waiting", OWNER_IMPLEMENTATION_GATEWAY))
 
     def test_review_result_marker_overrides_a_conflicting_request_heading(self):
         # The symmetric case: a ``## Gate: Review Request`` heading but a canonical review_result
