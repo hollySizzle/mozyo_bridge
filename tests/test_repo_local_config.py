@@ -165,8 +165,10 @@ class TopLevelFailClosedTest(unittest.TestCase):
             RepoLocalConfig.from_record({1: {}})
 
     def test_unsupported_version_rejected(self) -> None:
+        # v1 and v2 are supported (Redmine #14148); a future, not-yet-understood version
+        # still fails closed.
         with self.assertRaises(RepoLocalConfigError):
-            RepoLocalConfig.from_record({"version": 2})
+            RepoLocalConfig.from_record({"version": 3})
 
     def test_version_bool_rejected(self) -> None:
         # ``bool`` is an ``int`` subclass; ``version: true`` must not read as 1.
