@@ -409,26 +409,65 @@ class StaleWorkerRecoveryThroughPublicCli(unittest.TestCase):
         ):
             self.assertTrue(obs[axis], axis)
 
-    def test_close_succeeds_then_post_close_resume_with_additional_close_zero(self):
-        # THE post-close-resume acceptance measured through the public orchestration path:
-        # --execute closes the exact stale worker (once), owes the launch; a re-run recognises
-        # the durable transaction as a post-close resume and NEVER re-closes.
+    def test_recovery_drives_to_completed_terminal_single_redispatch_additional_close_zero(self):
+        # THE full #13806 recovery acceptance measured through the public orchestration path:
+        # pass 1 closes the exact stale worker (once) and OWNS the launch; pass 2 attests the
+        # fresh receiver, recognises the durable launch-owed transaction as a post-close resume,
+        # and drives it to the COMPLETED terminal — a single confirmed queue-enter redispatch of
+        # the original gate, with NO additional close (Redmine #14097 review j#85090 F2). Asserting
+        # ``post_close_resume`` alone was a false green: that flag is true for an authority refusal,
+        # a stopped launch/attestation, or ``redispatch_status=uncertain`` too.
         h = InstalledFaultHarness(self)
         ctx = h.recover_stale_git_lane("issue_14097_resume", issue="14097")
-        self.assertEqual(h.live_locator_count(), 1)
+        self.assertEqual(h.live_locator_count(), 2)  # the stale worker + its surviving gateway
 
-        first = h.recover_stale_cli(ctx, execute=True).json()
-        self.assertTrue(first["executed"])
-        self.assertTrue(first["closed_old_worker"])  # the exact old worker was closed
-        self.assertEqual(first["status"], "stopped")
-        self.assertIn("re-run resumes", first["detail"])  # the launch is owed, replay resumes
-        self.assertEqual(h.live_locator_count(), 0)  # the stale worker is gone (closed once)
+        outcome = h.drive_recover_stale_to_completion(ctx)
 
-        # The re-run observes the old worker gone and recognises the durable launch-owed
-        # transaction: it is a post-close resume, and it closes NOTHING more.
-        second = h.recover_stale_cli(ctx, execute=True).json()
+        # Pass 1: the exact old worker was closed once and the launch was owed (in_progress).
+        self.assertTrue(outcome.first["executed"])
+        self.assertTrue(outcome.first["closed_old_worker"])
+        self.assertEqual(outcome.first["status"], "stopped")
+        self.assertEqual(outcome.first["recovery_status"], "in_progress")
+
+        # A distinct fresh worker was launched (not the vanished old locator).
+        self.assertTrue(outcome.fresh_locator)
+        self.assertNotEqual(outcome.fresh_locator, outcome.old_locator)
+
+        # Pass 2: the COMPLETED terminal — replaced worker + single confirmed redispatch.
+        second = outcome.second
+        self.assertEqual(second["status"], "completed")
+        self.assertEqual(second["recovery_status"], "recovered")
+        self.assertEqual(second["redispatch_status"], "confirmed")
+        self.assertTrue(second["fresh_slot_attested"])
         self.assertTrue(second["post_close_resume"])
-        self.assertEqual(h.live_locator_count(), 0)  # additional close 0
+        # ``closed_old_worker`` is the DURABLE close-committed reflection (the participant is past
+        # ``close_owed``), so a completed post-close resume necessarily still reports it true — it
+        # is NOT a per-pass "closed something now" flag (`_closed_old_worker`, the phase predicate).
+        self.assertTrue(second["closed_old_worker"])
+
+        # "additional close 0" as an OBSERVABLE, not a boolean: pass 2 removed no inventory row
+        # (a close deletes the pane), and it fired exactly ONE confirmed redispatch to the fresh
+        # worker (single redispatch, never a duplicate dispatch).
+        self.assertEqual(outcome.agents_before, outcome.agents_after)
+        self.assertEqual(outcome.redispatch_ok_count, 1)
+
+    def test_injected_uncertain_redispatch_never_reads_completed(self):
+        # The negative control the acceptance predicate must survive: if the fresh receiver's
+        # startup attestation lands OUTSIDE the redispatch's durable landing window, the exact same
+        # drive stops at ``redispatch_status=uncertain`` and NEVER reaches the completed terminal —
+        # so a smoke asserting completion fails closed on it (Redmine #14097 review j#85090 F2).
+        h = InstalledFaultHarness(self)
+        ctx = h.recover_stale_git_lane("issue_14097_uncertain", issue="14097")
+
+        outcome = h.drive_recover_stale_to_completion(ctx, inject_uncertain=True)
+
+        second = outcome.second
+        self.assertNotEqual(second["status"], "completed")
+        self.assertEqual(second["redispatch_status"], "uncertain")
+        # The completion predicate the positive test asserts must reject this outcome.
+        self.assertFalse(
+            second["status"] == "completed" and second["redispatch_status"] == "confirmed"
+        )
 
     def test_an_identity_unknown_with_no_transaction_refuses_zero_close(self):
         # The fail-closed fence: a genuinely unknown identity with NO durable transaction is a

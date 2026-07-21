@@ -103,6 +103,19 @@ class _RecoverStaleContext(NamedTuple):
     worker_revision: str
     lane_revision: str
     lane_generation: str
+    gateway_locator: str = ""
+
+
+class RecoverStaleCompletion(NamedTuple):
+    """The two-pass #13806 recovery outcome + its observable single-redispatch / close counts."""
+
+    first: dict  # pass 1 payload: close the exact worker once, own the launch (in_progress)
+    second: dict  # pass 2 payload: post-close resume driven to its terminal
+    fresh_locator: str  # the heal-launched fresh worker (distinct from old_locator)
+    old_locator: str  # the closed stale worker's vanished locator
+    agents_before: frozenset  # inventory just before pass 2 (additional-close-0 observable)
+    agents_after: frozenset  # inventory after pass 2 — identical iff no additional close
+    redispatch_ok_count: int  # confirmed queue-enter deliveries to the fresh worker (== 1)
 
 
 class CliResult(NamedTuple):
@@ -117,14 +130,48 @@ class CliResult(NamedTuple):
         return json.loads(self.stdout)
 
 
+def _attest_launcher_capability_help() -> str:
+    """The exact ``<launcher> herdr agent-attest --help`` capability epilog, built canonically.
+
+    A managed fresh-worker launch (Redmine #13806 heal) runs a #13847 launcher-capability
+    preflight — ``<attest-launcher> herdr agent-attest --help`` — before ``agent start``, so a
+    hermetic launch must answer that probe. The installed layer runs the REAL wheel's binary
+    (which carries the capability); in-process there is no such subprocess, so this reproduces the
+    SAME epilog the source ``cli_core`` renders, from the SAME source builders + schema constants
+    (never a copied literal — a schema bump re-renders here automatically). Carries the
+    ``--assigned-name`` subcommand marker, the advertised schema token, and the writable-store set,
+    so :func:`parse_launcher_capability_output` reads a compatible launcher.
+    """
+    from mozyo_bridge.core.state.herdr_identity_attestation import (
+        HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+        RECOGNIZED_SCHEMA_VERSIONS,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+        ATTEST_CAPABILITY_MARKER,
+        build_attest_capability_contract_line,
+        build_attest_capability_stores_line,
+    )
+
+    return (
+        f"usage: mozyo-bridge herdr agent-attest [{ATTEST_CAPABILITY_MARKER} ASSIGNED_NAME]\n\n"
+        "capability contract (Redmine #13847):\n"
+        + build_attest_capability_contract_line(HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION)
+        + "\nwritable attestation store shapes (Redmine #13882):\n"
+        + build_attest_capability_stores_line(RECOGNIZED_SCHEMA_VERSIONS)
+        + "\n"
+    )
+
+
 class _HerdrRunner:
     """Route the driven subprocess calls of a public command hermetically (#14097).
 
-    A public command under the herdr backend shells out to three consumers: the herdr binary
-    (-> the shared :class:`FakeHerdr`), the git-topology probe of ``herdr_workspace_segment``
-    (-> *not a git repo*, the pure-herdr / external posture the scratch root models), and — on
-    the tmux fallback only — ``command -v tmux`` (-> *no tmux*). Any other argv is unexpected
-    and raises, preserving the fail-closed posture (no silent canned success).
+    A public command under the herdr backend shells out to these consumers: the herdr binary
+    (-> the shared :class:`FakeHerdr`); the git-topology probe of ``herdr_workspace_segment``
+    (-> real git against a git-backed lane root, else *not a git repo*); the #13847 attest-launcher
+    capability probe (``<launcher> herdr agent-attest --help`` -> the canonical capability epilog,
+    so a heal's fresh-worker launch preflight passes in-process exactly as the installed wheel's
+    binary would); and — on the tmux fallback only — ``command -v tmux`` (-> *no tmux*). Any other
+    argv is unexpected and raises, preserving the fail-closed posture (no silent canned success).
     """
 
     def __init__(self, fake: FakeHerdr, herdr_bin: str, real_run, real_popen) -> None:
@@ -146,6 +193,14 @@ class _HerdrRunner:
             # Delegate to REAL git: a git-backed lane root (shape 5) needs real ancestry /
             # worktree probes; a plain scratch root simply returns git's own "not a work tree".
             return self._real_run(argv, **kwargs)
+        if list(argv[1:4]) == ["herdr", "agent-attest", "--help"]:
+            # The #13847 launcher-capability preflight a heal's fresh-worker launch runs. In-process
+            # there is no wheel binary to exec, so answer with the canonical capability epilog (the
+            # installed layer runs the real binary). A compatible answer lets the launch proceed to
+            # ``agent start`` exactly as the built artifact does.
+            return subprocess.CompletedProcess(
+                list(argv), 0, stdout=_attest_launcher_capability_help(), stderr=""
+            )
         if head in ("sh", "/bin/sh", "bash", "/bin/bash"):
             # ``require_tmux`` runs ``sh -c 'command -v tmux'``; report tmux absent so a
             # misrouted send fails closed exactly as a pure-herdr session would.
@@ -210,6 +265,11 @@ class InstalledFaultHarness:
         self._provider_bins = FakeAgentBinaries(self._tmp)
         #: assigned-name -> seeded locator, for callers that re-reference a seeded slot.
         self._locators: dict[str, str] = {}
+        #: An optional ``(workspace_id, lane_id)`` the dispatch env attests AS instead of the
+        #: default coordinator identity. A worker-recovery redispatch anchors on the LANE repo
+        #: (``--repo`` == the lane worktree), so its nested ``handoff send`` must attest as that
+        #: lane's identity or the sender env fails the anchor-workspace fence (target_unavailable).
+        self._identity_override: "tuple[str, str] | None" = None
 
     # -- environment ----------------------------------------------------------
 
@@ -221,9 +281,14 @@ class InstalledFaultHarness:
         env.pop("MOZYO_REPO", None)
         env["MOZYO_HERDR_BINARY"] = self.herdr_bin
         env["MOZYO_BRIDGE_HOME"] = str(self.home)
-        env["MOZYO_WORKSPACE_ID"] = self.workspace_id
+        workspace_id, lane_id = (
+            self._identity_override
+            if self._identity_override is not None
+            else (self.workspace_id, COORDINATOR_LANE)
+        )
+        env["MOZYO_WORKSPACE_ID"] = workspace_id
         env["MOZYO_AGENT_ROLE"] = "codex"
-        env["MOZYO_LANE_ID"] = COORDINATOR_LANE
+        env["MOZYO_LANE_ID"] = lane_id
         # Pin the trusted provider executables so a launch resolves the stub binaries
         # unambiguously (a bare PATH could carry a second real ``claude`` / ``codex`` and the
         # resolver refuses an ambiguous match). This is the sanctioned override, not a PATH hack.
@@ -734,14 +799,27 @@ class InstalledFaultHarness:
         )
         lrec = lstore.get(lkey)
 
+        # A fake workspace rooted at the LANE checkout (cwd == repo), so the worker, its
+        # surviving gateway, and the heal's fresh launch all align on the lane the launch
+        # re-anchors to (the coordinator repo_root workspace is a DIFFERENT cwd — a launch
+        # seeded there cannot adopt the lane pair, effect_failed:launch). Mirrors the installed
+        # driver's ``seed_workspace(cwd=repo)`` layout so both layers exercise one launch shape.
+        lane_ws = self.fake.seed_workspace(cwd=str(repo))
+
         # The locator-present shell-residue worker: a real inventory row (revision-carrying,
         # foreground_cwd a real checkout) whose detected agent is blank => stale.
         name = encode_assigned_name(ws_id, "claude", lane_id)
         locator = self.fake.seed_agent(
-            name, workspace_id=self._ws, provider="", status=STALE_SLOT_STATUS,
+            name, workspace_id=lane_ws, provider="", status=STALE_SLOT_STATUS,
             revision=worker_revision, detected_agent="", cwd=str(repo),
         )
         self._locators[name] = locator
+        # The surviving same-lane codex gateway the heal adopts + pins the tab on (a heal never
+        # splits the pair; without a live gateway the fresh worker launch has nothing to adopt).
+        gateway_locator = self.fake.seed_agent(
+            encode_assigned_name(ws_id, "codex", lane_id), workspace_id=lane_ws,
+            provider="codex", cwd=str(repo),
+        )
         action_id = stale_worker_recovery_action_id(
             lane_id=lane_id, role="claude", provider="claude", assigned_name=name, locator=locator,
         )
@@ -750,6 +828,7 @@ class InstalledFaultHarness:
             worker_name=name, worker_locator=locator, action_id=action_id,
             worker_revision=worker_revision,
             lane_revision=str(lrec.revision), lane_generation=str(lrec.lane_generation),
+            gateway_locator=gateway_locator,
         )
 
     def recover_stale_cli(
@@ -771,6 +850,98 @@ class InstalledFaultHarness:
                 "--execute",
             ]
         return self.run_cli(argv)
+
+    def drive_recover_stale_to_completion(
+        self, ctx: _RecoverStaleContext, *, inject_uncertain: bool = False
+    ) -> "RecoverStaleCompletion":
+        """Drive the full #13806 recovery: close+launch, attest the fresh slot, redispatch once.
+
+        The two-pass shape the public command actually walks: the first ``--execute`` closes the
+        exact stale worker and OWNS the launch (a real fresh pane), leaving recovery ``in_progress``
+        (attestation is owed by the launched worker). Between passes this seeds the fresh receiver's
+        startup attestation — the durable signal the relaunched worker came online — so the second
+        pass is admitted as a post-close resume and drives close->launch->attest->redispatch to the
+        ``completed`` terminal: a single queue-enter redispatch of the original gate, landing-marker
+        confirmed (``reason=ok``) on the fresh worker.
+
+        ``inject_uncertain`` stamps the attestation in the far future so the redispatch's durable
+        landing fence (``recorded_after``) rejects the ledger record — the negative control: the
+        exact same drive then stops at ``redispatch_status=uncertain`` and never reaches completed.
+        Returns both payloads plus the pre/post agent set (the observable additional-close-0 count)
+        and the single-redispatch ledger count.
+        """
+        import datetime as _dt
+
+        # A live-composer echo so the queue-enter landing marker is observable in the fresh
+        # worker's pane read — the signal that promotes the redispatch to reason=ok (a bare
+        # queue_enter, marker unobserved, would stay uncertain).
+        self.fake.echo_composer = True
+        # The recovery drives on the LANE worktree (``--repo`` == ctx.repo); its redispatch's
+        # nested send anchors there, so attest AS the lane identity (not the coordinator's) or the
+        # sender-anchor fence blocks the send (target_unavailable).
+        self._identity_override = (ctx.workspace_id, ctx.lane_id)
+
+        first = self.recover_stale_cli(ctx, execute=True).json()
+        fresh_locator = self._fresh_worker_locator(ctx)
+        if fresh_locator:
+            observed_at = (
+                "2999-01-01T00:00:00+00:00"
+                if inject_uncertain
+                else _dt.datetime.now(_dt.timezone.utc).isoformat()
+            )
+            self._seed_fresh_attestation(ctx, fresh_locator, observed_at=observed_at)
+            self.fake.arm_transition(fresh_locator, STATUS_WORKING)
+
+        agents_before = self._agent_identity_set()
+        second = self.recover_stale_cli(ctx, execute=True).json()
+        agents_after = self._agent_identity_set()
+        return RecoverStaleCompletion(
+            first=first, second=second,
+            fresh_locator=fresh_locator, old_locator=ctx.worker_locator,
+            agents_before=agents_before, agents_after=agents_after,
+            redispatch_ok_count=self._redispatch_ok_count(ctx, fresh_locator),
+        )
+
+    def _fresh_worker_locator(self, ctx: _RecoverStaleContext) -> str:
+        """The heal-launched fresh worker's locator (same assigned name, a new pane)."""
+        for agent in self.fake.agents:
+            if agent["name"] == ctx.worker_name and agent["pane_id"] != ctx.worker_locator:
+                return agent["pane_id"]
+        return ""
+
+    def _seed_fresh_attestation(
+        self, ctx: _RecoverStaleContext, locator: str, *, observed_at: str
+    ) -> None:
+        """Seed the fresh receiver's startup identity attestation (the relaunch came online)."""
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore, IdentityAttestationRecord, VERDICT_PRESENT,
+        )
+
+        HerdrIdentityAttestationStore(home=self.home).upsert(
+            IdentityAttestationRecord(
+                assigned_name=ctx.worker_name, workspace_id=ctx.workspace_id, role="claude",
+                lane_id=ctx.lane_id, locator=locator, verdict=VERDICT_PRESENT,
+                observed_at=observed_at, replacement_action_id=ctx.action_id,
+            )
+        )
+
+    def _agent_identity_set(self) -> frozenset:
+        """The current (name, locator) inventory — an additional-close-0 observable."""
+        return frozenset((a["name"], a["pane_id"]) for a in self.fake.agents)
+
+    def _redispatch_ok_count(self, ctx: _RecoverStaleContext, fresh_locator: str) -> int:
+        """Confirmed (reason=ok) queue-enter deliveries to the fresh worker — single-redispatch."""
+        from mozyo_bridge.core.state.herdr_delivery_ledger import HerdrDeliveryLedger
+
+        try:
+            records = HerdrDeliveryLedger(home=self.home).records_for_issue(ctx.issue)
+        except Exception:  # noqa: BLE001 - an unreadable ledger reads as zero confirmed sends
+            return 0
+        return sum(
+            1 for r in records
+            if (r.entry_kind == "delivery_outcome" and r.status == "sent" and r.reason == "ok"
+                and r.rail == "queue_enter_rail" and r.target == fresh_locator)
+        )
 
     # -- inventory snapshots (cleanup / residue assertions) -------------------
 

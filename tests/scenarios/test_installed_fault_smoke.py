@@ -90,8 +90,11 @@ class BuildSummaryTests(unittest.TestCase):
         self.assertIn("callback_exactly_once", summary["representative_missing"])
 
     def test_required_paths_cover_f2_f3_f4(self):
-        # The F2 / F3 / F4 accepted-finding critical paths are all required installed.
-        for key in ("recover_stale", "session_rollback", "callback_exactly_once"):
+        # The F2 / F3 / F4 accepted-finding critical paths are all required installed. F2 carries a
+        # negative control too: an injected uncertain redispatch must not read as completed
+        # (Redmine #14097 review j#85090 F2).
+        for key in ("recover_stale", "recover_stale_negative", "session_rollback",
+                    "callback_exactly_once"):
             self.assertIn(key, mod.REQUIRED_REPRESENTATIVE)
 
     def test_provenance_problem_fails(self):

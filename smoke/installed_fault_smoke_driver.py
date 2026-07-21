@@ -77,7 +77,8 @@ def _herdr_repo(tmp: Path, ws_id: str) -> Path:
 #: The fault-shape critical paths the installed layer MUST drive as a real subprocess (not
 #: ``--help``). The pure summary fails closed if any is missing (Redmine #14097 review j#84441 F1).
 REQUIRED_REPRESENTATIVE: tuple[str, ...] = (
-    "callback_lease", "sublane_list", "recover_stale", "session_rollback", "callback_exactly_once",
+    "callback_lease", "sublane_list", "recover_stale", "recover_stale_negative",
+    "session_rollback", "callback_exactly_once",
 )
 
 
@@ -131,13 +132,79 @@ def drive_representative(cli: Path, tmp: Path) -> dict[str, bool]:
         results["sublane_list"] = False
 
     results["recover_stale"] = _drive_recover_stale(cli, tmp)
+    results["recover_stale_negative"] = _drive_recover_stale_negative(cli, tmp)
     results["session_rollback"] = _drive_session_rollback(cli, tmp)
     results["callback_exactly_once"] = _drive_callback_exactly_once(cli, tmp)
     return results
 
 
 def _drive_recover_stale(cli: Path, tmp: Path) -> bool:
-    """F2 critical path installed: the exact stale worker is CLOSED once and the launch is owed."""
+    """F2 positive installed: the recovery drives to the COMPLETED terminal through the artifact.
+
+    Not a boolean resume flag (Redmine #14097 review j#85090 F2 — ``post_close_resume`` is true for
+    an authority refusal / stopped launch / uncertain redispatch too). The built ``mozyo-bridge``
+    binary, in an isolated home + fake herdr, must reach: pass 1 closes the exact worker once and
+    owns the launch (``in_progress``); pass 2 attests the fresh receiver and drives the post-close
+    resume to ``status=completed`` / ``recovery_status=recovered`` / ``redispatch_status=confirmed``
+    / ``fresh_slot_attested`` — a SINGLE confirmed queue-enter redispatch (ledger reason=ok, count 1)
+    with NO additional close (the inventory row set is unchanged across pass 2).
+    """
+    outcome = _recover_stale_outcome(cli, tmp, "rs")
+    if outcome is None:
+        return False
+    p1, p2, agents_before, agents_after, ok_count, fresh, old = outcome
+    return (
+        bool(p1["closed_old_worker"]) and p1["status"] == "stopped"
+        and p1["recovery_status"] == "in_progress"
+        and bool(fresh) and fresh != old
+        and p2["status"] == "completed" and p2["recovery_status"] == "recovered"
+        and p2["redispatch_status"] == "confirmed" and bool(p2["fresh_slot_attested"])
+        and bool(p2["post_close_resume"])
+        # closed_old_worker is the DURABLE close-committed reflection (past close_owed), so a
+        # completed post-close resume still reports it true — not a per-pass "closed now" flag.
+        and bool(p2["closed_old_worker"])
+        and agents_before == agents_after  # additional close 0 (a close deletes the pane row)
+        and ok_count == 1  # single confirmed redispatch, never a duplicate dispatch
+    )
+
+
+def _drive_recover_stale_negative(cli: Path, tmp: Path) -> bool:
+    """F2 negative installed: an injected uncertain redispatch must NEVER read as completed.
+
+    The acceptance predicate the positive path asserts has to fail closed on a real fault. Seed the
+    fresh receiver's attestation OUTSIDE the redispatch's durable landing window so the confirm
+    fence rejects the send: the exact same drive then stops at ``redispatch_status=uncertain`` and
+    never reaches the completed terminal (proving the smoke's green is not unconditional).
+    """
+    outcome = _recover_stale_outcome(cli, tmp, "rsneg", inject_uncertain=True)
+    if outcome is None:
+        return False
+    _p1, p2, _ab, _aa, _ok, _fresh, _old = outcome
+    # The negative control holds iff the outcome is uncertain AND the completion predicate rejects it.
+    return (
+        p2.get("status") != "completed"
+        and p2.get("redispatch_status") == "uncertain"
+        and not (p2.get("status") == "completed" and p2.get("redispatch_status") == "confirmed")
+    )
+
+
+def _recover_stale_outcome(
+    cli: Path, tmp: Path, tag: str, *, inject_uncertain: bool = False
+) -> "tuple | None":
+    """Drive the two-pass #13806 recovery through the installed artifact; return payloads + observables.
+
+    Returns ``(pass1_json, pass2_json, agents_before, agents_after, redispatch_ok_count,
+    fresh_locator, old_locator)`` or ``None`` on a setup / parse failure. Between passes it seeds
+    the fresh receiver's startup identity attestation (the durable signal the relaunched worker came
+    online), stamped inside the redispatch landing window (positive) or far in the future
+    (``inject_uncertain`` — the confirm fence then rejects the send).
+    """
+    import datetime as _dt
+
+    from mozyo_bridge.core.state.herdr_delivery_ledger import HerdrDeliveryLedger
+    from mozyo_bridge.core.state.herdr_identity_attestation import (
+        HerdrIdentityAttestationStore, IdentityAttestationRecord, VERDICT_PRESENT,
+    )
     from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleKey, LaneLifecycleStore
     from mozyo_bridge.core.state.replacement_transaction import DecisionPointer
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.stale_worker_recovery import (  # noqa: E501
@@ -148,11 +215,11 @@ def _drive_recover_stale(cli: Path, tmp: Path) -> bool:
     )
     from tests.support.agent_provider_binaries import FakeAgentBinaries
 
-    lane = "issue_14097_smoke_worker"
+    lane = f"issue_14097_smoke_{tag}"
     ws_id = f"fixture-14097-smoke-{lane}"
-    repo = tmp / f"rs_repo_{lane}"
+    repo = tmp / f"rs_repo_{tag}"
     _git_init(repo, branch=lane, ws_id=ws_id)
-    home = tmp / "rs_home"
+    home = tmp / f"rs_home_{tag}"
     home.mkdir(parents=True, exist_ok=True)
     lstore = LaneLifecycleStore(home=home)
     lkey = LaneLifecycleKey(ws_id, lane)
@@ -162,6 +229,9 @@ def _drive_recover_stale(cli: Path, tmp: Path) -> bool:
     lrec = lstore.get(lkey)
     name = encode_assigned_name(ws_id, "claude", lane)
     fake = FakeHerdr(read_text="idle\n> ")
+    # A live-composer echo so the queue-enter landing marker is observable in the fresh worker's
+    # pane read — the signal that promotes the redispatch to reason=ok (the confirm oracle).
+    fake.echo_composer = True
     fws = fake.seed_workspace(cwd=str(repo))
     locator = fake.seed_agent(name, workspace_id=fws, provider="", status="unknown",
                               detected_agent="", revision="3", cwd=str(repo))
@@ -170,8 +240,8 @@ def _drive_recover_stale(cli: Path, tmp: Path) -> bool:
                     cwd=str(repo))
     action_id = stale_worker_recovery_action_id(lane_id=lane, role="claude", provider="claude",
                                                 assigned_name=name, locator=locator)
-    bins = FakeAgentBinaries(tmp / "rs_bins")
-    state = tmp / "rs_state.json"
+    bins = FakeAgentBinaries(tmp / f"rs_bins_{tag}")
+    state = tmp / f"rs_state_{tag}.json"
     state.write_text(json.dumps(fake.to_state()), encoding="utf-8")
 
     def env():
@@ -179,6 +249,12 @@ def _drive_recover_stale(cli: Path, tmp: Path) -> bool:
         e["PATH"] = str(bins.bin_dir) + os.pathsep + e.get("PATH", "")
         e["MOZYO_AGENT_CLAUDE_BINARY"] = bins.path("claude")
         e["MOZYO_AGENT_CODEX_BINARY"] = bins.path("codex")
+        # The recovery drives on the LANE worktree (``--repo`` == repo); its redispatch's nested
+        # send anchors there, so it must attest AS this lane's identity (env == the repo's anchor
+        # workspace) or the sender-anchor fence blocks the send (target_unavailable).
+        e["MOZYO_WORKSPACE_ID"] = ws_id
+        e["MOZYO_AGENT_ROLE"] = "codex"
+        e["MOZYO_LANE_ID"] = lane
         return e
 
     argv = [
@@ -190,17 +266,56 @@ def _drive_recover_stale(cli: Path, tmp: Path) -> bool:
         "--lane-revision", str(lrec.revision), "--lane-generation", str(lrec.lane_generation),
         "--execute", "--json", "--repo", str(repo),
     ]
-    first = _run(cli, argv, env())   # close the exact stale worker, own the launch
-    second = _run(cli, argv, env())  # the old worker is gone: a post-close resume, no re-close
+
+    # Pass 1: close the exact stale worker once, own the launch (attestation still owed).
+    first = _run(cli, argv, env(), cwd=str(repo))
     try:
         p1 = json.loads(first.stdout)
+    except ValueError:
+        return None
+
+    # The heal-launched fresh worker (same assigned name, a new pane) and its attestation.
+    st = json.loads(state.read_text(encoding="utf-8"))
+    fresh_candidates = [a["pane_id"] for a in st["agents"]
+                        if a["name"] == name and a["pane_id"] != locator]
+    if not fresh_candidates:
+        return None
+    fresh = fresh_candidates[0]
+    observed_at = (
+        "2999-01-01T00:00:00+00:00" if inject_uncertain
+        else _dt.datetime.now(_dt.timezone.utc).isoformat()
+    )
+    HerdrIdentityAttestationStore(home=home).upsert(IdentityAttestationRecord(
+        assigned_name=name, workspace_id=ws_id, role="claude", lane_id=lane, locator=fresh,
+        verdict=VERDICT_PRESENT, observed_at=observed_at, replacement_action_id=action_id))
+    # Re-serialize the fake (EXEC1 mutated it) with the composer echo + the fresh worker's
+    # turn-start armed, so the second pass observes a live, attested receiver.
+    fake2 = FakeHerdr.from_state(json.loads(state.read_text(encoding="utf-8")))
+    fake2.echo_composer = True
+    fake2.arm_transition(fresh, STATUS_WORKING)
+    agents_before = sorted((a["name"], a["pane_id"]) for a in fake2.agents)
+    state.write_text(json.dumps(fake2.to_state()), encoding="utf-8")
+
+    # Pass 2: the post-close resume driven to its terminal.
+    second = _run(cli, argv, env(), cwd=str(repo))
+    try:
         p2 = json.loads(second.stdout)
-        # F2 acceptance: the exact worker was closed once (execute 1), and the re-run recognises the
-        # durable transaction as a post-close resume without an additional close.
-        return (bool(p1["closed_old_worker"]) and p1["status"] == "stopped"
-                and bool(p2["post_close_resume"]))
-    except (ValueError, KeyError):
-        return False
+    except ValueError:
+        return None
+    agents_after = sorted(
+        (a["name"], a["pane_id"])
+        for a in FakeHerdr.from_state(json.loads(state.read_text(encoding="utf-8"))).agents
+    )
+    try:
+        records = HerdrDeliveryLedger(home=home).records_for_issue("14097")
+    except Exception:  # noqa: BLE001 - an unreadable ledger reads as zero confirmed sends
+        records = []
+    ok_count = sum(
+        1 for r in records
+        if (r.entry_kind == "delivery_outcome" and r.status == "sent" and r.reason == "ok"
+            and r.rail == "queue_enter_rail" and r.target == fresh)
+    )
+    return (p1, p2, agents_before, agents_after, ok_count, fresh, locator)
 
 
 def _seed_owed_rollback(fence, fake, ws_id: str, lane: str, nonce: str):
