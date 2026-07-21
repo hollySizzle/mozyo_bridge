@@ -317,6 +317,15 @@ def fold_work_unit(journals: Sequence[Tuple[object, str]]) -> str:
     Unlike ``normalize_work_unit_granularity`` (the dispatch-time validator, which raises on a
     bad token) this is a read-only projection over records written by many past sessions, so an
     unrecognized token folds to ``""`` — undeclared — rather than raising or being coerced.
+
+    **A declaration supersedes by EXISTING, not by being valid** (Redmine #13490 checkpoint
+    review j#85365 F1). The latest journal that carries a governed ``work_unit:`` field wins,
+    and only then is its value judged: a recognized token is the work unit, anything else folds
+    to ``""``. Skipping an out-of-vocabulary declaration instead — the earlier behaviour — let a
+    STALE older ``user_story`` survive a newer bad one, so a lane kept claiming US-level audit
+    authority the current record no longer supports. That is the same invariant #13952 F3 fixed
+    for review markers: a newer malformed record must shadow an older valid one, never be
+    dropped so the old one stays "latest".
     """
     latest: Optional[Tuple[int, str]] = None
     for journal_id, notes in journals or ():
@@ -325,12 +334,14 @@ def fold_work_unit(journals: Sequence[Tuple[object, str]]) -> str:
             continue
         match = _WORK_UNIT_FIELD_RE.search(notes or "")
         if match is None:
-            continue
+            continue  # no declaration here — this journal says nothing about the work unit
+        # A declaration IS present, so it supersedes regardless of what it says. An
+        # unrecognized value resolves to "" (undeclared), which routes to the same-lane
+        # implementation_gateway rather than to a US-level audit.
         token = _token(match.group("value"))
-        if token not in WORK_UNIT_GRANULARITIES:
-            continue
+        resolved = token if token in WORK_UNIT_GRANULARITIES else ""
         if latest is None or jint > latest[0]:
-            latest = (jint, token)
+            latest = (jint, resolved)
     return latest[1] if latest is not None else ""
 
 
