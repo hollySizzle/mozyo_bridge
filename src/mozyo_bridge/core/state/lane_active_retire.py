@@ -52,7 +52,6 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     DISPOSITION_ACTIVE,
     DISPOSITION_RETIRED,
     RELEASE_NOT_REQUESTED,
-    RELEASE_RELEASED,
     CasOutcome,
     DecisionPointer,
     DecisionPointerError,
@@ -71,12 +70,20 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (
     LaneLifecycleError,
 )
 
-#: The release states an ACTIVE live-zero row may hold. ``not_requested`` is the ordinary shape
-#: (nothing ever asked for a release); ``released`` is admitted because a completed release that
-#: never advanced the disposition leaves the same terminalizable row. ``requested`` / ``partial``
-#: are deliberately absent: an actuator may be closing panes right now, so the caller's live-zero
-#: read could be observing a half-finished release rather than a settled absence.
-_ADMISSIBLE_RELEASE_STATES = frozenset({RELEASE_NOT_REQUESTED, RELEASE_RELEASED})
+#: The ONLY release state an ACTIVE live-zero row may hold (Redmine #14242 review j#85219 F2).
+#:
+#: ``not_requested`` is the sole shape reachable through the public transitions: measured
+#: directly, ``request_release`` refuses an ``active`` row with ``CAS_UNEXPECTED_STATE`` and
+#: ``record_release_outcome`` refuses with ``CAS_ACTION_MISMATCH``, so an ``active`` row can
+#: never legitimately carry ``requested`` / ``partial`` / ``released``.
+#:
+#: An earlier revision of this surface also admitted ``released``, reasoning that "a completed
+#: release that never advanced the disposition" would leave the same terminalizable row. That
+#: shape has no public path and no live evidence — it is an invariant violation, not a residue —
+#: and a surface whose whole premise is that NO release witness exists must not grant extra
+#: permission to an unreachable one. Every non-``not_requested`` state now fails closed, so a
+#: corrupted row is refused rather than terminalized.
+_ADMISSIBLE_RELEASE_STATES = frozenset({RELEASE_NOT_REQUESTED})
 
 
 class LaneActiveRetireStore:
@@ -115,10 +122,18 @@ class LaneActiveRetireStore:
         exact active-bound signature holds — otherwise zero-write:
 
         - the row exists (:data:`CAS_NOT_FOUND`) and its ``expected_revision`` still matches
-          (:data:`CAS_STALE_REVISION`). The revision is the race fence: the caller measured the
-          live-zero inventory against THIS revision, so any concurrent declare / transition /
-          generation open that moved the row invalidates that measurement and loses here rather
-          than clobbering the newer state;
+          (:data:`CAS_STALE_REVISION`). This detects a concurrent **lifecycle-row** mutation (a
+          declare / transition / generation open) that moved the row after the caller's read.
+
+          .. warning::
+             It does **not** detect a process relaunch. Redmine #14242 review j#85219 F1,
+             confirmed by measurement: ``declare_active`` on an existing row returns
+             ``CAS_ALREADY_DECLARED`` zero-write and ``declare_lane`` is idempotent, so a pair
+             that starts between the caller's live-zero read and this CAS leaves ``revision``
+             unchanged and the write applies — marking a lane ``retired`` while its pair is
+             live. Closing that window needs an exclusion the launch path participates in;
+             until it exists this store must not be driven against a lane that could be
+             relaunched concurrently.
         - it is ``active`` — a ``hibernated`` row belongs to #13845 / #13841 / #13842, and a
           ``superseded`` / already ``retired`` row is not this surface's target — is an
           ``issue`` binding, owns **this exact** issue, and owns no project scope
@@ -128,9 +143,11 @@ class LaneActiveRetireStore:
           non-empty mismatch means the caller's ``--worktree`` belongs to a different lane, so
           it is refused rather than coerced. Re-checked HERE under the row lock: the command's
           action-time attestation is a diagnostic, this is the authority;
-        - its process release is ``not_requested`` or ``released``
-          (:data:`_ADMISSIBLE_RELEASE_STATES`) — never ``requested`` / ``partial``, which mean a
-          release is in flight and the caller's zero read may be mid-actuation
+        - its process release is exactly ``not_requested``
+          (:data:`_ADMISSIBLE_RELEASE_STATES`) — the only state an ``active`` row can reach
+          through the public transitions. ``requested`` / ``partial`` would mean a release is in
+          flight and the caller's zero read may be mid-actuation; ``released`` on an ``active``
+          row is unreachable and therefore a corrupted shape. All fail closed
           (:data:`CAS_FORBIDDEN_TRANSITION`); and no receiver replacement is in flight
           (:func:`replacement_settled`, same reason);
         - the ``decision`` anchor names this issue.
@@ -138,9 +155,10 @@ class LaneActiveRetireStore:
         **Liveness is NOT verified here and cannot be.** Unlike #13845 there is no durable
         release proof to pair with — an active row never requested one. The caller must
         establish positive absence from a fresh inventory read (expected slots, foreign slots,
-        locator-less rows, duplicates) and pass the revision it measured against, so this CAS's
-        stale-revision fence converts a concurrent relaunch into a refusal. A caller that skips
-        that read can terminalize a live lane; that contract is stated on the calling surface.
+        locator-less rows, duplicates). The stale-revision fence above does NOT convert a
+        concurrent relaunch into a refusal (see its warning): that window is open until a launch
+        exclusion exists. A caller that skips the read, or that runs while a relaunch is
+        possible, can terminalize a live lane.
 
         Deliberately NOT :meth:`LaneLifecycleStore.transition_disposition`: that generic edge
         accepts any ``active -> retired`` regardless of binding / release / worktree shape.
@@ -203,7 +221,8 @@ class LaneActiveRetireStore:
                 )
             if current.process_release not in _ADMISSIBLE_RELEASE_STATES:
                 # requested / partial: a release actuator may be closing panes right now, so the
-                # caller's zero read cannot be trusted as a settled absence.
+                # caller's zero read cannot be trusted as a settled absence. released: unreachable
+                # for an active row (review j#85219 F2), so it is a corrupted shape, not a residue.
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=False,
