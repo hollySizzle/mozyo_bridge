@@ -33,6 +33,33 @@ CREATE TABLE IF NOT EXISTS reconcile_watermark (
 )
 """
 
+#: The per-(workspace, issue) LOCAL reconcile snapshot (Redmine #14150 review F2): a compact,
+#: secret-safe fingerprint of the issue's owning-lane / generation / disposition / owner at the last
+#: successful reconcile. The changed-work incremental read re-fetches an issue whose snapshot moved —
+#: catching a LOCAL change the provider never saw (an owner resolving), which a naive ``updated_since``
+#: gate would permanently hide (the F3 refusal-clearing).
+_ISSUE_SNAPSHOT_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS reconcile_issue_snapshot (
+    workspace_id TEXT NOT NULL,
+    issue        TEXT NOT NULL,
+    snapshot     TEXT NOT NULL DEFAULT '',
+    updated_at   TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (workspace_id, issue)
+)
+"""
+
+#: The per-scope changed-work watermark (Redmine #14150 review F2): the provider ``updated_on`` cursor
+#: the changed-work page advances to on a successful cycle. A read with overlap (``watermark -
+#: overlap``) recovers boundary / lost updates.
+_CHANGED_WATERMARK_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS reconcile_changed_watermark (
+    scope      TEXT PRIMARY KEY,
+    watermark  TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+)
+"""
+
+
 def reconcile_cadence_path(home: Optional[Path] = None) -> Path:
     """Resolve the ``reconcile-cadence.sqlite`` path under the mozyo-bridge home."""
     return (home or mozyo_bridge_home()) / RECONCILE_CADENCE_FILENAME
@@ -58,6 +85,8 @@ class ReconcileCadenceStore:
         conn = sqlite3.connect(self.path, isolation_level=None)
         conn.execute("PRAGMA busy_timeout = 2000")
         conn.execute(_TABLE_SQL)
+        conn.execute(_ISSUE_SNAPSHOT_TABLE_SQL)
+        conn.execute(_CHANGED_WATERMARK_TABLE_SQL)
         return conn
 
     def read(self, workspace_id: str) -> ReconcileWatermark:
@@ -126,6 +155,112 @@ class ReconcileCadenceStore:
                 conn.execute("ROLLBACK")
             except sqlite3.DatabaseError:
                 pass
+        finally:
+            conn.close()
+
+
+    def _connect_ro(self) -> "Optional[sqlite3.Connection]":
+        if not self.path.exists():
+            return None
+        try:
+            return sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        except sqlite3.DatabaseError:
+            return None
+
+    def read_issue_snapshots(self, workspace_id: str, issues) -> dict:
+        """Return ``{issue -> stored snapshot}`` for the given issues (Redmine #14150 F2; missing -> '')."""
+        wsid = str(workspace_id or "").strip()
+        wanted = [str(i).strip() for i in (issues or ()) if str(i).strip()]
+        out = {i: "" for i in wanted}
+        if not wsid or not wanted:
+            return out
+        conn = self._connect_ro()
+        if conn is None:
+            return out
+        try:
+            has = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='reconcile_issue_snapshot'"
+            ).fetchone()
+            if has is None:
+                return out
+            placeholders = ",".join("?" for _ in wanted)
+            rows = conn.execute(
+                "SELECT issue, snapshot FROM reconcile_issue_snapshot WHERE workspace_id=? "
+                f"AND issue IN ({placeholders})",
+                (wsid, *wanted),
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            return out
+        finally:
+            conn.close()
+        for issue, snap in rows:
+            out[str(issue)] = str(snap or "")
+        return out
+
+    def write_issue_snapshot(self, workspace_id: str, issue: str, *, snapshot: str, now: str) -> None:
+        """Persist an issue's LOCAL reconcile snapshot (Redmine #14150 F2; caller writes on a fetch)."""
+        wsid = str(workspace_id or "").strip()
+        iss = str(issue or "").strip()
+        if not wsid or not iss:
+            return
+        try:
+            conn = self._connect()
+        except sqlite3.DatabaseError:
+            return
+        try:
+            conn.execute(
+                "INSERT INTO reconcile_issue_snapshot (workspace_id, issue, snapshot, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(workspace_id, issue) DO UPDATE SET "
+                "snapshot=excluded.snapshot, updated_at=excluded.updated_at",
+                (wsid, iss, str(snapshot or ""), str(now or "")),
+            )
+        except sqlite3.DatabaseError:
+            pass
+        finally:
+            conn.close()
+
+    def read_changed_watermark(self, scope: str) -> str:
+        """Return the per-scope changed-work watermark (Redmine #14150 F2; missing -> '', i.e. from-start)."""
+        sc = str(scope or "").strip()
+        if not sc:
+            return ""
+        conn = self._connect_ro()
+        if conn is None:
+            return ""
+        try:
+            has = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='reconcile_changed_watermark'"
+            ).fetchone()
+            if has is None:
+                return ""
+            row = conn.execute(
+                "SELECT watermark FROM reconcile_changed_watermark WHERE scope=?", (sc,)
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            return ""
+        finally:
+            conn.close()
+        return str(row[0]) if row is not None else ""
+
+    def advance_changed_watermark(self, scope: str, *, watermark: str, now: str) -> None:
+        """Advance the per-scope changed-work watermark (Redmine #14150 F2; caller advances on success only)."""
+        sc = str(scope or "").strip()
+        wm = str(watermark or "").strip()
+        if not sc or not wm:
+            return
+        try:
+            conn = self._connect()
+        except sqlite3.DatabaseError:
+            return
+        try:
+            conn.execute(
+                "INSERT INTO reconcile_changed_watermark (scope, watermark, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(scope) DO UPDATE SET "
+                "watermark=excluded.watermark, updated_at=excluded.updated_at",
+                (sc, wm, str(now or "")),
+            )
+        except sqlite3.DatabaseError:
+            pass
         finally:
             conn.close()
 

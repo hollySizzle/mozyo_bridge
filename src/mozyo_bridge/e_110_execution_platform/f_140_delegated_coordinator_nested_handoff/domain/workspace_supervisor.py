@@ -341,6 +341,70 @@ def select_drain_issues(pending_rows: Iterable[object], workspace_id: str) -> tu
     return tuple(issues)
 
 
+# ---------------------------------------------------------------------------
+# Provider reconciliation: changed-work incremental selection (Redmine #14150 review F2).
+# ---------------------------------------------------------------------------
+
+#: A reconcile-skip reason (fixed vocabulary): the issue was neither externally changed (per the
+#: provider changed-work watermark) nor locally changed since the last reconcile, and holds no
+#: un-accounted local work — so this pass skips its provider read (the local drain still delivers its
+#: safe pending). Surfaced so a skipped issue is operator-visible, never a silent drop.
+RECONCILE_SKIP_UNCHANGED = "reconcile_skipped_unchanged"
+
+
+def issue_reconcile_snapshot(
+    lane_id: object, generation: object, disposition: object, owner: object
+) -> str:
+    """A compact, secret-safe snapshot of an issue's LOCAL reconcile-relevant state (#14150 F2; pure).
+
+    Captures the owning lane / generation / disposition / authoritative owner so a change the provider
+    never sees — e.g. an ambiguous owner becoming resolved, which is exactly the F3 refusal-clearing —
+    forces a re-fetch even when the Redmine ``updated_on`` did not move. Non-secret (ids / tokens only).
+    """
+    parts = [str(lane_id or ""), str(generation or ""), str(disposition or ""), str(owner or "")]
+    return "|".join(p.replace("|", "_") for p in parts)
+
+
+def select_reconcile_issues(
+    roster_issues: Iterable[str],
+    *,
+    changed_ids: "frozenset[str] | set[str] | tuple[str, ...]",
+    changed_ok: bool,
+    snapshot_by_issue: dict,
+    prior_snapshot_by_issue: dict,
+    has_local_work: "frozenset[str] | set[str] | tuple[str, ...]",
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split a roster into ``(to_reconcile, skipped)`` for the changed-work incremental read (#14150 F2).
+
+    An issue is provider-reconciled this pass when ANY holds:
+    - it is in ``changed_ids`` (the provider changed-work page: externally / MCP updated), OR
+    - its LOCAL snapshot (:func:`issue_reconcile_snapshot`) differs from the stored prior snapshot — a
+      local change the provider never saw (owner resolved, generation advanced …), which covers the F3
+      refusal-clearing that a naive ``updated_since`` gate would permanently hide, OR
+    - it has un-accounted local work (a pending / inflight / uncertain outbox row) in ``has_local_work``.
+
+    ``changed_ok`` is False when the changed-work query itself failed/was unavailable — then the gate
+    fails OPEN (every roster issue is reconciled), so a broken incremental read never suppresses the
+    provider fallback (recovery contract). ``skipped`` issues get no provider read this pass; their safe
+    coordinator pending is still delivered by the local drain. Pure; order-preserving.
+    """
+    roster = tuple(dict.fromkeys(str(i).strip() for i in roster_issues if str(i).strip()))
+    changed = {str(i).strip() for i in (changed_ids or ())}
+    local_work = {str(i).strip() for i in (has_local_work or ())}
+    to_reconcile: list[str] = []
+    skipped: list[str] = []
+    for issue in roster:
+        if not changed_ok:
+            to_reconcile.append(issue)  # fail-open: a failed changed-work read reconciles everything
+            continue
+        snapshot_changed = snapshot_by_issue.get(issue) != prior_snapshot_by_issue.get(issue)
+        if issue in changed or snapshot_changed or issue in local_work:
+            to_reconcile.append(issue)
+        else:
+            skipped.append(issue)
+    return tuple(to_reconcile), tuple(skipped)
+
+
 def select_supervised_issues(
     roster_issues: Iterable[str],
     *,
@@ -452,6 +516,11 @@ class WorkspaceSupervisionOutcome:
     non_authoritative_issues: tuple[str, ...] = ()
     issues: tuple[IssueSupervisionOutcome, ...] = ()
     skipped_reason: str = ""
+    #: Roster issues the changed-work incremental read skipped this provider-reconcile pass (Redmine
+    #: #14150 review F2): unchanged externally (provider changed-work watermark) AND locally, with no
+    #: un-accounted local work — so no provider read fired for them (their safe pending is drained
+    #: locally). Surfaced so the incremental skip is operator-visible, never a silent drop.
+    reconcile_skipped_issues: tuple[str, ...] = ()
     #: The ACTUAL ticket-provider read count for this workspace (Redmine #14150 review F2): the number
     #: of ``read_entries`` (one HTTP fetch each) the reconcile source served this pass — supply +
     #: discovery + dispatch-anchor + review-identity + review_return / lane_gateway discovery +
@@ -507,6 +576,7 @@ class WorkspaceSupervisionOutcome:
             "supervised_issues": list(self.supervised_issues),
             "ignored_wake_issues": list(self.ignored_wake_issues),
             "non_authoritative_issues": list(self.non_authoritative_issues),
+            "reconcile_skipped_issues": list(self.reconcile_skipped_issues),
             "skipped_reason": self.skipped_reason,
             "events_supplied": self.events_supplied,
             "delivered": self.delivered,
@@ -797,6 +867,9 @@ __all__ = (
     "partition_delivery_receipts",
     "is_locally_attestable_route",
     "select_drain_issues",
+    "RECONCILE_SKIP_UNCHANGED",
+    "issue_reconcile_snapshot",
+    "select_reconcile_issues",
     "reconcile_backoff_seconds",
     "should_reconcile_source",
     "IssueSelection",

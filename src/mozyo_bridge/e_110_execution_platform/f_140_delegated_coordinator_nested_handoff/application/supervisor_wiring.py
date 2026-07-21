@@ -91,6 +91,34 @@ class _CountingSource:
         return getattr(self._inner, name)
 
 
+def supply_events(store: object, issue: str, source: object, binding: object) -> int:
+    """Fold one issue's Redmine journal markers into the runtime store (glance/resume supply).
+
+    Extracted from the composition root (module-health leaf split). Reuses the exact ``workflow watch``
+    intake (:func:`...cli_workflow_watch.evaluate_intake_from_store`) so the persisted events are
+    byte-identical to a manual watch, then appends the newly accepted events. Idempotent: a re-read of
+    the same journals accepts no new event (the durable ``redmine:<issue>:<journal>`` anchor
+    deduplicates), so a repeated sweep supplies 0. Returns the number of events newly appended.
+    """
+    import dataclasses as _dc
+
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_watch import (
+        evaluate_intake_from_store,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+        markers_from_source,
+    )
+
+    markers = markers_from_source(source, issue)
+    if not markers:
+        return 0
+    outcome = evaluate_intake_from_store(store, markers, binding=binding)
+    accepted = list(outcome.accepted_events)
+    if accepted:
+        store.append_events(_dc.asdict(event) for event in accepted)
+    return len(accepted)
+
+
 @dataclasses.dataclass(frozen=True)
 class SupervisedWorkspace:
     """The minimal workspace facts the supervisor needs (id + canonical checkout path).

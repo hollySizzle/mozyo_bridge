@@ -403,6 +403,163 @@ class SchemaForwardCompatTest(unittest.TestCase):
         self.assertEqual(rows[0].enqueue_lane_generation, "")  # absent column -> default, no raise
 
 
+class ReconcileIncrementalDomainTest(unittest.TestCase):
+    """Redmine #14150 review F2: pure changed-work reconcile selection."""
+
+    def _select(self, **kw):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+            select_reconcile_issues,
+        )
+        base = dict(
+            changed_ids=frozenset(), changed_ok=True,
+            snapshot_by_issue={}, prior_snapshot_by_issue={}, has_local_work=frozenset(),
+        )
+        base.update(kw)
+        return select_reconcile_issues(["1", "2", "3"], **base)
+
+    def test_changed_external_is_reconciled(self) -> None:
+        to, skip = self._select(changed_ids=frozenset({"2"}))
+        self.assertEqual(to, ("2",))
+        self.assertEqual(skip, ("1", "3"))
+
+    def test_local_snapshot_change_forces_refetch_even_if_not_externally_changed(self) -> None:
+        # F3-safety: issue 2's local snapshot moved (owner resolved) but Redmine did NOT change it.
+        to, skip = self._select(
+            changed_ids=frozenset(),
+            snapshot_by_issue={"1": "a", "2": "NEW", "3": "c"},
+            prior_snapshot_by_issue={"1": "a", "2": "OLD", "3": "c"},
+        )
+        self.assertIn("2", to)  # re-fetched despite no external change -> a cleared refusal is re-seen
+        self.assertNotIn("2", skip)
+
+    def test_un_accounted_local_work_is_reconciled(self) -> None:
+        to, _ = self._select(has_local_work=frozenset({"3"}))
+        self.assertIn("3", to)
+
+    def test_failed_changed_query_fails_open_reconciles_all(self) -> None:
+        to, skip = self._select(changed_ok=False, changed_ids=frozenset())
+        self.assertEqual(set(to), {"1", "2", "3"})  # never suppress the provider fallback
+        self.assertEqual(skip, ())
+
+
+class ReconcileChangedWorkStoreTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.store = ReconcileCadenceStore(path=Path(tempfile.mkdtemp()) / "rc.sqlite")
+
+    def test_issue_snapshot_roundtrip(self) -> None:
+        self.assertEqual(self.store.read_issue_snapshots("wsA", ["1"]), {"1": ""})
+        self.store.write_issue_snapshot("wsA", "1", snapshot="snap-1", now=CLOCK)
+        self.assertEqual(self.store.read_issue_snapshots("wsA", ["1", "2"]), {"1": "snap-1", "2": ""})
+
+    def test_changed_watermark_roundtrip(self) -> None:
+        self.assertEqual(self.store.read_changed_watermark("wsA"), "")
+        self.store.advance_changed_watermark("wsA", watermark="2026-07-20T00:00:00+00:00", now=CLOCK)
+        self.assertEqual(self.store.read_changed_watermark("wsA"), "2026-07-20T00:00:00+00:00")
+
+
+class ReconcileIncrementalWiringTest(unittest.TestCase):
+    """Redmine #14150 review F2: the built selector folds changed-work + local snapshot + work."""
+
+    def _build(self, *, changed, changed_ok, lane_facts, prior_snapshots=None, local_work=()):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_changed_work import (
+            build_reconcile_incremental_fn,
+        )
+        d = Path(tempfile.mkdtemp())
+        store = ReconcileCadenceStore(path=d / "rc.sqlite")
+        for iss, snap in (prior_snapshots or {}).items():
+            store.write_issue_snapshot("wsA", iss, snapshot=snap, now=CLOCK)
+        outbox = CallbackOutbox(path=d / "wf.sqlite")
+        for iss in local_work:
+            outbox.enqueue(
+                CallbackOutboxKey(source="redmine", issue=iss, journal="9", normalized_gate="g",
+                                  callback_route="coordinator", workspace_id="wsA"),
+                initial_state=CALLBACK_PENDING,
+            )
+        fn = build_reconcile_incremental_fn(
+            cadence_store=store, lifecycle_store=object(), outbox=outbox,
+            lane_facts_fn=lambda ws, i: lane_facts.get(i, ("", 0, "")),
+            authoritative_map_fn=lambda: {},
+            changed_work_fn=lambda ids, since: (frozenset(changed), "2026-07-20T01:00:00+00:00", changed_ok),
+            now_fn=lambda: CLOCK,
+        )
+        return fn, store
+
+    def test_snapshot_change_forces_refetch(self) -> None:
+        # Prior snapshot for issue 2 was under a stale (ambiguous) owner; the live lane_facts now differ
+        # (resolved) -> issue 2 is reconciled even though the changed-work query returned nothing.
+        fn, _ = self._build(
+            changed=set(), changed_ok=True,
+            lane_facts={"1": ("l1", 1, "active"), "2": ("l2", 2, "active")},
+            prior_snapshots={"1": issue_reconcile_snapshot_str("l1", 1, "active", ""),
+                             "2": issue_reconcile_snapshot_str("l2", 1, "active", "")},  # gen 1 != live 2
+        )
+        to, skip, _commit = fn("wsA", ["1", "2"])
+        self.assertIn("2", to)   # snapshot moved -> re-fetch
+        self.assertIn("1", skip)  # unchanged -> skip
+
+    def test_commit_advances_watermark_and_snapshot(self) -> None:
+        fn, store = self._build(changed={"1"}, changed_ok=True, lane_facts={"1": ("l1", 1, "active")})
+        to, _skip, commit = fn("wsA", ["1"])
+        self.assertEqual(to, ("1",))
+        commit(["1"])  # a successful reconcile
+        self.assertEqual(store.read_changed_watermark("wsA"), "2026-07-20T01:00:00+00:00")
+        self.assertNotEqual(store.read_issue_snapshots("wsA", ["1"])["1"], "")
+
+
+class SupervisorHonorsIncrementalTest(unittest.TestCase):
+    """Redmine #14150 review F2: the supervisor provider-reads ONLY the selector's to-reconcile subset."""
+
+    def test_skipped_issue_gets_no_provider_read(self) -> None:
+        from mozyo_bridge.core.state.supervisor_lease import SupervisorLeaseStore
+        from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStore
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+            SUPERVISION_BOUNDED_RECONCILIATION,
+        )
+
+        d = Path(tempfile.mkdtemp())
+        sp = d / "wf.sqlite"
+        read_issues: list = []
+
+        class _RecordingSource:
+            def read_entries(self, issue_id=None):
+                read_issues.append(str(issue_id))
+                return []
+
+        committed: dict = {}
+
+        def incremental(wsid, roster):
+            def commit(reconciled):
+                committed["reconciled"] = list(reconciled)
+            return ("1",), ("2",), commit  # reconcile issue 1, skip issue 2
+
+        sup = WorkspaceCallbackSupervisor(
+            holder="h",
+            lease_store=SupervisorLeaseStore(path=d / "l.sqlite"),
+            store=WorkflowRuntimeStore(path=sp),
+            outbox=CallbackOutbox(path=sp),
+            workspaces_fn=lambda ws=None: [SupervisedWorkspace(workspace_id="wsA", canonical_path=str(d))],
+            roster_fn=lambda ws: (("1", "2"), ""),
+            redmine_source_fn=lambda ws: _RecordingSource(),
+            sender_fn=lambda ws: _RecordingSender(),
+            clock=lambda: CLOCK,
+            reconcile_incremental_fn=incremental,
+        )
+        report = sup.run_once(mode=SUPERVISION_BOUNDED_RECONCILIATION)
+        ws = report.workspaces[0]
+        supervised_in_pass = [o.issue for o in ws.issues]
+        self.assertEqual(supervised_in_pass, ["1"])         # only issue 1 provider-reconciled
+        self.assertEqual(ws.reconcile_skipped_issues, ("2",))  # issue 2 skipped (no provider read)
+        self.assertNotIn("2", read_issues)                   # the skipped issue was never read
+        self.assertEqual(committed.get("reconciled"), ["1"])  # commit ran for the reconciled issue
+
+
+def issue_reconcile_snapshot_str(lane_id, generation, disposition, owner):
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+        issue_reconcile_snapshot,
+    )
+    return issue_reconcile_snapshot(lane_id, generation, disposition, owner)
+
+
 class PureHelperTest(unittest.TestCase):
     def test_backoff_is_monotonic_and_capped(self) -> None:
         base = reconcile_backoff_seconds(60, 0, max_interval_seconds=600)

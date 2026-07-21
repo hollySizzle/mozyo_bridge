@@ -32,7 +32,6 @@ live registry, Redmine, or daemon. The production defaults are built by :func:`b
 
 from __future__ import annotations
 
-import dataclasses
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
@@ -80,6 +79,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     _CountingSource,
     _NULL_SOURCE,
     _ProviderCallCounter,
+    supply_events as _supply_events,
     SupervisedWorkspace,
     default_authoritative_map,
     default_background_transport,
@@ -172,6 +172,9 @@ class WorkspaceCallbackSupervisor:
         reconcile_due_fn: Optional[Callable[[str], bool]] = None,
         reconcile_mark_fn: Optional[Callable[[str, bool], None]] = None,
         provider_counter_fn: Optional[Callable[[str], "_ProviderCallCounter"]] = None,
+        reconcile_incremental_fn: Optional[
+            Callable[[str, Sequence[str]], "tuple[tuple[str, ...], tuple[str, ...], Callable[[Sequence[str]], None]]"]
+        ] = None,
     ) -> None:
         holder = str(holder or "").strip()
         if not holder:
@@ -232,12 +235,17 @@ class WorkspaceCallbackSupervisor:
         # due-check failure fails toward reconciling (never silently suppresses the provider fallback).
         self._reconcile_due_fn = reconcile_due_fn
         self._reconcile_mark_fn = reconcile_mark_fn
-        # Redmine #14150 review F1: the shared per-workspace provider-call counter resolver. When wired,
-        # the reconcile source AND the sender's send-edge round-fence source share the SAME counter, so
-        # ``provider_calls`` is the ACTUAL whole-pass provider read count (incl. round-fence reads), not
-        # the reconcile source alone. Optional (default None -> a fresh per-pass counter that only the
-        # main reconcile source increments, the unit-fake path).
+        # Redmine #14150 review F1: shared per-workspace provider-call counter resolver — the reconcile
+        # source AND the sender's send-edge round-fence source share it, so ``provider_calls`` is the
+        # ACTUAL whole-pass provider read count. Optional (None -> fresh per-pass main-source-only count).
         self._provider_counter_fn = provider_counter_fn
+        # Redmine #14150 review F2: changed-work incremental-reconcile selector
+        # ``(workspace_id, roster) -> (to_reconcile, skipped, commit)`` — the subset changed externally
+        # (provider changed-work watermark) OR locally (per-issue snapshot) OR carrying un-accounted work
+        # gets a provider read; the rest skip (drained locally); ``commit`` advances watermark + snapshots
+        # on success. Bounded reconciliation only. Optional (None -> reconcile the whole roster); a failed
+        # changed-work read fails OPEN in the selector (never suppresses the provider fallback).
+        self._reconcile_incremental_fn = reconcile_incremental_fn
 
     # -- public entrypoint -------------------------------------------------
 
@@ -406,10 +414,8 @@ class WorkspaceCallbackSupervisor:
                         skipped_reason=SKIP_LEASE_LOST if drain_lease_lost else "",
                     )
             raw_source = self._redmine_source_fn(ws)
-            # Redmine #14150 review F1/F2: count the ACTUAL provider reads (read_entries = one HTTP
-            # fetch). The shared per-workspace counter (when wired) is also used by the sender's
-            # send-edge round-fence source, so the count spans the whole pass — reconcile discovery +
-            # fences + backlog + send-edge round-fence — not the reconcile source alone. Reset per pass.
+            # Redmine #14150 review F1: count the ACTUAL provider reads via the shared counter (spans
+            # the reconcile source + the sender's send-edge round-fence source). Reset per pass.
             counter = (
                 self._provider_counter_fn(wsid)
                 if self._provider_counter_fn is not None
@@ -419,9 +425,21 @@ class WorkspaceCallbackSupervisor:
             source = _CountingSource(raw_source, counter) if raw_source is not None else None
             sender = self._sender_fn(ws)
             binding = self._binding_fn(ws) if self._binding_fn is not None else None
+            # Redmine #14150 review F2: changed-work incremental read — provider-reconcile only the
+            # changed / locally-changed / has-work roster subset; skip the rest (drained locally). A
+            # selector failure fails OPEN to the full roster. Bounded reconciliation only.
+            reconcile_skipped: tuple[str, ...] = ()
+            reconcile_commit: Optional[Callable[[Sequence[str]], None]] = None
+            reconcile_targets: Sequence[str] = supervised
+            if mode == SUPERVISION_BOUNDED_RECONCILIATION and self._reconcile_incremental_fn:
+                try:
+                    reconcile_targets, reconcile_skipped, reconcile_commit = (
+                        self._reconcile_incremental_fn(wsid, supervised))
+                except Exception:  # noqa: BLE001 - a selector failure fails open to the full roster
+                    reconcile_targets, reconcile_skipped, reconcile_commit = supervised, (), None
             issue_outcomes: list[IssueSupervisionOutcome] = []
             lease_lost = False
-            for index, issue in enumerate(supervised):
+            for index, issue in enumerate(reconcile_targets):
                 # Issue-boundary renew fence (R1-F1): before each issue's side-effects (after the
                 # first, which the acquire above already fenced) re-establish lease ownership with a
                 # FRESH clock. renew() is holder-conditional: it returns False iff another supervisor
@@ -454,6 +472,14 @@ class WorkspaceCallbackSupervisor:
                     self._reconcile_mark_fn(wsid, produced)
                 except Exception:  # noqa: BLE001 - a watermark write never breaks the sweep
                     pass
+            # Redmine #14150 review F2: commit the changed-work cursor ONLY on a successful pass, for
+            # the issues that reconciled without a source error — a transient provider failure never
+            # advances the watermark past an un-read issue (recovery contract).
+            if not lease_lost and reconcile_commit is not None:
+                try:
+                    reconcile_commit([o.issue for o in issue_outcomes if not o.error])
+                except Exception:  # noqa: BLE001 - a cursor commit never breaks the sweep
+                    pass
             # Redmine #13974 R2: while we still hold the lease, drain THIS workspace's own pending +
             # stale-inflight backlog (issues NOT in the active roster) through the same action-time fence
             # (renew guard stops before a send on takeover; own-partition only; skip supervised issues).
@@ -477,6 +503,7 @@ class WorkspaceCallbackSupervisor:
                 supervised_issues=supervised,
                 ignored_wake_issues=selection.ignored_wake,
                 non_authoritative_issues=non_authoritative,
+                reconcile_skipped_issues=tuple(reconcile_skipped),
                 issues=tuple(issue_outcomes),
                 skipped_reason=SKIP_LEASE_LOST if lease_lost else "",
                 provider_calls=counter.n,
@@ -724,32 +751,8 @@ class WorkspaceCallbackSupervisor:
         )
 
     def _supply_events(self, issue: str, source: RedmineJournalSource, binding: object) -> int:
-        """Fold one issue's Redmine journal markers into the runtime store (glance/resume supply).
-
-        Reuses the exact ``workflow watch`` intake (:func:`evaluate_intake_from_store`) so the
-        persisted events are byte-identical to a manual watch, then appends the newly accepted
-        events. Idempotent: a re-read of the same journals accepts no new event (the durable
-        ``redmine:<issue>:<journal>`` anchor deduplicates), so a repeated sweep supplies 0.
-        Returns the number of events newly appended.
-        """
-        # Lazy import: the intake helper lives in the sibling watch CLI module; importing it here
-        # (application -> application, same bounded context) keeps the supply identical to
-        # `workflow watch` without duplicating the marker -> LaneEvent fold.
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_watch import (
-            evaluate_intake_from_store,
-        )
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
-            markers_from_source,
-        )
-
-        markers = markers_from_source(source, issue)
-        if not markers:
-            return 0
-        outcome = evaluate_intake_from_store(self._store, markers, binding=binding)
-        accepted = list(outcome.accepted_events)
-        if accepted:
-            self._store.append_events(dataclasses.asdict(event) for event in accepted)
-        return len(accepted)
+        """Fold one issue's Redmine markers into the runtime store — delegates to the wiring sibling."""
+        return _supply_events(self._store, issue, source, binding)
 
 
 def _group_wake_hints(wake_hints: Iterable[tuple[str, str]]) -> dict[str, tuple[str, ...]]:
@@ -932,6 +935,19 @@ def build_supervisor(
     def _reconcile_mark_fn(workspace_id: str, produced_new: bool) -> None:
         cadence_store.mark(workspace_id, now=_utc_now_iso(), produced=produced_new)
 
+    # Redmine #14150 review F2: the changed-work incremental-reconcile selector (Redmine updated_on
+    # adapter, fail-open, folded with local snapshots + un-accounted work) — one wiring factory.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_changed_work import (
+        default_reconcile_incremental_fn,
+    )
+
+    _reconcile_incremental_fn = default_reconcile_incremental_fn(
+        cadence_store=cadence_store, lifecycle_store=lifecycle_store, outbox=outbox,
+        lane_facts_fn=_lane_facts,
+        authoritative_map_fn=lambda: default_authoritative_map(lifecycle_store),
+        home=home, now_fn=_utc_now_iso,
+    )
+
     return WorkspaceCallbackSupervisor(
         holder=holder,
         lease_store=lease_store,
@@ -955,6 +971,7 @@ def build_supervisor(
         reconcile_due_fn=_reconcile_due_fn,
         reconcile_mark_fn=_reconcile_mark_fn,
         provider_counter_fn=lambda wsid: _counter_for(wsid),
+        reconcile_incremental_fn=_reconcile_incremental_fn,
     )
 
 

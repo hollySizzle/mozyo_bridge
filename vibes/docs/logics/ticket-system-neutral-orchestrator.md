@@ -438,6 +438,18 @@ provider reconciliation は per-workspace durable watermark（`reconcile-cadence
 し、drain-only tick は watermark を進めない（fallback を抑制しない）。cadence が壊れても安全側（未 reconcile
 → due）に倒れる rebuildable cache である。
 
+さらに due な workspace 内でも **changed-work incremental read** で issue 単位に fetch を絞る（#14150 review F2）:
+provider-neutral changed-work port（`select_reconcile_issues`）が、roster issue のうち (a) provider 変更
+（Redmine adapter は `updated_on` を overlap 付きで問い合わせる changed-work watermark）**または** (b) local
+snapshot 変化（owning-lane / generation / disposition / owner の per-issue fingerprint。provider が見ない
+local 変化＝owner 解消を捕捉）**または** (c) 未処理の local outbox work、を持つものだけを provider-reconcile し、
+残りは skip する（provider 読み 0、safe pending は local drain が配送）。changed-work watermark と per-issue
+snapshot は成功 pass のみ前進する。changed-work read の失敗は fail-open（全 roster を reconcile）で provider
+fallback を抑制しない。★(b) が必須なのは、単純な `updated_on` gating だけでは一時 refuse された gate（例:
+ambiguous owner）が後で解消しても Redmine journal 変更を伴わず skip され永久 zero-send になる（review F3
+regression）ため。local snapshot 変化が解消を捕捉して再 fetch を強制する。Redmine issue-detail は server-side
+journal since を持たないため、fetch 削減は changed-issue 選別（不変 issue の detail fetch を省く）で得る。
+
 ### lease lifecycle（bounded / error 終了）
 
 通常 `--run-once` 終了は workspace lease を解放する。`--watch` は iteration 跨ぎで lease を保持
