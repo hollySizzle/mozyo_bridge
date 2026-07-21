@@ -9,6 +9,8 @@ unconfigured binary, and self-identity env injection into the launched agent.
 from __future__ import annotations
 
 import atexit
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -2226,6 +2228,7 @@ class SessionStartCliTest(_SessionStartHarness, unittest.TestCase):
     def test_repeated_agent_flag_dies_fail_closed(self) -> None:
         from mozyo_bridge.application.cli import build_parser
 
+        stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
@@ -2233,10 +2236,17 @@ class SessionStartCliTest(_SessionStartHarness, unittest.TestCase):
                 ["herdr", "session-start", "--agent", "claude", "--agent", "claude"]
             )
             args.repo = str(repo)
-            with self.assertRaises(SystemExit) as ctx:
-                args.func(args)
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    args.func(args)
             # Non-zero fail-closed exit (die), not a silent success.
-            self.assertNotEqual(ctx.exception.code, 0)
+            self.assertEqual(ctx.exception.code, 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: herdr session-start failed: duplicate requested slot for "
+            "provider 'claude' in lane 'default'; each (provider, lane) may be "
+            "prepared once — remove the duplicate `--agent` argument\n",
+        )
 
     def test_default_both_providers_still_valid(self) -> None:
         # The default invocation (no --agent) resolves to both providers with no

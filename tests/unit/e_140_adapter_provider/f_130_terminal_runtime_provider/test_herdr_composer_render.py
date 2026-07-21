@@ -14,6 +14,8 @@ produce from plain text.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -505,9 +507,6 @@ class _Args:
 
 class DiagnosticCliTest(unittest.TestCase):
     def test_cli_non_herdr_reports_nothing_observed(self) -> None:
-        import io
-        import contextlib
-
         with tempfile.TemporaryDirectory() as tmp:
             args = _Args(str(_tmux_repo(tmp)), "poc_claude", json_flag=True)
             buf = io.StringIO()
@@ -519,10 +518,18 @@ class DiagnosticCliTest(unittest.TestCase):
         self.assertIsNone(payload["observation"])
 
     def test_cli_missing_target_dies(self) -> None:
+        stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp:
             args = _Args(str(_herdr_repo(tmp)), "   ")
-            with self.assertRaises(SystemExit):
-                cmd_herdr_composer_render(args)
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    cmd_herdr_composer_render(args)
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: herdr composer-render failed: a target handle (herdr assigned "
+            "name or window:pane locator) is required.\n",
+        )
 
 
 if __name__ == "__main__":
