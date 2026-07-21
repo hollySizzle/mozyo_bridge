@@ -608,6 +608,22 @@ Table naming:
       自らの signature を literal に述べる原則どおり、専用 store を追加した。`--retire-active-live-zero` は
       `--execute` / `--migrate-hibernated-legacy` / `--reconcile-hibernated-live` / `--retire-hibernated-bound`
       と競合する destructive intent ゆえ **2 つ以上の同時指定は command-time zero-write error**。
+      ★**launch / terminalize 排他**（#14242 review j#85219 F1 → design answer j#85269）: revision
+      fence は lifecycle row の mutation しか捕捉せず、**process launch は同 row を触らない**
+      （`declare_active`(existing)=`already_declared` zero-write、`declare_lane`=idempotent、実測）
+      ため、live-zero read → terminal CAS の間に pair が起動すると live のまま `retired` になりえた。
+      新 schema / durable claim は導入せず、**#13882 three-boundary lock を再利用**して解決する:
+      全 managed launch（ordinary create/heal、v1 replacement binding、quarantine `heal_receiver`、
+      lane identity を持たない bare / scratch / shared-space session start）は既に home の
+      attestation-store lock を **shared 非 blocking** で「最初の attestation read 前から最後の
+      actuation まで」保持するので、terminalizer が同 lock を **exclusive 非 blocking** で
+      action-time 半分（lifecycle 再読・inventory 再読・全 gate・terminal CAS）の間保持すれば
+      reader-writer 排他が成立する。launch 先行 → terminalize は `launch_in_flight` で zero-write /
+      terminalize 先行 → launch は admission で失敗し **workspace/tab/agent 生成前に zero-spawn**。
+      holder crash は OS が lock を解放するので stale claim / TTL / takeover recovery は不要。
+      lock 不可用（`fcntl` 非対応）は `exclusion_unavailable` で fail-closed（無施錠で進めない）。
+      ★residual（lock 正本が既に明記、本件で解決したと主張しない）: 本 protocol を知らない別 vintage
+      の launcher は排除できない。durable claim を足しても旧 binary は field を読まないため同じ。
     - **hibernated bound declared-pin repair** (`LanePinRepairStore.repair_hibernated_bound_pins`,
       #13879、live evidence #13846 j#79915)。#13809 / #13841 / #13842 / #13845 が **いずれも拒否**する隙間:
       **hibernated / released** かつ `worktree_identity` **非空**（bound）かつ `declared_slots` が **空**
