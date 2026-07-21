@@ -233,8 +233,8 @@ fail-closed dead-end (`herdr_self_lane_unresolved`、`sublane create/start --exe
   `sublane_herdr_projection`) から導出する。ただし **provider/placement は workflow authority
   ではない** (mid-review j#74748 F1 / j#74749 F1 / j#74750): mzb1 `role` は runtime provider
   token であり、default-lane pair は step 時点で gateway/grandparent を区別する durable role
-  authority を持たない (default-lane Claude は coordinator の assistant であって worker では
-  ない)。よって **非 default lane slot のみ** を lane-local class として分類し、default lane は
+  authority を持たない (default-lane の `coordinator_assistant` は worker ではなく、現在の
+  Claude binding も role authority ではない)。よって **非 default lane slot のみ** を lane-local class として分類し、default lane は
   fail-closed する:
   - **非 default** lane + provider `claude` → `implementation_worker` (孫 worker);
   - **非 default** lane + provider `codex` → `delegated_coordinator` (sublane gateway / 子);

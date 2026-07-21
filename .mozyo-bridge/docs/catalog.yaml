@@ -182,7 +182,7 @@ documents:
     type: spec
     status: active
     canonical_path: vibes/docs/specs/delegated-coordinator-role-profile.md
-    purpose: 委譲コーディネータ role model の採用記録と packaged `role_profile_templates.yaml` の同期 anchor。role 語彙・権限対応表・責務境界・固定 role profile template の配布正本は #13029 により skill-workflow-reference の `## 委譲コーディネータ role model (delegated coordinator)`。
+    purpose: 委譲コーディネータ role model の採用記録と packaged `role_profile_templates.yaml` の同期 anchor。固定runtime role語彙・権限対応表・責務境界・role profile templateの配布正本は #13029 により skill-workflow-reference の `## 委譲コーディネータ role model (delegated coordinator)`。provider-neutralな文書上の補助actor `coordinator_assistant` はまだruntime 4 roleへ未配線であることも固定する。
     audit_role: delegated_coordinator_role_profile_spec
     related_document_refs:
       - logic-coordinator-sublane-development-flow
@@ -270,7 +270,7 @@ documents:
     type: spec
     status: active
     canonical_path: vibes/docs/specs/herdr-default-lane-workflow-role-authority.md
-    purpose: "純 herdr default-lane pair が grandparent_coordinator と project_gateway を step 時点で区別する durable workflow-role authority を持たず workflow step が ambiguous_default_coordinator_role で fail-closed する問題 (Redmine #13583 / #13581 j#75707) を解く contract。provider / pane / default placement を role authority へ昇格せず、repo-local static artifact `.mozyo-bridge/workflow-role-bindings.json` (workspace_id / liveness / delivery / approval を保存しない topology 宣言) の schema/version/closed role/source_pointer、versioned な project_scope->lane_id 導出、provider_binding からの expected provider 照合、missing/ambiguous/invalid/provider_mismatch の fail-closed resolution matrix、resolution-only の Increment 1 と Herdr-native 一段 forward SEND の Increment 3 境界を定義する。role token 正本は transition_role。"
+    purpose: "純 herdr default-lane pair が grandparent_coordinator と project_gateway を step 時点で区別する durable workflow-role authority を持たず workflow step が ambiguous_default_coordinator_role で fail-closed する問題 (Redmine #13583 / #13581 j#75707) を解く contract。default-lane補助actorはprovider-neutralな `coordinator_assistant` と呼ぶがruntime tokenには未配線。provider / pane / default placement を role authority へ昇格せず、repo-local static artifact `.mozyo-bridge/workflow-role-bindings.json` (workspace_id / liveness / delivery / approval を保存しない topology 宣言) の schema/version/closed role/source_pointer、versioned な project_scope->lane_id 導出、provider_binding からの expected provider 照合、missing/ambiguous/invalid/provider_mismatch の fail-closed resolution matrix、resolution-only の Increment 1 と Herdr-native 一段 forward SEND の Increment 3 境界を定義する。role token 正本は transition_role。"
     audit_role: herdr_default_lane_workflow_role_authority_spec
     related_document_refs:
       - spec-herdr-native-identity
@@ -386,7 +386,7 @@ documents:
     type: rule
     status: active
     canonical_path: skills/mozyo-bridge-agent/references/workflow.md
-    purpose: mozyo-bridge-agent skill の作業 lifecycle と role boundary。
+    purpose: mozyo-bridge-agent skill の作業 lifecycle と role boundary。`coordinator_assistant` をprovider-neutralな非権威的補助actorの正式語とし、互換provider表記、input-not-evidence、禁止authority、runtime未配線境界を一意に定義する。
     audit_role: skill_workflow_rule
     related_document_refs:
       - rule-project-agent-workflow
@@ -843,7 +843,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/workflow-step-command-design.md
-    purpose: "`mozyo-bridge workflow step` を AI / operator の単一標準入口とし、current lane / durable gate / route identity から次の安全な 1 step を解決する思想と責務境界。交通整理は自動化し、domain/design 判断、work item 作成・選択判断、owner approval、release/destructive/credential 操作、raw pane delivery は自動化しない。現行bindingはRedmine、provider-neutral contractはlogic-ticket-system-neutral-orchestrator。既存 `project-gateway` / `handoff` / `q-enter` / `delegate-*` は primitive / compatibility / debug surface として扱う。"
+    purpose: "`mozyo-bridge workflow step` を AI / operator の単一標準入口とし、current lane / durable gate / route identity から次の安全な 1 step を解決する思想と責務境界。交通整理は自動化し、domain/design 判断、work item 作成・選択判断、owner approval、release/destructive/credential 操作、raw pane delivery は自動化しない。default-lane補助actorはprovider-neutralな `coordinator_assistant` だがruntime role authorityには未配線。現行bindingはRedmine、provider-neutral contractはlogic-ticket-system-neutral-orchestrator。既存 `project-gateway` / `handoff` / `q-enter` / `delegate-*` は primitive / compatibility / debug surface として扱う。"
     audit_role: workflow_step_command_design_logic
     related_document_refs:
       - logic-ticketless-project-gateway-runtime-ux
@@ -971,7 +971,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/coordinator-sublane-development-flow.md
-    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、Version / fixed_version を candidate grouping に留める ready work unit 数最大化型 lane 配置 (標準単位 UserStory、granularity 正本は spec-work-unit-granularity-config)、mozyo_bridge dogfood soft profile (target 4 / burst 5 / stop 6+) と帯域 / admission / pipeline fill、callback 欠落時の durable work record recovery (current adapterはRedmine journal) と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、ワークフロー管制ロードマップ、#12675 以降の祖父・親・子・孫実機前 workflow 分解を定義する repo-local 開発フロー spine。provider-neutral contractはlogic-ticket-system-neutral-orchestrator。標準フローは sequence diagram で lane boundary と callback boundary を固定し、詳細 flag は CLI help / validation error を正本にする。
+    purpose: coordinator、provider-neutralな非権威的補助actor `coordinator_assistant`、cockpit-visible implementation gateway / worker の責務分担、Version / fixed_version を candidate grouping に留める ready work unit 数最大化型 lane 配置 (標準単位 UserStory、granularity 正本は spec-work-unit-granularity-config)、mozyo_bridge dogfood soft profile (target 4 / burst 5 / stop 6+) と帯域 / admission / pipeline fill、callback 欠落時の durable work record recovery (current adapterはRedmine journal) と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、ワークフロー管制ロードマップ、#12675 以降の祖父・親・子・孫実機前 workflow 分解を定義する repo-local 開発フロー spine。provider-neutral contractはlogic-ticket-system-neutral-orchestrator。標準フローは sequence diagram で lane boundary と callback boundary を固定し、詳細 flag は CLI help / validation error を正本にする。
     audit_role: coordinator_sublane_development_flow_logic
     related_document_refs:
       - logic-sublane-lifecycle-map

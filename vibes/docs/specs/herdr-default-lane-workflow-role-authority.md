@@ -1,7 +1,8 @@
 # Herdr default-lane durable workflow-role authority (Redmine #13583)
 
-純 herdr セッションの **default lane pair**（coordinator の Codex + その Main-unit assistant
-Claude）が、`grandparent_coordinator`（department root）と `project_gateway` を step 時点で
+純 herdr セッションの **default lane pair**（`coordinator` + provider-neutral な
+`coordinator_assistant`; 現行 binding 例は Codex + Claude）が、`grandparent_coordinator`
+（department root）と `project_gateway` を step 時点で
 区別する durable な workflow-role authority を持たず、`workflow step --dry-run --json` が設定
 完了後も `ambiguous_default_coordinator_role` で fail-closed する問題（#13581 j#75707）を解く
 contract。
@@ -12,6 +13,11 @@ authority の正本であり、`spec-herdr-native-identity`（mzb1 identity mode
 `logic-ticketless-project-gateway-runtime-ux`（grandparent vs project_gateway の役割境界と一段
 委譲）を前提にする。Design Consultation は Redmine #13583 j#75780、Answer は j#75782、独立検証
 verdict は j#75808。
+
+ここで `coordinator_assistant` は authority を説明する文書語彙であり、現行 runtime の role profile
+token / `provider_binding` role / launch identity には未配線である。したがって本 contract は
+`coordinator_assistant` を CLI / config 入力として受理するとは主張しない。正式な安全境界と互換表記は
+skill `references/workflow.md` の **`coordinator_assistant` の安全使用境界**を正本とする。
 
 ## 1. 原則（provider / placement を role authority に昇格しない）
 

@@ -15,15 +15,15 @@ Redmineアダプターで運用する `mozyo_bridge` リポジトリ固有の実
 
 owner / user は状況に応じて、同じ運用単位を `管制塔`、`メインレーン`、`メインセッション`、`メインユニット`、`coordinator`、`main lane` と呼ぶことがある。これは人間の記憶と会話上の揺れとして許容する。
 
-本 flow では、これらの語が実装依頼や owner-facing 判断の文脈で出た場合、原則として **管制塔 Codex** を指すものとして解釈する。つまり、owner-facing、dispatch、仕様決定、audit、US close、integration、retirement、後続計画を担う actor である。
+本 flow では、これらの語が実装依頼や owner-facing 判断の文脈で出た場合、原則として **coordinator role** (現在の binding では管制塔 Codex) を指すものとして解釈する。つまり、owner-facing、dispatch、仕様決定、audit、US close、integration、retirement、後続計画を担う actor である。
 
 ただし、次は区別する。
 
-- `main lane Claude`: 管制塔が補助的に使う Claude pane。read-only 調査、要約、draft、Design Consultation 補助はできるが、通常開発実装者ではない。
+- `coordinator_assistant`: 管制塔に隣接する provider-neutral な非権威的補助 actor。read-only 調査、要約、draft、Design Consultation 補助はできるが、通常開発実装者ではない。`main lane Claude` / `default-lane Claude` は現在または過去の `coordinator_assistant via claude` を示す互換表記であり、正式な actor 名ではない。authority 正本は skill `references/workflow.md` の **`coordinator_assistant` の安全使用境界**。
 - `default lane` / `primary checkout`: checkout / workspace identity の概念。意思決定 actor ではない。
 - `Owner`: product、Version close、release、production publish、credential / destructive / security-sensitive 判断の承認者。管制塔とは別である。
 
-ユーザーが `メインでやって`、`メインレーンで判断して`、`管制塔で処理して` と言った場合、それは通常 **管制塔 Codex が判断・routing・audit を行う** という意味であり、main lane Claude に実装 diff を作らせてよいという意味ではない。
+ユーザーが `メインでやって`、`メインレーンで判断して`、`管制塔で処理して` と言った場合、それは通常 **coordinator が判断・routing・audit を行う** という意味であり、`coordinator_assistant` に実装 diff を作らせてよいという意味ではない。
 
 ## 目的
 
@@ -202,7 +202,7 @@ flow 型 guardrail の一般 authoring rule、Markdown 補足境界、`$validate
 
 ## 役割
 
-詳細な実行責務と lane boundary は `標準フロー` の sequence を読む。authority は、Owner = product / release / Version close / production / credential / destructive approval、管制塔 Codex = owner-facing / dispatch / design decision / audit / US close / integration / retirement / follow-up planning、main lane Claude = read-only 調査 / 要約 / draft / design consultation 補助、target-lane Codex = cross-lane gateway / same-lane Claude handoff / callback、sublane Claude = bounded implementation / implementation_done / review_request である。
+詳細な実行責務と lane boundary は `標準フロー` の sequence を読む。authority は、Owner = product / release / Version close / production / credential / destructive approval、coordinator = owner-facing / dispatch / design decision / audit / US close / integration / retirement / follow-up planning、`coordinator_assistant` = read-only 調査 / 要約 / draft / design consultation 補助、`implementation_gateway` = cross-lane gateway / same-lane worker handoff / callback、`implementation_worker` = bounded implementation / implementation_done / review_request である。Codex / Claude は現在の provider binding 例であり role 名ではない。
 
 ## 運用モデル
 
@@ -213,9 +213,9 @@ cockpit-visible sublane では、identity (workspace / lane / role / pane)、rou
 - **管制塔 Codex** は coordinator、auditor、owner-facing actor である。owner への質問、close approval 回収、Redmine gate 解釈、review conclusion、release / push / CI coordination、sublane 作成・退役、PoC finding の Redmine / repo-local docs 記録を担当する。
 - **target-lane Codex** はその lane の gateway である。durable Redmine anchor を読み、自 lane に属する request か確認し、same-lane Claude へ route し、blocked / review-ready / owner-action-needed を管制塔へ callback する。
 - **sublane Claude** は bounded implementation worker である。pane scrollback ではなく Redmine journal から実装し、implementation_done / review_request / verification / residual risk を再現可能に残す。owner close approval は回収しない。
-- **main lane Claude** は補助 actor である。長い journal / diff / log の要約、candidate 抽出、read-only 調査、draft wording、非権威的な option 比較には使えるが、通常開発実装者でも owner-facing coordinator でもない。
+- **`coordinator_assistant`** は provider-neutral な補助 actor である。長い journal / diff / log の要約、candidate 抽出、read-only 調査、draft wording、非権威的な option 比較には使えるが、通常開発実装者でも owner-facing coordinator でもない。
 
-main lane Claude が implementation request を受け取った場合は、実装前の設計矛盾・scope 不足・invariant 衝突を design consultation として整理してよい。ただし、調査や reroute 用の事実整理を終えたら停止する。実装 diff は専用 sublane / worktree に移して、target-lane Codex gateway 経由で same-lane Claude へ渡す。管制塔 Codex は `$forbid("main lane Claude へ実装型 work を直接渡す")` を遵守し、実装型 work を main lane Claude へ直接渡さない。
+`coordinator_assistant` が implementation-shaped request を受け取った場合は、実装前の設計矛盾・scope 不足・invariant 衝突を design consultation として整理してよい。ただし、調査や reroute 用の事実整理を終えたら停止する。実装 diff は専用 sublane / worktree に移して、`implementation_gateway` 経由で `implementation_worker` へ渡す。coordinator は `$forbid("coordinator_assistant へ実装型 work を直接渡す")` を遵守する。
 
 ### レーン作成単位
 
@@ -320,7 +320,7 @@ sublane の `implementation_done` / `review approved` / owner close approval は
 
 ### Admission Rule
 
-implementation-shaped work に Implementation Request を出す前に、管制塔は dispatch decision を記録する。受信者が既に開いている main-unit Claude であっても同じである。この decision を省略すると、管制塔 lane が黙って implementation lane へ変わるため process gap になる。
+implementation-shaped work に Implementation Request を出す前に、管制塔は dispatch decision を記録する。隣接する `coordinator_assistant` provider が既に開いていても同じである。この decision を省略すると、管制塔 lane が黙って implementation lane へ変わるため process gap になる。
 
 decision には次を記録する。
 
@@ -330,12 +330,12 @@ decision には次を記録する。
 - current active lane count と coordinator-blocking queue。
 - dispatch を止める場合の次 drain action。
 
-implementation-shaped work では sublane dispatch が default である。Main-unit Claude は read-only investigation、summary / draft、design consultation preparation、durable reason 付き urgent minimal correction、または明示的 owner / operator decision の例外に限る。「pane が既に開いている」は理由にならない。
+implementation-shaped work では sublane dispatch が default である。`coordinator_assistant` として許されるのは read-only investigation、summary / draft、design consultation preparation までである。urgent minimal correction や owner / operator decision に基づく実装を行う場合も、先に別の実装 role と gate を明示しなければならず、その作業は `coordinator_assistant` 利用ではない。「pane が既に開いている」は理由にならない。
 
 新しい sublane を dispatch する前に、管制塔は次を記録または確認する。
 
 - target issue、target lane、branch / worktree identity、durable dispatch anchor が既知。
-- work が implementation-shaped であり、main coordinator lane / main-unit Claude が担うべきではない。
+- work が implementation-shaped であり、main coordinator lane / `coordinator_assistant` が担うべきではない。
 - 未読の `review_request`、`owner_waiting`、`integration_waiting`、`close_waiting`、`blocked`、`callback_delivery_failed` が coordinator action を待っていない。
 - 開く lane について、次に必要な review / owner aggregation / retirement を管制塔が実施できる。
 - 別 active sublane と file、invariant、release-critical surface が実質的に重ならない。重なる場合は ordering / merge plan が記録済み。
@@ -344,7 +344,7 @@ implementation-shaped work では sublane dispatch が default である。Main-
 
 いずれかが満たせない場合は、追加 sublane を開かない。blocking state を記録し、先に drain する。
 
-すべて満たし ready implementation work がある場合、dispatch が preferred action である。ready work を残して管制塔が止まる場合、または default-lane Claude に直接渡す場合は、その状態で直列実行の方が効率的または安全である理由を記録する。
+すべて満たし ready implementation work がある場合、dispatch が preferred action である。ready work を残して管制塔が止まる場合、または `coordinator_assistant` provider へ別の明示 role / gate で渡す場合は、その状態で直列実行の方が効率的または安全である理由を記録する。
 
 ### Implementation Request Preflight
 
@@ -619,7 +619,7 @@ else implementation_shaped_dispatch
   Coordinator -> Coordinator: classify active lanes and pipeline admission
   note right of Coordinator
     forbid: coordinator creates normal implementation diff
-    forbid: main lane Claude receives implementation_request
+    forbid: coordinator_assistant receives implementation_request
   end note
   Coordinator -> Gateway: dispatch implementation request
   note right
@@ -752,7 +752,7 @@ owner decision (Redmine #13967) は、feature lane の early hibernate、install
 
 ## 失敗として扱う例
 
-`標準フロー` の `$forbid` / `$validate` に反する状態は失敗として扱う。特に、main lane Claude への実装直送、hidden subagent の sublane 扱い、owner close approval と Review Gate の混同、integration disposition なし close、retirement 未検討の lane 放置、Version close の owner approval bypass、後続提案の未分類放置は invalid である。
+`標準フロー` の `$forbid` / `$validate` に反する状態は失敗として扱う。特に、`coordinator_assistant` への実装直送、hidden subagent の sublane 扱い、owner close approval と Review Gate の混同、integration disposition なし close、retirement 未検討の lane 放置、Version close の owner approval bypass、後続提案の未分類放置は invalid である。
 
 ## 参照正本
 

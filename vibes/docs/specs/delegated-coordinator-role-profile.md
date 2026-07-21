@@ -6,6 +6,8 @@ Redmine #12393 / US #12387 / Feature #12386 (`Delegated Coordinator / Nested Han
 
 role 語彙 (最小 4 role: `coordinator` / `delegated_coordinator` / `implementation_gateway` / `implementation_worker`)、権限対応表、委譲の責務境界 (parent issue close / owner approval route / callback route / downstream dispatch 境界)、固定 role profile template (4 role の custom instruction 本文)、安全 invariant の正本は、#13029 により配布側 `skills/mozyo-bridge-agent/references/workflow.md` の `## 委譲コーディネータ role model (delegated coordinator)` にある。本書は再掲しない (#13029 で pointer 化)。孫 dispatch の context 保護判断も同節 `### 孫 dispatch / context 保護` を読む。
 
+`coordinator_assistant` は skill `references/workflow.md` の **`coordinator_assistant` の安全使用境界**が定義する provider-neutral な**文書上の補助 actor**であり、この固定 4 role profile 語彙にはまだ含まれない。packaged `role_profile_templates.yaml`、handoff `role_profile`、`provider_binding` role、launch/runtime identity の追加は未実装であり、本書やskillの用語追加をruntime配線完了の証拠にしてはならない。runtime対応は別issueで4 role contractへの影響を設計して実装する。
+
 ## scope の分担 (repo issue 履歴)
 
 - handoff で role profile template を解決し受信 prompt に展開する処理は #12388、孫 (grandchild) dispatch の context preservation policy は #12389、delegation policy の project 設定 knob は #12390、子 coordinator / 孫 lane の window / cockpit 表示方針は #12391、delegated coordinator の decision / callback / correction record は #12392 で扱った。本書は解決ロジック・設定 knob・表示方針・record schema を持たない。

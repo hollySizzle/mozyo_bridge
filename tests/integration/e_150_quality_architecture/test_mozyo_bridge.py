@@ -1055,15 +1055,13 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         # boundary defined elsewhere.
         self.assertIn("実装者 / 監査者の境界を免除しない", section)
 
-    def test_main_unit_claude_safe_use_section_present(self) -> None:
-        """Redmine #11858: the shared skill reference must carry the main-unit
-        Claude safe-use boundary so a main coordinator unit that places a
-        Claude pane beside the coordinator Codex knows what it may offload to
-        save Codex context and what stays owner-facing. The boundary is the
-        portable workflow risk, not an operator's private offload list."""
-        section_start = self.workflow.index("## Main-unit Claude の安全使用境界")
+    def test_coordinator_assistant_safe_use_section_present(self) -> None:
+        """Redmine #11858 / #14240: the shared skill carries one provider-neutral
+        coordinator-assistant boundary, including why the abstraction exists,
+        compatibility wording, and the explicit runtime gap."""
+        section_start = self.workflow.index("## `coordinator_assistant` の安全使用境界")
         section_end = self.workflow.index(
-            "\n## Claude / Codex 役割境界", section_start
+            "\n## 委譲コーディネータ role model", section_start
         )
         section = self.workflow[section_start:section_end]
         # Anchored to the durable record and framed as observed risk, not a
@@ -1074,12 +1072,22 @@ class SharedSkillWorkflowTest(unittest.TestCase):
             "特定 model の能力についての固定的な判断ではない",
             section,
         )
+        self.assertIn("正式な provider-neutral 語彙", section)
+        self.assertIn("provider の差し替えを authority の変更にしない", section)
+        self.assertIn("`coordinator_assistant via claude`", section)
+        self.assertIn("actor の canonical name ではない", section)
+        self.assertIn("### runtime 実装状況 (語彙先行、未配線)", section)
+        self.assertIn("packaged role profile token", section)
+        self.assertIn(
+            "`mozyo-bridge` command や config にこの token を渡せると記述してはならない",
+            section,
+        )
         # Output is input/draft, never evidence the coordinator can act on
         # without confirming against the source of truth.
         self.assertIn("draft / input であって決して evidence ではない", section)
         # The two explicit buckets the acceptance criteria require.
-        self.assertIn("### 許可される用途 (安全な Codex context 節約)", section)
-        self.assertIn("### 禁止される用途 (coordinator Codex に残すもの)", section)
+        self.assertIn("### 許可される用途 (安全な coordinator context 節約)", section)
+        self.assertIn("### 禁止される用途 (coordinator に残すもの)", section)
         # Concrete Codex-context-saving safe tasks.
         self.assertIn(
             "長い Redmine journal、diff、log、command transcript を、"
@@ -1091,32 +1099,28 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         self.assertIn("owner close approval", section)
         self.assertIn("Review Gate", section)
         self.assertIn("durable な routing 判断", section)
-        # The difference from a sublane Claude must be explicit.
-        self.assertIn("### sublane Claude との違い", section)
+        # The difference from a bounded implementation role must be explicit.
+        self.assertIn("### `implementation_worker` との違い", section)
         # Portable vs private operator preference separation.
         self.assertIn("public-private-boundary.md", section)
 
-    def test_main_unit_claude_safe_use_does_not_grant_owner_or_gate_authority(
+    def test_coordinator_assistant_does_not_grant_owner_or_gate_authority(
         self,
     ) -> None:
-        """The main-unit Claude section saves coordinator context but must not
-        read as moving any owner-facing / gate boundary onto the Claude pane.
-        A future edit that softened the prohibition into an allowance would be
-        caught here."""
-        section_start = self.workflow.index("## Main-unit Claude の安全使用境界")
+        """A provider binding never moves owner-facing or gate authority onto
+        the coordinator assistant."""
+        section_start = self.workflow.index("## `coordinator_assistant` の安全使用境界")
         section_end = self.workflow.index(
-            "\n## Claude / Codex 役割境界", section_start
+            "\n## 委譲コーディネータ role model", section_start
         )
         section = self.workflow[section_start:section_end]
         # The assistant framing and the non-relaxation clause must both stand.
-        self.assertIn("assistant であり並列 coordinator ではない", section)
+        self.assertIn("`coordinator_assistant` は並列 coordinator ではない", section)
         self.assertIn(
-            "owner 窓口と gate 判断は coordinator Codex に残る",
+            "owner 窓口と gate 判断は coordinator に残る",
             section,
         )
-        # It must defer owner approval to the single aggregation point, not the
-        # Claude pane.
-        self.assertIn("決して Claude pane にではない", section)
+        self.assertIn("決して `coordinator_assistant` には収束しない", section)
 
     def test_issue_subject_description_separation_section_present(self) -> None:
         """Redmine #11856: the shared skill reference must carry the

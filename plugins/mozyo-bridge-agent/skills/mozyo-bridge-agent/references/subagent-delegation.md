@@ -4,7 +4,7 @@ agent (特に coordinator 役) が main context を塞がないための subagen
 
 本 reference は既存の hidden-worker 禁止規約を **緩めない**。既存規約の正本は次を読む:
 
-- `references/workflow.md` `## Main-unit Claude の安全使用境界` (`### sublane Claude との違い` を含む): 可視 lane の実装 worker と、出力が input-not-evidence の assistant を分ける境界。
+- `references/workflow.md` の見出し **`coordinator_assistant` の安全使用境界** (`implementation_worker` との違いを含む): 可視 lane の実装 worker と、出力が input-not-evidence の provider-neutral assistant を分ける境界。
 - `references/workflow.md` `## Sublane の coordinator callback` / `## Workflow docs の正本境界`: 可視 lane / durable anchor 前提と hidden-worker 禁止の位置づけ。
 - 採用 repo の sublane 定義 (可視 checkout lane / pane identity を持つ実運用 lane のみを sublane とし、内部 `multi_agent` / hidden worker / forked subagent は sublane として扱わない) は repo-local rule に置かれる。`mozyo_bridge` では `vibes/docs/rules/agent-workflow.md` がそれを持つ。
 
@@ -31,7 +31,7 @@ agent (特に coordinator 役) が main context を塞がないための subagen
 
 ### (a) read-only 調査・検証実行・要約の委譲は常時許容
 
-read-only 調査、検証の実行、log / diff / journal の要約を subagent / background に委譲することは、それが **dispatch authority も実装 diff も持たない** ため常時許容される。これは `references/workflow.md` `## Main-unit Claude の安全使用境界` `### 許可される用途` の assistant タスク (要約・候補抽出・scratch 調査・draft) と同じ性質であり、subagent はその budget を親から借りる実行手段にすぎない。委譲した結論は input であって evidence ではなく、durable record に載せる前に委譲元が正本と突き合わせて確認する。
+read-only 調査、検証の実行、log / diff / journal の要約を subagent / background に委譲することは、それが **dispatch authority も実装 diff も持たない** ため常時許容される。これは `references/workflow.md` の **`coordinator_assistant` の安全使用境界** / **許可される用途**にある assistant タスク (要約・候補抽出・scratch 調査・draft) と同じ性質であり、subagent はその budget を親から借りる実行手段にすぎない。委譲した結論は input であって evidence ではなく、durable record に載せる前に委譲元が正本と突き合わせて確認する。
 
 ### (b) 実装 shaped work の subagent 委譲は条件付き
 
@@ -84,6 +84,6 @@ activity_routing:
 
 ## 境界
 
-- hidden-worker 禁止・可視 lane / durable anchor 前提の本文: `references/workflow.md` `## Main-unit Claude の安全使用境界` / `## Sublane の coordinator callback` / `## Workflow docs の正本境界` が正本。本 reference は再掲しない。
+- hidden-worker 禁止・可視 lane / durable anchor 前提の本文: `references/workflow.md` の **`coordinator_assistant` の安全使用境界** / `## Sublane の coordinator callback` / `## Workflow docs の正本境界` が正本。本 reference は再掲しない。
 - gate 語彙・必須 journal field・review / close の意味論: central preset が正本。本 reference は gate を追加しない。
 - 採用 repo 固有の sublane 定義・lane 数・cockpit 構成・具体 model 名: repo-local rule と operator runbook に置く。本配布 body には operator 固有の数値・path・pane id・具体 model 名を置かない。portable な部分は *委譲基準・hidden-worker 境界・model 選択の判断ロジック・統合 governor・記録規律* であり、具体値は operator のものである。

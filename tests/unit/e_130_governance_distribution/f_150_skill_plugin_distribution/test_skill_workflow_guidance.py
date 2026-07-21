@@ -477,7 +477,7 @@ class SameLaneDispatchDurableDocTest(unittest.TestCase):
         "この文書は repo-local の **一次 spine**",
         "target-lane Codex が durable anchor を読み、same-lane Claude へ実装依頼を submit 完結で渡す",
         "`--no-submit` / `--mode pending` は operator / debug fallback",
-        "$forbid(\"main lane Claude へ実装型 work を直接渡す\")",
+        "$forbid(\"coordinator_assistant へ実装型 work を直接渡す\")",
     )
 
     def test_operating_model_doc_carries_same_lane_dispatch_contract(self) -> None:
