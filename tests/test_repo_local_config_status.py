@@ -28,6 +28,9 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     SOURCE_DECLARED,
     SOURCE_DEFAULT,
     classify_config_sources,
+    ACTION_CONFIG_MIGRATE,
+    CONFIG_LEAF_KEYS,
+    SOURCE_COMPATIBILITY,
 )
 
 
@@ -67,7 +70,10 @@ class ClassifyConfigSourcesPureTest(unittest.TestCase):
         statuses = classify_config_sources(
             raw_record=None, config=config, schema_version=1, legacy_migratable=False
         )
-        self.assertEqual({s.key for s in statuses}, set(CONFIG_BLOCK_KEYS))
+        self.assertEqual(
+            {s.key for s in statuses},
+            set(CONFIG_BLOCK_KEYS) | {dotted for dotted, _ in CONFIG_LEAF_KEYS},
+        )
         self.assertTrue(all(s.source == SOURCE_DEFAULT for s in statuses))
         self.assertTrue(all(s.note == "" for s in statuses if s.key != "lane_placement"))
 
@@ -94,12 +100,19 @@ class ClassifyConfigSourcesPureTest(unittest.TestCase):
             legacy_migratable=True,
         )
         by_key = {s.key: s for s in statuses}
-        self.assertEqual(by_key["agent_launch"].source, SOURCE_DECLARED)
+        # j#85125 F3: a DECLARED legacy block is `compatibility` -- machine-readably
+        # distinct from a canonical declaration -- and carries the migrate action token.
+        self.assertEqual(by_key["agent_launch"].source, SOURCE_COMPATIBILITY)
+        self.assertEqual(by_key["agent_launch"].action, ACTION_CONFIG_MIGRATE)
         self.assertIn("config migrate", by_key["agent_launch"].note)
         # provider_binding was NOT in the raw record -> default, no migrate note (the
         # note is about a DECLARED legacy block, not a blanket v1 warning).
         self.assertEqual(by_key["provider_binding"].source, SOURCE_DEFAULT)
         self.assertEqual(by_key["provider_binding"].note, "")
+        # ...and the `agents` topology this v1 config resolves exists ONLY via the
+        # legacy translation: neither silence nor a canonical declaration.
+        self.assertEqual(by_key["agents"].source, SOURCE_COMPATIBILITY)
+        self.assertEqual(by_key["agents"].action, ACTION_CONFIG_MIGRATE)
 
     def test_lane_placement_carries_unintegrated_schema_note_regardless_of_source(
         self,
@@ -160,7 +173,10 @@ class ConfigStatusSettingsSurfaceTest(unittest.TestCase):
     def test_settings_key_set_matches_closed_vocabulary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = _status_json(Path(tmp))
-            self.assertEqual({s["key"] for s in out["settings"]}, set(CONFIG_BLOCK_KEYS))
+            self.assertEqual(
+                {s["key"] for s in out["settings"]},
+                set(CONFIG_BLOCK_KEYS) | {dotted for dotted, _ in CONFIG_LEAF_KEYS},
+            )
 
     def test_text_output_renders_source_per_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

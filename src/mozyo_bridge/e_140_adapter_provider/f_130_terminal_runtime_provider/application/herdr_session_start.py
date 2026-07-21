@@ -942,6 +942,10 @@ def _prepare_session_locked(
             result, workspace_id=workspace_id, binary=binary, runner=runner,
             timeout=timeout, attestation_read=attestation_read, probe=probe,
             attested_launch=bool(attest_launcher),
+            # j#85125 F2: a wrapped fresh launch must show its own attributed
+            # execution-stage rows before a green — the reader is action-scoped,
+            # so an unmanaged run (no transaction) composes the exact prior pipeline.
+            action_id=transaction.action_id if transaction is not None else "",
         )
     if transaction is not None:
         # Record the debt, never discharge it: closing what this run started is the

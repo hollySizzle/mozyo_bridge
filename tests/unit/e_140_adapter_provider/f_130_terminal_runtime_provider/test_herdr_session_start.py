@@ -486,6 +486,26 @@ class _Herdr:
         )
         record_identity_attestation(record, home=Path(self.attest_home))
         self.attest_writes.append(name)
+        # 3. the wrapper's OWN execution-stage evidence (Redmine #14222 j#85125 F2):
+        #    a real wrapped launch appends its attributed stage rows to the action's
+        #    projection before exec'ing the provider, and the health probe now demands
+        #    them before a green. Model exactly that — attributed to THIS assigned
+        #    name, under the SAME home the launcher's fence uses (patched env). An
+        #    unwrapped launch appends nothing, exactly as in production.
+        action_id = env.get("MOZYO_STARTUP_ACTION_ID", "")
+        if action_id:
+            from mozyo_bridge.core.state.startup_execution_events import (
+                STAGE_PROVIDER_EXEC_CALL_REACHED,
+                STAGE_WRAPPER_ENTERED,
+                append_execution_event,
+            )
+            from mozyo_bridge.core.state.startup_transaction_fence import (
+                StartupTransactionFence,
+            )
+
+            fence = StartupTransactionFence(home=Path(self.attest_home))
+            for stage in (STAGE_WRAPPER_ENTERED, STAGE_PROVIDER_EXEC_CALL_REACHED):
+                append_execution_event(fence, action_id, stage, participant=name)
 
 
 class _SessionStartHarness:

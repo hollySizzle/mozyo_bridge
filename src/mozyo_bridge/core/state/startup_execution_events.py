@@ -75,7 +75,12 @@ from mozyo_bridge.core.state.startup_transaction_fence import (
 #: ``STARTUP_TRANSACTION_FENCE_SCHEMA_VERSION``, which gates ``startup_actions`` /
 #: ``store_meta`` only). Stamped on every row so a future format change can be told
 #: apart from this one without touching the mandatory ``_verify_shape`` gate at all.
-STARTUP_EXECUTION_EVENTS_FORMAT_VERSION = 1
+#: v2 (Redmine #14222 review j#85125 F1): rows carry the PARTICIPANT identity (the
+#: assigned name) so a two-provider action's stages never blur into one shared
+#: timeline. v1 rows (no ``participant`` column / empty value) stay readable as
+#: UNATTRIBUTED — they are never guessed onto a participant of a multi-participant
+#: action (see :func:`scope_events_to_participant`).
+STARTUP_EXECUTION_EVENTS_FORMAT_VERSION = 2
 
 EXECUTION_EVENTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS startup_execution_events (
@@ -84,9 +89,29 @@ CREATE TABLE IF NOT EXISTS startup_execution_events (
     stage TEXT NOT NULL,
     bounded_reason TEXT NOT NULL,
     recorded_at TEXT NOT NULL,
-    format_version INTEGER NOT NULL
+    format_version INTEGER NOT NULL,
+    participant TEXT NOT NULL DEFAULT ''
 )
 """
+
+#: Additive column upgrade for a v1 table (created before ``participant`` existed).
+#: Applied opportunistically by the write paths; a failure to add the column leaves the
+#: table exactly as it was (the append then fails its own way, still never raising).
+_PARTICIPANT_COLUMN_SQL = (
+    "ALTER TABLE startup_execution_events ADD COLUMN participant TEXT NOT NULL DEFAULT ''"
+)
+
+
+def _table_has_participant(conn: sqlite3.Connection) -> bool:
+    """Whether the (existing) events table carries the v2 ``participant`` column."""
+    columns = conn.execute("PRAGMA table_info(startup_execution_events)").fetchall()
+    return any(row[1] == "participant" for row in columns)
+
+
+def _ensure_participant_column(conn: sqlite3.Connection) -> None:
+    """Upgrade a v1 table in place (idempotent; raises on a genuinely failed ALTER)."""
+    if not _table_has_participant(conn):
+        conn.execute(_PARTICIPANT_COLUMN_SQL)
 
 # --- Event stage vocabulary (Design Consultation Answer j#84724). Bounded tokens ----
 # only; a `:<bounded_reason>` suffix in the consultation answer is this module's
@@ -149,6 +174,12 @@ STAGE_NO_EVIDENCE = "no_evidence"
 #: and the gap itself — not a false "wrapper never ran" — is what is reported.
 REASON_STARTUP_EVIDENCE_UNAVAILABLE = "startup_evidence_unavailable"
 
+#: Legacy (v1, pre-participant) rows exist for this action but cannot be attributed to
+#: THIS participant of a multi-participant action (Redmine #14222 j#85125 F1). Reported
+#: as its own honest gap — never guessed onto a participant, never silently read as
+#: "no evidence at all".
+REASON_STARTUP_EVIDENCE_UNATTRIBUTED = "startup_evidence_unattributed"
+
 
 @dataclass(frozen=True)
 class ExecutionEvent:
@@ -165,6 +196,9 @@ class ExecutionEvent:
     bounded_reason: str
     recorded_at: str
     format_version: int
+    #: The participant (assigned name) this stage belongs to. Empty on a v1 legacy row —
+    #: an UNATTRIBUTED event, handled conservatively by the read-side scoping.
+    participant: str = ""
 
     def as_payload(self) -> dict:
         return {
@@ -174,6 +208,7 @@ class ExecutionEvent:
             "bounded_reason": self.bounded_reason,
             "recorded_at": self.recorded_at,
             "format_version": self.format_version,
+            "participant": self.participant,
         }
 
 
@@ -195,6 +230,7 @@ def ensure_execution_events_table(fence: StartupTransactionFence, action_id: str
         with fence._connection("rw") as conn:
             try:
                 conn.execute(EXECUTION_EVENTS_TABLE_SQL)
+                _ensure_participant_column(conn)
             except (sqlite3.DatabaseError, OSError) as exc:
                 raise StartupTransactionError(
                     "the optional startup execution events table could not be "
@@ -209,6 +245,7 @@ def append_execution_event(
     stage: str,
     *,
     bounded_reason: str = "",
+    participant: str = "",
 ) -> bool:
     """Best-effort append of one execution-stage event. Never raises.
 
@@ -218,6 +255,11 @@ def append_execution_event(
     contract, mirrored from :func:`.herdr_identity_attestation.
     record_identity_attestation`); the read side treats missing/incomplete evidence as
     its own typed gap, never as proof of what did or did not happen.
+
+    ``participant`` is the appending wrapper's own assigned name (Redmine #14222
+    j#85125 F1) — the identity a multi-participant action's read side scopes by. An
+    empty value is accepted (it lands an UNATTRIBUTED row, the v1 shape) so an older
+    caller keeps its exact behavior, but every current wrapper passes its name.
 
     Creates the table on demand (idempotent) so a caller is never blocked on whether
     :func:`ensure_execution_events_table` happened to run first — this call is
@@ -233,16 +275,18 @@ def append_execution_event(
         with fence._hold():
             with fence._connection("rw") as conn:
                 conn.execute(EXECUTION_EVENTS_TABLE_SQL)
+                _ensure_participant_column(conn)
                 conn.execute(
                     "INSERT INTO startup_execution_events "
-                    "(action_id, stage, bounded_reason, recorded_at, format_version) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "(action_id, stage, bounded_reason, recorded_at, format_version, "
+                    "participant) VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         normalized_id,
                         token,
                         _norm(bounded_reason),
                         _utc_now(),
                         STARTUP_EXECUTION_EVENTS_FORMAT_VERSION,
+                        _norm(participant),
                     ),
                 )
         return True
@@ -275,8 +319,13 @@ def read_execution_events(
             ).fetchone()
             if exists is None:
                 return None
+            # A v1 table (no `participant` column) reads as all-unattributed rows —
+            # never rejected, never guessed (Redmine #14222 j#85125 F1 read compat).
+            has_participant = _table_has_participant(conn)
+            participant_col = "participant" if has_participant else "''"
             rows = conn.execute(
-                "SELECT event_seq, stage, bounded_reason, recorded_at, format_version "
+                "SELECT event_seq, stage, bounded_reason, recorded_at, format_version, "
+                f"{participant_col} "
                 "FROM startup_execution_events WHERE action_id = ? ORDER BY event_seq",
                 (normalized_id,),
             ).fetchall()
@@ -290,6 +339,7 @@ def read_execution_events(
             bounded_reason=row[2],
             recorded_at=row[3],
             format_version=row[4],
+            participant=_norm(row[5]),
         )
         for row in rows
     )
@@ -319,6 +369,40 @@ class StartupEvidenceVerdict:
             "evidence_gap": self.evidence_gap,
             "bounded_reason": self.bounded_reason,
         }
+
+
+def scope_events_to_participant(
+    events: Optional[Sequence[ExecutionEvent]],
+    *,
+    participant: str,
+    sole_participant: bool,
+) -> tuple[Optional[tuple[ExecutionEvent, ...]], bool]:
+    """Scope one action's events to ONE participant (pure; Redmine j#85125 F1).
+
+    Returns ``(scoped_events, unattributed_only)``:
+
+    - ``None`` events (projection unreadable) pass through as ``(None, False)`` — the
+      evidence-gap classification is the classifier's, not this helper's.
+    - Rows attributed to ``participant`` (exact assigned-name match) are returned in
+      order. Rows attributed to a DIFFERENT participant never leak in — that is the F1
+      defect (one provider's ``provider_exec_rejected`` poisoning its sibling's join).
+    - Legacy UNATTRIBUTED rows (empty ``participant``, the v1 shape) are returned ONLY
+      when ``sole_participant`` is ``True`` — a single-participant action's rows are
+      unambiguous. For a multi-participant action they are dropped from every scope and
+      ``unattributed_only`` is ``True`` iff they were the only rows present, so the
+      caller can surface :data:`REASON_STARTUP_EVIDENCE_UNATTRIBUTED` instead of a
+      false "no evidence".
+    """
+    if events is None:
+        return None, False
+    name = _norm(participant)
+    attributed = tuple(e for e in events if e.participant == name and name)
+    if attributed:
+        return attributed, False
+    legacy = tuple(e for e in events if not e.participant)
+    if legacy and sole_participant:
+        return legacy, False
+    return (), bool(legacy)
 
 
 def classify_startup_evidence(
@@ -384,6 +468,7 @@ __all__ = (
     "JOIN_NOT_APPLICABLE",
     "JOIN_POST_EXEC_LOCATOR_ABSENT",
     "JOIN_PROVIDER_LIVE_CONFIRMED",
+    "REASON_STARTUP_EVIDENCE_UNATTRIBUTED",
     "REASON_STARTUP_EVIDENCE_UNAVAILABLE",
     "STAGE_ATTESTATION_WRITE_FAILED",
     "STAGE_ATTESTATION_WRITE_SUCCEEDED",
@@ -403,4 +488,5 @@ __all__ = (
     "classify_startup_evidence",
     "ensure_execution_events_table",
     "read_execution_events",
+    "scope_events_to_participant",
 )

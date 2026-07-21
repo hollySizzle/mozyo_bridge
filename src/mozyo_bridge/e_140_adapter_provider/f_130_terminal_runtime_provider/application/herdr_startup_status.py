@@ -37,10 +37,13 @@ from mozyo_bridge.core.state.startup_execution_events import (
     JOIN_NOT_APPLICABLE,
     JOIN_POST_EXEC_LOCATOR_ABSENT,
     JOIN_PROVIDER_LIVE_CONFIRMED,
+    REASON_STARTUP_EVIDENCE_UNATTRIBUTED,
     REASON_STARTUP_EVIDENCE_UNAVAILABLE,
     STAGE_NO_EVIDENCE,
+    StartupEvidenceVerdict,
     classify_startup_evidence,
     read_execution_events,
+    scope_events_to_participant,
 )
 from mozyo_bridge.core.state.startup_transaction_fence import (
     StartupTransactionError,
@@ -174,14 +177,33 @@ def build_startup_status(
     events = read_execution_events(fence, normalized)
     inventory_readable = live_locators is not None
     live = set(live_locators or ())
+    sole_participant = len(action.participants) == 1
 
     participants = []
     for participant in action.participants:
-        verdict = classify_startup_evidence(
+        # j#85125 F1: classify from THIS participant's own attributed rows only. A
+        # sibling's `provider_exec_rejected` must never collapse this participant's
+        # join to not_applicable, and vice versa. Legacy unattributed (v1) rows are
+        # honest-gapped on a multi-participant action, attributed only when the action
+        # has exactly one participant (unambiguous).
+        scoped, unattributed_only = scope_events_to_participant(
             events,
-            live_locator_observed=participant.locator in live,
-            inventory_readable=inventory_readable,
+            participant=participant.assigned_name,
+            sole_participant=sole_participant,
         )
+        if unattributed_only:
+            verdict = StartupEvidenceVerdict(
+                last_stage=STAGE_NO_EVIDENCE,
+                inventory_join=JOIN_NOT_APPLICABLE,
+                evidence_gap=True,
+                bounded_reason=REASON_STARTUP_EVIDENCE_UNATTRIBUTED,
+            )
+        else:
+            verdict = classify_startup_evidence(
+                scoped,
+                live_locator_observed=participant.locator in live,
+                inventory_readable=inventory_readable,
+            )
         if verdict.last_stage == STAGE_NO_EVIDENCE:
             next_action = _NEXT_ACTION_NO_EVIDENCE
         else:

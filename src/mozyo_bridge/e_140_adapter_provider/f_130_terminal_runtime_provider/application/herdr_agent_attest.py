@@ -109,7 +109,7 @@ EXEC_REASON_EXEC_RAISED = "exec_raised"
 Lister = Callable[[], Optional[Sequence[Mapping[str, object]]]]
 
 
-def _build_event_appender(action_id: str):
+def _build_event_appender(action_id: str, *, participant: str = ""):
     """Build the wrapper's ``(stage, bounded_reason="") -> None`` event sink (never raises).
 
     Returns a no-op when ``action_id`` is empty (an unwrapped launch, an older launcher
@@ -118,6 +118,10 @@ def _build_event_appender(action_id: str):
     the action's optional projection through the best-effort
     :func:`...startup_execution_events.append_execution_event`, which already swallows
     every failure — an evidence-recording problem must never stop a provider boot.
+
+    ``participant`` is THIS wrapper's own assigned name (Redmine #14222 j#85125 F1):
+    every stage it appends is attributed to it, so a two-provider action's read side
+    can scope each provider's timeline instead of blurring both into one.
     """
     if not action_id:
         return lambda stage, bounded_reason="": None
@@ -136,6 +140,7 @@ def _build_event_appender(action_id: str):
                 action_id,
                 stage,
                 bounded_reason=bounded_reason,
+                participant=participant,
             )
         except Exception:  # noqa: BLE001 — evidence recording never blocks the boot
             return
@@ -430,7 +435,12 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
     # Redmine #14231: the reserved startup action_id rides an `--env` key (see
     # MOZYO_STARTUP_ACTION_ID_ENV); absent (an unwrapped / older-launcher / test path) the
     # sink is a no-op and every stage append is skipped, so nothing here can fail a launch.
-    append_event = _build_event_appender(_norm(env.get(MOZYO_STARTUP_ACTION_ID_ENV, "")))
+    append_event = _build_event_appender(
+        _norm(env.get(MOZYO_STARTUP_ACTION_ID_ENV, "")),
+        # j#85125 F1: attribute every stage to THIS wrapper's assigned name so a pair
+        # action's two timelines never blur into one shared, cross-poisoning list.
+        participant=_norm(getattr(args, "assigned_name", "")),
+    )
     append_event(STAGE_WRAPPER_ENTERED)
     perform_self_attestation(
         assigned_name=_norm(getattr(args, "assigned_name", "")),
