@@ -46,10 +46,30 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-# Typed release-boundary block vocabulary (Redmine #13843). Each names the exact fence that
-# fired so the operator sees why the fresh re-validation refused the release.
-#: A fresh boundary fingerprint diverged from the preflight capture, or a mutation / pending
-#: composer is live at the boundary: a worktree mutation appeared AFTER preflight.
+# Typed release-boundary block vocabulary (Redmine #13843; split into per-axis subreasons by
+# Redmine #14230). Each names the exact fence that fired so the operator sees why the fresh
+# re-validation refused the release, distinguishing a worktree content change from a running
+# worker turn from a real pending composer input — three genuinely different causes that
+# calling for the SAME safe next action (never blind-retry; wait for quiescence / consume the
+# real input / do nothing about a worktree race) previously read as one coarse token.
+#: A fresh boundary WORKTREE content fingerprint (dirty / untracked / digest) diverged from
+#: the preflight capture — a file was modified / added AFTER preflight. Distinct from a
+#: running worker turn or a pending composer input (see below): this fires only on a worktree
+#: CONTENT change.
+BLOCK_WORKTREE_FINGERPRINT_CHANGED = "worktree_fingerprint_changed"
+#: A live managed slot is running a worker turn (non-quiescent runtime state) at the boundary
+#: — an absolute block regardless of worktree content (Redmine #13843 review F2): a running
+#: mutation must never be interrupted by a pane close.
+BLOCK_WORKER_BUSY = "worker_busy"
+#: A live managed slot carries a REAL pending composer input at the boundary (already
+#: ghost-empty-refined upstream, Redmine #14065 — an idle placeholder never reaches this
+#: reason). Distinct from :data:`COMPOSER_GHOST_EMPTY_OBSERVED`, which is a safe non-blocking
+#: observation, never a block reason.
+BLOCK_COMPOSER_PENDING_REAL = "composer_pending_real"
+#: Backward-compatibility coarse summary (Redmine #13843's original single token): present
+#: whenever any of the three subreasons above fired, so an existing consumer that only checks
+#: for this token is unaffected. Redmine #14230: never the ONLY reason in a fresh boundary
+#: block — one or more of the three typed subreasons above always accompanies it.
 BLOCK_RELEASE_BOUNDARY_MUTATION = "release_boundary_mutation"
 #: The lane's live managed slot set (assigned-name → locator) changed between the preflight
 #: snapshot and the boundary re-read, OR the fresh boundary inventory no longer carries the
@@ -66,9 +86,43 @@ BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT = "release_boundary_revision_drift"
 #: "attestation" fresh revalidate). A missing / stale / conflict / unreadable attestation on
 #: any live target fails the boundary closed.
 BLOCK_RELEASE_BOUNDARY_ATTESTATION_DRIFT = "release_boundary_attestation_drift"
-#: The boundary worktree fingerprint could not be read (fail closed — never actuate on a
-#: worktree we could not prove is unchanged).
+#: The boundary WORKTREE fingerprint could not be read (fail closed — never actuate on a
+#: worktree we could not prove is unchanged). Distinct from
+#: :data:`BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN` below (Redmine #14230): these are two
+#: different probes that used to fold into one "unreadable" fact.
 BLOCK_WORKTREE_UNREADABLE = "worktree_fingerprint_unreadable"
+#: The boundary live RUNTIME/activity probe (worker state / composer read) could not be read,
+#: OR returned a successfully-observed-but-unrecognised state (Redmine #13843 review F2's
+#: ``unknown`` runtime state — never mistaken for idle). Distinct from
+#: :data:`BLOCK_WORKTREE_UNREADABLE`: a worktree fingerprint can be perfectly readable while
+#: the runtime/activity probe that observes worker-busy / composer-pending fails or returns
+#: an unrecognised state (Redmine #14230).
+BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN = "runtime_state_unreadable_or_unknown"
+
+#: Every typed release-boundary block reason this fence can return (Redmine #14230): the
+#: closed vocabulary a reader can validate a fresh reason list against. Deliberately excludes
+#: :data:`BLOCK_RELEASE_BOUNDARY_GENERATION_DRIFT` / :data:`BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT`
+#: / :data:`BLOCK_RELEASE_BOUNDARY_ATTESTATION_DRIFT`, which are :func:`revalidate_boundary`'s
+#: own separate exact-generation dimensions, not part of THIS module's worktree/activity axis.
+RELEASE_BOUNDARY_REASONS: frozenset[str] = frozenset(
+    {
+        BLOCK_WORKTREE_FINGERPRINT_CHANGED,
+        BLOCK_WORKER_BUSY,
+        BLOCK_COMPOSER_PENDING_REAL,
+        BLOCK_RELEASE_BOUNDARY_MUTATION,
+        BLOCK_WORKTREE_UNREADABLE,
+        BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN,
+    }
+)
+
+#: A REAL pending composer input was recognised (never blocks, never sent to the fence) but a
+#: distinct ghost-empty placeholder WAS observed at the boundary (Redmine #14065 provider-
+#: declared ``dim`` style — a live-admitted idle placeholder, not a genuine unsent prompt).
+#: Redmine #14230: surfaced as a safe, secret-free OBSERVATION alongside the block reasons (or
+#: an ``ok`` verdict), never itself a block reason — a caller must not treat this as evidence
+#: of a real pending input, and must not treat its absence as proof no ghost existed (it is
+#: only observed when a live managed slot was actually probed).
+COMPOSER_GHOST_EMPTY_OBSERVED = "composer_ghost_empty"
 
 #: The post-release recovery reason: an unexpected dirty mutation was detected AFTER the
 #: managed processes were released. Success is withheld and the operator is directed to the
@@ -159,6 +213,7 @@ def revalidate_release_boundary(
     *,
     fingerprint_preflight: WorktreeMutationFingerprint,
     fingerprint_boundary: WorktreeMutationFingerprint,
+    fingerprint_worktree_readable: bool,
     slots_preflight: Mapping[str, tuple[str, str]],
     slots_boundary: Mapping[str, tuple[str, str]],
 ) -> ReleaseBoundaryRevalidation:
@@ -170,12 +225,52 @@ def revalidate_release_boundary(
     when the fresh boundary fingerprint has NOT diverged from the preflight capture AND the
     live slot set is unchanged. A block returns typed reasons and the caller performs **zero
     lifecycle transition / zero process close** (the disposition CAS has not yet run).
+
+    Redmine #14230: ``fingerprint_boundary.readable`` is the CALLER's fold of two distinct
+    probes — the worktree fingerprint and the live activity (worker-busy / composer-pending)
+    read (:func:`.sublane_hibernate_boundary.revalidate_boundary`). ``fingerprint_boundary``
+    alone cannot tell which one failed, so ``fingerprint_worktree_readable`` is passed
+    separately: when the fold is unreadable but the worktree sub-probe was fine, the ACTIVITY
+    probe is the one that failed (or returned an unrecognised runtime state) —
+    :data:`BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN` rather than
+    :data:`BLOCK_WORKTREE_UNREADABLE`. When readable, the three previously-collapsed
+    ``diverged_from`` axes are checked and reported separately
+    (:data:`BLOCK_WORKTREE_FINGERPRINT_CHANGED` / :data:`BLOCK_WORKER_BUSY` /
+    :data:`BLOCK_COMPOSER_PENDING_REAL`); :data:`BLOCK_RELEASE_BOUNDARY_MUTATION` is still
+    appended as a backward-compatibility summary whenever any of the three fires, so an
+    existing consumer checking only for the coarse token keeps working — it is never the SOLE
+    reason in a fresh boundary block.
     """
     reasons: list[str] = []
-    if not fingerprint_boundary.readable:
+    if not fingerprint_worktree_readable:
         reasons.append(BLOCK_WORKTREE_UNREADABLE)
-    elif fingerprint_boundary.diverged_from(fingerprint_preflight):
-        reasons.append(BLOCK_RELEASE_BOUNDARY_MUTATION)
+    elif not fingerprint_boundary.readable:
+        reasons.append(BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN)
+    else:
+        subreasons: list[str] = []
+        # Absolute-at-boundary axes (Redmine #13843: "regardless of the baseline") — checked
+        # first and independently, matching the original diverged_from() precedence.
+        if fingerprint_boundary.mutation_in_flight:
+            subreasons.append(BLOCK_WORKER_BUSY)
+        if fingerprint_boundary.pending_composer:
+            subreasons.append(BLOCK_COMPOSER_PENDING_REAL)
+        # Content-drift axis: an unreadable PREFLIGHT capture cannot prove equivalence either
+        # (the original diverged_from()'s "baseline unreadable -> diverged" rule, preserved
+        # here for the content axis specifically — the activity axes above never depended on
+        # baseline readability at all).
+        content_changed = (not fingerprint_preflight.readable) or (
+            (fingerprint_boundary.dirty, fingerprint_boundary.untracked, fingerprint_boundary.digest)
+            != (
+                fingerprint_preflight.dirty,
+                fingerprint_preflight.untracked,
+                fingerprint_preflight.digest,
+            )
+        )
+        if content_changed:
+            subreasons.append(BLOCK_WORKTREE_FINGERPRINT_CHANGED)
+        if subreasons:
+            reasons.extend(subreasons)
+            reasons.append(BLOCK_RELEASE_BOUNDARY_MUTATION)
     # The live managed slot set changing (a locator recycled to a new pane, a slot relaunched
     # or vanished) is an exact-generation change the preflight snapshot no longer describes —
     # fail closed rather than close a generation we did not re-verify.
@@ -217,14 +312,20 @@ def post_release_check(
 
 
 __all__ = (
+    "BLOCK_COMPOSER_PENDING_REAL",
     "BLOCK_RELEASE_BOUNDARY_ATTESTATION_DRIFT",
     "BLOCK_RELEASE_BOUNDARY_GENERATION_DRIFT",
     "BLOCK_RELEASE_BOUNDARY_MUTATION",
     "BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT",
+    "BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN",
+    "BLOCK_WORKER_BUSY",
+    "BLOCK_WORKTREE_FINGERPRINT_CHANGED",
     "BLOCK_WORKTREE_UNREADABLE",
     "CLEAN_WORKTREE_FINGERPRINT",
+    "COMPOSER_GHOST_EMPTY_OBSERVED",
     "RECOVERY_ACTION_DETAIL",
     "RECOVERY_POST_RELEASE_RESIDUE",
+    "RELEASE_BOUNDARY_REASONS",
     "PostReleaseCheck",
     "ReleaseBoundaryRevalidation",
     "WorktreeMutationFingerprint",

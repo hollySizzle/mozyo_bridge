@@ -53,8 +53,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_PENDING_PROMPT,
     BLOCK_PROJECT_GENERATION_MISMATCH,
     BLOCK_PROJECT_UNATTESTED,
+    BLOCK_COMPOSER_PENDING_REAL,
     BLOCK_RELEASE_BOUNDARY_GENERATION_DRIFT,
     BLOCK_RELEASE_BOUNDARY_MUTATION,
+    BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN,
+    BLOCK_WORKER_BUSY,
+    BLOCK_WORKTREE_FINGERPRINT_CHANGED,
     BLOCK_REVIEW_PENDING,
     BLOCK_STALE_ACTION_GENERATION,
     BLOCK_STALE_ACTION_IDENTITY,
@@ -1382,8 +1386,13 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
             )
             self.assertTrue(outcome.is_blocked)
             self.assertTrue(outcome.boundary_blocked)
+            # Redmine #14230: the typed content-changed subreason, plus the backward-compat
+            # coarse summary — never JUST the coarse token.
+            self.assertIn(BLOCK_WORKTREE_FINGERPRINT_CHANGED, outcome.boundary_reasons)
             self.assertIn(BLOCK_RELEASE_BOUNDARY_MUTATION, outcome.boundary_reasons)
             self.assertIn(BLOCK_RELEASE_BOUNDARY_MUTATION, outcome.blocked_reasons)
+            self.assertNotIn(BLOCK_WORKER_BUSY, outcome.boundary_reasons)
+            self.assertNotIn(BLOCK_COMPOSER_PENDING_REAL, outcome.boundary_reasons)
             self.assertIsNone(outcome.transition)  # CAS never attempted
             self.assertEqual(ops.close_calls, [])
             self.assertEqual(
@@ -1405,7 +1414,11 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
                 _request(), execute=True
             )
             self.assertTrue(outcome.is_blocked)
+            # Redmine #14230: the typed worker-busy subreason, plus the coarse summary.
+            self.assertIn(BLOCK_WORKER_BUSY, outcome.boundary_reasons)
             self.assertIn(BLOCK_RELEASE_BOUNDARY_MUTATION, outcome.boundary_reasons)
+            self.assertNotIn(BLOCK_WORKTREE_FINGERPRINT_CHANGED, outcome.boundary_reasons)
+            self.assertNotIn(BLOCK_COMPOSER_PENDING_REAL, outcome.boundary_reasons)
             self.assertEqual(ops.close_calls, [])
             self.assertEqual(
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
@@ -1424,8 +1437,31 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
                 _request(), execute=True
             )
             self.assertTrue(outcome.is_blocked)
+            # Redmine #14230: the typed real-pending-composer subreason, plus coarse summary.
+            self.assertIn(BLOCK_COMPOSER_PENDING_REAL, outcome.boundary_reasons)
             self.assertIn(BLOCK_RELEASE_BOUNDARY_MUTATION, outcome.boundary_reasons)
+            self.assertNotIn(BLOCK_WORKER_BUSY, outcome.boundary_reasons)
+            self.assertNotIn(BLOCK_WORKTREE_FINGERPRINT_CHANGED, outcome.boundary_reasons)
+            self.assertFalse(outcome.composer_ghost_observed)  # a REAL pending, not a ghost
             self.assertEqual(ops.close_calls, [])
+
+    def test_boundary_composer_ghost_observed_is_not_a_block_reason(self) -> None:
+        # Redmine #14230: a ghost-empty placeholder is a SAFE observation, never a block
+        # reason -- a lane with a ghost-only composer and no other divergence hibernates.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            ghost = LaneActivityObservation(
+                readable=True, composer_pending=False, composer_ghost_observed=True
+            )
+            ops = _FakeOps(rows=self._rows(), activities=[ghost])
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertFalse(outcome.is_blocked)
+            self.assertNotIn(BLOCK_COMPOSER_PENDING_REAL, outcome.boundary_reasons)
+            self.assertNotIn(BLOCK_RELEASE_BOUNDARY_MUTATION, outcome.boundary_reasons)
+            self.assertTrue(outcome.composer_ghost_observed)
 
     def test_boundary_unreadable_activity_blocks(self) -> None:
         # F2: an unreadable live activity observation fails closed (never "quiescent").
@@ -1440,9 +1476,12 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
                 _request(), execute=True
             )
             self.assertTrue(outcome.is_blocked)
-            # An unreadable activity makes the boundary fingerprint unreadable -> the
-            # worktree-unreadable fence fires (fail closed).
-            self.assertIn(BLOCK_WORKTREE_UNREADABLE, outcome.boundary_reasons)
+            # Redmine #14230: an unreadable ACTIVITY probe (not the worktree probe) fires the
+            # runtime-specific reason, distinct from a worktree-fingerprint-unreadable block.
+            self.assertIn(
+                BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN, outcome.boundary_reasons
+            )
+            self.assertNotIn(BLOCK_WORKTREE_UNREADABLE, outcome.boundary_reasons)
             self.assertEqual(ops.close_calls, [])
 
     def test_boundary_unreadable_worktree_blocks(self) -> None:
@@ -2167,7 +2206,7 @@ class RevalidateBoundaryReReadTest(unittest.TestCase):
             )
             self.assertGreater(store.get(key).revision, rec0.revision)
             ops = _FakeOps(rows=self._rows())
-            _rows1, _fp, reasons = revalidate_boundary(
+            _rows1, _fp, reasons, _ghost = revalidate_boundary(
                 ops=ops, store=store, key=key, rec0=rec0, rows0=self._rows(),
                 fingerprint_preflight=_CLEAN_FP, workspace_id=WS, lane=LANE,
                 project_scope="",
@@ -2185,7 +2224,7 @@ class RevalidateBoundaryReReadTest(unittest.TestCase):
             store.declare_active(key, decision=_decision(), issue_id=ISSUE)
             rec0 = store.get(key)
             ops = _FakeOps(rows=self._rows())
-            _rows1, _fp, reasons = revalidate_boundary(
+            _rows1, _fp, reasons, _ghost = revalidate_boundary(
                 ops=ops, store=store, key=key, rec0=rec0, rows0=self._rows(),
                 fingerprint_preflight=_CLEAN_FP, workspace_id=WS, lane=LANE,
                 project_scope="",
@@ -2226,7 +2265,7 @@ class RevalidateBoundaryReReadTest(unittest.TestCase):
             atts = _pg_attestations()
             del atts[PG_GW_NAME]
             ops = _FakeOps(rows=rows, attestations=atts)
-            _rows1, _fp, reasons = revalidate_boundary(
+            _rows1, _fp, reasons, _ghost = revalidate_boundary(
                 ops=ops, store=store, key=key, rec0=rec0, rows0=rows,
                 fingerprint_preflight=_CLEAN_FP, workspace_id=WS, lane=PG_LANE,
                 project_scope=PG_SCOPE,

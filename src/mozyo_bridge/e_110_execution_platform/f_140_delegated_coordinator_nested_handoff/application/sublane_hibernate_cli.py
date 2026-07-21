@@ -41,6 +41,12 @@ def format_hibernate_text(outcome: HibernateOutcome) -> str:
     ]
     if outcome.already_hibernated:
         lines.append("  lane already hibernated (idempotent resume)")
+    if outcome.composer_ghost_observed:
+        # Redmine #14230: a safe, non-blocking observation -- never itself a block reason.
+        lines.append(
+            "  observed: composer_ghost_empty (provider-declared placeholder, not a "
+            "real pending input)"
+        )
     if outcome.is_blocked:
         # Redmine #13843: render the release-boundary reasons alongside the preflight ones.
         lines.append(
