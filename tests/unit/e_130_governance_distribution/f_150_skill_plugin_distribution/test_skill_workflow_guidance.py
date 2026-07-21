@@ -495,6 +495,15 @@ class SameLaneDispatchDurableDocTest(unittest.TestCase):
                     ),
                 )
 
+    def test_coordinator_assistant_is_not_described_as_a_provider(self) -> None:
+        """Redmine #14240: actor and provider remain separate vocabulary."""
+        body = ROOT.joinpath(*self.DOC_PATH).read_text(encoding="utf-8")
+        self.assertNotIn("`coordinator_assistant` provider", body)
+        self.assertIn(
+            "`coordinator_assistant` に binding された provider / pane",
+            body,
+        )
+
 
 class SublaneCompletionGuardrailsDocTest(unittest.TestCase):
     """Pin the sublane completion guardrails in the consolidated workflow

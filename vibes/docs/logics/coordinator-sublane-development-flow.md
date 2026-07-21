@@ -320,7 +320,7 @@ sublane の `implementation_done` / `review approved` / owner close approval は
 
 ### Admission Rule
 
-implementation-shaped work に Implementation Request を出す前に、管制塔は dispatch decision を記録する。隣接する `coordinator_assistant` provider が既に開いていても同じである。この decision を省略すると、管制塔 lane が黙って implementation lane へ変わるため process gap になる。
+implementation-shaped work に Implementation Request を出す前に、管制塔は dispatch decision を記録する。隣接する `coordinator_assistant` に binding された provider / pane が既に開いていても同じである。この decision を省略すると、管制塔 lane が黙って implementation lane へ変わるため process gap になる。
 
 decision には次を記録する。
 
@@ -344,7 +344,7 @@ implementation-shaped work では sublane dispatch が default である。`coor
 
 いずれかが満たせない場合は、追加 sublane を開かない。blocking state を記録し、先に drain する。
 
-すべて満たし ready implementation work がある場合、dispatch が preferred action である。ready work を残して管制塔が止まる場合、または `coordinator_assistant` provider へ別の明示 role / gate で渡す場合は、その状態で直列実行の方が効率的または安全である理由を記録する。
+すべて満たし ready implementation work がある場合、dispatch が preferred action である。ready work を残して管制塔が止まる場合、または `coordinator_assistant` に binding された provider / pane へ別の明示 role / gate で渡す場合は、その状態で直列実行の方が効率的または安全である理由を記録する。
 
 ### Implementation Request Preflight
 
