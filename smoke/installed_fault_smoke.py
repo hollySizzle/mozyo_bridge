@@ -44,6 +44,14 @@ SHAPE_ENTRYPOINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("retire_migrate", ("sublane", "retire", "--help")),
 )
 
+#: The fault-shape CRITICAL paths the installed layer must drive as a real subprocess and assert
+#: (not merely dispatch ``--help``). The summary fails closed if any is missing (review j#84441
+#: F1): F2 recover-stale close/resume, F3 session-rollback replay, F4 callback exactly-once are
+#: the accepted-finding critical paths, alongside the callback-lease + stale-projection paths.
+REQUIRED_REPRESENTATIVE: tuple[str, ...] = (
+    "callback_lease", "sublane_list", "recover_stale", "session_rollback", "callback_exactly_once",
+)
+
 
 class SmokeError(RuntimeError):
     """A fatal smoke precondition / assertion failure (fail-closed, never a silent skip)."""
@@ -94,9 +102,15 @@ def build_summary(
     *, provenance_problems: list[str], wheel_name: str, wheel_sha256: str,
     entrypoints: dict[str, int], representative: dict[str, bool],
 ) -> dict:
-    """The final smoke verdict (secret-free, JSON-safe). PURE."""
-    entrypoints_ok = all(code == 0 for code in entrypoints.values())
-    representative_ok = all(representative.values())
+    """The final smoke verdict (secret-free, JSON-safe). PURE.
+
+    Fail-closed on a MISSING required critical path (review j#84441 F1): the summary must not read
+    ``ok`` while a shape's installed critical path was never driven — an absent key is a failure,
+    not a pass.
+    """
+    missing = [k for k in REQUIRED_REPRESENTATIVE if k not in representative]
+    entrypoints_ok = bool(entrypoints) and all(code == 0 for code in entrypoints.values())
+    representative_ok = not missing and all(representative.values())
     ok = not provenance_problems and entrypoints_ok and representative_ok
     return {
         "ok": ok,
@@ -107,6 +121,7 @@ def build_summary(
         "entrypoints_ok": entrypoints_ok,
         "representative": dict(representative),
         "representative_ok": representative_ok,
+        "representative_missing": missing,
     }
 
 

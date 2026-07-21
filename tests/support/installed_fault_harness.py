@@ -371,6 +371,35 @@ class InstalledFaultHarness:
         """Dispatch ``workflow callbacks`` (the callback-outbox pipeline) through the public CLI."""
         return self.run_cli(["workflow", "callbacks", *flags])
 
+    @contextlib.contextmanager
+    def counting_callback_transport(self):
+        """Bind an isolated fake callback transport that COUNTS each send; yields the send list.
+
+        The public deliver rail's real sender routes a live handoff; here it is replaced by a
+        test-owned transport that records every ``(row)`` it is asked to send and reports a
+        delivered outcome. This measures the actual send/recovery edge (not just outbox
+        enqueue-uniqueness): a delivered row is terminal, so a re-deliver sends nothing — the
+        same dispatch anchor is sent EXACTLY once.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            cli_workflow_callbacks as _cwc,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (  # noqa: E501
+            SEND_DELIVERED,
+        )
+
+        sends: list = []
+
+        def _sender(_args):
+            def _send(row):
+                sends.append(row)
+                return SEND_DELIVERED
+
+            return _send
+
+        with mock.patch.object(_cwc, "_callback_sender", _sender):
+            yield sends
+
     def run_lease_apply_with_failing_backup_cleanup(self, fingerprint: str) -> CliResult:
         """Drive the public lease apply with a mid-backup mutation + a failing backup cleanup.
 
