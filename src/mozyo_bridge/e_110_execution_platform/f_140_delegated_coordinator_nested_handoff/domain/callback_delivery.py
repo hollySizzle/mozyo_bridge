@@ -130,6 +130,14 @@ class CallbackSendResult:
     outcome: str
     persist_ok: Optional[bool] = None
     persist_reason: str = ""
+    #: The SEND edge's own reason token, normalized through
+    #: :func:`normalize_zero_send_reason` (Redmine #14248 review j#85410 F1). Distinct from
+    #: ``persist_reason``, which is the durable-receipt reason: a zero-send can carry an
+    #: authorization / transport-precondition reason while no receipt was ever attempted, so the
+    #: two are not interchangeable. Observability ONLY — it never changes ``outcome``. Secret-safe
+    #: by construction: an out-of-vocabulary value is replaced by the fixed
+    #: :data:`UNRECOGNIZED_ZERO_SEND_REASON` and the raw string is dropped.
+    send_reason: str = ""
 
 
 def normalize_send_result(value: object) -> CallbackSendResult:
@@ -141,7 +149,12 @@ def normalize_send_result(value: object) -> CallbackSendResult:
     """
     if isinstance(value, CallbackSendResult):
         outcome = value.outcome if value.outcome in SEND_OUTCOMES else SEND_UNCERTAIN
-        return CallbackSendResult(outcome, persist_ok=value.persist_ok, persist_reason=value.persist_reason)
+        return CallbackSendResult(
+            outcome,
+            persist_ok=value.persist_ok,
+            persist_reason=value.persist_reason,
+            send_reason=value.send_reason,
+        )
     if isinstance(value, str) and value in SEND_OUTCOMES:
         return CallbackSendResult(value)
     return CallbackSendResult(SEND_UNCERTAIN)

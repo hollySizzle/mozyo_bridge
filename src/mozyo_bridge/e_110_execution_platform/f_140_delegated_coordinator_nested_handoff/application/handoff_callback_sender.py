@@ -29,6 +29,7 @@ from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (
     CallbackSendResult,
     SEND_UNCERTAIN,
+    normalize_zero_send_reason,
     send_outcome_for_delivery,
 )
 
@@ -80,8 +81,16 @@ class HandoffCallbackSender:
         except Exception:  # noqa: BLE001 - a mid-send failure is fail-safe uncertain, never a retry
             return CallbackSendResult(SEND_UNCERTAIN)
         outcome = send_outcome_for_delivery(result.status, result.reason)
+        # Redmine #14248 review j#85410 F1: the send edge's own reason used to be consumed by
+        # `send_outcome_for_delivery` and then DROPPED, so a downstream reader could see
+        # `not_sent` but never whether it was an authorization refusal or a transport
+        # precondition. Carry it forward, normalized through the closed allowlist so the raw
+        # string never escapes. Observability only — `outcome` is unchanged.
         return CallbackSendResult(
-            outcome, persist_ok=result.persist_ok, persist_reason=result.persist_reason
+            outcome,
+            persist_ok=result.persist_ok,
+            persist_reason=result.persist_reason,
+            send_reason=normalize_zero_send_reason(result.reason),
         )
 
 

@@ -238,3 +238,71 @@ class Sha256Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CallbackDiagnosticsShapeTests(unittest.TestCase):
+    """Redmine #14248 review j#85410 F1 — the failure diagnostics SHAPE is itself pinned.
+
+    The previous diagnostics read a `reason` key the deliver payload never had, so the field was
+    permanently `null` and no test noticed. These pin the contract the reviewer asked for: a green
+    run emits NOTHING, and a failing run names the dimension AND carries a non-null send reason.
+    """
+
+    def _summary(self, representative, diagnostics):
+        return mod.build_summary(
+            provenance_problems=[], wheel_name="w.whl", wheel_sha256="sha",
+            entrypoints={"callback_lease": 0}, representative=representative,
+            representative_diagnostics=diagnostics,
+        )
+
+    def test_a_green_run_emits_no_diagnostics(self):
+        rep = {k: True for k in mod.REQUIRED_REPRESENTATIVE}
+        summary = self._summary(rep, {"callback_exactly_once": {"first_send_outcome": "delivered"}})
+        self.assertEqual(summary["representative_diagnostics"], {})
+
+    def test_a_failing_path_emits_its_diagnostic(self):
+        rep = {k: True for k in mod.REQUIRED_REPRESENTATIVE}
+        rep["callback_exactly_once"] = False
+        detail = {
+            "first_send_outcome": "not_sent",
+            "first_send_reason": "target_unavailable",
+            "failed_conjuncts": ["first_send_outcome_delivered"],
+        }
+        summary = self._summary(rep, {"callback_exactly_once": detail})
+        emitted = summary["representative_diagnostics"]["callback_exactly_once"]
+        self.assertEqual(emitted["first_send_outcome"], "not_sent")
+        self.assertIsNotNone(
+            emitted["first_send_reason"],
+            "a known failure must name its send reason, not report null",
+        )
+        self.assertTrue(emitted["failed_conjuncts"])
+
+    def test_the_driver_reads_the_key_the_payload_actually_publishes(self):
+        """The specific defect: the diagnostic must read `send_reason`, not a nonexistent `reason`.
+
+        Asserted against the REAL `DeliveryOutcome.as_payload` key set, so renaming the payload
+        field without updating the driver fails here instead of silently returning null forever.
+        """
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (  # noqa: E501
+            DeliveryOutcome,
+        )
+        from mozyo_bridge.core.state.callback_outbox import CallbackOutboxKey
+
+        # The driver is a sibling script, loaded the same way this module loads the smoke.
+        spec = importlib.util.spec_from_file_location(
+            "installed_fault_smoke_driver", ROOT / "smoke" / "installed_fault_smoke_driver.py"
+        )
+        driver = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(driver)
+
+        key = CallbackOutboxKey(source="redmine", issue="1", journal="2",
+                                normalized_gate="g", callback_route="coordinator")
+        published = set(DeliveryOutcome(key=key, send_outcome="not_sent",
+                                        resulting_state="pending").as_payload())
+        source = inspect.getsource(driver._drive_callback_exactly_once)
+        self.assertIn('"send_reason"', source)
+        self.assertIn("send_reason", published)
+        self.assertNotIn("reason", published - {"send_reason", "persist_reason"})

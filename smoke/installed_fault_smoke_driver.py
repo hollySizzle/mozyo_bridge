@@ -493,7 +493,7 @@ def _drive_callback_exactly_once(cli: Path, tmp: Path, diagnostics: "dict | None
         record.update({
             "first_delivered_count": len(first),
             "first_send_outcome": (first[0].get("send_outcome") if first else None),
-            "first_send_reason": (first[0].get("reason") if first else None),
+            "first_send_reason": (first[0].get("send_reason") if first else None),
             "second_delivered_count": len(second),
             "sweep_pending_count": len(list(sweep.get("pending") or ())),
             "sweep_dead_letter_count": len(list(sweep.get("dead_letter") or ())),

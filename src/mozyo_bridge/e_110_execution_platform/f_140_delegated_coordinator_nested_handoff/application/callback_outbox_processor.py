@@ -188,6 +188,11 @@ class DeliveryOutcome:
     #: reason token. Observability only — it never changed ``send_outcome`` / ``resulting_state``.
     persist_ok: "bool | None" = None
     persist_reason: str = ""
+    #: The SEND edge's normalized reason token (Redmine #14248 review j#85410 F1) — what made a
+    #: `not_sent` / `uncertain` outcome happen. Distinct from ``persist_reason`` (receipt
+    #: evidence): a zero-send commonly has a send reason and no receipt at all. Observability
+    #: only; already normalized to the closed allowlist by the sender.
+    send_reason: str = ""
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -200,6 +205,7 @@ class DeliveryOutcome:
             "ownership_lost": self.ownership_lost,
             "persist_ok": self.persist_ok,
             "persist_reason": self.persist_reason,
+            "send_reason": self.send_reason,
         }
 
 
@@ -557,6 +563,7 @@ class CallbackOutboxProcessor:
                     ownership_lost=not applied,
                     persist_ok=send_result.persist_ok,
                     persist_reason=send_result.persist_reason,
+                    send_reason=send_result.send_reason,
                 )
             )
         return report

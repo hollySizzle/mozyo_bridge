@@ -96,3 +96,58 @@ class HandoffCallbackSenderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SendReasonIsCarriedAndNormalized(unittest.TestCase):
+    """Redmine #14248 review j#85410 F1 — the send edge's reason must survive, secret-safe.
+
+    `send_outcome_for_delivery` consumed `result.reason` and the sender then DROPPED it, so a
+    downstream reader saw `not_sent` with no way to tell an authorization refusal from a
+    transport precondition. The installed smoke's diagnostic field was consequently pinned at
+    `null`. These pin that it is carried, normalized to the closed allowlist, and never raw.
+    """
+
+    def _send(self, status, reason):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.handoff_callback_sender import (  # noqa: E501
+            HandoffCallbackSender, HandoffDeliveryResult,
+        )
+
+        sender = HandoffCallbackSender(
+            lambda row: HandoffDeliveryResult(status=status, reason=reason)
+        )
+        return sender(object())
+
+    def test_a_known_zero_send_reason_is_carried(self):
+        result = self._send("blocked", "target_unavailable")
+        self.assertEqual(result.outcome, "not_sent")
+        self.assertEqual(result.send_reason, "target_unavailable")
+
+    def test_an_unknown_reason_normalizes_to_the_fixed_token_and_drops_the_raw_value(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (  # noqa: E501
+            UNRECOGNIZED_ZERO_SEND_REASON,
+        )
+
+        secret = "/Users/someone/.mozyo_bridge/token-abc123"
+        result = self._send("blocked", secret)
+        self.assertEqual(result.send_reason, UNRECOGNIZED_ZERO_SEND_REASON)
+        self.assertNotIn("token-abc123", result.send_reason)
+        self.assertNotIn("/Users", result.send_reason)
+
+    def test_send_reason_never_changes_the_outcome(self):
+        # Observability only: the same status/reason pair maps to the same outcome as before.
+        self.assertEqual(self._send("sent", "ok").outcome, "delivered")
+        self.assertEqual(self._send("blocked", "marker_timeout").outcome, "uncertain")
+
+    def test_delivery_outcome_payload_exposes_send_reason(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (  # noqa: E501
+            DeliveryOutcome,
+        )
+        from mozyo_bridge.core.state.callback_outbox import CallbackOutboxKey
+
+        key = CallbackOutboxKey(source="redmine", issue="1", journal="2", normalized_gate="g", callback_route="coordinator")
+        payload = DeliveryOutcome(
+            key=key, send_outcome="not_sent", resulting_state="pending",
+            send_reason="target_unavailable",
+        ).as_payload()
+        self.assertIn("send_reason", payload)
+        self.assertEqual(payload["send_reason"], "target_unavailable")
