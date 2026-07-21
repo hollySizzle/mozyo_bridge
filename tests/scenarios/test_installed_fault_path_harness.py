@@ -210,6 +210,40 @@ class CallbackLeaseRecoveryThroughPublicCli(unittest.TestCase):
         self.assertEqual(out.rc, 1)
         self.assertIn("zero_write=True", out.stdout)
 
+    def test_callback_ingest_is_exactly_once_and_sweep_never_amplifies(self):
+        # The callback half of the addendum j#83426: the same dispatch anchor is recovered/enqueued
+        # EXACTLY ONCE (duplicate notification 0), and a fresh-turn sweep never amplifies the
+        # pending / dead-letter backlog.
+        h = InstalledFaultHarness(self)
+        snapshot = h.write_redmine_snapshot("14097", "84000", "implementation_done")
+        candidate = "14097:84000:coordinator:implementation_done"
+        common = [
+            "--candidate", candidate, "--redmine-json", str(snapshot),
+            "--workspace-id", h.workspace_id, "--cursor", "84001", "--json",
+        ]
+
+        first = h.callbacks_cli("--ingest", *common).json()
+        self.assertEqual(first["enqueued"], 1)
+        self.assertEqual(first["duplicates"], 0)
+        self.assertEqual(first["dead_lettered"], 0)
+
+        # Re-ingesting the SAME dispatch anchor is idempotent: the outbox UNIQUE fence dedupes it,
+        # so it is never enqueued (or notified) twice.
+        again = h.callbacks_cli("--ingest", *common).json()
+        self.assertEqual(again["enqueued"], 0)
+        self.assertEqual(again["duplicates"], 1)
+        self.assertFalse(again["outcomes"][0]["inserted"])
+
+        # A fresh-turn sweep surfaces the single pending anchor and does NOT amplify the backlog.
+        swept = h.callbacks_cli("--sweep", "--workspace-id", h.workspace_id, "--json").json()
+        self.assertEqual(len(swept["pending"]), 1)
+        self.assertEqual(swept["pending"][0]["journal"], "84000")
+        self.assertEqual(swept["dead_letter"], [])
+        # A second sweep is still exactly one pending, zero dead-letter (no growth).
+        reswept = h.callbacks_cli("--sweep", "--workspace-id", h.workspace_id, "--json").json()
+        self.assertEqual(len(reswept["pending"]), 1)
+        self.assertEqual(reswept["dead_letter"], [])
+
     def test_rollback_cleanup_failure_is_a_typed_residue_never_hidden(self):
         # Item 3 of the IR: a rollback whose backup cleanup fails is an HONEST rollback_incomplete
         # residue (zero_write=False, the residue named), never a hidden write reported as clean.
@@ -277,6 +311,28 @@ class NestedRollbackPointerThroughPublicCli(unittest.TestCase):
         out = h.session_rollback_cli("startup-does-not-exist")
         self.assertEqual(out.json()["participants"], [])
         self.assertEqual(h.live_locator_count(), 1)  # the other action's slot is untouched
+
+    def test_same_binding_new_action_replay_after_rollback_discharge(self):
+        # The nested-rollback acceptance tail (issue Required work 2): after the PUBLIC rollback
+        # rail discharges the debt, the SAME unit replays toward a FRESH launch under a NEW action
+        # id — the discharged action is never resurrected.
+        h = InstalledFaultHarness(self)
+        action_a, _ = h.seed_owed_rollback(
+            "issue_14097_replay", providers=("claude",), nonce="n1"
+        )
+        self.assertEqual(h.session_rollback_cli(action_a, execute=True).json()["state"], "completed")
+        self.assertEqual(h.live_locator_count(), 0)  # action A's fresh launch was closed
+
+        # The same binding (same startup unit) replays: a fresh reservation mints a NEW action id.
+        action_b, _ = h.seed_owed_rollback(
+            "issue_14097_replay", providers=("claude",), nonce="n2"
+        )
+        self.assertNotEqual(action_b, action_a)  # a distinct new action id
+        replay = h.session_rollback_cli(action_b).json()
+        self.assertEqual(replay["participants"][0]["verdict"], "eligible")  # B is a live fresh launch
+
+        # Action A stays terminally discharged — the replay never resurrects the rolled-back one.
+        self.assertEqual(h.session_rollback_cli(action_a).json()["reason"], "already_rolled_back")
 
 
 # ---------------------------------------------------------------------------
