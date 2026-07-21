@@ -574,7 +574,8 @@ class SublaneHibernateUseCase:
             recovery_detail = ""
             redrive_lease_lost = False
             if execute and redrive_ok and not self._lease_held():
-                # Redmine #14219 T2a R1-F2: lease lost before the redrive close — close nothing.
+                # Redmine #14219 T2a R1-F2: an early exit — skip the boundary read entirely if the
+                # lease is already gone. This is NOT the commit-point fence (see below).
                 redrive_lease_lost = True
                 redrive_ok = False
             if execute and redrive_ok:
@@ -592,23 +593,33 @@ class SublaneHibernateUseCase:
                     )
                 )
                 if not boundary_reasons:
-                    # Bind the resume to the T1-verified revision (Redmine #13843 review F3):
-                    # an advance between T1 and the driver read closes nothing.
-                    release = self._drive_release(
-                        key, lane, workspace_id, rows1, action_id,
-                        expected_revision=rec.revision,
-                    )
-                    if release.admission_blocked:
-                        boundary_reasons = (BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT,)
-                        release = None
+                    # Redmine #14219 T2a R2-F1: the commit-point fence. The boundary read above can
+                    # be slow; re-check ownership HERE, immediately before the irreversible close, so
+                    # a takeover DURING that read closes nothing. The early guard is not enough.
+                    if not self._lease_held():
+                        redrive_lease_lost = True
                     else:
-                        post = post_release_residue(
-                            ops=self.ops, fingerprint_boundary=fingerprint_boundary
+                        # Bind the resume to the T1-verified revision (Redmine #13843 review F3):
+                        # an advance between T1 and the driver read closes nothing.
+                        release = self._drive_release(
+                            key, lane, workspace_id, rows1, action_id,
+                            expected_revision=rec.revision,
                         )
-                        post_residue = post.residue_detected
-                        recovery_detail = post.recovery_detail
-            redrive_executed = execute and redrive_ok and not boundary_reasons
-            redrive_blocked = execute and (not redrive_ok or bool(boundary_reasons))
+                        if release.admission_blocked:
+                            boundary_reasons = (BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT,)
+                            release = None
+                        else:
+                            post = post_release_residue(
+                                ops=self.ops, fingerprint_boundary=fingerprint_boundary
+                            )
+                            post_residue = post.residue_detected
+                            recovery_detail = post.recovery_detail
+            redrive_executed = (
+                execute and redrive_ok and not boundary_reasons and not redrive_lease_lost
+            )
+            redrive_blocked = execute and (
+                not redrive_ok or bool(boundary_reasons) or redrive_lease_lost
+            )
             preflight = HibernatePreflight(
                 original_identity_known=True,  # the hibernated lane is known
                 park_satisfied=request.assertions.park_satisfied,

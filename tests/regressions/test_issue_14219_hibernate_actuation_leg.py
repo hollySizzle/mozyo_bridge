@@ -319,6 +319,48 @@ class HibernateActuationLegTests(unittest.TestCase):
             self.assertEqual(ops.close_calls, [])
             self.assertEqual(self._disposition(store), DISPOSITION_ACTIVE)
 
+    def test_redrive_close_fence_catches_a_takeover_during_the_boundary_read(self):
+        # R2-F1 ordered race: on an already-hibernated redrive, the lease is held at the early
+        # check (call 1 -> True), then taken over DURING the boundary read (call 2 -> False),
+        # immediately before the close. The commit-point fence must close NOTHING.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate import (  # noqa: E501
+            SublaneHibernateUseCase as UC,
+        )
+
+        with TemporaryDirectory() as raw:
+            home = Path(raw)
+            store = self._seed(home)
+            # First: hibernate to a PARTIAL release (row hibernated, a close still owed).
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:claude"),),
+                failed=(("codex", f"{WS}:codex", "close_failed"),),
+            )
+            ops1 = _FakeOps(rows=[_row("codex", LANE), _row("claude", LANE)], close_result=partial)
+            first = UC(ops=ops1, store=store).run(_request_all_gates(), execute=True)
+            self.assertTrue(first.transition.applied)
+            self.assertEqual(self._disposition(store), DISPOSITION_HIBERNATED)
+
+            # Redrive with a guard that is True only on its first call.
+            calls = {"n": 0}
+
+            def guard():
+                calls["n"] += 1
+                return calls["n"] == 1
+
+            ops2 = _FakeOps(rows=[_row("codex", LANE), _row("claude", LANE)])
+            redrive = UC(ops=ops2, store=store, lease_guard=guard).run(
+                _request_all_gates(), execute=True
+            )
+            self.assertTrue(redrive.lease_lost)
+            self.assertTrue(redrive.is_blocked)
+            self.assertTrue(redrive.redrive_blocked)
+            self.assertFalse(redrive.executed)
+            # the fence prevented the close despite the early guard passing.
+            self.assertEqual(ops2.close_calls, [])
+            self.assertGreaterEqual(calls["n"], 2)  # early guard + commit-point guard both ran
+            self.assertEqual(self._disposition(store), DISPOSITION_HIBERNATED)
+
     def test_use_case_lease_guard_outcome_is_blocked_and_not_success(self):
         # R1-F2 at the use-case boundary: a commit-point lease loss is a typed blocked, zero-mutation
         # outcome (is_blocked True via the lease_lost property; is_success False; transition None).
