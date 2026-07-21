@@ -243,6 +243,39 @@ class Issue14150LeafReviewOwnerTest(unittest.TestCase):
         self.assertEqual(row.next_owner, OWNER_IMPLEMENTATION_GATEWAY)
         self.assertNotIn("US-level audit", row.next_action)
 
+    def test_a_later_invalid_declaration_supersedes_an_earlier_user_story(self):
+        """Parent-lane checkpoint review j#85365 F1 — the load-bearing case.
+
+        A declaration supersedes by EXISTING, not by being valid. Skipping an
+        out-of-vocabulary `work_unit:` let a STALE older `user_story` survive a newer bad one,
+        so the lane kept claiming US-level audit authority the current record no longer
+        supports. Same invariant as #13952 F3 for review markers: a newer malformed record must
+        shadow an older valid one, never be dropped so the old one stays "latest".
+        """
+        us = "## Gate: Implementation Request\n\n- work_unit: `user_story`\n"
+        bogus = "## Gate: Progress\n\n- work_unit: `whatever_unit`\n"
+        _, state, row = _fold(("100", us), ("101", bogus), ("102", J_14150_REVIEW_REQUEST))
+        self.assertEqual(state, "review_waiting")
+        self.assertEqual(row.work_unit, "", "an invalid latest declaration is 'undeclared'")
+        self.assertEqual(row.next_owner, OWNER_IMPLEMENTATION_GATEWAY)
+        self.assertNotIn("US-level audit", row.next_action)
+
+    def test_a_later_invalid_declaration_supersedes_an_earlier_leaf_issue(self):
+        leaf = "## Gate: Implementation Request\n\n- work_unit: `leaf_issue`\n"
+        bogus = "## Gate: Progress\n\n- work_unit: `whatever_unit`\n"
+        _, _, row = _fold(("100", leaf), ("101", bogus), ("102", J_14150_REVIEW_REQUEST))
+        self.assertEqual(row.work_unit, "")
+        self.assertEqual(row.next_owner, OWNER_IMPLEMENTATION_GATEWAY)
+
+    def test_a_later_valid_declaration_restores_authority(self):
+        # latest-wins in the other direction: a bad declaration is not sticky either.
+        bogus = "## Gate: Implementation Request\n\n- work_unit: `whatever_unit`\n"
+        us = "## Gate: Progress\n\n- work_unit: `user_story`\n"
+        _, _, row = _fold(("100", bogus), ("101", us), ("102", J_14150_REVIEW_REQUEST))
+        self.assertEqual(row.work_unit, "user_story")
+        self.assertEqual(row.next_owner, OWNER_AUDITOR)
+        self.assertIn("US-level audit", row.next_action)
+
     def test_out_of_vocabulary_work_unit_folds_to_undeclared(self):
         bogus = "## Gate: Implementation Request\n\n- work_unit: `whatever_unit`\n"
         _, _, row = _fold(("83413", bogus), ("84320", J_14150_REVIEW_REQUEST))
