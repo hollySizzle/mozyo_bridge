@@ -60,6 +60,7 @@ def discover_candidates(
     target_lane: str = "",
     target_receiver: str = "",
     target_generation: str = "",
+    enqueue_lane_generation: str = "",
     exclude_gates: "frozenset[str] | tuple[str, ...]" = (),
 ) -> list[CallbackCandidate]:
     """Discover callback candidates from a source issue's structured gate markers (#13520 F1-R1).
@@ -93,6 +94,7 @@ def discover_candidates(
                 target_lane=str(target_lane or "").strip(),
                 target_receiver=str(target_receiver or "").strip(),
                 target_generation=str(target_generation or "").strip(),
+                enqueue_lane_generation=str(enqueue_lane_generation or "").strip(),
             )
         )
     return candidates
@@ -221,6 +223,8 @@ def run_once(
     now: Optional[str] = None,
     send_fence_fn: "Optional[Callable[[CallbackOutboxRow], tuple[bool, str]]]" = None,
     issue: Optional[str] = None,
+    route: Optional[str] = None,
+    defer_fence_fn: "Optional[Callable[[CallbackOutboxRow], tuple[bool, str]]]" = None,
 ) -> dict:
     """Run one production callback pass (ingest -> deliver-once -> sweep); return a report.
 
@@ -237,7 +241,8 @@ def run_once(
     if candidates:
         report["ingest"] = processor.ingest(candidates, cursor=cursor, now=now).as_payload()
     report["deliver"] = processor.deliver(
-        sender, stale_seconds=stale_seconds, now=now, send_fence_fn=send_fence_fn, issue=issue
+        sender, stale_seconds=stale_seconds, now=now, send_fence_fn=send_fence_fn, issue=issue,
+        route=route, defer_fence_fn=defer_fence_fn,
     ).as_payload()
     report["sweep"] = processor.sweep(stale_seconds=stale_seconds, now=now).as_payload()
     return report

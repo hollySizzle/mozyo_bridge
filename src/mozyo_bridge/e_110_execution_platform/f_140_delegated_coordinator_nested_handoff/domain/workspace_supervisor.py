@@ -33,23 +33,46 @@ store / lease I/O so they are deterministically testable:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Iterable, Sequence
 
 # ---------------------------------------------------------------------------
 # Supervision modes (machine-readable; literal regardless of UI language).
 # ---------------------------------------------------------------------------
 
-#: Re-read the whole active-lane roster (recovers external / MCP-only Redmine updates).
+#: Re-read the whole active-lane roster (recovers external / MCP-only Redmine updates). This is the
+#: **ticket-provider reconciliation** leg (Redmine #14150): the low-frequency bounded fallback that
+#: reaches the provider to recover a lost wake / external (MCP / UI) update / service restart.
 SUPERVISION_BOUNDED_RECONCILIATION = "bounded_reconciliation"
-#: Supervise only the issues a mozyo-originated gate/handoff commit named (its local wake).
+#: Supervise only the issues a mozyo-originated gate/handoff commit named (its local wake). The
+#: event-driven ingest path: a fresh gate names its issue, so this pass reads the provider for that
+#: ONE issue (bounded, targeted) and drains it — reaching an exactly-once callback without waiting
+#: for the periodic reconcile interval (#14150 close condition 2).
 SUPERVISION_LOCAL_WAKE = "local_wake"
+#: The **local outbox drain** leg (Redmine #14150): read LOCAL state only (the outbox + the local
+#: lifecycle/lease authority) and deliver already-enqueued, locally-attestable pending rows. A
+#: drain pass makes **zero ticket-provider calls** — an empty pass and a safe-pending pass both
+#: reach the provider zero times (#14150 close condition 1). A row whose current generation / owner /
+#: dispatch anchor / retirement cannot be safely attested from local state is NOT blind-sent: it is
+#: left for the provider reconciliation leg (:func:`select_drain_delivery_route`).
+SUPERVISION_LOCAL_DRAIN = "local_drain"
 
-SUPERVISION_MODES = frozenset({SUPERVISION_BOUNDED_RECONCILIATION, SUPERVISION_LOCAL_WAKE})
+SUPERVISION_MODES = frozenset(
+    {SUPERVISION_BOUNDED_RECONCILIATION, SUPERVISION_LOCAL_WAKE, SUPERVISION_LOCAL_DRAIN}
+)
 
 #: Portable default bounded-reconciliation interval (seconds). Coarser than the callback wake
 #: cadence — external Redmine updates are the reconciliation target, not sub-minute latency. The
 #: operator tunes the concrete cadence in their runtime policy; this is only the neutral default.
 DEFAULT_RECONCILIATION_INTERVAL_SECONDS = 300
+#: Portable default LOCAL-drain interval (seconds). The drain reads local state only (no provider
+#: load), so it can run finer than the provider reconciliation cadence to deliver already-safe
+#: pending rows promptly — but it is still a bounded one-shot, never an in-turn poll. Chosen as a
+#: neutral sub-multiple of the reconciliation default (not a private runtime value); the operator
+#: tunes the concrete cadence in their runtime policy. Its correctness never depends on the cadence:
+#: a dropped drain tick loses nothing (the provider reconciliation leg and the next drain re-read the
+#: outbox), so this is a latency knob, not a safety one.
+DEFAULT_LOCAL_DRAIN_INTERVAL_SECONDS = 60
 
 #: A workspace whole-skip reason (fixed vocabulary).
 SKIP_LEASE_REFUSED = "lease_held_by_other"  # a live duplicate supervisor owns this workspace
@@ -58,6 +81,15 @@ SKIP_NO_ACTIVE_ISSUES = "no_active_issues_to_supervise"  # roster read OK but no
 #: The renew fence tripped mid-sweep: this workspace's lease was lost (taken over after expiry),
 #: so the supervisor stopped before the next issue's side-effects (Redmine #13683 review R1-F1).
 SKIP_LEASE_LOST = "lease_lost_midsweep"
+
+#: A per-issue supply error token: the Redmine source could not be read for durable-event supply /
+#: candidate discovery (fail-open per issue — the callback drain still ran).
+ISSUE_SOURCE_UNREADABLE = "redmine_source_unreadable"
+#: A per-issue error token: the whole issue pass raised (recorded, not fatal to the sweep).
+ISSUE_PASS_ERROR = "issue_pass_error"
+#: A per-issue error token: the send-boundary ownership fence tripped (a takeover during this
+#: issue's source reads), so the outbox delivery was skipped — zero-send (Redmine #13683 R2-F1).
+ISSUE_LEASE_LOST = "lease_lost_before_send"
 
 
 @dataclass(frozen=True)
@@ -247,6 +279,132 @@ def partition_delivery_receipts(
     return delivered, blocked
 
 
+# ---------------------------------------------------------------------------
+# Local outbox drain: locally-attestable route selection (Redmine #14150).
+# ---------------------------------------------------------------------------
+
+#: The coordinator callback route (a sublane callback wakes the coordinator lane). Mirrors
+#: ``...application.callback_runtime.DEFAULT_CALLBACK_ROUTE`` — the pure layer keeps its own literal
+#: so it never imports the application layer.
+COORDINATOR_ROUTE = "coordinator"
+
+#: The routes the LOCAL drain may deliver **without any ticket-provider read** (Redmine #14150). Only
+#: the general coordinator route qualifies in R1: its safety fence is the dispatch-anchor generation
+#: check, which reads the LOCAL lifecycle authority (``make_send_edge_fence``), and it carries no
+#: generation-correlation that the delivery authority would have to re-verify against a live provider
+#: round. The correlated ``review_return:<lane>`` route needs the send-edge review-round re-read (a
+#: provider call), and the ``lane_gateway:<lane>`` route needs its live owning-lane generation, so
+#: both are NOT locally attestable — a drain pass DEFERS them to the provider reconciliation leg
+#: rather than blind-send (the issue's "blind sendせず … reconciliation要求へ倒す" contract).
+LOCAL_DRAIN_ATTESTABLE_ROUTES = frozenset({COORDINATOR_ROUTE})
+
+#: A drain-deferred row reason (fixed vocabulary): the row's route is not locally attestable, so the
+#: local drain left it for the provider reconciliation leg (zero-send, never a blind send).
+DRAIN_DEFER_NOT_ATTESTABLE = "deferred_not_locally_attestable"
+#: A drain-deferred issue reason: the issue's current dispatch anchor could not be resolved from the
+#: LOCAL lifecycle authority, so the drain delivered none of its rows (fail-closed, deferred to the
+#: provider reconciliation leg) rather than deliver un-anchored (a possible previous-generation replay).
+DRAIN_DEFER_ANCHOR_UNRESOLVED = "deferred_local_anchor_unresolved"
+
+
+def is_locally_attestable_route(route: object) -> bool:
+    """True iff ``route`` can be safely delivered by the local drain (Redmine #14150; pure).
+
+    Only :data:`LOCAL_DRAIN_ATTESTABLE_ROUTES` qualify — every other route requires a live
+    ticket-provider read to attest (review-round currency / live owning-lane generation) and is
+    deferred to the provider reconciliation leg instead of blind-sent.
+    """
+    return str(route or "").strip() in LOCAL_DRAIN_ATTESTABLE_ROUTES
+
+
+def select_drain_issues(pending_rows: Iterable[object], workspace_id: str) -> tuple[str, ...]:
+    """The ordered, de-duplicated issues with a locally-attestable pending row (Redmine #14150; pure).
+
+    ``pending_rows`` are the workspace's LOCAL callback-outbox rows (duck-typed on ``.issue`` /
+    ``.callback_route`` / ``.workspace_id``). The drain visits only issues that own at least one
+    locally-attestable pending row **in this workspace's partition**, so a pass with no drainable row
+    visits nothing (and reads the provider zero times). Order-preserving on first appearance.
+    """
+    ws = str(workspace_id or "").strip()
+    issues: list[str] = []
+    seen: set[str] = set()
+    for row in pending_rows or ():
+        if str(getattr(row, "workspace_id", "") or "").strip() != ws:
+            continue
+        if not is_locally_attestable_route(getattr(row, "callback_route", "")):
+            continue
+        issue = str(getattr(row, "issue", "") or "").strip()
+        if not issue or issue in seen:
+            continue
+        seen.add(issue)
+        issues.append(issue)
+    return tuple(issues)
+
+
+# ---------------------------------------------------------------------------
+# Provider reconciliation: changed-work incremental selection (Redmine #14150 review F2).
+# ---------------------------------------------------------------------------
+
+#: A reconcile-skip reason (fixed vocabulary): the issue was neither externally changed (per the
+#: provider changed-work watermark) nor locally changed since the last reconcile, and holds no
+#: un-accounted local work — so this pass skips its provider read (the local drain still delivers its
+#: safe pending). Surfaced so a skipped issue is operator-visible, never a silent drop.
+RECONCILE_SKIP_UNCHANGED = "reconcile_skipped_unchanged"
+
+
+def issue_reconcile_snapshot(
+    lane_id: object, generation: object, disposition: object, owner: object
+) -> str:
+    """A compact, secret-safe snapshot of an issue's LOCAL reconcile-relevant state (#14150 F2; pure).
+
+    Captures the owning lane / generation / disposition / authoritative owner so a change the provider
+    never sees — e.g. an ambiguous owner becoming resolved, which is exactly the F3 refusal-clearing —
+    forces a re-fetch even when the Redmine ``updated_on`` did not move. Non-secret (ids / tokens only).
+    """
+    parts = [str(lane_id or ""), str(generation or ""), str(disposition or ""), str(owner or "")]
+    return "|".join(p.replace("|", "_") for p in parts)
+
+
+def select_reconcile_issues(
+    roster_issues: Iterable[str],
+    *,
+    changed_ids: "frozenset[str] | set[str] | tuple[str, ...]",
+    changed_ok: bool,
+    snapshot_by_issue: dict,
+    prior_snapshot_by_issue: dict,
+    has_local_work: "frozenset[str] | set[str] | tuple[str, ...]",
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split a roster into ``(to_reconcile, skipped)`` for the changed-work incremental read (#14150 F2).
+
+    An issue is provider-reconciled this pass when ANY holds:
+    - it is in ``changed_ids`` (the provider changed-work page: externally / MCP updated), OR
+    - its LOCAL snapshot (:func:`issue_reconcile_snapshot`) differs from the stored prior snapshot — a
+      local change the provider never saw (owner resolved, generation advanced …), which covers the F3
+      refusal-clearing that a naive ``updated_since`` gate would permanently hide, OR
+    - it has un-accounted local work (a pending / inflight / uncertain outbox row) in ``has_local_work``.
+
+    ``changed_ok`` is False when the changed-work query itself failed/was unavailable — then the gate
+    fails OPEN (every roster issue is reconciled), so a broken incremental read never suppresses the
+    provider fallback (recovery contract). ``skipped`` issues get no provider read this pass; their safe
+    coordinator pending is still delivered by the local drain. Pure; order-preserving.
+    """
+    roster = tuple(dict.fromkeys(str(i).strip() for i in roster_issues if str(i).strip()))
+    changed = {str(i).strip() for i in (changed_ids or ())}
+    local_work = {str(i).strip() for i in (has_local_work or ())}
+    to_reconcile: list[str] = []
+    skipped: list[str] = []
+    for issue in roster:
+        if not changed_ok:
+            to_reconcile.append(issue)  # fail-open: a failed changed-work read reconciles everything
+            continue
+        snapshot_changed = snapshot_by_issue.get(issue) != prior_snapshot_by_issue.get(issue)
+        if issue in changed or snapshot_changed or issue in local_work:
+            to_reconcile.append(issue)
+        else:
+            skipped.append(issue)
+    return tuple(to_reconcile), tuple(skipped)
+
+
 def select_supervised_issues(
     roster_issues: Iterable[str],
     *,
@@ -302,6 +460,16 @@ class IssueSupervisionOutcome:
     #: F2): historical (previous-generation) gate journals that would otherwise re-enqueue and
     #: re-deliver. Surfaced so a fenced zero-send is operator-visible, not a silent drop.
     historical_fenced: int = 0
+    #: Rows the LOCAL drain could not attest as current from local state and released back to pending
+    #: for the provider reconciliation leg (Redmine #14150): a zero-send that is neither a blind send
+    #: nor a terminal drop. Surfaced so a deferred-to-reconciliation outcome is operator-visible.
+    deferred: int = 0
+    #: Whether this issue's pass performed a ticket-provider (Redmine) read (Redmine #14150). The
+    #: LOCAL drain never reads the provider, so ``provider_read`` is ``False`` for every drain issue —
+    #: the report's ``provider_calls`` roll-up is then provably ``0`` for an empty / safe-pending drain
+    #: pass (close condition 1). The provider reconciliation leg sets it ``True`` only for issues it
+    #: actually read (a watermark-skipped issue stays ``False``), so the count is real provider work.
+    provider_read: bool = False
     error: str = ""
     #: The fixed-vocabulary review_result-return refusal reasons for this issue (#13684 review R1-F3):
     #: why a correlated return was NOT reserved (missing / ambiguous owner, self-route, stale, blank
@@ -325,6 +493,8 @@ class IssueSupervisionOutcome:
             "pending": self.pending,
             "dead_letter": self.dead_letter,
             "historical_fenced": self.historical_fenced,
+            "deferred": self.deferred,
+            "provider_read": self.provider_read,
             "error": self.error,
             "review_return_refusals": list(self.review_return_refusals),
             "lane_gateway_refusals": list(self.lane_gateway_refusals),
@@ -346,6 +516,17 @@ class WorkspaceSupervisionOutcome:
     non_authoritative_issues: tuple[str, ...] = ()
     issues: tuple[IssueSupervisionOutcome, ...] = ()
     skipped_reason: str = ""
+    #: Roster issues the changed-work incremental read skipped this provider-reconcile pass (Redmine
+    #: #14150 review F2): unchanged externally (provider changed-work watermark) AND locally, with no
+    #: un-accounted local work — so no provider read fired for them (their safe pending is drained
+    #: locally). Surfaced so the incremental skip is operator-visible, never a silent drop.
+    reconcile_skipped_issues: tuple[str, ...] = ()
+    #: The ACTUAL ticket-provider read count for this workspace (Redmine #14150 review F2): the number
+    #: of ``read_entries`` (one HTTP fetch each) the reconcile source served this pass — supply +
+    #: discovery + dispatch-anchor + review-identity + review_return / lane_gateway discovery +
+    #: own-workspace backlog drain. NOT the count of issues that touched the provider (which
+    #: under-counted a multi-read issue as 1). A local drain / downgraded workspace reads 0.
+    provider_calls: int = 0
     #: Own-workspace review_return backlog dispositions (Redmine #13974 R2): rows reserved for a
     #: now-hibernated / superseded lane whose issue is no longer in any active roster, drained under the
     #: lease. ``backlog_fenced`` terminally converged (zero-send); ``backlog_delivered`` is a REAL send
@@ -376,6 +557,17 @@ class WorkspaceSupervisionOutcome:
         # AND the backlog drain, so ``delivered`` never absorbs a send that did not wake the receiver.
         return sum(i.blocked for i in self.issues) + self.backlog_blocked
 
+    @property
+    def deferred(self) -> int:
+        # Redmine #14150: rows the local drain released back to pending for the reconciliation leg.
+        return sum(i.deferred for i in self.issues)
+
+    @property
+    def provider_read_issues(self) -> int:
+        # Redmine #14150: how many issues touched the provider this pass (observability alongside the
+        # ACTUAL ``provider_calls`` count — an issue can make several reads, so these differ by design).
+        return sum(1 for i in self.issues if i.provider_read)
+
     def as_payload(self) -> dict[str, object]:
         return {
             "workspace_id": self.workspace_id,
@@ -384,10 +576,14 @@ class WorkspaceSupervisionOutcome:
             "supervised_issues": list(self.supervised_issues),
             "ignored_wake_issues": list(self.ignored_wake_issues),
             "non_authoritative_issues": list(self.non_authoritative_issues),
+            "reconcile_skipped_issues": list(self.reconcile_skipped_issues),
             "skipped_reason": self.skipped_reason,
             "events_supplied": self.events_supplied,
             "delivered": self.delivered,
             "blocked": self.blocked,
+            "deferred": self.deferred,
+            "provider_calls": self.provider_calls,
+            "provider_read_issues": self.provider_read_issues,
             "backlog_fenced": self.backlog_fenced,
             "backlog_delivered": self.backlog_delivered,
             "backlog_blocked": self.backlog_blocked,
@@ -404,6 +600,10 @@ class SupervisorReport:
     mode: str
     holder: str
     workspaces: tuple[WorkspaceSupervisionOutcome, ...] = field(default_factory=tuple)
+    #: Wall-clock milliseconds the whole sweep took (Redmine #14150 observability). Set by the CLI
+    #: entrypoint (a clock read is impure, so the pure fold defaults it to 0). For a provider
+    #: reconciliation pass this is the reconcile duration the close condition asks be measurable.
+    duration_ms: int = 0
 
     @property
     def workspaces_supervised(self) -> int:
@@ -426,6 +626,36 @@ class SupervisorReport:
         return sum(w.blocked for w in self.workspaces)
 
     @property
+    def deferred(self) -> int:
+        # Redmine #14150: rows the local drain deferred to the provider reconciliation leg.
+        return sum(w.deferred for w in self.workspaces)
+
+    @property
+    def provider_calls(self) -> int:
+        """Ticket-provider reads this whole sweep performed (Redmine #14150 close condition 1).
+
+        Counted as the number of ACTUAL ``read_entries`` (one HTTP fetch each) the reconcile source
+        served across all workspaces (Redmine #14150 review F2) — NOT the number of issues that touched
+        the provider (a single issue makes several reads). A LOCAL drain never reads the provider, so an
+        empty drain pass and a safe-pending drain pass both roll up to ``0`` here — the testable contract.
+        """
+        return sum(w.provider_calls for w in self.workspaces)
+
+    @property
+    def empty_pass(self) -> bool:
+        """True iff this pass produced no delivery, no supply, and no provider read (Redmine #14150).
+
+        The observability signal the issue asks for: an empty drain pass (nothing to deliver) is
+        visible as ``empty_pass`` with ``provider_calls == 0``.
+        """
+        return (
+            self.delivered == 0
+            and self.blocked == 0
+            and self.events_supplied == 0
+            and self.provider_calls == 0
+        )
+
+    @property
     def backlog_fenced(self) -> int:
         return sum(w.backlog_fenced for w in self.workspaces)
 
@@ -438,16 +668,92 @@ class SupervisorReport:
             "action": "run-once",
             "mode": self.mode,
             "holder": self.holder,
+            "duration_ms": self.duration_ms,
             "workspaces_total": len(self.workspaces),
             "workspaces_supervised": self.workspaces_supervised,
             "workspaces_skipped": self.workspaces_skipped,
             "events_supplied": self.events_supplied,
             "delivered": self.delivered,
             "blocked": self.blocked,
+            "deferred": self.deferred,
+            "provider_calls": self.provider_calls,
+            "empty_pass": self.empty_pass,
             "backlog_fenced": self.backlog_fenced,
             "backlog_recovered": self.backlog_recovered,
             "workspaces": [w.as_payload() for w in self.workspaces],
         }
+
+
+# ---------------------------------------------------------------------------
+# Provider reconciliation cadence: watermark gate + jitter/backoff (Redmine #14150).
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso(value: object) -> "datetime | None":
+    """Parse an ISO-8601 timestamp to an aware UTC ``datetime`` (``None`` if unparseable; pure)."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def reconcile_backoff_seconds(
+    base_interval_seconds: int,
+    consecutive_empty_passes: int,
+    *,
+    max_interval_seconds: int,
+    jitter_unit: float = 0.0,
+    jitter_fraction: float = 0.0,
+) -> int:
+    """The next provider-reconcile due delay (seconds), backed off + jittered (Redmine #14150; pure).
+
+    The provider reconciliation leg must not re-read every workspace / every journal on a fixed tight
+    cadence. When consecutive passes find nothing new, the due interval backs off exponentially from
+    ``base_interval_seconds`` (doubling per empty pass) up to ``max_interval_seconds``, so an idle
+    fleet quiesces toward the ceiling instead of polling the provider at the floor. ``jitter_unit`` is
+    an injected value in ``[0, 1)`` (a seam — the caller supplies a deterministic value in tests and a
+    real RNG draw in production, so this stays pure and reproducible); it spreads the due time by up to
+    ``jitter_fraction`` of the backed-off interval so a fleet of workspaces does not thunder the
+    provider in lockstep. Returns an int in ``[base, max]`` (jitter only ADDS, never below base).
+    """
+    base = max(1, int(base_interval_seconds))
+    ceiling = max(base, int(max_interval_seconds))
+    empties = max(0, int(consecutive_empty_passes))
+    # Exponential backoff, capped — guard the shift so a large empty count never overflows.
+    backed = min(ceiling, base * (2 ** min(empties, 30)))
+    unit = min(max(float(jitter_unit), 0.0), 0.999999)
+    fraction = min(max(float(jitter_fraction), 0.0), 1.0)
+    jitter = int(backed * fraction * unit)
+    return min(ceiling, backed + jitter)
+
+
+def should_reconcile_source(
+    last_reconciled_at: object,
+    now: object,
+    due_after_seconds: int,
+) -> bool:
+    """True iff the provider reconcile watermark for a source is DUE (Redmine #14150; pure).
+
+    ``last_reconciled_at`` is the durable watermark of the last completed provider read for a source
+    (blank / unparseable -> never reconciled -> due). ``now`` is the current ISO timestamp; the source
+    is due when ``due_after_seconds`` have elapsed since the watermark. This is the differential-fetch
+    gate: a drain-only tick never sets the watermark (it made no provider read), so it never suppresses
+    a genuine reconcile; only a completed provider read advances it. An unparseable ``now`` fails toward
+    reconciling (never silently skips the provider fallback).
+    """
+    now_dt = _parse_iso(now)
+    if now_dt is None:
+        return True
+    last_dt = _parse_iso(last_reconciled_at)
+    if last_dt is None:
+        return True
+    return (now_dt - last_dt).total_seconds() >= max(0, int(due_after_seconds))
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +795,9 @@ class SupervisorServiceDefinition:
 
 #: The default service label (a reverse-DNS style id; not operator-private).
 DEFAULT_SUPERVISOR_SERVICE_LABEL = "org.mozyo-bridge.callback-supervisor"
+#: The default LOCAL-drain service label (Redmine #14150): the finer-cadence drain agent, distinct
+#: from the coarse provider-reconciliation agent so an OS scheduler runs BOTH bounded one-shots.
+DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL = "org.mozyo-bridge.callback-supervisor.drain"
 
 
 def build_service_definition(
@@ -498,6 +807,7 @@ def build_service_definition(
     run_at_login: bool = True,
     keep_alive: bool = False,
     label: str = DEFAULT_SUPERVISOR_SERVICE_LABEL,
+    local_drain: bool = False,
 ) -> SupervisorServiceDefinition:
     """Build the supervisor daemon's declarative service definition (pure, no secrets).
 
@@ -507,11 +817,22 @@ def build_service_definition(
     bounded cadence in the watcher/service layer, never an LLM turn). ``keep_alive`` defaults to
     **False**: the sweep exits and is re-run on the interval (launchd ``RunAtLoad`` + ``StartInterval``
     in Phase B1), so KeepAlive would only produce a tight restart loop (j#78995).
+
+    ``local_drain`` (Redmine #14150) builds the LOCAL-drain variant instead: the command is
+    ``<command_prefix> --drain-only`` (read local state only, zero ticket-provider reads) and
+    ``reconciliation_interval_seconds`` carries the FINER drain cadence. The OS scheduler runs this
+    bounded one-shot at the drain interval alongside the coarser reconciliation agent — the SAME
+    bounded command adapter, never an in-turn sleep/poll. The default label switches to the distinct
+    drain label unless the caller overrides ``label``.
     """
     interval = max(1, int(reconciliation_interval_seconds))
-    command = tuple(str(p) for p in command_prefix) + ("--run-once",)
+    action_flag = "--drain-only" if local_drain else "--run-once"
+    command = tuple(str(p) for p in command_prefix) + (action_flag,)
+    resolved_label = str(label)
+    if local_drain and resolved_label == DEFAULT_SUPERVISOR_SERVICE_LABEL:
+        resolved_label = DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL
     return SupervisorServiceDefinition(
-        label=str(label),
+        label=resolved_label,
         command=command,
         reconciliation_interval_seconds=interval,
         run_at_login=bool(run_at_login),
@@ -522,19 +843,35 @@ def build_service_definition(
 __all__ = (
     "SUPERVISION_BOUNDED_RECONCILIATION",
     "SUPERVISION_LOCAL_WAKE",
+    "SUPERVISION_LOCAL_DRAIN",
     "SUPERVISION_MODES",
     "DEFAULT_RECONCILIATION_INTERVAL_SECONDS",
+    "DEFAULT_LOCAL_DRAIN_INTERVAL_SECONDS",
     "SKIP_LEASE_REFUSED",
     "SKIP_ROSTER_UNREADABLE",
     "SKIP_NO_ACTIVE_ISSUES",
     "SKIP_LEASE_LOST",
+    "ISSUE_SOURCE_UNREADABLE",
+    "ISSUE_PASS_ERROR",
+    "ISSUE_LEASE_LOST",
     "DROP_NOT_AUTHORITATIVE",
+    "COORDINATOR_ROUTE",
+    "LOCAL_DRAIN_ATTESTABLE_ROUTES",
+    "DRAIN_DEFER_NOT_ATTESTABLE",
+    "DRAIN_DEFER_ANCHOR_UNRESOLVED",
     "authoritative_workspace_by_issue",
     "partition_authoritative",
     "fence_candidates_to_anchor",
     "make_send_edge_fence",
     "compose_send_edge_fences",
     "partition_delivery_receipts",
+    "is_locally_attestable_route",
+    "select_drain_issues",
+    "RECONCILE_SKIP_UNCHANGED",
+    "issue_reconcile_snapshot",
+    "select_reconcile_issues",
+    "reconcile_backoff_seconds",
+    "should_reconcile_source",
     "IssueSelection",
     "select_supervised_issues",
     "IssueSupervisionOutcome",
@@ -542,5 +879,6 @@ __all__ = (
     "SupervisorReport",
     "SupervisorServiceDefinition",
     "DEFAULT_SUPERVISOR_SERVICE_LABEL",
+    "DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL",
     "build_service_definition",
 )

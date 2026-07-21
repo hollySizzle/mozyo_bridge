@@ -214,6 +214,7 @@ CREATE TABLE IF NOT EXISTS callback_outbox (
     target_lane         TEXT NOT NULL DEFAULT '',
     target_receiver     TEXT NOT NULL DEFAULT '',
     target_generation   TEXT NOT NULL DEFAULT '',
+    enqueue_lane_generation TEXT NOT NULL DEFAULT '',
     seq                 INTEGER NOT NULL,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
@@ -289,6 +290,31 @@ def _ensure_callback_target_columns(conn: sqlite3.Connection) -> None:
     """
     have = {row[1] for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()}
     for name, decl in _CALLBACK_TARGET_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE callback_outbox ADD COLUMN {name} {decl}")
+
+
+#: The callback-outbox LOCAL attestation column (Redmine #14150). ``enqueue_lane_generation`` is the
+#: owning-lane generation, read from the LOCAL lifecycle authority at ingest, transactionally stamped
+#: on the row. The local outbox drain compares it to the current local lane generation to attest a
+#: coordinator row is still current WITHOUT a ticket-provider read — a stale row (the lane advanced a
+#: generation since enqueue) is fenced, never blind-sent. Distinct from ``target_generation`` (the
+#: delivery authority's expected/live generation seam, #13684), so this attestation never perturbs
+#: :func:`...domain.background_service_delivery.authorize_background_delivery`. Additive; no version bump.
+_CALLBACK_ATTESTATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("enqueue_lane_generation", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _ensure_callback_attestation_columns(conn: sqlite3.Connection) -> None:
+    """Add the #14150 local-attestation column to a callback table that lacks it (idempotent).
+
+    ``ALTER TABLE ADD COLUMN`` is additive and preserves rows; a no-op once present. An older build
+    that does not read the column is unaffected (it defaults ``''``), so the change is backward /
+    forward compatible without a container version bump (same posture as the ownership / target columns).
+    """
+    have = {row[1] for row in conn.execute("PRAGMA table_info(callback_outbox)").fetchall()}
+    for name, decl in _CALLBACK_ATTESTATION_COLUMNS:
         if name not in have:
             conn.execute(f"ALTER TABLE callback_outbox ADD COLUMN {name} {decl}")
 
@@ -453,6 +479,7 @@ class WorkflowRuntimeStore:
             _ensure_callback_ownership_columns(conn)
             _ensure_callback_target_columns(conn)
             _migrate_callback_outbox_workspace(conn)
+            _ensure_callback_attestation_columns(conn)
             conn.execute(
                 f"PRAGMA user_version = {WORKFLOW_RUNTIME_STORE_SCHEMA_VERSION}"
             )
@@ -467,6 +494,7 @@ class WorkflowRuntimeStore:
             _ensure_callback_ownership_columns(conn)
             _ensure_callback_target_columns(conn)
             _migrate_callback_outbox_workspace(conn)
+            _ensure_callback_attestation_columns(conn)
             conn.commit()
         else:
             conn.close()

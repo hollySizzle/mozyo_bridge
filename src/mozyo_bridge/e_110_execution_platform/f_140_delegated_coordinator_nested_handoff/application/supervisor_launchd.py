@@ -36,6 +36,7 @@ installing / restarting / uninstalling the agent is orthogonal to what the agent
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import plistlib
 import shutil
@@ -45,7 +46,9 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    DEFAULT_LOCAL_DRAIN_INTERVAL_SECONDS,
     DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
+    DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL,
     DEFAULT_SUPERVISOR_SERVICE_LABEL,
 )
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_context import (
@@ -80,6 +83,51 @@ SUPERVISOR_ARGV_TAIL = ("workflow", "supervisor", "--run-once")
 #: The structured flag that pins the mozyo home root onto the daemon argv (non-secret; a config
 #: directory, resolved by the supervisor CLI's ``--home``).
 SUPERVISOR_HOME_FLAG = "--home"
+
+# ---------------------------------------------------------------------------
+# Agent variants (Redmine #14150): the split runs TWO owned bounded one-shot agents at distinct
+# cadences — the coarse provider-reconciliation agent (``--run-once``) and the finer local-drain
+# agent (``--drain-only``). Each is an isolated owned label / plist / log; the lifecycle verbs below
+# operate on ONE agent (default: reconcile, so the pre-#14150 single-agent behaviour is byte-identical),
+# and the CLI orchestrates BOTH with a fail-closed / rollback dual-agent policy.
+# ---------------------------------------------------------------------------
+
+#: The local-drain agent's owned identity (distinct label / plist / log / argv tail).
+SUPERVISOR_DRAIN_LAUNCHD_LABEL = DEFAULT_SUPERVISOR_DRAIN_SERVICE_LABEL
+DRAIN_PLIST_RELATIVE = Path("Library/LaunchAgents") / f"{SUPERVISOR_DRAIN_LAUNCHD_LABEL}.plist"
+DRAIN_LOG_RELATIVE = Path("Library/Logs/mozyo-bridge/callback-supervisor-drain.log")
+SUPERVISOR_DRAIN_ARGV_TAIL = ("workflow", "supervisor", "--drain-only")
+
+
+@dataclasses.dataclass(frozen=True)
+class SupervisorAgent:
+    """One owned launchd agent's identity (label + plist/log paths + the bounded argv tail it runs)."""
+
+    label: str
+    argv_tail: tuple[str, ...]
+    plist_relative: Path
+    log_relative: Path
+    default_interval_seconds: int
+
+
+#: The coarse provider-reconciliation agent (``workflow supervisor --run-once``).
+RECONCILE_AGENT = SupervisorAgent(
+    label=SUPERVISOR_LAUNCHD_LABEL,
+    argv_tail=SUPERVISOR_ARGV_TAIL,
+    plist_relative=PLIST_RELATIVE,
+    log_relative=LOG_RELATIVE,
+    default_interval_seconds=DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
+)
+#: The finer local-drain agent (``workflow supervisor --drain-only``; Redmine #14150).
+DRAIN_AGENT = SupervisorAgent(
+    label=SUPERVISOR_DRAIN_LAUNCHD_LABEL,
+    argv_tail=SUPERVISOR_DRAIN_ARGV_TAIL,
+    plist_relative=DRAIN_PLIST_RELATIVE,
+    log_relative=DRAIN_LOG_RELATIVE,
+    default_interval_seconds=DEFAULT_LOCAL_DRAIN_INTERVAL_SECONDS,
+)
+#: The owned agents an install/uninstall/status sweep manages, in dependency order (reconcile first).
+SUPERVISOR_AGENTS = (RECONCILE_AGENT, DRAIN_AGENT)
 
 # ---------------------------------------------------------------------------
 # Fixed-vocabulary reason tokens (machine-readable; secret-safe; UI-language-independent).
@@ -147,14 +195,14 @@ Runner = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
 # ---------------------------------------------------------------------------
 
 
-def plist_path(os_home: Optional[Path] = None) -> Path:
+def plist_path(os_home: Optional[Path] = None, *, agent: SupervisorAgent = RECONCILE_AGENT) -> Path:
     """The owned plist path under the **OS user home** (``~/Library/LaunchAgents``)."""
-    return (os_home or Path.home()) / PLIST_RELATIVE
+    return (os_home or Path.home()) / agent.plist_relative
 
 
-def log_path(os_home: Optional[Path] = None) -> Path:
+def log_path(os_home: Optional[Path] = None, *, agent: SupervisorAgent = RECONCILE_AGENT) -> Path:
     """The owned log path under the **OS user home** (``~/Library/Logs``)."""
-    return (os_home or Path.home()) / LOG_RELATIVE
+    return (os_home or Path.home()) / agent.log_relative
 
 
 def resolve_mozyo_home(mozyo_home: Optional[Path] = None) -> Path:
@@ -176,6 +224,7 @@ def resolve_supervisor_command(
     *,
     mozyo_home: Optional[Path] = None,
     which: Callable[[str], Optional[str]] = shutil.which,
+    agent: SupervisorAgent = RECONCILE_AGENT,
 ) -> Optional[list[str]]:
     """The exact argv the agent runs, or ``None`` when the executable is not on PATH.
 
@@ -193,7 +242,7 @@ def resolve_supervisor_command(
         return None
     return [
         os.path.abspath(executable),
-        *SUPERVISOR_ARGV_TAIL,
+        *agent.argv_tail,
         SUPERVISOR_HOME_FLAG,
         str(resolve_mozyo_home(mozyo_home)),
     ]
@@ -204,6 +253,7 @@ def render_plist(
     *,
     interval_seconds: int,
     os_home: Optional[Path] = None,
+    agent: SupervisorAgent = RECONCILE_AGENT,
 ) -> bytes:
     """Render the LaunchAgent plist for the one-shot scheduled supervisor sweep.
 
@@ -217,12 +267,12 @@ def render_plist(
       the pinned ``--home <mozyo root>``). The log lives under the OS user home (``os_home``).
     """
     payload = {
-        "Label": SUPERVISOR_LAUNCHD_LABEL,
+        "Label": agent.label,
         "ProgramArguments": list(command),
         "RunAtLoad": True,
         "StartInterval": max(1, int(interval_seconds)),
-        "StandardOutPath": str(log_path(os_home)),
-        "StandardErrorPath": str(log_path(os_home)),
+        "StandardOutPath": str(log_path(os_home, agent=agent)),
+        "StandardErrorPath": str(log_path(os_home, agent=agent)),
         "ProcessType": "Background",
     }
     return plistlib.dumps(payload)
@@ -281,18 +331,20 @@ def _gui_domain() -> str:
     return f"gui/{os.getuid()}"
 
 
-def _service_target() -> str:
-    return f"{_gui_domain()}/{SUPERVISOR_LAUNCHD_LABEL}"
+def _service_target(agent: SupervisorAgent = RECONCILE_AGENT) -> str:
+    return f"{_gui_domain()}/{agent.label}"
 
 
 def _launchctl(runner: Runner, args: Sequence[str]) -> "subprocess.CompletedProcess[str]":
     return runner([_LAUNCHCTL, *args])
 
 
-def _is_loaded(runner: Runner) -> tuple[bool, Optional[int]]:
+def _is_loaded(
+    runner: Runner, agent: SupervisorAgent = RECONCILE_AGENT
+) -> tuple[bool, Optional[int]]:
     """Read-only ``launchctl print`` → (loaded, pid). Never raises for a missing launchctl."""
     try:
-        result = _launchctl(runner, ["print", _service_target()])
+        result = _launchctl(runner, ["print", _service_target(agent)])
     except FileNotFoundError:  # launchctl absent (non-darwin / minimal host)
         return False, None
     if result.returncode != 0:
@@ -320,6 +372,7 @@ def install(
     interval_seconds: int = DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
     runner: Runner = _default_runner,
     which: Callable[[str], Optional[str]] = shutil.which,
+    agent: SupervisorAgent = RECONCILE_AGENT,
 ) -> dict:
     """Write the owned plist and (re)bootstrap the agent. Idempotent; fail-closed zero-mutation.
 
@@ -332,24 +385,27 @@ def install(
     the agent is booted out (ignore-failure) then bootstrapped.
     """
     if not _running_on_darwin():
-        return _refused("install", REASON_UNSUPPORTED_PLATFORM)
+        return _refused("install", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
     resolved_mozyo = resolve_mozyo_home(mozyo_home)
-    command = resolve_supervisor_command(mozyo_home=resolved_mozyo, which=which)
+    command = resolve_supervisor_command(mozyo_home=resolved_mozyo, which=which, agent=agent)
     if command is None:
-        return _refused("install", REASON_EXECUTABLE_NOT_FOUND)
+        return _refused("install", REASON_EXECUTABLE_NOT_FOUND, label=agent.label)
     readiness = classify_credential_readiness(mozyo_home=resolved_mozyo)
     if readiness != CREDENTIAL_READY:
         return _refused(
-            "install", _CREDENTIAL_REFUSAL_REASON[readiness], credential_readiness=readiness
+            "install", _CREDENTIAL_REFUSAL_REASON[readiness],
+            credential_readiness=readiness, label=agent.label,
         )
 
-    target = plist_path(os_home)
+    target = plist_path(os_home, agent=agent)
     target.parent.mkdir(parents=True, exist_ok=True)
-    log_path(os_home).parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(render_plist(command, interval_seconds=interval_seconds, os_home=os_home))
+    log_path(os_home, agent=agent).parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(
+        render_plist(command, interval_seconds=interval_seconds, os_home=os_home, agent=agent)
+    )
     # A previously loaded agent must be booted out before bootstrap or launchd rejects the
     # duplicate label; a not-loaded bootout is fine to ignore (idempotent install).
-    _launchctl(runner, ["bootout", _service_target()])
+    _launchctl(runner, ["bootout", _service_target(agent)])
     result = _launchctl(runner, ["bootstrap", _gui_domain(), str(target)])
     if result.returncode != 0:
         return {
@@ -357,6 +413,7 @@ def install(
             "performed": False,
             "reason": REASON_BOOTSTRAP_FAILED,
             "credential_readiness": readiness,
+            "label": agent.label,
         }
     return {
         "action": "install",
@@ -364,6 +421,7 @@ def install(
         "reason": "",
         "credential_readiness": readiness,
         "scheduled_interval_seconds": max(1, int(interval_seconds)),
+        "label": agent.label,
     }
 
 
@@ -373,6 +431,7 @@ def restart(
     mozyo_home: Optional[Path] = None,
     runner: Runner = _default_runner,
     which: Callable[[str], Optional[str]] = shutil.which,
+    agent: SupervisorAgent = RECONCILE_AGENT,
 ) -> dict:
     """Kickstart (kill + relaunch) the *loaded* agent. Fail-closed zero-mutation.
 
@@ -389,52 +448,59 @@ def restart(
     non-ready pinned-home credential, or a service that is not loaded.
     """
     if not _running_on_darwin():
-        return _refused("restart", REASON_UNSUPPORTED_PLATFORM)
-    target = plist_path(os_home)
+        return _refused("restart", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
+    target = plist_path(os_home, agent=agent)
     if not target.exists():
-        return _refused("restart", REASON_NOT_INSTALLED)
+        return _refused("restart", REASON_NOT_INSTALLED, label=agent.label)
     installed = _read_installed_plist(target)
     if installed is None:
         # File present but unreadable / non-mapping — unhealthy, NOT absence (j#79136 R4-F3).
-        return _refused("restart", REASON_HOME_PIN_UNHEALTHY, home_pin=HOME_PIN_UNREADABLE)
+        return _refused(
+            "restart", REASON_HOME_PIN_UNHEALTHY, home_pin=HOME_PIN_UNREADABLE, label=agent.label
+        )
     installed_argv = installed.get("ProgramArguments")
     pinned, pin_status = _extract_pinned_home(installed_argv)
     if pin_status != HOME_PIN_OK:
-        return _refused("restart", REASON_HOME_PIN_UNHEALTHY, home_pin=pin_status)
+        return _refused("restart", REASON_HOME_PIN_UNHEALTHY, home_pin=pin_status, label=agent.label)
     # A requested home that disagrees with the installed pin is a re-point attempt — refuse; a home
     # change must rewrite the plist via install, not silently kickstart the old pin.
     if mozyo_home is not None and str(resolve_mozyo_home(mozyo_home)) != pinned:
-        return _refused("restart", REASON_HOME_PIN_MISMATCH, home_pin=pin_status)
+        return _refused("restart", REASON_HOME_PIN_MISMATCH, home_pin=pin_status, label=agent.label)
     pinned_home = Path(pinned)
-    expected = resolve_supervisor_command(mozyo_home=pinned_home, which=which)
+    expected = resolve_supervisor_command(mozyo_home=pinned_home, which=which, agent=agent)
     if expected is None:
-        return _refused("restart", REASON_EXECUTABLE_NOT_FOUND)
+        return _refused("restart", REASON_EXECUTABLE_NOT_FOUND, label=agent.label)
     # The installed command must still be exactly what an install would write (same authority as
     # `service_status`'s executable_matches): a moved executable or any argv drift means the loaded
     # service runs a stale command — reinstall to change it, never kickstart the drift (j#79136 R4-F2).
     if installed_argv != expected:
-        return _refused("restart", REASON_INSTALLED_COMMAND_DRIFT)
+        return _refused("restart", REASON_INSTALLED_COMMAND_DRIFT, label=agent.label)
     readiness = classify_credential_readiness(mozyo_home=pinned_home)
     if readiness != CREDENTIAL_READY:
         return _refused(
-            "restart", _CREDENTIAL_REFUSAL_REASON[readiness], credential_readiness=readiness
+            "restart", _CREDENTIAL_REFUSAL_REASON[readiness],
+            credential_readiness=readiness, label=agent.label,
         )
-    loaded, _pid = _is_loaded(runner)
+    loaded, _pid = _is_loaded(runner, agent=agent)
     if not loaded:
-        return _refused("restart", REASON_SERVICE_NOT_LOADED, credential_readiness=readiness)
-    result = _launchctl(runner, ["kickstart", "-k", _service_target()])
+        return _refused(
+            "restart", REASON_SERVICE_NOT_LOADED, credential_readiness=readiness, label=agent.label
+        )
+    result = _launchctl(runner, ["kickstart", "-k", _service_target(agent)])
     if result.returncode != 0:
         return {
             "action": "restart",
             "performed": False,
             "reason": REASON_KICKSTART_FAILED,
             "credential_readiness": readiness,
+            "label": agent.label,
         }
     return {
         "action": "restart",
         "performed": True,
         "reason": "",
         "credential_readiness": readiness,
+        "label": agent.label,
     }
 
 
@@ -442,6 +508,7 @@ def uninstall(
     *,
     os_home: Optional[Path] = None,
     runner: Runner = _default_runner,
+    agent: SupervisorAgent = RECONCILE_AGENT,
 ) -> dict:
     """Boot the agent out and remove exactly the owned plist. No credential required.
 
@@ -450,9 +517,9 @@ def uninstall(
     plist lives under the OS user home (``os_home``); no mozyo home is needed to remove it.
     """
     if not _running_on_darwin():
-        return _refused("uninstall", REASON_UNSUPPORTED_PLATFORM)
-    _launchctl(runner, ["bootout", _service_target()])
-    target = plist_path(os_home)
+        return _refused("uninstall", REASON_UNSUPPORTED_PLATFORM, label=agent.label)
+    _launchctl(runner, ["bootout", _service_target(agent)])
+    target = plist_path(os_home, agent=agent)
     existed = target.exists()
     if existed:
         target.unlink()
@@ -461,6 +528,7 @@ def uninstall(
         "performed": True,
         "reason": "",
         "removed": existed,
+        "label": agent.label,
     }
 
 
@@ -471,6 +539,7 @@ def service_status(
     interval_hint: int = DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
     runner: Runner = _default_runner,
     which: Callable[[str], Optional[str]] = shutil.which,
+    agent: SupervisorAgent = RECONCILE_AGENT,
 ) -> dict:
     """A read-only, redacted projection of the host service state. Mutates nothing.
 
@@ -486,9 +555,9 @@ def service_status(
     installed is ``credential_readiness`` the would-be root's (``mozyo_home`` / default). Never emits
     a credential value, a request header, a repo-local path, or pane text.
     """
-    target = plist_path(os_home)
+    target = plist_path(os_home, agent=agent)
     plist_exists = target.exists()
-    loaded, pid = _is_loaded(runner)
+    loaded, pid = _is_loaded(runner, agent=agent)
 
     installed = _read_installed_plist(target) if plist_exists else None
     # Three distinct states: absent (not_installed), present-but-unreadable (unreadable_plist), and
@@ -509,7 +578,7 @@ def service_status(
         )
         # "still what an install would write" is judged against the pinned home, not the caller's.
         expected = (
-            resolve_supervisor_command(mozyo_home=Path(pinned), which=which)
+            resolve_supervisor_command(mozyo_home=Path(pinned), which=which, agent=agent)
             if pin_status == HOME_PIN_OK
             else None
         )
@@ -533,7 +602,7 @@ def service_status(
 
     return {
         "action": "service-status",
-        "label": SUPERVISOR_LAUNCHD_LABEL,
+        "label": agent.label,
         "platform_supported": _running_on_darwin(),
         "installed": plist_exists,
         "plist_exists": plist_exists,
@@ -550,6 +619,122 @@ def service_status(
         "home_pin": pin_status,
         "executable_matches": executable_matches,
         "credential_readiness": credential_readiness,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dual-agent orchestration (Redmine #14150): install / restart / uninstall / status BOTH owned
+# agents (reconcile + drain) with a fail-closed / rollback policy, so an operator manages the split
+# as one owned pair. Each per-agent result is surfaced under ``agents`` (secret-safe tokens only).
+# ---------------------------------------------------------------------------
+
+
+def _first_failure_reason(results: Sequence[dict]) -> str:
+    """The reason token of the first non-performed agent (secret-safe), or '' when all performed."""
+    for r in results:
+        if not r.get("performed"):
+            return str(r.get("reason", ""))
+    return ""
+
+
+def install_pair(
+    *,
+    os_home: Optional[Path] = None,
+    mozyo_home: Optional[Path] = None,
+    reconcile_interval_seconds: int = DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
+    drain_interval_seconds: int = DEFAULT_LOCAL_DRAIN_INTERVAL_SECONDS,
+    runner: Runner = _default_runner,
+    which: Callable[[str], Optional[str]] = shutil.which,
+) -> dict:
+    """Install BOTH owned agents (reconcile + drain) atomically-or-nothing (Redmine #14150).
+
+    Installs the reconcile agent first (the coarse provider-reconciliation fallback); if it refuses
+    (non-darwin / missing executable / non-ready credential) nothing else is touched. If it installs
+    but the drain agent then fails, the reconcile install is ROLLED BACK (uninstalled) so a partial
+    failure never leaves a half-installed pair — the operator sees a clean fail-closed result and can
+    fix the cause and retry. Both succeeding is the only ``performed`` outcome. Idempotent (each
+    agent's install is bootout-then-bootstrap).
+    """
+    reconcile = install(
+        os_home=os_home, mozyo_home=mozyo_home, interval_seconds=reconcile_interval_seconds,
+        runner=runner, which=which, agent=RECONCILE_AGENT,
+    )
+    if not reconcile.get("performed"):
+        return {
+            "action": "install", "performed": False,
+            "reason": reconcile.get("reason", ""), "agents": [reconcile],
+        }
+    drain = install(
+        os_home=os_home, mozyo_home=mozyo_home, interval_seconds=drain_interval_seconds,
+        runner=runner, which=which, agent=DRAIN_AGENT,
+    )
+    if not drain.get("performed"):
+        # Partial failure: roll BOTH agents back so no half-installed pair is left behind — the
+        # reconcile agent that succeeded AND the drain agent's partial plist (``install`` writes the
+        # plist before it bootstraps, so a failed drain bootstrap leaves the file to clean up).
+        rollback = uninstall_pair(os_home=os_home, runner=runner)
+        return {
+            "action": "install", "performed": False, "reason": drain.get("reason", ""),
+            "rolled_back": True, "agents": [reconcile, drain], "rollback": rollback,
+        }
+    return {"action": "install", "performed": True, "reason": "", "agents": [reconcile, drain]}
+
+
+def uninstall_pair(
+    *, os_home: Optional[Path] = None, runner: Runner = _default_runner
+) -> dict:
+    """Uninstall BOTH owned agents (Redmine #14150). Each is idempotent; refuses only on non-darwin."""
+    results = [uninstall(os_home=os_home, runner=runner, agent=a) for a in SUPERVISOR_AGENTS]
+    return {
+        "action": "uninstall",
+        "performed": all(r.get("performed") for r in results),
+        "reason": _first_failure_reason(results),
+        "agents": results,
+    }
+
+
+def restart_pair(
+    *,
+    os_home: Optional[Path] = None,
+    mozyo_home: Optional[Path] = None,
+    runner: Runner = _default_runner,
+    which: Callable[[str], Optional[str]] = shutil.which,
+) -> dict:
+    """Restart BOTH owned agents (Redmine #14150). Each fails closed on not-loaded / drift / non-ready."""
+    results = [
+        restart(os_home=os_home, mozyo_home=mozyo_home, runner=runner, which=which, agent=a)
+        for a in SUPERVISOR_AGENTS
+    ]
+    return {
+        "action": "restart",
+        "performed": all(r.get("performed") for r in results),
+        "reason": _first_failure_reason(results),
+        "agents": results,
+    }
+
+
+def service_status_pair(
+    *,
+    os_home: Optional[Path] = None,
+    mozyo_home: Optional[Path] = None,
+    reconcile_interval_hint: int = DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
+    drain_interval_hint: int = DEFAULT_LOCAL_DRAIN_INTERVAL_SECONDS,
+    runner: Runner = _default_runner,
+    which: Callable[[str], Optional[str]] = shutil.which,
+) -> dict:
+    """Read-only redacted host status of BOTH owned agents (Redmine #14150). Mutates nothing."""
+    return {
+        "action": "service-status",
+        "agents": [
+            service_status(
+                os_home=os_home, mozyo_home=mozyo_home, interval_hint=reconcile_interval_hint,
+                runner=runner, which=which, agent=RECONCILE_AGENT,
+            ),
+            service_status(
+                os_home=os_home, mozyo_home=mozyo_home, interval_hint=drain_interval_hint,
+                runner=runner, which=which, agent=DRAIN_AGENT,
+            ),
+        ],
     }
 
 
@@ -635,4 +820,13 @@ __all__ = (
     "restart",
     "uninstall",
     "service_status",
+    "SupervisorAgent",
+    "RECONCILE_AGENT",
+    "DRAIN_AGENT",
+    "SUPERVISOR_AGENTS",
+    "SUPERVISOR_DRAIN_LAUNCHD_LABEL",
+    "install_pair",
+    "restart_pair",
+    "uninstall_pair",
+    "service_status_pair",
 )

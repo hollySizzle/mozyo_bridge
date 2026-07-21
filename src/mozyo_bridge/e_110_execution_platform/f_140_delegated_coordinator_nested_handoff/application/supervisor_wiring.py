@@ -30,6 +30,95 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 
+class _NullSource:
+    """A source yielding no journal entries — used when no Redmine source is configured.
+
+    The callback drain (recover / deliver-once / sweep) still runs against it, so an unconfigured
+    Redmine degrades to "drain the existing outbox" rather than skipping the workspace entirely.
+    """
+
+    def read_entries(self, issue_id: object = None):
+        return []
+
+
+#: The shared no-op source singleton (used by the drain path and the unconfigured-Redmine degrade).
+_NULL_SOURCE = _NullSource()
+
+
+class _ProviderCallCounter:
+    """A mutable ticket-provider read counter SHARED across every source a workspace pass builds.
+
+    Redmine #14150 review F1: ``read_entries`` is one fresh provider fetch (``LiveRedmineJournalSource``
+    issues a new HTTP request per call). A workspace pass reads the provider through MORE than the
+    reconcile source — the send-edge review-round fence builds its OWN source and re-reads the journal
+    at delivery time. Sharing ONE counter across all those sources makes ``provider_calls`` the ACTUAL
+    whole-pass provider call count (supply + discovery + dispatch-anchor + review-identity + review_return
+    / lane_gateway discovery + send-edge round-fence + own-workspace backlog), not just the reconcile
+    source's reads.
+    """
+
+    __slots__ = ("n",)
+
+    def __init__(self) -> None:
+        self.n = 0
+
+
+class _CountingSource:
+    """Wrap a Redmine source and increment a SHARED counter on every ``read_entries`` (Redmine #14150).
+
+    All sources a workspace pass constructs (the reconcile source AND the send-edge round-fence source)
+    wrap the SAME :class:`_ProviderCallCounter`, so the count reflects every real transport invocation
+    across the whole pass, not the per-issue boolean (which under-counted 1/issue) nor the reconcile
+    source alone (which missed the send-edge round-fence reads — review F1). ``count`` mirrors the
+    shared counter for callers that read a single wrapper directly.
+    """
+
+    __slots__ = ("_inner", "_counter")
+
+    def __init__(self, inner: object, counter: Optional["_ProviderCallCounter"] = None) -> None:
+        self._inner = inner
+        self._counter = counter if counter is not None else _ProviderCallCounter()
+
+    @property
+    def count(self) -> int:
+        return self._counter.n
+
+    def read_entries(self, issue_id: object = None):
+        self._counter.n += 1
+        return self._inner.read_entries(issue_id)
+
+    def __getattr__(self, name: str):  # delegate any other source attribute unchanged
+        return getattr(self._inner, name)
+
+
+def supply_events(store: object, issue: str, source: object, binding: object) -> int:
+    """Fold one issue's Redmine journal markers into the runtime store (glance/resume supply).
+
+    Extracted from the composition root (module-health leaf split). Reuses the exact ``workflow watch``
+    intake (:func:`...cli_workflow_watch.evaluate_intake_from_store`) so the persisted events are
+    byte-identical to a manual watch, then appends the newly accepted events. Idempotent: a re-read of
+    the same journals accepts no new event (the durable ``redmine:<issue>:<journal>`` anchor
+    deduplicates), so a repeated sweep supplies 0. Returns the number of events newly appended.
+    """
+    import dataclasses as _dc
+
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_watch import (
+        evaluate_intake_from_store,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+        markers_from_source,
+    )
+
+    markers = markers_from_source(source, issue)
+    if not markers:
+        return 0
+    outcome = evaluate_intake_from_store(store, markers, binding=binding)
+    accepted = list(outcome.accepted_events)
+    if accepted:
+        store.append_events(_dc.asdict(event) for event in accepted)
+    return len(accepted)
+
+
 @dataclasses.dataclass(frozen=True)
 class SupervisedWorkspace:
     """The minimal workspace facts the supervisor needs (id + canonical checkout path).

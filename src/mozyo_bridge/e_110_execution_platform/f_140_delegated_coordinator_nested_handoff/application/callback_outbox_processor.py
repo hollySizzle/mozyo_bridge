@@ -115,6 +115,9 @@ class CallbackCandidate:
     target_lane: str = ""
     target_receiver: str = ""
     target_generation: str = ""
+    #: The owning-lane generation read from the LOCAL lifecycle authority at ingest (Redmine #14150),
+    #: stamped on the row so the local outbox drain attests currency without a ticket-provider read.
+    enqueue_lane_generation: str = ""
 
 
 @dataclass(frozen=True)
@@ -216,6 +219,12 @@ class DeliveryReport:
     #: is operator-visible. This is where a PRE-EXISTING pending / recovered-then-reclaimed
     #: historical row is stopped — the ingest-side fence only stops NEWLY discovered candidates.
     fenced: list[tuple] = field(default_factory=list)
+    #: Rows the local drain could not attest as current from LOCAL state (Redmine #14150): a blank /
+    #: mismatched ``enqueue_lane_generation`` under a provider-free drain. Zero-send, and — unlike
+    #: ``fenced`` — NON-terminal: the row is released back to ``pending`` (no attempt bump) so the
+    #: provider reconciliation leg (which reads the durable authority) decides its fate. Surfaced so a
+    #: deferred zero-send is operator-visible, never a blind send and never a silent terminal drop.
+    deferred: list[tuple] = field(default_factory=list)
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -228,6 +237,10 @@ class DeliveryReport:
             "fenced": [
                 {"key": k.as_row() if hasattr(k, "as_row") else str(k), "detail": d}
                 for k, d in self.fenced
+            ],
+            "deferred": [
+                {"key": k.as_row() if hasattr(k, "as_row") else str(k), "detail": d}
+                for k, d in self.deferred
             ],
         }
 
@@ -362,6 +375,7 @@ class CallbackOutboxProcessor:
                     target_lane=candidate.target_lane,
                     target_receiver=candidate.target_receiver,
                     target_generation=candidate.target_generation,
+                    enqueue_lane_generation=candidate.enqueue_lane_generation,
                     cursor_source=self._source_name,
                     cursor=cursor,
                     now=now,
@@ -414,6 +428,8 @@ class CallbackOutboxProcessor:
         now: Optional[str] = None,
         send_fence_fn: "Optional[Callable[[CallbackOutboxRow], tuple[bool, str]]]" = None,
         issue: Optional[str] = None,
+        route: Optional[str] = None,
+        defer_fence_fn: "Optional[Callable[[CallbackOutboxRow], tuple[bool, str]]]" = None,
     ) -> DeliveryReport:
         """Recover crashed inflight rows, then fire **one** send per claimed pending row.
 
@@ -446,18 +462,37 @@ class CallbackOutboxProcessor:
         """
         report = DeliveryReport()
         issue_scope = str(issue).strip() if issue is not None and str(issue).strip() else None
+        # Redmine #14150: the local drain restricts the pass to the locally-attestable route so a
+        # provider-free sender never claims (and would blind-send) a review_return / lane_gateway row.
+        route_scope = str(route).strip() if route is not None and str(route).strip() else None
         # Recover only lease-expired (stale) inflight rows — never a concurrent processor's
         # fresh active claim (#13520 review F2). A default lease is used unless overridden.
         report.recovered.extend(
             self._outbox.recover_inflight(
                 stale_seconds=stale_seconds, now=now,
-                workspace_id=self._workspace_id or None, issue=issue_scope,
+                workspace_id=self._workspace_id or None, issue=issue_scope, route=route_scope,
             )
         )
         for row in self._outbox.claim_pending(
-            limit=limit, now=now, workspace_id=self._workspace_id or None, issue=issue_scope
+            limit=limit, now=now, workspace_id=self._workspace_id or None, issue=issue_scope,
+            route=route_scope,
         ):
             token = row.claim_token
+            # The defer edge (Redmine #14150): BEFORE the send-edge checkpoint, the local drain's
+            # attestation fence decides whether this row is deliverable from LOCAL state (a coordinator
+            # row whose ``enqueue_lane_generation`` matches the current local lane generation). A row it
+            # cannot attest is DEFERRED — released back to ``pending`` (no ``send_attempted``, no attempt
+            # bump), so it is neither blind-sent nor terminally dropped: the provider reconciliation leg
+            # re-decides it against the durable authority. This runs before ``mark_sending`` so a
+            # deferred row never carries a post-send edge that crash-recovery would call uncertain.
+            if defer_fence_fn is not None:
+                deferred, defer_reason = defer_fence_fn(row)
+                if deferred:
+                    self._outbox.release_claim(
+                        row.key, claim_token=token, now=now, detail=defer_reason
+                    )
+                    report.deferred.append((row.key, defer_reason))
+                    continue
             # The send gate: mark_sending is token-conditional. If we no longer own the row
             # (its claim was recovered + re-claimed elsewhere) it returns False and we DO NOT
             # send — a de-owned processor never fires a duplicate callback.

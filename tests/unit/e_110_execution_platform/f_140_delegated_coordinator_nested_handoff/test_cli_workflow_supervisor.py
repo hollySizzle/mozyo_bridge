@@ -62,12 +62,20 @@ class CliWorkflowSupervisorTest(unittest.TestCase):
         rc, out = self._service_status()
         self.assertEqual(rc, 0)
         payload = json.loads(out)
-        self.assertFalse(payload["installed"])
-        self.assertFalse(payload["loaded"])
+        # Redmine #14150: the projection is now the owned PAIR (reconcile + drain agents).
+        agents = payload["agents"]
+        self.assertEqual(len(agents), 2)
+        reconcile, drain = agents
+        self.assertFalse(reconcile["installed"])
+        self.assertFalse(reconcile["loaded"])
+        self.assertFalse(drain["installed"])
         self.assertEqual(payload["phase"], "B1")
-        self.assertFalse(payload["keep_alive_present"])
+        self.assertFalse(reconcile["keep_alive_present"])
         self.assertEqual(payload["definition"]["command"][-1], "--run-once")
+        self.assertEqual(payload["drain_definition"]["command"][-1], "--drain-only")
         self.assertFalse(payload["definition"]["keep_alive"])
+        # The two agents are distinct owned labels.
+        self.assertNotEqual(reconcile["label"], drain["label"])
         # Secret-free and path-free.
         self.assertNotIn("api_key", out.lower())
         self.assertNotIn(self.home, out)
@@ -76,15 +84,18 @@ class CliWorkflowSupervisorTest(unittest.TestCase):
         # Positive verdict held deterministic by the same OS-home seam: an owned
         # plist under the isolated home is reported installed, proving the
         # projection reflects the controlled home rather than being always-false.
-        target = sl.plist_path(self.os_home)
+        target = sl.plist_path(self.os_home)  # default agent = reconcile
         target.parent.mkdir(parents=True, exist_ok=True)
         argv = ["/opt/bin/mozyo-bridge", "workflow", "supervisor", "--run-once", "--home", self.home]
         target.write_bytes(sl.render_plist(argv, interval_seconds=300, os_home=self.os_home))
         rc, out = self._service_status()
         self.assertEqual(rc, 0)
         payload = json.loads(out)
-        self.assertTrue(payload["installed"])
-        self.assertTrue(payload["plist_exists"])
+        reconcile = payload["agents"][0]
+        self.assertTrue(reconcile["installed"])  # the reconcile agent's owned plist is present
+        self.assertTrue(reconcile["plist_exists"])
+        # The drain agent was NOT installed, so the pair projection distinguishes them.
+        self.assertFalse(payload["agents"][1]["installed"])
 
     def test_mutating_verbs_fail_closed_zero_mutation_on_non_darwin(self) -> None:
         with patch.object(sl, "_running_on_darwin", return_value=False), patch.object(

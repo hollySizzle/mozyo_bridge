@@ -702,5 +702,112 @@ class ServiceStatusTest(_DarwinCase):
         self.assertFalse(status["executable_matches"])
 
 
+class _FailNthBootstrap:
+    """A runner that fails the N-th ``bootstrap`` (all else ok) — models a partial dual-agent install."""
+
+    def __init__(self, fail_bootstrap: int) -> None:
+        self.calls: list[list[str]] = []
+        self._fail = fail_bootstrap
+        self._bootstraps = 0
+
+    def __call__(self, argv):
+        argv = list(argv)
+        self.calls.append(argv)
+        if len(argv) >= 2 and argv[1] == "bootstrap":
+            self._bootstraps += 1
+            if self._bootstraps == self._fail:
+                return _result(1)
+        return _result(0)
+
+
+class DualAgentPairTest(_DarwinCase):
+    """Redmine #14150 F1: the split's owned dual-agent (reconcile + drain) lifecycle."""
+
+    def test_agents_are_distinct_owned_identities(self) -> None:
+        self.assertNotEqual(sl.RECONCILE_AGENT.label, sl.DRAIN_AGENT.label)
+        self.assertNotEqual(sl.RECONCILE_AGENT.plist_relative, sl.DRAIN_AGENT.plist_relative)
+        self.assertEqual(sl.DRAIN_AGENT.argv_tail[-1], "--drain-only")
+        self.assertEqual(sl.RECONCILE_AGENT.argv_tail[-1], "--run-once")
+
+    def test_install_pair_installs_both_agents(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        runner = FakeRunner()
+        result = sl.install_pair(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            reconcile_interval_seconds=300, drain_interval_seconds=60,
+            runner=runner, which=_which_found,
+        )
+        self.assertTrue(result["performed"])
+        self.assertEqual([a["label"] for a in result["agents"]],
+                         [sl.RECONCILE_AGENT.label, sl.DRAIN_AGENT.label])
+        # Both owned plists exist, at their own intervals + argv tails.
+        recon = plistlib.loads(sl.plist_path(self.os_home, agent=sl.RECONCILE_AGENT).read_bytes())
+        drain = plistlib.loads(sl.plist_path(self.os_home, agent=sl.DRAIN_AGENT).read_bytes())
+        self.assertEqual(recon["ProgramArguments"][-3], "--run-once")
+        self.assertEqual(drain["ProgramArguments"][-3], "--drain-only")
+        self.assertEqual(recon["StartInterval"], 300)
+        self.assertEqual(drain["StartInterval"], 60)
+        # Both bootstrapped (2 bootstraps).
+        self.assertEqual(runner.verbs.count("bootstrap"), 2)
+
+    def test_install_pair_rolls_back_both_on_drain_failure(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        runner = _FailNthBootstrap(fail_bootstrap=2)  # reconcile bootstrap ok, drain bootstrap fails
+        result = sl.install_pair(
+            os_home=self.os_home, mozyo_home=self.mozyo_home,
+            runner=runner, which=_which_found,
+        )
+        self.assertFalse(result["performed"])
+        self.assertTrue(result["rolled_back"])
+        # Neither owned plist remains — the successful reconcile agent AND the partial drain plist
+        # are both cleaned up, so no half-installed pair is left behind (fail-closed).
+        self.assertFalse(sl.plist_path(self.os_home, agent=sl.RECONCILE_AGENT).exists())
+        self.assertFalse(sl.plist_path(self.os_home, agent=sl.DRAIN_AGENT).exists())
+
+    def test_install_pair_fail_closed_non_darwin_touches_nothing(self) -> None:
+        with patch.object(sl, "_running_on_darwin", return_value=False):
+            result = sl.install_pair(
+                os_home=self.os_home, mozyo_home=self.mozyo_home,
+                runner=FakeRunner(), which=_which_found,
+            )
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], sl.REASON_UNSUPPORTED_PLATFORM)
+        self.assertFalse(sl.plist_path(self.os_home, agent=sl.RECONCILE_AGENT).exists())
+        self.assertFalse(sl.plist_path(self.os_home, agent=sl.DRAIN_AGENT).exists())
+
+    def test_uninstall_pair_removes_both(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        sl.install_pair(os_home=self.os_home, mozyo_home=self.mozyo_home,
+                        runner=FakeRunner(), which=_which_found)
+        result = sl.uninstall_pair(os_home=self.os_home, runner=FakeRunner())
+        self.assertTrue(result["performed"])
+        self.assertFalse(sl.plist_path(self.os_home, agent=sl.RECONCILE_AGENT).exists())
+        self.assertFalse(sl.plist_path(self.os_home, agent=sl.DRAIN_AGENT).exists())
+
+    def test_restart_pair_re_login_e2e_kickstarts_both_when_loaded(self) -> None:
+        # Installed + loaded pair -> restart (re-login / service kickstart) drives BOTH agents.
+        _write_home_credential(self.mozyo_home)
+        sl.install_pair(os_home=self.os_home, mozyo_home=self.mozyo_home,
+                        runner=FakeRunner(), which=_which_found)
+        runner = FakeRunner(print_result=_result(0))  # `print` returns 0 -> loaded
+        result = sl.restart_pair(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=runner, which=_which_found,
+        )
+        self.assertTrue(result["performed"])
+        self.assertEqual(runner.verbs.count("kickstart"), 2)  # both agents kickstarted
+
+    def test_service_status_pair_reports_both(self) -> None:
+        _write_home_credential(self.mozyo_home)
+        sl.install_pair(os_home=self.os_home, mozyo_home=self.mozyo_home,
+                        runner=FakeRunner(), which=_which_found)
+        status = sl.service_status_pair(
+            os_home=self.os_home, mozyo_home=self.mozyo_home, runner=FakeRunner(), which=_which_found,
+        )
+        agents = status["agents"]
+        self.assertEqual([a["label"] for a in agents],
+                         [sl.RECONCILE_AGENT.label, sl.DRAIN_AGENT.label])
+        self.assertTrue(all(a["installed"] for a in agents))
+
+
 if __name__ == "__main__":
     unittest.main()
