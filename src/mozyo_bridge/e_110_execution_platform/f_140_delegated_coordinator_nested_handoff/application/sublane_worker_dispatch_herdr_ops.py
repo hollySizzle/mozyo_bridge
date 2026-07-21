@@ -399,16 +399,20 @@ class HerdrWorkerDispatchOps:
         (``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` / ``MOZYO_LANE_ID`` cross-checked
         against the repo anchor) EXACTLY as the inner ``handoff send`` rail does
         (``herdr_send_entry.resolve_herdr_send_target`` — the shared
-        ``herdr_workspace_segment`` anchor + the pre-#13377 legacy-lane fallback), then runs
-        the SAME pure :func:`decide_gateway_route` policy the inner rail enforces. Because the
-        inputs and the policy are identical, an admitted sender here is exactly one the inner
-        rail's gateway-route gate would also admit — so the preflight never over-blocks a
-        legitimate same-lane gateway (Acceptance #4), while a coordinator / foreign /
-        cross-lane sender (or an unattested origin) fails closed BEFORE any outbox reserve
-        with zero write and zero send (Acceptance #1). The verdict is a pure function of the
-        sender env + resolved lane, so it is identical on dry-run and execute (Acceptance #2).
-        An explicit ``--allow-direct-worker`` releases a cross-lane drive as an exception,
-        mirroring the inner rail's ``gateway_route_exception``.
+        ``herdr_workspace_segment`` anchor + the pre-#13377 legacy-lane fallback), requires the
+        sender's own role to be the binding-resolved **gateway** provider (Redmine #14192
+        review j#84236 F1: Acceptance #1 wants the same-lane *gateway*, not merely a same-lane
+        agent — a same-lane worker is NOT a legitimate dispatch origin), then runs the SAME
+        pure :func:`decide_gateway_route` policy the inner rail enforces for the lane check.
+        An admitted sender is a same-lane gateway (or the coordinator releasing a cross-lane
+        drive via ``--allow-direct-worker``), so the preflight never over-blocks a legitimate
+        gateway (Acceptance #4), while a coordinator / foreign / cross-lane / non-gateway-role
+        / unattested sender fails closed BEFORE any outbox reserve with zero write and zero
+        send (Acceptance #1). The verdict is a pure function of the sender env + resolved lane
+        + binding, so it is identical on dry-run and execute (Acceptance #2). An explicit
+        ``--allow-direct-worker`` releases a cross-lane drive as an exception (mirroring the
+        inner rail's ``gateway_route_exception``) but never relaxes the gateway-role guard —
+        that exception is a cross-lane carve-out, not a relaxation of WHO may originate.
         """
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
             herdr_workspace_segment,
@@ -463,6 +467,31 @@ class HerdrWorkerDispatchOps:
             )
 
         sender = sender_res.identity
+        # Redmine #14192 review j#84236 F1: `decide_gateway_route` verifies same-lane-UNIT
+        # but is role-agnostic about the SENDER — a same-lane worker addressing a same-lane
+        # worker resolves to ROUTE_ALLOWED. Acceptance #1 requires the sender to be the target
+        # lane's current same-lane GATEWAY, so the sender's own launch-time role must be the
+        # binding-resolved gateway (coordinator) provider. Both legitimate origins — the
+        # same-lane gateway and the coordinator (a `--allow-direct-worker` cross-lane drive) —
+        # ARE that provider, so this guard admits them while failing closed on a same-lane
+        # worker (or any non-gateway agent) BEFORE any outbox reserve, on both dry-run and
+        # execute. It is NOT released by `--allow-direct-worker`: that exception is a
+        # cross-LANE carve-out, not a relaxation of WHO may originate a dispatch. A rebound
+        # gateway provider moves this check with no literal edit. The strip-only comparison
+        # mirrors `decide_gateway_route`'s `_norm`; both tokens are already canonical provider
+        # ids (`resolve_sender_identity` admits only a known provider role, and the binding
+        # stores canonical ids).
+        if (sender.role or "").strip() != (gateway_provider or "").strip():
+            return SenderDispatchAdmission(
+                admitted=False,
+                reason=(
+                    "dispatch-worker sender is not the target lane's gateway role; only the "
+                    "same-lane gateway (or the coordinator for an explicit cross-lane "
+                    "exception) may originate a worker dispatch. Fail-closed before any "
+                    "outbox reserve"
+                ),
+                detail_token="sender_not_gateway_role",
+            )
         decision = decide_gateway_route(
             GatewayRouteRequest(
                 kind="implementation_request",

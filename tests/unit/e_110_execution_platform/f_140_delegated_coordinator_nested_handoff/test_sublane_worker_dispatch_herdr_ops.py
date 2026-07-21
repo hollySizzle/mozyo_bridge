@@ -787,6 +787,8 @@ class SenderAdmissionPreflightTests(unittest.TestCase):
         lane_ws="ws",
         allow_direct_worker=False,
         unattested=False,
+        gateway_provider="codex",
+        worker_provider="claude",
     ):
         lane = SimpleNamespace(
             workspace_id=lane_ws,
@@ -806,7 +808,7 @@ class SenderAdmissionPreflightTests(unittest.TestCase):
             }
         )
         ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE, env=env)
-        with patch.object(ops, "worker_provider", return_value="claude"), patch(
+        with patch.object(ops, "worker_provider", return_value=worker_provider), patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology.herdr_workspace_segment",
             return_value="ws",
         ), patch(
@@ -814,7 +816,7 @@ class SenderAdmissionPreflightTests(unittest.TestCase):
             return_value="",
         ), patch(
             "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution.resolve_gateway_provider",
-            return_value="codex",
+            return_value=gateway_provider,
         ):
             return ops.observe_sender_admission(
                 lane=lane, request=request, allow_direct_worker=allow_direct_worker
@@ -845,10 +847,46 @@ class SenderAdmissionPreflightTests(unittest.TestCase):
 
     def test_cross_lane_with_allow_direct_worker_is_admitted_exception(self):
         # The explicit durable exception releases a cross-lane drive (mirrors the inner
-        # rail's gateway_route_exception).
+        # rail's gateway_route_exception). The sender is still the gateway (codex) role.
         verdict = self._observe(sender_lane="default", allow_direct_worker=True)
         self.assertTrue(verdict.admitted)
         self.assertTrue(verdict.exception_applied)
+
+    def test_same_lane_worker_role_sender_is_blocked(self):
+        # Review j#84236 F1: a same-lane WORKER (role != gateway provider) is NOT a legitimate
+        # dispatch origin even though its lane matches — Acceptance #1 requires the GATEWAY.
+        verdict = self._observe(sender_lane=LANE_LABEL, sender_role="claude")
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.detail_token, "sender_not_gateway_role")
+
+    def test_same_lane_worker_role_with_allow_direct_worker_still_blocked(self):
+        # The cross-lane exception never relaxes WHO may originate: a worker-role sender is
+        # blocked regardless of --allow-direct-worker.
+        verdict = self._observe(
+            sender_lane=LANE_LABEL, sender_role="claude", allow_direct_worker=True
+        )
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.detail_token, "sender_not_gateway_role")
+
+    def test_rebound_gateway_binding_admits_matching_role_blocks_mismatch(self):
+        # The guard keys on the binding-resolved gateway provider, not a literal `codex`:
+        # rebind the gateway role to `claude` (worker role -> `codex`). A same-lane sender
+        # whose role matches the rebound gateway is admitted; a mismatch fails closed.
+        admitted = self._observe(
+            sender_lane=LANE_LABEL,
+            sender_role="claude",
+            gateway_provider="claude",
+            worker_provider="codex",
+        )
+        self.assertTrue(admitted.admitted)
+        blocked = self._observe(
+            sender_lane=LANE_LABEL,
+            sender_role="codex",
+            gateway_provider="claude",
+            worker_provider="codex",
+        )
+        self.assertFalse(blocked.admitted)
+        self.assertEqual(blocked.detail_token, "sender_not_gateway_role")
 
 
 class TargetLanePinArgvTests(unittest.TestCase):
