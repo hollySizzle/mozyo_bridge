@@ -120,6 +120,47 @@ CALLBACK_DELIVERY_FAILED = "delivery_failed"
 
 CALLBACK_STATES = frozenset({CALLBACK_NONE, CALLBACK_DUE, CALLBACK_DELIVERY_FAILED})
 
+# ---------------------------------------------------------------------------
+# Integration disposition (the coordinator's post-review decision about the integration
+# branch — central preset `### Commit Hash Origin 到達可能性` / 統合責務). Redmine #14213.
+#
+# This is a CLOSED TYPED vocabulary, not a boolean: a *completion* disposition means the work
+# reached the integration branch; a *pending* disposition (``explicit_deferral`` /
+# ``integration_blocked``) is a durable statement that integration is still OWED. Collapsing
+# the two into one ``integration_recorded`` flag is what let an approved-review lane with a
+# recorded ``explicit_deferral`` project as "collect owner close approval" — i.e. it steered a
+# main-unmerged issue toward close (#14213, dogfood evidence #14192 j#84323 / #14150 j#84424).
+# ---------------------------------------------------------------------------
+
+INTEGRATION_NONE = "none"
+INTEGRATION_MERGE = "merge"
+INTEGRATION_PATCH_EQUIVALENT = "patch_equivalent"
+INTEGRATION_EXPLICIT_DEFERRAL = "explicit_deferral"
+INTEGRATION_BLOCKED = "integration_blocked"
+#: A disposition heading/marker was present but its value is out of vocabulary. Deliberately
+#: NOT ``none``: "a disposition we could not read" must never be projected as "no disposition
+#: was ever made", so it is treated as pending (integration is not proven done).
+INTEGRATION_UNKNOWN = "unknown"
+
+INTEGRATION_DISPOSITIONS = frozenset(
+    {
+        INTEGRATION_NONE,
+        INTEGRATION_MERGE,
+        INTEGRATION_PATCH_EQUIVALENT,
+        INTEGRATION_EXPLICIT_DEFERRAL,
+        INTEGRATION_BLOCKED,
+        INTEGRATION_UNKNOWN,
+    }
+)
+
+#: Dispositions that mean the work IS on the integration branch (integration no longer owed).
+INTEGRATION_COMPLETE_DISPOSITIONS = frozenset({INTEGRATION_MERGE, INTEGRATION_PATCH_EQUIVALENT})
+
+#: Dispositions that mean integration is still OWED. ``unknown`` is here by fail-closed design.
+INTEGRATION_PENDING_DISPOSITIONS = frozenset(
+    {INTEGRATION_EXPLICIT_DEFERRAL, INTEGRATION_BLOCKED, INTEGRATION_UNKNOWN}
+)
+
 
 # ---------------------------------------------------------------------------
 # Input: one lane's durable-record facts.
@@ -140,9 +181,12 @@ class LaneSignal:
     ``commit_bearing`` marks work that produced commits (so it can be
     ``integration_waiting`` until merged / pushed / patch-equivalent / explicitly
     deferred). ``integration_recorded`` is true once that integration disposition (or a
-    no-commit determination) is in the durable record. ``issue_open`` reflects the
-    Redmine issue status (open vs closed). ``blocker_recorded`` marks a recorded
-    blocker / failed handoff / unresolved dependency.
+    no-commit determination) is in the durable record. ``integration_disposition`` is the
+    TYPED latest disposition (:data:`INTEGRATION_*`): it distinguishes "integrated" from
+    "explicitly deferred / blocked", which the ``integration_recorded`` boolean cannot
+    express (Redmine #14213). ``issue_open`` reflects the Redmine issue status (open vs
+    closed). ``blocker_recorded`` marks a recorded blocker / failed handoff / unresolved
+    dependency.
     """
 
     issue: str
@@ -153,6 +197,19 @@ class LaneSignal:
     integration_recorded: bool = False
     issue_open: bool = True
     blocker_recorded: bool = False
+    integration_disposition: str = INTEGRATION_NONE
+
+
+def _integration_owed(signal: LaneSignal) -> bool:
+    """True when the durable record explicitly says integration is still owed (pure).
+
+    Reads the TYPED :data:`INTEGRATION_PENDING_DISPOSITIONS` only — a recorded
+    ``explicit_deferral`` / ``integration_blocked`` / unreadable disposition. ``none`` (no
+    disposition recorded) is NOT "owed" here: the pre-existing ``commit_bearing and not
+    integration_recorded`` inference still covers that case at the close-family steps, so this
+    predicate only ADDS the positively-recorded pending states (Redmine #14213).
+    """
+    return signal.integration_disposition in INTEGRATION_PENDING_DISPOSITIONS
 
 
 def classify_lane_state(signal: LaneSignal) -> str:
@@ -170,9 +227,11 @@ def classify_lane_state(signal: LaneSignal) -> str:
        back with the implementer) -> :data:`LANE_STATE_IMPLEMENTING` (**not** blocking);
     4. ``implementation_done`` / ``review_request``, or a ``review`` still pending ->
        :data:`LANE_STATE_REVIEW_WAITING` (Codex audit owed);
-    5. a ``review`` approved -> :data:`LANE_STATE_OWNER_WAITING` (owner aggregation is
-       the next coordinator-only action; the integration concern surfaces after owner
-       approval is recorded);
+    5. a ``review`` approved -> :data:`LANE_STATE_INTEGRATION_WAITING` when a PENDING
+       integration disposition is recorded (``explicit_deferral`` / ``integration_blocked`` /
+       unreadable — the approved work is durably NOT on the integration branch), else
+       :data:`LANE_STATE_OWNER_WAITING` (owner aggregation is the next coordinator-only
+       action);
     6. ``owner_close_approval`` recorded -> :data:`LANE_STATE_INTEGRATION_WAITING` if
        the work is commit-bearing and integration is not yet recorded, else
        :data:`LANE_STATE_CLOSE_WAITING` while the issue is still open, else
@@ -215,13 +274,24 @@ def classify_lane_state(signal: LaneSignal) -> str:
     if gate == GATE_REVIEW and signal.review_conclusion == REVIEW_PENDING:
         return LANE_STATE_REVIEW_WAITING
 
-    # 5. review approved — owner aggregation is the next coordinator-only action.
+    # 5. review approved — owner aggregation is the next coordinator-only action, UNLESS the
+    # durable record already carries a PENDING integration disposition. A recorded
+    # ``explicit_deferral`` / ``integration_blocked`` is a positive statement that the approved
+    # work is NOT on the integration branch, so the lane is integration_waiting and the glance
+    # must not steer a main-unmerged issue toward owner close (Redmine #14213; dogfood #14192
+    # j#84323, #14150 j#84424). Note this deliberately does NOT require ``commit_bearing``: an
+    # explicit deferral is stronger evidence than the inferred commit fact, and requiring both
+    # would re-open the same unsafe close guidance whenever the commit field is unreadable.
     if gate == GATE_REVIEW and signal.review_conclusion == REVIEW_APPROVED:
+        if _integration_owed(signal):
+            return LANE_STATE_INTEGRATION_WAITING
         return LANE_STATE_OWNER_WAITING
 
     # 6. owner close approval recorded — integration, then close, then retirement.
     if gate == GATE_OWNER_CLOSE_APPROVAL:
-        if signal.commit_bearing and not signal.integration_recorded:
+        if _integration_owed(signal) or (
+            signal.commit_bearing and not signal.integration_recorded
+        ):
             return LANE_STATE_INTEGRATION_WAITING
         if signal.issue_open:
             return LANE_STATE_CLOSE_WAITING
@@ -229,7 +299,9 @@ def classify_lane_state(signal: LaneSignal) -> str:
 
     # 7. close gate — retire_ready unless commit-bearing work is still unmerged.
     if gate == GATE_CLOSE:
-        if signal.commit_bearing and not signal.integration_recorded:
+        if _integration_owed(signal) or (
+            signal.commit_bearing and not signal.integration_recorded
+        ):
             return LANE_STATE_INTEGRATION_WAITING
         return LANE_STATE_RETIRE_READY
 
@@ -428,6 +500,15 @@ __all__ = (
     "CALLBACK_DUE",
     "CALLBACK_DELIVERY_FAILED",
     "CALLBACK_STATES",
+    "INTEGRATION_NONE",
+    "INTEGRATION_MERGE",
+    "INTEGRATION_PATCH_EQUIVALENT",
+    "INTEGRATION_EXPLICIT_DEFERRAL",
+    "INTEGRATION_BLOCKED",
+    "INTEGRATION_UNKNOWN",
+    "INTEGRATION_DISPOSITIONS",
+    "INTEGRATION_COMPLETE_DISPOSITIONS",
+    "INTEGRATION_PENDING_DISPOSITIONS",
     "ADMISSION_DISPATCH_SUBLANE",
     "ADMISSION_STOP_AND_DRAIN",
     "LaneSignal",

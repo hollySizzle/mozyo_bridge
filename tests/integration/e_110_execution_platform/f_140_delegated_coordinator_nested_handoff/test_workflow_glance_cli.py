@@ -182,7 +182,10 @@ class ActiveLanesRedmineFoldTest(unittest.TestCase):
         self.assertIn("13425", rows)  # roster + Redmine fold, NOT the (empty) store
         self.assertEqual(rows["13425"]["workflow_state"], "review_waiting")  # impl_done+review_request
         self.assertEqual(rows["13425"]["latest_journal"], "73980")
-        self.assertEqual(rows["13425"]["next_owner"], "auditor")
+        # Redmine #14213 acceptance 4: this fixture declares no work unit, so the Review Gate is
+        # owed by the same-lane gateway. US-level audit is claimed only on positive evidence.
+        self.assertEqual(rows["13425"]["next_owner"], "implementation_gateway")
+        self.assertEqual(rows["13425"]["work_unit"], "")
         self.assertFalse(payload["degraded"])
 
     def test_unrecognized_template_is_degraded_unknown_not_dropped(self):
