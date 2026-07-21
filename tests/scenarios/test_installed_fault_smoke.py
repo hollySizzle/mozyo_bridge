@@ -40,33 +40,68 @@ class VerifyProvenanceTests(unittest.TestCase):
         base.update(over)
         return base
 
+    def _codes(self, **over):
+        return mod.provenance_reason_codes(**self._facts(**over))
+
     def test_installed_artifact_has_no_problems(self):
         self.assertEqual(mod.verify_provenance(**self._facts()), [])
 
     def test_module_from_checkout_is_flagged(self):
-        problems = mod.verify_provenance(
-            **self._facts(module_file="/checkout/src/mozyo_bridge/__init__.py")
-        )
-        self.assertTrue(any("checkout" in p for p in problems))
+        # Redmine #14247: asserting `"checkout" in message` was VACUOUS -- the module is also
+        # outside the venv, and THAT message echoes the "/checkout/..." path.
+        self.assertIn(mod.PROVENANCE_MODULE_FROM_CHECKOUT, self._codes(
+            module_file="/checkout/src/mozyo_bridge/__init__.py"))
 
     def test_executable_outside_venv_is_flagged(self):
-        problems = mod.verify_provenance(**self._facts(executable="/usr/local/bin/mozyo-bridge"))
-        self.assertTrue(any("not inside the venv" in p for p in problems))
+        self.assertIn(mod.PROVENANCE_EXECUTABLE_OUTSIDE_VENV,
+                      self._codes(executable="/usr/local/bin/mozyo-bridge"))
 
     def test_pipx_global_is_flagged(self):
-        problems = mod.verify_provenance(
-            **self._facts(executable=_PIPX_GLOBAL_BIN)
-        )
-        self.assertTrue(any("pipx" in p for p in problems))
+        # Redmine #14247: the ORIGINAL `any("pipx" in p)` passed even with the pipx branch
+        # deleted, because a pipx global path is also outside the venv and the
+        # executable-outside-venv message echoes that path. Assert the typed code instead.
+        self.assertIn(mod.PROVENANCE_PIPX_GLOBAL, self._codes(executable=_PIPX_GLOBAL_BIN))
 
     def test_non_site_packages_module_is_flagged(self):
-        problems = mod.verify_provenance(
-            **self._facts(module_file="/venv/lib/mozyo_bridge/__init__.py")
-        )
-        self.assertTrue(any("site-packages" in p for p in problems))
+        self.assertIn(mod.PROVENANCE_MODULE_NOT_SITE_PACKAGES,
+                      self._codes(module_file="/venv/lib/mozyo_bridge/__init__.py"))
 
     def test_empty_version_is_flagged(self):
-        self.assertTrue(any("version" in p for p in mod.verify_provenance(**self._facts(version=""))))
+        self.assertIn(mod.PROVENANCE_VERSION_EMPTY, self._codes(version=""))
+
+    # -- the three fixtures the acceptance requires be told apart -------------------------------
+    # Each asserts the ABSENCE of its siblings' codes, so no reason can pass by accidentally
+    # containing another's string.
+
+    def test_valid_isolated_venv_yields_no_reason_at_all(self):
+        self.assertEqual(self._codes(), [])
+
+    def test_outside_venv_only_is_not_misclassified_as_pipx(self):
+        codes = self._codes(executable="/usr/local/bin/mozyo-bridge")
+        self.assertIn(mod.PROVENANCE_EXECUTABLE_OUTSIDE_VENV, codes)
+        self.assertNotIn(mod.PROVENANCE_PIPX_GLOBAL, codes)
+        self.assertNotIn(mod.PROVENANCE_MODULE_FROM_CHECKOUT, codes)
+
+    def test_pipx_global_is_classified_as_pipx_and_not_as_checkout(self):
+        codes = self._codes(executable=_PIPX_GLOBAL_BIN)
+        self.assertIn(mod.PROVENANCE_PIPX_GLOBAL, codes)
+        self.assertNotIn(mod.PROVENANCE_MODULE_FROM_CHECKOUT, codes)
+
+    def test_every_emitted_code_is_in_the_closed_vocabulary(self):
+        codes = self._codes(executable=_PIPX_GLOBAL_BIN, module_file="", version="")
+        self.assertTrue(codes)
+        for code in codes:
+            self.assertIn(code, mod.PROVENANCE_REASON_CODES)
+
+    def test_codes_and_messages_stay_paired(self):
+        # Guards the single-source invariant: one finding == one code == one message.
+        facts = self._facts(module_file="/checkout/src/mozyo_bridge/__init__.py")
+        self.assertEqual(
+            [m for _, m in mod.provenance_findings(**facts)], mod.verify_provenance(**facts)
+        )
+        self.assertEqual(
+            [c for c, _ in mod.provenance_findings(**facts)], mod.provenance_reason_codes(**facts)
+        )
 
 
 class BuildSummaryTests(unittest.TestCase):

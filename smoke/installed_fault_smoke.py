@@ -67,6 +67,80 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+# Closed vocabulary of provenance rejection reasons (Redmine #14247). Each code names exactly one
+# classification branch. The human-readable message ECHOES the offending path, so asserting on a
+# substring of the message is vacuous: a `pipx` global path is also outside the venv, so the
+# executable-outside-venv message alone contains "pipx" and satisfies `any("pipx" in p)` even when
+# the pipx branch is deleted. Negative controls therefore assert CODES, never message substrings.
+PROVENANCE_EXECUTABLE_OUTSIDE_VENV = "executable_outside_venv"
+PROVENANCE_MODULE_UNRESOLVED = "module_unresolved"
+PROVENANCE_MODULE_OUTSIDE_VENV = "module_outside_venv"
+PROVENANCE_MODULE_FROM_CHECKOUT = "module_from_checkout"
+PROVENANCE_MODULE_NOT_SITE_PACKAGES = "module_not_under_site_packages"
+PROVENANCE_PIPX_GLOBAL = "pipx_global"
+PROVENANCE_VERSION_EMPTY = "version_empty"
+
+PROVENANCE_REASON_CODES: tuple[str, ...] = (
+    PROVENANCE_EXECUTABLE_OUTSIDE_VENV,
+    PROVENANCE_MODULE_UNRESOLVED,
+    PROVENANCE_MODULE_OUTSIDE_VENV,
+    PROVENANCE_MODULE_FROM_CHECKOUT,
+    PROVENANCE_MODULE_NOT_SITE_PACKAGES,
+    PROVENANCE_PIPX_GLOBAL,
+    PROVENANCE_VERSION_EMPTY,
+)
+
+
+def provenance_findings(
+    *, executable: str, module_file: str, version: str, venv_dir: str, checkout_root: str
+) -> list[tuple[str, str]]:
+    """Return ``(reason_code, message)`` per failed provenance check. PURE. Single source of truth.
+
+    ``verify_provenance`` (messages) and ``provenance_reason_codes`` (typed codes) BOTH derive from
+    this one list, so a code can never drift away from the branch that produces its message.
+    """
+    findings: list[tuple[str, str]] = []
+    venv = str(Path(venv_dir).resolve())
+    checkout = str(Path(checkout_root).resolve())
+    exe = str(Path(executable).resolve()) if executable else ""
+    mod = str(Path(module_file).resolve()) if module_file else ""
+    if not exe.startswith(venv + os.sep):
+        findings.append((
+            PROVENANCE_EXECUTABLE_OUTSIDE_VENV,
+            f"executable {exe!r} is not inside the venv {venv!r}",
+        ))
+    if not mod:
+        findings.append((
+            PROVENANCE_MODULE_UNRESOLVED, "mozyo_bridge module file could not be resolved"
+        ))
+    else:
+        if not mod.startswith(venv + os.sep):
+            findings.append((
+                PROVENANCE_MODULE_OUTSIDE_VENV, f"module {mod!r} is not inside the venv {venv!r}"
+            ))
+        if mod.startswith(checkout + os.sep):
+            findings.append((
+                PROVENANCE_MODULE_FROM_CHECKOUT,
+                f"module {mod!r} loaded from the checkout, not the installed artifact",
+            ))
+        if "site-packages" not in mod:
+            findings.append((
+                PROVENANCE_MODULE_NOT_SITE_PACKAGES, f"module {mod!r} is not under site-packages"
+            ))
+    if "pipx" in exe or "pipx" in mod:
+        findings.append((
+            PROVENANCE_PIPX_GLOBAL, "resolved to a pipx global, not the isolated venv"
+        ))
+    if not version.strip():
+        findings.append((PROVENANCE_VERSION_EMPTY, "mozyo-bridge --version produced no version"))
+    return findings
+
+
+def provenance_reason_codes(**facts: str) -> list[str]:
+    """Return only the typed reason codes. Negative controls assert against THIS, not messages."""
+    return [code for code, _ in provenance_findings(**facts)]
+
+
 def verify_provenance(
     *, executable: str, module_file: str, version: str, venv_dir: str, checkout_root: str
 ) -> list[str]:
@@ -75,28 +149,13 @@ def verify_provenance(
     The exercised CLI must resolve to the venv, and its ``mozyo_bridge`` module must load from the
     venv's ``site-packages`` — never the editable checkout tree or a ``pipx`` global. This is what
     distinguishes an installed-artifact run from a source-dispatch run.
+
+    Output is unchanged by Redmine #14247: the summary keeps publishing these same messages.
     """
-    problems: list[str] = []
-    venv = str(Path(venv_dir).resolve())
-    checkout = str(Path(checkout_root).resolve())
-    exe = str(Path(executable).resolve()) if executable else ""
-    mod = str(Path(module_file).resolve()) if module_file else ""
-    if not exe.startswith(venv + os.sep):
-        problems.append(f"executable {exe!r} is not inside the venv {venv!r}")
-    if not mod:
-        problems.append("mozyo_bridge module file could not be resolved")
-    else:
-        if not mod.startswith(venv + os.sep):
-            problems.append(f"module {mod!r} is not inside the venv {venv!r}")
-        if mod.startswith(checkout + os.sep):
-            problems.append(f"module {mod!r} loaded from the checkout, not the installed artifact")
-        if "site-packages" not in mod:
-            problems.append(f"module {mod!r} is not under site-packages")
-    if "pipx" in exe or "pipx" in mod:
-        problems.append("resolved to a pipx global, not the isolated venv")
-    if not version.strip():
-        problems.append("mozyo-bridge --version produced no version")
-    return problems
+    return [message for _, message in provenance_findings(
+        executable=executable, module_file=module_file, version=version,
+        venv_dir=venv_dir, checkout_root=checkout_root,
+    )]
 
 
 def recover_stale_accepts(outcome: "dict | None") -> bool:
