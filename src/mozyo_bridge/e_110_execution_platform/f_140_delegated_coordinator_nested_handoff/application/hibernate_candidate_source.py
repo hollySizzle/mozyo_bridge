@@ -18,6 +18,7 @@ from typing import Optional
 from mozyo_bridge.core.state.lane_lifecycle import load_lane_lifecycle_readonly
 
 from ..domain.hibernate_candidate import (
+    HibernateCandidate,
     HibernateNonCandidate,
     LifecycleAnchor,
     SelectedLane,
@@ -38,3 +39,23 @@ def bind_active_lifecycle_anchor(
     """
     records = load_lane_lifecycle_readonly(home=home)
     return bind_lifecycle_anchor(records, selected=selected)
+
+
+def still_current(candidate: HibernateCandidate, *, home: Optional[Path] = None) -> bool:
+    """Action-time revalidation (Redmine #14219 T2): is the candidate's exact anchor still current?
+
+    The public hibernate CAS pins to its own fresh read (not the request's ``expected_revision``,
+    unless a project-gateway binding is set), so a lane that drifted between candidate build and
+    actuation would otherwise be hibernated in its new state — evidence the candidate never proved.
+    This re-reads the read-only store and confirms the record STILL matches the candidate's exact
+    ``(workspace, lane, generation, revision)``; any drift, absence, ambiguity, or unreadable store
+    fails closed to ``False`` (reusing the T1 binder, which already fails closed on each of those).
+    """
+    selected = SelectedLane(
+        issue_id=candidate.issue_id,
+        repo_workspace_id=candidate.anchor.repo_workspace_id,
+        lane_id=candidate.anchor.lane_id,
+        lane_generation=candidate.anchor.lane_generation,
+        revision=candidate.anchor.revision,
+    )
+    return isinstance(bind_active_lifecycle_anchor(selected, home=home), LifecycleAnchor)
