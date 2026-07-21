@@ -86,11 +86,65 @@ def _parse_wake_hint(spec: str) -> tuple[str, str]:
 
 
 def _emit(payload: dict, *, as_json: bool, text_lines) -> None:
+    """Emit the canonical payload as JSON, or the human text rows (Redmine #14150 j#85115).
+
+    ``text_lines`` may be a sequence OR a zero-argument callable returning one. In JSON mode the
+    text rows are **never built**, so a defect confined to the text formatter cannot take down
+    the machine-readable output.
+
+    That laziness is the structural fix for the run-once crash: every caller used to build its
+    text rows eagerly and pass the finished list, so a single stale attribute in a text row
+    (``w.provider_reads`` after the R3 rename to ``provider_calls``) raised before ``_emit`` was
+    even reached — killing ``--json`` and, with it, the LaunchAgent ``--run-once`` reconcile pass
+    that never got to report a terminal outcome. Passing a builder keeps the text path's failure
+    modes inside the text path.
+    """
     if as_json:
         print(_json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    else:
-        for line in text_lines:
-            print(line)
+        return
+    for line in (text_lines() if callable(text_lines) else text_lines):
+        print(line)
+
+
+def _run_once_text_lines(report, action_label: str) -> list:
+    """The human text rows for a run-once / drain report (pure; built only in text mode).
+
+    Every per-workspace value here is read from the CANONICAL report contract. The workspace row
+    reports ``provider_calls`` — the ACTUAL provider read count the R3 split introduced
+    (:class:`...domain.workspace_supervisor.WorkspaceSupervisionOutcome`). It previously read a
+    ``provider_reads`` attribute that no longer existed on that contract, which is the defect
+    Redmine #14150 j#85115 recorded.
+    """
+    lines = [
+        f"action: {action_label}",
+        f"mode: {report.mode}",
+        f"duration_ms: {report.duration_ms}",
+        f"workspaces_total: {len(report.workspaces)}",
+        f"workspaces_supervised: {report.workspaces_supervised}",
+        f"workspaces_skipped: {report.workspaces_skipped}",
+        f"events_supplied: {report.events_supplied}",
+        f"delivered: {report.delivered}",
+        # Receipt truth (Redmine #13683 R2): claimed rows that did NOT wake the receiver (busy /
+        # uncertain / reconciled-away), held as retryable / uncertain receipts — surfaced alongside
+        # ``delivered`` so the projection never presents a non-wake as a delivery.
+        f"blocked: {report.blocked}",
+        # Redmine #14150 observability: provider (Redmine) reads this pass (0 for a drain), rows
+        # deferred to the reconciliation leg, and whether the whole pass was empty.
+        f"deferred: {report.deferred}",
+        f"provider_calls: {report.provider_calls}",
+        f"empty_pass: {report.empty_pass}",
+    ]
+    for w in report.workspaces:
+        if w.lease_acquired:
+            lines.append(
+                f"  ws {w.workspace_id}: supervised {len(w.supervised_issues)} issue(s), "
+                f"events={w.events_supplied} delivered={w.delivered} blocked={w.blocked} "
+                f"deferred={w.deferred} provider_calls={w.provider_calls}"
+                + (f" [{w.skipped_reason}]" if w.skipped_reason else "")
+            )
+        else:
+            lines.append(f"  ws {w.workspace_id}: skipped ({w.skipped_reason})")
+    return lines
 
 
 def _cmd_run_once(args: argparse.Namespace) -> int:
@@ -121,36 +175,11 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
     report = dataclasses.replace(report, duration_ms=int((time.monotonic() - started) * 1000))
     payload = report.as_payload()
     action_label = "drain" if drain_only else "run-once"
-    lines = [
-        f"action: {action_label}",
-        f"mode: {report.mode}",
-        f"duration_ms: {report.duration_ms}",
-        f"workspaces_total: {len(report.workspaces)}",
-        f"workspaces_supervised: {report.workspaces_supervised}",
-        f"workspaces_skipped: {report.workspaces_skipped}",
-        f"events_supplied: {report.events_supplied}",
-        f"delivered: {report.delivered}",
-        # Receipt truth (Redmine #13683 R2): claimed rows that did NOT wake the receiver (busy /
-        # uncertain / reconciled-away), held as retryable / uncertain receipts — surfaced alongside
-        # ``delivered`` so the projection never presents a non-wake as a delivery.
-        f"blocked: {report.blocked}",
-        # Redmine #14150 observability: provider (Redmine) reads this pass (0 for a drain), rows
-        # deferred to the reconciliation leg, and whether the whole pass was empty.
-        f"deferred: {report.deferred}",
-        f"provider_calls: {report.provider_calls}",
-        f"empty_pass: {report.empty_pass}",
-    ]
-    for w in report.workspaces:
-        if w.lease_acquired:
-            lines.append(
-                f"  ws {w.workspace_id}: supervised {len(w.supervised_issues)} issue(s), "
-                f"events={w.events_supplied} delivered={w.delivered} blocked={w.blocked} "
-                f"deferred={w.deferred} provider_reads={w.provider_reads}"
-                + (f" [{w.skipped_reason}]" if w.skipped_reason else "")
-            )
-        else:
-            lines.append(f"  ws {w.workspace_id}: skipped ({w.skipped_reason})")
-    _emit(payload, as_json=bool(getattr(args, "as_json", False)), text_lines=lines)
+    _emit(
+        payload,
+        as_json=bool(getattr(args, "as_json", False)),
+        text_lines=lambda: _run_once_text_lines(report, action_label),
+    )
     return 0
 
 
@@ -223,7 +252,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
         lease = lease_holders.get(rec.workspace_id)
         held = f"leased by {lease.holder} until {lease.expires_at}" if lease else "unleased"
         lines.append(f"  ws {rec.workspace_id} ({rec.project_name}): {held}")
-    _emit(payload, as_json=bool(getattr(args, "as_json", False)), text_lines=lines)
+    _emit(
+        payload, as_json=bool(getattr(args, "as_json", False)), text_lines=lambda: lines
+    )
     return 0
 
 
@@ -292,7 +323,7 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
                 f"[{kind}] credential_readiness: {host['credential_readiness']}",
                 f"[{kind}] command: {' '.join(defn.command)}",
             ]
-        _emit(payload, as_json=as_json, text_lines=lines)
+        _emit(payload, as_json=as_json, text_lines=lambda: lines)
         return 0
 
     if verb == "install":
@@ -325,7 +356,7 @@ def _cmd_service(args: argparse.Namespace, *, verb: str) -> int:
         if "credential_readiness" in a:
             detail += f" credential_readiness={a['credential_readiness']}"
         lines.append(detail)
-    _emit(payload, as_json=as_json, text_lines=lines)
+    _emit(payload, as_json=as_json, text_lines=lambda: lines)
     return 0 if performed else 1
 
 
