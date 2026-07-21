@@ -384,32 +384,28 @@ class ActiveRetireCasMatrix(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class LaunchRaceIsNotYetClosed(unittest.TestCase):
-    """The invariant F1 requires, written as an executable expectation.
+class LaunchExclusionTest(unittest.TestCase):
+    """The launch / terminalize exclusion F1 required (review j#85219, answer j#85269).
 
-    Measured facts (see `test_relaunch_does_not_advance_the_lifecycle_revision`): a process
-    launch does not mutate the lifecycle row, so the CAS's `expected_revision` fence cannot see
-    it. A pair that starts between the caller's live-zero read and the terminal write therefore
-    leaves the lane recorded as `retired` while it is live.
-
-    The desired behaviour is expressed as an `expectedFailure` rather than omitted, so the
-    invariant is executable and reviewable now. When the launch-exclusion design lands, this
-    test will pass — and because unittest reports an unexpected success as a FAILED run, the run
-    itself will demand the decorator be removed. It is deliberately not inverted into a test that
-    asserts the defective behaviour: that would pin the bug as contract.
+    The revision fence alone cannot see a process relaunch, so the exclusion is the home's
+    attestation-store lock: every managed launch holds it SHARED (non-blocking) from before its
+    first attestation read through its last actuation, and the terminalizer holds it EXCLUSIVE
+    across its whole action-time half.
     """
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "lifecycle.sqlite"
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
 
     def test_relaunch_does_not_advance_the_lifecycle_revision(self):
-        # The measurement F1 turns on. This one PASSES: it records why the fence is blind.
+        # WHY the exclusion is needed: the measurement F1 turns on. A relaunch-shaped
+        # declaration leaves `revision` untouched, so a CAS fenced on it is blind to launches.
         _seed_active_bound(path=self.path, key=_key())
         lifecycle = LaneLifecycleStore(path=self.path)
         before = lifecycle.get(_key()).revision
-        # The declaration writes a launch path performs against an existing row:
         declared = lifecycle.declare_active(
             _key(), decision=_decision(), issue_id=_ISSUE, worktree_identity=_BOUND_WT
         )
@@ -418,32 +414,193 @@ class LaunchRaceIsNotYetClosed(unittest.TestCase):
             _key(), decision=_decision(), issue_id=_ISSUE,
             declared_slots=_pins(), worktree_identity=_BOUND_WT,
         )
-        self.assertEqual(
-            lifecycle.get(_key()).revision, before,
-            "a relaunch-shaped declaration must not be assumed to advance the revision",
+        self.assertEqual(lifecycle.get(_key()).revision, before)
+
+    def test_a_launch_holding_shared_blocks_the_terminalize(self):
+        # Required test 1: launch-shared first -> terminalize zero-write.
+        from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+            attestation_store_lock,
         )
 
-    @unittest.expectedFailure
-    def test_pair_appearing_after_the_zero_read_must_be_zero_write(self):
-        # The invariant #14242 Acceptance requires ("action-time positive zero", "revision race
-        # is zero-write"), currently UNMET.
+        with attestation_store_lock(self.home, exclusive=False, blocking=False):
+            with self.assertRaises(Exception) as caught:
+                with attestation_store_lock(self.home, exclusive=True, blocking=False):
+                    self.fail("the terminalizer must not acquire while a launch holds shared")
+        self.assertIn("Busy", type(caught.exception).__name__)
+
+    def test_a_terminalize_holding_exclusive_blocks_every_launch(self):
+        # Required test 2: terminalize-exclusive first -> the SHARED acquire every managed
+        # launch performs fails, so no workspace / tab / agent is ever created. Exercised on the
+        # shared primitive itself because every spawn path (ordinary create / heal, the v1
+        # replacement binding, quarantine heal_receiver, and the bare / scratch / shared-space
+        # session starts) funnels through the same shared acquisition.
+        from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+            attestation_store_lock,
+        )
+
+        with attestation_store_lock(self.home, exclusive=True, blocking=False):
+            with self.assertRaises(Exception) as caught:
+                with attestation_store_lock(self.home, exclusive=False, blocking=False):
+                    self.fail("a launch must not acquire while a terminalize holds exclusive")
+        self.assertIn("Busy", type(caught.exception).__name__)
+
+    def test_every_managed_launch_funnel_takes_the_shared_lock(self):
+        # Structural: the exclusion only holds because the launch funnels acquire the shared
+        # lock. Pinned by source inspection so a future spawn path that bypasses admission is
+        # caught here rather than discovered as a live mis-terminalize.
+        import inspect
+
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_actuator_herdr_ops,
+        )
+
+        funnel = inspect.getsource(herdr_session_start.prepare_session)
+        self.assertIn("attestation_store_lock(", funnel)
+        self.assertIn("exclusive=False", funnel)
+        # The v1 replacement binding reaches `_prepare_session_locked` DIRECTLY with
+        # admission_lock_held=True, so its caller must hold the same shared lock.
+        v1_caller = inspect.getsource(sublane_actuator_herdr_ops.HerdrSublaneActuatorOps.heal_lane_column)
+        self.assertIn("attestation_store_lock(", v1_caller)
+        self.assertIn("exclusive=False", v1_caller)
+
+    def test_terminalizer_reports_launch_in_flight_and_writes_nothing(self):
+        # Required test: lock busy -> typed blocked, lifecycle row zero-write.
+        from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+            AttestationStoreLockBusy,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_active_live_zero_retire as active_module,
+        )
+
         _seed_active_bound(path=self.path, key=_key())
-        lifecycle = LaneLifecycleStore(path=self.path)
-        measured_revision = lifecycle.get(_key()).revision  # live-zero read happened here
-        # ... a pair starts. It touches herdr, not the lifecycle row, so revision is unchanged.
-        self.assertEqual(lifecycle.get(_key()).revision, measured_revision)
-        out = LaneActiveRetireStore(path=self.path).retire_active_live_zero(
-            _key(),
-            expected_revision=measured_revision,
-            issue_id=_ISSUE,
-            worktree_identity=_BOUND_WT,
-            decision=_decision(),
-        )
-        self.assertFalse(out.applied, "a lane whose pair started after the zero read must not terminalize")
+
+        @contextlib.contextmanager
+        def _busy(*_a, **_k):
+            raise AttestationStoreLockBusy("a managed launch holds the store")
+            yield  # pragma: no cover
+
+        with mock.patch(
+            "mozyo_bridge.core.state.herdr_identity_attestation_schema."
+            "attestation_store_lock",
+            side_effect=_busy,
+        ):
+            verdict = self._run_terminalizer()
+        self.assertEqual(verdict.state, "blocked")
+        self.assertEqual(verdict.reason, "launch_in_flight")
         self.assertEqual(
-            lifecycle.get(_key()).lane_disposition, DISPOSITION_ACTIVE,
-            "the lane must remain active while its pair is live",
+            LaneLifecycleStore(path=self.path).get(_key()).lane_disposition,
+            DISPOSITION_ACTIVE,
         )
+
+    def test_terminalizer_reports_exclusion_unavailable(self):
+        # Required test: no advisory locking -> typed blocked, never proceed unlocked.
+        from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+            AttestationStoreLockUnavailable,
+        )
+
+        _seed_active_bound(path=self.path, key=_key())
+
+        @contextlib.contextmanager
+        def _unavailable(*_a, **_k):
+            raise AttestationStoreLockUnavailable("fcntl.flock is unavailable")
+            yield  # pragma: no cover
+
+        with mock.patch(
+            "mozyo_bridge.core.state.herdr_identity_attestation_schema."
+            "attestation_store_lock",
+            side_effect=_unavailable,
+        ):
+            verdict = self._run_terminalizer()
+        self.assertEqual(verdict.state, "blocked")
+        self.assertEqual(verdict.reason, "exclusion_unavailable")
+        self.assertEqual(
+            LaneLifecycleStore(path=self.path).get(_key()).lane_disposition,
+            DISPOSITION_ACTIVE,
+        )
+
+    def test_real_terminalizer_blocks_against_a_genuinely_held_launch_lock(self):
+        """The end-to-end invariant: a launch holding shared makes the REAL terminalizer
+        zero-write, promptly.
+
+        Drives the actual `run_active_live_zero_retire` (not the lock primitive) while a
+        launch-shaped SHARED acquisition is held on the SAME home, so the terminalizer's own
+        `exclusive=True, blocking=False` arguments are what is under test:
+
+        - `exclusive=False` would let it acquire alongside the launch and proceed -> the
+          reason would not be `launch_in_flight`;
+        - `blocking=True` would make it queue behind the launch instead of failing fast -> it
+          would not return within the timeout.
+
+        Run on a worker thread with a join timeout so a blocking regression surfaces as a test
+        failure rather than a hung suite.
+        """
+        import threading
+
+        from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+            attestation_store_lock,
+        )
+
+        _seed_active_bound(path=self.path, key=_key())
+        home = Path(self.tmp.name) / "lockhome"
+        home.mkdir()
+        box: dict = {}
+
+        def _drive():
+            try:
+                box["verdict"] = self._run_terminalizer()
+            except BaseException as exc:  # noqa: BLE001 - surfaced by the assertions below
+                box["error"] = exc
+
+        with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}):
+            # A managed launch holds the home's store SHARED, exactly as admission does.
+            with attestation_store_lock(home, exclusive=False, blocking=False):
+                worker = threading.Thread(target=_drive, daemon=True)
+                worker.start()
+                worker.join(timeout=10)
+                self.assertFalse(
+                    worker.is_alive(),
+                    "the terminalizer queued behind an in-flight launch instead of failing "
+                    "fast; it must be non-blocking",
+                )
+        self.assertNotIn("error", box, f"terminalizer raised: {box.get('error')!r}")
+        verdict = box["verdict"]
+        self.assertEqual(verdict.state, "blocked", verdict)
+        self.assertEqual(verdict.reason, "launch_in_flight", verdict)
+        self.assertEqual(
+            LaneLifecycleStore(path=self.path).get(_key()).lane_disposition,
+            DISPOSITION_ACTIVE,
+            "a lane must stay active while a launch is in flight",
+        )
+
+    def _run_terminalizer(self):
+        """Drive the terminalizer far enough to reach the exclusion boundary."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_active_live_zero_retire as active_module,
+            sublane_herdr_projection as projection,
+            sublane_retire_actuation as retire_actuation,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start,
+        )
+
+        args = argparse.Namespace(
+            issue=_ISSUE, journal=_JOURNAL, lane_label=_LANE,
+            worktree=str(self.home), branch=_LANE, integration_branch="main",
+        )
+        with mock.patch.object(projection, "repo_backend_is_herdr", return_value=True), \
+             mock.patch.object(
+                 herdr_session_start, "herdr_workspace_segment", return_value=_WORKSPACE_ID
+             ), \
+             mock.patch.object(
+                 retire_actuation, "attest_retire_target", return_value=(True, "", "")
+             ):
+            return active_module.run_active_live_zero_retire(
+                args, Path(self.tmp.name) / "repo",
+                head_integrated=True, worktree_branch=_LANE,
+            )
 
 
 # ---------------------------------------------------------------------------

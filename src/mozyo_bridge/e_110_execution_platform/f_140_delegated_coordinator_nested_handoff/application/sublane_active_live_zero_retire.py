@@ -33,16 +33,20 @@ be refused explicitly, and the CAS's expected-revision fence has to carry the ra
 - a foreign occupant in a targeted unit means a real process is still running there;
 - and the revision the zero read was measured against is passed to the CAS.
 
-.. warning::
-   **Known open window (Redmine #14242 review j#85219 F1).** That revision fence does NOT close
-   the read -> write race for a *process relaunch*: a launch does not mutate the lifecycle row
-   (``declare_active`` on an existing row is ``CAS_ALREADY_DECLARED`` zero-write, ``declare_lane``
-   is idempotent), so ``revision`` is unchanged and the terminal write applies — recording a lane
-   as ``retired`` while its pair is live. A second inventory read would not help; the same window
-   simply moves. Closing it requires an exclusion the launch / resume / adopt admission path
-   participates in, which is a cross-surface design decision raised as a design consultation on
-   #14242. Until it is resolved this surface must not be run against a lane that could be
-   relaunched concurrently.
+**The launch race, and how it is closed** (Redmine #14242 review j#85219 F1, design answer
+j#85269). The revision fence alone does NOT see a process relaunch: a launch does not mutate the
+lifecycle row (``declare_active`` on an existing row is ``CAS_ALREADY_DECLARED`` zero-write,
+``declare_lane`` is idempotent), so ``revision`` is unchanged and the terminal write would apply
+— recording a lane as ``retired`` while its pair is live. A second inventory read does not help;
+the same window simply moves.
+
+The exclusion is therefore taken from the existing #13882 three-boundary protocol rather than a
+new durable claim: every managed launch already holds the home's attestation-store lock SHARED
+and non-blocking from before its first attestation read through its last actuation, so this
+surface takes that same lock EXCLUSIVE and non-blocking for its whole action-time half. A launch
+in flight makes this acquire fail (zero-write); this terminalize in flight makes the launch's
+acquire fail at admission, before any workspace / tab / agent exists (zero-spawn). A holder crash
+releases it at the OS level, so there is no stale claim, TTL, or takeover recovery to get wrong.
 
 Gate order mirrors #13845 deliberately, so an operator reads one vocabulary across every retire
 intent and a reviewer can diff the two surfaces line for line.
@@ -109,6 +113,14 @@ ACTIVE_RETIRE_LANE_NOT_DECLARED = "lane_not_declared"
 ACTIVE_RETIRE_REVISION_RACE = "revision_race"
 #: The bounded CAS raised a store error (surfaced, not swallowed).
 ACTIVE_RETIRE_STORE_ERROR = "store_error"
+#: The home's attestation-store lock could not be taken EXCLUSIVELY, so a managed launch (or a
+#: self-attestation write, or maintenance) is in flight on this home right now (Redmine #14242
+#: review j#85219 F1, design answer j#85269). The terminalizer never queues ahead of an in-flight
+#: launch: it reports blocked and writes nothing, exactly as attestation maintenance does.
+ACTIVE_RETIRE_LAUNCH_IN_FLIGHT = "launch_in_flight"
+#: Advisory file locking is unavailable on this platform, so the launch/terminalize exclusion
+#: protocol cannot be honored. Proceeding would advertise a guarantee that is not there.
+ACTIVE_RETIRE_EXCLUSION_UNAVAILABLE = "exclusion_unavailable"
 
 
 @dataclass(frozen=True)
@@ -329,6 +341,117 @@ def run_active_live_zero_retire(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
+    from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+        AttestationStoreLockBusy,
+        AttestationStoreLockUnavailable,
+        attestation_store_lock,
+    )
+    from mozyo_bridge.shared.paths import mozyo_bridge_home
+
+    # ---- the launch / terminalize exclusion (Redmine #14242 j#85269) -------------------
+    #
+    # Boundary 3 of the #13882 three-boundary protocol, reused rather than reinvented. Every
+    # managed launch — ordinary create / heal, the v1 replacement binding, quarantine's
+    # heal_receiver, and the lane-identity-less bare / scratch / shared-space session starts —
+    # holds this home's attestation-store lock SHARED, non-blocking, from before its first
+    # attestation read through its last actuation. Taking it EXCLUSIVE here is therefore a
+    # reader-writer exclusion over the exact window F1 left open:
+    #
+    #   - a launch already holding shared -> this acquire fails -> zero-write here;
+    #   - this terminalize holding exclusive -> the launch's shared acquire fails at
+    #     admission, before any workspace / tab / agent exists -> zero-spawn there.
+    #
+    # It is held across the lifecycle read, the action-time inventory read, every gate below,
+    # and the terminal CAS, so nothing can start between the live-zero measurement and the
+    # write. A holder crash releases it at the OS level, so there is no stale claim, no TTL and
+    # no takeover recovery to get wrong. The window is home-wide and brief; over-blocking a
+    # concurrent unrelated launch for that window is strictly safer than terminalizing a lane
+    # whose pair just came back.
+    #
+    # Residual, inherited from the lock's own contract and NOT claimed to be solved here: a
+    # launcher of another vintage does not know this protocol. A durable claim column would not
+    # fix that either — an old binary would not read it (j#85269).
+    try:
+        with attestation_store_lock(
+            mozyo_bridge_home(), exclusive=True, blocking=False
+        ):
+            return _terminalize_under_exclusion(
+                args,
+                repo_root,
+                workspace_id=workspace_id,
+                legacy_token=legacy_token,
+                metadata_token=metadata_token,
+                lane_label=lane_label,
+                issue=issue,
+                journal=journal,
+            )
+    except AttestationStoreLockBusy as exc:
+        return _blocked(
+            ACTIVE_RETIRE_LAUNCH_IN_FLIGHT,
+            detail=(
+                f"the home's attestation-store lock is held by another operation ({exc}); a "
+                "managed launch, a self-attestation write, or maintenance is in flight, so a "
+                "live-zero measurement taken now could be invalidated before the write. "
+                "Nothing was read or written; re-run once it finishes"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+        )
+    except AttestationStoreLockUnavailable as exc:
+        return _blocked(
+            ACTIVE_RETIRE_EXCLUSION_UNAVAILABLE,
+            detail=(
+                f"advisory file locking is unavailable on this platform ({exc}), so the "
+                "launch / terminalize exclusion cannot be honored. Terminalizing without it "
+                "would advertise a guarantee that is not there"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+        )
+
+
+def _terminalize_under_exclusion(
+    args: argparse.Namespace,
+    repo_root: Path,
+    *,
+    workspace_id: str,
+    legacy_token: str,
+    metadata_token: str,
+    lane_label: str,
+    issue: str,
+    journal: str,
+):
+    """The action-time half, run while HOLDING the exclusive launch-exclusion lock (#14242).
+
+    Everything here is re-read under the lock: the durable lifecycle row (and the revision the
+    CAS is fenced on), the live inventory, and every liveness gate. Split into its own function
+    so the lock's scope is the function boundary — it is impossible to add a gate that
+    accidentally runs outside the exclusion.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        list_herdr_agent_rows,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
+        REASON_INVENTORY_UNREADABLE,
+        REASON_PROVIDER_NOT_LAUNCHABLE,
+        REASON_PROVIDER_UNRESOLVED,
+        REASON_WORKSPACE_UNRESOLVED,
+        expected_live_slots,
+        expected_slot_rows,
+        plan_herdr_retire_close,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+        WorkflowProviderUnresolved,
+        resolve_gateway_provider,
+        resolve_worker_provider,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+        HerdrSessionStartError,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
+        SLOT_STALE,
+        classify_named_slot,
+    )
     from mozyo_bridge.core.state.lane_lifecycle import (
         DISPOSITION_RETIRED,
         LaneLifecycleError,
@@ -619,6 +742,8 @@ __all__ = (
     "ACTIVE_RETIRE_LANE_NOT_DECLARED",
     "ACTIVE_RETIRE_REVISION_RACE",
     "ACTIVE_RETIRE_STORE_ERROR",
+    "ACTIVE_RETIRE_LAUNCH_IN_FLIGHT",
+    "ACTIVE_RETIRE_EXCLUSION_UNAVAILABLE",
     "ActiveLiveZeroRetireVerdict",
     "format_active_retire_text",
     "run_active_live_zero_retire",

@@ -125,15 +125,13 @@ class LaneActiveRetireStore:
           (:data:`CAS_STALE_REVISION`). This detects a concurrent **lifecycle-row** mutation (a
           declare / transition / generation open) that moved the row after the caller's read.
 
-          .. warning::
-             It does **not** detect a process relaunch. Redmine #14242 review j#85219 F1,
-             confirmed by measurement: ``declare_active`` on an existing row returns
-             ``CAS_ALREADY_DECLARED`` zero-write and ``declare_lane`` is idempotent, so a pair
-             that starts between the caller's live-zero read and this CAS leaves ``revision``
-             unchanged and the write applies — marking a lane ``retired`` while its pair is
-             live. Closing that window needs an exclusion the launch path participates in;
-             until it exists this store must not be driven against a lane that could be
-             relaunched concurrently.
+          It does **not** detect a process relaunch: a launch does not mutate this row
+          (``declare_active`` on an existing row is ``CAS_ALREADY_DECLARED`` zero-write,
+          ``declare_lane`` is idempotent), so ``revision`` is unchanged (Redmine #14242 review
+          j#85219 F1, measured). That window is closed by the CALLER, which holds the home's
+          attestation-store lock EXCLUSIVE across its live-zero read and this CAS while every
+          managed launch holds it shared (design answer j#85269). This store must only be
+          driven from under that exclusion;
         - it is ``active`` — a ``hibernated`` row belongs to #13845 / #13841 / #13842, and a
           ``superseded`` / already ``retired`` row is not this surface's target — is an
           ``issue`` binding, owns **this exact** issue, and owns no project scope
@@ -155,10 +153,8 @@ class LaneActiveRetireStore:
         **Liveness is NOT verified here and cannot be.** Unlike #13845 there is no durable
         release proof to pair with — an active row never requested one. The caller must
         establish positive absence from a fresh inventory read (expected slots, foreign slots,
-        locator-less rows, duplicates). The stale-revision fence above does NOT convert a
-        concurrent relaunch into a refusal (see its warning): that window is open until a launch
-        exclusion exists. A caller that skips the read, or that runs while a relaunch is
-        possible, can terminalize a live lane.
+        locator-less rows, duplicates) AND hold the launch exclusion described above across both
+        the read and this call. A caller that skips either can terminalize a live lane.
 
         Deliberately NOT :meth:`LaneLifecycleStore.transition_disposition`: that generic edge
         accepts any ``active -> retired`` regardless of binding / release / worktree shape.
