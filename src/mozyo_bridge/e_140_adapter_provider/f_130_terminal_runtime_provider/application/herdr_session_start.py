@@ -356,6 +356,9 @@ def prepare_session(
         ) from exc
 
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_lifecycle_admission import admit_launch_against_lifecycle  # noqa: E501
+
+
 def _prepare_session_locked(
     *,
     repo_root: Path,
@@ -538,6 +541,14 @@ def _prepare_session_locked(
     result = SessionStartResult(
         workspace_id=workspace_id, lane_id=lane or "default", dry_run=dry_run
     )
+
+    # Redmine #14242 F3 — the ORDER half of the launch / terminalize exclusion. Placement is
+    # load-bearing (see the leaf's docstring): here it runs under the caller-held shared lock on
+    # BOTH entry paths. A dry run actuates nothing.
+    if not dry_run:
+        admit_launch_against_lifecycle(
+            workspace_id=workspace_id, lane_id=result.lane_id, store_home=store_home
+        )
 
     # Config-driven pane placement (Redmine #13646, Design Answer j#76564): resolve the
     # lane class's `(split, order)` ONCE, then reorder the requested providers so the

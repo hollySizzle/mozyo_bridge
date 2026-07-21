@@ -645,9 +645,11 @@ def _terminalize_under_exclusion(
     try:
         outcome = store.retire_active_live_zero(
             key,
-            # The revision the live-zero read above was measured against. NOTE (review j#85219
-            # F1): this catches a concurrent lifecycle-row mutation, NOT a process relaunch —
-            # that window is still open, see the module warning.
+            # The revision the live-zero read above was measured against. On its own this
+            # catches a concurrent lifecycle-row mutation, NOT a process relaunch (review
+            # j#85219 F1). The relaunch window is closed by the two halves around it: the
+            # caller-held EXCLUSIVE lock serializes the concurrent case, and the launch funnel's
+            # retired admission refuses the post-terminal case (review j#85296 F3).
             expected_revision=record.revision,
             issue_id=issue,
             worktree_identity=metadata_token,

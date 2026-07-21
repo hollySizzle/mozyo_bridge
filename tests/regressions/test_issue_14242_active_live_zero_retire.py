@@ -604,6 +604,139 @@ class LaunchExclusionTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 1c. The post-terminal launch admission (review j#85296 F3) — the ORDER half.
+# ---------------------------------------------------------------------------
+
+
+class PostTerminalLaunchAdmissionTest(unittest.TestCase):
+    """The exclusion's second half: order, not just concurrency (review j#85296 F3).
+
+    The attestation-store lock serializes launch and terminalize while both are in flight, but
+    it is released once the terminal CAS commits. Without a durable-disposition admission an
+    ordinary `prepare_session` could then acquire the shared lock and spawn into the lane that
+    was just terminalized — a live pair under a `retired` row.
+
+    The four ordered cases the review requires are pinned here as 1-4.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+
+    def _admit(self, lane: str = _LANE):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+            admit_launch_against_lifecycle,
+        )
+
+        return admit_launch_against_lifecycle(
+            workspace_id=_WORKSPACE_ID, lane_id=lane, store_home=str(self.home)
+        )
+
+    def _retire(self) -> None:
+        lifecycle = LaneLifecycleStore(home=self.home)
+        rec = lifecycle.get(_key())
+        lifecycle.transition_disposition(
+            _key(), expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=rec.revision, target=DISPOSITION_RETIRED, decision=_decision(),
+        )
+
+    # -- ordered case 3: terminal complete, lock released, retry -> zero-spawn -------------
+
+    def test_3_retry_after_terminal_and_lock_release_is_zero_spawn(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+            HerdrSessionStartError,
+        )
+
+        _seed_active_bound(path=None, key=_key())  # home-scoped via MOZYO_BRIDGE_HOME below
+        with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}):
+            _seed_active_bound(path=self.home / "state.sqlite", key=_key())
+        self._admit()  # active: launches exactly as before
+        self._retire()
+        with self.assertRaises(HerdrSessionStartError) as caught:
+            self._admit()
+        self.assertIn("retired", str(caught.exception))
+        self.assertIn("No workspace / tab / agent was created", str(caught.exception))
+
+    # -- ordered case 4: after an explicit re-incarnation -> launch allowed ----------------
+
+    def test_4_launch_allowed_after_open_next_generation(self):
+        _seed_active_bound(path=self.home / "state.sqlite", key=_key())
+        self._retire()
+        lifecycle = LaneLifecycleStore(home=self.home)
+        rec = lifecycle.get(_key())
+        reopened = LaneDeclarationStore(home=self.home).open_next_generation(
+            _key(), expected_revision=rec.revision, expected_generation=rec.lane_generation,
+            decision=_decision(), declared_slots=_pins(),
+        )
+        self.assertTrue(reopened.applied, reopened.reason)
+        after = lifecycle.get(_key())
+        self.assertEqual(after.lane_disposition, DISPOSITION_ACTIVE)
+        self.assertGreater(after.lane_generation, rec.lane_generation)
+        self._admit()  # must not raise
+
+    # -- the narrowness of the admission ---------------------------------------------------
+
+    def test_rowless_lane_is_unaffected(self):
+        self._admit()  # no row at all -> unchanged behaviour
+
+    def test_default_coordinator_lane_never_consults_the_store(self):
+        # The bare `mozyo` / scratch `session-start` pair owns no lifecycle row by design, so it
+        # must launch even when the store is unreadable.
+        (self.home / "state.sqlite").write_text("not a database", encoding="utf-8")
+        self._admit(lane="default")
+
+    def test_active_superseded_and_hibernated_still_launch(self):
+        _seed_active_bound(path=self.home / "state.sqlite", key=_key())
+        self._admit()
+        lifecycle = LaneLifecycleStore(home=self.home)
+        rec = lifecycle.get(_key())
+        lifecycle.transition_disposition(
+            _key(), expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=rec.revision, target=DISPOSITION_HIBERNATED,
+            decision=_decision(),
+        )
+        self._admit()  # a hibernated lane is resumable, not terminal
+
+    def test_unreadable_store_refuses_a_named_lane(self):
+        # "unreadable is not absent" — the standing rule. Bounded to named lanes, so the
+        # coordinator pair (above) can always still start.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+            HerdrSessionStartError,
+        )
+
+        (self.home / "state.sqlite").write_text("not a database", encoding="utf-8")
+        with self.assertRaises(HerdrSessionStartError) as caught:
+            self._admit()
+        self.assertIn("unreadable", str(caught.exception))
+
+    def test_admission_runs_before_any_herdr_write_on_both_entry_paths(self):
+        # Structural: the call must sit in `_prepare_session_locked` (which BOTH the ordinary
+        # path and the v1 replacement's direct `admission_lock_held=True` call enter), not in
+        # `prepare_session` — otherwise the v1 path bypasses it.
+        import inspect
+
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start,
+        )
+
+        body = inspect.getsource(herdr_session_start._prepare_session_locked)
+        self.assertIn("admit_launch_against_lifecycle(", body)
+        # ...and before the slot execution that performs the spawn.
+        self.assertLess(
+            body.index("admit_launch_against_lifecycle("),
+            body.index("_execute_slot("),
+            "the admission must precede the spawn",
+        )
+        self.assertNotIn(
+            "admit_launch_against_lifecycle(",
+            inspect.getsource(herdr_session_start.prepare_session),
+            "placing it on prepare_session would let the v1 direct path bypass it",
+        )
+
+
+# ---------------------------------------------------------------------------
 # 2. Non-erosion of the sibling surfaces.
 # ---------------------------------------------------------------------------
 
