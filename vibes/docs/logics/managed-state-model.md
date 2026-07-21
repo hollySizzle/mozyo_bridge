@@ -300,7 +300,10 @@ Table naming:
     間に worker が worktree mutation を開始でき、lane が `hibernated`/`released` でも durable boundary
     record 無しの dirty residue が残る。actuation は preflight (T0) で状態 snapshot を取り、**release
     直前 (T1)** に同一 fresh snapshot で ①worktree fingerprint (tracked 内容+untracked 内容に感応な
-    digest、porcelain 行だけでない)、②worker running / pending composer の live 観測、③live managed
+    digest、porcelain 行だけでない)、②worker running / pending composer の live 観測 (#14065 provider
+    ghost gate で ghost-refine。#14239: gate へ渡す facts reader の arity 違反で refinement が silent 無効化され
+    dim ghost が `composer_pending_real` に誤分類されていたのを修正し、公開 `composer-render` 診断と同一の
+    authority-resolved live read へ統一)、③live managed
     slot (`assigned_name→locator`)、④lifecycle revision、⑤(project-gateway) exact declared generation
     + startup attestation を **再検証**し、preflight から drift したら **lifecycle transition 0 /
     process close 0 の typed blocked**。CAS→partial→retry は idempotent で redrive も同じ fence を通す

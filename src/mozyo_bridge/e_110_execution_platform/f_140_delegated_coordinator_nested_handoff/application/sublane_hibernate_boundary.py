@@ -403,7 +403,6 @@ def read_live_lane_activity(
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_ghost_composer_observation import (  # noqa: E501
         apply_ghost_empty,
         default_ghost_policy,
-        read_render_ghost_facts,
     )
 
     try:
@@ -441,13 +440,18 @@ def read_live_lane_activity(
         )
         if not observation.readable:
             return LaneActivityObservation(readable=False)
+        # Redmine #14239: `facts_reader` takes a 1-arg `Callable[[str], RenderGhostFacts]`;
+        # passing the raw 3-arg `read_render_ghost_facts` here violated that contract, the
+        # arity `TypeError` was swallowed by the gate's fail-safe preserve, and every dim
+        # ghost was misclassified `composer_pending_real` (j#84950 6/6 block). Omit the
+        # reader so the gate binds the SAME authority-resolved live read (repo_root/env)
+        # the public `composer-render` diagnostic uses.
         effective_pending = apply_ghost_empty(
             observation.has_pending,
             policy=ghost_policy,
             repo_root=repo_root,
             env=env,
             locator=locator,
-            facts_reader=read_render_ghost_facts,
         )
         if effective_pending is True:
             composer_pending = True
