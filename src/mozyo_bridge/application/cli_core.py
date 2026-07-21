@@ -540,16 +540,36 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
         default=None,
         help="Granularity of the dispatched work unit (default: repo-local "
         "config `work_unit.granularity`, else user_story — the governed "
-        "standard; leaf_issue only for the governed task-level exceptions; "
-        "epic/feature require --work-unit-decision-journal).",
+        "standard; leaf_issue requires either --leaf-standalone or "
+        "--work-unit-decision-journal, see below; epic/feature require "
+        "--work-unit-decision-journal).",
     )
     sublane_create.add_argument(
         "--work-unit-decision-journal",
         dest="work_unit_decision_journal",
         default=None,
         help="Durable journal id of the explicit owner/operator decision that "
-        "authorizes an epic/feature-sized implementation dispatch. Required "
-        "for --work-unit epic|feature; ignored otherwise.",
+        "authorizes an epic/feature-sized implementation dispatch, or a "
+        "leaf_issue dispatch for an issue that HAS a parent UserStory. "
+        "Required for --work-unit epic|feature, and for --work-unit "
+        "leaf_issue unless --leaf-standalone is also passed; ignored "
+        "otherwise. Redmine #14224: a task-level review need alone is never "
+        "this anchor.",
+    )
+    # Redmine #14224: leaf-lane admission fence. `leaf_issue` is no longer an
+    # unconditional exception (#14222's 8/9-active-lanes-leaf-sized problem) -- a
+    # leaf dispatch for an issue WITH a parent UserStory now requires the same
+    # explicit-decision-anchor mechanism epic/feature already use.
+    # `--leaf-standalone` is the other escape valve: a genuinely standalone leaf
+    # issue (no parent US) dispatches freely, no anchor needed.
+    sublane_create.add_argument(
+        "--leaf-standalone",
+        dest="leaf_standalone",
+        action="store_true",
+        help="Declare that --work-unit leaf_issue names an issue with NO parent "
+        "UserStory (a standalone issue) -- allows the leaf dispatch without "
+        "--work-unit-decision-journal. Ignored for work units other than "
+        "leaf_issue.",
     )
     # Live actuator (Redmine #12973): opt-in `--execute` performs the additive
     # worktree + cockpit column + gateway dispatch; without it the surface stays the

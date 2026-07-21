@@ -624,8 +624,22 @@ class PlanWorkUnitGateTests(unittest.TestCase):
         plan = plan_sublane_create(request, self._launch())
         self.assertEqual(plan.status, CREATE_PLANNED)
 
-    def test_leaf_issue_exception_unit_plans(self):
+    def test_leaf_issue_without_standalone_or_anchor_fails_closed_redmine_14224(self):
         plan = plan_sublane_create(_req(work_unit="leaf_issue"), self._launch())
+        self.assertEqual(plan.status, CREATE_BLOCKED)
+        self.assertIn("work_unit_leaf_decision_required", plan.blocked_reasons)
+
+    def test_leaf_issue_standalone_plans_no_anchor_needed(self):
+        plan = plan_sublane_create(
+            _req(work_unit="leaf_issue", leaf_standalone=True), self._launch()
+        )
+        self.assertEqual(plan.status, CREATE_PLANNED)
+
+    def test_leaf_issue_with_parent_us_and_anchor_plans(self):
+        plan = plan_sublane_create(
+            _req(work_unit="leaf_issue", work_unit_decision_anchor="70719"),
+            self._launch(),
+        )
         self.assertEqual(plan.status, CREATE_PLANNED)
 
     def test_epic_without_decision_anchor_fails_closed(self):

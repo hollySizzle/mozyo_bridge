@@ -35,8 +35,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WORK_UNIT_EXPLICIT_DECISION_REQUIRED,
     WORK_UNIT_FEATURE,
     WORK_UNIT_GRANULARITIES,
-    WORK_UNIT_LEAF_EXCEPTION,
+    WORK_UNIT_LEAF_DECISION_RECORDED,
+    WORK_UNIT_LEAF_DECISION_REQUIRED,
     WORK_UNIT_LEAF_ISSUE,
+    WORK_UNIT_LEAF_STANDALONE,
     WORK_UNIT_STANDARD,
     WORK_UNIT_USER_STORY,
     WorkUnitDispatchDecision,
@@ -126,13 +128,56 @@ class DispatchDecisionTests(unittest.TestCase):
         self.assertEqual(decision.status, DISPATCH_ALLOWED)
         self.assertEqual(decision.diagnostic, WORK_UNIT_STANDARD)
 
-    def test_leaf_issue_is_the_allowed_exception_unit(self):
+    def test_leaf_issue_blocks_by_default_redmine_14224(self):
+        # Redmine #14224: a leaf_issue dispatch with NO standalone declaration and NO
+        # decision anchor is blocked by default -- this is the fix itself (leaf_issue
+        # was unconditionally allowed before #14224, which is how 8/9 active lanes
+        # ended up leaf-sized despite the user_story standard).
         decision = decide_work_unit_dispatch(WORK_UNIT_LEAF_ISSUE)
+        self.assertFalse(decision.is_allowed)
+        self.assertEqual(decision.status, DISPATCH_BLOCKED)
+        self.assertEqual(decision.diagnostic, WORK_UNIT_LEAF_DECISION_REQUIRED)
+
+    def test_leaf_issue_standalone_is_allowed_no_anchor_needed(self):
+        decision = decide_work_unit_dispatch(
+            WORK_UNIT_LEAF_ISSUE, leaf_standalone=True
+        )
         self.assertTrue(decision.is_allowed)
-        self.assertEqual(decision.diagnostic, WORK_UNIT_LEAF_EXCEPTION)
-        # The reason points at the governed task-level exception vocabulary
-        # instead of inventing a new one.
-        self.assertIn("task_level", decision.reason)
+        self.assertEqual(decision.diagnostic, WORK_UNIT_LEAF_STANDALONE)
+
+    def test_leaf_issue_with_parent_us_allowed_with_durable_anchor(self):
+        decision = decide_work_unit_dispatch(
+            WORK_UNIT_LEAF_ISSUE, explicit_decision_anchor="70719"
+        )
+        self.assertTrue(decision.is_allowed)
+        self.assertEqual(decision.diagnostic, WORK_UNIT_LEAF_DECISION_RECORDED)
+        self.assertEqual(decision.decision_anchor, "70719")
+
+    def test_leaf_issue_blank_anchor_counts_as_absent(self):
+        decision = decide_work_unit_dispatch(
+            WORK_UNIT_LEAF_ISSUE, explicit_decision_anchor="   "
+        )
+        self.assertFalse(decision.is_allowed)
+        self.assertEqual(decision.diagnostic, WORK_UNIT_LEAF_DECISION_REQUIRED)
+
+    def test_leaf_issue_standalone_takes_precedence_over_missing_anchor(self):
+        # standalone=True needs no anchor at all -- it is a genuinely separate escape
+        # valve from the anchor mechanism, not a fallback that still checks for one.
+        decision = decide_work_unit_dispatch(
+            WORK_UNIT_LEAF_ISSUE, leaf_standalone=True, explicit_decision_anchor=None
+        )
+        self.assertTrue(decision.is_allowed)
+        self.assertEqual(decision.diagnostic, WORK_UNIT_LEAF_STANDALONE)
+
+    def test_leaf_issue_review_exception_alone_does_not_bypass_the_fence(self):
+        # Redmine #14222/#14224 close condition 2: "review exceptionだけではblock
+        # 解除されない" -- there is no parameter for a review-exception flag at all, so
+        # passing only the granularity (as if a task-level review need were somehow
+        # itself the anchor) stays blocked. The ONLY escapes are leaf_standalone=True
+        # or a real explicit_decision_anchor.
+        decision = decide_work_unit_dispatch(WORK_UNIT_LEAF_ISSUE)
+        self.assertFalse(decision.is_allowed)
+        self.assertIn("task-level review", decision.reason)
 
     def test_epic_and_feature_block_without_explicit_decision(self):
         for unit in sorted(EXPLICIT_DECISION_GRANULARITIES):
