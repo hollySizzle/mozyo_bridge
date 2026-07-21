@@ -679,6 +679,56 @@ class FakeHerdr:
             for a in self._agents.values()
         ]
 
+    # -- serialize / hydrate seam (Redmine #14097 installed smoke adapter) -----
+    # The installed smoke drives the REAL installed CLI in a subprocess, which shells out to a
+    # standalone ``MOZYO_HERDR_BINARY`` executable — the in-process fake cannot cross that
+    # boundary. So the smoke persists this fake's state to a file and a thin smoke-owned adapter
+    # (``smoke/support/fake_herdr_cli.py``) rehydrates THIS canonical fake and replays a single
+    # command. No second Herdr protocol model is authored (coordinator decision j#83808 Q3): the
+    # command vocabulary / JSON shape stay owned here; the smoke owns only the persistence + exec.
+
+    def to_state(self) -> dict:
+        """A JSON-serializable snapshot of the live inventory (for the smoke adapter)."""
+        return {
+            "read_text": self.read_text,
+            "workspace_seq": self._workspace_seq,
+            "workspaces": [
+                {
+                    "workspace_id": ws.workspace_id, "cwd": ws.cwd, "panes": list(ws.panes),
+                    "pane_seq": ws.pane_seq, "pane_tab": dict(ws.pane_tab), "tab_seq": ws.tab_seq,
+                }
+                for ws in self._workspaces.values()
+            ],
+            "agents": [
+                {
+                    "name": a.name, "pane_id": a.pane_id, "workspace_id": a.workspace_id,
+                    "provider": a.provider, "cwd": a.cwd, "status": a.status, "tab_id": a.tab_id,
+                    "revision": a.revision, "detected_agent": a.detected_agent,
+                }
+                for a in self._agents.values()
+            ],
+        }
+
+    @classmethod
+    def from_state(cls, state: dict) -> "FakeHerdr":
+        """Rehydrate a fake from :meth:`to_state` (the smoke adapter's hydrate step)."""
+        fake = cls(read_text=str(state.get("read_text", "")))
+        fake._workspace_seq = int(state.get("workspace_seq", 0))
+        for wsd in state.get("workspaces", []):
+            fake._workspaces[wsd["workspace_id"]] = _Workspace(
+                workspace_id=wsd["workspace_id"], panes=list(wsd.get("panes", [])),
+                cwd=wsd.get("cwd", ""), pane_seq=int(wsd.get("pane_seq", 0)),
+                pane_tab=dict(wsd.get("pane_tab", {})), tab_seq=int(wsd.get("tab_seq", 0)),
+            )
+        for ad in state.get("agents", []):
+            fake._agents[ad["pane_id"]] = _Agent(
+                name=ad["name"], pane_id=ad["pane_id"], workspace_id=ad["workspace_id"],
+                provider=ad.get("provider", ""), cwd=ad.get("cwd", ""),
+                status=ad.get("status", DEFAULT_START_STATUS), tab_id=ad.get("tab_id", ""),
+                revision=ad.get("revision", ""), detected_agent=ad.get("detected_agent"),
+            )
+        return fake
+
     def agent_named(self, name: str) -> Optional[dict]:
         """The single live agent carrying ``name``, or ``None`` (fail on duplicate)."""
         matches = [a for a in self._agents.values() if a.name == name]
