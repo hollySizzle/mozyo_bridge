@@ -658,8 +658,12 @@ def _prepare_session_locked(
     # the live-but-unattested pair. Read-only; never migrates the shared home. See
     # `preflight_attest_store_schema`.
     if attest_launcher and launch_plans:
+        # Redmine #14231 j#84910: probe in the SAME cwd the wrapper will get
+        # (`build_agent_start_argv` passes `--cwd repo_root`), so a launcher that only
+        # fails inside the lane's own config directory is caught here — before the first
+        # workspace / tab / agent write — instead of vanishing the pair after launch.
         observation = preflight_attest_launcher_capability(
-            attest_launcher, runner, timeout, env
+            attest_launcher, runner, timeout, env, repo_root=repo_root
         )
         preflight_attest_store_schema(
             observation,
