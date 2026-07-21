@@ -53,9 +53,21 @@ scratch inventory drains to zero.
 
 from __future__ import annotations
 
+import importlib.util
 import unittest
+from pathlib import Path
 
 from tests.support.installed_fault_harness import InstalledFaultHarness
+
+# The F2 acceptance predicate is single-sourced in the installed-smoke orchestrator (review
+# j#85253): load it so this hermetic scenario accepts/rejects the completed terminal by the SAME
+# rule the installed smoke's positive drive and negative control use — one predicate, no copies.
+_SMOKE = Path(__file__).resolve().parents[2] / "smoke" / "installed_fault_smoke.py"
+_smoke_spec = importlib.util.spec_from_file_location("installed_fault_smoke", _SMOKE)
+_smoke = importlib.util.module_from_spec(_smoke_spec)
+assert _smoke_spec.loader is not None
+_smoke_spec.loader.exec_module(_smoke)
+recover_stale_accepts = _smoke.recover_stale_accepts
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +435,10 @@ class StaleWorkerRecoveryThroughPublicCli(unittest.TestCase):
 
         outcome = h.drive_recover_stale_to_completion(ctx)
 
+        # THE single shared acceptance predicate — the same one the installed smoke's positive
+        # drive scores and its negative control negates (review j#85253).
+        self.assertTrue(recover_stale_accepts(outcome.acceptance_outcome()))
+
         # Pass 1: the exact old worker was closed once and the launch was owed (in_progress).
         self.assertTrue(outcome.first["executed"])
         self.assertTrue(outcome.first["closed_old_worker"])
@@ -446,28 +462,28 @@ class StaleWorkerRecoveryThroughPublicCli(unittest.TestCase):
         self.assertTrue(second["closed_old_worker"])
 
         # "additional close 0" as an OBSERVABLE, not a boolean: pass 2 removed no inventory row
-        # (a close deletes the pane), and it fired exactly ONE confirmed redispatch to the fresh
-        # worker (single redispatch, never a duplicate dispatch).
+        # (a close deletes the pane), and it fired exactly ONE exact-marker redispatch attempt to
+        # the fresh worker, which confirmed (single redispatch, never a duplicate dispatch).
         self.assertEqual(outcome.agents_before, outcome.agents_after)
+        self.assertEqual(outcome.redispatch_attempt_count, 1)
         self.assertEqual(outcome.redispatch_ok_count, 1)
 
-    def test_injected_uncertain_redispatch_never_reads_completed(self):
-        # The negative control the acceptance predicate must survive: if the fresh receiver's
-        # startup attestation lands OUTSIDE the redispatch's durable landing window, the exact same
-        # drive stops at ``redispatch_status=uncertain`` and NEVER reaches the completed terminal —
-        # so a smoke asserting completion fails closed on it (Redmine #14097 review j#85090 F2).
+    def test_injected_uncertain_redispatch_is_rejected_by_the_shared_predicate(self):
+        # The negative CONTROL: an attestation landing OUTSIDE the redispatch's durable window makes
+        # the confirm fence reject the send, so the drive stops at ``redispatch_status=uncertain`` —
+        # and the SAME shared acceptance predicate the positive test asserts must return False on it
+        # (Redmine #14097 review j#85253). Sharing one predicate means the post_close_resume-only
+        # regression j#85090 flagged would flip THIS control red, not pass silently.
         h = InstalledFaultHarness(self)
         ctx = h.recover_stale_git_lane("issue_14097_uncertain", issue="14097")
 
         outcome = h.drive_recover_stale_to_completion(ctx, inject_uncertain=True)
 
-        second = outcome.second
-        self.assertNotEqual(second["status"], "completed")
-        self.assertEqual(second["redispatch_status"], "uncertain")
-        # The completion predicate the positive test asserts must reject this outcome.
-        self.assertFalse(
-            second["status"] == "completed" and second["redispatch_status"] == "confirmed"
-        )
+        # The injection actually landed the uncertain fault (guard against a vacuous negation)...
+        self.assertNotEqual(outcome.second["status"], "completed")
+        self.assertEqual(outcome.second["redispatch_status"], "uncertain")
+        # ...and the ONE shared predicate rejects it.
+        self.assertFalse(recover_stale_accepts(outcome.acceptance_outcome()))
 
     def test_an_identity_unknown_with_no_transaction_refuses_zero_close(self):
         # The fail-closed fence: a genuinely unknown identity with NO durable transaction is a

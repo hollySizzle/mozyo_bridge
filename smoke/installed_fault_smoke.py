@@ -99,6 +99,45 @@ def verify_provenance(
     return problems
 
 
+def recover_stale_accepts(outcome: "dict | None") -> bool:
+    """The SINGLE F2 acceptance predicate: a completed post-close-resume terminal, one confirmed
+    redispatch, no additional close (Redmine #14097 review j#85090 / j#85253). PURE.
+
+    Shared VERBATIM by the installed positive drive, the installed negative CONTROL (which asserts
+    THIS predicate returns False on an injected-uncertain outcome), and the hermetic scenario. One
+    predicate — not two copies — is the point: weakening any conjunct (say, dropping the
+    ``confirmed`` check, the very post_close_resume-only regression j#85090 flagged) makes the
+    negative control's ``not recover_stale_accepts(uncertain)`` flip green->red instead of being
+    silently tolerated by a laxer second copy. An absent / malformed outcome is not accepted.
+
+    ``outcome`` keys (built identically by both layers):
+    ``pass1`` / ``pass2`` (the two recover-stale payloads), ``fresh_locator`` / ``old_locator``,
+    ``agents_unchanged`` (bool: the inventory row set is identical across pass 2 — the additional-
+    close-0 observable), ``redispatch_attempt_count`` (ALL exact-marker/target delivery_outcome
+    rows) and ``redispatch_ok_count`` (the ``reason=ok`` subset).
+    """
+    if not isinstance(outcome, dict):
+        return False
+    p1 = outcome.get("pass1") or {}
+    p2 = outcome.get("pass2") or {}
+    return bool(
+        p1.get("closed_old_worker") and p1.get("status") == "stopped"
+        and p1.get("recovery_status") == "in_progress"
+        and outcome.get("fresh_locator")
+        and outcome.get("fresh_locator") != outcome.get("old_locator")
+        and p2.get("status") == "completed" and p2.get("recovery_status") == "recovered"
+        and p2.get("redispatch_status") == "confirmed" and p2.get("fresh_slot_attested")
+        and p2.get("post_close_resume")
+        # DURABLE close-committed reflection (phase past close_owed), true on a completed resume;
+        # "no additional close" is the inventory observable below, not this flag (review j#85253
+        # 判定済み: closed_old_worker == true is correct, not a per-pass close count).
+        and p2.get("closed_old_worker")
+        and outcome.get("agents_unchanged") is True  # additional close 0 (a close deletes a row)
+        and outcome.get("redispatch_attempt_count") == 1  # exactly one dispatch attempt...
+        and outcome.get("redispatch_ok_count") == 1       # ...and it confirmed (reason=ok)
+    )
+
+
 def build_summary(
     *, provenance_problems: list[str], wheel_name: str, wheel_sha256: str,
     entrypoints: dict[str, int], representative: dict[str, bool],
