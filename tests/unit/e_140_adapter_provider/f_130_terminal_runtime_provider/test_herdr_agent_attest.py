@@ -10,6 +10,8 @@ is not actually replaced).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -256,10 +258,17 @@ class CmdAgentAttestTest(unittest.TestCase):
             )
 
     def test_missing_provider_argv_fails_closed(self) -> None:
-        with patch("os.execvp") as execvp:
-            with self.assertRaises(SystemExit):
+        stderr = io.StringIO()
+        with patch("os.execvp") as execvp, contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
                 cmd_herdr_agent_attest(self._args([]))
             execvp.assert_not_called()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: herdr agent-attest requires a provider command after `--` to exec "
+            "(usage: herdr agent-attest --assigned-name ... -- <provider> [args...])\n",
+        )
 
 
 def _install_real_exe(directory: str, name: str) -> str:
@@ -412,12 +421,20 @@ class CmdAgentAttestArgv0DecouplingTest(unittest.TestCase):
     def _assert_alias_fails_closed(self, provider_argv, alias) -> None:
         # A set-but-unbound alias dies typed/value-free: NEITHER exec runs (no launch),
         # and the value is dropped from the env even on the failure path.
-        execv, execvp, leftover = self._run(
-            provider_argv, {MOZYO_PROVIDER_ARGV0_ENV: alias}
-        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            execv, execvp, leftover = self._run(
+                provider_argv, {MOZYO_PROVIDER_ARGV0_ENV: alias}
+            )
         execv.assert_not_called()
         execvp.assert_not_called()
         self.assertIsNone(leftover)
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: MOZYO_PROVIDER_ARGV0 did not verify as a trusted alias bound to "
+            "the provider exec target (an absolute exec-target realpath named by an "
+            "absolute same-file alias); refusing to launch with an unverified argv[0]\n",
+        )
 
     def test_relative_alias_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
