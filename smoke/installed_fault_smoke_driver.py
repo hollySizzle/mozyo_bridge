@@ -143,49 +143,38 @@ def _drive_recover_stale(cli: Path, tmp: Path) -> bool:
 
     Not a boolean resume flag (Redmine #14097 review j#85090 F2 — ``post_close_resume`` is true for
     an authority refusal / stopped launch / uncertain redispatch too). The built ``mozyo-bridge``
-    binary, in an isolated home + fake herdr, must reach: pass 1 closes the exact worker once and
-    owns the launch (``in_progress``); pass 2 attests the fresh receiver and drives the post-close
-    resume to ``status=completed`` / ``recovery_status=recovered`` / ``redispatch_status=confirmed``
-    / ``fresh_slot_attested`` — a SINGLE confirmed queue-enter redispatch (ledger reason=ok, count 1)
-    with NO additional close (the inventory row set is unchanged across pass 2).
+    binary, in an isolated home + fake herdr, must satisfy the SINGLE shared acceptance predicate
+    :func:`installed_fault_smoke.recover_stale_accepts`: pass 1 closes the exact worker once and owns
+    the launch (``in_progress``); pass 2 attests the fresh receiver and drives the post-close resume
+    to completed / recovered / confirmed / fresh-attested, a single redispatch (exactly one exact-
+    marker queue-enter delivery attempt, and it confirmed) with NO additional close.
     """
-    outcome = _recover_stale_outcome(cli, tmp, "rs")
-    if outcome is None:
-        return False
-    p1, p2, agents_before, agents_after, ok_count, fresh, old = outcome
-    return (
-        bool(p1["closed_old_worker"]) and p1["status"] == "stopped"
-        and p1["recovery_status"] == "in_progress"
-        and bool(fresh) and fresh != old
-        and p2["status"] == "completed" and p2["recovery_status"] == "recovered"
-        and p2["redispatch_status"] == "confirmed" and bool(p2["fresh_slot_attested"])
-        and bool(p2["post_close_resume"])
-        # closed_old_worker is the DURABLE close-committed reflection (past close_owed), so a
-        # completed post-close resume still reports it true — not a per-pass "closed now" flag.
-        and bool(p2["closed_old_worker"])
-        and agents_before == agents_after  # additional close 0 (a close deletes the pane row)
-        and ok_count == 1  # single confirmed redispatch, never a duplicate dispatch
-    )
+    from installed_fault_smoke import recover_stale_accepts
+
+    return recover_stale_accepts(_recover_stale_outcome(cli, tmp, "rs"))
 
 
 def _drive_recover_stale_negative(cli: Path, tmp: Path) -> bool:
-    """F2 negative installed: an injected uncertain redispatch must NEVER read as completed.
+    """F2 negative CONTROL installed: the SAME acceptance predicate must reject an injected fault.
 
-    The acceptance predicate the positive path asserts has to fail closed on a real fault. Seed the
-    fresh receiver's attestation OUTSIDE the redispatch's durable landing window so the confirm
-    fence rejects the send: the exact same drive then stops at ``redispatch_status=uncertain`` and
-    never reaches the completed terminal (proving the smoke's green is not unconditional).
+    Seed the fresh receiver's attestation OUTSIDE the redispatch's durable landing window so the
+    confirm fence rejects the send: the exact same drive then stops at ``redispatch_status=uncertain``
+    and the ONE shared :func:`installed_fault_smoke.recover_stale_accepts` predicate must return False
+    on it (Redmine #14097 review j#85253). Because positive and negative share that predicate,
+    weakening any conjunct (e.g. the post_close_resume-only regression j#85090 flagged) flips this
+    control green->red instead of passing silently. Guarded on the injection actually landing the
+    uncertain fault, so a setup slip cannot vacuously satisfy the negation.
     """
+    from installed_fault_smoke import recover_stale_accepts
+
     outcome = _recover_stale_outcome(cli, tmp, "rsneg", inject_uncertain=True)
     if outcome is None:
         return False
-    _p1, p2, _ab, _aa, _ok, _fresh, _old = outcome
-    # The negative control holds iff the outcome is uncertain AND the completion predicate rejects it.
-    return (
-        p2.get("status") != "completed"
-        and p2.get("redispatch_status") == "uncertain"
-        and not (p2.get("status") == "completed" and p2.get("redispatch_status") == "confirmed")
+    injected_uncertain = (
+        outcome["pass2"].get("redispatch_status") == "uncertain"
+        and outcome["pass2"].get("status") != "completed"
     )
+    return injected_uncertain and not recover_stale_accepts(outcome)
 
 
 def _recover_stale_outcome(
@@ -310,12 +299,44 @@ def _recover_stale_outcome(
         records = HerdrDeliveryLedger(home=home).records_for_issue("14097")
     except Exception:  # noqa: BLE001 - an unreadable ledger reads as zero confirmed sends
         records = []
-    ok_count = sum(
-        1 for r in records
-        if (r.entry_kind == "delivery_outcome" and r.status == "sent" and r.reason == "ok"
-            and r.rail == "queue_enter_rail" and r.target == fresh)
+    # Single-redispatch is measured on ALL exact-marker/target delivery attempts, not only the
+    # ``reason=ok`` subset (review j#85253): "one confirmed send + one extra non-ok attempt" must
+    # not read as a single redispatch. ``attempt_count`` counts every queue-enter delivery_outcome
+    # to the fresh worker for this recovery's redispatch marker; ``ok_count`` its confirmed subset.
+    redispatch_marker = _redispatch_marker(issue="14097", journal="79485")
+    attempts = [
+        r for r in records
+        if (r.entry_kind == "delivery_outcome" and r.rail == "queue_enter_rail"
+            and r.target == fresh and _norm(r.notification_marker) == redispatch_marker)
+    ]
+    ok_count = sum(1 for r in attempts if r.status == "sent" and r.reason == "ok")
+    return {
+        "pass1": p1, "pass2": p2,
+        "fresh_locator": fresh, "old_locator": locator,
+        "agents_unchanged": agents_before == agents_after,
+        "redispatch_attempt_count": len(attempts),
+        "redispatch_ok_count": ok_count,
+    }
+
+
+def _redispatch_marker(*, issue: str, journal: str) -> str:
+    """The exact ``[mozyo:handoff:...]`` marker the recovery redispatch writes (worker provider).
+
+    Rebuilt through the SAME canonical ``build_marker`` the live use case's ``_redispatch_marker``
+    uses (Redmine #13806 R3-F1) so the ledger filter matches byte-for-byte and never drifts from
+    what ``dispatch_to_worker`` records (Redmine #14097 review j#85253 single-redispatch). The
+    redispatch gate kind is the fixed ``implementation_request`` and the worker provider ``claude``.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+        RedmineAnchor,
+        build_marker,
     )
-    return (p1, p2, agents_before, agents_after, ok_count, fresh, locator)
+
+    return build_marker(RedmineAnchor(issue=issue, journal=journal), "implementation_request", "claude")
+
+
+def _norm(value: "str | None") -> str:
+    return (value or "").strip()
 
 
 def _seed_owed_rollback(fence, fake, ws_id: str, lane: str, nonce: str):

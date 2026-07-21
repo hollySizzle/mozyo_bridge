@@ -115,7 +115,22 @@ class RecoverStaleCompletion(NamedTuple):
     old_locator: str  # the closed stale worker's vanished locator
     agents_before: frozenset  # inventory just before pass 2 (additional-close-0 observable)
     agents_after: frozenset  # inventory after pass 2 — identical iff no additional close
-    redispatch_ok_count: int  # confirmed queue-enter deliveries to the fresh worker (== 1)
+    redispatch_attempt_count: int  # ALL exact-marker/target queue-enter delivery attempts (== 1)
+    redispatch_ok_count: int  # the reason=ok (confirmed) subset of those attempts (== 1)
+
+    def acceptance_outcome(self) -> dict:
+        """The shape :func:`installed_fault_smoke.recover_stale_accepts` scores (shared predicate).
+
+        Both layers feed the SAME dict to the SAME predicate (Redmine #14097 review j#85253), so the
+        hermetic scenario and the installed smoke accept/reject F2 by one rule, not two copies.
+        """
+        return {
+            "pass1": self.first, "pass2": self.second,
+            "fresh_locator": self.fresh_locator, "old_locator": self.old_locator,
+            "agents_unchanged": self.agents_before == self.agents_after,
+            "redispatch_attempt_count": self.redispatch_attempt_count,
+            "redispatch_ok_count": self.redispatch_ok_count,
+        }
 
 
 class CliResult(NamedTuple):
@@ -895,11 +910,12 @@ class InstalledFaultHarness:
         agents_before = self._agent_identity_set()
         second = self.recover_stale_cli(ctx, execute=True).json()
         agents_after = self._agent_identity_set()
+        attempts, ok = self._redispatch_counts(ctx, fresh_locator)
         return RecoverStaleCompletion(
             first=first, second=second,
             fresh_locator=fresh_locator, old_locator=ctx.worker_locator,
             agents_before=agents_before, agents_after=agents_after,
-            redispatch_ok_count=self._redispatch_ok_count(ctx, fresh_locator),
+            redispatch_attempt_count=attempts, redispatch_ok_count=ok,
         )
 
     def _fresh_worker_locator(self, ctx: _RecoverStaleContext) -> str:
@@ -929,19 +945,32 @@ class InstalledFaultHarness:
         """The current (name, locator) inventory — an additional-close-0 observable."""
         return frozenset((a["name"], a["pane_id"]) for a in self.fake.agents)
 
-    def _redispatch_ok_count(self, ctx: _RecoverStaleContext, fresh_locator: str) -> int:
-        """Confirmed (reason=ok) queue-enter deliveries to the fresh worker — single-redispatch."""
-        from mozyo_bridge.core.state.herdr_delivery_ledger import HerdrDeliveryLedger
+    def _redispatch_counts(self, ctx: _RecoverStaleContext, fresh_locator: str) -> "tuple[int, int]":
+        """``(attempt_count, ok_count)`` of the redispatch on its EXACT marker/target.
 
+        Single-redispatch is measured on ALL exact-marker/target queue-enter delivery attempts, not
+        just the ``reason=ok`` subset (Redmine #14097 review j#85253): "one confirmed send + one
+        extra non-ok attempt" must not read as a single redispatch. The marker is rebuilt through the
+        canonical ``build_marker`` (byte-identical to what ``dispatch_to_worker`` records)."""
+        from mozyo_bridge.core.state.herdr_delivery_ledger import HerdrDeliveryLedger
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            RedmineAnchor, build_marker,
+        )
+
+        marker = build_marker(
+            RedmineAnchor(issue=ctx.issue, journal="79485"), "implementation_request", "claude"
+        )
         try:
             records = HerdrDeliveryLedger(home=self.home).records_for_issue(ctx.issue)
-        except Exception:  # noqa: BLE001 - an unreadable ledger reads as zero confirmed sends
-            return 0
-        return sum(
-            1 for r in records
-            if (r.entry_kind == "delivery_outcome" and r.status == "sent" and r.reason == "ok"
-                and r.rail == "queue_enter_rail" and r.target == fresh_locator)
-        )
+        except Exception:  # noqa: BLE001 - an unreadable ledger reads as zero attempts
+            return 0, 0
+        attempts = [
+            r for r in records
+            if (r.entry_kind == "delivery_outcome" and r.rail == "queue_enter_rail"
+                and r.target == fresh_locator and (r.notification_marker or "").strip() == marker)
+        ]
+        ok = sum(1 for r in attempts if r.status == "sent" and r.reason == "ok")
+        return len(attempts), ok
 
     # -- inventory snapshots (cleanup / residue assertions) -------------------
 
