@@ -20,6 +20,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.support.private_path_fixtures import linux_home_path
+
 ROOT = Path(__file__).resolve().parents[2]
 _SCRIPT = ROOT / "scripts" / "disposable_ubuntu_smoke.py"
 
@@ -30,15 +32,19 @@ _spec.loader.exec_module(mod)
 
 _DIGEST = "ubuntu@sha256:" + ("0" * 64)
 
+# The in-container harness home is genuinely home-shaped, so it is composed at runtime:
+# `release check tree` blocks a `/home/<name>/` literal in a tracked file, fixtures included.
+_HARNESS_HOME = linux_home_path("smoke")
+
 
 def _facts(**overrides):
     base = {
         "harness_user": "smoke",
         "harness_uid": 1001,
-        "harness_home": "/home/smoke",
+        "harness_home": _HARNESS_HOME,
         "observed_version_mozyo_bridge": "1.2.3",
         "observed_version_mozyo": "1.2.3",
-        "package_path": "/home/smoke/venv/lib/python3.12/site-packages/mozyo_bridge",
+        "package_path": _HARNESS_HOME + "/venv/lib/python3.12/site-packages/mozyo_bridge",
         "preset": "redmine-governed",
         "source_mount_present": False,
         "extra_mounts": [],
