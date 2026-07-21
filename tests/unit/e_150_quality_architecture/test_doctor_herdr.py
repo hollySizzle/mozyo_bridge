@@ -17,7 +17,13 @@ from mozyo_bridge.application.doctor_herdr import (
     HerdrDoctorReads,
     HerdrSectionUseCase,
     LiveHerdrDoctorReads,
+    build_attestation_joins,
     evaluate_herdr_section,
+)
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    IdentityAttestationRecord,
+    VERDICT_MISSING,
+    VERDICT_PRESENT,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_observability import (  # noqa: E501
     HerdrInventoryView,
@@ -112,6 +118,83 @@ class EvaluateHerdrSectionTest(unittest.TestCase):
         section = evaluate_herdr_section(_ok_view(agents=()))
         self.assertEqual("ok", section["status"])
         self.assertTrue(section["notes"])
+
+
+class HerdrSectionAttestationTest(unittest.TestCase):
+    """Startup self-attestation join (Redmine #13637): a managed workspace agent with
+    an absent / stale / missing / conflicting self-attestation drags doctor non-green,
+    worded honestly (self-attestation, never a live-env read) and value-free."""
+
+    def _view_with_agent(self, locator="%5"):
+        ours = encode_assigned_name("ws-a", "claude", "")
+        agents = project_observed_agents(
+            [{"name": ours, "agent_status": "working", "pane_id": locator}]
+        )
+        return ours, _ok_view(agents=agents)
+
+    def _rec(self, name, *, locator="%5", verdict=VERDICT_PRESENT):
+        return IdentityAttestationRecord(
+            assigned_name=name,
+            workspace_id="ws-a",
+            role="claude",
+            lane_id="default",
+            locator=locator,
+            verdict=verdict,
+        )
+
+    def test_absent_record_is_warning_and_notes_self_attestation(self) -> None:
+        ours, view = self._view_with_agent()
+        joins = build_attestation_joins(view, lambda n: None)  # legacy / no record
+        section = evaluate_herdr_section(view, attestations=joins)
+        self.assertEqual("warning", section["status"])
+        self.assertTrue(
+            any("self-attestation" in note for note in section["notes"])
+        )
+        self.assertTrue(section["next_action"])
+
+    def test_present_generation_matched_is_ok(self) -> None:
+        ours, view = self._view_with_agent(locator="%5")
+        joins = build_attestation_joins(
+            view, lambda n: self._rec(n, locator="%5") if n == ours else None
+        )
+        section = evaluate_herdr_section(view, attestations=joins)
+        self.assertEqual("ok", section["status"])
+
+    def test_stale_locator_is_warning(self) -> None:
+        ours, view = self._view_with_agent(locator="%5")
+        joins = build_attestation_joins(
+            view, lambda n: self._rec(n, locator="%OLD") if n == ours else None
+        )
+        section = evaluate_herdr_section(view, attestations=joins)
+        self.assertEqual("warning", section["status"])
+        self.assertTrue(any("stale" in note for note in section["notes"]))
+
+    def test_missing_verdict_is_warning_without_leaking_values(self) -> None:
+        ours, view = self._view_with_agent(locator="%5")
+        joins = build_attestation_joins(
+            view,
+            lambda n: self._rec(n, locator="%5", verdict=VERDICT_MISSING)
+            if n == ours
+            else None,
+        )
+        section = evaluate_herdr_section(view, attestations=joins)
+        self.assertEqual("warning", section["status"])
+        # Value-free: notes carry states / identity, never an env value.
+        joined_notes = " ".join(section["notes"])
+        self.assertIn("missing", joined_notes)
+
+    def test_use_case_reads_store_and_goes_warning_on_absent(self) -> None:
+        ours, view = self._view_with_agent()
+        section = HerdrSectionUseCase(
+            FakeHerdrDoctorReads(view), attestation_reader=lambda n: None
+        ).execute()
+        self.assertEqual("warning", section["status"])
+
+    def test_no_attestation_argument_is_byte_invariant_ok(self) -> None:
+        # A caller that does not join (or the tmux / server-down paths) stays ok.
+        _, view = self._view_with_agent()
+        section = evaluate_herdr_section(view)  # no attestations kwarg
+        self.assertEqual("ok", section["status"])
 
 
 class HerdrSectionUseCaseTest(unittest.TestCase):

@@ -21,7 +21,10 @@ Fail-closed: an un-attested sender identity, an unavailable herdr binary / inven
 or a receiver that does not resolve to a single live agent raises
 :class:`HerdrSendEntryError`; the caller emits a structured ``blocked`` /
 ``target_unavailable`` outcome and ``die``s — never a silent tmux fallback, never a send
-to a guessed target.
+to a guessed target. One case projects differently (Redmine #13884): an explicit
+``--target`` that names a different agent than the resolved route raises
+:class:`HerdrExplicitTargetMismatchError` and projects onto ``blocked`` / ``invalid_args``
+(an inconsistent argument, not an unavailable window) — still a zero-send.
 """
 
 from __future__ import annotations
@@ -54,8 +57,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+    AGENT_PROVIDERS,
     MOZYO_WORKSPACE_ID_ENV,
     REASON_MISSING_SENDER_ENV,
+    RECEIVER_COORDINATOR,
     resolve_sender_identity,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
@@ -76,12 +81,50 @@ class HerdrSendEntryError(ValueError):
         self.reason = reason
 
 
-def _terminal_transport_config(args: argparse.Namespace) -> Optional[TerminalTransportConfig]:
-    """The repo-local ``terminal_transport`` selection, or ``None`` if unreadable."""
+#: The existing delivery-outcome reason a herdr explicit-target mismatch projects onto
+#: (Redmine #13884 review j#83307 F1/F2). NOT a new fail-closed token: the herdr resolution
+#: vocabulary stays the #13302 ledger set (``vibes/docs/specs/herdr-native-identity.md``
+#: §3.1). ``invalid_args`` (an inconsistent ``--target`` argument, not an unavailable window)
+#: is the pre-existing ``DeliveryOutcome`` reason whose ``next_action`` ("supply the required
+#: arguments") is consistent with the cause; the full ``--target-lane`` retry guidance rides
+#: the die message. ``orchestrate_handoff`` reads this off ``exc.reason`` and surfaces it
+#: instead of the generic ``target_unavailable`` (which would tell the operator to start a
+#: window — contradicting the cause).
+EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON: str = "invalid_args"
+
+
+class HerdrExplicitTargetMismatchError(HerdrSendEntryError):
+    """An explicit ``--target`` named a different agent than the resolved route (#13884).
+
+    A discriminable :class:`HerdrSendEntryError` subclass carrying the pre-existing
+    :data:`EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON` (``invalid_args``) as its ``reason`` — no
+    new fail-closed token is minted (herdr-native-identity.md §3.1). The locator is never
+    promoted to a routing authority (#13305); this only refuses when the named target and
+    the resolved target disagree, and it stays a zero-send (``target=None``, no injection).
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message, reason=EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON)
+
+
+def _terminal_transport_config_for_root(
+    repo_root: Path,
+) -> Optional[TerminalTransportConfig]:
+    """The repo-local ``terminal_transport`` selection for a resolved repo root.
+
+    The Namespace-free core (Redmine #13729): the handoff facade resolves the repo
+    root once at its boundary and passes the ``Path`` in, so this and the callers
+    below never touch an ``argparse.Namespace``.
+    """
     try:
-        return load_repo_local_config(repo_root_from_args(args)).terminal_transport
+        return load_repo_local_config(repo_root).terminal_transport
     except RepoLocalConfigError:
         return None
+
+
+def _terminal_transport_config(args: argparse.Namespace) -> Optional[TerminalTransportConfig]:
+    """The repo-local ``terminal_transport`` selection, or ``None`` if unreadable."""
+    return _terminal_transport_config_for_root(repo_root_from_args(args))
 
 
 def herdr_backend_selected(args: argparse.Namespace) -> bool:
@@ -109,8 +152,13 @@ def explicit_tmux_pane_target(args: argparse.Namespace) -> bool:
     return is_explicit_pane_target(getattr(args, "target", None))
 
 
-def herdr_effective_backend_selected(args: argparse.Namespace) -> bool:
+def herdr_effective_backend_selected(*, repo_root: Path, target: str | None) -> bool:
     """True iff this send should use the herdr backend **for its target kind** (#13320).
+
+    Redmine #13729: the handoff facade passes the resolved ``repo_root`` (its
+    boundary Namespace->Path conversion) and the raw ``--target`` scalar, so this
+    predicate is Namespace-free. Behaviour is byte-identical to the former
+    ``herdr_backend_selected(args) and not explicit_tmux_pane_target(args)``.
 
     The single effective-backend predicate shared by both send-path branch points —
     the ``@bind_runtime_transport`` decorator (which installs the herdr binding +
@@ -130,11 +178,16 @@ def herdr_effective_backend_selected(args: argparse.Namespace) -> bool:
     ``%pane`` / absent tmux / receiver-binding mismatch still fails closed on the tmux
     path exactly as it does under ``backend: tmux``.
     """
-    return herdr_backend_selected(args) and not explicit_tmux_pane_target(args)
+    config = _terminal_transport_config_for_root(repo_root)
+    backend_selected = config is not None and config.backend == BACKEND_HERDR
+    return backend_selected and not is_explicit_pane_target(target)
 
 
-def herdr_auto_target_repo(args: argparse.Namespace) -> str:
+def herdr_auto_target_repo(repo_root: Path) -> str:
     """Resolve ``--target-repo auto`` for a herdr send to the sender's own repo root.
+
+    Redmine #13729: takes the facade-resolved ``repo_root`` (Namespace-free);
+    byte-identical to the former ``str(repo_root_from_args(args))``.
 
     Redmine #13331 (j#73312 scope addition #2): a herdr send has no tmux ``%pane`` /
     ``pane_current_path`` to infer a target repo from, so the ``%pane``-only ``auto`` gate is
@@ -146,7 +199,7 @@ def herdr_auto_target_repo(args: argparse.Namespace) -> str:
     ``target_repo_mismatch`` gate like a hand-passed root. Kept out of the oversized
     ``commands.py`` (module-health gate); the command module calls this from its herdr branch.
     """
-    return str(repo_root_from_args(args))
+    return str(repo_root)
 
 
 def _legacy_lane_token(repo_root: Path) -> str:
@@ -171,7 +224,7 @@ def _legacy_lane_token(repo_root: Path) -> str:
         return ""
 
 
-def _explicit_target_workspace_id(args: argparse.Namespace) -> str:
+def _explicit_target_workspace_id(target_repo: str | None) -> str:
     """The herdr workspace *segment* of an explicit ``--target-repo <path>``, or ``""``.
 
     Redmine #13377 (shared project workspace): a lane worktree's segment resolves to the
@@ -185,7 +238,7 @@ def _explicit_target_workspace_id(args: argparse.Namespace) -> str:
     ``auto`` sentinel, an unset value, or an unresolvable path (so the caller falls back
     to same-workspace resolution rather than guessing a workspace).
     """
-    raw = getattr(args, "target_repo", None)
+    raw = target_repo
     if not raw or raw == AUTO_TARGET_REPO:
         return ""
     try:
@@ -194,8 +247,20 @@ def _explicit_target_workspace_id(args: argparse.Namespace) -> str:
         return ""
 
 
-def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dict:
+def resolve_herdr_send_target(
+    *,
+    repo_root: Path,
+    target: str | None,
+    target_repo: str | None,
+    target_lane: str | None,
+    receiver: str,
+) -> dict:
     """Resolve the herdr-native send target and synthesize its pane record (fail-closed).
+
+    Redmine #13729: the handoff facade passes the resolved ``repo_root`` and the
+    raw ``--target`` / ``--target-repo`` / ``--target-lane`` scalars, so this
+    resolver is Namespace-free; behaviour is byte-identical to the former
+    ``args``-reading form.
 
     Resolves the sender identity (``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` /
     ``MOZYO_LANE_ID`` cross-checked against the repo anchor), lists the live herdr
@@ -213,13 +278,12 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
     ``binds_receiver`` still resolves the strong role. Raises
     :class:`HerdrSendEntryError` on any fail-closed condition.
     """
-    config = _terminal_transport_config(args)
+    config = _terminal_transport_config_for_root(repo_root)
     if config is None or config.backend != BACKEND_HERDR:
         raise HerdrSendEntryError(
             "herdr send target requested but the herdr backend is not selected",
             reason="backend_not_selected",
         )
-    repo_root = repo_root_from_args(args)
     # Redmine #13377 (design j#73613): the sender's own workspace segment. A lane agent
     # (gateway / worker) runs in a linked git worktree, whose segment now resolves to the
     # MAIN checkout's workspace identity (shared project workspace) — matching the
@@ -290,12 +354,33 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
     # route authority; the live locator stays transient cache). A `--target-repo` that
     # resolves to the sender's own workspace (or `auto` / unset) falls through to the
     # same-workspace path unchanged.
-    target_workspace_id = _explicit_target_workspace_id(args)
+    target_workspace_id = _explicit_target_workspace_id(target_repo)
     cross_workspace = bool(target_workspace_id) and target_workspace_id != sender.workspace_id
-    explicit_lane = getattr(args, "target_lane", None)
+    explicit_lane = target_lane
+    # Redmine #13476 (Design Consultation Answer j#74599, Option A): the sublane->parent
+    # coordinator callback keeps the backend-neutral documented form
+    # `--to codex --target coordinator`. `--target coordinator` is a semantic pseudo-target
+    # (the same `coordinator` route identity the tmux pane resolver consumes as
+    # `COORDINATOR_LABEL`), NOT a live herdr locator, so the herdr rail translates it here
+    # into the coordinator route authority instead of routing by the `--to` receiver.
+    # Resolving with the `coordinator` receiver makes `resolve_target_role` bind the
+    # configured coordinator provider and `derive_target_lane` derive the workspace DEFAULT
+    # lane (tier 3 — the parent coordinator), NOT the sublane sender's own lane (the tier-2
+    # same-lane a bare `--to codex` derives, Review j#74511 Finding 1). An explicit
+    # `--target-lane` still wins (tier-1 explicit lane in `derive_target_lane`), so an
+    # intentional lane override is never ignored. The outward `receiver` (marker `to=codex`
+    # / the `binds_receiver` process gate) is unchanged — the coordinator IS a codex, so the
+    # role the route resolves (coordinator provider) matches the `--to codex` binding, and
+    # `--to` public choices stay `claude|codex` (this is an internal, semantic translation).
+    norm_target = _norm(target)
+    route_receiver = (
+        RECEIVER_COORDINATOR
+        if norm_target == RECEIVER_COORDINATOR
+        else receiver
+    )
     if cross_workspace:
         resolution = resolve_herdr_cross_workspace_target(
-            receiver,
+            route_receiver,
             target_workspace_id,
             rows,
             coordinator_provider=coordinator_provider,
@@ -311,7 +396,7 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
         # (Redmine #13377) is the explicit-lane field a coordinator→lane-gateway
         # dispatch passes under the shared project workspace model.
         resolution = resolve_herdr_route_target(
-            receiver,
+            route_receiver,
             sender,
             rows,
             coordinator_provider=coordinator_provider,
@@ -326,6 +411,40 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
         )
     identity = resolution.identity
     assert identity is not None  # success guarantees an identity
+    # Redmine #13884 (repro anchors #13882 j#79958 / #13883 j#79959): an explicit concrete
+    # `--target` (a live herdr locator / assigned name — NOT the `coordinator` pseudo-target,
+    # NOT a bare provider token) asserts WHICH agent the send must reach. The #13305 route
+    # authority resolves the target from `--to` + `--target-lane` + `--target-repo` and
+    # treats the locator as transient cache, never the routing key — correct by design (a
+    # locator is not stable identity), and the exact reason a lane-pinned worker dispatch
+    # (#13485/#13488) passes `--target <worker-locator>` alongside `--target-lane <lane>`
+    # yet still resolves the stable slot. The defect was the SILENT drop: a `--target` that
+    # named a DIFFERENT agent than the derived route (a coordinator's cross-lane
+    # `--target <lane-gateway-locator>` with no `--target-lane`, which derived the sender's
+    # OWN default lane and resolved the coordinator's own pane) was dropped, the send landed
+    # on that wrong agent, and it reported a false-positive `sent` (a sender echo). Cross-check
+    # the explicit target against the resolved identity: a `--target` that agrees with the
+    # derived route (same live locator or same durable assigned name) passes through unchanged
+    # (resolve-to-exact); a MISMATCH raises :class:`HerdrExplicitTargetMismatchError`, which the
+    # `orchestrate_handoff` herdr branch projects onto a zero-send `blocked` / `invalid_args`
+    # outcome (`target=None`, no injection — an inconsistent `--target` argument, not an
+    # unavailable window; see EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON), never a coordinator /
+    # sender-lane fallback. The locator stays evidence, never the authority — the pin
+    # (`--target-lane`), not the locator, is what resolves the intended target; this guard only
+    # refuses to send when the named target and the resolved target disagree.
+    if norm_target and norm_target != RECEIVER_COORDINATOR and norm_target not in AGENT_PROVIDERS:
+        if norm_target not in (_norm(resolution.locator), _norm(resolution.assigned_name)):
+            raise HerdrExplicitTargetMismatchError(
+                f"herdr send named an explicit --target {target!r} but the route authority "
+                f"resolved a different agent (live locator {resolution.locator!r}, name "
+                f"{resolution.assigned_name!r}) from --to={receiver!r} + --target-lane="
+                f"{(_norm(explicit_lane) or None)!r} + --target-repo (lane basis "
+                f"{resolution.lane_basis!r}). The named target and the derived route "
+                "disagree; refusing to send to the derived target, which would echo the "
+                "send onto the sender's own lane and report a false-positive `sent` "
+                "(Redmine #13884). Pin the intended lane with --target-lane <lane> (or use "
+                "--target coordinator) so the route authority resolves the target you named."
+            )
     # The synthesized target record's `cwd` is the TARGET agent's repo root (the tmux path
     # reads the target pane's own cwd). Three shapes (#13331 / #13377 j#73640 finding 1):
     #
@@ -340,7 +459,7 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
     #   The explicit pair rides the same like-for-like precedent as cross-workspace;
     # - every other same-workspace send (no explicit lane) keeps `cwd` = the sender's
     #   repo root, so the repo gate's conservatism for implicit sends is unchanged.
-    raw_target_repo = getattr(args, "target_repo", None)
+    raw_target_repo = target_repo
     explicit_target_repo = bool(raw_target_repo) and raw_target_repo != AUTO_TARGET_REPO
     if cross_workspace or (explicit_target_repo and _norm(explicit_lane)):
         target_cwd = str(Path(raw_target_repo).expanduser())
@@ -377,6 +496,8 @@ def resolve_herdr_send_target(args: argparse.Namespace, *, receiver: str) -> dic
 
 __all__ = (
     "HerdrSendEntryError",
+    "HerdrExplicitTargetMismatchError",
+    "EXPLICIT_TARGET_MISMATCH_OUTCOME_REASON",
     "explicit_tmux_pane_target",
     "herdr_backend_selected",
     "herdr_effective_backend_selected",

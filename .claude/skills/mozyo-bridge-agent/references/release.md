@@ -4,6 +4,20 @@
 
 本 reference は **mozyo-bridge package 自体** の release runbook である — `hollySizzle/mozyo_bridge` の versioning、TestPyPI / PyPI publishing、distribution check を扱う。採用 project がこの package を publish することはなく、自身の release にこの runbook を適用しない。project 自身の release process を使い、portable な姿勢のみを保つ (release の risk に見合った検証を実行し、local token upload より OIDC Trusted Publishing を優先する)。runbook は maintainer session と dogfooding session が携行できるよう配布本文に残す。
 
+## Versioning Policy
+
+mozyo-bridge package version は semantic versioning に従う。segment の意味は次で固定する。
+
+- **patch** (`x.y.Z`): 後方互換な fix。契約 (CLI surface / API / preset) を変えない bug fix と内部修正。
+- **minor** (`x.Y.0`): feature 追加、または backend capability の拡張。後方互換を保つ。
+- **major** (`X.0.0`): breaking contract。既存の CLI / API / preset 契約を後方非互換に変更する。
+
+次の feature release から **`0.10` 系** に入る (feature 追加のため minor bump)。
+
+- **Redmine Version (`#308` 等) は roadmap bucket** であり、package version でも release authority でもない。roadmap の grouping と、実際に出荷する package version / tag は別物として扱う。issue を Redmine Version に割り当てても、それが特定の package version を確約するわけではない。
+- herdr adapter のような feature は minor-release 候補だが、実際の package version は **下記の release gate でのみ決定** する。roadmap や本 policy 文書が version 番号を先取りして固定することはない。
+- version の **決定・bump・tag・TestPyPI / PyPI publication・GitHub Release は、本 policy 成文化では行わない**。それらは下記「Release フロー」「Distribution gate」の release gate でのみ行う。
+
 ## 標準検証
 
 変更に見合った最小の check set を使う。
@@ -36,15 +50,40 @@ MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.p
 7. 内部 beta distribution は TestPyPI install の検証後に完了として扱う。
 8. production PyPI release は別途、明示的に要求された場合にのみ決定する。
 
+## Release-dogfood の集約 (専用 release issue)
+
+TestPyPI / installed dogfood を各 feature lane の drain へ直列結合すると、実装 → 反復 review → installed dogfood → ticket close が 1 本の lane に連なり、coordinator の常駐 lane 回収が遅れる (Redmine #13967 owner decision)。標準は、**TestPyPI / installed dogfood を専用の release issue へ集約する** ことである。feature lane は same-lane Review Gate approved + staging integration + required CI green を満たしたら early hibernate し (skill `references/workflow.md` `## Sublane hibernate (プロセス解放) と early hibernate`)、**dogfood の実行と evidence を専用 release issue へ durable に委譲** する。委譲するのは dogfood の execution / evidence であって close authority ではない: source issue の close authority と owner close approval は **coordinator の通常経路** (US-level audit → owner close approval → Close Gate) に残り、release issue へは移らない。
+
+- **専用 release issue は durable link を持つ。** 委譲元の source issue、dogfood 対象の exact SHA、acceptance criteria、resume / close 条件を release issue の durable record にリンクする。委譲は「あとで pane で覚えておく」ではなく durable record 上の park / delegation record である。
+- **hibernate を close / dogfood 成功 / owner approval へ読み替えない。** early hibernate は process を畳むだけで、source issue は依然 open である。dogfood が green になっても、それは release issue 側の gate であって source issue の close ではない。source issue の完了は通常経路 (US-level audit → owner close approval → Close Gate) を通る。
+- **release issue は publish → QA を運用単位とする。** 集約された dogfood は、非循環 exact-candidate gate (`## TestPyPI exact-candidate 手動配布`) で publish し、`#13528「TestPyPI publish」→ #13527「exact install QA」` 型の順序で QA する。複数の source issue の dogfood を 1 つの release candidate へまとめてよい (lane ごとに TestPyPI publish を分割しない)。
+- **drain queue 上の可視化。** 委譲済み dogfood は coordinator の drain queue projection の `release_dogfood` bucket に現れ (`references/workflow.md` `### Drain queue projection と process retention`)、feature-lane coordinator の process retention を `hold` にしない (release issue owner の cadence で処理される)。
+- portable な部分は、*dogfood の execution/evidence を feature lane へ直列化せず専用 release issue へ集約し、source issue / exact SHA / acceptance / resume・close 条件を durable にリンクし、source issue の close authority と owner close approval は coordinator の通常経路に残し、hibernate を close / dogfood 成功 / owner approval へ読み替えないこと* である。具体的な release issue の番号・運用 cadence は operator の runtime policy であり配布本文に焼かない。
+
 ## TestPyPI dev 自動配布 (main CI)
 
 `.github/workflows/testpypi.yml` は、`main` で `Test` workflow が成功した後に、一意な TestPyPI dev artifact を自動で publish する (Redmine #12756)。これにより、source-runtime や `PYTHONPATH=src` に依存する代わりに、実 smoke 作業 (例: #12709) 向けに、通常 PATH で install 可能な artifact を `main` に整合させ続ける。
 
 - Trigger: `Test` に対する `workflow_run` (`completed`, `branches: [main]`)。job は `workflow_run.conclusion == 'success'` のときにのみ publish する。
-- Version: job は `scripts/compute_testpypi_dev_version.py` を実行し、commit 済みの `pyproject.toml` version に PEP 440 の `.dev<N>` segment を付加する。`N` は UTC timestamp と、トリガーとなった `Test` run の globally-unique な id を連結したものであり (例: `0.9.2.dev20260628090000123456789`)、同一秒に完了した 2 つの `Test` run でも異なる version を生成し、TestPyPI 上で決して衝突しない。この書き換えは CI checkout 内の一時的なもので決して commit されないため、commit 済みの release version には触れない。
-- Auth: GitHub Actions Trusted Publishing / OIDC (`environment: testpypi`, `id-token: write`)。自動経路は manual dispatch と同じ `testpypi.yml` workflow file に置かれ、既存の TestPyPI pending publisher (workflow `testpypi.yml`) がそのまま authorize し続ける。local の PyPI token は使わない。
-- 手動の `workflow_dispatch` は不変である: exact-version の release-candidate 検証のために、commit 済みの (static な) release version を build する。
-- Evidence: dev-publish job は `version` と `commit` SHA (加えて source CI run の URL) を workflow run の job summary に書き込む。対応関係はそこで読む。
+- Version: job は `scripts/compute_testpypi_dev_version.py --write` を実行し、commit 済みの release version に PEP 440 の `.dev<N>` segment を付加する。書き換え対象は canonical release-version mirror set 全体 (`pyproject.toml` の `[project].version` と `src/mozyo_bridge/__init__.py` の `__version__`) であり、両 file を同一の exact dev version へ揃える。これにより wheel METADATA と runtime `__version__` (ひいては `mozyo-bridge --version` / `mozyo --version`) が一致する (Redmine #13586。以前は `pyproject.toml` だけ書き換えたため両者が食い違っていた)。mirror set は hardcode せず `vibes/docs/logics/release-helper-contract.md` から読み、`mozyo-bridge release bump` と同じ stdlib-only primitive (release version-governance Feature package の `version_mirror` module: `src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/version_mirror.py`) を再利用する。shared kernel は凍結 (Redmine #12640) のため `shared/` には置かない。`N` は UTC timestamp と、トリガーとなった `Test` run の globally-unique な id を連結したものであり (例: `0.9.2.dev20260628090000123456789`)、同一秒に完了した 2 つの `Test` run でも異なる version を生成し、TestPyPI 上で決して衝突しない。書き換えは pre-write validation 後にのみ全 file を更新する two-phase であり (base が mirror 間で不一致、または literal 欠落なら両 file 不変で fail)、CI checkout 内の一時的なもので決して commit されないため、commit 済みの release version には触れない。
+- Auth: GitHub Actions Trusted Publishing / OIDC。`testpypi.yml` は build job と publish job に分離され (Redmine #13601)、`id-token: write` + `environment: testpypi` を持つのは publish job だけである。publish job は build job が上げた artifact を download して upload するだけで、checkout / build / verify は trusted な build job 側 (OIDC credential なし) に閉じる。既存の TestPyPI pending publisher (workflow `testpypi.yml`) がそのまま authorize し続ける。local の PyPI token は使わない。
+- Evidence: dev-publish (自動) path は `version` と `commit` SHA (加えて source CI run の URL) を workflow run の job summary に書き込む。対応関係はそこで読む。exact-candidate (手動) path も `version` / `source_sha` / `source_ref` を job summary に書く。
+
+## TestPyPI exact-candidate 手動配布 (internal beta, Redmine #13601)
+
+内部 beta の手動配布は `origin/main` promotion や Redmine Version close を先に要求しない。`Version close → origin/main → TestPyPI → #13528/#13527 → Version close` の循環を壊すため、exact reviewed integration head を **main 固定の workflow 定義** から直接 publish する非循環 gate を使う。
+
+- workflow の定義 / event ref は `main` 固定である。任意の staging ref を workflow authority として実行しない (それを許すと staging ref の workflow 定義が OIDC を要求できてしまう)。
+- artifact authority は exact `source_sha`、release approval authority は Redmine gate + 外部 `testpypi` environment protection (owner required reviewer + main-only deployment branch policy) であり、3 者を分離する。
+- 手動 `workflow_dispatch` は required inputs を取る: exact 40-hex `source_sha`、`expected_version`、approved origin ref の `source_ref` (action-time に exact `source_sha` へ解決すること。ancestor-only / local-only SHA は不可)、correlation 用の `dispatch_nonce`。
+- `source_ref` は **origin 上の ref literal** で綴る (`refs/heads/<branch>` が canonical、短縮 `<branch>` も可)。git が local で表示する remote-tracking name (`origin/<branch>` / `refs/remotes/origin/<branch>`) は **曖昧なので渡さない**: remote は `origin/<branch>` という名の branch を実際に持てるため、helper は推測せず dispatch 前に reject し exact な訂正を返す (silent normalize はしない)。理由は「origin 上に存在しないから」ではない (zero 解決は典型例であって理由ではない。#13883 j#79995 F3)。policy 正本: `vibes/docs/logics/release-helper-contract.md` の `### source_ref Spelling Policy`。
+- exactly-one は **構造保証ではなく動的検査**。`ls-remote` の tail 一致は full path にも作用し、branch `foo/refs/heads/main` があれば `refs/heads/main` は 2 件に一致する。canonical form は「最も曖昧さが少ない」であって「常に一意」ではない。衝突時は client / server 双方が refuse するため fail-closed で、回復は origin 側の衝突 ref を rename/削除するか別 ref を使う (#13883 j#79995 F1)。
+- trusted な build job が dispatch 前/実行内で fail-closed 照合する: HEAD == `source_sha`、`source_ref` が origin 上で **exact 1 件** の named ref に解決しその tip == `source_sha` (glob/refspec metacharacter は reject、ancestor-only/local-only 不可)、2-file version mirror == `expected_version`、candidate `.github/workflows/test.yml` が **trusted `origin/main` の test.yml と byte 一致** (candidate が自 Test workflow を弱めて green を偽装するのを防ぐ。#13601 j#76006 F1)、同 SHA の `Test` workflow (`test.yml`) が `completed` + `success`、`expected_version` が TestPyPI 未使用 (`releases` object schema を満たさない応答 / lookup 不能は fail-closed)。
+- helper: `mozyo-bridge release publish --testpypi --source-sha <40-hex> --expected-version <X.Y.Z> --source-ref refs/heads/<branch>` が `gh workflow run testpypi.yml --ref main -f source_sha=... -f expected_version=... -f source_ref=... -f dispatch_nonce=...` を構成し、run-name 中の nonce で dispatch と run を決定的に相関する (latest-one 推測はしない。exact 1 件以外は fail-closed)。
+- helper は `gh workflow run` の **前に** client preflight を行い、`source_ref` を origin 上で non-peel ちょうど 1 件に解決して tip == `source_sha` を確認する。zero / multi / mismatch では **dispatch を 0 回** にして exit する (Redmine #13883。以前は起動後 build 前に落ちて run を 1 本無駄にしていた)。annotated tag は non-peel tip が tag object のため mismatch として refuse される (server gate と同一挙動)。preflight は trusted workflow gate の mirror であり、gate authority は workflow 側に残る。
+- 順序: #13528「TestPyPI publish」→ #13527「exact install QA」。exact install QA は publish 後に `scripts/install_testpypi_dev.sh <exact version>` で行い、`origin/main` promotion / Version close を前提にしない。
+- automatic main-CI dev publish path は後方互換に維持する (owner 承認済みの `testpypi` required reviewer 導入後は automatic path も deployment approval 待ちになる — これは意図的な OIDC protection 優先の変更)。
+- 外部 environment 変更 (required reviewer / deployment branch policy) と実際の dispatch は、implementation review green 後に owner action として分離する。
 
 production PyPI は分離されたままである。この workflow は production PyPI へ publish せず、tag も打たず、GitHub Release も決して作成しない (production の `publish.yml` は `release: published` で走る)。
 
@@ -61,7 +100,7 @@ scripts/install_testpypi_dev.sh 0.9.2.dev20260628090000123456789
 
 script は pip backend で install し (`mozyo-bridge` は TestPyPI、依存関係は PyPI、`--pre`、`--force`)、install された surface を検証する:
 
-- `mozyo-bridge --version` と `mozyo --version` (必須)
+- `mozyo-bridge --version` と `mozyo --version` (必須)。両 CLI が報告する version は、pin した exact dev version と **厳密一致** を assert する。どちらかが不一致なら script は nonzero で停止する (install された artifact が pin した build でないため、smoke 証跡を誤って別 build に結び付けない — Redmine #13586)。
 - `mozyo-bridge project-gateway consult --help` (必須)
 - `mozyo-bridge workflow step --help` (将来の #12755 — それが出荷される前に build された artifact に対しては PENDING として報告され、failure ではない)
 
@@ -103,6 +142,30 @@ pipx install --backend pip --index-url https://test.pypi.org/simple/ --pip-args 
 - 変更に関わる配布 scaffold/rule 内容が、install 済み package の内部に存在することを確認する。
 - `rules install`、per-preset の scaffold、`scaffold status`、`doctor --target` が、fresh な TestPyPI / PyPI install 経路から動作することを確認する。
 - production PyPI distribution は内部 beta distribution と分離されており、明示的な production release の要求または承認を要する。
+
+## 使い捨て Ubuntu container smoke (#14100)
+
+venv fresh-install smoke に加えて、`testpypi.yml` / `publish.yml` の build job は
+`Upload built distributions` の前に **使い捨て pinned Ubuntu container** で同一 wheel を
+black-box する (`scripts/disposable_ubuntu_smoke.py`)。venv smoke が build runner 上で
+runner user として `--version` / `--help` を確認するのに対し、container smoke は非root
+user・fresh HOME・source checkout 不在・pinned Ubuntu LTS 上で実 user harness
+(`rules install/status`、fresh target への `scaffold apply/status`、`docs validate/resolve`、
+read-only `doctor runtime`) を横断し、artifact-only mount の wheel byte が installed
+provenance と expected version に一致することを機械照合する。
+
+- blocking authority は **image DIGEST**。default `blocking` mode は digest pin
+  (`ubuntu@sha256:<64-hex>`) を必須とし floating tag を拒否する。advisory な `canary`
+  mode は floating tag を許すが blocking gate には接続しない。
+- release path (TestPyPI acceptance / production prepublish) の gate のみで、quick
+  issue-branch lane (`test.yml`) には接続しない。
+- credential は image / container env / summary へ入れない。summary は image ref/digest・
+  wheel sha256・expected/observed version・runtime user/uid・fresh HOME・source-mount
+  不在・surface 結果・duration を secret-safe な JSON で出す。
+- maintainer は本 smoke を ad-hoc でも回せる:
+  `python scripts/disposable_ubuntu_smoke.py --artifact-dir <dist> --expected-version <X.Y.Z> --image ubuntu@sha256:<digest>`。
+- 契約と digest pin authority の正本: `vibes/docs/logics/tiered-ci-gate-policy.md`
+  (`## Disposable Ubuntu container smoke`)。
 
 ## Trusted Publishing
 

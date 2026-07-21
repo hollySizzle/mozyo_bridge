@@ -162,6 +162,8 @@ def cmd_session_boundary_prompt(args: argparse.Namespace) -> int:
             issue=str(args.issue),
             journal=str(args.journal),
             repo_pointer=session.name,
+            issue_subject=str(getattr(args, "issue_subject", "") or ""),
+            issue_role=str(getattr(args, "issue_role", "") or ""),
             parent_issue=getattr(args, "parent", None),
             commit=getattr(args, "commit", None),
             target_lane=getattr(args, "target_lane", None),

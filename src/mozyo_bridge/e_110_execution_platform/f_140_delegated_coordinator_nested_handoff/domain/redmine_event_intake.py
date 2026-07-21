@@ -52,6 +52,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CALLBACK_NONE,
     CALLBACK_STATES,
     GATE_KINDS,
+    GATE_OWNER_CLOSE_APPROVAL,
     GATE_REVIEW,
     REVIEW_APPROVED,
     REVIEW_CHANGES_REQUESTED,
@@ -113,8 +114,12 @@ def redmine_event_id(issue: str, journal: str) -> str:
 
 #: Marker-facing gate name -> runtime gate kind. Only the names that differ are listed;
 #: an unlisted name is used as-is (and rejected if not in :data:`GATE_KINDS`).
+#: ``owner_close_approval_waiting`` is the callback-facing state name (a child is waiting for
+#: owner close approval — workflow.md ``### coordinator callback を要する state``); it maps onto
+#: the runtime ``owner_close_approval`` gate (#13520 review F5).
 MARKER_GATE_ALIASES: dict[str, str] = {
     "review_result": GATE_REVIEW,
+    "owner_close_approval_waiting": GATE_OWNER_CLOSE_APPROVAL,
 }
 
 
@@ -175,6 +180,14 @@ class JournalMarker:
     integration_recorded: bool = False
     issue_open: bool = True
     blocker_recorded: bool = False
+    #: Redmine #13974 (additive review-gate contract): the exact full commit head this review gate
+    #: reviewed / requested (``target_head``), and — on a ``review_result`` — the exact
+    #: ``review_request_journal`` it answers. Blank on non-review gates and on legacy markers written
+    #: before the contract. The callback generation fence conjoins them (with lane identity + lifecycle
+    #: generation + the provider-authoritative review_result journal id as source sequence) and fails
+    #: closed when a review row's head / round drifts or is missing — never parsed from prose.
+    target_head: str = ""
+    review_request_journal: str = ""
 
     @property
     def event_id(self) -> str:
@@ -216,6 +229,8 @@ def build_marker(
     integration_recorded: bool = False,
     issue_open: bool = True,
     blocker_recorded: bool = False,
+    target_head: str = "",
+    review_request_journal: str = "",
 ) -> JournalMarker:
     """Validate + normalize a structured marker into a :class:`JournalMarker` (pure).
 
@@ -257,6 +272,8 @@ def build_marker(
         integration_recorded=bool(integration_recorded),
         issue_open=bool(issue_open),
         blocker_recorded=bool(blocker_recorded),
+        target_head=str(target_head or "").strip(),
+        review_request_journal=str(review_request_journal or "").strip(),
     )
 
 

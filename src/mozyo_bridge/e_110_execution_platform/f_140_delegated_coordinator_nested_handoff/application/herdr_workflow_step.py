@@ -1,0 +1,804 @@
+"""herdr-native `workflow step` resolution adapter (Redmine #13489).
+
+Bridges the impure runtime inputs a herdr session carries — launch-time sender env, the
+repo anchor, the lane metadata store, and the live ``herdr agent list`` inventory — into the
+pure herdr classifier + resolver (:mod:`...domain.workflow_step_herdr`). It is the herdr
+counterpart of the tmux wiring in :func:`...application.cli_workflow.cmd_workflow_step`
+(``current_pane`` + tmux inventory -> :func:`...domain.workflow_step.resolve_workflow_step`),
+and it produces the SAME replayable :class:`~...domain.workflow_step.WorkflowStepOutcome`
+envelope so ``workflow step`` reads the same under either backend.
+
+Increment 1 (Redmine #13489 j#74685 design_boundary) is **resolution-only**: it resolves the
+current lane's herdr-native identity + role and, for a worker / gateway lane, verifies the
+lane's Redmine ``issue+journal`` anchor against **source-of-truth Redmine** and — for a
+gateway — the same-lane worker liveness **cardinality** before naming a role-appropriate next
+action. It fails closed on an unattested identity, an unclassifiable lane (default-lane pair /
+unknown provider), an unverified / ambiguous / retired / missing anchor, or a missing /
+duplicate / unaddressable worker. It performs no sublane lifecycle mutation and no delivery —
+the policy-permitted one-step auto-execution and the destructive drain/retire boundary are
+increment 2.
+
+Mid-review corrections landed here (j#74748 … j#74787): F1 removes the registry
+``project_name`` project-scope heuristic and defers to the pure classifier's default-lane
+fail-closed; the same-lane worker liveness returns the 0 / 1 / 2+ cardinality (duplicate
+identity is ambiguity, not a target); and **F3 verifies the anchor against live source-of-truth
+Redmine** — the lane metadata (and the workflow runtime store) are only *caller-supplied
+advisory projections*, so the lane's single non-retired record names the *candidate* issue
+(cardinality-preserving) and the credential-gated :class:`LiveRedmineJournalSource` +
+structured gate marker are the authority for the exact ``issue+journal`` anchor.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Mapping, Optional
+
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.relative_route import (
+    ROLE_DELEGATED_COORDINATOR,
+    ROLE_IMPLEMENTATION_WORKER,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
+    EXECUTION_BLOCKED,
+    OWNER_OPERATOR,
+    PRIMITIVE_NONE,
+    STATE_LANE_UNRESOLVED,
+    WorkflowAnchor,
+    WorkflowStepOutcome,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
+    ANCHOR_AMBIGUOUS,
+    ANCHOR_MISSING,
+    ANCHOR_RETIRED,
+    ANCHOR_STORE_MISMATCH,
+    ANCHOR_UNVERIFIED,
+    ANCHOR_VERIFIED,
+    REASON_HERDR_SENDER_IDENTITY_UNRESOLVED,
+    WORKER_ABSENT,
+    WORKER_AMBIGUOUS,
+    WORKER_LIVE,
+    WORKER_LOCATOR_MISSING,
+    WORKER_UNAVAILABLE,
+    classify_herdr_workflow_lane,
+    resolve_herdr_workflow_step,
+)
+
+
+def _anchor_workspace_id(repo_root) -> Optional[str]:
+    """The sender's own workspace segment for the anchor↔env gate (mirrors herdr_send_entry).
+
+    Under the #13377 shared-project-workspace model a lane agent runs in a linked worktree
+    whose segment resolves to the MAIN checkout's workspace identity; a standalone / main
+    checkout resolves to its registry workspace_id. Legacy ``wt_<hash>`` lane attestation
+    (pre-#13377 lanes still live during the transition) is accepted exactly when the env
+    carries the worktree's deterministically re-derived token, never an arbitrary env value.
+    """
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
+        herdr_workspace_segment,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+        _norm,
+        derive_lane_workspace_token,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+        MOZYO_WORKSPACE_ID_ENV,
+    )
+
+    anchor_ws = herdr_workspace_segment(repo_root) or None
+    env_ws = _norm(os.environ.get(MOZYO_WORKSPACE_ID_ENV))
+    if env_ws and env_ws != (anchor_ws or ""):
+        try:
+            legacy_token = derive_lane_workspace_token(str(repo_root))
+        except (OSError, ValueError):
+            legacy_token = ""
+        if legacy_token and env_ws == legacy_token:
+            anchor_ws = legacy_token
+    return anchor_ws
+
+
+def _candidate_issue(repo_root, lane_id: str) -> tuple[str, str]:
+    """The lane's candidate Redmine issue id, preserving record cardinality (F3b).
+
+    The lane metadata store is **display metadata, never routing authority** — read here ONLY
+    to name the *candidate* issue the source-of-truth Redmine read then verifies. Record
+    cardinality is preserved (mid-review j#74785 F3b): the lane must have **exactly one**
+    non-retired record. Returns ``(issue, "")`` on a single clean candidate, else
+    ``("", fail_status)`` where ``fail_status`` is :data:`ANCHOR_AMBIGUOUS` (2+ records — a
+    duplicate active or an active+retired stale coexistence), :data:`ANCHOR_RETIRED` (the sole
+    record is a tombstone), or :data:`ANCHOR_MISSING` (no record / no issue / unreadable store).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
+        repo_scope_workspace_id,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+        _norm,
+        _norm_lane,
+    )
+
+    want_ws = _norm(repo_scope_workspace_id(repo_root))
+    want_lane = _norm_lane(lane_id)
+    if not want_ws:
+        return "", ANCHOR_MISSING
+    try:
+        from mozyo_bridge.core.state.lane_metadata import load_lane_records
+
+        records = load_lane_records()
+    except Exception:  # noqa: BLE001 - an unreadable display store fails the anchor gate closed
+        return "", ANCHOR_MISSING
+
+    matching = [
+        record
+        for record in records.values()
+        if _norm(getattr(record, "repo_workspace_id", "")) == want_ws
+        and _norm_lane(getattr(record, "lane_id", "")) == want_lane
+    ]
+    if not matching:
+        return "", ANCHOR_MISSING
+    if len(matching) >= 2:
+        # Duplicate active or active+retired stale coexistence: never collapse the drift.
+        return "", ANCHOR_AMBIGUOUS
+    record = matching[0]
+    if getattr(record, "retired", False):
+        return "", ANCHOR_RETIRED
+    issue = _norm(getattr(record, "issue_id", ""))
+    if not issue:
+        return "", ANCHOR_MISSING
+    return issue, ""
+
+
+def _redmine_journal_source_for(args: argparse.Namespace):
+    """The credential-gated live Redmine journal source (the source-of-truth read boundary).
+
+    Reuses the existing :class:`LiveRedmineJournalSource` (Redmine #13289) — daemon-trusted
+    credentials, redirect-refusing opener, injected transport, redacted errors — rather than
+    reimplementing any credential / network layer (mid-review j#74784). Raises
+    :class:`LiveRedmineJournalError` when credentials are unconfigured (the anchor gate then
+    fails closed). ``args`` is accepted for a future ``--redmine-json`` snapshot override seam.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
+        LiveRedmineJournalSource,
+    )
+
+    return LiveRedmineJournalSource.from_environment()
+
+
+def _verify_lane_gate_live(args: argparse.Namespace, issue: str) -> tuple[str, str]:
+    """The verified ``(journal, gate)`` for ``issue`` from source-of-truth Redmine (F3a), or ``("","")``.
+
+    Reads the candidate issue's journals live and extracts the **structured gate markers**
+    (:func:`markers_from_source` — only gate-bearing kinds, from a machine ``[mozyo:…]`` token,
+    never prose). Returns the latest gate marker's journal id + runtime gate **only** when its
+    marker issue matches the candidate issue — so a forged / mismatched / non-gate / non-existent
+    anchor never verifies. Any unconfigured-credential / transport / decode failure returns
+    ``("", "")`` (the anchor gate fails closed; the underlying errors are already
+    credential/URL-redacted).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
+        LiveRedmineJournalError,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+        markers_from_source,
+    )
+
+    issue = (issue or "").strip()
+    if not issue:
+        return "", ""
+    try:
+        source = _redmine_journal_source_for(args)
+        markers = markers_from_source(source, issue)
+    except LiveRedmineJournalError:
+        return "", ""
+    except Exception:  # noqa: BLE001 - any live-read failure fails the anchor gate closed
+        return "", ""
+    journal = ""
+    gate = ""
+    for marker in markers:
+        if str(getattr(marker, "issue", "")).strip() != issue:
+            continue  # issue mismatch: the gate marker is not this lane's issue
+        candidate = str(getattr(marker, "journal", "")).strip()
+        if candidate:
+            journal = candidate  # latest gate marker (markers are note-ordered) wins
+            gate = str(getattr(marker, "gate", "")).strip()
+    return journal, gate
+
+
+def _load_workflow_store(args: argparse.Namespace):
+    """The persisted workflow runtime store (``--store-path`` or the home default), or ``None``.
+
+    Read here ONLY as a caller-supplied advisory projection for the F3c cross-check — never the
+    anchor authority. Returns ``None`` on any construction failure so an absent / unreadable
+    store simply skips the cross-check (the live-authoritative path is unaffected).
+    """
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_resume import (
+            _store_from_args,
+        )
+
+        return _store_from_args(args)
+    except Exception:  # noqa: BLE001 - a store construction failure just skips the cross-check
+        return None
+
+
+def _canonical_event_journal(event_id: str, issue: str) -> str:
+    """The journal id of a **canonical** ``redmine:<issue>:<journal>`` anchor, else "".
+
+    The source contract is :func:`...redmine_event_intake.redmine_event_id` — a canonical
+    Redmine anchor is ``redmine:<issue>:<journal>`` (mid-review j#74834 F3c-1). The ``redmine:``
+    prefix is **required**: a bare ``<issue>:<journal>`` (the internal store key any caller can
+    write), an opaque / extra-segment / issue-mismatched id all yield "" so a synthetic store
+    assertion never corroborates the source-of-truth anchor. The embedded issue must equal
+    ``issue`` and be re-derivable via :func:`redmine_event_id` (defensive round-trip).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
+        redmine_event_id,
+    )
+
+    s = (event_id or "").strip()
+    if not s.startswith("redmine:"):
+        return ""
+    parts = s.split(":")
+    if len(parts) != 3:
+        return ""
+    _, eid_issue, journal = parts[0], parts[1].strip(), parts[2].strip()
+    want = (issue or "").strip()
+    if not journal or eid_issue != want:
+        return ""
+    # Defensive: the id must be exactly the canonical form for this (issue, journal).
+    if s != redmine_event_id(want, journal):
+        return ""
+    return journal
+
+
+def _store_lane_anchor(
+    args: argparse.Namespace, workspace_id: str, lane_id: str
+) -> "tuple[str, str, str] | None":
+    """The advisory store's asserted ``(issue, journal, gate)`` for this lane, or ``None`` (F3c).
+
+    Reads the caller-supplied workflow runtime store's ``(workspace_id, lane_id)`` route
+    candidate + its canonical gate event as an **advisory cross-check** — never the authority.
+    ``None`` means the store contributes no assertion for this lane (absent / unreadable / no
+    route). A lane whose store routes name **two+ distinct issues** returns a sentinel issue
+    (``"<ambiguous>"``) so the caller treats it as a mismatch. Empty ``journal`` / ``gate`` mean
+    the store asserted a route issue but no canonical gate event.
+    """
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+        _norm,
+        _norm_lane,
+    )
+
+    store = _load_workflow_store(args)
+    if store is None or not store.path.exists():
+        return None
+    try:
+        routes = store.read_route_identities()
+        events = store.read_events()
+    except Exception:  # noqa: BLE001 - an unreadable store contributes no cross-check assertion
+        return None
+
+    want_ws = _norm(workspace_id)
+    want_lane = _norm_lane(lane_id)
+    issues = {
+        _norm(getattr(r, "issue", ""))
+        for r in routes
+        if _norm(getattr(r, "workspace_id", "")) == want_ws
+        and _norm_lane(getattr(r, "lane_id", "")) == want_lane
+        and _norm(getattr(r, "issue", ""))
+    }
+    if not issues:
+        return None
+    if len(issues) >= 2:
+        return "<ambiguous>", "", ""
+    issue = next(iter(issues))
+    # Select the LATEST matching-issue event row first (events are seq-ordered), then validate
+    # ONLY that row — a latest forged / non-canonical row must never silently fall back to an
+    # earlier valid one (mid-review j#74838). A latest row that fails canonical validation yields
+    # ``journal=""`` (-> the caller's exact-match cross-check fails closed).
+    latest = None
+    for event in events:
+        if _norm(getattr(event, "issue", "")) == issue:
+            latest = event
+    if latest is None:
+        return issue, "", ""
+    journal = _canonical_event_journal(getattr(latest, "event_id", ""), issue)
+    gate = _norm(getattr(latest, "gate", "")) if journal else ""
+    return issue, journal, gate
+
+
+def _store_contradicts(
+    store_anchor: "tuple[str, str, str] | None", issue: str, journal: str, gate: str
+) -> bool:
+    """True when the advisory store asserts anything but the exact live anchor for this lane.
+
+    Once the store asserts a route for this lane (``store_anchor is not None``), it must
+    corroborate the source-of-truth Redmine verification **exactly** — the same canonical
+    ``(issue, journal, gate)`` — or it is drift / a forged / synthetic / non-canonical event
+    (mid-review j#74827). A route present with an unusable event yields ``(issue, "", "")``,
+    which is not the verified tuple, so it fails closed. ``None`` (no route for this lane, or an
+    absent / unreadable store) never contradicts — the live-authoritative path is unaffected.
+    """
+    if store_anchor is None:
+        return False
+    return store_anchor != (issue, journal, gate)
+
+
+def _resolve_lane_anchor(args: argparse.Namespace, workspace_id: str, repo_root, lane_id: str) -> tuple[str, str]:
+    """Verify the lane's Redmine ``issue+journal`` anchor against source-of-truth Redmine (F3).
+
+    Both the lane metadata and the workflow runtime store are **caller-supplied advisory
+    projections**, not Redmine authority (mid-review j#74784): a caller can write either. So the
+    anchor is verified against the **live source-of-truth Redmine** gate journal:
+
+    1. the lane's single non-retired lane-metadata record names the *candidate* issue
+       (:func:`_candidate_issue`, cardinality-preserving — duplicate / stale / missing fail
+       closed);
+    2. that issue's journals are read live via the credential-gated
+       :class:`LiveRedmineJournalSource` and its **structured gate marker** is verified
+       (:func:`_verify_lane_gate_live`): the exact gate journal id + gate, matching the candidate;
+    3. the caller-supplied runtime store is cross-checked (F3c): if it asserts a *different*
+       ``(issue, journal, gate)`` for this same lane, fail closed rather than trust the store.
+
+    Returns (:data:`ANCHOR_VERIFIED`, ``redmine:issue=<id>:journal=<id>``) only when all hold;
+    otherwise a fail-closed status (:data:`ANCHOR_AMBIGUOUS` / :data:`ANCHOR_RETIRED` /
+    :data:`ANCHOR_MISSING` for the candidate, :data:`ANCHOR_UNVERIFIED` when the live Redmine read
+    finds no matching gate marker, :data:`ANCHOR_STORE_MISMATCH` when the advisory store drifts).
+    """
+    issue, cand_status = _candidate_issue(repo_root, lane_id)
+    if cand_status:
+        return cand_status, ""
+    journal, gate = _verify_lane_gate_live(args, issue)
+    if not journal:
+        return ANCHOR_UNVERIFIED, ""
+    if _store_contradicts(_store_lane_anchor(args, workspace_id, lane_id), issue, journal, gate):
+        return ANCHOR_STORE_MISMATCH, ""
+    return ANCHOR_VERIFIED, WorkflowAnchor(issue=issue, journal=journal).pointer()
+
+
+def _same_lane_worker_liveness(
+    workspace_id: str, lane_id: str, *, env: Mapping[str, str]
+) -> str:
+    """The same-lane ``claude`` worker slot cardinality (mid-review j#74749 F2 / j#74750).
+
+    Preserves 0 / 1 / 2+ and the usable-locator distinction from the live ``herdr agent list``
+    inventory: :data:`WORKER_ABSENT` (0), :data:`WORKER_LIVE` (1 with a usable locator),
+    :data:`WORKER_LOCATOR_MISSING` (1 without a locator), :data:`WORKER_AMBIGUOUS` (2+ =
+    duplicate identity), :data:`WORKER_UNAVAILABLE` (the inventory could not be read). Pure over
+    the decode of each row's mzb1 name — a duplicate is ambiguity, never a silently-picked target.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
+        list_herdr_agent_rows,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
+        WORKER_ROLE,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
+        HerdrSessionStartError,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+        AGENT_KEY_NAME,
+        _agent_locator,
+        _norm_lane,
+        decode_assigned_name,
+    )
+
+    try:
+        rows = list_herdr_agent_rows(env)
+    except HerdrSessionStartError:
+        return WORKER_UNAVAILABLE
+    want_lane = _norm_lane(lane_id)
+    present = 0
+    with_locator = 0
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        decode = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decode.ok or decode.identity is None:
+            continue
+        identity = decode.identity
+        if identity.workspace_id != workspace_id or identity.role != WORKER_ROLE:
+            continue
+        if _norm_lane(identity.lane_id) != want_lane:
+            continue
+        present += 1
+        if _agent_locator(row):
+            with_locator += 1
+    if present == 0:
+        return WORKER_ABSENT
+    if present >= 2:
+        return WORKER_AMBIGUOUS
+    return WORKER_LIVE if with_locator == 1 else WORKER_LOCATOR_MISSING
+
+
+def _anchor_issue(anchor_pointer: str) -> str:
+    """The issue id embedded in a verified ``redmine:issue=<id>:journal=<id>`` anchor, else ""."""
+    s = (anchor_pointer or "").strip()
+    if not s or s == "none" or not s.startswith("redmine:"):
+        return ""
+    for field in s.split(":"):
+        field = field.strip()
+        if field.startswith("issue="):
+            return field[len("issue="):].strip()
+    return ""
+
+
+def _resolve_lane_dispatch_decision(
+    args: argparse.Namespace, workspace_id: str, lane_id: str, issue: str
+):
+    """The bounded dispatch decision for a gateway lane (increment 2), or ``None`` (Redmine #13489).
+
+    Resolves the source-of-truth Redmine dispatch authorization + the exact target's action-time
+    runtime (:func:`...herdr_dispatch_authority.resolve_dispatch_decision`). Returns ``None`` when
+    the anchor carried no issue id (the pure resolver then keeps the resolution-only monitor
+    no-op). A read failure inside the resolver fails closed to a BLOCKED decision (never a send).
+    """
+    if not issue:
+        return None
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_authority import (
+        resolve_dispatch_decision,
+    )
+
+    return resolve_dispatch_decision(
+        args, workspace_id=workspace_id, lane_id=lane_id, issue=issue, env=os.environ
+    )
+
+
+def _resolve_role_authority(args: argparse.Namespace, repo_root, sender):
+    """The durable workflow-role resolution for the current lane (Redmine #13583).
+
+    Reads the repo-local static binding declaration
+    (``.mozyo-bridge/workflow-role-bindings.json``) and cross-checks the current lane's provider
+    against the provider ``provider_binding`` expects for the bound role, then delegates to the
+    pure :func:`resolve_role_for_lane`. The current workspace is already attested upstream (the
+    sender-identity gate fails closed on an unattested identity), so the file — which stores no
+    ``workspace_id`` literal — is trusted as this attested workspace's topology.
+
+    Returns a :class:`WorkflowRoleResolution`: ``resolved`` (grandparent / project gateway),
+    ``blocked`` (malformed / ambiguous / provider mismatch — fail closed), or ``missing`` (no
+    binding for this lane -> the caller keeps the existing herdr classification). A **broken**
+    provider config (Redmine #13583 R1) does NOT degrade to the compat default — the expected
+    provider becomes unresolvable, so a lane that actually has a binding fails closed
+    (``provider_mismatch``) rather than resolving on an unverified default surface. A **missing**
+    config is not broken: ``load_workflow_binding`` returns the compat default without raising, so
+    an unconfigured repo keeps the legacy codex/claude expectation.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
+        load_workflow_binding,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_role_authority_source import (
+        load_parsed_role_bindings,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+        ROLE_PROJECT_GATEWAY as BINDING_PROJECT_GATEWAY,
+        ROLE_ROOT_COORDINATOR as BINDING_ROOT_COORDINATOR,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
+        resolve_role_for_lane,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+        ROLE_GRANDPARENT_COORDINATOR,
+    )
+
+    parsed = load_parsed_role_bindings(repo_root)
+    try:
+        binding, _warnings = load_workflow_binding(repo_root)
+    except Exception:  # noqa: BLE001 - a broken config fails closed, never a default surface (R1)
+        binding = None
+
+    def _expected(role: str):
+        # A broken provider config cannot confirm the coordinator surface: return None so the
+        # pure resolver fails closed (provider_mismatch) when a binding matches this lane. The
+        # authority's canonical grandparent_coordinator maps to provider_binding's compat
+        # ``root_coordinator`` role for the lookup (both default to codex).
+        if binding is None:
+            return None
+        key = (
+            BINDING_ROOT_COORDINATOR
+            if role == ROLE_GRANDPARENT_COORDINATOR
+            else BINDING_PROJECT_GATEWAY
+        )
+        return binding.provider_for(key)
+
+    return resolve_role_for_lane(
+        parsed, lane_id=sender.lane_id, provider=sender.role, expected_provider=_expected
+    )
+
+
+def resolve_herdr_step_outcome(args: argparse.Namespace) -> WorkflowStepOutcome:
+    """Resolve the herdr-native ``workflow step`` outcome for the current lane (Redmine #13489).
+
+    Resolves the sender identity from launch env + the repo anchor (fail-closed on an
+    unattested identity), classifies the workflow lane role, verifies the lane's Redmine issue
+    anchor (worker / gateway), and — for a sublane gateway lane — reads the live inventory for
+    its same-lane worker cardinality, then delegates to the pure resolver. Never mutates a lane
+    or delivers anything (increment 1 is resolution-only).
+
+    A durable workflow-role authority (Redmine #13583) is resolved first: a **resolved** default
+    lane (grandparent / project gateway) or a **blocked** authority short-circuits here without
+    any anchor / inventory read (a coordinator lane is not the worker/gateway anchor gate); a
+    **missing** binding falls through to the existing worker / gateway flow unchanged.
+    """
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+        resolve_sender_identity,
+    )
+
+    repo_root = repo_root_from_args(args)
+    anchor_ws = _anchor_workspace_id(repo_root)
+    sender_res = resolve_sender_identity(os.environ, anchor_workspace_id=anchor_ws)
+    if not sender_res.ok or sender_res.identity is None:
+        # An unattested herdr identity is not a workflow-step origin. Name the herdr-native
+        # cause and the one sanctioned lane-dispatch route (mirrors herdr_send_entry).
+        return WorkflowStepOutcome(
+            state=STATE_LANE_UNRESOLVED,
+            next_action=(
+                "resolve the herdr lane identity before stepping: this shell carries no "
+                "attested launch-time lane-sender identity (MOZYO_WORKSPACE_ID / "
+                "MOZYO_AGENT_ROLE). Run workflow step from inside an attested herdr lane "
+                "agent, or dispatch lanes through the coordinator (coordinator -> "
+                "target-lane Codex gateway -> same-lane Claude worker). See "
+                "vibes/docs/specs/herdr-native-identity.md."
+            ),
+            execution=EXECUTION_BLOCKED,
+            reason=REASON_HERDR_SENDER_IDENTITY_UNRESOLVED,
+            next_owner=OWNER_OPERATOR,
+            primitive=PRIMITIVE_NONE,
+            repo_root=str(repo_root),
+            durable_anchor="none",
+            detail=f"sender identity unresolved ({sender_res.reason}): {sender_res.detail}",
+        )
+
+    sender = sender_res.identity
+    lane = classify_herdr_workflow_lane(
+        provider=sender.role,
+        lane_id=sender.lane_id,
+        repo_root=str(repo_root),
+    )
+
+    # Durable workflow-role authority (Redmine #13583) takes precedence over the
+    # provider/placement classification, which cannot tell a grandparent from a project gateway.
+    # A resolved / blocked authority resolves or fails closed here with NO anchor / inventory
+    # read; a missing binding threads through and falls back to the existing classification.
+    role_authority = _resolve_role_authority(args, repo_root, sender)
+    if role_authority is not None and (role_authority.resolved or role_authority.blocked):
+        return resolve_herdr_workflow_step(lane, role_authority=role_authority)
+
+    # A worker / gateway lane is anchor-gated (j#74748 F3); default-lane / unknown provider
+    # fails closed in the pure resolver without any store / inventory read.
+    anchor_status: Optional[str] = None
+    anchor_pointer = ""
+    worker_liveness: Optional[str] = None
+    if lane.caller_role in (ROLE_IMPLEMENTATION_WORKER, ROLE_DELEGATED_COORDINATOR):
+        anchor_status, anchor_pointer = _resolve_lane_anchor(
+            args, sender.workspace_id, repo_root, sender.lane_id
+        )
+    dispatch_decision = None
+    if lane.caller_role == ROLE_DELEGATED_COORDINATOR and anchor_status == ANCHOR_VERIFIED:
+        # Only read the live inventory when the gateway lane actually reaches the worker gate.
+        worker_liveness = _same_lane_worker_liveness(
+            sender.workspace_id, sender.lane_id, env=os.environ
+        )
+        # Increment 2 (Redmine #13489): with a single live same-lane worker, resolve the bounded
+        # dispatch authority from source-of-truth Redmine (a valid, non-superseded coordinator
+        # dispatch authorization) + the exact target's action-time runtime state. Absent an
+        # authorization this decides MONITOR, so the resolution-only monitor no-op is preserved
+        # and product auto-dispatch stays disabled until a coordinator records one (j#75006).
+        if worker_liveness == WORKER_LIVE:
+            dispatch_decision = _resolve_lane_dispatch_decision(
+                args, sender.workspace_id, sender.lane_id, _anchor_issue(anchor_pointer)
+            )
+
+    return resolve_herdr_workflow_step(
+        lane,
+        role_authority=role_authority,
+        worker_liveness=worker_liveness,
+        anchor_status=anchor_status,
+        anchor_pointer=anchor_pointer,
+        dispatch_decision=dispatch_decision,
+    )
+
+
+def execute_herdr_forward_leg(args: argparse.Namespace, outcome):
+    """Perform the fenced one-step herdr coordinator forward at action time (Redmine #13583 Inc 3).
+
+    The executable counterpart of :func:`resolve_herdr_step_outcome`'s resolution-only forward
+    outcome (``execution=ready`` + a herdr forward primitive). It **re-resolves** the sender
+    identity + durable role authority from the live launch env + binding declaration at action time
+    (safety-contract point 2 — never trusts the resolution-time outcome), resolves the single live
+    target from the herdr inventory, and drives the dedicated
+    :class:`~mozyo_bridge.core.state.forward_outbox_fence.ForwardOutboxFence` around one ticketless
+    send via :func:`execute_herdr_forward`. A default-lane role that no longer resolves (a binding /
+    provider change between resolution and action) fails closed to a zero-send.
+
+    Returns a :class:`...herdr_forward_send.ForwardExecutionResult`.
+    """
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+        resolve_sender_identity,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+        _agent_locator,
+        decode_assigned_name,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_role_authority_source import (
+        load_parsed_role_bindings,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_forward_send import (
+        ForwardExecutionResult,
+        OrchestrateHandoffForwardSendPort,
+        execute_herdr_forward,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (
+        ZERO_SEND,
+        plan_forward_route,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+        ROLE_PROJECT_GATEWAY,
+    )
+    from mozyo_bridge.core.state.forward_outbox_fence import ForwardOutboxFence
+
+    def _blocked(reason: str, detail: str) -> "ForwardExecutionResult":
+        return ForwardExecutionResult(
+            sent=False, decision=ZERO_SEND, target_status="", fence_state="", reason=reason,
+            detail=detail,
+        )
+
+    repo_root = repo_root_from_args(args)
+    anchor_ws = _anchor_workspace_id(repo_root)
+    sender_res = resolve_sender_identity(os.environ, anchor_workspace_id=anchor_ws)
+    if not sender_res.ok or sender_res.identity is None:
+        return _blocked(
+            "herdr_forward_sender_unresolved",
+            f"sender identity unresolved at action time ({sender_res.reason})",
+        )
+    sender = sender_res.identity
+
+    # Action-time re-validation (point 2): the durable role authority must STILL resolve this lane
+    # to a coordinator role; a binding / provider change since resolution fails closed to no send.
+    role_authority = _resolve_role_authority(args, repo_root, sender)
+    if role_authority is None or not role_authority.resolved:
+        return _blocked(
+            "herdr_forward_role_unresolved",
+            "the durable workflow-role authority no longer resolves this lane to a coordinator role",
+        )
+
+    # R1-F3: resolve the TARGET role's provider from the action-time provider_binding (not a
+    # hard-coded codex), and use the same provider for target resolution AND the semantic receiver.
+    # unknown / unbound / unsupported provider fails closed to a zero-send.
+    plan = plan_forward_route(role_authority.role, role_authority.project_scope)
+    if plan is None:
+        return _blocked("herdr_forward_no_route", f"role {role_authority.role!r} has no forward")
+    target_provider = _forward_target_provider(args, repo_root, plan.to_role)
+    if not target_provider:
+        return _blocked(
+            "herdr_forward_provider_unresolved",
+            f"the provider_binding resolves no provider for the forward target role {plan.to_role!r}; "
+            "bind it (or fix the config) before forwarding",
+        )
+
+    parsed = load_parsed_role_bindings(repo_root)
+    gateway_lane_ids = frozenset(
+        b.lane_id for b in parsed.bindings if b.role == ROLE_PROJECT_GATEWAY
+    )
+    try:
+        rows = _same_lane_agent_rows(env=os.environ)
+    except Exception:  # noqa: BLE001 - an unreadable inventory yields no target -> fail closed
+        rows = []
+
+    # R1-F2: the execution path NEVER bootstraps the store — an un-bootstrapped / lost store is a
+    # do-not-send condition (execute_herdr_forward returns fence-unavailable). Init/recovery is the
+    # explicit operator `workflow forward-fence --bootstrap` / `--recover`.
+    fence = ForwardOutboxFence()
+
+    return execute_herdr_forward(
+        role_authority,
+        args=args,
+        workspace_id=sender.workspace_id,
+        sender_lane_id=sender.lane_id,
+        target_provider=target_provider,
+        gateway_lane_ids=gateway_lane_ids,
+        rows=rows,
+        decode=decode_assigned_name,
+        locator_of=_agent_locator,
+        fence=fence,
+        send_port=OrchestrateHandoffForwardSendPort(
+            repo_root=str(repo_root), receiver_provider=target_provider
+        ),
+    )
+
+
+def _forward_target_provider(args, repo_root, to_role: str) -> str:
+    """The action-time provider_binding provider for a forward target role, or "" (Redmine #13583 R1-F3).
+
+    Maps the forward's target role to a ``RoleProviderBinding`` role and resolves the provider from
+    the current ``provider_binding`` (so a rebind is honored, and an unbound role fails closed):
+
+    - ``project_gateway`` -> the ``project_gateway`` binding role;
+    - ``delegated_coordinator`` (the child sublane gateway) -> the generic ``coordinator`` binding
+      role (both default to codex; a child coordinator is a coordinator-provider lane).
+
+    A broken provider config, an unmapped role, or an unbound binding yields ``""`` (the leg then
+    fails closed to a zero-send rather than target a guessed provider).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
+        load_workflow_binding,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+        ROLE_COORDINATOR,
+        ROLE_PROJECT_GATEWAY as BINDING_PROJECT_GATEWAY,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
+        ROLE_PROJECT_GATEWAY,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.relative_route import (
+        ROLE_DELEGATED_COORDINATOR,
+    )
+
+    binding_role = {
+        ROLE_PROJECT_GATEWAY: BINDING_PROJECT_GATEWAY,
+        ROLE_DELEGATED_COORDINATOR: ROLE_COORDINATOR,
+    }.get(to_role)
+    if binding_role is None:
+        return ""
+    try:
+        binding, _warnings = load_workflow_binding(repo_root)
+    except Exception:  # noqa: BLE001 - a broken provider config fails closed (never a default)
+        return ""
+    if binding is None:
+        return ""
+    return binding.provider_for(binding_role) or ""
+
+
+def _same_lane_agent_rows(*, env):
+    """The live herdr ``agent list`` rows (fail-closed helper, mirrors the dispatch inventory read)."""
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (
+        list_herdr_agent_rows,
+    )
+
+    return list_herdr_agent_rows(env)
+
+
+def complete_forward_generation_on_callback(args, *, delivered: bool) -> bool:
+    """The correlated-callback completion hook: complete a forward generation on positive delivery.
+
+    Fired by the ticketless callback send path (Redmine #13583 R1-F1, Design Answer j#76528 §4).
+    When a ticketless callback that **echoes** a ``forward_action_id`` is **positively delivered**
+    (``delivered``), this CAS-completes the exact delivered forward generation whose opaque action id
+    + reverse route (the callback's ``read_contract`` is the forward's ``from_role``) match, so the
+    caller's next ``workflow step`` may mint a new generation. It is **fail-soft**: a non-forward
+    callback (no id), a failed delivery, an unresolved herdr workspace, or an un-bootstrapped store
+    is a no-op (``False``) — never an error and never a spurious completion. A stale / duplicate /
+    drifted callback simply does not match (the store no-ops), so it can never close a newer
+    generation. Returns ``True`` only when a real delivered generation was completed.
+    """
+    if not delivered:
+        return False
+    action_id = (getattr(args, "forward_action_id", "") or "").strip()
+    read_contract = (getattr(args, "read_contract", "") or "").strip()  # the forward's from_role
+    if not action_id or not read_contract:
+        return False
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+        resolve_sender_identity,
+    )
+    from mozyo_bridge.core.state.forward_outbox_fence import ForwardOutboxFence
+
+    try:
+        repo_root = repo_root_from_args(args)
+        anchor_ws = _anchor_workspace_id(repo_root)
+        sender_res = resolve_sender_identity(os.environ, anchor_workspace_id=anchor_ws)
+        if not sender_res.ok or sender_res.identity is None:
+            return False  # not an attested herdr sender -> nothing to complete (fail-soft)
+        fence = ForwardOutboxFence()
+        if not fence.is_bootstrapped():
+            return False  # no forward store -> the generation (if any) stays delivered, safely
+        return fence.complete_by_correlation(
+            action_id, workspace_id=sender_res.identity.workspace_id, from_role=read_contract
+        )
+    except Exception:  # noqa: BLE001 - the completion is best-effort; it never breaks the callback
+        return False
+
+
+__all__ = (
+    "resolve_herdr_step_outcome",
+    "execute_herdr_forward_leg",
+    "complete_forward_generation_on_callback",
+)

@@ -62,7 +62,6 @@ from mozyo_bridge.application.tmux_option_port import (
     TmuxOptionWriterPort,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
-    AGENT_KINDS,
     build_target_candidates,
     discover_agents,
     filter_agents,
@@ -98,9 +97,16 @@ class ResolveAgentTargetsUseCase:
     def __init__(self, discovery: AgentDiscoveryPort) -> None:
         self._discovery = discovery
 
-    def resolve(self, *, agent_filter, session_filter) -> list:
-        if agent_filter is not None and agent_filter not in AGENT_KINDS:
-            die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
+    def resolve(self, *, agent_filter, session_filter, snapshot=None) -> list:
+        # Validate against the injected snapshot's vocabulary (Redmine #13569 R2-F1), so a
+        # synthetic provider the composition injected is accepted here; `None` uses built-in.
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (  # noqa: E501
+            agent_kinds,
+        )
+
+        known = agent_kinds(snapshot)
+        if agent_filter is not None and agent_filter not in known:
+            die(f"--agent must be one of {sorted(known)}; got {agent_filter!r}")
 
         canonical_cache: dict[str, object] = {}
 
@@ -347,16 +353,25 @@ def cmd_agents_list(args: argparse.Namespace) -> int:
     working. Single tmux server assumed; a multi-server deployment would
     key on ``(socket, pane_id)``.
     """
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import fold_agents_by_pane
+    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
+        agent_kinds,
+        fold_agents_by_pane,
+    )
 
     require_tmux()
+    # The runtime handler validates and classifies against the SAME snapshot the parser
+    # composition injected (Redmine #13569 R2-F1), threaded through `args.snapshot`, so a
+    # synthetic provider accepted by `--agent` is also recognized here — not re-rejected
+    # against a fixed built-in set. `None` uses the built-in providers, byte-identical.
+    snapshot = getattr(args, "snapshot", None)
+    known = agent_kinds(snapshot)
     agent_filter = getattr(args, "agent", None)
-    if agent_filter is not None and agent_filter not in AGENT_KINDS:
-        die(f"--agent must be one of {sorted(AGENT_KINDS)}; got {agent_filter!r}")
+    if agent_filter is not None and agent_filter not in known:
+        die(f"--agent must be one of {sorted(known)}; got {agent_filter!r}")
     session_filter = getattr(args, "session", None)
     records = filter_agents(
         fold_agents_by_pane(
-            discover_agents(),
+            discover_agents(snapshot=snapshot),
             resolve_canonical=lambda root: resolve_canonical_session(root).name,
         ),
         session=session_filter,
@@ -438,6 +453,32 @@ def _scan_progress_note(event) -> None:
         )
 
 
+def _emit_herdr_backend_note(args: argparse.Namespace) -> None:
+    """Print a ``herdr backend active`` demotion note for ``agents targets`` (Redmine #13446).
+
+    ``agents targets`` lists the tmux discovery pool; under ``terminal_transport.backend:
+    herdr`` that pool is empty and the surface reads as a dead tmux-era listing — the same
+    harness gap (#13435 j#74176 -> j#74177) where an agent reaches for tmux selection while
+    the herdr workspace's agents are live. Emit a stderr note that names this a tmux-era
+    primitive/debug surface and points at the standard ``sublane create --execute`` dispatch,
+    but do not fail: the command stays a read-only listing. Guarded by
+    :func:`herdr_backend_active`, so the tmux-backend stdout / stderr stays byte-identical.
+    """
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
+        herdr_backend_active,
+        herdr_backend_guidance,
+    )
+
+    try:
+        repo_root = repo_root_from_args(args)
+    except (OSError, ValueError):
+        return
+    if not herdr_backend_active(repo_root):
+        return
+    print(f"note: {herdr_backend_guidance()}", file=sys.stderr)
+
+
 def cmd_agents_targets(args: argparse.Namespace) -> int:
     """Canonical handoff-target projection for LLM / operator use (#11811, #11907).
 
@@ -468,6 +509,8 @@ def cmd_agents_targets(args: argparse.Namespace) -> int:
     identity hints only.
     """
     require_tmux()
+    # herdr-backend demotion note (#13446): read-only, stderr-only, tmux byte-invariant.
+    _emit_herdr_backend_note(args)
 
     # Silent-hang fix (#12985): the per-root bounded project-scope scan behind
     # discovery can walk a large root for 30s+. Install the stderr note listener

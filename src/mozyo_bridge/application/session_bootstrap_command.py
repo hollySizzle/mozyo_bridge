@@ -44,6 +44,10 @@ import re
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.default_agent_topology import (
+    DEFAULT_EXPECTED_AGENTS,
+)
+
 
 # --- Pure projection: line parsing, marker normalization, command basename. ---
 
@@ -320,20 +324,21 @@ class SessionBootstrapUseCase:
             self._ops.load_tmux_conf_for(args)
             config_loaded = True
         created: list[str] = []
+        first_agent = DEFAULT_EXPECTED_AGENTS[0]
         if not self._ops.session_exists(args.session):
-            claude_pane = self._ops.new_agent_session_window(
-                "claude", args.session, args.cwd
+            first_pane = self._ops.new_agent_session_window(
+                first_agent, args.session, args.cwd
             )
-            created.append(f"claude:{claude_pane}")
+            created.append(f"{first_agent}:{first_pane}")
         if args.config and not config_loaded:
             self._ops.load_tmux_conf_for(args)
         windows = self._ops.list_session_windows(args.session)
-        for agent in ("claude", "codex"):
+        for agent in DEFAULT_EXPECTED_AGENTS:
             if agent in windows:
                 continue
             pane_id = self._ops.new_agent_window(agent, args.session, args.cwd)
             created.append(f"{agent}:{pane_id}")
-        for agent in ("claude", "codex"):
+        for agent in DEFAULT_EXPECTED_AGENTS:
             pane = self._ops.find_agent_window(agent, args.session)
             if pane:
                 self._ops.ensure_agent_target(pane, agent, args.force)

@@ -64,6 +64,16 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: packaged agent provider profile registry data source of truth
+  patterns:
+  - src/mozyo_bridge/e_140_adapter_provider/f_160_provider_registry/domain/agent_provider_profiles.yaml
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/plugin-ready-adapter-boundary.md と @vibes/docs/specs/project-map.md と @vibes/docs/rules/agent-workflow.md
+    と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: delegated coordinator runtime and projection source
   patterns:
   - src/mozyo_bridge/e_130_governance_distribution/f_140_rules_docs_catalog/domain/repo_local_config.py
@@ -71,6 +81,7 @@ rules:
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile_config.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile_templates.yaml
+  - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/role_profile_field_resolution.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
   - src/mozyo_bridge/e_110_execution_platform/f_120_agent_discovery_pane_resolution/domain/agent_discovery.py
   - src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
@@ -88,6 +99,7 @@ rules:
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/grandchild_dispatch.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/grandchild_stamp.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/grandchild_stamp.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_handoff_grandchild_realization.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_projection.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_display.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegated_coordinator_route_plan.py
@@ -102,14 +114,64 @@ rules:
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_backend_neutral_resolver.py
   - tests/scenarios/test_delegated_coordinator_route_plan.py
   - tests/regressions/test_issue_12474_delegated_route_gaps.py
+  - tests/regressions/test_issue_13571_grandchild_realization_binding.py
   - tests/support/delegation_route_fakes.py
+  - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_role_profile_field_resolution.py
+  - tests/integration/e_110_execution_platform/f_130_handoff_routing/test_handoff_role_profile_default_resolution.py
   severity: block
-  message: 'このファイルを変更する場合は､ @vibes/docs/logics/delegated-coordinator-cockpit-display.md と @vibes/docs/specs/delegation-policy-project-config.md
-    と @vibes/docs/specs/work-unit-granularity-config.md と @vibes/docs/specs/delegated-coordinator-decision-records.md と @vibes/docs/specs/delegated-route-live-executor.md
-    と @vibes/docs/specs/route-identity-ledger.md と @vibes/docs/specs/delegated-coordinator-role-profile.md と @vibes/docs/logics/coordinator-sublane-development-flow.md
-    と @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/managed-state-model.md と @vibes/docs/logics/unit-target-model.md
-    と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md
-    をよく確認し従うこと
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/role-profile-handoff-expansion.md と @vibes/docs/logics/delegated-coordinator-cockpit-display.md
+    と @vibes/docs/specs/delegation-policy-project-config.md と @vibes/docs/specs/work-unit-granularity-config.md と @vibes/docs/specs/delegated-coordinator-decision-records.md
+    と @vibes/docs/specs/delegated-route-live-executor.md と @vibes/docs/specs/route-identity-ledger.md と @vibes/docs/specs/delegated-coordinator-role-profile.md
+    と @vibes/docs/logics/coordinator-sublane-development-flow.md と @vibes/docs/logics/tmux-send-safety-contract.md と @vibes/docs/logics/managed-state-model.md
+    と @vibes/docs/logics/unit-target-model.md と @vibes/docs/rules/public-private-boundary.md と @vibes/docs/rules/agent-workflow.md
+    と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: coordinator fill decision / lane actionability / execution-surface source
+  patterns:
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_fill_decision.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/lane_actionability.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/lane_execution_surface.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/sublane_admission.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_fill.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_admission.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_fill_decision.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_lane_actionability.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_lane_execution_surface.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_sublane_admission.py
+  - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_fill_decision_cli.py
+  - tests/regressions/test_issue_13756_fill_actionability.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/coordinator-sublane-development-flow.md と @vibes/docs/specs/delegated-coordinator-decision-records.md
+    と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: herdr default-lane durable workflow-role authority source
+  patterns:
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_role_authority.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/workflow_role_authority_source.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_step_herdr.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_workflow_step.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_forward_route.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_forward_send.py
+  - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/delivery_outcome_gate.py
+  - src/mozyo_bridge/core/state/forward_outbox_fence.py
+  - .mozyo-bridge/workflow-role-bindings.json
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority_source.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_step_herdr.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_workflow_step_adapter.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_forward_route.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_forward_send.py
+  - tests/unit/core/state/test_forward_outbox_fence.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/herdr-default-lane-workflow-role-authority.md と @vibes/docs/logics/workflow-step-command-design.md
+    と @vibes/docs/logics/ticketless-project-gateway-runtime-ux.md と @vibes/docs/specs/herdr-native-identity.md と @vibes/docs/logics/managed-state-model.md
+    と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
@@ -160,6 +222,22 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: declared-pin role vocabulary owner and its writers / consumers
+  patterns:
+  - src/mozyo_bridge/core/state/lane_pin_role.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_adopt_declaration.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_hibernated_pair_recovery.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_hibernated_pin_repair.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_hibernated_live_reconcile.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/operator_startup_gate_producer.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/operator_startup_resume_target.py
+  - tests/regressions/test_issue_13920_adopt_recover_role_vocabulary.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/managed-state-model.md と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: module-health metrics and oversized-module gate source
   patterns:
   - src/mozyo_bridge/e_150_quality_architecture/f_130_module_health/domain/module_health.py
@@ -180,6 +258,19 @@ rules:
   - test_runtime_budget.yaml
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/test-runtime-profiling-policy.md と @vibes/docs/logics/tests-placement-discovery-policy.md
+    と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: local parallel test runner (isolated process shards) source
+  patterns:
+  - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_parallel.py
+  - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/commands_test_parallel.py
+  - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/cli_test_parallel.py
+  - test_parallel_policy.yaml
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/local-parallel-test-runner-policy.md と @vibes/docs/logics/tests-placement-discovery-policy.md
     と @vibes/docs/specs/project-map.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
@@ -331,11 +422,12 @@ rules:
   patterns:
   - src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/release.py
   - .github/workflows/**
+  - scripts/disposable_ubuntu_smoke.py
   - pyproject.toml
   - .github/ISSUE_TEMPLATE/**
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/rules/release-distribution.md と @vibes/docs/logics/release-flow.md と @vibes/docs/logics/release-helper-contract.md
-    と @skills/mozyo-bridge-agent/references/release.md をよく確認し従うこと
+    と @vibes/docs/logics/tiered-ci-gate-policy.md と @skills/mozyo-bridge-agent/references/release.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 

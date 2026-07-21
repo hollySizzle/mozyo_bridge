@@ -212,7 +212,6 @@ class RetireTargetWorktreeDirtyGateTest(unittest.TestCase):
 
         all_true = RetireAssertions(
             issue_closed=True,
-            owner_approval_present=True,
             callbacks_drained=True,
             verification_passed=True,
             durable_record_recorded=True,
@@ -258,11 +257,12 @@ class RetireTargetWorktreeDirtyGateTest(unittest.TestCase):
             branch="issue_13331_x",
             integration_branch=None,
             issue_closed=True,
-            owner_approved=True,
             callbacks_drained=True,
             verified=True,
             durable_record=True,
             target_identity_known=True,
+            latest_generation_admissible=True,  # #13518 R3-F2 fail-closed invariant asserted
+            review_generation_json=None,
             execute=execute,
             repo=str(repo),
             json=True,
@@ -317,6 +317,11 @@ class NonGitRetireCloseTest(unittest.TestCase):
         import argparse
         from unittest.mock import patch
 
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            DecisionPointer,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
         from mozyo_bridge.core.state.lane_metadata import (
             load_lane_records,
             record_lane_created,
@@ -328,7 +333,9 @@ class NonGitRetireCloseTest(unittest.TestCase):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             sublane_herdr_projection as proj,
             sublane_herdr_retire as retire_mod,
-            sublane_lifecycle_command as lc,
+            # Redmine #13754: the guarded close moved out of the command boundary into
+            # its own actuation module (which now also returns a fail-closed verdict).
+            sublane_retire_actuation as actuation,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
             HerdrRetireCloseResult,
@@ -348,6 +355,18 @@ class NonGitRetireCloseTest(unittest.TestCase):
                 project_ws = register_workspace(root, home=home).record.workspace_id
                 # The non-git create site wrote a lane-scoped `dl_` metadata record.
                 dl_token = derive_directory_lane_token(str(root.resolve()), lane_label)
+                # Redmine #13754: the create site also declares the lane's durable
+                # lifecycle owner binding AND its canonical worktree binding (the `dl_`
+                # token); the retire attests `(project_ws, lane)` issue + worktree against
+                # the requested `--issue` / `--worktree` before any close.
+                LaneLifecycleStore().declare_active(
+                    LaneLifecycleKey(project_ws, lane_label),
+                    decision=DecisionPointer(
+                        source="redmine", issue_id="13392", journal_id="77985"
+                    ),
+                    issue_id="13392",
+                    worktree_identity=dl_token,
+                )
                 record_lane_created(
                     lane_workspace_token=dl_token,
                     repo_workspace_id=project_ws,
@@ -377,13 +396,15 @@ class NonGitRetireCloseTest(unittest.TestCase):
                         foreign_names=plan.foreign_names,
                     )
 
-                args = argparse.Namespace(worktree=str(root), lane_label=lane_label)
+                args = argparse.Namespace(
+                    worktree=str(root), lane_label=lane_label, issue="13392"
+                )
                 with patch.object(
                     proj, "list_herdr_agent_rows", return_value=rows
                 ), patch.object(
                     retire_mod, "execute_herdr_retire_close", side_effect=_fake_execute
                 ):
-                    result = lc._maybe_herdr_retire_close(args, root)
+                    result = actuation.run_guarded_retire_close(args, root)
                 records = load_lane_records(home=home)
 
         plan = captured["plan"]

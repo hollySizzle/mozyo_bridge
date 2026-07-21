@@ -30,6 +30,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     extract_markers,
     extract_markers_from_note,
     markers_from_source,
+    render_workflow_event_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     GATE_REVIEW,
@@ -78,9 +79,15 @@ class ExtractFromNoteTest(unittest.TestCase):
         note = "[mozyo:unknownchannel:gate=review_request]"
         self.assertEqual(extract_markers_from_note("12672", "1", note), ())
 
-    def test_malformed_conclusion_fails_closed_skipped(self):
+    def test_malformed_conclusion_is_recognized_as_non_explicit(self):
+        # Redmine #13974 j#81512: a RECOGNIZED review_result gate with an out-of-vocabulary conclusion
+        # is NOT dropped (that would let a newer malformed result be invisible so an older valid result
+        # stays "latest" and delivers). It stays recognized with a non-explicit (pending) conclusion so
+        # it shadows the old result; the callback fence then refuses the non-explicit conclusion.
         note = "[mozyo:workflow-event:gate=review_result:conclusion=maybe]"
-        self.assertEqual(extract_markers_from_note("12672", "1", note), ())
+        markers = extract_markers_from_note("12672", "1", note)
+        self.assertEqual([m.gate for m in markers], ["review"])
+        self.assertEqual(markers[0].review_conclusion, "pending")
 
     def test_multiple_markers_in_one_note(self):
         note = (
@@ -198,6 +205,52 @@ class NestedRestShapeTest(unittest.TestCase):
         payload = {"issue": {"id": "12672"}}
         source = MappingRedmineJournalSource(payload=payload)
         self.assertEqual(source.read_entries(), [])
+
+
+class RenderWorkflowEventMarkerTest(unittest.TestCase):
+    """The gate-journal marker PRODUCER (#13520 review F1-R1): render round-trips to a marker."""
+
+    def test_bare_marker_round_trips_through_the_classifier(self):
+        token = render_workflow_event_marker("review_request")
+        self.assertEqual(token, "[mozyo:workflow-event:gate=review_request]")
+        markers = extract_markers_from_note("13543", "75212", f"review posted {token}")
+        self.assertEqual([(m.issue, m.journal, m.gate) for m in markers], [("13543", "75212", "review_request")])
+
+    def test_review_result_alias_round_trips_to_review(self):
+        token = render_workflow_event_marker("review_result")
+        markers = extract_markers_from_note("13543", "75212", token)
+        self.assertEqual(markers[0].gate, "review")  # review_result -> review runtime gate
+
+    def test_optional_fields_are_emitted_and_read_back(self):
+        token = render_workflow_event_marker("implementation_done", commit_bearing=True, issue_open=False)
+        markers = extract_markers_from_note("13543", "75094", token)
+        self.assertTrue(markers[0].commit_bearing)
+        self.assertFalse(markers[0].issue_open)
+
+    def test_non_gate_kind_is_rejected(self):
+        with self.assertRaises(ValueError):
+            render_workflow_event_marker("reply")
+
+    def test_blocked_is_callback_required_and_round_trips(self):
+        # #13520 review F5: the callback-required vocabulary (workflow.md ### coordinator
+        # callback を要する state) includes blocked — a coordinator must be woken on a blocker.
+        token = render_workflow_event_marker("blocked")
+        self.assertEqual(token, "[mozyo:workflow-event:gate=blocked]")
+        markers = extract_markers_from_note("13518", "75300", f"blocked on X {token}")
+        self.assertEqual(markers[0].gate, "blocked")
+
+    def test_owner_close_approval_waiting_round_trips_to_owner_close_approval(self):
+        # #13520 review F5: the marker-facing owner_close_approval_waiting state maps onto the
+        # runtime owner_close_approval gate.
+        token = render_workflow_event_marker("owner_close_approval_waiting")
+        markers = extract_markers_from_note("13518", "75301", token)
+        self.assertEqual(markers[0].gate, "owner_close_approval")
+
+    def test_still_rejects_non_callback_gate_close(self):
+        # `close` reaches a terminal gate but is not a coordinator-callback state (the coordinator
+        # drives close, it is not woken to it) — the producer must not mint a marker for it.
+        with self.assertRaises(ValueError):
+            render_workflow_event_marker("close")
 
 
 if __name__ == "__main__":

@@ -50,11 +50,18 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     decode_assigned_name,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.pane_render_observation import (  # noqa: E501
+    RENDER_REASON_INVALID_TARGET,
+    RENDER_REASON_UNKNOWN_PROVIDER,
+    RENDER_REASON_UNREADABLE,
+    PaneRenderObservation,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
     REASON_TRANSPORT_ERROR,
     TerminalTransportConfig,
     TerminalTransportError,
+    valid_target,
 )
 
 # The herdr JSON keys a status token may live under on an ``agent list`` row —
@@ -297,10 +304,139 @@ def read_herdr_inventory(
     )
 
 
+@dataclass(frozen=True)
+class ComposerRenderView:
+    """The redacted composer-render diagnostic read result (fail-closed, #14065).
+
+    ``backend_selected`` is False when the repo-local config does not select the
+    herdr backend — the diagnostic then renders *nothing* about a render, exactly
+    like :class:`HerdrInventoryView` (tmux byte-invariance). When selected,
+    ``observation`` carries the typed, fully-redacted :class:`PaneRenderObservation`
+    (closed enums / bool only — no body / hash / length / ANSI). ``target`` is the
+    herdr locator / assigned name the read was issued against (a handle, never pane
+    body), retained so the operator can correlate the observation.
+    """
+
+    backend_selected: bool
+    target: str = ""
+    observation: Optional[PaneRenderObservation] = None
+    #: The authority-resolved provider id (the managed row's identity role, e.g.
+    #: ``claude`` / ``codex``) for ``target``, or ``""`` when the target did not
+    #: authority-resolve. A provider id is an identity token, never pane body.
+    provider: str = ""
+
+    def to_record(self) -> dict:
+        """A JSON-serializable, fully-redacted dict (the diagnostic ``--json`` shape)."""
+        return {
+            "backend_selected": self.backend_selected,
+            "target": self.target,
+            "provider": self.provider,
+            "observation": (
+                self.observation.to_record() if self.observation is not None else None
+            ),
+        }
+
+
+def _resolve_authority_target(inventory: "HerdrInventoryView", target: str):
+    """The managed inventory row that authority-resolves ``target``, or ``None``.
+
+    A target authority-resolves only when the live inventory read succeeded, this
+    repo's workspace segment is known, and a **managed** row in *that* segment
+    carries the target as its assigned name or transient locator. A foreign,
+    mismatched, or unresolvable target returns ``None`` — so the diagnostic never
+    reads a pane it cannot tie to this repo's workspace (Redmine #14065 review
+    j#82166 finding 1, Design Answer j#82160 item 5).
+    """
+    if inventory is None or not inventory.ok or not inventory.workspace_segment:
+        return None
+    for agent in inventory.agents:
+        if not agent.managed or agent.workspace_id != inventory.workspace_segment:
+            continue
+        if agent.name == target or (agent.locator and agent.locator == target):
+            return agent
+    return None
+
+
+def read_composer_render(
+    repo_root: Path,
+    target: str,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    transport=None,
+    inventory: "Optional[HerdrInventoryView]" = None,
+) -> ComposerRenderView:
+    """Observe one pane's composer *style* for ``repo_root`` (fail-closed, no raise).
+
+    The measurement instrument's read-only diagnostic entry (Redmine #14065 Design
+    Answer j#82160). Authority resolution is fail-closed and layered: the herdr
+    backend must be selected (a non-herdr / broken config observes nothing), the
+    ``target`` must be a well-formed handle (:func:`valid_target`), and — critically
+    — it must **authority-resolve** to a managed pane in this repo's workspace
+    segment via the live inventory (:func:`_resolve_authority_target`), so a
+    syntactically-valid but foreign / mismatched target reads *nothing*
+    (``unknown_provider``) rather than reaching the transport (review j#82166
+    finding 1). The binary comes only from the trusted environment. Every mechanical
+    failure — an unconfigured / missing binary, a transport error, an unsupported
+    ANSI capability, an unreadable render — becomes a fail-closed
+    :class:`PaneRenderObservation`, never a raise and never a positive signal.
+    ``transport`` / ``env`` / ``inventory`` are injectable so tests never spawn herdr.
+    """
+    config = _terminal_transport_config(repo_root)
+    if config is None or config.backend != BACKEND_HERDR:
+        return ComposerRenderView(backend_selected=False, target=target)
+    if not valid_target(target):
+        return ComposerRenderView(
+            backend_selected=True,
+            target=target,
+            observation=PaneRenderObservation.failed(RENDER_REASON_INVALID_TARGET),
+        )
+    source_env = env if env is not None else os.environ
+    # Authority-resolve the target against this repo's managed inventory BEFORE any
+    # provider read. A foreign / mismatched / unresolvable target fails closed and
+    # the transport is never touched.
+    if inventory is None:
+        inventory = read_herdr_inventory(repo_root, env=source_env)
+    resolved = _resolve_authority_target(inventory, target)
+    if resolved is None:
+        return ComposerRenderView(
+            backend_selected=True,
+            target=target,
+            observation=PaneRenderObservation.failed(RENDER_REASON_UNKNOWN_PROVIDER),
+        )
+    provider = resolved.role
+    if transport is None:
+        try:
+            from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
+                resolve_terminal_transport,
+            )
+
+            transport = resolve_terminal_transport(config, env=source_env)
+        except TerminalTransportError:
+            return ComposerRenderView(
+                backend_selected=True,
+                target=target,
+                provider=provider,
+                observation=PaneRenderObservation.failed(RENDER_REASON_UNREADABLE),
+            )
+    if transport is None:  # defensive: herdr_enabled implies non-None
+        return ComposerRenderView(
+            backend_selected=True,
+            target=target,
+            provider=provider,
+            observation=PaneRenderObservation.failed(RENDER_REASON_UNREADABLE),
+        )
+    observation = transport.read_pane_render(target)
+    return ComposerRenderView(
+        backend_selected=True, target=target, provider=provider, observation=observation
+    )
+
+
 __all__ = (
+    "ComposerRenderView",
     "HerdrInventoryView",
     "HerdrObservedAgent",
     "herdr_backend_selected_for",
     "project_observed_agents",
+    "read_composer_render",
     "read_herdr_inventory",
 )

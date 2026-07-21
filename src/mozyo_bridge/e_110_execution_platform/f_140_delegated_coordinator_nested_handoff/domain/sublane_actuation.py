@@ -97,6 +97,23 @@ REASON_WORKTREE_CREATE_FAILED = "worktree_create_failed"
 #: The cockpit lane column could not be appended, or the read-back did not show a live
 #: gateway + worker pane pair for the lane.
 REASON_PANE_CREATE_FAILED = "pane_create_failed"
+#: The managed-launch capability preflight (Redmine #13847) refused BEFORE any process
+#: launch: the resolved launcher is executable and carries ``herdr agent-attest`` but its
+#: attestation-store schema does not match this runtime's, so its self-attestations would
+#: be dropped and the pair would boot live-but-unattested. Distinct from
+#: ``pane_create_failed`` so create/start surfaces the typed launcher-compat blocker with
+#: its schema-upgrade recovery, and never actuates a lane that cannot attest.
+REASON_LAUNCHER_INCOMPATIBLE = "launcher_runtime_incompatible"
+#: A freshly-launched pair did not confirm BOTH slots' post-launch self-attestation
+#: (Redmine #13847): a slot is absent / stale / missing / conflict / unobserved, so the
+#: pair booted partially (live-but-unattested — the live evidence). Create/start refuses to
+#: promote it to ``executed`` and returns this typed blocker with a durable recovery
+#: pointer to the public exact-pair recovery, never a false success.
+REASON_PARTIAL_PAIR_RECOVERY = "partial_pair_recovery_required"
+#: The embedded herdr ``session-start`` action did not positively confirm every role's
+#: startup health. The action result is authoritative before inventory read-back: a live
+#: locator or later pane visibility must never turn an unhealthy launch into success.
+REASON_STARTUP_HEALTH_UNCONFIRMED = "startup_health_unconfirmed"
 #: The appended / adopted lane did not carry the expected identity stamps (repo-root /
 #: lane) on read-back, so the lane could not be positively confirmed.
 REASON_STAMP_FAILED = "stamp_failed"
@@ -105,11 +122,35 @@ REASON_STAMP_FAILED = "stamp_failed"
 #: Adopting or dispatching to it would misdeliver #<issue> to the wrong gateway, so the
 #: ambiguous target fails closed before any adopt / dispatch.
 REASON_LANE_MISMATCH = "lane_identity_mismatch"
+#: A live ADOPT could not declare the lane's lifecycle owner binding (Redmine #13809 /
+#: #13810 R3-F3): the raw live pair was ambiguous / stale / unattested / a recycled
+#: generation, or the declaration conflicted. Dispatching to an owner-unbound lane would
+#: leave the ``original_identity_unknown`` hibernate blocker in place, so the adopt fails
+#: closed before dispatch rather than reporting a false success.
+REASON_ADOPT_OWNER_UNBOUND = "adopt_owner_unbound"
 #: The gateway ``implementation_request`` dispatch returned a non-zero / failed outcome.
 REASON_HANDOFF_FAILED = "handoff_failed"
 #: The #13002 work-unit granularity gate refused: an ``epic`` / ``feature`` unit was
 #: requested without an explicit owner / operator decision anchor (durable journal id).
 REASON_WORK_UNIT_BLOCKED = "work_unit_blocked"
+#: The action-time sender-attestation preflight refused a live dispatch (#13518 j#75671 / review
+#: R2-F3): the coordinator sender identity was not attested, so actuating would create a lane /
+#: worktree and THEN fail the governed dispatch on an unattested sender (a partial launch that
+#: forces raw-input recovery). Fail closed BEFORE any worktree / launch side effect, with a
+#: replayable resume plan (re-attest the sender, then re-run create).
+REASON_SENDER_UNATTESTED = "sender_unattested"
+#: The existing lane's gateway/worker pair is split across tabs / workspaces
+#: (Redmine #13705): ``read_lane`` reports ``pair_split`` (both panes live but not
+#: co-located). A same-tab-contract lane admits only ``active`` for adopt / dispatch,
+#: so a split pair fails closed with zero append / dispatch — an actionable degraded
+#: state recovered by retire + recreate, never adopted or healed over.
+REASON_PAIR_SPLIT = "pair_split"
+#: The action-time runtime fingerprint gate refused before any mutation (Redmine
+#: #13705): the active runtime surface is missing placement behavior the repo-local
+#: source ships (a source/installed skew — the exact class that split the pair). The
+#: official mutating front door goes zero-write, so an incompatible / stale runtime
+#: cannot actuate a lane it would place incorrectly.
+REASON_RUNTIME_FINGERPRINT = "runtime_fingerprint"
 #: The #13290 dispatch admission gate refused: the caller-supplied fill decision
 #: resolved to a concrete stop and no explicit override was supplied. Defined in
 #: :mod:`...domain.sublane_dispatch_admission`; re-exported here so the actuator's
@@ -125,11 +166,34 @@ BLOCKED_REASONS = frozenset(
         REASON_PANE_CREATE_FAILED,
         REASON_STAMP_FAILED,
         REASON_LANE_MISMATCH,
+        REASON_ADOPT_OWNER_UNBOUND,
         REASON_HANDOFF_FAILED,
         REASON_WORK_UNIT_BLOCKED,
+        REASON_SENDER_UNATTESTED,
+        REASON_PAIR_SPLIT,
+        REASON_RUNTIME_FINGERPRINT,
+        REASON_LAUNCHER_INCOMPATIBLE,
+        REASON_PARTIAL_PAIR_RECOVERY,
+        REASON_STARTUP_HEALTH_UNCONFIRMED,
         REASON_FILL_STOP,
     }
 )
+
+
+class SublaneLauncherIncompatibleError(RuntimeError):
+    """A live launch was refused because the launcher is capability-incompatible.
+
+    Redmine #13847: raised by the herdr-backed actuator ops when the managed-launch
+    capability preflight refuses (its attestation-store schema does not match the source
+    runtime), so the use case can map it to the typed :data:`REASON_LAUNCHER_INCOMPATIBLE`
+    blocker distinctly from a generic pane-create failure — the schema mismatch has a
+    different recovery (upgrade the launcher) and must never read as a transient append
+    failure. Carries the underlying capability verdict ``reason`` for the journal detail.
+    """
+
+    def __init__(self, message: str, *, reason: str):
+        super().__init__(message)
+        self.reason = reason
 
 # ---------------------------------------------------------------------------
 # Dispatch outcome tokens recorded in the outcome / journal.
@@ -208,6 +272,52 @@ class ActuationStep:
 
 
 @dataclass(frozen=True)
+class SublaneStartupRoleHealth:
+    """Safe projection of one embedded session-start participant's result."""
+
+    provider: str
+    disposition: str
+    health: str
+    compensation: str
+    blocker_id: str = ""
+    detail: str = ""
+
+    def as_payload(self) -> dict[str, str]:
+        return {
+            "provider": self.provider,
+            "disposition": self.disposition,
+            "health": self.health,
+            "compensation": self.compensation,
+            "blocker_id": self.blocker_id,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class SublaneStartupObservation:
+    """Typed embedded startup result propagated across the actuator port."""
+
+    ok: bool
+    action_id: str
+    roles: Tuple[SublaneStartupRoleHealth, ...]
+    rollback_owed: bool
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "ok": self.ok,
+            "action_id": self.action_id,
+            "roles": [role.as_payload() for role in self.roles],
+            "rollback_owed": self.rollback_owed,
+        }
+
+    def health_summary(self) -> str:
+        """Return fixed role-health tokens only; never pane output or locators."""
+        return ", ".join(
+            f"{role.provider}={role.health}/{role.compensation}" for role in self.roles
+        ) or "no_roles"
+
+
+@dataclass(frozen=True)
 class SublaneActuationOutcome:
     """The machine-readable result of a ``sublane start`` plan / actuation.
 
@@ -236,6 +346,7 @@ class SublaneActuationOutcome:
     adopted: bool = False
     steps: Tuple[ActuationStep, ...] = ()
     blocked_reasons: Tuple[str, ...] = ()
+    startup: Optional[SublaneStartupObservation] = None
     # #13290 dispatch admission gate: the concrete FILL_* token the caller-supplied
     # fill decision resolved to (``None`` when the gate was not armed), and the
     # explicit override reason recorded when a stop was intentionally proceeded past.
@@ -270,7 +381,7 @@ class SublaneActuationOutcome:
         return self.dispatch_result == DISPATCH_WORKER_DISPATCHED
 
     def as_payload(self) -> dict[str, object]:
-        return {
+        payload = {
             "status": self.status,
             "execute": self.execute,
             "reason": self.reason,
@@ -292,6 +403,21 @@ class SublaneActuationOutcome:
             "fill_override_reason": self.fill_override_reason,
             "gateway_ready": self.gateway_ready,
         }
+        if self.startup is not None:
+            payload["startup"] = self.startup.as_payload()
+        if self.is_blocked and "sender_attestation" in self.blocked_reasons:
+            payload["next_action"] = {
+                "action": "restore_attested_coordinator_shell",
+                "allowed_methods": [
+                    "relaunch_from_fixed_session_start",
+                    "verified_high_level_coordinator_proxy",
+                ],
+                "forbidden_methods": [
+                    "manual_mozyo_env_injection",
+                    "raw_herdr_send",
+                ],
+            }
+        return payload
 
 
 def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
@@ -347,11 +473,27 @@ def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
     # stays byte-for-byte unchanged.
     if outcome.gateway_ready is not None:
         lines.append(f"- gateway_ready: {str(outcome.gateway_ready).lower()}")
+    if outcome.startup is not None:
+        lines.extend(
+            (
+                f"- startup_action_id: {outcome.startup.action_id or '-'}",
+                f"- startup_ok: {str(outcome.startup.ok).lower()}",
+                f"- startup_health: {outcome.startup.health_summary()}",
+                f"- startup_rollback_owed: {str(outcome.startup.rollback_owed).lower()}",
+            )
+        )
     if outcome.is_blocked:
         lines.append("- blocked_reasons: " + ", ".join(outcome.blocked_reasons))
-        lines.append(
-            "- next_action: coordinator callback (fail-closed; lane not fully actuated)"
-        )
+        if "sender_attestation" in outcome.blocked_reasons:
+            lines.append(
+                "- next_action: restore an attested coordinator shell by relaunching "
+                "from fixed session-start, or use a verified high-level coordinator "
+                "proxy; do not inject MOZYO env manually or use raw herdr send"
+            )
+        else:
+            lines.append(
+                "- next_action: coordinator callback (fail-closed; lane not fully actuated)"
+            )
     else:
         lines.append("- next_action: " + _next_action(outcome))
     return "\n".join(lines)
@@ -402,6 +544,7 @@ __all__ = (
     "ACTUATE_READY",
     "ACTUATE_BLOCKED",
     "ACTUATE_STATES",
+    "REASON_SENDER_UNATTESTED",
     "REASON_MISSING_IDENTITY",
     "REASON_LAUNCH_BLOCKED",
     "REASON_ANCHOR_REQUIRED",
@@ -409,8 +552,12 @@ __all__ = (
     "REASON_PANE_CREATE_FAILED",
     "REASON_STAMP_FAILED",
     "REASON_LANE_MISMATCH",
+    "REASON_ADOPT_OWNER_UNBOUND",
     "REASON_HANDOFF_FAILED",
     "REASON_WORK_UNIT_BLOCKED",
+    "REASON_PAIR_SPLIT",
+    "REASON_RUNTIME_FINGERPRINT",
+    "REASON_STARTUP_HEALTH_UNCONFIRMED",
     "REASON_FILL_STOP",
     "BLOCKED_REASONS",
     "DISPATCH_GATEWAY_NOTIFIED",
@@ -419,6 +566,8 @@ __all__ = (
     "DISPATCH_NOT_ATTEMPTED",
     "DISPATCH_RESULTS",
     "ActuationStep",
+    "SublaneStartupRoleHealth",
+    "SublaneStartupObservation",
     "SublaneActuationOutcome",
     "render_actuation_journal",
 )

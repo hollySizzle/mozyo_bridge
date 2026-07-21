@@ -47,7 +47,7 @@ include:
 
 allowlist:
   - path: src/mozyo_bridge/application/commands.py
-    lines: 3518
+    lines: 2266
     reason: >-
       Monolithic command-handler module; the CLI parser split (#12138/#12141/
       #12153/#12155) moved registration out but the handler bodies still live
@@ -1031,6 +1031,132 @@ allowlist:
       repo root instead of the `%pane`-only gate; the resolution itself is the new
       `herdr_send_entry.herdr_auto_target_repo` helper, not here — only the guarded branch
       remains). tmux `auto` is byte-invariant (the branch is guarded on `herdr_send`).
+      Raised 3518 -> 3525 for the #13477 role-profile `redmine_project` auto-resolution
+      wiring in `orchestrate_handoff`: the parse + `durable_anchor` + verified-default
+      auto-fill now go through the extracted
+      `f_130_handoff_routing/application/role_profile_field_resolution.py` helper (the
+      workspace-default read itself is `core.state.workspace_defaults.resolve_default_project`),
+      so only the one guarded call site + its import remain here.
+      Raised 3525 -> 3541 for the #13583 R1-F1 forward generation correlation: the two ticketless
+      payload constructions in `orchestrate_handoff` thread the additive `forward_action_id` (herdr
+      forward only; the field + round-trip live in the `f_130_handoff_routing/domain/ticketless_*`
+      value objects, not here), and `cmd_handoff_ticketless_callback` calls the best-effort
+      completion hook after a delivered callback (the hook itself is
+      `herdr_workflow_step.complete_forward_generation_on_callback`, not here — only the guarded
+      call site remains).
+      Raised 3541 -> 3552 for the #13583 R2-F2 positive-delivery gate: `orchestrate_handoff`
+      publishes its terminal transport outcome at the two delivery paths (`pending_input` + the
+      sent/queue-enter terminal) so a caller can tell a real delivery from an rc-0
+      `pending_input` / marker-unobserved `queue_enter`. The predicate + publisher were
+      **extracted** to the new
+      `f_130_handoff_routing/application/delivery_outcome_gate.py` (only the two call sites + a
+      re-export remain here), so this is +11 for the wiring, not the logic.
+      Baseline 3551 -> 3577 for #13760 (startup-admission zero-send): the pre-send
+      startup admission call in `orchestrate_handoff` — the single action-time read
+      that refuses a send to a receiver still on a provider startup screen (trust /
+      first-run setup / login), which #13582 j#77917 proved a readiness-time check
+      cannot catch. Deliberately NOT inline: the gate body (classify, emit the
+      structured blocked outcome, ledger, die) lives in the new
+      `f_130_handoff_routing/application/startup_admission_gate.py`, mirroring the
+      #12918 `gateway_route_gate` precedent, so this module keeps only the call and
+      grows by ~26 lines instead of ~85. The provider-specific screen signatures are
+      profile DATA, never source in here.
+      Raised 3577 -> 3593 for #13729 tranche 1 (handoff OOP decomposition, typed
+      input seam): `orchestrate_handoff` converts its `argparse.Namespace` + entry
+      policy once into the typed frozen `HandoffCommandInput` and reads scalar
+      inputs off it instead of scattered `getattr(args, ...)`. The value object +
+      Namespace adapter live in the new
+      `f_130_handoff_routing/domain/handoff_command_input.py` +
+      `application/handoff_command_input_adapter.py`; this module keeps only the
+      one-time conversion + the (~1:1) `inp.<field>` reads, so the +16 is the seam
+      scaffold (import + single conversion). `target_repo` stays on the Namespace
+      (mutated in place, re-read by not-yet-extracted target resolution). Later
+      tranches (design j#78394 Tasks 2-5) extract the 1699-line body and drain this
+      toward `commands.py < 2200`.
+      Raised 3593 -> 3636 for #13729 tranche 1 review j#78706 correction (R1
+      Namespace confinement): the facade now captures the full command input in
+      `HandoffCommandInput`, resolves the repo root once at its boundary, models
+      the `--target-repo auto` mutation as a typed local (`resolved_target_repo`),
+      passes a publish callback + typed scalars (allow_direct_worker /
+      main_lane_exception / target_repo / target_lane / record / submit / persist)
+      to the herdr target trio, the gateway-route / main-lane / startup-admission
+      gates, and the delivery-record helpers, so no routing / target / gate /
+      record helper accepts an `argparse.Namespace`. The +43 is the explicit
+      typed-scalar wiring at those call sites; the helper bodies did NOT move here
+      (their logic stays in their own modules, drained one family per tranche).
+      Tightened 3636 -> 3342 for #13729 tranche 2 (Anchor/Profile Envelope Planner):
+      the early anchor build (Redmine/Asana/ticketless typed anchor + payloads) and
+      the pre-send envelope resolution (execution root / role profile / transition
+      role / workflow contract / notification body / landing marker) moved to the
+      new `f_130_handoff_routing/application/handoff_envelope_planner.py`
+      (`HandoffEnvelopePlanner.plan_anchor` / `plan_delivery_envelope`); the facade
+      keeps two thin try/except call sites that map `EnvelopePlanError` back to the
+      byte-identical blocked outcome. Net -294. Shared baseline change: reconcile at
+      integration if another tranche/lane also edits this file.
+      Tightened 3342 -> 3306 for #13729 tranche 3 (herdr event-driven --mode standard
+      turn-start rail): the ~74-line inline block that drives the `HerdrTurnStartRail`,
+      projects the `(status, reason)` wire, and assembles + emits + ledgers the terminal
+      outcome then persists (`sent`) or dies (no C-u rollback, no re-send) moved to the new
+      `f_130_handoff_routing/application/handoff_herdr_standard_rail.py`
+      (`HerdrStandardRailUseCase` over a typed `HerdrStandardRailRequest` + a side-effect
+      `HerdrStandardRailOps` port; `LiveHerdrStandardRailOps` routes the ledger / persist /
+      die seams through `commands` at call time). The facade keeps one thin call site that
+      builds the typed request from the resolved envelope and returns the use case result.
+      Net -36. Shared baseline change: reconcile at integration if another tranche/lane also
+      edits this file.
+      Tightened 3306 -> 3044 for #13729 tranche 4 (common tmux transport rail): the ~308-line
+      inline block that injects the marker+body once and drives it to a terminal disposition
+      (pending park / marker landing gate + C-u rollback / Enter-only retry / standard turn-start
+      confirmation / final sent assembly with the emit / persist / ledger / focus-restore side
+      effects) moved to the new
+      `f_130_handoff_routing/application/handoff_tmux_transport_rail.py`
+      (`TmuxTransportRailUseCase` over a typed `TmuxTransportRailRequest` + a side-effect
+      `TmuxTransportRailOps` port; `LiveTmuxTransportRailOps` routes run_tmux / capture_pane /
+      wait_for_text and the observe / persist / ledger / restore / die seams through `commands`
+      at call time so the transport-wiring swap and every monkeypatch seam stay in force). The
+      facade keeps one thin call site that builds the typed request from the resolved envelope +
+      raw scalars and returns the use case result. Net -262. Shared baseline change: reconcile at
+      integration if another tranche/lane also edits this file.
+      Tightened 3044 -> 2860 for #13729 tranche 5 (handoff target-resolution preflight): the
+      ~218-line inline block that resolves the send target (herdr-native inventory / tmux pane
+      resolver), emits the `target_unavailable` `<session>:codex` gateway diagnostic, surfaces the
+      same-lane duplicate diagnostics, resolves `--target-repo auto` (herdr self-root / explicit
+      `%pane` cwd inference with the `invalid_args` + `target_repo_mismatch` fail-closed gates), and
+      projects the canonical `project_preflight_target` moved to the new
+      `f_130_handoff_routing/application/handoff_target_resolution.py`
+      (`TargetResolutionUseCase` over a typed `TargetResolutionRequest` + `TargetResolutionResult`
+      + a side-effect `TargetResolutionOps` port; `LiveTargetResolutionOps` routes the
+      resolve_herdr_send_target / pane_info / herdr_auto_target_repo / project_preflight_target and
+      the pane-resolver / project-discovery / diagnostic seams through `commands` at call time so
+      every monkeypatch seam stays in force). The facade keeps one thin call site that builds the
+      typed request from the resolved envelope + backend predicate and reads the resolved
+      target_info / target / duplicate_lane_panes / resolved_target_repo / preflight_target back off
+      the typed result (and drop the now-orphaned `HerdrSendEntryError` / `AUTO_TARGET_REPO` /
+      `is_explicit_pane_target` facade imports, whose only uses moved into the use case). Net -184.
+      Shared baseline change: reconcile at integration if another tranche/lane also edits this file.
+      Tightened 2860 -> 2266 for #13729 tranche 6 (handoff admission pipeline): the ~637-line inline
+      block that runs the fixed-order sequence of die-able admission gates over the resolved target
+      (the #12441/#13174 main-lane implementation guard, the #11779/#11822/#11908 receiver binding,
+      the #11301/#13261 session binding, the #10332 cross-workspace `--to claude` gate, the #12918
+      gateway-route enforcement, the #11625/#12658 `--target-repo` identity gate, the #12658
+      `--target-project` scope gate, the #12597 standard_target_admission inactive-split plan, and
+      the #12597 foreground-agent binding) moved to the new
+      `f_130_handoff_routing/application/handoff_admission_pipeline.py`
+      (`AdmissionPipelineUseCase` over a typed `AdmissionPipelineRequest` + `AdmissionPipelineResult`
+      + a side-effect `AdmissionPipelineOps` port; `LiveAdmissionPipelineOps` routes the two
+      monkeypatched seams (`current_session_name` / `ensure_agent_target`) through `commands` at call
+      time and imports every other effect — the config-resolving main-lane / gateway-route gates, the
+      project-discovery resolvers, the cross-session diagnostic — directly from its f_110 / f_140 /
+      f_120 module). The facade keeps one thin call site that builds the typed request from the
+      resolved target + backend predicate + raw entry scalars and reads the two crossing values (the
+      resolved admission policy + the deferred inactive-split activation plan) back off the typed
+      result (and drop the now-orphaned `resolve_standard_target_admission_policy` /
+      `evaluate_standard_target_admission` / `build_inactive_pane_fallback_command` /
+      `is_receiver_agent_process` / `normalize_path_unicode` facade imports, whose only uses moved
+      into the use case). The inactive split is NOT actuated in the use case: the real `select-pane`
+      stays deferred to the facade, after every die-able gate AND the startup-admission gate. Net
+      -594. Shared baseline change: reconcile at integration if another tranche/lane also edits this
+      file.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
@@ -1063,7 +1189,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/release.py
-    lines: 1470
+    lines: 1510
     reason: >-
       Release check/bump/publish/workflow helpers in one module. Splitting
       touches release gates, so it is sequenced carefully. Path re-keyed from
@@ -1072,19 +1198,50 @@ allowlist:
       to the Redmine-numbered Epic/Feature path for the #12622/#12626 layout
       correction (byte-identical move, line count unchanged), landing in the
       same commit as the move per the #12591 j#65488 / #12624 atomicity rule.
+      Baseline 1470 -> 1495 for #13601: the TestPyPI exact-candidate dispatch
+      (source_sha/expected_version/source_ref inputs, 40-hex SHA validation, and
+      deterministic nonce-based run correlation) is cohesive with the existing
+      publish helper and is not split ad hoc while the release-gate split is
+      still sequenced.
+      Baseline 1495 -> 1510 for #13883: the `source_ref` spelling policy and
+      action-time origin preflight were extracted to the sibling module
+      ``application/source_ref.py`` rather than grown here (same posture as
+      ``version_mirror``), so only the wiring — the import and the pre-dispatch
+      validate/preflight call in ``_publish_testpypi`` — remains in this module.
+      The feature itself is ~190 lines; +15 is what could not be moved without
+      making the publish helper's own control flow unreadable.
     owner_issue: "#12321"
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 2126
+    lines: 2216
     reason: >-
+      Baseline 2202 -> 2216 for #13844 (shared lifecycle schema reader-upgrade routing):
+      the additive `reader_upgrade_required` token on the closed `Reason` vocabulary plus
+      its one-line `next_action_for` / `_outcome_narrative` branches — the same additive-
+      Reason pattern as #12918's `gateway_route_blocked` and #13760's startup reason below.
+      The per-reason wording strings live in the f_130 sibling `gateway_route_wording.py`
+      (this module imports them); only the Reason token + its dispatch arms must live here,
+      because this module owns the closed vocabulary and all its per-reason dispatch.
       Handoff routing/kind/mode domain core. Cohesive but over threshold.
       Relocated move-only from `src/mozyo_bridge/domain/handoff.py` to the
       Redmine-numbered execution_platform layout by #12624 (US #12622); line
       count unchanged, legacy path preserved as a `sys.modules` facade. Self-
       module baseline re-point per #12623 conflict-point policy; foreign drift
       and final module_health integration remain #12630's.
+      Baseline 2126 -> 2202 for #13760 (startup-admission zero-send): the
+      `receiver_startup_interaction_required` blocked reason + the additive
+      `startup_admission` structured field, and their three wording branches in
+      `next_action_for` / `_outcome_narrative` / `_receiver_contract_line`. This
+      module owns the closed `Reason` vocabulary and ALL of its per-reason wording
+      in one dispatch (the #13255 rail reasons landed the same way); splitting one
+      reason's prose into a sibling module to buy ~60 lines would fragment that
+      dispatch and make the vocabulary harder to audit, not easier. The gate's
+      behaviour — the pane read, the pure classifier, the emit/die — is NOT here: it
+      is in `f_130_handoff_routing/application/startup_admission_gate.py` and the
+      e_140 `herdr_startup_admission` evaluator, and the provider-specific screen
+      signatures are profile DATA (`agent_provider_profiles.yaml`), not source.
       Baseline raised 1084 -> 1151 for the #12388 role-profile fields on the
       delivery outcome / notification body / delivery record (the resolved-text
       rendering stays out of the auto-persist body).
@@ -1246,24 +1403,70 @@ allowlist:
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
-  - path: src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_start.py
-    lines: 1025
+  - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_actuator_use_case.py
+    lines: 1086
     reason: >-
-      herdr session-start orchestration (mint/adopt durable identities +
-      workspace placement + base-pane reclaim). Was already at ~985 lines
-      (just under threshold) before #13425; the #13425 provider-agnostic
-      launch-argv wiring (the config-derived `agent_launch.resolve_launch_argv`
-      threaded through `prepare_session` -> lane_class derivation -> the
-      `launch_argv_extra` extend in `_execute_slot`, plus the CLI config load)
-      tipped it to 1025. The wiring is deliberately minimal — the launch-argv
-      vocabulary + validation live in the sibling
-      `f_140_rules_docs_catalog/domain/agent_launch_argv.py`, not here. A split
-      of this module is DEFERRED because it is a shared touch surface with the
-      in-flight #13392 (herdr non-git parity: lane repo-root collapse, which
-      edits the identity/repo-root part of this same file); splitting it in this
-      lane would conflict with #13392, so the module decomposition is a
-      coordinator-sequenced follow-up under the herdr backend-swap program
-      (Version #308) once both US integrate.
-    owner_issue: "#13425"
-    resolution_version: "v0.10.10 (Version #241 ratchet) — split coordinated with #13392 under the herdr backend-swap program (Version #308)"
-    expires: "2027-11-30"
+      Backend-agnostic sublane actuation choreography (create / adopt / confirm /
+      dispatch). Already at 999 lines before #13810; the #13809 review (j#78890
+      R3-F3) required an owner-unbound fail-closed BLOCK on the adopt path, which
+      crossed it to 1036. Redmine #13847 adds two more required fail-closed branches
+      of the same shape: (1) the managed-launch capability preflight raises a typed
+      launcher-incompatible error (attestation-store schema skew) that must return a
+      DISTINCT `launcher_runtime_incompatible` `_blocked` result before dispatch; and
+      (2) the post-launch pair self-attestation gate, which must NOT promote a
+      partially-booted (live-but-unattested) pair to `executed` and returns a
+      `partial_pair_recovery_required` block before the dispatch branch — which crossed
+      it to 1086. Both pure decisions live in the sibling `herdr_launcher_capability.py`
+      / `pair_launch_attestation.py`, and the attestation gate body itself is carved
+      into `sublane_actuator_gates.py`; only the block-or-proceed control flow (which
+      must return the use case's `_blocked` result with the request context) lands here.
+      Splitting this shared orchestration mid-review-cycle for these fail-closed branches
+      is disproportionate risk; the `_execute` block-site repetition decomposition is
+      deferred to a follow-up under this issue's Version.
+    owner_issue: "#13847"
+    resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
+    expires: "2027-10-08"
+
+  - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_actuator_herdr_ops.py
+    lines: 1032
+    reason: >-
+      herdr-backend creation-side actuation IO port for `sublane start --execute`
+      (the sibling of the tmux LiveSublaneActuatorOps). A cohesive IO adapter — launch
+      the pair via prepare_session, resolve the live lane from the herdr inventory,
+      probe gateway readiness, dispatch. Was at 998 lines; Redmine #13847 added the two
+      required additions its port must carry: (1) translate the managed-launch
+      capability-preflight failure (HerdrLauncherIncompatibleError) into the typed
+      `SublaneLauncherIncompatibleError` the use case maps to `launcher_runtime_incompatible`;
+      and (2) `observe_pair_attestation`, the read-only port method the post-launch
+      attestation gate polls (a thin delegation to the cohesive
+      `sublane_pair_attestation_ops.observe_lane_pair_attestation` helper — the real
+      store/inventory IO lives there, not here). Splitting this adapter mid-review-cycle
+      for two small required additions is disproportionate risk; the extraction of the
+      slot-resolution / read-back helpers is deferred to a follow-up under this issue's
+      Version.
+    owner_issue: "#13847"
+    resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
+    expires: "2027-10-08"
+
+
+# herdr_session_start.py was allowlisted at 1027 lines (owner_issue #13425, split
+# deferred pending #13392). Redmine #13411 (lane=tab subdivision) resolved the
+# deferral: the pure placement/topology decisions + payload parsers were extracted
+# to the cohesive sibling
+# `e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_lane_topology.py`
+# (~446 lines: placement decisions + payload parsers + the workspace-segment
+# resolver), dropping herdr_session_start to ~970 lines — back under the 1000
+# threshold even after the j#74433 / j#74434 review-fix guards. The allowlist entry
+# was removed then; it was re-added after the #13613/#13614 integration (#13518
+# restack) pushed the file to 1013, and grew to a 1075 baseline through #13637.
+#
+# Redmine #13646 (config-driven `lane_placement`) removed that entry AGAIN by carrying
+# out the reduction the #13637 entry itself pre-declared ("a further reduction could
+# extract the empty-base-pane / tab reclaim helpers if this grows"): the fail-closed
+# herdr command runner, the `agent list` read, and the workspace/tab create + root-pane
+# reclaim helpers moved to the cohesive sibling
+# `e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_pane_lifecycle.py`
+# (~186 lines), and the new placement decisions (split direction, container occupancy,
+# launch order, per-slot placement) went to the pure `herdr_lane_topology.py`. Net:
+# herdr_session_start is 997 lines — under the threshold WITH the whole #13646 feature
+# added, so it carries no allowlist entry.

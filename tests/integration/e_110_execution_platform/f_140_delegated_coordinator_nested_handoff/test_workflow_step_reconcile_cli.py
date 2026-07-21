@@ -36,9 +36,19 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     cli_workflow,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
+    EXECUTION_NO_OP,
+    EXECUTION_READY,
+    PRIMITIVE_NONE,
+    WorkflowStepOutcome,
+)
 
 REPO = "/work/repo"
 PROJECT = "cloud-drive"
+
+
+def _boom(*_a, **_k):
+    raise AssertionError("tmux rail reached under the herdr backend")
 
 
 def _cand(pane_id, *, role="codex", project_scope="", lane_kind="", repo_root=REPO):
@@ -89,6 +99,8 @@ def _run_step(args, candidates, *, self_pane="%self"):
     """Run `cmd_workflow_step` with a real store read (only tmux/discovery patched)."""
     out = io.StringIO()
     with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+        cli_workflow, "_herdr_step_preflight", lambda _a: None
+    ), patch.object(
         cli_workflow, "current_pane", lambda: self_pane
     ), patch.object(
         cli_workflow, "_discover_candidates", return_value=candidates
@@ -235,6 +247,99 @@ class BackwardCompatTest(_StoreCase):
         payload = json.loads(text)
         self.assertEqual(payload["reason"], "consultation_ready")
         self.assertNotIn("reconcile_disposition", payload)
+
+
+class HerdrCommonReconcileTest(_StoreCase):
+    """The herdr live outcome flows through the SAME store reconcile as tmux (F2 / R2 j#74770).
+
+    Injects the herdr live outcome (patching `_herdr_step_preflight` so the backend-specific
+    resolution is fixed) and drives the real shared store reconcile. `require_tmux` /
+    `current_pane` blow up if reached, proving the herdr path never touches the tmux rail.
+    """
+
+    def _run_herdr(self, live, args):
+        out = io.StringIO()
+        with patch.object(cli_workflow, "require_tmux", _boom), patch.object(
+            cli_workflow, "current_pane", _boom
+        ), patch.object(
+            cli_workflow, "_herdr_step_preflight", lambda _a: live
+        ), contextlib.redirect_stdout(out):
+            rc = cli_workflow.cmd_workflow_step(args)
+        return rc, out.getvalue()
+
+    def test_herdr_forward_leg_is_gated_by_a_pending_gating_action(self):
+        # A gating store action (review approved -> aggregate_owner_approval,
+        # requires_confirmation) must downgrade a herdr live forward (`ready`) leg to blocked.
+        self._persist(
+            "13291:review_request,id=13291:72672,commit=1",
+            "13291:review,id=13291:72700,conclusion=approved,commit=1",
+            routes=("route_id=r,issue=13291,ws=w,role=codex,pane_name=gw,pane_id=%17",),
+        )
+        live = WorkflowStepOutcome(
+            state="child_worker_dispatch",
+            next_action="dispatch the same-lane worker",
+            execution=EXECUTION_READY,
+            reason="herdr_worker_dispatch_ready",
+            next_owner="child",
+            primitive=PRIMITIVE_NONE,  # resolution-only: not executable, so no tmux dispatch
+            durable_anchor="redmine:issue=13291:journal=72672",
+        )
+        rc, text = self._run_herdr(live, _args(self.store_path))
+        payload = json.loads(text)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["execution"], "blocked")
+        self.assertEqual(payload["reason"], "store_pending_action_gates")
+        self.assertEqual(payload["reconcile_disposition"], "store_gates_live")
+        self.assertEqual(
+            payload["store_pending_action"]["action"], "aggregate_owner_approval"
+        )
+
+    def test_store_action_for_a_different_issue_is_not_adopted(self):
+        # F3c: the herdr live anchor was verified against source-of-truth Redmine (issue 13489);
+        # a caller-supplied store's pending action for a DIFFERENT issue (13291) must not be
+        # surfaced as `store_aligned` — it is rejected as `store_issue_mismatch`, live unchanged.
+        self._persist(
+            "13291:review_request,id=13291:72672,commit=1",
+            routes=("route_id=r,issue=13291,ws=w,role=codex,pane_name=gw,pane_id=%17",),
+        )
+        live = WorkflowStepOutcome(
+            state="grandchild_redmine_work",
+            next_action="read the verified anchor and implement",
+            execution=EXECUTION_NO_OP,
+            reason="herdr_worker_step_ready",
+            next_owner="grandchild",
+            primitive=PRIMITIVE_NONE,
+            durable_anchor="redmine:issue=13489:journal=74766",  # verified issue != store's 13291
+        )
+        rc, text = self._run_herdr(live, _args(self.store_path))
+        payload = json.loads(text)
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["reason"], "herdr_worker_step_ready")  # live unchanged
+        self.assertEqual(payload["reconcile_disposition"], "store_issue_mismatch")
+
+    def test_herdr_outcome_surfaces_a_non_gating_pending_action(self):
+        # A non-gating pending action (review_request + codex route -> perform_review) is
+        # surfaced alongside the unchanged herdr live outcome in the SAME envelope (aligned).
+        self._persist(
+            "13291:review_request,id=13291:72672,commit=1",
+            routes=("route_id=r,issue=13291,ws=w,role=codex,pane_name=gw,pane_id=%17",),
+        )
+        live = WorkflowStepOutcome(
+            state="grandchild_redmine_work",
+            next_action="read the verified anchor and implement",
+            execution=EXECUTION_NO_OP,
+            reason="herdr_worker_step_ready",
+            next_owner="grandchild",
+            primitive=PRIMITIVE_NONE,
+            durable_anchor="redmine:issue=13291:journal=72672",
+        )
+        rc, text = self._run_herdr(live, _args(self.store_path))
+        payload = json.loads(text)
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["reason"], "herdr_worker_step_ready")
+        self.assertEqual(payload["reconcile_disposition"], "store_aligned")
+        self.assertEqual(payload["store_pending_action"]["action"], "perform_review")
+        self.assertFalse(payload["store_pending_action"]["requires_confirmation"])
 
 
 if __name__ == "__main__":

@@ -506,6 +506,26 @@ class HerdrTurnStartRail:
         """
         return self._reader
 
+    def read_visible_pane(self, target: str) -> str:
+        """The rendered visible content of ``target`` (a read-only borrow of the transport).
+
+        Redmine #14082 R2: the background_service delivery seam runs the #13760 pre-send startup
+        admission (:func:`...herdr_startup_admission.evaluate_startup_admission`) immediately before
+        :meth:`drive_turn_start`, exactly as the ``handoff send`` boundary does. That gate needs the
+        receiver's VISIBLE pane text (classified against the provider's declared startup screens),
+        which is a different read than the ``read_agent_state`` snapshot the rail's precondition gate
+        uses. This exposes the transport's ``read_pane`` read-only — symmetric with :attr:`reader` — so
+        a caller holding the resolved rail reads the visible pane through the same bound primitive
+        without resolving a second transport from config. Raises on a failed read so the admission
+        fails **closed** (an unreadable pane is a zero-send refusal, never treated as startup-clear).
+        """
+        read = self._transport.read_pane(target)
+        if not read.ok or read.content is None:
+            raise TerminalTransportError(
+                f"visible-pane read failed for {target!r}: {read.reason or 'unreadable'}"
+            )
+        return read.content
+
     def drive_turn_start(
         self, target: str, text: str, *, enter_keys: str = DEFAULT_ENTER_KEYS
     ) -> TurnStartResult:

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
@@ -32,9 +32,19 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
+    LaunchPreflight,
+    SublaneIntegrationPolicy,
+    WorktreeLaunchDecision,
+    decide_worktree_launch,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
+    SublaneCreateRequest,
     SublaneLaneView,
     project_sublanes,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
+    SublaneStartupObservation,
 )
 
 
@@ -100,11 +110,34 @@ class SublaneActuatorOps(Protocol):
         self, *, branch: str, worktree_path: str, base_ref: Optional[str] = None
     ) -> None: ...
 
-    def append_lane_column(self, worktree_path: str) -> None: ...
+    def append_lane_column(
+        self, worktree_path: str
+    ) -> Optional[SublaneStartupObservation]:
+        """Launch a pair; ``None`` is reserved for legacy non-herdr adapters."""
+        ...
 
     def append_lane_argv(self, worktree_path: str) -> list[str]: ...
 
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]: ...
+
+    def declare_adopted_lane_lifecycle(
+        self, worktree_path: str, *, adopted: bool
+    ) -> str:
+        """Backfill an ADOPTED lane's lifecycle owner binding (Redmine #13809).
+
+        A live-adopt (``adopted`` True) records the lane's owner row through the common
+        declaration service, fail-closed and idempotent — closing the gap where a lane
+        adopted onto a live pair skipped :meth:`append_lane_column` and stayed
+        owner-rowless. A create (``adopted`` False) already declared via the append.
+
+        Returns an outcome status from
+        :mod:`...sublane_adopt_declaration` (``ADOPT_DECL_*``): only a value in
+        ``ADOPT_DECL_PROCEED`` (a fresh / idempotent ``declared``, or the non-gated
+        ``not_adopted``) authorizes the caller to proceed to dispatch; any other value
+        leaves the lane owner-unbound and the caller must fail closed (R3-F3). An adapter
+        whose backend does not manage adopt owner rows returns ``ADOPT_DECL_NOT_ADOPTED``.
+        """
+        ...
 
     def probe_gateway_ready(self, gateway_pane: str) -> bool:
         """One non-fatal readiness snapshot of the gateway pane (#13293).
@@ -154,6 +187,22 @@ class LiveSublaneActuatorOps:
 
     def _git(self) -> LiveSublaneGitOperations:
         return LiveSublaneGitOperations(repo_root=self.repo_root)
+
+    def gateway_provider(self) -> str:
+        """The runtime provider bound to the coordinator (gateway) role (Redmine #13569).
+
+        The coordinator -> lane-gateway dispatch and the gateway readiness probe key on
+        this, resolved from the repo-local ``RoleProviderBinding`` (default ``codex``,
+        byte-identical) so a rebound gateway provider moves the ``--to`` receiver and the
+        readiness check with no source edit. An unbound coordinator role raises
+        :class:`WorkflowProviderUnresolved`, which the actuation turns into a fail-closed
+        zero-dispatch.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            resolve_gateway_provider,
+        )
+
+        return resolve_gateway_provider(str(self.repo_root))
 
     def canonical_workspace_root(self) -> str:
         # #13392: the workspace root the actuation is driven from — the lane runtime root
@@ -231,6 +280,19 @@ class LiveSublaneActuatorOps:
             return basename_matches[0]
         return None
 
+    def declare_adopted_lane_lifecycle(
+        self, worktree_path: str, *, adopted: bool
+    ) -> str:
+        # The tmux/cockpit backend does not gate adopt owner rows: the standard herdr
+        # sublane live-adopt owner-row gap (Redmine #13809) is the herdr adapter's. The
+        # cockpit lane's owner binding is declared through the cockpit-append CLI this
+        # adapter drives; ``not_adopted`` signals the use case not to fail closed here.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_NOT_ADOPTED,
+        )
+
+        return ADOPT_DECL_NOT_ADOPTED
+
     def probe_gateway_ready(self, gateway_pane: str) -> bool:
         # #13293: one non-fatal readiness snapshot — the gateway's foreground process is
         # the Codex TUI (strong per-receiver identity, the same check the queue-enter
@@ -247,8 +309,9 @@ class LiveSublaneActuatorOps:
         )
 
         try:
+            gateway_provider = self.gateway_provider()
             info = pane_info(gateway_pane)
-            if not is_receiver_agent_process(info.get("command", ""), "codex"):
+            if not is_receiver_agent_process(info.get("command", ""), gateway_provider):
                 return False
             rendered = capture_pane(gateway_pane, GATEWAY_READY_CAPTURE_LINES)
         except (SystemExit, Exception):  # noqa: BLE001 — a probe never fails the actuation.
@@ -269,7 +332,7 @@ class LiveSublaneActuatorOps:
             "handoff",
             "send",
             "--to",
-            "codex",
+            self.gateway_provider(),
             "--source",
             "redmine",
             "--issue",
@@ -289,6 +352,9 @@ class LiveSublaneActuatorOps:
             "--profile-field",
             f"lane={lane_label}",
         ]
+        # The live callers resolve the #13476 stable-route default
+        # (SublaneCreateRequest.resolved_upstream_coordinator), so this is always
+        # non-empty in normal flow; the guard stays as null-safety for direct callers.
         if upstream_coordinator:
             argv += ["--profile-field", f"upstream_coordinator={upstream_coordinator}"]
         return self._drive_cli(argv)
@@ -316,6 +382,70 @@ def resolve_lane_runtime_root(
     return worktree_path or ""
 
 
+def default_nongit_worktree_request(
+    ops: object, request: SublaneCreateRequest, is_git: bool
+) -> SublaneCreateRequest:
+    """Default a non-git lane's omitted ``--worktree`` to the workspace root (Redmine #13432).
+
+    In a non-git (directory-scaffold) workspace the lane has no worktree — it runs in the
+    workspace root itself (#13392 論点1) — so an omitted ``--worktree`` collapses to the lane
+    runtime root. Returns ``request`` unchanged for a Git workspace, when a worktree is
+    already supplied, or when the ops adapter exposes no resolvable workspace root (the
+    non-git plan does not require the field either way).
+    """
+    if is_git or (request.worktree_path or "").strip():
+        return request
+    root = resolve_lane_runtime_root(ops, "", skip_no_git=True)
+    if not root:
+        return request
+    return replace(request, worktree_path=root)
+
+
+def decide_create_launch(
+    ops: object, request: SublaneCreateRequest, policy: SublaneIntegrationPolicy
+) -> WorktreeLaunchDecision:
+    """The #12604 worktree launch decision for a create request over the ops git probes.
+
+    Shared by the plan-only (:class:`SublaneCreateUseCase`) and actuator
+    (:class:`SublaneActuateUseCase`) create paths: probe git, resolve the identity /
+    worktree-exists preflight facts, and ask the pure :func:`decide_worktree_launch`. A
+    non-git workspace resolves to ``LAUNCH_SKIP_NO_GIT`` before the identity gate, so a
+    #13432 non-git lane (optional ``--branch`` / ``--worktree``) is never blocked here.
+    """
+    is_git = ops.is_git_workspace()
+    identity_known = bool(request.branch) and bool(request.worktree_path)
+    worktree_exists = (
+        ops.worktree_exists(request.branch) if is_git and identity_known else False
+    )
+    preflight = LaunchPreflight(
+        is_git_workspace=is_git,
+        worktree_exists=worktree_exists,
+        branch_resolved=bool(request.branch),
+        target_identity_known=identity_known,
+    )
+    return decide_worktree_launch(policy, preflight)
+
+
+def resolve_create_identity(
+    ops: object, request: SublaneCreateRequest
+) -> tuple[SublaneCreateRequest, tuple[str, ...]]:
+    """Resolve the create-request identity + its fail-closed ``missing_fields`` (Redmine #13432).
+
+    The shared #13432 identity contract for both the plan-only and the actuator create use
+    cases: a blank field under the Git-strict contract triggers one git probe; in a non-git
+    workspace ``--branch`` / ``--worktree`` are optional and the omitted ``--worktree``
+    defaults to the workspace root. A fully-supplied request never probes (so a later gate —
+    work-unit / anchor — still short-circuits before any probe). Returns the (possibly
+    worktree-defaulted) request and the remaining required-field gap.
+    """
+    missing = request.missing_fields()
+    if not missing:
+        return request, missing
+    is_git = ops.is_git_workspace()
+    request = default_nongit_worktree_request(ops, request, is_git)
+    return request, request.missing_fields(is_git=is_git)
+
+
 def _normalize_path(path: str) -> str:
     try:
         return str(Path(path).expanduser().resolve())
@@ -330,4 +460,7 @@ __all__ = (
     "SublaneActuatorOps",
     "LiveSublaneActuatorOps",
     "resolve_lane_runtime_root",
+    "decide_create_launch",
+    "default_nongit_worktree_request",
+    "resolve_create_identity",
 )

@@ -1,61 +1,14 @@
-"""`mozyo-bridge sublane dispatch-worker` ack-drive boundary (Redmine #12988).
+"""Fail-closed ``sublane dispatch-worker`` drive (#12988, hardened by #13846).
 
-#12986 left ``sublane create --execute`` honestly stopping at
-``gateway_notified`` / ``worker_dispatch_confirmed=false``: a gateway send
-exiting 0 proves gateway notification only. This module adds the follow-up
-**worker-dispatch ack drive**: the lane's Codex gateway (the only sanctioned
-same-lane forwarding actor) runs ``sublane dispatch-worker --execute`` to
-forward the anchored ``implementation_request`` to its same-lane Claude worker
-over the *existing* governed ``handoff send --to claude`` rail, and the drive
-records the measured delivery ACK as :data:`DISPATCH_WORKER_DISPATCHED` /
-``worker_dispatch_confirmed=true`` — or fails closed, keeping the lane's
-recorded ``gateway_notified`` state untouched.
-
-What this drive deliberately does NOT do:
-
-- it never weakens a routing gate: the send is composed through the real CLI
-  parser (the same fully-defaulted path the gateway would type by hand), so the
-  #12918 gateway-route gate, the cross-session / cross-lane blocks, the
-  ``--target-repo`` identity gate, and the queue-enter submit-complete rail all
-  still apply, unhidden;
-- it never claims more than a **delivery ACK**: ``worker_dispatched`` means the
-  worker runtime received the anchored input, never that the worker progressed
-  or completed (``vibes/docs/logics/ack-completion-receiver-state.md``); no
-  completion detector is introduced;
-- it never dispatches unanchored: a live send without a durable-anchor journal
-  id fails closed (:data:`REASON_ANCHOR_REQUIRED`), mirroring the #12973
-  actuator's dispatch step;
-- it never targets a lane whose identity does not match the request
-  (:func:`lane_identity_matches`, the j#70250 misdelivery guard).
-
-OOP-first boundary (mirrors #12973 ``sublane_actuator``):
-:class:`WorkerDispatchUseCase` holds the fail-closed decision flow and never
-touches IO; the :class:`WorkerDispatchOps` port owns every side effect;
-:class:`LiveWorkerDispatchOps` composes the real primitives (lane read-back via
-the #12973 actuator's proven inventory fold + the ``handoff send`` CLI
-contract); the typed :class:`WorkerDispatchOutcome` carries the machine-readable
-payload; and the thin ``cmd_sublane_dispatch_worker`` handler owns stdout and
-the exit code. The default UX is a side-effect-free dry-run preview; ``--execute``
-is the opt-in live drive, exactly like the actuator surface.
-
-Backend selection (Redmine #13357): under ``terminal_transport.backend: herdr``
-(#13331 option A — a lane is its own per-lane herdr workspace) the handler picks
-the herdr adapter
-:class:`~...application.sublane_worker_dispatch_herdr_ops.HerdrWorkerDispatchOps`
-through :func:`_resolve_worker_dispatch_ops` (the same
-:func:`~...application.sublane_herdr_projection.repo_backend_is_herdr` selector
-``sublane create --execute`` uses), so the measured-ACK contract above holds on
-the herdr rail too. Anything else keeps the tmux :class:`LiveWorkerDispatchOps`,
-byte-for-byte.
+IO stays behind :class:`WorkerDispatchOps`; the use case requires current worker
+authority plus a causally-bound turn-start and never equates transport ACK with
+worker uptake.  It does not close, relaunch, or infer task completion.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import json
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,6 +17,9 @@ from typing import Callable, Optional, Protocol, runtime_checkable
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator import (
     LiveSublaneActuatorOps,
     resolve_dispatch_admission_args,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
+    WorkflowProviderUnresolved,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
     ACTUATE_BLOCKED,
@@ -87,29 +43,34 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     redact_worktree_paths,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (
+    ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
+    REASON_FOREIGN_SENDER,
     REASON_LANE_NOT_RESOLVED,
     REASON_LANE_PANE_MISSING,
     REASON_WORKER_DISPATCH_FAILED,
+    REASON_WORKER_TURN_START_UNCONFIRMED,
+    TURN_START_STARTED,
     WORKER_DISPATCH_DELIVERY_FAILED,
+    WORKER_DISPATCH_TURN_START_UNCONFIRMED,
+    SenderDispatchAdmission,
+    WorkerDispatchAdmission,
+    WorkerDispatchAdmissionFacts,
     WorkerDispatchOutcome,
     WorkerDispatchRequest,
     lane_identity_matches,
     render_worker_dispatch_journal,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatch_send import (  # noqa: E501,F401
+    # Re-exported so `_worker_dispatcher._drive_worker_send_argv` / `._worker_dispatch_argv`
+    # / `._replayable_command` stay the established call + monkeypatch seams after the
+    # Redmine #14192 leaf carve (line-cap). Callers reference these module globals.
+    _drive_worker_send_argv,
+    _replayable_command,
+    _worker_dispatch_argv,
+)
 
 
-# ---------------------------------------------------------------------------
-# Worker readiness wait tuning (#13301). Mirrors the #13293 gateway readiness wait
-# but targets the same-lane Claude worker pane: before the queue-enter forward, the
-# drive polls the worker pane up to ``DEFAULT_WORKER_READY_PROBES`` times at
-# ``DEFAULT_WORKER_READY_INTERVAL_SECONDS`` apart (≈ a 10s window by default) so a
-# freshly-launched worker TUI has time to boot before the forward — the second-wave
-# 3/4-lane failure mode (j#72860/72861/72862) was "forward typed into a still-booting
-# worker composer", the worker-side analog of the gateway dispatch-loss the #13293
-# wait closed on the gateway pane. The wait NEVER hard-blocks the queue-enter rail:
-# an unconfirmed readiness degrades to a recorded ``worker_ready=false`` and forwards
-# anyway (the handoff Enter-only retry is the landing safety net).
-# ---------------------------------------------------------------------------
+# Worker readiness wait tuning (#13301); #13846 now treats loss as a hard fence.
 
 DEFAULT_WORKER_READY_PROBES = 20
 DEFAULT_WORKER_READY_INTERVAL_SECONDS = 0.5
@@ -137,6 +98,10 @@ class WorkerDispatchOps(Protocol):
 
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]: ...
 
+    def observe_worker_dispatch_admission(
+        self, *, lane: SublaneLaneView, request: WorkerDispatchRequest
+    ) -> WorkerDispatchAdmission: ...
+
     def probe_worker_ready(self, worker_pane: str) -> bool:
         """One non-fatal readiness snapshot of the same-lane worker pane (#13301).
 
@@ -161,6 +126,41 @@ class WorkerDispatchOps(Protocol):
         allow_direct_worker: bool = False,
     ) -> int: ...
 
+    def dispatch_to_worker_turn_start(
+        self,
+        *,
+        issue: str,
+        journal: str,
+        worker_pane: str,
+        lane_label: str,
+        gateway_callback_target: Optional[str],
+        target_repo: str,
+        worker_assigned_name: str,
+        allow_direct_worker: bool = False,
+    ) -> tuple[int, str, bool]:
+        """``(delivery_ack_rc, turn_start_token, known_not_sent)`` (Redmine #14192).
+
+        ``known_not_sent`` is ``True`` only when a non-zero send's inner rail PROVED a
+        pre-injection zero-send (a ``gateway_route_blocked`` / ``reader_upgrade_required``
+        gate), so the caller cancels the exact fence key instead of poisoning it to the
+        reconcile-only ``uncertain`` terminal. Every other non-zero outcome is ``False``.
+        """
+        ...
+
+    def reserve_worker_dispatch(
+        self, *, admission: WorkerDispatchAdmission, request: WorkerDispatchRequest
+    ) -> tuple[bool, str]: ...
+
+    def complete_worker_dispatch(
+        self,
+        *,
+        admission: WorkerDispatchAdmission,
+        request: WorkerDispatchRequest,
+        delivered: bool,
+        detail: str,
+        known_not_sent: bool = False,
+    ) -> bool: ...
+
 
 @dataclass(frozen=True)
 class LiveWorkerDispatchOps:
@@ -180,8 +180,45 @@ class LiveWorkerDispatchOps:
     def _actuator_ops(self) -> LiveSublaneActuatorOps:
         return LiveSublaneActuatorOps(repo_root=self.repo_root)
 
+    def worker_provider(self) -> str:
+        """The runtime provider bound to the implementer (worker) role (Redmine #13569).
+
+        Resolved from the repo-local ``RoleProviderBinding`` (default ``claude``,
+        byte-identical) so the forward keys on the role, not a literal — a rebound worker
+        provider moves the ``--to`` receiver and the readiness probe with no source edit.
+        An unbound worker role raises :class:`WorkflowProviderUnresolved`, which the drive
+        turns into a fail-closed zero-send.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            resolve_worker_provider,
+        )
+
+        return resolve_worker_provider(str(self.repo_root))
+
     def read_lane(self, worktree_path: str) -> Optional[SublaneLaneView]:
         return self._actuator_ops().read_lane(worktree_path)
+
+    def observe_worker_dispatch_admission(
+        self, *, lane: SublaneLaneView, request: WorkerDispatchRequest
+    ) -> WorkerDispatchAdmission:
+        # tmux has no lifecycle-generation + startup-attestation join equivalent.
+        # Locator/process presence alone is not authority to inject (#13846).
+        facts = WorkerDispatchAdmissionFacts(
+            lifecycle_current=False,
+            anchor_current=False,
+            identity_attested=False,
+            action_binding_current=False,
+            slot_state="unknown",
+            locator_present=bool(lane.worker_pane),
+            receiver_state="unknown",
+            generation_binding_current=False,
+            worker_locator=lane.worker_pane,
+        )
+        return WorkerDispatchAdmission(
+            ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
+            "tmux receiver lacks the generation-bound authority required for dispatch",
+            facts,
+        )
 
     def probe_worker_ready(self, worker_pane: str) -> bool:
         # #13301: one non-fatal readiness snapshot — the worker's foreground process
@@ -201,8 +238,9 @@ class LiveWorkerDispatchOps:
         )
 
         try:
+            worker_provider = self.worker_provider()
             info = pane_info(worker_pane)
-            if not is_receiver_agent_process(info.get("command", ""), "claude"):
+            if not is_receiver_agent_process(info.get("command", ""), worker_provider):
                 return False
             rendered = capture_pane(worker_pane, WORKER_READY_CAPTURE_LINES)
         except (SystemExit, Exception):  # noqa: BLE001 — a probe never fails the drive.
@@ -228,154 +266,23 @@ class LiveWorkerDispatchOps:
             gateway_callback_target=gateway_callback_target,
             target_repo=target_repo,
             allow_direct_worker=allow_direct_worker,
+            worker_provider=self.worker_provider(),
         )
-        return _drive_worker_send_argv(argv)
+        rc, _known_not_sent = _drive_worker_send_argv(argv)
+        return rc
 
+    def dispatch_to_worker_turn_start(self, **kwargs) -> tuple[int, str, bool]:
+        worker_assigned_name = kwargs.pop("worker_assigned_name", None)
+        del worker_assigned_name
+        # tmux never reserves the generation-bound outbox fence (its
+        # `complete_worker_dispatch` is a no-op), so `known_not_sent` is inert here.
+        return self.dispatch_to_worker(**kwargs), "unknown", False
 
-def _drive_worker_send_argv(argv: list[str]) -> int:
-    """Run the composed same-lane ``handoff send`` argv, fail-closed (shared).
+    def reserve_worker_dispatch(self, **kwargs) -> tuple[bool, str]:
+        return False, "tmux dispatch has no generation-bound outbox authority"
 
-    Review j#71597: the inner `handoff send` fails closed through
-    `die()` == `raise SystemExit`, which `except Exception` never
-    catches, and it emits its own delivery record to stdout. Both must
-    be contained here so the outer WorkerDispatchOutcome stays the
-    single fail-closed, machine-readable surface: run the composed
-    primitive under stdout capture and convert any SystemExit
-    (including an argparse usage error) to its exit code. The captured
-    inner record is surfaced to stderr on failure so the blocked send
-    stays diagnosable without polluting the outer `--json` stdout.
-
-    Shared by the tmux :class:`LiveWorkerDispatchOps` and the herdr
-    :class:`~...application.sublane_worker_dispatch_herdr_ops.HerdrWorkerDispatchOps`
-    (#13357), so both backends measure the delivery ACK with the identical
-    containment; extracting it changes no tmux behaviour.
-    """
-    from mozyo_bridge.application.cli import build_parser, normalize_paths
-
-    inner_out = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(inner_out):
-            args = build_parser().parse_args(argv)
-            args = normalize_paths(args)
-            rc = int(args.func(args) or 0)
-    except SystemExit as exc:
-        # A SystemExit is always the *fail-closed* leg here (`die()` /
-        # argparse usage error); the success leg returns an int. A
-        # non-int / None exit code is never treated as a delivery ACK —
-        # an ambiguous exit must not promote to `worker_dispatched`.
-        code = exc.code
-        rc = code if isinstance(code, int) and code != 0 else 1
-    if rc != 0:
-        captured = inner_out.getvalue().strip()
-        if captured:
-            print(
-                "worker handoff send (inner delivery record):\n" + captured,
-                file=sys.stderr,
-            )
-    return rc
-
-
-def _worker_dispatch_argv(
-    *,
-    issue: str,
-    journal: str,
-    worker_pane: str,
-    lane_label: str,
-    gateway_callback_target: Optional[str],
-    target_repo: str,
-    allow_direct_worker: bool = False,
-    repo_root: Optional[str] = None,
-) -> list[str]:
-    """The same-lane worker forward as the gateway would type it (pure).
-
-    ``--role-profile implementation_worker`` binds the worker's effective
-    instruction set; ``gateway_callback_target`` (the lane's own gateway pane)
-    is the worker's same-lane callback address. The queue-enter rail keeps the
-    dispatch submit-complete (#12207) with standard_target_admission covering
-    the usually-inactive worker split (#12597).
-
-    ``allow_direct_worker`` (#13301) threads the explicit ``--allow-direct-worker``
-    gateway-route exception (#12918) onto the send so a drive from a pane whose lane
-    Unit differs from the worker's (e.g. a coordinator stall-drive) is admitted and
-    recorded distinctly as a ``gateway_route_exception`` instead of failing closed.
-    The same-lane gateway drive leaves it off (default), so the #12988 contract is
-    byte-for-byte back-compatible.
-
-    ``repo_root`` (Redmine #13397) pins the top-level ``--repo`` so the inner
-    ``handoff send`` resolves its *effective backend* from the SAME repo the outer
-    ``sublane dispatch-worker`` already selected — not from the driving process's
-    cwd. Under ``terminal_transport.backend: herdr`` the send-path backend predicate
-    (``herdr_effective_backend_selected`` → ``load_repo_local_config(repo_root_from_args(args))``)
-    reads the config at ``repo_root_from_args``, which defaults to a marker walk from
-    cwd. In-project (``mozyo_bridge``) the herdr selection is a *committed* config, so
-    every checkout / lane worktree carries it and cwd resolution happens to agree; in
-    an **external** adopted project the herdr selection lives only at the adopted root,
-    so a drive whose cwd resolves elsewhere re-derived ``backend: tmux`` and validated
-    the herdr worker locator (``wS:p3``) as an invalid tmux target, failing closed with
-    ``target_unavailable`` (#13379 j#73722). Pinning ``--repo`` to the outer-resolved
-    root makes the inner backend match the outer selection. ``None`` (the tmux
-    :class:`LiveWorkerDispatchOps` default) omits the flag, so the tmux argv stays
-    byte-for-byte the pre-#13397 shape.
-    """
-    argv: list[str] = []
-    if repo_root:
-        # Top-level flag: it MUST precede the ``handoff`` subcommand.
-        argv += ["--repo", repo_root]
-    argv += [
-        "handoff",
-        "send",
-        "--to",
-        "claude",
-        "--source",
-        "redmine",
-        "--issue",
-        issue,
-        "--journal",
-        journal,
-        "--kind",
-        "implementation_request",
-        "--target",
-        worker_pane,
-        "--target-repo",
-        target_repo,
-        "--mode",
-        "queue-enter",
-        "--role-profile",
-        "implementation_worker",
-        "--profile-field",
-        f"lane={lane_label}",
-    ]
-    if gateway_callback_target:
-        argv += [
-            "--profile-field",
-            f"gateway_callback_target={gateway_callback_target}",
-        ]
-    if allow_direct_worker:
-        argv.append("--allow-direct-worker")
-    return argv
-
-
-def _replayable_command(
-    *,
-    issue: str,
-    journal: Optional[str],
-    worker_pane: Optional[str],
-    lane_label: str,
-    gateway_callback_target: Optional[str],
-    target_repo: str,
-    allow_direct_worker: bool = False,
-) -> str:
-    return "mozyo-bridge " + " ".join(
-        _worker_dispatch_argv(
-            issue=issue,
-            journal=journal or "<journal>",
-            worker_pane=worker_pane or "<worker-pane>",
-            lane_label=lane_label,
-            gateway_callback_target=gateway_callback_target,
-            target_repo=target_repo,
-            allow_direct_worker=allow_direct_worker,
-        )
-    )
+    def complete_worker_dispatch(self, **kwargs) -> bool:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -385,16 +292,7 @@ def _replayable_command(
 
 @dataclass
 class WorkerDispatchUseCase:
-    """Drive the fail-closed same-lane worker transfer over :class:`WorkerDispatchOps`.
-
-    The flow stops at the first failure and reports the partial state: missing
-    identity, missing durable anchor, an unresolved lane, a lane-identity
-    mismatch (j#70250 guard), or a missing worker / gateway pane all block
-    before any send; a non-zero / raised send is recorded as
-    ``delivery_failed``, never as a confirmed dispatch. Only a measured
-    delivery ACK (send exit 0 on the submit-complete rail) yields
-    :data:`DISPATCH_WORKER_DISPATCHED` / ``worker_dispatch_confirmed=true``.
-    """
+    """Drive the generation-bound, exactly-once same-lane worker transfer."""
 
     ops: WorkerDispatchOps
     # #13301 pre-dispatch worker readiness wait (injectable for tests). ``probes<=0``
@@ -404,17 +302,7 @@ class WorkerDispatchUseCase:
     sleep: Callable[[float], None] = field(default=time.sleep)
 
     def _wait_worker_ready(self, worker_pane: Optional[str]) -> Optional[bool]:
-        """Bounded, non-fatal pre-forward worker readiness wait (#13301).
-
-        Polls :meth:`WorkerDispatchOps.probe_worker_ready` up to
-        ``worker_ready_probes`` times, ``worker_ready_interval_seconds`` apart, so a
-        freshly-launched worker TUI has time to boot before the queue-enter forward.
-        Returns ``None`` when the wait is disabled (``probes<=0``) or no worker pane
-        resolved — nothing was probed. Otherwise ``True`` on the first ready
-        observation or ``False`` when the window elapses unconfirmed. It NEVER raises
-        and NEVER blocks the forward: an unconfirmed ``False`` degrades to a recorded
-        observation and the caller forwards anyway (mirrors the #13293 gateway wait).
-        """
+        """Poll a bounded readiness window; ``False`` is a #13846 send fence."""
         probes = self.worker_ready_probes
         if probes <= 0 or not worker_pane:
             return None
@@ -424,6 +312,69 @@ class WorkerDispatchUseCase:
             if attempt + 1 < probes:
                 self.sleep(self.worker_ready_interval_seconds)
         return False
+
+    def _command_pins(self) -> dict:
+        """Backend-specific replay-authority pins."""
+        getter = getattr(self.ops, "command_authority_pins", None)
+        return getter() if callable(getter) else {}
+
+    def _display_worker_provider(self) -> str:
+        """Binding-resolved provider for the display/replay command."""
+        getter = getattr(self.ops, "worker_provider", None)
+        if not callable(getter):
+            return "claude"
+        try:
+            return getter()
+        except WorkflowProviderUnresolved:
+            return "claude"
+
+    def _sender_admission(
+        self,
+        lane: SublaneLaneView,
+        request: WorkerDispatchRequest,
+        *,
+        allow_direct_worker: bool,
+    ) -> Optional[SenderDispatchAdmission]:
+        """Consult the backend's pre-reserve sender-identity preflight (#14192).
+
+        An OPTIONAL port capability (resolved by name, like ``command_authority_pins``):
+        the herdr adapter verifies the sender IS this lane's current same-lane gateway
+        before any outbox reserve, so a coordinator / foreign / cross-lane sender fails
+        closed with zero write and zero send. ``None`` (the tmux adapter, which does not
+        provide it) skips the preflight and keeps the pre-#14192 flow byte-for-byte — the
+        tmux inner send still runs its own gateway-route gate. An unexpected raise fails
+        closed (a not-admitted verdict), never silently admits.
+        """
+        gate = getattr(self.ops, "observe_sender_admission", None)
+        if not callable(gate):
+            return None
+        try:
+            return gate(
+                lane=lane, request=request, allow_direct_worker=allow_direct_worker
+            )
+        except Exception as exc:  # noqa: BLE001 - unreadable sender authority fails closed
+            return SenderDispatchAdmission(
+                admitted=False,
+                reason=f"sender dispatch authority could not be observed: {exc}",
+                detail_token="sender_authority_unreadable",
+            )
+
+    def _observe_admission(
+        self, lane: SublaneLaneView, request: WorkerDispatchRequest
+    ) -> WorkerDispatchAdmission:
+        try:
+            return self.ops.observe_worker_dispatch_admission(
+                lane=lane, request=request
+            )
+        except Exception as exc:  # noqa: BLE001 - unreadable authority is conflict
+            facts = WorkerDispatchAdmissionFacts(
+                False, False, False, False, "unknown", bool(lane.worker_pane), "unknown"
+            )
+            return WorkerDispatchAdmission(
+                ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
+                f"worker dispatch authority could not be observed: {exc}",
+                facts,
+            )
 
     def run(
         self,
@@ -523,6 +474,24 @@ class WorkerDispatchUseCase:
                 fill_override_reason=fill_override_reason,
             )
 
+        # #13846: classify the current lifecycle generation, startup attestation,
+        # receiver state and prior exact delivery before requiring a locator.  This
+        # preserves authoritative terminal absence as a typed stale-recovery result.
+        dispatch_admission = self._observe_admission(lane, request)
+        if not dispatch_admission.is_healthy:
+            return self._blocked(
+                request,
+                reason=dispatch_admission.reason,
+                reasons=(dispatch_admission.decision,),
+                target_repo=target_repo,
+                execute=execute,
+                gateway_pane=lane.gateway_pane,
+                worker_pane=lane.worker_pane,
+                fill_decision=fill_decision_token,
+                fill_override_reason=fill_override_reason,
+                dispatch_admission=dispatch_admission,
+            )
+
         # 5. Both panes must be live: the worker is the transfer target and the
         # gateway is the worker's recorded same-lane callback address.
         if not lane.worker_pane or not lane.gateway_pane:
@@ -541,6 +510,35 @@ class WorkerDispatchUseCase:
                 fill_override_reason=fill_override_reason,
             )
 
+        # 5b. Sender-identity preflight (#14192): verify the sender IS this lane's
+        # current same-lane gateway BEFORE any outbox reserve, and on BOTH dry-run and
+        # execute so their verdicts match (Acceptance #1/#2). A coordinator / foreign /
+        # cross-lane sender fails closed here with zero fence write and zero send, so the
+        # inner rail's `gateway_route_blocked` can never reserve-then-poison the exact
+        # key (Acceptance #5). The tmux adapter omits the capability -> preflight skipped,
+        # byte-for-byte the pre-#14192 flow (the tmux inner send keeps its own route gate).
+        sender_admission = self._sender_admission(
+            lane, request, allow_direct_worker=allow_direct_worker
+        )
+        if sender_admission is not None and not sender_admission.admitted:
+            return self._blocked(
+                request,
+                reason=sender_admission.reason,
+                reasons=(REASON_FOREIGN_SENDER,)
+                + (
+                    (sender_admission.detail_token,)
+                    if sender_admission.detail_token
+                    else ()
+                ),
+                target_repo=target_repo,
+                execute=execute,
+                gateway_pane=lane.gateway_pane,
+                worker_pane=lane.worker_pane,
+                fill_decision=fill_decision_token,
+                fill_override_reason=fill_override_reason,
+            )
+
+        pins = self._command_pins()
         command = _replayable_command(
             issue=request.issue,
             journal=request.journal,
@@ -549,6 +547,9 @@ class WorkerDispatchUseCase:
             gateway_callback_target=lane.gateway_pane,
             target_repo=target_repo,
             allow_direct_worker=allow_direct_worker,
+            target_lane=pins.get("target_lane"),
+            repo_root=pins.get("repo_root"),
+            worker_provider=self._display_worker_provider(),
         )
 
         # 6. Dry-run: preview the resolved transfer; perform nothing.
@@ -568,26 +569,70 @@ class WorkerDispatchUseCase:
                 durable_anchor=(request.journal or None),
                 command=command,
                 allow_direct_worker=allow_direct_worker,
+                admission_decision=dispatch_admission.decision,
+                admission_reason=dispatch_admission.reason,
+                lane_generation=dispatch_admission.facts.lane_generation,
+                worker_assigned_name=dispatch_admission.facts.worker_assigned_name,
+                receiver_state=dispatch_admission.facts.receiver_state,
             )
 
-        # 6b. Pre-forward worker readiness wait (#13301, execute path only): give a
-        # freshly-launched worker TUI time to boot before the queue-enter forward, so
-        # the anchored implementation_request lands on a live composer instead of
-        # vanishing into a still-booting one (the worker-side analog of the #13293
-        # gateway wait). Bounded + non-fatal — an unconfirmed readiness degrades to a
-        # recorded worker_ready=false and forwards anyway (the queue-enter rail never
-        # hard-blocks; the handoff Enter-only retry is the landing safety net).
+        # 6b. Bounded readiness observation; an unconfirmed receiver is a zero-send.
         worker_ready = self._wait_worker_ready(lane.worker_pane)
 
-        # 7. Live drive: the send's exit code is the delivery-ACK measurement.
+        # Re-observe immediately before injection.  A process/action completion
+        # between probe and act invalidates the first observation; never send on it.
+        action_admission = self._observe_admission(lane, request)
+        if worker_ready is False or action_admission != dispatch_admission:
+            return self._blocked(
+                request,
+                reason="worker authority changed or readiness disappeared before injection",
+                reasons=(ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,),
+                target_repo=target_repo,
+                execute=True,
+                gateway_pane=lane.gateway_pane,
+                worker_pane=lane.worker_pane,
+                fill_decision=fill_decision_token,
+                fill_override_reason=fill_override_reason,
+                dispatch_admission=action_admission,
+                worker_ready=worker_ready,
+            )
+
+        reserved, reserve_detail = self.ops.reserve_worker_dispatch(
+            admission=action_admission, request=request
+        )
+        if not reserved:
+            conflict = WorkerDispatchAdmission(
+                ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
+                f"dispatch outbox reservation refused: {reserve_detail}",
+                action_admission.facts,
+            )
+            return self._blocked(
+                request,
+                reason=conflict.reason,
+                reasons=(conflict.decision,),
+                target_repo=target_repo,
+                execute=True,
+                gateway_pane=lane.gateway_pane,
+                worker_pane=lane.worker_pane,
+                dispatch_admission=conflict,
+                worker_ready=worker_ready,
+            )
+
+        # 7. Live drive: retain transport ACK and turn-start as separate facts.
+        # ``known_not_sent`` (#14192) defaults False so the except legs — whose fate is
+        # unknown — stay uncertain; only a returned proven pre-injection zero-send sets it.
+        known_not_sent = False
         try:
-            rc = self.ops.dispatch_to_worker(
+            rc, turn_start, known_not_sent = self.ops.dispatch_to_worker_turn_start(
                 issue=request.issue,
                 journal=anchor,
                 worker_pane=lane.worker_pane,
                 lane_label=request.lane_label,
                 gateway_callback_target=lane.gateway_pane,
                 target_repo=target_repo,
+                worker_assigned_name=(
+                    dispatch_admission.facts.worker_assigned_name or ""
+                ),
                 allow_direct_worker=allow_direct_worker,
             )
         except SystemExit as exc:
@@ -598,12 +643,26 @@ class WorkerDispatchUseCase:
             # durable fail-closed record.
             code = exc.code
             rc = code if isinstance(code, int) and code != 0 else 1
+            turn_start = "not_started"
             detail = f"worker handoff send exited: SystemExit({exc.code})"
         except Exception as exc:  # noqa: BLE001 — fail-closed on any send failure.
             rc = 1
+            turn_start = "not_started"
             detail = f"worker handoff send raised: {exc}"
         else:
             detail = f"worker handoff send to {lane.worker_pane} exit={rc}"
+        # #14192: a proven pre-injection zero-send (`known_not_sent`) cancels the exact
+        # fence key (never replayed) instead of poisoning it to the reconcile-only
+        # `uncertain` terminal; every other non-delivered outcome stays uncertain.
+        outcome_durable = self.ops.complete_worker_dispatch(
+            admission=dispatch_admission,
+            request=request,
+            delivered=(rc == 0 and turn_start == TURN_START_STARTED),
+            detail=detail,
+            known_not_sent=known_not_sent,
+        )
+        if not outcome_durable:
+            turn_start = "unknown"
         if rc != 0:
             return WorkerDispatchOutcome(
                 status=ACTUATE_BLOCKED,
@@ -625,6 +684,39 @@ class WorkerDispatchUseCase:
                 fill_override_reason=fill_override_reason,
                 worker_ready=worker_ready,
                 allow_direct_worker=allow_direct_worker,
+                admission_decision=dispatch_admission.decision,
+                admission_reason=dispatch_admission.reason,
+                lane_generation=dispatch_admission.facts.lane_generation,
+                worker_assigned_name=dispatch_admission.facts.worker_assigned_name,
+                receiver_state=dispatch_admission.facts.receiver_state,
+                turn_start_outcome=turn_start,
+            )
+        if turn_start != TURN_START_STARTED:
+            return WorkerDispatchOutcome(
+                status=ACTUATE_BLOCKED,
+                execute=True,
+                reason="transport acknowledged queue entry, but no causally-bound "
+                "worker turn-start was observed; refusing ACK-only promotion",
+                issue=request.issue,
+                lane_label=request.lane_label,
+                worktree_path=request.worktree_path,
+                gateway_pane=lane.gateway_pane,
+                worker_pane=lane.worker_pane,
+                dispatch_target=lane.worker_pane,
+                dispatch_result=WORKER_DISPATCH_TURN_START_UNCONFIRMED,
+                durable_anchor=(request.journal or None),
+                command=command,
+                blocked_reasons=(REASON_WORKER_TURN_START_UNCONFIRMED,),
+                fill_decision=fill_decision_token,
+                fill_override_reason=fill_override_reason,
+                worker_ready=worker_ready,
+                allow_direct_worker=allow_direct_worker,
+                admission_decision=dispatch_admission.decision,
+                admission_reason=dispatch_admission.reason,
+                lane_generation=dispatch_admission.facts.lane_generation,
+                worker_assigned_name=dispatch_admission.facts.worker_assigned_name,
+                receiver_state=dispatch_admission.facts.receiver_state,
+                turn_start_outcome=turn_start,
             )
         override_suffix = (
             f" — fill-decision stop overridden (reason: {fill_override_reason})"
@@ -634,9 +726,9 @@ class WorkerDispatchUseCase:
         return WorkerDispatchOutcome(
             status=ACTUATE_EXECUTED,
             execute=True,
-            reason="same-lane worker transfer delivery-acked "
-            f"({detail}); worker_dispatch_confirmed=true (delivery ACK only — "
-            "not worker progress or completion)" + override_suffix,
+            reason="same-lane worker transfer delivery-acked and turn-start observed "
+            f"({detail}); worker_dispatch_confirmed=true (not worker progress or "
+            "completion)" + override_suffix,
             issue=request.issue,
             lane_label=request.lane_label,
             worktree_path=request.worktree_path,
@@ -650,6 +742,12 @@ class WorkerDispatchUseCase:
             fill_override_reason=fill_override_reason,
             worker_ready=worker_ready,
             allow_direct_worker=allow_direct_worker,
+            admission_decision=dispatch_admission.decision,
+            admission_reason=dispatch_admission.reason,
+            lane_generation=dispatch_admission.facts.lane_generation,
+            worker_assigned_name=dispatch_admission.facts.worker_assigned_name,
+            receiver_state=dispatch_admission.facts.receiver_state,
+            turn_start_outcome=turn_start,
         )
 
     # -- helpers ------------------------------------------------------------
@@ -666,6 +764,8 @@ class WorkerDispatchUseCase:
         worker_pane: Optional[str] = None,
         fill_decision: Optional[str] = None,
         fill_override_reason: Optional[str] = None,
+        dispatch_admission: Optional[WorkerDispatchAdmission] = None,
+        worker_ready: Optional[bool] = None,
     ) -> WorkerDispatchOutcome:
         return WorkerDispatchOutcome(
             status=ACTUATE_BLOCKED,
@@ -686,10 +786,33 @@ class WorkerDispatchUseCase:
                 lane_label=request.lane_label,
                 gateway_callback_target=gateway_pane,
                 target_repo=target_repo,
+                worker_provider=self._display_worker_provider(),
+                **{
+                    k: v
+                    for k, v in self._command_pins().items()
+                    if k in ("target_lane", "repo_root")
+                },
             ),
             blocked_reasons=reasons,
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
+            worker_ready=worker_ready,
+            admission_decision=(
+                dispatch_admission.decision if dispatch_admission else None
+            ),
+            admission_reason=(dispatch_admission.reason if dispatch_admission else None),
+            lane_generation=(
+                dispatch_admission.facts.lane_generation if dispatch_admission else None
+            ),
+            worker_assigned_name=(
+                dispatch_admission.facts.worker_assigned_name
+                if dispatch_admission
+                else None
+            ),
+            receiver_state=(
+                dispatch_admission.facts.receiver_state if dispatch_admission else None
+            ),
+            retry_allowed=(dispatch_admission.retry_allowed if dispatch_admission else False),
         )
 
 

@@ -239,6 +239,8 @@ def _plan_for(scenario):
         upstream_coordinator="coord",
         gateway_callback_target="gw-cb",
         parent_callback_target="p-cb",
+        gateway_provider="codex",
+        worker_provider="claude",
     )
     match = [RealizationCandidateView(True, True, True)]
     if scenario.grandchild_realization == "same_lane_fallback":

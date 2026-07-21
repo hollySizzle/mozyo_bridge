@@ -53,7 +53,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, NoReturn, Protocol, runtime_checkable
+from typing import Any, Callable, Mapping, NoReturn, Optional, Protocol, runtime_checkable
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
     SLOT_ADOPTED,
@@ -65,9 +65,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
-    PROVIDER_CLAUDE,
-    PROVIDER_CODEX,
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.default_agent_topology import (
+    DEFAULT_EXPECTED_AGENTS,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
@@ -82,8 +81,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 # --- Pure policy: attach hint, ready flag, JSON payload, text block. ----------
 
 #: The provider slots bare ``mozyo`` prepares — one herdr agent per provider,
-#: matching the tmux path's ``claude`` + ``codex`` windows.
-LAUNCH_PROVIDERS: tuple[str, ...] = (PROVIDER_CLAUDE, PROVIDER_CODEX)
+#: matching the tmux path's ``claude`` + ``codex`` windows. Sourced from the single
+#: canonical default-topology contract (Redmine #13569) so the herdr launch pair and
+#: the tmux status/doctor "expected" judgment can never drift.
+LAUNCH_PROVIDERS: tuple[str, ...] = DEFAULT_EXPECTED_AGENTS
 
 
 def herdr_attach_command_line(binary: str) -> str:
@@ -130,6 +131,10 @@ def build_herdr_json_payload(
     full session-start outcome (workspace / lane / per-slot names + locators).
     """
 
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
+        HERDR_STANDARD_DISPATCH_HINT,
+    )
+
     return {
         "backend": BACKEND_HERDR,
         "ready": session_ready(result),
@@ -137,6 +142,11 @@ def build_herdr_json_payload(
         "attach": attach_command,
         "attached": False,
         "no_attach": True,
+        # Redmine #13446: the standard next-action pointer, so `mozyo --json` confirms the
+        # herdr workspace/agents AND names the safe lane-dispatch surface (`sublane create
+        # --execute`) rather than leaving the tmux-era selection primitives as the apparent
+        # entrypoint.
+        "next_action": HERDR_STANDARD_DISPATCH_HINT,
     }
 
 
@@ -150,6 +160,10 @@ def render_herdr_session_block(
     so ``--no-attach`` prints exactly what the operator needs to attach later.
     """
 
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
+        HERDR_STANDARD_DISPATCH_HINT,
+    )
+
     lines = [
         f"herdr session-start: workspace={result.workspace_id} lane={result.lane_id}"
     ]
@@ -159,6 +173,10 @@ def render_herdr_session_block(
             line += f" locator={slot.locator}"
         lines.append(line)
     lines.append(f"attach: {attach_command}")
+    # Redmine #13446: name the standard lane-dispatch next action so the confirmed herdr
+    # workspace/agents summary also tells the operator the safe next step (not the tmux-era
+    # selection primitives).
+    lines.append(f"next: {HERDR_STANDARD_DISPATCH_HINT}")
     return "\n".join(lines)
 
 
@@ -237,15 +255,37 @@ class LiveHerdrLaunchOps:
         from mozyo_bridge.application.repo_local_config_loader import (
             load_repo_local_config,
         )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.coordinator_placement_loader import (  # noqa: E501
+            resolve_coordinator_placement_mode,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
+            CoordinatorPlacementError,
+        )
 
-        agent_launch = load_repo_local_config(repo_root).agent_launch
+        # Config-driven pane placement (Redmine #13646): the bare `mozyo` coordinator pair
+        # is the `default` lane_class, so the config's `lane_placement.default` split /
+        # order decides the pair's geometry (e.g. `split: down` for the owner's vertical
+        # main window) and which provider occupies first. Unconfigured repos keep the herdr
+        # server default placement and the requested provider order, byte-for-byte.
+        repo_config = load_repo_local_config(repo_root)
+        # Operator-scoped coordinator placement mode (Redmine #14139): read from the
+        # mozyo-bridge HOME (never a repo-committed value), so the coordinator pair lands
+        # in a per-project workspace (default) or the shared coordinators space per this
+        # operator's choice. A broken operator file fails closed with an actionable refusal.
+        try:
+            coordinator_placement_mode = resolve_coordinator_placement_mode()
+        except CoordinatorPlacementError as exc:
+            self.die(f"mozyo launch failed: invalid operator coordinator placement: {exc}")
+            raise AssertionError("unreachable")
         return prepare_session(
             repo_root=repo_root,
             providers=list(LAUNCH_PROVIDERS),
             lane_id="",
             env=self._env,
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
-            agent_launch=agent_launch,
+            agent_launch=repo_config.agent_launch,
+            lane_placement=repo_config.lane_placement,
+            coordinator_placement_mode=coordinator_placement_mode,
         )
 
     def attach(self, argv: list[str]) -> NoReturn:
@@ -292,9 +332,19 @@ class MozyoHerdrLaunchUseCase:
 
     Decides refusal vs JSON vs no-attach vs attach; the terminal ``os.execvp``
     attach and stdout stay in :func:`deliver_herdr_launch_outcome`.
+
+    ``reconcile_seam`` (Redmine #13806 tranche C) is the optional bare-``mozyo`` pre-attach
+    replacement reconciliation hook. When injected AND the resolved session is NOT ready
+    (a stale-attestation coordinator slot), it is consulted before the attach and returns
+    either ``None`` (reconciled or nothing to do — proceed to attach unchanged) or a single
+    actionable blocked message (fail closed before attaching, zero writes). Left ``None`` by
+    default, so a ready session — and every existing caller / test — behaves byte-for-byte as
+    before; the live composition wiring (resolve the transaction + run the executor / drain)
+    is deferred to the post-review live gate (j#79209 non-scope).
     """
 
     ops: HerdrLaunchOps
+    reconcile_seam: Optional[Callable[[SessionStartResult], Optional[str]]] = None
 
     def run(self, args: argparse.Namespace) -> HerdrLaunchOutcome:
         ops = self.ops
@@ -371,6 +421,16 @@ class MozyoHerdrLaunchUseCase:
                     payload, ensure_ascii=False, indent=2, sort_keys=True
                 )
             )
+
+        # (Redmine #13806 tranche C) Bare-`mozyo` pre-attach replacement reconciliation:
+        # only when a seam is injected AND the session is not ready (an unresolved
+        # coordinator slot). A ready session, and every caller that does not inject a seam,
+        # skips this entirely (behavior preserved). A blocked reconciliation fails closed
+        # before attaching with the seam's actionable message.
+        if self.reconcile_seam is not None and not session_ready(result):
+            blocked_message = self.reconcile_seam(result)
+            if blocked_message is not None:
+                return HerdrLaunchOutcome(error_message=blocked_message)
 
         return HerdrLaunchOutcome(
             pre_attach_text=render_herdr_session_block(result, attach_command),

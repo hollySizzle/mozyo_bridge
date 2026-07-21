@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -35,19 +36,31 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LiveWorkerDispatchOps,
     WorkerDispatchOps,
     WorkerDispatchUseCase,
+    _replayable_command,
     _resolve_worker_dispatch_ops,
+    _worker_dispatch_argv,
 )
+from mozyo_bridge.core.state.lane_lifecycle_model import ProcessGenerationPin
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     ACTUATE_BLOCKED,
     ACTUATE_EXECUTED,
     DISPATCH_WORKER_DISPATCHED,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (  # noqa: E501
+    ADMISSION_HEALTHY,
+    ADMISSION_STALE_WORKER_RECOVERY_REQUIRED,
+    ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
+    REASON_FOREIGN_SENDER,
     WORKER_DISPATCH_DELIVERY_FAILED,
+    SenderDispatchAdmission,
+    WorkerDispatchAdmission,
+    WorkerDispatchAdmissionFacts,
     WorkerDispatchRequest,
+    classify_send_known_not_sent,
     lane_identity_matches,
 )
 
+from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
 from tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_sublane_actuator_herdr_ops import (  # noqa: E501
     HERDR_ENV,
     _fake_binary,
@@ -56,6 +69,28 @@ from tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_hand
 
 LANE_LABEL = "issue_13357_dispatch_worker_herdr"
 ISSUE = "13357"
+
+
+def _healthy_admission() -> WorkerDispatchAdmission:
+    return WorkerDispatchAdmission(
+        ADMISSION_HEALTHY,
+        "healthy",
+        WorkerDispatchAdmissionFacts(
+            True,
+            True,
+            True,
+            True,
+            "live",
+            True,
+            "awaiting_input",
+            generation_binding_current=True,
+            lane_generation=1,
+            worker_assigned_name="mzb1_ws_claude_lane",
+            workspace_id="ws",
+            lane_id=LANE_LABEL,
+            action_id="lane_generation_1",
+        ),
+    )
 
 
 class _HerdrLaneFixture:
@@ -68,7 +103,7 @@ class _HerdrLaneFixture:
         self.worktree = Path(tmp) / "lane-wt"
         self.worktree.mkdir(exist_ok=True)
         binpath = _fake_binary(tmp)
-        self.env = {HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(self.home)}
+        self.env = with_provider_path({HERDR_ENV: str(binpath), "MOZYO_BRIDGE_HOME": str(self.home)})
 
     def stand_up_lane(self) -> None:
         actuator = HerdrSublaneActuatorOps(
@@ -148,6 +183,348 @@ class WorkerReadinessProbeTests(unittest.TestCase):
                 self.assertFalse(ops.probe_worker_ready(""))
 
 
+class WorkerAdmissionObservationTests(unittest.TestCase):
+    def _observe(self, rows, attestation, *, lifecycle_overrides=None):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        lane = SimpleNamespace(
+            workspace_id="ws", lane_id=LANE_LABEL, worker_pane="w28:p75"
+        )
+        request = WorkerDispatchRequest(ISSUE, LANE_LABEL, "/repo", "81683")
+        worker_name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        lifecycle_values = dict(
+            issue_id=ISSUE,
+            lane_disposition="active",
+            lane_generation=7,
+            decision_journal="81683",
+            replacement_action_id="",
+            declared_pins=(
+                ProcessGenerationPin(
+                    role="gateway",
+                    provider="codex",
+                    assigned_name=encode_assigned_name("ws", "codex", LANE_LABEL),
+                    locator="w28:p74",
+                ),
+                ProcessGenerationPin(
+                    role="worker",
+                    provider="claude",
+                    assigned_name=worker_name,
+                    locator="w28:p75",
+                ),
+            ),
+        )
+        lifecycle_values.update(lifecycle_overrides or {})
+        lifecycle = SimpleNamespace(**lifecycle_values)
+        ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
+        with patch.object(ops, "worker_provider", return_value="claude"), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection.list_herdr_agent_rows",
+            return_value=rows,
+        ), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection.repo_scope_workspace_id",
+            return_value="ws",
+        ), patch(
+            "mozyo_bridge.core.state.lane_lifecycle.LaneLifecycleStore.get",
+            return_value=lifecycle,
+        ), patch(
+            "mozyo_bridge.core.state.herdr_identity_attestation.HerdrIdentityAttestationStore.read",
+            return_value=attestation,
+        ), patch(
+            "mozyo_bridge.core.state.herdr_delivery_ledger.HerdrDeliveryLedger.records_for_issue",
+            return_value=[],
+        ):
+            return ops.observe_worker_dispatch_admission(lane=lane, request=request)
+
+    def _attestation(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        return SimpleNamespace(
+            assigned_name=encode_assigned_name("ws", "claude", LANE_LABEL),
+            workspace_id="ws",
+            role="claude",
+            lane_id=LANE_LABEL,
+            locator="w28:p75",
+            verdict="present",
+            replacement_action_id="",
+        )
+
+    def test_current_live_attested_idle_receiver_is_healthy(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        result = self._observe(
+            [
+                {
+                    "name": name,
+                    "pane_id": "w28:p75",
+                    "agent": "claude",
+                    "agent_status": "idle",
+                }
+            ],
+            self._attestation(),
+        )
+        self.assertEqual(result.decision, ADMISSION_HEALTHY)
+        self.assertEqual(result.facts.lane_generation, 7)
+
+    def test_fresh_generation_live_runtime_revision_is_healthy_not_conflict(self):
+        # Redmine #13846: the declared worker pin carries no runtime_revision (the fixture's
+        # declared_pins leave it empty, exactly as adopt/hibernate declarations do — the
+        # generation discriminant is the live locator), yet the live `agent list` row DOES
+        # surface a runtime_revision. A full match_key equality treated that asymmetry as a
+        # mismatch and raised a false `worker_liveness_authority_conflict`; binding on the
+        # (role/provider/assigned_name/locator) identity keeps this current fresh generation
+        # healthy while the locator still matches.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        result = self._observe(
+            [
+                {
+                    "name": name,
+                    "pane_id": "w28:p75",
+                    "provider": "claude",
+                    "agent": "claude",
+                    "agent_status": "idle",
+                    "runtime_revision": "cli-2.1.0",
+                }
+            ],
+            self._attestation(),
+        )
+        self.assertEqual(result.decision, ADMISSION_HEALTHY)
+        self.assertTrue(result.facts.generation_binding_current)
+
+    def test_live_runtime_revision_diverging_from_declared_is_conflict(self):
+        # Adversarial: when the declared pin DID observe a runtime revision and the live row
+        # surfaces a DIFFERENT one (a same-name process re-launched at a newer runtime), that
+        # is a distinct generation and must fail closed even though the locator matches.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        declared_pins = (
+            ProcessGenerationPin(
+                role="gateway",
+                provider="codex",
+                assigned_name=encode_assigned_name("ws", "codex", LANE_LABEL),
+                locator="w28:p74",
+            ),
+            ProcessGenerationPin(
+                role="worker",
+                provider="claude",
+                assigned_name=name,
+                locator="w28:p75",
+                runtime_revision="cli-1.0.0",
+            ),
+        )
+        result = self._observe(
+            [
+                {
+                    "name": name,
+                    "pane_id": "w28:p75",
+                    "provider": "claude",
+                    "agent": "claude",
+                    "agent_status": "idle",
+                    "runtime_revision": "cli-2.1.0",
+                }
+            ],
+            self._attestation(),
+            lifecycle_overrides={"declared_pins": declared_pins},
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+
+    def test_locator_bearing_stale_row_is_authority_conflict(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        result = self._observe(
+            [{"name": name, "pane_id": "w28:p75", "agent": "", "status": "unknown"}],
+            self._attestation(),
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+
+    def test_current_slot_absence_routes_recovery_without_send_authority(self):
+        attestation = self._attestation()
+        attestation.replacement_action_id = "replace-7"
+        result = self._observe(
+            [],
+            attestation,
+            lifecycle_overrides={"replacement_action_id": "replace-7"},
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_STALE_WORKER_RECOVERY_REQUIRED
+        )
+
+    def test_live_locator_drift_from_declared_worker_pin_is_conflict(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        attestation = self._attestation()
+        attestation.locator = "w28:p-new"
+        result = self._observe(
+            [
+                {
+                    "name": name,
+                    "pane_id": "w28:p-new",
+                    "provider": "claude",
+                    "agent": "claude",
+                    "agent_status": "idle",
+                }
+            ],
+            attestation,
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+
+    def _fresh_row(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        return {
+            "name": encode_assigned_name("ws", "claude", LANE_LABEL),
+            "pane_id": "w28:p75",
+            "provider": "claude",
+            "agent": "claude",
+            "agent_status": "idle",
+        }
+
+    def test_fresh_create_no_declared_slots_live_attested_is_healthy(self):
+        # Redmine #13846 R4 (live evidence #14062 j#82028): a fresh `sublane create
+        # --no-dispatch` lane declares its owner row through `declare_active`, which writes NO
+        # declared-slot snapshot (a legitimate generation-1 shape). The worker is live and its
+        # startup self-attestation is present + generation-bound to the LIVE locator. The R3
+        # `binds_same_generation` fix never fires (there is no declared pin), so before this
+        # correction the empty snapshot collapsed to a false `worker_liveness_authority_conflict`
+        # and blocked the whole installed fresh E2E. The slot-less generation authority is the
+        # startup self-attestation, so this fresh generation is HEALTHY.
+        result = self._observe(
+            [self._fresh_row()],
+            self._attestation(),
+            lifecycle_overrides={"declared_pins": ()},
+        )
+        self.assertEqual(result.decision, ADMISSION_HEALTHY)
+        self.assertTrue(result.facts.generation_binding_current)
+        self.assertEqual(result.facts.generation_binding_detail, "")
+
+    def test_fresh_create_no_slots_unattested_worker_stays_conflict(self):
+        # A slot-less create row without a present + generation-bound startup self-attestation
+        # has NO generation authority and must stay fail-closed. `attestation=None` (never ran /
+        # absent) and a stale attestation (recorded locator drifted from the live slot) are both
+        # unattested for this generation — zero-send, with the failing authority field surfaced.
+        stale = self._attestation()
+        stale.locator = "w28:p-old"
+        for attestation in (None, stale):
+            with self.subTest(attestation=attestation):
+                result = self._observe(
+                    [self._fresh_row()],
+                    attestation,
+                    lifecycle_overrides={"declared_pins": ()},
+                )
+                self.assertEqual(
+                    result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+                )
+                self.assertFalse(result.facts.generation_binding_current)
+                self.assertIn(
+                    "fresh_startup_self_attestation_not_generation_bound",
+                    result.reason,
+                )
+
+    def test_fresh_create_wrong_live_provider_stays_conflict(self):
+        # Redmine #13846 R4 review F1: a slot-less fresh row whose live `provider` / detected
+        # `agent` disagrees with the resolved worker provider is a foreign / mis-bound process
+        # even though the assigned name and locator line up and the startup attestation is
+        # present. The declared path rejects this via `binds_same_generation` (`live_pin.provider`);
+        # the slot-less path must fail closed on the same identity axis instead of promoting to
+        # healthy — the provider VALUE is never exposed, only the field-label detail token.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        # name still encodes the expected `claude` slot (so the row is name-matched), but the live
+        # row surfaces a foreign provider + detected agent. `agent=codex` keeps the slot LIVE
+        # (positive detection), so `slot_state` alone does not block it.
+        wrong_provider_row = {
+            "name": name,
+            "pane_id": "w28:p75",
+            "provider": "codex",
+            "agent": "codex",
+            "agent_status": "idle",
+        }
+        result = self._observe(
+            [wrong_provider_row],
+            self._attestation(),
+            lifecycle_overrides={"declared_pins": ()},
+        )
+        self.assertEqual(
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+        )
+        self.assertFalse(result.facts.generation_binding_current)
+        self.assertIn("fresh_live_provider_mismatch", result.reason)
+        self.assertNotIn("codex", result.reason)
+
+    def test_incomplete_or_foreign_declared_pair_stays_conflict(self):
+        # A positively suspicious declared shape is NEVER the slot-less fresh path: a half pair
+        # (worker without gateway -> incomplete) and a foreign pin role are ambiguous provenance
+        # and must fail closed even though the live worker is attested — "the row has pins" is
+        # not proof of the current generation, and the fresh fallback covers ONLY a genuinely
+        # empty (PIN_PAIR_ABSENT) snapshot.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+            encode_assigned_name,
+        )
+
+        name = encode_assigned_name("ws", "claude", LANE_LABEL)
+        incomplete = (ProcessGenerationPin("worker", "claude", name, "w28:p75"),)
+        foreign = (
+            ProcessGenerationPin("someslot", "claude", name, "w28:p75"),
+            ProcessGenerationPin(
+                "otherslot", "codex", encode_assigned_name("ws", "codex", LANE_LABEL),
+                "w28:p74",
+            ),
+        )
+        for pins in (incomplete, foreign):
+            with self.subTest(pins=pins):
+                result = self._observe(
+                    [self._fresh_row()],
+                    self._attestation(),
+                    lifecycle_overrides={"declared_pins": pins},
+                )
+                self.assertEqual(
+                    result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+                )
+                self.assertIn("declared_slots_unresolved", result.reason)
+
+    def test_terminal_absence_with_stale_anchor_or_action_is_conflict(self):
+        attestation = self._attestation()
+        attestation.replacement_action_id = "replace-old"
+        for overrides in (
+            {"decision_journal": "old", "replacement_action_id": "replace-old"},
+            {"replacement_action_id": "replace-new"},
+        ):
+            with self.subTest(overrides=overrides):
+                result = self._observe([], attestation, lifecycle_overrides=overrides)
+                self.assertEqual(
+                    result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
+                )
+
+
 class DispatchContainmentTests(unittest.TestCase):
     """The herdr adapter drives the shared composed-CLI containment (j#71597)."""
 
@@ -200,6 +577,12 @@ class DispatchContainmentTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--target") + 1], "wC:p3")
         self.assertFalse(argv[argv.index("--target") + 1].startswith("%"))
         self.assertEqual(argv[argv.index("--target-repo") + 1], "auto")
+        # Redmine #13485: the herdr worker dispatch pins the explicit lane authority so
+        # the route authority resolves the stable `(workspace, lane_label, claude)`
+        # identity, not the sender-derived lane. Placed with the target coordinates,
+        # before `--mode` (mirrors the gateway dispatch's `--target-lane`).
+        self.assertEqual(argv[argv.index("--target-lane") + 1], LANE_LABEL)
+        self.assertLess(argv.index("--target-lane"), argv.index("--mode"))
         self.assertEqual(argv[argv.index("--mode") + 1], "queue-enter")
         self.assertEqual(
             argv[argv.index("--role-profile") + 1], "implementation_worker"
@@ -224,6 +607,416 @@ class DispatchContainmentTests(unittest.TestCase):
         )
         self.assertEqual(rc, 1)
         self.assertEqual(out, "")
+
+
+class TurnStartLedgerTests(unittest.TestCase):
+    def _observe(self, record):
+        ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
+        with patch.object(ops, "worker_provider", return_value="claude"), patch(
+            "mozyo_bridge.core.state.herdr_delivery_ledger.HerdrDeliveryLedger.records_for_issue",
+            return_value=[record],
+        ):
+            return ops._observe_worker_turn_start(
+                "mzb1_ws_claude_lane",
+                issue=ISSUE,
+                journal="81683",
+                worker_locator="w28:p75",
+            )
+
+    def test_queue_event_busy_is_causally_started_even_without_provider_projection(self):
+        record = SimpleNamespace(
+            journal_id="81683",
+            receiver="claude",
+            provider=None,
+            target="w28:p75",
+            turn_start_outcome=None,
+            queue_enter_observation={"runtime_state": "busy"},
+        )
+        self.assertEqual(self._observe(record), "started")
+
+    def test_queue_event_awaiting_input_is_delivered_not_started(self):
+        record = SimpleNamespace(
+            journal_id="81683",
+            receiver="claude",
+            provider=None,
+            target="w28:p75",
+            turn_start_outcome=None,
+            queue_enter_observation={"runtime_state": "awaiting_input"},
+        )
+        self.assertEqual(self._observe(record), "delivered_not_started")
+
+
+class DispatchOutboxAdmissionTests(unittest.TestCase):
+    def test_exact_key_is_reserved_once_and_turn_start_marks_delivered(self):
+        request = WorkerDispatchRequest(ISSUE, LANE_LABEL, "/repo", "81683")
+        ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"MOZYO_BRIDGE_HOME": tmp}, clear=False
+        ), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution.target_is_retiring",
+            return_value=(False, ""),
+        ):
+            won, _state = ops.reserve_worker_dispatch(
+                admission=_healthy_admission(), request=request
+            )
+            self.assertTrue(won)
+            self.assertTrue(
+                ops.complete_worker_dispatch(
+                    admission=_healthy_admission(),
+                    request=request,
+                    delivered=True,
+                    detail="turn started",
+                )
+            )
+            replay_won, replay_state = ops.reserve_worker_dispatch(
+                admission=_healthy_admission(), request=request
+            )
+        self.assertFalse(replay_won)
+        self.assertIn("delivered", replay_state)
+
+    def _reserve_then_complete(self, *, known_not_sent, journal):
+        # Reserve the exact key, then complete a NON-delivered send with the given
+        # `known_not_sent`, and return the resulting fence state for the key (#14192).
+        from mozyo_bridge.core.state.dispatch_outbox_fence import DispatchOutboxFence
+
+        request = WorkerDispatchRequest(ISSUE, LANE_LABEL, "/repo", journal)
+        ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"MOZYO_BRIDGE_HOME": tmp}, clear=False
+        ), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution.target_is_retiring",
+            return_value=(False, ""),
+        ):
+            won, _state = ops.reserve_worker_dispatch(
+                admission=_healthy_admission(), request=request
+            )
+            self.assertTrue(won)
+            ops.complete_worker_dispatch(
+                admission=_healthy_admission(),
+                request=request,
+                delivered=False,
+                detail="gateway_route_blocked" if known_not_sent else "",
+                known_not_sent=known_not_sent,
+            )
+            key = ops._fence_key(_healthy_admission(), request)
+            # A subsequent reserve must still be never-send in BOTH terminals.
+            replay_won, replay_state = ops.reserve_worker_dispatch(
+                admission=_healthy_admission(), request=request
+            )
+            return DispatchOutboxFence().state_of(key), replay_won, replay_state
+
+    def test_known_not_sent_cancels_key_never_poisons_uncertain(self):
+        # #14192 Acceptance #3: a PROVEN pre-injection zero-send is CANCELLED (an honest
+        # never-replay terminal), NOT poisoned to the reconcile-only `uncertain`.
+        from mozyo_bridge.core.state.dispatch_outbox_fence import (
+            FENCE_CANCELLED,
+            FENCE_UNCERTAIN,
+        )
+
+        state, replay_won, replay_state = self._reserve_then_complete(
+            known_not_sent=True, journal="knsonce"
+        )
+        self.assertEqual(state, FENCE_CANCELLED)
+        self.assertNotEqual(state, FENCE_UNCERTAIN)
+        self.assertFalse(replay_won)  # exactly-once invariant preserved (never-send)
+        self.assertIn("cancelled", replay_state)
+
+    def test_uncertain_outcome_still_poisons_when_not_known_not_sent(self):
+        # A non-delivered outcome whose fate is UNKNOWN (not a proven zero-send) stays
+        # `uncertain` and never-replay, byte-for-byte the prior behaviour.
+        from mozyo_bridge.core.state.dispatch_outbox_fence import FENCE_UNCERTAIN
+
+        state, replay_won, replay_state = self._reserve_then_complete(
+            known_not_sent=False, journal="uncert1"
+        )
+        self.assertEqual(state, FENCE_UNCERTAIN)
+        self.assertFalse(replay_won)
+        self.assertIn("uncertain", replay_state)
+
+
+class ClassifyKnownNotSentTests(unittest.TestCase):
+    """Pure classification of the captured inner-send record (#14192)."""
+
+    def test_gateway_route_blocked_is_known_not_sent(self):
+        record = (
+            "## delivery record\n- reason: gateway_route_blocked\n\n"
+            '{"status": "blocked", "reason": "gateway_route_blocked", "receiver": "claude"}'
+        )
+        self.assertTrue(classify_send_known_not_sent(record))
+
+    def test_reader_upgrade_required_is_known_not_sent(self):
+        self.assertTrue(
+            classify_send_known_not_sent('{"status": "blocked", "reason": "reader_upgrade_required"}')
+        )
+
+    def test_sent_outcome_is_not_known_not_sent(self):
+        self.assertFalse(
+            classify_send_known_not_sent('{"status": "sent", "reason": "delivered"}')
+        )
+
+    def test_other_blocked_reason_is_not_known_not_sent(self):
+        # A post-injection / different-gate block is NOT a proven pre-injection zero-send;
+        # it must fall through to `uncertain` (fail toward uncertain).
+        self.assertFalse(
+            classify_send_known_not_sent('{"status": "blocked", "reason": "target_unavailable"}')
+        )
+
+    def test_unparseable_record_is_not_known_not_sent(self):
+        for text in ("", "not json at all", "{malformed", "worker handoff send record"):
+            with self.subTest(text=text):
+                self.assertFalse(classify_send_known_not_sent(text))
+
+    def test_only_the_last_json_object_line_is_read(self):
+        # A non-blocked earlier JSON-looking line never overrides the final outcome line.
+        record = (
+            '{"status": "blocked", "reason": "gateway_route_blocked"}\n'
+            '{"status": "sent", "reason": "delivered"}'
+        )
+        self.assertFalse(classify_send_known_not_sent(record))
+
+
+class SenderAdmissionPreflightTests(unittest.TestCase):
+    """`observe_sender_admission`: the pre-reserve same-lane gateway verdict (#14192)."""
+
+    def _observe(
+        self,
+        *,
+        sender_lane,
+        sender_ws="ws",
+        sender_role="codex",
+        lane_ws="ws",
+        allow_direct_worker=False,
+        unattested=False,
+        gateway_provider="codex",
+        worker_provider="claude",
+    ):
+        lane = SimpleNamespace(
+            workspace_id=lane_ws,
+            lane_id=LANE_LABEL,
+            lane_label=LANE_LABEL,
+            worker_pane="w:pW",
+            gateway_pane="w:pG",
+        )
+        request = WorkerDispatchRequest(ISSUE, LANE_LABEL, "/repo", "j1")
+        env = (
+            {}
+            if unattested
+            else {
+                "MOZYO_WORKSPACE_ID": sender_ws,
+                "MOZYO_AGENT_ROLE": sender_role,
+                "MOZYO_LANE_ID": sender_lane,
+            }
+        )
+        ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE, env=env)
+        with patch.object(ops, "worker_provider", return_value=worker_provider), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology.herdr_workspace_segment",
+            return_value="ws",
+        ), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry._legacy_lane_token",
+            return_value="",
+        ), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution.resolve_gateway_provider",
+            return_value=gateway_provider,
+        ):
+            return ops.observe_sender_admission(
+                lane=lane, request=request, allow_direct_worker=allow_direct_worker
+            )
+
+    def test_same_lane_gateway_sender_is_admitted(self):
+        verdict = self._observe(sender_lane=LANE_LABEL)
+        self.assertTrue(verdict.admitted)
+        self.assertFalse(verdict.exception_applied)
+
+    def test_cross_lane_coordinator_sender_is_blocked(self):
+        # The reported dogfood: a coordinator whose lane differs from the target sublane.
+        verdict = self._observe(sender_lane="default")
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.detail_token, "coordinator_to_sublane_worker_bypass")
+
+    def test_unattested_operator_shell_is_blocked(self):
+        verdict = self._observe(sender_lane=LANE_LABEL, unattested=True)
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.detail_token, "missing_sender_env")
+
+    def test_foreign_workspace_sender_is_blocked(self):
+        # A sender whose env workspace does not match the repo anchor fails closed at
+        # identity resolution (never mints a name for another workspace).
+        verdict = self._observe(sender_lane=LANE_LABEL, sender_ws="other_ws")
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.detail_token, "env_anchor_workspace_mismatch")
+
+    def test_cross_lane_with_allow_direct_worker_is_admitted_exception(self):
+        # The explicit durable exception releases a cross-lane drive (mirrors the inner
+        # rail's gateway_route_exception). The sender is still the gateway (codex) role.
+        verdict = self._observe(sender_lane="default", allow_direct_worker=True)
+        self.assertTrue(verdict.admitted)
+        self.assertTrue(verdict.exception_applied)
+
+    def test_same_lane_worker_role_sender_is_blocked(self):
+        # Review j#84236 F1: a same-lane WORKER (role != gateway provider) is NOT a legitimate
+        # dispatch origin even though its lane matches — Acceptance #1 requires the GATEWAY.
+        verdict = self._observe(sender_lane=LANE_LABEL, sender_role="claude")
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.detail_token, "sender_not_gateway_role")
+
+    def test_same_lane_worker_role_with_allow_direct_worker_still_blocked(self):
+        # The cross-lane exception never relaxes WHO may originate: a worker-role sender is
+        # blocked regardless of --allow-direct-worker.
+        verdict = self._observe(
+            sender_lane=LANE_LABEL, sender_role="claude", allow_direct_worker=True
+        )
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.detail_token, "sender_not_gateway_role")
+
+    def test_rebound_gateway_binding_admits_matching_role_blocks_mismatch(self):
+        # The guard keys on the binding-resolved gateway provider, not a literal `codex`:
+        # rebind the gateway role to `claude` (worker role -> `codex`). A same-lane sender
+        # whose role matches the rebound gateway is admitted; a mismatch fails closed.
+        admitted = self._observe(
+            sender_lane=LANE_LABEL,
+            sender_role="claude",
+            gateway_provider="claude",
+            worker_provider="codex",
+        )
+        self.assertTrue(admitted.admitted)
+        blocked = self._observe(
+            sender_lane=LANE_LABEL,
+            sender_role="codex",
+            gateway_provider="claude",
+            worker_provider="codex",
+        )
+        self.assertFalse(blocked.admitted)
+        self.assertEqual(blocked.detail_token, "sender_not_gateway_role")
+
+
+class TargetLanePinArgvTests(unittest.TestCase):
+    """Redmine #13485: `--target-lane` pins the worker's stable lane identity on the
+    herdr rail; the tmux path (no `target_lane`) stays byte-for-byte the prior shape."""
+
+    _BASE = dict(
+        issue=ISSUE,
+        journal="73381",
+        worker_pane="wC:p3",
+        lane_label=LANE_LABEL,
+        gateway_callback_target="wC:p2",
+        target_repo="auto",
+    )
+
+    def test_tmux_argv_omits_target_lane_byte_invariant(self):
+        # The tmux `LiveWorkerDispatchOps` default (`target_lane=None`) must never emit
+        # `--target-lane`: the tmux worker addresses an explicit `%pane` and never rides
+        # the herdr lane-derivation rail.
+        argv = _worker_dispatch_argv(**self._BASE)
+        self.assertNotIn("--target-lane", argv)
+        # The exact pre-#13485 tmux shape (also the `repo_root=None` tmux default).
+        self.assertEqual(
+            argv,
+            [
+                "handoff", "send",
+                "--to", "claude",
+                "--source", "redmine",
+                "--issue", ISSUE,
+                "--journal", "73381",
+                "--kind", "implementation_request",
+                "--target", "wC:p3",
+                "--target-repo", "auto",
+                "--mode", "queue-enter",
+                "--role-profile", "implementation_worker",
+                "--profile-field", f"lane={LANE_LABEL}",
+                "--profile-field", "gateway_callback_target=wC:p2",
+            ],
+        )
+
+    def test_target_lane_pins_explicit_lane_before_mode(self):
+        argv = _worker_dispatch_argv(**self._BASE, target_lane=LANE_LABEL)
+        self.assertEqual(argv[argv.index("--target-lane") + 1], LANE_LABEL)
+        # Grouped with the target coordinates: after `--target-repo`, before `--mode`.
+        self.assertLess(argv.index("--target-repo"), argv.index("--target-lane"))
+        self.assertLess(argv.index("--target-lane"), argv.index("--mode"))
+
+    def test_empty_target_lane_is_omitted(self):
+        # A blank/None lane is never emitted as an empty `--target-lane` token.
+        self.assertNotIn("--target-lane", _worker_dispatch_argv(**self._BASE, target_lane=""))
+        self.assertNotIn(
+            "--target-lane", _worker_dispatch_argv(**self._BASE, target_lane=None)
+        )
+
+
+class ReplayCommandAuthorityTests(unittest.TestCase):
+    """Redmine #13485 review F1: the outcome / dry-run `command` (a *replayable* retry
+    command) must carry the same stable-lane authority the actual herdr dispatch pins, so
+    replaying it re-resolves the stable slot — never the sender-derived lane. tmux
+    unchanged."""
+
+    _BASE = dict(
+        issue=ISSUE,
+        journal="73381",
+        worker_pane="wC:p3",
+        lane_label=LANE_LABEL,
+        gateway_callback_target="wC:p2",
+        target_repo="auto",
+    )
+
+    def test_tmux_replay_command_carries_no_pins(self):
+        # No pins (tmux `LiveWorkerDispatchOps` default) -> byte-for-byte the prior command.
+        cmd = _replayable_command(**self._BASE)
+        self.assertNotIn("--target-lane", cmd)
+        self.assertNotIn("--repo", cmd)
+        self.assertTrue(cmd.startswith("mozyo-bridge handoff send "))
+
+    def test_herdr_replay_command_carries_lane_and_repo_pins(self):
+        cmd = _replayable_command(
+            **self._BASE, target_lane=LANE_LABEL, repo_root="/wt/13485"
+        )
+        self.assertIn(f"--target-lane {LANE_LABEL}", cmd)
+        # The #13397 `--repo` pin precedes the `handoff` subcommand.
+        self.assertTrue(cmd.startswith("mozyo-bridge --repo /wt/13485 handoff send "))
+
+    def test_herdr_ops_supplies_lane_and_repo_pins(self):
+        ops = HerdrWorkerDispatchOps(
+            repo_root=Path("/wt/13485"), lane_label=LANE_LABEL, issue=ISSUE
+        )
+        pins = ops.command_authority_pins()
+        self.assertEqual(pins["target_lane"], LANE_LABEL)
+        self.assertEqual(pins["repo_root"], "/wt/13485")
+
+    def test_tmux_ops_has_no_pins_capability(self):
+        # The optional capability is absent on the tmux adapter, so the use case reads {}.
+        self.assertFalse(
+            hasattr(LiveWorkerDispatchOps(repo_root=Path(".")), "command_authority_pins")
+        )
+
+    def test_herdr_dry_run_outcome_command_carries_pins_end_to_end(self):
+        # The true wiring: use case -> ops.command_authority_pins() -> outcome.command.
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _HerdrLaneFixture(tmp)
+            request = WorkerDispatchRequest(
+                issue=ISSUE,
+                lane_label=LANE_LABEL,
+                worktree_path=str(fx.worktree),
+                journal="73381",
+            )
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(fx.home)}, clear=False
+            ):
+                fx.stand_up_lane()
+                ops = fx.ops()
+                with patch.object(
+                    ops, "observe_worker_dispatch_admission", return_value=_healthy_admission()
+                ), patch.object(
+                    ops,
+                    "observe_sender_admission",
+                    return_value=SenderDispatchAdmission(
+                        admitted=True, reason="test same-lane gateway"
+                    ),
+                ):
+                    outcome = WorkerDispatchUseCase(
+                        ops, worker_ready_probes=0
+                    ).run(request, execute=False)
+        self.assertIn(f"--target-lane {LANE_LABEL}", outcome.command)
+        self.assertIn("--repo", outcome.command)
+        # And the replayed command's argv is exactly what the herdr adapter drives.
+        self.assertIn("handoff send", outcome.command)
 
 
 class BackendSelectorTests(unittest.TestCase):
@@ -285,12 +1078,27 @@ class HerdrUseCaseDriveTests(unittest.TestCase):
             os.environ, {"MOZYO_BRIDGE_HOME": str(fx.home)}, clear=False
         ):
             fx.stand_up_lane()
+            ops = fx.ops()
             use_case = WorkerDispatchUseCase(
-                fx.ops(), worker_ready_probes=1, sleep=lambda s: None
+                ops, worker_ready_probes=1, sleep=lambda s: None
             )
-            with patch(
+            with patch.object(
+                ops, "observe_worker_dispatch_admission", return_value=_healthy_admission()
+            ), patch.object(
+                ops,
+                "observe_sender_admission",
+                return_value=SenderDispatchAdmission(
+                    admitted=True, reason="test same-lane gateway"
+                ),
+            ), patch.object(
+                ops, "reserve_worker_dispatch", return_value=(True, "reserved")
+            ), patch.object(
+                ops, "complete_worker_dispatch", return_value=True
+            ), patch.object(
+                ops, "_observe_worker_turn_start", return_value="started"
+            ), patch(
                 "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatcher._drive_worker_send_argv",  # noqa: E501
-                return_value=send_rc,
+                return_value=(send_rc, False),
             ) as drive:
                 outcome = use_case.run(request, execute=True)
         return outcome, drive
@@ -342,12 +1150,16 @@ class InnerSendBackendPinTests(unittest.TestCase):
 
     def _effective_backend_from_argv(self, argv: list) -> bool:
         from mozyo_bridge.application.cli import build_parser, normalize_paths
+        from mozyo_bridge.application.commands_common import repo_root_from_args
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (  # noqa: E501
             herdr_effective_backend_selected,
         )
 
         ns = normalize_paths(build_parser().parse_args(argv))
-        return herdr_effective_backend_selected(ns)
+        # Redmine #13729: the predicate takes the facade-resolved repo root + target scalar.
+        return herdr_effective_backend_selected(
+            repo_root=repo_root_from_args(ns), target=getattr(ns, "target", None)
+        )
 
     def test_pinned_repo_resolves_herdr_from_a_divergent_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:

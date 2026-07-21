@@ -56,6 +56,7 @@ from mozyo_bridge.application.handoff_delivery_command import (  # noqa: F401
     maybe_persist_delivery_record as _maybe_persist_delivery_record,
     record_command_from_args as _record_command_from_args,
     record_format_from_args as _record_format_from_args,
+    record_format_from_value as _record_format_from_value,
     record_herdr_send_ledger as _record_herdr_send_ledger,
     submit_lines_for as _submit_lines_for,
 )
@@ -124,8 +125,6 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     project_preflight_target,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
-    AUTO_TARGET_REPO,
-    AnchorError,
     KIND_LABELS,
     MODE_PENDING,
     MODE_QUEUE_ENTER,
@@ -136,44 +135,31 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     SOURCES,
     SOURCE_TICKETLESS,
     TargetActivationOutcome,
-    TicketlessAnchor,
-    TicketlessConsultationAnchor,
-    TicketlessWorkIntakeAnchor,
-    build_execution_root,
-    build_inactive_pane_fallback_command,
-    build_marker,
-    build_notification_body,
-    evaluate_standard_target_admission,
-    is_explicit_pane_target,
     make_outcome,
-    normalize_anchor,
     resolve_queue_enter_retry_policy,
-    resolve_standard_target_admission_policy,
 )
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
-    RoleProfileError,
-    parse_profile_fields,
-    resolve_role_profile,
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_command_input_adapter import (
+    HandoffNamespaceAdapter,
 )
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
-    TransitionRoleError,
-    resolve_transition_role,
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_envelope_planner import (
+    EnvelopePlanError,
+    HandoffEnvelopePlanner,
 )
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.workflow_contract import (
-    WorkflowContractError,
-    resolve_workflow_contract,
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_standard_rail import (
+    HerdrStandardRailRequest,
+    run_herdr_standard_rail,
 )
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_callback import (
-    TicketlessCallback,
-    TicketlessCallbackError,
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_tmux_transport_rail import (
+    TmuxTransportRailRequest,
+    run_tmux_transport_rail,
 )
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_consultation import (
-    TicketlessConsultation,
-    TicketlessConsultationError,
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_target_resolution import (
+    TargetResolutionRequest,
+    run_target_resolution,
 )
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_work_intake import (
-    TicketlessWorkIntake,
-    TicketlessWorkIntakeError,
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_admission_pipeline import (
+    AdmissionPipelineRequest,
+    run_admission_pipeline,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.notification import build_prompt, landing_marker, validate_notify_gate
 from mozyo_bridge.workspace_registry import (
@@ -187,7 +173,6 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     ensure_agent_target,
     find_agent_window,
     is_agent_process,
-    is_receiver_agent_process,
     is_tmux_target,
     mark_read,
     pane_info,
@@ -227,7 +212,6 @@ active_herdr_turn_start_rail = None
 # instead of via the tmux pane resolver, so a pure herdr session (no tmux server)
 # routes. Strictly config-guarded; the tmux path is untouched.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (
-    HerdrSendEntryError,
     herdr_auto_target_repo,
     herdr_effective_backend_selected,
     resolve_herdr_send_target,
@@ -246,7 +230,6 @@ from mozyo_bridge.shared.errors import die
 from mozyo_bridge.shared.paths import (
     default_queue_path,
     default_tmux_conf,
-    normalize_path_unicode,
 )
 
 
@@ -269,21 +252,20 @@ def load_tmux_conf_for(args: argparse.Namespace) -> bool:
 def _agents_target_candidates(args: argparse.Namespace) -> list:
     """Shared discovery → ``TargetRecord`` candidate pipeline (#11811 / #11907).
 
-    Thin wrapper: the discovery orchestration was extracted to
-    :class:`mozyo_bridge.application.commands_agents.ResolveAgentTargetsUseCase`,
-    which depends on the injected
-    :class:`mozyo_bridge.application.agent_discovery_port.AgentDiscoveryPort`
-    instead of the four naked external reads (live discovery / canonical session /
-    git checkout probe / project scope) — the OOP-first read-discovery tranche
-    (Redmine #12749 / #12638 / #12785). This wrapper keeps the public name so the
-    ``agents targets`` / attention handlers and the delegated-coordinator /
-    project-gateway callers that ``from ...commands import _agents_target_candidates``
-    (and the tests that patch ``commands._agents_target_candidates``) are unchanged.
-    Behavior-preserving.
+    Thin wrapper over :class:`~mozyo_bridge.application.commands_agents.ResolveAgentTargetsUseCase`
+    (over the injected :class:`~mozyo_bridge.application.agent_discovery_port.AgentDiscoveryPort`
+    — the #12749 / #12638 / #12785 OOP-first read tranche); keeps the public name so the
+    ``agents targets`` / attention handlers and the delegated-coordinator / project-gateway
+    callers (and tests) that import ``commands._agents_target_candidates`` are unchanged. The
+    composition-injected ``args.snapshot`` (Redmine #13569 R2-F1) is threaded into the discovery
+    adapter and the use-case validation so the runtime read uses the SAME provider vocabulary
+    the CLI choices came from; ``None`` uses the built-in providers.
     """
-    return ResolveAgentTargetsUseCase(LiveAgentDiscovery()).resolve(
+    _s = getattr(args, "snapshot", None)
+    return ResolveAgentTargetsUseCase(LiveAgentDiscovery(snapshot=_s)).resolve(
         agent_filter=getattr(args, "agent", None),
         session_filter=getattr(args, "session", None),
+        snapshot=_s,
     )
 
 
@@ -1617,6 +1599,15 @@ def _maybe_restore_previous_active(
     )
 
 
+# Redmine #13583 R2-F2 positive-delivery gate (rc 0 is NOT proof of delivery). The predicate +
+# terminal-path publisher live in `f_130_.../application/delivery_outcome_gate.py`; re-exported.
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.delivery_outcome_gate import (  # noqa: E402,E501
+    delivery_was_positive,
+    make_publishing_emitter as _make_publishing_emitter,
+    publish_delivery_outcome as _publish_delivery_outcome,
+)
+
+
 @bind_runtime_transport
 def orchestrate_handoff(
     args: argparse.Namespace,
@@ -1658,23 +1649,58 @@ def orchestrate_handoff(
     would let an explicit `%pane` for a foreign Claude pane be typed into under
     a ``to=codex`` marker, defeating the gateway boundary.
     """
+    # Redmine #13729 (tranche 1): the Namespace ends here. Scalar inputs + entry
+    # policy convert once into the typed `HandoffCommandInput`; `args` still
+    # carries the mutated `target_repo` and threads to the not-yet-extracted
+    # target/transport helpers (design j#78394 Tasks 3-4).
+    inp = HandoffNamespaceAdapter.from_namespace(
+        args,
+        default_kind=default_kind,
+        require_receiver_binding=require_receiver_binding,
+        ticketless=ticketless,
+        ticketless_consultation=ticketless_consultation,
+        ticketless_work_intake=ticketless_work_intake,
+    )
+    # Redmine #13729 tranche 2: the Anchor/Profile Envelope Planner (design j#78394).
+    envelope_planner = HandoffEnvelopePlanner()
+
     # Redmine #13261 (increment 2): resolve the backend once and gate every tmux-only
     # step on it. Under herdr a pure session has no tmux server, so `require_tmux()`
     # (and the tmux gates below) must not run; the target is resolved herdr-natively.
     # #13320 (a-narrow): an explicit `%pane` target still rides the tmux rail even under
     # herdr — the effective predicate (also read by `@bind_runtime_transport`) narrows.
-    herdr_send = herdr_effective_backend_selected(args)
+    # R3-F1: every terminal outcome (incl. the herdr event rail) publishes via this emitter.
+    # Redmine #13729: the emitter takes a facade-owned publish callback (not the
+    # Namespace); the facade writes the delivery outcome onto its own `args` — its
+    # caller wrappers read it back via `delivery_was_positive(args)` after this
+    # returns — so the outcome hand-back stays byte-identical while the emitter and
+    # every deep helper are Namespace-free.
+    _emit = _make_publishing_emitter(
+        lambda outcome: _publish_delivery_outcome(args, outcome), _emit_outcome
+    )
+    # Redmine #13729: the facade's single Namespace->Path boundary conversion. The
+    # herdr backend predicate already resolves this repo root unconditionally, so
+    # computing it once here (and passing it to the herdr helpers + the profile
+    # block) is behaviour-neutral and keeps `repo_root_from_args` off the deep path.
+    repo_root = repo_root_from_args(args)
+    herdr_send = herdr_effective_backend_selected(repo_root=repo_root, target=inp.target)
     if not herdr_send:
         require_tmux()
 
-    record_format = _record_format_from_args(args)
-    record_command = _record_command_from_args(args)
+    record_format = _record_format_from_value(inp.record_format)
+    record_command = str(inp.record_command) if inp.record_command else None
 
-    receiver = getattr(args, "to", None)
+    # Redmine #13729: `--target-repo auto` / herdr-auto resolution mutated
+    # `args.target_repo` in place and later gates re-read it. Model that as an
+    # explicit typed facade-local resolution scalar so no gate reads a mutated
+    # Namespace attribute. Seeded from the initial parsed value.
+    resolved_target_repo = inp.target_repo
+
+    receiver = inp.to
     if receiver not in RECEIVERS:
         die(f"--to must be one of {sorted(RECEIVERS)}; got {receiver!r}")
 
-    if ticketless:
+    if inp.ticketless:
         # Redmine #12703: the ticketless no-anchor callback rail carries no Redmine
         # / Asana anchor, so it does not accept `--source` and is not in `SOURCES`.
         # The source token is fixed to `ticketless` for the marker / outcome. This
@@ -1682,21 +1708,21 @@ def orchestrate_handoff(
         # anchor requirement is untouched.
         source = SOURCE_TICKETLESS
     else:
-        source = getattr(args, "source", None)
+        source = inp.source
         if source not in SOURCES:
             die(f"--source must be one of {sorted(SOURCES)}; got {source!r}")
 
-    kind = getattr(args, "kind", None) or default_kind
-    mode = getattr(args, "mode", MODE_QUEUE_ENTER) or MODE_QUEUE_ENTER
+    kind = inp.kind or inp.default_kind
+    mode = inp.mode or MODE_QUEUE_ENTER
     if mode not in MODES:
         die(f"--mode must be one of {sorted(MODES)}; got {mode!r}")
 
-    if mode == MODE_QUEUE_ENTER and bool(getattr(args, "force", False)):
+    if mode == MODE_QUEUE_ENTER and bool(inp.force):
         # Per the relaxed queue-enter rail contract, the agent gate must be
         # stricter than strict `standard`: `--force` cannot be used to bypass
         # non-agent target checks under this rail. The rail only makes sense
         # for Claude/Codex agent panes whose prompt queue accepts Enter.
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="invalid_args",
@@ -1718,7 +1744,7 @@ def orchestrate_handoff(
         )
 
     if kind not in KIND_LABELS:
-        _emit_outcome(
+        _emit(
             make_outcome(
                 status="blocked",
                 reason="invalid_args",
@@ -1735,402 +1761,21 @@ def orchestrate_handoff(
         )
         die(f"--kind must be one of {sorted(KIND_LABELS)}; got {kind!r}")
 
-    summary = getattr(args, "summary", None)
+    summary = inp.summary
 
-    # Redmine #12703: the structured ticketless callback result (return leg), built
-    # distinctly from the transport outcome. `None` for every anchored send/reply.
-    ticketless_callback_payload: TicketlessCallback | None = None
-    # Redmine #12740: the structured forward ticketless consultation (forward leg),
-    # built distinctly from the transport outcome and from the return-leg callback
-    # above. `None` unless `ticketless_consultation=True`.
-    ticketless_consultation_payload: TicketlessConsultation | None = None
-    # Redmine #12748: the structured forward ticketless work-intake (parent -> child
-    # forward leg), built distinctly from the transport outcome and from the
-    # grandparent->parent consultation / return callback above. `None` unless
-    # `ticketless_work_intake=True`.
-    ticketless_work_intake_payload: TicketlessWorkIntake | None = None
-
-    if ticketless and ticketless_work_intake:
-        # Redmine #12748: build the structured FORWARD work-intake payload, then
-        # derive the no-anchor `TicketlessWorkIntakeAnchor` from it. Construction
-        # fails closed (blocked / invalid_args) on an unknown token or an empty /
-        # unknown callback-method set. No anchor is fabricated (the child owns the
-        # anchor create/select/blocked decision) and the worker-dispatch anchor gate
-        # is not relaxed (a worker dispatch is not expressible on this work-intake
-        # rail; the payload restates the invariants for the child).
-        try:
-            ticketless_work_intake_payload = TicketlessWorkIntake(
-                work_shape=getattr(args, "work_shape", None),
-                callback_to_role=getattr(args, "callback_to_role", None),
-                callback_methods=getattr(args, "callback_methods", None),
-                read_contract=getattr(args, "read_contract", None),
-            )
-        except TicketlessWorkIntakeError as exc:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=None,
-                    anchor=None,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-        anchor = TicketlessWorkIntakeAnchor(
-            work_shape=ticketless_work_intake_payload.work_shape,
-            callback_to_role=ticketless_work_intake_payload.callback_to_role,
-        )
-    elif ticketless and ticketless_consultation:
-        # Redmine #12740: build the structured FORWARD consultation payload, then
-        # derive the no-anchor `TicketlessConsultationAnchor` from it. Construction
-        # fails closed (blocked / invalid_args) on an unknown token or an empty /
-        # unknown callback-method set. No anchor is fabricated and the worker-dispatch
-        # anchor gate is not relaxed (a worker dispatch is not expressible on this
-        # consultation rail; the payload restates the invariant for the receiver).
-        try:
-            ticketless_consultation_payload = TicketlessConsultation(
-                consultation_kind=getattr(args, "consultation_kind", None),
-                callback_to_role=getattr(args, "callback_to_role", None),
-                callback_methods=getattr(args, "callback_methods", None),
-                read_contract=getattr(args, "read_contract", None),
-            )
-        except TicketlessConsultationError as exc:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=None,
-                    anchor=None,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-        anchor = TicketlessConsultationAnchor(
-            consultation_kind=ticketless_consultation_payload.consultation_kind,
-            callback_to_role=ticketless_consultation_payload.callback_to_role,
-        )
-    elif ticketless:
-        # Build the structured callback result, then derive the no-anchor
-        # `TicketlessAnchor` from it. Construction fails closed (blocked /
-        # invalid_args) on an unknown token or — critically — on a dispatch
-        # decision that is an actual worker dispatch (which still requires a real
-        # Redmine anchor; the child -> grandchild boundary is not relaxed).
-        try:
-            ticketless_callback_payload = TicketlessCallback(
-                classification=getattr(args, "classification", None),
-                dispatch_decision=getattr(args, "dispatch_decision", None),
-                next_action_owner=getattr(args, "workflow_next_owner", None),
-                callback_reason=getattr(args, "callback_reason", None),
-                read_contract=getattr(args, "read_contract", None),
-            )
-        except TicketlessCallbackError as exc:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=None,
-                    anchor=None,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-        anchor = TicketlessAnchor(
-            classification=ticketless_callback_payload.classification,
-            dispatch_decision=ticketless_callback_payload.dispatch_decision,
-        )
-    else:
-        try:
-            anchor = normalize_anchor(
-                source,
-                task_id=getattr(args, "task_id", None),
-                comment_id=getattr(args, "comment_id", None),
-                anchor_url=getattr(args, "anchor_url", None),
-                issue=getattr(args, "issue", None),
-                journal=getattr(args, "journal", None),
-            )
-        except AnchorError as exc:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_anchor",
-                    receiver=receiver,
-                    target=None,
-                    anchor=None,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-
-    if herdr_send:
-        # Redmine #13261 (increment 2): pure-herdr target resolution. There is no
-        # tmux pane to read, so resolve the receiver against the live herdr inventory
-        # scoped by the launch-time sender identity (env + anchor) and synthesize a
-        # `project_preflight_target`-compatible pane record whose `id` is the live
-        # herdr locator. Fail-closed (un-attested sender / unavailable inventory /
-        # no single live agent) emits a `target_unavailable` blocked outcome and dies
-        # — never a silent tmux fallback.
-        try:
-            target_info = resolve_herdr_send_target(args, receiver=receiver)
-        except HerdrSendEntryError as exc:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="target_unavailable",
-                    receiver=receiver,
-                    target=None,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-    else:
-        target_arg = getattr(args, "target", None) or receiver
-        try:
-            target_info = pane_info(target_arg)
-        except SystemExit:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="target_unavailable",
-                    receiver=receiver,
-                    target=None,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            # Diagnostics only (Redmine #11776): when a `<session>:codex` gateway
-            # location fails to resolve, distinguish exact tmux window-name
-            # resolution from inventory agent_kind classification and list the
-            # session's Codex-like candidate panes. Best-effort and additive — the
-            # original resolver failure (already printed) and the blocked outcome
-            # are unchanged.
-            try:
-                if (
-                    ":" in target_arg
-                    and not target_arg.startswith("%")
-                    and target_arg.split(":", 1)[1].split(".", 1)[0] == "codex"
-                ):
-                    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
-                    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
-                        codex_gateway_candidates,
-                    )
-                    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
-                        target_unavailable_codex_diagnostic,
-                    )
-
-                    _sess = target_arg.split(":", 1)[0]
-                    _cands = [
-                        rec.to_dict()
-                        for rec in codex_gateway_candidates(_sess, _pr.pane_lines())
-                    ]
-                    _diag = target_unavailable_codex_diagnostic(
-                        _sess, "codex", _cands
-                    )
-                    print(_diag, file=sys.stderr)
-            except (Exception, SystemExit):
-                # Diagnostics are strictly best-effort. `pane_lines()` calls
-                # `die()` (SystemExit) when tmux is absent, so catch SystemExit too
-                # — a diagnostics failure must never replace the original
-                # `target_unavailable` outcome (Redmine #11778).
-                pass
-            raise
-
-    target = target_info["id"]
-
-    # Redmine #12229: surface duplicate same-lane receiver panes in the durable
-    # record so the receiver pane and any stale-input duplicate stay both
-    # visible and the receiver/actor record cannot silently diverge (a cockpit
-    # gateway repair can leave two same-lane Claude panes, #12226 j#61213). This
-    # reads a LIVE tmux snapshot at action time
-    # (`vibes/docs/logics/runtime-observability-boundary.md`), never a stored
-    # projection. It is strictly diagnostic and best-effort: it never blocks the
-    # send and never replaces an outcome (an explicit `--target %pane` is the
-    # documented escape hatch, and queue-enter's Step 11 active-split gate
-    # already fail-closes the inactive duplicate). A snapshot read failure must
-    # not change delivery, so swallow any error.
-    from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
-
-    duplicate_lane_panes: list[str] = []
-    if not herdr_send:
-        # Redmine #13261: this same-lane-duplicate diagnostic reads a LIVE tmux pane
-        # snapshot, which has no meaning in a pure herdr session — so it is an
-        # explicit no-op under the herdr backend (an empty list), not a swallowed
-        # tmux-absence error. herdr identity uniqueness is enforced upstream by the
-        # assigned-name decode (a duplicate assigned name fails closed).
-        try:
-            duplicate_lane_panes = [
-                _pr.duplicate_pane_record_row(pane)
-                for pane in _pr.same_lane_receiver_duplicates(
-                    target_info, _pr.pane_lines(), receiver
-                )
-            ]
-        except (Exception, SystemExit):
-            duplicate_lane_panes = []
-
-    # `--target-repo auto` (Redmine #11778): resolve the cross-workspace
-    # identity gate from the explicitly-named pane's own cwd so the operator
-    # does not hand-run `tmux display-message -p -t %pane '#{pane_current_path}'`
-    # before a safe gateway send. Strictly limited to an explicit `%pane`
-    # target — never a receiver label, a `session:window` location, or implicit
-    # discovery — and fail-closed when the pane cwd has no inferable
-    # workspace/repo root. The resolved root then flows through the SAME
-    # cross-session admission and `target_repo_mismatch` gates below as a
-    # hand-passed `--target-repo <root>`; auto cannot weaken them (a pane with
-    # no reachable marker is rejected here, and `--to claude` cross-session is
-    # still blocked downstream regardless).
-    if getattr(args, "target_repo", None) == AUTO_TARGET_REPO and herdr_send:
-        # Redmine #13331 (j#73312 #2): herdr has no `%pane` to infer from, so `auto`
-        # resolves to the sender's own repo root (the same-workspace target's repo). tmux
-        # `auto` is untouched (guarded on `herdr_send`). See `herdr_auto_target_repo`.
-        args.target_repo = herdr_auto_target_repo(args)
-    elif getattr(args, "target_repo", None) == AUTO_TARGET_REPO:
-        raw_target = getattr(args, "target", None)
-        if not is_explicit_pane_target(raw_target):
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(
-                "`--target-repo auto` requires an explicit `%pane` target; "
-                f"target={(raw_target or '<receiver-window>')!r} is not a "
-                "`%pane` id. Auto never widens to receiver-label, "
-                "`session:window`, or discovery targets — name the exact pane, "
-                "or pass an explicit `--target-repo <root>`."
-            )
-            raise AssertionError("unreachable")
-        auto_cwd = target_info.get("cwd") or ""
-        # Prefer the real Git worktree root over a nested project-local scaffold
-        # marker (Redmine #12658 j#66504): a target pane inside a monorepo project
-        # subdir that carries its own `.mozyo-bridge/scaffold.json` must still
-        # resolve `--target-repo auto` to the Git repo root, not the subdir, so the
-        # repo gate gates on the Git root as documented. Non-git scaffold
-        # workspaces still fall back to the marker resolver (#11301).
-        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
-            resolve_workspace_root as _resolve_workspace_root,
-        )
-
-        auto_root = _resolve_workspace_root(auto_cwd)
-        if not auto_root:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="target_repo_mismatch",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(
-                "`--target-repo auto` could not infer a workspace/repo root "
-                f"from target_cwd={(auto_cwd or '<unknown>')!r}; identity "
-                "unestablished, fail-closed. Scaffold the target workspace so "
-                "it carries a `.mozyo-bridge/scaffold.json` / git marker, or "
-                "pass an explicit `--target-repo <root>`."
-            )
-            raise AssertionError("unreachable")
-        # Diagnostics: record the resolved cwd and inferred root so the auto
-        # decision is auditable, then hand the concrete root to the gates below.
-        print(
-            f"--target-repo auto resolved: target_pane={target} "
-            f"target_cwd={auto_cwd!r} -> repo_root={auto_root!r}",
-            file=sys.stderr,
-        )
-        args.target_repo = auto_root
-
-    # Explicit-pane preflight projection (Redmine #11908): resolve the target
-    # pane onto the canonical `TargetRecord` identity vocabulary
-    # (`vibes/docs/logics/unit-target-model.md` "Resolver priority") via the same
-    # projection `agents targets` uses, so normal-local and cockpit panes share
-    # one resolver. Pane option role/workspace/lane is primary; the window name
-    # is a compatibility fallback (`role_source == window_name`); ambiguous /
-    # unknown is surfaced for fail-closed handling below.
-    preflight_target = project_preflight_target(target_info)
-
-    # Main-lane implementation-dispatch guard (Redmine #12441; prevention note
-    # #12438 j#63436; role-based since Redmine #13174). In the managed cockpit /
-    # sublane operating model (epic #12366;
-    # `vibes/docs/logics/coordinator-sublane-development-flow.md`) the main-unit
-    # implementer surface is not where implementation runs; implementation-shaped
-    # work defaults to a cockpit-visible sublane, so a direct `implementation_request`
-    # into the cockpit's default/main-lane implementer pane is a process gap (#12438
-    # j#63432/j#63434). The guard reasons about the implementer *role*: the boundary
-    # resolves the implementer's runtime provider from the repo-local RoleProviderBinding
-    # (#12673/#13157; default -> `claude`, byte-identical) and fails closed in EVERY mode
-    # (the resolved target's lane/view is known here, before the mode-scoped binding gate
-    # below) unless an explicit `--main-lane-exception` references an owner/operator
-    # decision. Deliberately scoped to cockpit panes: a plain `normal_window` agent, a
-    # same-lane *sublane* implementer (non-`default` lane), a dispatch to any non-implementer
-    # provider (the gateway route), and any non-`implementation_request` notification are all
-    # unaffected. The binding wiring lives in the f_140 `main_lane_guard_gate` seam.
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (
-        main_lane_guard_blocked,
-    )
-
-    if main_lane_guard_blocked(
-        args, receiver=receiver, kind=kind, preflight_target=preflight_target
-    ):
-        _emit_outcome(
+    # Redmine #13729 tranche 2: the Anchor/Profile Envelope Planner owns the typed
+    # anchor + ticketless payload build. On malformed input it raises with no extra
+    # outcome fields, matching the original early anchor block (target/anchor None).
+    try:
+        _anchor_plan = envelope_planner.plan_anchor(inp)
+    except EnvelopePlanError as exc:
+        _emit(
             make_outcome(
                 status="blocked",
-                reason="main_lane_implementation_blocked",
+                reason=exc.reason,
                 receiver=receiver,
-                target=target,
-                anchor=anchor,
+                target=None,
+                anchor=None,
                 mode=mode,
                 kind=kind,
                 notification_marker=None,
@@ -2139,47 +1784,115 @@ def orchestrate_handoff(
             record_format=record_format,
             command=record_command,
         )
-        die(
-            "blocked: `--to claude --kind implementation_request` resolved to "
-            f"the repo's default/main lane (pane {target}, lane="
-            f"{preflight_target.lane_id!r}). Implementation-shaped work defaults "
-            "to a cockpit-visible sublane — \"pane already open\" is not an "
-            "exception. Dispatch through the target-lane Codex gateway "
-            "(`--to codex --target <session>:codex --target-repo <root>`), which "
-            "performs the same-lane Claude handoff, or — only with a genuine "
-            "owner/operator decision recorded in the durable anchor — pass "
-            "`--main-lane-exception <journal-ref>`. A same-lane sublane Claude "
-            "dispatch (non-default lane) is unaffected."
-        )
+        die(exc.message)
         raise AssertionError("unreachable")
+    anchor = _anchor_plan.anchor
+    ticketless_callback_payload = _anchor_plan.callback_payload
+    ticketless_consultation_payload = _anchor_plan.consultation_payload
+    ticketless_work_intake_payload = _anchor_plan.work_intake_payload
+    # Redmine #13729 tranche 5: the handoff target-resolution preflight slice owns the herdr /
+    # tmux target resolution, the `target_unavailable` `<session>:codex` gateway diagnostic, the
+    # same-lane duplicate diagnostics, the `--target-repo auto` resolution, and the canonical
+    # `project_preflight_target` projection. It is carved into the typed
+    # ``handoff_target_resolution`` use case — the facade only assembles the typed request (the
+    # resolved `repo_root` + `herdr_send` backend predicate + the raw target scalars + the
+    # terminal-outcome context) and reads the resolved values back off the typed result, so no
+    # downstream gate reads a mutated Namespace attribute. The emitted blocked outcomes, the
+    # printed diagnostics, the re-raised tmux resolver ``SystemExit``, and every ``die`` message
+    # are byte-identical to the original inline block.
+    _target_resolution = run_target_resolution(
+        TargetResolutionRequest(
+            repo_root=repo_root,
+            target=inp.target,
+            target_repo=inp.target_repo,
+            target_lane=inp.target_lane,
+            receiver=receiver,
+            anchor=anchor,
+            mode=mode,
+            kind=kind,
+            source=source,
+            record_format=record_format,
+            record_command=record_command,
+            resolved_target_repo=resolved_target_repo,
+            herdr_send=herdr_send,
+        ),
+        emit=_emit,
+    )
+    target_info = _target_resolution.target_info
+    target = _target_resolution.target
+    duplicate_lane_panes = _target_resolution.duplicate_lane_panes
+    resolved_target_repo = _target_resolution.resolved_target_repo
+    preflight_target = _target_resolution.preflight_target
 
-    if (mode == MODE_QUEUE_ENTER or require_receiver_binding) and not preflight_target.binds_receiver(receiver):
-        # Step 9 (v0.2; role-aware since Redmine #11822, projection since #11908;
-        # mode-independent for receiver-locked wrappers since Redmine #11779).
-        # Under the relaxed queue-enter rail, marker miss does NOT roll back, so
-        # an explicit `--target %X` that resolves to a different agent would
-        # silently press Enter into the wrong receiver's pane. The agent gate
-        # (`ensure_agent_target`) only verifies the pane is running *some* agent
-        # process (claude / codex / node) and does not bind the pane to the
-        # intended receiver. `binds_receiver` binds the explicit target to the
-        # receiver via the canonical projection: a strong, non-ambiguous role ==
-        # receiver from either the `@mozyo_agent_role` pane option (cockpit /
-        # `cockpit_pane` view) or the `<agent>` window name (normal `mozyo` /
-        # `normal_window` view). A cockpit pane no longer needs `--force`; a weak
-        # / ambiguous / mismatched signal stays fail-closed, matching the
-        # contract's "Allowed Targets".
-        #
-        # `require_receiver_binding` extends this gate to `standard` / `pending`
-        # for wrappers whose contract fixes the receiver (cross-workspace
-        # consult): without it, `--mode standard` / `--mode pending` would skip
-        # the binding and let an explicit foreign-Claude `%pane` be typed into
-        # under a `to=codex` marker.
-        observed_window = preflight_target.window_name or "<unknown>"
-        observed_role = preflight_target.pane_option_role or "<none>"
-        _emit_outcome(
+    # Redmine #13729 tranche 6: the handoff admission-pipeline slice owns the fixed-order sequence
+    # of die-able admission gates over the resolved target — the main-lane implementation guard, the
+    # receiver / session / cross-workspace `--to claude` binding gates, the gateway-route
+    # enforcement, the `--target-repo` / `--target-project` identity gates, the
+    # standard_target_admission inactive-split plan, and the foreground-agent binding. It is carved
+    # into the typed ``handoff_admission_pipeline`` use case: the facade only assembles the typed
+    # request (the resolved target / preflight projection from the tranche-5 slice + the backend
+    # predicate + the terminal-outcome context + the raw entry scalars each gate reads) and reads
+    # the two values that cross the boundary — the resolved admission policy and the deferred
+    # inactive-split activation plan — back off the typed result. The gate evaluation order, the
+    # emitted blocked outcomes (reason / extras / recovery_command), the printed diagnostics, the
+    # re-raised agent-gate ``SystemExit``, and every ``die`` message are byte-identical to the
+    # original inline block. The inactive split is NOT actuated here: the real ``select-pane`` stays
+    # deferred to the facade below, after every die-able gate AND the startup-admission gate pass.
+    _admission = run_admission_pipeline(
+        AdmissionPipelineRequest(
+            receiver=receiver,
+            kind=kind,
+            mode=mode,
+            source=source,
+            anchor=anchor,
+            target=target,
+            target_info=target_info,
+            preflight_target=preflight_target,
+            herdr_send=herdr_send,
+            resolved_target_repo=resolved_target_repo,
+            record_format=record_format,
+            record_command=record_command,
+            raw_target=inp.target,
+            require_receiver_binding=bool(inp.require_receiver_binding),
+            has_main_lane_exception=bool(inp.main_lane_exception),
+            allow_direct_worker=bool(inp.allow_direct_worker),
+            target_project=inp.target_project,
+            no_target_activation=bool(inp.no_target_activation),
+            restore_previous_active=bool(inp.restore_previous_active),
+            force=bool(inp.force),
+        ),
+        emit=_emit,
+    )
+    admission_policy = _admission.admission_policy
+    activate_inactive_target = _admission.activate_inactive_target
+    # Redmine #12597: the inactive-split activation is actuated below (after startup admission), so
+    # the facade owns the `TargetActivationOutcome` local the transport rail threads onto the record.
+    target_activation: TargetActivationOutcome | None = None
+
+    # Redmine #13729 tranche 2: the Anchor/Profile Envelope Planner resolves the
+    # pre-send envelope (execution root / role profile / transition role / workflow
+    # contract / notification body / landing marker). On malformed input it raises with
+    # the exact cumulative partial-state extras each original stage emitted; the facade
+    # merges them with its base context for a byte-identical blocked outcome + die.
+    try:
+        envelope = envelope_planner.plan_delivery_envelope(
+            inp,
+            anchor=anchor,
+            callback_payload=ticketless_callback_payload,
+            consultation_payload=ticketless_consultation_payload,
+            work_intake_payload=ticketless_work_intake_payload,
+            repo_root=repo_root,
+            resolved_target_repo=resolved_target_repo,
+            target_cwd=target_info.get("cwd") or "",
+            summary=summary,
+            receiver=receiver,
+            kind=kind,
+        )
+    except EnvelopePlanError as exc:
+        _emit(
             make_outcome(
                 status="blocked",
-                reason="invalid_args",
+                reason=exc.reason,
                 receiver=receiver,
                 target=target,
                 anchor=anchor,
@@ -2187,730 +1900,51 @@ def orchestrate_handoff(
                 kind=kind,
                 notification_marker=None,
                 source=source,
+                **exc.outcome_extra,
             ),
             record_format=record_format,
             command=record_command,
+            **exc.emit_extra,
         )
-        gate_label = (
-            f"--mode {MODE_QUEUE_ENTER}"
-            if mode == MODE_QUEUE_ENTER
-            else "this handoff primitive"
-        )
-        die(
-            f"{gate_label} requires the explicit --target pane to resolve "
-            f"to the receiver; --to={receiver!r} but pane {target} resolved to "
-            f"role={preflight_target.role!r} (source={preflight_target.role_source}, "
-            f"confidence={preflight_target.confidence}, "
-            f"ambiguous={preflight_target.ambiguous}, view={preflight_target.view_kind}; "
-            f"window={observed_window!r}, @mozyo_agent_role={observed_role!r}). "
-            "Drop --target to use role resolution, or pass a pane that resolves "
-            "to the receiver."
-        )
+        die(exc.message)
         raise AssertionError("unreachable")
+    execution_root = envelope.execution_root
+    role_profile_resolution = envelope.role_profile_resolution
+    role_profile_contract = envelope.role_profile_contract
+    transition_role_boundary = envelope.transition_role_boundary
+    workflow_contract_bundle = envelope.workflow_contract_bundle
+    body = envelope.body
+    marker = envelope.marker
 
-    if mode == MODE_QUEUE_ENTER and not herdr_send:
-        # Redmine #13261: this session-binding gate binds the target to the sender's
-        # *tmux session* — a concept that does not exist in a pure herdr session. It
-        # is an explicit no-op under the herdr backend: the herdr target is addressed
-        # by its live locator and is already scoped to the sender's workspace + role
-        # by the inventory decode (WU1), which supersedes tmux-session binding.
-        #
-        # Step 10 (v0.3; constrained cross-session admission added in
-        # Redmine #11301): session binding. queue-enter is bound to the
-        # sender's tmux session by default — under marker miss it does not roll
-        # back, so an explicit `--target %X` in a foreign session could
-        # otherwise land in a different repo's agent, and tmux-outside
-        # invocations have no sender session to compare against.
-        #
-        # A cross-session target is admitted ONLY under the constrained rail:
-        # both sender and target sessions must be resolvable, `--target` must
-        # be an explicit pane / tmux target (not receiver auto-discovery), and
-        # `--target-repo` must be supplied so the workspace identity gate runs.
-        # When admitted, the request still flows through every downstream gate:
-        # the cross-session `--to claude` gate keeps Claude on the codex-gateway
-        # path, the `--target-repo` gate fails closed on identity mismatch, and
-        # Steps 11 / 12 bind the active pane and the foreground agent process.
-        # This lets a configured workspace skip the manual `--mode standard`
-        # fallback while ambiguous / unconfigured states stay fail-closed.
-        sender_session = current_session_name()
-        target_location = target_info.get("location") or ""
-        target_session = (
-            target_location.split(":", 1)[0] if ":" in target_location else ""
-        )
-        same_session = (
-            bool(sender_session)
-            and bool(target_session)
-            and sender_session == target_session
-        )
-        if not same_session:
-            both_sessions_known = bool(sender_session) and bool(target_session)
-            explicit_target = bool(getattr(args, "target", None))
-            has_target_repo = bool(getattr(args, "target_repo", None))
-            cross_session_admitted = (
-                both_sessions_known and explicit_target and has_target_repo
-            )
-            if not cross_session_admitted:
-                _emit_outcome(
-                    make_outcome(
-                        status="blocked",
-                        reason="invalid_args",
-                        receiver=receiver,
-                        target=target,
-                        anchor=anchor,
-                        mode=mode,
-                        kind=kind,
-                        notification_marker=None,
-                        source=source,
-                    ),
-                    record_format=record_format,
-                    command=record_command,
-                )
-                die(
-                    "--mode queue-enter requires the target pane to live in the "
-                    "sender's tmux session, or a constrained cross-session "
-                    "target (an explicit --target pane id plus --target-repo "
-                    "identity gate); "
-                    f"sender_session={(sender_session or '<unset>')!r} "
-                    f"target_session={(target_session or '<unknown>')!r} "
-                    f"explicit_target={explicit_target} "
-                    f"target_repo={'set' if has_target_repo else 'unset'}. "
-                    "Run `mozyo-bridge` from inside the receiver's tmux "
-                    "session, pass an explicit pane id together with "
-                    "--target-repo, or use `--mode standard`."
-                )
-                raise AssertionError("unreachable")
-
-    # Cross-Workspace Handoff Gate (Redmine #10332).
-    #
-    # When the resolved target lives in a different tmux session from the
-    # sender, ``--to claude`` is rejected at the CLI. The cross-workspace
-    # path must route through the target session's Codex window so the
-    # target workspace's audit boundary is preserved; an origin Codex typing
-    # directly into another workspace's Claude pane bypasses that boundary.
-    #
-    # Same-session ``--to claude`` is unaffected (existing window-only
-    # resolver). Cross-session ``--to codex`` is the explicit gateway path.
-    # When the sender is outside tmux (`sender_session` is None) the check
-    # is skipped because we cannot prove cross-session intent; the
-    # queue-enter rail's own session check below still applies in that
-    # mode. The optional ``--target-repo`` check below adds repo-mismatch
-    # fail-closed on top of this gate.
-    # Redmine #13261: the cross-session `--to claude` gate compares tmux session
-    # names. Under the herdr backend there is no tmux session (sender_session_xw is
-    # empty), so the gate below is an explicit no-op — the herdr target's audit
-    # boundary is enforced by the workspace-scoped inventory decode, not tmux-session
-    # membership.
-    sender_session_xw = "" if herdr_send else current_session_name()
-    target_location_xw = target_info.get("location") or ""
-    target_session_xw = (
-        target_location_xw.split(":", 1)[0] if ":" in target_location_xw else ""
-    )
-    if (
-        sender_session_xw
-        and target_session_xw
-        and sender_session_xw != target_session_xw
-        and receiver == "claude"
-    ):
-        _emit_outcome(
-            make_outcome(
-                status="blocked",
-                reason="cross_session_claude",
-                receiver=receiver,
-                target=target,
-                anchor=anchor,
-                mode=mode,
-                kind=kind,
-                notification_marker=None,
-                source=source,
-            ),
-            record_format=record_format,
-            command=record_command,
-        )
-        # Diagnostics only (Redmine #11776): point the operator at the safe
-        # Codex gateway route with concrete candidate pane(s). Best-effort —
-        # any discovery failure falls back to the boundary message unchanged,
-        # and the cross-session `--to claude` block itself is untouched.
-        gateway_hint = ""
-        try:
-            from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain import pane_resolver as _pr
-            from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
-                codex_gateway_candidates,
-            )
-            from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import cross_session_gateway_hint
-
-            _cands = [
-                rec.to_dict()
-                for rec in codex_gateway_candidates(
-                    target_session_xw, _pr.pane_lines()
-                )
-            ]
-            gateway_hint = cross_session_gateway_hint(target_session_xw, _cands)
-        except (Exception, SystemExit):
-            # Best-effort: `pane_lines()` calls `die()` (SystemExit) when tmux
-            # is absent. Catch SystemExit too so the diagnostics path can never
-            # pre-empt the `cross_session_claude` boundary message that must be
-            # the command's terminal output (Redmine #11778).
-            gateway_hint = ""
-        die(
-            "cross-session handoff to Claude is not allowed; "
-            f"sender_session={sender_session_xw!r} target_session={target_session_xw!r}. "
-            "Naming a foreign workspace's Claude pane directly bypasses its "
-            "audit boundary. Route through the target session's Codex window "
-            "with `--to codex --target <target_session>:codex --target-repo "
-            "<target_workspace_root>` and ask that Codex to perform the local "
-            "Claude handoff. With an explicit --target and a passing "
-            "--target-repo identity gate, that gateway send is admitted on the "
-            "default queue-enter rail (Redmine #11301); `--mode standard` (or "
-            "`--mode pending`) remains an available fallback, e.g. when you "
-            "cannot assert --target-repo. See the Cross-Workspace Handoff rule "
-            "in the agent workflow."
-            + (f"\n\n{gateway_hint}" if gateway_hint else "")
-        )
-        raise AssertionError("unreachable")
-
-    # Gateway Route Enforcement Gate (Redmine #12918): fail closed when a governed
-    # implementation_request / review_result is sent `--to claude` directly to a
-    # worker in a different lane than the sender, bypassing that lane's Codex
-    # gateway. The whole gate (policy + emit + die) lives in the f_140
-    # `application/gateway_route_gate` seam so this oversized module keeps only the
-    # one call.
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.gateway_route_gate import (
-        enforce_gateway_route,
+    read_lines = int(inp.read_lines or 50)
+    # Internal pane snapshot preflight (the standard path must not require callers to run
+    # `mozyo-bridge read` first) AND — under herdr — the Redmine #13760 pre-send startup
+    # admission: the same single action-time read is classified against the receiver
+    # provider's declared startup screens, and a trust / first-run / login screen refuses
+    # the send with ZERO bytes typed. The gate body lives in the f_130 seam (module-health;
+    # and it keeps every provider-specific string in profile DATA, out of this module).
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.startup_admission_gate import (
+        admit_receiver_startup_or_die,
     )
 
-    # Redmine #13261 (increment 4): under the herdr backend resolve the sender lane
-    # Unit from the env-derived SenderIdentity (already resolved for the target above)
-    # so the gate enforces on the env sender lane and makes ZERO tmux calls; under tmux
-    # `sender_lane_unit` is None and the gate keeps its `current_pane_lane_unit()` path
-    # byte-identical.
-    herdr_sender_lane_unit = (
-        (target_info.get("herdr_sender_workspace_id"), target_info.get("herdr_sender_lane_id"))
-        if herdr_send
-        else None
-    )
-    enforce_gateway_route(
-        args,
-        kind=kind,
+    admit_receiver_startup_or_die(
+        herdr_send=herdr_send,
         receiver=receiver,
-        preflight_target=preflight_target,
-        source=source,
-        mode=mode,
-        anchor=anchor,
         target=target,
+        read_lines=read_lines,
+        capture_pane=capture_pane,
+        emit=_emit,
         record_format=record_format,
         record_command=record_command,
-        emit=_emit_outcome,
-        sender_lane_unit=herdr_sender_lane_unit,
+        anchor=anchor,
+        mode=mode,
+        kind=kind,
+        source=source,
+        execution_root=execution_root,
+        role_profile_contract=role_profile_contract,
+        duplicate_lane_panes=duplicate_lane_panes,
+        ledger=_record_herdr_send_ledger,
     )
-
-    expected_target_repo = getattr(args, "target_repo", None)
-    if expected_target_repo:
-        expected_resolved = str(Path(expected_target_repo).expanduser().resolve())
-        # Prefer the real Git worktree root over a nested project-local scaffold
-        # marker (Redmine #12658 j#66504) so a target pane inside a monorepo
-        # project subdir (which may carry its own `.mozyo-bridge/scaffold.json`)
-        # still gates against the Git repo root — otherwise an explicit
-        # `--target-repo <Git root>` would fail closed before the project gate can
-        # run. Non-git scaffold workspaces still fall back to the marker resolver.
-        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
-            resolve_workspace_root as _resolve_workspace_root,
-        )
-
-        observed_repo = _resolve_workspace_root(target_info.get("cwd") or "")
-        # Identity comparison goes through the shared Unicode normalization
-        # (Redmine #11625): an NFC-spelled --target-repo must match an NFD
-        # pane cwd for the same directory instead of fail-closing on bytes.
-        if observed_repo is None or normalize_path_unicode(
-            observed_repo
-        ) != normalize_path_unicode(expected_resolved):
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="target_repo_mismatch",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            if observed_repo is None:
-                # Identity could not be established at all: the target cwd does
-                # not walk up to any git / pyproject / scaffold marker. Keep
-                # fail-closed, but hand back a concrete setup action instead of
-                # forcing the operator to reason about repo-root heuristics.
-                setup_hint = (
-                    "the target workspace has no identity marker reachable "
-                    f"from target_cwd={(target_info.get('cwd') or '<unknown>')!r}. "
-                    "For a non-git workspace, scaffold it so it carries "
-                    "`.mozyo-bridge/scaffold.json` (run `mozyo-bridge scaffold "
-                    f"apply <preset> --target {expected_resolved}`), then retry. "
-                    "Or drop `--target-repo` to skip the check."
-                )
-            else:
-                setup_hint = (
-                    f"target pane resolves to repo root {observed_repo!r}. "
-                    "Pass a target pane whose cwd resolves under the expected "
-                    "repo root, or drop `--target-repo` to skip the check."
-                )
-            die(
-                "target pane is not in the expected repo; "
-                f"expected={expected_resolved!r} "
-                f"observed={(observed_repo or '<unknown>')!r} "
-                f"target_cwd={(target_info.get('cwd') or '<unknown>')!r}. "
-                + setup_hint
-            )
-            raise AssertionError("unreachable")
-
-    # Project-Scope Handoff Gate (Redmine #12658). LAYERED ON TOP of the Git
-    # `--target-repo` gate above, never replacing it: the repo gate stays the
-    # fail-closed Git-repo-root identity check, and this adds an additional
-    # constraint that the target resolve to a specific adopted project scope. A
-    # target in the correct Git repository but OUTSIDE the expected project path
-    # fails closed here. `--target-repo auto` is not repurposed to resolve project
-    # paths (it still gates on the Git repo root); the project scope is derived
-    # separately from the target pane's cwd via the bounded project discovery, or
-    # read from a stamped `@mozyo_project_scope` pane option when present.
-    expected_project = getattr(args, "target_project", None)
-    if expected_project:
-        target_cwd = target_info.get("cwd") or ""
-        # Project scope is layered UNDER the Git repo identity and is never a
-        # substitute for repo preflight (Redmine #12658 review j#66481 blocker 2):
-        # `--target-project` requires an explicit `--target-repo` (incl. `auto`)
-        # gate so the same adopted project id in an unrelated repo can never become
-        # the sole identity gate. `--target-repo` has already been validated above
-        # when present.
-        if not expected_target_repo:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(
-                "`--target-project` requires an explicit `--target-repo` "
-                "(or `--target-repo auto`) Git-repo gate; project scope is layered "
-                "under workspace identity and must not be the sole identity gate. "
-                f"target_project={expected_project!r} was given without "
-                "`--target-repo`. Add `--target-repo <root>` / `--target-repo auto`."
-            )
-            raise AssertionError("unreachable")
-
-        observed_scope = None
-        observed_path = None
-        # Default to the explicit repo gate value so the fail-closed die() message
-        # below always has a concrete git_repo_root, even if discovery raises.
-        git_root = str(Path(expected_target_repo).expanduser().resolve())
-        try:
-            from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
-                project_scope_for_cwd,
-                resolve_workspace_root,
-            )
-            from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.project_scope import (
-                path_under_repo_relative,
-            )
-
-            # The project path is repo-relative to the real Git worktree root, so
-            # the stamped cwd-under-project check resolves the Git root (preferring
-            # it over a nested project-local scaffold marker, #12658 j#66499). The
-            # repo gate above already enforced `--target-repo`.
-            git_root = resolve_workspace_root(target_cwd) or git_root
-            stamped_scope = (target_info.get("project_scope") or "").strip()
-            stamped_path = (target_info.get("project_path") or "").strip()
-            # A stamped pane option is a projection cache, not authority: it is only
-            # trusted when the pane's cwd is actually under the stamped project path
-            # within the verified Git repo root (Redmine #12658 review j#66481
-            # blocker 1) — a stale / wrong option can never bypass the
-            # cwd-under-project condition. Otherwise (or on no stamp) the scope is
-            # re-derived from the live project.yaml sources, which is itself
-            # cwd-under-project by construction and fail-closes on cache drift.
-            if stamped_scope and stamped_path and path_under_repo_relative(
-                target_cwd, repo_root=git_root, project_path=stamped_path
-            ):
-                observed_scope = stamped_scope
-                observed_path = stamped_path
-            else:
-                resolved = project_scope_for_cwd(target_cwd, git_root)
-                if resolved is not None:
-                    observed_scope = resolved.scope
-                    observed_path = resolved.path
-        except Exception:  # noqa: BLE001 - fail closed below on any discovery error
-            observed_scope = None
-            observed_path = None
-
-        if observed_scope != expected_project:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="target_project_mismatch",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(
-                "target pane is not in the expected project scope; "
-                f"expected_project={expected_project!r} "
-                f"observed_project={(observed_scope or '<none>')!r} "
-                f"observed_project_path={(observed_path or '<none>')!r} "
-                f"git_repo_root={(git_root or '<unknown>')!r} "
-                f"target_cwd={(target_cwd or '<unknown>')!r}. "
-                "The target must be inside the expected adopted project (its cwd "
-                "under the project path) with a passing Git repo gate. A target in "
-                "the correct repo but outside the project path fails closed. Pass "
-                "a pane whose cwd is under the project, ensure the project carries "
-                "a `runtime_identity.enabled: true` opt-in, or drop "
-                "`--target-project` to gate on the Git repo root only."
-            )
-            raise AssertionError("unreachable")
-
-    # Step 11 (v0.5, Redmine #12597): standard_target_admission. Replaces the
-    # v0.3 unconditional active-split fail-closed. tmux delivers keystrokes to
-    # the pane addressed by `-t` even when it is an inactive split, so the old
-    # gate's concern was visibility (the receiver agent is, by construction, not
-    # the foreground process the operator is looking at), not deliverability.
-    # The owner (j#65493) judged the hard block over-strict: an inactive
-    # registered agent pane that passes the minimal admission contract (live
-    # pane + strong role match + workspace_id + unambiguous target) is now
-    # *activated* by the rail (via `tmux select-pane` — pane selection only,
-    # never raw key injection) and delivered to, with the active化 / restore
-    # facts recorded in the durable record. `lane_id` / the Step 12 foreground
-    # allowlist / repo-cwd checks stay as additional hardening, not minimal
-    # admission conditions, so a git-less / non-scaffolded unit is not broken.
-    # The policy is config-driven through the single
-    # `resolve_standard_target_admission_policy` seam (constants + optional CLI
-    # overrides), not scattered per caller/wrapper.
-    admission_policy = resolve_standard_target_admission_policy(
-        activate_inactive=(
-            False if getattr(args, "no_target_activation", False) else None
-        ),
-        restore_previous_active=(
-            True if getattr(args, "restore_previous_active", False) else None
-        ),
-    )
-    admission = evaluate_standard_target_admission(
-        target_info, receiver=receiver, preflight=preflight_target
-    )
-    activate_inactive_target = False
-    target_activation: TargetActivationOutcome | None = None
-    if mode == MODE_QUEUE_ENTER and target_info.get("pane_active") != "1":
-        if admission.admitted and admission_policy.activate_inactive:
-            # Admitted inactive split: defer the actual `select-pane` until just
-            # before typing (after the remaining die-able gates) so we never
-            # steal focus for a send that then fails a later gate.
-            activate_inactive_target = True
-        else:
-            observed_active = target_info.get("pane_active") or "<unknown>"
-            # Concrete strict-rail recovery (Redmine #12162). `target` is the
-            # already-resolved pane id (an explicit `%pane`), so `--target-repo
-            # auto` can pin its identity, and the command carries the same
-            # receiver / source / kind / anchor.
-            recovery_command = build_inactive_pane_fallback_command(
-                receiver=receiver,
-                kind=kind,
-                target=target,
-                anchor=anchor,
-            )
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-                recovery_command=recovery_command,
-            )
-            if not admission_policy.activate_inactive:
-                reason_clause = (
-                    "target-pane activation is disabled by policy "
-                    "(--no-target-activation), so an inactive split stays "
-                    "fail-closed exactly like the pre-#12597 active-split gate"
-                )
-            else:
-                reason_clause = (
-                    "standard_target_admission did not admit the inactive "
-                    "split; unmet minimal conditions: "
-                    f"{', '.join(admission.unmet_conditions()) or '—'} "
-                    "(register the workspace so the pane carries a workspace_id, "
-                    "or use a pane that resolves strongly to the receiver)"
-                )
-            if recovery_command:
-                fallback_hint = (
-                    " The safest retry is the strict rail, which does not "
-                    "require the receiver pane to be the active split (it "
-                    f"observes the landing marker instead): `{recovery_command}`"
-                )
-            else:
-                fallback_hint = (
-                    " As a fallback you can pin the pane and re-check identity "
-                    "with `--target %pane --target-repo auto` and retry under "
-                    "`--mode standard`, which does not require the active split."
-                )
-            die(
-                "--mode queue-enter requires the target pane to be the active "
-                "split of its window or to pass standard_target_admission; pane "
-                f"{target} has pane_active={observed_active!r} and "
-                f"{reason_clause}. Activate the receiver pane in tmux, or drop "
-                "--target to use window-name resolution." + fallback_hint
-            )
-            raise AssertionError("unreachable")
-
-    if mode == MODE_QUEUE_ENTER:
-        # Step 12 (v0.3): per-receiver foreground process binding. Stricter
-        # than the generic `ensure_agent_target` agent gate. Literal basenames
-        # (`claude` / `node` for `claude`, `codex` for `codex`) give strong
-        # receiver identity. Versioned native binary basenames give only weak
-        # identity (receiver-agnostic regex) — see
-        # `is_receiver_agent_process` and Open Question 8 in the contract.
-        # The CLI does not advertise the weak case as strong; it just admits
-        # under Step 9 + Layer A discipline.
-        pane_command = target_info.get("command") or ""
-        if not is_receiver_agent_process(pane_command, receiver):
-            observed_command = Path(pane_command).name or "<none>"
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="target_not_agent",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(
-                "--mode queue-enter requires the foreground process to match "
-                f"the {receiver} agent; pane {target} has process "
-                f"{observed_command!r}. Restart the receiver agent in the "
-                "pane, or pass a pane that is running the agent."
-            )
-            raise AssertionError("unreachable")
-    else:
-        try:
-            ensure_agent_target(target_info, receiver, force=bool(getattr(args, "force", False)))
-        except SystemExit:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="target_not_agent",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            raise
-
-    # Target execution root / workdir propagation (Redmine #12098). When the
-    # operator asserts a `--workdir`, carry it as an explicit execution root so
-    # the receiver can recover a nested project root (distinct from the pane cwd
-    # / cross-workspace repo root) from the durable record instead of grepping
-    # pane scrollback. The relative pointer is computed against the strongest
-    # available repo anchor: an explicit `--target-repo` (already resolved from
-    # `auto` above when used), else the target pane's inferred repo root. This
-    # is wording/record-layer only — it does not gate pane selection and does
-    # not relax any cross-session / cross-lane boundary.
-    execution_root = None
-    workdir_arg = getattr(args, "workdir", None)
-    if workdir_arg:
-        workdir_abs = str(Path(workdir_arg).expanduser().resolve())
-        repo_anchor = getattr(args, "target_repo", None)
-        if repo_anchor and repo_anchor != AUTO_TARGET_REPO:
-            repo_anchor_abs = str(Path(repo_anchor).expanduser().resolve())
-        else:
-            repo_anchor_abs = infer_repo_root(target_info.get("cwd") or "") or None
-        execution_root = build_execution_root(
-            workdir_abs, repo_root_abs=repo_anchor_abs
-        )
-
-    # Redmine #12388: resolve the requested fixed role profile before any pane
-    # send. Auto-fill `durable_anchor` from the anchor so the most common
-    # placeholder needs no `--profile-field`. Fail closed (blocked /
-    # invalid_args) on an unknown role or a malformed `--profile-field`; omitting
-    # `--role-profile` is the explicit fallback of no profile expansion.
-    role_profile_resolution = None
-    role_profile_arg = getattr(args, "role_profile", None)
-    if role_profile_arg:
-        try:
-            profile_fields = parse_profile_fields(getattr(args, "profile_field", None))
-            profile_fields.setdefault("durable_anchor", anchor.human_pointer())
-            role_profile_resolution = resolve_role_profile(
-                role_profile_arg, profile_fields
-            )
-        except RoleProfileError as exc:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                    execution_root=execution_root,
-                ),
-                record_format=record_format,
-                command=record_command,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-
-    role_profile_contract = (
-        role_profile_resolution.resolved_text if role_profile_resolution else None
-    )
-
-    # Redmine #12706: resolve the explicit transition role/action boundary before
-    # any pane send. The token is set programmatically by the routing command (the
-    # `project-gateway handoff` route injects `grandparent_coordinator` on a
-    # successful gateway resolution), never typed manually as product evidence.
-    # Fail closed (blocked / invalid_args) on an unknown token; omitting it is the
-    # explicit fallback of no role binding.
-    transition_role_boundary = None
-    transition_role_arg = getattr(args, "transition_role", None)
-    if transition_role_arg:
-        try:
-            transition_role_boundary = resolve_transition_role(transition_role_arg)
-        except TransitionRoleError as exc:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                    execution_root=execution_root,
-                    role_profile=role_profile_resolution,
-                ),
-                record_format=record_format,
-                command=record_command,
-                role_profile_contract=role_profile_contract,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-
-    # Redmine #12700: resolve the workflow-contract reference bundle before any
-    # pane send. The token is set programmatically by the routing command (the
-    # `project-gateway handoff` route injects the grandparent bundle on a
-    # successful gateway resolution), never typed manually. Fail closed (blocked /
-    # invalid_args) on an unknown token; omitting it is the explicit fallback of no
-    # contract binding. The bundle carries resolvable doc pointers (catalog ids +
-    # canonical + monorepo-nested paths), never doc bodies.
-    workflow_contract_bundle = None
-    workflow_contract_arg = getattr(args, "workflow_contract", None)
-    if workflow_contract_arg:
-        try:
-            workflow_contract_bundle = resolve_workflow_contract(workflow_contract_arg)
-        except WorkflowContractError as exc:
-            _emit_outcome(
-                make_outcome(
-                    status="blocked",
-                    reason="invalid_args",
-                    receiver=receiver,
-                    target=target,
-                    anchor=anchor,
-                    mode=mode,
-                    kind=kind,
-                    notification_marker=None,
-                    source=source,
-                    execution_root=execution_root,
-                    role_profile=role_profile_resolution,
-                    transition_role=transition_role_boundary,
-                ),
-                record_format=record_format,
-                command=record_command,
-                role_profile_contract=role_profile_contract,
-            )
-            die(str(exc))
-            raise AssertionError("unreachable")
-
-    try:
-        body = build_notification_body(
-            anchor,
-            kind,
-            summary,
-            receiver,
-            execution_root=execution_root,
-            role_profile=role_profile_resolution,
-            transition_role=transition_role_boundary,
-            workflow_contract=workflow_contract_bundle,
-            ticketless_callback=ticketless_callback_payload,
-            ticketless_consultation=ticketless_consultation_payload,
-            ticketless_work_intake=ticketless_work_intake_payload,
-        )
-    except AnchorError as exc:
-        _emit_outcome(
-            make_outcome(
-                status="blocked",
-                reason="invalid_args",
-                receiver=receiver,
-                target=target,
-                anchor=anchor,
-                mode=mode,
-                kind=kind,
-                notification_marker=None,
-                source=source,
-                execution_root=execution_root,
-                role_profile=role_profile_resolution,
-                transition_role=transition_role_boundary,
-                workflow_contract=workflow_contract_bundle,
-                ticketless_callback=ticketless_callback_payload,
-                ticketless_consultation=ticketless_consultation_payload,
-                ticketless_work_intake=ticketless_work_intake_payload,
-            ),
-            record_format=record_format,
-            command=record_command,
-            role_profile_contract=role_profile_contract,
-        )
-        die(str(exc))
-        raise AssertionError("unreachable")
-
-    marker = build_marker(anchor, kind, receiver)
-
-    read_lines = int(getattr(args, "read_lines", 50) or 50)
-    # Internal pane snapshot preflight. The standard path must not require
-    # callers to run `mozyo-bridge read` first.
-    capture_pane(target, read_lines)
 
     # Redmine #12597: activate an admitted inactive split now — after every
     # die-able gate above — so we never steal the operator's focus for a send
@@ -2931,373 +1965,82 @@ def orchestrate_handoff(
     # common shim-backed choreography (auditor j#72602 decisions 1/2/3/5). The rail is
     # stashed on `active_herdr_turn_start_rail` by `bind_runtime_transport`.
     if herdr_send and mode == MODE_STANDARD:
-        rail = active_herdr_turn_start_rail
-        if rail is None:  # defensive: the decorator always stashes it under herdr
-            die(
-                "herdr backend selected for a --mode standard send but no turn-start "
-                "rail was installed; refusing to fall back to the capture rail. "
-                f"target={target}"
-            )
-            raise AssertionError("unreachable")
-        turn_start = rail.drive_turn_start(target, f"{marker} {body}")
-        status, reason = _project_herdr_turn_start(turn_start)
-        # Machine-readable turn-start telemetry (turn_start_outcome / snapshot_state /
-        # wait_kind / enter_resends / reclassified_blocked) for EVERY rail outcome,
-        # rendered redaction-safe by the rail's own record renderer and persisted on
-        # the delivery record (auditor j#72602 decision 4).
-        turn_start_lines = _turn_start_rail_record_lines(turn_start)
-        # Redmine #13255 j#72695: carry the SAME telemetry as a structured field on
-        # the outcome so it lands in the JSON / persisted record (an auditor / the
-        # future #12656 ledger reads this, not the reused `(status, reason)` wire
-        # alone) AND so the delivery-record wording discriminates a herdr
-        # `delivered_not_started` from the tmux/capture standard rail's
-        # `turn_start_unconfirmed`.
-        turn_start_telemetry = turn_start.to_telemetry_dict()
-        outcome = make_outcome(
-            status=status,
-            reason=reason,
-            receiver=receiver,
-            target=target,
-            anchor=anchor,
-            mode=mode,
-            kind=kind,
-            notification_marker=marker,
-            execution_root=execution_root,
-            role_profile=role_profile_resolution,
-            transition_role=transition_role_boundary,
-            workflow_contract=workflow_contract_bundle,
-            ticketless_callback=ticketless_callback_payload,
-            ticketless_consultation=ticketless_consultation_payload,
-            ticketless_work_intake=ticketless_work_intake_payload,
-            turn_start_outcome=turn_start_telemetry,
-        )
-        _emit_outcome(
-            outcome,
-            record_format=record_format,
-            command=record_command,
-            duplicate_lane_panes=duplicate_lane_panes or None,
-            role_profile_contract=role_profile_contract,
-            submit_lines=_submit_lines_for(args, outcome),
-            turn_start_lines=turn_start_lines,
-        )
-        # Redmine #13300: persist every event-rail outcome (incl. delivered-not-started)
-        # before the sent/die branch, so no terminal event-rail path escapes the ledger.
-        _record_herdr_send_ledger(outcome)
-        if status == "sent":
-            _maybe_persist_delivery_record(
-                args,
-                outcome,
-                duplicate_lane_panes=duplicate_lane_panes,
-                record_format=record_format,
-                turn_start_lines=turn_start_lines,
-            )
-            return 0
-        die(
-            "handoff was routed through the herdr event-driven turn-start rail but "
-            f"no turn start was confirmed (rail outcome {turn_start.outcome}); the "
-            f"{receiver} receiver was not observed starting a turn. The marker+body "
-            "was typed at most once and only Enter was sent (no C-u rollback, no "
-            f"re-send). Read the receiver before re-issuing. target={target} "
-            f"marker={marker}"
-        )
-        raise AssertionError("unreachable")
-
-    run_tmux("send-keys", "-t", target, "-l", "--", f"{marker} {body}")
-
-    if mode == MODE_PENDING:
-        outcome = make_outcome(
-            status="pending_input",
-            reason="ok",
-            receiver=receiver,
-            target=target,
-            anchor=anchor,
-            mode=mode,
-            kind=kind,
-            notification_marker=marker,
-            execution_root=execution_root,
-            role_profile=role_profile_resolution,
-            transition_role=transition_role_boundary,
-            workflow_contract=workflow_contract_bundle,
-            ticketless_callback=ticketless_callback_payload,
-            ticketless_consultation=ticketless_consultation_payload,
-            ticketless_work_intake=ticketless_work_intake_payload,
-        )
-        _emit_outcome(
-            outcome,
-            record_format=record_format,
-            command=record_command,
-            duplicate_lane_panes=duplicate_lane_panes or None,
-            role_profile_contract=role_profile_contract,
-            submit_lines=_submit_lines_for(args, outcome),
-        )
-        _maybe_persist_delivery_record(
-            args,
-            outcome,
-            duplicate_lane_panes=duplicate_lane_panes,
-            record_format=record_format,
-        )
-        return 0
-
-    landing_timeout = float(getattr(args, "landing_timeout", 8.0) or 8.0)
-    landing_lines = max(read_lines, 200)
-    marker_observed = wait_for_text(target, marker, landing_lines, landing_timeout)
-
-    if not marker_observed and mode != MODE_QUEUE_ENTER:
-        run_tmux("send-keys", "-t", target, "C-u")
-        outcome = make_outcome(
-            status="blocked",
-            reason="marker_timeout",
-            receiver=receiver,
-            target=target,
-            anchor=anchor,
-            mode=mode,
-            kind=kind,
-            notification_marker=marker,
-            execution_root=execution_root,
-            role_profile=role_profile_resolution,
-            transition_role=transition_role_boundary,
-            workflow_contract=workflow_contract_bundle,
-            ticketless_callback=ticketless_callback_payload,
-            ticketless_consultation=ticketless_consultation_payload,
-            ticketless_work_intake=ticketless_work_intake_payload,
-        )
-        _emit_outcome(
-            outcome,
-            record_format=record_format,
-            command=record_command,
-            duplicate_lane_panes=duplicate_lane_panes or None,
-            role_profile_contract=role_profile_contract,
-            submit_lines=_submit_lines_for(args, outcome),
-        )
-        _emit_handoff_marker_timeout_guidance(receiver)
-        die(
-            "handoff marker was not observed in target pane; a C-u rollback was issued and Enter was not pressed (the receiver composer state was not verified). "
-            f"target={target} marker={marker}"
-        )
-        raise AssertionError("unreachable")
-
-    submit_delay = max(0.0, float(getattr(args, "submit_delay", 0.2) or 0.0))
-    if submit_delay:
-        time.sleep(submit_delay)
-
-    # Redmine #13166 / #13262: on the strict `--mode standard` rail, snapshot the
-    # receiver pane immediately before Enter so the post-Enter turn-start
-    # observation below has a pre-submit baseline. The marker was already observed
-    # (a marker miss died at `marker_timeout` above), so this baseline holds the
-    # marker+body sitting in the composer. #13166 gated this on codex only; #13262
-    # generalizes it to any `--mode standard` send (claude and codex) since the
-    # observation is receiver-agnostic. The queue-enter rail keeps its prior
-    # behavior untouched (its marker-unobserved path stays `sent` / `queue_enter`).
-    standard_rail = mode == MODE_STANDARD
-    turn_start_window = _resolve_turn_start_window(
-        getattr(args, "landing_timeout", None), landing_timeout
-    )
-    turn_start_baseline = (
-        capture_pane(target, landing_lines) if standard_rail else None
-    )
-
-    run_tmux("send-keys", "-t", target, "Enter")
-    enter_attempts = 1
-
-    # Enter-only retry (Redmine #12580 / #12581). Only the `queue-enter` rail,
-    # and only when the landing marker was not observed: a busy or redrawing
-    # Claude/Codex TUI can drop the first Enter even though the marker+body
-    # landed cleanly. Re-issue Enter — and ONLY Enter; the marker+body typed
-    # once above is never re-injected, and an empty Enter on an idle agent
-    # composer is a no-op, so the payload cannot be duplicated — on the policy
-    # interval until the marker is observed or the window elapses. The
-    # `standard` / `pending` rails never reach this branch, so their semantics
-    # are untouched. The 30s/2s defaults live behind
-    # `resolve_queue_enter_retry_policy` (the config boundary) and are
-    # overridable via `--queue-enter-retry-window` / `-interval`.
-    retry_policy = resolve_queue_enter_retry_policy(
-        getattr(args, "queue_enter_retry_window", None),
-        getattr(args, "queue_enter_retry_interval", None),
-    )
-    retry_engaged = (
-        mode == MODE_QUEUE_ENTER and not marker_observed and retry_policy.enabled
-    )
-    if retry_engaged:
-        for _ in range(retry_policy.max_retries):
-            if retry_policy.interval_seconds:
-                time.sleep(retry_policy.interval_seconds)
-            if _marker_visible_in(capture_pane(target, landing_lines), marker):
-                marker_observed = True
-                break
-            run_tmux("send-keys", "-t", target, "Enter")
-            enter_attempts += 1
-
-    # Redmine #13166 / #13262: standard-rail turn-start verification. Marker
-    # observed + Enter issued proves the sender pressed Enter, not that the receiver
-    # TUI submitted the prompt and started a turn — a busy / redrawing composer can
-    # absorb the Enter and leave the marker+body unsubmitted while the rail still
-    # reported `sent` / `ok` (the false-positive delivery this bug fixes). The rail
-    # now observes the receiver pane for post-Enter turn-start activity (read-only;
-    # no re-typed marker+body, no re-issued Enter, no auto-resend). #13166 ran this
-    # for codex only; #13262 generalizes it to any `--mode standard` send (claude
-    # and codex). The queue-enter rail is untouched: its marker-unobserved path
-    # stays `sent` / `queue_enter`, never blocking.
-    turn_start_lines = None
-    if standard_rail:
-        turn_start = _observe_standard_turn_start(
-            target,
-            baseline_capture=turn_start_baseline or "",
-            capture=capture_pane,
-            sleep=time.sleep,
-            window_seconds=turn_start_window,
-            lines=landing_lines,
-        )
-        turn_start_lines = _turn_start_record_lines(
-            turn_start, rail_label=f"{receiver} standard-rail"
-        )
-        if not turn_start.confirmed:
-            outcome = make_outcome(
-                status="blocked",
-                reason="turn_start_unconfirmed",
-                receiver=receiver,
+        # Redmine #13729 tranche 3: the herdr event-driven turn-start rail slice owns its own
+        # control flow (returns / dies without falling through). It is carved into the typed
+        # ``handoff_herdr_standard_rail`` use case — the facade only assembles the typed request
+        # (the resolved envelope value objects + terminal outcome context) and hands it the
+        # stashed rail + the per-call publishing emitter. The emit / ledger / persist / die side
+        # effects, the marker+body-once-only choreography, and both die messages are unchanged.
+        return run_herdr_standard_rail(
+            active_herdr_turn_start_rail,
+            HerdrStandardRailRequest(
                 target=target,
+                marker=marker,
+                body=body,
+                receiver=receiver,
                 anchor=anchor,
                 mode=mode,
                 kind=kind,
-                notification_marker=marker,
                 execution_root=execution_root,
-                role_profile=role_profile_resolution,
-                transition_role=transition_role_boundary,
-                workflow_contract=workflow_contract_bundle,
+                role_profile_resolution=role_profile_resolution,
+                role_profile_contract=role_profile_contract,
+                transition_role_boundary=transition_role_boundary,
+                workflow_contract_bundle=workflow_contract_bundle,
                 ticketless_callback=ticketless_callback_payload,
                 ticketless_consultation=ticketless_consultation_payload,
                 ticketless_work_intake=ticketless_work_intake_payload,
-            )
-            _emit_outcome(
-                outcome,
                 record_format=record_format,
-                command=record_command,
-                duplicate_lane_panes=duplicate_lane_panes or None,
-                role_profile_contract=role_profile_contract,
-                submit_lines=_submit_lines_for(args, outcome),
-                turn_start_lines=turn_start_lines,
-            )
-            die(
-                "handoff landing marker was observed and Enter was pressed, but the "
-                f"{receiver} receiver pane showed no turn-start activity within the "
-                "observation window; the Enter may have been absorbed by a busy / "
-                "redrawing composer. No C-u rollback and no re-send were issued (the "
-                "marker+body was typed once). Read the receiver to confirm whether "
-                "the turn started before re-issuing under --mode standard. "
-                f"target={target} marker={marker}"
-            )
-            raise AssertionError("unreachable")
-
-    # Redmine #13292: additive, telemetry-only queue-enter turn-start observation
-    # under the herdr backend (j#72602 decision 5's deferred follow-up, design
-    # confirmed #13292 j#72759). The queue-enter inject → Enter → Enter-only retry
-    # choreography above is left BYTE-IDENTICAL; only AFTER it, and only for a herdr
-    # send, do we take a read-only `agent get` runtime-state snapshot (#13246
-    # `read_agent_state`, borrowed from the already-resolved rail's reader — no
-    # second config read, no `drive_turn_start`, no injection ownership, no
-    # `precondition_not_idle` fail-close). The result is recorded as additive
-    # telemetry ONLY: it never changes `status` / `reason` / `next_action_owner`
-    # (they stay `sent` / `ok`|`queue_enter` / `receiver`) and never blocks the send
-    # — a read failure / `unknown` / `awaiting_input` all just record telemetry. It
-    # is kept structurally separate from the event rail's `turn_start_outcome` (a
-    # post-hoc snapshot does not prove causality like an armed `wait agent-status`
-    # transition). The tmux backend and every non-queue-enter rail are untouched
-    # (`queue_enter_observation` stays `None`).
-    queue_enter_observation = None
-    if herdr_send and mode == MODE_QUEUE_ENTER:
-        rail = active_herdr_turn_start_rail
-        if rail is not None:  # always installed under herdr; skip defensively if not
-            queue_enter_snapshot = _observe_queue_enter_turn_start(
-                target,
-                read=rail.reader.read_agent_state,
-                sleep=time.sleep,
-            )
-            queue_enter_observation = queue_enter_snapshot.to_telemetry_dict()
-            # Reuse the additive `turn_start_lines` record channel (appended, never
-            # overrides `next_action`); the queue-enter renderer labels itself
-            # telemetry-only and does not reuse the event rail's wording.
-            turn_start_lines = _queue_enter_turn_start_record_lines(queue_enter_snapshot)
-
-    # Wording-layer differentiation under the relaxed `queue-enter` rail:
-    # marker observed (possibly via the Enter-only retry above) → strict
-    # `sent`/`ok`; marker still unobserved → `sent`/`queue_enter` (sender did
-    # not pre-confirm landing). The receiver-side contract and
-    # `next_action_owner` stay identical to strict `sent` per the contract.
-    relaxed_unobserved = mode == MODE_QUEUE_ENTER and not marker_observed
-    outcome = make_outcome(
-        status="sent",
-        reason="queue_enter" if relaxed_unobserved else "ok",
-        receiver=receiver,
-        target=target,
-        anchor=anchor,
-        mode=mode,
-        kind=kind,
-        notification_marker=marker,
-        execution_root=execution_root,
-        role_profile=role_profile_resolution,
-        # Redmine #12706 carried the transition boundary on the pending /
-        # marker_timeout paths but dropped it on this successful-delivery path, so
-        # the durable record / JSON wire showed no boundary on a real send. Thread
-        # it here so the standard transition payload carries the boundary on the
-        # delivery that matters; #12700 adds the workflow-contract bundle alongside.
-        transition_role=transition_role_boundary,
-        workflow_contract=workflow_contract_bundle,
-        ticketless_callback=ticketless_callback_payload,
-        ticketless_consultation=ticketless_consultation_payload,
-        ticketless_work_intake=ticketless_work_intake_payload,
-        # Redmine #13292: additive, telemetry-only herdr queue-enter turn-start
-        # snapshot (`None` for tmux / non-queue-enter). Never influences the wire.
-        queue_enter_turn_start_observation=queue_enter_observation,
-    )
-    # Durable retry telemetry (policy + attempted count + interval) is recorded
-    # in the delivery record / narrative only when the Enter-only retry actually
-    # engaged. It is wording-layer only: it never reaches the wire enums or the
-    # inspector projection (`Status` / `reason` / `next_action_owner` are
-    # unchanged), matching the contract's strong boundary.
-    retry_record = (
-        QueueEnterRetryOutcome(
-            window_seconds=retry_policy.window_seconds,
-            interval_seconds=retry_policy.interval_seconds,
-            enter_attempts=enter_attempts,
-            marker_observed=marker_observed,
+                record_command=record_command,
+                duplicate_lane_panes=duplicate_lane_panes,
+                submit_intent=inp.submit_intent,
+                submit_delivery_id=inp.submit_delivery_id,
+                persist_delivery=bool(inp.persist_delivery),
+            ),
+            emit=_emit,
         )
-        if retry_engaged
-        else None
+
+    # Redmine #13729 tranche 4: the common tmux transport rail slice owns its own control flow
+    # (every path returns / dies without falling through). It is carved into the typed
+    # ``handoff_tmux_transport_rail`` use case — the facade only assembles the typed request (the
+    # resolved envelope value objects + terminal outcome context + the raw landing / submit /
+    # retry scalars + the pre-resolved focus-restore activation) and hands it the per-call
+    # publishing emitter. The inject / marker gate / C-u rollback / Enter-only retry / standard
+    # turn-start confirmation / final sent assembly choreography, the emit / persist / ledger /
+    # restore side effects, and both ``die`` messages are unchanged.
+    return run_tmux_transport_rail(
+        TmuxTransportRailRequest(
+            target=target,
+            marker=marker,
+            body=body,
+            receiver=receiver,
+            anchor=anchor,
+            mode=mode,
+            kind=kind,
+            execution_root=execution_root,
+            role_profile_resolution=role_profile_resolution,
+            role_profile_contract=role_profile_contract,
+            transition_role_boundary=transition_role_boundary,
+            workflow_contract_bundle=workflow_contract_bundle,
+            ticketless_callback=ticketless_callback_payload,
+            ticketless_consultation=ticketless_consultation_payload,
+            ticketless_work_intake=ticketless_work_intake_payload,
+            record_format=record_format,
+            record_command=record_command,
+            duplicate_lane_panes=duplicate_lane_panes,
+            submit_intent=inp.submit_intent,
+            submit_delivery_id=inp.submit_delivery_id,
+            persist_delivery=bool(inp.persist_delivery),
+            herdr_send=herdr_send,
+            read_lines=read_lines,
+            landing_timeout=inp.landing_timeout,
+            submit_delay=inp.submit_delay,
+            queue_enter_retry_window=inp.queue_enter_retry_window,
+            queue_enter_retry_interval=inp.queue_enter_retry_interval,
+            target_activation=target_activation,
+            restore_previous_active=admission_policy.restore_previous_active,
+        ),
+        emit=_emit,
     )
-    # Redmine #12597: if standard_target_admission activated an inactive split
-    # and the policy asks to restore focus, re-select the previously-active pane
-    # after delivery. Pane selection only, best-effort (a vanished pane must not
-    # break the already-completed send), and the restore fact is recorded.
-    target_activation = _maybe_restore_previous_active(
-        target_activation,
-        restore_previous_active=admission_policy.restore_previous_active,
-    )
-    _emit_outcome(
-        outcome,
-        record_format=record_format,
-        command=record_command,
-        duplicate_lane_panes=duplicate_lane_panes or None,
-        role_profile_contract=role_profile_contract,
-        retry=retry_record,
-        activation=target_activation,
-        submit_lines=_submit_lines_for(args, outcome),
-        turn_start_lines=turn_start_lines,
-    )
-    _maybe_persist_delivery_record(
-        args,
-        outcome,
-        duplicate_lane_panes=duplicate_lane_panes,
-        record_format=record_format,
-        retry=retry_record,
-        activation=target_activation,
-        turn_start_lines=turn_start_lines,
-    )
-    # Redmine #13300: persist the herdr queue-enter outcome to the #13296 ledger. This
-    # terminal block is shared with tmux, so the emission is guarded on `herdr_send`
-    # (tmux 経路不変); the Enter-only retry telemetry enriches the same entry.
-    if herdr_send:
-        _record_herdr_send_ledger(outcome, retry_outcome=retry_record)
-    return 0
 
 
 # ``CONSULT_DEFAULT_KIND`` and the four ``handoff`` command entry bodies moved to
@@ -3331,15 +2074,23 @@ def cmd_handoff_reply(args: argparse.Namespace) -> int:
 
 
 def cmd_handoff_ticketless_callback(args: argparse.Namespace) -> int:
-    """Thin adapter: the body lives in ``HandoffCommandUseCase.run_ticketless_callback``."""
+    """Thin adapter: the body lives in ``HandoffCommandUseCase.run_ticketless_callback``.
+
+    Redmine #13583 R1-F1: on a positively-delivered callback that echoes a ``forward_action_id``,
+    complete the correlated forward generation (best-effort; never alters the callback's own rc).
+    """
     from mozyo_bridge.application.handoff_command import (
         HandoffCommandUseCase,
         LiveHandoffCommandOps,
     )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_workflow_step import (
+        complete_forward_generation_on_callback,
+    )
 
-    return HandoffCommandUseCase(
-        LiveHandoffCommandOps()
-    ).run_ticketless_callback(args)
+    rc = HandoffCommandUseCase(LiveHandoffCommandOps()).run_ticketless_callback(args)
+    # R2-F2: gate on the transport's structured `sent`/`ok`, never on rc (see delivery_outcome_gate).
+    complete_forward_generation_on_callback(args, delivered=delivery_was_positive(args))
+    return rc
 
 
 def cmd_handoff_cross_workspace_consult(args: argparse.Namespace) -> int:

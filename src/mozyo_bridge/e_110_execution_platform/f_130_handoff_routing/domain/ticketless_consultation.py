@@ -176,6 +176,10 @@ class TicketlessConsultation:
     callback_to_role: str
     callback_methods: tuple[str, ...]
     read_contract: str
+    #: Opaque forward generation correlation id (Redmine #13583 R1-F1). ``""`` for a non-forward
+    #: (tmux) consultation; a herdr coordinator forward sets it so the returning callback can echo
+    #: it and complete the exact forward generation. Never a role / approval / anchor authority.
+    forward_action_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -202,6 +206,11 @@ class TicketlessConsultation:
                 self.read_contract, READ_CONTRACT_TOKENS, field="read_contract"
             ),
         )
+        object.__setattr__(
+            self,
+            "forward_action_id",
+            str(self.forward_action_id).strip() if self.forward_action_id is not None else "",
+        )
 
     @property
     def worker_dispatch_requires_anchor(self) -> bool:
@@ -210,13 +219,16 @@ class TicketlessConsultation:
 
     def to_structured_dict(self) -> dict[str, object]:
         """Structured, free-text-free fields for the handoff consultation payload."""
-        return {
+        payload: dict[str, object] = {
             "consultation_kind": self.consultation_kind,
             "callback_to_role": self.callback_to_role,
             "callback_methods": list(self.callback_methods),
             "read_contract": self.read_contract,
             "worker_dispatch_requires_anchor": WORKER_DISPATCH_REQUIRES_ANCHOR,
         }
+        if self.forward_action_id:
+            payload["forward_action_id"] = self.forward_action_id
+        return payload
 
     def marker_fields(self) -> list[tuple[str, str]]:
         """Marker key/value pairs for the ticketless forward landing marker.
@@ -242,6 +254,18 @@ class TicketlessConsultation:
         the read contract, and the preserved worker-dispatch anchor rule.
         """
         methods = " or ".join(self.callback_methods)
+        # Redmine #13583 R2-F1: the forward generation id MUST ride the receiver-visible one-line
+        # body (this clause is what `build_notification_body` types into the pane / herdr agent).
+        # The structured dict is sender-side output the receiver cannot read on the no-anchor rail,
+        # so without this the receiver could never echo the id and the generation would never
+        # complete. Single line by construction (no newlines).
+        correlation = (
+            f"; forward_action_id {self.forward_action_id} — echo it verbatim on your callback "
+            f"(`--forward-action-id {self.forward_action_id}`) so the caller's forward generation "
+            "completes and it may consult again"
+            if self.forward_action_id
+            else ""
+        )
         return (
             f"ticketless consultation: kind {self.consultation_kind}; return the "
             f"result to {self.callback_to_role} via {methods}; act under the "
@@ -249,6 +273,7 @@ class TicketlessConsultation:
             "domain probe still requires a Redmine anchor (mint one and use "
             "`handoff send --source redmine`); the structured consultation fields "
             "are the durable delivery record (no Redmine anchor was fabricated)"
+            + correlation
         )
 
     def record_lines(self) -> list[str]:
@@ -259,7 +284,7 @@ class TicketlessConsultation:
         without re-reading the pane.
         """
         methods = ", ".join(f"`{m}`" for m in self.callback_methods)
-        return [
+        lines = [
             f"- Ticketless consultation: kind `{self.consultation_kind}`",
             f"  - Return result to role: `{self.callback_to_role}`",
             f"  - Return via: {methods}",
@@ -268,6 +293,13 @@ class TicketlessConsultation:
             f"`{str(WORKER_DISPATCH_REQUIRES_ANCHOR).lower()}` "
             "(this no-anchor forward rail does not relax the worker-dispatch gate)",
         ]
+        if self.forward_action_id:
+            lines.append(
+                f"  - Forward action id: `{self.forward_action_id}` "
+                f"(echo verbatim: `--forward-action-id {self.forward_action_id}` on your callback, "
+                "so the caller's forward generation completes)"
+            )
+        return lines
 
 
 def ticketless_consultation_from_payload(
@@ -295,6 +327,7 @@ def ticketless_consultation_from_payload(
         callback_to_role=callback_to_role,  # type: ignore[arg-type]
         callback_methods=callback_methods,  # type: ignore[arg-type]
         read_contract=read_contract,  # type: ignore[arg-type]
+        forward_action_id=payload.get("forward_action_id", ""),  # type: ignore[arg-type]
     )
 
 

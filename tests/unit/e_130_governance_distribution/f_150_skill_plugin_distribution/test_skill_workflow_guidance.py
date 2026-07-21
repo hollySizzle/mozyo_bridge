@@ -145,6 +145,18 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # runtime-fingerprint verification discipline.
         "## ACK / delivery / completion の分離",
         "## Runtime fingerprint 検証規律",
+        # Redmine #13489 (owner intent j#74953): the agent wait / polling
+        # efficiency standard, plus its four load-bearing sub-sections.
+        "## Wait / polling 効率標準",
+        "### blocking wait を token 消費と誤認しない",
+        "### bounded wait は user commentary SLA 内に収める",
+        "### timeout / state 不変時に pane history を掘らない",
+        "### 通常 finding は gate journal にまとめ、即時 interrupt は Critical に限定する",
+        # Redmine #13518 (owner intent j#75078): dispatch 後は LLM turn を
+        # zero-wait で終了し、通常運用は mozyo facade only、raw Herdr/tmux は
+        # operator debug に限る。45–55 秒 cadence は LLM turn ではなく
+        # background watcher / operator debug へ再帰属した。
+        "### dispatch / handoff 後は LLM turn を zero-wait で終了する",
     )
 
     PHRASE_MARKERS: tuple[str, ...] = (
@@ -347,6 +359,54 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         ".mozyo-bridge/project-defaults.yaml",
         "明示の `project_id` は常に default に優先する",
         "UNVERIFIED",
+        # Redmine #13489 (owner intent j#74953): the load-bearing semantics of the
+        # wait / polling efficiency standard. A byte-parity pass alone would not
+        # catch these being deleted or weakened, so pin them verbatim: a blocking
+        # wait is not token spend, the 45-55s bounded cadence, no pane-history dig
+        # on an unchanged timeout, the 20-40 line read window, no scrollback re-read,
+        # findings batched to the gate journal, and immediate interrupts limited to
+        # Critical safety / authority / irreversibility.
+        "10–30 秒間隔の反復 poll を「進捗確認」として標準化しない",
+        "user commentary SLA 内の **45–55 秒**を基本周期とする",
+        "bounded wait が timeout し durable state が不変なら、pane history を読まない",
+        "pane 末尾の **20–40 行**を読む",
+        "同じ scrollback を再読しない",
+        "gate journal の時点でまとめて durable record に載せる",
+        "即時 interrupt は、**安全・authority・不可逆リスクに関わる Critical**",
+        "user commentary SLA 内の 45–55 秒基本 cadence に収める",
+        # Redmine #13518 (owner intent j#75078): the load-bearing semantics of
+        # the zero-wait / mozyo-only doctrine. Pin them verbatim so a byte-parity
+        # pass alone cannot let them be deleted or weakened: the LLM turn ends
+        # without blocking wait / poll after a dispatch, raw herdr wait/read/list
+        # + pane/tmux ops are operator-debug primitives (not agent tools), the
+        # 45–55s cadence is re-homed to the background watcher / operator layer,
+        # and the four role profiles carry the mozyo-facade-only + zero-wait/yield
+        # discipline.
+        "blocking wait も poll も実行せず、turn を終了 (yield) する",
+        "`herdr agent wait` / `herdr agent read` / `herdr agent list` / raw pane・tmux 操作は adapter test と operator debug のための primitive",
+        "watcher / operator 側の観測周期である",
+        "通常運用は mozyo semantic facade (`workflow step` / `handoff` 等) のみを使う。raw Herdr / tmux command は adapter test / operator debug に限り、通常 turn では使わない",
+        "dispatch / handoff / callback を送信したら blocking wait / poll をせず turn を終了 (zero-wait / yield) し、進捗再開は durable callback による新 turn に委ねる",
+        "handoff / callback を送信したら blocking wait / poll をせず turn を終了 (zero-wait / yield) し、進捗再開は durable callback による新 turn に委ねる",
+        # Redmine #13745 (parent #13490): the fixed gateway/worker role-profile
+        # harness is synced to the durable-callback + duplicate-control contract
+        # that worked in #13569 (j#77346-j#77348). Pin the load-bearing clauses
+        # verbatim so a byte-parity pass alone cannot delete or weaken them: the
+        # gateway does not request a main duplicate review, single-sends
+        # `changes_requested` to the same-lane worker, state-only-callbacks
+        # `approved` upstream, records the callback outcome and fails closed on a
+        # self / foreign / ambiguous target or uncertain delivery (no blind
+        # retry), and never reads worker completion / pane state / transport ACK
+        # as a Review Gate or integration completion; the worker records its
+        # verdict / correction to the same-lane gateway and keeps the hierarchical
+        # route instead of callbacking a main coordinator or foreign lane direct.
+        "same-lane ownership を確認したら main coordinator に重複 review を要求しない (durable Review Result が正本)",
+        "`changes_requested` は same-lane worker へ単回送達し、blind re-send しない",
+        "review_result が `approved` のときは上位 (<upstream_coordinator>) へ状態だけを callback し、diff review を main で重複させない",
+        "callback outcome (sent / blocked / not-attempted) を durable 記録する。actual target が self-route / foreign lane / ambiguous、または delivery が uncertain なら fail-closed で停止し、blind retry しない",
+        "worker の完了報告・pane 状態・transport ACK を Review Gate approval や integration 完了と読み替えない",
+        "implementation / review finding verdict / correction を durable 記録し、same-lane gateway (<gateway_callback_target>) へ返す",
+        "main coordinator や foreign lane へ直接 callback せず、same-lane gateway を経由する階層 route を維持する",
     )
 
     SKILL_PATH = (

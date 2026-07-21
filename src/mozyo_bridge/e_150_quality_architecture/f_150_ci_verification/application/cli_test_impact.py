@@ -10,6 +10,9 @@ subcommands:
 - ``tests profile`` — run the suite with per-test timing and print a runtime
   summary against the slow-test budget (Redmine #12754); registered from
   :mod:`...application.cli_test_runtime`.
+- ``tests parallel`` — run the whole suite across isolated process shards with a
+  fail-closed aggregate verdict (Redmine #13733); registered from
+  :mod:`...application.cli_test_parallel` (plus a hidden ``_shard-worker``).
 
 The family stays read-only with no routing / approval authority. Handlers live
 in :mod:`...application.commands_test_impact` and
@@ -20,6 +23,9 @@ matching the ``health`` family shape.
 from __future__ import annotations
 
 from mozyo_bridge.application.cli_common import add_repo_option
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.cli_test_parallel import (
+    register_parallel,
+)
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.cli_test_runtime import (
     register_profile,
 )
@@ -70,7 +76,7 @@ def register(sub) -> None:
         dest="all_changed",
         action="store_true",
         default=False,
-        help="Use unstaged + untracked changes (instead of unstaged-only).",
+        help="Use staged + unstaged + untracked changes (instead of unstaged-only).",
     )
     resolve.add_argument(
         "--base",
@@ -96,3 +102,4 @@ def register(sub) -> None:
     resolve.set_defaults(func=cmd_tests_resolve)
 
     register_profile(tests_sub)
+    register_parallel(tests_sub)

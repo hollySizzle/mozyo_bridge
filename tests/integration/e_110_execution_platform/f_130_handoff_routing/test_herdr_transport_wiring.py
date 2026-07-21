@@ -45,6 +45,36 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 
 
+#: What a live, started-up agent TUI actually renders on an idle pane — a framed
+#: composer, never a blank buffer (Redmine #13760). The pre-send startup-admission gate
+#: reads THIS, so the fixture has to be realistic: modelling `agent read` as an empty
+#: string would have let a blank pane stand in for a ready one, which is the exact
+#: false-ready confusion the gate exists to remove.
+IDLE_COMPOSER = (
+    "╭────────────────────────────────────────────────╮\n"
+    '│ > Try "fix the failing handoff test"           │\n'
+    "╰────────────────────────────────────────────────╯\n"
+    "  ? for shortcuts"
+)
+
+#: The Claude workspace-trust confirmation, as a real TUI renders it: framed, and
+#: hard-wrapped mid-token at the pane width. This is the screen #13760 was raised on
+#: (#13582 j#77917) — a live, non-blank, "ready-looking" pane with no composer, whose
+#: default answer a stray Enter accepts.
+TRUST_SCREEN = (
+    "╭────────────────────────────────────────────────╮\n"
+    "│ Accessing workspace:                           │\n"
+    "│ /w/lane                                        │\n"
+    "│ Quick safety check: Is this a project you cr   │\n"
+    "│ eated or one you trust? (Like your own code)   │\n"
+    "│ Claude Code'll be able to read, edit, and ex   │\n"
+    "│ ecute files here.                              │\n"
+    "│ ❯ 1. Yes, proceed                              │\n"
+    "│   2. No, exit                                  │\n"
+    "╰────────────────────────────────────────────────╯"
+)
+
+
 class _FakeWaitProc:
     """A fake ``wait agent-status`` subprocess (herdr event wait), classified on exit."""
 
@@ -87,6 +117,8 @@ class _FakeHerdr:
         read_returns_body=False,
         fail_send_text=False,
         fail_send_keys=False,
+        pane_content=None,
+        fail_read=False,
     ):
         self.agent_rows = agent_rows
         self.sends: list = []
@@ -98,6 +130,12 @@ class _FakeHerdr:
         self._read_returns_body = read_returns_body
         self._fail_send_text = fail_send_text
         self._fail_send_keys = fail_send_keys
+        # Redmine #13760: what the receiver's pane is rendering. Defaults to a live,
+        # started-up idle composer (what every pre-#13760 test implicitly assumed);
+        # a test sets `pane_content=TRUST_SCREEN` to put the receiver on a startup
+        # screen, or `fail_read=True` to make the visible read fail outright.
+        self._pane_content = IDLE_COMPOSER if pane_content is None else pane_content
+        self._fail_read = fail_read
 
     def run(self, argv, capture_output=None, text=None, timeout=None, **kw):
         rest = list(argv[1:])
@@ -140,12 +178,19 @@ class _FakeHerdr:
         if rest[:2] == ["agent", "read"]:
             target = rest[2]
             self.sends.append(("read", target))
+            if self._fail_read:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="pane read failed"
+                )
+            # The rendered pane: whatever the receiver is showing, plus the injected
+            # body when the composer is holding it (the Enter-resend gate's signature).
             body = (
                 self._last_body_by_target.get(target, "")
                 if self._read_returns_body
                 else ""
             )
-            return subprocess.CompletedProcess(argv, 0, stdout=body, stderr="")
+            content = f"{self._pane_content}\n{body}" if body else self._pane_content
+            return subprocess.CompletedProcess(argv, 0, stdout=content, stderr="")
         raise AssertionError(f"unexpected subprocess call: {argv!r}")
 
     def popen(self, argv, stdout=None, stderr=None, text=None, **kw):
@@ -877,6 +922,305 @@ class ExplicitPaneTargetRoutesTmuxTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=True):
                 with self.assertRaises(SystemExit):
                     resolve_handoff_transport_runtime(self._args(repo, None))
+
+
+class HerdrEventRailForwardCompletionTest(unittest.TestCase):
+    """The herdr event-driven rail must publish its terminal outcome (Redmine #13583 R3-F1).
+
+    The event rail builds an outcome, emits it, and returns 0 on a `sent` projection. Before the
+    R3-F1 fix it never published that outcome, so `delivery_was_positive(args)` was False on the
+    NORMAL herdr route and a correlated forward generation could never complete — the caller could
+    never forward again (fail-safe stuck). These drive a REAL `handoff ticketless-callback` over the
+    event rail against a live forward store: the generation completes on an actual `sent`, and does
+    NOT complete when the rail fails to confirm a turn start.
+    """
+
+    def _drive(self, *, wait_results, read_contract="grandparent_coordinator"):
+        from mozyo_bridge.application.cli import build_parser
+        from mozyo_bridge.core.state.forward_outbox_fence import (
+            ForwardOutboxFence,
+            ForwardRouteKey,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            (repo / ".mozyo-bridge").mkdir()
+            (repo / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 1\nterminal_transport:\n  backend: herdr\n", encoding="utf-8"
+            )
+            register_workspace(repo, home=home)
+            ws = read_anchor(repo)["workspace_id"]
+
+            # A live forward store holding a DELIVERED generation awaiting its correlated callback.
+            fence = ForwardOutboxFence(home=home)
+            fence.bootstrap()
+            route = ForwardRouteKey(ws, "default", read_contract, "project_gateway", "")
+            minted = fence.reserve(route).action_id
+            fence.mark_delivered(route, minted)
+
+            herdr = _FakeHerdr(
+                [
+                    {"name": encode_assigned_name(ws, "codex", "lane-1"), "pane_id": "wS:pS"},
+                    {"name": encode_assigned_name(ws, "claude", "lane-1"), "pane_id": "wT:pT"},
+                ],
+                get_states=["idle"],
+                wait_results=wait_results,
+            )
+            herdr_bin = repo / "fake-herdr"
+            herdr_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            herdr_bin.chmod(herdr_bin.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+            argv = [
+                "handoff", "ticketless-callback", "--to", "claude", "--target", "wT:pT",
+                "--target-repo", str(repo),
+                "--classification", "consultation_result",
+                "--dispatch-decision", "no_dispatch",
+                "--workflow-next-owner", "caller",
+                "--callback-reason", "no_dispatch_decided",
+                "--read-contract", read_contract,
+                "--forward-action-id", minted,
+                "--mode", "standard", "--landing-timeout", "0.05", "--submit-delay", "0",
+            ]
+            args = build_parser().parse_args(argv)
+            args.repo = str(repo)
+
+            env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+            env["MOZYO_HERDR_BINARY"] = str(herdr_bin)
+            env["MOZYO_REPO"] = str(repo)
+            env["MOZYO_BRIDGE_HOME"] = str(home)
+            env["MOZYO_WORKSPACE_ID"] = ws
+            env["MOZYO_AGENT_ROLE"] = "codex"
+            env["MOZYO_LANE_ID"] = "lane-1"
+
+            with patch("subprocess.run", herdr.run), patch(
+                "subprocess.Popen", herdr.popen
+            ), patch("mozyo_bridge.application.commands.time.sleep"), patch.dict(
+                os.environ, env, clear=True
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                try:
+                    args.func(args)
+                except BaseException:  # noqa: BLE001 - a non-sent rail dies; that IS the negative
+                    pass
+                published = getattr(args, "delivery_outcome", None)
+                state = fence.active(route).state
+            return published, state, minted
+
+    def test_event_rail_sent_publishes_outcome_and_completes_generation(self):
+        from mozyo_bridge.core.state.forward_outbox_fence import FORWARD_COMPLETED
+
+        published, state, _minted = self._drive(wait_results=[(0, "")])
+        # 1) the event rail PUBLISHES its terminal outcome (the R3-F1 gap).
+        self.assertIsNotNone(published, "the event rail must publish its terminal outcome")
+        self.assertEqual(published.status, "sent")
+        self.assertEqual(published.reason, "ok")
+        # 2) so the correlated generation actually completes on a real herdr delivery.
+        self.assertEqual(state, FORWARD_COMPLETED)
+
+    def test_event_rail_non_sent_does_not_complete_generation(self):
+        from mozyo_bridge.core.state.forward_outbox_fence import FORWARD_DELIVERED
+
+        # The rail never confirms a turn start -> non-`sent` projection -> zero completion.
+        _published, state, _minted = self._drive(wait_results=[(1, "")])
+        self.assertEqual(state, FORWARD_DELIVERED)
+
+
+class StartupAdmissionZeroSendTest(unittest.TestCase):
+    """The pre-send startup-admission gate at the shared herdr send boundary (#13760).
+
+    The defect (#13582 j#77917): a fresh worktree's managed Claude worker was sitting on
+    the trust confirmation. It is a live, non-blank pane, so readiness said ok, the
+    queue-enter rail typed the Implementation Request into it, and the Enter was absorbed
+    as the dialog's default Yes — the request body was destroyed while the transport
+    recorded `sent / queue_enter`.
+
+    Every test here asserts the property that was violated, not just the status token:
+    on a startup screen, ZERO bytes reach the receiver (no `send_text`, no `send_keys`).
+    """
+
+    # Borrow the pure-herdr end-to-end harness (a real `handoff send` through the real
+    # orchestrate path, faked only at the herdr CLI) without re-running its own tests.
+    _run = PureHerdrEndToEndTest._run
+
+    def _sent_ops(self, herdr):
+        return [op for op in herdr.sends if op[0] in ("send_text", "send_keys")]
+
+    def test_trust_screen_queue_enter_is_zero_send(self) -> None:
+        # The exact live shape of j#77917: `--mode queue-enter`, receiver on the trust
+        # screen. Before #13760 this returned `sent / queue_enter` after typing the body.
+        herdr = _FakeHerdr([], get_states=["idle"], pane_content=TRUST_SCREEN)
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
+        )
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "blocked", msg=out)
+        self.assertEqual(
+            outcome.get("reason"), "receiver_startup_interaction_required", msg=out
+        )
+        # The whole point: nothing was typed and Enter was never pressed.
+        self.assertEqual(self._sent_ops(herdr), [], msg=herdr.sends)
+        # The structured outcome names the provider and the screen — and nothing else.
+        # The pane's text (which carries the workspace path the dialog is asking about)
+        # must never reach a pasteable durable record.
+        admission = outcome.get("startup_admission")
+        self.assertEqual(admission.get("provider_id"), "claude", msg=out)
+        self.assertEqual(
+            admission.get("blocker_id"), "workspace_trust_confirmation", msg=out
+        )
+        self.assertNotIn("Quick safety check", out)
+        self.assertNotIn("/w/lane", out)
+        # The operator owns the next action: only a human clears a trust prompt.
+        self.assertEqual(outcome.get("next_action_owner"), "operator", msg=out)
+
+    def test_trust_screen_standard_mode_is_zero_send(self) -> None:
+        # The gate is on the SHARED send boundary, so the event-driven standard rail is
+        # refused before it ever arms a wait — not just the queue-enter rail.
+        herdr = _FakeHerdr([], get_states=["idle"], pane_content=TRUST_SCREEN)
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="standard"
+        )
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(
+            outcome.get("reason"), "receiver_startup_interaction_required", msg=out
+        )
+        self.assertEqual(self._sent_ops(herdr), [], msg=herdr.sends)
+        self.assertEqual([op for op in herdr.sends if op[0] == "wait"], [], msg=herdr.sends)
+
+    def test_theme_and_login_screens_are_zero_send(self) -> None:
+        # #13760 j#78082: the blockers are not trust-only. A fresh interactive Claude
+        # startup stops at the theme picker, then at login — both render a live pane with
+        # no composer, and both must refuse with their own fixed blocker id.
+        screens = {
+            "first_run_theme": (
+                "Let's get started.\n\n"
+                "Choose the text style that looks best with your terminal\n"
+                "❯ 1. Dark mode"
+            ),
+            "login_required": (
+                "Select login method:\n\n"
+                "❯ 1. Claude account with subscription · Pro, Max\n"
+                "  2. Anthropic Console account"
+            ),
+        }
+        for blocker_id, screen in screens.items():
+            with self.subTest(blocker=blocker_id):
+                herdr = _FakeHerdr([], get_states=["idle"], pane_content=screen)
+                result, herdr, _ws, out, err = self._run(
+                    agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
+                )
+                self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+                outcome = _outcome_from(out)
+                self.assertEqual(
+                    outcome.get("reason"),
+                    "receiver_startup_interaction_required",
+                    msg=out,
+                )
+                self.assertEqual(
+                    outcome["startup_admission"].get("blocker_id"), blocker_id, msg=out
+                )
+                self.assertEqual(self._sent_ops(herdr), [], msg=herdr.sends)
+
+    def test_one_signature_alone_does_not_block_a_ready_composer(self) -> None:
+        # The AND guard (j#77947 correction 1). A ready composer that merely CONTAINS one
+        # of the trust screen's phrases — e.g. the previous turn's transcript quoting it —
+        # is not a startup screen, and a gate that fired here would brick real dispatch.
+        quoting_composer = (
+            f"{IDLE_COMPOSER}\n"
+            "  We fixed the pane that asked: Is this a project you created or one you "
+            "trust?"
+        )
+        herdr = _FakeHerdr(
+            [],
+            get_states=["idle"],
+            wait_results=[(0, "")],
+            pane_content=quoting_composer,
+        )
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="standard"
+        )
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertEqual(len(self._sent_ops(herdr)), 2, msg=herdr.sends)
+
+    def test_admitted_idle_composer_is_byte_invariant(self) -> None:
+        # A started-up receiver is unchanged by the gate: same outcome, same single
+        # body injection, and no `startup_admission` field on the outcome at all
+        # (j#77947 Q3 — the admitted queue-enter contract is byte-invariant).
+        herdr = _FakeHerdr([], get_states=["idle"], wait_results=[(0, "")])
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
+        )
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertEqual(outcome.get("reason"), "queue_enter", msg=out)
+        self.assertIsNone(outcome.get("startup_admission"), msg=out)
+        send_texts = [op for op in herdr.sends if op[0] == "send_text"]
+        self.assertEqual(len(send_texts), 1, msg=herdr.sends)
+
+    def test_unreadable_pane_is_zero_send_and_not_a_startup_blocker(self) -> None:
+        # j#77947 invariant 4: an unreadable receiver must NOT decay to "startup clear"
+        # (which would type into a pane we cannot see). It fails closed on the existing
+        # transport-failure vocabulary — distinct from a matched blocker, so an auditor
+        # never reads "we could not see the pane" as "the pane was fine".
+        herdr = _FakeHerdr([], get_states=["idle"], fail_read=True)
+        result, herdr, _ws, out, err = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
+        )
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "blocked", msg=out)
+        self.assertEqual(outcome.get("reason"), "target_unavailable", msg=out)
+        self.assertEqual(
+            outcome["startup_admission"].get("outcome"), "receiver_unreadable", msg=out
+        )
+        self.assertEqual(self._sent_ops(herdr), [], msg=herdr.sends)
+
+    def test_cleared_blocker_delivers_the_same_anchor_exactly_once(self) -> None:
+        # j#77947 invariant 5: a zero-send consumes no delivery. After the operator
+        # clears the screen, re-issuing the SAME durable anchor through the SAME
+        # high-level command delivers it — exactly once, with the body typed once.
+        blocked = _FakeHerdr([], get_states=["idle"], pane_content=TRUST_SCREEN)
+        result, blocked, _ws, out, _err = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=blocked, mode="queue-enter"
+        )
+        self.assertNotEqual(result, 0)
+        self.assertEqual(self._sent_ops(blocked), [], msg=blocked.sends)
+
+        cleared = _FakeHerdr([], get_states=["idle"], wait_results=[(0, "")])
+        result, cleared, _ws, out2, err2 = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=cleared, mode="queue-enter"
+        )
+        self.assertEqual(result, 0, msg=f"out={out2}\nerr={err2}")
+        retry_outcome = _outcome_from(out2)
+        self.assertEqual(retry_outcome.get("status"), "sent", msg=out2)
+        send_texts = [op for op in cleared.sends if op[0] == "send_text"]
+        self.assertEqual(len(send_texts), 1, msg=cleared.sends)
+        # The same anchor and the same marker the refused attempt would have carried:
+        # the recovery is a re-issue, not a new dispatch identity.
+        self.assertEqual(retry_outcome["anchor"].get("task_id"), "T1", msg=out2)
+
+    def test_codex_receiver_declares_no_blockers_and_is_admitted(self) -> None:
+        # The gate is provider-neutral and DATA-driven: codex declares no startup
+        # screens, so it is admitted even against a pane rendering Claude's trust text.
+        # (Registering a guessed codex signature would either never fire or block a
+        # ready pane; the profile stays empty until a real screen is observed.)
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_admission import (  # noqa: E501
+            evaluate_startup_admission,
+        )
+
+        admission = evaluate_startup_admission(
+            provider_id="codex", read_visible=lambda: TRUST_SCREEN
+        )
+        self.assertTrue(admission.admitted)
+        self.assertEqual(admission.blocker_id, "")
 
 
 if __name__ == "__main__":  # pragma: no cover

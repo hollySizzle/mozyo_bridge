@@ -52,10 +52,16 @@ WORKSPACE_MARKERS = (
 # workspace — otherwise the bare-`mozyo` adoption gate refuses an adopted
 # project and the repo-local backend selection never reads its config.
 REPO_LOCAL_CONFIG_MARKER = ".mozyo-bridge/config.yaml"
-# Markers that establish a repo / workspace root for identity inference. The
-# walk returns the deepest ancestor bearing ANY marker, so adding workspace
-# markers can only stop the walk earlier (at a more specific root) — it never
-# overrides a deeper git / pyproject root.
+# Markers that drive the FALLBACK marker walk in :func:`find_repo_root` — the
+# walk reached ONLY when no Git worktree root is above the cwd (see that
+# function's Git-root-first contract, Redmine #13641). Within that fallback walk
+# the deepest ancestor bearing ANY marker wins. This set does NOT describe the
+# primary resolution: when a Git root IS reachable it is the workspace and wins
+# over every deeper non-git marker listed here (``pyproject.toml`` /
+# ``.tmux.conf`` / config / anchor / scaffold). So a Git root can and does
+# override a deeper ``pyproject.toml`` root — the deliberate reversal of the
+# pre-#13641 marker-only behavior, where adding a workspace marker could only
+# stop the walk earlier and never overrode a deeper git / pyproject root.
 REPO_ROOT_MARKERS = PROJECT_MARKERS + WORKSPACE_MARKERS + (REPO_LOCAL_CONFIG_MARKER,)
 # Markers that establish mozyo ADOPTION of an already-resolved root (Redmine
 # #13379). Identity inference (which ancestor is the root) and adoption (did
@@ -95,9 +101,12 @@ def infer_git_worktree_root(start: str | Path | None) -> Path | None:
     marker-based resolver would stop at the project subdir and collapse the
     workspace identity onto the project. The Git worktree root is the workspace;
     the nested scaffold marker only matters when there is no Git root above (a
-    genuinely non-git scaffolded workspace, Redmine #11301), which the caller
-    handles by falling back to the marker resolver. Returns ``None`` on an
-    unreadable path or when no ``.git`` is reachable.
+    genuinely non-git scaffolded workspace, Redmine #11301), which the callers
+    handle by falling back to the marker resolver — both
+    :func:`find_repo_root` (the shared identity/config-root resolver, Git-root-
+    first since Redmine #13641) and
+    :func:`project_discovery.resolve_workspace_root` (cockpit identity). Returns
+    ``None`` on an unreadable path or when no ``.git`` is reachable.
     """
     if not start:
         return None
@@ -114,9 +123,41 @@ def infer_git_worktree_root(start: str | Path | None) -> Path | None:
 
 
 def find_repo_root(start: Path | None = None) -> Path:
+    """Resolve the repo / workspace identity root for ``start`` (or the cwd).
+
+    Git-root-first (Redmine #13641): when a Git worktree root is reachable above
+    ``start``, that Git root IS the workspace and wins — even when a nested
+    ``.mozyo-bridge/scaffold.json`` (or another workspace marker) sits in a
+    monorepo project subdirectory between ``start`` and the Git root. The plain
+    marker walk stops at that nested marker and collapses the workspace identity
+    onto the project subtree — the trap documented on
+    :func:`infer_git_worktree_root` (Redmine #12658) and fixed for cockpit
+    identity in :func:`project_discovery.resolve_workspace_root`. Before this the
+    bare-``mozyo`` entrypoint resolved its config root through the marker walk, so
+    a subtree with a bare ``scaffold.json`` shadowed the Git root's
+    ``.mozyo-bridge/config.yaml``: the invocation read the (usually absent)
+    subtree config and fell through to the default tmux backend instead of the
+    Git root's ``terminal_transport.backend`` (Redmine #13641). Making the shared
+    resolver Git-root-first aligns every entrypoint with the workspace invariant
+    (``Workspace = Git repository / registry identity``,
+    ``project-scoped-workspace-identity.md``).
+
+    The marker walk is the fallback ONLY when no Git root is reachable, so it is
+    behavior-preserving for a genuinely non-git scaffolded workspace (Redmine
+    #11301), a registry-anchored non-git workspace (#11429), and a config-only
+    adopted root (#13379): each still resolves to its marker root exactly as
+    before. Explicit ``--repo`` / ``MOZYO_REPO`` never reach here (they short-
+    circuit in :func:`resolve_repo_root`), so that override contract is unchanged.
+    Note that a Git-root-first result is not by itself an adoption decision:
+    :func:`workspace_adoption_marker` still gates whether the resolved root is
+    launched, so an unadopted Git root does not start a real agent (#13379).
+    """
     current = Path(start or Path.cwd()).expanduser().resolve()
     if current.is_file():
         current = current.parent
+    git_root = infer_git_worktree_root(current)
+    if git_root is not None:
+        return git_root
     for path in (current, *current.parents):
         if any((path / marker).exists() for marker in REPO_ROOT_MARKERS):
             return path

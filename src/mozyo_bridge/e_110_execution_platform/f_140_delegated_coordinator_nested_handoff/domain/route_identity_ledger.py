@@ -123,6 +123,22 @@ ROUTE_TARGET_EXPECTED_ROLE: dict[str, str] = {
     TARGET_SAME_LANE_WORKER: ROLE_CLAUDE,
 }
 
+
+def expected_roles_for(*, gateway_provider: str, worker_provider: str) -> dict[str, str]:
+    """The per-target expected-role map for a resolved binding (Redmine #13569 Increment 2B).
+
+    Gateway / coordinator targets expect the ``gateway_provider`` pane; the same-lane worker
+    target expects the ``worker_provider`` pane. Defaults (``codex`` / ``claude``) reproduce
+    :data:`ROUTE_TARGET_EXPECTED_ROLE` byte-for-byte, so an unrebound binding re-resolves
+    identically; a rebound provider makes the role-mismatch guard key on ITS provider.
+    """
+    return {
+        TARGET_CHILD_GATEWAY: gateway_provider,
+        TARGET_GRANDCHILD_GATEWAY: gateway_provider,
+        TARGET_PARENT_COORDINATOR: gateway_provider,
+        TARGET_SAME_LANE_WORKER: worker_provider,
+    }
+
 # ---------------------------------------------------------------------------
 # Live-inventory pane-record keys. The resolver consumes the read-only row shape
 # produced by ``tmux_client.try_pane_lines`` (``id`` / ``workspace_id`` /
@@ -455,6 +471,7 @@ def enforce_route_target_guards(
     identity: RouteIdentity,
     *,
     cross_project: bool = False,
+    expected_roles: "Optional[Mapping[str, str]]" = None,
 ) -> None:
     """Run the fail-closed routing guards for a #12550 logical route target.
 
@@ -475,7 +492,12 @@ def enforce_route_target_guards(
     Redmine #13302) share the identical guard vocabulary without either forking
     it. Returns ``None`` on success; raises on a guard violation.
     """
-    expected_role = ROUTE_TARGET_EXPECTED_ROLE.get(target_token)
+    # The expected role per logical target is the built-in binding by default (gateway ->
+    # codex, worker -> claude); an injected ``expected_roles`` supplies the binding-resolved
+    # providers (Redmine #13569 Increment 2B), so a rebound worker/gateway pane re-resolves
+    # against ITS provider and the role-mismatch guard keys on the binding, not the literal.
+    role_map = ROUTE_TARGET_EXPECTED_ROLE if expected_roles is None else expected_roles
+    expected_role = role_map.get(target_token)
     if expected_role is None:
         raise DelegationRoutePlanError(
             f"unknown logical route target {target_token!r}; cannot re-resolve"
@@ -498,6 +520,7 @@ def resolve_for_route_target(
     inventory: Sequence[Mapping[str, object]],
     *,
     cross_project: bool = False,
+    expected_roles: "Optional[Mapping[str, str]]" = None,
 ) -> RouteResolution:
     """Re-resolve a #12550 logical route target, enforcing the routing guards.
 
@@ -507,7 +530,9 @@ def resolve_for_route_target(
     (:func:`enforce_route_target_guards`) run before any live match; once they
     pass, resolution delegates to :func:`resolve_route`.
     """
-    enforce_route_target_guards(target_token, identity, cross_project=cross_project)
+    enforce_route_target_guards(
+        target_token, identity, cross_project=cross_project, expected_roles=expected_roles
+    )
     return resolve_route(identity, inventory)
 
 

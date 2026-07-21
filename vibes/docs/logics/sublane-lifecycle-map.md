@@ -62,6 +62,25 @@ retire_三義:
             spec-route-identity-ledger (stale pane id ではなく route identity で再解決),
             spec-delegated-coordinator-decision-records (callback target schema)
 
+[4b] hibernate / resume  issue が open のまま lane の常駐 process だけを非破壊的に畳む
+                         (worktree/branch/未push commit/lane metadata/callback route は保存)。
+                         retire ではない (retire は issue closed 前提)。逆遷移は resume。
+      正本: logic-coordinator-sublane-development-flow (Early hibernate ... 節: park basis /
+            drain-queue process retention / dogfood 委譲),
+            skill references/workflow.md `## Sublane hibernate (プロセス解放) と early hibernate`
+      park basis: dependency (依存 wait で park) | early_hibernate (Redmine #13967: review
+            approved + staging integration + CI green + dogfood の execution/evidence を専用
+            release issue へ委譲。close authority + owner approval は coordinator に残す)。
+      注: hibernate は close / dogfood 成功 / owner approval へ読み替えない。common safety gate
+          (pending review/callback/integration/work/prompt・dirty/unpushed・identity 不明) は fail-closed。
+          owner approval pending は basis 依存 (early hibernate では blocker にしない)。
+      release-boundary TOCTOU 保全 fence (Redmine #13843): preflight と process release は atomic で
+          なく、間に worker が worktree mutation を開始でき dirty residue を残す。release 直前の再検証・
+          typed blocked・post-check withhold・recovery 収束の **execution 契約は本 map に複製しない**。
+          正本: [[logic-managed-state-model]] `lane_lifecycle_records` の「hibernate release-boundary
+          TOCTOU 保全 fence」節 (fingerprint/activity/attestation/revision の release 直前再検証と
+          process_release state 分離)、および `sublane_hibernate*.py` module docstring。
+
 [5] retire               lane を退役する (pane/worktree/branch)。owner 確認なしに退役してよい条件は所有 doc。
       正本: logic-worktree-lifecycle-boundary (sublane retirement authority / record),
             logic-coordinator-sublane-development-flow (retirement drain),

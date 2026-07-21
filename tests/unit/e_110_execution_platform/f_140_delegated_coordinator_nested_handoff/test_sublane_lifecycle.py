@@ -30,6 +30,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_BLOCKED,
     LAUNCH_CREATE_WORKTREE,
     LAUNCH_REUSE_WORKTREE,
+    LAUNCH_SKIP_DISABLED,
     LAUNCH_SKIP_NO_GIT,
     RETIRE_OK,
     RetireDecision,
@@ -38,6 +39,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     CREATE_BLOCKED,
     CREATE_PLANNED,
+    DEFAULT_UPSTREAM_COORDINATOR_ROUTE,
     STALE_HINT_BRANCH_INTEGRATED,
     STALE_HINT_DUPLICATE_ISSUE_LANE,
     STALE_HINT_GATEWAY_PANE_MISSING,
@@ -54,6 +56,16 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     preflight_sublane_retire,
     project_sublanes,
     redact_worktree_paths,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
+    LANE_BASIS_COORDINATOR_DEFAULT,
+    LANE_BASIS_SENDER_SAME_LANE,
+    SenderIdentity,
+    derive_target_lane,
+    resolve_target_role,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    DEFAULT_LANE,
 )
 
 # Redmine #13368: synthetic host-local absolute worktree path. Uses a `/workspace`
@@ -362,6 +374,110 @@ def _req(**kw):
     return SublaneCreateRequest(**base)
 
 
+class ResolvedUpstreamCoordinatorTests(unittest.TestCase):
+    """#13476: the request's single-source-of-truth callback-route default."""
+
+    def test_omitted_resolves_to_stable_route_token(self):
+        self.assertEqual(
+            _req(upstream_coordinator=None).resolved_upstream_coordinator(),
+            DEFAULT_UPSTREAM_COORDINATOR_ROUTE,
+        )
+
+    def test_blank_or_whitespace_resolves_to_stable_route_token(self):
+        # A blank / whitespace-only value is treated as omitted (never emitted verbatim).
+        for blank in ("", "   "):
+            self.assertEqual(
+                _req(upstream_coordinator=blank).resolved_upstream_coordinator(),
+                DEFAULT_UPSTREAM_COORDINATOR_ROUTE,
+            )
+
+    def test_explicit_value_wins_and_is_stripped(self):
+        self.assertEqual(
+            _req(upstream_coordinator="  %7  ").resolved_upstream_coordinator(), "%7"
+        )
+
+    def test_stable_route_token_is_not_a_physical_pane_id(self):
+        # #13476 Boundary: the OSS default must not hard-code a physical pane id.
+        self.assertEqual(DEFAULT_UPSTREAM_COORDINATOR_ROUTE, "coordinator")
+        self.assertNotIn("%", DEFAULT_UPSTREAM_COORDINATOR_ROUTE)
+
+
+class UpstreamCoordinatorHerdrRouteTests(unittest.TestCase):
+    """#13476 Review j#74511 Finding 1: pin the default token against the REAL herdr
+    route authority the active backend consumes, so the coordinator-route identity is
+    verified end-to-end (not just asserted as a string) and the same-lane misroute
+    mechanism the finding identified stays visible to any future change.
+    """
+
+    def _sublane_sender(self):
+        # A sublane gateway/worker: a real (non-default) lane id.
+        return SenderIdentity(
+            workspace_id="ws1", role="codex", lane_id="issue_13476_x"
+        )
+
+    def test_token_derives_the_default_lane_coordinator_from_a_sublane(self):
+        # The default token, fed through the herdr lane authority as the receiver,
+        # derives the workspace DEFAULT lane (the parent coordinator), never the
+        # sender's own sublane. This is the routable coordinator identity.
+        deriv = derive_target_lane(
+            DEFAULT_UPSTREAM_COORDINATOR_ROUTE, self._sublane_sender()
+        )
+        self.assertEqual(deriv.lane, DEFAULT_LANE)
+        self.assertEqual(deriv.basis, LANE_BASIS_COORDINATOR_DEFAULT)
+
+    def test_bare_codex_receiver_from_a_sublane_derives_same_lane(self):
+        # The finding's misroute mechanism, pinned so it cannot silently "fix" itself:
+        # a bare `--to codex` from a sublane derives the sender's OWN lane (the herdr
+        # rail keys lane off the `--to` receiver, not `--target coordinator`). This is
+        # why the documented `--to codex --target coordinator` callback FORM misroutes
+        # under herdr — a routing-authority concern outside this lifecycle leaf.
+        deriv = derive_target_lane("codex", self._sublane_sender())
+        self.assertEqual(deriv.lane, "issue_13476_x")
+        self.assertEqual(deriv.basis, LANE_BASIS_SENDER_SAME_LANE)
+
+    def test_token_resolves_the_coordinator_provider_role(self):
+        role = resolve_target_role(
+            DEFAULT_UPSTREAM_COORDINATOR_ROUTE, coordinator_provider="codex"
+        )
+        self.assertTrue(role.ok)
+        self.assertEqual(role.role, "codex")
+
+    def test_explicit_upstream_coordinator_wins_at_resolver(self):
+        # An explicit override is carried verbatim by the profile-field resolver (never
+        # rewritten to the default token). This is a resolver-level unit assertion — the
+        # `upstream_coordinator` profile field is guidance text, not a send route, so the
+        # real herdr callback-route resolution is pinned separately at the send entry
+        # (test_herdr_send_entry.CoordinatorPseudoTargetHerdrSendTest, #13476 j#74537
+        # re-review: this test does NOT exercise herdr send / target resolution).
+        req = _req(upstream_coordinator="%9")
+        self.assertEqual(req.resolved_upstream_coordinator(), "%9")
+
+
+class MissingFieldsTests(unittest.TestCase):
+    """#13432: the is_git-conditional identity requirement on the request."""
+
+    def test_git_requires_all_four(self):
+        # Default (is_git=True) keeps the historical full requirement byte-invariant.
+        self.assertEqual(_req().missing_fields(), ())
+        self.assertEqual(
+            _req(branch="", worktree_path="").missing_fields(),
+            ("branch", "worktree_path"),
+        )
+
+    def test_non_git_makes_branch_and_worktree_optional(self):
+        self.assertEqual(
+            _req(branch="", worktree_path="").missing_fields(is_git=False), ()
+        )
+
+    def test_non_git_still_requires_issue_and_lane_label(self):
+        self.assertEqual(
+            _req(issue="", lane_label="", branch="", worktree_path="").missing_fields(
+                is_git=False
+            ),
+            ("issue", "lane_label"),
+        )
+
+
 class PlanCreateTests(unittest.TestCase):
     def _launch(self, action):
         return WorktreeLaunchDecision(action=action, reason="r")
@@ -375,6 +491,32 @@ class PlanCreateTests(unittest.TestCase):
         self.assertIn("--issue 12955", dispatch.command)
         self.assertIn("implementation_gateway", dispatch.command)
         self.assertIn("lane=issue_12955_x", dispatch.command)
+
+    def test_dispatch_defaults_upstream_coordinator_to_stable_route_token(self):
+        # #13476: an omitted --upstream-coordinator no longer emits a hand-editable
+        # `<coordinator-pane>` literal into the profile field; the plan defaults to the
+        # stable `coordinator` route token (resolved workspace-scoped / fail-closed).
+        plan = plan_sublane_create(
+            _req(upstream_coordinator=None), self._launch(LAUNCH_CREATE_WORKTREE)
+        )
+        dispatch = plan.steps[-1]
+        self.assertIn(
+            f"upstream_coordinator={DEFAULT_UPSTREAM_COORDINATOR_ROUTE}",
+            dispatch.command,
+        )
+        self.assertNotIn("<coordinator-pane>", dispatch.command)
+
+    def test_dispatch_prefers_explicit_upstream_coordinator(self):
+        # #13476: an explicit --upstream-coordinator value always wins over the default.
+        plan = plan_sublane_create(
+            _req(upstream_coordinator="%7"), self._launch(LAUNCH_CREATE_WORKTREE)
+        )
+        dispatch = plan.steps[-1]
+        self.assertIn("upstream_coordinator=%7", dispatch.command)
+        self.assertNotIn(
+            f"upstream_coordinator={DEFAULT_UPSTREAM_COORDINATOR_ROUTE}",
+            dispatch.command,
+        )
 
     def test_base_ref_pins_the_planned_worktree_add(self):
         # #13293: an explicit base ref is reflected as the git <commit-ish> positional
@@ -407,11 +549,67 @@ class PlanCreateTests(unittest.TestCase):
         self.assertEqual(plan.steps, ())
         self.assertIn("missing_field:worktree_path", plan.blocked_reasons)
 
+    def test_non_git_optional_branch_and_worktree_plans(self):
+        # #13432: on the non-git (LAUNCH_SKIP_NO_GIT) path --branch/--worktree are optional,
+        # so a request with both blank still plans the lane / dispatch steps.
+        plan = plan_sublane_create(
+            _req(branch="", worktree_path=""), self._launch(LAUNCH_SKIP_NO_GIT)
+        )
+        self.assertEqual(plan.status, CREATE_PLANNED)
+        self.assertEqual(plan.steps[0].title, "skip worktree")
+        self.assertEqual(len(plan.steps), 4)
+
+    def test_non_git_still_requires_lane_identity(self):
+        # #13432: only the Git worktree identity relaxes; issue / lane_label always required.
+        plan = plan_sublane_create(
+            _req(issue="", branch="", worktree_path=""),
+            self._launch(LAUNCH_SKIP_NO_GIT),
+        )
+        self.assertEqual(plan.status, CREATE_BLOCKED)
+        self.assertIn("missing_field:issue", plan.blocked_reasons)
+
+    def test_non_git_relaxation_does_not_leak_to_git_reuse_or_create(self):
+        # #13432 byte-invariance: a blank worktree on any Git launch action still fails
+        # closed (only LAUNCH_SKIP_NO_GIT relaxes the requirement).
+        for action in (LAUNCH_CREATE_WORKTREE, LAUNCH_REUSE_WORKTREE):
+            plan = plan_sublane_create(
+                _req(branch="", worktree_path=""), self._launch(action)
+            )
+            self.assertEqual(plan.status, CREATE_BLOCKED)
+            self.assertIn("missing_field:worktree_path", plan.blocked_reasons)
+            self.assertIn("missing_field:branch", plan.blocked_reasons)
+
     def test_blocked_launch_fails_closed(self):
         plan = plan_sublane_create(_req(), self._launch(LAUNCH_BLOCKED))
         self.assertEqual(plan.status, CREATE_BLOCKED)
         self.assertEqual(plan.steps, ())
         self.assertIn(LAUNCH_BLOCKED, plan.blocked_reasons)
+
+    def test_explicit_is_git_false_relaxes_under_skip_disabled(self):
+        # #13432 Review j#74285 finding 1: a non-git workspace whose operator opted out of
+        # worktree management (`manage_worktree: false`) collapses to skip_disabled BEFORE
+        # the non-git launch branch. The caller carries the probed git-ness explicitly, so
+        # --branch/--worktree relax on the real git-ness, not the skip_disabled token.
+        plan = plan_sublane_create(
+            _req(branch="", worktree_path=""),
+            self._launch(LAUNCH_SKIP_DISABLED),
+            is_git=False,
+        )
+        self.assertEqual(plan.status, CREATE_PLANNED)
+        self.assertEqual(plan.steps[0].title, "skip worktree")
+        self.assertEqual(len(plan.steps), 4)
+
+    def test_explicit_is_git_true_keeps_full_requirement_under_skip_disabled(self):
+        # #13432 byte-invariance: a Git workspace under `manage_worktree: false` still
+        # requires the full Git identity — the explicit git-ness governs, not the token.
+        plan = plan_sublane_create(
+            _req(branch="", worktree_path=""),
+            self._launch(LAUNCH_SKIP_DISABLED),
+            is_git=True,
+        )
+        self.assertEqual(plan.status, CREATE_BLOCKED)
+        self.assertIn("missing_field:branch", plan.blocked_reasons)
+        self.assertIn("missing_field:worktree_path", plan.blocked_reasons)
 
 
 class PlanWorkUnitGateTests(unittest.TestCase):

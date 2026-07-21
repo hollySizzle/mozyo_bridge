@@ -16,6 +16,7 @@ import contextlib
 import gzip
 import io
 import json
+import shlex
 import sys
 import tempfile
 import threading
@@ -28,6 +29,12 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
+
+from tests.support.agent_provider_binaries import (
+    SHARED_PROVIDER_BINS,
+    provider_bin_path,
+    with_provider_path,
+)
 
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.otel_receiver import (
     build_server,
@@ -545,6 +552,9 @@ class BootstrapInjectionTest(unittest.TestCase):
                     # their shell (#11925 override rail) to keep this test
                     # hermetic regardless of the launching environment.
                     "MOZYO_CLAUDE_PERMISSION_MODE": "",
+                    # #13441: argv[0] resolves from the trusted PATH; blank any inherited
+                    # trusted override so the fixture PATH is authoritative (R1-F4).
+                    **with_provider_path(),
                 },
                 clear=False,
             ), \
@@ -559,7 +569,7 @@ class BootstrapInjectionTest(unittest.TestCase):
         self.assertTrue(command.startswith("env "), command)
         self.assertIn("OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318", command)
         self.assertIn("mozyo.session=mozyo-demo,mozyo.agent=claude", command)
-        self.assertTrue(command.endswith(" claude"), command)
+        self.assertTrue(command.endswith(f" {shlex.quote(provider_bin_path('claude'))}"), command)
         self.assertNotIn("OTEL_LOG_USER_PROMPTS", command)
 
 
@@ -574,7 +584,10 @@ class ClaudePermissionModeLaunchTest(unittest.TestCase):
     def _command(self, agent: str, env: dict[str, str]) -> str:
         from mozyo_bridge.application.commands import _agent_launch_command
 
-        with patch.dict("os.environ", env, clear=False):
+        # Since #13441 argv[0] is the provider's verified absolute executable, resolved
+        # from the trusted PATH. Pin a hermetic PATH so this never resolves (or depends
+        # on) the host's real `claude` / `codex`.
+        with patch.dict("os.environ", with_provider_path(env), clear=False):
             return _agent_launch_command(agent, "mozyo-demo", cwd=None)
 
     def test_unset_keeps_bare_claude_launch(self) -> None:
@@ -582,20 +595,23 @@ class ClaudePermissionModeLaunchTest(unittest.TestCase):
         # behavior must never change silently.
         env = {"MOZYO_CLAUDE_PERMISSION_MODE": ""}
         command = self._command("claude", env)
-        self.assertTrue(command.endswith(" claude"), command)
+        self.assertTrue(command.endswith(f" {shlex.quote(provider_bin_path('claude'))}"), command)
         self.assertNotIn("--permission-mode", command)
 
     def test_auto_mode_appended_for_claude(self) -> None:
         env = {"MOZYO_CLAUDE_PERMISSION_MODE": "auto"}
         command = self._command("claude", env)
         self.assertTrue(
-            command.endswith(" claude --permission-mode auto"), command
+            command.endswith(
+                f" {shlex.quote(provider_bin_path('claude'))} --permission-mode auto"
+            ),
+            command,
         )
 
     def test_blank_whitespace_value_is_treated_as_unset(self) -> None:
         env = {"MOZYO_CLAUDE_PERMISSION_MODE": "  "}
         command = self._command("claude", env)
-        self.assertTrue(command.endswith(" claude"), command)
+        self.assertTrue(command.endswith(f" {shlex.quote(provider_bin_path('claude'))}"), command)
         self.assertNotIn("--permission-mode", command)
 
     def test_codex_pane_is_never_affected(self) -> None:
@@ -603,7 +619,7 @@ class ClaudePermissionModeLaunchTest(unittest.TestCase):
         # the operator has the env var exported in their shell.
         env = {"MOZYO_CLAUDE_PERMISSION_MODE": "auto"}
         command = self._command("codex", env)
-        self.assertTrue(command.endswith(" codex"), command)
+        self.assertTrue(command.endswith(f" {shlex.quote(provider_bin_path('codex'))}"), command)
         self.assertNotIn("--permission-mode", command)
 
     def test_other_valid_modes_are_accepted(self) -> None:
@@ -612,7 +628,11 @@ class ClaudePermissionModeLaunchTest(unittest.TestCase):
                 env = {"MOZYO_CLAUDE_PERMISSION_MODE": mode}
                 command = self._command("claude", env)
                 self.assertTrue(
-                    command.endswith(f" claude --permission-mode {mode}"), command
+                    command.endswith(
+                        f" {shlex.quote(provider_bin_path('claude'))}"
+                        f" --permission-mode {mode}"
+                    ),
+                    command,
                 )
 
     def test_invalid_mode_is_a_hard_error(self) -> None:
@@ -768,32 +788,81 @@ class InventoryActivityJoinTest(unittest.TestCase):
         )
 
 
+class _FakeHealthzResponse:
+    """Context-manager stand-in for ``urllib.request.urlopen`` returning a 200
+    ``/healthz`` body, so the OTel receiver probe is deterministic and never
+    reads the host's real ``127.0.0.1:4318`` receiver (Redmine #14103)."""
+
+    def __enter__(self) -> "_FakeHealthzResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return b"{}"
+
+
+def _healthz_up(*_a: object, **_k: object) -> _FakeHealthzResponse:
+    return _FakeHealthzResponse()
+
+
+def _healthz_down(*_a: object, **_k: object):
+    raise urllib.error.URLError("otel receiver down (fixture)")
+
+
 class DoctorOtelSectionTest(unittest.TestCase):
-    def test_receiver_down_is_by_design_and_gaps_are_listed(self) -> None:
+    # A fixed tmux pane view (one claude pane that never emitted telemetry),
+    # injected so the section is judged off the fixture, not the live host.
+    _PANES = [
+        {
+            "id": "%1",
+            "location": "mozyo-demo:1.0",
+            "command": "claude",
+            "cwd": "",
+            "window_name": "claude",
+            "pane_active": "1",
+        },
+    ]
+
+    def _run_section(self, *, healthz) -> dict:
+        """Run ``doctor_otel_section`` over a hermetic temp home with the tmux
+        pane view fixed and the receiver ``/healthz`` probe faked (``healthz`` is
+        the ``urlopen`` double). Reads neither the host receiver nor
+        ``~/.mozyo_bridge`` — the section's verdict comes only from the fixtures.
+        """
         from mozyo_bridge.application.doctor import doctor_otel_section
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
-            panes = [
-                {
-                    "id": "%1",
-                    "location": "mozyo-demo:1.0",
-                    "command": "claude",
-                    "cwd": "",
-                    "window_name": "claude",
-                    "pane_active": "1",
-                },
-            ]
             with patch.dict(
                 "os.environ", {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
             ), patch(
                 "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.try_pane_lines",
-                return_value=panes,
-            ):
-                section = doctor_otel_section(argparse.Namespace())
+                return_value=[dict(pane) for pane in self._PANES],
+            ), patch("urllib.request.urlopen", healthz):
+                return doctor_otel_section(argparse.Namespace())
+
+    def test_receiver_down_is_by_design_and_gaps_are_listed(self) -> None:
+        section = self._run_section(healthz=_healthz_down)
         self.assertEqual("ok", section["status"])
         self.assertFalse(section["receiver_reachable"])
         self.assertTrue(
+            any("BY DESIGN" in note for note in section["notes"])
+        )
+        self.assertEqual(
+            [{"pane_id": "%1", "session": "mozyo-demo", "agent": "claude"}],
+            section["unobserved_agents"],
+        )
+
+    def test_receiver_reachable_is_reported_when_healthz_responds(self) -> None:
+        # Positive verdict, held deterministic by the same seam: a responding
+        # /healthz is reported reachable and drops the BY DESIGN down-note, while
+        # the section stays a diagnosis and still lists the unobserved pane.
+        section = self._run_section(healthz=_healthz_up)
+        self.assertEqual("ok", section["status"])
+        self.assertTrue(section["receiver_reachable"])
+        self.assertFalse(
             any("BY DESIGN" in note for note in section["notes"])
         )
         self.assertEqual(

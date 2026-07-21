@@ -47,9 +47,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     _lane_state,
     parse_issue_from_lane_label,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
+    _tab_id_of_row,
+    _workspace_prefix,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
+    _list_rows,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
     HerdrSessionStartError,
-    _list_rows,
     _resolve_binary_or_die,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
@@ -61,6 +67,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     decode_assigned_name,
     derive_lane_workspace_token,
     is_lane_workspace_token,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
+    SLOT_LIVE,
+    classify_named_slot,
 )
 
 
@@ -109,6 +119,17 @@ GATEWAY_SLOT_MISSING_HINT = "gateway_slot_missing"
 #: The lane unit has no live ``claude`` worker slot (implementer lost /
 #: never adopted) — the herdr analogue of the tmux ``worker_pane_missing``.
 WORKER_SLOT_MISSING_HINT = "worker_slot_missing"
+#: The lane unit's ``codex`` gateway locator IS present in the live inventory but
+#: :func:`classify_named_slot` reads it as :data:`SLOT_STALE` — a #13518 shell
+#: residue (the durable name row survives with no managed agent behind it), not a
+#: live pair member. Distinct from :data:`GATEWAY_SLOT_MISSING_HINT` (no row at
+#: all): a stale slot IS visible in ``agent list`` yet must not count toward
+#: ``active`` placement. Advisory display material only.
+GATEWAY_SLOT_STALE_HINT = "gateway_slot_stale"
+#: The lane unit's ``claude`` worker locator is present but reads
+#: :data:`SLOT_STALE` (shell residue). The worker analogue of
+#: :data:`GATEWAY_SLOT_STALE_HINT`. Advisory display material only.
+WORKER_SLOT_STALE_HINT = "worker_slot_stale"
 #: An ACTIVE lane metadata record's lane unit has NO live managed slot at all:
 #: the lane vanished (agents closed outside retire) while the durable display
 #: record still says active. Rendered as a detached row so the loss stays
@@ -181,6 +202,41 @@ def probe_worktree_resolved(path: str) -> Optional[bool]:
     return result.returncode == 0
 
 
+def is_git_worktree_root(resolved: Path | str) -> bool:
+    """True when ``resolved`` is itself the root of a git worktree (Redmine #13933).
+
+    The discriminant for the lane-identity token family (``wt_`` linked git worktree vs
+    ``dl_`` non-git directory-scaffold lane), probed on the TARGET root rather than inferred
+    from the caller's cwd (design answer j#81046 Decision 1).  Both a linked worktree and the
+    main checkout are worktree roots, so ``--show-toplevel`` must equal the path itself: a
+    plain directory that merely sits INSIDE some enclosing repository is not a worktree of its
+    own, yet ``--is-inside-work-tree`` would call it one.  Both sides are resolved so a symlink
+    cannot read as a mismatch.  Never raises; git unavailable / non-git reads ``False``.
+    """
+    import subprocess
+
+    try:
+        root = Path(resolved).resolve()
+        if not root.is_dir():
+            return False
+    except OSError:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            text=True, capture_output=True,
+        )
+    except OSError:
+        return False
+    top = (getattr(result, "stdout", "") or "").strip()
+    if result.returncode != 0 or not top:
+        return False
+    try:
+        return Path(top).resolve() == root
+    except OSError:
+        return False
+
+
 @dataclass(frozen=True)
 class _LaneEntry:
     """One pre-hint lane row of the fold (internal assembly record)."""
@@ -189,6 +245,10 @@ class _LaneEntry:
     lane_id: str
     gateway: Optional[str]
     worker: Optional[str]
+    #: Each live slot's placement-container key ``(herdr_workspace, tab_id)`` — the
+    #: pair-split discriminant (Redmine #13705). ``None`` for an absent slot.
+    gateway_placement: Optional[tuple]
+    worker_placement: Optional[tuple]
     lane_label: str
     issue: Optional[str]
     branch: Optional[str]
@@ -199,6 +259,39 @@ class _LaneEntry:
     #: only repo-scoped entries participate in duplicate-issue grouping, so a
     #: same-issue lane of a *different* repo never fabricates a duplicate hint.
     repo_scoped: bool
+    #: A locator was present for the role but :func:`classify_named_slot` read it
+    #: as :data:`SLOT_STALE` (#13518 shell residue) — the slot does NOT count as a
+    #: live pair member and the row carries the matching ``*_slot_stale`` hint.
+    #: Distinct from an absent slot (``gateway`` / ``worker`` is ``None`` and the
+    #: stale flag is ``False``), which keeps the ``*_slot_missing`` hint.
+    gateway_stale: bool = False
+    worker_stale: bool = False
+
+
+def _managed_pair_for(
+    workspace_id: str,
+    resolve_repo_root: "Callable[[str], Optional[str]]",
+) -> tuple[str, str]:
+    """The (gateway, worker) provider pair a unit's lane is expected to run (Redmine #13569).
+
+    Resolves the unit's repo root (via the injected ``resolve_repo_root``) and reads the
+    repo-local ``RoleProviderBinding`` for that repo, so a lane whose binding rebound its
+    gateway / worker providers is projected by ITS providers. Any failure (unresolved repo,
+    broken / unbound binding) falls back to the built-in ``(GATEWAY_ROLE, WORKER_ROLE)`` pair
+    — the projection is a read-model and must never raise; the built-in pair is byte-identical.
+    """
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            resolve_gateway_provider,
+            resolve_worker_provider,
+        )
+
+        repo_root = resolve_repo_root(workspace_id) if resolve_repo_root else None
+        if not repo_root:
+            return (GATEWAY_ROLE, WORKER_ROLE)
+        return (resolve_gateway_provider(repo_root), resolve_worker_provider(repo_root))
+    except Exception:  # noqa: BLE001 — a read-model projection never raises.
+        return (GATEWAY_ROLE, WORKER_ROLE)
 
 
 def project_herdr_sublanes(
@@ -228,6 +321,20 @@ def project_herdr_sublanes(
     (a gateway-only / worker-only unit is a degraded lane, surfaced with its state).
     Foreign (non-mzb1) rows are dropped.
 
+    Slot liveness (Redmine #14063): a decoded row's LOCATOR existing is not proof of a
+    live agent. Each slot's row is run through the shared :func:`classify_named_slot`
+    (#13518), and only a :data:`~...herdr_slot_liveness.SLOT_LIVE` slot counts toward
+    live placement / ``active``. A locator whose row reads ``SLOT_STALE`` (a reboot shell
+    residue: the durable name row survives with no managed agent behind it) never
+    populates ``gateway_pane`` / ``worker_pane`` — so it is never routed into and never
+    reads ``active`` — and instead surfaces a diagnostic ``gateway_slot_stale`` /
+    ``worker_slot_stale`` hint. Thus a **live + stale** pair reads one-sided
+    (``gateway_only`` / ``worker_only``), a **both-stale** unit reads ``detached`` with
+    both stale hints, and a **both-live** pair stays ``active``. This is an OBSERVED
+    process-state read; it is never conflated with a lane's DESIRED lifecycle
+    (``hibernated`` / ``released``), and an empty ``panes`` tuple is never taken as
+    slot-absence evidence.
+
     Lane identity resolution (Redmine #13356 j#73386 / #13377): the host-local lane
     metadata record written at ``sublane create`` is the primary source of the lane's
     human identity (``lane_label`` / ``issue`` / ``branch`` / worktree ``repo_root``) —
@@ -242,7 +349,10 @@ def project_herdr_sublanes(
     Stale / retire hints (Redmine #13358), all advisory-only:
 
     - a lane with only one live managed slot carries :data:`GATEWAY_SLOT_MISSING_HINT` /
-      :data:`WORKER_SLOT_MISSING_HINT` for the lost slot;
+      :data:`WORKER_SLOT_MISSING_HINT` for a genuinely absent slot, or
+      :data:`GATEWAY_SLOT_STALE_HINT` / :data:`WORKER_SLOT_STALE_HINT` for a slot whose
+      locator is present but classified :data:`~...herdr_slot_liveness.SLOT_STALE`
+      (#13518 shell residue, Redmine #14063) — the stale slot never counts as live;
     - an ACTIVE record in ``lane_records`` whose lane unit has NO live managed slot is
       emitted as an extra detached row (appended after the live lanes, token-sorted)
       carrying :data:`LANE_SLOTS_MISSING_HINT` — a vanished lane stays visible instead
@@ -275,6 +385,15 @@ def project_herdr_sublanes(
             if rec_ws and rec_lane:
                 records_by_unit.setdefault((rec_ws, rec_lane), record)
     slots: dict[tuple[str, str], dict[str, str]] = {}
+    #: role -> placement-container key ``(herdr_workspace, tab_id)`` per lane unit,
+    #: captured alongside the locator so a pair split across tabs / workspaces reads
+    #: as ``pair_split`` instead of ``active`` (Redmine #13705).
+    placements: dict[tuple[str, str], dict[str, tuple]] = {}
+    #: role -> :func:`classify_named_slot` verdict per lane unit. A locator alone no
+    #: longer proves a live slot (Redmine #14063): a #13518 shell residue keeps its
+    #: durable name row and locator, so the fold reads the row's typed liveness and
+    #: only a :data:`SLOT_LIVE` slot counts toward live placement / ``active``.
+    liveness: dict[tuple[str, str], dict[str, str]] = {}
     order: list[tuple[str, str]] = []
     exclude = _norm(exclude_workspace_id)
     repo_scope = _norm(repo_workspace_id)
@@ -292,8 +411,11 @@ def project_herdr_sublanes(
         if not decode.ok or decode.identity is None:
             continue
         identity = decode.identity
-        if identity.role not in (GATEWAY_ROLE, WORKER_ROLE):
-            continue
+        # Collect any decoded managed-scheme slot; the gateway/worker pair is picked
+        # per-unit below using that unit's binding-resolved providers (Redmine #13569
+        # R2-F2), so a lane whose binding rebound its providers is still projected rather
+        # than filtered out against a fixed ``codex/claude`` pair. A default-lane coordinator
+        # pair is still excluded below.
         ws = identity.workspace_id
         lane = _norm_lane(identity.lane_id)
         if not ws:
@@ -309,14 +431,41 @@ def project_herdr_sublanes(
         unit = (ws, lane)
         if unit not in slots:
             slots[unit] = {}
+            placements[unit] = {}
+            liveness[unit] = {}
             order.append(unit)
-        slots[unit].setdefault(identity.role, locator)
+        if identity.role not in slots[unit]:
+            slots[unit][identity.role] = locator
+            # A locator existing is NOT proof of a live agent (Redmine #14063): a
+            # #13518 shell residue keeps its name row + locator. Record the row's
+            # typed liveness so the entry build below counts only a SLOT_LIVE slot
+            # toward live placement, surfacing a stale one as a diagnostic hint.
+            liveness[unit][identity.role] = classify_named_slot(row)
+            # The placement key pairs the herdr terminal workspace (locator prefix,
+            # the #13380 axis) with the tab (#13411 axis); an equal key for both
+            # slots proves one operable pair.
+            placements[unit][identity.role] = (
+                _workspace_prefix(locator),
+                _tab_id_of_row(row),
+            )
 
     entries: list[_LaneEntry] = []
     for unit in order:
         ws, lane = unit
-        gateway = slots[unit].get(GATEWAY_ROLE)
-        worker = slots[unit].get(WORKER_ROLE)
+        gateway_provider, worker_provider = _managed_pair_for(ws, resolve_repo_root)
+        gateway_locator = slots[unit].get(gateway_provider)
+        worker_locator = slots[unit].get(worker_provider)
+        # A slot counts as a LIVE pair member only when its row classified SLOT_LIVE
+        # (Redmine #14063). A locator whose row read SLOT_STALE is a #13518 shell
+        # residue: it does not populate gateway/worker (so it never routes and never
+        # reads ``active``), and is flagged stale so the hint pass names it distinctly
+        # from an absent slot. A slot with no row at all leaves the flag False.
+        gateway_live = liveness[unit].get(gateway_provider) == SLOT_LIVE
+        worker_live = liveness[unit].get(worker_provider) == SLOT_LIVE
+        gateway = gateway_locator if gateway_live else None
+        worker = worker_locator if worker_live else None
+        gateway_stale = gateway_locator is not None and not gateway_live
+        worker_stale = worker_locator is not None and not worker_live
         legacy_unit = lane == DEFAULT_LANE
         if legacy_unit:
             record = resolve_lane_record(ws) if resolve_lane_record is not None else None
@@ -352,6 +501,18 @@ def project_herdr_sublanes(
                 lane_id=lane,
                 gateway=gateway,
                 worker=worker,
+                # Key the placement lookup on the SAME binding-resolved pair as the slot
+                # lookup above (Redmine #13569 R2-F2 invariant): a rebound lane stored its
+                # placement under its own provider ids, so keying on the fixed
+                # GATEWAY_ROLE / WORKER_ROLE would miss it and read the pair-split fence as
+                # "no placement" — the exact read-back skew #13705 fences against. A stale
+                # slot contributes no placement: it is not a live pair member (#14063).
+                gateway_placement=(
+                    placements[unit].get(gateway_provider) if gateway_live else None
+                ),
+                worker_placement=(
+                    placements[unit].get(worker_provider) if worker_live else None
+                ),
                 lane_label=lane_label,
                 issue=issue or None,
                 branch=branch,
@@ -359,6 +520,8 @@ def project_herdr_sublanes(
                 identity_hints=identity_hints,
                 slots_missing=False,
                 repo_scoped=_record_repo_scoped(record),
+                gateway_stale=gateway_stale,
+                worker_stale=worker_stale,
             )
         )
 
@@ -396,6 +559,8 @@ def project_herdr_sublanes(
                     lane_id=unit_lane,
                     gateway=None,
                     worker=None,
+                    gateway_placement=None,
+                    worker_placement=None,
                     lane_label=lane_label,
                     issue=issue or None,
                     branch=getattr(record, "branch", "") or None,
@@ -422,9 +587,17 @@ def project_herdr_sublanes(
         if entry.slots_missing:
             hints.append(LANE_SLOTS_MISSING_HINT)
         else:
-            if not entry.gateway:
+            # A stale slot (locator present, classified SLOT_STALE) gets the distinct
+            # ``*_slot_stale`` hint; a genuinely absent slot keeps ``*_slot_missing``
+            # (Redmine #14063). The two are mutually exclusive per role: a stale slot
+            # has a locator, so it is never also "missing".
+            if entry.gateway_stale:
+                hints.append(GATEWAY_SLOT_STALE_HINT)
+            elif not entry.gateway:
                 hints.append(GATEWAY_SLOT_MISSING_HINT)
-            if not entry.worker:
+            if entry.worker_stale:
+                hints.append(WORKER_SLOT_STALE_HINT)
+            elif not entry.worker:
                 hints.append(WORKER_SLOT_MISSING_HINT)
         if entry.repo_scoped:
             for peer_idx in lanes_by_issue.get(entry.issue or "", ()):
@@ -451,7 +624,12 @@ def project_herdr_sublanes(
                 repo_root=entry.repo_root,
                 gateway_pane=entry.gateway,
                 worker_pane=entry.worker,
-                state=_lane_state(entry.gateway, entry.worker),
+                state=_lane_state(
+                    entry.gateway,
+                    entry.worker,
+                    gateway_placement=entry.gateway_placement,
+                    worker_placement=entry.worker_placement,
+                ),
                 stale_hints=tuple(hints),
             )
         )
@@ -527,6 +705,13 @@ def herdr_lane_view_for_worktree(
     when the worktree has no resolvable segment, the inventory is unavailable, or
     neither managed slot is live.
 
+    Slot liveness (Redmine #14063): as in :func:`project_herdr_sublanes`, a locator is
+    not proof of a live agent — each slot's row is classified by
+    :func:`classify_named_slot` and a ``SLOT_STALE`` #13518 shell residue never
+    populates ``gateway_pane`` / ``worker_pane`` (surfacing a ``*_slot_stale`` hint
+    instead). A both-stale unit thus resolves to ``None`` (neither slot live), exactly
+    like a unit with no rows at all.
+
     Deliberately **not wired into ``sublane dispatch-worker`` here**: the herdr
     dispatch drive (lane read-back + measured-ACK forward) is Redmine #13357's
     surface (``sublane_worker_dispatch_herdr_ops``, developed in a sibling lane);
@@ -551,6 +736,11 @@ def herdr_lane_view_for_worktree(
     except HerdrSessionStartError:
         return None
 
+    slot_placements: dict[str, tuple] = {}
+    #: role -> :func:`classify_named_slot` verdict, populated alongside the locator so
+    #: a #13518 shell residue is excluded from the live view (Redmine #14063).
+    slot_liveness: dict[str, str] = {}
+
     def _unit_slots(want_ws: str, want_lane: str) -> dict[str, str]:
         unit_slots: dict[str, str] = {}
         for row in rows:
@@ -567,8 +757,16 @@ def herdr_lane_view_for_worktree(
             if identity.role not in (GATEWAY_ROLE, WORKER_ROLE):
                 continue
             locator = _agent_locator(row)
-            if locator:
-                unit_slots.setdefault(identity.role, locator)
+            if locator and identity.role not in unit_slots:
+                unit_slots[identity.role] = locator
+                # A locator is not proof of a live agent (Redmine #14063): classify the
+                # row so the caller can exclude a SLOT_STALE shell residue below.
+                slot_liveness[identity.role] = classify_named_slot(row)
+                # Placement key for the pair-split verdict (Redmine #13705).
+                slot_placements[identity.role] = (
+                    _workspace_prefix(locator),
+                    _tab_id_of_row(row),
+                )
         return unit_slots
 
     # Shared project workspace model (#13377): the lane unit is (project workspace,
@@ -591,20 +789,30 @@ def herdr_lane_view_for_worktree(
         candidate = _unit_slots(legacy_ws, DEFAULT_LANE)
         if candidate:
             workspace_id, lane_id, slots = legacy_ws, DEFAULT_LANE, candidate
-    gateway = slots.get(GATEWAY_ROLE)
-    worker = slots.get(WORKER_ROLE)
+    # Live-only slots (Redmine #14063): a SLOT_STALE locator (#13518 shell residue) is
+    # not a live pair member — it neither routes nor reads ``active``. A slot present but
+    # stale surfaces the distinct ``*_slot_stale`` hint below.
+    gateway_locator = slots.get(GATEWAY_ROLE)
+    worker_locator = slots.get(WORKER_ROLE)
+    gateway = gateway_locator if slot_liveness.get(GATEWAY_ROLE) == SLOT_LIVE else None
+    worker = worker_locator if slot_liveness.get(WORKER_ROLE) == SLOT_LIVE else None
     if not gateway and not worker:
         return None
     if record is not None and record.lane_label:
         lane_label = record.lane_label
         issue = record.issue_id or parse_issue_from_lane_label(lane_label)
         branch = record.branch or None
-        hints: tuple[str, ...] = ()
+        hints_list: list[str] = []
     else:
         lane_label = Path(worktree_path).name
         issue = parse_issue_from_lane_label(lane_label)
         branch = None
-        hints = (LANE_RECORD_MISSING_HINT,)
+        hints_list = [LANE_RECORD_MISSING_HINT]
+    if gateway_locator is not None and gateway is None:
+        hints_list.append(GATEWAY_SLOT_STALE_HINT)
+    if worker_locator is not None and worker is None:
+        hints_list.append(WORKER_SLOT_STALE_HINT)
+    hints = tuple(hints_list)
     return SublaneLaneView(
         workspace_id=workspace_id,
         lane_id=lane_id,
@@ -614,18 +822,26 @@ def herdr_lane_view_for_worktree(
         repo_root=str(worktree_path),
         gateway_pane=gateway,
         worker_pane=worker,
-        state=_lane_state(gateway, worker),
+        state=_lane_state(
+            gateway,
+            worker,
+            gateway_placement=slot_placements.get(GATEWAY_ROLE),
+            worker_placement=slot_placements.get(WORKER_ROLE),
+        ),
         stale_hints=hints,
     )
 
 
 __all__ = (
     "GATEWAY_SLOT_MISSING_HINT",
+    "GATEWAY_SLOT_STALE_HINT",
     "LANE_RECORD_MISSING_HINT",
     "LANE_SLOTS_MISSING_HINT",
     "WORKER_SLOT_MISSING_HINT",
+    "WORKER_SLOT_STALE_HINT",
     "herdr_lane_view_for_worktree",
     "herdr_sublane_views",
+    "is_git_worktree_root",
     "list_herdr_agent_rows",
     "probe_worktree_resolved",
     "project_herdr_sublanes",

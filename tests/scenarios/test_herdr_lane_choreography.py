@@ -304,13 +304,18 @@ class _Finding1World:
         cwd — the pure, root-cause observation (no herdr subprocess needed).
         """
         from mozyo_bridge.application.cli import build_parser
+        from mozyo_bridge.application.commands_common import repo_root_from_args
 
         args = build_parser().parse_args(self.inner_argv(pin=pin))
         prev_cwd = os.getcwd()
         os.chdir(self.driving_child)
         try:
             with mock.patch.dict(os.environ, self.sender_env(), clear=True):
-                return herdr_effective_backend_selected(args)
+                # Redmine #13729: pass the facade-resolved repo root + target scalar.
+                return herdr_effective_backend_selected(
+                    repo_root=repo_root_from_args(args),
+                    target=getattr(args, "target", None),
+                )
         finally:
             os.chdir(prev_cwd)
 
@@ -321,7 +326,7 @@ class _Finding1World:
             out = io.StringIO()
             err = io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                rc = _drive_worker_send_argv(self.inner_argv(pin=pin))
+                rc, _known_not_sent = _drive_worker_send_argv(self.inner_argv(pin=pin))
         return rc, out.getvalue(), err.getvalue()
 
     def dispatch_via_production_ops(self):

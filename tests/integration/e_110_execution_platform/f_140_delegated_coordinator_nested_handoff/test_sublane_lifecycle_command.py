@@ -34,6 +34,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
     INTEGRATION_BLOCKED,
     RETIRE_OK,
+    SublaneIntegrationPolicy,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     CREATE_BLOCKED,
@@ -60,6 +61,7 @@ class FakeOps:
         dirty=False,
         branches=None,
         integrated=None,
+        workspace_root=None,
     ):
         self._rows = rows or []
         self._git = git
@@ -68,8 +70,14 @@ class FakeOps:
         self._branches = branches or {}
         # (branch, integration_branch) -> Optional[bool] ancestry answers (#13086).
         self._integrated = integrated or {}
+        # #13432 optional capability: the workspace root a non-git omitted --worktree
+        # defaults to. When None the fake omits the capability entirely (older-adapter
+        # parity — the getattr discovery falls back to leaving the worktree blank).
+        self._workspace_root = workspace_root
         self.branch_calls = []
         self.integrated_calls = []
+        if workspace_root is not None:
+            self.canonical_workspace_root = lambda: workspace_root
 
     def pane_rows(self):
         return list(self._rows)
@@ -212,18 +220,68 @@ class CreateUseCaseTests(unittest.TestCase):
         self.assertEqual(outcome.plan.launch_action, "skip_no_git")
         self.assertEqual(outcome.plan.status, CREATE_PLANNED)
 
-    def test_missing_field_short_circuits_before_probe(self):
+    def test_git_missing_field_fails_closed(self):
+        # #13432: a Git workspace keeps the full identity requirement, so a missing
+        # worktree still fails closed (the probe order changed, the contract did not).
         ops = FakeOps(git=True)
         outcome = SublaneCreateUseCase(ops).run(_req(worktree_path=""))
         self.assertEqual(outcome.plan.status, CREATE_BLOCKED)
+        self.assertIn("missing_field:worktree_path", outcome.plan.blocked_reasons)
+
+    def test_non_git_omitted_branch_and_worktree_plans(self):
+        # #13432: --branch/--worktree are optional in a non-git workspace; the plan still
+        # resolves (skip_no_git) with the lane / dispatch steps present.
+        ops = FakeOps(git=False, workspace_root="/ws")
+        outcome = SublaneCreateUseCase(ops).run(_req(branch="", worktree_path=""))
+        self.assertEqual(outcome.plan.status, CREATE_PLANNED)
+        self.assertEqual(outcome.plan.launch_action, "skip_no_git")
+        self.assertEqual(len(outcome.plan.steps), 4)
+
+    def test_non_git_missing_lane_identity_still_fails_closed(self):
+        # #13432: only the Git worktree identity relaxes; issue / lane_label are required
+        # in every workspace.
+        ops = FakeOps(git=False, workspace_root="/ws")
+        outcome = SublaneCreateUseCase(ops).run(
+            _req(lane_label="", branch="", worktree_path="")
+        )
+        self.assertEqual(outcome.plan.status, CREATE_BLOCKED)
+        self.assertIn("missing_field:lane_label", outcome.plan.blocked_reasons)
+
+    def test_non_git_manage_worktree_false_still_relaxes(self):
+        # #13432 Review j#74285 finding 1: a non-git workspace under an operator
+        # `manage_worktree: false` opt-out collapses the launch action to skip_disabled
+        # BEFORE the non-git branch. The identity relaxation must track the probed
+        # git-ness, not the launch-action token, or the plan-only path would wrongly
+        # re-require --branch/--worktree and diverge from the actuator identity path.
+        ops = FakeOps(git=False, workspace_root="/ws")
+        policy = SublaneIntegrationPolicy(manage_worktree=False)
+        outcome = SublaneCreateUseCase(ops, policy).run(
+            _req(branch="", worktree_path="")
+        )
+        self.assertEqual(outcome.plan.status, CREATE_PLANNED)
+        self.assertEqual(outcome.plan.launch_action, "skip_disabled")
+        self.assertEqual(len(outcome.plan.steps), 4)
+
+    def test_git_manage_worktree_false_keeps_full_identity_requirement(self):
+        # #13432 byte-invariance: the relaxation is scoped to a *non-git* workspace. A Git
+        # workspace under `manage_worktree: false` still requires the full Git identity, so
+        # a blank worktree fails closed (skip_disabled must not leak the non-git relaxation).
+        ops = FakeOps(git=True)
+        policy = SublaneIntegrationPolicy(manage_worktree=False)
+        outcome = SublaneCreateUseCase(ops, policy).run(
+            _req(branch="", worktree_path="")
+        )
+        self.assertEqual(outcome.plan.status, CREATE_BLOCKED)
+        self.assertIn("missing_field:branch", outcome.plan.blocked_reasons)
+        self.assertIn("missing_field:worktree_path", outcome.plan.blocked_reasons)
 
 
 class RetireUseCaseTests(unittest.TestCase):
     def _all_true(self):
         return RetireAssertions(
-            issue_closed=True, owner_approval_present=True, callbacks_drained=True,
+            issue_closed=True, callbacks_drained=True,
             verification_passed=True, durable_record_recorded=True,
-            target_identity_known=True,
+            target_identity_known=True, latest_generation_admissible=True,
         )
 
     def test_clean_all_invariants_retire_ok(self):
@@ -244,6 +302,33 @@ class RetireUseCaseTests(unittest.TestCase):
         self.assertEqual(outcome.preflight.decision.state, INTEGRATION_BLOCKED)
         self.assertIn("dirty_worktree", outcome.preflight.decision.blocked_reasons)
 
+    def test_inadmissible_latest_generation_blocks_the_actual_retire(self):
+        # #13518 R3-F2: the ACTUAL CLI retire path (SublaneRetireUseCase -> decide_retire_integration)
+        # fences a stale/unclean latest review generation. Every other invariant satisfied, only the
+        # generation fence unsatisfied -> the retire integration is blocked (no default-True bypass).
+        assertions = RetireAssertions(
+            issue_closed=True, callbacks_drained=True,
+            verification_passed=True, durable_record_recorded=True, target_identity_known=True,
+            latest_generation_admissible=False,
+        )
+        outcome = SublaneRetireUseCase(FakeOps(git=True, dirty=False)).run(
+            issue="12955", lane_label="issue_12955_x", worktree_path="/wt",
+            branch="b", integration_branch=None, assertions=assertions,
+        )
+        self.assertEqual(outcome.preflight.decision.state, INTEGRATION_BLOCKED)
+        self.assertIn("stale_review_generation", outcome.preflight.decision.blocked_reasons)
+        self.assertFalse(outcome.preflight.may_retire)
+
+    def test_default_assertions_fail_closed_on_generation_fence(self):
+        # A retire with NO asserted generation admissibility fails closed on this fence too (the
+        # default RetireAssertions() is fully unsatisfied — the stale-generation reason is present).
+        outcome = SublaneRetireUseCase(FakeOps(git=True, dirty=False)).run(
+            issue="12955", lane_label="issue_12955_x", worktree_path="/wt",
+            branch="b", integration_branch=None, assertions=RetireAssertions(),
+        )
+        self.assertEqual(outcome.preflight.decision.state, INTEGRATION_BLOCKED)
+        self.assertIn("stale_review_generation", outcome.preflight.decision.blocked_reasons)
+
     def test_missing_invariants_block_fail_closed(self):
         outcome = SublaneRetireUseCase(FakeOps(git=True)).run(
             issue="12955", lane_label="issue_12955_x", worktree_path="/wt",
@@ -262,9 +347,9 @@ class RecordPathRedactionTests(unittest.TestCase):
 
     def _all_true(self):
         return RetireAssertions(
-            issue_closed=True, owner_approval_present=True, callbacks_drained=True,
+            issue_closed=True, callbacks_drained=True,
             verification_passed=True, durable_record_recorded=True,
-            target_identity_known=True,
+            target_identity_known=True, latest_generation_admissible=True,
         )
 
     def test_list_text_shows_basename_json_keeps_abs(self):
@@ -313,6 +398,68 @@ class RecordPathRedactionTests(unittest.TestCase):
             if s["command"]
         ]
         self.assertTrue(any(_WT in c for c in commands))
+
+
+class LatestGenerationAdmissibleResolutionTest(unittest.TestCase):
+    """#13518 R3-F2: latest-generation admissibility for a retire is MEASURED at action-time from a
+    durable review observation (fence), else the operator assertion, else fail-closed."""
+
+    def _resolve(self, **over):
+        import argparse
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
+            _resolve_latest_generation_admissible,
+        )
+
+        base = dict(review_generation_json=None, latest_generation_admissible=False)
+        base.update(over)
+        return _resolve_latest_generation_admissible(argparse.Namespace(**base))
+
+    def _write_obs(self, tmp, decisions):
+        import json
+
+        p = Path(tmp) / "reviewgen.json"
+        p.write_text(json.dumps({
+            "issue": "13518", "review_request_journal": "76004", "target_head": "0f548b7",
+            "decisions": decisions,
+        }), encoding="utf-8")
+        return str(p)
+
+    def test_no_source_and_no_flag_fails_closed(self):
+        self.assertFalse(self._resolve())
+
+    def test_operator_flag_asserts_when_no_source(self):
+        self.assertTrue(self._resolve(latest_generation_admissible=True))
+
+    def test_measured_admissible_from_clean_approved_generation(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as t:
+            obs = self._write_obs(t, [{"kind": "approval", "seq": 5}])
+            # The measurement OVERRIDES a False flag (measured beats asserted).
+            self.assertTrue(self._resolve(review_generation_json=obs, latest_generation_admissible=False))
+
+    def test_measured_inadmissible_when_unresolved_blocking_finding(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as t:
+            obs = self._write_obs(t, [
+                {"kind": "approval", "seq": 5},
+                {"kind": "finding", "seq": 6, "blocking": True, "disposition": "unresolved"},
+            ])
+            # Even with a True flag, the measured unclean latest generation fails closed.
+            self.assertFalse(self._resolve(review_generation_json=obs, latest_generation_admissible=True))
+
+    def test_measured_inadmissible_when_no_approval(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as t:
+            obs = self._write_obs(t, [{"kind": "finding", "seq": 6, "blocking": False}])
+            self.assertFalse(self._resolve(review_generation_json=obs))
+
+    def test_unreadable_source_fails_closed(self):
+        self.assertFalse(self._resolve(review_generation_json="/nonexistent/reviewgen.json",
+                                       latest_generation_admissible=True))
 
 
 if __name__ == "__main__":

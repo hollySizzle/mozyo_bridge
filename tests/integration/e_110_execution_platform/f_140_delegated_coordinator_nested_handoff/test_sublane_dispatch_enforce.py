@@ -35,6 +35,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTUATE_READY,
     DISPATCH_WORKER_DISPATCHED,
     REASON_FILL_STOP,
+    REASON_MISSING_IDENTITY,
     render_actuation_journal,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_dispatch_admission import (  # noqa: E501
@@ -46,6 +47,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneLaneView,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (  # noqa: E501
+    ADMISSION_HEALTHY,
+    TURN_START_STARTED,
+    WorkerDispatchAdmission,
+    WorkerDispatchAdmissionFacts,
     WorkerDispatchRequest,
     render_worker_dispatch_journal,
 )
@@ -119,6 +124,16 @@ class FakeActuatorOps:
     def read_lane(self, worktree_path):
         return _lane()
 
+    def declare_adopted_lane_lifecycle(self, worktree_path, *, adopted):
+        # Redmine #13809: adopt owner-row backfill hook; this dispatch-gate fake always
+        # proceeds (a successful declaration / non-gated create).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_DECLARED,
+            ADOPT_DECL_NOT_ADOPTED,
+        )
+
+        return ADOPT_DECL_DECLARED if adopted else ADOPT_DECL_NOT_ADOPTED
+
     def probe_gateway_ready(self, gateway_pane):
         # #13293: this fake's lane is always ready, so the readiness wait resolves on
         # the first probe (no back-off) and the dispatch-admission behavior is unchanged.
@@ -144,6 +159,38 @@ def _create_req(**kw):
 
 
 class CreateGateTests(unittest.TestCase):
+    def test_sender_attestation_fails_before_every_side_effect(self):
+        class MissingSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                return False, "missing_sender_env: sender identity is absent"
+
+        ops = MissingSenderOps()
+        outcome = SublaneActuateUseCase(ops).run(
+            _create_req(), execute=True, fill_inputs=_dispatch_next_inputs()
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_MISSING_IDENTITY, outcome.blocked_reasons)
+        self.assertIn("sender_attestation", outcome.blocked_reasons)
+        self.assertIn("missing_sender_env", outcome.reason)
+        self.assertEqual(ops.calls, [])
+        next_action = outcome.as_payload()["next_action"]
+        self.assertEqual(next_action["action"], "restore_attested_coordinator_shell")
+        self.assertIn(
+            "manual_mozyo_env_injection", next_action["forbidden_methods"]
+        )
+
+    def test_sender_attestation_is_not_required_for_create_only(self):
+        class MissingSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                raise AssertionError("create-only must not inspect dispatch sender")
+
+        ops = MissingSenderOps()
+        outcome = SublaneActuateUseCase(ops).run(
+            _create_req(), execute=True, dispatch=False
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertNotIn("dispatch", ops.calls)
+
     def test_stop_without_override_fails_closed_before_side_effects(self):
         ops = FakeActuatorOps()
         outcome = SublaneActuateUseCase(ops).run(
@@ -301,9 +348,41 @@ class FakeWorkerDispatchOps:
         # tests; report ready immediately so the bounded wait resolves in one probe.
         return True
 
+    def observe_worker_dispatch_admission(self, **kwargs):
+        return WorkerDispatchAdmission(
+            ADMISSION_HEALTHY,
+            "fixture authority is current",
+            WorkerDispatchAdmissionFacts(
+                lifecycle_current=True,
+                anchor_current=True,
+                identity_attested=True,
+                action_binding_current=True,
+                slot_state="live",
+                locator_present=True,
+                receiver_state="awaiting_input",
+                generation_binding_current=True,
+                workspace_id="ws",
+                lane_id="l1",
+                lane_generation=1,
+                worker_assigned_name="mzb1_ws_claude_l1",
+                worker_locator="%291",
+                action_id="lane_generation_1",
+            ),
+        )
+
+    def reserve_worker_dispatch(self, **kwargs):
+        return True, "reserved"
+
     def dispatch_to_worker(self, **kwargs):
         self.calls.append("dispatch")
         return 0
+
+    def dispatch_to_worker_turn_start(self, **kwargs):
+        kwargs.pop("worker_assigned_name", None)
+        return self.dispatch_to_worker(**kwargs), TURN_START_STARTED, False
+
+    def complete_worker_dispatch(self, **kwargs):
+        return True
 
 
 def _worker_req(**kw):

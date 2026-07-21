@@ -19,6 +19,12 @@ from __future__ import annotations
 
 import argparse
 
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (
+    AgentProviderRuntimeSnapshot,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_receiver_vocab import (
+    receiver_choices,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     MODE_QUEUE_ENTER,
     MODES,
@@ -36,7 +42,11 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
 )
 
 
-def _add_ticketless_delivery_options(parser_: argparse.ArgumentParser) -> None:
+def _add_ticketless_delivery_options(
+    parser_: argparse.ArgumentParser,
+    *,
+    snapshot: AgentProviderRuntimeSnapshot | None = None,
+) -> None:
     """Add the delivery/record knobs the ticketless callback rail shares.
 
     A focused subset of ``configure_handoff_parser``: it deliberately omits
@@ -49,7 +59,7 @@ def _add_ticketless_delivery_options(parser_: argparse.ArgumentParser) -> None:
     ``handoff send`` so the callback rides the standard rail safely.
     """
     parser_.add_argument(
-        "--to", required=True, choices=["claude", "codex"],
+        "--to", required=True, choices=receiver_choices(snapshot),
         help="Semantic receiver agent — the caller lane the callback returns to",
     )
     parser_.add_argument(
@@ -195,5 +205,13 @@ def configure_ticketless_callback_parser(parser_: argparse.ArgumentParser) -> No
             "Which workflow-contract set governed this result "
             "(`grandparent_coordinator` / `project_gateway`); resolvable via the "
             "#12700 workflow contract refs / #12706 transition role payload tokens."
+        ),
+    )
+    parser_.add_argument(
+        "--forward-action-id", dest="forward_action_id", default="",
+        help=(
+            "Echo the opaque forward generation id (Redmine #13583) the consultation / work-intake "
+            "payload carried, so a positively-delivered callback completes the exact forward "
+            "generation. Omit for a plain (non-forward) ticketless callback."
         ),
     )

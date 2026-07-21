@@ -346,6 +346,7 @@ def resolve_launch_adopt(
     required_role: str = ROLE_CODEX,
     excluded_lane_ids: Iterable[str] = (),
     child_project: Optional[str] = None,
+    gateway_provider: str = ROLE_CODEX,
 ) -> LaunchAdoptDecision:
     """Resolve a fail-closed launch/adopt decision over discovery candidates.
 
@@ -384,11 +385,15 @@ def resolve_launch_adopt(
             f"unknown launch_adopt_mode {mode!r}; expected one of "
             f"{sorted(LAUNCH_ADOPT_MODES)}"
         )
-    if required_role != ROLE_CODEX:
+    # The route must land at the child GATEWAY, never a direct worker send. The gateway
+    # provider is the binding-resolved coordinator/gateway provider (Redmine #13569 j#76969
+    # correction 3), default ``codex`` (byte-identical) — a rebound gateway provider is
+    # accepted while a worker-provider landing is still refused.
+    if required_role != gateway_provider:
         raise DelegationLaunchAdoptError(
-            f"delegated coordinator route must land at the child Codex gateway; "
-            f"required_role may not be {required_role!r} (no direct cross-lane / "
-            f"cross-project Claude send)."
+            f"delegated coordinator route must land at the child gateway provider "
+            f"{gateway_provider!r}; required_role may not be {required_role!r} (no direct "
+            f"cross-lane / cross-project worker send)."
         )
 
     def _decision(

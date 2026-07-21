@@ -71,6 +71,15 @@ dispatch 候補の選定:
 2. current Version の ready 在庫が枯れたときのみ、関連 Feature 配下の US または隣接する (テーマ継続の) Version から補充し、**補充理由を dispatch decision journal に残す**。
 3. Version 所属は durable-record gate を上書きしない: US が dispatch 可能なのは record が ready だからであり、どの bucket にいるかではない。Version が同じ / 違うこと自体は直列化・並列化いずれの理由にもならない。
 
+### 日付制約下の割当と no-remint 規律
+
+Redmine の `precedes` relation は先行 issue の due と後続 issue の start に日付制約を課し、`assign_to_version` は割当先 Redmine Version の `effective_date` から issue の start / due を自動設定する。この 2 つが噛み合うと、制約を満たさない割当は失敗する。失敗のたびに「より後ろの `effective_date` を持つ新しい Redmine Version を作って再試行する」と、成功しなかった試行分が **空の Redmine Version** として残置され、候補範囲を汚す (Redmine #13818 の #309 / #310 発生機序)。これは Redmine Version を候補範囲でなく date-scheduling authority のように扱った副産物であり、次を守って防ぐ。
+
+- **create 前に既存 Redmine Version を全量照合する。** `list_versions` は page 上限で既存 bucket を返しきらないことがある。返ってきた集合に見えないことを「その候補範囲は存在しない」と扱わず、pagination を汲んで全量を突合してから作成要否を判断する (見えない既存 bucket の重複再作成は Redmine #13376 と同型の乱造要因)。
+- **必要な `effective_date` を作成前に計算する。** 割当対象 issue の `precedes` chain と `assign_to_version` の auto-date semantics から、制約を満たす `effective_date` を先に求め、その 1 つの Redmine Version を 1 回で作成する。後ろ日付の bucket を試行錯誤で mint しながら当てにいく (mint-on-retry) をしない。
+- **割当に失敗しても remint しない。** `assign_to_version` が失敗したら、同じテーマの新しい Redmine Version を作り直して再試行しない。代わりに、生じた空残骸の Redmine Version id・失敗理由・operator cleanup の pointer を journal に残し、cleanup を operator 経路へ回す。no-remint は失敗を新 bucket で隠すためではなく、監査可能な残骸記録として残すための規律である。
+- **live な update / delete capability は本 guideline の scope 外。** 空 Redmine Version の実際の close / delete や `effective_date` の後追い更新を実行する live surface は本 doc では実装せず、Redmine #12651 の Redmine Version 操作面 capability split (設計正本 `redmine-version-operation-surface.md` §4 の Version write live executor / flat issue-by-version 読み adapter の分解) への接続点として扱う。それが配線されるまでの残骸整理は operator UI 経路 (同 §4) に委ねる。
+
 ## 境界
 
 - gate 名、必須 field、review / close の意味論: central preset (本 doc は gate 語彙を追加しない)。

@@ -132,11 +132,13 @@ documents:
     type: task
     status: active
     canonical_path: vibes/docs/tasks/new-session-onboarding.md
-    purpose: 新規 session の agent が chat context なしで立ち上がっても現在地に到達するための安定した導線 (Redmine #13406)。読む順序 / Redmine 機能カタログ (Epic/Feature) / vibes/docs レイアウト / herdr 運用要点への pointer。state snapshot を焼かず、live state は Redmine journal を正本とする。
+    purpose: 新規 session の agent が chat context なしで立ち上がっても現在地に到達するための安定した導線 (Redmine #13406 / #13472 / #13615 / #14098)。読む順序 / Redmine 機能カタログ (Epic/Feature) / 現在地の見つけ方 / session boundary-prompt の必須 anchor / transition bundle / Herdr recovery分類 / installed black-box環境のartifact・image・検証面分離 / vibes/docs レイアウトへの pointer。state snapshot (日付・主戦場・open backlog) を焼かず、live state は Redmine journal を正本とする discovery / prompt contract。
     audit_role: new_session_onboarding_task
     related_document_refs:
       - rule-project-agent-workflow
       - rule-workflow-docs-boundary
+      - logic-session-boundary
+      - spec-session-continuity-user-harness
       - task-herdr-lane-operations
       - task-external-project-herdr-adoption
 
@@ -149,6 +151,21 @@ documents:
     related_document_refs:
       - skill-project-map-reference
       - spec-bounded-context-map
+
+  - id: spec-session-continuity-user-harness
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/session-continuity-user-harness.md
+    purpose: 新規sessionがchat memoryやpane scrollbackに依存せず、router / central preset / cataloged docs / Redmine durable state / temporary transition bundle / boundary promptからactive workflowと承認境界を復元するuser harness仕様。恒久contractと`vibes/docs/temps/`の時点snapshotを分離し、lane/runtime/sender-shell/auth state、installed artifactと外部実行環境の証拠分離、受領後cleanupまで定義する (Redmine #13529 / #13615 / #14098)。
+    audit_role: session_continuity_user_harness_spec
+    related_document_refs:
+      - task-new-session-onboarding
+      - logic-session-boundary
+      - rule-workflow-docs-boundary
+      - rule-project-agent-workflow
+      - rule-public-private-boundary
+      - spec-herdr-native-identity
+      - task-herdr-lane-operations
 
   - id: spec-bounded-context-map
     type: spec
@@ -211,6 +228,28 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-ticket-system-neutral-orchestrator
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/ticket-system-neutral-orchestrator.md
+    purpose: Redmineを推奨・既定アダプターに留め、永続作業記録port、正本境界、正規化event、再照合・回復、review・integration・closeのsequence、現行0.12.2との差、段階移行を固定するプロバイダー非依存の自動オーケストレーター制御設計正本。
+    audit_role: ticket_system_neutral_orchestrator_logic
+    related_document_refs:
+      - logic-plugin-ready-adapter-boundary
+      - logic-coordinator-sublane-development-flow
+      - logic-workflow-step-command-design
+      - logic-autonomous-ticket-entrypoint
+      - logic-managed-state-model
+      - spec-route-identity-ledger
+      - spec-delegated-coordinator-decision-records
+      - spec-delegated-coordinator-role-profile
+      - rule-llm-rule-authoring
+      - rule-docs-catalog-governance
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: spec-herdr-native-identity
     type: spec
     status: active
@@ -225,6 +264,37 @@ documents:
       - rule-public-private-boundary
       - rule-project-agent-workflow
       - skill-workflow-reference
+      - spec-project-map
+
+  - id: spec-herdr-default-lane-workflow-role-authority
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/herdr-default-lane-workflow-role-authority.md
+    purpose: "純 herdr default-lane pair が grandparent_coordinator と project_gateway を step 時点で区別する durable workflow-role authority を持たず workflow step が ambiguous_default_coordinator_role で fail-closed する問題 (Redmine #13583 / #13581 j#75707) を解く contract。provider / pane / default placement を role authority へ昇格せず、repo-local static artifact `.mozyo-bridge/workflow-role-bindings.json` (workspace_id / liveness / delivery / approval を保存しない topology 宣言) の schema/version/closed role/source_pointer、versioned な project_scope->lane_id 導出、provider_binding からの expected provider 照合、missing/ambiguous/invalid/provider_mismatch の fail-closed resolution matrix、resolution-only の Increment 1 と Herdr-native 一段 forward SEND の Increment 3 境界を定義する。role token 正本は transition_role。"
+    audit_role: herdr_default_lane_workflow_role_authority_spec
+    related_document_refs:
+      - spec-herdr-native-identity
+      - logic-workflow-step-command-design
+      - logic-ticketless-project-gateway-runtime-ux
+      - logic-managed-state-model
+      - logic-workspace-registry
+      - logic-project-scoped-workspace-identity
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
+  - id: spec-conversational-onboarding-tool-contract
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/conversational-onboarding-tool-contract.md
+    purpose: bare mozyo 一語から非エンジニア向け会話 onboarding を開始し、LLMをclosed intent変換へ限定したまま、preflight・scaffold・typed config・workspace登録・herdr起動を決定論toolで実行するcontract。home/sync/Git/binaryのmodel起動前gate、plan drift、idempotent resume、verification責務を定義する。
+    audit_role: conversational_onboarding_tool_contract_spec
+    related_document_refs:
+      - task-external-project-herdr-adoption
+      - logic-bootstrap
+      - logic-turnkey-e2e-acceptance
+      - spec-herdr-native-identity
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
       - spec-project-map
 
   - id: spec-delegated-route-live-executor
@@ -488,6 +558,7 @@ documents:
     purpose: external plugin API 公開前に、ticket / presentation / terminal runtime / catalog / telemetry / release helper の built-in adapter 境界と v0.8 最初の候補を分類する設計正本。
     audit_role: plugin_ready_adapter_boundary_logic
     related_document_refs:
+      - logic-ticket-system-neutral-orchestrator
       - logic-managed-state-model
       - logic-workspace-registry
       - logic-coordinator-sublane-development-flow
@@ -661,6 +732,7 @@ documents:
       - rule-llm-rule-authoring
       - skill-workflow-reference
       - spec-project-map
+      - spec-session-continuity-user-harness
 
   - id: logic-cockpit-attention-state
     type: logic
@@ -716,6 +788,19 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-herdr-live-relayout-runbook
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/herdr-live-relayout-runbook.md
+    purpose: "live な herdr pane pair の位置交換 (swap) と split 方向変換 (左右 ⇔ 上下) を実機検証済み recipe として固定する operator runbook (Redmine #13648 / #13664)。2 段 bounce (`pane move --new-tab` 退避 → 元 tab へ `--split down|right --target-pane` で戻す) 手順、same-tab re-split が `same_tab` no-op / `pane swap` は位置交換のみ / TUI に orientation 変換 action 不在という herdr 0.7.1 gap、assigned-name authority 不変・agent process 無傷・一時 tab 自動消滅・target identity 確認・失敗時 fail-closed の安全境界、upstream 要望未提出 (外部投稿しない)、設定駆動配置 (#13646 / #13647) との境界を記録する。live pair の即時再配置の唯一の経路。"
+    audit_role: herdr_live_relayout_runbook_logic
+    related_document_refs:
+      - task-herdr-lane-operations
+      - spec-herdr-native-identity
+      - logic-pane-centric-cockpit-semantics
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-project-scoped-workspace-identity
     type: logic
     status: active
@@ -758,7 +843,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/workflow-step-command-design.md
-    purpose: "`mozyo-bridge workflow step` を AI / operator の単一標準入口とし、current lane / durable gate / route identity から次の安全な 1 step を解決する思想と責務境界。交通整理は自動化し、domain/design 判断、Redmine issue 作成・選択判断、owner approval、release/destructive/credential 操作、raw pane delivery は自動化しない。既存 `project-gateway` / `handoff` / `q-enter` / `delegate-*` は primitive / compatibility / debug surface として扱う。"
+    purpose: "`mozyo-bridge workflow step` を AI / operator の単一標準入口とし、current lane / durable gate / route identity から次の安全な 1 step を解決する思想と責務境界。交通整理は自動化し、domain/design 判断、work item 作成・選択判断、owner approval、release/destructive/credential 操作、raw pane delivery は自動化しない。現行bindingはRedmine、provider-neutral contractはlogic-ticket-system-neutral-orchestrator。既存 `project-gateway` / `handoff` / `q-enter` / `delegate-*` は primitive / compatibility / debug surface として扱う。"
     audit_role: workflow_step_command_design_logic
     related_document_refs:
       - logic-ticketless-project-gateway-runtime-ux
@@ -768,6 +853,7 @@ documents:
       - spec-route-identity-ledger
       - logic-tmux-send-safety-contract
       - logic-coordinator-sublane-development-flow
+      - logic-ticket-system-neutral-orchestrator
       - rule-project-agent-workflow
       - rule-docs-catalog-governance
       - spec-project-map
@@ -885,7 +971,7 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/coordinator-sublane-development-flow.md
-    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、Version / fixed_version を candidate grouping に留める ready work unit 数最大化型 lane 配置 (標準単位 UserStory、granularity 正本は spec-work-unit-granularity-config)、mozyo_bridge dogfood soft profile (target 4 / burst 5 / stop 6+) と帯域 / admission / pipeline fill、callback 欠落時の Redmine journal recovery と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、ワークフロー管制ロードマップ、#12675 以降の祖父・親・子・孫実機前 workflow 分解を定義する repo-local 開発フロー spine。標準フローは sequence diagram で lane boundary と callback boundary を固定し、詳細 flag は CLI help / validation error を正本にする。
+    purpose: 管制塔 Codex と cockpit-visible sublane の責務分担、Version / fixed_version を candidate grouping に留める ready work unit 数最大化型 lane 配置 (標準単位 UserStory、granularity 正本は spec-work-unit-granularity-config)、mozyo_bridge dogfood soft profile (target 4 / burst 5 / stop 6+) と帯域 / admission / pipeline fill、callback 欠落時の durable work record recovery (current adapterはRedmine journal) と nagger 補助境界、仕様決定 routing、US close 権限、sublane retirement、#12603 Git worktree lifecycle 再設計の運用境界、ワークフロー管制ロードマップ、#12675 以降の祖父・親・子・孫実機前 workflow 分解を定義する repo-local 開発フロー spine。provider-neutral contractはlogic-ticket-system-neutral-orchestrator。標準フローは sequence diagram で lane boundary と callback boundary を固定し、詳細 flag は CLI help / validation error を正本にする。
     audit_role: coordinator_sublane_development_flow_logic
     related_document_refs:
       - logic-sublane-lifecycle-map
@@ -902,6 +988,7 @@ documents:
       - logic-session-inventory
       - logic-tmux-send-safety-contract
       - logic-delegated-coordinator-cockpit-display
+      - logic-ticket-system-neutral-orchestrator
       - skill-workflow-reference
       - spec-project-map
 
@@ -1088,6 +1175,23 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: logic-coordinator-autonomy-evaluation
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/coordinator-autonomy-evaluation.md
+    purpose: 長時間operator離席下のcoordinator runを、throughput、人間介入、correctness、安全、auditability、unattended production readinessへ分解して評価し、2026-07-12〜13の実績・失敗・次回benchmark metricを固定する正本。live workflow stateはRedmineを正本とする。
+    audit_role: coordinator_autonomy_evaluation_logic
+    related_document_refs:
+      - logic-coordinator-sublane-development-flow
+      - logic-delegated-coordinator-smoke-test-frame
+      - logic-delegated-coordinator-real-machine-acceptance
+      - logic-delegated-coordinator-cockpit-display
+      - spec-delegated-coordinator-role-profile
+      - spec-delegated-coordinator-decision-records
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: logic-role-profile-handoff-expansion
     type: logic
     status: active
@@ -1256,11 +1360,12 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/autonomous-ticket-entrypoint.md
-    purpose: ticket-ID entrypoint と durable ticket record 起点の自律作業設計。
+    purpose: ticket-ID entrypointとdurable work record起点の自律作業設計。Redmine / Asana別のintakeはprovider adapter規則であり、製品中核のprovider-neutral contractはlogic-ticket-system-neutral-orchestrator。
     audit_role: autonomous_ticket_entrypoint_logic
     related_document_refs:
       - skill-workflow-reference
       - logic-tmux-send-safety-contract
+      - logic-ticket-system-neutral-orchestrator
 
   - id: logic-ack-completion-receiver-state
     type: logic
@@ -1292,6 +1397,18 @@ documents:
       - logic-module-health-gate
       - spec-project-map
 
+  - id: logic-local-parallel-test-runner-policy
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/local-parallel-test-runner-policy.md
+    purpose: "local isolated-process parallel test runner (Redmine #13733) の設計正本。`mozyo-bridge tests parallel` が serial `unittest discover` と同一 test 集合/verdict を isolated process shard で並列実行する契約、deterministic shard plan (duration/test-count weight の LPT)、fail-closed aggregate (failure/timeout/crash/import-error/parity-mismatch は green にしない)、shard ごとの HOME/TMPDIR/MOZYO isolation と live-session env pin 除去、明示 serial bucket 機構 (`test_parallel_policy.yaml`) とその既定が空である evidence-based 根拠、速度値を hard gate にしない不変条件を定義する。"
+    audit_role: local_parallel_test_runner_policy_logic
+    related_document_refs:
+      - logic-test-runtime-profiling-policy
+      - logic-tests-placement-discovery-policy
+      - logic-module-health-gate
+      - spec-project-map
+
   - id: logic-pre-commit-focused-verification
     type: logic
     status: active
@@ -1303,6 +1420,18 @@ documents:
       - logic-test-runtime-profiling-policy
       - rule-project-agent-workflow
       - skill-workflow-reference
+
+  - id: logic-tiered-ci-gate-policy
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/tiered-ci-gate-policy.md
+    purpose: "全 branch push で Python 3.10-3.13 full matrix を反復していた CI を risk tier 別 gate へ再編する設計正本 (Redmine #13734 / 親 US #13732)。issue-branch push を quick/affected 単一 Python に縮小し full matrix を auto 発火させない routing、integration push (main/int_*/integration_*) の exact-SHA clean single-Python full + wheel/sdist + fresh-install smoke を 1 回、TestPyPI build job の manual/auto 両 event inline clean-full + artifact/install smoke による pre-publish gate 抜け封鎖 (#13601 OIDC 境界と data gate 温存)、nightly の 3.10-3.13 full matrix 維持、production publish workflow の exact release/tag SHA full matrix + tag<->version mirror + fresh-install の機械強制と OIDC publish job 分離、concurrency cancel/serialize と run summary provenance、現行 green 証跡の非無効化を定義する。CI authority は unittest discover / tests profile のままで #13733 local 並列 runner に依存しない。"
+    audit_role: tiered_ci_gate_policy_logic
+    related_document_refs:
+      - logic-test-runtime-profiling-policy
+      - logic-module-health-gate
+      - logic-release-flow
+      - logic-release-helper-contract
 
 file_conventions:
   - id: fc-agent-routers
@@ -1373,6 +1502,17 @@ file_conventions:
       - logic-coordinator-sublane-development-flow
       - logic-ticketless-project-gateway-runtime-ux
 
+  - id: fc-agent-provider-profiles
+    name: packaged agent provider profile registry data source of truth
+    patterns:
+      - src/mozyo_bridge/e_140_adapter_provider/f_160_provider_registry/domain/agent_provider_profiles.yaml
+    severity: block
+    document_refs:
+      - logic-plugin-ready-adapter-boundary
+      - spec-project-map
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
   - id: fc-delegated-coordinator-runtime-source
     name: delegated coordinator runtime and projection source
     patterns:
@@ -1381,6 +1521,7 @@ file_conventions:
       - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile.py
       - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile_config.py
       - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile_templates.yaml
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/role_profile_field_resolution.py
       - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
       - src/mozyo_bridge/e_110_execution_platform/f_120_agent_discovery_pane_resolution/domain/agent_discovery.py
       - src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
@@ -1398,6 +1539,7 @@ file_conventions:
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/grandchild_dispatch.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/grandchild_stamp.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/grandchild_stamp.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_handoff_grandchild_realization.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_projection.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegation_display.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/delegated_coordinator_route_plan.py
@@ -1412,9 +1554,13 @@ file_conventions:
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_backend_neutral_resolver.py
       - tests/scenarios/test_delegated_coordinator_route_plan.py
       - tests/regressions/test_issue_12474_delegated_route_gaps.py
+      - tests/regressions/test_issue_13571_grandchild_realization_binding.py
       - tests/support/delegation_route_fakes.py
+      - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_role_profile_field_resolution.py
+      - tests/integration/e_110_execution_platform/f_130_handoff_routing/test_handoff_role_profile_default_resolution.py
     severity: block
     document_refs:
+      - logic-role-profile-handoff-expansion
       - logic-delegated-coordinator-cockpit-display
       - spec-delegation-policy-project-config
       - spec-work-unit-granularity-config
@@ -1427,6 +1573,57 @@ file_conventions:
       - logic-managed-state-model
       - logic-unit-target-model
       - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
+  - id: fc-coordinator-fill-actionability
+    name: coordinator fill decision / lane actionability / execution-surface source
+    patterns:
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_fill_decision.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/lane_actionability.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/lane_execution_surface.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/sublane_admission.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_fill.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_admission.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_fill_decision.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_lane_actionability.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_lane_execution_surface.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_sublane_admission.py
+      - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_fill_decision_cli.py
+      - tests/regressions/test_issue_13756_fill_actionability.py
+    severity: block
+    document_refs:
+      - logic-coordinator-sublane-development-flow
+      - spec-delegated-coordinator-decision-records
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
+  - id: fc-herdr-workflow-role-authority
+    name: herdr default-lane durable workflow-role authority source
+    patterns:
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_role_authority.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/workflow_role_authority_source.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_step_herdr.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_workflow_step.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_forward_route.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_forward_send.py
+      - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/delivery_outcome_gate.py
+      - src/mozyo_bridge/core/state/forward_outbox_fence.py
+      - .mozyo-bridge/workflow-role-bindings.json
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority_source.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_step_herdr.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_workflow_step_adapter.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_forward_route.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_forward_send.py
+      - tests/unit/core/state/test_forward_outbox_fence.py
+    severity: block
+    document_refs:
+      - spec-herdr-default-lane-workflow-role-authority
+      - logic-workflow-step-command-design
+      - logic-ticketless-project-gateway-runtime-ux
+      - spec-herdr-native-identity
+      - logic-managed-state-model
       - rule-project-agent-workflow
       - skill-workflow-reference
 
@@ -1481,6 +1678,22 @@ file_conventions:
       - logic-workspace-registry
       - spec-project-map
 
+  - id: fc-lane-pin-role-source
+    name: declared-pin role vocabulary owner and its writers / consumers
+    patterns:
+      - src/mozyo_bridge/core/state/lane_pin_role.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_adopt_declaration.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_hibernated_pair_recovery.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_hibernated_pin_repair.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_hibernated_live_reconcile.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/operator_startup_gate_producer.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/operator_startup_resume_target.py
+      - tests/regressions/test_issue_13920_adopt_recover_role_vocabulary.py
+    severity: block
+    document_refs:
+      - logic-managed-state-model
+      - spec-project-map
+
   - id: fc-module-health-source
     name: module-health metrics and oversized-module gate source
     patterns:
@@ -1503,6 +1716,19 @@ file_conventions:
     severity: block
     document_refs:
       - logic-test-runtime-profiling-policy
+      - logic-tests-placement-discovery-policy
+      - spec-project-map
+
+  - id: fc-test-parallel-runner-source
+    name: local parallel test runner (isolated process shards) source
+    patterns:
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain/test_parallel.py
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/commands_test_parallel.py
+      - src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/application/cli_test_parallel.py
+      - test_parallel_policy.yaml
+    severity: block
+    document_refs:
+      - logic-local-parallel-test-runner-policy
       - logic-tests-placement-discovery-policy
       - spec-project-map
 
@@ -1668,6 +1894,7 @@ file_conventions:
     patterns:
       - src/mozyo_bridge/e_130_governance_distribution/f_160_release_version_governance/application/release.py
       - .github/workflows/**
+      - scripts/disposable_ubuntu_smoke.py
       - pyproject.toml
       - .github/ISSUE_TEMPLATE/**
     severity: block
@@ -1675,6 +1902,7 @@ file_conventions:
       - rule-release-distribution
       - logic-release-flow
       - logic-release-helper-contract
+      - logic-tiered-ci-gate-policy
       - skill-release-reference
 
   - id: fc-pre-commit-hook-script

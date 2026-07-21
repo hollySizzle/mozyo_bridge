@@ -40,9 +40,10 @@ from mozyo_bridge.core.state.herdr_delivery_ledger import (
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     DeliveryOutcome,
 )
+from tests.support.private_path_fixtures import macos_home_path
 
 # An absolute path shape the redaction contract forbids in a persisted row.
-_SECRET_ABS_PATH = "/Users/someone/private/lane/worktree"
+_SECRET_ABS_PATH = macos_home_path("someone", "private", "lane", "worktree")
 
 # The #13255 event-rail turn-start telemetry (tokens + numbers only).
 _EVENT_TELEMETRY = {

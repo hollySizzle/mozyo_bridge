@@ -1,16 +1,9 @@
 """Fail-closed creation-side actuation use case for ``sublane start`` (Redmine #13299).
 
-Byte-preserving carve of :class:`SublaneActuateUseCase` out of the #12973
-``sublane_actuator`` facade (module-health decomposition of the at-ceiling use case;
-the facade re-exports this class, so the public import surface is unchanged).
-
-The use case holds the fail-closed decision flow and never touches IO: it drives the
-injected :class:`...application.sublane_actuator_ops.SublaneActuatorOps` port, consults the
-pure :func:`decide_worktree_launch` launch policy and the #13290
-:func:`evaluate_dispatch_admission` gate (whose concrete stop vocabulary stays the single
-#12855 fill-decision authority — never re-implemented here), and assembles the typed,
-replayable :class:`SublaneActuationOutcome`. The concrete side effects live behind the
-port in :mod:`...application.sublane_actuator_ops`.
+The use case owns the decision flow and never touches IO. It drives the injected
+:class:`...application.sublane_actuator_ops.SublaneActuatorOps` port, consults the pure
+launch and dispatch gates, and assembles the replayable
+:class:`SublaneActuationOutcome`; concrete side effects live behind the port.
 """
 
 from __future__ import annotations
@@ -26,10 +19,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_GATEWAY_NOTIFIED,
     DISPATCH_NOT_ATTEMPTED,
     DISPATCH_SKIPPED,
+    REASON_ADOPT_OWNER_UNBOUND,
     REASON_ANCHOR_REQUIRED,
     REASON_HANDOFF_FAILED,
     REASON_LANE_MISMATCH,
     REASON_LAUNCH_BLOCKED,
+    REASON_LAUNCHER_INCOMPATIBLE,
     REASON_FILL_STOP,
     REASON_MISSING_IDENTITY,
     REASON_PANE_CREATE_FAILED,
@@ -42,6 +37,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STEP_SKIPPED,
     ActuationStep,
     SublaneActuationOutcome,
+    SublaneLauncherIncompatibleError,
+    SublaneStartupObservation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_dispatch_admission import (
     evaluate_dispatch_admission,
@@ -54,10 +51,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_CREATE_WORKTREE,
     LAUNCH_REUSE_WORKTREE,
     LAUNCH_SKIP_NO_GIT,
-    LaunchPreflight,
     SublaneIntegrationPolicy,
     WorktreeLaunchDecision,
-    decide_worktree_launch,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     SublaneCreateRequest,
@@ -69,7 +64,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DEFAULT_GATEWAY_READY_INTERVAL_SECONDS,
     DEFAULT_GATEWAY_READY_PROBES,
     SublaneActuatorOps,
+    decide_create_launch,
+    resolve_create_identity,
     resolve_lane_runtime_root,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_gates import (  # noqa: E501
+    pair_attestation_admission,
+    pair_split_admission,
+    runtime_placement_gate,
+    startup_health_admission,
 )
 
 
@@ -82,11 +85,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 class SublaneActuateUseCase:
     """Drive the fail-closed creation-side actuation over :class:`SublaneActuatorOps`.
 
-    The runtime preflight is the final authority (the #12604 acceptance style): the use
-    case probes git through the port, asks the pure :func:`decide_worktree_launch`, and — in
-    a live ``--execute`` run — performs only the additive side effects the plan authorizes,
-    **stopping at the first failure and reporting the partial state** rather than a partial
-    success. A dry-run resolves the plan and performs nothing.
+    The runtime preflight is the final authority (#12604 acceptance style): probe git
+    through the port, ask the pure :func:`decide_worktree_launch`, and — in a live
+    ``--execute`` run — perform only the additive side effects the plan authorizes,
+    **stopping at the first failure and reporting the partial state**. A dry-run
+    resolves the plan and performs nothing.
     """
 
     ops: SublaneActuatorOps
@@ -103,15 +106,11 @@ class SublaneActuateUseCase:
         """Bounded, non-fatal pre-dispatch readiness wait (#13293).
 
         Polls :meth:`SublaneActuatorOps.probe_gateway_ready` up to
-        ``gateway_ready_probes`` times, ``gateway_ready_interval_seconds`` apart, so a
-        freshly-launched gateway TUI has time to boot before the queue-enter dispatch.
-        Returns ``(ready, probes_run)``. ``ready`` is ``None`` when the wait is disabled
-        (``probes<=0``) or no gateway pane resolved — nothing was probed. Otherwise it is
-        ``True`` on the first ready observation or ``False`` when the window elapses
-        unconfirmed. It NEVER raises and NEVER blocks the dispatch: an unconfirmed
-        ``False`` degrades to a recorded observation and the caller dispatches anyway
-        (the queue-enter rail never hard-blocks; the handoff Enter-only retry is the
-        landing safety net).
+        ``gateway_ready_probes`` times, ``gateway_ready_interval_seconds`` apart. Returns
+        ``(ready, probes_run)``: ``ready`` is ``None`` when disabled (``probes<=0``) or no
+        gateway pane resolved, ``True`` on the first ready observation, else ``False`` when
+        the window elapses. NEVER raises / blocks — an unconfirmed ``False`` degrades to a
+        recorded observation and the caller dispatches anyway (Enter-only retry is the net).
         """
         probes = self.gateway_ready_probes
         if probes <= 0 or not gateway_pane:
@@ -129,13 +128,10 @@ class SublaneActuateUseCase:
     ) -> bool:
         """True iff the resolved ``lane`` is the requested target (pure).
 
-        The lane's ``lane_label`` must equal the requested label, and its issue must
-        match the requested issue. The lane's ``issue`` is parsed from its label by
-        :func:`project_sublanes`; ``parse_issue_from_lane_label`` is used as the fallback
-        so a lane whose ``issue`` field was not pre-populated is still validated by re-
-        parsing its label. A blank requested label / issue, a mismatched label, or a
-        mismatched issue all fail closed — this is the guard that stops a repo-root /
-        basename collision from misdelivering to the wrong gateway (Review j#70250).
+        The lane's ``lane_label`` must equal the requested label and its issue the
+        requested issue (falling back to ``parse_issue_from_lane_label`` when the ``issue``
+        field was not pre-populated). A blank / mismatched label or issue fails closed —
+        the guard that stops a repo-root / basename collision misdelivering (j#70250).
         """
         want_label = (request.lane_label or "").strip()
         got_label = (lane.lane_label or "").strip()
@@ -149,24 +145,6 @@ class SublaneActuateUseCase:
             return False
         return True
 
-    def _decide_launch(
-        self, request: SublaneCreateRequest
-    ) -> WorktreeLaunchDecision:
-        is_git = self.ops.is_git_workspace()
-        identity_known = bool(request.branch) and bool(request.worktree_path)
-        worktree_exists = (
-            self.ops.worktree_exists(request.branch)
-            if is_git and identity_known
-            else False
-        )
-        preflight = LaunchPreflight(
-            is_git_workspace=is_git,
-            worktree_exists=worktree_exists,
-            branch_resolved=bool(request.branch),
-            target_identity_known=identity_known,
-        )
-        return decide_worktree_launch(self.policy, preflight)
-
     def run(
         self,
         request: SublaneCreateRequest,
@@ -177,8 +155,9 @@ class SublaneActuateUseCase:
         fill_inputs: Optional[FillDecisionInputs] = None,
         override_fill_stop: Optional[str] = None,
     ) -> SublaneActuationOutcome:
-        # 1. Fail closed on missing identity before any probe.
-        missing = request.missing_fields()
+        # 1. Fail closed on missing identity (#13432: a non-git workspace relaxes
+        # --branch/--worktree and defaults the omitted worktree to the workspace root).
+        request, missing = resolve_create_identity(self.ops, request)
         if missing:
             return self._blocked(
                 request,
@@ -190,8 +169,7 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 2. Work-unit granularity gate (#13002): an epic / feature unit is never
-        # actuated / dispatched without an explicit owner / operator decision anchor.
+        # 2. Epic/feature units require an explicit owner decision anchor (#13002).
         unit_decision = request.work_unit_decision()
         if not unit_decision.is_allowed:
             return self._blocked(
@@ -214,15 +192,7 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 3b. Dispatch admission gate (#13290, live-dispatch path only): consult the
-        # caller-supplied fill decision (the single #12855 authority) and fail closed
-        # on a concrete stop unless an explicit override reason is supplied. When no
-        # fill context is supplied the gate is not armed and this is a no-op, keeping
-        # the #12973 live-actuation contract byte-for-byte back-compatible. Scoped to
-        # ``execute and dispatch`` (same as the anchor gate above): #13290 gates the
-        # ``--execute`` *dispatch*, while ``--no-dispatch`` is a create/adopt-only
-        # surface that dispatches no worker and so has nothing to gate. A dry-run
-        # (``execute=False``) likewise performs nothing to gate (Review j#72744 #2).
+        # 3b. Live dispatch fails closed on a fill stop unless explicitly overridden.
         fill_decision_token: Optional[str] = None
         fill_override_reason: Optional[str] = None
         if execute and dispatch:
@@ -242,10 +212,25 @@ class SublaneActuateUseCase:
             fill_decision_token = admission.fill_decision
             fill_override_reason = admission.override_reason
 
-        # 4. Resolve the launch decision; a blocked launch is fail-closed. With every
-        # identity field present (step 1 passed) the pure decision does not currently
-        # return LAUNCH_BLOCKED, but this stays fail-closed if that contract changes.
-        launch = self._decide_launch(request)
+            # #13613: optional herdr sender attestation must fail before mutation;
+            # absence preserves tmux and existing test-port compatibility.
+            sender_preflight = getattr(self.ops, "preflight_dispatch_sender", None)
+            if callable(sender_preflight):
+                sender_ok, sender_detail = sender_preflight()
+                if not sender_ok:
+                    return self._blocked(
+                        request,
+                        launch_action=None,
+                        reason="dispatch sender attestation failed before actuation; "
+                        f"{sender_detail}",
+                        reasons=(REASON_MISSING_IDENTITY, "sender_attestation"),
+                        dispatch=dispatch,
+                        fill_decision=fill_decision_token,
+                        fill_override_reason=fill_override_reason,
+                    )
+
+        # 4. Resolve the launch decision and preserve a fail-closed future contract.
+        launch = decide_create_launch(self.ops, request, self.policy)
         if launch.action == LAUNCH_BLOCKED:
             return self._blocked(
                 request,
@@ -254,6 +239,15 @@ class SublaneActuateUseCase:
                 reasons=(REASON_LAUNCH_BLOCKED,),
                 dispatch=dispatch,
             )
+
+        # 4b. Action-time runtime fingerprint gate; includes ``--no-dispatch`` (#13705).
+        if execute:
+            gate_outcome = runtime_placement_gate(
+                self, request, launch_action=launch.action, dispatch=dispatch,
+                fill_decision=fill_decision_token, fill_override_reason=fill_override_reason,
+            )
+            if gate_outcome is not None:
+                return gate_outcome
 
         # 5. Dry-run: resolve the plan; perform nothing.
         if not execute:
@@ -286,6 +280,7 @@ class SublaneActuateUseCase:
         fill_decision: Optional[str] = None,
         fill_override_reason: Optional[str] = None,
         gateway_ready: Optional[bool] = None,
+        startup: Optional[SublaneStartupObservation] = None,
     ) -> SublaneActuationOutcome:
         return SublaneActuationOutcome(
             status=ACTUATE_BLOCKED,
@@ -307,6 +302,7 @@ class SublaneActuateUseCase:
             fill_decision=fill_decision,
             fill_override_reason=fill_override_reason,
             gateway_ready=gateway_ready,
+            startup=startup,
         )
 
     @staticmethod
@@ -461,10 +457,8 @@ class SublaneActuateUseCase:
                     order=1,
                     title="create worktree",
                     status=STEP_EXECUTED,
-                    # #13368: prose detail is pasteable; name the portable sibling
-                    # basename, not the host-local absolute path (the replayable
-                    # `git worktree add` command below keeps the absolute path for
-                    # local replay, redacted only in the human-readable text render).
+                    # #13368: pasteable prose names the portable sibling basename, not
+                    # the absolute path (the replay command below keeps the abs path).
                     detail=f"created worktree {portable_worktree_label(request.worktree_path)} "
                     f"on branch {request.branch}"
                     + (
@@ -497,12 +491,7 @@ class SublaneActuateUseCase:
                 )
             )
 
-        # Step 2 — append (or adopt) the cockpit lane column. A lane that already resolves
-        # for this worktree MUST match the requested identity before we adopt or dispatch
-        # to it: a repo-root / basename collision with a different (or stale) lane is an
-        # ambiguous target and fails closed here. Never adopt / append onto — nor later
-        # dispatch to — a lane whose lane_label / issue does not match the request, which
-        # would misdeliver the implementation_request to the wrong gateway (Review j#70250).
+        # Step 2 — adopt/append only after the resolved lane identity matches (j#70250).
         existing = self.ops.read_lane(lane_runtime_root)
         if existing is not None and not self._identity_matches(existing, request):
             steps.append(
@@ -546,7 +535,30 @@ class SublaneActuateUseCase:
             )
         else:
             try:
-                self.ops.append_lane_column(lane_runtime_root)
+                startup = self.ops.append_lane_column(lane_runtime_root)
+            except SublaneLauncherIncompatibleError as exc:
+                # Capability skew is a typed pre-launch block, not a transient append error.
+                steps.append(
+                    ActuationStep(
+                        order=2,
+                        title="managed-launch capability preflight",
+                        status=STEP_BLOCKED,
+                        detail=f"launcher incompatible ({exc.reason}): {exc}",
+                        command=None,
+                    )
+                )
+                return self._blocked(
+                    request,
+                    launch_action=launch.action,
+                    reason="managed-launch launcher capability-incompatible "
+                    "(attestation-store schema mismatch); refusing to launch a pair that "
+                    "would boot live but unattested — upgrade the launcher and re-run",
+                    reasons=(REASON_LAUNCHER_INCOMPATIBLE, exc.reason),
+                    dispatch=dispatch,
+                    steps=tuple(steps),
+                    fill_decision=fill_decision,
+                    fill_override_reason=fill_override_reason,
+                )
             except Exception as exc:  # noqa: BLE001 — fail-closed on any append failure.
                 steps.append(
                     ActuationStep(
@@ -567,6 +579,18 @@ class SublaneActuateUseCase:
                     fill_decision=fill_decision,
                     fill_override_reason=fill_override_reason,
                 )
+            startup_block = startup_health_admission(
+                self,
+                request,
+                startup,
+                launch_action=launch.action,
+                dispatch=dispatch,
+                steps=steps,
+                fill_decision=fill_decision,
+                fill_override_reason=fill_override_reason,
+            )
+            if startup_block is not None:
+                return startup_block
             lane = self.ops.read_lane(lane_runtime_root)
             if not (lane and lane.gateway_pane and lane.worker_pane):
                 steps.append(
@@ -599,6 +623,17 @@ class SublaneActuateUseCase:
                     command=None,
                 )
             )
+
+        # Redmine #13705 R1-F2: admit ONLY an operable same-tab pair — a `pair_split`
+        # lane is a degraded state the adopt path would otherwise dispatch to (gate in
+        # ``sublane_actuator_gates``; covers both read-back sites).
+        split_outcome = pair_split_admission(
+            self, request, lane, launch_action=launch.action, dispatch=dispatch,
+            adopted=adopted, steps=steps, fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
+        )
+        if split_outcome is not None:
+            return split_outcome
 
         # Step 3 — confirm the identity stamps landed on the resolved lane.
         if not lane or not lane.repo_root:
@@ -668,6 +703,62 @@ class SublaneActuateUseCase:
                 command=None,
             )
         )
+        # Redmine #13809 / #13810 R3-F3: a live ADOPT declares the lane's owner row via the
+        # common declaration service and MUST succeed (fresh or idempotent) before dispatch;
+        # an owner-unbound outcome (ambiguous / stale / unattested / recycled / conflict)
+        # fails closed here rather than dispatching to a lane hibernate can never resolve.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_OWNER_UNBOUND,
+        )
+
+        adopt_outcome = self.ops.declare_adopted_lane_lifecycle(
+            lane_runtime_root, adopted=adopted
+        )
+        if adopt_outcome in ADOPT_DECL_OWNER_UNBOUND:
+            steps.append(
+                ActuationStep(
+                    order=3,
+                    title="declare adopted lane owner",
+                    status=STEP_BLOCKED,
+                    detail=f"adopted lane owner binding not declared ({adopt_outcome}); "
+                    "refusing to dispatch to an owner-unbound lane",
+                    command=None,
+                )
+            )
+            return self._blocked(
+                request,
+                launch_action=launch.action,
+                reason=f"adopted lane owner binding not declared ({adopt_outcome}); "
+                "fail-closed before dispatch (owner-unbound lane)",
+                reasons=(REASON_ADOPT_OWNER_UNBOUND,),
+                dispatch=dispatch,
+                steps=tuple(steps),
+                gateway_pane=gateway_pane,
+                worker_pane=worker_pane,
+                adopted=adopted,
+                fill_decision=fill_decision,
+                fill_override_reason=fill_override_reason,
+            )
+
+        # Step 3c — post-launch pair self-attestation gate (Redmine #13847): a fresh launch
+        # that does not confirm BOTH slots' startup self-attestation booted partially (live
+        # but unattested/stale) and must NOT be promoted to `executed`. Fires before the
+        # dispatch branch so it covers `--no-dispatch` create (the live-evidence case) too.
+        attest_outcome = pair_attestation_admission(
+            self,
+            request,
+            launch_action=launch.action,
+            dispatch=dispatch,
+            adopted=adopted,
+            gateway_pane=gateway_pane,
+            worker_pane=worker_pane,
+            lane_runtime_root=lane_runtime_root,
+            steps=steps,
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
+        )
+        if attest_outcome is not None:
+            return attest_outcome
 
         # Step 4 (--no-dispatch) — nothing to dispatch, so nothing to make ready.
         if not dispatch:
@@ -703,14 +794,10 @@ class SublaneActuateUseCase:
                 fill_override_reason=fill_override_reason,
             )
 
-        # Step 4 — pre-dispatch gateway readiness wait (#13293). Give a freshly-launched
-        # gateway TUI time to boot before the queue-enter dispatch so the input lands on
-        # a live composer instead of vanishing into a still-booting one (the j#72677 /
-        # 5-example, 100%-reproduction dispatch-loss failure mode). This NEVER hard-blocks
-        # the queue-enter rail (#13262/#13255): an unconfirmed readiness degrades to a
-        # recorded ``gateway_ready=false`` and the dispatch proceeds anyway — the handoff
-        # Enter-only retry (#12580/#12581) is the landing safety net and the coordinator
-        # watches for a no-progress lane.
+        # Step 4 — pre-dispatch gateway readiness wait (#13293): let a freshly-launched
+        # gateway TUI boot so queue-enter lands on a live composer (j#72677). NEVER
+        # hard-blocks — unconfirmed degrades to ``gateway_ready=false`` and dispatches
+        # anyway (Enter-only retry #12580 is the net).
         gateway_ready, ready_probes = self._wait_gateway_ready(gateway_pane)
         if gateway_ready is None:
             readiness_detail = (
@@ -748,7 +835,7 @@ class SublaneActuateUseCase:
                 journal=(request.journal or ""),
                 gateway_pane=gateway_pane or "",
                 lane_label=request.lane_label,
-                upstream_coordinator=request.upstream_coordinator,
+                upstream_coordinator=request.resolved_upstream_coordinator(),
                 target_repo=target_repo,
             )
         except Exception as exc:  # noqa: BLE001 — fail-closed on any dispatch failure.
@@ -757,11 +844,9 @@ class SublaneActuateUseCase:
         else:
             dispatch_detail = f"handoff send to gateway {gateway_pane} exit={rc}"
         if rc != 0:
-            # Redmine #13378: a failed dispatch whose gateway slot is GONE on
-            # read-back is the measured vanish mode (an idle pre-session gateway
-            # killed by a host-level agent-CLI update) — self-heal once and retry,
-            # when the ops adapter offers the capability. Any other failure keeps
-            # the plain fail-closed block below, byte-for-byte.
+            # Redmine #13378: a failed dispatch whose gateway slot is GONE on read-back
+            # is the measured vanish mode — self-heal once and retry when the ops adapter
+            # offers the capability; any other failure keeps the plain block below.
             healed_outcome = self._heal_and_retry_dispatch(
                 request,
                 launch,
@@ -820,10 +905,8 @@ class SublaneActuateUseCase:
             gateway_pane=gateway_pane,
             worker_pane=worker_pane,
             dispatch_target=gateway_pane,
-            # Redmine #12986: a gateway `handoff send` exit 0 proves gateway
-            # notification only, never that the same-lane worker was dispatched or
-            # started. Record it honestly as `gateway_notified` (not `sent`) so a
-            # gateway-notified-but-quiet lane is never read as worker-started.
+            # Redmine #12986: a gateway send exit 0 is gateway notification only — record
+            # `gateway_notified` (not `sent`) so a quiet lane is not read as worker-started.
             dispatch_result=DISPATCH_GATEWAY_NOTIFIED,
             adopted=adopted,
             steps=tuple(steps),
@@ -986,7 +1069,7 @@ class SublaneActuateUseCase:
 
     def _dispatch_command(self, request: SublaneCreateRequest) -> str:
         journal = request.journal or "<journal>"
-        coordinator = request.upstream_coordinator or "<coordinator-pane>"
+        coordinator = request.resolved_upstream_coordinator()
         return (
             "mozyo-bridge handoff send --to codex --source redmine "
             f"--issue {request.issue} --journal {journal} "

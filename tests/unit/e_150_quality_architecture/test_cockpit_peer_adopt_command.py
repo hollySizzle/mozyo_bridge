@@ -123,9 +123,9 @@ class PureHelperTest(unittest.TestCase):
     """The pure parse / projection helpers (Redmine #12978)."""
 
     def test_project_pane_runtime_full_line(self) -> None:
-        parsed = project_pane_runtime("/home/x/repo\tclaude\tfeature-x\n")
+        parsed = project_pane_runtime("/workspace/repo\tclaude\tfeature-x\n")
         self.assertEqual(
-            {"cwd": "/home/x/repo", "process": "claude", "lane_label": "feature-x"}, parsed
+            {"cwd": "/workspace/repo", "process": "claude", "lane_label": "feature-x"}, parsed
         )
 
     def test_project_pane_runtime_short_line_pads(self) -> None:

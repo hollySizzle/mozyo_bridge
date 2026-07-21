@@ -43,6 +43,8 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     DEFAULT_MERGE_ON_RETIRE,
     DEFAULT_PRESENTATION_SURFACE,
     REPO_LOCAL_CONFIG_VERSION,
+    LanePlacementConfig,
+    LanePlacementError,
     PresentationSelectionConfig,
     RepoLocalConfig,
     RepoLocalConfigError,
@@ -833,6 +835,7 @@ class LaunchArgvConfigTest(unittest.TestCase):
     def test_bad_tokens_fail_closed(self) -> None:
         bad_argvs = (
             [""],  # empty token
+            ["--"],  # option terminator can hide later mozyo-managed flags
             ["a\nb"],  # newline
             ["a\tb"],  # tab / control char
             [5],  # non-string
@@ -912,6 +915,138 @@ class ProviderBindingConfigTest(unittest.TestCase):
         self.assertEqual(
             config.provider_binding, RoleProviderBindingConfig.default()
         )
+
+
+class LanePlacementConfigTest(unittest.TestCase):
+    """The closed ``lane_placement`` schema (Redmine #13646, Design Answer j#76564).
+
+    Declares the herdr pane-pair split direction + provider order per lane class. Absent
+    is behavior-preserving; every unknown / invalid shape fails closed. The block is a
+    future-launch policy, never a live-layout / route authority — which is also why the
+    key is ``lane_placement`` and NOT ``pane_placement`` (the boundary screen rejects any
+    key containing ``pane``).
+    """
+
+    def test_absent_block_is_behavior_preserving(self) -> None:
+        config = RepoLocalConfig.from_record({})
+        self.assertEqual(config.lane_placement, LanePlacementConfig.default())
+        self.assertEqual(config.lane_placement.placements, ())
+        # Every lane class resolves to the legacy (inherit-everything) placement.
+        for lane_class in ("default", "sublane"):
+            resolved = config.lane_placement.resolve(lane_class)
+            self.assertIsNone(resolved.split)
+            self.assertIsNone(resolved.order)
+
+    def test_full_record_resolves_both_lane_classes(self) -> None:
+        config = RepoLocalConfig.from_record(
+            {
+                "lane_placement": {
+                    "default": {"split": "down", "order": ["codex", "claude"]},
+                    "sublane": {"split": "right", "order": ["claude", "codex"]},
+                }
+            }
+        )
+        default = config.lane_placement.resolve("default")
+        self.assertEqual(default.split, "down")
+        self.assertEqual(default.order, ("codex", "claude"))
+        sublane = config.lane_placement.resolve("sublane")
+        self.assertEqual(sublane.split, "right")
+        self.assertEqual(sublane.order, ("claude", "codex"))
+
+    def test_fields_are_individually_optional(self) -> None:
+        # A partial object configures only its own field; the other inherits legacy.
+        config = RepoLocalConfig.from_record(
+            {"lane_placement": {"default": {"split": "down"}, "sublane": {}}}
+        )
+        default = config.lane_placement.resolve("default")
+        self.assertEqual(default.split, "down")
+        self.assertIsNone(default.order)
+        sublane = config.lane_placement.resolve("sublane")
+        self.assertIsNone(sublane.split)
+        self.assertIsNone(sublane.order)
+
+    def test_absent_lane_class_inherits_legacy(self) -> None:
+        config = RepoLocalConfig.from_record(
+            {"lane_placement": {"sublane": {"split": "down"}}}
+        )
+        self.assertIsNone(config.lane_placement.resolve("default").split)
+        self.assertEqual(config.lane_placement.resolve("sublane").split, "down")
+
+    def test_pane_placement_key_rejected_by_the_boundary_screen(self) -> None:
+        # The block is deliberately NOT named `pane_placement`: `_FORBIDDEN_KEY_PARTS`
+        # contains `pane`, so such a key is rejected as a boundary token BEFORE the
+        # unknown-key check (worker characterization j#76559 / Design Answer j#76564 Q1).
+        with self.assertRaises(RepoLocalConfigError) as ctx:
+            RepoLocalConfig.from_record(
+                {"pane_placement": {"default": {"split": "down"}}}
+            )
+        self.assertIn("boundary token", str(ctx.exception))
+
+    def test_unknown_lane_class_rejected(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record({"lane_placement": {"main": {"split": "down"}}})
+
+    def test_unknown_class_key_rejected(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {"lane_placement": {"default": {"direction": "down"}}}
+            )
+
+    def test_invalid_split_direction_rejected(self) -> None:
+        for bad in ("up", "left", "RIGHT", "", "vertical", 1, True):
+            with self.subTest(split=bad):
+                with self.assertRaises(RepoLocalConfigError):
+                    RepoLocalConfig.from_record(
+                        {"lane_placement": {"default": {"split": bad}}}
+                    )
+
+    def test_order_must_be_an_exact_permutation(self) -> None:
+        # Missing provider, duplicate, unknown provider, a bare string, and a non-list
+        # all fail closed — a partial order can never silently drop a provider.
+        for bad in (
+            ["codex"],
+            ["codex", "codex"],
+            ["codex", "claude", "gemini"],
+            "codex,claude",
+            {"codex": 1},
+            [],
+        ):
+            with self.subTest(order=bad):
+                with self.assertRaises(RepoLocalConfigError):
+                    RepoLocalConfig.from_record(
+                        {"lane_placement": {"sublane": {"order": bad}}}
+                    )
+
+    def test_non_mapping_block_and_class_rejected(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record({"lane_placement": ["default"]})
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record({"lane_placement": {"default": "down"}})
+
+    def test_unsupported_version_rejected(self) -> None:
+        with self.assertRaises(RepoLocalConfigError):
+            RepoLocalConfig.from_record(
+                {"lane_placement": {"version": 99, "default": {"split": "down"}}}
+            )
+
+    def test_direct_construction_is_validated(self) -> None:
+        # A directly-constructed config is checked as thoroughly as a parsed one, so a
+        # bad value can never enter through the dataclass back door. The sibling raises its
+        # own LanePlacementError; RepoLocalConfig.from_record re-raises it as a
+        # RepoLocalConfigError so the loader keeps one fail-closed boundary (asserted above).
+        with self.assertRaises(LanePlacementError):
+            LanePlacementConfig(placements=(("default", "sideways", None),))
+        with self.assertRaises(LanePlacementError):
+            LanePlacementConfig(placements=(("nowhere", "down", None),))
+        with self.assertRaises(LanePlacementError):
+            LanePlacementConfig(placements=(("default", None, ("codex",)),))
+
+    def test_config_is_hashable(self) -> None:
+        # The placements tuple keeps RepoLocalConfig hashable (the frozen-record rule).
+        config = RepoLocalConfig.from_record(
+            {"lane_placement": {"default": {"split": "down", "order": ["codex", "claude"]}}}
+        )
+        self.assertIsInstance(hash(config.lane_placement), int)
 
 
 if __name__ == "__main__":

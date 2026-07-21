@@ -16,7 +16,6 @@ through the exact same record path as every other ``orchestrate_handoff`` gate.
 
 from __future__ import annotations
 
-import argparse
 import sys
 from typing import Any, Callable, Optional, Tuple
 
@@ -29,23 +28,85 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (
     load_workflow_binding,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
+    WorkflowProviderUnresolved,
+    resolve_gateway_provider,
+    resolve_worker_provider,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_route_enforcement import (
     GatewayRouteRequest,
     decide_gateway_route,
     render_block_die_message,
     render_exception_advisory,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
-    PROVIDER_CLAUDE,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
-    ROLE_IMPLEMENTER,
-)
 from mozyo_bridge.shared.errors import die
 
 
+def _resolve_target_disposition(
+    preflight_target: Any,
+) -> Tuple[Optional[str], bool, bool]:
+    """``(disposition, unreadable, upgrade_required)`` for the target lane's authority (#13681).
+
+    Four distinct outcomes, kept apart so an unreadable authority never masquerades as
+    active (R1 F3, j#77247), and so a NEWER-schema store is told apart from a corrupt one
+    (Redmine #13844 design 5):
+
+    - ``(None, False, False)`` — no ``(workspace_id, lane_id)`` unit, a malformed unit, or a
+      readable store with **no row** for the lane (owner-unbound). Byte-invariant: no
+      disposition block. An owner-unbound lane is a deliberate compatibility carve-out until
+      legacy migration (#13685), never assumed active.
+    - ``(disposition, False, False)`` — a lifecycle row resolved; a non-active disposition
+      zero-sends. Keys on the SAME ``(project workspace segment, lane_label)`` unit the
+      create (W1) and supersede (W2) writes use.
+    - ``(None, True, False)`` — the store could not be READ (missing driver / corruption /
+      permission / partial / malformed shape). Fail-closed: the send is refused rather than
+      assumed active, because an unreadable authority may be masking a superseded lane.
+    - ``(None, True, True)`` — the store is a NEWER schema than this source CLI can read (a
+      concurrent newer-schema lane migrated the shared home store). Still fail-closed, but the
+      caller routes the operation to the current compatible facade instead of a generic block
+      (never a raw DB downgrade).
+    """
+    workspace = getattr(preflight_target, "workspace_id", None)
+    lane = getattr(preflight_target, "lane_id", None)
+    if not workspace or not lane:
+        return None, False, False
+    from mozyo_bridge.core.state.lane_lifecycle import (
+        LaneLifecycleError,
+        LaneLifecycleKey,
+        LaneLifecycleReader,
+        LaneLifecycleReaderUpgradeRequired,
+    )
+
+    try:
+        key = LaneLifecycleKey(str(workspace), str(lane))
+    except ValueError:
+        # A malformed unit cannot address a lifecycle row — not a read failure.
+        return None, False, False
+    try:
+        # Redmine #13844: the standard-handoff lifecycle lookup reads through the read-only,
+        # version-compatible READER — NEVER the migrating store. A ``standard`` handoff sent by
+        # a newer-schema source CLI must not forward-migrate the shared home authority store
+        # (which would fail-close every concurrent older-schema reader lane and stop their
+        # transport with ``gateway_route_blocked``). The reader reads an older KNOWN shape with
+        # in-memory defaults (no DB write) and fails closed only on an unknown / newer /
+        # partial store — so the routing read reaches the read-only API and never the mutation
+        # / migration API.
+        record = LaneLifecycleReader().get(key)
+    except LaneLifecycleReaderUpgradeRequired:
+        # Redmine #13844 design 5: the store is a NEWER schema than this reader — a distinct,
+        # actionable fail-closed (route to the current facade), not a generic block.
+        return None, True, True
+    except (LaneLifecycleError, OSError):
+        # Action-time read failure (corrupt / partial / unreadable): fail closed, never active.
+        return None, True, False
+    return (
+        (record.lane_disposition, False, False)
+        if record is not None
+        else (None, False, False)
+    )
+
+
 def enforce_gateway_route(
-    args: argparse.Namespace,
     *,
     kind: str | None,
     receiver: str,
@@ -57,6 +118,7 @@ def enforce_gateway_route(
     record_format: str,
     record_command: str | None,
     emit: Callable[..., None],
+    allow_direct_worker: bool,
     sender_lane_unit: Optional[Tuple[Optional[str], Optional[str]]] = None,
 ) -> None:
     """Apply the #12918 gateway-route gate; fail closed on a cross-lane worker send.
@@ -80,13 +142,63 @@ def enforce_gateway_route(
         sender_ws, sender_lane = sender_lane_unit
     else:
         sender_ws, sender_lane = current_pane_lane_unit()
-    # Role-based worker discrimination (Redmine #13174): resolve the implementer
-    # (worker) role's runtime provider from the repo-local binding (#12673/#13157;
-    # default -> claude, byte-identical) so the authority decision keys on the role,
-    # not the literal `claude` receiver token. A broken config fails closed through
-    # the loader's RepoLocalConfigError.
-    binding, _warnings = load_workflow_binding()
-    worker_provider = binding.provider_for(ROLE_IMPLEMENTER) or PROVIDER_CLAUDE
+    # Role-based worker discrimination (Redmine #13174): resolve the implementer (worker)
+    # and coordinator (gateway) providers from the binding so the authority decision keys on
+    # the role, not the literal receiver token. The receiver lives in the TARGET workspace,
+    # so the authority is the TARGET repo's binding (Redmine #13569 R2-F3b) — resolved from
+    # ``preflight_target.repo_root`` — not the sender's cwd binding: a gateway rebound in the
+    # target workspace must be the exact allowed head, and a cross-workspace send to a third
+    # provider must not slip through on the sender's (default) binding. ``None`` (same-repo /
+    # no target root) resolves the local binding, byte-identical. A broken config fails closed
+    # through the loader; an unbound role fails closed here rather than silently defaulting
+    # (j#76969 correction 4) — without resolvable providers the discrimination cannot be made.
+    target_repo_root = getattr(preflight_target, "repo_root", None)
+    binding, _warnings = load_workflow_binding(target_repo_root)
+    try:
+        worker_provider = resolve_worker_provider(binding=binding)
+        gateway_provider = resolve_gateway_provider(binding=binding)
+    except WorkflowProviderUnresolved as exc:
+        die(str(exc))
+        raise AssertionError("unreachable")
+    # Redmine #13681 W3 + R1 F2/F3 (j#77247): resolve the TARGET lane's lifecycle disposition
+    # so a delivery to a non-active lane (superseded / hibernated / retired) — or one whose
+    # lifecycle authority is unreadable — zero-sends for ANY kind, before the kind-scoped
+    # gateway governance. Resolved from the same target the provider binding is (the
+    # receiver's workspace); an owner-unbound lane resolves to (None, False) and keeps the
+    # gate byte-invariant (the compatibility carve-out).
+    (
+        target_disposition,
+        target_lifecycle_unreadable,
+        target_reader_upgrade_required,
+    ) = _resolve_target_disposition(preflight_target)
+    if target_reader_upgrade_required:
+        # Redmine #13844 design 5: the target's lifecycle authority is a NEWER schema than this
+        # source CLI can read (a concurrent newer-schema lane migrated the shared home store).
+        # Emit a DISTINCT, typed, actionable outcome — route via the current compatible facade,
+        # never a raw DB downgrade — instead of collapsing it into a generic
+        # ``gateway_route_blocked`` (which would read as "the route is wrong" rather than "this
+        # reader is stale"). Fail closed before any text is typed, like the block path.
+        emit(
+            make_outcome(
+                status="blocked",
+                reason="reader_upgrade_required",
+                receiver=receiver,
+                target=target,
+                anchor=anchor,
+                mode=mode,
+                kind=kind,
+                notification_marker=None,
+                source=source,
+            ),
+            record_format=record_format,
+            command=record_command,
+        )
+        die(
+            "lifecycle authority is a newer schema than this source CLI can read "
+            f"(reader_upgrade_required); lane {preflight_target.lane_id!r}. Re-run from the "
+            "current up-to-date source CLI / installed facade; do not downgrade the store."
+        )
+        raise AssertionError("unreachable")
     decision = decide_gateway_route(
         GatewayRouteRequest(
             kind=kind,
@@ -97,8 +209,15 @@ def enforce_gateway_route(
             target_workspace_id=preflight_target.workspace_id,
             target_lane_id=preflight_target.lane_id,
             target_role=preflight_target.role,
-            allow_direct_worker=bool(getattr(args, "allow_direct_worker", False)),
+            allow_direct_worker=allow_direct_worker,
             worker_provider=worker_provider,
+            gateway_provider=gateway_provider,
+            # Redmine #13681 W3 + R1 F2/F3 (j#77247): zero-send ANY delivery to a lane the
+            # lifecycle authority marks non-active (superseded / hibernated / retired), and
+            # fail closed when that authority is unreadable. An owner-unbound lane (no row)
+            # resolves to (None, False) and stays byte-invariant.
+            target_lane_disposition=target_disposition,
+            target_lane_lifecycle_unreadable=target_lifecycle_unreadable,
         )
     )
     if decision.is_blocked:

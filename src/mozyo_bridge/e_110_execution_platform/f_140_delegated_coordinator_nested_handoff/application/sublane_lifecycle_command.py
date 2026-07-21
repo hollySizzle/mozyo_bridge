@@ -37,22 +37,23 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (
+    decide_create_launch,
+    default_nongit_worktree_request,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (
-    LaunchPreflight,
     RetirePreflight,
     SublaneIntegrationPolicy,
     decide_retire_integration,
-    decide_worktree_launch,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     CREATE_BLOCKED,
@@ -90,6 +91,15 @@ class SublaneLifecycleOps(Protocol):
     probe cannot answer — unknown never fabricates a hint). There is intentionally no
     create / remove / merge / pane-kill method — the actuating half of the lifecycle
     is gated (worktree-lifecycle-boundary.md).
+
+    Optional capability (Redmine #13432, mirroring the #13392 actuator port): an adapter
+    MAY additionally provide ``canonical_workspace_root() -> str`` — the workspace root the
+    command runs in. :class:`SublaneCreateUseCase` reads it (via ``getattr`` through the
+    shared :func:`resolve_lane_runtime_root`) to default a non-git lane's omitted
+    ``--worktree`` to the workspace root (the lane runtime root a directory-scaffold lane
+    collapses to). Discovered via ``getattr`` and deliberately NOT part of this protocol so
+    existing adapters / test fakes that only drive the Git path stay conformant (they fall
+    back to leaving the omitted worktree blank, which a non-git plan does not require).
     """
 
     def pane_rows(self) -> list[dict[str, str]]: ...
@@ -115,6 +125,12 @@ class LiveSublaneLifecycleOps:
 
     def _git(self) -> LiveSublaneGitOperations:
         return LiveSublaneGitOperations(repo_root=self.repo_root)
+
+    def canonical_workspace_root(self) -> str:
+        # #13432 (mirrors the #13392 actuator adapter): the workspace root the command runs
+        # in — the lane runtime root of a non-git (skip_no_git) lane, which has no worktree
+        # and runs here, so an omitted `--worktree` defaults to it.
+        return str(self.repo_root)
 
     def pane_rows(self) -> list[dict[str, str]]:
         # Imported lazily so the pure use cases / tests never require the tmux
@@ -200,14 +216,27 @@ class RetireAssertions:
     These mirror the #12604 :class:`RetireInvariants`: facts no probe can infer, supplied
     by the coordinator from the Redmine issue / journal state. Every default is the
     unsatisfied (safe-failing) value, so a caller that omits a flag fails closed.
+
+    Redmine #13602 (Design Consultation j#76403, Option A): there is deliberately no
+    ``owner_approval_present`` assertion / ``--owner-approved`` flag — routine
+    green-preflight retirement is coordinator authority. ``issue_closed`` abstracts over the
+    close contract that applied to the issue type (a child Task/Test/Bug via ``task_close``
+    with no owner_close_approval; a US / standalone issue via an owner_close_approval-backed
+    close — central preset ``US-Level Audit Model``); retire never re-collects the owner
+    close approval. An outstanding owner-approval-waiting still blocks via
+    ``callbacks_drained``.
     """
 
     issue_closed: bool = False
-    owner_approval_present: bool = False
     callbacks_drained: bool = False
     verification_passed: bool = False
     durable_record_recorded: bool = False
     target_identity_known: bool = False
+    #: The latest review generation is admissible for integration (#13518 review R2-F7 / R3-F2).
+    #: FAIL-CLOSED default: the actual `sublane retire` integration decision no longer default-admits
+    #: a stale last-write-wins approval — the coordinator must positively assert (from the durable
+    #: review journals) OR the CLI must measure it via `evaluate_integration_admissible`.
+    latest_generation_admissible: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -316,30 +345,25 @@ class SublaneCreateUseCase:
     policy: SublaneIntegrationPolicy = SublaneIntegrationPolicy.default()
 
     def run(self, request: SublaneCreateRequest) -> SublaneCreateOutcome:
-        # A missing identity field short-circuits before any git probe (fail-closed).
-        if request.missing_fields():
-            plan = plan_sublane_create(
-                request,
-                decide_worktree_launch(
-                    self.policy, LaunchPreflight(is_git_workspace=False)
-                ),
-            )
-            return SublaneCreateOutcome(plan=plan)
+        # #13432: in a non-git (directory-scaffold) workspace the lane has no worktree —
+        # `--branch` / `--worktree` are optional there — and an omitted `--worktree`
+        # defaults to the workspace root (the #13392 論点1 lane runtime root), so the plan /
+        # dispatch carry the root the lane actually runs in. A Git workspace keeps the full
+        # identity requirement, so a missing field still fails closed in
+        # plan_sublane_create (byte-invariant contract). The probed git-ness is passed
+        # explicitly to plan_sublane_create so the identity relaxation tracks the real
+        # workspace, not the launch-action token — an operator `manage_worktree: false`
+        # opt-out collapses the launch action to LAUNCH_SKIP_DISABLED before the non-git
+        # branch, and inferring git-ness from that token would wrongly re-require the Git
+        # identity and diverge from the actuator's resolve_create_identity path (Review
+        # #13432 j#74285 finding 1). The shared decide_create_launch re-probes git for the
+        # launch action.
         is_git = self.ops.is_git_workspace()
-        identity_known = bool(request.branch) and bool(request.worktree_path)
-        worktree_exists = (
-            self.ops.worktree_exists(request.branch)
-            if is_git and identity_known
-            else False
+        request = default_nongit_worktree_request(self.ops, request, is_git)
+        decision = decide_create_launch(self.ops, request, self.policy)
+        return SublaneCreateOutcome(
+            plan=plan_sublane_create(request, decision, is_git=is_git)
         )
-        preflight = LaunchPreflight(
-            is_git_workspace=is_git,
-            worktree_exists=worktree_exists,
-            branch_resolved=bool(request.branch),
-            target_identity_known=identity_known,
-        )
-        decision = decide_worktree_launch(self.policy, preflight)
-        return SublaneCreateOutcome(plan=plan_sublane_create(request, decision))
 
 
 @dataclass
@@ -391,9 +415,9 @@ class SublaneRetireUseCase:
             target_identity_known=assertions.target_identity_known,
             verification_passed=assertions.verification_passed,
             issue_closed=assertions.issue_closed,
-            owner_approval_present=assertions.owner_approval_present,
             callbacks_drained=assertions.callbacks_drained,
             durable_record_recorded=assertions.durable_record_recorded,
+            latest_generation_admissible=assertions.latest_generation_admissible,
         )
         decision = decide_retire_integration(policy, preflight)
         result = preflight_sublane_retire(
@@ -609,14 +633,92 @@ def cmd_sublane_create(args: argparse.Namespace) -> int:
     return 1 if outcome.plan.status == CREATE_BLOCKED else 0
 
 
+def _resolve_latest_generation_admissible(args: argparse.Namespace) -> bool:
+    """Resolve the latest-generation integration admissibility for a retire (#13518 R3-F2).
+
+    Priority: (1) a coordinator-supplied durable review observation (``--review-generation-json``)
+    is MEASURED at action-time through the pure review-generation fence
+    (:func:`...review_generation.evaluate_integration_admissible`) — an unreadable / malformed file
+    or an inadmissible latest generation fails closed. (2) Otherwise the operator's durable-record
+    assertion (``--latest-generation-admissible``). (3) Absent both, ``False`` (fail-closed) — the
+    actual integration decision never default-admits a stale last-write-wins approval.
+    """
+    path = (getattr(args, "review_generation_json", None) or "").strip()
+    if path:
+        try:
+            import json
+
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_generation import (  # noqa: E501
+                ReviewDecision,
+                ReviewGeneration,
+                evaluate_integration_admissible,
+            )
+
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+            gen = ReviewGeneration(
+                issue=str(raw.get("issue", "")),
+                review_request_journal=str(raw.get("review_request_journal", "")),
+                target_head=str(raw.get("target_head", "")),
+            )
+            decisions = [
+                ReviewDecision(
+                    generation=ReviewGeneration(
+                        issue=str(d.get("issue", raw.get("issue", ""))),
+                        review_request_journal=str(
+                            d.get("review_request_journal", raw.get("review_request_journal", ""))
+                        ),
+                        target_head=str(d.get("target_head", raw.get("target_head", ""))),
+                    ),
+                    kind=str(d.get("kind", "")),
+                    seq=int(d.get("seq", 0)),
+                    blocking=bool(d.get("blocking", False)),
+                    disposition=str(d.get("disposition", "unresolved")),
+                    journal_id=str(d.get("journal_id", "")),
+                )
+                for d in (raw.get("decisions") or [])
+            ]
+            return bool(evaluate_integration_admissible(gen, decisions).admissible)
+        except Exception:  # noqa: BLE001 - unreadable / malformed durable observation -> fail closed
+            return False
+    return bool(getattr(args, "latest_generation_admissible", False))
+
+
 def cmd_sublane_retire(args: argparse.Namespace) -> int:
+    # Redmine #13841 review j#79150 finding 3 + #13842 + #13845: --execute (guarded pane
+    # close), --migrate-hibernated-legacy (metadata-only empty-binding live-zero migration),
+    # --reconcile-hibernated-live (bounded live-pair reconcile), and --retire-hibernated-bound
+    # (metadata-only bound live-zero terminal retire) are conflicting destructive intents.
+    # Reject any combination as a zero-write failure rather than silently resolving to one —
+    # the help promises they are mutually exclusive, and nothing (no preflight, no actuation)
+    # runs here.
+    _intents = [
+        name
+        for name, flag in (
+            ("--execute", "execute"),
+            ("--migrate-hibernated-legacy", "migrate_hibernated_legacy"),
+            ("--reconcile-hibernated-live", "reconcile_hibernated_live"),
+            ("--retire-hibernated-bound", "retire_hibernated_bound"),
+        )
+        if getattr(args, flag, False)
+    ]
+    if len(_intents) > 1:
+        print(
+            "error: " + ", ".join(_intents) + " are mutually exclusive "
+            "(each is a distinct retire intent); pass exactly one",
+            file=sys.stderr,
+        )
+        return 1
     assertions = RetireAssertions(
         issue_closed=bool(getattr(args, "issue_closed", False)),
-        owner_approval_present=bool(getattr(args, "owner_approved", False)),
         callbacks_drained=bool(getattr(args, "callbacks_drained", False)),
         verification_passed=bool(getattr(args, "verified", False)),
         durable_record_recorded=bool(getattr(args, "durable_record", False)),
         target_identity_known=bool(getattr(args, "target_identity_known", False)),
+        # #13518 R3-F2: when a durable review observation is supplied, MEASURE latest-generation
+        # admissibility at action-time via the review-generation fence (unreadable / malformed ->
+        # fail-closed). Otherwise fall back to the operator's durable-record assertion. Absent both
+        # the fence stays fail-closed (False), so the actual integration never default-admits.
+        latest_generation_admissible=_resolve_latest_generation_admissible(args),
     )
     repo_root = _repo_root(args)
     # Redmine #13331 review j#73338: probe the TARGET lane worktree's dirty state (the
@@ -649,123 +751,165 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     # the lane workspace's managed gateway/worker agents. Never removes a worktree / deletes
     # a branch (still runbook per worktree-lifecycle-boundary.md); never touches a foreign
     # agent. The default (no --execute) path is byte-for-byte the preflight-only behaviour.
+    #
+    # Redmine #13841: --migrate-hibernated-legacy is the metadata-only path for a hibernated /
+    # released LEGACY row (empty worktree binding) the guarded close can never retire (it blocks
+    # forever on worktree_binding_unverified) and #13809 backfill does not cover (active-row
+    # only). It launches / closes / resumes NO process. It and --execute are conflicting
+    # destructive intents, so passing both is rejected up front (review j#79150 finding 3, the
+    # guard at the top of this handler) — the branch below runs the migration in the exclusive
+    # case where only --migrate-hibernated-legacy is set, and never the guarded close.
     close_result = None
-    if getattr(args, "execute", False) and outcome.preflight.may_retire:
-        close_result = _maybe_herdr_retire_close(args, repo_root)
+    migration_result = None
+    reconcile_result = None
+    bound_retire_result = None
+    if getattr(args, "migrate_hibernated_legacy", False):
+        if outcome.preflight.may_retire:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_legacy_retire import (  # noqa: E501
+                run_hibernated_legacy_retire_migration,
+            )
+
+            # Head integration is an action-time invariant the retire preflight (run with
+            # merge_on_retire=False) does not check: probe --branch's ancestry into
+            # --integration-branch read-only. Unknown / non-ancestor fails closed downstream.
+            ops = LiveSublaneLifecycleOps(repo_root=repo_root)
+            head_integrated = ops.branch_integrated(
+                getattr(args, "branch", None) or "",
+                getattr(args, "integration_branch", None) or "",
+            )
+            # The --worktree's ACTUAL checked-out branch (review j#79150 finding 1): the
+            # migration requires it to equal --branch, so the clean + integrated evidence
+            # describes the worktree's real head and not an unrelated branch name.
+            worktree_branch = (
+                ops.branch_for(worktree) if worktree else None
+            )
+            migration_result = run_hibernated_legacy_retire_migration(
+                args,
+                repo_root,
+                head_integrated=head_integrated,
+                worktree_branch=worktree_branch,
+            )
+    elif getattr(args, "reconcile_hibernated_live", False):
+        # Redmine #13842: the bounded live-pair reconcile for a hibernated / released legacy
+        # row whose exact managed pair is live (the #13756 contradiction). Like the migration
+        # it runs only when the preflight permits retirement (so the callback / review
+        # obligations block upstream); unlike it, it verifies the exact live pair and hands off
+        # to the #13754 guarded close. Never runs the plain guarded close below.
+        if outcome.preflight.may_retire:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_live_reconcile import (  # noqa: E501
+                run_hibernated_live_reconcile,
+            )
+
+            ops = LiveSublaneLifecycleOps(repo_root=repo_root)
+            head_integrated = ops.branch_integrated(
+                getattr(args, "branch", None) or "",
+                getattr(args, "integration_branch", None) or "",
+            )
+            worktree_branch = ops.branch_for(worktree) if worktree else None
+            reconcile_result = run_hibernated_live_reconcile(
+                args,
+                repo_root,
+                head_integrated=head_integrated,
+                worktree_branch=worktree_branch,
+            )
+    elif getattr(args, "retire_hibernated_bound", False):
+        # Redmine #13845: the metadata-only TERMINAL retire for a hibernated / released BOUND
+        # row whose live pair is already gone (#13810 j#79416). The #13754 guarded close leaves
+        # it a permanent `zero_close_unproven` (there is nothing to close, yet the durable row
+        # is not `retired`), and the #13841 migration / #13842 reconcile both refuse it because
+        # they require an EMPTY worktree binding. Like them it runs only when the preflight
+        # permits retirement (so the callback / review obligations block upstream), and it
+        # launches / closes / resumes NO process. Never runs the plain guarded close below.
+        if outcome.preflight.may_retire:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_retire import (  # noqa: E501
+                run_hibernated_bound_retire,
+            )
+
+            ops = LiveSublaneLifecycleOps(repo_root=repo_root)
+            head_integrated = ops.branch_integrated(
+                getattr(args, "branch", None) or "",
+                getattr(args, "integration_branch", None) or "",
+            )
+            worktree_branch = ops.branch_for(worktree) if worktree else None
+            # Redmine #14066 review j#82298 F2: the literal-ancestor path must stay byte-identical
+            # to #13845 — NO file IO / git probe / Redmine read / exception surface added. So the
+            # patch-equivalent resolver is only imported AND called when the literal ancestry
+            # probe did NOT pass. When --branch is a literal ancestor (head_integrated is True) the
+            # resolver is never constructed and the retire runs exactly as before. On the
+            # non-literal path the resolver fresh-reads the exact Redmine integration journal
+            # (credential-gated authority) and recomputes patch-ids / origin reachability; ``None``
+            # means no integration journal was supplied (the retire keeps its literal
+            # ``head_not_integrated``), and every read / probe / fence failure is fail-closed.
+            patch_equivalent = None
+            if head_integrated is not True:
+                from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_patch_equivalent_integration import (  # noqa: E501
+                    resolve_patch_equivalent_integration,
+                )
+
+                patch_equivalent = resolve_patch_equivalent_integration(args, repo_root)
+            bound_retire_result = run_hibernated_bound_retire(
+                args,
+                repo_root,
+                head_integrated=head_integrated,
+                worktree_branch=worktree_branch,
+                patch_equivalent=patch_equivalent,
+            )
+    elif getattr(args, "execute", False) and outcome.preflight.may_retire:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E501
+            run_guarded_retire_close,
+        )
+
+        close_result = run_guarded_retire_close(args, repo_root)
     payload = outcome.as_payload()
+    # Redmine #13754: the ACTUATION verdict — not the preflight — decides whether the lane
+    # was actually retired. ``decision.state: retire_ok`` says the retire was *permitted*;
+    # reading it as "the pair is gone" is exactly the #13748 j#77473 misread (empty close,
+    # exit 0, pair still live). Under --execute / --migrate-hibernated-legacy the command's
+    # success is the conjunction of the preflight AND the actuation / migration verdict,
+    # surfaced as one unambiguous ``retire_ok`` and in the exit code.
+    actuated_ok = True
     if close_result is not None:
         payload["herdr_retire_close"] = close_result.as_payload()
+        actuated_ok = close_result.ok
+    if migration_result is not None:
+        payload["hibernated_legacy_retire_migration"] = migration_result.as_payload()
+        actuated_ok = migration_result.ok
+    if reconcile_result is not None:
+        payload["hibernated_live_reconcile"] = reconcile_result.as_payload()
+        actuated_ok = reconcile_result.ok
+    if bound_retire_result is not None:
+        payload["hibernated_bound_retire"] = bound_retire_result.as_payload()
+        actuated_ok = bound_retire_result.ok
+    payload["retire_ok"] = bool(outcome.preflight.may_retire and actuated_ok)
     if getattr(args, "json", False):
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(format_retire_text(outcome, worktree_path=worktree))
         if close_result is not None:
-            print(_format_herdr_close_text(close_result))
-    return 0 if outcome.preflight.may_retire else 1
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E501
+                format_retire_close_text,
+            )
 
+            print(format_retire_close_text(close_result))
+        if migration_result is not None:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_legacy_retire import (  # noqa: E501
+                format_migration_text,
+            )
 
-def _maybe_herdr_retire_close(args: argparse.Namespace, repo_root: Path):
-    """Guarded herdr retire close, or ``None`` when not on the herdr backend (Redmine #13377).
+            print(format_migration_text(migration_result))
+        if reconcile_result is not None:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_live_reconcile import (  # noqa: E501
+                format_reconcile_text,
+            )
 
-    Resolves the lane's unit from the ``--worktree`` anchor — the shared project
-    workspace segment + the requested ``--lane-label`` (design j#73613), plus the legacy
-    pre-#13377 per-lane ``wt_<hash>`` twin — plans the managed-slot close from the live
-    herdr inventory, and executes it. The close never touches the project workspace, the
-    default-lane coordinator pair, or another lane's slots. Fail-safe: a missing
-    ``--worktree`` / unresolvable unit / unavailable inventory yields a result with no
-    close targets (recorded), never a crash and never a foreign close.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-        list_herdr_agent_rows,
-        repo_backend_is_herdr,
-    )
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
-        HerdrRetireCloseResult,
-        execute_herdr_retire_close,
-        plan_herdr_retire_close,
-    )
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
-        HerdrSessionStartError,
-        herdr_workspace_segment,
-    )
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-        derive_directory_lane_token,
-        derive_lane_workspace_token,
-    )
+            print(format_reconcile_text(reconcile_result))
+        if bound_retire_result is not None:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_retire import (  # noqa: E501
+                format_bound_retire_text,
+            )
 
-    if not repo_backend_is_herdr(repo_root):
-        return None
-    worktree = getattr(args, "worktree", None)
-    lane_label = (getattr(args, "lane_label", "") or "").strip()
-    if not worktree:
-        return HerdrRetireCloseResult(workspace_id="", lane_id=lane_label)
-    # Resolve the lane's unit through the shared resolver: the worktree inherits the
-    # project workspace identity (#13377), and its stable path token names the legacy
-    # pre-#13377 per-lane workspace (compatibility close) plus the metadata tombstone key.
-    try:
-        resolved_worktree = Path(worktree).expanduser().resolve()
-        workspace_id = herdr_workspace_segment(resolved_worktree)
-    except (OSError, ValueError):
-        return HerdrRetireCloseResult(workspace_id="", lane_id=lane_label)
-    # #13392: a non-git (directory scaffold) lane runs in the workspace root itself — the
-    # ``--worktree`` anchor collapses to the workspace root (== ``repo_root``), exactly as
-    # the create site collapsed it. Such a lane has no ``wt_<hash>`` per-lane workspace
-    # twin, and its metadata record is keyed on the lane-scoped ``dl_`` token (matching the
-    # non-git create site). A Git lane's distinct worktree keeps the path-derived ``wt_``
-    # token both as the legacy twin and as the tombstone key.
-    try:
-        collapsed_to_root = resolved_worktree == repo_root.expanduser().resolve()
-    except OSError:
-        collapsed_to_root = False
-    if collapsed_to_root:
-        legacy_token = ""
-        metadata_token = derive_directory_lane_token(str(resolved_worktree), lane_label)
-    else:
-        legacy_token = derive_lane_workspace_token(str(resolved_worktree))
-        metadata_token = legacy_token
-    if not workspace_id and not legacy_token:
-        return HerdrRetireCloseResult(workspace_id="", lane_id=lane_label)
-    try:
-        rows = list_herdr_agent_rows(os.environ)
-    except HerdrSessionStartError:
-        return HerdrRetireCloseResult(workspace_id=workspace_id, lane_id=lane_label)
-    plan = plan_herdr_retire_close(
-        rows,
-        workspace_id=workspace_id,
-        lane_id=lane_label,
-        legacy_workspace_id=legacy_token,
-    )
-    result = execute_herdr_retire_close(plan)
-    # Best-effort lane metadata tombstone (Redmine #13356 j#73386 Q2): the retire
-    # command boundary marks the lane's display-metadata record `retired` (kept as
-    # a tombstone for late label resolution / residue diagnosis, never deleted
-    # here). The record key is the same key the matching create site upsert on
-    # (the ``wt_`` path token for a Git lane, the ``dl_`` lane-scoped token for a
-    # non-git one). Never raises; an unrecorded lane simply stays unrecorded.
-    from mozyo_bridge.core.state.lane_metadata import record_lane_retired
-
-    record_lane_retired(metadata_token)
-    return result
-
-
-def _format_herdr_close_text(result) -> str:
-    unit = result.workspace_id or "<unresolved>"
-    if getattr(result, "lane_id", ""):
-        unit = f"{unit} lane={result.lane_id}"
-    lines = [f"  herdr retire close: workspace={unit}"]
-    if not result.closed and not result.failed:
-        lines.append("    - no managed lane agents to close (already retired / absent)")
-    for role, locator in result.closed:
-        lines.append(f"    - closed {role} {locator}")
-    for role, locator, detail in result.failed:
-        lines.append(f"    ! close failed {role} {locator}: {detail}")
-    if result.foreign_names:
-        lines.append(
-            "    (lane unit also has non-managed agents, recorded and never closed: "
-            + ", ".join(result.foreign_names)
-            + ")"
-        )
-    return "\n".join(lines)
+            print(format_bound_retire_text(bound_retire_result))
+    return 0 if (outcome.preflight.may_retire and actuated_ok) else 1
 
 
 __all__ = (

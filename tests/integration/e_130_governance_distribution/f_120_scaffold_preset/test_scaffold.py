@@ -1475,6 +1475,14 @@ class ScaffoldRulesTest(unittest.TestCase):
         import subprocess
         import venv as _venv
 
+        from tests.support.nested_python import hermetic_python_env
+
+        # Everything that touches the venv runs without the caller's PYTHONPATH:
+        # an inherited `src/` entry makes pip see this same version as already
+        # importable and skip the install (exit 0, no console script), which would
+        # silently hollow out every assertion below (Redmine #13735 j#78390 F1).
+        nested_env = hermetic_python_env()
+
         repo_root = Path(__file__).resolve().parents[4]
         with tempfile.TemporaryDirectory() as tmp:
             dist = Path(tmp) / "dist"
@@ -1510,6 +1518,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 [str(venv_python), "-m", "pip", "install", "-q", str(wheels[0])],
                 capture_output=True,
                 text=True,
+                env=nested_env,
             )
             if install_proc.returncode != 0:
                 self.skipTest(
@@ -1526,6 +1535,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 [str(venv_bin), "rules", "install", "--home", str(home_dir)],
                 capture_output=True,
                 text=True,
+                env=nested_env,
             )
             self.assertEqual(
                 0,
@@ -1549,6 +1559,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                env=nested_env,
             )
             self.assertEqual(
                 0,
@@ -1613,6 +1624,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
+                env=nested_env,
             )
             self.assertEqual(
                 0,

@@ -84,60 +84,106 @@ class DocsAuditImpactDirtyFileTest(unittest.TestCase):
             stderr=subprocess.DEVNULL,
         )
 
-    def test_audit_impact_returns_clean_on_unrelated_dirty_file_when_generated_check_passes(
-        self,
-    ) -> None:
+    def _bring_up_governed_repo(self, tmp: str) -> Path:
+        """Governed scaffold + live catalog + clean generated file + git repo.
+
+        Shared by the dirty-file and staged-file gates below so both drive
+        the identical real-scaffold workspace.
+        """
         import shutil as _shutil
 
+        home = Path(tmp) / "home"
+        project = Path(tmp) / "project"
+        project.mkdir()
+
+        # Bring up a governed scaffold so the catalog skeleton ships.
+        self._run_cli(["rules", "install", "--home", str(home)])
+        self._run_cli(
+            [
+                "scaffold",
+                "apply",
+                "redmine-governed",
+                "--target",
+                str(project),
+                "--home",
+                str(home),
+            ]
+        )
+        # The skeleton is the safe minimal catalog to drive resolver +
+        # generator against; we promote it to the live catalog as the
+        # docs `## Quick Start` invocation does.
+        example = project / ".mozyo-bridge" / "docs" / "catalog.yaml.example"
+        catalog = project / ".mozyo-bridge" / "docs" / "catalog.yaml"
+        _shutil.copyfile(example, catalog)
+
+        # Regenerate the generated file so the drift check is clean on
+        # the first audit-impact call. Without this the test would
+        # measure missing-output behavior instead of the dirty-file
+        # interaction.
+        gen_code, _ = self._run_cli(
+            [
+                "docs",
+                "generate-file-conventions",
+                "--repo",
+                str(project),
+            ]
+        )
+        self.assertEqual(0, gen_code)
+
+        # Initialize a git repo so `audit_doc_impact` can read the
+        # all-changed listing via `git ls-files --others --exclude-standard`.
+        self._run_git(project, "init", "--initial-branch=main")
+        self._run_git(project, "config", "user.email", "test@example.invalid")
+        self._run_git(project, "config", "user.name", "Test")
+        # Commit the scaffold so subsequent untracked files are the
+        # only unstaged work; otherwise every scaffold file would
+        # also report and noise the assertion.
+        self._run_git(project, "add", ".")
+        self._run_git(project, "commit", "-m", "scaffold")
+        return project
+
+    def test_audit_impact_all_changed_surfaces_staged_paths_with_check_generated(
+        self,
+    ) -> None:
+        """`--all-changed --check-generated` must audit the complete set.
+
+        Redmine #13919: `--all-changed` read unstaged + untracked only, so a
+        worktree whose work was fully staged — the state an operator is in at
+        the pre-commit gate — reported "No changed paths." and exited 0. The
+        `--check-generated` trailer stayed clean too, so the whole gate read
+        as a pass. Exit 0 alone therefore proves nothing here; the assertion
+        is on the path actually being surfaced.
+        """
         with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp) / "home"
-            project = Path(tmp) / "project"
-            project.mkdir()
+            project = self._bring_up_governed_repo(tmp)
 
-            # Bring up a governed scaffold so the catalog skeleton ships.
-            self._run_cli(["rules", "install", "--home", str(home)])
-            self._run_cli(
-                [
-                    "scaffold",
-                    "apply",
-                    "redmine-governed",
-                    "--target",
-                    str(project),
-                    "--home",
-                    str(home),
-                ]
-            )
-            # The skeleton is the safe minimal catalog to drive resolver +
-            # generator against; we promote it to the live catalog as the
-            # docs `## Quick Start` invocation does.
-            example = project / ".mozyo-bridge" / "docs" / "catalog.yaml.example"
-            catalog = project / ".mozyo-bridge" / "docs" / "catalog.yaml"
-            _shutil.copyfile(example, catalog)
+            staged = project / "staged_notes.txt"
+            staged.write_text("staged work\n", encoding="utf-8")
+            self._run_git(project, "add", "staged_notes.txt")
 
-            # Regenerate the generated file so the drift check is clean on
-            # the first audit-impact call. Without this the test would
-            # measure missing-output behavior instead of the dirty-file
-            # interaction.
-            gen_code, _ = self._run_cli(
+            code, output = self._run_cli(
                 [
                     "docs",
-                    "generate-file-conventions",
+                    "audit-impact",
+                    "--all-changed",
+                    "--check-generated",
                     "--repo",
                     str(project),
                 ]
             )
-            self.assertEqual(0, gen_code)
 
-            # Initialize a git repo so `audit_doc_impact` can read the
-            # all-changed listing via `git ls-files --others --exclude-standard`.
-            self._run_git(project, "init", "--initial-branch=main")
-            self._run_git(project, "config", "user.email", "test@example.invalid")
-            self._run_git(project, "config", "user.name", "Test")
-            # Commit the scaffold so subsequent untracked files are the
-            # only unstaged work; otherwise every scaffold file would
-            # also report and noise the assertion.
-            self._run_git(project, "add", ".")
-            self._run_git(project, "commit", "-m", "scaffold")
+            self.assertEqual(0, code, msg=output)
+            self.assertIn("[staged_notes.txt]", output)
+            # The pre-fix failure mode verbatim: a fully staged worktree
+            # reported as an empty one.
+            self.assertNotIn("No changed paths.", output)
+            self.assertIn("is up to date", output)
+
+    def test_audit_impact_returns_clean_on_unrelated_dirty_file_when_generated_check_passes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._bring_up_governed_repo(tmp)
 
             # Drop an unrelated dirty file. It is intentionally outside
             # every governed-preset file_convention so the resolver

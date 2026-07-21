@@ -179,11 +179,20 @@ class BoundaryPrompt:
     prompt to surface. ``repo_pointer`` is a **portable** identifier (canonical
     session name / workspace id), never an absolute path; the absolute repo
     root and execution-root workdir live only in the structured outcome.
+
+    ``issue_subject`` and ``issue_role`` are required, non-empty fields
+    (Redmine #13479). The subject lets the prompt render ``#<id> <short
+    subject>`` instead of a bare id, and the role states what the issue *is*
+    (e.g. smoke本番 / pre-smoke再検証 / metadata cleanup / operator decision) so a
+    fresh session cannot misread a Test / cleanup / readiness issue as its
+    production counterpart. Empty / whitespace values fail closed.
     """
 
     issue: str
     journal: str
     repo_pointer: str
+    issue_subject: str
+    issue_role: str
     parent_issue: Optional[str] = None
     commit: Optional[str] = None
     target_lane: Optional[str] = None
@@ -200,6 +209,18 @@ class BoundaryPrompt:
             raise SessionBoundaryError(
                 "boundary prompt requires both issue and journal (the durable "
                 "anchor)"
+            )
+        if not self.issue_subject or not self.issue_subject.strip():
+            raise SessionBoundaryError(
+                "boundary prompt requires a non-empty issue_subject so the "
+                "prompt reads `#<id> <short subject>`, not a bare id "
+                "(Redmine #13479)"
+            )
+        if not self.issue_role or not self.issue_role.strip():
+            raise SessionBoundaryError(
+                "boundary prompt requires a non-empty issue_role so a fresh "
+                "session cannot misread the issue's purpose (e.g. Test vs "
+                "production) (Redmine #13479)"
             )
         _reject_absolute(self.repo_pointer, "repo_pointer")
         if self.next_actor is not None and self.next_actor not in NEXT_ACTORS:
@@ -234,8 +255,9 @@ def build_boundary_prompt(prompt: BoundaryPrompt) -> str:
             "pointer, not a new authority."
         ),
         "",
-        f"- Ticket: `#{prompt.issue}`"
+        f"- Ticket: `#{prompt.issue} {prompt.issue_subject.strip()}`"
         + (f" (parent US `#{prompt.parent_issue}`)" if prompt.parent_issue else ""),
+        f"- Role: {prompt.issue_role.strip()}",
         f"- Durable anchor: `{anchor}`",
         f"- Repo: `{prompt.repo_pointer}` (portable identifier; resolve the "
         "checkout from the workspace registry, not from pane location)",

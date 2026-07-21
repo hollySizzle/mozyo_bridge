@@ -67,8 +67,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
-    REASON_BINARY_NOT_FOUND,
-    REASON_BINARY_UNCONFIGURED,
     TerminalTransportConfig,
     TerminalTransportError,
     valid_target,
@@ -85,11 +83,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     HerdrCliAgentStateReader,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
-    HERDR_BINARY_ENV,
     Runner,
     HerdrCliTransport,
     _bounded_detail,
-    _resolve_binary,
+    resolve_herdr_binary,
 )
 
 #: The outer ``communicate`` timeout margin (seconds) added on top of the herdr
@@ -276,9 +273,9 @@ def _resolve_herdr_binary(
     """Resolve the trusted-env herdr binary for ``config``, or ``None`` (off).
 
     Rides on exactly the same default-off backend selection and trusted-environment
-    binary resolution (:func:`_resolve_binary`, :data:`HERDR_BINARY_ENV`) as the
-    #13245 / #13246 resolvers, so the wired rail's three providers never point at
-    different binaries. Fail-closed: an unconfigured or unresolvable binary raises
+    binary resolution (:func:`resolve_herdr_binary`) as the #13245 / #13246
+    resolvers, so the wired rail's three providers never point at different
+    binaries. Fail-closed: an unconfigured or unresolvable binary raises
     :class:`TerminalTransportError` (no silent fallback to tmux).
     """
     if config is None:
@@ -286,24 +283,7 @@ def _resolve_herdr_binary(
     if not config.herdr_enabled:
         return None
     source_env = env if env is not None else os.environ
-    raw = source_env.get(HERDR_BINARY_ENV)
-    binary = raw.strip() if isinstance(raw, str) else ""
-    if not binary:
-        raise TerminalTransportError(
-            f"terminal transport backend 'herdr' is selected but no herdr binary "
-            f"is configured in the trusted environment ({HERDR_BINARY_ENV}); refusing "
-            f"to fall back to tmux",
-            reason=REASON_BINARY_UNCONFIGURED,
-        )
-    resolved = _resolve_binary(binary, source_env)
-    if resolved is None:
-        raise TerminalTransportError(
-            f"herdr binary {binary!r} (from {HERDR_BINARY_ENV}) was not found as an "
-            f"executable file or on the trusted environment PATH; refusing to fall "
-            f"back to tmux",
-            reason=REASON_BINARY_NOT_FOUND,
-        )
-    return resolved
+    return resolve_herdr_binary(source_env).path
 
 
 def resolve_turn_start_rail(

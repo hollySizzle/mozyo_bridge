@@ -53,6 +53,31 @@ class SelectedTarget:
     selection: TargetSelection
 
 
+def _herdr_backend_selection_hint(repo_root: Optional[str]) -> str:
+    """A ``herdr backend active`` guidance clause for a failed semantic selection (#13446).
+
+    ``handoff send --select`` / ``message --select-role`` narrow over the tmux discovery
+    pool; under ``terminal_transport.backend: herdr`` that pool is empty (no tmux panes),
+    so the pure selector fails closed with a tmux-shaped ``no_candidate:repo`` — the exact
+    #13435 j#74176 -> j#74177 recurrence where the coordinator reached for tmux selection
+    while the herdr workspace's agents were live. When the resolved repo selects the herdr
+    backend, prepend the shared ``herdr backend active`` marker + standard-dispatch hint so
+    the operator is pointed at ``sublane create --execute`` / ``--target-lane`` instead of
+    left with a tmux diagnostic. Returns ``""`` (no change) under the tmux backend or when
+    no repo identity is resolvable, keeping the tmux-backend message byte-identical.
+    """
+    if not repo_root:
+        return ""
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_entrypoint_preflight import (
+        herdr_backend_active,
+        herdr_backend_guidance,
+    )
+
+    if not herdr_backend_active(Path(repo_root)):
+        return ""
+    return herdr_backend_guidance() + " "
+
+
 def discover_all_candidates() -> list[TargetCandidate]:
     """Discover every classified target candidate (no role/session pre-filter).
 
@@ -141,13 +166,38 @@ def select_semantic_target(
         project_scope=project,
         sender_repo_root=sender_repo_root,
     )
-    selection = select_target(pool, query, normalize=normalize_path_unicode)
+    # The cross-workspace worker-direct refusal keys on the binding-resolved implementer
+    # (worker) provider (Redmine #13569 R1-F5), so a rebound worker is still refused across
+    # a workspace boundary — the live path must thread the binding, never let the pure
+    # selector fall back to the literal `claude` default. Resolved from the sender's own
+    # repo-local binding (default `claude`, byte-identical); an unbound implementer fails
+    # closed with no send.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+        WorkflowProviderUnresolved,
+        resolve_worker_provider,
+    )
+
+    try:
+        # The cross-workspace worker-direct refusal keys on whether the CANDIDATE (which
+        # lives in the TARGET workspace) is that workspace's worker, so the worker provider
+        # is resolved from the TARGET repo's binding (`expected_repo`), not the sender's
+        # (Redmine #13569 R2-F5b). A worker rebound in the target workspace is then correctly
+        # refused for a cross-workspace direct route. `expected_repo` is non-None here (the
+        # None case died above). Default `claude`, byte-identical for the built-in binding.
+        worker_provider = resolve_worker_provider(expected_repo)
+    except WorkflowProviderUnresolved as exc:
+        die(f"semantic target selection failed ({exc}); no message was sent.")
+        raise AssertionError("unreachable")
+    selection = select_target(
+        pool, query, normalize=normalize_path_unicode, worker_provider=worker_provider
+    )
     if not selection.resolved:
         print(render_selection_diagnostics(selection), file=sys.stderr)
         die(
             "semantic target selection failed "
             f"({selection.reason}); no message was sent. "
-            "Resolve the candidates above (or use an explicit `%pane` as a "
+            + _herdr_backend_selection_hint(sender_repo_root or expected_repo)
+            + "Resolve the candidates above (or use an explicit `%pane` as a "
             "debug escape hatch)."
         )
         raise AssertionError("unreachable")

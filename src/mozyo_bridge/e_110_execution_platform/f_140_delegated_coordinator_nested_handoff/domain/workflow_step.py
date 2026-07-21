@@ -119,6 +119,9 @@ PRIMITIVE_CONSULT = "project_gateway_consult"
 PRIMITIVE_CHILD_INTAKE = "project_gateway_child_intake"
 PRIMITIVE_HANDOFF_SEND = "handoff_send"
 PRIMITIVE_TICKETLESS_CALLBACK = "handoff_ticketless_callback"
+# #13489 / #13813: own reserve+send+outcome fence + a dedicated CLI leg, NOT the ``executable`` set.
+PRIMITIVE_HERDR_DISPATCH_WORKER = "herdr_dispatch_worker"
+PRIMITIVE_OPERATOR_STARTUP_RESUME = "operator_startup_resume"
 PRIMITIVE_NONE = "none"
 
 # ``state`` — the resolved workflow state token.
@@ -152,6 +155,11 @@ REASON_CALLBACK_NOT_APPLICABLE = "callback_not_applicable"
 REASON_SELF_LANE_UNRESOLVED = "self_lane_unresolved"
 REASON_LANE_ROLE_UNRESOLVED = "lane_role_unresolved"
 REASON_UNSAFE_PROVIDER_BINDING = "unsafe_provider_binding"
+# Redmine #13446: the herdr-backend counterpart of ``self_lane_unresolved``. Emitted by the
+# CLI preflight (not this pure machine) when ``terminal_transport.backend: herdr`` is active,
+# so ``workflow step`` fails closed with a herdr-specific reason + ``sublane`` next_action
+# instead of dying on the tmux ``%pane`` self-lane resolution the herdr session cannot serve.
+REASON_HERDR_SELF_LANE_UNRESOLVED = "herdr_self_lane_unresolved"
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +280,7 @@ class WorkflowStepOutcome:
     def ok(self) -> bool:
         """True when the step is forward progress (executed / ready / no_op / dry_run).
 
-        ``blocked`` is the only not-ok execution: the route could not be safely
-        advanced and the named ``next_owner`` must act.
+        ``blocked`` is the only not-ok execution: the route could not be safely advanced.
         """
         return self.execution != EXECUTION_BLOCKED
 
@@ -281,13 +288,11 @@ class WorkflowStepOutcome:
     def executable(self) -> bool:
         """True when a non-dry-run CLI run may dispatch the named primitive.
 
-        Every ``ready`` leg the design lets ``workflow step`` perform is executable:
-        the no-anchor consultation / work-intake forwards, the determined ticketless
-        callback, and the anchored worker dispatch (allowed only because the route
-        reached ``ready`` — the child lane reaches it solely when an already-available
-        Redmine anchor was supplied and a unique grandchild worker resolved). The
-        grandchild Redmine-work ``no_op`` and every ``blocked`` outcome are not
-        executable (they are the worker's / owner's / operator's action).
+        Every ``ready`` leg the design lets ``workflow step`` perform is executable: the
+        no-anchor consultation / work-intake forwards, the determined ticketless callback, and
+        the anchored worker dispatch (the child lane reaches it solely with an already-available
+        Redmine anchor + a unique grandchild worker). The grandchild ``no_op`` and every
+        ``blocked`` outcome are not; the herdr auto-dispatch leg rides its own fence, not this set.
         """
         return self.execution == EXECUTION_READY and self.primitive in (
             PRIMITIVE_CONSULT,

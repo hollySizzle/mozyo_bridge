@@ -33,6 +33,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_SKIPPED,
     REASON_ANCHOR_REQUIRED,
     REASON_HANDOFF_FAILED,
+    REASON_ADOPT_OWNER_UNBOUND,
     REASON_LANE_MISMATCH,
     REASON_MISSING_IDENTITY,
     REASON_PANE_CREATE_FAILED,
@@ -46,13 +47,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneActuationOutcome,
     render_actuation_journal,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+    SublaneIntegrationPolicy,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+    DEFAULT_UPSTREAM_COORDINATOR_ROUTE,
     SublaneCreateRequest,
     SublaneLaneView,
 )
 
 
-def _lane(*, gateway="%120", worker="%121", repo_root="/wt/12973"):
+def _lane(*, gateway="%120", worker="%121", repo_root="/wt/12973", state="active"):
     return SublaneLaneView(
         workspace_id="ws",
         lane_id="l1",
@@ -62,8 +67,17 @@ def _lane(*, gateway="%120", worker="%121", repo_root="/wt/12973"):
         repo_root=repo_root,
         gateway_pane=gateway,
         worker_pane=worker,
-        state="active",
+        state=state,
     )
+
+
+def _split_lane(**kw):
+    """A lane whose gateway/worker pair is split across tabs (Redmine #13705)."""
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+        SUBLANE_STATE_PAIR_SPLIT,
+    )
+
+    return _lane(state=SUBLANE_STATE_PAIR_SPLIT, **kw)
 
 
 class FakeActuatorOps:
@@ -82,7 +96,12 @@ class FakeActuatorOps:
         append_argv=None,
         gateway_ready=True,
         workspace_root="/ws",
+        adopt_outcome=None,
     ):
+        # Redmine #13809 R3-F3: the adopt owner-row declaration outcome this fake reports;
+        # default proceeds (a successful declaration). A test overrides it to a fail-closed
+        # status to exercise the owner-unbound dispatch block.
+        self._adopt_outcome = adopt_outcome
         self._git = git
         # #13392: the optional canonical-workspace-root capability the use case reads to
         # collapse a non-git (skip_no_git) lane's runtime root off the phantom worktree.
@@ -138,6 +157,19 @@ class FakeActuatorOps:
         if not self._lane_seq:
             return None
         return self._lane_seq.pop(0)
+
+    def declare_adopted_lane_lifecycle(self, worktree_path, *, adopted):
+        # Redmine #13809: record ONLY the real adopt-path backfill call (adopted=True), so
+        # a create (adopted=False, a no-op) leaves existing calls-list assertions unchanged.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_DECLARED,
+            ADOPT_DECL_NOT_ADOPTED,
+        )
+
+        if not adopted:
+            return ADOPT_DECL_NOT_ADOPTED
+        self.calls.append(("declare_adopted_lane_lifecycle", worktree_path))
+        return self._adopt_outcome or ADOPT_DECL_DECLARED
 
     def probe_gateway_ready(self, gateway_pane):
         self.calls.append(("probe_gateway_ready", gateway_pane))
@@ -224,12 +256,64 @@ class DryRunTests(unittest.TestCase):
 
 
 class MissingIdentityTests(unittest.TestCase):
-    def test_missing_field_blocks_before_probe(self):
+    def test_git_missing_field_fails_closed(self):
+        # #13432: a blank field triggers one git probe (to decide non-git optionality);
+        # in a Git workspace the identity requirement is unchanged, so a missing worktree
+        # still fails closed with `missing_field:worktree_path`. Only the read probe ran —
+        # no worktree/pane/dispatch mutation.
         ops = FakeActuatorOps(git=True)
         outcome = SublaneActuateUseCase(ops).run(_req(worktree_path=""), execute=True)
         self.assertEqual(outcome.status, ACTUATE_BLOCKED)
         self.assertIn(REASON_MISSING_IDENTITY, outcome.blocked_reasons)
-        self.assertEqual(ops.calls, [])  # short-circuit before any probe
+        self.assertIn("missing_field:worktree_path", outcome.blocked_reasons)
+        self.assertEqual(ops.calls, ["is_git"])  # probe only; no mutation
+
+    def test_non_git_omitted_branch_and_worktree_actuates(self):
+        # #13432: in a non-git workspace --branch/--worktree are optional; the lane has no
+        # worktree (skip_no_git) and the omitted --worktree defaults to the workspace root,
+        # so the create actuates end-to-end without operator-supplied worktree identity.
+        ops = FakeActuatorOps(
+            git=False, workspace_root="/ws", lanes=[None, _lane(repo_root="/ws")]
+        )
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(branch="", worktree_path=""), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertEqual(outcome.launch_action, "skip_no_git")
+        # the omitted worktree collapsed to the workspace root for append + dispatch.
+        self.assertEqual(outcome.worktree_path, "/ws")
+        append_paths = [c[1] for c in ops.calls if c[0] == "append_lane_column"]
+        self.assertEqual(append_paths, ["/ws"])
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(dispatch["target_repo"], "/ws")
+
+    def test_non_git_manage_worktree_false_still_actuates(self):
+        # #13432 Review j#74285 finding 1 (actuate-side parity): the omitted-identity
+        # relaxation must hold under an operator `manage_worktree: false` opt-out too. The
+        # actuator resolves identity from the probed git-ness (resolve_create_identity), so
+        # it never depended on the launch action — this pins the parity with the plan-only
+        # path, which the finding surfaced diverging under this exact policy.
+        ops = FakeActuatorOps(
+            git=False, workspace_root="/ws", lanes=[None, _lane(repo_root="/ws")]
+        )
+        policy = SublaneIntegrationPolicy(manage_worktree=False)
+        outcome = SublaneActuateUseCase(ops, policy).run(
+            _req(branch="", worktree_path=""), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertEqual(outcome.launch_action, "skip_disabled")
+        self.assertEqual(outcome.worktree_path, "/ws")
+
+    def test_non_git_still_requires_issue_and_lane_label(self):
+        # #13432: only the Git worktree identity relaxes in a non-git workspace; the lane
+        # identity (issue / lane_label) is required in every workspace.
+        ops = FakeActuatorOps(git=False, workspace_root="/ws")
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(issue="", branch="", worktree_path=""), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_MISSING_IDENTITY, outcome.blocked_reasons)
+        self.assertIn("missing_field:issue", outcome.blocked_reasons)
 
     def test_anchor_required_when_execute_dispatch_without_journal(self):
         outcome = SublaneActuateUseCase(FakeActuatorOps()).run(
@@ -246,6 +330,57 @@ class MissingIdentityTests(unittest.TestCase):
         )
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
         self.assertEqual(outcome.dispatch_result, DISPATCH_SKIPPED)
+
+
+class SenderAttestationPreflightTests(unittest.TestCase):
+    """#13518 R3-F4a → #13613: the single sender-attestation authority is the ops-level
+    ``preflight_dispatch_sender`` (which compares the sender identity to the workspace anchor /
+    registry / coordinator provider), NOT a presence-only ``sender_attested`` boolean derived from
+    a merely non-empty MOZYO_WORKSPACE_ID / MOZYO_AGENT_ROLE. A wrong-but-nonempty env therefore no
+    longer passes as attested. No presence-only second authority is retained on the use case."""
+
+    def test_failing_ops_preflight_blocks_before_actuation(self):
+        # A resolved-but-mismatched sender identity fails the ops preflight and blocks BEFORE any
+        # worktree side effect (a wrong-nonempty env would have passed the old presence-only path).
+        class MismatchedSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                return False, "sender_workspace_mismatch: resolved != anchor"
+
+        ops = MismatchedSenderOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn("sender_attestation", outcome.blocked_reasons)
+        self.assertIn("sender_workspace_mismatch", outcome.reason)
+        self.assertFalse([c for c in ops.calls if isinstance(c, tuple) and c[0] == "create_worktree"])
+
+    def test_absent_ops_preflight_is_backcompat_no_op(self):
+        # An ops port without preflight_dispatch_sender (tmux / legacy) is not gated — the #13613
+        # attestation is opt-in per the backend port, keeping existing callers byte-for-byte.
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        self.assertFalse(hasattr(ops, "preflight_dispatch_sender"))
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+
+    def test_passing_ops_preflight_proceeds(self):
+        class AttestedSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                return True, "sender_attested"
+
+        ops = AttestedSenderOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+
+    def test_no_dispatch_is_not_gated_by_sender(self):
+        # --no-dispatch creates/adopts but dispatches no worker, so the sender gate does not arm.
+        class ExplodingSenderOps(FakeActuatorOps):
+            def preflight_dispatch_sender(self):
+                raise AssertionError("create-only must not inspect dispatch sender")
+
+        ops = ExplodingSenderOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(journal=None), execute=True, dispatch=False
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 
 
 class WorkUnitGateTests(unittest.TestCase):
@@ -319,6 +454,42 @@ class ExecuteHappyPathTests(unittest.TestCase):
         # a reuse launch never calls create_worktree
         self.assertNotIn("create_worktree", ops._names())
 
+    def test_adopt_owner_unbound_blocks_before_dispatch(self):
+        # Redmine #13809 R3-F3 / R4-F3: a live adopt whose owner declaration is refused by a
+        # fail-closed condition — an unattested live pair, OR an inventory that became
+        # unreadable at declaration time (after the lane was confirmed) — fails closed BEFORE
+        # dispatch rather than reporting a false success while the lane stays owner-unbound.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_UNATTESTED,
+            ADOPT_DECL_UNREADABLE,
+        )
+
+        for token in (ADOPT_DECL_UNATTESTED, ADOPT_DECL_UNREADABLE):
+            with self.subTest(token=token):
+                ops = FakeActuatorOps(
+                    git=True, worktree_exists=True, lanes=[_lane()],
+                    adopt_outcome=token,
+                )
+                outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+                self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+                self.assertIn(REASON_ADOPT_OWNER_UNBOUND, outcome.blocked_reasons)
+                self.assertIn("owner-unbound", outcome.reason)
+                self.assertNotIn("dispatch", ops._names())  # no dispatch to an unbound lane
+
+    def test_adopt_owner_unbound_by_design_still_proceeds(self):
+        # An owner-unbound-BY-DESIGN outcome (a journal-less adopt: no anchor to declare) is
+        # NOT a #13809 failure — the create path also declares nothing — so it proceeds.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            ADOPT_DECL_NO_ANCHOR,
+        )
+
+        ops = FakeActuatorOps(
+            git=True, worktree_exists=True, lanes=[_lane()],
+            adopt_outcome=ADOPT_DECL_NO_ANCHOR,
+        )
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+
     def test_non_git_skips_worktree_but_still_appends(self):
         ops = FakeActuatorOps(git=False, lanes=[None, _lane()])
         outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
@@ -371,6 +542,29 @@ class ExecuteHappyPathTests(unittest.TestCase):
         self.assertEqual(append_paths, ["/wt/12973"])
         dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
         self.assertEqual(dispatch["target_repo"], "auto")
+
+    def test_execute_defaults_omitted_upstream_coordinator_to_stable_route(self):
+        # #13476: the live dispatch resolves an omitted --upstream-coordinator to the
+        # stable `coordinator` route token (never drops the field, never a literal).
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(upstream_coordinator=None), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(
+            dispatch["upstream_coordinator"], DEFAULT_UPSTREAM_COORDINATOR_ROUTE
+        )
+
+    def test_execute_prefers_explicit_upstream_coordinator(self):
+        # #13476: an explicit value flows through the live dispatch unchanged.
+        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(upstream_coordinator="%9"), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(dispatch["upstream_coordinator"], "%9")
 
     def test_no_dispatch_stops_after_panes(self):
         ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
@@ -632,6 +826,44 @@ class DispatchSelfHealTests(unittest.TestCase):
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
         self.assertEqual(outcome.dispatch_result, DISPATCH_SKIPPED)
         self.assertNotIn("heal_lane_column", ops._names())
+
+    def test_healed_pair_split_lane_blocks_before_retry(self):
+        # Redmine #13705 R1-F2: a healed lane whose pair is split across tabs is not
+        # operable — the dispatch retry must not fire, fail closed on pair_split.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            REASON_PAIR_SPLIT,
+        )
+
+        ops = self._healable(
+            lanes=[None, _lane(), _lane(gateway=None), _split_lane(gateway="%130")],
+            dispatch_rcs=(1,),
+        )
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_PAIR_SPLIT, outcome.blocked_reasons)
+        # Healed once, but the retry dispatch never fired to the split lane.
+        self.assertEqual(ops._names().count("heal_lane_column"), 1)
+        self.assertEqual(ops._names().count("dispatch"), 1)
+
+
+class PairSplitAdmissionTests(unittest.TestCase):
+    """Redmine #13705 R1-F2: a `pair_split` lane is not adopted / dispatched."""
+
+    def test_existing_pair_split_lane_is_not_adopted_or_dispatched(self):
+        # Pre-fix regression: an already-split #13441-type lane (both panes present but
+        # in different tabs) was adopted as a healthy pair and dispatched. It must now
+        # fail closed with zero append / dispatch.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            REASON_PAIR_SPLIT,
+        )
+
+        ops = FakeActuatorOps(git=True, lanes=[_split_lane()], dispatch_rc=0)
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_PAIR_SPLIT, outcome.blocked_reasons)
+        names = ops._names()
+        self.assertNotIn("append_lane_column", names)
+        self.assertNotIn("dispatch", names)
 
 
 class RenderTests(unittest.TestCase):

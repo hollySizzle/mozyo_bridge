@@ -38,6 +38,12 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     cli_workflow,
+    operator_startup_resume_leg,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.operator_startup_resume_leg import (
+    GATE_READ_CORRUPT,
+    GATE_READ_UNREADABLE,
+    LatestGateRead,
 )
 
 REPO = "/work/repo"
@@ -97,6 +103,8 @@ _ABSENT_STORE = (None, "store_absent")
 def _run(args, candidates, *, self_pane="%self"):
     out = io.StringIO()
     with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+        cli_workflow, "_herdr_step_preflight", lambda _a: None
+    ), patch.object(
         cli_workflow, "current_pane", lambda: self_pane
     ), patch.object(
         cli_workflow, "_discover_candidates", return_value=candidates
@@ -173,6 +181,8 @@ class ExecuteForwardLegTest(unittest.TestCase):
 
         out = io.StringIO()
         with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+        cli_workflow, "_herdr_step_preflight", lambda _a: None
+    ), patch.object(
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[_cand("%self"), gateway]
@@ -199,6 +209,8 @@ class ExecuteForwardLegTest(unittest.TestCase):
     def test_execute_json_is_single_envelope(self):
         gateway = _cand("%gw", project_scope=PROJECT)
         with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+        cli_workflow, "_herdr_step_preflight", lambda _a: None
+    ), patch.object(
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[_cand("%self"), gateway]
@@ -273,6 +285,8 @@ class ExecuteWorkerDispatchTest(unittest.TestCase):
 
         out = io.StringIO()
         with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+        cli_workflow, "_herdr_step_preflight", lambda _a: None
+    ), patch.object(
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[child, worker]
@@ -320,6 +334,8 @@ class ExecuteCallbackTest(unittest.TestCase):
 
         out = io.StringIO()
         with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+        cli_workflow, "_herdr_step_preflight", lambda _a: None
+    ), patch.object(
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
             cli_workflow, "_discover_candidates", return_value=[gateway, grandparent]
@@ -351,6 +367,118 @@ class ExecuteCallbackTest(unittest.TestCase):
         orch.assert_not_called()
         self.assertEqual(rc, 1)
         self.assertIn("caller_missing", text)
+
+
+class HerdrForwardLegCliTest(unittest.TestCase):
+    """The Increment-3 herdr coordinator-forward leg is fired only on a non-dry-run step (#13583).
+
+    Under the herdr backend the preflight resolves a coordinator lane to a ready forward outcome.
+    ``cmd_workflow_step`` must dispatch the dedicated forward leg exactly once on execute, and NEVER
+    on ``--dry-run`` (dry-run purity, safety-contract point 6): a dry-run resolves the route/result
+    and touches no fence / send.
+    """
+
+    def _forward_outcome(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
+            EXECUTION_READY,
+            OWNER_PARENT,
+            STATE_GRANDPARENT_CONSULTATION,
+            WorkflowStepOutcome,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (
+            PRIMITIVE_HERDR_FORWARD_CONSULT,
+            REASON_HERDR_FORWARD_CONSULT_READY,
+        )
+
+        return WorkflowStepOutcome(
+            state=STATE_GRANDPARENT_CONSULTATION,
+            next_action="forward a single ticketless consultation to the single live gateway",
+            execution=EXECUTION_READY,
+            reason=REASON_HERDR_FORWARD_CONSULT_READY,
+            next_owner=OWNER_PARENT,
+            primitive=PRIMITIVE_HERDR_FORWARD_CONSULT,
+            caller_role="grandparent_coordinator",
+            repo_root=REPO,
+            durable_anchor="none",
+        )
+
+    def _run_forward(self, args, *, leg_result):
+        out = io.StringIO()
+        with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
+            cli_workflow, "_herdr_step_preflight", lambda _a: self._forward_outcome()
+        ), patch.object(
+            cli_workflow, "_load_store_action", return_value=_ABSENT_STORE
+        ), patch.object(
+            cli_workflow, "_execute_herdr_forward_leg", return_value=leg_result
+        ) as leg_mock, contextlib.redirect_stdout(out):
+            rc = cli_workflow.cmd_workflow_step(args)
+        return rc, out.getvalue(), leg_mock
+
+    def test_dry_run_never_fires_the_forward_leg(self):
+        rc, text, leg_mock = self._run_forward(_args(dry_run=True), leg_result=(0, ""))
+        leg_mock.assert_not_called()  # dry-run: zero fence / send
+        self.assertEqual(rc, 0)
+        self.assertIn("execution: dry_run", text)
+        self.assertIn("herdr_forward_consultation_ready", text)
+
+    def test_execute_fires_the_forward_leg_once(self):
+        rc, text, leg_mock = self._run_forward(
+            _args(dry_run=False), leg_result=(0, "forward_result: sent")
+        )
+        self.assertEqual(leg_mock.call_count, 1)
+        self.assertEqual(rc, 0)
+        self.assertIn("execution: executed", text)
+
+    def test_forward_leg_rc_is_surfaced(self):
+        # A fence-unavailable / uncertain leg returns rc 1; the step surfaces the real outcome.
+        rc, _text, leg_mock = self._run_forward(
+            _args(dry_run=False), leg_result=(1, "forward_result: zero_send")
+        )
+        self.assertEqual(leg_mock.call_count, 1)
+        self.assertEqual(rc, 1)
+
+
+class StartupGateIndeterminateFailClosedTest(unittest.TestCase):
+    """review j#79524 F3: from the real ``cmd_workflow_step`` orchestration, an INDETERMINATE latest
+    startup gate (corrupt / unreadable / source error) must route to the dedicated resume leg and
+    fail closed — the generic ``_execute_primitive`` must NOT run, and the leg zero-actuates (no
+    fence / reserve / send / write). The candidates below would otherwise dispatch a normal
+    primitive, so this pins the top-level runtime-safety invariant of j#79214 Required impl 2.
+    """
+
+    def _run_indeterminate(self, gate_source):
+        # An executable outcome (project_gateway_consult) that WOULD dispatch _execute_primitive.
+        candidates = [_cand("%self"), _cand("%gw", project_scope=PROJECT)]
+        with patch.object(
+            operator_startup_resume_leg, "_default_gate_source", gate_source
+        ), patch.object(cli_workflow, "_execute_primitive") as exec_mock, patch.object(
+            cli_workflow,
+            "_execute_startup_resume_leg",
+            wraps=cli_workflow._execute_startup_resume_leg,
+        ) as leg_spy:
+            rc, text = _run(_args(issue="13760"), candidates)
+        # The generic primitive never ran; the dedicated resume leg ran exactly once, fail-closed.
+        exec_mock.assert_not_called()
+        self.assertEqual(leg_spy.call_count, 1)
+        self.assertEqual(rc, 1)
+        return text
+
+    def test_corrupt_latest_routes_to_leg_and_zero_actuation(self) -> None:
+        self._run_indeterminate(lambda repo_root, env: lambda issue: LatestGateRead(GATE_READ_CORRUPT))
+
+    def test_unreadable_latest_routes_to_leg_and_zero_actuation(self) -> None:
+        self._run_indeterminate(
+            lambda repo_root, env: lambda issue: LatestGateRead(GATE_READ_UNREADABLE)
+        )
+
+    def test_source_error_routes_to_leg_and_zero_actuation(self) -> None:
+        def _raising_source(repo_root, env):
+            def _read(issue):
+                raise RuntimeError("ticket provider down")
+
+            return _read
+
+        self._run_indeterminate(_raising_source)
 
 
 if __name__ == "__main__":

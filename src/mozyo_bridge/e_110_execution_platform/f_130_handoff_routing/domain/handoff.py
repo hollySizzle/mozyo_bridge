@@ -37,6 +37,8 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (
     GATEWAY_ROUTE_BLOCKED_NARRATIVE,
     GATEWAY_ROUTE_BLOCKED_NEXT_ACTION,
+    READER_UPGRADE_REQUIRED_NARRATIVE,
+    READER_UPGRADE_REQUIRED_NEXT_ACTION,
 )
 
 if TYPE_CHECKING:
@@ -708,10 +710,25 @@ Reason = Literal[
     "turn_start_absent",
     "precondition_not_idle",
     "inject_failed",
+    # Redmine #13760: the receiver is showing a provider STARTUP screen (a trust
+    # confirmation / first-run theme picker / login prompt) that cannot accept a
+    # handoff body. Refused at the pre-send admission gate, BEFORE any injection:
+    # nothing was typed, no Enter was pressed, no ACK was produced. Distinct from
+    # `receiver_blocked` (a post-injection runtime block) and from
+    # `precondition_not_idle` (a busy pane): a startup screen renders as a live,
+    # non-blank, "ready-looking" pane, which is exactly why typing into it silently
+    # destroyed an Implementation Request (#13582 j#77917).
+    "receiver_startup_interaction_required",
     "cross_session_claude",
     "target_repo_mismatch",
     "gateway_route_blocked",
     "main_lane_implementation_blocked",
+    # Redmine #13844: the target lane's lifecycle authority is a NEWER schema than this
+    # source CLI can read (a concurrent newer-schema lane migrated the shared home store).
+    # A distinct, actionable block — route via the current compatible facade, never downgrade
+    # — kept apart from the generic `gateway_route_blocked` (an unreadable/corrupt store) so
+    # the operator is told the reader is stale, not that the route is wrong.
+    "reader_upgrade_required",
 ]
 NextActionOwner = Literal["receiver", "sender", "operator"]
 
@@ -834,6 +851,18 @@ class DeliveryOutcome:
     # durable-record safe. `None` for the tmux backend, the event-driven standard
     # rail, and every non-queue-enter path (the explicit fallback).
     queue_enter_turn_start_observation: Optional[dict[str, Any]] = None
+    # Redmine #13760: the pre-send startup-admission verdict (`outcome` /
+    # `provider_id` / `blocker_id`), built by
+    # `herdr_startup_admission.StartupAdmission.to_telemetry_dict`. Set ONLY on a
+    # refusal (a matched provider startup screen, an unreadable receiver, or an
+    # unprofiled provider), so an ADMITTED send's outcome is byte-identical to before
+    # the gate existed. Fixed tokens only — the blocker id names the screen and the
+    # pane's own text is never carried (j#77947 invariant 3: a startup screen can show
+    # a workspace path, and a delivery record is pasteable into a durable journal).
+    # This is what lets an auditor tell "the receiver was never sent anything because
+    # it was still starting up" from every other blocked reason, WITHOUT reading a
+    # transcript. `None` for every admitted send and every non-herdr path.
+    startup_admission: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1092,6 +1121,28 @@ def next_action_for(
                 "(it does not exist). Re-establish the receiver agent, then retry."
             ),
         )
+    if reason == "receiver_startup_interaction_required":
+        # Redmine #13760: the pre-send admission gate matched a declared provider
+        # startup screen on the receiver (trust / first-run theme / login). Nothing was
+        # typed and no Enter was pressed — a startup screen has no composer, and the
+        # Enter that "delivered" j#77917 was absorbed as the dialog's default answer.
+        # The owner is the OPERATOR, not the sender: only a human can clear a trust or
+        # login prompt in the provider's own UI, and mozyo will never answer one. Once
+        # it is cleared, re-issuing the SAME durable anchor delivers exactly once (this
+        # refusal consumed no delivery and no idempotency completion).
+        return (
+            "operator",
+            (
+                f"the {receiver} receiver is showing a provider startup screen (trust "
+                "confirmation / first-run setup / login), which cannot accept a handoff "
+                "body — nothing was typed, no Enter was pressed, and no delivery was "
+                "recorded. Clear the prompt in the receiver's own UI (or start a fresh "
+                "receiver whose startup is already complete), then re-issue the same "
+                "durable anchor through the same high-level command. Do not hand-type "
+                "the body and do not press Enter at the receiver: a blind Enter accepts "
+                "the screen's default answer and destroys the request (Redmine #13760)."
+            ),
+        )
     if reason == "precondition_not_idle":
         # Redmine #13255: the pre-injection snapshot found the receiver not idle, so
         # the rail refused to inject (nothing was typed, no Enter) — a turn started
@@ -1162,6 +1213,10 @@ def next_action_for(
         # Wording lives in the f_130 sibling `gateway_route_wording` (the policy is
         # in the f_140 enforcement module, which handoff cannot import back).
         return "sender", GATEWAY_ROUTE_BLOCKED_NEXT_ACTION
+    if reason == "reader_upgrade_required":
+        # Redmine #13844: the shared lifecycle authority is a newer schema than this reader.
+        # Route via the current compatible facade; never downgrade the DB.
+        return "sender", READER_UPGRADE_REQUIRED_NEXT_ACTION
     if reason == "main_lane_implementation_blocked":
         return (
             "sender",
@@ -1552,6 +1607,16 @@ def _outcome_narrative(
             "pane does not exist, so no turn could start. The receiver agent is not "
             "addressable; nothing was confirmed delivered."
         )
+    if reason == "receiver_startup_interaction_required":
+        return (
+            "startup admission (pre-send, every mode): the receiver's visible pane was "
+            "read at action time and matched a declared provider startup screen (a "
+            "trust confirmation / first-run setup / login prompt), which renders as a "
+            "live pane but has no composer. The send was refused BEFORE injection: no "
+            "text, no Enter, no C-u, no ACK. mozyo never answers a startup prompt — a "
+            "blind Enter accepts its default and destroys the request body (Redmine "
+            "#13760)."
+        )
     if reason == "precondition_not_idle":
         return (
             "herdr turn-start rail (--mode standard): the pre-injection snapshot "
@@ -1603,6 +1668,8 @@ def _outcome_narrative(
         )
     if reason == "gateway_route_blocked":
         return GATEWAY_ROUTE_BLOCKED_NARRATIVE
+    if reason == "reader_upgrade_required":
+        return READER_UPGRADE_REQUIRED_NARRATIVE
     if reason == "main_lane_implementation_blocked":
         return (
             "Main-lane dispatch guard (Redmine #12441): `--to claude --kind "
@@ -1648,6 +1715,17 @@ def _receiver_contract_line(
             f"Receiver-side contract: {receiver} must read the durable anchor "
             "manually if action is still required; the pane notification's turn "
             "start could not be confirmed and nothing was re-submitted."
+        )
+    if reason == "receiver_startup_interaction_required":
+        # Redmine #13760: nothing reached the receiver — it never had a composer to
+        # reach. Say so plainly, and name the operator (not the receiver) as the owner:
+        # the receiver cannot read a durable anchor it has not finished starting up.
+        return (
+            f"Receiver-side contract: none — the {receiver} receiver has not finished "
+            "starting up (a trust / setup / login screen is on it), so it received "
+            "nothing and can act on nothing. An operator clears the startup screen in "
+            "the receiver's own UI; the same durable anchor is then re-sent by the "
+            "sender and delivers exactly once."
         )
     if reason in (
         "receiver_blocked",
@@ -1792,6 +1870,7 @@ def build_delivery_record(
     activation: Optional["TargetActivationOutcome"] = None,
     submit_lines: Optional[Sequence[str]] = None,
     turn_start_lines: Optional[Sequence[str]] = None,
+    startup_admission_lines: Optional[Sequence[str]] = None,
 ) -> str:
     """Render a durable delivery-record text from a structured outcome.
 
@@ -1943,6 +2022,15 @@ def build_delivery_record(
         # observation the rail already performed and never overrides
         # `next_action`; the structured `(status, reason)` wire is unchanged.
         lines.extend(turn_start_lines)
+    if startup_admission_lines:
+        # Redmine #13760: additive pre-send startup-admission telemetry (the refused
+        # provider + the fixed blocker id + the zero-send verdict). Pre-rendered by the
+        # caller via `herdr_startup_admission.startup_admission_record_lines` — fixed
+        # tokens only, and deliberately NOT the pane's text: a startup screen shows the
+        # workspace path it is asking you to trust, and this record is pasted verbatim
+        # into a durable journal (j#77947 invariant 3). Emitted only on a refusal, so an
+        # admitted send's record is byte-identical.
+        lines.extend(startup_admission_lines)
     if outcome.status == "sent" and outcome.reason == "queue_enter":
         # Operator-facing escalation hint required by the contract's Durable
         # Wording Requirements. This note does NOT override `next_action`;
@@ -2017,6 +2105,7 @@ def make_outcome(
     ticketless_work_intake: Optional["TicketlessWorkIntake"] = None,
     turn_start_outcome: Optional[dict[str, Any]] = None,
     queue_enter_turn_start_observation: Optional[dict[str, Any]] = None,
+    startup_admission: Optional[dict[str, Any]] = None,
 ) -> DeliveryOutcome:
     # `source` is part of the structured outcome contract and must survive
     # anchor-normalization failure paths. When the anchor was successfully
@@ -2066,6 +2155,7 @@ def make_outcome(
         ),
         turn_start_outcome=turn_start_outcome,
         queue_enter_turn_start_observation=queue_enter_turn_start_observation,
+        startup_admission=startup_admission,
     )
 
 

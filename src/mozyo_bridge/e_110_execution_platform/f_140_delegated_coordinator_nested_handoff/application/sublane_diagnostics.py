@@ -27,9 +27,19 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from typing import Any
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
+    read_watermark,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import sublane_callback
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
+    classify_sweep,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    MappingRedmineJournalSource,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (
     CLAUDE_PERMISSION_MODES,
     SOURCE_ENV_INVALID,
@@ -147,13 +157,384 @@ def cmd_sublane_readiness(args: argparse.Namespace) -> int:
 # --- callback-recovery -------------------------------------------------------
 
 
+#: Provenance of the ``new_durable_progress`` input — the distinction Redmine #13889 turns on.
+PROGRESS_DERIVED = "derived_dispatch_anchored"
+PROGRESS_ASSERTED = "asserted_unanchored"
+
+#: The actuating sweep found the callback-sweep lease store inconsistent (Redmine #13951). The
+#: sweep zero-sends and PROJECTS this as an actionable typed blocker rather than raising an opaque
+#: error the supervisor/service would swallow as a silent stop.
+CALLBACK_LEASE_INCONSISTENT = "callback_lease_inconsistent"
+
+#: Marker channel for the durable lease-blocker projection. NOT a ``workflow-event`` gate channel,
+#: so the gate watcher / callback discovery treat it as inert prose — it never mints a callback
+#: candidate. Its fields are the idempotency key: the same (issue, lane, generation, state,
+#: fingerprint) yields the same marker, so a prior projection is detectable in the durable record.
+CALLBACK_LEASE_BLOCKER_CHANNEL = "callback-lease-blocker"
+
+#: Projection dispositions recorded on the blocker (review R1-F1 #13951): the blocker was newly
+#: recorded to the issue journal, a matching projection already existed (idempotent skip), or the
+#: journal write failed (fail-closed + retryable — the next sweep re-attempts).
+PROJECTION_RECORDED = "recorded"
+PROJECTION_SKIPPED_DUPLICATE = "skipped_duplicate"
+PROJECTION_FAILED = "failed"
+
+
+def _callback_lease_blocker(diagnosis, args) -> dict[str, Any]:
+    """Build the actionable, redaction-safe blocker for an inconsistent lease store (#13951 #3).
+
+    ``diagnosis`` is a :class:`...callback_sweep_lease.LeaseDiagnosis` (already redaction-safe: no
+    owner token, raw row, or absolute path). The result matches the ``callback-recovery`` verdict
+    shape so the same text/JSON formatter and non-zero exit apply — the operator sees the typed
+    state, the zero-send invariant, and the exact public recovery rail, never a stack trace. It is
+    bound to the exact issue / lane / generation the sweep was actuating (review R1-F1), so the
+    durable projection names one dispatch round, never a wildcard.
+    """
+    issue = str(getattr(args, "issue", "") or "").strip()
+    lane = str(getattr(args, "lane", "") or "").strip()
+    generation = str(getattr(args, "lane_generation", "") or "").strip()
+    return {
+        "state": CALLBACK_LEASE_INCONSISTENT,
+        "is_stall": True,
+        "issue": issue,
+        "lane": lane,
+        "lane_generation": generation,
+        "dispatch_delivered": bool(getattr(args, "dispatch_delivered", False)),
+        "new_durable_progress": False,
+        "callback": getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
+        "stale_cli": bool(getattr(args, "stale_cli", False)),
+        "summary": (
+            f"the callback-sweep attempt lease store is inconsistent ({diagnosis.state}: "
+            f"{diagnosis.reason}); the sweep zero-sent rather than run unserialized, and this is an "
+            "actionable operator blocker — the supervisor/service must project it, not silent-stop"
+        ),
+        "recovery": [
+            "inspect: `mozyo-bridge workflow callback-lease` (typed status + artifact fingerprint)",
+            "dry-run: `mozyo-bridge workflow callback-lease --recover` (writes nothing)",
+            "actuate: `mozyo-bridge workflow callback-lease --recover --apply --expect-fingerprint "
+            "<token>` ONLY after confirming no sweep is mid-attempt (it invalidates every grant)",
+        ],
+        "invariants": [
+            "zero-send: no callback was delivered while the lease store is inconsistent",
+            f"recoverable={diagnosis.recoverable} has_live_owner={diagnosis.has_live_owner}",
+        ],
+        "progress_provenance": PROGRESS_DERIVED,
+        "callback_lease_diagnosis": diagnosis.as_dict(),
+    }
+
+
+def _lease_blocker_marker(blocker: dict[str, Any], diagnosis) -> str:
+    """The machine-readable idempotency marker: one per (issue, lane, generation, state, fingerprint).
+
+    A plain substring match of this exact token against a prior journal note proves the same blocker
+    was already projected — so a repeated sweep over a still-inconsistent store does not spawn a
+    duplicate journal. When the store's state or fingerprint changes, the marker changes and a fresh
+    projection is warranted. Every field is non-sensitive (no path, no owner token).
+    """
+    return (
+        f"[mozyo:{CALLBACK_LEASE_BLOCKER_CHANNEL}"
+        f":issue={blocker['issue']}:lane={blocker['lane']}"
+        f":generation={blocker['lane_generation']}:state={diagnosis.state}"
+        f":fingerprint={diagnosis.fingerprint}]"
+    )
+
+
+def _blocker_already_projected(source, issue: str, marker: str) -> bool:
+    """True iff a prior journal on ``issue`` already carries ``marker`` (durable-record dedup).
+
+    Fail-OPEN toward projecting: a read error returns False (not-yet-projected), so an unreadable
+    source never silently SUPPRESSES a real blocker — idempotency degrades to at-least-once, which
+    is the safe direction for a fail-closed operator signal.
+    """
+    if source is None or not marker:
+        return False
+    try:
+        for entry in source.read_entries(issue):
+            if marker in (getattr(entry, "notes", "") or ""):
+                return True
+    except Exception:  # noqa: BLE001 - a read failure must not suppress a real projection
+        return False
+    return False
+
+
+def _format_lease_blocker_note(blocker: dict[str, Any], marker: str) -> str:
+    """Render the redaction-safe durable blocker note (canonical Blocked heading + the dedup marker)."""
+    diag = blocker["callback_lease_diagnosis"]
+    lines = [
+        "## Gate: Blocked — callback-sweep lease store inconsistent",
+        "",
+        marker,
+        "",
+        f"- state: {blocker['state']}",
+        f"- issue: #{blocker['issue']} lane: {blocker['lane']} generation: {blocker['lane_generation']}",
+        f"- lease_state: {diag['state']} (recoverable={diag['recoverable']} "
+        f"has_live_owner={diag['has_live_owner']} fingerprint={diag['fingerprint']})",
+        f"- {blocker['summary']}",
+        "",
+        "### recovery",
+    ]
+    lines += [f"- {step}" for step in blocker["recovery"]]
+    lines += ["", "### invariants"]
+    lines += [f"- {inv}" for inv in blocker["invariants"]]
+    return "\n".join(lines)
+
+
+def _project_lease_blocker(diagnosis, args, *, source, post_note) -> dict[str, Any]:
+    """Record the lease-inconsistency blocker to the issue's durable journal, idempotently (#13951 #3).
+
+    The acceptance requires the supervisor/service to PROJECT the inconsistency as an actionable
+    typed blocker onto the durable record — a return payload / stdout line is not a durable work
+    record. This writes the redaction-safe blocker (bound to the exact issue/lane/generation) to the
+    issue journal via ``post_note``, deduped against the durable record so a repeated sweep does not
+    stack duplicate journals. Zero-send is preserved: this is a projection onto the issue's own
+    journal, NOT a coordinator callback delivery (that path never runs — the sweep returns here).
+
+    A journal write failure is fail-closed and retryable: the blocker still returns (non-zero,
+    ``is_stall``) with ``projection == failed`` and the marker is NOT recorded, so the next sweep
+    re-attempts. The blocker always carries its ``projection`` disposition for the operator surface.
+    """
+    blocker = _callback_lease_blocker(diagnosis, args)
+    marker = _lease_blocker_marker(blocker, diagnosis)
+    blocker["blocker_marker"] = marker
+    if _blocker_already_projected(source, blocker["issue"], marker):
+        blocker["projection"] = PROJECTION_SKIPPED_DUPLICATE
+        return blocker
+    note = _format_lease_blocker_note(blocker, marker)
+    try:
+        journal_id = post_note(blocker["issue"], note)
+    except Exception as exc:  # noqa: BLE001 - a write failure is fail-closed + retryable, never a crash
+        blocker["projection"] = PROJECTION_FAILED
+        blocker["projection_error"] = type(exc).__name__
+        return blocker
+    blocker["projection"] = PROJECTION_RECORDED
+    blocker["projection_journal"] = str(journal_id or "")
+    return blocker
+
+
+def _snapshot_source(args: argparse.Namespace) -> MappingRedmineJournalSource:
+    payload = json.loads(Path(str(args.journals_json)).read_text(encoding="utf-8"))
+    return MappingRedmineJournalSource(payload=payload)
+
+
+def _derive_from_journals(args: argparse.Namespace) -> dict[str, Any]:
+    """Derive the verdict from a durable journal snapshot, anchored on the exact dispatch marker.
+
+    The #13889 read-only path: ``--journals-json`` supplies the ``include=journals`` snapshot and the
+    verdict is derived through the SAME :func:`...callback_sweep.read_watermark` the actuating path
+    uses — anchored on this lane+generation's structured IR marker, ordered by durable journal id,
+    and round-aware. Classification only: no fence is reserved and nothing is sent.
+    """
+    source = _snapshot_source(args)
+    watermark = read_watermark(
+        source,
+        str(getattr(args, "issue", "") or "").strip(),
+        lane=str(getattr(args, "lane", "") or "").strip(),
+        lane_generation=getattr(args, "lane_generation", None),
+    )
+    result = classify_sweep(
+        watermark=watermark,
+        callback=getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
+        stale_cli=bool(getattr(args, "stale_cli", False)),
+    )
+    result["progress_provenance"] = PROGRESS_DERIVED
+    return result
+
+
+def attested_workspace_id(args: argparse.Namespace) -> str:
+    """MEASURE the partition workspace id from the canonical registry authority (review R3-F2).
+
+    The fence key is partitioned by workspace, so a wrong / invented id reserves a DIFFERENT row and
+    the same recovery sends twice. The id must therefore be measured, and an earlier revision only
+    *claimed* to measure it: it read ``read_anchor(repo_root)`` and then fell back to the
+    caller-supplied ``--workspace-id`` when that returned ``None`` — which is exactly what happens
+    in a **linked sublane worktree**, where anchors are untracked. So on every lane where this
+    command actually runs, the "measured" authority was absent and the CLI argument minted the fence
+    partition itself.
+
+    The authority is :func:`...workspace_registry.resolve_canonical_session`, the canonical resolver
+    that already handles the #13152 topology: registry row -> local anchor -> **linked worktree
+    inheriting its main checkout's identity** -> derivation. A sublane worktree resolves to its
+    parent workspace_id through that inheritance, which is the id the fence must partition on.
+
+    ``--workspace-id`` is an **equality assertion only** — it can confirm what was measured but can
+    never supply it. A blank / unreadable authority returns blank, and :func:`sweep_once` then
+    zero-sends rather than actuate on a partition nobody measured.
+    """
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.core.state.workspace_registry import resolve_canonical_session
+
+    try:
+        resolved = str(
+            resolve_canonical_session(repo_root_from_args(args)).workspace_id or ""
+        ).strip()
+    except Exception:  # noqa: BLE001 - an unreadable authority is unattested, never assumed
+        resolved = ""
+    asserted = str(getattr(args, "workspace_id", "") or "").strip()
+    if asserted and asserted != resolved:
+        raise SystemExit(
+            f"--workspace-id {asserted!r} does not match the measured workspace identity "
+            f"{resolved or '<unresolved>'!r}; refusing to actuate on an unattested fence "
+            f"partition (the flag asserts what was measured, it cannot supply it)"
+        )
+    return resolved
+
+
+def _execute_sweep(args: argparse.Namespace) -> dict[str, Any]:
+    """The ACTUATING sweep: fresh read -> re-read -> fence -> durable record -> one recovery.
+
+    The production caller for :func:`...callback_sweep.sweep_once` (review R1-F1). Everything the
+    acceptance turns on binds only when a real recovery runs through here, so the path is composed
+    from the three authorities the reviews established:
+
+    - a **live** durable source (R2-F1). ``--journals-json`` is read-only classification: it is a
+      frozen snapshot, so its "re-read" cannot observe a gate landing after the decision and
+      ``sweep_once`` refuses to mutate on it;
+    - an **attested** workspace id (R2-F2), measured from the durable anchor, not defaulted;
+    - a **durable recovery record written before the send** (R2-F3), which the notification then
+      points at — a re-poke with no journal behind it is prohibited outright.
+
+    Fail-closed throughout: an unconfigured live source, an unattested workspace, an unwritable
+    record, an unbootstrapped fence, a lost reserve, opaque post-anchor journals, a landed gate, or
+    a superseded round all zero-send.
+    """
+    from mozyo_bridge.core.state.callback_publication_fence import CallbackPublicationFence
+    from mozyo_bridge.core.state.callback_sweep_lease import CallbackSweepLease
+    from mozyo_bridge.core.state.dispatch_outbox_fence import DispatchOutboxFence
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_sweep import (
+        build_recovery_recorder,
+        build_recovery_sender,
+        sweep_once,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (
+        SWEEP_RECOVERY_RECEIVER,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
+        LiveRedmineJournalSource,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport import (
+        redmine_delivery_transport_from_env,
+    )
+
+    issue = str(getattr(args, "issue", "") or "").strip()
+    lane = str(getattr(args, "lane", "") or "").strip()
+    generation = str(getattr(args, "lane_generation", "") or "").strip()
+    target = str(getattr(args, "target", "") or "").strip()
+    if not (issue and lane and generation and target):
+        raise SystemExit(
+            "--execute requires --issue, --lane, --lane-generation and --target "
+            "(the recovery is fenced on the exact dispatch round and delivered to one target)"
+        )
+    if getattr(args, "journals_json", None):
+        raise SystemExit(
+            "--execute cannot use --journals-json: a snapshot is frozen, so the pre-mutation "
+            "re-read could not observe a gate landing after the decision (Redmine #13889 R2-F1). "
+            "The actuating sweep reads Redmine live; --journals-json stays read-only."
+        )
+    # The live read boundary fails closed when the trusted credentials are unconfigured.
+    try:
+        source = LiveRedmineJournalSource.from_environment()
+    except Exception as exc:  # noqa: BLE001 - unconfigured live read -> no actuation
+        raise SystemExit(
+            f"--execute needs a live Redmine read boundary ({type(exc).__name__}: {exc}); "
+            f"without it the pre-mutation re-read cannot see new gates, so the sweep will not "
+            f"mutate"
+        ) from exc
+    transport = redmine_delivery_transport_from_env()
+    if transport is None:
+        raise SystemExit(
+            "--execute needs the Redmine note write opt-in (MOZYO_REDMINE_DELIVERY_WRITE): the "
+            "stall classification must be durably recorded before the pointer send (a silent "
+            "re-poke is prohibited)"
+        )
+    # The lease store is identity-pinned and never auto-creates (R6-F2), so the composition root
+    # bootstraps it explicitly; a store LOSS then fails closed instead of minting a duplicate lease.
+    # #13951 #3: a fail-closed store must PROJECT as an actionable typed blocker onto the DURABLE
+    # record, not raise an opaque error the supervisor/service swallows as a silent stop, and not
+    # merely return a payload (a return value / stdout line is not a durable work record — review
+    # R1-F1). Diagnose it (read-only), then record the redaction-safe blocker to the issue journal
+    # idempotently via the note transport already resolved above. Zero-send is preserved: this is a
+    # projection onto the issue's own journal, NOT a coordinator callback. Do NOT auto-recover here
+    # (a silent re-create would hand a second live owner the same anchor).
+    from mozyo_bridge.core.state.callback_sweep_lease import CallbackSweepLeaseError
+
+    lease = CallbackSweepLease(home=None)
+    try:
+        lease.bootstrap()
+    except CallbackSweepLeaseError:
+        return _project_lease_blocker(
+            lease.diagnose(), args, source=source, post_note=transport.post_issue_note
+        )
+    # The publication authority (j#80383 option (d)). Ordinary execute must NEVER bootstrap it:
+    # bootstrap's both-absent branch re-mints the store, and a re-minted store forgets the
+    # reservation a suspended sweep still holds -- the same store-wide reclaim that `recover()`
+    # performed, just reachable from the normal path (R12-F1). So this only ever *checks*, and an
+    # absent or lost store stops the sweep instead of quietly rebuilding the fence around it.
+    publication_fence = CallbackPublicationFence(home=None)
+    if not publication_fence.is_bootstrapped():
+        raise SystemExit(
+            "callback publication fence is not ready: refusing to sweep, because publishing "
+            "without the fence can duplicate a recovery record. Run `mozyo-bridge workflow "
+            "callback-publication --bootstrap` -- on first use it initializes the store, and on a "
+            "store that predates the fence's first-init seal it adopts it in place, keeping any "
+            "reservation it already holds. A store LOSS after that is fail-closed by design and "
+            "needs the store restored, not re-created."
+        )
+    result = sweep_once(
+        workspace_id=attested_workspace_id(args),
+        lane_id=lane,
+        issue=issue,
+        lane_generation=generation,
+        source=source,
+        fence=DispatchOutboxFence(home=None),
+        lease=lease,
+        target_assigned_name=target,
+        send_fn=build_recovery_sender(issue=issue, target=target),
+        # R7-F1: `sweep_once` supplies the live-grant predicate, so the ownership check lands
+        # after the recorder's own reads and immediately before its write — not merely before the
+        # recorder is called, which left a whole Redmine round-trip unguarded.
+        record_fn_factory=lambda grant_is_live: build_recovery_recorder(
+            source=source, issue=issue, lane=lane, lane_generation=generation,
+            post_note=transport.post_issue_note, grant_is_live=grant_is_live,
+            publication_fence=publication_fence,
+            workspace_id=attested_workspace_id(args),
+            # #13910: the record carries the receiver-side admission key, so it must name the
+            # exact route this delivery is addressed to and the role allowed to admit it. Both
+            # come from the same values the send uses -- `target` is the fence's
+            # `target_assigned_name`, and the receiver constant is the sender's own `--to`.
+            route_identity=target,
+            receiver_identity=SWEEP_RECOVERY_RECEIVER,
+        ),
+        callback=getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
+        stale_cli=bool(getattr(args, "stale_cli", False)),
+    )
+    result["progress_provenance"] = PROGRESS_DERIVED
+    return result
+
+
 def build_callback_recovery(args: argparse.Namespace) -> dict[str, Any]:
-    return sublane_callback.classify_callback_stall(
+    """Classify a delivered-but-quiet unit of work, deriving progress when a snapshot is supplied.
+
+    Two provenances, and the output always says which (#13889):
+
+    - ``--journals-json`` (+ ``--lane`` / ``--lane-generation``) -> **derived**: anchored on the
+      exact dispatch marker and ordered by durable journal id, so a gate that landed seconds before
+      the sweep is seen on the first pass;
+    - ``--progress`` / no snapshot -> **asserted**: the legacy hand-set boolean. It is the input
+      that produced the #13883 false stalls (an agent's earlier read is a coordinator-local cutoff),
+      so the verdict is tagged unanchored rather than being silently trusted as equivalent.
+    """
+    if getattr(args, "execute", False):
+        return _execute_sweep(args)
+    if getattr(args, "journals_json", None):
+        return _derive_from_journals(args)
+    result = sublane_callback.classify_callback_stall(
         dispatch_delivered=bool(getattr(args, "dispatch_delivered", False)),
         new_durable_progress=bool(getattr(args, "progress", False)),
         callback=getattr(args, "callback", sublane_callback.CALLBACK_ABSENT),
         stale_cli=bool(getattr(args, "stale_cli", False)),
     )
+    result["progress_provenance"] = PROGRESS_ASSERTED
+    return result
 
 
 def format_callback_recovery_text(result: dict[str, Any]) -> str:
@@ -162,9 +543,55 @@ def format_callback_recovery_text(result: dict[str, Any]) -> str:
         f"  inputs: dispatch_delivered={result['dispatch_delivered']} "
         f"new_durable_progress={result['new_durable_progress']} "
         f"callback={result['callback']} stale_cli={result['stale_cli']}",
-        f"  summary: {result['summary']}",
-        "  recovery:",
     ]
+    # #13951 #3: when this is a lease-inconsistency blocker, surface whether it was durably PROJECTED
+    # to the issue journal — a recorded projection is the difference between an actionable blocker and
+    # a silent stop. A failed write is fail-closed and retryable; the operator must see it.
+    projection = result.get("projection")
+    if projection == PROJECTION_RECORDED:
+        lines.append(
+            f"  projection: recorded to durable journal j#{result.get('projection_journal') or '?'}"
+        )
+    elif projection == PROJECTION_SKIPPED_DUPLICATE:
+        lines.append("  projection: already recorded (idempotent skip; no duplicate journal)")
+    elif projection == PROJECTION_FAILED:
+        lines.append(
+            f"  projection: FAILED to write durable journal "
+            f"({result.get('projection_error') or 'unknown'}) — fail-closed, retry the sweep"
+        )
+    provenance = result.get("progress_provenance", "")
+    if provenance == PROGRESS_DERIVED:
+        lines.append(
+            f"  watermark: derived, anchored on dispatch journal "
+            f"{result.get('dispatch_journal') or '-'} (ordered durable journal id)"
+        )
+        for entry in result.get("progress_journals", []):
+            lines.append(f"    progress: j#{entry['journal']} {entry['kind']}")
+    elif provenance == PROGRESS_ASSERTED:
+        lines.append(
+            "  watermark: ASSERTED (not dispatch-anchored) — new_durable_progress was supplied by "
+            "hand, so a gate that landed after your read is invisible here. Pass --journals-json "
+            "with --lane/--lane-generation to derive it from the durable record instead."
+        )
+    if result.get("sweep_complete") is False:
+        # R5-F4: this field previously existed but NOTHING read it — the exit code only happened to
+        # be non-zero because `is_stall` was true. A durable mutation landed and the sweep did not
+        # finish, so it must be visible on the surface an operator actually reads.
+        lines.append(
+            f"  INCOMPLETE: a durable recovery record (j#"
+            f"{result.get('recovery_record_journal') or '?'}) WAS written but the sweep did not "
+            f"finish ({result.get('send_reason') or 'unknown'}) — re-run it; do not treat this as "
+            f"a resolved sweep"
+        )
+    elif result.get("resolution_recorded") is False:
+        lines.append(
+            f"  INCOMPLETE: the verdict was NOT durably recorded "
+            f"({result.get('record_reason') or 'unknown'}) — a stall check and its classification "
+            f"are themselves durable events, so this sweep is not resolved"
+        )
+    elif result.get("recovery_record_journal"):
+        lines.append(f"  recovery record: j#{result['recovery_record_journal']}")
+    lines += [f"  summary: {result['summary']}", "  recovery:"]
     for i, step in enumerate(result["recovery"], 1):
         lines.append(f"    {i}. {step}")
     if result["invariants"]:
@@ -180,6 +607,12 @@ def cmd_sublane_callback_recovery(args: argparse.Namespace) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(format_callback_recovery_text(result))
+    # An actuating sweep that did not finish, or whose resolution never landed durably, is
+    # INCOMPLETE rather than resolved (reviews R3-F4 / R5-F4): exit non-zero explicitly, so a
+    # caller reading only the return code can never treat it as a finished sweep. Relying on
+    # `is_stall` to happen to be true here was the R5-F4 defect.
+    if result.get("sweep_complete") is False or result.get("resolution_recorded") is False:
+        return 1
     # A genuine stall returns non-zero so the coordinator can branch on it in
     # scripts; non-stall outcomes (complete / not-required / not-a-candidate)
     # return 0. Read-only either way.

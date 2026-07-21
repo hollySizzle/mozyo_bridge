@@ -196,7 +196,10 @@ class MaybePersistTest(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             uc.maybe_persist(
-                args, _outcome(), duplicate_lane_panes=None, record_format=RECORD_FORMAT_BOTH
+                _outcome(),
+                persist_delivery=bool(getattr(args, "persist_delivery", False)),
+                duplicate_lane_panes=None,
+                record_format=RECORD_FORMAT_BOTH,
             )
         self.assertEqual("", buf.getvalue())
         self.assertEqual([], ops.resolve_calls)
@@ -217,8 +220,8 @@ class MaybePersistTest(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             uc.maybe_persist(
-                args,
                 _outcome(source=SOURCE_REDMINE),
+                persist_delivery=bool(getattr(args, "persist_delivery", False)),
                 duplicate_lane_panes=None,
                 record_format=RECORD_FORMAT_TEXT,
             )
@@ -236,8 +239,8 @@ class MaybePersistTest(unittest.TestCase):
         args = argparse.Namespace(persist_delivery=True)
         with contextlib.redirect_stdout(io.StringIO()):
             uc.maybe_persist(
-                args,
                 _outcome(source="asana"),
+                persist_delivery=bool(getattr(args, "persist_delivery", False)),
                 duplicate_lane_panes=None,
                 record_format=RECORD_FORMAT_JSON,
             )
@@ -252,8 +255,8 @@ class MaybePersistTest(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             uc.maybe_persist(
-                args,
                 _outcome(source=SOURCE_REDMINE),
+                persist_delivery=bool(getattr(args, "persist_delivery", False)),
                 duplicate_lane_panes=None,
                 record_format=RECORD_FORMAT_TEXT,
             )
@@ -268,16 +271,16 @@ class SubmitLinesForTest(unittest.TestCase):
     def test_no_submit_intent_yields_none(self) -> None:
         # A normal `handoff send` / `reply` has no q-enter telemetry, so its
         # record stays byte-identical (Redmine #12705).
-        self.assertIsNone(submit_lines_for(argparse.Namespace(), _outcome()))
+        self.assertIsNone(submit_lines_for(_outcome(), submit_intent=None, submit_delivery_id=None))
         self.assertIsNone(
-            submit_lines_for(argparse.Namespace(submit_intent=""), _outcome())
+            submit_lines_for(_outcome(), submit_intent="", submit_delivery_id=None)
         )
 
     def test_intent_renders_submit_lines_with_delivery_id(self) -> None:
         args = argparse.Namespace(
             submit_intent="reply", submit_delivery_id="q-abc123"
         )
-        lines = submit_lines_for(args, _outcome())
+        lines = submit_lines_for(_outcome(), submit_intent=getattr(args, "submit_intent", None), submit_delivery_id=getattr(args, "submit_delivery_id", None))
         assert lines is not None
         self.assertIn("intent `reply`", lines[0])
         self.assertIn("delivery id `q-abc123`", lines[0])
@@ -285,7 +288,7 @@ class SubmitLinesForTest(unittest.TestCase):
 
     def test_missing_delivery_id_falls_back_to_em_dash(self) -> None:
         args = argparse.Namespace(submit_intent="worker_dispatch")
-        lines = submit_lines_for(args, _outcome())
+        lines = submit_lines_for(_outcome(), submit_intent=getattr(args, "submit_intent", None), submit_delivery_id=getattr(args, "submit_delivery_id", None))
         assert lines is not None
         self.assertIn("delivery id `—`", lines[0])
 

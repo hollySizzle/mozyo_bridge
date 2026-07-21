@@ -306,6 +306,7 @@ def resolve_for_route_target_neutral(
     *,
     backend: str,
     cross_project: bool = False,
+    expected_roles: "Optional[Mapping[str, str]]" = None,
 ) -> RouteResolution:
     """Re-resolve a #12550 logical route target against a backend's live inventory.
 
@@ -326,7 +327,9 @@ def resolve_for_route_target_neutral(
     :class:`BackendNeutralResolverError`; a guard violation raises
     :class:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegation_route_planner.DelegationRoutePlanError`.
     """
-    enforce_route_target_guards(target_token, identity, cross_project=cross_project)
+    enforce_route_target_guards(
+        target_token, identity, cross_project=cross_project, expected_roles=expected_roles
+    )
     return resolve_route_neutral(identity, inventory, backend=backend)
 
 

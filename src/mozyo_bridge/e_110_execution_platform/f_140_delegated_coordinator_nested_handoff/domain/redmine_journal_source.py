@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Protocol, Sequence
+from typing import ClassVar, Iterable, Mapping, Protocol, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
     JournalMarker,
@@ -49,6 +49,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     build_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
+    CALLBACK_NONE,
+    CALLBACK_STATES,
+    REVIEW_CONCLUSIONS,
     REVIEW_PENDING,
 )
 
@@ -70,12 +73,27 @@ _RECOGNIZED_CHANNELS = frozenset(
     {MARKER_CHANNEL_HANDOFF, MARKER_CHANNEL_WORKFLOW_EVENT}
 )
 
-#: The gate-bearing kinds a marker may name (mirrors the adapter's core-owned
-#: ``WORKFLOW_GATE_KINDS``; kept local so this domain stays inside its bounded context and
-#: does not import the e_140 adapter). A non-gate kind (``implementation_request`` /
-#: ``design_consultation`` / ``reply`` / ``start`` / ``close`` …) is skipped, never guessed.
+#: The **callback-required** gate kinds a marker may name — the states that must wake the
+#: coordinator (``skills/mozyo-bridge-agent/references/workflow.md`` ``### coordinator callback
+#: を要する state``: ``implementation_done | review_request | review_result |
+#: owner_close_approval_waiting | blocked``). #13520 review F5: this is DELIBERATELY broader than
+#: the provider review-gate vocabulary ``WORKFLOW_GATE_KINDS`` (which excludes owner-close because
+#: "close approval is satisfied" is a core decision, not a provider-observable fact) — a callback
+#: only *wakes the coordinator to read the journal*, it authorizes nothing, so ``blocked`` and
+#: ``owner_close_approval_waiting`` legitimately trigger a callback. Kept local so this domain
+#: stays inside its bounded context and does not import the e_140 adapter. A non-gate kind
+#: (``implementation_request`` / ``design_consultation`` / ``reply`` / ``start`` / ``close`` …)
+#: is skipped, never guessed. ``review_result`` / ``owner_close_approval_waiting`` are the
+#: marker-facing names; :data:`...redmine_event_intake.MARKER_GATE_ALIASES` maps them onto the
+#: runtime ``review`` / ``owner_close_approval`` gates.
 GATE_BEARING_KINDS: frozenset[str] = frozenset(
-    {"implementation_done", "review_request", "review_result"}
+    {
+        "implementation_done",
+        "review_request",
+        "review_result",
+        "owner_close_approval_waiting",
+        "blocked",
+    }
 )
 
 #: ``[mozyo:<channel>:<body>]`` — the body is the ':'-separated key=value field list.
@@ -94,6 +112,25 @@ def _parse_marker_fields(body: str) -> dict[str, str]:
             continue
         fields[key.strip()] = value.strip()
     return fields
+
+
+def marker_fields_in_note(notes: str) -> tuple[tuple[str, dict[str, str]], ...]:
+    """Every ``[mozyo:<channel>:...]`` marker in a note as ``(channel, fields)``, in note order (pure).
+
+    The shared structured-token scan the marker readers are built on: it recognizes the token
+    grammar and parses the field list, but applies **no** vocabulary policy — each reader decides
+    which channel / kind it accepts. Unrecognized channels are dropped here so a reader never has
+    to know the channel set. Prose is never inspected; a note with no token yields ``()``.
+    """
+    if not notes:
+        return ()
+    found: list[tuple[str, dict[str, str]]] = []
+    for match in _MARKER_RE.finditer(notes):
+        channel = match.group("channel")
+        if channel not in _RECOGNIZED_CHANNELS:
+            continue
+        found.append((channel, _parse_marker_fields(match.group("body"))))
+    return tuple(found)
 
 
 @dataclass(frozen=True)
@@ -134,18 +171,35 @@ def _gate_marker_from_fields(
             return default
         return raw.strip().lower() in ("1", "true", "yes", "y")
 
+    # Redmine #13974 j#81512: a RECOGNIZED gate-bearing marker is never made invisible by an
+    # out-of-vocabulary ``conclusion`` / ``callback`` — that would let a NEWER malformed review_result
+    # (e.g. ``conclusion=bogus``) be dropped so an OLDER valid result stays "latest" and delivers.
+    # Instead the bad sub-field fails closed to its non-explicit default (``pending`` / ``none``), so
+    # the marker still counts in the latest computation and SHADOWS the old result; the callback fence
+    # then refuses the non-explicit conclusion (discovery 0-enqueue / send-edge terminal).
+    conclusion = (fields.get("conclusion") or REVIEW_PENDING).strip() or REVIEW_PENDING
+    if conclusion not in REVIEW_CONCLUSIONS:
+        conclusion = REVIEW_PENDING
+    callback = (fields.get("callback") or CALLBACK_NONE).strip() or CALLBACK_NONE
+    if callback not in CALLBACK_STATES:
+        callback = CALLBACK_NONE
+
     try:
         return build_marker(
             entry.issue_id,
             entry.journal_id,
             kind,  # build_marker maps review_result -> review and validates the vocabulary
-            review_conclusion=(fields.get("conclusion") or REVIEW_PENDING).strip()
-            or REVIEW_PENDING,
-            callback_state=(fields.get("callback") or "none").strip() or "none",
+            review_conclusion=conclusion,
+            callback_state=callback,
             commit_bearing=_flag("commit", False),
             integration_recorded=_flag("integrated", False),
             issue_open=_flag("open", True),
             blocker_recorded=_flag("blocker", False),
+            # Redmine #13974 additive review-gate contract: the reviewed/requested head (``head``)
+            # and, on a review_result, the answered review_request journal (``req``). Absent on
+            # legacy markers -> blank (the callback fence fails such a review row closed).
+            target_head=(fields.get("head") or "").strip(),
+            review_request_journal=(fields.get("req") or "").strip(),
         )
     except (JournalMarkerError, ValueError):
         # A structured marker carrying an out-of-vocabulary conclusion / callback is skipped
@@ -154,7 +208,11 @@ def _gate_marker_from_fields(
 
 
 def extract_markers_from_note(
-    issue_id: str, journal_id: str, notes: str
+    issue_id: str,
+    journal_id: str,
+    notes: str,
+    *,
+    channels: "frozenset[str] | set[str] | None" = None,
 ) -> tuple[JournalMarker, ...]:
     """Extract every structured gate marker from one journal note (pure; never prose).
 
@@ -162,6 +220,12 @@ def extract_markers_from_note(
     into a :class:`JournalMarker` when it names a gate-bearing kind, and returns them in
     note order. A note with no recognized marker token yields ``()`` — the watcher reads the
     structured token, never the surrounding narrative.
+
+    ``channels`` optionally restricts extraction to a SUBSET of the recognized channels — the
+    channel provenance a caller needs to keep the two channels apart (Redmine #13952 R6 review
+    j#83467 F5: the ``handoff`` channel is a delivery *notification*, not durable review truth,
+    so a read-model over the durable record must be able to ask for the ``workflow-event``
+    channel alone). ``None`` (the default) keeps the existing all-recognized-channels behavior.
     """
     if not notes:
         return ()
@@ -174,6 +238,8 @@ def extract_markers_from_note(
     for match in _MARKER_RE.finditer(notes):
         channel = match.group("channel")
         if channel not in _RECOGNIZED_CHANNELS:
+            continue
+        if channels is not None and channel not in channels:
             continue
         fields = _parse_marker_fields(match.group("body"))
         marker = _gate_marker_from_fields(entry, channel, fields)
@@ -188,19 +254,26 @@ def extract_marker(entry: RedmineJournalEntry) -> JournalMarker | None:
     return markers[0] if markers else None
 
 
-def extract_markers(entries: Iterable[RedmineJournalEntry]) -> tuple[JournalMarker, ...]:
+def extract_markers(
+    entries: Iterable[RedmineJournalEntry],
+    *,
+    channels: "frozenset[str] | set[str] | None" = None,
+) -> tuple[JournalMarker, ...]:
     """All structured gate markers across an ordered sequence of journal entries (pure).
 
     One entry may carry more than one structured marker (e.g. a combined Implementation Done
     / Review Request gate journal embedding both tokens); each becomes its own
     :class:`JournalMarker`. Entries are read in order so the result is replay-stable, and the
     intake's duplicate suppression (same ``redmine:<issue>:<journal>`` anchor) handles a
-    re-read of the same entry.
+    re-read of the same entry. ``channels`` restricts extraction to a channel subset (see
+    :func:`extract_markers_from_note`); ``None`` keeps all recognized channels.
     """
     markers: list[JournalMarker] = []
     for entry in entries:
         markers.extend(
-            extract_markers_from_note(entry.issue_id, entry.journal_id, entry.notes)
+            extract_markers_from_note(
+                entry.issue_id, entry.journal_id, entry.notes, channels=channels
+            )
         )
     return tuple(markers)
 
@@ -238,6 +311,13 @@ class MappingRedmineJournalSource:
     """
 
     payload: Mapping[str, object]
+
+    #: This source is a FROZEN snapshot: every :meth:`read_entries` re-parses the SAME supplied
+    #: mapping, so two reads can never differ. An actuating caller that re-reads before mutating
+    #: (the #13889 callback sweep) would get a no-op guard and leave its TOCTOU window open, so the
+    #: property is declared False and such callers must refuse to mutate on it (review R2-F1).
+    #: Read-only classification over a snapshot remains perfectly valid.
+    fresh_read: ClassVar[bool] = False
 
     @staticmethod
     def _as_journal_list(raw: object) -> list[Mapping[str, object]] | None:
@@ -293,15 +373,240 @@ def markers_from_source(
     return extract_markers(source.read_entries(issue_id))
 
 
+# ---------------------------------------------------------------------------
+# Dispatch marker — a SEPARATE closed vocabulary from the gate-bearing kinds (Redmine #13758
+# review R5-F3 / Design Answer j#79507 Q2). A dispatch (implementation_request) is NOT a
+# callback-required gate, so it must NOT widen GATE_BEARING_KINDS or be mis-promoted to a
+# callback event. The canonical Implementation Request writer embeds this marker in the IR
+# journal body; the reconciler reads the marker's OWNING Redmine entry journal_id as the exact
+# dispatch anchor (NOT the marker's self-reported ``journal=`` — no self-reference / chicken-
+# and-egg). A legacy prose-only IR (no marker) is fail-closed: never parse-guessed.
+# ---------------------------------------------------------------------------
+DISPATCH_KIND_IMPLEMENTATION_REQUEST = "implementation_request"
+
+
+def render_dispatch_marker(lane: str, lane_generation: object) -> str:
+    """The structured dispatch marker for an IR journal (pure; the producer inverse of the reader).
+
+    ``[mozyo:workflow-event:kind=implementation_request:lane=<lane>:lane_generation=<n>]`` — the
+    canonical Implementation Request writer embeds this in the IR journal body so the reconciler
+    can resolve the exact dispatch anchor from the owning entry's journal id (Design Answer
+    j#79507 Q2). A separate closed vocabulary from :func:`render_workflow_event_marker` (which is
+    for callback gate kinds); this token names ``implementation_request`` and carries no gate.
+    """
+    lane_s = str(lane or "").strip()
+    gen_s = str(lane_generation if lane_generation is not None else "").strip()
+    return (
+        f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:"
+        f"kind={DISPATCH_KIND_IMPLEMENTATION_REQUEST}:lane={lane_s}:lane_generation={gen_s}]"
+    )
+
+
+def render_dispatch_note(body: str, *, lane: str, lane_generation: object) -> str:
+    """A canonical Implementation Request note: prose ``body`` + the embedded dispatch marker."""
+    marker = render_dispatch_marker(lane, lane_generation)
+    body = str(body or "").rstrip()
+    return f"{body}\n\n{marker}" if body else marker
+
+
+def dispatch_entry_journals(
+    entries: "Iterable[RedmineJournalEntry]",
+    *,
+    lane: str,
+    lane_generation: object,
+) -> "tuple[str, ...]":
+    """The DISTINCT owning entry journal ids that carry a current dispatch marker (pure, sorted).
+
+    Scans the ``[mozyo:workflow-event:kind=implementation_request:...]`` markers whose ``lane`` /
+    ``lane_generation`` match and returns each OWNING entry's ``journal_id`` (deduped, sorted). The
+    length distinguishes the three cases the writer's idempotency needs (Redmine #13758 R7-F3):
+    ``0`` — no current dispatch (a legacy prose-only IR — never guessed, and the point to write a
+    fresh marker); ``1`` — the exact current dispatch (recover / anchor); ``>=2`` — an ambiguous /
+    foreign duplicate (zero-send, and never add a further marker). A same-entry re-read dedups to
+    one id (a same IR-journal retry is the same dispatch).
+    """
+    lane_s = str(lane or "").strip()
+    gen_s = str(lane_generation if lane_generation is not None else "").strip()
+    if not (lane_s and gen_s):
+        return ()
+    found: set[str] = set()
+    for entry in entries or ():
+        entry_journal = str(getattr(entry, "journal_id", "") or "").strip()
+        if not entry_journal:
+            continue
+        for channel, fields in marker_fields_in_note(getattr(entry, "notes", "") or ""):
+            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+                continue
+            if str(fields.get("kind", "")).strip() != DISPATCH_KIND_IMPLEMENTATION_REQUEST:
+                continue
+            if str(fields.get("lane", "")).strip() != lane_s:
+                continue
+            if str(fields.get("lane_generation", "")).strip() != gen_s:
+                continue
+            found.add(entry_journal)
+    return tuple(sorted(found))
+
+
+def dispatch_generations(entries: "Iterable[RedmineJournalEntry]", *, lane: str) -> "tuple[int, ...]":
+    """Every lane_generation this lane has a dispatch marker for (pure, sorted ascending).
+
+    The **round authority** a sweep needs to notice it is reasoning about a superseded round
+    (Redmine #13889 review F3): :func:`resolve_dispatch_entry_journal` answers "where is round N's
+    anchor" for a generation the caller already fixed, so it can never reveal that round N+1 has
+    since opened. This scans the same durable dispatch markers WITHOUT fixing a generation, so a
+    caller can compare the round it is sweeping against the newest round on the record. A
+    non-numeric / blank generation is skipped (never guessed).
+    """
+    lane_s = str(lane or "").strip()
+    if not lane_s:
+        return ()
+    found: set[int] = set()
+    for entry in entries or ():
+        for channel, fields in marker_fields_in_note(getattr(entry, "notes", "") or ""):
+            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+                continue
+            if str(fields.get("kind", "")).strip() != DISPATCH_KIND_IMPLEMENTATION_REQUEST:
+                continue
+            if str(fields.get("lane", "")).strip() != lane_s:
+                continue
+            raw = str(fields.get("lane_generation", "")).strip()
+            try:
+                found.add(int(raw))
+            except (TypeError, ValueError):
+                continue
+    return tuple(sorted(found))
+
+
+def resolve_dispatch_entry_journal(
+    entries: "Iterable[RedmineJournalEntry]",
+    *,
+    lane: str,
+    lane_generation: object,
+) -> str:
+    """The Redmine entry journal id of the CURRENT dispatch for ``(lane, lane_generation)`` (pure).
+
+    The exact dispatch anchor (Design Answer j#79507 Q2): the OWNING entry's ``journal_id`` of the
+    single current ``kind=implementation_request`` marker — the anchor authority is the durable
+    entry, not the marker's self-reported fields. Fail-closed to ``""`` (zero-send) unless EXACTLY
+    ONE such entry exists (see :func:`dispatch_entry_journals`): zero matches (a legacy prose-only
+    IR — never guessed) or two-or-more distinct entries (ambiguous / foreign) both return ``""``.
+    """
+    journals = dispatch_entry_journals(entries, lane=lane, lane_generation=lane_generation)
+    return journals[0] if len(journals) == 1 else ""
+
+
+def dispatch_entry_journal_from_source(
+    source: RedmineJournalSource, issue_id: str, *, lane: str, lane_generation: object
+) -> str:
+    """Read the issue's entries and resolve the current dispatch entry journal (over ``source``)."""
+    return resolve_dispatch_entry_journal(
+        source.read_entries(issue_id), lane=lane, lane_generation=lane_generation
+    )
+
+
+def render_workflow_event_marker(
+    gate: str,
+    *,
+    conclusion: str | None = None,
+    callback: str | None = None,
+    commit_bearing: bool | None = None,
+    integration_recorded: bool | None = None,
+    issue_open: bool | None = None,
+    blocker_recorded: bool | None = None,
+    target_head: str | None = None,
+    review_request_journal: str | None = None,
+) -> str:
+    """Render the structured ``[mozyo:workflow-event:...]`` gate marker for a gate journal (pure).
+
+    This is the **producer** inverse of :func:`extract_markers_from_note` (#13520 review F1-R1):
+    an agent recording a handoff-worthy gate journal (implementation_done / review_request /
+    review_result) embeds the returned token in the journal notes so the callback watcher can
+    **discover** the gate structurally later — the watcher reads the machine token, never the
+    surrounding prose. Only the fields that are set are emitted (a bare marker carries just the
+    gate). ``gate`` must be a gate-bearing kind (:data:`GATE_BEARING_KINDS`); anything else is a
+    programming error and raises. The output round-trips through
+    :func:`extract_markers_from_note` back to the same :class:`JournalMarker`.
+
+    **Review-gate producer contract (Redmine #13974 / j#81454 A, additive).** A review-gate producer
+    MUST carry the reviewed commit head so the callback generation fence can conjoin the target-head
+    dimension (never parsed from prose): a ``review_request`` marker carries ``target_head`` (the exact
+    full commit head the round pins); a ``review_result`` marker carries ``target_head`` (the head it
+    reviewed) AND ``review_request_journal`` (the request it answers) AND its ``conclusion``.
+    ``source_sequence`` is NOT self-declared — it is the Redmine provider's own ``review_result``
+    journal id (the durable record authority). A head-less marker (a legacy producer) is accepted for
+    back-compat but fails the callback head fence closed, so a review returns to the current lane only
+    when its head still matches the current review generation head. The canonical production writer is
+    ``mozyo-bridge workflow callbacks --emit-gate`` (:func:`...callback_gate_record.emit_gate_record` ->
+    :func:`render_gate_note`), which fail-closed-refuses a review gate lacking a full ``target_head``
+    (and, on a ``review_result``, the answered ``review_request`` journal). This renderer is the machine
+    contract's authority; the agent-facing producer rule lives in the governed preset's
+    ``### Review Generation Marker Contract v2``.
+    """
+    gate_s = str(gate).strip()
+    if gate_s not in GATE_BEARING_KINDS:
+        raise ValueError(
+            f"render_workflow_event_marker gate must be one of {sorted(GATE_BEARING_KINDS)}, "
+            f"got {gate!r}"
+        )
+    fields = [f"gate={gate_s}"]
+    if conclusion is not None:
+        fields.append(f"conclusion={str(conclusion).strip()}")
+    if callback is not None:
+        fields.append(f"callback={str(callback).strip()}")
+    for key, value in (
+        ("commit", commit_bearing),
+        ("integrated", integration_recorded),
+        ("open", issue_open),
+        ("blocker", blocker_recorded),
+    ):
+        if value is not None:
+            fields.append(f"{key}={'1' if value else '0'}")
+    # Redmine #13974 additive review-gate contract: the reviewed/requested head (``head``) and, on a
+    # review_result, the answered review_request journal (``req``). A git SHA is hex and a journal id
+    # numeric, so neither collides with the ``:``/``=`` marker grammar. Only emitted when supplied.
+    if target_head is not None:
+        fields.append(f"head={str(target_head).strip()}")
+    if review_request_journal is not None:
+        fields.append(f"req={str(review_request_journal).strip()}")
+    return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{':'.join(fields)}]"
+
+
+def render_gate_note(gate: str, *, body: str = "", **marker_fields: object) -> str:
+    """Render a **canonical gate-record note**: prose body + the embedded gate marker (pure).
+
+    The single canonical renderer for a callback-required gate journal (#13520 review F1a): a gate
+    recorded through this path always carries the structured
+    :func:`render_workflow_event_marker` token, so the callback watcher can **discover** it
+    (:func:`markers_from_source`) instead of relying on a hand-written fixture marker or prose. The
+    marker is appended after the human-readable ``body`` (blank body -> just the marker). ``gate``
+    must be a callback-required kind (:data:`GATE_BEARING_KINDS`); ``marker_fields`` are forwarded
+    to :func:`render_workflow_event_marker` (conclusion / callback / commit_bearing / …). Pure;
+    the caller (the application writer) posts the returned text as a Redmine journal note.
+    """
+    marker = render_workflow_event_marker(gate, **marker_fields)  # type: ignore[arg-type]
+    body_s = str(body or "").rstrip()
+    return f"{body_s}\n\n{marker}" if body_s else marker
+
+
 __all__ = (
     "MARKER_CHANNEL_HANDOFF",
     "MARKER_CHANNEL_WORKFLOW_EVENT",
     "GATE_BEARING_KINDS",
     "RedmineJournalEntry",
+    "marker_fields_in_note",
     "extract_markers_from_note",
     "extract_marker",
     "extract_markers",
     "RedmineJournalSource",
     "MappingRedmineJournalSource",
     "markers_from_source",
+    "render_workflow_event_marker",
+    "render_gate_note",
+    "DISPATCH_KIND_IMPLEMENTATION_REQUEST",
+    "render_dispatch_marker",
+    "render_dispatch_note",
+    "dispatch_entry_journals",
+    "dispatch_generations",
+    "resolve_dispatch_entry_journal",
+    "dispatch_entry_journal_from_source",
 )

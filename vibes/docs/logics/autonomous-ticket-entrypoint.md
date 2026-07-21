@@ -6,6 +6,10 @@ When a user, another agent, or a `mozyo-bridge` pane delivers only a ticket ID (
 
 This entrypoint is for the autonomous-handoff case where the inbound message does not by itself carry purpose, target paths, completion criteria, or prohibitions. The agent must resolve those from the ticket's source of truth before acting.
 
+製品レベルのオーケストレーターは、RedmineまたはAsanaを必須としない。プロバイダー非依存の
+契約は `vibes/docs/logics/ticket-system-neutral-orchestrator.md` を正本とする。以下のシステム別分岐は、
+アダプター固有の受付規則である。各プロバイダーの永続性を保つが、中核の状態機械には含めない。
+
 ## What Counts As "Ticket-ID Only"
 
 Any of the following inbound shapes counts as ticket-ID-only and triggers this entrypoint:

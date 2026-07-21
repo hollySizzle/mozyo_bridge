@@ -1,0 +1,286 @@
+"""Process-external self-close executor (Redmine #13806 tranche C).
+
+The victim coordinator arms its self-close and yields (tranche B stops at
+``self_close_armed``); THIS runs *outside* the victim process (never a synchronous
+self-kill, j#78384 §2 mandatory safety / Verdict j#78406) to actually replace the current
+coordinator. It re-verifies the action-time seals — transaction phase, exact action
+generation, the old coordinator's pinned identity, turn-ended + idle, no pending composer,
+the preservation seal, and the continuation seal (:func:`decide_self_close`) — and only
+then drives the self participant ``close_owed -> launch_owed -> verify_owed -> replaced``
+by reusing the tranche B actuator's :meth:`...ReplacementActuatorUseCase.drive_self_participant`
+(so the exact same evidence-gated close/launch, action-bound attestation, pre-effect lease
+re-authentication, and CAS discipline apply — the old generation is closed, the fresh
+coordinator launched + attested).
+
+The self-specific seals are re-observed **at the exact destructive-close call site**, not
+once early (Redmine #13806 R1-F1 / R2-F1): a :class:`_SelfSealAwareActuatorPort` re-runs
+:func:`decide_self_close` inside the self participant's ``close_exact_generation`` — reached
+by the tranche B close path AFTER its ``observe_preservation`` and its ``_reauth_before_effect``
+(lease re-auth), immediately before the inner close. A seal that regresses (a pending composer
+appearing, a turn resuming) anywhere up to that point makes the wrapper REFUSE the close
+(return :data:`...replacement_actuation.CLOSE_ERROR`), so the tranche B close path leaves the
+participant ``close_owed`` with zero close and the failing seal surfaced. The guard is at the
+close call site — not at ``observe_preservation``, which would leave the observe→close window
+open (the R2-F1 residual). This reuses the tranche B close path; there is no second close
+primitive.
+
+It performs NO fresh-coordinator claim: after the self is ``replaced`` and the lease
+released, a fresh action-attested coordinator claims and drains
+(:mod:`...fresh_coordinator_drain`). A self-close-then-crash or a missing fresh coordinator
+is recovered by re-running from the durable owed state; unknown / ambiguous / recycled /
+newer-authority observations are zero additional close (all enforced by the reused tranche B
+steps).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Callable, Protocol, runtime_checkable
+
+from mozyo_bridge.core.state.replacement_preservation import PreservationObservation
+from mozyo_bridge.core.state.replacement_transaction import ReplacementTransactionStore
+from mozyo_bridge.core.state.replacement_transaction_model import (
+    ParticipantPin,
+    ReplacementTransactionKey,
+    ReplacementTransactionRecord,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (  # noqa: E501
+    DEFAULT_LEASE_TTL_SECONDS,
+    ActuationResult,
+    ReplacementActuatorUseCase,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator_ops import (  # noqa: E501
+    ExactGenerationActuatorPort,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E501
+    ACTUATION_ARMED,
+    CLOSE_ERROR,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.session_replacement_reconcile import (  # noqa: E501
+    SELF_CLOSE_MAY_PROCEED,
+    SelfCloseObservation,
+    decide_self_close,
+)
+
+#: Statuses for a self-close executor run (a closed vocabulary).
+SELF_CLOSE_REPLACED = "self_replaced"
+SELF_CLOSE_BLOCKED = "blocked"
+SELF_CLOSE_INVALID_TOPOLOGY = "invalid_topology"
+SELF_CLOSE_GENERATION_MISMATCH = "generation_mismatch"
+SELF_CLOSE_NOT_FOUND = "not_found"
+#: The self-drive stopped fail-closed (lease lost / effect failed / attestation, etc.); the
+#: underlying actuation status is carried in ``detail``.
+SELF_CLOSE_ACTUATION_STOPPED = "actuation_stopped"
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@runtime_checkable
+class SelfCloseSealPort(Protocol):
+    """The action-time seal observation the process-external executor needs (faked)."""
+
+    def observe_self_close_seals(
+        self, record: ReplacementTransactionRecord, self_pin: ParticipantPin
+    ) -> SelfCloseObservation:
+        """Gather the live seals for the self-close (phase / generation / old-coordinator
+        identity / turn-ended / idle / no-pending-composer / preservation / continuation).
+        """
+        ...
+
+
+class _SelfSealAwareActuatorPort:
+    """Wraps an :class:`ExactGenerationActuatorPort` to re-verify the self seals at close.
+
+    Every method delegates to the wrapped ``inner`` port EXCEPT the self participant's
+    :meth:`close_exact_generation` — the exact destructive-close call site, reached by the
+    tranche B ``_step_close_owed`` AFTER its ``observe_preservation`` and ``_reauth_before_effect``
+    (lease re-auth). For the self participant it re-reads the durable row and re-runs
+    :func:`decide_self_close` immediately before delegating to the inner close; a regressed
+    seal REFUSES the close (returns :data:`CLOSE_ERROR`), so the tranche B close path leaves
+    the participant ``close_owed`` with zero close (Redmine #13806 R2-F1 — the guard must be
+    at the close boundary, after the lease re-auth, not at ``observe_preservation`` which
+    leaves the observe→close window open). The failing seal is captured in
+    :attr:`last_seal_block` for the durable record. Non-self participants (there are none in
+    a self-drive, but defensively) are unaffected.
+    """
+
+    def __init__(
+        self,
+        inner: ExactGenerationActuatorPort,
+        seal_port: SelfCloseSealPort,
+        store: ReplacementTransactionStore,
+        key: ReplacementTransactionKey,
+        self_identity: tuple,
+    ) -> None:
+        self._inner = inner
+        self._seal_port = seal_port
+        self._store = store
+        self._key = key
+        self._self_identity = self_identity
+        self.last_seal_block = ""
+
+    def observe_old_slot(self, pin: ParticipantPin) -> str:
+        return self._inner.observe_old_slot(pin)
+
+    def observe_preservation(self, pin: ParticipantPin) -> PreservationObservation:
+        return self._inner.observe_preservation(pin)
+
+    def close_exact_generation(self, pin: ParticipantPin) -> str:
+        if pin.identity == self._self_identity:
+            # Re-verify the self seals HERE — the exact close call site, after the tranche B
+            # lease re-auth — so a seal regressing anywhere between the earlier
+            # observations and this point still blocks the destructive close (R2-F1).
+            record = self._store.get(self._key)
+            self_pin = (
+                record.find_participant(self._self_identity)
+                if record is not None
+                else None
+            )
+            if record is None or self_pin is None:
+                self.last_seal_block = "record_or_participant_missing"
+                return CLOSE_ERROR
+            verdict = decide_self_close(
+                self._seal_port.observe_self_close_seals(record, self_pin)
+            )
+            if verdict != SELF_CLOSE_MAY_PROCEED:
+                # A self seal regressed by the close boundary — refuse the close. Tranche B
+                # then leaves the participant ``close_owed`` (effect_failed), zero close.
+                self.last_seal_block = verdict
+                return CLOSE_ERROR
+        return self._inner.close_exact_generation(pin)
+
+    def launch_action_bound(self, action_id: str, pin: ParticipantPin) -> str:
+        return self._inner.launch_action_bound(action_id, pin)
+
+    def verify_attestation(self, action_id: str, pin: ParticipantPin) -> str:
+        return self._inner.verify_attestation(action_id, pin)
+
+
+@dataclass(frozen=True)
+class SelfCloseResult:
+    """The outcome of one self-close executor run."""
+
+    status: str
+    phase: str = ""
+    revision: int = 0
+    blocked_reason: str = ""
+    detail: str = ""
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "phase": self.phase,
+            "revision": self.revision,
+            "blocked_reason": self.blocked_reason,
+            "detail": self.detail,
+        }
+
+
+class SelfCloseExecutorUseCase:
+    """Re-verify seals, then replace the self coordinator via the tranche B actuator."""
+
+    def __init__(
+        self,
+        store: ReplacementTransactionStore,
+        actuation_port: ExactGenerationActuatorPort,
+        seal_port: SelfCloseSealPort,
+        *,
+        clock: Callable[[], str] = _utc_now,
+        lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
+    ) -> None:
+        self._store = store
+        self._actuation_port = actuation_port
+        self._seal_port = seal_port
+        self._clock = clock
+        self._ttl = lease_ttl_seconds
+
+    def run(
+        self,
+        key: ReplacementTransactionKey,
+        *,
+        holder: str,
+        expected_action_generation: int,
+    ) -> SelfCloseResult:
+        """Verify the seals and replace the self coordinator, or stop fail-closed.
+
+        ``holder`` is the executor's (process-external) lease identity — NOT the fresh
+        coordinator's. On success the self participant is ``replaced``, the lease is released,
+        and the transaction is ready for the fresh-coordinator claim.
+        """
+        rec = self._store.get(key)
+        if rec is None:
+            return SelfCloseResult(status=SELF_CLOSE_NOT_FOUND)
+        if rec.action_generation != expected_action_generation:
+            return SelfCloseResult(
+                status=SELF_CLOSE_GENERATION_MISMATCH, phase=rec.phase,
+                revision=rec.revision,
+            )
+        self_pins = [p for p in rec.participants if p.is_self]
+        if len(self_pins) != 1:
+            return SelfCloseResult(
+                status=SELF_CLOSE_INVALID_TOPOLOGY, phase=rec.phase,
+                revision=rec.revision,
+                detail="exactly one self participant required",
+            )
+        self_pin = self_pins[0]
+        # Fast-fail: the action-time seal re-verify (pure decision over live observations)
+        # before any claim / effect. Zero effect on any failing seal (j#78384 §2/§3).
+        verdict = decide_self_close(
+            self._seal_port.observe_self_close_seals(rec, self_pin)
+        )
+        if verdict != SELF_CLOSE_MAY_PROCEED:
+            return SelfCloseResult(
+                status=SELF_CLOSE_BLOCKED, phase=rec.phase, revision=rec.revision,
+                blocked_reason=verdict,
+            )
+        # Drive the self participant via the reused tranche B actuator, but through a
+        # self-seal-aware port so the seals are RE-verified at the destructive-close boundary
+        # (R1-F1) — a seal regressing after the fast-fail above still blocks the close.
+        wrapped = _SelfSealAwareActuatorPort(
+            self._actuation_port, self._seal_port, self._store, key, self_pin.identity
+        )
+        actuator = ReplacementActuatorUseCase(
+            self._store, wrapped, clock=self._clock, lease_ttl_seconds=self._ttl
+        )
+        outcome: ActuationResult = actuator.drive_self_participant(
+            key, holder=holder, expected_action_generation=expected_action_generation
+        )
+        after = self._store.get(key)
+        if wrapped.last_seal_block:
+            # A self seal regressed at the close boundary — the wrapper refused the close, so
+            # the drive stopped fail-closed with zero close. Surface it as a blocked self-close
+            # with the exact failing seal (takes precedence over the generic actuation status).
+            return SelfCloseResult(
+                status=SELF_CLOSE_BLOCKED,
+                phase=after.phase if after else "",
+                revision=after.revision if after else 0,
+                blocked_reason=wrapped.last_seal_block,
+            )
+        if outcome.status == ACTUATION_ARMED:
+            return SelfCloseResult(
+                status=SELF_CLOSE_REPLACED,
+                phase=after.phase if after else "",
+                revision=after.revision if after else 0,
+            )
+        return SelfCloseResult(
+            status=SELF_CLOSE_ACTUATION_STOPPED,
+            phase=after.phase if after else "",
+            revision=after.revision if after else 0,
+            detail=outcome.status,
+        )
+
+
+__all__ = (
+    "SelfCloseSealPort",
+    "SelfCloseResult",
+    "SelfCloseExecutorUseCase",
+    "SELF_CLOSE_REPLACED",
+    "SELF_CLOSE_BLOCKED",
+    "SELF_CLOSE_INVALID_TOPOLOGY",
+    "SELF_CLOSE_GENERATION_MISMATCH",
+    "SELF_CLOSE_NOT_FOUND",
+    "SELF_CLOSE_ACTUATION_STOPPED",
+)

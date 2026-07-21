@@ -1,34 +1,14 @@
-"""Pure sublane worker-dispatch ack-drive vocabulary / outcome (Redmine #12988).
+"""Pure worker-dispatch admission/result vocabulary (#12988, #13846).
 
-#12986 renamed the creation-side dispatch record honestly: a ``sublane create
---execute`` gateway ``handoff send`` exiting 0 is :data:`DISPATCH_GATEWAY_NOTIFIED`
-only — the gateway pane received the notification, the same-lane Claude worker
-start is unproven — and reserved :data:`DISPATCH_WORKER_DISPATCHED` for a future
-real ack-driven step. #12988 delivers that step: the ``sublane dispatch-worker``
-drive (application layer :mod:`...application.sublane_worker_dispatcher`) lets the
-lane's Codex gateway forward the anchored ``implementation_request`` to its
-same-lane worker over the governed ``handoff send --to claude`` rail and record
-the *measured* outcome, so ``worker_dispatch_confirmed=true`` /
-``worker_dispatched`` is only ever written from a real worker-transfer delivery
-ACK — never inferred from gateway notification alone.
-
-This module is the **pure vocabulary + outcome value object + durable-record
-renderer** for that drive. It holds no IO and orchestrates nothing.
-
-Semantics contract (``vibes/docs/logics/ack-completion-receiver-state.md``, the
-ACK / delivery / completion separation): ``worker_dispatched`` is a **delivery
-ACK at the worker pane** — the submit-complete rail handed the anchored
-implementation_request to the worker runtime — and nothing more. It does NOT
-claim the worker processed the request, made progress, or completed anything;
-task completion stays with the durable Redmine record. The fail-closed side is
-equally fixed: when the drive cannot confirm the transfer (missing identity /
-anchor, unresolved lane, missing pane, failed / refused send) the lane's
-recorded dispatch state **stays** :data:`DISPATCH_GATEWAY_NOTIFIED` — a failed
-drive is :data:`WORKER_DISPATCH_DELIVERY_FAILED`, never a silent promotion.
+``worker_dispatched`` requires current generation-bound authority, a transport
+ACK, and a causally-bound worker turn-start.  It is still not progress or task
+completion; those remain durable workflow facts.  Any missing/uncertain fact
+keeps the lane at ``gateway_notified`` and forbids an automatic replay.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -49,26 +29,38 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 # ---------------------------------------------------------------------------
 # Drive-specific result / blocked-reason tokens.
 #
-# The drive's own result is one of three literals: the worker transfer was
+# The drive's own result records transport and turn-start separately: the worker
+# transfer was
 # confirmed (`worker_dispatched`, reusing the #12986 reserved token), the send
 # was attempted and did not ack (`delivery_failed`, aligned with the
-# transport-agnostic ACK contract state of the same name), or the drive never
-# reached the send (`not_attempted`: dry-run, or blocked before dispatch).
+# transport-agnostic ACK contract state), transport ACK lacked turn-start
+# (`turn_start_unconfirmed`), or the drive never reached the send (`not_attempted`).
 # ---------------------------------------------------------------------------
 
 #: The same-lane send was attempted but no delivery ACK landed (non-zero exit,
 #: refused preflight, or a raised failure). The lane's recorded dispatch state
 #: stays ``gateway_notified`` — fail-closed, never promoted.
 WORKER_DISPATCH_DELIVERY_FAILED = "delivery_failed"
+#: Queue entry was acknowledged, but no causally-bound worker turn-start was
+#: observed.  Injection may have happened, so this is deliberately non-retryable.
+WORKER_DISPATCH_TURN_START_UNCONFIRMED = "turn_start_unconfirmed"
 
 WORKER_DISPATCH_RESULTS = frozenset(
     {
         DISPATCH_WORKER_DISPATCHED,
         WORKER_DISPATCH_DELIVERY_FAILED,
+        WORKER_DISPATCH_TURN_START_UNCONFIRMED,
         DISPATCH_NOT_ATTEMPTED,
     }
 )
 
+#: The sender that drove ``dispatch-worker`` is not the target lane's current
+#: same-lane gateway (Redmine #14192): a foreign / cross-lane sender (e.g. a
+#: coordinator shell) whose launch-time lane identity does not resolve to this
+#: lane's gateway route. The pre-reserve sender preflight fails closed on it with
+#: zero fence write and zero send, so the inner rail's ``gateway_route_blocked``
+#: never reserves-then-poisons the exact key. Same verdict on dry-run and execute.
+REASON_FOREIGN_SENDER = "foreign_sender_route_blocked"
 #: No lane resolved for the requested worktree in the live pane inventory.
 REASON_LANE_NOT_RESOLVED = "lane_not_resolved"
 #: The resolved lane has no live worker (or gateway) pane to transfer to /
@@ -76,17 +68,205 @@ REASON_LANE_NOT_RESOLVED = "lane_not_resolved"
 REASON_LANE_PANE_MISSING = "lane_pane_missing"
 #: The same-lane worker send returned a non-zero / failed outcome.
 REASON_WORKER_DISPATCH_FAILED = "worker_dispatch_failed"
+REASON_WORKER_TURN_START_UNCONFIRMED = "worker_turn_start_unconfirmed"
+
+# Action-time liveness-authority admission (#13846).  A stale-name token is a
+# diagnosis, never permission to close/relaunch or to inject another request.
+ADMISSION_HEALTHY = "healthy"
+ADMISSION_STALE_WORKER_RECOVERY_REQUIRED = "stale_worker_recovery_required"
+ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT = "worker_liveness_authority_conflict"
+WORKER_DISPATCH_ADMISSION_DECISIONS = frozenset(
+    {
+        ADMISSION_HEALTHY,
+        ADMISSION_STALE_WORKER_RECOVERY_REQUIRED,
+        ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
+    }
+)
+
+TURN_START_STARTED = "started"
+TURN_START_DELIVERED_NOT_STARTED = "delivered_not_started"
+TURN_START_NOT_STARTED = "not_started"
+TURN_START_UNKNOWN = "unknown"
 
 WORKER_DISPATCH_BLOCKED_REASONS = frozenset(
     {
         REASON_MISSING_IDENTITY,
         REASON_ANCHOR_REQUIRED,
+        REASON_FOREIGN_SENDER,
         REASON_LANE_NOT_RESOLVED,
         REASON_LANE_MISMATCH,
         REASON_LANE_PANE_MISSING,
         REASON_WORKER_DISPATCH_FAILED,
+        REASON_WORKER_TURN_START_UNCONFIRMED,
+        ADMISSION_STALE_WORKER_RECOVERY_REQUIRED,
+        ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
     }
 )
+
+#: The inner ``handoff send`` outcome reasons that PROVE a known-not-sent before any
+#: injection (Redmine #14192). The gateway-route enforcement gate — the sender-lane
+#: bypass block AND the lifecycle-target invariant, both emitted as
+#: ``gateway_route_blocked`` — and the newer-schema ``reader_upgrade_required`` gate
+#: all ``die`` *before* the transport rail types a byte. A non-zero worker send whose
+#: structured outcome carries one of these reasons is therefore a proven zero-injection
+#: (text / Enter 0), NOT an uncertain send: the exact fence key is cancelled (never
+#: replayed) rather than poisoned to the reconcile-only ``uncertain`` terminal. Every
+#: other non-zero outcome — an unparseable record, a timeout, or any post-injection
+#: failure whose fate is unknown — stays ``uncertain`` and never-replay (Acceptance #3).
+SEND_KNOWN_NOT_SENT_REASONS = frozenset(
+    {"gateway_route_blocked", "reader_upgrade_required"}
+)
+
+
+def classify_send_known_not_sent(record_text: str) -> bool:
+    """True iff the captured inner-send record proves a pre-injection zero-send (pure).
+
+    The composed inner ``handoff send`` emits its structured :class:`DeliveryOutcome`
+    with the default ``record_format=both``, whose LAST line is the single-line
+    ``outcome.to_json()`` (the documented scrape target). This reads that last JSON
+    object and returns ``True`` only for an explicit ``status == "blocked"`` whose
+    ``reason`` is in :data:`SEND_KNOWN_NOT_SENT_REASONS` — a gate that fails closed
+    before injection. Anything else — no JSON line, a non-object payload, a
+    non-``blocked`` status, an unrecognized reason, or a parse failure — returns
+    ``False`` so an ambiguous / post-injection / uncertain outcome is never mistaken
+    for a proven not-sent (fail toward ``uncertain``, Redmine #14192 Acceptance #3).
+    """
+    for line in reversed((record_text or "").splitlines()):
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        return (
+            str(payload.get("status", "")) == "blocked"
+            and str(payload.get("reason", "")) in SEND_KNOWN_NOT_SENT_REASONS
+        )
+    return False
+
+
+@dataclass(frozen=True)
+class SenderDispatchAdmission:
+    """The pre-reserve sender-identity verdict for a worker dispatch (Redmine #14192).
+
+    ``admitted`` is the sole authorization: only an admitted sender proceeds to the
+    outbox reserve + send. ``reason`` is a public-safe explanation (no locator /
+    secret); ``detail_token`` is a value-free discriminator (e.g. the resolved
+    :class:`GatewayRouteDecision` ``blocked_reason``, or a sender-identity failure
+    reason) surfaced in the blocked outcome so a recurrence is diagnosable.
+    ``exception_applied`` records an admitted cross-lane drive released only by the
+    explicit ``--allow-direct-worker`` durable exception (mirrors the inner gateway
+    route's ``gateway_route_exception``).
+    """
+
+    admitted: bool
+    reason: str
+    detail_token: str = ""
+    exception_applied: bool = False
+
+
+@dataclass(frozen=True)
+class WorkerDispatchAdmissionFacts:
+    """One action-time join of durable and live worker authority."""
+
+    lifecycle_current: bool
+    anchor_current: bool
+    identity_attested: bool
+    action_binding_current: bool
+    slot_state: str
+    locator_present: bool
+    receiver_state: str
+    generation_binding_current: bool = False
+    # #13846 R4: a value-free token naming WHICH generation authority did not bind when
+    # ``generation_binding_current`` is False (e.g. a slot-less fresh row whose live startup
+    # self-attestation is not generation-bound, or a declared-pin identity / locator / revision
+    # divergence). Empty when current. Surfaced in the conflict reason so a recurrence is
+    # diagnosable from the public structured outcome without exposing a locator / secret.
+    generation_binding_detail: str = ""
+    terminal_absence_authoritative: bool = False
+    duplicate_or_uncertain_delivery: bool = False
+    workspace_id: Optional[str] = None
+    lane_id: Optional[str] = None
+    lane_generation: Optional[int] = None
+    worker_assigned_name: Optional[str] = None
+    worker_locator: Optional[str] = None
+    action_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class WorkerDispatchAdmission:
+    """Typed dispatch decision; only ``healthy`` authorizes one injection."""
+
+    decision: str
+    reason: str
+    facts: WorkerDispatchAdmissionFacts
+
+    @property
+    def is_healthy(self) -> bool:
+        return self.decision == ADMISSION_HEALTHY
+
+    @property
+    def retry_allowed(self) -> bool:
+        # A stale decision authorizes recovery, not replay of this injection.
+        return False
+
+
+def decide_worker_dispatch_admission(
+    facts: WorkerDispatchAdmissionFacts,
+) -> WorkerDispatchAdmission:
+    """Fail closed over lifecycle, attestation, receiver and delivery causality."""
+    authority_checks = (
+        (facts.lifecycle_current, "lane lifecycle generation is not current"),
+        (facts.anchor_current, "dispatch anchor is not the current lane decision"),
+        (
+            facts.generation_binding_current,
+            "the live or absent worker is not bound to the current declared process generation"
+            + (
+                f" ({facts.generation_binding_detail})"
+                if facts.generation_binding_detail
+                else ""
+            ),
+        ),
+        (facts.action_binding_current, "replacement/action binding is not current"),
+        (
+            not facts.duplicate_or_uncertain_delivery,
+            "an earlier exact dispatch may already have injected this request",
+        ),
+    )
+    for ok, reason in authority_checks:
+        if not ok:
+            return WorkerDispatchAdmission(
+                ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT, reason, facts
+            )
+    if facts.terminal_absence_authoritative and not facts.locator_present:
+        return WorkerDispatchAdmission(
+            ADMISSION_STALE_WORKER_RECOVERY_REQUIRED,
+            "the current generation's worker is authoritatively absent; route the "
+            "owner-governed stale-worker recovery before dispatch",
+            facts,
+        )
+    checks = (
+        (facts.identity_attested, "worker startup identity/generation is not attested"),
+        (facts.slot_state == "live", "named worker slot is not positively live"),
+        (facts.locator_present, "worker locator is absent"),
+        (
+            facts.receiver_state in ("awaiting_input", "turn_ended"),
+            "worker receiver is not presently dispatch-admissible",
+        ),
+    )
+    for ok, reason in checks:
+        if not ok:
+            return WorkerDispatchAdmission(
+                ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT, reason, facts
+            )
+    return WorkerDispatchAdmission(
+        ADMISSION_HEALTHY,
+        "current lifecycle, startup attestation, receiver and action binding agree",
+        facts,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +372,15 @@ class WorkerDispatchOutcome:
     # cross-lane drive (e.g. a coordinator stall-drive) is admitted and recorded
     # distinctly as a ``gateway_route_exception`` instead of failing closed.
     allow_direct_worker: bool = False
+    # #13846 action-time authority and ACK/turn-start separation.  Additive JSON
+    # fields keep existing consumers compatible while preventing ACK-only promotion.
+    admission_decision: Optional[str] = None
+    admission_reason: Optional[str] = None
+    lane_generation: Optional[int] = None
+    worker_assigned_name: Optional[str] = None
+    receiver_state: Optional[str] = None
+    turn_start_outcome: Optional[str] = None
+    retry_allowed: bool = False
 
     @property
     def is_blocked(self) -> bool:
@@ -203,14 +392,16 @@ class WorkerDispatchOutcome:
 
     @property
     def worker_dispatch_confirmed(self) -> bool:
-        """True only when the worker-transfer delivery ACK was measured.
+        """True only for healthy authority + delivery ACK + worker turn-start.
 
-        Mirrors :attr:`SublaneActuationOutcome.worker_dispatch_confirmed`: only
-        the explicit :data:`DISPATCH_WORKER_DISPATCHED` result confirms; a
-        dry-run, a pre-send block, and a ``delivery_failed`` send all stay
-        unconfirmed (Redmine #12986 / #12988).
+        A dry-run, pre-send block, delivery failure, or ACK-only result stays
+        unconfirmed (#12986 / #12988 / #13846).
         """
-        return self.dispatch_result == DISPATCH_WORKER_DISPATCHED
+        return (
+            self.dispatch_result == DISPATCH_WORKER_DISPATCHED
+            and self.admission_decision == ADMISSION_HEALTHY
+            and self.turn_start_outcome == TURN_START_STARTED
+        )
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -232,6 +423,13 @@ class WorkerDispatchOutcome:
             "fill_override_reason": self.fill_override_reason,
             "worker_ready": self.worker_ready,
             "allow_direct_worker": self.allow_direct_worker,
+            "admission_decision": self.admission_decision,
+            "admission_reason": self.admission_reason,
+            "lane_generation": self.lane_generation,
+            "worker_assigned_name": self.worker_assigned_name,
+            "receiver_state": self.receiver_state,
+            "turn_start_outcome": self.turn_start_outcome,
+            "retry_allowed": self.retry_allowed,
         }
 
 
@@ -239,10 +437,8 @@ def render_worker_dispatch_journal(outcome: WorkerDispatchOutcome) -> str:
     """Render the drive outcome as a replayable durable-record snippet (pure).
 
     The gateway posts this to the Redmine durable anchor so the coordinator can
-    read the *measured* worker-dispatch state instead of inferring it from the
-    creation-side ``gateway_notified`` record. A fail-closed run spells out that
-    the lane's recorded dispatch state stays ``gateway_notified`` and carries
-    the replayable retry command.
+    read the measured state instead of inferring it from ``gateway_notified``.
+    A fail-closed run keeps that state and says whether replay is forbidden.
     """
     heading = (
         "## sublane worker dispatch blocked"
@@ -267,6 +463,19 @@ def render_worker_dispatch_journal(outcome: WorkerDispatchOutcome) -> str:
         f"- worker_dispatch_confirmed: {str(outcome.worker_dispatch_confirmed).lower()}",
         f"- durable_anchor: {outcome.durable_anchor or '-'}",
     ]
+    if outcome.admission_decision is not None:
+        lines.extend(
+            [
+                f"- admission_decision: {outcome.admission_decision}",
+                f"- admission_reason: {outcome.admission_reason or '-'}",
+                f"- lane_generation: {outcome.lane_generation or '-'}",
+                f"- worker_assigned_name: {outcome.worker_assigned_name or '-'}",
+                f"- receiver_state: {outcome.receiver_state or '-'}",
+            ]
+        )
+    if outcome.turn_start_outcome is not None:
+        lines.append(f"- turn_start_outcome: {outcome.turn_start_outcome}")
+    lines.append(f"- retry_allowed: {str(outcome.retry_allowed).lower()}")
     # #13290: record the consulted fill decision and any explicit override so the
     # durable record carries the admission decision (reason + anchor) that let a
     # stop-classified worker dispatch proceed. Emitted only when the gate was armed.
@@ -305,9 +514,17 @@ def _next_action(outcome: WorkerDispatchOutcome) -> str:
         return "re-run with --execute to drive the same-lane worker transfer"
     if outcome.dispatch_result == DISPATCH_WORKER_DISPATCHED:
         return (
-            "worker transfer delivery-acked (delivery ACK only — not worker "
+            "worker transfer delivery-acked and turn-start observed (not worker "
             "progress or completion). Await the worker's durable journals and "
             "route callbacks per the coordinator-callback checklist"
+        )
+    if not outcome.retry_allowed:
+        return (
+            "worker dispatch NOT confirmed; fail-closed, the lane stays "
+            "`gateway_notified`. "
+            "Do not auto-retry because injection or receiver authority is uncertain. "
+            "Re-observe the durable lane authority "
+            "and route stale recovery through #13806 when required"
         )
     return (
         "worker dispatch NOT confirmed; the lane's recorded dispatch state "
@@ -319,11 +536,28 @@ def _next_action(outcome: WorkerDispatchOutcome) -> str:
 
 __all__ = (
     "WORKER_DISPATCH_DELIVERY_FAILED",
+    "WORKER_DISPATCH_TURN_START_UNCONFIRMED",
     "WORKER_DISPATCH_RESULTS",
+    "REASON_FOREIGN_SENDER",
+    "SEND_KNOWN_NOT_SENT_REASONS",
+    "classify_send_known_not_sent",
+    "SenderDispatchAdmission",
     "REASON_LANE_NOT_RESOLVED",
     "REASON_LANE_PANE_MISSING",
     "REASON_WORKER_DISPATCH_FAILED",
+    "REASON_WORKER_TURN_START_UNCONFIRMED",
     "WORKER_DISPATCH_BLOCKED_REASONS",
+    "ADMISSION_HEALTHY",
+    "ADMISSION_STALE_WORKER_RECOVERY_REQUIRED",
+    "ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT",
+    "WORKER_DISPATCH_ADMISSION_DECISIONS",
+    "TURN_START_STARTED",
+    "TURN_START_DELIVERED_NOT_STARTED",
+    "TURN_START_NOT_STARTED",
+    "TURN_START_UNKNOWN",
+    "WorkerDispatchAdmissionFacts",
+    "WorkerDispatchAdmission",
+    "decide_worker_dispatch_admission",
     "WorkerDispatchRequest",
     "lane_identity_matches",
     "WorkerDispatchOutcome",

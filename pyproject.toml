@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mozyo-bridge"
-version = "0.10.0"
+version = "0.12.3a1"
 description = "Redmine-gated tmux pane notification bridge for Claude Code and Codex terminals"
 readme = "README.md"
 license = "MIT"
@@ -104,6 +104,13 @@ mozyo_bridge = [
     # template bodies + version/source pointers ship as this packaged artifact,
     # loaded via importlib.resources by f_130 role_profile.py at import.
     "e_110_execution_platform/f_130_handoff_routing/domain/role_profile_templates.yaml",
+    # Agent provider profiles (Redmine #13441). The built-in claude/codex launch
+    # profiles (executable metadata, protocol family, discovery aliases,
+    # capabilities, managed-flag spellings) ship as this packaged artifact, loaded
+    # via importlib.resources by f_160 agent_provider_profile.py at import. Without
+    # it an installed wheel cannot resolve ANY agent provider and every launch
+    # fails closed, so it must travel with the package, not just the repo.
+    "e_140_adapter_provider/f_160_provider_registry/domain/agent_provider_profiles.yaml",
 ]
 
 [tool.pytest.ini_options]
@@ -122,6 +129,45 @@ python_version = "3.10"
 mypy_path = "src"
 files = [
     "src/mozyo_bridge/e_150_quality_architecture/f_150_ci_verification/domain",
+    # Redmine #13729 tranche 2: the handoff Anchor/Profile Envelope Planner boundary
+    # (typed value objects + Protocol port + fully-annotated live adapter).
+    "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_envelope_planner.py",
+    # Its constructor-injected fake port: checked so the `EnvelopePlannerOps`
+    # structural-conformance assignment is a real gate against fake signature drift
+    # (review j#79040 F1').
+    "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_envelope_planner.py",
+    # Redmine #13729 tranche 3: the herdr event-driven --mode standard turn-start rail
+    # slice (typed request + Protocol ports for the rail and the side effects + a
+    # fully-annotated live adapter).
+    "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_herdr_standard_rail.py",
+    # Its constructor-injected fake port + fake rail: checked so the
+    # `HerdrStandardRailOps` / `TurnStartRailPort` structural-conformance assignments
+    # are real gates against fake signature drift (review j#79040 F1').
+    "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_herdr_standard_rail.py",
+    # Redmine #13729 tranche 4: the common tmux transport rail slice (typed request +
+    # Protocol port for the inject / marker gate / rollback / retry / turn-start / emit
+    # side effects + a fully-annotated live adapter).
+    "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_tmux_transport_rail.py",
+    # Its constructor-injected fake port: checked so the `TmuxTransportRailOps`
+    # structural-conformance assignment is a real gate against fake signature drift
+    # (review j#79040 F1').
+    "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_tmux_transport_rail.py",
+    # Redmine #13729 tranche 5: the handoff target-resolution preflight slice (typed request +
+    # result + Protocol port for the herdr / tmux resolve / diagnostic / duplicate / auto-repo
+    # / preflight-projection side effects + a fully-annotated live adapter).
+    "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_target_resolution.py",
+    # Its constructor-injected fake port: checked so the `TargetResolutionOps`
+    # structural-conformance assignment is a real gate against fake signature drift
+    # (review j#79040 F1').
+    "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_target_resolution.py",
+    # Redmine #13729 tranche 6: the handoff admission-pipeline slice (typed request + result +
+    # Protocol port for the session / config-gate / project-discovery / agent-gate / diagnostic /
+    # emit-die side effects + a fully-annotated live adapter).
+    "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_admission_pipeline.py",
+    # Its constructor-injected fake port: checked so the `AdmissionPipelineOps`
+    # structural-conformance assignment is a real gate against fake signature drift
+    # (review j#79040 F1').
+    "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_admission_pipeline.py",
 ]
 # The repo is not yet type-clean as a whole: do not chase imports out of the
 # typed island into untyped modules, and tolerate third-party packages that
@@ -141,6 +187,52 @@ no_implicit_optional = true
 # globally) is how the gate ratchets one bounded context at a time.
 [[tool.mypy.overrides]]
 module = "mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.*"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true
+
+# Redmine #13729 tranche 2: the handoff envelope planner boundary is held to the
+# same fully-annotated bar as the CI-verification island (value objects / Protocol
+# port / live adapter all typed). Ratcheted one bounded context at a time.
+[[tool.mypy.overrides]]
+module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_envelope_planner"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true
+
+# Redmine #13729 tranche 3: the herdr standard-rail slice is held to the same
+# fully-annotated bar (typed request / Protocol ports / live adapter all typed).
+[[tool.mypy.overrides]]
+module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_standard_rail"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true
+
+# Redmine #13729 tranche 4: the common tmux transport rail slice is held to the same
+# fully-annotated bar (typed request / Protocol port / live adapter all typed).
+[[tool.mypy.overrides]]
+module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_tmux_transport_rail"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true
+
+# Redmine #13729 tranche 5: the handoff target-resolution preflight slice is held to the same
+# fully-annotated bar (typed request / result / Protocol port / live adapter all typed).
+[[tool.mypy.overrides]]
+module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_target_resolution"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true
+
+# Redmine #13729 tranche 6: the handoff admission-pipeline slice is held to the same
+# fully-annotated bar (typed request / result / Protocol port / live adapter all typed).
+[[tool.mypy.overrides]]
+module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_admission_pipeline"
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true

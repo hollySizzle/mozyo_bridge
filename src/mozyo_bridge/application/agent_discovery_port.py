@@ -66,10 +66,18 @@ class LiveAgentDiscovery:
     ``commands`` module at call time (see the module docstring's compatibility
     bridge note) so the residual ``commands``-owned leaf reads — and the tests that
     patch them — stay intact during the migration.
+
+    ``snapshot`` (Redmine #13569 R2-F1) is the injected agent-provider snapshot used to
+    classify discovered panes; ``None`` uses the built-in providers. The composition
+    constructs this adapter with the SAME snapshot the CLI choices were built from, so the
+    runtime ``agents targets`` read classifies a synthetic provider's panes correctly.
     """
 
+    def __init__(self, snapshot=None) -> None:
+        self._snapshot = snapshot
+
     def discover(self) -> list:
-        return _discover_agents()
+        return _discover_agents(snapshot=self._snapshot)
 
     def canonical_session(self, repo_root: str):
         # ``derive_unregistered=False``: read-only discovery hot path — a

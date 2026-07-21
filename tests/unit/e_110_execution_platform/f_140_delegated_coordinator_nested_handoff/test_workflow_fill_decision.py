@@ -24,9 +24,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_actionability import (
+    ACTIONABILITY_DELEGATED_IN_FLIGHT,
+    DELIVERY_SENT,
+    OWNER_DEDICATED_GATEWAY,
+    ActionabilityClaim,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_execution_surface import (
+    DISPATCH_ACK_WORKER_CONFIRMED,
+    SURFACE_MANAGED_SUBLANE,
+    LaneProvenance,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_fill_decision import (
     COORDINATOR_BLOCKING_STATES,
     FILL_DISPATCH_NEXT,
+    FILL_STOP_ACTUATION_UNAVAILABLE,
     FILL_STOP_COORDINATOR_BLOCKING,
     FILL_STOP_NO_READY_WORK,
     FILL_STOP_OVERLAP,
@@ -41,6 +53,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LANE_STATE_OWNER_WAITING,
     LANE_STATE_RETIRE_READY,
     LANE_STATE_REVIEW_WAITING,
+    MAIN_COORDINATOR_OWNED_STATES,
     NEXT_DRAIN_NONE,
     NEXT_DRAIN_OWNER,
     NEXT_DRAIN_RETIREMENT,
@@ -49,6 +62,26 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LaneState,
     evaluate_fill_decision,
     is_coordinator_blocking,
+)
+
+# A lane that can legitimately be delegated: a verified managed sublane whose review is
+# in flight on its dedicated gateway.
+_VERIFIED_SUBLANE = LaneProvenance(
+    execution_surface=SURFACE_MANAGED_SUBLANE,
+    workspace="w19",
+    lane="issue_13441_provider_registry",
+    issue_generation="1",
+    lifecycle_revision="3",
+    durable_anchor="13441#77503",
+    gateway_identity="w19:p1",
+    worker_identity="w19:p2",
+    dispatch_ack=DISPATCH_ACK_WORKER_CONFIRMED,
+)
+_VERIFIED_DELEGATION = ActionabilityClaim(
+    actionability=ACTIONABILITY_DELEGATED_IN_FLIGHT,
+    next_action_owner=OWNER_DEDICATED_GATEWAY,
+    delivery_state=DELIVERY_SENT,
+    callback_expected=True,
 )
 
 
@@ -219,6 +252,85 @@ class StopReasonTest(unittest.TestCase):
         )
         self.assertEqual(out.fill_decision, FILL_STOP_NO_READY_WORK)
         self.assertEqual(out.next_drain_action, NEXT_DRAIN_RETIREMENT)
+
+
+class ActionabilityIntegrationTest(unittest.TestCase):
+    """The #13756 axes as the fill policy sees them (the axis detail is pinned in
+    ``test_lane_actionability`` / ``test_lane_execution_surface``)."""
+
+    def test_main_owned_states_are_a_subset_of_the_blocking_states(self):
+        # A state that cannot be delegated must be one that blocks in the first place;
+        # otherwise the "not delegable" rule would be describing a lane that never stops.
+        self.assertLessEqual(MAIN_COORDINATOR_OWNED_STATES, COORDINATOR_BLOCKING_STATES)
+
+    def test_review_waiting_is_delegable_but_owner_waiting_is_not(self):
+        self.assertNotIn(LANE_STATE_REVIEW_WAITING, MAIN_COORDINATOR_OWNED_STATES)
+        self.assertIn(LANE_STATE_OWNER_WAITING, MAIN_COORDINATOR_OWNED_STATES)
+        self.assertIn(LANE_STATE_INTEGRATION_WAITING, MAIN_COORDINATOR_OWNED_STATES)
+        self.assertIn(LANE_STATE_CLOSE_WAITING, MAIN_COORDINATOR_OWNED_STATES)
+
+    def test_unknown_state_class_is_main_owned_so_no_claim_rescues_it(self):
+        # If the state cannot be read, the claim attached to it cannot be trusted either.
+        lane = LaneState(
+            issue="9999",
+            state_class="totally_unknown",
+            claim=_VERIFIED_DELEGATION,
+            provenance=_VERIFIED_SUBLANE,
+        )
+        self.assertTrue(lane.state_is_main_owned())
+        self.assertTrue(lane.coordinator_blocking())
+        out = evaluate_fill_decision(
+            _inputs(lanes=[lane], ready_independent_work=1, capacity_remaining=1)
+        )
+        self.assertEqual(out.fill_decision, FILL_STOP_COORDINATOR_BLOCKING)
+
+    def test_delegated_review_lane_is_not_a_stop_reason(self):
+        out = evaluate_fill_decision(
+            _inputs(
+                lanes=[
+                    LaneState(
+                        issue="13441",
+                        state_class=LANE_STATE_REVIEW_WAITING,
+                        claim=_VERIFIED_DELEGATION,
+                        provenance=_VERIFIED_SUBLANE,
+                    )
+                ],
+                ready_independent_work=1,
+                capacity_remaining=1,
+            )
+        )
+        self.assertEqual(out.fill_decision, FILL_DISPATCH_NEXT)
+        self.assertEqual(out.delegated_in_flight, ("13441",))
+        self.assertEqual(out.coordinator_blocking, ())
+
+    def test_blocking_reason_names_the_refusal(self):
+        # The stop reason must say *why* a claimed delegation was refused, so the
+        # coordinator can journal the verdict instead of re-deriving it.
+        out = evaluate_fill_decision(
+            _inputs(
+                lanes=[
+                    LaneState(
+                        issue="13441",
+                        state_class=LANE_STATE_REVIEW_WAITING,
+                        claim=_VERIFIED_DELEGATION,
+                        provenance=LaneProvenance(),
+                    )
+                ]
+            )
+        )
+        self.assertEqual(out.fill_decision, FILL_STOP_COORDINATOR_BLOCKING)
+        self.assertIn("surface_not_verified_managed_sublane", out.reason)
+
+    def test_actuation_unavailable_is_a_fixed_blocked_result(self):
+        out = evaluate_fill_decision(
+            _inputs(
+                ready_independent_work=5,
+                capacity_remaining=5,
+                managed_sublane_actuation_available=False,
+            )
+        )
+        self.assertEqual(out.fill_decision, FILL_STOP_ACTUATION_UNAVAILABLE)
+        self.assertFalse(out.should_dispatch)
 
 
 class AdvisoryAndPayloadTest(unittest.TestCase):

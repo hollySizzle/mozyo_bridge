@@ -112,14 +112,29 @@ class RetireInvariants:
     use case never infers them from git. Defaults are the *unsatisfied* / safe-failing
     values for the safety-critical ones so a caller that forgets a field fails closed —
     except the ones that are true by construction at a retire attempt.
+
+    Redmine #13602 (Design Consultation j#76403, Option A): there is deliberately no
+    ``owner_approval_present`` invariant — routine green-preflight retirement is coordinator
+    authority. ``issue_closed`` abstracts over the close contract that applied to the issue
+    type (a child Task/Test/Bug via ``task_close`` with no owner_close_approval; a US /
+    standalone issue via an owner_close_approval-backed close — central preset
+    ``US-Level Audit Model``), which the coordinator asserts as a single closed fact; retire
+    never re-collects the owner close approval. An outstanding owner-approval-waiting still
+    blocks via ``callbacks_drained``.
     """
 
     target_identity_known: bool = False
     verification_passed: bool = False
     issue_closed: bool = False
-    owner_approval_present: bool = False
     callbacks_drained: bool = False
     durable_record_recorded: bool = False
+    #: The latest review generation is admissible for integration (#13518 review R2-F7 / R4-F3): the
+    #: latest generation is approved with NO unresolved blocking finding
+    #: (:func:`...domain.review_generation.evaluate_integration_admissible`). Like every other
+    #: invariant here it defaults to the UNSATISFIED (fail-closed) value — a caller that omits it is
+    #: BLOCKED, never default-admitted; the coordinator supplies the measured / durable-record
+    #: admissibility. (Previously this one field defaulted True, an inconsistent bypass — R4-F3.)
+    latest_generation_admissible: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +185,16 @@ class SublaneIntegrationUseCase:
         The runtime preflight is the final authority: git facts are probed through the
         port, the invariants come from the durable record, and the pure
         :func:`decide_retire_integration` decides. The merge is attempted **only** when
-        every non-merge gate already passes — so a dirty worktree, a missing owner
-        approval, an open issue, an undrained callback, or a failed verification blocks
-        retirement *before* any merge runs. A merge conflict then re-decides to
-        ``integration_blocked``.
+        every non-merge gate already passes — so a dirty worktree, an open issue, an
+        undrained callback, or a failed verification blocks retirement *before* any merge
+        runs. A merge conflict then re-decides to ``integration_blocked``.
         """
+        # R2-F7 / R3-F2 integration latest-generation fence: the inadmissible-generation stop is now
+        # threaded through the pure :func:`decide_retire_integration` as a first-class preflight
+        # invariant (the SAME authority the actual CLI retire path uses — no separate early-return
+        # that only this non-CLI use case honoured). A stale last-write-wins approval never
+        # integrates: the fence blocks BEFORE any merge because a merge is attempted only after every
+        # non-merge gate (this one included) already passes.
         is_git = self.operations.is_git_workspace()
         target = self.policy.integration_branch
         worktree_dirty = self.operations.worktree_dirty() if is_git else False
@@ -192,9 +212,9 @@ class SublaneIntegrationUseCase:
             target_identity_known=invariants.target_identity_known,
             verification_passed=invariants.verification_passed,
             issue_closed=invariants.issue_closed,
-            owner_approval_present=invariants.owner_approval_present,
             callbacks_drained=invariants.callbacks_drained,
             durable_record_recorded=invariants.durable_record_recorded,
+            latest_generation_admissible=invariants.latest_generation_admissible,
         )
 
         # First decide WITHOUT attempting the merge. If anything blocks (including an
@@ -218,9 +238,12 @@ class SublaneIntegrationUseCase:
                         target_identity_known=invariants.target_identity_known,
                         verification_passed=invariants.verification_passed,
                         issue_closed=invariants.issue_closed,
-                        owner_approval_present=invariants.owner_approval_present,
                         callbacks_drained=invariants.callbacks_drained,
                         durable_record_recorded=invariants.durable_record_recorded,
+                        # R4-F3: propagate the fence (default is now fail-closed) so a merge-conflict
+                        # re-decision does not spuriously add stale_review_generation after step 1
+                        # already admitted the generation.
+                        latest_generation_admissible=invariants.latest_generation_admissible,
                     ),
                 )
         return decision

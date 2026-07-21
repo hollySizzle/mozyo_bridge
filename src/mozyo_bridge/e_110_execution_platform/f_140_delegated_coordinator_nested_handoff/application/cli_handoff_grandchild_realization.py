@@ -216,6 +216,32 @@ def _register_grandchild_gate(handoff_sub) -> None:
         ),
     )
     parser.add_argument(
+        "--grandchild-unit",
+        dest="grandchild_unit",
+        metavar="workspace_id/lane_id",
+        help=(
+            "The EXACT dispatch-selected/created/adopted grandchild lane unit "
+            "(`<workspace_id>/<lane_id>`) the gate binds to. The gate re-verifies "
+            "exactly this unit's role/depth/parent/repo against the live "
+            "inventory and fails closed on a missing/mismatched/ambiguous identity "
+            "— it never adopts the first depth-2 sibling under the coordinator "
+            "(Redmine #13571). Required for a realized verdict when a grandchild is "
+            "required; omit only with `--no-require-grandchild`."
+        ),
+    )
+    parser.add_argument(
+        "--grandchild-repo",
+        dest="grandchild_repo",
+        metavar="repo_identity",
+        help=(
+            "Canonical child repo identity (the `--target-repo` gate value) of the "
+            "dispatch-selected grandchild. REQUIRED together with "
+            "`--grandchild-unit`: repo is part of the exact identity, so the "
+            "matched inventory row's repo must equal it. Omitting it leaves the "
+            "target unbound and the gate fails closed (Redmine #13571)."
+        ),
+    )
+    parser.add_argument(
         "--no-require-grandchild",
         dest="require_grandchild",
         action="store_false",

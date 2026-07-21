@@ -45,6 +45,50 @@ completion criteria for beta and production distribution live here.
 - A stable-looking version such as `0.1.4` on TestPyPI is still an internal beta
   artifact unless production PyPI publish has explicitly been requested and
   completed.
+- Internal beta publication must not require promoting public history first.
+  The manual TestPyPI dispatch builds an exact reviewed candidate `source_sha`
+  from a `main`-fixed workflow and does NOT require an `origin/main` push or a
+  Redmine Version close as a precondition (Redmine #13601). This breaks the
+  `Version close -> origin/main -> TestPyPI -> #13528/#13527 -> Version close`
+  cycle: the `main`-only publication checkpoint still gates public-history
+  promotion, but internal beta distribution is decoupled from it.
+- The manual dispatch is gated fail-closed on the exact candidate: the 40-hex
+  `source_sha`, its `expected_version` mirror match, a candidate
+  `.github/workflows/test.yml` byte-identical to trusted `origin/main` (so a
+  candidate cannot weaken its own Test workflow to fake a green run), a
+  successful `Test` CI run for that SHA, an unused TestPyPI version (a payload
+  lacking the `releases` object or an unreachable lookup fails closed), and an
+  origin `source_ref` that resolves to exactly one named ref whose tip is the
+  SHA. Trusted Publishing credentials (`id-token: write` + `environment:
+  testpypi`) live only in the artifact-download+publish job, separate from
+  checkout/build/verify.
+- Spell `source_ref` as a ref literal ON ORIGIN (`refs/heads/<branch>` is
+  canonical; a bare `<branch>` is accepted). The helper rejects git's LOCAL
+  remote-tracking names (`origin/<branch>`, `refs/remotes/origin/<branch>`)
+  before dispatch with the exact correction rather than normalizing them
+  silently, because they are AMBIGUOUS rather than absent: a remote may carry a
+  branch literally named `origin/<branch>`, so `origin/main` could mean either
+  branch and guessing would silently build a different commit. The helper also
+  resolves the ref against origin before dispatching, so a zero / ambiguous /
+  mismatched ref costs zero dispatches instead of a run that dies before build.
+  Note `git ls-remote` matches a ref-name TAIL — including for full paths — so
+  no spelling is exactly-one by construction; the exactly-one requirement is
+  checked dynamically on both client and server, and a genuine collision is
+  resolved on origin, not by re-spelling the ref (Redmine #13883; policy source:
+  `vibes/docs/logics/release-helper-contract.md` -> `source_ref Spelling
+  Policy`).
+- Order the internal-beta steps as #13528 (TestPyPI publish) then #13527 (exact
+  install QA); the install QA runs against the published exact version, not a
+  floating `main` install.
+- Before the built wheel is uploaded, the build job also runs the disposable
+  Ubuntu container smoke (`scripts/disposable_ubuntu_smoke.py`, Redmine #14100):
+  the SAME wheel bytes are black-boxed on a DIGEST-pinned, non-root, fresh-HOME
+  Ubuntu container with no source checkout mounted, exercising the real user
+  harness (rules / scaffold / docs / doctor). The image digest is the blocking
+  authority (a floating tag is refused in blocking mode). This is a blocking
+  release-path gate only; it is never added to the quick issue-branch lane. See
+  `vibes/docs/logics/tiered-ci-gate-policy.md` -> `Disposable Ubuntu container
+  smoke`.
 
 ## Production Distribution
 
@@ -56,3 +100,7 @@ completion criteria for beta and production distribution live here.
   GitHub Release.
 - Production PyPI publish must use GitHub Actions Trusted Publishing, not local
   token upload, unless a separate emergency procedure is explicitly approved.
+- The production build job runs the same disposable Ubuntu container smoke on
+  the built wheel before upload, with the release tag's stripped version as the
+  expected version. It runs in the `build` job, which carries no `id-token`, so
+  the OIDC boundary (publish-only) is preserved.

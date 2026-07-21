@@ -58,6 +58,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_BLOCKED,
     LAUNCH_CREATE_WORKTREE,
     LAUNCH_REUSE_WORKTREE,
+    LAUNCH_SKIP_NO_GIT,
     RetireDecision,
     WorktreeLaunchDecision,
     render_integration_decision_journal,
@@ -72,9 +73,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 # Roles + lane identity (literal; machine-readable regardless of UI language).
 # ---------------------------------------------------------------------------
 
-#: The sublane gateway role — the Codex pane the coordinator routes governed kinds to.
+#: The sublane gateway role — the Codex pane the coordinator routes governed kinds to. NOT a declared-pin role: that vocabulary is owned by ``core.state.lane_pin_role`` (Redmine #13920).
 GATEWAY_ROLE = "codex"
-#: The sublane worker role — the same-lane Claude implementer.
+#: The sublane worker role — the same-lane Claude implementer. Not a declared-pin role either (see :data:`GATEWAY_ROLE`).
 WORKER_ROLE = "claude"
 
 #: The reserved non-sublane lane id (cockpit / unmanaged panes carry this).
@@ -193,6 +194,9 @@ SUBLANE_STATE_GATEWAY_ONLY = "gateway_only"
 SUBLANE_STATE_WORKER_ONLY = "worker_only"
 #: Neither a gateway nor a worker pane is live (only other/unknown-role panes).
 SUBLANE_STATE_DETACHED = "detached"
+#: Both panes are live but not in one placement container — a runtime skew split
+#: the pair across herdr tabs / workspaces (Redmine #13705; herdr projection only).
+SUBLANE_STATE_PAIR_SPLIT = "pair_split"
 
 SUBLANE_STATES = frozenset(
     {
@@ -200,6 +204,7 @@ SUBLANE_STATES = frozenset(
         SUBLANE_STATE_GATEWAY_ONLY,
         SUBLANE_STATE_WORKER_ONLY,
         SUBLANE_STATE_DETACHED,
+        SUBLANE_STATE_PAIR_SPLIT,
     }
 )
 
@@ -354,8 +359,20 @@ def _is_non_sublane_lane(lane_id: str, lane_label: str, lane_kind: str) -> bool:
     return False
 
 
-def _lane_state(gateway_pane: Optional[str], worker_pane: Optional[str]) -> str:
+def _lane_state(
+    gateway_pane: Optional[str],
+    worker_pane: Optional[str],
+    *,
+    gateway_placement: Optional[object] = None,
+    worker_placement: Optional[object] = None,
+) -> str:
+    """The coarse lane state; optional ``(herdr_workspace, tab_id)`` placement keys
+    make a live pair not sharing one container read ``pair_split`` (Redmine #13705).
+    Placement-unaware callers pass ``None`` and keep the pre-#13705 verdict."""
     if gateway_pane and worker_pane:
+        placed = gateway_placement is not None and worker_placement is not None
+        if placed and gateway_placement != worker_placement:
+            return SUBLANE_STATE_PAIR_SPLIT
         return SUBLANE_STATE_ACTIVE
     if gateway_pane:
         return SUBLANE_STATE_GATEWAY_ONLY
@@ -545,6 +562,31 @@ CREATE_BLOCKED = "blocked"
 
 CREATE_STATES = frozenset({CREATE_PLANNED, CREATE_BLOCKED})
 
+#: The backend-neutral coordinator-route IDENTITY a dispatch defaults its
+#: ``upstream_coordinator`` role-profile field to when the operator omits
+#: ``--upstream-coordinator`` (Redmine #13476). The literal ``"coordinator"`` is the
+#: single token BOTH backends' route authorities recognise as the workspace parent
+#: coordinator: the tmux pane resolver (``pane_resolver.COORDINATOR_LABEL``, a
+#: ``--target coordinator`` pseudo-target) and the herdr route authority
+#: (``herdr_target_resolution.RECEIVER_COORDINATOR`` — a ``coordinator`` receiver
+#: derives the workspace DEFAULT lane, tier 3, and resolves the coordinator provider
+#: via the role->provider binding, #12015 / #12673 / #13305). It is a route identity,
+#: never a physical ``%pane`` id, so it carries no host-specific identity into the OSS
+#: default. An explicit ``--upstream-coordinator`` value always wins.
+#:
+#: IMPORTANT (Redmine #13476 Review j#74511, Finding 1): this token names the
+#: coordinator route *identity*; it does NOT by itself make the gateway's *callback*
+#: land on the parent coordinator under every backend. Under herdr the send rail
+#: derives the target lane from the ``--to`` receiver, so a bare ``--to codex`` from a
+#: sublane derives the sender's OWN lane (tier-2 same-lane); only the ``coordinator``
+#: receiver / an explicit default-lane derives the parent. Whether the documented
+#: gateway->coordinator callback FORM (`--to codex --target coordinator`) is consumed
+#: correctly on the herdr rail is a routing-authority concern owned outside this
+#: lifecycle leaf (the pseudo-target is a tmux pane-resolver construct the herdr rail
+#: does not currently consume). This default supplies the correct identity; the
+#: callback-form routing is tracked separately.
+DEFAULT_UPSTREAM_COORDINATOR_ROUTE = "coordinator"
+
 
 @dataclass(frozen=True)
 class SublaneCreateRequest:
@@ -553,8 +595,11 @@ class SublaneCreateRequest:
     Every field is caller-supplied so the domain never fabricates a worktree path or
     branch from the issue number (the boundary doc keeps issue-number -> path/branch
     generation an operator decision). ``journal`` is the durable anchor the dispatch
-    steps point at. ``upstream_coordinator`` is the coordinator pane the gateway calls
-    back to; ``None`` renders a placeholder in the dispatch step.
+    steps point at. ``upstream_coordinator`` is the coordinator route the gateway calls
+    back to; when the operator omits it, the dispatch defaults to the stable
+    ``--target coordinator`` route token (:data:`DEFAULT_UPSTREAM_COORDINATOR_ROUTE`,
+    #13476) rather than emitting a hand-editable ``<coordinator-pane>`` literal. An
+    explicit value always wins (see :meth:`resolved_upstream_coordinator`).
 
     ``work_unit`` declares the governed granularity of the dispatched unit (#13002):
     the caller-asserted kind of ``issue`` (``user_story`` standard default /
@@ -589,17 +634,43 @@ class SublaneCreateRequest:
             explicit_decision_anchor=self.work_unit_decision_anchor,
         )
 
-    def missing_fields(self) -> Tuple[str, ...]:
-        """The required identity fields left blank (fail-closed trigger)."""
+    def resolved_upstream_coordinator(self) -> str:
+        """The ``upstream_coordinator`` profile-field value the dispatch carries (#13476).
+
+        Returns the explicit ``--upstream-coordinator`` value when the operator supplied
+        one (stripped), otherwise the stable ``--target coordinator`` route token
+        (:data:`DEFAULT_UPSTREAM_COORDINATOR_ROUTE`). Never returns empty, so the gateway
+        role profile's ``<upstream_coordinator>`` placeholder always resolves to a
+        routable callback target instead of a hand-editable ``<coordinator-pane>``
+        literal (or an unresolved placeholder). This is the single source of truth for
+        the default; every dispatch command / argv builder reads it.
+        """
+        explicit = (self.upstream_coordinator or "").strip()
+        return explicit or DEFAULT_UPSTREAM_COORDINATOR_ROUTE
+
+    def missing_fields(self, *, is_git: bool = True) -> Tuple[str, ...]:
+        """The required identity fields left blank (fail-closed trigger).
+
+        ``issue`` / ``lane_label`` are the lane identity and are required in every
+        workspace. ``branch`` / ``worktree_path`` are the Git worktree identity: they
+        are required only in a Git workspace (``is_git=True``, the default that keeps
+        every existing caller byte-invariant). In a non-Git directory scaffold
+        (``is_git=False``, #13432) the lane has no worktree — it runs in the workspace
+        root itself (#13392 論点1) — so ``--branch`` / ``--worktree`` are optional and
+        are not fail-closed triggers. The caller supplies ``is_git`` from the runtime
+        git probe (the CLI resolves it before validating; the pure
+        :func:`plan_sublane_create` derives it from the launch decision).
+        """
         missing = []
         if not (self.issue or "").strip():
             missing.append("issue")
         if not (self.lane_label or "").strip():
             missing.append("lane_label")
-        if not (self.branch or "").strip():
-            missing.append("branch")
-        if not (self.worktree_path or "").strip():
-            missing.append("worktree_path")
+        if is_git:
+            if not (self.branch or "").strip():
+                missing.append("branch")
+            if not (self.worktree_path or "").strip():
+                missing.append("worktree_path")
         return tuple(missing)
 
 
@@ -652,7 +723,10 @@ class SublaneCreatePlan:
 
 
 def plan_sublane_create(
-    request: SublaneCreateRequest, launch: WorktreeLaunchDecision
+    request: SublaneCreateRequest,
+    launch: WorktreeLaunchDecision,
+    *,
+    is_git: Optional[bool] = None,
 ) -> SublaneCreatePlan:
     """Compose the #12604 launch decision with the pane / dispatch steps (pure).
 
@@ -670,8 +744,24 @@ def plan_sublane_create(
        a no-op reuse note rather than a ``git worktree add``.
 
     The steps are a *plan*: this function actuates nothing.
+
+    #13432: the identity requirement relaxes in a non-Git (directory-scaffold) workspace,
+    where the lane has no worktree — so ``--branch`` / ``--worktree`` are optional there.
+    The caller passes the runtime git-ness explicitly via ``is_git`` (the workspace's real
+    git probe), because the launch *action* alone cannot carry it: an operator opt-out
+    (``manage_worktree: false``) collapses to :data:`LAUNCH_SKIP_DISABLED` *before* the
+    non-Git branch of :func:`decide_worktree_launch`, so a non-Git lane under that policy
+    still reads as ``skip_disabled`` — inferring git-ness from the action token would then
+    wrongly require ``--branch`` / ``--worktree`` and diverge from the actuator's
+    identity path (Review #13432 j#74285 finding 1). When ``is_git`` is not supplied it
+    falls back to the launch-action heuristic (``action != LAUNCH_SKIP_NO_GIT``), which is
+    exact for every action a direct caller constructs except that one policy-opt-out combo;
+    every production caller passes the probed value. A Git workspace keeps the full Git
+    identity requirement byte-invariant.
     """
-    missing = request.missing_fields()
+    if is_git is None:
+        is_git = launch.action != LAUNCH_SKIP_NO_GIT
+    missing = request.missing_fields(is_git=is_git)
     if missing:
         return SublaneCreatePlan(
             status=CREATE_BLOCKED,
@@ -764,7 +854,7 @@ def plan_sublane_create(
 def _dispatch_command(request: SublaneCreateRequest) -> str:
     """The replayable gateway ``handoff send`` command for the create plan (pure)."""
     journal = request.journal or "<journal>"
-    coordinator = request.upstream_coordinator or "<coordinator-pane>"
+    coordinator = request.resolved_upstream_coordinator()
     return (
         "mozyo-bridge handoff send --to codex --source redmine "
         f"--issue {request.issue} --journal {journal} "
@@ -885,6 +975,7 @@ __all__ = (
     "SUBLANE_STATE_GATEWAY_ONLY",
     "SUBLANE_STATE_WORKER_ONLY",
     "SUBLANE_STATE_DETACHED",
+    "SUBLANE_STATE_PAIR_SPLIT",
     "SUBLANE_STATES",
     "STALE_HINT_GATEWAY_PANE_MISSING",
     "STALE_HINT_WORKER_PANE_MISSING",

@@ -245,6 +245,37 @@ def derive_directory_lane_token(canonical_workspace_root: str, lane_id: str) -> 
     return f"{DIRECTORY_LANE_TOKEN_PREFIX}_{digest[:_LANE_TOKEN_HEX_LEN]}"
 
 
+def lane_runtime_identity(
+    canonical_root: str, lane_id: str, *, git_worktree: bool
+) -> str:
+    """The lane identity token for a runtime root, chosen by that root's KIND (#13933).
+
+    The two token families above are not interchangeable spellings of one identity: a
+    linked git worktree is named by :func:`derive_lane_workspace_token` (``wt_``) and a
+    non-git directory-scaffold lane by :func:`derive_directory_lane_token` (``dl_``).
+    ``git_worktree`` is therefore the ONLY discriminant, and it is a fact about the root
+    being named -- callers must probe the root itself (Redmine #13933 j#81046 Decision 1).
+
+    Deriving it from a caller-relative coincidence instead -- classically
+    ``resolved == repo_root`` -- is a defect, not a shortcut.  That proxy holds only while
+    ``repo_root`` really is the coordinator's workspace root (the mint-time meaning in
+    ``sublane_actuator_herdr_ops``, where a non-git lane's runtime root collapses onto it).
+    Where ``repo_root`` is instead the caller's ``--repo`` / cwd, the same expression turns
+    the token family into a function of the operator's working directory: the identical lane
+    resolved ``wt_`` from one directory and ``dl_`` from another, so its own durable row
+    failed to match itself and the public rail dead-ended (#13846 j#81024, diagnosed in
+    #13933 j#81043).
+
+    A token is never chosen to make a persisted row agree: the root's kind decides, and a
+    row that disagrees is a real mismatch for the caller to report.
+    """
+    return (
+        derive_lane_workspace_token(canonical_root)
+        if git_worktree
+        else derive_directory_lane_token(canonical_root, lane_id)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed decode reason vocabulary (core-owned, closed set).
 # ---------------------------------------------------------------------------
@@ -727,6 +758,7 @@ __all__ = (
     "DIRECTORY_LANE_TOKEN_PREFIX",
     "derive_lane_workspace_token",
     "derive_directory_lane_token",
+    "lane_runtime_identity",
     "is_lane_workspace_token",
     "NAME_MAX_LENGTH",
     "REASON_BAD_ESCAPE",

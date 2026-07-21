@@ -20,10 +20,12 @@ auditor ruling's focused-test list (j#73153):
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mozyo_bridge.application.herdr_launch_command import (
     HerdrLaunchOutcome,
@@ -32,6 +34,7 @@ from mozyo_bridge.application.herdr_launch_command import (
     deliver_herdr_launch_outcome,
     herdr_attach_argv,
     herdr_attach_command_line,
+    render_herdr_session_block,
     session_ready,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
@@ -193,6 +196,18 @@ class HerdrLaunchPolicyTests(unittest.TestCase):
         self.assertEqual(payload["attach"], "/usr/local/bin/herdr")
         self.assertEqual(payload["session_start"]["workspace_id"], "ws1")
         self.assertEqual(len(payload["session_start"]["slots"]), 2)
+        # Redmine #13446: the JSON confirms the workspace/agents AND names the standard
+        # next action (sublane dispatch), not just the tmux-era attach.
+        self.assertIn("sublane create --execute", payload["next_action"])
+
+    def test_session_block_names_standard_next_action(self) -> None:
+        block = render_herdr_session_block(_ready_result(), "/usr/local/bin/herdr")
+        # Existing lines preserved (agents/workspace confirmed + attach hint).
+        self.assertIn("herdr session-start", block)
+        self.assertIn("attach: /usr/local/bin/herdr", block)
+        # Redmine #13446: the summary also points at the standard lane-dispatch surface.
+        self.assertIn("next: ", block)
+        self.assertIn("sublane create --execute", block)
 
 
 # --- use case decision --------------------------------------------------------
@@ -348,7 +363,14 @@ class DeliverHerdrLaunchOutcomeTests(unittest.TestCase):
 
 
 class BareMozyoBackendRoutingTests(unittest.TestCase):
-    """``cli.main`` routes bare ``mozyo`` by the resolved repo's backend."""
+    """``cli.main`` routes bare ``mozyo`` by the *adopted* repo's backend.
+
+    An adopted project (config present) still launches by its
+    ``terminal_transport.backend`` with no regression. An *unadopted* directory
+    no longer auto-launches tmux: it enters the #13497 onboarding gate, so no
+    backend launch happens until the project is adopted (contract change owned by
+    #13497; the adopted-launch regression is unchanged).
+    """
 
     def _run_main_with_config(self, config_body: str | None) -> tuple[bool, bool]:
         from mozyo_bridge.application import cli
@@ -382,10 +404,66 @@ class BareMozyoBackendRoutingTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         return called["tmux"], called["herdr"]
 
-    def test_config_absent_routes_to_tmux_path(self) -> None:
-        tmux, herdr = self._run_main_with_config(None)
-        self.assertTrue(tmux)
-        self.assertFalse(herdr)
+    def test_fresh_json_emits_single_json_no_launch(self) -> None:
+        # #13497 j#74970 F3: bare `mozyo --json` on an unadopted root must emit a
+        # single machine-readable JSON object and never launch or read stdin.
+        import contextlib
+        import json as _json
+
+        from mozyo_bridge.application import cli
+        from mozyo_bridge.application import herdr_launch_command
+
+        called = {"tmux": False, "herdr": False}
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orig_tmux = cli.cmd_mozyo
+            orig_herdr = herdr_launch_command.cmd_mozyo_herdr
+            cli.cmd_mozyo = lambda args: called.__setitem__("tmux", True) or 0
+            herdr_launch_command.cmd_mozyo_herdr = (
+                lambda args: called.__setitem__("herdr", True) or 0
+            )
+            try:
+                with mock.patch("sys.stdin", io.StringIO("")), \
+                     contextlib.redirect_stdout(buf):
+                    rc = cli.main(["--repo", str(repo), "--json"])
+            finally:
+                cli.cmd_mozyo = orig_tmux
+                herdr_launch_command.cmd_mozyo_herdr = orig_herdr
+
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(called["tmux"])
+        self.assertFalse(called["herdr"])
+        obj = _json.loads(buf.getvalue())  # exactly one JSON object
+        self.assertIn("error", obj)
+
+    def test_config_absent_enters_onboarding_not_tmux(self) -> None:
+        # #13497: an unadopted directory no longer auto-launches tmux; bare
+        # `mozyo` enters onboarding. With no human on stdin it cancels/blocks
+        # fail-closed and never touches a backend launch.
+        from mozyo_bridge.application import cli
+        from mozyo_bridge.application import herdr_launch_command
+
+        called = {"tmux": False, "herdr": False}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            orig_tmux = cli.cmd_mozyo
+            orig_herdr = herdr_launch_command.cmd_mozyo_herdr
+            cli.cmd_mozyo = lambda args: called.__setitem__("tmux", True) or 0
+            herdr_launch_command.cmd_mozyo_herdr = (
+                lambda args: called.__setitem__("herdr", True) or 0
+            )
+            try:
+                with mock.patch("sys.stdin", io.StringIO("")):
+                    rc = cli.main(["--repo", str(repo), "--no-attach"])
+            finally:
+                cli.cmd_mozyo = orig_tmux
+                herdr_launch_command.cmd_mozyo_herdr = orig_herdr
+
+        self.assertNotEqual(rc, 0)  # onboarding not completed without a human
+        self.assertFalse(called["tmux"])
+        self.assertFalse(called["herdr"])
 
     def test_explicit_tmux_backend_routes_to_tmux_path(self) -> None:
         tmux, herdr = self._run_main_with_config(
