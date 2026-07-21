@@ -133,11 +133,15 @@ ordered steps (実行順は機械的依存で確定する: `scaffold apply` は 
 backend launch は本 US の step ではない。bare `mozyo` entry / launch は #13497 (conversation
 provider / bare entry hook) が所有し、本 tool は launch を実行・主張しない。
 
-config write は `{version: 1, terminal_transport: {backend: herdr}}` の typed record を排他 create
-(temp + `os.link`) で確定する。file 不在は create、typed-equivalent は no-op、その他の既存 config は
-上書きせず `existing_config_requires_separate_merge` で停止する。check-then-replace の TOCTOU 窓を
-持たず、race で負けた場合は existing を再読して no-op / fail-closed に確定する。LLM に YAML を生成・
-merge させない。
+config write は role-canonical **v2** の `{version: 2, terminal_transport: {backend: herdr}}` typed
+record を排他 create (temp + `os.link`) で確定する (`agents` block を持たないため built-in default
+topology へ解決する; Redmine #14148 item 7)。file 不在は create、typed-equivalent は no-op、その他の
+既存 config は上書きせず `existing_config_requires_separate_merge` で停止する。旧 onboarding が書いた
+`version: 1` の **minimal herdr record** (only `terminal_transport`) は v2 target と挙動同値 (移行対象
+なし) のため **明示互換の no-op** とし silent rewrite しない。provider-keyed block (`provider_binding` /
+`agent_launch`) を持つ v1 config は divergent 扱いで、operator は `mozyo-bridge config migrate` で解決
+する。check-then-replace の TOCTOU 窓を持たず、race で負けた場合は existing を再読して no-op /
+fail-closed に確定する。LLM に YAML を生成・merge させない。
 
 各 step は idempotent で、失敗時も完了 step と原因を credential-free receipt に残す。`onboarding.resume`
 は 1 call = 1 pending idempotent step を実行する。自動 rollback で user file を消さない。backup と

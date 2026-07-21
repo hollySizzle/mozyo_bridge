@@ -43,7 +43,10 @@ from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.appli
 )
 from mozyo_bridge.e_120_operations_cockpit.f_120_cockpit_web_ui.application import cli_cockpit
 from mozyo_bridge.e_120_operations_cockpit.f_150_attention_freshness_projection.application import cli_presentation
-from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application import cli_docs_scaffold
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application import (
+    cli_config,
+    cli_docs_scaffold,
+)
 from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import cli_release
 from mozyo_bridge.e_150_quality_architecture.f_130_module_health.application import cli_module_health
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application import (
@@ -206,6 +209,13 @@ _FAMILY_BINDINGS: tuple[tuple[CliFamily, Callable[[object], None]], ...] = (
             summary="rules/scaffold/docs governance family.",
         ),
         cli_docs_scaffold.register,
+    ),
+    (
+        CliFamily(
+            name="config",
+            summary="repo-local config.yaml schema migration (v1 -> v2) family.",
+        ),
+        cli_config.register,
     ),
     (
         CliFamily(

@@ -85,6 +85,7 @@ EXPECTED_TOP_LEVEL_ORDER = [
     "rules",
     "scaffold",
     "docs",
+    "config",
     "onboarding",
     "events",
     "otel",

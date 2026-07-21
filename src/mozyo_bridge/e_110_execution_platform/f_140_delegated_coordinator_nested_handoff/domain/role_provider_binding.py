@@ -96,22 +96,76 @@ WORKFLOW_ROLES: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
-# The default (compatibility) binding. Identical in spirit to the old private
-# ``_OWNER_ROLE_EXPECTED_PROVIDER`` — gateway / coordination / audit / owner run on
-# codex, implementation runs on claude — extended to the #12670 lane-role names so
-# the broader vocabulary resolves the same way. Changing a value here changes the
-# product default for EVERY workflow surface; rebinding for one run is an override,
-# not an edit here.
+# Canonical built-in default agent topology (Redmine #14148, Design Consultation
+# finding 1). The SINGLE source of the product default, expressed role-canonically
+# as ``role -> profile -> provider`` so no surface hard-codes a role's brand. Both
+# ``_DEFAULT_BINDING`` (role -> provider) and the default expected launch topology
+# (``default_agent_topology.DEFAULT_EXPECTED_AGENTS``) are PROJECTIONS of this, and a
+# v2 config with no ``agents`` block resolves to it. A provider named here is a
+# built-in adapter id (the trusted boundary) — the one legitimate place a brand
+# appears, as a *profile attribute*, never as role authority. Changing a value here
+# changes the product default for EVERY workflow surface; rebinding for one run is an
+# override, not an edit here.
+#
+# The profile names are function-oriented (not brand-named): the *coordination*
+# surface (gateway / coordinator / auditor / owner) and the *implementation* surface.
 # ---------------------------------------------------------------------------
-_DEFAULT_BINDING: dict[str, str] = {
-    ROLE_COORDINATOR: PROVIDER_CODEX,
-    ROLE_AUDITOR: PROVIDER_CODEX,
-    ROLE_OWNER: PROVIDER_CODEX,
-    ROLE_IMPLEMENTER: PROVIDER_CLAUDE,
-    ROLE_ROOT_COORDINATOR: PROVIDER_CODEX,
-    ROLE_PROJECT_GATEWAY: PROVIDER_CODEX,
-    ROLE_IMPLEMENTATION_WORKER: PROVIDER_CLAUDE,
+DEFAULT_PROFILE_COORDINATION: str = "coordination"
+DEFAULT_PROFILE_IMPLEMENTATION: str = "implementation"
+
+#: Built-in default profile name -> provider (a built-in adapter id).
+DEFAULT_PROFILE_PROVIDERS: "dict[str, str]" = {
+    DEFAULT_PROFILE_COORDINATION: PROVIDER_CODEX,
+    DEFAULT_PROFILE_IMPLEMENTATION: PROVIDER_CLAUDE,
 }
+
+#: Built-in default workflow role -> profile name (the role-canonical topology).
+DEFAULT_ROLE_PROFILES: "dict[str, str]" = {
+    ROLE_COORDINATOR: DEFAULT_PROFILE_COORDINATION,
+    ROLE_AUDITOR: DEFAULT_PROFILE_COORDINATION,
+    ROLE_OWNER: DEFAULT_PROFILE_COORDINATION,
+    ROLE_ROOT_COORDINATOR: DEFAULT_PROFILE_COORDINATION,
+    ROLE_PROJECT_GATEWAY: DEFAULT_PROFILE_COORDINATION,
+    ROLE_IMPLEMENTER: DEFAULT_PROFILE_IMPLEMENTATION,
+    ROLE_IMPLEMENTATION_WORKER: DEFAULT_PROFILE_IMPLEMENTATION,
+}
+
+#: The default launch / creation order of the expected agent pair, as *profiles*. The
+#: order is a launch-topology decision (implementation first, then coordination — the
+#: historical #13569 ``claude`` then ``codex`` order), NOT derived from the provider
+#: registry (known != expected, per plugin-ready-adapter-boundary).
+DEFAULT_EXPECTED_PROFILE_ORDER: "tuple[str, ...]" = (
+    DEFAULT_PROFILE_IMPLEMENTATION,
+    DEFAULT_PROFILE_COORDINATION,
+)
+
+
+def default_role_provider_map() -> "dict[str, str]":
+    """The role -> provider default, projected from the canonical role -> profile -> provider.
+
+    The single projection ``_DEFAULT_BINDING`` and every default-binding consumer read, so
+    a role's default provider is derived from its default profile, never a second literal
+    map that could drift from the topology.
+    """
+    return {
+        role: DEFAULT_PROFILE_PROVIDERS[profile]
+        for role, profile in DEFAULT_ROLE_PROFILES.items()
+    }
+
+
+def default_expected_provider_order() -> "tuple[str, ...]":
+    """The default expected launch providers, projected from the canonical profile order.
+
+    The launch topology (``default_agent_topology.DEFAULT_EXPECTED_AGENTS``) reads this so
+    the expected pair follows the one canonical default topology and is not re-derived from
+    the provider registry (known != expected).
+    """
+    return tuple(DEFAULT_PROFILE_PROVIDERS[p] for p in DEFAULT_EXPECTED_PROFILE_ORDER)
+
+
+#: The default (compatibility) role -> provider binding — a PROJECTION of the canonical
+#: role-canonical topology above (byte-identical to the historical codex/claude map).
+_DEFAULT_BINDING: "dict[str, str]" = default_role_provider_map()
 
 
 class RoleProviderBindingError(ValueError):
@@ -267,6 +321,13 @@ __all__ = (
     "ROLE_PROJECT_GATEWAY",
     "ROLE_IMPLEMENTATION_WORKER",
     "WORKFLOW_ROLES",
+    "DEFAULT_PROFILE_COORDINATION",
+    "DEFAULT_PROFILE_IMPLEMENTATION",
+    "DEFAULT_PROFILE_PROVIDERS",
+    "DEFAULT_ROLE_PROFILES",
+    "DEFAULT_EXPECTED_PROFILE_ORDER",
+    "default_role_provider_map",
+    "default_expected_provider_order",
     "RoleProviderBindingError",
     "normalize_role",
     "normalize_provider",

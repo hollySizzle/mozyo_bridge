@@ -1288,6 +1288,20 @@ documents:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: logic-provider-neutral-config-v2
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/provider-neutral-config-v2.md
+    purpose: "repo-local config schema v2 (role-canonical topology + named runtime profile) の設計・運用正本 (Redmine #14148)。provider を role authority から分離し trusted adapter 属性へ閉じ込める agents.profiles/roles schema、canonical role->profile->(provider, launch_argv) 解決と現行 provider-unit launch が消費する current-launch compatibility adapter (canonical と称さない) の境界、同一(provider,lane_class)衝突の config-load fail-closed と launch-time role 別 profile 反映の #13647 への委譲、config migrate --check/--write の lossless/idempotent/atomic/registered-adapter 診断、v1 deprecation/removal lifecycle (0.13.0 deprecated / 0.15.0 earliest removal / observable gate)、trusted executable boundary を定義する。"
+    audit_role: provider_neutral_config_v2_logic
+    related_document_refs:
+      - logic-modular-config-driven-refactor
+      - logic-plugin-ready-adapter-boundary
+      - spec-herdr-default-lane-workflow-role-authority
+      - spec-herdr-native-identity
+      - rule-project-agent-workflow
+      - rule-public-private-boundary
+
   - id: logic-skill-distribution
     type: logic
     status: active

@@ -19,17 +19,19 @@ status/doctor/launch "expected" judgment both reference, so the two can never dr
 
 from __future__ import annotations
 
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
-    PROVIDER_CLAUDE,
-    PROVIDER_CODEX,
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+    default_expected_provider_order,
 )
 
 #: The built-in default agent pair a ``mozyo`` / herdr session launches and is expected
-#: to carry. A literal contract by design — order is the launch/creation order
-#: (``claude`` first, then ``codex``). Consumers that judge missing / ready take this
-#: as an overridable input so a test (or a future topology binding) can supply a
-#: different expected set without editing a consumer.
-DEFAULT_EXPECTED_AGENTS: tuple[str, ...] = (PROVIDER_CLAUDE, PROVIDER_CODEX)
+#: to carry. It is a PROJECTION of the one canonical role-canonical default topology
+#: (:data:`~mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding.DEFAULT_EXPECTED_PROFILE_ORDER`,
+#: Redmine #14148 finding 1) — the *expected* launch pair, deliberately NOT derived from
+#: the provider registry (known != expected). Order is the launch/creation order
+#: (``claude`` first, then ``codex``). Consumers that judge missing / ready take this as an
+#: overridable input so a test (or a future topology binding) can supply a different
+#: expected set without editing a consumer. Byte-identical to the previous literal.
+DEFAULT_EXPECTED_AGENTS: tuple[str, ...] = default_expected_provider_order()
 
 
 __all__ = ("DEFAULT_EXPECTED_AGENTS",)

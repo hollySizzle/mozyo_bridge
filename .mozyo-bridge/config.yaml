@@ -1,23 +1,32 @@
-version: 1
+version: 2
+agents:
+  profiles:
+    implementation:
+      provider: claude
+      launch_argv:
+        sublane:
+        - --model
+        - claude-opus-4-8
+    coordination:
+      provider: codex
+      launch_argv:
+        default:
+        - --model
+        - gpt-5.6-sol
+        - --config
+        - model_reasoning_effort=xhigh
+        sublane:
+        - --config
+        - model_reasoning_effort=high
 presentation:
   project_group_presentation: project_group_tmux_window
   project_groups:
-    - group_id: project:mozyo_bridge
-      label: mozyo_bridge
+  - group_id: project:mozyo_bridge
+    label: mozyo_bridge
   grouping:
     membership_rules:
-      - when:
-          repo_label: mozyo-giken-3800-mozyo-bridge
-        group_id: project:mozyo_bridge
-agent_launch:
-  launch_argv:
-    claude:
-      sublane: ["--model", "claude-opus-4-8"]
-    codex:
-      default: ["--model", "gpt-5.6-sol", "--config", "model_reasoning_effort=xhigh"]
-      sublane: ["--config", "model_reasoning_effort=high"]
-provider_binding:
-  bindings:
-    coordinator: codex
+    - when:
+        repo_label: mozyo-giken-3800-mozyo-bridge
+      group_id: project:mozyo_bridge
 terminal_transport:
   backend: herdr

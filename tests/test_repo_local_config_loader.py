@@ -193,8 +193,9 @@ class FailClosedSchemaTest(unittest.TestCase):
                 load_repo_local_config(tmp)
 
     def test_unsupported_version(self) -> None:
+        # v1 and v2 are supported (Redmine #14148); a future version fails closed.
         with tempfile.TemporaryDirectory() as tmp:
-            _write_config(Path(tmp), "version: 2\n")
+            _write_config(Path(tmp), "version: 3\n")
             with self.assertRaises(RepoLocalConfigError):
                 load_repo_local_config(tmp)
 
