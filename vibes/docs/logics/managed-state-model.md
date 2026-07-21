@@ -579,6 +579,35 @@ Table naming:
       zero-write で拒否する。`--retire-hibernated-bound` は `--execute` / `--migrate-hibernated-legacy` /
       `--reconcile-hibernated-live` と競合する destructive intent ゆえ **2 つ以上の同時指定は command-time zero-write
       error**。
+    - **active live-zero terminal retire** (`LaneActiveRetireStore.retire_active_live_zero`,
+      #14242、live evidence #14222 j#85208-j#85209)。#13754 / #13841 / #13842 / #13845 が **いずれも
+      収束させられない**隙間: **active** かつ `binding_kind='issue'` かつ `worktree_identity` **非空**（bound）で、
+      issue と children が closed・head integrated・worktree clean なのに managed pair が **既に positive zero**
+      のケース。#13754 guarded close は閉じる対象が無く `zero_close_unproven` を恒久的に返し（row が未 `retired`
+      ゆえ zero-close を retire と読まないのは正しい fail-closed）、#13845 は CAS が `hibernated` +
+      `process_release='released'` を要求するため `not_hibernated_bound_state` で拒否、#13841 / #13842 は
+      `worktree_identity` **空**を要求する。本 surface は 1 本の bounded CAS で `active -> retired` へ
+      **metadata-only** に terminalize する（process launch/close/resume なし、worktree/branch 削除なし）。
+      ★**#13845 と決定的に異なる点: release witness が存在しない**。#13845 は live-zero read と durable
+      `process_release='released'` という**独立 2 witness**を連言するが、active row は構造上
+      `process_release='not_requested'`（`request_release` 自体が active row を `unexpected_state` で拒否する）。
+      したがって **live-inventory zero read が唯一の liveness authority** となり、caller 側の要求水準が上がる:
+      unreadable inventory / duplicate canonical slot / locator-less（liveness contract が positive stale と
+      言わない）row / foreign occupant は **すべて zero-write 拒否**し、かつ **zero read を測定した exact revision**
+      を CAS へ渡す（read と write の間に relaunch された pair は `CAS_STALE_REVISION` で敗れ、clobber しない）。
+      ★書込条件は「row 存在 かつ exact `expected_revision` 一致」かつ「`active` / `binding_kind='issue'` /
+      この exact issue 所有 / project scope 無し / `worktree_identity` 非空かつ attested token と一致」かつ
+      「`process_release ∈ {not_requested, released}` / replacement settled」の全成立時のみ。`requested` /
+      `partial` は actuator が pane を閉じている最中でありうるため拒否（active row では到達不能だが backstop として
+      保持し、white-box test で固定）。★worktree token は CAS 内（row lock 下）で再照合する — attestation pre-gate は
+      **診断**であって authority ではない（pre-gate を外しても CAS が `not_active_bound_state` で拒否することを
+      test で固定）。★declared pins / worktree identity / generation / release / replacement / `reconcile_phase` は
+      **保持**し、書くのは disposition + decision anchor + revision のみ。★duplicate replay は idempotent だが
+      success を返す前に live-zero を action-time 再確認する。★**#13845 の CAS を `active` 受理へ広げない**:
+      広げると active row が「自らは決して供給できない release proof」の上で terminalize しうる。各 surface が
+      自らの signature を literal に述べる原則どおり、専用 store を追加した。`--retire-active-live-zero` は
+      `--execute` / `--migrate-hibernated-legacy` / `--reconcile-hibernated-live` / `--retire-hibernated-bound`
+      と競合する destructive intent ゆえ **2 つ以上の同時指定は command-time zero-write error**。
     - **hibernated bound declared-pin repair** (`LanePinRepairStore.repair_hibernated_bound_pins`,
       #13879、live evidence #13846 j#79915)。#13809 / #13841 / #13842 / #13845 が **いずれも拒否**する隙間:
       **hibernated / released** かつ `worktree_identity` **非空**（bound）かつ `declared_slots` が **空**
