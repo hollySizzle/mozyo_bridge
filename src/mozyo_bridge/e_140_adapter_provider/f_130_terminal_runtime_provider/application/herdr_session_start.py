@@ -357,6 +357,7 @@ def prepare_session(
 
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_lifecycle_admission import admit_launch_against_lifecycle  # noqa: E501
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_preflight import validate_session_request  # noqa: E501
 
 
 def _prepare_session_locked(
@@ -438,48 +439,17 @@ def _prepare_session_locked(
             raise HerdrSessionStartError(
                 f"unknown provider {provider!r}; expected one of {sorted(AGENT_PROVIDERS)}"
             )
-    # Fail closed on an unknown operator placement mode BEFORE any side effect
-    # (Redmine #14139). The composition roots pass a value already validated by the
-    # config loader; this guard makes the pure entry point reject a bad string
-    # directly too, so an unknown mode can never silently degrade to per-project.
-    if coordinator_placement_mode not in COORDINATOR_PLACEMENT_MODES:
-        raise HerdrSessionStartError(
-            f"unknown coordinator placement mode {coordinator_placement_mode!r}; "
-            f"expected one of {sorted(COORDINATOR_PLACEMENT_MODES)}"
-        )
-    # Reject a duplicate (provider, lane) slot BEFORE any side effect (spec §5
-    # slot-uniqueness). Every requested provider shares this run's lane, so a
-    # repeated provider is a repeated slot: it would mint the SAME
-    # `mzb1_<ws>_<role>_<lane>` name twice (two launches / two renames) — the read
-    # side then fails closed with `multiple_matches`, leaving the session unusable.
-    # Fail-closed rejection (not silent de-dup) matches the spec wording, so the CLI
-    # can keep its repeatable `--agent` flag.
-    seen_slots: set = set()
-    lane_norm = _norm(lane_id)
-    for provider in providers:
-        slot = (provider, lane_norm)
-        if slot in seen_slots:
-            raise HerdrSessionStartError(
-                f"duplicate requested slot for provider {provider!r} in lane "
-                f"{lane_norm or 'default'!r}; each (provider, lane) may be prepared "
-                "once — remove the duplicate `--agent` argument"
-            )
-        seen_slots.add(slot)
-    # Validate the managed permission policy BEFORE any side effect (review j#73404):
-    # the lane chokepoint requests (codex, claude), so a validation that only fires
-    # inside the claude slot's launch would leave the codex gateway already started — a
-    # partial lane — when the env override is invalid. Applicability is now data-driven
-    # (#13441 R1-F2): every requested provider is asked, and one answers only if its
-    # profile declares the managed permission concept. Validating here (rather than only
-    # in the launch preflight below) keeps an invalid override fail-closed even on an
-    # adopt-only run, exactly as before.
-    for provider in providers:
-        try:
-            permission_mode_argv(
-                provider, policy_default=claude_permission_mode_default, env=env
-            )
-        except InvalidPermissionMode as exc:
-            raise HerdrSessionStartError(str(exc)) from exc
+    # Argument-level fail-closed validation, BEFORE any side effect: unknown placement mode
+    # (#14139), duplicate (provider, lane) slot (spec §5), invalid managed permission policy
+    # (j#73404). Extracted verbatim to a leaf for the module-health budget (#14242 j#85316).
+    validate_session_request(
+        providers=providers,
+        lane_id=lane_id,
+        coordinator_placement_mode=coordinator_placement_mode,
+        claude_permission_mode_default=claude_permission_mode_default,
+        env=env,
+        error_type=HerdrSessionStartError,
+    )
     binary = _resolve_binary_or_die(env)
     # The mozyo-bridge launcher the #13637 self-check wraps the provider through
     # (resolved once, shared by every launched slot; "" disables wrapping).
