@@ -52,6 +52,13 @@ def format_hibernate_text(outcome: HibernateOutcome) -> str:
         lines.append(
             "  -> fail-closed blocked: " + ", ".join(outcome.blocked_reasons)
         )
+        # Redmine #14230 review j#84793 R1-F2: an actionable, secret-free next-action
+        # instruction per fired release-boundary reason (never just the coarse summary).
+        next_actions = outcome.next_actions
+        if next_actions.actions:
+            lines.append(f"  next action: {next_actions.primary}")
+            for action in next_actions.actions:
+                lines.append(f"    - {action}: {next_actions.details[action]}")
         if outcome.transition is not None and not outcome.transition.applied:
             lines.append(f"  commit refused: {outcome.transition.reason}")
         return "\n".join(lines)

@@ -97,7 +97,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_WORKTREE_UNREADABLE,
     COMPOSER_GHOST_EMPTY_OBSERVED,
     RELEASE_BOUNDARY_REASONS,
+    ReleaseBoundaryNextActions,
     WorktreeMutationFingerprint,
+    release_boundary_next_actions,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
     LaneActivityObservation,
@@ -194,6 +196,16 @@ class HibernateOutcome:
         return tuple(self.preflight.blocked_reasons) + tuple(self.boundary_reasons)
 
     @property
+    def next_actions(self) -> ReleaseBoundaryNextActions:
+        """The safe next action(s) for the T1 release-boundary reasons (Redmine #14230).
+
+        Computed from :attr:`boundary_reasons` only (never the preflight reasons, which
+        already carry their own long-established operator vocabulary / recovery paths) —
+        pure, secret-free, closed (:func:`release_boundary_next_actions`).
+        """
+        return release_boundary_next_actions(self.boundary_reasons)
+
+    @property
     def is_success(self) -> bool:
         """A clean, FULLY-actuated hibernate success (Redmine #13843 review F5).
 
@@ -222,6 +234,7 @@ class HibernateOutcome:
             "is_success": self.is_success,
             "boundary_blocked": self.boundary_blocked,
             "boundary_reasons": list(self.boundary_reasons),
+            "boundary_next_actions": self.next_actions.as_payload(),
             "success_withheld": self.success_withheld,
             "recovery_detail": self.recovery_detail,
             "composer_ghost_observed": self.composer_ghost_observed,

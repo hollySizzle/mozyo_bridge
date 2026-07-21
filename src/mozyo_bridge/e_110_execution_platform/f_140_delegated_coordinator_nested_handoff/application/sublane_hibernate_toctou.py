@@ -43,7 +43,7 @@ reproduced deterministically with no sleeps and nothing dangerous enabled in pro
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping
 
 # Typed release-boundary block vocabulary (Redmine #13843; split into per-axis subreasons by
@@ -137,6 +137,129 @@ RECOVERY_ACTION_DETAIL = (
     "generation via `sublane resume` (issue / worktree / branch / commits are preserved — "
     "nothing was discarded)"
 )
+
+# ---------------------------------------------------------------------------
+# Reason -> safe next action (Redmine #14230 review j#84793 R1-F2). j#84750 item 3's four
+# outcomes, closed and secret-safe: no body / hash / length / substring / path ever appears
+# in a next-action token or detail — only the fixed instruction text below.
+# ---------------------------------------------------------------------------
+
+#: The evidence is unprovable (a readability failure, not an observed change): re-observe,
+#: never guess at what changed.
+NEXT_ACTION_READ_RECOVERY = "read_recovery"
+#: A live worker is mid-turn: wait for it to reach a quiescent state, never interrupt.
+NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION = "wait_for_worker_completion"
+#: A REAL pending composer input was observed: it needs an owner-approved disposition
+#: (consume or quarantine), never an automatic discard and never a blind retry.
+NEXT_ACTION_OWNER_APPROVED_QUARANTINE = "owner_approved_quarantine"
+#: A worktree content mutation appeared between preflight and boundary: this specific
+#: attempt is refused, but blindly re-issuing the same hibernate risks racing the SAME
+#: worker write again — re-observe the lane before retrying.
+NEXT_ACTION_NO_BLIND_RETRY = "no_blind_retry"
+
+NEXT_ACTIONS: frozenset[str] = frozenset(
+    {
+        NEXT_ACTION_READ_RECOVERY,
+        NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION,
+        NEXT_ACTION_OWNER_APPROVED_QUARANTINE,
+        NEXT_ACTION_NO_BLIND_RETRY,
+    }
+)
+
+_NEXT_ACTION_DETAIL: dict[str, str] = {
+    NEXT_ACTION_READ_RECOVERY: (
+        "the boundary re-read itself was unreadable (not merely unchanged); re-run the "
+        "read (doctor / dry-run preflight) once the transport / runtime state is "
+        "observable again — do not infer a mutation from an unreadable probe"
+    ),
+    NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION: (
+        "a live managed slot is mid-turn; wait for it to reach a quiescent runtime state "
+        "(awaiting_input / turn_ended), then re-issue hibernate — never interrupt a "
+        "running turn with a pane close"
+    ),
+    NEXT_ACTION_OWNER_APPROVED_QUARANTINE: (
+        "a real (non-ghost) pending composer input was observed; it requires an "
+        "owner-approved disposition (consume the input, or quarantine the lane) before "
+        "hibernate can proceed — never auto-discard it"
+    ),
+    NEXT_ACTION_NO_BLIND_RETRY: (
+        "the worktree content changed between preflight and this boundary re-read; "
+        "re-observe the lane (a fresh preflight) before retrying — reissuing the same "
+        "hibernate immediately risks racing the same in-flight write again"
+    ),
+}
+
+#: Decision order when multiple axes fire simultaneously (Redmine #14230 review j#84793
+#: R1-F2 "multiple-axis決定順"): the axis whose evidence is least trustworthy / most urgent
+#: to resolve wins as the PRIMARY next action. An unreadable probe means nothing else here
+#: can even be trusted, so it always wins; a live worker turn must never be interrupted
+#: regardless of what else is also true; a real pending composer needs owner attention
+#: before anything else; a plain content race is the softest case. Every fired reason's own
+#: action is still returned in :func:`release_boundary_next_actions` (see ``actions``) —
+#: this order only picks which ONE is ``primary`` for a single-line operator headline.
+_NEXT_ACTION_PRIORITY: tuple[str, ...] = (
+    NEXT_ACTION_READ_RECOVERY,
+    NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION,
+    NEXT_ACTION_OWNER_APPROVED_QUARANTINE,
+    NEXT_ACTION_NO_BLIND_RETRY,
+)
+
+#: The reason -> next-action mapping. Deliberately excludes :data:`BLOCK_RELEASE_BOUNDARY_MUTATION`
+#: (a backward-compatibility summary, never actionable on its own) and the exact-generation
+#: dimensions (:data:`BLOCK_RELEASE_BOUNDARY_GENERATION_DRIFT` / `_REVISION_DRIFT` /
+#: `_ATTESTATION_DRIFT`), which are a different axis (#13811) with their own re-verification
+#: semantics outside this reason-granularity fix's scope.
+_REASON_NEXT_ACTION: dict[str, str] = {
+    BLOCK_WORKTREE_UNREADABLE: NEXT_ACTION_READ_RECOVERY,
+    BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN: NEXT_ACTION_READ_RECOVERY,
+    BLOCK_WORKER_BUSY: NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION,
+    BLOCK_COMPOSER_PENDING_REAL: NEXT_ACTION_OWNER_APPROVED_QUARANTINE,
+    BLOCK_WORKTREE_FINGERPRINT_CHANGED: NEXT_ACTION_NO_BLIND_RETRY,
+}
+
+
+@dataclass(frozen=True)
+class ReleaseBoundaryNextActions:
+    """The safe next action(s) for a set of release-boundary reasons (pure, secret-free).
+
+    ``primary`` is the single highest-priority action (:data:`_NEXT_ACTION_PRIORITY`) for a
+    one-line operator headline; ``actions`` carries EVERY distinct action implied by the
+    fired reasons, in that same priority order (never collapsed to just the primary — a
+    caller acting only on ``primary`` while a DIFFERENT axis also fired would silently drop
+    an obligation, e.g. clearing a worktree race while a worker is still mid-turn).
+    ``details`` maps each action to its fixed, value-free instruction text.
+    """
+
+    primary: str = ""
+    actions: tuple[str, ...] = ()
+    details: Mapping[str, str] = field(default_factory=dict)
+
+    def as_payload(self) -> dict:
+        return {
+            "primary": self.primary,
+            "actions": list(self.actions),
+            "details": dict(self.details),
+        }
+
+
+def release_boundary_next_actions(reasons: "tuple[str, ...]") -> ReleaseBoundaryNextActions:
+    """Derive the safe next action(s) for a fresh release-boundary reason list (pure).
+
+    Reads only the fixed, closed :data:`_REASON_NEXT_ACTION` mapping — never a value, a
+    path, a hash, pane text, or any other secret-shaped input. An empty / all-unmapped
+    ``reasons`` (e.g. only :data:`BLOCK_RELEASE_BOUNDARY_MUTATION`, or an exact-generation
+    reason outside this axis) yields an empty :class:`ReleaseBoundaryNextActions` — never a
+    fabricated action for evidence this function was not given.
+    """
+    fired = {action for reason in reasons if (action := _REASON_NEXT_ACTION.get(reason))}
+    if not fired:
+        return ReleaseBoundaryNextActions()
+    ordered = tuple(action for action in _NEXT_ACTION_PRIORITY if action in fired)
+    return ReleaseBoundaryNextActions(
+        primary=ordered[0],
+        actions=ordered,
+        details={action: _NEXT_ACTION_DETAIL[action] for action in ordered},
+    )
 
 
 @dataclass(frozen=True)
@@ -240,9 +363,17 @@ def revalidate_release_boundary(
     appended as a backward-compatibility summary whenever any of the three fires, so an
     existing consumer checking only for the coarse token keeps working — it is never the SOLE
     reason in a fresh boundary block.
+
+    Review j#84793 R1-F1 correction: an unreadable PREFLIGHT (T0) worktree capture is ALSO
+    :data:`BLOCK_WORKTREE_UNREADABLE`, never :data:`BLOCK_WORKTREE_FINGERPRINT_CHANGED` — an
+    unreadable baseline means the content comparison cannot be proven either way (we cannot
+    show equivalence, but we equally cannot show a change), which is exactly what
+    "unreadable" already means elsewhere in this fence. Folding it into "changed" claimed a
+    fact (a mutation happened) the evidence does not support and misdirected recovery toward
+    a worktree race instead of a read-recovery next action.
     """
     reasons: list[str] = []
-    if not fingerprint_worktree_readable:
+    if not fingerprint_worktree_readable or not fingerprint_preflight.readable:
         reasons.append(BLOCK_WORKTREE_UNREADABLE)
     elif not fingerprint_boundary.readable:
         reasons.append(BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN)
@@ -254,17 +385,17 @@ def revalidate_release_boundary(
             subreasons.append(BLOCK_WORKER_BUSY)
         if fingerprint_boundary.pending_composer:
             subreasons.append(BLOCK_COMPOSER_PENDING_REAL)
-        # Content-drift axis: an unreadable PREFLIGHT capture cannot prove equivalence either
-        # (the original diverged_from()'s "baseline unreadable -> diverged" rule, preserved
-        # here for the content axis specifically — the activity axes above never depended on
-        # baseline readability at all).
-        content_changed = (not fingerprint_preflight.readable) or (
-            (fingerprint_boundary.dirty, fingerprint_boundary.untracked, fingerprint_boundary.digest)
-            != (
-                fingerprint_preflight.dirty,
-                fingerprint_preflight.untracked,
-                fingerprint_preflight.digest,
-            )
+        # Content-drift axis. Both captures are already proven readable at this point (the
+        # unreadable branch above returns before reaching here), so this is a genuine
+        # tuple-mismatch comparison, never a readability fallback.
+        content_changed = (
+            fingerprint_boundary.dirty,
+            fingerprint_boundary.untracked,
+            fingerprint_boundary.digest,
+        ) != (
+            fingerprint_preflight.dirty,
+            fingerprint_preflight.untracked,
+            fingerprint_preflight.digest,
         )
         if content_changed:
             subreasons.append(BLOCK_WORKTREE_FINGERPRINT_CHANGED)
@@ -323,12 +454,19 @@ __all__ = (
     "BLOCK_WORKTREE_UNREADABLE",
     "CLEAN_WORKTREE_FINGERPRINT",
     "COMPOSER_GHOST_EMPTY_OBSERVED",
+    "NEXT_ACTIONS",
+    "NEXT_ACTION_NO_BLIND_RETRY",
+    "NEXT_ACTION_OWNER_APPROVED_QUARANTINE",
+    "NEXT_ACTION_READ_RECOVERY",
+    "NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION",
     "RECOVERY_ACTION_DETAIL",
     "RECOVERY_POST_RELEASE_RESIDUE",
     "RELEASE_BOUNDARY_REASONS",
     "PostReleaseCheck",
+    "ReleaseBoundaryNextActions",
     "ReleaseBoundaryRevalidation",
     "WorktreeMutationFingerprint",
     "post_release_check",
+    "release_boundary_next_actions",
     "revalidate_release_boundary",
 )

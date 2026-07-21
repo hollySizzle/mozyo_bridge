@@ -78,6 +78,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_toctou import (  # noqa: E501
     BLOCK_RELEASE_BOUNDARY_ATTESTATION_DRIFT,
     BLOCK_RELEASE_BOUNDARY_REVISION_DRIFT,
+    NEXT_ACTION_NO_BLIND_RETRY,
+    NEXT_ACTION_OWNER_APPROVED_QUARANTINE,
+    NEXT_ACTION_READ_RECOVERY,
+    NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION,
+    release_boundary_next_actions,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
     LaneActivityObservation,
@@ -1502,6 +1507,24 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
                 DISPOSITION_ACTIVE,
             )
 
+    def test_boundary_unreadable_preflight_t0_worktree_blocks_as_unreadable(self) -> None:
+        # Redmine #14230 review j#84793 R1-F1: an unreadable PREFLIGHT (T0) capture must
+        # classify as worktree_fingerprint_unreadable, never worktree_fingerprint_changed
+        # -- an unreadable baseline cannot prove a content change happened.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            unreadable_t0 = WorktreeMutationFingerprint(readable=False)
+            ops = _FakeOps(rows=self._rows(), fingerprints=[unreadable_t0, _CLEAN_FP])
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_WORKTREE_UNREADABLE, outcome.boundary_reasons)
+            self.assertNotIn(BLOCK_WORKTREE_FINGERPRINT_CHANGED, outcome.boundary_reasons)
+            self.assertNotIn(BLOCK_RELEASE_BOUNDARY_MUTATION, outcome.boundary_reasons)
+            self.assertEqual(ops.close_calls, [])
+
     def test_boundary_generation_drift_blocks(self) -> None:
         # The live managed slot set changes between the preflight read and the boundary read
         # (the worker pane recycled to a new locator) — a generation drift the preflight
@@ -1611,6 +1634,122 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
             rec = store.get(LaneLifecycleKey(WS, LANE))
             self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
             self.assertEqual(rec.process_release, RELEASE_PARTIAL)
+
+
+class ReleaseBoundaryNextActionsTest(unittest.TestCase):
+    """Redmine #14230 review j#84793 R1-F2: reason -> safe next action mapping (pure)."""
+
+    def test_no_reasons_yields_empty(self) -> None:
+        actions = release_boundary_next_actions(())
+        self.assertEqual(actions.primary, "")
+        self.assertEqual(actions.actions, ())
+        self.assertEqual(actions.details, {})
+
+    def test_coarse_summary_alone_yields_no_action(self) -> None:
+        # BLOCK_RELEASE_BOUNDARY_MUTATION is a backward-compat summary only; it must never
+        # be treated as its own actionable reason (j#84793: "coarse summary単独禁止").
+        actions = release_boundary_next_actions((BLOCK_RELEASE_BOUNDARY_MUTATION,))
+        self.assertEqual(actions.actions, ())
+
+    def test_worktree_unreadable_maps_to_read_recovery(self) -> None:
+        actions = release_boundary_next_actions((BLOCK_WORKTREE_UNREADABLE,))
+        self.assertEqual(actions.primary, NEXT_ACTION_READ_RECOVERY)
+        self.assertEqual(actions.actions, (NEXT_ACTION_READ_RECOVERY,))
+
+    def test_runtime_unreadable_also_maps_to_read_recovery(self) -> None:
+        actions = release_boundary_next_actions(
+            (BLOCK_RUNTIME_STATE_UNREADABLE_OR_UNKNOWN,)
+        )
+        self.assertEqual(actions.primary, NEXT_ACTION_READ_RECOVERY)
+
+    def test_worker_busy_maps_to_wait_for_completion(self) -> None:
+        actions = release_boundary_next_actions(
+            (BLOCK_WORKER_BUSY, BLOCK_RELEASE_BOUNDARY_MUTATION)
+        )
+        self.assertEqual(actions.primary, NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION)
+        self.assertEqual(actions.actions, (NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION,))
+
+    def test_composer_pending_real_maps_to_owner_approved_quarantine(self) -> None:
+        actions = release_boundary_next_actions(
+            (BLOCK_COMPOSER_PENDING_REAL, BLOCK_RELEASE_BOUNDARY_MUTATION)
+        )
+        self.assertEqual(actions.primary, NEXT_ACTION_OWNER_APPROVED_QUARANTINE)
+
+    def test_worktree_changed_maps_to_no_blind_retry(self) -> None:
+        actions = release_boundary_next_actions(
+            (BLOCK_WORKTREE_FINGERPRINT_CHANGED, BLOCK_RELEASE_BOUNDARY_MUTATION)
+        )
+        self.assertEqual(actions.primary, NEXT_ACTION_NO_BLIND_RETRY)
+
+    def test_multiple_axes_decision_order_unreadable_wins_primary(self) -> None:
+        # Redmine #14230 j#84793 "multiple-axis決定順": worker-busy and composer-pending-real
+        # both fired alongside an unreadable axis -- unreadable is the least-trustworthy
+        # evidence and wins as primary, but EVERY fired axis's action is still present so a
+        # caller cannot silently drop the worker-busy obligation by acting on primary alone.
+        actions = release_boundary_next_actions(
+            (
+                BLOCK_WORKTREE_UNREADABLE,
+                BLOCK_WORKER_BUSY,
+                BLOCK_COMPOSER_PENDING_REAL,
+            )
+        )
+        self.assertEqual(actions.primary, NEXT_ACTION_READ_RECOVERY)
+        self.assertEqual(
+            set(actions.actions),
+            {
+                NEXT_ACTION_READ_RECOVERY,
+                NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION,
+                NEXT_ACTION_OWNER_APPROVED_QUARANTINE,
+            },
+        )
+
+    def test_worker_busy_outranks_composer_and_worktree_changed(self) -> None:
+        actions = release_boundary_next_actions(
+            (
+                BLOCK_WORKER_BUSY,
+                BLOCK_COMPOSER_PENDING_REAL,
+                BLOCK_WORKTREE_FINGERPRINT_CHANGED,
+                BLOCK_RELEASE_BOUNDARY_MUTATION,
+            )
+        )
+        self.assertEqual(actions.primary, NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION)
+        self.assertEqual(len(actions.actions), 3)
+
+    def test_details_carry_no_body_hash_length_or_path(self) -> None:
+        # Every detail is a fixed instruction string -- never a value derived from the
+        # composer body / a digest / a path (Redmine #14230 acceptance 2).
+        actions = release_boundary_next_actions(
+            (
+                BLOCK_WORKTREE_UNREADABLE,
+                BLOCK_WORKER_BUSY,
+                BLOCK_COMPOSER_PENDING_REAL,
+                BLOCK_WORKTREE_FINGERPRINT_CHANGED,
+            )
+        )
+        for detail in actions.details.values():
+            self.assertNotRegex(detail, r"^/|\s/[\w.-]+/")  # no absolute filesystem path
+            self.assertNotRegex(detail, r"\b[0-9a-f]{8,}\b")  # no hex digest
+
+    def test_outcome_next_actions_property_reflects_boundary_reasons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            store.declare_active(
+                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+            )
+            running = LaneActivityObservation(readable=True, worker_busy=True)
+            ops = _FakeOps(
+                rows=[_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")],
+                activities=[running],
+            )
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertEqual(outcome.next_actions.primary, NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION)
+            payload = outcome.as_payload()
+            self.assertEqual(
+                payload["boundary_next_actions"]["primary"],
+                NEXT_ACTION_WAIT_FOR_WORKER_COMPLETION,
+            )
 
 
 class WorktreeMutationFingerprintTest(unittest.TestCase):
