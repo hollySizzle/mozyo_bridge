@@ -699,6 +699,8 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
             ("--migrate-hibernated-legacy", "migrate_hibernated_legacy"),
             ("--reconcile-hibernated-live", "reconcile_hibernated_live"),
             ("--retire-hibernated-bound", "retire_hibernated_bound"),
+            # Redmine #14242: the active live-zero terminal retire is a fifth distinct intent.
+            ("--retire-active-live-zero", "retire_active_live_zero"),
         )
         if getattr(args, flag, False)
     ]
@@ -764,6 +766,7 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     migration_result = None
     reconcile_result = None
     bound_retire_result = None
+    active_retire_result = None
     if getattr(args, "migrate_hibernated_legacy", False):
         if outcome.preflight.may_retire:
             from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_legacy_retire import (  # noqa: E501
@@ -855,6 +858,41 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
                 worktree_branch=worktree_branch,
                 patch_equivalent=patch_equivalent,
             )
+    elif getattr(args, "retire_active_live_zero", False):
+        # Redmine #14242: the metadata-only TERMINAL retire for an ACTIVE bound row whose live
+        # pair is already gone (#14222 j#85208). The #13754 guarded close leaves it a permanent
+        # `zero_close_unproven`, and #13845 refuses it (`not_hibernated_bound_state`) because its
+        # CAS requires hibernated + released — an active row has neither. Like the siblings it
+        # runs only when the preflight permits retirement (so the closed-issue / callback /
+        # review obligations block upstream), and it launches / closes / resumes NO process.
+        if outcome.preflight.may_retire:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_active_live_zero_retire import (  # noqa: E501
+                run_active_live_zero_retire,
+            )
+
+            ops = LiveSublaneLifecycleOps(repo_root=repo_root)
+            head_integrated = ops.branch_integrated(
+                getattr(args, "branch", None) or "",
+                getattr(args, "integration_branch", None) or "",
+            )
+            worktree_branch = ops.branch_for(worktree) if worktree else None
+            # Same #14066 discipline as #13845: the patch-equivalent resolver is imported AND
+            # called ONLY when the literal ancestry probe did not pass, so a literal-ancestor
+            # lane performs no extra Redmine read / git probe.
+            patch_equivalent = None
+            if head_integrated is not True:
+                from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_patch_equivalent_integration import (  # noqa: E501
+                    resolve_patch_equivalent_integration,
+                )
+
+                patch_equivalent = resolve_patch_equivalent_integration(args, repo_root)
+            active_retire_result = run_active_live_zero_retire(
+                args,
+                repo_root,
+                head_integrated=head_integrated,
+                worktree_branch=worktree_branch,
+                patch_equivalent=patch_equivalent,
+            )
     elif getattr(args, "execute", False) and outcome.preflight.may_retire:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E501
             run_guarded_retire_close,
@@ -881,6 +919,9 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     if bound_retire_result is not None:
         payload["hibernated_bound_retire"] = bound_retire_result.as_payload()
         actuated_ok = bound_retire_result.ok
+    if active_retire_result is not None:
+        payload["active_live_zero_retire"] = active_retire_result.as_payload()
+        actuated_ok = active_retire_result.ok
     payload["retire_ok"] = bool(outcome.preflight.may_retire and actuated_ok)
     if getattr(args, "json", False):
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
@@ -910,6 +951,12 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
             )
 
             print(format_bound_retire_text(bound_retire_result))
+        if active_retire_result is not None:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_active_live_zero_retire import (  # noqa: E501
+                format_active_retire_text,
+            )
+
+            print(format_active_retire_text(active_retire_result))
     return 0 if (outcome.preflight.may_retire and actuated_ok) else 1
 
 

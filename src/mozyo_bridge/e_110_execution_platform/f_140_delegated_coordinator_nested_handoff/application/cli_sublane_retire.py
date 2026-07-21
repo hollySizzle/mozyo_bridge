@@ -203,6 +203,33 @@ def register_sublane_retire(
         ),
     )
     sublane_retire.add_argument(
+        "--retire-active-live-zero",
+        dest="retire_active_live_zero",
+        action="store_true",
+        help=(
+            "Redmine #14242: metadata-only TERMINAL retire for an ACTIVE bound owner row whose "
+            "managed pair is already positively gone — the #14222 j#85208 gap where the issue "
+            "and its children are closed, the head is integrated and the worktree is clean, but "
+            "the #13754 guarded close returns a permanent `zero_close_unproven` (nothing to "
+            "close, yet the row is not `retired`) and --retire-hibernated-bound refuses with "
+            "`not_hibernated_bound_state` because its CAS requires hibernated + released. "
+            "Unlike that surface there is NO durable release witness to pair with (an active row "
+            "never requested one), so the live-inventory zero read is the only liveness "
+            "authority and every ambiguity is refused: an unreadable inventory, a duplicate "
+            "canonical slot, a locator-less row the liveness contract does not positively call "
+            "dead, and any foreign / unexpected occupant each fail closed zero-write. Requires "
+            "the preflight to permit retirement AND --worktree to attest against the row's "
+            "recorded canonical binding AND the row to be active + issue-bound + owning --issue "
+            "AND --branch integrated (literal ancestor, or a #14066 patch_equivalent "
+            "integration verified via --integration-journal). The CAS is fenced on the exact "
+            "revision the zero read was measured against, so a pair relaunched in between loses "
+            "rather than being clobbered. Launches / closes / resumes NO process; removes no "
+            "worktree / branch. Duplicate replay is idempotent. Mutually exclusive with "
+            "--execute, --migrate-hibernated-legacy, --reconcile-hibernated-live and "
+            "--retire-hibernated-bound (passing more than one is a zero-write error)."
+        ),
+    )
+    sublane_retire.add_argument(
         "--integration-journal",
         dest="integration_journal",
         default=None,
