@@ -42,14 +42,17 @@ def bind_active_lifecycle_anchor(
 
 
 def still_current(candidate: HibernateCandidate, *, home: Optional[Path] = None) -> bool:
-    """Action-time revalidation (Redmine #14219 T2): is the candidate's exact anchor still current?
+    """The LIFECYCLE COMPONENT of action-time revalidation (Redmine #14219 T2, R1-F3).
 
-    The public hibernate CAS pins to its own fresh read (not the request's ``expected_revision``,
-    unless a project-gateway binding is set), so a lane that drifted between candidate build and
-    actuation would otherwise be hibernated in its new state — evidence the candidate never proved.
-    This re-reads the read-only store and confirms the record STILL matches the candidate's exact
-    ``(workspace, lane, generation, revision)``; any drift, absence, ambiguity, or unreadable store
-    fails closed to ``False`` (reusing the T1 binder, which already fails closed on each of those).
+    Confirms the candidate's exact ``(workspace, lane, generation, revision)`` is still the single
+    active lifecycle record; any drift, absence, ambiguity, or unreadable store fails closed to
+    ``False`` (reusing the T1 binder). This is NOT sufficient on its own: a review supersession or an
+    integration/CI/dogfood/origin lapse leaves the lifecycle row unchanged, so the actuation leg's
+    ``refresh_fn`` must AND this with a fresh re-production of every basis conjunct + head (T2b) and
+    require exact equality to the built candidate. The public hibernate CAS pins to its own fresh
+    read (not the request's ``expected_revision``, unless a project-gateway binding is set), so this
+    lifecycle-drift check is the part that stops a drifted lane from being hibernated in its new
+    state.
     """
     selected = SelectedLane(
         issue_id=candidate.issue_id,

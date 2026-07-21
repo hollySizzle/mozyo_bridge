@@ -23,7 +23,7 @@ The obligation flags and the basis-event journal are supplied by injected seams 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Callable, Optional, Sequence
 
 from ..domain.hibernate_actuation import (
     NO_ACTUATION_DEFERRED_ONE_PER_PASS,
@@ -39,18 +39,19 @@ from .sublane_hibernate_assertions import HibernateAssertions
 
 # Per-candidate attempt outcome kinds (closed vocabulary).
 ATTEMPT_ACTUATED = "actuated"
+ATTEMPT_PARTIAL = "actuated_release_incomplete"
 ATTEMPT_BLOCKED = "blocked"
 ATTEMPT_DEFERRED = "deferred"
 ATTEMPT_LEASE_LOST = "lease_lost"
 ATTEMPT_NO_JOURNAL = "no_basis_journal"
-ATTEMPT_STALE = "stale_anchor"
+ATTEMPT_STALE = "stale_basis"
 
 # Fixed reason tokens the leg emits itself (secret-free; the use case's own reasons are already a
 # closed vocabulary and are passed through verbatim).
 LEG_REASON_LEASE_LOST = "supervisor_lease_lost"
 LEG_REASON_SUCCESS_WITHHELD = "release_success_withheld"
 LEG_REASON_NOT_ACTUATED = "not_actuated"
-LEG_REASON_ANCHOR_DRIFTED = "anchor_drifted_since_build"
+LEG_REASON_BASIS_STALE = "basis_stale_since_build"
 
 
 @dataclass(frozen=True)
@@ -116,7 +117,7 @@ def _blocked_reason(outcome: HibernateOutcome) -> str:
 def run_hibernate_pass(
     candidates: Sequence[HibernateCandidate],
     *,
-    revalidate_fn: Callable[[HibernateCandidate], bool],
+    refresh_fn: Callable[[HibernateCandidate], Optional[HibernateCandidate]],
     obligations_fn: Callable[[HibernateCandidate], ActionTimeObligations],
     journal_fn: Callable[[HibernateCandidate], str],
     use_case: SublaneHibernateUseCase,
@@ -124,17 +125,25 @@ def run_hibernate_pass(
 ) -> HibernatePassResult:
     """Run one bounded hibernate pass, actuating at most one lifecycle mutation.
 
-    ``revalidate_fn`` re-confirms a candidate's exact anchor is still current at action time (the
-    public CAS pins to its own fresh read, so a lane that drifted since build must not be
-    hibernated — see :func:`hibernate_candidate_source.still_current`). ``obligations_fn`` /
-    ``journal_fn`` source the action-time obligation flags and the durable basis-event journal for a
-    candidate (T2b seams). ``lease_renew_fn`` renews the supervisor lease and returns ``False`` if it
-    was taken over. The pass:
+    ``refresh_fn`` is the action-time revalidation (Redmine #14219 T2a R1-F3): it RE-PRODUCES the
+    candidate from every durable authority afresh (lifecycle anchor + each basis conjunct + head)
+    and the pass proceeds only if the fresh candidate is EXACTLY EQUAL to the built one. Lifecycle
+    identity alone is not enough — a review supersession, an integration/CI/dogfood lapse, or an
+    origin-reachability change between build and actuation must abort, even when the lifecycle row
+    is unchanged. A ``None`` or non-equal refresh is a typed stale zero-actuation. (The concrete
+    producers behind ``refresh_fn`` are T2b; the leg only requires the composite re-check.)
+
+    ``obligations_fn`` / ``journal_fn`` source the action-time obligation flags and the durable
+    basis-event journal (T2b seams). ``lease_renew_fn`` is the pre-run wrapper lease fence; the
+    commit-point fence is the ``use_case``'s own injected ``lease_guard`` (R1-F2). The pass:
 
       * iterates candidates in :func:`order_candidates` order;
-      * once one hibernate is applied, defers every remaining candidate (one mutation per pass);
-      * re-validates the anchor, then renews the lease, immediately before each ``execute`` — a
-        drifted anchor or a lost lease actuates nothing;
+      * consumes the one-mutation budget on the AUTHORITATIVE mutation fact
+        (``transition.applied``) — a CAS that applied but left an incomplete release still consumes
+        it (R1-F1), so a partial hibernate never permits a second CAS in the pass;
+      * re-validates (composite refresh) then renews the lease immediately before each ``execute``;
+        a stale refresh, a lost wrapper lease, or a lease lost at the use case's commit boundary
+        (``outcome.lease_lost``) actuates nothing;
       * records each candidate's typed outcome and never retries a block within the pass.
     """
     ordered = order_candidates(candidates)
@@ -160,22 +169,41 @@ def run_hibernate_pass(
             attempts.append(HibernateAttempt(issue, lane, ATTEMPT_NO_JOURNAL, fields))
             continue
 
-        # Action-time revalidation: the exact anchor must still be current (fail-closed on drift).
-        if not revalidate_fn(candidate):
-            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_STALE, LEG_REASON_ANCHOR_DRIFTED))
+        # Action-time revalidation: a fresh re-production of the candidate must be EXACTLY equal —
+        # lifecycle anchor AND every durable basis conjunct/head still current (fail-closed).
+        if refresh_fn(candidate) != candidate:
+            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_STALE, LEG_REASON_BASIS_STALE))
             continue
 
-        # Lease-boundary fence: renew immediately before the sole irreversible mutation.
+        # Wrapper lease fence: renew immediately before the mutation (auxiliary to the use case's
+        # own commit-point lease_guard).
         if not lease_renew_fn():
             attempts.append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
             stopped = True
             continue
 
         outcome = use_case.run(_to_request(fields), execute=True)
-        if outcome.is_success:
+
+        # A lease lost at the use case's commit boundary committed nothing; stop the pass.
+        if outcome.lease_lost:
+            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
+            stopped = True
+            continue
+
+        # The one-mutation budget is keyed to the AUTHORITATIVE mutation fact (R1-F1): a CAS that
+        # applied consumes it even if the release was incomplete / withheld.
+        applied = outcome.transition is not None and outcome.transition.applied
+        if applied:
             mutated = True
-            revision = outcome.transition.revision if outcome.transition is not None else 0
-            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_ACTUATED, "", revision=revision))
+            revision = outcome.transition.revision
+            if outcome.is_success:
+                attempts.append(
+                    HibernateAttempt(issue, lane, ATTEMPT_ACTUATED, "", revision=revision)
+                )
+            else:
+                attempts.append(HibernateAttempt(
+                    issue, lane, ATTEMPT_PARTIAL, _blocked_reason(outcome), revision=revision
+                ))
         else:
             attempts.append(HibernateAttempt(issue, lane, ATTEMPT_BLOCKED, _blocked_reason(outcome)))
 
@@ -186,6 +214,7 @@ def run_hibernate_pass(
 
 __all__ = [
     "ATTEMPT_ACTUATED",
+    "ATTEMPT_PARTIAL",
     "ATTEMPT_BLOCKED",
     "ATTEMPT_DEFERRED",
     "ATTEMPT_LEASE_LOST",

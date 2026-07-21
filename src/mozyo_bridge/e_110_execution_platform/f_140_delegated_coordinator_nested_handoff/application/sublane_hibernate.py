@@ -50,7 +50,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
@@ -170,9 +170,16 @@ class HibernateOutcome:
     #: means either no ghost was observed, or activity was never probed (unreadable boundary /
     #: no live slots) — never asserted as proof no ghost existed.
     composer_ghost_observed: bool = False
+    #: Redmine #14219 T2a R1-F2: the supervisor lease was lost at the commit boundary (the
+    #: injected ``lease_guard`` refused immediately before the CAS / redrive close), so this
+    #: attempt committed NOTHING — a taken-over runner must not double-actuate. Zero transition,
+    #: zero close. ``False`` for the default CLI path (no lease guard).
+    lease_lost: bool = False
 
     @property
     def is_blocked(self) -> bool:
+        if self.lease_lost:
+            return True
         if self.already_hibernated:
             # A re-drive on an already-hibernated lane still fails closed when its
             # current preservation gate is unmet, the inventory is unreadable (R1-F2), or the
@@ -238,6 +245,7 @@ class HibernateOutcome:
             "success_withheld": self.success_withheld,
             "recovery_detail": self.recovery_detail,
             "composer_ghost_observed": self.composer_ghost_observed,
+            "lease_lost": self.lease_lost,
             "blocked_reasons": list(self.blocked_reasons),
             "preflight": self.preflight.as_payload(),
             "transition": (
@@ -388,10 +396,22 @@ class HibernateRequest:
 
 @dataclass
 class SublaneHibernateUseCase:
-    """Preflight + disposition CAS (active -> hibernated) + tombstone-free release."""
+    """Preflight + disposition CAS (active -> hibernated) + tombstone-free release.
+
+    ``lease_guard`` (Redmine #14219 T2a R1-F2) is an optional ownership re-check invoked at the
+    irreversible commit boundary — immediately before the fresh-path CAS and before the redrive
+    close. A background auto-hibernate runner injects its supervisor-lease renew here so a lease
+    lost during the T0/T1 boundary reads aborts with zero transition / zero close, instead of a
+    taken-over runner completing the mutation. ``None`` (the default, e.g. the interactive CLI) is
+    a behavior-preserving no-op.
+    """
 
     ops: SublaneHibernateOps
     store: LaneLifecycleStore
+    lease_guard: "Optional[Callable[[], bool]]" = None
+
+    def _lease_held(self) -> bool:
+        return self.lease_guard is None or bool(self.lease_guard())
 
     def _decision(self, request: HibernateRequest) -> Optional[DecisionPointer]:
         try:
@@ -552,6 +572,11 @@ class SublaneHibernateUseCase:
             composer_ghost_observed = False
             post_residue = False
             recovery_detail = ""
+            redrive_lease_lost = False
+            if execute and redrive_ok and not self._lease_held():
+                # Redmine #14219 T2a R1-F2: lease lost before the redrive close — close nothing.
+                redrive_lease_lost = True
+                redrive_ok = False
             if execute and redrive_ok:
                 rows1, fingerprint_boundary, boundary_reasons, composer_ghost_observed = (
                     revalidate_boundary(
@@ -610,6 +635,7 @@ class SublaneHibernateUseCase:
                 release=release,
                 success_withheld=post_residue,
                 recovery_detail=recovery_detail,
+                lease_lost=redrive_lease_lost,
                 detail=redrive_detail(
                     redrive_ok=redrive_ok,
                     boundary_reasons=boundary_reasons,
@@ -714,6 +740,19 @@ class SublaneHibernateUseCase:
         # F2) — bound here so the atomic CAS itself refuses a same-generation revision drift,
         # not only the pre-CAS gate; for an issue lane it is the current revision (unchanged).
         assert rec is not None  # guaranteed by original_identity_known
+        # Redmine #14219 T2a R1-F2: re-check ownership at the commit boundary. The boundary reads
+        # above (T0/T1) can be slow; a lease lost in that window must abort BEFORE the CAS, so a
+        # taken-over runner never commits. Zero transition, zero close.
+        if not self._lease_held():
+            return HibernateOutcome(
+                executed=False,
+                preflight=preflight,
+                issue=issue,
+                lane=lane,
+                project_scope=project_scope,
+                lease_lost=True,
+                detail="fail-closed: supervisor lease lost before hibernate commit",
+            )
         # Redmine #13844 R3: hibernate is a schema-needing mutation. Its write opens through the
         # universal `_connect_write` gate, which emits the PRE-migration peer-reader advisory to
         # stderr BEFORE the shared store is migrated (no per-command emit needed here).

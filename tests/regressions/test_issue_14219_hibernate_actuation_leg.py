@@ -32,9 +32,16 @@ from mozyo_bridge.core.state.lane_lifecycle import (
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
     HerdrRetireCloseResult,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    encode_assigned_name,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate import (  # noqa: E501
+    HibernateRequest,
     SublaneHibernateUseCase,
     WorktreeMutationFingerprint,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_assertions import (  # noqa: E501
+    HibernateAssertions,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
     LaneActivityObservation,
@@ -45,6 +52,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ATTEMPT_DEFERRED,
     ATTEMPT_LEASE_LOST,
     ATTEMPT_NO_JOURNAL,
+    ATTEMPT_PARTIAL,
     ATTEMPT_STALE,
     run_hibernate_pass,
 )
@@ -65,9 +73,11 @@ JOURNAL = "85508"
 
 
 class _FakeOps:
-    """Minimal SublaneHibernateOps: a clean, quiescent, releasable lane."""
+    """Minimal SublaneHibernateOps: a clean, quiescent lane (optionally with live slots)."""
 
-    def __init__(self):
+    def __init__(self, rows=None, close_result=None):
+        self._rows = list(rows) if rows is not None else []
+        self._close_result = close_result
         self.close_calls: list = []
         self.executed_reads = 0
 
@@ -75,7 +85,9 @@ class _FakeOps:
         return WS
 
     def read_inventory(self):
-        return [], True  # no live slots -> release is not_requested -> clean success
+        # No rows -> release is not_requested -> clean success. Rows + a partial close_result ->
+        # RELEASE_PARTIAL (CAS applied, is_success False).
+        return list(self._rows), True
 
     def read_attestation(self, assigned_name):
         return None
@@ -89,10 +101,27 @@ class _FakeOps:
 
     def execute_close(self, plan):
         self.close_calls.append(plan)
+        if self._close_result is not None:
+            return self._close_result
         return HerdrRetireCloseResult(
             workspace_id=plan.workspace_id, lane_id=plan.lane_id,
             closed=tuple(plan.close_targets), failed=(), foreign_names=plan.foreign_names,
         )
+
+
+def _row(role: str, lane: str) -> dict:
+    return {"name": encode_assigned_name(WS, role, lane), "pane_id": f"{WS}:{role}"}
+
+
+def _request_all_gates(lane=LANE, issue=ISSUE) -> HibernateRequest:
+    return HibernateRequest(
+        issue=issue, lane=lane, journal=JOURNAL,
+        assertions=HibernateAssertions(
+            explicitly_parked=True, callbacks_drained=True, no_review_pending=True,
+            no_owner_approval_pending=True, no_integration_pending=True, no_pending_prompt=True,
+            not_working=True, worktree_clean=True, boundary_recorded=False,
+        ),
+    )
 
 
 def _decision(journal=JOURNAL, issue=ISSUE) -> DecisionPointer:
@@ -122,12 +151,18 @@ def _obligations(**over):
 
 class HibernateActuationLegTests(unittest.TestCase):
     def _run(self, store, candidates, *, obligations=None, journal=JOURNAL, lease=True,
-             current=True, ops=None):
+             fresh=True, ops=None, lease_guard=None):
         ops = ops or _FakeOps()
-        use_case = SublaneHibernateUseCase(ops=ops, store=store)
+        use_case = SublaneHibernateUseCase(ops=ops, store=store, lease_guard=lease_guard)
+        # refresh_fn re-produces the candidate; `fresh=True` -> exact same candidate (current);
+        # `fresh=False` -> None (a lapsed basis / drift); or pass a callable for finer control.
+        if callable(fresh):
+            refresh_fn = fresh
+        else:
+            refresh_fn = (lambda c: c) if fresh else (lambda c: None)
         result = run_hibernate_pass(
             candidates,
-            revalidate_fn=lambda c: current,
+            refresh_fn=refresh_fn,
             obligations_fn=lambda c: obligations or _obligations(),
             journal_fn=lambda c: journal,
             use_case=use_case,
@@ -137,7 +172,9 @@ class HibernateActuationLegTests(unittest.TestCase):
 
     def _seed(self, home, lane=LANE, issue=ISSUE, ws=WS):
         store = LaneLifecycleStore(home=home)
-        store.declare_active(LaneLifecycleKey(ws, lane), decision=_decision(), issue_id=issue)
+        store.declare_active(
+            LaneLifecycleKey(ws, lane), decision=_decision(issue=issue), issue_id=issue
+        )
         return store
 
     def _disposition(self, store, lane=LANE, ws=WS):
@@ -183,6 +220,40 @@ class HibernateActuationLegTests(unittest.TestCase):
             self.assertEqual(self._disposition(store, lane="lane-b"), DISPOSITION_HIBERNATED)
             self.assertEqual(self._disposition(store, lane="lane-a"), DISPOSITION_ACTIVE)
 
+    def test_a_partial_release_consumes_the_one_mutation_budget(self):
+        # R1-F1: the first candidate's CAS applies (row hibernated) but its release is incomplete,
+        # so is_success is False. The budget is keyed to transition.applied, so it is consumed:
+        # mutations=1, the second candidate is DEFERRED (never a second CAS), and its row stays
+        # active. Ordered first is issue 14200/lane-a (the partial one).
+        with TemporaryDirectory() as raw:
+            home = Path(raw)
+            store = self._seed(home, lane="lane-a", issue="14200")
+            store.declare_active(
+                LaneLifecycleKey(WS, "lane-b"),
+                decision=_decision("85509", issue="14219"), issue_id="14219",
+            )
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id="lane-a",
+                closed=(("claude", f"{WS}:claude"),),
+                failed=(("codex", f"{WS}:codex", "close_failed"),),
+            )
+            ops = _FakeOps(
+                rows=[_row("codex", "lane-a"), _row("claude", "lane-a")], close_result=partial
+            )
+            result, _ = self._run(
+                store,
+                [_candidate(lane="lane-b", issue="14219"), _candidate(lane="lane-a", issue="14200")],
+                ops=ops,
+            )
+            self.assertEqual(result.mutations, 1)
+            kinds = [a.kind for a in result.attempts]
+            self.assertEqual(kinds.count(ATTEMPT_PARTIAL), 1)
+            self.assertEqual(kinds.count(ATTEMPT_DEFERRED), 1)
+            self.assertEqual(kinds.count(ATTEMPT_ACTUATED), 0)
+            # lane-a hibernated (CAS applied); lane-b never touched.
+            self.assertEqual(self._disposition(store, lane="lane-a"), DISPOSITION_HIBERNATED)
+            self.assertEqual(self._disposition(store, lane="lane-b"), DISPOSITION_ACTIVE)
+
     def test_lost_lease_stops_the_pass_with_zero_mutation(self):
         with TemporaryDirectory() as raw:
             home = Path(raw)
@@ -193,22 +264,40 @@ class HibernateActuationLegTests(unittest.TestCase):
             self.assertEqual(ops.close_calls, [])
             self.assertEqual(self._disposition(store), DISPOSITION_ACTIVE)
 
-    def test_a_drifted_anchor_is_not_actuated(self):
+    def test_a_lapsed_basis_refresh_none_is_not_actuated(self):
+        # R1-F3: the composite refresh re-produces nothing (a durable basis lapsed since build):
+        # zero mutation, the use case is never driven.
         with TemporaryDirectory() as raw:
             home = Path(raw)
             store = self._seed(home)
-            # Action-time revalidation says the anchor is no longer current (drifted since build):
-            # zero mutation, the use case is never driven.
-            result, ops = self._run(store, [_candidate()], current=False)
+            result, ops = self._run(store, [_candidate()], fresh=False)
             self.assertEqual(result.mutations, 0)
             self.assertEqual(result.attempts[0].kind, ATTEMPT_STALE)
             self.assertEqual(ops.close_calls, [])
             self.assertEqual(ops.executed_reads, 0)
             self.assertEqual(self._disposition(store), DISPOSITION_ACTIVE)
 
-    def test_still_current_detects_a_drifted_revision(self):
-        # The real revalidation predicate: a candidate whose revision no longer matches the store
-        # is not current; a matching one is.
+    def test_a_non_equal_refresh_is_not_actuated(self):
+        # R1-F3: the fresh candidate differs from the built one (e.g. the review head moved):
+        # exact-equality fails -> stale zero-actuation, even though a candidate exists.
+        with TemporaryDirectory() as raw:
+            home = Path(raw)
+            store = self._seed(home)
+            moved = _candidate()
+            moved = hc.HibernateCandidate(
+                issue_id=moved.issue_id, anchor=moved.anchor,
+                head=hc.BoundField(value="b" * 40, provenance=hc.PROVENANCE_GIT_REMOTE),
+                basis=moved.basis, conjuncts=moved.conjuncts,
+            )
+            result, ops = self._run(store, [_candidate()], fresh=lambda c: moved)
+            self.assertEqual(result.mutations, 0)
+            self.assertEqual(result.attempts[0].kind, ATTEMPT_STALE)
+            self.assertEqual(ops.executed_reads, 0)
+            self.assertEqual(self._disposition(store), DISPOSITION_ACTIVE)
+
+    def test_still_current_detects_a_drifted_lifecycle_row(self):
+        # The lifecycle component of the composite: a candidate whose revision/lane/generation no
+        # longer matches the store is not current; a matching one is.
         with TemporaryDirectory() as raw:
             home = Path(raw)
             store = self._seed(home)  # declared at revision 1
@@ -216,6 +305,38 @@ class HibernateActuationLegTests(unittest.TestCase):
             self.assertFalse(still_current(_candidate(rev=2), home=home))
             self.assertFalse(still_current(_candidate(lane="lane-other"), home=home))
             self.assertFalse(still_current(_candidate(gen=5), home=home))
+
+    def test_lease_lost_at_the_commit_boundary_commits_nothing(self):
+        # R1-F2: the use case's own lease_guard refuses at the commit boundary (after the wrapper
+        # renew passed): zero transition, zero close, the pass stops.
+        with TemporaryDirectory() as raw:
+            home = Path(raw)
+            store = self._seed(home)
+            # wrapper lease renew passes (lease=True), but the commit-point guard refuses.
+            result, ops = self._run(store, [_candidate()], lease=True, lease_guard=lambda: False)
+            self.assertEqual(result.mutations, 0)
+            self.assertEqual(result.attempts[0].kind, ATTEMPT_LEASE_LOST)
+            self.assertEqual(ops.close_calls, [])
+            self.assertEqual(self._disposition(store), DISPOSITION_ACTIVE)
+
+    def test_use_case_lease_guard_outcome_is_blocked_and_not_success(self):
+        # R1-F2 at the use-case boundary: a commit-point lease loss is a typed blocked, zero-mutation
+        # outcome (is_blocked True via the lease_lost property; is_success False; transition None).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate import (  # noqa: E501
+            SublaneHibernateUseCase as UC,
+        )
+
+        with TemporaryDirectory() as raw:
+            home = Path(raw)
+            store = self._seed(home)
+            outcome = UC(ops=_FakeOps(), store=store, lease_guard=lambda: False).run(
+                _request_all_gates(), execute=True
+            )
+            self.assertTrue(outcome.lease_lost)
+            self.assertTrue(outcome.is_blocked)
+            self.assertFalse(outcome.is_success)
+            self.assertIsNone(outcome.transition)
+            self.assertEqual(self._disposition(store), DISPOSITION_ACTIVE)
 
     def test_blocked_preflight_does_not_mutate_and_is_not_retried(self):
         with TemporaryDirectory() as raw:
