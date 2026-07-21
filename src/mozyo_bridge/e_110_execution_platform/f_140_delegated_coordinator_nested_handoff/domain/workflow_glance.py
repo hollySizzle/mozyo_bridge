@@ -36,6 +36,28 @@ Design contract (Redmine #13435 j#74172):
 - **pane scrollback is never the source of workflow truth.** A ``runtime_state`` that
   came from a live pane read carries ``delivery_source=runtime_observation`` so the
   reader can see it is a supplementary signal, not a gate.
+
+Authority dimension (Redmine #14213). Two states cannot be resolved by the state class
+alone, and projecting them from a constant produced actively unsafe guidance:
+
+- **who owes a Review Gate** depends on the work unit. ``review_waiting`` used to assert
+  "auditor review owed (US-level audit)" unconditionally, so a leaf issue was routed to the
+  auditor while the SAME row's ``reconcile.expected_owner`` said ``implementation_gateway``
+  (#14150 j#84320). US-level audit is now claimed only on a positive ``work_unit:
+  user_story`` declaration; leaf and undeclared units route to the same-lane gateway, and
+  :func:`next_owner_contradicts` makes the no-contradiction rule checkable.
+- **what an integration-owed lane waits on** depends on the coordinator's integration
+  disposition. The disposition was folded to a single boolean set only by a *completion*
+  value, so a recorded ``explicit_deferral`` left NO trace and an approved-review lane whose
+  work was durably not on the integration branch projected as "collect owner close approval"
+  — steering a main-unmerged issue toward close (#14192 j#84323). The disposition is now a
+  closed typed token (:mod:`...domain.glance_integration_disposition`) whose *pending* kinds
+  hold the lane in ``integration_waiting``, carrying the coordinator's own structured unlock
+  / reason / next-owner fields.
+
+Both authority facts are read from STRUCTURED fields only. An undeclared work unit and an
+unreadable disposition each fail closed to the safe side — "no US-audit authority" and
+"integration not proven done" — rather than being guessed from prose.
 """
 
 from __future__ import annotations
@@ -47,10 +69,23 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ExecutionSurfaceFacts,
     ReconcileFacts,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_integration_disposition import (
+    IntegrationDispositionFacts,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.reconcile_gate_chain import (
+    OWNER_GATEWAY as RECONCILE_OWNER_GATEWAY,
+    OWNER_WORKER as RECONCILE_OWNER_WORKER,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     GATE_NONE,
+    INTEGRATION_NONE,
+    INTEGRATION_PENDING_DISPOSITIONS,
     LaneSignal,
     classify_lane_state,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.work_unit_granularity import (
+    WORK_UNIT_GRANULARITIES,
+    WORK_UNIT_USER_STORY,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_fill_decision import (
     LANE_STATE_BLOCKED,
@@ -164,6 +199,53 @@ OWNER_AUDITOR = "auditor"
 OWNER_COORDINATOR = "coordinator"
 OWNER_OWNER = "owner"
 OWNER_NONE = "none"
+#: The same-lane reviewer role. Bound to the reconciler's OWN literal
+#: (:data:`...reconcile_gate_chain.OWNER_GATEWAY`) rather than re-spelled, so a row's
+#: ``next_owner`` and its ``reconcile.expected_owner`` cannot drift apart by construction
+#: (Redmine #14213 acceptance 5). A leaf / undeclared-work-unit Review Gate is owed here, NOT
+#: by the auditor: US-level audit is only claimed on positive work-unit evidence (acceptance 4).
+OWNER_IMPLEMENTATION_GATEWAY = RECONCILE_OWNER_GATEWAY
+
+#: ``next_owner`` tokens that mean the SAME role as a reconciler ``expected_owner`` token. The
+#: glance names roles in short form (``worker``) while the reconciler uses the same-lane role
+#: ids (``implementation_worker``); they are equivalent, not contradictory. Used by
+#: :func:`next_owner_contradicts` so acceptance 5 is a checkable property rather than a
+#: hand-maintained coincidence.
+#: Every owner token the projection may emit. A structured ``next_owner`` recorded on an
+#: integration-disposition journal is honoured only if it is one of these (fail-closed).
+_KNOWN_OWNERS: frozenset = frozenset(
+    {
+        OWNER_WORKER,
+        OWNER_AUDITOR,
+        OWNER_COORDINATOR,
+        OWNER_OWNER,
+        OWNER_NONE,
+        OWNER_IMPLEMENTATION_GATEWAY,
+    }
+)
+
+_OWNER_EQUIVALENTS: dict[str, frozenset] = {
+    OWNER_WORKER: frozenset({OWNER_WORKER, RECONCILE_OWNER_WORKER}),
+    OWNER_IMPLEMENTATION_GATEWAY: frozenset({OWNER_IMPLEMENTATION_GATEWAY}),
+}
+
+
+def next_owner_contradicts(next_owner: str, expected_owner: str) -> bool:
+    """True when a row's ``next_owner`` CONTRADICTS the reconciler's ``expected_owner`` (pure).
+
+    A blank ``expected_owner`` is "the reconciler does not attribute this position to a
+    same-lane owner" (it returns ``None`` for coordinator / owner-owed states), so it never
+    contradicts. Two non-blank tokens contradict unless they name the same role — see
+    :data:`_OWNER_EQUIVALENTS`. This is the invariant #14213 acceptance 5 fixes: a leaf lane
+    used to project ``next_owner=auditor`` beside ``expected_owner=implementation_gateway``.
+    """
+    expected = str(expected_owner or "").strip()
+    actual = str(next_owner or "").strip()
+    if not expected or not actual:
+        return False
+    if actual == expected:
+        return False
+    return expected not in _OWNER_EQUIVALENTS.get(actual, frozenset({actual}))
 
 # Base next-action / next-owner per workflow state class (before a live delivery
 # anomaly is considered). A live (non-stale) delivery anomaly overrides the owner to
@@ -174,9 +256,13 @@ _STATE_NEXT: dict[str, tuple[str, str]] = {
         OWNER_WORKER,
         "worker implementing; await implementation_done",
     ),
+    # The DEFAULT review owner is the same-lane gateway, not the auditor: a Review Gate is owed
+    # by the same-lane ``implementation_gateway`` unless the durable record positively declares a
+    # ``user_story`` work unit (Redmine #14213 acceptance 4). ``_review_next`` applies that
+    # evidence; this entry is the no-evidence fallback.
     LANE_STATE_REVIEW_WAITING: (
-        OWNER_AUDITOR,
-        "auditor review owed (US-level audit)",
+        OWNER_IMPLEMENTATION_GATEWAY,
+        "same-lane implementation_gateway: Review Gate owed (leaf / undeclared work unit)",
     ),
     LANE_STATE_OWNER_WAITING: (
         OWNER_COORDINATOR,
@@ -218,12 +304,71 @@ _STATE_NEXT: dict[str, tuple[str, str]] = {
 }
 
 
-def next_action_for_state(state_class: str) -> tuple[str, str]:
+def _review_next(work_unit: str) -> tuple[str, str]:
+    """The ``(next_owner, next_action)`` for ``review_waiting``, from work-unit evidence (pure).
+
+    US-level audit is claimed ONLY when the durable record declares a ``user_story`` work unit.
+    A ``leaf_issue`` declaration, an undeclared unit, or an out-of-vocabulary token all route to
+    the same-lane ``implementation_gateway`` — the role that actually owes a leaf/task-level
+    Review Gate, and the one the reconciler already expects (Redmine #14213 acceptance 4/5).
+    """
+    unit = str(work_unit or "").strip()
+    if unit == WORK_UNIT_USER_STORY:
+        return (OWNER_AUDITOR, "auditor review owed (US-level audit)")
+    if unit and unit in WORK_UNIT_GRANULARITIES:
+        return (
+            OWNER_IMPLEMENTATION_GATEWAY,
+            f"same-lane implementation_gateway: Review Gate owed ({unit})",
+        )
+    return _STATE_NEXT[LANE_STATE_REVIEW_WAITING]
+
+
+def _integration_next(integration: "IntegrationDispositionFacts") -> tuple[str, str]:
+    """The ``(next_owner, next_action)`` for ``integration_waiting`` (pure).
+
+    When a PENDING disposition is durably recorded, the action names it and carries the
+    coordinator's own structured ``unlock`` / ``reason`` fields, so the operator reads the
+    recorded unlock condition instead of re-deriving it. Every element comes from a structured
+    field — an absent field is simply omitted, never guessed from prose (acceptance 3).
+
+    The recorded ``next_owner`` is honoured only when it is a known owner token; anything else
+    falls back to the coordinator (who owns integration disposition) while the raw value stays
+    visible in the row's ``integration`` payload group.
+    """
+    base_owner, base_action = _STATE_NEXT[LANE_STATE_INTEGRATION_WAITING]
+    facts = integration.validated()
+    if facts.disposition not in INTEGRATION_PENDING_DISPOSITIONS:
+        return (base_owner, base_action)
+
+    owner = facts.next_owner if facts.next_owner in _KNOWN_OWNERS else base_owner
+    parts = [f"{owner}: integration owed ({facts.disposition}); not merged — do not close"]
+    if facts.unlock:
+        parts.append(f"unlock: {facts.unlock}")
+    if facts.reason:
+        parts.append(f"reason: {facts.reason}")
+    return (owner, "; ".join(parts))
+
+
+def next_action_for_state(
+    state_class: str,
+    *,
+    work_unit: str = "",
+    integration: "IntegrationDispositionFacts | None" = None,
+) -> tuple[str, str]:
     """The base ``(next_owner, next_action)`` for a workflow state class (pure).
+
+    ``work_unit`` / ``integration`` are the durable AUTHORITY facts that refine two states the
+    static table cannot resolve on its own (Redmine #14213): who owes a Review Gate (leaf vs
+    US-level audit), and what an ``integration_waiting`` lane is actually waiting on. Both are
+    optional so existing callers keep the previous behaviour for every other state.
 
     Fail-closed: an unrecognized state class is routed to the coordinator to
     investigate rather than silently dropped.
     """
+    if state_class == LANE_STATE_REVIEW_WAITING:
+        return _review_next(work_unit)
+    if state_class == LANE_STATE_INTEGRATION_WAITING and integration is not None:
+        return _integration_next(integration)
     return _STATE_NEXT.get(
         state_class,
         (OWNER_COORDINATOR, f"coordinator: investigate unrecognized state {state_class}"),
@@ -286,6 +431,15 @@ class IssueGlanceSnapshot:
     reconcile: ReconcileFacts = field(default_factory=ReconcileFacts)
     authority: AuthorityFacts = field(default_factory=AuthorityFacts)
     execution: ExecutionSurfaceFacts = field(default_factory=ExecutionSurfaceFacts)
+    #: The durable work-unit declaration (``leaf_issue`` / ``user_story``) or ``""`` when the
+    #: record never declares one. Drives whether a Review Gate is projected as a same-lane
+    #: gateway review or a US-level audit (Redmine #14213).
+    work_unit: str = ""
+    #: The latest typed integration disposition. Defaults to "none recorded", so a producer
+    #: that does not yet fill it folds exactly as before.
+    integration: IntegrationDispositionFacts = field(
+        default_factory=IntegrationDispositionFacts
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +481,22 @@ class WorkflowGlanceRow:
     reconcile: ReconcileFacts = field(default_factory=ReconcileFacts)
     authority: AuthorityFacts = field(default_factory=AuthorityFacts)
     execution: ExecutionSurfaceFacts = field(default_factory=ExecutionSurfaceFacts)
+    #: The durable authority facts behind ``next_owner`` / ``next_action`` (Redmine #14213), so
+    #: a reader can see WHY a Review Gate was routed to the gateway rather than the auditor, and
+    #: what an ``integration_waiting`` lane is blocked on.
+    work_unit: str = ""
+    integration: IntegrationDispositionFacts = field(
+        default_factory=IntegrationDispositionFacts
+    )
+
+    @property
+    def next_owner_conflicts_reconcile(self) -> bool:
+        """True when ``next_owner`` contradicts the reconciler's ``expected_owner``.
+
+        The #14213 acceptance-5 invariant, exposed on the row so the contradiction is
+        observable in the JSON contract instead of only in tests.
+        """
+        return next_owner_contradicts(self.next_owner, self.reconcile.validated().expected_owner)
 
     @property
     def has_active_anomaly(self) -> bool:
@@ -353,6 +523,9 @@ class WorkflowGlanceRow:
             "reconcile": self.reconcile.as_payload(),
             "authority": self.authority.as_payload(),
             "execution_surface": self.execution.as_payload(),
+            "work_unit": self.work_unit,
+            "integration": self.integration.as_payload(),
+            "next_owner_conflicts_reconcile": self.next_owner_conflicts_reconcile,
         }
 
 
@@ -415,7 +588,15 @@ def fold_glance_row(snapshot: IssueGlanceSnapshot) -> WorkflowGlanceRow:
     )
     stale = _anomaly_is_stale(anomaly, delivery.observed_journal, snapshot.latest_gate_journal)
 
-    next_owner, next_action = next_action_for_state(state_class)
+    integration = snapshot.integration.validated()
+    work_unit = str(snapshot.work_unit or "").strip()
+    if work_unit not in WORK_UNIT_GRANULARITIES:
+        # Fail-closed: an out-of-vocabulary declaration is "undeclared", never coerced to a
+        # unit that would grant US-level audit authority the record does not support.
+        work_unit = ""
+    next_owner, next_action = next_action_for_state(
+        state_class, work_unit=work_unit, integration=integration
+    )
     if anomaly != ANOMALY_NONE and not stale:
         # A live delivery anomaly is a coordinator routing/repair concern regardless of
         # the underlying workflow state (a done lane whose handoff never submitted is a
@@ -444,6 +625,8 @@ def fold_glance_row(snapshot: IssueGlanceSnapshot) -> WorkflowGlanceRow:
         reconcile=snapshot.reconcile.validated(),
         authority=snapshot.authority.validated(),
         execution=snapshot.execution.validated(),
+        work_unit=work_unit,
+        integration=integration,
     )
 
 
@@ -578,7 +761,9 @@ __all__ = (
     "OWNER_COORDINATOR",
     "OWNER_OWNER",
     "OWNER_NONE",
+    "OWNER_IMPLEMENTATION_GATEWAY",
     "next_action_for_state",
+    "next_owner_contradicts",
     "DeliveryObservation",
     "IssueGlanceSnapshot",
     "WorkflowGlanceRow",

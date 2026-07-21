@@ -36,6 +36,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REVIEW_CONCLUSIONS,
     REVIEW_PENDING,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_integration_disposition import (
+    IntegrationDispositionFacts,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (
     fold_issue_gate_facts,
     lane_signal_from_gate_facts,
@@ -816,6 +819,12 @@ def active_lane_snapshots(
         signal = None
         gate_journal = ""
         degraded = False
+        # Redmine #14213: the durable authority facts behind the next-action projection. They
+        # come from the SAME fold as the gate facts, so they are only populated on the Redmine
+        # path; the advisory-store fallback leaves them at their fail-closed defaults (no
+        # work-unit evidence, no disposition recorded).
+        work_unit = ""
+        integration = IntegrationDispositionFacts()
 
         if redmine_source is not None:
             record = None
@@ -829,6 +838,8 @@ def active_lane_snapshots(
                 if facts is not None:
                     signal = lane_signal_from_gate_facts(issue, facts, issue_open=record.issue_open)
                     gate_journal = facts.latest_gate_journal
+                    work_unit = facts.work_unit
+                    integration = facts.integration
                 else:
                     # No recognized gate. A closed Redmine status is NOT fabricated into a
                     # retire decision here: without resolved gate/commit/integration facts we
@@ -868,6 +879,8 @@ def active_lane_snapshots(
                 or AuthorityFacts(),
                 execution=(authority_map.get(issue) or (None, ExecutionSurfaceFacts()))[1]
                 or ExecutionSurfaceFacts(),
+                work_unit=work_unit,
+                integration=integration,
             )
         )
     return GlanceCollection(snapshots=tuple(snaps), notes=tuple(notes))
