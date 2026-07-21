@@ -1,15 +1,21 @@
-"""Deterministic installed fault-path harness (Redmine #14097).
+"""Deterministic fault-path truth tables — source-public-dispatch layer (Redmine #14097).
 
-Each of this repo's four release-critical fault shapes already has a deterministic regression,
-but every one of those drives its use case / store / domain fold through **internal module
-imports**. None routes ``argv`` through the *public* CLI dispatch (``build_parser() -> args.func``)
-— the exact surface the installed ``mozyo-bridge`` binary runs. This scenario closes that gap: it
-reproduces and MEASURES each fault shape through the public command dispatch, confined to an
-isolated ``MOZYO_BRIDGE_HOME`` + a scratch herdr workspace / process (a fake herdr over the
-subprocess boundary), so no managed lane / callback / lease is ever touched.
+This is the **hermetic source-public-dispatch layer** of the #14097 harness (coordinator decision
+j#83766): it carries the detailed per-shape fault *truth tables* by routing ``argv`` through the
+public command dispatch (``build_parser() -> args.func``) — the same parser/handlers the installed
+binary runs — driven in-process over the worktree source, confined to an isolated
+``MOZYO_BRIDGE_HOME`` + a scratch herdr workspace/process (a fake herdr over the subprocess
+boundary), so no managed lane / callback / lease is ever touched. Each release-critical fault
+shape already has a deterministic regression, but every one drives its use case / store / domain
+fold through **internal module imports**, never the public command dispatch; this layer closes
+that gap.
 
-The four shapes and what the installed public surface must show (issue Acceptance + the
-stale-locator addendum j#83362 + the callback-lease addendum j#83426):
+Installed *provenance* (a wheel built from the review head, installed into an isolated temp venv
+and driven as a real subprocess) is the SEPARATE ``installed`` smoke layer — a CI/network gate,
+not this offline suite — and is never claimed here.
+
+The shapes and what the public command surface must show (issue Acceptance + the stale-locator
+addendum j#83362 + the callback-lease addendum j#83426 + the #13897 addendum j#83575):
 
 1. **Post-close stale-worker resume** (#13806) — ``sublane recover-stale``. The public preflight
    POSITIVELY observes a locator-present shell-residue worker (``is_stale`` + ``identity_resolved``
@@ -325,6 +331,52 @@ class StaleWorkerRecoveryThroughPublicCli(unittest.TestCase):
         self.assertEqual(result.rc, 1)
         self.assertFalse(result.json()["observation"]["is_standard_sublane_worker"])
         self.assertFalse(result.json()["closed_old_worker"])
+
+    def test_preflight_over_a_git_lane_is_fully_actionable(self):
+        # The full positive observation: over a real git-backed lane the preflight measures
+        # every recover-stale conjunct as satisfied (the fault is a genuine stale worker).
+        h = InstalledFaultHarness(self)
+        ctx = h.recover_stale_git_lane("issue_14097_resume", issue="14097")
+        obs = h.recover_stale_cli(ctx).json()["observation"]
+        for axis in (
+            "identity_resolved", "is_standard_sublane_worker", "issue_lane_matches",
+            "generation_matches", "not_productive", "is_stale", "worktree_readable",
+            "no_authority_conflict",
+        ):
+            self.assertTrue(obs[axis], axis)
+
+    def test_close_succeeds_then_post_close_resume_with_additional_close_zero(self):
+        # THE post-close-resume acceptance measured through the public orchestration path:
+        # --execute closes the exact stale worker (once), owes the launch; a re-run recognises
+        # the durable transaction as a post-close resume and NEVER re-closes.
+        h = InstalledFaultHarness(self)
+        ctx = h.recover_stale_git_lane("issue_14097_resume", issue="14097")
+        self.assertEqual(h.live_locator_count(), 1)
+
+        first = h.recover_stale_cli(ctx, execute=True).json()
+        self.assertTrue(first["executed"])
+        self.assertTrue(first["closed_old_worker"])  # the exact old worker was closed
+        self.assertEqual(first["status"], "stopped")
+        self.assertIn("re-run resumes", first["detail"])  # the launch is owed, replay resumes
+        self.assertEqual(h.live_locator_count(), 0)  # the stale worker is gone (closed once)
+
+        # The re-run observes the old worker gone and recognises the durable launch-owed
+        # transaction: it is a post-close resume, and it closes NOTHING more.
+        second = h.recover_stale_cli(ctx, execute=True).json()
+        self.assertTrue(second["post_close_resume"])
+        self.assertEqual(h.live_locator_count(), 0)  # additional close 0
+
+    def test_an_identity_unknown_with_no_transaction_refuses_zero_close(self):
+        # The fail-closed fence: a genuinely unknown identity with NO durable transaction is a
+        # fresh recovery whose block is real — never launched blind as a "resume", zero-close.
+        h = InstalledFaultHarness(self)
+        ctx = h.recover_stale_git_lane("issue_14097_ghost", issue="14097")
+        # Drop the worker row so the identity is unknown, with no prior --execute (no txn).
+        h.fake._agents.pop(ctx.worker_locator, None)
+        outcome = h.recover_stale_cli(ctx, execute=True).json()
+        self.assertEqual(outcome["status"], "refused")
+        self.assertFalse(outcome["post_close_resume"])
+        self.assertFalse(outcome["closed_old_worker"])
 
 
 # ---------------------------------------------------------------------------

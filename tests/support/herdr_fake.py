@@ -173,6 +173,14 @@ class _Agent:
     tab_id: str = ""  # the herdr tab the agent's pane lives in (Redmine #13411)
     launch_argv: list = field(default_factory=list)  # the post-``--`` provider argv
     env: dict = field(default_factory=dict)  # the injected ``--env K=V`` pairs
+    #: The live worker inventory row revision, when a scenario pins the #13806 recover-stale
+    #: worker-revision generation gate. Empty (default) renders no ``revision`` field, the legacy
+    #: minimal shape most scenarios use.
+    revision: str = ""
+    #: The detected managed provider agent behind the pane, when a scenario distinguishes a live
+    #: pane (a named provider) from a shell residue (``""``, present-but-blank). ``None`` (default)
+    #: renders no ``agent`` field, the shape whose liveness is decided by ``status`` alone.
+    detected_agent: "str | None" = None
 
 
 class FakeHerdr:
@@ -235,11 +243,16 @@ class FakeHerdr:
         provider: str = "",
         status: str = DEFAULT_START_STATUS,
         cwd: str = "",
+        revision: str = "",
+        detected_agent: "str | None" = None,
     ) -> str:
         """Place a live agent directly in ``workspace_id``, returning its locator.
 
         Seeds the live inventory the way a prior ``agent start`` would have, so a
         scenario can stand up an existing lane slot without replaying its launch.
+        ``revision`` / ``detected_agent`` pin the richer ``agent list`` row fields a
+        recover-stale generation gate / shell-residue classification reads; both default to
+        the legacy minimal shape (field absent).
         """
         ws = self._workspaces.get(workspace_id)
         if ws is None:
@@ -254,6 +267,8 @@ class FakeHerdr:
             provider=provider,
             status=status,
             cwd=cwd,
+            revision=revision,
+            detected_agent=detected_agent,
         )
         return pane_id
 
@@ -498,6 +513,16 @@ class FakeHerdr:
             # agent lives in one so a heal can rejoin the same tab.
             if agent.tab_id:
                 row["tab_id"] = agent.tab_id
+            # The richer #13806 recover-stale row fields, rendered only when a scenario pins
+            # them (legacy minimal shape otherwise): the worker inventory revision, the detected
+            # managed provider agent (present-but-blank == shell residue), and the foreground cwd
+            # the worktree-readable probe reads.
+            if agent.revision:
+                row["revision"] = agent.revision
+            if agent.detected_agent is not None:
+                row["agent"] = agent.detected_agent
+            if agent.cwd:
+                row["foreground_cwd"] = agent.cwd
             rows.append(row)
         # Splice any injected malformed / extra rows verbatim (one-shot).
         if self.extra_list_rows:

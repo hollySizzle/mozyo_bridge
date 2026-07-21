@@ -1,13 +1,22 @@
-"""Isolated-home + scratch-workspace rail for deterministic *installed* fault paths (#14097).
+"""Isolated-home + scratch-workspace rail for the deterministic fault paths of #14097.
+
+This is the **source-public-dispatch** layer (Redmine #14097 coordinator decision j#83766): it
+carries the detailed per-shape fault *truth tables* by routing ``argv`` through the SAME public
+command dispatch the installed binary runs (``build_parser() -> args.func``), driven **in-process
+over the worktree source** for a fast, hermetic, offline scenario. It is deliberately NOT the
+installed-artifact evidence — that (a wheel built from the review head, installed into an
+isolated temp venv and driven as a real subprocess with a proven non-checkout provenance) is the
+separate ``installed`` smoke layer, a CI/network gate, because building + installing an artifact
+is not hermetic and belongs with ``scripts/disposable_ubuntu_smoke.py`` and ``smoke/``, not the
+offline ``tests/scenarios`` suite (``tests-placement-discovery-policy.md``). Claims of installed
+provenance live there, never here.
 
 The fault shapes this repo pins for release verification — post-close stale-worker resume
 (#13806), the nested unhealthy-launch rollback pointer (#13948), the stale-locator ``sublane
 list`` projection (#14063), callback-sweep lease recovery (#13951), and the hibernated-legacy
 migration foreign-inventory gate (#13897) — each already have deterministic regressions, but
 every one of those drives its use case / store / domain fold through **internal module
-imports**. None routes ``argv`` through the *public* CLI dispatch (``build_parser() ->
-args.func``), which is exactly the surface the installed ``mozyo-bridge`` binary runs. This
-harness closes that gap:
+imports**, never through the public command dispatch. This layer closes that gap:
 
 - it drives the SAME public command dispatch the installed CLI runs (the real argparse tree
   + the real ``cmd_*`` handlers), so the scenario measures the public orchestration path, not
@@ -20,12 +29,11 @@ harness closes that gap:
   (the home-scoped public stores + the fake's one-shot stimuli), so an operator/agent driving
   the harness never issues a raw SQLite / tmux / Herdr mutation.
 
-It is deliberately NOT a subprocess of the operator's ``pipx``-installed binary: that would
-be non-hermetic (it measures whatever artifact is installed, not the source under review) and
-belongs to the release / container smoke, not the CI-hermetic ``tests/scenarios`` suite. The
-public *dispatch* — the parser and the ``cmd_*`` handlers — is byte-identical to what the
-installed entrypoint calls, so the coverage is the installed public surface; only the process
-boundary is in-process.
+The public *dispatch* here — the parser and the ``cmd_*`` handlers — is byte-identical to what
+the installed entrypoint calls, so this layer exercises the real public command surface over the
+source under review. What it does NOT establish is installed *provenance* (that the exercised
+code came from a built + installed artifact rather than the checkout): that claim is the
+``installed`` smoke layer's job and is never asserted from here.
 """
 
 from __future__ import annotations
@@ -47,6 +55,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     encode_assigned_name,
 )
 
+from tests.support.agent_provider_binaries import FakeAgentBinaries
 from tests.support.herdr_fake import (
     DEFAULT_START_STATUS,
     STATUS_WORKING,
@@ -79,6 +88,21 @@ class _LegacyLaneContext(NamedTuple):
     lane_id: str
     workspace_id: str
     issue: str
+
+
+class _RecoverStaleContext(NamedTuple):
+    """A git-backed active lane with a locator-present stale worker (#13806 recover-stale)."""
+
+    repo: Path
+    lane_id: str
+    workspace_id: str
+    issue: str
+    worker_name: str
+    worker_locator: str
+    action_id: str
+    worker_revision: str
+    lane_revision: str
+    lane_generation: str
 
 
 class CliResult(NamedTuple):
@@ -181,6 +205,9 @@ class InstalledFaultHarness:
         self.fake = FakeHerdr(read_text="idle\n> ")
         self._ws = self.fake.seed_workspace(cwd=str(self.repo_root))
         self._runner = _HerdrRunner(self.fake, self.herdr_bin, subprocess.run, subprocess.Popen)
+        # Real (stub) provider executables under a trusted bin dir, so a recover-stale / launch
+        # path resolves the exact worker provider (never the developer's real ``claude``).
+        self._provider_bins = FakeAgentBinaries(self._tmp)
         #: assigned-name -> seeded locator, for callers that re-reference a seeded slot.
         self._locators: dict[str, str] = {}
 
@@ -197,6 +224,8 @@ class InstalledFaultHarness:
         env["MOZYO_WORKSPACE_ID"] = self.workspace_id
         env["MOZYO_AGENT_ROLE"] = "codex"
         env["MOZYO_LANE_ID"] = COORDINATOR_LANE
+        # Prepend the trusted provider bin dir so a launch resolves the stub provider executable.
+        env["PATH"] = str(self._provider_bins.bin_dir) + os.pathsep + env.get("PATH", "")
         return env
 
     @contextlib.contextmanager
@@ -593,6 +622,101 @@ class InstalledFaultHarness:
             LaneLifecycleKey(ctx.workspace_id, ctx.lane_id)
         )
         return "" if rec is None else rec.lane_disposition
+
+    # -- stale-worker post-close-resume fixture rail (#13806 F2) ---------------
+
+    def recover_stale_git_lane(
+        self, lane_id: str, *, issue: str, worker_revision: str = "3"
+    ) -> _RecoverStaleContext:
+        """A git-backed active lane with a locator-present shell-residue worker.
+
+        recover-stale's preflight + close-boundary + launch-authority fences read a REAL git
+        checkout (branch == lane id, the issue lane id IS its branch) and a live lane lifecycle
+        whose worktree token matches. This rail stands up that isolated state so the public
+        ``sublane recover-stale`` command reaches ``actionable`` and drives the real close /
+        launch-owed / post-close resume — no managed lane touched.
+        """
+        import json as _json
+
+        from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleKey, LaneLifecycleStore
+        from mozyo_bridge.core.state.replacement_transaction import DecisionPointer
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.stale_worker_recovery import (  # noqa: E501
+            stale_worker_recovery_action_id,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            derive_lane_workspace_token,
+        )
+
+        repo = self._tmp / f"recover_repo_{lane_id}"
+        # A real git checkout whose branch IS the lane id (the launch-authority branch fence).
+        self._git("init", "-b", lane_id, cwd=self._tmp, extra=[str(repo)])
+        self._git("config", "user.email", "harness@example.invalid", cwd=repo)
+        self._git("config", "user.name", "harness", cwd=repo)
+        (repo / ".mozyo-bridge").mkdir(parents=True, exist_ok=True)
+        (repo / ".mozyo-bridge" / "config.yaml").write_text(
+            "version: 1\nterminal_transport:\n  backend: herdr\n", encoding="utf-8"
+        )
+        ws_id = f"fixture-14097-recover-{lane_id}"
+        (repo / ".mozyo-bridge" / "workspace-anchor.json").write_text(
+            _json.dumps({
+                "schema_version": 1, "workspace_id": ws_id,
+                "canonical_session": "fixture_14097_recover", "project_name": "mozyo-bridge",
+                "created_at": "2026-01-01T00:00:00+00:00", "updated_at": "2026-01-01T00:00:00+00:00",
+            }),
+            encoding="utf-8",
+        )
+        (repo / "README.md").write_text("x\n", encoding="utf-8")
+        self._git("add", "-A", cwd=repo)
+        self._git("commit", "-m", "base", cwd=repo)
+
+        # A live ACTIVE lane lifecycle whose worktree token equals the recovery worktree's token
+        # (the launch-authority fence). Its revision / generation pin the close-boundary fence.
+        token = derive_lane_workspace_token(str(repo))
+        lstore = LaneLifecycleStore(home=self.home)
+        lkey = LaneLifecycleKey(ws_id, lane_id)
+        lstore.declare_active(
+            lkey, decision=DecisionPointer(source="redmine", issue_id=issue, journal_id="79485"),
+            issue_id=issue, worktree_identity=token,
+        )
+        lrec = lstore.get(lkey)
+
+        # The locator-present shell-residue worker: a real inventory row (revision-carrying,
+        # foreground_cwd a real checkout) whose detected agent is blank => stale.
+        name = encode_assigned_name(ws_id, "claude", lane_id)
+        locator = self.fake.seed_agent(
+            name, workspace_id=self._ws, provider="", status=STALE_SLOT_STATUS,
+            revision=worker_revision, detected_agent="", cwd=str(repo),
+        )
+        self._locators[name] = locator
+        action_id = stale_worker_recovery_action_id(
+            lane_id=lane_id, role="claude", provider="claude", assigned_name=name, locator=locator,
+        )
+        return _RecoverStaleContext(
+            repo=repo, lane_id=lane_id, workspace_id=ws_id, issue=issue,
+            worker_name=name, worker_locator=locator, action_id=action_id,
+            worker_revision=worker_revision,
+            lane_revision=str(lrec.revision), lane_generation=str(lrec.lane_generation),
+        )
+
+    def recover_stale_cli(
+        self, ctx: _RecoverStaleContext, *, execute: bool = False
+    ) -> CliResult:
+        """Dispatch ``sublane recover-stale`` for ctx (read-only preflight, or ``--execute``)."""
+        argv = [
+            "sublane", "recover-stale",
+            "--issue", ctx.issue, "--lane", ctx.lane_id, "--role", "claude", "--provider", "claude",
+            "--assigned-name", ctx.worker_name, "--locator", ctx.worker_locator,
+            "--worker-revision", ctx.worker_revision,
+            "--expected-gate", "implementation_request", "--next-semantic-action", "dispatch_once",
+            "--json", "--repo", str(ctx.repo),
+        ]
+        if execute:
+            argv += [
+                "--action-id", ctx.action_id, "--journal", "79485", "--action-generation", "7",
+                "--lane-revision", ctx.lane_revision, "--lane-generation", ctx.lane_generation,
+                "--execute",
+            ]
+        return self.run_cli(argv)
 
     # -- inventory snapshots (cleanup / residue assertions) -------------------
 
