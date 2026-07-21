@@ -323,6 +323,84 @@ class FreshScaffoldRoundTripTest(unittest.TestCase):
         self.assertTrue(twice.already_current)
         self.assertEqual(twice.migrated, once)
 
+    def test_real_onboarding_writer_produces_loadable_v2(self) -> None:
+        # Run the actual onboarding config writer (not a stand-in) and confirm the file it
+        # creates loads as role-canonical v2 (Redmine #14148 review j#84516 finding 1).
+        import tempfile
+        from pathlib import Path
+
+        from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.application.config_write import (
+            CONFIG_WRITE_CREATED,
+            write_once_config,
+        )
+        from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = write_once_config(Path(tmp))
+            self.assertEqual(result.outcome, CONFIG_WRITE_CREATED)
+            cfg = load_repo_local_config(str(Path(tmp)))
+            self.assertEqual(cfg.schema_version, REPO_LOCAL_CONFIG_V2)
+            self.assertEqual(cfg.agents.resolve_provider_for_role("coordinator"), "codex")
+            self.assertEqual(cfg.deprecation_warnings(), ())  # fresh v2 -> no deprecation
+
+
+class ConfigStatusDeprecationSurfaceTest(unittest.TestCase):
+    """`config status` is the public surface that surfaces the v1 deprecation warning
+    (Redmine #14148 review j#84516 finding 2). Observable for a v1 migratable config;
+    silent for v1-unrelated-only / v2 / missing."""
+
+    def _status_json(self, repo):
+        import contextlib
+        import io
+        import json as _json
+        import types
+
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application.cli_config import (
+            cmd_config_status,
+        )
+
+        args = types.SimpleNamespace(repo=str(repo), json=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cmd_config_status(args)
+        self.assertEqual(rc, 0)
+        return _json.loads(buf.getvalue())
+
+    def _write(self, repo, text):
+        from pathlib import Path
+
+        d = Path(repo) / ".mozyo-bridge"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "config.yaml").write_text(text, encoding="utf-8")
+
+    def test_v1_migratable_surfaces_deprecation(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, "version: 1\nagent_launch:\n  launch_argv:\n    claude:\n      sublane: [\"--model\", \"m\"]\n")
+            out = self._status_json(Path(tmp))
+            self.assertEqual(out["schema_version"], 1)
+            self.assertTrue(out["deprecated"])
+            self.assertTrue(any("config migrate" in w for w in out["warnings"]))
+
+    def test_v2_missing_and_v1_unrelated_are_silent(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # missing config
+            self.assertFalse(self._status_json(Path(tmp))["deprecated"])
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, "version: 2\nterminal_transport:\n  backend: herdr\n")
+            self.assertFalse(self._status_json(Path(tmp))["deprecated"])
+        with tempfile.TemporaryDirectory() as tmp:
+            # v1 with only unrelated (non-migratable) content -> silent
+            self._write(tmp, "version: 1\nterminal_transport:\n  backend: herdr\n")
+            out = self._status_json(Path(tmp))
+            self.assertEqual(out["schema_version"], 1)
+            self.assertFalse(out["deprecated"])
+
 
 class ConfigMigrateCliTest(unittest.TestCase):
     """`config migrate` dry-run writes nothing; `--write` is atomic + idempotent."""

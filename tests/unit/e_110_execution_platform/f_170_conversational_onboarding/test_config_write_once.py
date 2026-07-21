@@ -27,16 +27,28 @@ class ConfigWriteOnceTests(unittest.TestCase):
     def _config(self) -> Path:
         return self.root / ".mozyo-bridge" / "config.yaml"
 
-    def test_absent_creates_typed_record(self) -> None:
+    def test_absent_creates_role_canonical_v2_record(self) -> None:
+        # Redmine #14148 item 7: fresh onboarding writes the role-canonical v2 record.
         result = write_once_config(self.root)
         self.assertEqual(result.outcome, CONFIG_WRITE_CREATED)
         parsed = yaml.safe_load(self._config().read_text(encoding="utf-8"))
-        self.assertEqual(parsed, {"version": 1, "terminal_transport": {"backend": "herdr"}})
+        self.assertEqual(parsed, {"version": 2, "terminal_transport": {"backend": "herdr"}})
 
     def test_second_write_is_no_op(self) -> None:
         write_once_config(self.root)
         result = write_once_config(self.root)
         self.assertEqual(result.outcome, CONFIG_WRITE_NO_OP)
+
+    def test_legacy_v1_minimal_record_is_explicit_compatible_no_op(self) -> None:
+        # A minimal herdr record written by an earlier onboarding at version 1 is
+        # behaviorally identical to the v2 target (nothing to migrate), so it is an
+        # explicit-compatible no-op — never silently rewritten to v2 (finding 1).
+        cfg = self._config()
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text("version: 1\nterminal_transport:\n  backend: herdr\n", encoding="utf-8")
+        result = write_once_config(self.root)
+        self.assertEqual(result.outcome, CONFIG_WRITE_NO_OP)
+        self.assertIn("version: 1", cfg.read_text(encoding="utf-8"))  # untouched
 
     def test_equivalent_without_version_is_no_op(self) -> None:
         cfg = self._config()

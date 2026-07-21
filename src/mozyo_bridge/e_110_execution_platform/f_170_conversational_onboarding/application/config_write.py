@@ -1,18 +1,25 @@
-"""Typed write-once ``.mozyo-bridge/config.yaml`` tool (Redmine #13498).
+"""Typed write-once ``.mozyo-bridge/config.yaml`` tool (Redmine #13498 / #14148).
 
 The onboarding runner never lets the model author or merge YAML. This tool
-writes exactly one typed record — ``{version: 1, terminal_transport: {backend:
-herdr}}`` — with strict write-once semantics:
+writes exactly one typed record — the role-canonical v2 minimal herdr record
+``{version: 2, terminal_transport: {backend: herdr}}`` (no ``agents`` block, so
+it resolves to the built-in default topology) — with strict write-once semantics:
 
-- **absent** → atomic create;
-- **typed-equivalent** → no-op (a re-run, or a hand-written minimal herdr
-  config, that already expresses this exact record);
+- **absent** → atomic create of the v2 record;
+- **typed-equivalent** → no-op. This covers a re-run *and* an existing minimal
+  herdr record written by an earlier onboarding at ``version: 1``: the v1 and v2
+  minimal records are behaviorally identical (default topology + herdr, nothing
+  to migrate), so a legacy v1 minimal record is treated as **explicitly
+  compatible** and left untouched — never silently rewritten to v2 (Redmine
+  #14148 review j#84516 finding 1);
 - **any other existing config** → fail closed (``existing_config_requires_separate_merge``);
-  the tool never overwrites or merges a divergent config.
+  the tool never overwrites or merges a divergent config. A v1 config carrying
+  provider-keyed blocks (``provider_binding`` / ``agent_launch``) is divergent and
+  the operator resolves it with ``mozyo-bridge config migrate``.
 
 Equivalence is judged on the parsed structure (not bytes), so YAML formatting
 differences do not defeat the no-op. The write is atomic (temp file + fsync +
-``os.replace``) so a crash can never leave a half-written config.
+``os.link``) so a crash can never leave a half-written config.
 """
 
 from __future__ import annotations
@@ -41,11 +48,18 @@ __all__ = (
 CONFIG_WRITE_CREATED = "created"
 CONFIG_WRITE_NO_OP = "no_op"
 
-# The exact typed record this tool owns. version 1, herdr backend, nothing else.
+# The exact typed record this tool owns. Role-canonical v2, herdr backend, nothing else
+# (no ``agents`` block -> the built-in default topology). Redmine #14148 item 7.
 TARGET_CONFIG_RECORD: dict[str, object] = {
-    "version": 1,
+    "version": 2,
     "terminal_transport": {"backend": BACKEND_HERDR},
 }
+
+#: Schema versions of the *minimal herdr record* (only terminal_transport) that are
+#: behaviorally identical to the v2 target and therefore an explicit-compatible no-op.
+#: A v1 minimal record carries nothing to migrate, so re-running onboarding over it must
+#: not rewrite it; a v1 config with provider-keyed blocks is divergent (see _is_equivalent).
+_EQUIVALENT_MINIMAL_VERSIONS: frozenset[int] = frozenset({1, 2})
 
 _CONFIG_RELPATH = Path(".mozyo-bridge") / "config.yaml"
 
@@ -69,19 +83,22 @@ class ConfigWriteResult:
 
 
 def _is_equivalent(parsed: object) -> bool:
-    """True when ``parsed`` already expresses exactly the target typed record.
+    """True when ``parsed`` is the minimal herdr record (v1 or v2), an explicit no-op.
 
-    Lenient only about an omitted ``version`` (the loader defaults it to 1) and
-    key ordering; anything richer (extra top-level sections, a different backend,
-    extra ``terminal_transport`` keys other than the recognised ``version``)
-    is treated as a divergent config, not an equivalent one.
+    The target is the v2 minimal record, but a legacy v1 minimal record (only
+    ``terminal_transport``, no provider-keyed blocks) is behaviorally identical and is
+    treated as explicitly compatible so re-running onboarding never silently rewrites it
+    (Redmine #14148 finding 1). Lenient about an omitted ``version`` (the loader defaults
+    it to 1) and key ordering; anything richer (extra top-level sections such as
+    ``provider_binding`` / ``agent_launch`` / ``agents``, a different backend, unexpected
+    ``terminal_transport`` keys) is a divergent config, not an equivalent one.
     """
     if not isinstance(parsed, Mapping):
         return False
     if set(parsed) - {"version", "terminal_transport"}:
         return False
     version = parsed.get("version", 1)
-    if version != 1:
+    if version not in _EQUIVALENT_MINIMAL_VERSIONS:
         return False
     transport = parsed.get("terminal_transport")
     if not isinstance(transport, Mapping):

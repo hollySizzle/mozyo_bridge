@@ -54,6 +54,21 @@ def register(sub) -> None:
     )
     config_sub = config.add_subparsers(dest="config_command", required=True)
 
+    status = config_sub.add_parser(
+        "status",
+        help=(
+            "Report the repo-local config schema version and any actionable "
+            "deprecation warning (read-only; the v1 -> v2 deprecation surface)."
+        ),
+    )
+    add_repo_option(status)
+    status.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a machine-readable JSON result instead of human text.",
+    )
+    status.set_defaults(func=cmd_config_status)
+
     migrate = config_sub.add_parser(
         "migrate",
         help=(
@@ -133,6 +148,48 @@ def _atomic_write(path: Path, text: str) -> Path:
             pass
         raise
     return backup
+
+
+def cmd_config_status(args) -> int:
+    """Handle ``config status`` — the public read-only v1 deprecation surface.
+
+    Loads the repo-local config through the same fail-closed loader every command uses and
+    surfaces its schema version plus any actionable deprecation warning (Redmine #14148
+    review j#84516 finding 2). It is observable for a v1 config that carries migratable
+    provider-keyed content and silent for a v1-unrelated-only / v2 / missing config — the
+    deprecation warning is not secret and never prints credential-shaped data (the schema
+    forbids such fields).
+    """
+    from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
+
+    as_json = bool(getattr(args, "json", False))
+    path = repo_local_config_path(getattr(args, "repo", None))
+    try:
+        config = load_repo_local_config(getattr(args, "repo", None))
+    except RepoLocalConfigError as exc:
+        if as_json:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+        else:
+            print(f"config status: cannot read {path}: {exc}", file=sys.stderr)
+        return 1
+
+    warnings = list(config.deprecation_warnings())
+    if as_json:
+        print(json.dumps({
+            "ok": True,
+            "path": str(path),
+            "schema_version": config.schema_version,
+            "deprecated": bool(warnings),
+            "warnings": warnings,
+        }))
+    else:
+        print(f"config: {path}")
+        print(f"  schema version: {config.schema_version}")
+        for warning in warnings:
+            print(f"  deprecation: {warning}")
+        if not warnings:
+            print("  deprecation: none")
+    return 0
 
 
 def cmd_config_migrate(args) -> int:
@@ -222,4 +279,4 @@ def cmd_config_migrate(args) -> int:
     return 0
 
 
-__all__ = ("register", "cmd_config_migrate")
+__all__ = ("register", "cmd_config_migrate", "cmd_config_status")
