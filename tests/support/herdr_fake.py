@@ -213,6 +213,13 @@ class FakeHerdr:
         self.locator_render_key = LOCATOR_KEY
         # --- pre-armed wait transitions (change-semantics, design §1.1 F) -------
         self._armed_transitions: list = []  # (target, to_status) queued FIFO
+        # --- composer echo (opt-in, #14097 installed smoke deliver landing) ------
+        #: When ``True``, ``pane send-text`` accumulates into a per-target composer buffer that
+        #: ``agent read`` then serves back — so a queue-enter send observes the marker it just
+        #: typed (an instant live-composer echo). Default ``False`` keeps the fixed-text read model
+        #: every existing scenario relies on.
+        self.echo_composer: bool = False
+        self._composer: dict = {}
 
     # -- seeding / injection --------------------------------------------------
 
@@ -519,9 +526,10 @@ class FakeHerdr:
         agent = self._resolve_agent(target)
         if agent is None:
             return _err(argv, f"agent_not_found: {target}")
+        text = self._composer.get(target, self.read_text) if self.echo_composer else self.read_text
         return _ok(
             argv,
-            {"result": {"read": {"text": self.read_text, "truncated": False}}},
+            {"result": {"read": {"text": text, "truncated": False}}},
         )
 
     def _cmd_pane_close(self, argv, rest):
@@ -546,6 +554,8 @@ class FakeHerdr:
         # real transport reports the send failure rather than a fabricated OK.
         if self._workspace_of_pane(target) is None:
             return _err(argv, f"no such pane: {target}")
+        if self.echo_composer and len(rest) > 3:
+            self._composer[target] = self._composer.get(target, self.read_text) + "\n" + rest[3]
         return _ok(argv, {"result": {"type": "ok"}})
 
     # -- wait resolution (change-semantics, no real time) ---------------------
@@ -656,6 +666,9 @@ class FakeHerdr:
         """A JSON-serializable snapshot of the live inventory (for the smoke adapter)."""
         return {
             "read_text": self.read_text,
+            "echo_composer": self.echo_composer,
+            "composer": dict(self._composer),
+            "armed_transitions": [list(t) for t in self._armed_transitions],
             "workspace_seq": self._workspace_seq,
             "workspaces": [
                 {
@@ -678,6 +691,9 @@ class FakeHerdr:
     def from_state(cls, state: dict) -> "FakeHerdr":
         """Rehydrate a fake from :meth:`to_state` (the smoke adapter's hydrate step)."""
         fake = cls(read_text=str(state.get("read_text", "")))
+        fake.echo_composer = bool(state.get("echo_composer", False))
+        fake._composer = dict(state.get("composer", {}))
+        fake._armed_transitions = [tuple(t) for t in state.get("armed_transitions", [])]
         fake._workspace_seq = int(state.get("workspace_seq", 0))
         for wsd in state.get("workspaces", []):
             fake._workspaces[wsd["workspace_id"]] = _Workspace(

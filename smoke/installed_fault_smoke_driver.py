@@ -43,8 +43,8 @@ def _base_env(home: Path, *, herdr_state: Path | None = None) -> dict:
     return env
 
 
-def _run(cli: Path, argv: list[str], env: dict) -> subprocess.CompletedProcess:
-    return subprocess.run([str(cli), *argv], capture_output=True, text=True, env=env)
+def _run(cli: Path, argv: list[str], env: dict, *, cwd: "str | None" = None) -> subprocess.CompletedProcess:
+    return subprocess.run([str(cli), *argv], capture_output=True, text=True, env=env, cwd=cwd)
 
 
 def drive_entrypoints(cli: Path, tmp: Path) -> dict[str, int]:
@@ -165,12 +165,23 @@ def _drive_recover_stale(cli: Path, tmp: Path) -> bool:
     fws = fake.seed_workspace(cwd=str(repo))
     locator = fake.seed_agent(name, workspace_id=fws, provider="", status="unknown",
                               detected_agent="", revision="3", cwd=str(repo))
+    # The surviving gateway slot the heal adopts + pins the tab on (a heal never splits the pair).
+    fake.seed_agent(encode_assigned_name(ws_id, "codex", lane), workspace_id=fws, provider="codex",
+                    cwd=str(repo))
     action_id = stale_worker_recovery_action_id(lane_id=lane, role="claude", provider="claude",
                                                 assigned_name=name, locator=locator)
     bins = FakeAgentBinaries(tmp / "rs_bins")
-    env = _base_env(home, herdr_state=_write_state(fake, tmp, "rs_state.json"))
-    env["PATH"] = str(bins.bin_dir) + os.pathsep + env.get("PATH", "")
-    out = _run(cli, [
+    state = tmp / "rs_state.json"
+    state.write_text(json.dumps(fake.to_state()), encoding="utf-8")
+
+    def env():
+        e = _base_env(home, herdr_state=state)
+        e["PATH"] = str(bins.bin_dir) + os.pathsep + e.get("PATH", "")
+        e["MOZYO_AGENT_CLAUDE_BINARY"] = bins.path("claude")
+        e["MOZYO_AGENT_CODEX_BINARY"] = bins.path("codex")
+        return e
+
+    argv = [
         "sublane", "recover-stale", "--issue", "14097", "--lane", lane, "--role", "claude",
         "--provider", "claude", "--assigned-name", name, "--locator", locator,
         "--worker-revision", "3", "--expected-gate", "implementation_request",
@@ -178,67 +189,139 @@ def _drive_recover_stale(cli: Path, tmp: Path) -> bool:
         "--journal", "79485", "--action-generation", "7",
         "--lane-revision", str(lrec.revision), "--lane-generation", str(lrec.lane_generation),
         "--execute", "--json", "--repo", str(repo),
-    ], env)
+    ]
+    first = _run(cli, argv, env())   # close the exact stale worker, own the launch
+    second = _run(cli, argv, env())  # the old worker is gone: a post-close resume, no re-close
     try:
-        payload = json.loads(out.stdout)
-        return bool(payload["closed_old_worker"]) and payload["status"] == "stopped"
+        p1 = json.loads(first.stdout)
+        p2 = json.loads(second.stdout)
+        # F2 acceptance: the exact worker was closed once (execute 1), and the re-run recognises the
+        # durable transaction as a post-close resume without an additional close.
+        return (bool(p1["closed_old_worker"]) and p1["status"] == "stopped"
+                and bool(p2["post_close_resume"]))
     except (ValueError, KeyError):
         return False
 
 
+def _seed_owed_rollback(fence, fake, ws_id: str, lane: str, nonce: str):
+    """Reserve a startup action + record a fresh idle launch that owes a rollback; return action id."""
+    from mozyo_bridge.core.state.startup_transaction_fence import Participant, StartupUnit
+
+    action = fence.reserve(StartupUnit(workspace_id=ws_id, lane_id=lane, providers=("claude",)), nonce)
+    name = encode_assigned_name(ws_id, "claude", lane)
+    locator = fake.seed_agent(name, workspace_id=list(fake._workspaces)[0], provider="claude")
+    fence.record_participant(action.action_id,
+                             Participant(role="claude", assigned_name=name, locator=locator,
+                                         receipt=locator))
+    return action.action_id, locator
+
+
 def _drive_session_rollback(cli: Path, tmp: Path) -> bool:
-    """F3 critical path installed: the fresh unhealthy launch is closed, then replay is idempotent."""
-    from mozyo_bridge.core.state.startup_transaction_fence import (
-        Participant, StartupTransactionFence, StartupUnit,
-    )
+    """F3 critical path installed: after discharge, the SAME binding replays under a NEW action id.
+
+    Action A is rolled back; then a fresh reservation of the SAME startup unit mints a NEW action
+    id (A != B), B is a live fresh launch (``eligible``), and A stays terminally rolled back.
+    """
+    from mozyo_bridge.core.state.startup_transaction_fence import StartupTransactionFence
 
     lane, ws_id = "issue_14097_smoke_nested", "fixture-14097-smoke-nested"
     home = tmp / "sr_home"
     home.mkdir(parents=True, exist_ok=True)
     fence = StartupTransactionFence(home=home)
-    action = fence.reserve(StartupUnit(workspace_id=ws_id, lane_id=lane, providers=("claude",)), "n1")
-    name = encode_assigned_name(ws_id, "claude", lane)
     fake = FakeHerdr(read_text="idle\n> ")
-    fws = fake.seed_workspace(cwd=str(tmp))
-    locator = fake.seed_agent(name, workspace_id=fws, provider="claude")
-    fence.record_participant(action.action_id,
-                             Participant(role="claude", assigned_name=name, locator=locator,
-                                         receipt=locator))
-    state = _write_state(fake, tmp, "sr_state.json")
+    fake.seed_workspace(cwd=str(tmp))
+    action_a, _ = _seed_owed_rollback(fence, fake, ws_id, lane, "n1")
+    state = tmp / "sr_state.json"
+    state.write_text(json.dumps(fake.to_state()), encoding="utf-8")
     env = _base_env(home, herdr_state=state)
-    execu = _run(cli, ["herdr", "session-rollback", "--action-id", action.action_id,
-                       "--execute", "--json", "--repo", str(tmp)], env)
-    replay = _run(cli, ["herdr", "session-rollback", "--action-id", action.action_id,
-                        "--json", "--repo", str(tmp)], env)
+
+    discharge = _run(cli, ["herdr", "session-rollback", "--action-id", action_a,
+                           "--execute", "--json", "--repo", str(tmp)], env)
+    # The same binding replays: a fresh reservation of the same unit mints a NEW action id. Reload
+    # the state the discharge just mutated (A's fresh launch closed) before seeding B's launch.
+    fake = FakeHerdr.from_state(json.loads(state.read_text(encoding="utf-8")))
+    action_b, _ = _seed_owed_rollback(fence, fake, ws_id, lane, "n2")
+    state.write_text(json.dumps(fake.to_state()), encoding="utf-8")
+    replay_b = _run(cli, ["herdr", "session-rollback", "--action-id", action_b,
+                          "--json", "--repo", str(tmp)], env)
+    replay_a = _run(cli, ["herdr", "session-rollback", "--action-id", action_a,
+                          "--json", "--repo", str(tmp)], env)
     try:
-        ex = json.loads(execu.stdout)
-        rp = json.loads(replay.stdout)
-        return (ex["state"] == "completed" and ex["participants"][0]["closed"]
-                and rp["reason"] == "already_rolled_back")
+        dis = json.loads(discharge.stdout)
+        rb = json.loads(replay_b.stdout)
+        ra = json.loads(replay_a.stdout)
+        return (dis["state"] == "completed" and dis["participants"][0]["closed"]
+                and action_b != action_a
+                and rb["participants"][0]["verdict"] == "eligible"
+                and ra["reason"] == "already_rolled_back")
     except (ValueError, KeyError, IndexError):
         return False
 
 
 def _drive_callback_exactly_once(cli: Path, tmp: Path) -> bool:
-    """F4 critical path installed: re-ingesting the same dispatch anchor is idempotent (dup 0)."""
+    """F4 critical path installed: the same dispatch anchor is DELIVERED (sent) exactly once.
+
+    Ingest the anchor, then ``--deliver`` it and re-``--deliver``: the send/recovery edge fires
+    once (a delivered row is terminal, so the re-deliver sends nothing), and a post-delivery sweep
+    does not amplify the pending / dead-letter backlog.
+    """
+    ws_id = "fixture-14097-smoke-cb"
+    repo = _herdr_repo_named(tmp, ws_id, "cb_repo")
     home = tmp / "cb_home"
     home.mkdir(parents=True, exist_ok=True)
     snap = tmp / "cb_issue.json"
     snap.write_text(json.dumps({"issue": {"id": "14097", "journals": [
         {"id": "84000", "notes": "gate [mozyo:workflow-event:gate=implementation_done]"}
     ]}}), encoding="utf-8")
-    env = _base_env(home)
+    # The coordinator target the delivered callback routes to: a live default-lane codex pane in
+    # the sending workspace, so the isolated fake-herdr transport can land the one send.
+    fake = FakeHerdr(read_text="idle\n> ")
+    fake.echo_composer = True  # the queue-enter send observes the marker it typed (landing)
+    fws = fake.seed_workspace(cwd=str(repo))
+    # The coordinator target starts IDLE and its turn-start (a change INTO ``working``) is armed,
+    # so the delivered callback's turn-start confirmation fires via the canonical fake's popen wait
+    # seam (Design Consultation j#84712) -> a confirmed ``delivered`` terminal.
+    coord = fake.seed_agent(encode_assigned_name(ws_id, "codex", "default"),
+                            workspace_id=fws, provider="codex")
+    fake.arm_transition(coord, "working")
+    state = _write_state(fake, tmp, "cb_state.json")
+
+    def env():
+        e = _base_env(home, herdr_state=state)
+        e["MOZYO_WORKSPACE_ID"] = ws_id
+        return e
+
     common = ["--candidate", "14097:84000:coordinator:implementation_done",
-              "--redmine-json", str(snap), "--workspace-id", "fixture-14097-smoke-cb",
-              "--cursor", "84001", "--json"]
-    first = _run(cli, ["workflow", "callbacks", "--ingest", *common], env)
-    again = _run(cli, ["workflow", "callbacks", "--ingest", *common], env)
+              "--redmine-json", str(snap), "--workspace-id", ws_id, "--cursor", "84001", "--json"]
+    # The deliver's nested `handoff send` attests the sender from the CWD anchor, so run under the
+    # herdr repo whose anchor is this workspace (else env-vs-anchor workspace mismatch blocks it).
+    _run(cli, ["workflow", "callbacks", "--ingest", *common], env(), cwd=str(repo))
+    d1 = _run(cli, ["workflow", "callbacks", "--deliver", "--workspace-id", ws_id, "--json"], env(), cwd=str(repo))
+    d2 = _run(cli, ["workflow", "callbacks", "--deliver", "--workspace-id", ws_id, "--json"], env(), cwd=str(repo))
+    sw = _run(cli, ["workflow", "callbacks", "--sweep", "--workspace-id", ws_id, "--json"], env(), cwd=str(repo))
     try:
-        return (json.loads(first.stdout)["enqueued"] == 1
-                and json.loads(again.stdout)["duplicates"] == 1
-                and json.loads(again.stdout)["enqueued"] == 0)
-    except (ValueError, KeyError):
+        p1, p2, sweep = json.loads(d1.stdout), json.loads(d2.stdout), json.loads(sw.stdout)
+        # The dispatch anchor is DELIVERED (a confirmed turn-start terminal) exactly once: the
+        # deliver claims + sends the row and the receiver's turn-start confirms it; the re-deliver
+        # sends nothing (a delivered row is terminal — duplicate notification 0); and a post-delivery
+        # sweep does not amplify the pending / dead-letter backlog.
+        return (len(p1["delivered"]) == 1 and p1["delivered"][0]["send_outcome"] == "delivered"
+                and p2["delivered"] == []
+                and sweep["dead_letter"] == [] and len(sweep["pending"]) == 0)
+    except (ValueError, KeyError, IndexError):
         return False
+
+
+def _herdr_repo_named(tmp: Path, ws_id: str, name: str) -> Path:
+    repo = tmp / name
+    (repo / ".mozyo-bridge").mkdir(parents=True, exist_ok=True)
+    (repo / ".mozyo-bridge" / "config.yaml").write_text(
+        "version: 1\nterminal_transport:\n  backend: herdr\n", encoding="utf-8")
+    (repo / ".mozyo-bridge" / "workspace-anchor.json").write_text(json.dumps({
+        "schema_version": 1, "workspace_id": ws_id, "canonical_session": "fixture_14097_smoke",
+        "project_name": "mozyo-bridge", "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00"}), encoding="utf-8")
+    return repo
 
 
 def _git_init(repo: Path, *, branch: str, ws_id: str) -> None:

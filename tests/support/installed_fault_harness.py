@@ -224,8 +224,12 @@ class InstalledFaultHarness:
         env["MOZYO_WORKSPACE_ID"] = self.workspace_id
         env["MOZYO_AGENT_ROLE"] = "codex"
         env["MOZYO_LANE_ID"] = COORDINATOR_LANE
-        # Prepend the trusted provider bin dir so a launch resolves the stub provider executable.
+        # Pin the trusted provider executables so a launch resolves the stub binaries
+        # unambiguously (a bare PATH could carry a second real ``claude`` / ``codex`` and the
+        # resolver refuses an ambiguous match). This is the sanctioned override, not a PATH hack.
         env["PATH"] = str(self._provider_bins.bin_dir) + os.pathsep + env.get("PATH", "")
+        env["MOZYO_AGENT_CLAUDE_BINARY"] = self._provider_bins.path("claude")
+        env["MOZYO_AGENT_CODEX_BINARY"] = self._provider_bins.path("codex")
         return env
 
     @contextlib.contextmanager

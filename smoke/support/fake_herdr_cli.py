@@ -46,6 +46,18 @@ def main(argv: list[str]) -> int:
         sys.stderr.write(f"fake_herdr_cli: unreadable state {state_path}: {exc}\n")
         return 2
     fake = FakeHerdr.from_state(state)
+    # The turn-start wait rail (``wait agent-status``) is the canonical fake's POPEN seam, not its
+    # run seam — model it here so the installed CLI's delivery confirmation observes an armed
+    # transition (Redmine #14097 Design Consultation j#84712). Any other argv replays through run.
+    if argv[:2] == ["wait", "agent-status"]:
+        proc = fake.popen([sys.argv[0], *argv])
+        out, err = proc.communicate()
+        state_path.write_text(json.dumps(fake.to_state()), encoding="utf-8")
+        if out:
+            sys.stdout.write(out)
+        if err:
+            sys.stderr.write(err)
+        return int(proc.returncode or 0)
     # ``fake.run`` takes the full argv (binary + command); replay exactly this invocation.
     result = fake.run([sys.argv[0], *argv])
     # Persist any mutation (pane close / agent start) so a later invocation sees it.
