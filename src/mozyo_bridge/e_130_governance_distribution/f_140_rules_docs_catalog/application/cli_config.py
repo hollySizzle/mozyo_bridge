@@ -37,6 +37,9 @@ from mozyo_bridge.application.repo_local_config_loader import repo_local_config_
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.config_migration import (
     migrate_record,
 )
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config_status import (  # noqa: E501
+    classify_config_sources,
+)
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
     RepoLocalConfig,
     RepoLocalConfigError,
@@ -151,14 +154,16 @@ def _atomic_write(path: Path, text: str) -> Path:
 
 
 def cmd_config_status(args) -> int:
-    """Handle ``config status`` — the public read-only v1 deprecation surface.
+    """Handle ``config status`` — the public read-only config visibility surface.
 
     Loads the repo-local config through the same fail-closed loader every command uses and
-    surfaces its schema version plus any actionable deprecation warning (Redmine #14148
-    review j#84516 finding 2). It is observable for a v1 config that carries migratable
-    provider-keyed content and silent for a v1-unrelated-only / v2 / missing config — the
-    deprecation warning is not secret and never prints credential-shaped data (the schema
-    forbids such fields).
+    surfaces its schema version, any actionable deprecation warning (Redmine #14148 review
+    j#84516 finding 2), and — Redmine #14222/#14223 — the per-key effective value + source
+    (``declared`` vs the silent behavior-preserving ``default``) for every top-level config
+    block, via :func:`~...domain.repo_local_config_status.classify_config_sources`. This
+    stays the ONE status command (#14223 close condition: no second ``status`` surface);
+    nothing here writes, and nothing prints credential-shaped data (the schema forbids such
+    fields at load time, so this surface inherits that guarantee without a new check).
     """
     from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
 
@@ -174,6 +179,21 @@ def cmd_config_status(args) -> int:
         return 1
 
     warnings = list(config.deprecation_warnings())
+    # Redmine #14222/#14223: per-key effective value + source (declared vs the silent
+    # behavior-preserving default), reusing THIS surface rather than a second status
+    # command. `_load_raw_record` already exists for `config migrate`'s dry-run plan; a
+    # parse failure here cannot happen (the loader above already proved the file parses),
+    # so any raise would be a genuine bug, not a reachable user-facing path.
+    raw_record = _load_raw_record(path)
+    settings = [
+        status.as_payload()
+        for status in classify_config_sources(
+            raw_record=raw_record,
+            config=config,
+            schema_version=config.schema_version,
+            legacy_migratable=bool(warnings),
+        )
+    ]
     if as_json:
         print(json.dumps({
             "ok": True,
@@ -181,6 +201,7 @@ def cmd_config_status(args) -> int:
             "schema_version": config.schema_version,
             "deprecated": bool(warnings),
             "warnings": warnings,
+            "settings": settings,
         }))
     else:
         print(f"config: {path}")
@@ -189,6 +210,12 @@ def cmd_config_status(args) -> int:
             print(f"  deprecation: {warning}")
         if not warnings:
             print("  deprecation: none")
+        print("  settings:")
+        for setting in settings:
+            line = f"    {setting['key']}: {setting['source']}"
+            if setting["note"]:
+                line += f" ({setting['note']})"
+            print(line)
     return 0
 
 
