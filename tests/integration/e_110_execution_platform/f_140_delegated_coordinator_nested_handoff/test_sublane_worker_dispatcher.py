@@ -148,7 +148,7 @@ class FakeWorkerDispatchOps:
 
     def dispatch_to_worker_turn_start(self, **kwargs):
         kwargs.pop("worker_assigned_name", None)
-        return self.dispatch_to_worker(**kwargs), self._turn_start
+        return self.dispatch_to_worker(**kwargs), self._turn_start, False
 
     def reserve_worker_dispatch(self, **kwargs):
         self.calls.append(("reserve", kwargs))

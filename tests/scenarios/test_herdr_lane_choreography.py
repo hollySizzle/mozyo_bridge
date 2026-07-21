@@ -326,7 +326,7 @@ class _Finding1World:
             out = io.StringIO()
             err = io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                rc = _drive_worker_send_argv(self.inner_argv(pin=pin))
+                rc, _known_not_sent = _drive_worker_send_argv(self.inner_argv(pin=pin))
         return rc, out.getvalue(), err.getvalue()
 
     def dispatch_via_production_ops(self):

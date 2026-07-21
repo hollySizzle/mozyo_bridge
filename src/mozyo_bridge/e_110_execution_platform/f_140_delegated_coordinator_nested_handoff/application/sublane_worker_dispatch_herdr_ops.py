@@ -23,6 +23,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneLaneView,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (  # noqa: E501
+    SenderDispatchAdmission,
     WorkerDispatchAdmission,
     WorkerDispatchAdmissionFacts,
     WorkerDispatchRequest,
@@ -385,6 +386,153 @@ class HerdrWorkerDispatchOps:
         )
         return decide_worker_dispatch_admission(facts)
 
+    def observe_sender_admission(
+        self,
+        *,
+        lane: SublaneLaneView,
+        request: WorkerDispatchRequest,
+        allow_direct_worker: bool = False,
+    ) -> SenderDispatchAdmission:
+        """Pre-reserve verdict: is the SENDER this lane's current same-lane gateway? (#14192)
+
+        Resolves the sender's launch-time :class:`SenderIdentity` from ``self.env``
+        (``MOZYO_WORKSPACE_ID`` / ``MOZYO_AGENT_ROLE`` / ``MOZYO_LANE_ID`` cross-checked
+        against the repo anchor) EXACTLY as the inner ``handoff send`` rail does
+        (``herdr_send_entry.resolve_herdr_send_target`` — the shared
+        ``herdr_workspace_segment`` anchor + the pre-#13377 legacy-lane fallback), requires the
+        sender's own role to be the binding-resolved **gateway** provider (Redmine #14192
+        review j#84236 F1: Acceptance #1 wants the same-lane *gateway*, not merely a same-lane
+        agent — a same-lane worker is NOT a legitimate dispatch origin), then runs the SAME
+        pure :func:`decide_gateway_route` policy the inner rail enforces for the lane check.
+        An admitted sender is a same-lane gateway (or the coordinator releasing a cross-lane
+        drive via ``--allow-direct-worker``), so the preflight never over-blocks a legitimate
+        gateway (Acceptance #4), while a coordinator / foreign / cross-lane / non-gateway-role
+        / unattested sender fails closed BEFORE any outbox reserve with zero write and zero
+        send (Acceptance #1). The verdict is a pure function of the sender env + resolved lane
+        + binding, so it is identical on dry-run and execute (Acceptance #2). An explicit
+        ``--allow-direct-worker`` releases a cross-lane drive as an exception (mirroring the
+        inner rail's ``gateway_route_exception``) but never relaxes the gateway-role guard —
+        that exception is a cross-lane carve-out, not a relaxation of WHO may originate.
+        """
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
+            herdr_workspace_segment,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (  # noqa: E501
+            _legacy_lane_token,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (  # noqa: E501
+            MOZYO_WORKSPACE_ID_ENV,
+            resolve_sender_identity,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            WorkflowProviderUnresolved,
+            resolve_gateway_provider,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_route_enforcement import (  # noqa: E501
+            GatewayRouteRequest,
+            decide_gateway_route,
+        )
+
+        # Anchor workspace: the shared project segment, with the pre-#13377 legacy per-lane
+        # token accepted when a live legacy lane's env still carries it (mirrors
+        # herdr_send_entry so this preflight and the inner rail resolve the SAME sender).
+        anchor_ws = herdr_workspace_segment(self.repo_root) or None
+        env_ws = (self.env.get(MOZYO_WORKSPACE_ID_ENV) or "").strip()
+        if env_ws and env_ws != (anchor_ws or ""):
+            legacy_token = _legacy_lane_token(self.repo_root)
+            if legacy_token and env_ws == legacy_token:
+                anchor_ws = legacy_token
+
+        sender_res = resolve_sender_identity(self.env, anchor_workspace_id=anchor_ws)
+        if not sender_res.ok or sender_res.identity is None:
+            return SenderDispatchAdmission(
+                admitted=False,
+                reason=(
+                    "dispatch-worker sender is not an attested same-lane gateway "
+                    f"({sender_res.reason}); refusing to reserve the outbox or send from a "
+                    "foreign / unattested origin. Dispatch through the coordinator -> "
+                    "target-lane gateway -> same-lane worker route instead"
+                ),
+                detail_token=sender_res.reason or "sender_identity_unresolved",
+            )
+
+        try:
+            worker_provider = self.worker_provider()
+            gateway_provider = resolve_gateway_provider(str(self.repo_root))
+        except WorkflowProviderUnresolved as exc:
+            return SenderDispatchAdmission(
+                admitted=False,
+                reason=f"worker/gateway provider binding is unresolved: {exc}",
+                detail_token="provider_binding_unresolved",
+            )
+
+        sender = sender_res.identity
+        # Redmine #14192 review j#84236 F1: `decide_gateway_route` verifies same-lane-UNIT
+        # but is role-agnostic about the SENDER — a same-lane worker addressing a same-lane
+        # worker resolves to ROUTE_ALLOWED. Acceptance #1 requires the sender to be the target
+        # lane's current same-lane GATEWAY, so the sender's own launch-time role must be the
+        # binding-resolved gateway (coordinator) provider. Both legitimate origins — the
+        # same-lane gateway and the coordinator (a `--allow-direct-worker` cross-lane drive) —
+        # ARE that provider, so this guard admits them while failing closed on a same-lane
+        # worker (or any non-gateway agent) BEFORE any outbox reserve, on both dry-run and
+        # execute. It is NOT released by `--allow-direct-worker`: that exception is a
+        # cross-LANE carve-out, not a relaxation of WHO may originate a dispatch. A rebound
+        # gateway provider moves this check with no literal edit. The strip-only comparison
+        # mirrors `decide_gateway_route`'s `_norm`; both tokens are already canonical provider
+        # ids (`resolve_sender_identity` admits only a known provider role, and the binding
+        # stores canonical ids).
+        if (sender.role or "").strip() != (gateway_provider or "").strip():
+            return SenderDispatchAdmission(
+                admitted=False,
+                reason=(
+                    "dispatch-worker sender is not the target lane's gateway role; only the "
+                    "same-lane gateway (or the coordinator for an explicit cross-lane "
+                    "exception) may originate a worker dispatch. Fail-closed before any "
+                    "outbox reserve"
+                ),
+                detail_token="sender_not_gateway_role",
+            )
+        decision = decide_gateway_route(
+            GatewayRouteRequest(
+                kind="implementation_request",
+                receiver=worker_provider,
+                sender_identity_known=True,
+                sender_workspace_id=sender.workspace_id,
+                sender_lane_id=sender.lane_id,
+                # The cross-workspace enforcement is already done by the anchor cross-check in
+                # `resolve_sender_identity` (env workspace == repo anchor == the target lane's
+                # workspace, since `read_lane` resolves the SAME `self.repo_root`), exactly as
+                # the inner rail enforces it. Passing the resolved sender workspace keeps the
+                # route decision's discriminator the LANE alone, so a token disagreement between
+                # `herdr_workspace_segment` and the `read_lane` projection can never over-block a
+                # legitimate same-lane gateway (Acceptance #4). A foreign-workspace sender has
+                # already failed closed at identity resolution above.
+                target_workspace_id=sender.workspace_id,
+                # The `--target-lane` pin the dispatch drives is the request label, which is
+                # exactly the explicit lane the inner rail's route target resolves to (tier-1).
+                target_lane_id=request.lane_label,
+                allow_direct_worker=allow_direct_worker,
+                worker_provider=worker_provider,
+                gateway_provider=gateway_provider,
+            )
+        )
+        if decision.is_blocked:
+            return SenderDispatchAdmission(
+                admitted=False,
+                reason=(
+                    "dispatch-worker sender lane does not match the target lane's same-lane "
+                    "gateway route; fail-closed before any outbox reserve. Route through the "
+                    "target lane's gateway, or supply --allow-direct-worker for an explicit "
+                    "durable cross-lane exception"
+                ),
+                detail_token=decision.blocked_reason or "gateway_route_blocked",
+            )
+        return SenderDispatchAdmission(
+            admitted=True,
+            reason="sender is the target lane's current same-lane gateway route",
+            exception_applied=decision.is_exception,
+        )
+
     def probe_worker_ready(self, worker_pane: str) -> bool:
         """One non-fatal live-presence snapshot of the worker locator (#13301 herdr form).
 
@@ -454,8 +602,19 @@ class HerdrWorkerDispatchOps:
         request: WorkerDispatchRequest,
         delivered: bool,
         detail: str,
+        known_not_sent: bool = False,
     ) -> bool:
-        """Persist delivered only for turn-start; every other send is uncertain."""
+        """Persist delivered only for turn-start; every other send is uncertain.
+
+        Redmine #14192: a ``known_not_sent`` non-delivered outcome — the inner rail
+        PROVED a pre-injection zero-send (``gateway_route_blocked`` /
+        ``reader_upgrade_required``, text / Enter 0) — is CANCELLED (a never-replay
+        terminal that honestly records "not sent"), NOT poisoned to the reconcile-only
+        ``uncertain`` terminal. Every other non-delivered outcome — an unparseable
+        record, a timeout, or a post-injection failure whose fate is unknown — stays
+        ``uncertain`` and never-replay, byte-for-byte the prior behaviour. The exactly-once
+        reserve-before-send invariant is unchanged: both terminals are never-send.
+        """
         from mozyo_bridge.core.state.dispatch_outbox_fence import (
             DispatchOutboxFence,
             DispatchOutboxFenceError,
@@ -468,7 +627,16 @@ class HerdrWorkerDispatchOps:
         try:
             if delivered and fence.mark_delivered(key, detail=detail):
                 return True
-            fence.record_uncertain(key, detail=detail or "worker send outcome uncertain")
+            if not delivered and known_not_sent:
+                fence.mark_cancelled(
+                    key,
+                    detail=detail
+                    or "inner rail proved known-not-sent (zero injection) before send",
+                )
+            else:
+                fence.record_uncertain(
+                    key, detail=detail or "worker send outcome uncertain"
+                )
         except DispatchOutboxFenceError:
             return False
         except Exception:  # noqa: BLE001 - an unconfirmed outcome is never delivered
@@ -510,7 +678,37 @@ class HerdrWorkerDispatchOps:
         (#13483 j#74570). This mirrors the coordinator→gateway leg, which already pins
         ``--target-lane`` (:meth:`HerdrSublaneActuatorOps.dispatch_argv`).
         """
-        argv = _worker_dispatcher._worker_dispatch_argv(
+        rc, _known_not_sent = _worker_dispatcher._drive_worker_send_argv(
+            self._compose_worker_send_argv(
+                issue=issue,
+                journal=journal,
+                worker_pane=worker_pane,
+                lane_label=lane_label,
+                gateway_callback_target=gateway_callback_target,
+                target_repo=target_repo,
+                allow_direct_worker=allow_direct_worker,
+            )
+        )
+        return rc
+
+    def _compose_worker_send_argv(
+        self,
+        *,
+        issue: str,
+        journal: str,
+        worker_pane: str,
+        lane_label: str,
+        gateway_callback_target: Optional[str],
+        target_repo: str,
+        allow_direct_worker: bool = False,
+    ) -> list[str]:
+        """The governed same-lane forward argv with the herdr-only pins (shared).
+
+        Composed once so both :meth:`dispatch_to_worker` (rc only) and
+        :meth:`dispatch_to_worker_turn_start` (rc + turn-start + the #14192
+        ``known_not_sent`` classification) drive the byte-identical argv.
+        """
+        return _worker_dispatcher._worker_dispatch_argv(
             issue=issue,
             journal=journal,
             worker_pane=worker_pane,
@@ -536,7 +734,6 @@ class HerdrWorkerDispatchOps:
             # (default `claude`), so a rebound worker follows without a literal edit.
             worker_provider=self.worker_provider(),
         )
-        return _worker_dispatcher._drive_worker_send_argv(argv)
 
     def dispatch_to_worker_turn_start(
         self,
@@ -549,37 +746,48 @@ class HerdrWorkerDispatchOps:
         target_repo: str,
         worker_assigned_name: str,
         allow_direct_worker: bool = False,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, str, bool]:
         """Drive the worker forward AND surface the herdr turn-start signal (Redmine #13489 F2).
 
-        Returns ``(delivery_ack_rc, turn_start_token)``. The ACK rc is
-        :meth:`dispatch_to_worker`'s submit-completion measurement — which is **not** a
-        turn-start confirmation (mid-review j#75047 F2). The turn-start token is the
-        dispatch-ops-surfaced herdr runtime signal that the receiver's turn actually started:
-        after a positive ACK, the exact worker is re-resolved in the live inventory and its
-        runtime receiver-state is read — ``busy`` / ``working`` (the turn started) ->
-        ``started``; a still-``awaiting_input`` worker (ACK landed but no turn) ->
-        ``delivered_not_started``; any other / unobservable state -> ``unknown``. A non-zero ACK
-        -> ``not_started``. Conservative: only a definitive ``started`` promotes to
-        ``delivered`` upstream; everything else is uncertain. No raw wait loop is introduced —
-        a single structured observation.
+        Returns ``(delivery_ack_rc, turn_start_token, known_not_sent)``. The ACK rc is
+        the submit-completion measurement — which is **not** a turn-start confirmation
+        (mid-review j#75047 F2). The turn-start token is the dispatch-ops-surfaced herdr
+        runtime signal that the receiver's turn actually started: after a positive ACK, the
+        exact worker is re-resolved in the live inventory and its runtime receiver-state is
+        read — ``busy`` / ``working`` (the turn started) -> ``started``; a still-
+        ``awaiting_input`` worker (ACK landed but no turn) -> ``delivered_not_started``; any
+        other / unobservable state -> ``unknown``. A non-zero ACK -> ``not_started``.
+        Conservative: only a definitive ``started`` promotes to ``delivered`` upstream;
+        everything else is uncertain. No raw wait loop is introduced — a single structured
+        observation.
+
+        Redmine #14192: ``known_not_sent`` is ``True`` only when a non-zero send's inner
+        rail PROVED a pre-injection zero-send (``classify_send_known_not_sent`` over the
+        captured structured outcome), so the use case cancels the exact fence key instead
+        of poisoning it to ``uncertain``. A zero ACK (delivered) is never a known-not-sent.
         """
-        rc = self.dispatch_to_worker(
-            issue=issue,
-            journal=journal,
-            worker_pane=worker_pane,
-            lane_label=lane_label,
-            gateway_callback_target=gateway_callback_target,
-            target_repo=target_repo,
-            allow_direct_worker=allow_direct_worker,
+        rc, known_not_sent = _worker_dispatcher._drive_worker_send_argv(
+            self._compose_worker_send_argv(
+                issue=issue,
+                journal=journal,
+                worker_pane=worker_pane,
+                lane_label=lane_label,
+                gateway_callback_target=gateway_callback_target,
+                target_repo=target_repo,
+                allow_direct_worker=allow_direct_worker,
+            )
         )
         if int(rc or 0) != 0:
-            return rc, "not_started"
-        return rc, self._observe_worker_turn_start(
-            worker_assigned_name,
-            issue=issue,
-            journal=journal,
-            worker_locator=worker_pane,
+            return rc, "not_started", known_not_sent
+        return (
+            rc,
+            self._observe_worker_turn_start(
+                worker_assigned_name,
+                issue=issue,
+                journal=journal,
+                worker_locator=worker_pane,
+            ),
+            known_not_sent,
         )
 
     def _observe_worker_turn_start(

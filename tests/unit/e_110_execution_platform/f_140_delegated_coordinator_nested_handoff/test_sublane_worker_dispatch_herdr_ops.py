@@ -50,10 +50,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ADMISSION_HEALTHY,
     ADMISSION_STALE_WORKER_RECOVERY_REQUIRED,
     ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
+    REASON_FOREIGN_SENDER,
     WORKER_DISPATCH_DELIVERY_FAILED,
+    SenderDispatchAdmission,
     WorkerDispatchAdmission,
     WorkerDispatchAdmissionFacts,
     WorkerDispatchRequest,
+    classify_send_known_not_sent,
     lane_identity_matches,
 )
 
@@ -671,6 +674,220 @@ class DispatchOutboxAdmissionTests(unittest.TestCase):
         self.assertFalse(replay_won)
         self.assertIn("delivered", replay_state)
 
+    def _reserve_then_complete(self, *, known_not_sent, journal):
+        # Reserve the exact key, then complete a NON-delivered send with the given
+        # `known_not_sent`, and return the resulting fence state for the key (#14192).
+        from mozyo_bridge.core.state.dispatch_outbox_fence import DispatchOutboxFence
+
+        request = WorkerDispatchRequest(ISSUE, LANE_LABEL, "/repo", journal)
+        ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"MOZYO_BRIDGE_HOME": tmp}, clear=False
+        ), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution.target_is_retiring",
+            return_value=(False, ""),
+        ):
+            won, _state = ops.reserve_worker_dispatch(
+                admission=_healthy_admission(), request=request
+            )
+            self.assertTrue(won)
+            ops.complete_worker_dispatch(
+                admission=_healthy_admission(),
+                request=request,
+                delivered=False,
+                detail="gateway_route_blocked" if known_not_sent else "",
+                known_not_sent=known_not_sent,
+            )
+            key = ops._fence_key(_healthy_admission(), request)
+            # A subsequent reserve must still be never-send in BOTH terminals.
+            replay_won, replay_state = ops.reserve_worker_dispatch(
+                admission=_healthy_admission(), request=request
+            )
+            return DispatchOutboxFence().state_of(key), replay_won, replay_state
+
+    def test_known_not_sent_cancels_key_never_poisons_uncertain(self):
+        # #14192 Acceptance #3: a PROVEN pre-injection zero-send is CANCELLED (an honest
+        # never-replay terminal), NOT poisoned to the reconcile-only `uncertain`.
+        from mozyo_bridge.core.state.dispatch_outbox_fence import (
+            FENCE_CANCELLED,
+            FENCE_UNCERTAIN,
+        )
+
+        state, replay_won, replay_state = self._reserve_then_complete(
+            known_not_sent=True, journal="knsonce"
+        )
+        self.assertEqual(state, FENCE_CANCELLED)
+        self.assertNotEqual(state, FENCE_UNCERTAIN)
+        self.assertFalse(replay_won)  # exactly-once invariant preserved (never-send)
+        self.assertIn("cancelled", replay_state)
+
+    def test_uncertain_outcome_still_poisons_when_not_known_not_sent(self):
+        # A non-delivered outcome whose fate is UNKNOWN (not a proven zero-send) stays
+        # `uncertain` and never-replay, byte-for-byte the prior behaviour.
+        from mozyo_bridge.core.state.dispatch_outbox_fence import FENCE_UNCERTAIN
+
+        state, replay_won, replay_state = self._reserve_then_complete(
+            known_not_sent=False, journal="uncert1"
+        )
+        self.assertEqual(state, FENCE_UNCERTAIN)
+        self.assertFalse(replay_won)
+        self.assertIn("uncertain", replay_state)
+
+
+class ClassifyKnownNotSentTests(unittest.TestCase):
+    """Pure classification of the captured inner-send record (#14192)."""
+
+    def test_gateway_route_blocked_is_known_not_sent(self):
+        record = (
+            "## delivery record\n- reason: gateway_route_blocked\n\n"
+            '{"status": "blocked", "reason": "gateway_route_blocked", "receiver": "claude"}'
+        )
+        self.assertTrue(classify_send_known_not_sent(record))
+
+    def test_reader_upgrade_required_is_known_not_sent(self):
+        self.assertTrue(
+            classify_send_known_not_sent('{"status": "blocked", "reason": "reader_upgrade_required"}')
+        )
+
+    def test_sent_outcome_is_not_known_not_sent(self):
+        self.assertFalse(
+            classify_send_known_not_sent('{"status": "sent", "reason": "delivered"}')
+        )
+
+    def test_other_blocked_reason_is_not_known_not_sent(self):
+        # A post-injection / different-gate block is NOT a proven pre-injection zero-send;
+        # it must fall through to `uncertain` (fail toward uncertain).
+        self.assertFalse(
+            classify_send_known_not_sent('{"status": "blocked", "reason": "target_unavailable"}')
+        )
+
+    def test_unparseable_record_is_not_known_not_sent(self):
+        for text in ("", "not json at all", "{malformed", "worker handoff send record"):
+            with self.subTest(text=text):
+                self.assertFalse(classify_send_known_not_sent(text))
+
+    def test_only_the_last_json_object_line_is_read(self):
+        # A non-blocked earlier JSON-looking line never overrides the final outcome line.
+        record = (
+            '{"status": "blocked", "reason": "gateway_route_blocked"}\n'
+            '{"status": "sent", "reason": "delivered"}'
+        )
+        self.assertFalse(classify_send_known_not_sent(record))
+
+
+class SenderAdmissionPreflightTests(unittest.TestCase):
+    """`observe_sender_admission`: the pre-reserve same-lane gateway verdict (#14192)."""
+
+    def _observe(
+        self,
+        *,
+        sender_lane,
+        sender_ws="ws",
+        sender_role="codex",
+        lane_ws="ws",
+        allow_direct_worker=False,
+        unattested=False,
+        gateway_provider="codex",
+        worker_provider="claude",
+    ):
+        lane = SimpleNamespace(
+            workspace_id=lane_ws,
+            lane_id=LANE_LABEL,
+            lane_label=LANE_LABEL,
+            worker_pane="w:pW",
+            gateway_pane="w:pG",
+        )
+        request = WorkerDispatchRequest(ISSUE, LANE_LABEL, "/repo", "j1")
+        env = (
+            {}
+            if unattested
+            else {
+                "MOZYO_WORKSPACE_ID": sender_ws,
+                "MOZYO_AGENT_ROLE": sender_role,
+                "MOZYO_LANE_ID": sender_lane,
+            }
+        )
+        ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE, env=env)
+        with patch.object(ops, "worker_provider", return_value=worker_provider), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology.herdr_workspace_segment",
+            return_value="ws",
+        ), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry._legacy_lane_token",
+            return_value="",
+        ), patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution.resolve_gateway_provider",
+            return_value=gateway_provider,
+        ):
+            return ops.observe_sender_admission(
+                lane=lane, request=request, allow_direct_worker=allow_direct_worker
+            )
+
+    def test_same_lane_gateway_sender_is_admitted(self):
+        verdict = self._observe(sender_lane=LANE_LABEL)
+        self.assertTrue(verdict.admitted)
+        self.assertFalse(verdict.exception_applied)
+
+    def test_cross_lane_coordinator_sender_is_blocked(self):
+        # The reported dogfood: a coordinator whose lane differs from the target sublane.
+        verdict = self._observe(sender_lane="default")
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.detail_token, "coordinator_to_sublane_worker_bypass")
+
+    def test_unattested_operator_shell_is_blocked(self):
+        verdict = self._observe(sender_lane=LANE_LABEL, unattested=True)
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.detail_token, "missing_sender_env")
+
+    def test_foreign_workspace_sender_is_blocked(self):
+        # A sender whose env workspace does not match the repo anchor fails closed at
+        # identity resolution (never mints a name for another workspace).
+        verdict = self._observe(sender_lane=LANE_LABEL, sender_ws="other_ws")
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.detail_token, "env_anchor_workspace_mismatch")
+
+    def test_cross_lane_with_allow_direct_worker_is_admitted_exception(self):
+        # The explicit durable exception releases a cross-lane drive (mirrors the inner
+        # rail's gateway_route_exception). The sender is still the gateway (codex) role.
+        verdict = self._observe(sender_lane="default", allow_direct_worker=True)
+        self.assertTrue(verdict.admitted)
+        self.assertTrue(verdict.exception_applied)
+
+    def test_same_lane_worker_role_sender_is_blocked(self):
+        # Review j#84236 F1: a same-lane WORKER (role != gateway provider) is NOT a legitimate
+        # dispatch origin even though its lane matches — Acceptance #1 requires the GATEWAY.
+        verdict = self._observe(sender_lane=LANE_LABEL, sender_role="claude")
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.detail_token, "sender_not_gateway_role")
+
+    def test_same_lane_worker_role_with_allow_direct_worker_still_blocked(self):
+        # The cross-lane exception never relaxes WHO may originate: a worker-role sender is
+        # blocked regardless of --allow-direct-worker.
+        verdict = self._observe(
+            sender_lane=LANE_LABEL, sender_role="claude", allow_direct_worker=True
+        )
+        self.assertFalse(verdict.admitted)
+        self.assertEqual(verdict.detail_token, "sender_not_gateway_role")
+
+    def test_rebound_gateway_binding_admits_matching_role_blocks_mismatch(self):
+        # The guard keys on the binding-resolved gateway provider, not a literal `codex`:
+        # rebind the gateway role to `claude` (worker role -> `codex`). A same-lane sender
+        # whose role matches the rebound gateway is admitted; a mismatch fails closed.
+        admitted = self._observe(
+            sender_lane=LANE_LABEL,
+            sender_role="claude",
+            gateway_provider="claude",
+            worker_provider="codex",
+        )
+        self.assertTrue(admitted.admitted)
+        blocked = self._observe(
+            sender_lane=LANE_LABEL,
+            sender_role="codex",
+            gateway_provider="claude",
+            worker_provider="codex",
+        )
+        self.assertFalse(blocked.admitted)
+        self.assertEqual(blocked.detail_token, "sender_not_gateway_role")
+
 
 class TargetLanePinArgvTests(unittest.TestCase):
     """Redmine #13485: `--target-lane` pins the worker's stable lane identity on the
@@ -786,6 +1003,12 @@ class ReplayCommandAuthorityTests(unittest.TestCase):
                 ops = fx.ops()
                 with patch.object(
                     ops, "observe_worker_dispatch_admission", return_value=_healthy_admission()
+                ), patch.object(
+                    ops,
+                    "observe_sender_admission",
+                    return_value=SenderDispatchAdmission(
+                        admitted=True, reason="test same-lane gateway"
+                    ),
                 ):
                     outcome = WorkerDispatchUseCase(
                         ops, worker_ready_probes=0
@@ -862,6 +1085,12 @@ class HerdrUseCaseDriveTests(unittest.TestCase):
             with patch.object(
                 ops, "observe_worker_dispatch_admission", return_value=_healthy_admission()
             ), patch.object(
+                ops,
+                "observe_sender_admission",
+                return_value=SenderDispatchAdmission(
+                    admitted=True, reason="test same-lane gateway"
+                ),
+            ), patch.object(
                 ops, "reserve_worker_dispatch", return_value=(True, "reserved")
             ), patch.object(
                 ops, "complete_worker_dispatch", return_value=True
@@ -869,7 +1098,7 @@ class HerdrUseCaseDriveTests(unittest.TestCase):
                 ops, "_observe_worker_turn_start", return_value="started"
             ), patch(
                 "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatcher._drive_worker_send_argv",  # noqa: E501
-                return_value=send_rc,
+                return_value=(send_rc, False),
             ) as drive:
                 outcome = use_case.run(request, execute=True)
         return outcome, drive

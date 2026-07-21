@@ -189,7 +189,7 @@ class _DivergentSenderWorld:
         with self._driving_context():
             out, err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                rc = _drive_worker_send_argv(argv)
+                rc, _known_not_sent = _drive_worker_send_argv(argv)
         return rc, out.getvalue(), err.getvalue()
 
     def drive_pinned_replay_argv(self):
@@ -214,7 +214,7 @@ class _DivergentSenderWorld:
         with self._driving_context():
             out, err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                rc = _drive_worker_send_argv(argv)
+                rc, _known_not_sent = _drive_worker_send_argv(argv)
         return rc, argv, out.getvalue(), err.getvalue()
 
     def dispatch_via_production_ops(self, *, worker_pane: str = None):

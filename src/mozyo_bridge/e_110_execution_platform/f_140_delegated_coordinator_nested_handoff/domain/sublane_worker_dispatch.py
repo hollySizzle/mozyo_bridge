@@ -8,6 +8,7 @@ keeps the lane at ``gateway_notified`` and forbids an automatic replay.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -53,6 +54,13 @@ WORKER_DISPATCH_RESULTS = frozenset(
     }
 )
 
+#: The sender that drove ``dispatch-worker`` is not the target lane's current
+#: same-lane gateway (Redmine #14192): a foreign / cross-lane sender (e.g. a
+#: coordinator shell) whose launch-time lane identity does not resolve to this
+#: lane's gateway route. The pre-reserve sender preflight fails closed on it with
+#: zero fence write and zero send, so the inner rail's ``gateway_route_blocked``
+#: never reserves-then-poisons the exact key. Same verdict on dry-run and execute.
+REASON_FOREIGN_SENDER = "foreign_sender_route_blocked"
 #: No lane resolved for the requested worktree in the live pane inventory.
 REASON_LANE_NOT_RESOLVED = "lane_not_resolved"
 #: The resolved lane has no live worker (or gateway) pane to transfer to /
@@ -84,6 +92,7 @@ WORKER_DISPATCH_BLOCKED_REASONS = frozenset(
     {
         REASON_MISSING_IDENTITY,
         REASON_ANCHOR_REQUIRED,
+        REASON_FOREIGN_SENDER,
         REASON_LANE_NOT_RESOLVED,
         REASON_LANE_MISMATCH,
         REASON_LANE_PANE_MISSING,
@@ -93,6 +102,70 @@ WORKER_DISPATCH_BLOCKED_REASONS = frozenset(
         ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
     }
 )
+
+#: The inner ``handoff send`` outcome reasons that PROVE a known-not-sent before any
+#: injection (Redmine #14192). The gateway-route enforcement gate — the sender-lane
+#: bypass block AND the lifecycle-target invariant, both emitted as
+#: ``gateway_route_blocked`` — and the newer-schema ``reader_upgrade_required`` gate
+#: all ``die`` *before* the transport rail types a byte. A non-zero worker send whose
+#: structured outcome carries one of these reasons is therefore a proven zero-injection
+#: (text / Enter 0), NOT an uncertain send: the exact fence key is cancelled (never
+#: replayed) rather than poisoned to the reconcile-only ``uncertain`` terminal. Every
+#: other non-zero outcome — an unparseable record, a timeout, or any post-injection
+#: failure whose fate is unknown — stays ``uncertain`` and never-replay (Acceptance #3).
+SEND_KNOWN_NOT_SENT_REASONS = frozenset(
+    {"gateway_route_blocked", "reader_upgrade_required"}
+)
+
+
+def classify_send_known_not_sent(record_text: str) -> bool:
+    """True iff the captured inner-send record proves a pre-injection zero-send (pure).
+
+    The composed inner ``handoff send`` emits its structured :class:`DeliveryOutcome`
+    with the default ``record_format=both``, whose LAST line is the single-line
+    ``outcome.to_json()`` (the documented scrape target). This reads that last JSON
+    object and returns ``True`` only for an explicit ``status == "blocked"`` whose
+    ``reason`` is in :data:`SEND_KNOWN_NOT_SENT_REASONS` — a gate that fails closed
+    before injection. Anything else — no JSON line, a non-object payload, a
+    non-``blocked`` status, an unrecognized reason, or a parse failure — returns
+    ``False`` so an ambiguous / post-injection / uncertain outcome is never mistaken
+    for a proven not-sent (fail toward ``uncertain``, Redmine #14192 Acceptance #3).
+    """
+    for line in reversed((record_text or "").splitlines()):
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        return (
+            str(payload.get("status", "")) == "blocked"
+            and str(payload.get("reason", "")) in SEND_KNOWN_NOT_SENT_REASONS
+        )
+    return False
+
+
+@dataclass(frozen=True)
+class SenderDispatchAdmission:
+    """The pre-reserve sender-identity verdict for a worker dispatch (Redmine #14192).
+
+    ``admitted`` is the sole authorization: only an admitted sender proceeds to the
+    outbox reserve + send. ``reason`` is a public-safe explanation (no locator /
+    secret); ``detail_token`` is a value-free discriminator (e.g. the resolved
+    :class:`GatewayRouteDecision` ``blocked_reason``, or a sender-identity failure
+    reason) surfaced in the blocked outcome so a recurrence is diagnosable.
+    ``exception_applied`` records an admitted cross-lane drive released only by the
+    explicit ``--allow-direct-worker`` durable exception (mirrors the inner gateway
+    route's ``gateway_route_exception``).
+    """
+
+    admitted: bool
+    reason: str
+    detail_token: str = ""
+    exception_applied: bool = False
 
 
 @dataclass(frozen=True)
@@ -465,6 +538,10 @@ __all__ = (
     "WORKER_DISPATCH_DELIVERY_FAILED",
     "WORKER_DISPATCH_TURN_START_UNCONFIRMED",
     "WORKER_DISPATCH_RESULTS",
+    "REASON_FOREIGN_SENDER",
+    "SEND_KNOWN_NOT_SENT_REASONS",
+    "classify_send_known_not_sent",
+    "SenderDispatchAdmission",
     "REASON_LANE_NOT_RESOLVED",
     "REASON_LANE_PANE_MISSING",
     "REASON_WORKER_DISPATCH_FAILED",
