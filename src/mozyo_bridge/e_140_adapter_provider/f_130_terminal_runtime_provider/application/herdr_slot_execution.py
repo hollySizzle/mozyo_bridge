@@ -75,6 +75,7 @@ def _execute_slot(
     launch_argv_extra: Sequence[str] = (),
     order_deferred: bool = False,
     replacement_action_id: str = "",
+    action_id: str = "",
 ) -> SlotResult:
     if plan.kind == "adopt":
         return SlotResult(
@@ -149,6 +150,7 @@ def _execute_slot(
         resolved=resolved,
         launch_argv_extra=launch_argv_extra,
         replacement_action_id=replacement_action_id,
+        action_id=action_id,
     )
     started = _invoke(
         binary,
