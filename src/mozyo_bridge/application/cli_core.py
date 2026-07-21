@@ -73,6 +73,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (
     register_sublane_quarantine_parser,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine_inspect import (  # noqa: E501
+    register_sublane_quarantine_inspect_parser,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery_cli import (  # noqa: E501
     register_sublane_recover_stale_parser,
 )
@@ -820,6 +823,7 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     register_sublane_declare_project_gateway_parser(sublane_sub)
     register_sublane_resume_parser(sublane_sub)
     register_sublane_quarantine_parser(sublane_sub)
+    register_sublane_quarantine_inspect_parser(sublane_sub)
     register_sublane_recover_stale_parser(sublane_sub)
     register_sublane_recover_pair_parser(sublane_sub)
     register_sublane_repair_pins_parser(sublane_sub)
