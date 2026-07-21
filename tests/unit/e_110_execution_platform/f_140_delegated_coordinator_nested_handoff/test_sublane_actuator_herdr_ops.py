@@ -197,6 +197,28 @@ class _StatefulHerdr:
                     ),
                     home=Path(self.attest_home),
                 )
+                # Redmine #14222 j#85125 F2: a real wrapped launch also appends its
+                # attributed execution-stage rows before exec'ing, and the health
+                # probe now demands them before a green. Model that exactly.
+                action_id = launch_env.get("MOZYO_STARTUP_ACTION_ID", "")
+                if action_id:
+                    from mozyo_bridge.core.state.startup_execution_events import (
+                        STAGE_PROVIDER_EXEC_CALL_REACHED,
+                        STAGE_WRAPPER_ENTERED,
+                        append_execution_event,
+                    )
+                    from mozyo_bridge.core.state.startup_transaction_fence import (
+                        StartupTransactionFence,
+                    )
+
+                    events_fence = StartupTransactionFence(home=Path(self.attest_home))
+                    for stage in (
+                        STAGE_WRAPPER_ENTERED,
+                        STAGE_PROVIDER_EXEC_CALL_REACHED,
+                    ):
+                        append_execution_event(
+                            events_fence, action_id, stage, participant=name
+                        )
             return subprocess.CompletedProcess(
                 argv,
                 0,

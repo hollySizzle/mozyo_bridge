@@ -113,6 +113,7 @@ def preflight_attest_launcher_capability(
     runner: Runner,
     timeout: float,
     env: Mapping[str, str],
+    repo_root=None,
 ) -> LauncherCapabilityObservation:
     """Fail closed unless ``launcher`` can run the ``herdr agent-attest`` wrapper.
 
@@ -174,9 +175,24 @@ def preflight_attest_launcher_capability(
         f"{MOZYO_BRIDGE_LAUNCHER_ENV} to an absolute launcher that has it."
     )
     probe = build_attest_capability_probe_argv(launcher)
+    # Redmine #14231 (root cause j#84906, disposition j#84910): the probe MUST run with the
+    # same cwd the real wrapper gets. `build_agent_start_argv` passes `--cwd <repo_root>` to
+    # `herdr agent start`, so the wrapper process starts inside the lane worktree — and a
+    # mozyo-bridge CLI reads that directory's `.mozyo-bridge/config.yaml` at startup. A
+    # launcher predating a config schema bump therefore exits non-zero THERE while exiting 0
+    # in a config-less directory. Probing in the caller's cwd made that skew invisible:
+    # measured on one binary, exit 0 from a config-less cwd and exit 2 from the v2 lane cwd,
+    # so the probe passed and only the wrapper died — the vanishing pair of #14222 j#84620.
+    # `None` keeps the caller's cwd (the pre-#14231 shape) for callers that have no repo
+    # root to point at.
     try:
         completed = runner(
-            probe, capture_output=True, text=True, timeout=timeout, env=dict(env)
+            probe,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=dict(env),
+            cwd=str(repo_root) if repo_root else None,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise HerdrSessionStartError(

@@ -639,8 +639,12 @@ def _prepare_session_locked(
     # the live-but-unattested pair. Read-only; never migrates the shared home. See
     # `preflight_attest_store_schema`.
     if attest_launcher and launch_plans:
+        # Redmine #14231 j#84910: probe in the SAME cwd the wrapper will get
+        # (`build_agent_start_argv` passes `--cwd repo_root`), so a launcher that only
+        # fails inside the lane's own config directory is caught here — before the first
+        # workspace / tab / agent write — instead of vanishing the pair after launch.
         observation = preflight_attest_launcher_capability(
-            attest_launcher, runner, timeout, env
+            attest_launcher, runner, timeout, env, repo_root=repo_root
         )
         preflight_attest_store_schema(
             observation,
@@ -878,6 +882,7 @@ def _prepare_session_locked(
                 launch_argv_extra=launch_argv_extra,
                 order_deferred=order_deferred,
                 replacement_action_id=replacement_action_id,
+                action_id=transaction.action_id if transaction is not None else "",
             )
         )
         if plan.kind == "launch":
@@ -918,6 +923,10 @@ def _prepare_session_locked(
             result, workspace_id=workspace_id, binary=binary, runner=runner,
             timeout=timeout, attestation_read=attestation_read, probe=probe,
             attested_launch=bool(attest_launcher),
+            # j#85125 F2: a wrapped fresh launch must show its own attributed
+            # execution-stage rows before a green — the reader is action-scoped,
+            # so an unmanaged run (no transaction) composes the exact prior pipeline.
+            action_id=transaction.action_id if transaction is not None else "",
         )
     if transaction is not None:
         # Record the debt, never discharge it: closing what this run started is the

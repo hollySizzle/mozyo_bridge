@@ -564,6 +564,7 @@ def _build_create_request(
         upstream_coordinator=getattr(args, "upstream_coordinator", None),
         work_unit=work_unit,
         work_unit_decision_anchor=work_unit_decision_anchor,
+        leaf_standalone=bool(getattr(args, "leaf_standalone", False)),
         base_ref=getattr(args, "base_ref", None),
     )
 

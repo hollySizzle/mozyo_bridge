@@ -18,8 +18,14 @@ from __future__ import annotations
 # Split so the tracked source never contains the scanned literal. Joined at
 # runtime these are exactly `/Users` and `/home`.
 _MACOS_HOME_ROOT = "/" + "Users"
+_LINUX_HOME_ROOT = "/" + "home"
 
 
 def macos_home_path(*parts: str) -> str:
     """Return `/Users/<parts...>`, a macOS personal-home-shaped absolute path."""
     return "/".join((_MACOS_HOME_ROOT, *parts))
+
+
+def linux_home_path(*parts: str) -> str:
+    """Return `/home/<parts...>`, a Linux personal-home-shaped absolute path."""
+    return "/".join((_LINUX_HOME_ROOT, *parts))

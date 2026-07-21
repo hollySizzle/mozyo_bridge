@@ -24,14 +24,22 @@ This module is the pure schema + decision core for that granularity:
   the behavior-preserving ``user_story`` default.
 - **Fail-closed dispatch decision.** :func:`decide_work_unit_dispatch` is the pure
   gate the sublane dispatch surface consults: ``user_story`` is the allowed
-  default; ``leaf_issue`` is allowed as the narrow exception path (it exists for
-  the central preset's ``us_level_audit.task_level例外`` — guardrail / release /
-  credential / destructive / CI-publish / workflow changes and the other
-  task-level exception conditions; this module deliberately introduces no new
-  exception vocabulary); ``epic`` / ``feature`` are **blocked unless an explicit
-  owner / operator decision anchor (a durable Redmine journal id) is supplied**,
-  because those units are prone to unbounded scope. The decision is
-  decision-support output: it never sends, approves, or closes anything.
+  default; ``epic`` / ``feature`` are **blocked unless an explicit owner /
+  operator decision anchor (a durable Redmine journal id) is supplied**, because
+  those units are prone to unbounded scope. The decision is decision-support
+  output: it never sends, approves, or closes anything.
+- **Leaf-lane admission fence (Redmine #14224).** ``leaf_issue`` is NOT an
+  unconditional exception. A standalone issue (no parent UserStory) dispatches
+  freely — that was never the over-fragmentation problem. A leaf issue that HAS
+  a parent US requires the SAME explicit owner / operator decision anchor
+  mechanism epic/feature already use. **Review finding だけでは block を解除
+  しない** — a task-level review need is a REVIEW-granularity fact (the central
+  preset's ``us_level_audit.task_level例外``), never itself a LANE/dispatch-
+  granularity decision anchor; conflating the two is exactly how #14222's 9
+  active lanes ended up 8-of-9 leaf-sized despite the #13002 US-standard
+  default. Existing in-flight leaf lanes are grandfathered by construction —
+  this fence only fires at NEW ``sublane create`` dispatch time, so it never
+  retroactively touches a lane that already exists.
 
 What the granularity knob can and cannot do (the #13002 invariant boundary,
 mirroring ``spec-delegation-policy-project-config``): it selects the *standard
@@ -90,9 +98,24 @@ DISPATCH_BLOCKED: str = "dispatch_blocked"
 
 #: The standard governed unit — allowed with no extra condition.
 WORK_UNIT_STANDARD: str = "work_unit_standard"
-#: The leaf-issue exception path — allowed; exists for the central preset's
-#: ``us_level_audit.task_level例外`` conditions (no new exception vocabulary).
-WORK_UNIT_LEAF_EXCEPTION: str = "work_unit_leaf_exception"
+#: Redmine #14224: a ``leaf_issue`` dispatch for an issue that has NO parent UserStory
+#: (a genuinely standalone issue) — allowed, no anchor required. This is the ONLY
+#: unconditional leaf path; a leaf issue that DOES have a parent US falls through to
+#: :data:`WORK_UNIT_LEAF_DECISION_REQUIRED` / :data:`WORK_UNIT_LEAF_DECISION_RECORDED`
+#: below.
+WORK_UNIT_LEAF_STANDALONE: str = "work_unit_leaf_standalone"
+#: Redmine #14224: a ``leaf_issue`` dispatch for an issue that HAS a parent UserStory, with
+#: an explicit owner / operator decision anchor recorded — allowed. A task-level review
+#: exception alone (no anchor) does NOT reach this state; only a real durable decision
+#: pointer does (mirrors the epic/feature anchor semantics exactly).
+WORK_UNIT_LEAF_DECISION_RECORDED: str = "work_unit_leaf_decision_recorded"
+#: Redmine #14224: a ``leaf_issue`` dispatch for an issue that HAS a parent UserStory, with
+#: no explicit decision anchor and not declared standalone — BLOCKED. This is the #14222 /
+#: #14224 fix itself: before this, every ``leaf_issue`` dispatch reached
+#: (the now-removed) unconditional ``WORK_UNIT_LEAF_EXCEPTION``, which is how 8 of 9 active
+#: lanes ended up leaf-sized. A task-level review need is NOT, by itself, this anchor — see
+#: the module docstring's "review exception だけでは block 解除されない" invariant.
+WORK_UNIT_LEAF_DECISION_REQUIRED: str = "work_unit_leaf_decision_required"
 #: An ``epic`` / ``feature`` unit with a recorded explicit decision anchor.
 WORK_UNIT_EXPLICIT_DECISION_RECORDED: str = "work_unit_explicit_decision_recorded"
 #: An ``epic`` / ``feature`` unit with no explicit decision anchor — blocked.
@@ -251,6 +274,7 @@ def decide_work_unit_dispatch(
     granularity: str,
     *,
     explicit_decision_anchor: Optional[str] = None,
+    leaf_standalone: bool = False,
 ) -> WorkUnitDispatchDecision:
     """Decide whether a work unit of ``granularity`` may be implementation-dispatched.
 
@@ -260,10 +284,25 @@ def decide_work_unit_dispatch(
       (never silently treated as the default);
     - ``user_story`` -> allowed (:data:`WORK_UNIT_STANDARD`) — the governed
       standard unit;
-    - ``leaf_issue`` -> allowed (:data:`WORK_UNIT_LEAF_EXCEPTION`) — the narrow
-      exception unit whose conditions are the central preset's
-      ``us_level_audit.task_level例外`` (this decision does not verify the
-      condition itself; the coordinator's dispatch decision journal owns that);
+    - ``leaf_issue`` -> the Redmine #14224 admission fence:
+
+      - ``leaf_standalone=True`` (the caller declares this issue has NO parent
+        UserStory) -> allowed (:data:`WORK_UNIT_LEAF_STANDALONE`), no anchor
+        needed — a genuinely standalone leaf issue was never the #14222
+        over-fragmentation problem;
+      - otherwise (the default: assume a child of a US unless told
+        otherwise — fail CLOSED, matching the epic/feature default) ->
+        blocked (:data:`WORK_UNIT_LEAF_DECISION_REQUIRED`) **unless**
+        ``explicit_decision_anchor`` names a durable owner / operator decision
+        record, in which case it is allowed
+        (:data:`WORK_UNIT_LEAF_DECISION_RECORDED`). There is deliberately no
+        third parameter for "a task-level review is needed" — a review need
+        alone can never satisfy this anchor (central preset
+        ``us_level_audit.task_level例外`` governs REVIEW granularity, not
+        LANE/dispatch granularity; #14222's whole point is that those two are
+        different questions). This mirrors the epic/feature anchor mechanism
+        exactly rather than inventing a second admission state machine
+        (#14224 scope: reuse the #13290-family single decision authority).
     - ``epic`` / ``feature`` -> blocked
       (:data:`WORK_UNIT_EXPLICIT_DECISION_REQUIRED`) **unless**
       ``explicit_decision_anchor`` names the durable owner / operator decision
@@ -285,13 +324,35 @@ def decide_work_unit_dispatch(
             decision_anchor=anchor,
         )
     if token == WORK_UNIT_LEAF_ISSUE:
+        if leaf_standalone:
+            return WorkUnitDispatchDecision(
+                granularity=token,
+                status=DISPATCH_ALLOWED,
+                diagnostic=WORK_UNIT_LEAF_STANDALONE,
+                reason="leaf_issue dispatch allowed: the caller declares this issue "
+                "has no parent UserStory (a standalone issue), so the #14222 "
+                "US-fragmentation concern does not apply",
+                decision_anchor=anchor,
+            )
+        if anchor is None:
+            return WorkUnitDispatchDecision(
+                granularity=token,
+                status=DISPATCH_BLOCKED,
+                diagnostic=WORK_UNIT_LEAF_DECISION_REQUIRED,
+                reason="leaf_issue dispatch for an issue with a parent UserStory "
+                "requires an explicit owner / operator decision recorded as a "
+                "durable anchor (journal id), or an explicit standalone-issue "
+                "declaration; a task-level review need alone does not satisfy "
+                "this — task-level review happens inside the parent US lane "
+                "(us_level_audit.task_level例外 governs review granularity, not "
+                "lane/dispatch granularity)",
+            )
         return WorkUnitDispatchDecision(
             granularity=token,
             status=DISPATCH_ALLOWED,
-            diagnostic=WORK_UNIT_LEAF_EXCEPTION,
-            reason="leaf_issue is the exception unit for the governed "
-            "task-level exception conditions (us_level_audit.task_level例外); "
-            "record the applicable condition in the dispatch decision journal",
+            diagnostic=WORK_UNIT_LEAF_DECISION_RECORDED,
+            reason="leaf_issue dispatch for a child of a UserStory allowed by "
+            f"explicit owner / operator decision recorded at durable anchor {anchor}",
             decision_anchor=anchor,
         )
     # epic / feature: explicit owner / operator decision required.
@@ -327,7 +388,9 @@ __all__ = (
     "DISPATCH_ALLOWED",
     "DISPATCH_BLOCKED",
     "WORK_UNIT_STANDARD",
-    "WORK_UNIT_LEAF_EXCEPTION",
+    "WORK_UNIT_LEAF_STANDALONE",
+    "WORK_UNIT_LEAF_DECISION_RECORDED",
+    "WORK_UNIT_LEAF_DECISION_REQUIRED",
     "WORK_UNIT_EXPLICIT_DECISION_RECORDED",
     "WORK_UNIT_EXPLICIT_DECISION_REQUIRED",
     "WorkUnitGranularityError",

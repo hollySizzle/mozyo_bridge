@@ -10,6 +10,8 @@ is not actually replaced).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -23,28 +25,60 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     VERDICT_PRESENT,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_agent_attest import (
+    SELF_LOOKUP_TOTAL_BUDGET_SECONDS,
     _argv0_alias_binds_to_exec_target,
-    _live_lister,
+    bounded_self_lookup,
     cmd_herdr_agent_attest,
     perform_self_attestation,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
+    TerminalTransportError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
     MOZYO_PROVIDER_ARGV0_ENV,
 )
 
 NAME = "mzb1_ws1_claude_default"
+# MOZYO_HERDR_BINARY is part of the launcher-injected env (see herdr_launch_argv's
+# HERDR_BINARY_ENV): without it the bounded self-lookup stops at `binary_unresolved`
+# before it can reach the injected runner at all.
 _GOOD_ENV = {
     "MOZYO_WORKSPACE_ID": "ws1",
     "MOZYO_AGENT_ROLE": "claude",
     "MOZYO_LANE_ID": "default",
+    "MOZYO_HERDR_BINARY": "/x/herdr",
 }
 
 
-def _lister(*rows):
-    return lambda: list(rows)
+def _runner(*rows):
+    """A fake subprocess runner returning ``rows`` as an `agent list` JSON payload."""
+    import json as _json
+
+    def _run(argv, **kwargs):
+        return argparse.Namespace(returncode=0, stdout=_json.dumps(list(rows)))
+
+    return _run
+
+
+def _failing_runner(exc=OSError("herdr down")):
+    def _run(argv, **kwargs):
+        raise exc
+
+    return _run
 
 
 class PerformSelfAttestationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # The real resolver verifies the binary exists and is executable; these tests
+        # inject the subprocess runner instead, so the resolution itself is stubbed.
+        patcher = patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_agent_attest.resolve_herdr_binary",
+            return_value=argparse.Namespace(path="/x/herdr"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_matching_env_records_present_with_self_resolved_locator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -54,7 +88,7 @@ class PerformSelfAttestationTest(unittest.TestCase):
                 role="claude",
                 lane="default",
                 env=_GOOD_ENV,
-                lister=_lister({"name": NAME, "pane_id": "wY:p2"}),
+                runner=_runner({"name": NAME, "pane_id": "wY:p2"}),
                 home=home,
             )
             self.assertEqual(rec.verdict, VERDICT_PRESENT)
@@ -72,7 +106,7 @@ class PerformSelfAttestationTest(unittest.TestCase):
                 role="claude",
                 lane="default",
                 env={"MOZYO_HERDR_BINARY": "/x/herdr"},  # triplet absent
-                lister=_lister({"name": NAME, "pane_id": "wY:p2"}),
+                runner=_runner({"name": NAME, "pane_id": "wY:p2"}),
                 home=Path(tmp),
             )
             self.assertEqual(rec.verdict, VERDICT_MISSING)
@@ -89,45 +123,63 @@ class PerformSelfAttestationTest(unittest.TestCase):
                     "MOZYO_AGENT_ROLE": "claude",
                     "MOZYO_LANE_ID": "default",
                 },
-                lister=_lister({"name": NAME, "pane_id": "wY:p2"}),
+                runner=_runner({"name": NAME, "pane_id": "wY:p2"}),
                 home=Path(tmp),
             )
             self.assertEqual(rec.verdict, VERDICT_CONFLICT)
 
-    def test_ambiguous_self_lookup_records_empty_locator(self) -> None:
-        # Two rows with this name (or none) -> no unambiguous locator; recorded empty,
-        # which the read side treats as stale / fail-closed.
+    def test_ambiguous_self_lookup_writes_nothing_redmine_14231(self) -> None:
+        # Redmine #14231 (j#84865): two rows with this name -> no exact locator, so NO
+        # attestation record is written at all (an empty-locator record is not a valid
+        # exact identity). The failure is carried by the action's event projection.
         with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            events = []
             rec = perform_self_attestation(
                 assigned_name=NAME,
                 workspace_id="ws1",
                 role="claude",
                 lane="default",
                 env=_GOOD_ENV,
-                lister=_lister(
+                runner=_runner(
                     {"name": NAME, "pane_id": "wY:p2"},
                     {"name": NAME, "pane_id": "wZ:p9"},
                 ),
-                home=Path(tmp),
+                home=home,
+                append_event=lambda stage, bounded_reason="": events.append(
+                    (stage, bounded_reason)
+                ),
             )
-            self.assertEqual(rec.locator, "")
+            self.assertIsNone(rec)
+            self.assertIsNone(HerdrIdentityAttestationStore(home=home).read(NAME))
+            self.assertIn(
+                ("self_lookup_failed", "row_ambiguous"), events
+            )
+            self.assertIn(
+                ("attestation_write_failed", "locator_unavailable"), events
+            )
 
-    def test_lister_failure_records_empty_locator_not_raises(self) -> None:
-        def _boom():
-            raise RuntimeError("herdr down")
-
+    def test_lookup_failure_writes_nothing_and_never_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            events = []
             rec = perform_self_attestation(
                 assigned_name=NAME,
                 workspace_id="ws1",
                 role="claude",
                 lane="default",
                 env=_GOOD_ENV,
-                lister=_boom,
-                home=Path(tmp),
+                runner=_failing_runner(),
+                home=home,
+                append_event=lambda stage, bounded_reason="": events.append(
+                    (stage, bounded_reason)
+                ),
             )
-            self.assertEqual(rec.locator, "")
-            self.assertEqual(rec.verdict, VERDICT_PRESENT)
+            self.assertIsNone(rec)
+            self.assertIsNone(HerdrIdentityAttestationStore(home=home).read(NAME))
+            self.assertIn(
+                ("attestation_write_failed", "locator_unavailable"), events
+            )
 
 
     def test_replacement_action_id_is_recorded(self) -> None:
@@ -141,7 +193,7 @@ class PerformSelfAttestationTest(unittest.TestCase):
                 lane="default",
                 env=_GOOD_ENV,
                 replacement_action_id="recover:l:worker:claude:wk:w2",
-                lister=_lister({"name": NAME, "pane_id": "wY:p2"}),
+                runner=_runner({"name": NAME, "pane_id": "wY:p2"}),
                 home=home,
             )
             self.assertEqual(rec.replacement_action_id, "recover:l:worker:claude:wk:w2")
@@ -150,35 +202,38 @@ class PerformSelfAttestationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             rec = perform_self_attestation(
                 assigned_name=NAME, workspace_id="ws1", role="claude", lane="default",
-                env=_GOOD_ENV, lister=_lister({"name": NAME, "pane_id": "wY:p2"}),
+                env=_GOOD_ENV, runner=_runner({"name": NAME, "pane_id": "wY:p2"}),
                 home=Path(tmp),
             )
             self.assertEqual(rec.replacement_action_id, "")
 
 
-class LiveListerTerminalIsolationTest(unittest.TestCase):
-    """The pre-exec self-attestation lister must never touch the pane terminal (#14017).
+class BoundedSelfLookupTest(unittest.TestCase):
+    """The pre-exec self-lookup: terminal isolation (#14017) + total budget (#14231).
 
-    The wrapper runs inside the herdr-spawned pane and is about to ``execvp`` the
+    The wrapper runs inside the herdr-spawned pane and is about to ``exec`` the
     interactive provider into that same pane. Its ``herdr agent list`` child is kept
     off the pane's controlling terminal on every fd, so it can never perturb the
-    stdin / foreground state the provider inherits — the disturbance that made Claude
-    exit into ``shell_residue`` while Codex survived.
+    stdin / foreground state the provider inherits. Redmine #14231 additionally bounds
+    the WHOLE lookup to :data:`SELF_LOOKUP_TOTAL_BUDGET_SECONDS` on an injected
+    monotonic clock — no real sleeping, no real subprocess.
     """
 
     _ENV = {"MOZYO_HERDR_BINARY": "/x/herdr", "PATH": "/usr/bin"}
 
-    def _run_lister(self, run_mock):
+    def _lookup(self, run_mock, monotonic=None, budget=SELF_LOOKUP_TOTAL_BUDGET_SECONDS):
         with patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             "application.herdr_agent_attest.resolve_herdr_binary",
             return_value=argparse.Namespace(path="/x/herdr"),
-        ), patch(
-            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_agent_attest.subprocess.run",
-            run_mock,
         ):
-            return _live_lister(self._ENV)()
+            return bounded_self_lookup(
+                NAME,
+                self._ENV,
+                runner=run_mock,
+                monotonic=monotonic or (lambda: 0.0),
+                total_budget_seconds=budget,
+            )
 
     def test_list_subprocess_detaches_from_pane_terminal(self) -> None:
         import subprocess as _sp
@@ -194,9 +249,91 @@ class LiveListerTerminalIsolationTest(unittest.TestCase):
                 returncode=0, stdout='[{"name": "' + NAME + '", "pane_id": "wY:p2"}]'
             )
 
-        rows = self._run_lister(_run)
-        # The isolation kwargs do not change functionality: a valid payload still parses.
-        self.assertEqual(rows, [{"name": NAME, "pane_id": "wY:p2"}])
+        locator, stage, reason = self._lookup(_run)
+        self.assertEqual(locator, "wY:p2")
+        self.assertEqual(stage, "self_lookup_succeeded")
+        self.assertEqual(reason, "")
+
+    def test_total_budget_is_never_exceeded_by_repeated_row_absent(self) -> None:
+        # Redmine #14231 j#84743: row_absent is the ONLY retried case, and the whole
+        # retry loop must fit inside the 2s budget. Fake monotonic advances 0.5s per
+        # attempt, so the 5th call would be at 2.0s -> the loop must stop before it.
+        clock = {"t": 0.0}
+        calls = []
+
+        def _monotonic():
+            return clock["t"]
+
+        def _run(argv, **kwargs):
+            calls.append(kwargs.get("timeout"))
+            clock["t"] += 0.5
+            return argparse.Namespace(returncode=0, stdout="[]")  # zero matches
+
+        locator, stage, reason = self._lookup(_run, monotonic=_monotonic)
+        self.assertEqual(locator, "")
+        self.assertEqual(stage, "self_lookup_timed_out")
+        self.assertEqual(reason, "row_absent")
+        self.assertEqual(len(calls), 4)  # 0.0/0.5/1.0/1.5 -> the 2.0s check stops it
+        # Every attempt's own timeout was capped to the REMAINING budget, so no single
+        # call could outlive it (the pre-#14231 bug was a fixed 10s per attempt).
+        self.assertEqual(calls, [2.0, 1.5, 1.0, 0.5])
+
+    def test_slow_success_inside_budget_still_succeeds(self) -> None:
+        clock = {"t": 0.0}
+
+        def _monotonic():
+            return clock["t"]
+
+        payloads = ["[]", '[{"name": "' + NAME + '", "pane_id": "wY:p2"}]']
+
+        def _run(argv, **kwargs):
+            clock["t"] += 0.9
+            return argparse.Namespace(returncode=0, stdout=payloads.pop(0))
+
+        locator, stage, _ = self._lookup(_run, monotonic=_monotonic)
+        self.assertEqual(locator, "wY:p2")
+        self.assertEqual(stage, "self_lookup_succeeded")
+
+    def test_unreadable_read_fails_immediately_without_burning_budget(self) -> None:
+        calls = []
+
+        def _run(argv, **kwargs):
+            calls.append(1)
+            return argparse.Namespace(returncode=1, stdout="")  # non-zero exit
+
+        locator, stage, reason = self._lookup(_run)
+        self.assertEqual(locator, "")
+        self.assertEqual(stage, "self_lookup_failed")
+        self.assertEqual(reason, "list_unreadable")
+        self.assertEqual(len(calls), 1)  # not retried: a retry cannot fix it
+
+    def test_ambiguous_row_fails_immediately(self) -> None:
+        def _run(argv, **kwargs):
+            return argparse.Namespace(
+                returncode=0,
+                stdout='[{"name": "' + NAME + '", "pane_id": "wY:p2"}, '
+                '{"name": "' + NAME + '", "pane_id": "wZ:p9"}]',
+            )
+
+        _, stage, reason = self._lookup(_run)
+        self.assertEqual(stage, "self_lookup_failed")
+        self.assertEqual(reason, "row_ambiguous")
+
+    def test_unresolved_binary_fails_without_running_anything(self) -> None:
+        def _explode(argv, **kwargs):
+            raise AssertionError("must not run a subprocess with no binary")
+
+        with patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_agent_attest.resolve_herdr_binary",
+            side_effect=TerminalTransportError("unresolved"),
+        ):
+            locator, stage, reason = bounded_self_lookup(
+                NAME, self._ENV, runner=_explode, monotonic=lambda: 0.0
+            )
+        self.assertEqual(locator, "")
+        self.assertEqual(stage, "self_lookup_failed")
+        self.assertEqual(reason, "binary_unresolved")
 
 
 class CmdAgentAttestTest(unittest.TestCase):
@@ -221,8 +358,8 @@ class CmdAgentAttestTest(unittest.TestCase):
              "MOZYO_WORKSPACE_ID": "ws1", "MOZYO_AGENT_ROLE": "claude", "MOZYO_LANE_ID": "default"},
         ), patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_agent_attest._live_lister",
-            return_value=_lister({"name": NAME, "pane_id": "wY:p2"}),
+            "application.herdr_agent_attest.bounded_self_lookup",
+            return_value=("wY:p2", "self_lookup_succeeded", ""),
         ), patch("os.execvp") as execvp:
             execvp.side_effect = SystemExit(0)
             with self.assertRaises(SystemExit):
@@ -240,8 +377,8 @@ class CmdAgentAttestTest(unittest.TestCase):
             "os.environ", {"MOZYO_BRIDGE_HOME": tmp, "MOZYO_HERDR_BINARY": "/x/herdr"}
         ), patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_agent_attest._live_lister",
-            return_value=_lister({"name": NAME, "pane_id": "wY:p2"}),
+            "application.herdr_agent_attest.bounded_self_lookup",
+            return_value=("wY:p2", "self_lookup_succeeded", ""),
         ), patch(
             "os.execvp"
         ) as execvp:
@@ -256,10 +393,17 @@ class CmdAgentAttestTest(unittest.TestCase):
             )
 
     def test_missing_provider_argv_fails_closed(self) -> None:
-        with patch("os.execvp") as execvp:
-            with self.assertRaises(SystemExit):
+        stderr = io.StringIO()
+        with patch("os.execvp") as execvp, contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
                 cmd_herdr_agent_attest(self._args([]))
             execvp.assert_not_called()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: herdr agent-attest requires a provider command after `--` to exec "
+            "(usage: herdr agent-attest --assigned-name ... -- <provider> [args...])\n",
+        )
 
 
 def _install_real_exe(directory: str, name: str) -> str:
@@ -372,8 +516,8 @@ class CmdAgentAttestArgv0DecouplingTest(unittest.TestCase):
         base.update(env)
         with patch.dict("os.environ", base, clear=True), patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_agent_attest._live_lister",
-            return_value=_lister({"name": NAME, "pane_id": "wY:p2"}),
+            "application.herdr_agent_attest.bounded_self_lookup",
+            return_value=("wY:p2", "self_lookup_succeeded", ""),
         ), patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             "application.herdr_agent_attest.record_identity_attestation",
@@ -412,12 +556,20 @@ class CmdAgentAttestArgv0DecouplingTest(unittest.TestCase):
     def _assert_alias_fails_closed(self, provider_argv, alias) -> None:
         # A set-but-unbound alias dies typed/value-free: NEITHER exec runs (no launch),
         # and the value is dropped from the env even on the failure path.
-        execv, execvp, leftover = self._run(
-            provider_argv, {MOZYO_PROVIDER_ARGV0_ENV: alias}
-        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            execv, execvp, leftover = self._run(
+                provider_argv, {MOZYO_PROVIDER_ARGV0_ENV: alias}
+            )
         execv.assert_not_called()
         execvp.assert_not_called()
         self.assertIsNone(leftover)
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: MOZYO_PROVIDER_ARGV0 did not verify as a trusted alias bound to "
+            "the provider exec target (an absolute exec-target realpath named by an "
+            "absolute same-file alias); refusing to launch with an unverified argv[0]\n",
+        )
 
     def test_relative_alias_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -9,6 +9,8 @@ unconfigured binary, and self-identity env injection into the launched agent.
 from __future__ import annotations
 
 import atexit
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -486,6 +488,26 @@ class _Herdr:
         )
         record_identity_attestation(record, home=Path(self.attest_home))
         self.attest_writes.append(name)
+        # 3. the wrapper's OWN execution-stage evidence (Redmine #14222 j#85125 F2):
+        #    a real wrapped launch appends its attributed stage rows to the action's
+        #    projection before exec'ing the provider, and the health probe now demands
+        #    them before a green. Model exactly that — attributed to THIS assigned
+        #    name, under the SAME home the launcher's fence uses (patched env). An
+        #    unwrapped launch appends nothing, exactly as in production.
+        action_id = env.get("MOZYO_STARTUP_ACTION_ID", "")
+        if action_id:
+            from mozyo_bridge.core.state.startup_execution_events import (
+                STAGE_PROVIDER_EXEC_CALL_REACHED,
+                STAGE_WRAPPER_ENTERED,
+                append_execution_event,
+            )
+            from mozyo_bridge.core.state.startup_transaction_fence import (
+                StartupTransactionFence,
+            )
+
+            fence = StartupTransactionFence(home=Path(self.attest_home))
+            for stage in (STAGE_WRAPPER_ENTERED, STAGE_PROVIDER_EXEC_CALL_REACHED):
+                append_execution_event(fence, action_id, stage, participant=name)
 
 
 class _SessionStartHarness:
@@ -2226,6 +2248,7 @@ class SessionStartCliTest(_SessionStartHarness, unittest.TestCase):
     def test_repeated_agent_flag_dies_fail_closed(self) -> None:
         from mozyo_bridge.application.cli import build_parser
 
+        stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
@@ -2233,10 +2256,17 @@ class SessionStartCliTest(_SessionStartHarness, unittest.TestCase):
                 ["herdr", "session-start", "--agent", "claude", "--agent", "claude"]
             )
             args.repo = str(repo)
-            with self.assertRaises(SystemExit) as ctx:
-                args.func(args)
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    args.func(args)
             # Non-zero fail-closed exit (die), not a silent success.
-            self.assertNotEqual(ctx.exception.code, 0)
+            self.assertEqual(ctx.exception.code, 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: herdr session-start failed: duplicate requested slot for "
+            "provider 'claude' in lane 'default'; each (provider, lane) may be "
+            "prepared once — remove the duplicate `--agent` argument\n",
+        )
 
     def test_default_both_providers_still_valid(self) -> None:
         # The default invocation (no --agent) resolves to both providers with no

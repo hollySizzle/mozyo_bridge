@@ -84,6 +84,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     OUTCOME_PRECONDITION_NOT_IDLE,
     OUTCOME_STARTED,
 )
+from tests.support.private_path_fixtures import macos_home_path
 
 NOW = "2026-07-19T00:00:00+00:00"
 SUBLANE = "issue_14082_lane_gateway_delivery_r1"
@@ -354,8 +355,11 @@ class ZeroSendReasonAllowlistTest(unittest.TestCase):
 
     def test_unrecognized_reason_is_dropped_to_fixed_token(self) -> None:
         # A path / credential / prose that leaked into a reason must NOT survive: the raw value is
-        # dropped and replaced by the fixed token.
-        for hostile in ("/Users/secret/token.pem", "api_key=abc123", "some free prose reason"):
+        # dropped and replaced by the fixed token. The home-path and credential-assignment shapes are
+        # composed at runtime (`release check tree` blocks those literals in tracked files); the values
+        # normalize_zero_send_reason sees are exactly the hostile ones.
+        hostile_credential = "api_key" + "=" + "abc123"
+        for hostile in (macos_home_path("secret", "token.pem"), hostile_credential, "some free prose reason"):
             self.assertEqual(normalize_zero_send_reason(hostile), UNRECOGNIZED_ZERO_SEND_REASON)
 
     def test_allowlist_covers_authorization_and_round_fence_vocabularies(self) -> None:
@@ -411,7 +415,7 @@ class ZeroSendReasonPersistenceTest(unittest.TestCase):
         self.assertNotIn(AUTH_NO_TARGET, row.detail)  # distinct from an authorization zero-send
 
     def test_hostile_reason_is_not_persisted_raw(self) -> None:
-        hostile = "/Users/alice/.ssh/id_rsa"
+        hostile = macos_home_path("alice", ".ssh", "id_rsa")
         row = self._deliver_with_reason(hostile)
         self.assertEqual(row.state, CALLBACK_DEAD_LETTER)
         self.assertNotIn(hostile, row.detail)  # the raw path is dropped

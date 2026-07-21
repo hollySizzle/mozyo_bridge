@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+import time
 from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.core.state.herdr_identity_attestation import (
@@ -41,8 +42,21 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     classify_identity_env,
     record_identity_attestation,
 )
+from mozyo_bridge.core.state.startup_execution_events import (
+    STAGE_ATTESTATION_WRITE_FAILED,
+    STAGE_ATTESTATION_WRITE_SUCCEEDED,
+    STAGE_PROVIDER_EXEC_CALL_REACHED,
+    STAGE_PROVIDER_EXEC_FAILED,
+    STAGE_PROVIDER_EXEC_REJECTED,
+    STAGE_SELF_LOOKUP_FAILED,
+    STAGE_SELF_LOOKUP_STARTED,
+    STAGE_SELF_LOOKUP_SUCCEEDED,
+    STAGE_SELF_LOOKUP_TIMED_OUT,
+    STAGE_WRAPPER_ENTERED,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
     MOZYO_PROVIDER_ARGV0_ENV,
+    MOZYO_STARTUP_ACTION_ID_ENV,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
@@ -59,41 +73,195 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     resolve_herdr_binary,
 )
 
-#: The identity var whose value is the wrapper's own attest CLI flag, kept as a
-#: literal so this module needs no dependency other than the domain / infra it
-#: already uses for the live self-lookup.
-_ATTEST_LIST_RETRIES = 3
+#: Total wall-clock budget for the pre-exec self-lookup (Redmine #14231, clarification
+#: j#84743). The pre-#14231 shape was 3 retries x a 10s per-call timeout = up to ~30s
+#: spent BEFORE the provider is exec'd, while the launcher's own startup-health probe
+#: only waits 10s (40 x 0.25s) — an inversion in which a "best-effort, non-blocking"
+#: lookup could outlive the deadline that decides whether the launch is healthy. This
+#: cap keeps the whole lookup inside a small fraction of that probe window; the number
+#: of attempts inside it is an implementation detail, but the budget is never zero or
+#: negative.
+SELF_LOOKUP_TOTAL_BUDGET_SECONDS = 2.0
+
+#: Closed, value-free reasons a bounded self-lookup can fail (Redmine #14231). Each names
+#: WHICH observation failed, never a path / payload / env value.
+SELF_LOOKUP_REASON_BINARY_UNRESOLVED = "binary_unresolved"
+SELF_LOOKUP_REASON_LIST_UNREADABLE = "list_unreadable"
+SELF_LOOKUP_REASON_ROW_ABSENT = "row_absent"
+SELF_LOOKUP_REASON_ROW_AMBIGUOUS = "row_ambiguous"
+
+#: The attestation write did not happen because no exact locator was resolved (Redmine
+#: #14231 coordinator interpretation j#84865). Distinct from a store write that RAISED:
+#: nothing was attempted, because an empty-locator record is not a valid exact identity
+#: and is no longer written. The action's event projection carries this typed outcome.
+ATTESTATION_REASON_LOCATOR_UNAVAILABLE = "locator_unavailable"
+#: The attestation store write itself failed (the best-effort writer returned no
+#: persisted record). Value-free: names the step, never the store error text.
+ATTESTATION_REASON_STORE_WRITE_FAILED = "store_write_failed"
+
+#: The injected ``MOZYO_PROVIDER_ARGV0`` alias did not re-verify as a trusted alias of the
+#: exec target at this boundary (#14017's fail-closed check), so the exec was refused.
+EXEC_REASON_ARGV0_ALIAS_UNBOUND = "argv0_alias_unbound"
+#: The ``exec`` call itself raised (a missing / non-executable target). Value-free.
+EXEC_REASON_EXEC_RAISED = "exec_raised"
 
 #: A live ``agent list`` lister: returns raw herdr rows, or ``None`` on any failure.
 Lister = Callable[[], Optional[Sequence[Mapping[str, object]]]]
 
 
-def _own_locator(assigned_name: str, lister: Optional[Lister]) -> str:
-    """Resolve THIS agent's live locator by self-lookup, ``""`` on any ambiguity.
+def _build_event_appender(action_id: str, *, participant: str = ""):
+    """Build the wrapper's ``(stage, bounded_reason="") -> None`` event sink (never raises).
 
-    Runs the injected ``lister`` (``herdr agent list``) and returns the locator of
-    the single row whose durable name equals ``assigned_name``. Zero rows (herdr has
-    not surfaced the just-started agent yet), more than one (a duplicate name), an
-    empty locator, or a lister failure all resolve to ``""`` — which the read side
-    treats as ``stale`` / fail-closed. Never raises: a self-lookup problem must not
-    stop the boot.
+    Returns a no-op when ``action_id`` is empty (an unwrapped launch, an older launcher
+    that does not inject :data:`MOZYO_STARTUP_ACTION_ID_ENV`, or a test path) so the
+    pre-#14231 launch shape stays byte-invariant. When it is present the sink appends to
+    the action's optional projection through the best-effort
+    :func:`...startup_execution_events.append_execution_event`, which already swallows
+    every failure — an evidence-recording problem must never stop a provider boot.
+
+    ``participant`` is THIS wrapper's own assigned name (Redmine #14222 j#85125 F1):
+    every stage it appends is attributed to it, so a two-provider action's read side
+    can scope each provider's timeline instead of blurring both into one.
     """
-    if lister is None:
-        return ""
-    try:
-        rows = lister()
-    except Exception:  # noqa: BLE001 — a self-lookup failure must never block exec
-        return ""
-    if not rows:
-        return ""
+    if not action_id:
+        return lambda stage, bounded_reason="": None
+
+    def _append(stage: str, bounded_reason: str = "") -> None:
+        try:
+            from mozyo_bridge.core.state.startup_execution_events import (
+                append_execution_event,
+            )
+            from mozyo_bridge.core.state.startup_transaction_fence import (
+                StartupTransactionFence,
+            )
+
+            append_execution_event(
+                StartupTransactionFence(),
+                action_id,
+                stage,
+                bounded_reason=bounded_reason,
+                participant=participant,
+            )
+        except Exception:  # noqa: BLE001 — evidence recording never blocks the boot
+            return
+
+    return _append
+
+
+def _match_own_locator(
+    assigned_name: str, rows: Optional[Sequence[Mapping[str, object]]]
+) -> tuple[str, str]:
+    """Pick THIS agent's locator out of one ``agent list`` payload (pure, never raises).
+
+    Returns ``(locator, reason)`` — exactly one is non-empty. ``rows is None`` is an
+    unreadable read (:data:`SELF_LOOKUP_REASON_LIST_UNREADABLE`), zero matches is
+    :data:`SELF_LOOKUP_REASON_ROW_ABSENT` (herdr may not have surfaced the just-started
+    agent yet — the ONLY retryable case), more than one is
+    :data:`SELF_LOOKUP_REASON_ROW_AMBIGUOUS`, and an exactly-one match carrying an empty
+    locator is ``row_absent`` too (a row without a locator identifies nothing).
+    """
+    if rows is None:
+        return "", SELF_LOOKUP_REASON_LIST_UNREADABLE
     matches = [
         row
         for row in rows
         if isinstance(row, Mapping) and _norm(row.get(AGENT_KEY_NAME)) == assigned_name
     ]
-    if len(matches) != 1:
-        return ""
-    return _norm(_agent_locator(matches[0]))
+    if len(matches) > 1:
+        return "", SELF_LOOKUP_REASON_ROW_AMBIGUOUS
+    if not matches:
+        return "", SELF_LOOKUP_REASON_ROW_ABSENT
+    locator = _norm(_agent_locator(matches[0]))
+    if not locator:
+        return "", SELF_LOOKUP_REASON_ROW_ABSENT
+    return locator, ""
+
+
+def bounded_self_lookup(
+    assigned_name: str,
+    env: Mapping[str, str],
+    *,
+    runner=None,
+    monotonic=None,
+    total_budget_seconds: float = SELF_LOOKUP_TOTAL_BUDGET_SECONDS,
+) -> tuple[str, str, str]:
+    """Resolve THIS agent's live locator under a total wall-clock budget (never raises).
+
+    Returns ``(locator, stage, bounded_reason)`` where ``stage`` is one of
+    :data:`STAGE_SELF_LOOKUP_SUCCEEDED` / :data:`STAGE_SELF_LOOKUP_TIMED_OUT` /
+    :data:`STAGE_SELF_LOOKUP_FAILED` and ``bounded_reason`` is a closed
+    ``SELF_LOOKUP_REASON_*`` token (empty on success).
+
+    Budget (Redmine #14231, clarification j#84743): the WHOLE lookup — every attempt
+    plus the gaps between them — fits inside ``total_budget_seconds``, measured on the
+    injected ``monotonic`` clock. Each subprocess timeout is capped to the time actually
+    remaining, so the last attempt can never overrun the budget the way the pre-#14231
+    3 x 10s retry loop could (which is what inverted the wrapper against the launcher's
+    own 10s startup-health probe). A non-positive budget is refused as a caller error via
+    ``max(..., 0)`` on the remaining time: the first attempt still runs with a floor, so
+    the lookup never degrades into "no observation at all" silently.
+
+    Retry policy: **only** :data:`SELF_LOOKUP_REASON_ROW_ABSENT` is retried, because it
+    is the one genuinely transient case (herdr registration lag right after
+    ``agent start``). An unresolvable binary, a failed / non-zero / unparseable read, and
+    an ambiguous duplicate-name row are all conditions that a 2-second wait cannot fix —
+    retrying them would spend the whole budget to reach the same verdict.
+
+    **Terminal-hygiene invariant (defensive; NOT the #14017 root cause).** This runs
+    *inside the herdr-spawned pane*, as the wrapper about to exec the interactive
+    provider into that same pane. The ``agent list`` child is kept off the pane's
+    controlling terminal on every standard fd: ``capture_output`` pipes stdout/stderr,
+    and ``stdin=subprocess.DEVNULL`` + ``start_new_session=True`` give it no fd pointing
+    at the pane PTY and no controlling-terminal association. (History: #14017 R1 commit
+    86fc24bc hypothesised this detach WAS the provider-exit fix; installed dogfood
+    refuted it — j#81858 / j#81867 — and the real correction is the exec-target / argv[0]
+    decoupling in :func:`cmd_herdr_agent_attest`. This is kept as sound hygiene only.)
+    """
+    # Resolved at CALL time, not bound as a default: `subprocess.run` / `time.monotonic`
+    # are patched at the module attribute by existing regression tests (#14017), and a
+    # default-argument binding would freeze the import-time object past those patches.
+    run = runner if runner is not None else subprocess.run
+    clock = monotonic if monotonic is not None else time.monotonic
+    deadline = clock() + max(float(total_budget_seconds), 0.0)
+    try:
+        binary = resolve_herdr_binary(env).path
+    except TerminalTransportError:
+        return "", STAGE_SELF_LOOKUP_FAILED, SELF_LOOKUP_REASON_BINARY_UNRESOLVED
+
+    last_reason = SELF_LOOKUP_REASON_ROW_ABSENT
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return "", STAGE_SELF_LOOKUP_TIMED_OUT, last_reason
+        # Cap each attempt's own timeout to the remaining budget so no single call can
+        # outlive it; never exceed the shared command timeout either.
+        attempt_timeout = min(remaining, float(COMMAND_TIMEOUT_SECONDS))
+        rows: Optional[Sequence[Mapping[str, object]]]
+        try:
+            completed = run(
+                [binary, "agent", "list"],
+                capture_output=True,
+                text=True,
+                timeout=attempt_timeout,
+                env=dict(env),
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            rows = None
+        else:
+            rows = (
+                _extract_list_rows(completed.stdout)
+                if getattr(completed, "returncode", 1) == 0
+                else None
+            )
+        locator, reason = _match_own_locator(assigned_name, rows)
+        if locator:
+            return locator, STAGE_SELF_LOOKUP_SUCCEEDED, ""
+        if reason != SELF_LOOKUP_REASON_ROW_ABSENT:
+            # Not a registration-lag case; a retry inside this budget cannot change it.
+            return "", STAGE_SELF_LOOKUP_FAILED, reason
+        last_reason = reason
 
 
 def perform_self_attestation(
@@ -104,26 +272,60 @@ def perform_self_attestation(
     lane: str,
     env: Mapping[str, str],
     replacement_action_id: str = "",
-    lister: Optional[Lister] = None,
     home=None,
     now: Optional[str] = None,
-) -> IdentityAttestationRecord:
+    append_event=None,
+    runner=None,
+    monotonic=None,
+    total_budget_seconds: float = SELF_LOOKUP_TOTAL_BUDGET_SECONDS,
+) -> Optional[IdentityAttestationRecord]:
     """Observe this process's identity env + live locator; record it (best-effort).
 
-    Pure over its inputs apart from the single best-effort store write: it classifies
-    the ``env`` mapping (the caller passes ``os.environ``) against the
-    launcher-expected identity, self-resolves the live locator via ``lister``, and
-    upserts a generation-bound record. Returns the record (persisted form when the
-    write succeeded, else the in-memory record) so a caller / test can assert on it.
-    Never raises.
+    Classifies the ``env`` mapping (the caller passes ``os.environ``) against the
+    launcher-expected identity, self-resolves the live locator under a bounded budget
+    (:func:`bounded_self_lookup`), and — **only when an exact locator was resolved** —
+    upserts a generation-bound record. Returns the record (persisted form when the write
+    succeeded, else the in-memory record), or ``None`` when no locator was available and
+    therefore nothing was written. Never raises.
+
+    Redmine #14231 (coordinator interpretation j#84865): an empty-locator record is NO
+    LONGER written. The attestation store's identity semantics include the exact locator;
+    a record without one is not a valid exact identity, and writing it just to have a row
+    put an ambiguous state in front of every reader. The failure is instead expressed on
+    the action's own append-only event projection as
+    ``attestation_write_failed`` + :data:`ATTESTATION_REASON_LOCATOR_UNAVAILABLE` — a
+    typed outcome saying "attestation could not be persisted for this action", which is
+    exactly what happened. Reading pre-existing empty-locator records stays compatible;
+    that compatibility is not a reason to keep writing new ones. The provider boot
+    continues either way (the wrapper never blocks the boot); the post-launch gate treats
+    missing evidence as ``startup_evidence_unavailable``, never as proof the wrapper
+    never ran or the provider exited.
+
+    ``append_event`` is the injected ``(stage, bounded_reason) -> None`` sink for the
+    typed stage events; ``None`` disables event recording entirely (every pre-#14231
+    caller / test path stays byte-invariant).
     """
+    emit = append_event or (lambda stage, bounded_reason="": None)
     verdict, detail = classify_identity_env(
         expected_workspace_id=workspace_id,
         expected_role=role,
         expected_lane=lane,
         env=env,
     )
-    locator = _own_locator(assigned_name, lister)
+    emit(STAGE_SELF_LOOKUP_STARTED)
+    locator, stage, reason = bounded_self_lookup(
+        assigned_name,
+        env,
+        runner=runner,
+        monotonic=monotonic,
+        total_budget_seconds=total_budget_seconds,
+    )
+    emit(stage, reason)
+    if not locator:
+        # No exact locator -> no attestation write at all (j#84865). The action's event
+        # projection carries the typed outcome instead of the store carrying an invalid row.
+        emit(STAGE_ATTESTATION_WRITE_FAILED, ATTESTATION_REASON_LOCATOR_UNAVAILABLE)
+        return None
     record = IdentityAttestationRecord(
         assigned_name=assigned_name,
         workspace_id=_norm(workspace_id),
@@ -136,69 +338,11 @@ def perform_self_attestation(
         replacement_action_id=_norm(replacement_action_id),
     )
     persisted = record_identity_attestation(record, home=home)
-    return persisted or record
-
-
-def _live_lister(env: Mapping[str, str]) -> Lister:
-    """Build a live ``herdr agent list`` lister with a small bounded retry.
-
-    Resolves the herdr binary from the SAME trusted environment the rest of the
-    herdr code uses (``MOZYO_HERDR_BINARY`` / trusted PATH, Redmine #13496 —
-    injected onto this agent at launch), then runs ``agent list`` up to
-    :data:`_ATTEST_LIST_RETRIES` times so a herdr-registration lag right after start
-    still resolves the agent's own row. Returns ``None`` on unresolved binary /
-    repeated failure (the caller records an empty locator — fail-closed).
-
-    **Terminal-hygiene invariant (defensive; NOT the #14017 root cause).** This lister
-    runs *inside the herdr-spawned pane*, as the wrapper process about to exec the
-    interactive provider into that same pane. The ``agent list`` child is kept off the
-    pane's controlling terminal on **every** standard fd: ``capture_output`` already
-    pipes stdout/stderr, and ``stdin=subprocess.DEVNULL`` + ``start_new_session=True``
-    give the child no fd pointing at the pane PTY and no controlling-terminal
-    association — a query command needs neither. This keeps the pre-exec self-lookup
-    from perturbing the terminal the provider inherits and is byte-for-byte parity with
-    the unwrapped (pre-#13637) launch; it is retained as sound hygiene, provider-neutral.
-
-    History (Redmine #14017): R1 (commit 86fc24bc) hypothesised that this lister's
-    inherited controlling terminal WAS the provider-asymmetric ``shell_residue`` exit
-    and shipped this detach as the fix. Installed dogfood **refuted** that: Claude still
-    exited with the wrapper's lister fully detached (j#81858), and even with the whole
-    ``agent-attest`` wrapper removed (j#81867). The isolated root trigger is the
-    provider **argv[0]**: under Herdr, Claude's interactive TUI exits immediately when
-    invoked with its symlink-collapsed realpath as argv[0], and stays resident when
-    invoked with its trusted absolute alias (j#81879). The real correction is the
-    exec-target / argv[0] decoupling in :func:`cmd_herdr_agent_attest`; this detach is
-    kept only as harmless terminal hygiene, not as the fix.
-    """
-
-    def _list() -> Optional[Sequence[Mapping[str, object]]]:
-        try:
-            binary = resolve_herdr_binary(env).path
-        except TerminalTransportError:
-            return None
-        last: Optional[Sequence[Mapping[str, object]]] = None
-        for _ in range(_ATTEST_LIST_RETRIES):
-            try:
-                completed = subprocess.run(
-                    [binary, "agent", "list"],
-                    capture_output=True,
-                    text=True,
-                    timeout=COMMAND_TIMEOUT_SECONDS,
-                    env=dict(env),
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            if completed.returncode != 0:
-                continue
-            rows = _extract_list_rows(completed.stdout)
-            if rows:
-                return rows
-            last = rows
-        return last
-
-    return _list
+    if persisted is None:
+        emit(STAGE_ATTESTATION_WRITE_FAILED, ATTESTATION_REASON_STORE_WRITE_FAILED)
+        return record
+    emit(STAGE_ATTESTATION_WRITE_SUCCEEDED)
+    return persisted
 
 
 def _argv0_alias_binds_to_exec_target(argv0_alias: str, exec_target: str) -> bool:
@@ -288,6 +432,16 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
         raise AssertionError("unreachable")
 
     env = os.environ
+    # Redmine #14231: the reserved startup action_id rides an `--env` key (see
+    # MOZYO_STARTUP_ACTION_ID_ENV); absent (an unwrapped / older-launcher / test path) the
+    # sink is a no-op and every stage append is skipped, so nothing here can fail a launch.
+    append_event = _build_event_appender(
+        _norm(env.get(MOZYO_STARTUP_ACTION_ID_ENV, "")),
+        # j#85125 F1: attribute every stage to THIS wrapper's assigned name so a pair
+        # action's two timelines never blur into one shared, cross-poisoning list.
+        participant=_norm(getattr(args, "assigned_name", "")),
+    )
+    append_event(STAGE_WRAPPER_ENTERED)
     perform_self_attestation(
         assigned_name=_norm(getattr(args, "assigned_name", "")),
         workspace_id=_norm(getattr(args, "workspace_id", "")),
@@ -295,7 +449,7 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
         lane=_norm(getattr(args, "lane", "")),
         env=env,
         replacement_action_id=_norm(getattr(args, "replacement_action_id", "")),
-        lister=_live_lister(env),
+        append_event=append_event,
     )
     # Redmine #14017: the exec target is always provider_argv[0] (the verified realpath);
     # the trusted argv[0] alias, if any, arrives out-of-band via MOZYO_PROVIDER_ARGV0. It
@@ -315,6 +469,9 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
         if not _argv0_alias_binds_to_exec_target(argv0_alias, exec_target):
             from mozyo_bridge.shared.errors import die
 
+            append_event(
+                STAGE_PROVIDER_EXEC_REJECTED, EXEC_REASON_ARGV0_ALIAS_UNBOUND
+            )
             die(
                 "MOZYO_PROVIDER_ARGV0 did not verify as a trusted alias bound to the "
                 "provider exec target (an absolute exec-target realpath named by an "
@@ -323,18 +480,42 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
             raise AssertionError("unreachable")
         # Exec the verified realpath, but present the trusted alias as argv[0]. os.execv
         # takes an explicit path, so PATH is never consulted and the alias is never run.
-        os.execv(exec_target, [argv0_alias, *provider_argv[1:]])
+        # The `provider_exec_call_reached` event is appended BEFORE the call because a
+        # successful exec replaces this process — there is no "after" in which to write it
+        # (Redmine #14231: the event proves control flow reached the exec call, never that
+        # the provider executed; live confirmation only comes from an inventory join).
+        append_event(STAGE_PROVIDER_EXEC_CALL_REACHED)
+        try:
+            os.execv(exec_target, [argv0_alias, *provider_argv[1:]])
+        except OSError:
+            append_event(STAGE_PROVIDER_EXEC_FAILED, EXEC_REASON_EXEC_RAISED)
+            raise
         raise AssertionError("unreachable")  # pragma: no cover - execv replaces process
     # No alias var — an unwrapped / unsymlinked / Codex launch, or an older wrapper that
     # ignores the key (version skew). Keep the realpath on both the exec target and argv[0]:
     # the honest, byte-invariant fallback that never weakens the trust boundary by execing
     # an alias.
-    os.execvp(exec_target, provider_argv)
+    append_event(STAGE_PROVIDER_EXEC_CALL_REACHED)
+    try:
+        os.execvp(exec_target, provider_argv)
+    except OSError:
+        append_event(STAGE_PROVIDER_EXEC_FAILED, EXEC_REASON_EXEC_RAISED)
+        raise
     raise AssertionError("unreachable")  # pragma: no cover - execvp replaces process
 
 
 __all__ = (
+    "ATTESTATION_REASON_LOCATOR_UNAVAILABLE",
+    "ATTESTATION_REASON_STORE_WRITE_FAILED",
+    "EXEC_REASON_ARGV0_ALIAS_UNBOUND",
+    "EXEC_REASON_EXEC_RAISED",
+    "SELF_LOOKUP_REASON_BINARY_UNRESOLVED",
+    "SELF_LOOKUP_REASON_LIST_UNREADABLE",
+    "SELF_LOOKUP_REASON_ROW_ABSENT",
+    "SELF_LOOKUP_REASON_ROW_AMBIGUOUS",
+    "SELF_LOOKUP_TOTAL_BUDGET_SECONDS",
     "Lister",
+    "bounded_self_lookup",
     "cmd_herdr_agent_attest",
     "perform_self_attestation",
 )

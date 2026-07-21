@@ -415,12 +415,36 @@ class WorkUnitGateTests(unittest.TestCase):
         )
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 
-    def test_leaf_issue_exception_unit_executes(self):
+    def test_leaf_issue_without_standalone_or_anchor_blocks_redmine_14224(self):
+        # Redmine #14224: leaf_issue is no longer an unconditional exception -- a
+        # leaf dispatch with neither --leaf-standalone nor a decision anchor is
+        # assumed to be a child of a UserStory and blocks before any probe, exactly
+        # like the epic/feature gate above.
+        ops = FakeActuatorOps(git=True)
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(work_unit="leaf_issue"), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_WORK_UNIT_BLOCKED, outcome.blocked_reasons)
+        self.assertIn("work_unit_leaf_decision_required", outcome.blocked_reasons)
+        self.assertEqual(ops.calls, [])
+
+    def test_leaf_issue_standalone_executes_no_anchor_needed(self):
         ops = FakeActuatorOps(
             git=True, worktree_exists=False, lanes=[None, _lane()], dispatch_rc=0
         )
         outcome = SublaneActuateUseCase(ops).run(
-            _req(work_unit="leaf_issue"), execute=True
+            _req(work_unit="leaf_issue", leaf_standalone=True), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+
+    def test_leaf_issue_with_parent_us_and_decision_anchor_executes(self):
+        ops = FakeActuatorOps(
+            git=True, worktree_exists=False, lanes=[None, _lane()], dispatch_rc=0
+        )
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(work_unit="leaf_issue", work_unit_decision_anchor="70719"),
+            execute=True,
         )
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 

@@ -173,6 +173,14 @@ class _Agent:
     tab_id: str = ""  # the herdr tab the agent's pane lives in (Redmine #13411)
     launch_argv: list = field(default_factory=list)  # the post-``--`` provider argv
     env: dict = field(default_factory=dict)  # the injected ``--env K=V`` pairs
+    #: The live worker inventory row revision, when a scenario pins the #13806 recover-stale
+    #: worker-revision generation gate. Empty (default) renders no ``revision`` field, the legacy
+    #: minimal shape most scenarios use.
+    revision: str = ""
+    #: The detected managed provider agent behind the pane, when a scenario distinguishes a live
+    #: pane (a named provider) from a shell residue (``""``, present-but-blank). ``None`` (default)
+    #: renders no ``agent`` field, the shape whose liveness is decided by ``status`` alone.
+    detected_agent: "str | None" = None
 
 
 class FakeHerdr:
@@ -216,6 +224,13 @@ class FakeHerdr:
         self.locator_render_key = LOCATOR_KEY
         # --- pre-armed wait transitions (change-semantics, design §1.1 F) -------
         self._armed_transitions: list = []  # (target, to_status) queued FIFO
+        # --- composer echo (opt-in, #14097 installed smoke deliver landing) ------
+        #: When ``True``, ``pane send-text`` accumulates into a per-target composer buffer that
+        #: ``agent read`` then serves back — so a queue-enter send observes the marker it just
+        #: typed (an instant live-composer echo). Default ``False`` keeps the fixed-text read model
+        #: every existing scenario relies on.
+        self.echo_composer: bool = False
+        self._composer: dict = {}
 
     # -- seeding / injection --------------------------------------------------
 
@@ -235,11 +250,16 @@ class FakeHerdr:
         provider: str = "",
         status: str = DEFAULT_START_STATUS,
         cwd: str = "",
+        revision: str = "",
+        detected_agent: "str | None" = None,
     ) -> str:
         """Place a live agent directly in ``workspace_id``, returning its locator.
 
         Seeds the live inventory the way a prior ``agent start`` would have, so a
         scenario can stand up an existing lane slot without replaying its launch.
+        ``revision`` / ``detected_agent`` pin the richer ``agent list`` row fields a
+        recover-stale generation gate / shell-residue classification reads; both default to
+        the legacy minimal shape (field absent).
         """
         ws = self._workspaces.get(workspace_id)
         if ws is None:
@@ -254,6 +274,8 @@ class FakeHerdr:
             provider=provider,
             status=status,
             cwd=cwd,
+            revision=revision,
+            detected_agent=detected_agent,
         )
         return pane_id
 
@@ -498,6 +520,16 @@ class FakeHerdr:
             # agent lives in one so a heal can rejoin the same tab.
             if agent.tab_id:
                 row["tab_id"] = agent.tab_id
+            # The richer #13806 recover-stale row fields, rendered only when a scenario pins
+            # them (legacy minimal shape otherwise): the worker inventory revision, the detected
+            # managed provider agent (present-but-blank == shell residue), and the foreground cwd
+            # the worktree-readable probe reads.
+            if agent.revision:
+                row["revision"] = agent.revision
+            if agent.detected_agent is not None:
+                row["agent"] = agent.detected_agent
+            if agent.cwd:
+                row["foreground_cwd"] = agent.cwd
             rows.append(row)
         # Splice any injected malformed / extra rows verbatim (one-shot).
         if self.extra_list_rows:
@@ -529,9 +561,10 @@ class FakeHerdr:
         agent = self._resolve_agent(target)
         if agent is None:
             return _err(argv, f"agent_not_found: {target}")
+        text = self._composer.get(target, self.read_text) if self.echo_composer else self.read_text
         return _ok(
             argv,
-            {"result": {"read": {"text": self.read_text, "truncated": False}}},
+            {"result": {"read": {"text": text, "truncated": False}}},
         )
 
     def _cmd_pane_close(self, argv, rest):
@@ -556,6 +589,8 @@ class FakeHerdr:
         # real transport reports the send failure rather than a fabricated OK.
         if self._workspace_of_pane(target) is None:
             return _err(argv, f"no such pane: {target}")
+        if self.echo_composer and len(rest) > 3:
+            self._composer[target] = self._composer.get(target, self.read_text) + "\n" + rest[3]
         return _ok(argv, {"result": {"type": "ok"}})
 
     # -- wait resolution (change-semantics, no real time) ---------------------
@@ -653,6 +688,62 @@ class FakeHerdr:
             {"name": a.name, "pane_id": a.pane_id, "status": a.status}
             for a in self._agents.values()
         ]
+
+    # -- serialize / hydrate seam (Redmine #14097 installed smoke adapter) -----
+    # The installed smoke drives the REAL installed CLI in a subprocess, which shells out to a
+    # standalone ``MOZYO_HERDR_BINARY`` executable — the in-process fake cannot cross that
+    # boundary. So the smoke persists this fake's state to a file and a thin smoke-owned adapter
+    # (``smoke/support/fake_herdr_cli.py``) rehydrates THIS canonical fake and replays a single
+    # command. No second Herdr protocol model is authored (coordinator decision j#83808 Q3): the
+    # command vocabulary / JSON shape stay owned here; the smoke owns only the persistence + exec.
+
+    def to_state(self) -> dict:
+        """A JSON-serializable snapshot of the live inventory (for the smoke adapter)."""
+        return {
+            "read_text": self.read_text,
+            "echo_composer": self.echo_composer,
+            "composer": dict(self._composer),
+            "armed_transitions": [list(t) for t in self._armed_transitions],
+            "workspace_seq": self._workspace_seq,
+            "workspaces": [
+                {
+                    "workspace_id": ws.workspace_id, "cwd": ws.cwd, "panes": list(ws.panes),
+                    "pane_seq": ws.pane_seq, "pane_tab": dict(ws.pane_tab), "tab_seq": ws.tab_seq,
+                }
+                for ws in self._workspaces.values()
+            ],
+            "agents": [
+                {
+                    "name": a.name, "pane_id": a.pane_id, "workspace_id": a.workspace_id,
+                    "provider": a.provider, "cwd": a.cwd, "status": a.status, "tab_id": a.tab_id,
+                    "revision": a.revision, "detected_agent": a.detected_agent,
+                }
+                for a in self._agents.values()
+            ],
+        }
+
+    @classmethod
+    def from_state(cls, state: dict) -> "FakeHerdr":
+        """Rehydrate a fake from :meth:`to_state` (the smoke adapter's hydrate step)."""
+        fake = cls(read_text=str(state.get("read_text", "")))
+        fake.echo_composer = bool(state.get("echo_composer", False))
+        fake._composer = dict(state.get("composer", {}))
+        fake._armed_transitions = [tuple(t) for t in state.get("armed_transitions", [])]
+        fake._workspace_seq = int(state.get("workspace_seq", 0))
+        for wsd in state.get("workspaces", []):
+            fake._workspaces[wsd["workspace_id"]] = _Workspace(
+                workspace_id=wsd["workspace_id"], panes=list(wsd.get("panes", [])),
+                cwd=wsd.get("cwd", ""), pane_seq=int(wsd.get("pane_seq", 0)),
+                pane_tab=dict(wsd.get("pane_tab", {})), tab_seq=int(wsd.get("tab_seq", 0)),
+            )
+        for ad in state.get("agents", []):
+            fake._agents[ad["pane_id"]] = _Agent(
+                name=ad["name"], pane_id=ad["pane_id"], workspace_id=ad["workspace_id"],
+                provider=ad.get("provider", ""), cwd=ad.get("cwd", ""),
+                status=ad.get("status", DEFAULT_START_STATUS), tab_id=ad.get("tab_id", ""),
+                revision=ad.get("revision", ""), detected_agent=ad.get("detected_agent"),
+            )
+        return fake
 
     def agent_named(self, name: str) -> Optional[dict]:
         """The single live agent carrying ``name``, or ``None`` (fail on duplicate)."""

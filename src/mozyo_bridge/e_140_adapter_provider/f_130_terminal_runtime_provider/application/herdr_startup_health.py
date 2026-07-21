@@ -76,6 +76,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     COMPENSATION_ROLLBACK_OWED,
     DISPOSITION_ADOPTED,
     DISPOSITION_FRESH_LAUNCHED,
+    EVIDENCE_NOT_APPLICABLE,
+    EVIDENCE_PRESENT,
+    EVIDENCE_UNAVAILABLE,
     HEALTH_ATTESTATION_TIMEOUT,
     HEALTH_DETAIL,
     HEALTH_HEALTHY,
@@ -83,6 +86,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     HEALTH_PROVIDER_EXITED,
     HEALTH_RECEIVER_UNREADABLE,
     HEALTH_SHELL_RESIDUE,
+    HEALTH_STARTUP_EVIDENCE_UNAVAILABLE,
     HEALTH_STARTUP_INTERACTION,
     SCREEN_BLOCKED,
     SCREEN_CLEAR,
@@ -170,8 +174,56 @@ _RETRYABLE = frozenset(
         HEALTH_SHELL_RESIDUE,
         HEALTH_ATTESTATION_TIMEOUT,
         HEALTH_RECEIVER_UNREADABLE,
+        # j#85125 F2: the wrapper appends its stages while the provider is still
+        # booting, so an early poll can legitimately see no attributed row yet.
+        HEALTH_STARTUP_EVIDENCE_UNAVAILABLE,
     }
 )
+
+
+#: ``assigned_name -> EVIDENCE_* token`` for the launching action's execution-stage
+#: projection (Redmine #14222 j#85125 F2). ``None`` = no action to consult (a dry run,
+#: an unwrapped launch, an adopt-only pass, an older caller) — every classification
+#: stays byte-invariant at :data:`EVIDENCE_NOT_APPLICABLE`.
+EvidenceReader = Callable[[str], str]
+
+
+def live_evidence_reader(action_id: str) -> Optional[EvidenceReader]:
+    """Bind the launching action's participant-scoped evidence read (never raises).
+
+    Returns ``None`` for an empty ``action_id`` so the caller composes exactly the
+    pre-#14231 pipeline. Otherwise the reader reports :data:`EVIDENCE_PRESENT` iff at
+    least one execution-stage row is ATTRIBUTED to the asked assigned name, and
+    :data:`EVIDENCE_UNAVAILABLE` for everything else — a missing table, an unreadable
+    store, zero rows, or rows only for a sibling. Expected-and-missing is exactly what
+    the pure classifier downgrades (j#85125 F2); it never masks a more specific
+    verdict because :func:`...domain.startup_health.classify_startup_health` orders
+    evidence last.
+    """
+    normalized = (action_id or "").strip()
+    if not normalized:
+        return None
+
+    def _read(assigned_name: str) -> str:
+        try:
+            from mozyo_bridge.core.state.startup_execution_events import (
+                read_execution_events,
+            )
+            from mozyo_bridge.core.state.startup_transaction_fence import (
+                StartupTransactionFence,
+            )
+
+            events = read_execution_events(StartupTransactionFence(), normalized)
+        except Exception:  # noqa: BLE001 — an unreadable projection is the gap itself
+            return EVIDENCE_UNAVAILABLE
+        if not events:
+            return EVIDENCE_UNAVAILABLE
+        name = _norm(assigned_name)
+        if name and any(e.participant == name for e in events):
+            return EVIDENCE_PRESENT
+        return EVIDENCE_UNAVAILABLE
+
+    return _read
 
 
 def _screen_of(
@@ -235,6 +287,7 @@ def _observe_once(
     read_visible: VisibleReader,
     attested_launch: bool = True,
     registry=None,
+    evidence: str = EVIDENCE_NOT_APPLICABLE,
 ) -> tuple[str, str]:
     """Classify one live slot against an ALREADY-READ inventory -> ``(health, blocker)``.
 
@@ -264,6 +317,7 @@ def _observe_once(
                 launched_locator=launched_locator,
                 screen=SCREEN_UNREADABLE,
                 attestation=ATTESTATION_ABSENT,
+                evidence=evidence,
             ),
             "",
         )
@@ -296,6 +350,7 @@ def _observe_once(
         row_stale=row_stale,
         live_locator=live_locator,
         launched_locator=_norm(launched_locator),
+        evidence=evidence,
         screen=screen,
         attestation=attestation,
     )
@@ -306,7 +361,20 @@ def _slot_health(
     *, slot_provider, assigned_name, locator, disposition, health, blocker_id
 ) -> SlotHealth:
     healthy = health == HEALTH_HEALTHY
-    owed = (not healthy) and disposition == DISPOSITION_FRESH_LAUNCHED
+    # Redmine #14231: `startup_evidence_unavailable` is non-green but owes NO compensation.
+    # The slot itself was observed live at its launched locator, screen-clear, and
+    # generation-matched-attested — the ONLY thing missing is this run's own record of how
+    # it got there. Treating that as rollback_owed would close a demonstrably working pane
+    # over a reporting gap, and would give the evidence projection rollback authority *by
+    # its absence* — exactly what Design Answer j#84724 forbids ("新しいprojectionは診断で
+    # あり、workflow truth・rollback authority・liveness authorityへ昇格しない"). It stays
+    # fail-closed in the sense the answer asked for: the run does not report a green, and
+    # the operator is pointed at `herdr startup-status` — it just does not demand a close.
+    owed = (
+        (not healthy)
+        and health != HEALTH_STARTUP_EVIDENCE_UNAVAILABLE
+        and disposition == DISPOSITION_FRESH_LAUNCHED
+    )
     return SlotHealth(
         provider=slot_provider,
         assigned_name=assigned_name,
@@ -337,6 +405,7 @@ def probe_startup_health(
     polls: int = DEFAULT_PROBE_POLLS,
     interval: float = DEFAULT_PROBE_INTERVAL,
     sleeper: Callable[[float], None] = time.sleep,
+    evidence_reader: Optional[EvidenceReader] = None,
 ) -> SlotHealth:
     """Observe ONE live slot until healthy, terminal, or the deadline expires.
 
@@ -357,6 +426,11 @@ def probe_startup_health(
     blocker_id = ""
     attempts = max(1, int(polls))
     for attempt in range(attempts):
+        expected = (
+            evidence_reader is not None
+            and disposition == DISPOSITION_FRESH_LAUNCHED
+            and attested_launch
+        )
         health, blocker_id = _observe_once(
             provider=provider,
             assigned_name=assigned_name,
@@ -368,6 +442,9 @@ def probe_startup_health(
             read_visible=read_visible,
             attested_launch=attested_launch,
             registry=registry,
+            evidence=(
+                evidence_reader(assigned_name) if expected else EVIDENCE_NOT_APPLICABLE
+            ),
         )
         if health == HEALTH_HEALTHY or health not in _RETRYABLE:
             break
@@ -422,6 +499,7 @@ def attach_startup_health(
     attestation_read: AttestationReader,
     attested_launch: bool = True,
     probe: Optional[StartupProbe] = None,
+    action_id: str = "",
 ) -> None:
     """Run pass 3 over a completed run and replace its slots with health-carrying ones.
 
@@ -443,6 +521,10 @@ def attach_startup_health(
         read_visible=cfg.visible_reader or live_visible_reader(binary, runner, timeout),
         attested_launch=attested_launch,
         probe=cfg,
+        # j#85125 F2: a wrapped fresh launch under a known action must show its own
+        # attributed stage rows before a green is allowed; absent/unreadable evidence
+        # downgrades (never masks a more specific verdict, never owes a rollback).
+        evidence_reader=live_evidence_reader(action_id) if attested_launch else None,
     )
 
 
@@ -456,6 +538,7 @@ def probe_session_health(
     read_visible: VisibleReader,
     attested_launch: bool = True,
     probe: Optional[StartupProbe] = None,
+    evidence_reader: Optional[EvidenceReader] = None,
 ) -> list:
     """Probe every accountable slot of a run and return the health-carrying results.
 
@@ -494,6 +577,19 @@ def probe_session_health(
     if not targets:
         return list(slots)
 
+    def _evidence_of(slot, disposition) -> str:
+        """THIS round's evidence token for one slot (j#85125 F2). Only a fresh, wrapped
+        launch with a bound reader is expected to have attributed stage rows; an
+        adopted slot's wrapper ran under an earlier action and an unwrapped launch has
+        no wrapper at all — both stay byte-invariant at not_applicable."""
+        if (
+            evidence_reader is None
+            or disposition != DISPOSITION_FRESH_LAUNCHED
+            or not attested_launch
+        ):
+            return EVIDENCE_NOT_APPLICABLE
+        return evidence_reader(slot.assigned_name)
+
     def _round(rows) -> dict:
         """Judge EVERY role against one snapshot. No role is carried over from a
         previous round — the whole verdict set is a function of this one view."""
@@ -514,6 +610,7 @@ def probe_session_health(
                     attested_launch or disposition != DISPOSITION_FRESH_LAUNCHED
                 ),
                 registry=cfg.registry,
+                evidence=_evidence_of(slot, disposition),
             )
             for index, slot, disposition in targets
         }
@@ -572,6 +669,8 @@ __all__ = (
     "AttestationReader",
     "Lister",
     "VisibleReader",
+    "EvidenceReader",
+    "live_evidence_reader",
     "probe_session_health",
     "probe_startup_health",
 )
