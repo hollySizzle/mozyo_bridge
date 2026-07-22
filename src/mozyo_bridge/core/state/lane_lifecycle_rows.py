@@ -7,8 +7,8 @@ The row-level DB plumbing that both the core CAS store
 ``lane_lifecycle_records`` row:
 
 - :func:`_record` — decode a ``SELECT`` row (all columns) into a typed record;
-- :func:`_insert_active_row` — the single fresh-``active``-row ``INSERT`` (one 22-column
-  value tuple, so no call site can drift out of column order with the schema);
+- :func:`_insert_active_row` — the single fresh-``active``-row ``INSERT`` (one value tuple
+  sized to the schema's column vocabulary, so no call site can drift out of column order);
 - :func:`_locked_row` — read the row inside an already-open ``BEGIN IMMEDIATE``;
 - :func:`_active_owner` / :func:`_active_project_owner` — the in-lock owner pre-checks for
   the issue and project-gateway owner indexes;
@@ -72,6 +72,7 @@ def _record(row: Sequence[object]) -> LaneLifecycleRecord:
         lane_generation=int(row[19]),
         declared_slots=str(row[20] or ""),
         reconcile_phase=str(row[21] or ""),
+        lane_kind=str(row[22] or ""),
     )
 
 
@@ -96,13 +97,19 @@ def _insert_active_row(
     project_scope: str = "",
     lane_generation: int = 1,
     declared_slots: str = "",
+    lane_kind: str = "",
 ) -> None:
     """INSERT a fresh ``active`` / ``not_requested`` lane row (one column vocabulary).
 
     The single place a brand-new lane row is written — used by ``declare_active`` and the
     recovery-lane create inside ``supersede_and_activate`` (core store), and by
-    ``declare_lane`` (declaration service) — so the 22-column value tuple exists once and
+    ``declare_lane`` (declaration service) — so the single value tuple exists once and
     cannot drift per call site.
+
+    ``lane_kind`` (Redmine #13647 Tranche 1b) is the resolved delegation-geometry kind the
+    creating caller supplied for this generation (``""`` when the caller has no durable kind
+    fact — the pre-#13647 byte-invariant default, so a heal then falls back to ``lane_class``
+    geometry). It is stored generation-bound as the launch path's heal authority.
     """
     conn.execute(
         _INSERT_SQL,
@@ -129,6 +136,7 @@ def _insert_active_row(
             lane_generation,
             declared_slots,
             "",  # reconcile_phase: a fresh lane is never reconcile-retired (v6, #13842)
+            lane_kind,  # v7 (#13647): generation-bound lane-role heal authority
         ),
     )
 

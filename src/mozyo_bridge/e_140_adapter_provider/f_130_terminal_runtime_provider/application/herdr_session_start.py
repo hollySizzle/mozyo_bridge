@@ -520,11 +520,16 @@ def _prepare_session_locked(
 
     # Redmine #14242 F3 — the ORDER half of the launch / terminalize exclusion. Placement is
     # load-bearing (see the leaf's docstring): here it runs under the caller-held shared lock on
-    # BOTH entry paths. A dry run actuates nothing.
-    if not dry_run:
-        admit_launch_against_lifecycle(
-            workspace_id=workspace_id, lane_id=result.lane_id, store_home=store_home
-        )
+    # BOTH entry paths. A dry run actuates nothing and consults no durable state. That same
+    # boundary read resolves this launch's lane-kind (Redmine #13647 T1b): caller context
+    # (fresh launch) reconciled with the stored generation-bound kind (heal), fail-closed.
+    lane_kind = admit_launch_against_lifecycle(
+        workspace_id=workspace_id,
+        lane_id=result.lane_id,
+        store_home=store_home,
+        launch_context=launch_context,
+        dry_run=dry_run,
+    )
 
     # Config-driven pane placement (Redmine #13646, Design Answer j#76564): resolve the
     # lane class's `(split, order)` ONCE, then reorder the requested providers so the
@@ -538,11 +543,9 @@ def _prepare_session_locked(
     # pane / display cache. Precedence is `by_lane_kind[kind] > lane_class > default`
     # (`resolve_placement_policy_for_role`); a `None` context / unresolved kind / a config
     # with no matching `by_lane_kind` entry all fall straight through to the pre-#13646
-    # lane-class resolution (byte-invariant). Fresh-launch actuation authority is this
-    # context, not any stored value (the lifecycle-stored kind is the heal authority,
-    # Tranche 1b).
+    # lane-class resolution (byte-invariant). Fresh-launch actuation authority is that
+    # context, the stored kind is the HEAL authority — reconciled above (Tranche 1b).
     lane_class = "default" if result.lane_id == DEFAULT_LANE else "sublane"
-    lane_kind = launch_context.lane_kind if launch_context is not None else None
     config_split, config_order = resolve_placement_policy_for_role(
         lane_placement, lane_class, lane_kind
     )

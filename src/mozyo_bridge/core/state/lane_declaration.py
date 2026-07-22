@@ -58,6 +58,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     replacement_settled,
     validate_declared_slots,
 )
+from mozyo_bridge.core.state.lane_kind import optional_lane_kind
 from mozyo_bridge.core.state.lane_lifecycle_rows import (
     _active_owner,
     _active_project_owner,
@@ -103,6 +104,7 @@ class LaneDeclarationStore:
         project_scope: str = "",
         declared_slots: Sequence[ProcessGenerationPin] = (),
         worktree_identity: str = "",
+        lane_kind: str = "",
         now: Optional[str] = None,
     ) -> CasOutcome:
         """The common declaration / backfill service for BOTH binding kinds (Redmine #13810).
@@ -126,6 +128,15 @@ class LaneDeclarationStore:
         index, not a later check, makes double ownership impossible). Every refusal is
         zero-write.
 
+        ``lane_kind`` (v7, Redmine #13647) is the delegation-geometry kind the creating
+        caller resolved from durable governance, stored generation-bound as the heal
+        authority for lane-role pane placement (see
+        :meth:`...LaneLifecycleStore.declare_active`). It is part of the **declaration
+        identity**: a re-declare that carries a *different* kind is a divergent re-declare
+        (:data:`CAS_ALREADY_DECLARED`, zero-write), never silently accepted as the idempotent
+        no-op — the stored geometry authority is not overwritten by a later caller's guess.
+        Empty (the default every pre-#13647 caller passes) keeps this surface byte-invariant.
+
         Bulk / implicit backfill is out of scope: this declares one exact lane from one
         durable decision. A legacy rowless lane is re-declared explicitly, never guessed.
         """
@@ -139,6 +150,10 @@ class LaneDeclarationStore:
         # here, never stored (the ProcessGenerationPin R1-F4 discipline).
         pinned = validate_declared_slots(tuple(declared_slots))
         encoded_slots = encode_declared_slots(pinned)
+        # v7 (#13647): fail closed on an off-vocabulary kind before any connection opens.
+        geometry_kind = (
+            optional_lane_kind(norm(lane_kind), source="declare_lane(lane_kind=)") or ""
+        )
         if kind == BINDING_KIND_ISSUE:
             if scope:
                 raise ValueError("an issue lane owns no project scope")
@@ -180,6 +195,9 @@ class LaneDeclarationStore:
                     and existing.project_scope == scope
                     and existing.worktree_identity == worktree
                     and existing.declared_slots == encoded_slots
+                    # v7 (#13647): the stored geometry kind is part of the declaration
+                    # identity — a re-declare carrying a different kind is divergent below.
+                    and existing.lane_kind == geometry_kind
                 ):
                     conn.execute("ROLLBACK")
                     return CasOutcome(
@@ -214,6 +232,7 @@ class LaneDeclarationStore:
                     project_scope=scope,
                     lane_generation=1,
                     declared_slots=encoded_slots,
+                    lane_kind=geometry_kind,
                 )
             except sqlite3.IntegrityError:
                 # The owner index is the backstop the pre-checks above should have caught.
@@ -385,6 +404,7 @@ class LaneDeclarationStore:
         expected_generation: int,
         decision: DecisionPointer,
         declared_slots: Sequence[ProcessGenerationPin] = (),
+        lane_kind: Optional[str] = None,
         now: Optional[str] = None,
     ) -> CasOutcome:
         """Re-incarnate a **retired** lane as its next generation (Redmine #13810).
@@ -404,9 +424,29 @@ class LaneDeclarationStore:
         re-incarnated, not a re-declaration — while ``declared_slots`` records the new
         generation's observed slot set. If the issue / scope was taken by another active lane
         while this one was retired, the re-open is refused :data:`CAS_OWNER_CONFLICT`.
+
+        ``lane_kind`` (v7, Redmine #13647) is the ONLY place a lane's stored
+        delegation-geometry kind may change: it is immutable *within* a generation, and a
+        governance re-binding (a lane re-incarnated at a different position in the delegation
+        tree) takes effect on the NEW generation, never as an in-place overwrite of the one a
+        live launch may already have healed from. ``None`` (the default) **carries the current
+        generation's kind forward** — a reopen is the same lane, so its geometry is preserved
+        exactly as its binding is; an explicit token re-binds it (and an explicit ``""``
+        clears it back to "no durable kind fact" / ``lane_class`` fallback). A present
+        non-canonical token fails closed before any write.
         """
         pinned = validate_declared_slots(tuple(declared_slots))
         encoded_slots = encode_declared_slots(pinned)
+        rebind_kind = (
+            None
+            if lane_kind is None
+            else (
+                optional_lane_kind(
+                    norm(lane_kind), source="open_next_generation(lane_kind=)"
+                )
+                or ""
+            )
+        )
         stamp = now or _utc_now()
         # Redmine #13844 R2: an incarnation is a schema-needing mutation — open through the shared
         # explicit write gate (preflight peers FIRST, then backup-first migration, typed outcome).
@@ -506,7 +546,7 @@ class LaneDeclarationStore:
                     "process_release = ?, release_action_id = ?, release_pins = ?, "
                     "replacement_state = ?, replacement_action_id = ?, "
                     "replacement_pins = ?, declared_slots = ?, reconcile_phase = ?, "
-                    "revision = ?, "
+                    "lane_kind = ?, revision = ?, "
                     "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                     "updated_at = ? "
                     "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
@@ -524,6 +564,9 @@ class LaneDeclarationStore:
                         # NOT a reconcile-retired one — clear any stale reconcile owed-close phase
                         # so an old generation's provenance never authorizes a new one.
                         "",
+                        # v7 (Redmine #13647): carry the geometry kind forward unless the
+                        # caller explicitly re-binds it at this generation boundary.
+                        current.lane_kind if rebind_kind is None else rebind_kind,
                         revision,
                         decision.source,
                         decision.issue_id,

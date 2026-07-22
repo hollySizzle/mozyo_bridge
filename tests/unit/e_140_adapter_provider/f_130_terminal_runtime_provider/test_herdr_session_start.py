@@ -4834,5 +4834,196 @@ class LaneKindPlacementSchemaTest(unittest.TestCase):
         self.assertEqual(config.resolve("sublane"), ResolvedPlacement(split="down"))
 
 
+class LaneKindHealAuthorityLaunchTest(unittest.TestCase):
+    """The lifecycle-stored `lane_kind` as the OFFLINE heal authority (#13647 T1b).
+
+    Tranche 1a made a fresh launch place by the caller-supplied
+    :class:`LaneLaunchContext`. Tranche 1b stores that kind generation-bound on the
+    lane's lifecycle authority record, so a RELAUNCH of an existing lane reproduces the
+    same geometry with no caller state and no network (disposition j#85650 P1). These
+    drive the real ``prepare_session`` chokepoint against a real lifecycle store.
+
+    Fail-closed reconciliation: when the caller-supplied and the stored kind BOTH exist
+    and disagree, one of them is stale, so the launch refuses with zero Herdr side effect
+    rather than placing the pair somewhere the durable record contradicts.
+    """
+
+    @staticmethod
+    def _placement(**top):
+        return LanePlacementConfig.from_record(top)
+
+    def _run(self, tmp, *, herdr, lane, stored_kind=None, launch_context=None, config=None):
+        """Prepare a lane session with an optional DURABLE lifecycle row for that lane."""
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            DecisionPointer,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        home = Path(tmp) / "home"
+        home.mkdir()
+        binpath = Path(tmp) / "fake-herdr"
+        binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+            register_workspace(repo, home=home)
+            ws = read_anchor(repo)["workspace_id"]
+            if stored_kind is not None:
+                # The durable authority row this lane was CREATED with (Tranche 1b),
+                # written through the public declaration surface — not hand-poked SQL.
+                outcome = LaneLifecycleStore(home=home).declare_active(
+                    LaneLifecycleKey(ws, lane),
+                    decision=DecisionPointer(
+                        source="redmine", issue_id="13647", journal_id="85826"
+                    ),
+                    issue_id="13647",
+                    lane_kind=stored_kind,
+                )
+                self.assertTrue(outcome.applied)
+            result = prepare_session(
+                repo_root=repo,
+                providers=["codex", "claude"],
+                lane_id=lane,
+                env=_launch_env(binpath),
+                runner=herdr.run,
+                lane_placement=config,
+                launch_context=launch_context,
+            )
+        return result, ws
+
+    @staticmethod
+    def _second_split(herdr):
+        second = herdr.start_argvs[1]
+        return second[second.index("--split") + 1] if "--split" in second else None
+
+    def test_stored_kind_places_the_relaunch_with_no_caller_context(self) -> None:
+        # The heal acceptance: NOTHING is handed to the launch (`launch_context=None`),
+        # yet the lane places by the kind its create recorded — read offline from the
+        # lifecycle authority record. Without T1b this fell back to `lane_class`.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            self._run(
+                tmp,
+                herdr=herdr,
+                lane="lane-heal",
+                stored_kind="delegated_coordinator",
+                launch_context=None,
+                config=self._placement(
+                    by_lane_kind={"delegated_coordinator": {"split": "down"}}
+                ),
+            )
+        self.assertEqual(self._second_split(herdr), "down")
+
+    def test_stored_kind_is_read_without_touching_the_display_cache(self) -> None:
+        # The stored kind is the ONLY durable input: a 孫 (implementation) lane and a 子
+        # (delegated_coordinator) lane in the SAME lane class get distinct geometry on a
+        # heal, decided by the lifecycle row alone.
+        config = self._placement(
+            by_lane_kind={
+                "delegated_coordinator": {"split": "down"},
+                "implementation": {"split": "right"},
+            },
+            sublane={"split": "down"},
+        )
+        splits = {}
+        for kind in ("delegated_coordinator", "implementation"):
+            with tempfile.TemporaryDirectory() as tmp:
+                herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+                self._run(
+                    tmp,
+                    herdr=herdr,
+                    lane=f"lane-{kind}",
+                    stored_kind=kind,
+                    config=config,
+                )
+                splits[kind] = self._second_split(herdr)
+        self.assertEqual(splits, {"delegated_coordinator": "down", "implementation": "right"})
+
+    def test_context_wins_when_the_lane_has_no_stored_kind(self) -> None:
+        # A fresh create: the row exists but records no kind (pre-#13647 / no durable
+        # fact), so the caller-supplied fresh-launch authority decides.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            self._run(
+                tmp,
+                herdr=herdr,
+                lane="lane-fresh",
+                stored_kind="",
+                launch_context=LaneLaunchContext(lane_kind="implementation"),
+                config=self._placement(by_lane_kind={"implementation": {"split": "right"}}),
+            )
+        self.assertEqual(self._second_split(herdr), "right")
+
+    def test_agreeing_context_and_stored_kind_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            self._run(
+                tmp,
+                herdr=herdr,
+                lane="lane-agree",
+                stored_kind="implementation",
+                launch_context=LaneLaunchContext(lane_kind="implementation"),
+                config=self._placement(by_lane_kind={"implementation": {"split": "right"}}),
+            )
+        # Agreement launches (both slots actuated) and places by the agreed kind.
+        self.assertEqual(len(herdr.start_argvs), 2)
+        self.assertEqual(self._second_split(herdr), "right")
+
+    def test_contradicting_context_refuses_with_zero_side_effect(self) -> None:
+        # The fail-closed core: a stored `implementation` lane handed a
+        # `delegated_coordinator` context is a contradiction about the SAME generation.
+        # Refuse before the first Herdr write — no workspace / tab / agent.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            with self.assertRaises(HerdrSessionStartError) as caught:
+                self._run(
+                    tmp,
+                    herdr=herdr,
+                    lane="lane-conflict",
+                    stored_kind="implementation",
+                    launch_context=LaneLaunchContext(lane_kind="delegated_coordinator"),
+                )
+            message = str(caught.exception)
+        self.assertIn("implementation", message)
+        self.assertIn("delegated_coordinator", message)
+        # Zero actuation: the refusal precedes the first `agent start` / workspace write.
+        self.assertEqual(herdr.start_argvs, [])
+
+    def test_no_stored_and_no_context_is_byte_invariant(self) -> None:
+        # Neither authority has a kind -> the pre-#13647 lane-class geometry, exactly.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            self._run(
+                tmp,
+                herdr=herdr,
+                lane="lane-plain",
+                stored_kind="",
+                launch_context=None,
+                config=self._placement(
+                    by_lane_kind={"implementation": {"split": "down"}},
+                ),
+            )
+        self.assertEqual(self._second_split(herdr), "right")  # legacy sublane split
+
+    def test_rowless_lane_is_unchanged(self) -> None:
+        # No lifecycle row at all (a scratch lane): the launch consults nothing durable
+        # and behaves exactly as before.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            self._run(
+                tmp,
+                herdr=herdr,
+                lane="lane-scratch",
+                stored_kind=None,
+                launch_context=None,
+            )
+        self.assertEqual(len(herdr.start_argvs), 2)
+        self.assertEqual(self._second_split(herdr), "right")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

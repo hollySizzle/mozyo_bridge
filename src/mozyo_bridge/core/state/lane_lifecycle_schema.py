@@ -63,11 +63,21 @@ LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
 #: (co-located, recovered by the component's own ``operator_current_state`` re-declare) rather
 #: than a separate losable cache: a load-bearing owed-state marker must not be a rebuildable
 #: cache (R6). A pre-v6 row migrates with an empty phase (an ordinary / non-reconcile row).
-LANE_LIFECYCLE_SCHEMA_VERSION = 6
-#: The component shapes this build can read and write. ``1``–``5`` are migrated
-#: additively to ``6``; anything else — a newer version from a future build, or a foreign
+#: v7 (Redmine #13647 Tranche 1b) adds ``lane_kind`` — the resolved delegation-geometry
+#: kind (``coordinator`` | ``delegated_coordinator`` | ``implementation``) the lane was
+#: created with, stored generation-bound so a heal resolves the SAME lane-role placement
+#: OFFLINE (never re-read from Redmine, never from the display cache). It is the launch
+#: path's *heal authority* for lane-role pane placement (the fresh-launch authority stays
+#: the caller-supplied ``LaneLaunchContext``); ``lane_kind`` is immutable within a
+#: generation — a governance change re-binds it on a NEW generation, never an in-place
+#: overwrite. A pre-v7 row migrates with an empty ``lane_kind`` (no durable kind fact → the
+#: launch path falls back to ``lane_class`` geometry, the issue's close condition), never a
+#: guessed value.
+LANE_LIFECYCLE_SCHEMA_VERSION = 7
+#: The component shapes this build can read and write. ``1``–``6`` are migrated
+#: additively to ``7``; anything else — a newer version from a future build, or a foreign
 #: value — fails closed and the store is left untouched (R3-F1).
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7})
 #: A coordinator decision that cannot be rebuilt from events; loss requires an
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
@@ -100,6 +110,7 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     lane_generation INTEGER NOT NULL DEFAULT 1,
     declared_slots TEXT NOT NULL DEFAULT '',
     reconcile_phase TEXT NOT NULL DEFAULT '',
+    lane_kind TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (repo_workspace_id, lane_id)
 )
 """
@@ -134,7 +145,8 @@ _COLUMNS = (
     "revision, release_action_id, release_pins, replacement_state, "
     "replacement_action_id, replacement_pins, decision_source, "
     "decision_issue_id, decision_journal, created_at, updated_at, worktree_identity, "
-    "binding_kind, project_scope, lane_generation, declared_slots, reconcile_phase"
+    "binding_kind, project_scope, lane_generation, declared_slots, reconcile_phase, "
+    "lane_kind"
 )
 
 _V1_COLUMNS = frozenset(
@@ -162,6 +174,7 @@ _V5_ADDS = frozenset(
     {"binding_kind", "project_scope", "lane_generation", "declared_slots"}  # #13810
 )
 _V6_ADDS = frozenset({"reconcile_phase"})  # #13842 reconcile owed-close provenance
+_V7_ADDS = frozenset({"lane_kind"})  # #13647 generation-bound lane-role heal authority
 
 #: The EXACT allowed column-name signatures per recorded version (Redmine #13754 R6-F1,
 #: j#78803). A recognized store must match one of its version's signatures EXACTLY (set
@@ -177,6 +190,7 @@ _SHAPE_V3_WORKTREE = _V1_COLUMNS | _V2_ADDS | _V4_ADDS
 _SHAPE_V4 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS
 _SHAPE_V5 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS | _V5_ADDS
 _SHAPE_V6 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS | _V5_ADDS | _V6_ADDS
+_SHAPE_V7 = _SHAPE_V6 | _V7_ADDS
 _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     1: (_SHAPE_V1,),
     2: (_SHAPE_V2,),
@@ -184,6 +198,7 @@ _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     4: (_SHAPE_V4,),
     5: (_SHAPE_V5,),
     6: (_SHAPE_V6,),
+    7: (_SHAPE_V7,),
 }
 
 #: The authority-affecting definition each column MUST carry: ``(type, notnull, default,
@@ -214,6 +229,7 @@ _COLUMN_DEFS: dict[str, tuple[str, int, Optional[str], int]] = {
     "lane_generation": ("INTEGER", 1, "1", 0),
     "declared_slots": ("TEXT", 1, "''", 0),
     "reconcile_phase": ("TEXT", 1, "''", 0),
+    "lane_kind": ("TEXT", 1, "''", 0),
 }
 
 
@@ -874,6 +890,14 @@ def ensure_lane_lifecycle_schema(path: Path) -> LifecycleSchemaOutcome:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN reconcile_phase TEXT NOT NULL DEFAULT ''"
+                )
+            # v7 (Redmine #13647): the generation-bound lane-role heal authority. A pre-v7 row
+            # lands with an empty ``lane_kind`` — no durable kind fact, so a heal falls back to
+            # ``lane_class`` geometry (the issue's close condition), never a guessed kind.
+            if "lane_kind" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN lane_kind TEXT NOT NULL DEFAULT ''"
                 )
             conn.execute(_OWNER_INDEX_SQL)
             conn.execute(_PROJECT_OWNER_INDEX_SQL)

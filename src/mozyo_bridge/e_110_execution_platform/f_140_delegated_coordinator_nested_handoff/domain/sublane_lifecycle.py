@@ -561,6 +561,16 @@ class SublaneCreateRequest:
     # is not part of the lane *identity* (adopt / read-back match on label / issue), so
     # it never participates in the identity guard.
     base_ref: Optional[str] = None
+    #: #13647 T1b: the delegation-geometry kind (``coordinator`` /
+    #: ``delegated_coordinator`` / ``implementation``) of the lane being created — a
+    #: GOVERNANCE fact the creating coordinator asserts (which position in the delegation
+    #: tree this lane occupies), which no probe can infer at create time and which the
+    #: display cache must never supply. Stored generation-bound on the lifecycle authority
+    #: row so a later heal resolves the lane's pane placement offline. Empty (the default)
+    #: records no kind: placement stays ``lane_class``-derived, byte-for-byte pre-#13647.
+    #: Like ``base_ref`` it is not part of the lane *identity*, so the adopt / read-back
+    #: identity guard never consults it.
+    lane_kind: str = ""
 
     def work_unit_decision(self) -> WorkUnitDispatchDecision:
         """The fail-closed #13002/#14224 work-unit dispatch decision for this request."""

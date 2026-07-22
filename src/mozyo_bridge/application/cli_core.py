@@ -25,6 +25,7 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
     agent_provider_ids,
 )
 from mozyo_bridge.application.cli_common import add_repo_option
+from mozyo_bridge.core.state.lane_kind import LANE_KINDS
 from mozyo_bridge.application.commands import (
     cmd_doctor,
     cmd_doctor_instruction,
@@ -522,6 +523,23 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     )
     sublane_create.add_argument(
         "--journal", default=None, help="Durable-anchor journal id for the dispatch step"
+    )
+    # Lane-role aware pane placement (Redmine #13647 Tranche 1b, disposition j#85650):
+    # the creating coordinator ASSERTS where in the delegation tree the new lane sits
+    # (親 / 子 / 孫) — a governance fact no probe can infer at create time and which the
+    # display cache must never supply. It is stored generation-bound on the lane's
+    # lifecycle authority row, so every later heal places the lane's panes by the same
+    # kind, offline. Omitted (the default) records no kind: placement stays lane-class
+    # derived, byte-for-byte pre-#13647. `choices` is the canonical 3-token vocabulary —
+    # deliberately no parent/child/grandchild alias (P3).
+    sublane_create.add_argument(
+        "--lane-kind",
+        dest="lane_kind",
+        choices=sorted(LANE_KINDS),
+        default="",
+        help="Delegation-geometry kind of the lane being created (coordinator / "
+        "delegated_coordinator / implementation), recorded as the durable heal "
+        "authority for this lane's pane placement (default: unrecorded)",
     )
     sublane_create.add_argument(
         "--upstream-coordinator",

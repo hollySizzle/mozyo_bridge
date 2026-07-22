@@ -130,6 +130,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     norm,
     release_transition_allowed,
 )
+from mozyo_bridge.core.state.lane_kind import optional_lane_kind
 from mozyo_bridge.core.state.lane_lifecycle_schema import (
     LANE_LIFECYCLE_COMPONENT,
     LANE_LIFECYCLE_RECOVERY_POLICY,
@@ -315,6 +316,7 @@ class LaneLifecycleStore:
         decision: DecisionPointer,
         issue_id: str = "",
         worktree_identity: str = "",
+        lane_kind: str = "",
         now: Optional[str] = None,
     ) -> CasOutcome:
         """Declare a fresh lane ``active`` / ``not_requested`` at revision 1.
@@ -331,6 +333,16 @@ class LaneLifecycleStore:
         allowed (a lane whose worktree is not yet bound), and reads back fail-closed at
         retire — never a guessed binding.
 
+        ``lane_kind`` (v7, Redmine #13647) is the delegation-geometry kind the CREATING
+        caller resolved from durable governance (``coordinator`` / ``delegated_coordinator``
+        / ``implementation``), written here so a later heal resolves the same lane-role pane
+        placement **offline**. Empty is the pre-#13647 default — no durable kind fact, so the
+        launch path falls back to ``lane_class`` geometry — while a present non-canonical
+        token fails closed (:class:`~mozyo_bridge.core.state.lane_kind.LaneKindError`) rather
+        than storing an off-vocabulary authority value. It is bound to THIS generation: no
+        transition rewrites it, and a governance change re-binds it on a new generation via
+        ``open_next_generation``.
+
         Refuses an existing lane (:data:`CAS_ALREADY_DECLARED`) — a re-declare must
         go through an explicit transition, never a silent overwrite (the
         tombstone-reviving ``lane_metadata.upsert`` is the anti-pattern). Refuses
@@ -345,6 +357,9 @@ class LaneLifecycleStore:
                 f"is being bound to {issue!r}"
             )
         worktree = norm(worktree_identity)
+        # Fail closed BEFORE the connection opens: an off-vocabulary kind never reaches the
+        # store, and the refusal costs no lock / no schema-ensuring write open.
+        kind = optional_lane_kind(norm(lane_kind), source="declare_active(lane_kind=)") or ""
         stamp = now or _utc_now()
         conn = self._connect_write(key)
         try:
@@ -373,6 +388,7 @@ class LaneLifecycleStore:
                     revision=1,
                     stamp=stamp,
                     worktree=worktree,
+                    lane_kind=kind,
                 )
             except sqlite3.IntegrityError:
                 # The index is the backstop the pre-checks above should have caught.
@@ -642,7 +658,11 @@ class LaneLifecycleStore:
                     # generation 1. Its worktree binding (Redmine #13754) and any
                     # declared-slot snapshot (Redmine #13810) are written when that lane is
                     # actually created / declared, not here — empty defaults, so its execute
-                    # retire fails closed until then, never a guessed binding.
+                    # retire fails closed until then, never a guessed binding. Its
+                    # ``lane_kind`` (v7, #13647) is empty for the same reason: a recovery lane
+                    # is a DIFFERENT lane, so inheriting the superseded lane's geometry kind
+                    # would be a guess. It falls back to ``lane_class`` placement until its own
+                    # create declares a kind.
                     _insert_active_row(
                         conn,
                         key=recovery,

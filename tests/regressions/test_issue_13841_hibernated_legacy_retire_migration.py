@@ -34,6 +34,12 @@ no raw Herdr / tmux, no origin/main, no production / tag / publish.
 
 from __future__ import annotations
 
+# The build's current lifecycle schema version: these fixtures pin "a v5 store the
+# write gate forward-migrates to CURRENT", not a frozen target version number.
+from mozyo_bridge.core.state.lane_lifecycle_schema import (
+    LANE_LIFECYCLE_SCHEMA_VERSION,
+)
+
 import argparse
 import contextlib
 import io
@@ -509,6 +515,9 @@ class RetireMigrationCommandTests(unittest.TestCase):
         conn = sqlite3.connect(lane_lifecycle_path())
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
+            # or the shape is a NEWER table merely re-stamped to an old version.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -521,6 +530,9 @@ class RetireMigrationCommandTests(unittest.TestCase):
         conn = sqlite3.connect(lane_lifecycle_path())
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
+            # or the shape is a NEWER table merely re-stamped to an old version.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -553,10 +565,10 @@ class RetireMigrationCommandTests(unittest.TestCase):
         mig = self._mig(payload)
         self.assertEqual(mig["state"], MIGRATE_BLOCKED)
         self.assertEqual(mig["reason"], MIGRATE_NOT_LEGACY_STATE)
-        self.assertEqual(self._schema_version(), 6)  # the write gate migrated the shared store
+        self.assertEqual(self._schema_version(), LANE_LIFECYCLE_SCHEMA_VERSION)  # the write gate migrated the shared store
         self.assertIsNotNone(mig["lifecycle_migration"])
         self.assertEqual(mig["lifecycle_migration"]["from_version"], 5)
-        self.assertEqual(mig["lifecycle_migration"]["to_version"], 6)
+        self.assertEqual(mig["lifecycle_migration"]["to_version"], LANE_LIFECYCLE_SCHEMA_VERSION)
         self.assertIn(
             "issue_13800_peer_lane", mig["lifecycle_migration"]["peer_active_lanes"]
         )
@@ -568,11 +580,11 @@ class RetireMigrationCommandTests(unittest.TestCase):
         self.assertEqual(self._schema_version(), 5)
         code2, text = self._migrate(json_out=False)
         self.assertEqual(code2, 1)
-        self.assertEqual(self._schema_version(), 6)
+        self.assertEqual(self._schema_version(), LANE_LIFECYCLE_SCHEMA_VERSION)
         self.assertNotIn("nothing was written", text)
         self.assertIn("row CAS did not apply", text)
         self.assertIn("SCHEMA was already forward-migrated", text)
-        self.assertIn("v5 -> v6", text)
+        self.assertIn(f"v5 -> v{LANE_LIFECYCLE_SCHEMA_VERSION}", text)
 
     # -- the happy path ---------------------------------------------------
 

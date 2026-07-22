@@ -144,11 +144,25 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
     except CoordinatorPlacementError as exc:
         die(f"herdr session-start failed: invalid operator coordinator placement: {exc}")
         raise AssertionError("unreachable")
+    # Lane-role placement (Redmine #13647 T1b): a no-lane session-start IS the coordinator
+    # (親) pair by construction of this surface, so it carries that fresh-launch authority
+    # explicitly. A NAMED lane supplies none here on purpose — its kind is the durable
+    # generation-bound fact the launch chokepoint reads OFFLINE from the lifecycle authority
+    # record (the heal authority), never re-derived from the command line or a display cache.
+    from mozyo_bridge.core.state.lane_kind import LANE_KIND_COORDINATOR
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501
+        LaneLaunchContext,
+    )
+
+    launch_context = (
+        None if lane_id else LaneLaunchContext(lane_kind=LANE_KIND_COORDINATOR)
+    )
     try:
         result = _use_case.prepare_session(
             repo_root=repo_root,
             providers=list(agents),
             lane_id=lane_id,
+            launch_context=launch_context,
             env=os.environ,
             dry_run=dry_run,
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,

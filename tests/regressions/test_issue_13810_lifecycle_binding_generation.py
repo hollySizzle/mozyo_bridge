@@ -587,10 +587,11 @@ class SchemaV5MigrationTest(unittest.TestCase):
     def test_fresh_store_is_v5_with_both_owner_indexes(self) -> None:
         LaneLifecycleStore(home=self.home).ensure_schema()
         self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
-        # v5 added the binding/generation columns; v6 (Redmine #13842) added reconcile_phase.
-        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 6)
+        # v5 added the binding/generation columns; v6 (Redmine #13842) added reconcile_phase;
+        # v7 (Redmine #13647) added lane_kind.
+        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 7)
         for col in ("binding_kind", "project_scope", "lane_generation", "declared_slots",
-                    "reconcile_phase"):
+                    "reconcile_phase", "lane_kind"):
             self.assertIn(col, self._columns())
         self.assertIn("idx_lane_lifecycle_active_owner", self._indexes())
         self.assertIn("idx_lane_lifecycle_active_project_owner", self._indexes())
@@ -606,10 +607,10 @@ class SchemaV5MigrationTest(unittest.TestCase):
         conn = sqlite3.connect(path)
         try:
             conn.execute("DROP INDEX IF EXISTS idx_lane_lifecycle_active_project_owner")
-            # Drop the v5 binding/generation columns AND the v6 reconcile_phase so the rewound
-            # shape is a genuine pre-#13810 v4 signature.
+            # Drop the v5 binding/generation columns, the v6 reconcile_phase AND the v7
+            # lane_kind so the rewound shape is a genuine pre-#13810 v4 signature.
             for col in ("binding_kind", "project_scope", "lane_generation", "declared_slots",
-                        "reconcile_phase"):
+                        "reconcile_phase", "lane_kind"):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 4 WHERE component = ?",
@@ -654,9 +655,11 @@ class SchemaV5MigrationTest(unittest.TestCase):
         path = lane_lifecycle_path(self.home)
         conn = sqlite3.connect(path)
         try:
-            # Drop ONLY the v6 reconcile_phase column; keep the v5 columns and BOTH owner
-            # indexes so the rewound shape is a genuine v5 signature, not a v4 one.
+            # Drop the post-v5 columns (v6 reconcile_phase, v7 lane_kind); keep the v5
+            # columns and BOTH owner indexes so the rewound shape is a genuine v5 signature,
+            # not a v4 one.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -683,7 +686,7 @@ class SchemaV5MigrationTest(unittest.TestCase):
         LaneLifecycleStore(home=self.home).ensure_schema()
 
         self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
-        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 6)
+        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 7)
         # the pre-migration snapshot was preserved before the first write (backup-first)
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)

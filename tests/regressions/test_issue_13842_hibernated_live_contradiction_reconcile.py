@@ -30,6 +30,12 @@ Herdr / tmux, no origin/main, no production / tag / publish.
 
 from __future__ import annotations
 
+# The build's current lifecycle schema version: these fixtures pin "a v5 store the
+# write gate forward-migrates to CURRENT", not a frozen target version number.
+from mozyo_bridge.core.state.lane_lifecycle_schema import (
+    LANE_LIFECYCLE_SCHEMA_VERSION,
+)
+
 import argparse
 import contextlib
 import io
@@ -836,6 +842,9 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         conn = sqlite3.connect(lane_lifecycle_path())
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
+            # or the shape is a NEWER table merely re-stamped to an old version.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -887,12 +896,12 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         self.assertEqual(result.state, RECONCILE_BLOCKED)
         self.assertEqual(result.reason, RECON_REVISION_RACE)
         # the write gate migrated the shared store even though the retire CAS then refused.
-        self.assertEqual(self._schema_version(), 6)
+        self.assertEqual(self._schema_version(), LANE_LIFECYCLE_SCHEMA_VERSION)
         self.assertFalse(result.retired)  # the lane ROW was NOT retired
         self.assertEqual(result.closed, ())  # and nothing was closed
         self.assertIsNotNone(result.lifecycle_migration)
         self.assertEqual(result.lifecycle_migration["from_version"], 5)
-        self.assertEqual(result.lifecycle_migration["to_version"], 6)
+        self.assertEqual(result.lifecycle_migration["to_version"], LANE_LIFECYCLE_SCHEMA_VERSION)
         self.assertIn(
             "issue_13800_peer_lane", result.lifecycle_migration["peer_active_lanes"]
         )
@@ -901,7 +910,7 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         self.assertNotIn("nothing was written or closed", text)
         self.assertIn("no lane-row write and no pane close", text)
         self.assertIn("separate side effect", text)
-        self.assertIn("v5 -> v6", text)
+        self.assertIn(f"v5 -> v{LANE_LIFECYCLE_SCHEMA_VERSION}", text)
 
     def test_r13844_v5_peer_migrating_close_failure_is_honest_auxiliary(self) -> None:
         # Auxiliary (Redmine #13844 R6-F2): a DIFFERENT production migrating-blocked branch — the
@@ -916,13 +925,13 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         result = self._run(ops=ops)
         self.assertEqual(result.state, RECONCILE_BLOCKED)
         self.assertEqual(result.reason, RECON_CLOSE_FAILED)
-        self.assertEqual(self._schema_version(), 6)
+        self.assertEqual(self._schema_version(), LANE_LIFECYCLE_SCHEMA_VERSION)
         self.assertTrue(result.retired)
         self.assertEqual(result.lifecycle_migration["from_version"], 5)
         text = format_reconcile_text(result)
         self.assertNotIn("nothing was written or closed", text)
         self.assertIn("durable write: lane retired", text)
-        self.assertIn("v5 -> v6", text)
+        self.assertIn(f"v5 -> v{LANE_LIFECYCLE_SCHEMA_VERSION}", text)
 
     # -- the happy path ---------------------------------------------------
 

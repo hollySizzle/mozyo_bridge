@@ -445,12 +445,56 @@ lane_placement:
   (`_FORBIDDEN_KEY_PARTS`) は `pane` を含む key を allowed-key 判定より前に拒否するため、live pane
   addressing に見えない名前へ寄せている (boundary screen は緩めない)。
 
-### 拡張点 (v1 非対象)
+### 拡張点 (#13646 v1 非対象 → #13647 で解消)
 
-owner の「親子孫 3 層それぞれで変えたい」要望のうち、**layer 別 (親 / 子 / 孫 lane role 別) の key 分けは
-v1 に含めない**: launch 経路の語彙は現状 lane_class (`default` / `sublane`) の 2 値であり、layer 別 keying
-には lane-role 語彙の launch 時解決が別途必要。schema は lane class key を追加するだけで拡張でき
-(closed set に新 class を足す)、既存 class の意味論は変わらないため、この拡張点は塞がっていない。
+owner の「親子孫 3 層それぞれで変えたい」要望のうち、layer 別 (親 / 子 / 孫 lane role 別) の key 分けは
+**#13646 v1 には含めなかった**: launch 経路の語彙が lane_class (`default` / `sublane`) の 2 値しか無く、
+layer 別 keying には lane-role 語彙の launch 時解決が別途必要だったため。予告どおり既存 class の意味論を
+変えない additive 拡張として **#13647 が `by_lane_kind` block を追加**した (下記 §5.2)。
+
+## 5.2 by_lane_kind — lane-role (親 / 子 / 孫) 別 pane 幾何 (Redmine #13647)
+
+§5.1 の lane_class 軸と **disjoint な additive 軸**。同じ `sublane` class の中で 子
+(`delegated_coordinator`) と 孫 (`implementation`) に異なる split を与える。
+
+```yaml
+lane_placement:
+  sublane:                       # lane class 軸 (#13646) — そのまま有効
+    split: right
+  by_lane_kind:                  # lane role 軸 (#13647) — additive
+    coordinator:            { split: down }
+    delegated_coordinator:  { split: down }
+    implementation:         { split: right, order: [claude, codex] }
+```
+
+### Vocabulary (fail-closed、alias 無し)
+
+- key は canonical 3-token `coordinator` | `delegated_coordinator` | `implementation` **のみ**
+  (disposition j#85650 P3)。`parent` / `child` / `grandchild` / `coordinator_assistant` は parse 時に
+  `LanePlacementError`。owner 向け表示が 親/子/孫 を使うことと machine vocabulary の拡張は別。
+- `split` / `order` の語彙・fail-closed 規律は §5.1 と同一。block 自体は optional。
+
+### Precedence
+
+`by_lane_kind[kind]` > `lane_class` > legacy 既定。kind 層が参照されるのは **durable な lane_kind が
+解決でき、かつ config がその kind を明示宣言している時だけ**。未解決 kind / 未宣言 kind / block 不在は
+すべて §5.1 の lane-class 解決へ **byte 一致で** fall-through する (`resolve_container_plan` 幾何
+engine は無改修)。
+
+### lane_kind の 2 authority (Redmine #13647 Tranche 1a / 1b)
+
+- **fresh launch** = caller-supplied `LaneLaunchContext` (pure immutable value)。create / heal
+  boundary で **創出側 caller が governance から解決**して `prepare_session` へ渡す。bare `mozyo`
+  launch と no-lane `herdr session-start` は構造上 `coordinator` を渡す。`sublane create --lane-kind`
+  は創出側 coordinator の宣言を運ぶ。
+- **heal** = lane lifecycle authority row の generation-bound `lane_kind` (schema v7、
+  `managed-state-model.md`)。launch chokepoint が **network 無し / display cache 無し**で offline 読解する。
+- **矛盾は fail-closed**: 両方あって不一致なら片方が stale。launch admission (#14242 の
+  disposition admission と同じ pre-side-effect boundary、同一 snapshot) が **workspace / tab / agent を
+  1 つも作らずに拒否**する。再結線は generation 境界 (`open_next_generation(lane_kind=...)`) のみ。
+- provider / pane 近接 / `lane_metadata` などの display 由来値から lane_kind を推測しない
+  (disposition j#85650)。`--dry-run` は durable state を一切参照せず caller context だけで plan する
+  (#13595 / #14242 と同じく dry run は store-free)。
 
 ## 5.1.1 coordinator placement mode — operator-scoped 配置 (Redmine #14139)
 

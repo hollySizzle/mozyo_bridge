@@ -134,6 +134,9 @@ def _seed_v5(home: Path, *, disposition: str = DISPOSITION_ACTIVE) -> Path:
     conn = sqlite3.connect(path)
     try:
         conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+        # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
+        # or the shape is a NEWER table merely re-stamped to an old version.
+        conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
         conn.execute(
             "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
             (LANE_LIFECYCLE_COMPONENT,),
@@ -355,9 +358,9 @@ class WriteMigratingGateTest(unittest.TestCase):
         out = ensure_lane_lifecycle_schema(path)
         self.assertEqual(out.action, SCHEMA_MIGRATED)
         self.assertEqual(out.from_version, 5)
-        self.assertEqual(out.to_version, 6)
+        self.assertEqual(out.to_version, LANE_LIFECYCLE_SCHEMA_VERSION)
         self.assertIsNotNone(out.backup_dir)
-        self.assertEqual(_recorded_version(self.home), 6)
+        self.assertEqual(_recorded_version(self.home), LANE_LIFECYCLE_SCHEMA_VERSION)
         self.assertIn("reconcile_phase", _columns(self.home))
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)
@@ -383,7 +386,7 @@ class WriteMigratingGateTest(unittest.TestCase):
         self.assertEqual(rec.reconcile_phase, "")
         self.assertEqual(_recorded_version(self.home), 5)  # read did not migrate
         ensure_lane_lifecycle_schema(path)  # now an explicit writer migrates
-        self.assertEqual(_recorded_version(self.home), 6)
+        self.assertEqual(_recorded_version(self.home), LANE_LIFECYCLE_SCHEMA_VERSION)
 
     def test_writer_still_fails_closed_on_newer_store(self) -> None:
         path = _seed_v5(self.home)
@@ -579,7 +582,7 @@ class WriteGatePreparationTest(unittest.TestCase):
         self.assertTrue(prep.migrated)
         self.assertTrue(prep.peer_reader_risk)
         # and the store is now migrated (the gate performed the mutation)
-        self.assertEqual(_recorded_version(self.home), 6)
+        self.assertEqual(_recorded_version(self.home), LANE_LIFECYCLE_SCHEMA_VERSION)
 
     def test_declare_lane_surfaces_write_preparation(self) -> None:
         # Redmine #13844 F1: the production declaration write gate (LaneDeclarationStore) runs the
@@ -789,7 +792,7 @@ class FaithfulReviewAndConcurrencyTest(unittest.TestCase):
         self.assertEqual(errors, [])  # no torn read, no spurious lock failure
         self.assertTrue(read_dispositions)
         self.assertTrue(all(d == DISPOSITION_ACTIVE for d in read_dispositions))
-        self.assertEqual(_recorded_version(self.home), 6)  # the migration committed
+        self.assertEqual(_recorded_version(self.home), LANE_LIFECYCLE_SCHEMA_VERSION)  # the migration committed
 
     def test_migration_restart_idempotent_under_repeated_ensure(self) -> None:
         # Restart idempotency: repeated explicit ensures after the first migration are intact,
@@ -885,7 +888,7 @@ class TornSnapshotReadDuringMigrationTest(unittest.TestCase):
 
         self.assertEqual(errors, [])  # a torn snapshot fails here as partial/corrupt
         self.assertEqual(reader_calls["n"], 2)  # the pinned point was actually exercised
-        self.assertEqual(_recorded_version(self.home), 6)  # the migration committed
+        self.assertEqual(_recorded_version(self.home), LANE_LIFECYCLE_SCHEMA_VERSION)  # the migration committed
         self.assertEqual(len(results), 1)
         return results[0]
 
@@ -963,6 +966,9 @@ class UniversalWriteGateTest(unittest.TestCase):
         conn = sqlite3.connect(path)
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
+            # or the shape is a NEWER table merely re-stamped to an old version.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -994,7 +1000,7 @@ class UniversalWriteGateTest(unittest.TestCase):
         self.assertIn("issue_13800_peer_lane", prep.preflight.peer_active_lanes)
         self.assertNotIn(LANE, prep.preflight.peer_active_lanes)  # writer excluded
         self.assertTrue(prep.peer_reader_risk)
-        self.assertEqual(_recorded_version(self.home), 6)
+        self.assertEqual(_recorded_version(self.home), LANE_LIFECYCLE_SCHEMA_VERSION)
 
     def test_release_mutation_runs_gate(self) -> None:
         # A release open (request_release) on a non-active lane also runs the gate.
@@ -1008,7 +1014,7 @@ class UniversalWriteGateTest(unittest.TestCase):
             target="hibernated",
             decision=_issue_decision(),
         )
-        self.assertEqual(_recorded_version(self.home), 6)
+        self.assertEqual(_recorded_version(self.home), LANE_LIFECYCLE_SCHEMA_VERSION)
         # request_release still goes through the gate (intact now); last_write_preparation set.
         rec2 = store.get(LaneLifecycleKey(WS, LANE))
         from mozyo_bridge.core.state.lane_lifecycle import ReleasePin
@@ -1146,6 +1152,9 @@ class RealCommandMigrationAdvisoryTest(unittest.TestCase):
         conn = sqlite3.connect(path)
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
+            # or the shape is a NEWER table merely re-stamped to an old version.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1197,8 +1206,8 @@ class RealCommandMigrationAdvisoryTest(unittest.TestCase):
         self.assertIn("advisory (Redmine #13844)", advisory)
         self.assertIn("ABOUT TO forward-migrate", advisory)  # pre-migration wording
         self.assertIn("issue_13800_peer_lane", advisory)
-        self.assertIn("v5 -> v6", advisory)
-        self.assertEqual(_recorded_version(self.home), 6)
+        self.assertIn(f"v5 -> v{LANE_LIFECYCLE_SCHEMA_VERSION}", advisory)
+        self.assertEqual(_recorded_version(self.home), LANE_LIFECYCLE_SCHEMA_VERSION)
 
 
 # -- R3-F1: the advisory is emitted BEFORE the migration (time-series) -------------------
@@ -1229,6 +1238,9 @@ class PreMigrationAdvisoryTimingTest(unittest.TestCase):
         conn = sqlite3.connect(path)
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
+            # or the shape is a NEWER table merely re-stamped to an old version.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1272,7 +1284,7 @@ class PreMigrationAdvisoryTimingTest(unittest.TestCase):
         self.assertEqual(snap.get("version_at_emit"), 5)
         self.assertEqual(snap.get("backups_at_emit"), 0)
         # ... and only the subsequent migration made it v6 with the backup-first snapshot.
-        self.assertEqual(_recorded_version(self.home), 6)
+        self.assertEqual(_recorded_version(self.home), LANE_LIFECYCLE_SCHEMA_VERSION)
         self.assertEqual(len(list((self.home / "backups").glob("state-*"))), 1)
 
 
@@ -1304,6 +1316,9 @@ class ComposingStoreMigrationSurfaceTest(unittest.TestCase):
         conn = sqlite3.connect(path)
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
+            # or the shape is a NEWER table merely re-stamped to an old version.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),

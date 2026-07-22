@@ -566,6 +566,11 @@ def _build_create_request(
         work_unit_decision_anchor=work_unit_decision_anchor,
         leaf_standalone=bool(getattr(args, "leaf_standalone", False)),
         base_ref=getattr(args, "base_ref", None),
+        # Redmine #13647 T1b: the caller-asserted delegation-geometry kind. Both request
+        # construction sites (this plan-only surface and the actuating one in
+        # `sublane_actuator`) must carry it, or a plan and its `--execute` would resolve
+        # different placement authority (the j#84882 drift lesson).
+        lane_kind=getattr(args, "lane_kind", "") or "",
     )
 
 

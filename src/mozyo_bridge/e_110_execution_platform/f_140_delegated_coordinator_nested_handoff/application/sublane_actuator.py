@@ -222,6 +222,10 @@ def _resolve_sublane_ops(
             # owner binding rides the same `--journal` the dispatch leg carries. A create
             # with no journal is owner-unbound (no lifecycle row).
             journal=request.journal or "",
+            # Redmine #13647 T1b: the creating caller's delegation-geometry assertion
+            # travels to the create-time lifecycle declaration, where it is stored
+            # generation-bound as the lane's offline heal authority for pane placement.
+            lane_kind=request.lane_kind,
             quiet_stdout=quiet_stdout,
         )
     return LiveSublaneActuatorOps(repo_root=repo_root, quiet_stdout=quiet_stdout)
@@ -330,6 +334,7 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
         # the drift the exact-installed black-box caught.
         leaf_standalone=bool(getattr(args, "leaf_standalone", False)),
         base_ref=getattr(args, "base_ref", None),
+        lane_kind=getattr(args, "lane_kind", "") or "",
     )
     fill_inputs, override_fill_stop = resolve_dispatch_admission_args(args)
     # #13293: in --json mode, confine the composed sub-CLI (cockpit append / handoff

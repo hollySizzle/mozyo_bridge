@@ -22,6 +22,12 @@ targets the exact pinned locator (never a foreign or recycled pane).
 
 from __future__ import annotations
 
+# The build's current lifecycle schema version: these fixtures pin "a v5 store the
+# write gate forward-migrates to CURRENT", not a frozen target version number.
+from mozyo_bridge.core.state.lane_lifecycle_schema import (
+    LANE_LIFECYCLE_SCHEMA_VERSION,
+)
+
 import dataclasses
 import sys
 import tempfile
@@ -824,6 +830,9 @@ class QuarantineMigrationAuditTest(_QuarantineCase):
         conn = sqlite3.connect(path)
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
+            # or the shape is a NEWER table merely re-stamped to an old version.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -853,18 +862,18 @@ class QuarantineMigrationAuditTest(_QuarantineCase):
         outcome = self._run(_FakeOps(), execute=True)
 
         self.assertEqual(outcome.replacement_state, REPLACEMENT_REPLACED)
-        self.assertEqual(self._recorded_version(), 6)  # the first write migrated the store
+        self.assertEqual(self._recorded_version(), LANE_LIFECYCLE_SCHEMA_VERSION)  # the first write migrated the store
         # The migration is NOT lost to the later intact writes (R4-F1): the outcome carries it.
         self.assertIsNotNone(outcome.lifecycle_migration)
         self.assertEqual(outcome.lifecycle_migration["from_version"], 5)
-        self.assertEqual(outcome.lifecycle_migration["to_version"], 6)
+        self.assertEqual(outcome.lifecycle_migration["to_version"], LANE_LIFECYCLE_SCHEMA_VERSION)
         self.assertIn("issue_13800_peer_lane", outcome.lifecycle_migration["peer_active_lanes"])
         # JSON payload carries it ...
         self.assertEqual(outcome.as_payload()["lifecycle_migration"]["from_version"], 5)
         # ... and the text renderer surfaces it.
         text = quarantine_module.format_quarantine_text(outcome)
         self.assertIn("forward-migrated", text)
-        self.assertIn("v5 -> v6", text)
+        self.assertIn(f"v5 -> v{LANE_LIFECYCLE_SCHEMA_VERSION}", text)
 
     def test_reused_store_does_not_report_a_past_run_migration(self) -> None:
         # Redmine #13844 R5-F1: the migration is OPERATION-scoped, not store-lifetime. A store /
@@ -877,7 +886,7 @@ class QuarantineMigrationAuditTest(_QuarantineCase):
         # (a) v5 success -> migrates the shared store to v6 and reports it.
         first = self._run(_FakeOps(), execute=True)
         self.assertEqual(first.lifecycle_migration["from_version"], 5)
-        self.assertEqual(self._recorded_version(), 6)
+        self.assertEqual(self._recorded_version(), LANE_LIFECYCLE_SCHEMA_VERSION)
 
         # (b) execute=False preflight on the SAME store: no write, no migration this run.
         second = self._run(_FakeOps(signal=_signal(correlated_marker_ids=(MARKER,))), execute=False)
@@ -909,11 +918,11 @@ class QuarantineMigrationAuditTest(_QuarantineCase):
         self.store = LaneReplacementStore(home=self.home)
         redrive = self._run(_FakeOps(signal=_signal(generation_matches=False)))
         self.assertEqual(redrive.replacement_state, REPLACEMENT_REPLACED)
-        self.assertEqual(self._recorded_version(), 6)
+        self.assertEqual(self._recorded_version(), LANE_LIFECYCLE_SCHEMA_VERSION)
         self.assertIsNotNone(redrive.lifecycle_migration)
         self.assertEqual(redrive.lifecycle_migration["from_version"], 5)
         self.assertEqual(redrive.as_payload()["lifecycle_migration"]["from_version"], 5)
-        self.assertIn("v5 -> v6", quarantine_module.format_quarantine_text(redrive))
+        self.assertIn(f"v5 -> v{LANE_LIFECYCLE_SCHEMA_VERSION}", quarantine_module.format_quarantine_text(redrive))
 
     def test_existing_requested_redrive_on_v5_carries_migration(self) -> None:
         # Redmine #13844 R6-F1: a redrive of an EXISTING requested generation migrates on its
@@ -929,10 +938,10 @@ class QuarantineMigrationAuditTest(_QuarantineCase):
         self.store = LaneReplacementStore(home=self.home)
         redrive = self._run(_FakeOps())  # close now succeeds -> pending -> replaced
         self.assertEqual(redrive.replacement_state, REPLACEMENT_REPLACED)
-        self.assertEqual(self._recorded_version(), 6)
+        self.assertEqual(self._recorded_version(), LANE_LIFECYCLE_SCHEMA_VERSION)
         self.assertIsNotNone(redrive.lifecycle_migration)
         self.assertEqual(redrive.lifecycle_migration["from_version"], 5)
-        self.assertIn("v5 -> v6", quarantine_module.format_quarantine_text(redrive))
+        self.assertIn(f"v5 -> v{LANE_LIFECYCLE_SCHEMA_VERSION}", quarantine_module.format_quarantine_text(redrive))
 
 
 if __name__ == "__main__":

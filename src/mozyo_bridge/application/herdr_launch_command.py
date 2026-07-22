@@ -277,10 +277,21 @@ class LiveHerdrLaunchOps:
         except CoordinatorPlacementError as exc:
             self.die(f"mozyo launch failed: invalid operator coordinator placement: {exc}")
             raise AssertionError("unreachable")
+        # Lane-role placement (Redmine #13647): the bare `mozyo` pair IS the 親 —
+        # `lane_kind: coordinator` is true by construction of this entry point, not
+        # inferred from a display cache or pane proximity, so it is the caller-supplied
+        # fresh-launch authority the launch chokepoint keys `by_lane_kind` on. A repo with
+        # no `by_lane_kind.coordinator` block keeps its `lane_placement.default` geometry.
+        from mozyo_bridge.core.state.lane_kind import LANE_KIND_COORDINATOR
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501
+            LaneLaunchContext,
+        )
+
         return prepare_session(
             repo_root=repo_root,
             providers=list(LAUNCH_PROVIDERS),
             lane_id="",
+            launch_context=LaneLaunchContext(lane_kind=LANE_KIND_COORDINATOR),
             env=self._env,
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
             agent_launch=repo_config.agent_launch,

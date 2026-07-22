@@ -156,6 +156,12 @@ class HerdrSublaneActuatorOps:
     #: #13681 W1). It travels the same ``--journal`` anchor the dispatch leg uses; a
     #: create with no journal is owner-unbound and writes no lifecycle row.
     journal: str = ""
+    #: The delegation-geometry kind (``coordinator`` / ``delegated_coordinator`` /
+    #: ``implementation``) the CREATING caller resolved from durable governance (Redmine
+    #: #13647 T1b). Stored generation-bound on the lifecycle authority row at create, so a
+    #: later heal resolves this lane's pane placement offline. Empty (every pre-#13647
+    #: caller) records no kind and keeps ``lane_class`` placement, byte-for-byte.
+    lane_kind: str = ""
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     runner: Optional[Runner] = None
     providers: tuple[str, ...] = HERDR_LANE_PROVIDERS
@@ -456,61 +462,27 @@ class HerdrSublaneActuatorOps:
     def _declare_lane_lifecycle(
         self, repo_workspace_id: str, *, worktree_identity: str = ""
     ) -> None:
-        """Declare this lane's owner binding (best-effort, never raises; Redmine #13681 W1).
+        """Declare this lane's owner binding via the create-declaration leaf (#13681 W1).
 
-        A declare needs both the lane unit identity `(repo_workspace_id, lane_label)`
-        and the durable decision anchor `(--journal)`. A create with no journal — or an
-        unresolved workspace segment / lane label — is **owner-unbound**: no lifecycle
-        row is written, and the lane reads as owner-unbound at the roster and send gate.
-        That is a fail-closed gap surfaced honestly downstream, never a guessed owner.
-
-        ``worktree_identity`` (Redmine #13754) is the lane's canonical worktree token,
-        recorded here so ``retire --execute`` can prove the caller's ``--worktree``
-        belongs to this lane. It is the SAME token the display-metadata record is keyed
-        on, computed once at the create boundary so writer and reader cannot drift.
-
-        The write is best-effort like the metadata upsert: a store error never breaks the
-        actuation. A re-run (self-heal, #13378) re-declares and is refused idempotently
-        (`already_declared`); a create for an issue another lane still actively owns is
-        refused (`owner_conflict`) and the recovery lane stays unbound until an explicit
-        `sublane supersede` hands ownership over (W2) — both are correct, not errors.
+        The body moved to
+        :func:`...sublane_create_lifecycle_declaration.declare_created_lane_lifecycle`
+        unchanged (module-health leaf extraction, Redmine #13647 T1b); this stays as the
+        adapter's call seam and supplies the create-time governance facts it owns —
+        including ``lane_kind``, the delegation-geometry kind (親 / 子 / 孫) the creating
+        caller resolved and this create stores generation-bound as the heal authority.
         """
-        journal = _norm(self.journal)
-        issue = _norm(self.issue)
-        lane = _norm(self.lane_label)
-        workspace = _norm(repo_workspace_id)
-        if not (journal and issue and lane and workspace):
-            return
-        from mozyo_bridge.core.state.lane_lifecycle import (
-            DecisionPointer,
-            DecisionPointerError,
-            LaneLifecycleError,
-            LaneLifecycleKey,
-            LaneLifecycleStore,
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_create_lifecycle_declaration import (  # noqa: E501
+            declare_created_lane_lifecycle,
         )
 
-        try:
-            key = LaneLifecycleKey(workspace, lane)
-            decision = DecisionPointer(
-                source="redmine", issue_id=issue, journal_id=journal
-            )
-        except (DecisionPointerError, ValueError):
-            # A non-decimal issue / journal cannot anchor a re-readable decision — skip
-            # rather than write an owner row no recovery could ever resolve.
-            return
-        try:
-            LaneLifecycleStore().declare_active(
-                key,
-                decision=decision,
-                issue_id=issue,
-                worktree_identity=worktree_identity,
-            )
-        except (LaneLifecycleError, DecisionPointerError, OSError) as exc:
-            print(
-                f"warning: lane lifecycle declare skipped ({type(exc).__name__}); "
-                "lane reads as owner-unbound",
-                file=sys.stderr,
-            )
+        declare_created_lane_lifecycle(
+            repo_workspace_id=repo_workspace_id,
+            lane_label=self.lane_label,
+            issue=self.issue,
+            journal=self.journal,
+            worktree_identity=worktree_identity,
+            lane_kind=self.lane_kind,
+        )
 
     def declare_adopted_lane_lifecycle(
         self, worktree_path: str, *, adopted: bool

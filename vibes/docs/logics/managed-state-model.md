@@ -329,6 +329,33 @@ Table naming:
     unsupported として DB を書き換えない」の実装)。rows は lifecycle authority であり、metadata を
     v2 へ書き戻すと **newer semantics を知らない code が authority を更新できてしまう**。read/write は
     `unknown` / `None` / error へ落ち、active を推定しない。
+  - **lane 幾何 kind (lane-role pane placement の heal 正本)** (schema v7、#13647 Tranche 1b /
+    Design Answer j#85645 / disposition j#85650 P1)。追加 field `lane_kind`
+    (`coordinator` | `delegated_coordinator` | `implementation` の canonical 3-token。alias 無し)。
+    - **何を保存するか**: lane が **create された時点で創出側 caller が governance から解決した**
+      delegation-tree 上の位置 (親 / 子 / 孫)。placement geometry 軸であり、mzb1 name /
+      `MOZYO_AGENT_ROLE` (= provider) / route / attest / retire authority には一切昇格しない。
+    - **なぜ authority row に置くか**: heal (再 launch) が **同じ pane geometry を offline で**
+      再現するため。launch path (`prepare_session`) は pure orchestration であり、heal のたびに
+      Redmine を読み直す network 依存を launch chokepoint へ持ち込まない。`lane_metadata` /
+      display projection は自身の docstring で "never routing authority / read fail-open" を宣言する
+      **display join** なので、そこへ role 列を足して launch authority へ昇格させない
+      (この誤設計は j#85644 → 正本 j#85645 で棄却済み)。
+    - **generation-bound / immutable**: 世代内では不変。governance 上の再結線は
+      `open_next_generation(lane_kind=...)` という **明示 CAS の generation 境界でのみ** 起きる
+      (`None` = 現世代の値を carry forward、明示 `""` = 「durable kind fact 無し」への retract)。
+      ordinary な disposition transition は `lane_kind` を書き換えない。
+    - **declaration identity の一部**: 異なる kind を載せた re-declare は idempotent no-op ではなく
+      **divergent re-declare** (`already_declared`、zero-write)。既存 geometry authority を後発
+      caller の推測で上書きさせない (`lane_metadata.upsert` の tombstone 復活 anti-pattern と同型)。
+    - **fail-closed vocabulary**: 非 canonical token は store へ届く前に `LaneKindError` で zero-write
+      拒否。`declared_slots` には混載しない (あちらは launch 後 observation、こちらは pre-launch 宣言)。
+    - **migration / fallback**: pre-v7 row は additive backup-first migration で **空** `lane_kind` を
+      得る (推測値を書かない)。空 = durable kind fact 無し → launch は従来どおり `lane_class`
+      (`default` / `sublane`) 幾何へ byte 一致で fallback する。
+    - **launch 時の 2 authority と矛盾時の扱い** (`herdr-native-identity.md` §5.2): fresh launch は
+      caller-supplied `LaneLaunchContext`、heal は本 field。両方あり **不一致**なら片方が stale なので
+      launch は **zero side effect で fail-closed 拒否** (どちらかを黙って採用しない)。
   - **binding kind / lane generation / typed process pins** (schema v5、#13810 / Design Answer
     j#78386)。project-gateway 用の別 owner component は作らず、同一 `lane_lifecycle_records` row /
     同一 revision CAS を additive 拡張する (別 component にすると owner row と release/replacement
