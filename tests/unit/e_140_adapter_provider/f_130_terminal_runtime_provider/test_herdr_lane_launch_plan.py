@@ -279,6 +279,46 @@ class LaneLaunchPlanImmutabilityTest(unittest.TestCase):
         self.assertIsInstance(plan.slots, tuple)
         self.assertIsInstance(plan.slots[0].launch_argv, tuple)
 
+    def test_the_resolver_copies_the_placement_order(self) -> None:
+        # Review j#85863: the order sequence IS the launch geometry (which provider occupies
+        # the container), so a caller-owned list here means the validated geometry could
+        # change between the preflight and the launch that acts on it.
+        order = ["claude", "codex"]
+        plan = _resolve([_spec()], placement=("right", order))
+        order.clear()
+        self.assertEqual(plan.placement, ("right", ("claude", "codex")))
+
+    def test_the_public_constructor_owns_its_sequences(self) -> None:
+        # The type is public, so it must own its data on EVERY construction path — not only
+        # the one the resolver takes.
+        slots = [_spec()]
+        order = ["claude"]
+        plan = ResolvedLaneLaunchPlan(
+            lane_class="sublane", slots=slots, placement=("down", order)
+        )
+        slots.clear()
+        order.clear()
+        self.assertEqual(len(plan.slots), 1)
+        self.assertIsInstance(plan.slots, tuple)
+        self.assertEqual(plan.placement, ("down", ("claude",)))
+
+    def test_the_constructor_refuses_malformed_sequences(self) -> None:
+        for kwargs in (
+            {"slots": ["not a slot"]},
+            {"slots": "claude"},
+            {"placement": ("right", ["claude", 7])},
+            {"placement": ("right", "claude")},
+            {"placement": (1, None)},
+            {"placement": ("right",)},
+        ):
+            with self.assertRaises(LaneLaunchPlanError):
+                ResolvedLaneLaunchPlan(lane_class="sublane", **kwargs)
+
+    def test_an_absent_placement_stays_the_neutral_pair(self) -> None:
+        plan = ResolvedLaneLaunchPlan(lane_class="sublane")
+        self.assertEqual(plan.placement, (None, None))
+        self.assertEqual(ResolvedLaneLaunchPlan(lane_class="sublane", placement=None).placement, (None, None))
+
 
 class LaneLaunchPlanAnchorTest(unittest.TestCase):
     @staticmethod

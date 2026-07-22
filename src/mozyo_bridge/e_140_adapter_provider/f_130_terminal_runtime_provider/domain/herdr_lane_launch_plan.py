@@ -56,8 +56,9 @@ class SlotLaunchSpec:
     registry defines); ``profile_id`` is the named profile that role selects; ``provider``
     is the runtime that executes it; ``launch_argv`` is the exact resolved argv tail.
     ``physical_slot`` names the pair position the slot occupies (a caller-supplied label
-    such as ``"first"`` / ``"second"``, or ``""`` when the caller does not pin one) — it is
-    a *plan* coordinate, never a live ``%pane`` id.
+    such as ``"first"`` / ``"second"``) — a *plan* coordinate, never a live ``%pane`` id. It
+    is REQUIRED in a plan: a blank position is not "unpinned", it is an unstated one, and it
+    used to slip past the position-collision check (review j#85859 F2).
 
     Every field is caller-supplied on purpose: this type asserts nothing about where the
     values came from, and the plan below refuses whatever it cannot fully resolve.
@@ -98,6 +99,67 @@ class SlotLaunchSpec:
         object.__setattr__(self, "launch_argv", tokens)
 
 
+def _owned_slots(slots: object) -> tuple:
+    """The plan's own immutable slot sequence, or a typed refusal (review j#85863)."""
+    if isinstance(slots, (str, bytes)):
+        raise LaneLaunchPlanError(
+            f"plan slots must be a sequence of SlotLaunchSpec, got {type(slots).__name__}"
+        )
+    try:
+        owned = tuple(slots)
+    except TypeError as exc:
+        raise LaneLaunchPlanError(
+            f"plan slots are not iterable ({type(slots).__name__})"
+        ) from exc
+    for slot in owned:
+        if not isinstance(slot, SlotLaunchSpec):
+            raise LaneLaunchPlanError(
+                f"plan slot {slot!r} is {type(slot).__name__}, not SlotLaunchSpec; the plan "
+                "does not carry a slot it cannot validate"
+            )
+    return owned
+
+
+def _owned_placement(placement: object) -> tuple:
+    """The plan's own immutable ``(split, order)`` geometry, or a typed refusal.
+
+    The order sequence is the launch geometry — WHICH provider occupies the container — so a
+    caller-owned list here means the resolved geometry could change between validation and
+    the launch that acts on it.
+    """
+    if placement is None:
+        return (None, None)
+    try:
+        split, order = placement
+    except (TypeError, ValueError) as exc:
+        raise LaneLaunchPlanError(
+            f"plan placement must be a (split, order) pair, got {placement!r}"
+        ) from exc
+    if split is not None and not isinstance(split, str):
+        raise LaneLaunchPlanError(
+            f"plan placement split must be a string or None, got {type(split).__name__}"
+        )
+    if order is None:
+        return (split, None)
+    if isinstance(order, (str, bytes)):
+        raise LaneLaunchPlanError(
+            f"plan placement order must be a sequence of providers, got {order!r}"
+        )
+    try:
+        owned_order = tuple(order)
+    except TypeError as exc:
+        raise LaneLaunchPlanError(
+            f"plan placement order is not iterable ({type(order).__name__})"
+        ) from exc
+    for provider in owned_order:
+        if not isinstance(provider, str):
+            raise LaneLaunchPlanError(
+                f"plan placement order entry {provider!r} is {type(provider).__name__}, "
+                "not str"
+            )
+    return (split, owned_order)
+
+
 @dataclass(frozen=True)
 class ResolvedLaneLaunchPlan:
     """A fully resolved, validated pair plan — the last thing fixed before the first write.
@@ -106,8 +168,13 @@ class ResolvedLaneLaunchPlan:
     ``source_anchor`` is the durable governance record the whole plan was resolved from;
     ``slots`` are the validated per-slot plans in launch order.
 
-    Constructed only by :func:`resolve_lane_launch_plan`, so an instance is by construction
-    one that passed every whole-plan validation.
+    Normally constructed by :func:`resolve_lane_launch_plan`, so an instance has passed every
+    whole-plan validation — but the constructor is public, so it OWNS its data either way:
+    every sequence it is handed is copied into a tuple here (review j#85863). ``frozen=True``
+    only stops the attributes being re-bound; without the copy a caller that passed a list
+    kept a live handle into the validated plan and could empty its slots or its launch order
+    afterwards (both measured). A plan that can change after it is validated cannot be "the
+    last thing fixed before the first write", which is this type's entire purpose.
     """
 
     lane_class: str
@@ -115,6 +182,10 @@ class ResolvedLaneLaunchPlan:
     placement: tuple[Optional[str], Optional[Sequence[str]]] = (None, None)
     source_anchor: Optional[DecisionPointer] = None
     slots: tuple[SlotLaunchSpec, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "slots", _owned_slots(self.slots))
+        object.__setattr__(self, "placement", _owned_placement(self.placement))
 
     @property
     def workflow_roles(self) -> tuple[str, ...]:
@@ -280,31 +351,30 @@ def resolve_lane_launch_plan(
                 f"{where} pins no physical slot; a plan that describes this launch names "
                 "the pair position each slot occupies"
             )
-        if True:
-            previous = by_position.get(position)
-            if previous is None:
-                by_position[position] = slot
-            elif previous.provider == slot.provider:
-                if (
-                    previous.profile_id != slot.profile_id
-                    or previous.launch_argv != slot.launch_argv
-                ):
-                    raise LaneLaunchPlanError(
-                        f"physical slot {position!r} is planned twice for provider "
-                        f"{slot.provider!r} with different profile / argv "
-                        f"({previous.profile_id!r} vs {slot.profile_id!r}); the plan does "
-                        "not choose between them"
-                    )
+        previous = by_position.get(position)
+        if previous is None:
+            by_position[position] = slot
+        elif previous.provider == slot.provider:
+            if (
+                previous.profile_id != slot.profile_id
+                or previous.launch_argv != slot.launch_argv
+            ):
                 raise LaneLaunchPlanError(
                     f"physical slot {position!r} is planned twice for provider "
-                    f"{slot.provider!r}; one pair position holds one slot"
+                    f"{slot.provider!r} with different profile / argv "
+                    f"({previous.profile_id!r} vs {slot.profile_id!r}); the plan does "
+                    "not choose between them"
                 )
-            else:
-                raise LaneLaunchPlanError(
-                    f"physical slot {position!r} is claimed by two providers "
-                    f"({previous.provider!r} and {slot.provider!r}); one pair position "
-                    "holds one slot"
-                )
+            raise LaneLaunchPlanError(
+                f"physical slot {position!r} is planned twice for provider "
+                f"{slot.provider!r}; one pair position holds one slot"
+            )
+        else:
+            raise LaneLaunchPlanError(
+                f"physical slot {position!r} is claimed by two providers "
+                f"({previous.provider!r} and {slot.provider!r}); one pair position "
+                "holds one slot"
+            )
     return ResolvedLaneLaunchPlan(
         lane_class=lane_class,
         lane_kind=kind,
