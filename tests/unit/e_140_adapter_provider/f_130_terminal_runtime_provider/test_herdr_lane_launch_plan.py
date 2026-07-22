@@ -32,6 +32,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 
 PROVIDERS = frozenset({"claude", "codex"})
 ROLES = frozenset({"coordinator", "implementer", "implementation_worker", "auditor"})
+LANE_CLASSES = frozenset({"default", "sublane"})
+SPLITS = frozenset({"right", "down"})
 
 
 def _spec(**over) -> SlotLaunchSpec:
@@ -61,6 +63,8 @@ def _resolve(specs, **over):
         slot_specs=specs,
         known_providers=PROVIDERS,
         known_roles=ROLES,
+        known_lane_classes=LANE_CLASSES,
+        known_splits=SPLITS,
         request_providers=[s.provider for s in specs],
         anchors=[ANCHOR] if specs else [],
     )
@@ -271,7 +275,7 @@ class LaneLaunchPlanImmutabilityTest(unittest.TestCase):
     def test_a_string_argv_refuses(self) -> None:
         with self.assertRaises(LaneLaunchPlanError) as caught:
             _spec(launch_argv="--model x")
-        self.assertIn("not an argv", str(caught.exception))
+        self.assertIn("not an ordered token sequence", str(caught.exception))
 
     def test_a_non_string_token_refuses(self) -> None:
         with self.assertRaises(LaneLaunchPlanError):
@@ -398,6 +402,173 @@ class LaneLaunchPlanTypeBoundaryTest(unittest.TestCase):
         # ...while the resolver — the launch-validating entry — refuses the same slot.
         with self.assertRaises(LaneLaunchPlanError):
             _resolve([_spec(workflow_role="not-a-known-role")])
+
+
+class LaneLaunchPlanInjectedVocabularyTest(unittest.TestCase):
+    """The injected vocabularies are inputs too, and are checked like one (j#85875 F1)."""
+
+    VOCABULARY_FIELDS = (
+        "known_roles",
+        "known_providers",
+        "known_lane_classes",
+        "known_splits",
+    )
+
+    def test_a_bare_string_vocabulary_refuses(self) -> None:
+        # The dangerous case: `role in "ximplementerx"` is a SUBSTRING test, so the
+        # fail-closed vocabulary check silently stops being one.
+        for field in self.VOCABULARY_FIELDS:
+            with self.assertRaises(LaneLaunchPlanError) as caught:
+                _resolve([_spec()], **{field: "ximplementerxclaudexsublanexrightx"})
+            self.assertIn("substring test", str(caught.exception))
+
+    def test_a_non_iterable_or_mistyped_vocabulary_refuses(self) -> None:
+        for field in self.VOCABULARY_FIELDS:
+            for bad in (None, [7], {7: "x"}):
+                with self.assertRaises(LaneLaunchPlanError):
+                    _resolve([_spec()], **{field: bad})
+
+
+class LaneLaunchPlanOrderedSequenceTest(unittest.TestCase):
+    """Order-bearing fields accept ordered sequences only (j#85875 F3).
+
+    A set iterates in an order that is not part of the value, so the same plan would fix a
+    different argv / launch order in a different process — the opposite of "fixed before the
+    first write".
+    """
+
+    def test_argv_refuses_unordered_containers(self) -> None:
+        for bad in ({"--model", "x"}, {"--model": "x"}, frozenset({"a"})):
+            with self.assertRaises(LaneLaunchPlanError) as caught:
+                _spec(launch_argv=bad)
+            self.assertIn("ordered sequence", str(caught.exception))
+
+    def test_plan_slots_refuse_unordered_containers(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError):
+            ResolvedLaneLaunchPlan(lane_class="sublane", slots={_spec()})
+
+    def test_placement_order_refuses_unordered_containers(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError):
+            ResolvedLaneLaunchPlan(
+                lane_class="sublane", placement=("right", {"claude", "codex"})
+            )
+
+    def test_request_providers_refuse_unordered_containers(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError):
+            _resolve([_spec()], request_providers={"claude"})
+
+    def test_ordered_sequences_are_accepted_and_owned(self) -> None:
+        plan = _resolve([_spec(launch_argv=["--model", "x"])], placement=("right", ["claude"]))
+        self.assertEqual(plan.slots[0].launch_argv, ("--model", "x"))
+        self.assertEqual(plan.placement, ("right", ("claude",)))
+
+
+class LaneLaunchPlanClosedGeometryTest(unittest.TestCase):
+    """A "resolved" plan carries geometry the system actually recognises (j#85875 F4)."""
+
+    def test_an_unknown_lane_class_refuses(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _resolve([_spec()], lane_class="foreign")
+        self.assertIn("unknown lane class", str(caught.exception))
+
+    def test_an_unknown_split_refuses(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _resolve([_spec()], placement=("diagonal", None))
+        self.assertIn("unknown placement split", str(caught.exception))
+
+    def test_an_order_naming_an_unregistered_provider_refuses(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _resolve([_spec()], placement=("right", ["foreign"]))
+        self.assertIn("unregistered provider", str(caught.exception))
+
+    def test_an_order_repeating_a_provider_refuses(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _resolve([_spec()], placement=("right", ["claude", "claude"]))
+        self.assertIn("twice", str(caught.exception))
+
+    def test_a_resolved_geometry_is_carried(self) -> None:
+        plan = _resolve([_spec()], placement=("down", ["claude", "codex"]))
+        self.assertEqual(plan.placement, ("down", ("claude", "codex")))
+
+    def test_the_launch_order_is_still_not_compared_with_the_request(self) -> None:
+        # j#85859 F2's boundary is unchanged: placement reorders AFTER the preflight, so the
+        # geometry's order is validated as a VALUE, never against the request's order.
+        plan = _resolve(
+            [
+                _spec(),
+                _spec(
+                    workflow_role="coordinator",
+                    profile_id="profile.coordinator",
+                    provider="codex",
+                    physical_slot="second",
+                ),
+            ],
+            request_providers=["codex", "claude"],
+            placement=("right", ["codex", "claude"]),
+        )
+        self.assertEqual(plan.providers, ("claude", "codex"))
+
+
+class LaunchPreflightVocabularyWiringTest(unittest.TestCase):
+    """The application injects the CANONICAL vocabularies, not a convenient superset.
+
+    The plan leaf takes its vocabularies as data, which is what keeps it pure — but that
+    also means its fail-closed behaviour is only as good as what the composition root hands
+    it. A mutation widening the injected sets was invisible to every other test (measured),
+    so this pins the wiring itself: the preflight passes the same frozensets the config
+    context defines (Redmine #13646 §5.1) and the launch's own provider / role registries.
+    """
+
+    def test_the_preflight_passes_the_canonical_sets(self) -> None:
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (  # noqa: E501
+            WORKFLOW_ROLES,
+        )
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (  # noqa: E501
+            LANE_PLACEMENT_LANE_CLASSES,
+            LANE_PLACEMENT_SPLIT_DIRECTIONS,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_preflight import (  # noqa: E501
+            validate_session_request,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain import (  # noqa: E501
+            herdr_lane_launch_plan as plan_module,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501
+            LaneLaunchContext,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (  # noqa: E501
+            AGENT_PROVIDERS,
+        )
+
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return plan_module.ResolvedLaneLaunchPlan(lane_class=kwargs["lane_class"])
+
+        context = LaneLaunchContext(
+            anchors=[ANCHOR],
+            slot_specs=[
+                _spec(workflow_role="implementer", provider="claude"),
+            ],
+        )
+        with patch.object(plan_module, "resolve_lane_launch_plan", _capture):
+            validate_session_request(
+                providers=["claude"],
+                lane_id="lane-x",
+                coordinator_placement_mode="per_project_space",
+                claude_permission_mode_default="auto",
+                env={},
+                error_type=RuntimeError,
+                launch_context=context,
+            )
+        self.assertEqual(captured["known_roles"], WORKFLOW_ROLES)
+        self.assertEqual(captured["known_providers"], AGENT_PROVIDERS)
+        self.assertEqual(captured["known_lane_classes"], LANE_PLACEMENT_LANE_CLASSES)
+        self.assertEqual(captured["known_splits"], LANE_PLACEMENT_SPLIT_DIRECTIONS)
+        self.assertEqual(tuple(captured["request_providers"]), ("claude",))
 
 
 class LaneLaunchPlanAnchorTest(unittest.TestCase):

@@ -31,14 +31,39 @@ absent, so a geometry-only or context-free launch stays byte-invariant.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from collections import abc
+from dataclasses import dataclass
+from typing import Optional
 
 from mozyo_bridge.core.state.lane_kind import optional_lane_kind
 from mozyo_bridge.core.state.lane_lifecycle_model import DecisionPointer
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_plan import (  # noqa: E501
+    LaneLaunchPlanError,
     SlotLaunchSpec,
 )
+
+
+def _checked_elements(value: object, expected: type, *, field: str) -> tuple:
+    """An owned ordered tuple whose every element is ``expected``, or a typed refusal.
+
+    Ordered because ``slot_specs`` carries the pair's slot order; a set would make the
+    context's meaning depend on iteration order. The refusal type is the plan module's, so
+    the launch's single ``except`` still turns every plan-shaped defect into a typed
+    zero-start.
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(value, abc.Sequence):
+        raise LaneLaunchPlanError(
+            f"{field} must be an ordered sequence of {expected.__name__}, got "
+            f"{type(value).__name__}"
+        )
+    owned = tuple(value)
+    for element in owned:
+        if not isinstance(element, expected):
+            raise LaneLaunchPlanError(
+                f"{field} entry {element!r} is {type(element).__name__}, not "
+                f"{expected.__name__}"
+            )
+    return owned
 
 
 @dataclass(frozen=True)
@@ -72,8 +97,26 @@ class LaneLaunchContext:
             optional_lane_kind(self.lane_kind, source="LaneLaunchContext.lane_kind"),
         )
 
-        object.__setattr__(self, "anchors", tuple(self.anchors))
-        object.__setattr__(self, "slot_specs", tuple(self.slot_specs))
+        # This value is an AUTHORITY carrier, so it verifies what it carries (review
+        # j#85875 F2): a list of look-alike strings used to become the context's governance
+        # anchors, and a non-SlotLaunchSpec entry travelled as far as the resolver. The
+        # module docstring has claimed "validated on construction" since Tranche 1; these
+        # two fields now honour it. The plan resolver keeps its own independent guards —
+        # each boundary is separately tested so neither masks the other's loss.
+        object.__setattr__(
+            self,
+            "anchors",
+            _checked_elements(
+                self.anchors, DecisionPointer, field="LaneLaunchContext.anchors"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "slot_specs",
+            _checked_elements(
+                self.slot_specs, SlotLaunchSpec, field="LaneLaunchContext.slot_specs"
+            ),
+        )
 
     @property
     def has_lane_kind(self) -> bool:

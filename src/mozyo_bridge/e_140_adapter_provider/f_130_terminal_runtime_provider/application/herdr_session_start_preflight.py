@@ -130,6 +130,10 @@ def _validate_slot_plan(
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (  # noqa: E501
         AGENT_PROVIDERS,
     )
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (  # noqa: E501
+        LANE_PLACEMENT_LANE_CLASSES,
+        LANE_PLACEMENT_SPLIT_DIRECTIONS,
+    )
 
     try:
         resolve_lane_launch_plan(
@@ -141,6 +145,10 @@ def _validate_slot_plan(
             request_providers=tuple(providers),
             known_providers=AGENT_PROVIDERS,
             known_roles=WORKFLOW_ROLES,
+            # The canonical closed geometry vocabularies (#13646 §5.1), injected here so the
+            # pure plan leaf validates the geometry without importing the config context.
+            known_lane_classes=LANE_PLACEMENT_LANE_CLASSES,
+            known_splits=LANE_PLACEMENT_SPLIT_DIRECTIONS,
             lane_kind=getattr(launch_context, "lane_kind", None),
             anchors=tuple(getattr(launch_context, "anchors", ()) or ()),
         )

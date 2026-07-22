@@ -488,17 +488,21 @@ class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):
         # Review j#85870: the launch turns this module's refusals into its own typed
         # zero-start, so a plan defect must not escape as some other exception type — a
         # caller catching HerdrSessionStartError would otherwise see an untyped crash.
+        # The defect used here is one the CONTEXT legitimately carries (a well-formed slot
+        # naming an unregistered provider) and only the resolver can judge; the context's own
+        # malformed-input refusals are pinned in its unit sibling (j#85875 F2).
         herdr = FakeHerdr()
         with self.assertRaises(HerdrSessionStartError) as caught:
             self._run(
-                lane="lane-plan-badanchor",
+                lane="lane-plan-badprovider",
                 stored_kind="",
                 launch_context=LaneLaunchContext(
-                    slot_specs=self._pair(), anchors=("redmine#13647",)
+                    anchors=(self.ANCHOR,),
+                    slot_specs=self._pair(provider="gemini"),
                 ),
                 herdr=herdr,
             )
-        self.assertIn("must be a DecisionPointer", str(caught.exception))
+        self.assertIn("managed-launch plan refused", str(caught.exception))
         self.assertEqual(self._writes(herdr), [])
 
     def test_ambiguous_governance_anchor_refuses(self) -> None:
