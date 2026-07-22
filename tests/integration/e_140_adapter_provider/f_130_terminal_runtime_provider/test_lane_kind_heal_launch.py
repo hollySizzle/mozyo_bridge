@@ -484,6 +484,23 @@ class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):
         self.assertIn("does not describe this launch's providers", str(caught.exception))
         self.assertEqual(self._writes(herdr), [])
 
+    def test_a_malformed_plan_refuses_with_the_launch_error_type(self) -> None:
+        # Review j#85870: the launch turns this module's refusals into its own typed
+        # zero-start, so a plan defect must not escape as some other exception type — a
+        # caller catching HerdrSessionStartError would otherwise see an untyped crash.
+        herdr = FakeHerdr()
+        with self.assertRaises(HerdrSessionStartError) as caught:
+            self._run(
+                lane="lane-plan-badanchor",
+                stored_kind="",
+                launch_context=LaneLaunchContext(
+                    slot_specs=self._pair(), anchors=("redmine#13647",)
+                ),
+                herdr=herdr,
+            )
+        self.assertIn("must be a DecisionPointer", str(caught.exception))
+        self.assertEqual(self._writes(herdr), [])
+
     def test_ambiguous_governance_anchor_refuses(self) -> None:
         herdr = FakeHerdr()
         with self.assertRaises(HerdrSessionStartError) as caught:

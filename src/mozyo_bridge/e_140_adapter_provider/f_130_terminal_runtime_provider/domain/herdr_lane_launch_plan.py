@@ -40,12 +40,35 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Collection, Optional, Sequence
 
-from mozyo_bridge.core.state.lane_kind import optional_lane_kind
+from mozyo_bridge.core.state.lane_kind import LaneKindError, optional_lane_kind
 from mozyo_bridge.core.state.lane_lifecycle_model import DecisionPointer
 
 
 class LaneLaunchPlanError(ValueError):
-    """A lane launch plan is unresolvable / contradictory; fail closed (zero-start)."""
+    """A lane launch plan is unresolvable / contradictory; fail closed (zero-start).
+
+    The ONE error this module raises. Everything it refuses — a structural type violation at
+    construction, a vocabulary / uniqueness / reconciliation defect in the resolver, an
+    unusable governance anchor — surfaces as this type, so the launch's own fail-closed
+    boundary catches all of them with a single ``except`` and turns them into a typed
+    zero-start (review j#85870: a refusal that escapes as some other exception type is not
+    part of the advertised contract).
+    """
+
+
+def _checked_str(value: object, *, field: str) -> str:
+    """``value`` as a ``str``, or a typed refusal (review j#85870).
+
+    A type annotation is documentation, not a runtime check, and ``frozen=True`` only stops
+    re-binding — neither stops a caller handing this boundary an ``int`` provider or a
+    ``None`` role. The value objects here are the launch's fail-closed authority, so they
+    verify their own fields on EVERY construction path rather than trusting the annotation.
+    """
+    if not isinstance(value, str):
+        raise LaneLaunchPlanError(
+            f"{field} must be a string, got {type(value).__name__} {value!r}"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -71,6 +94,13 @@ class SlotLaunchSpec:
     physical_slot: str = ""
 
     def __post_init__(self) -> None:
+        # Structural validation, on every construction path (review j#85870): the four
+        # scalar fields are exactly what downstream code interpolates into a launch, an
+        # error message or a dict key, so a non-string here is refused rather than carried.
+        # This is deliberately TYPE-only — whether a role exists in the vocabulary, or a
+        # position collides with a peer's, is contextual and belongs to the resolver.
+        for field_name in ("workflow_role", "profile_id", "provider", "physical_slot"):
+            _checked_str(getattr(self, field_name), field=f"SlotLaunchSpec.{field_name}")
         # Copy the argv into a tuple at CONSTRUCTION (review j#85859 F3). ``frozen=True``
         # only stops the attribute being re-bound; a caller that passed a list kept a live
         # handle to the validated plan's command and could empty it afterwards (measured:
@@ -184,6 +214,19 @@ class ResolvedLaneLaunchPlan:
     slots: tuple[SlotLaunchSpec, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
+        _checked_str(self.lane_class, field="ResolvedLaneLaunchPlan.lane_class")
+        if self.lane_kind is not None:
+            _checked_str(self.lane_kind, field="ResolvedLaneLaunchPlan.lane_kind")
+        if self.source_anchor is not None and not isinstance(
+            self.source_anchor, DecisionPointer
+        ):
+            # A plan's provenance is the durable decision record itself, not a token that
+            # merely looks like one: a string here would read back as governance the store
+            # never issued (review j#85870 measured `source_anchor='not a pointer'`).
+            raise LaneLaunchPlanError(
+                "ResolvedLaneLaunchPlan.source_anchor must be a DecisionPointer, got "
+                f"{type(self.source_anchor).__name__} {self.source_anchor!r}"
+            )
         object.__setattr__(self, "slots", _owned_slots(self.slots))
         object.__setattr__(self, "placement", _owned_placement(self.placement))
 
@@ -219,6 +262,11 @@ def resolve_source_anchor(
     for anchor in anchors:
         if anchor is None:
             continue
+        if not isinstance(anchor, DecisionPointer):
+            raise LaneLaunchPlanError(
+                f"a governance anchor must be a DecisionPointer, got "
+                f"{type(anchor).__name__} {anchor!r}"
+            )
         if anchor not in distinct:
             distinct.append(anchor)
     if not distinct:
@@ -292,9 +340,26 @@ def resolve_lane_launch_plan(
     ``slot_specs=()`` returns an empty plan (no roles, no anchor requirement, no
     reconciliation): the launch is byte-for-byte the pre-#13647 one, so an unconfigured /
     legacy caller is unaffected.
+
+    Division of labour (review j#85870): **structural** validation — is each field the type
+    it claims to be, does the value own its sequences — happens in the value objects'
+    constructors and therefore on EVERY path, including a direct
+    ``ResolvedLaneLaunchPlan(...)``. **Contextual** validation — vocabulary membership,
+    cross-slot uniqueness, reconciliation with the launch, anchor exactness — needs inputs
+    only this function is given, so it happens here. A directly constructed plan is
+    consequently *type-valid* but NOT "validated against a launch": only a plan this
+    function returned has been checked against the pair it belongs to.
     """
-    kind = optional_lane_kind(lane_kind, source="ResolvedLaneLaunchPlan.lane_kind")
-    slots = tuple(slot_specs)
+    try:
+        kind = optional_lane_kind(lane_kind, source="ResolvedLaneLaunchPlan.lane_kind")
+    except LaneKindError as exc:
+        # Re-typed at the plan boundary (review j#85870): the launch catches this module's
+        # error to produce its typed zero-start, so a vocabulary refusal that escaped as a
+        # different type would leave the caller with an untyped failure instead. The cause
+        # chain keeps the original vocabulary error visible.
+        raise LaneLaunchPlanError(str(exc)) from exc
+    slots = _owned_slots(slot_specs)
+    request = _checked_request_providers(request_providers)
     anchor = resolve_source_anchor(anchors, required=bool(slots))
     if not slots:
         return ResolvedLaneLaunchPlan(
@@ -304,7 +369,7 @@ def resolve_lane_launch_plan(
             source_anchor=anchor,
             slots=(),
         )
-    _reconcile_with_request(slots, request_providers)
+    _reconcile_with_request(slots, request)
     seen_roles: dict = {}
     by_position: dict = {}
     for index, slot in enumerate(slots):
@@ -342,7 +407,7 @@ def resolve_lane_launch_plan(
                 "cannot be carried by two slots of the same pair"
             )
         seen_roles[slot.workflow_role] = where
-        position = slot.physical_slot
+        position = slot.physical_slot  # already type-checked at slot construction
         if not position:
             # A blank position is not "unpinned", it is an unstated one — and a blank was an
             # escape hatch out of the collision check below (review j#85859 F2). A plan that
@@ -382,6 +447,25 @@ def resolve_lane_launch_plan(
         source_anchor=anchor,
         slots=slots,
     )
+
+
+def _checked_request_providers(request_providers: object) -> tuple[str, ...]:
+    """The launch's actual provider list as strings, or a typed refusal (j#85870)."""
+    if isinstance(request_providers, (str, bytes)):
+        raise LaneLaunchPlanError(
+            f"the launch's providers must be a sequence, got {request_providers!r}"
+        )
+    try:
+        providers = tuple(request_providers)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise LaneLaunchPlanError(
+            "the launch's providers are not iterable "
+            f"({type(request_providers).__name__}); the plan cannot be reconciled with a "
+            "launch whose slot set is unknown"
+        ) from exc
+    for provider in providers:
+        _checked_str(provider, field="request provider")
+    return providers
 
 
 def _reconcile_with_request(

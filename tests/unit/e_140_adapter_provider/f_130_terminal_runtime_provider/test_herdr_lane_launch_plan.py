@@ -97,7 +97,10 @@ class LaneLaunchPlanHappyPathTest(unittest.TestCase):
     def test_the_geometry_axis_is_carried_and_validated(self) -> None:
         plan = _resolve([_spec()], lane_kind="implementation")
         self.assertEqual(plan.lane_kind, "implementation")
-        with self.assertRaises(LaneKindError):
+        # The vocabulary refusal is re-typed at this boundary (j#85870) so the launch's
+        # single `except` still turns it into a typed zero-start; the cause is asserted in
+        # LaneLaunchPlanTypeBoundaryTest.
+        with self.assertRaises(LaneLaunchPlanError):
             _resolve([_spec()], lane_kind="grandchild")
 
     def test_same_provider_may_carry_distinct_profiles_in_distinct_slots(self) -> None:
@@ -318,6 +321,83 @@ class LaneLaunchPlanImmutabilityTest(unittest.TestCase):
         plan = ResolvedLaneLaunchPlan(lane_class="sublane")
         self.assertEqual(plan.placement, (None, None))
         self.assertEqual(ResolvedLaneLaunchPlan(lane_class="sublane", placement=None).placement, (None, None))
+
+
+class LaneLaunchPlanTypeBoundaryTest(unittest.TestCase):
+    """The value objects check their own fields on EVERY construction path (j#85870).
+
+    A type annotation is documentation and ``frozen=True`` only stops re-binding, so neither
+    stops a caller handing this boundary an `int` provider or a `None` role. These pin the
+    STRUCTURAL half of the contract — the half that holds even for a plan built directly,
+    without the resolver — because the type is public and a plan's consumer cannot tell which
+    path built it.
+    """
+
+    BAD_SCALARS = (7, None, ["x"], object())
+
+    def test_every_slot_scalar_field_must_be_a_string(self) -> None:
+        for field in ("workflow_role", "profile_id", "provider", "physical_slot"):
+            for bad in self.BAD_SCALARS:
+                with self.assertRaises(LaneLaunchPlanError) as caught:
+                    _spec(**{field: bad})
+                self.assertIn(f"SlotLaunchSpec.{field} must be a string", str(caught.exception))
+
+    def test_plan_scalars_must_be_strings(self) -> None:
+        for bad in self.BAD_SCALARS:
+            with self.assertRaises(LaneLaunchPlanError):
+                ResolvedLaneLaunchPlan(lane_class=bad)
+        for bad in (7, ["x"], object()):
+            with self.assertRaises(LaneLaunchPlanError):
+                ResolvedLaneLaunchPlan(lane_class="sublane", lane_kind=bad)
+
+    def test_the_anchor_must_be_a_decision_pointer(self) -> None:
+        # A provenance token that merely LOOKS like a record would read back as governance
+        # the durable store never issued.
+        for bad in ("redmine#13647", 7, {"issue": "13647"}):
+            with self.assertRaises(LaneLaunchPlanError) as caught:
+                ResolvedLaneLaunchPlan(lane_class="sublane", source_anchor=bad)
+            self.assertIn("must be a DecisionPointer", str(caught.exception))
+
+    def test_the_resolver_refuses_a_non_pointer_anchor(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _resolve([_spec()], anchors=["not a pointer"])
+        self.assertIn("must be a DecisionPointer", str(caught.exception))
+
+    def test_the_exported_anchor_resolver_refuses_a_non_pointer(self) -> None:
+        # `resolve_source_anchor` is exported and callable on its own, so it carries its own
+        # contract — asserting only through `resolve_lane_launch_plan` would let the plan
+        # constructor's guard mask the loss of this one (measured: a mutation removing this
+        # check was invisible until this case existed).
+        for bad in ("redmine#13647", 7, {"issue": "13647"}):
+            with self.assertRaises(LaneLaunchPlanError) as caught:
+                resolve_source_anchor([bad])
+            self.assertIn("must be a DecisionPointer", str(caught.exception))
+
+    def test_the_launch_provider_list_is_type_checked(self) -> None:
+        for bad in (None, "claude", [7], object()):
+            with self.assertRaises(LaneLaunchPlanError):
+                _resolve([_spec()], request_providers=bad)
+
+    def test_a_vocabulary_refusal_surfaces_as_this_module_error(self) -> None:
+        # The launch catches THIS module's error to build its typed zero-start, so a lane-kind
+        # vocabulary refusal that escaped as LaneKindError would leave the caller with an
+        # untyped failure. The cause chain keeps the original error visible.
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _resolve([_spec()], lane_kind="grandchild")
+        self.assertIsInstance(caught.exception.__cause__, LaneKindError)
+
+    def test_a_direct_plan_is_type_valid_but_not_launch_validated(self) -> None:
+        # The documented split: a directly built plan passes structural validation and is
+        # deliberately NOT claimed to be reconciled with any launch (no anchor requirement,
+        # no vocabulary check, no request comparison happens here).
+        plan = ResolvedLaneLaunchPlan(
+            lane_class="sublane", slots=[_spec(workflow_role="not-a-known-role")]
+        )
+        self.assertEqual(plan.workflow_roles, ("not-a-known-role",))
+        self.assertIsNone(plan.source_anchor)
+        # ...while the resolver — the launch-validating entry — refuses the same slot.
+        with self.assertRaises(LaneLaunchPlanError):
+            _resolve([_spec(workflow_role="not-a-known-role")])
 
 
 class LaneLaunchPlanAnchorTest(unittest.TestCase):

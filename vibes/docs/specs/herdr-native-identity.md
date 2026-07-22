@@ -556,10 +556,32 @@ copy** する:
   container を占めるか。検証後に変わればどの pane が先に置かれるかが変わる）
 
 copy は resolver 経路だけでなく **public constructor 経路でも**行う（型は公開されており、
-resolver を経ない構築も正当な入口であるため）。要素型不正（`SlotLaunchSpec` 以外の slot、
-非 str の argv token / provider、argv や order に文字列そのものを渡す、`(split, order)` の形を
-成さない placement）はすべて typed refusal。`source_anchor` は `DecisionPointer`（frozen・
+resolver を経ない構築も正当な入口であるため）。`source_anchor` は `DecisionPointer`（frozen・
 scalar のみ）なので追加の copy は不要。
+
+### 構造 validation と 文脈 validation の分離
+
+type annotation は runtime 検査ではなく、`frozen=True` は属性の再束縛しか防がない。したがって
+**value object 自身が自分の field を construction 時に検査する**:
+
+- **構造 (structural) validation — 全 construction path で常に実行**:
+  `SlotLaunchSpec` の `workflow_role` / `profile_id` / `provider` / `physical_slot` は `str` 必須。
+  `ResolvedLaneLaunchPlan` の `lane_class` は `str`、`lane_kind` は `str` か `None`、
+  `source_anchor` は `DecisionPointer` か `None`（「それらしい文字列」は governance provenance に
+  昇格しない）。sequence は上記のとおり所有 copy し、要素型不正も拒否する。
+- **文脈 (contextual) validation — `resolve_lane_launch_plan` のみ**: 語彙 membership
+  (role / provider)、cross-slot の一意性、実 launch との照合、anchor exactness。これらは
+  resolver にしか渡されない入力を必要とする。
+
+したがって **直接構築した plan は「型として妥当」だが「この launch に対して validated」ではない**。
+「validated plan」と呼べるのは resolver が返した plan だけである。
+
+### 単一 typed error
+
+本境界が拒否するものは（構造・文脈・anchor いずれも）すべて `LaneLaunchPlanError` として送出する。
+launch 側は単一の `except` でそれを typed zero-start に変換するため、別の例外型で抜けると
+「typed zero-start」という公開契約が破れる（lane-kind 語彙違反もこの型へ再送出し、原因は
+`__cause__` に保持する）。
 
 ### 境界
 
