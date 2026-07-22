@@ -28,17 +28,17 @@
       "sha256": "718e6707047608a7f830c5a06b9c2796ff1114f0d926011dfde59d4afcd949c2"
     },
     "AGENTS.md": {
-      "sha256": "114a2eee95ad6802c093e67f93fd43cc24b651fbd73671e8868bf0389beba2ec"
+      "sha256": "65bd0d7869cc1173094c6a41c04b4fe35c0c81b372e258b2390d2ef39928fc36"
     },
     "CLAUDE.md": {
       "sha256": "f0898607d2b3bed191e2a1a753a0fc10eb1f8b9f0934830a48177b34ab2406e5"
     }
   },
-  "generated_by": "mozyo-bridge 0.12.0a7",
+  "generated_by": "mozyo-bridge 0.12.3a1",
   "mode": "repo-local",
   "preset": "redmine-governed",
-  "preset_hash": "fb211ae68f81355da8496eb6e26dda4f5207edb0f20eab50a37fa2d19cbb9818",
-  "preset_version": "2026.07.18.4",
+  "preset_hash": "0af6e657c5e0320c17b7283d0eda4fdbaefe91dba2d7def41e9f6b1e68144682",
+  "preset_version": "2026.07.22.1",
   "rule_path": ".mozyo-bridge/rules/presets/redmine-governed/agent-workflow.md",
   "schema_version": 2
 }

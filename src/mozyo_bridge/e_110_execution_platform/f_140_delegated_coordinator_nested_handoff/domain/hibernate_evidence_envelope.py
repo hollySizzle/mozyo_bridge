@@ -58,6 +58,16 @@ ENVELOPE_CONFLICT = "envelope_conflict"
 LANE_ENVELOPE_RESOLVE_REASONS = frozenset({ENVELOPE_ABSENT, ENVELOPE_CONFLICT})
 
 
+def is_full_sha(value: object) -> bool:
+    """True when ``value`` is a canonical full lowercase commit hash (pure).
+
+    The single head-shape predicate for the hibernate-evidence surface, so every head a marker
+    carries — the envelope's own ``head`` and the additive ``integration_head`` (step 3b) — is
+    judged by the same rule and cannot drift apart.
+    """
+    return bool(_FULL_SHA_RE.match(str(value or "").strip()))
+
+
 @dataclass(frozen=True)
 class LaneEvidenceEnvelope:
     """The exact lane (and optionally head) a durable conjunct event is bound to."""
@@ -109,7 +119,7 @@ def parse_lane_envelope(
     generation = int(generation_raw)
 
     head = str(fields.get(FIELD_HEAD, "") or "").strip()
-    if head and not _FULL_SHA_RE.match(head):
+    if head and not is_full_sha(head):
         return EnvelopeParseError(ENVELOPE_MALFORMED_HEAD, head)
     if require_head and not head:
         return EnvelopeParseError(ENVELOPE_MISSING_HEAD)

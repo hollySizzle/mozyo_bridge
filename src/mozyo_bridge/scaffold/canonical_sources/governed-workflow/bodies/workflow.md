@@ -300,6 +300,18 @@ review-gate の structured marker が callback generation fence へ供給する 
 - marker は canonical renderer (`render_gate_note` / `render_workflow_event_marker`) が付与する。手書き marker も同一 grammar に従う。
 - skill reference は本節への pointer のみを持ち、field key・必須 gate 組合せ・disposition・source_sequence authority を複製しない。
 
+### Hibernate Evidence Marker Contract
+
+lane を自動で hibernate してよいかの basis conjunct が読む durable evidence marker の producer 契約 (Redmine #14219)。auto-hibernate の根拠は coordinator による全条件の再宣言ではなく、**各 authority が自分の権限で書いた durable event** である。したがって evidence marker は、どの lane の・どの generation の・どの commit についての主張なのかを machine-readable に自己束縛しなければならない。
+
+- **共通 lane envelope。** evidence を成すすべての marker は `workspace=<workspace id>` / `lane=<lane id>` / `lane_generation=<正の整数>` を持つ。commit について述べる evidence はさらに `head=<full commit SHA>` を持つ。issue id だけの correlation や現行 lifecycle row からの補完で lane / generation を補わない — それは旧 generation の evidence を現 generation へ昇格させる。
+- **evidence 種別 (closed vocabulary)。** `review_result` (既存 review gate marker へ envelope を additive 付与) / `integration_disposition` / `required_ci_green` / `dogfood_delegated` / `park_declared`。
+- **integration_disposition は source head と integration head を分離する。** `head` は review 対象の lane / source head、`integration_head` は integration branch 上で統合を証明した exact commit、`integration_branch` は統合先 ref、`disposition` は `merge` | `patch_equivalent`。patch-equivalent / cherry-pick では両者が別 commit になるため、単一の head では統合を証明できない。`explicit_deferral` / `integration_blocked` は正当な durable disposition だが、統合済みの主張ではないので evidence にはならない。
+- **CI / dogfood / park は callback-required gate ではない。** generic `workflow-event` evidence として記録し、callback を要する gate 語彙を拡張しない (余計な callback を生む)。`required_ci_green` は `run` と `conclusion=success`、`dogfood_delegated` は委譲先 `release_issue`、`park_declared` は envelope 自体が主張である。
+- **issuer は権限を持つ actor に固定する。** `review_result`=same-lane reviewer / gateway、`integration_disposition` / `required_ci_green` / `dogfood_delegated`=coordinator、`park_declared`=当該 lane の implementation worker。他 actor が代理で合成しない。delegation を成果 (dogfood 成功、CI green) と読み替えない。
+- **fail-closed。** missing / malformed / 非 full-hex head / 非正 generation / cross-lane / 旧 generation / head mismatch / 相反する重複 marker は「条件が未充足」ではなく typed unknown-or-stale として zero-actuation とする。散文からの補完は禁止。同一種別の読めない marker を読み飛ばして別の marker を採ることもしない — 新しい記録が古い記録に負けるため。
+- **additive であり既存 projection を変えない。** envelope / 追加 field は既存 consumer (review generation fence、workflow glance の integration disposition projection) から不可視であり、marker を持たない従来の記録の解釈も変えない。従来 marker は既存用途では有効なままで、auto-hibernate evidence としてのみ不成立となる。
+
 ### Review Finding Verdict Obligation (迎合禁止)
 
 <!-- mozyo-bridge:activation:always id=no-sycophancy-evidence-provenance digest="迎合せず結論を述べ、review finding には根拠の出所を明示する。正本: central preset `### Review Finding Verdict Obligation (迎合禁止)` / `### 根拠出所分類`。" -->
@@ -385,6 +397,7 @@ origin到達可能性:
     - review 承認後、coordinator が integration branch への統合を merge | patch_equivalent | explicit_deferral のいずれかとして判断し、統合 commit 群・merge 方式・検証結果を integration journal に記録する
     - merge の標準は ff-only (`git merge --ff-only`)。non-ff (merge commit / rebase 統合) を使う場合は理由を integration journal に記録する
     - 統合後の Review Gate 済み commit hash が rebase 等で origin 到達不能になった場合は、re-anchoring correction journal で新 hash へ再接続する (silent edit をしない)
+    - integration journal を自動判断の evidence として使う場合は、`### Hibernate Evidence Marker Contract` の `integration_disposition` marker を additive に埋め込む (source head / integration_head / integration_branch / disposition を分離した machine-readable 形)。marker を持たない従来の記録は既存 projection では有効なままで、自動判断の evidence としてのみ不成立とする
   監査者責務:
     - Review Gate で対象 commit 群が origin 上に到達可能であることを remote verification として確認し、結果を review journal に残す
     - 到達性が確認できない場合は事実指摘ではなく blocker として扱い、close へ進めない
