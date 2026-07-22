@@ -571,6 +571,86 @@ class LaunchPreflightVocabularyWiringTest(unittest.TestCase):
         self.assertEqual(tuple(captured["request_providers"]), ("claude",))
 
 
+class _Shifting:
+    """Factory for a container whose value CHANGES between reads.
+
+    The adversarial input for a time-of-check/time-of-use gap: if a boundary validates one
+    read and stores another, this makes the difference observable instead of theoretical.
+    """
+
+    @staticmethod
+    def of(base_type, first, later):
+        class Shifting(base_type):
+            reads = 0
+
+            def __iter__(self):
+                type(self).reads += 1
+                return iter(first if type(self).reads == 1 else later)
+
+        return Shifting
+
+
+class LaneLaunchPlanSingleEvaluationTest(unittest.TestCase):
+    """What was validated is what gets stored (review j#85885).
+
+    The R5 geometry fix checked one read of the caller's `placement` and then handed the
+    ORIGINAL object to the plan constructor, which read it again — so a placement that
+    changed between reads landed an unchecked `("diagonal", ("foreign",))` inside a plan the
+    resolver had just called validated (measured). Each caller input is therefore read
+    exactly once, and the checked value is the stored one.
+    """
+
+    def test_a_shifting_placement_stores_the_validated_value(self) -> None:
+        shifting = _Shifting.of(
+            tuple, ("right", ("claude", "codex")), ("diagonal", ("foreign",))
+        )
+        plan = _resolve([_spec()], placement=shifting((None, None)))
+        self.assertEqual(plan.placement, ("right", ("claude", "codex")))
+        self.assertEqual(shifting.reads, 1)
+
+    def test_the_empty_legacy_plan_also_stores_the_validated_geometry(self) -> None:
+        # The legacy branch returns early, so it needs its own case: a probe that made ONLY
+        # that branch re-read the caller's placement was invisible to every other test.
+        shifting = _Shifting.of(
+            tuple, ("down", ("claude", "codex")), ("diagonal", ("foreign",))
+        )
+        plan = _resolve(
+            [],
+            placement=shifting((None, None)),
+            request_providers=["claude", "codex"],
+        )
+        self.assertEqual(plan.slots, ())
+        self.assertEqual(plan.placement, ("down", ("claude", "codex")))
+        self.assertEqual(shifting.reads, 1)
+
+    def test_a_shifting_slot_sequence_stores_the_validated_value(self) -> None:
+        foreign = _spec(workflow_role="not-a-known-role", provider="claude")
+        shifting = _Shifting.of(list, [_spec()], [foreign])
+        plan = _resolve([_spec()], slot_specs=shifting([_spec()]))
+        self.assertEqual(plan.workflow_roles, ("implementer",))
+        self.assertEqual(shifting.reads, 1)
+
+    def test_a_shifting_anchor_sequence_stores_the_validated_value(self) -> None:
+        other = DecisionPointer(source="redmine", issue_id="99999", journal_id="1")
+        shifting = _Shifting.of(list, [ANCHOR], [other])
+        plan = _resolve([_spec()], anchors=shifting([ANCHOR]))
+        self.assertEqual(plan.source_anchor, ANCHOR)
+        self.assertEqual(shifting.reads, 1)
+
+    def test_a_shifting_argv_stores_the_validated_value(self) -> None:
+        shifting = _Shifting.of(list, ["--model", "x"], ["--evil"])
+        slot = _spec(launch_argv=shifting(["--model", "x"]))
+        self.assertEqual(slot.launch_argv, ("--model", "x"))
+        self.assertEqual(shifting.reads, 1)
+
+    def test_a_shifting_vocabulary_is_read_once(self) -> None:
+        # A vocabulary that widened on a second read would let an unknown role through
+        # after the membership check had already been made against the narrow one.
+        shifting = _Shifting.of(list, ["implementer"], ["implementer", "not-a-known-role"])
+        _resolve([_spec()], known_roles=shifting(["implementer"]))
+        self.assertEqual(shifting.reads, 1)
+
+
 class LaneLaunchPlanAnchorTest(unittest.TestCase):
     @staticmethod
     def _anchor(journal="85856", issue="13647") -> DecisionPointer:

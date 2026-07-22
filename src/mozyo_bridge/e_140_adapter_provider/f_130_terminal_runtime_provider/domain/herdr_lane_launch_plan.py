@@ -382,7 +382,7 @@ def resolve_lane_launch_plan(
     request = _checked_request_providers(request_providers)
     providers_vocabulary = _checked_vocabulary(known_providers, field="known providers")
     roles_vocabulary = _checked_vocabulary(known_roles, field="known workflow roles")
-    _checked_geometry(
+    checked_placement = _checked_geometry(
         lane_class=lane_class,
         placement=placement,
         known_lane_classes=_checked_vocabulary(
@@ -396,7 +396,7 @@ def resolve_lane_launch_plan(
         return ResolvedLaneLaunchPlan(
             lane_class=lane_class,
             lane_kind=kind,
-            placement=placement,
+            placement=checked_placement,
             source_anchor=anchor,
             slots=(),
         )
@@ -474,7 +474,9 @@ def resolve_lane_launch_plan(
     return ResolvedLaneLaunchPlan(
         lane_class=lane_class,
         lane_kind=kind,
-        placement=placement,
+        # The value the geometry check itself validated — never a second read of the
+        # caller's object (review j#85885).
+        placement=checked_placement,
         source_anchor=anchor,
         slots=slots,
     )
@@ -487,8 +489,14 @@ def _checked_geometry(
     known_lane_classes: frozenset,
     known_splits: frozenset,
     known_providers: frozenset,
-) -> None:
+) -> tuple:
     """The pair geometry this plan fixes must itself be RESOLVED (review j#85875 F4).
+
+    Returns the OWNED, validated geometry — and the caller must store exactly that value
+    (review j#85885). Checking one read of the caller's object and then storing a second
+    read of it is a time-of-check/time-of-use gap: a placement whose value changes between
+    reads was measured landing an unchecked ``("diagonal", ("foreign",))`` inside a plan the
+    resolver had just "validated". Check what you use; use what you checked.
 
     The whole-plan contract is that ``lane_kind?, lane_class, resolved placement`` are fixed
     before the first write (Design Answer j#85645). A plan carrying ``lane_class="foreign"``
@@ -506,14 +514,15 @@ def _checked_geometry(
             f"unknown lane class {lane_class!r}; known classes: "
             f"{', '.join(sorted(known_lane_classes))}"
         )
-    split, order = _owned_placement(placement)
+    owned = _owned_placement(placement)
+    split, order = owned
     if split is not None and split not in known_splits:
         raise LaneLaunchPlanError(
             f"unknown placement split {split!r}; known splits: "
             f"{', '.join(sorted(known_splits))}"
         )
     if order is None:
-        return
+        return owned
     seen: set = set()
     for provider in order:
         if provider not in known_providers:
@@ -527,6 +536,7 @@ def _checked_geometry(
                 "permutation, not a multiset"
             )
         seen.add(provider)
+    return owned
 
 
 def _checked_request_providers(request_providers: object) -> tuple[str, ...]:

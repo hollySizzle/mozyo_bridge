@@ -110,5 +110,29 @@ class LaneLaunchContextAuthorityFieldsTest(unittest.TestCase):
         self.assertTrue(context.has_slot_plan)
 
 
+class LaneLaunchContextSingleEvaluationTest(unittest.TestCase):
+    """The carrier stores what it checked, too (review j#85885, same shape)."""
+
+    def test_a_shifting_slot_sequence_stores_the_validated_value(self) -> None:
+        foreign = SlotLaunchSpec(
+            workflow_role="foreign",
+            profile_id="foreign",
+            provider="foreign",
+            launch_argv=("x",),
+            physical_slot="first",
+        )
+
+        class Shifting(list):
+            reads = 0
+
+            def __iter__(self):
+                type(self).reads += 1
+                return iter([SPEC] if type(self).reads == 1 else [foreign])
+
+        context = LaneLaunchContext(slot_specs=Shifting([SPEC]))
+        self.assertEqual(context.slot_specs, (SPEC,))
+        self.assertEqual(Shifting.reads, 1)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
