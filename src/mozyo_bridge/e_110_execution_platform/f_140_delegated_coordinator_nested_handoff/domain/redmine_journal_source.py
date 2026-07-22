@@ -515,6 +515,9 @@ def render_workflow_event_marker(
     blocker_recorded: bool | None = None,
     target_head: str | None = None,
     review_request_journal: str | None = None,
+    evidence_workspace: str | None = None,
+    evidence_lane: str | None = None,
+    evidence_lane_generation: int | None = None,
 ) -> str:
     """Render the structured ``[mozyo:workflow-event:...]`` gate marker for a gate journal (pure).
 
@@ -568,6 +571,18 @@ def render_workflow_event_marker(
         fields.append(f"head={str(target_head).strip()}")
     if review_request_journal is not None:
         fields.append(f"req={str(review_request_journal).strip()}")
+    # Redmine #14219 T2b: the common hibernate-evidence lane envelope
+    # (``workspace``/``lane``/``lane_generation``). ADDITIVE and opt-in — a marker without it is
+    # unchanged for the review generation fence / glance (which never read these keys), and simply
+    # fails closed as auto-hibernate evidence (a superseded generation's evidence cannot be reused).
+    # workspace/lane are identifiers and the generation an integer, so none collides with the
+    # ``:``/``=`` grammar.
+    if evidence_workspace is not None:
+        fields.append(f"workspace={str(evidence_workspace).strip()}")
+    if evidence_lane is not None:
+        fields.append(f"lane={str(evidence_lane).strip()}")
+    if evidence_lane_generation is not None:
+        fields.append(f"lane_generation={int(evidence_lane_generation)}")
     return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{':'.join(fields)}]"
 
 
