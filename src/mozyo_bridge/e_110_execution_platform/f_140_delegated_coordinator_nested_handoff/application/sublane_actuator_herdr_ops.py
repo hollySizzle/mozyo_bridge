@@ -392,6 +392,12 @@ class HerdrSublaneActuatorOps:
                 action_nonce=action_nonce,
                 startup_fence=startup_fence,
                 admission_lock_held=admission_lock_held,
+                # Redmine #13647 T1b (review j#85848 F1): the lane's delegation-geometry
+                # kind must reach the FIRST launch. The lifecycle row this lane heals from
+                # is declared only after this call returns, so a fresh create has no stored
+                # kind yet — the caller's context is the only authority that exists at the
+                # moment the panes are actually created.
+                launch_context=self._launch_context(),
             )
         except HerdrLauncherIncompatibleError as exc:
             # Redmine #13847: typed launcher-compat error (not a generic pane-create failure),
@@ -408,6 +414,23 @@ class HerdrSublaneActuatorOps:
         # actuation — the projections fail open (`lane_record_missing`).
         self._record_lane_metadata(worktree_path)
         return result
+
+    def _launch_context(self):
+        """This lane's caller-supplied :class:`LaneLaunchContext`, or ``None`` (#13647 T1b).
+
+        Built from the create-time governance fact the coordinator asserted
+        (``sublane create --lane-kind``). No kind -> ``None``, so the launch keeps its
+        pre-#13647 ``lane_class`` geometry byte-for-byte; a heal of a lane whose row already
+        records a kind resolves it from that row instead (and a disagreement between the two
+        is refused at the launch admission, never silently resolved).
+        """
+        if not _norm(self.lane_kind):
+            return None
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501
+            LaneLaunchContext,
+        )
+
+        return LaneLaunchContext(lane_kind=_norm(self.lane_kind))
 
     def _record_lane_metadata(self, worktree_path: str) -> None:
         """Upsert the lane's display-metadata record (best-effort, never raises)."""

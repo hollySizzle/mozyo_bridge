@@ -799,6 +799,11 @@ class _StartArgs:
     cwd: str = ""
     provider: str = ""
     no_focus: bool = False
+    #: The explicit-placement first launch (Redmine #13646 R1-F1) passes ``--focus`` so the
+    #: container's split target is the 1st agent rather than the empty root pane. A real
+    #: herdr 0.7.1 flag; modelled here (Redmine #13647 T1b) because the create path now
+    #: reaches that branch whenever a lane declares an explicit placement.
+    focus: bool = False
     permission_mode: str = ""
     env: dict = field(default_factory=dict)
     launch_argv: list = field(default_factory=list)
@@ -847,6 +852,9 @@ def _parse_agent_start(rest: list) -> _StartArgs:
             i += 2
         elif token == "--no-focus":
             args.no_focus = True
+            i += 1
+        elif token == "--focus":
+            args.focus = True
             i += 1
         else:
             raise UnknownHerdrCommandError(

@@ -34,6 +34,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from mozyo_bridge.core.state.lane_kind import LaneKindError, checked_lane_kind
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     DEFAULT_LANE,
     _norm,
@@ -43,6 +44,37 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 #: re-incarnation is the explicit ``open_next_generation`` path only, so spawning into a retired
 #: row would create a live pair the durable record says is gone.
 LAUNCH_ADMISSIBLE_DISPOSITIONS = frozenset({"active", "superseded", "hibernated"})
+
+
+def _checked_stored_lane_kind(
+    stored: str, *, lane: str, error_type: type
+) -> Optional[str]:
+    """The row's ``lane_kind`` as a CANONICAL token, or fail closed (#13647 review j#85848 F2).
+
+    ``""`` is the one legitimate absence: a pre-v7 / legacy lane simply has no durable kind
+    fact, so the launch falls back to ``lane_class`` geometry exactly as before. Anything
+    ELSE that is not one of the three canonical tokens is an authority value this build
+    cannot interpret — a tampered row, a foreign writer, or a vocabulary from a future build
+    — and this component's standing rule is that uninterpretable is NOT absent. Silently
+    treating it as "no kind" would place the pair by a geometry the durable record does not
+    actually say, which is the guess the whole design exists to prevent (disposition j#85650:
+    invalid / ambiguous is zero-start, only blank falls back).
+
+    Raised here, at the same pre-side-effect boundary as the disposition refusal, so the
+    refusal costs no workspace / tab / agent.
+    """
+    if not stored:
+        return None  # no durable kind fact: the sanctioned lane_class fallback
+    try:
+        return checked_lane_kind(stored, source=f"lane {lane!r} stored lane_kind")
+    except LaneKindError as exc:
+        raise error_type(
+            f"managed-launch admission refused: lane {lane!r} has a durably recorded "
+            f"lane-kind this build cannot interpret ({exc}). An uninterpretable authority "
+            f"value is not an absent one, so the lane's pane geometry cannot be resolved "
+            f"without guessing. Repair the lifecycle record (re-declare, or re-bind at a "
+            f"generation boundary) before launching. No workspace / tab / agent was created."
+        ) from exc
 
 
 def _admitted_lane_kind(
@@ -100,7 +132,9 @@ def _admitted_lane_kind(
         return None  # a rowless lane (scratch / not yet declared): unchanged
     disposition = _norm(record.lane_disposition)
     if disposition in LAUNCH_ADMISSIBLE_DISPOSITIONS:
-        return _norm(getattr(record, "lane_kind", "")) or None
+        return _checked_stored_lane_kind(
+            _norm(getattr(record, "lane_kind", "")), lane=lane, error_type=error_type
+        )
     raise error_type(
         f"managed-launch admission refused: lane {lane!r} is durably {disposition!r} and a "
         f"retired generation is terminal. Re-incarnate it explicitly (open_next_generation) "

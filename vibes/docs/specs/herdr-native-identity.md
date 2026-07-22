@@ -487,11 +487,21 @@ engine は無改修)。
   boundary で **創出側 caller が governance から解決**して `prepare_session` へ渡す。bare `mozyo`
   launch と no-lane `herdr session-start` は構造上 `coordinator` を渡す。`sublane create --lane-kind`
   は創出側 coordinator の宣言を運ぶ。
+  **lane の初回 launch では context が唯一の authority である** (review j#85848 F1): create 経路は
+  lane の lifecycle row を **launch が返った後**に declare するため、初回 launch 時点に stored kind は
+  存在しない。context を渡さないと「pane を実際に作る launch」だけが `lane_class` 幾何になり、以後の
+  heal だけ設定どおりになるという逆転が起きる。よって actuator は `prepare_actuator_lane_session`
+  (create / heal / v1 replacement が通る唯一の funnel) へ pre-launch に context を渡す。
 - **heal** = lane lifecycle authority row の generation-bound `lane_kind` (schema v7、
   `managed-state-model.md`)。launch chokepoint が **network 無し / display cache 無し**で offline 読解する。
 - **矛盾は fail-closed**: 両方あって不一致なら片方が stale。launch admission (#14242 の
   disposition admission と同じ pre-side-effect boundary、同一 snapshot) が **workspace / tab / agent を
   1 つも作らずに拒否**する。再結線は generation 境界 (`open_next_generation(lane_kind=...)`) のみ。
+- **stored token は read 境界で canonical validation する** (review j#85848 F2): 空 = 「durable kind
+  fact 無し」= 唯一の正当な不在で `lane_class` fallback。空でない **非 canonical 値**(改竄 row /
+  foreign writer / 将来 build の語彙)は「解釈できない authority 値」であり、**不在として扱わず**
+  副作用前に launch error にする (j#85650「invalid / ambiguous は zero-start、blank のみ fallback」、
+  および本 component の "unreadable is not absent" 規律)。
 - provider / pane 近接 / `lane_metadata` などの display 由来値から lane_kind を推測しない
   (disposition j#85650)。`--dry-run` は durable state を一切参照せず caller context だけで plan する
   (#13595 / #14242 と同じく dry run は store-free)。

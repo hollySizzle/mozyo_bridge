@@ -4,9 +4,11 @@ Design answer j#85645 / disposition j#85650 P1: the lane-role (親 / 子 / 孫) 
 lane was CREATED with is stored on the lane's lifecycle authority record, generation-bound,
 so a heal resolves the same placement OFFLINE — never by re-reading Redmine at launch time,
 and never from ``lane_metadata`` / a display projection (which declare themselves "never
-routing authority"; the j#85644 → j#85645 correction).
+routing authority"; the j#85644 -> j#85645 correction).
 
-What these pin, in the order the value moves:
+Integration (`tests-placement-discovery-policy.md` 配置決定木 5): several REAL collaborators
+wired together — the CAS store, the declaration store, the schema/migration gate and a real
+SQLite file — hermetic in a temp dir. What it pins:
 
 1. **schema v7 / migration** — a genuine v6 store migrates additively, backup-first, to v7
    with an EMPTY ``lane_kind`` (no durable fact, never a guessed kind), and a v6 store is
@@ -15,13 +17,10 @@ What these pin, in the order the value moves:
    kind, fail closed on an off-vocabulary token, and treat the kind as part of the
    declaration identity (a divergent re-declare never overwrites it);
 3. **generation binding** — no ordinary transition mutates the stored kind; a re-incarnation
-   carries it forward by default and re-binds ONLY when the caller says so explicitly;
-4. **create threading** — ``sublane create --lane-kind`` reaches the declaration, and the
-   CLI vocabulary is exactly the canonical three tokens (no alias, P3).
+   carries it forward by default and re-binds ONLY when the caller says so explicitly.
 
-The launch-side half of Tranche 1b (offline heal read + fail-closed reconciliation at
-``prepare_session``) is pinned in
-``tests/unit/.../test_herdr_session_start.py::LaneKindHealAuthorityLaunchTest``.
+The create-side threading lives in the f_140 integration sibling; the launch-side heal read
+and its fail-closed reconciliation in the f_130 one (review j#85848 Finding 3).
 """
 
 from __future__ import annotations
@@ -361,87 +360,6 @@ class LaneKindSchemaMigrationTest(unittest.TestCase):
         self.assertEqual(
             store.get(self.key).lane_kind, LANE_KIND_DELEGATED_COORDINATOR
         )
-
-
-class LaneKindCreateThreadingTest(unittest.TestCase):
-    """`sublane create --lane-kind` reaches the durable declaration (create threading)."""
-
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.home = Path(self._tmp.name)
-
-    def _declare(self, **kwargs) -> None:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_create_lifecycle_declaration import (  # noqa: E501
-            declare_created_lane_lifecycle,
-        )
-
-        from unittest.mock import patch
-        import os
-
-        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False):
-            declare_created_lane_lifecycle(
-                repo_workspace_id=WS,
-                lane_label=LANE,
-                issue=ISSUE,
-                journal="85826",
-                worktree_identity="wt_13647",
-                **kwargs,
-            )
-
-    def test_create_declaration_records_the_callers_kind(self) -> None:
-        self._declare(lane_kind=LANE_KIND_IMPLEMENTATION)
-        record = LaneLifecycleStore(home=self.home).get(LaneLifecycleKey(WS, LANE))
-        self.assertIsNotNone(record)
-        self.assertEqual(record.lane_kind, LANE_KIND_IMPLEMENTATION)
-
-    def test_create_declaration_without_a_kind_is_unchanged(self) -> None:
-        self._declare()
-        record = LaneLifecycleStore(home=self.home).get(LaneLifecycleKey(WS, LANE))
-        self.assertEqual(record.lane_kind, "")
-
-    def test_an_off_vocabulary_kind_leaves_the_lane_owner_unbound(self) -> None:
-        # Best-effort contract: the store refuses, the actuation does not break, and the
-        # lane honestly reads as owner-unbound rather than carrying a bogus authority.
-        self._declare(lane_kind="grandchild")
-        self.assertIsNone(
-            LaneLifecycleStore(home=self.home).get(LaneLifecycleKey(WS, LANE))
-        )
-
-    def test_cli_vocabulary_is_the_canonical_three_tokens(self) -> None:
-        # No parent / child / grandchild alias on the operator surface either (P3).
-        import argparse
-
-        from mozyo_bridge.application.cli import build_parser
-
-        parser = build_parser()
-        args = parser.parse_args(
-            [
-                "sublane",
-                "create",
-                "--issue",
-                ISSUE,
-                "--lane-label",
-                LANE,
-                "--lane-kind",
-                LANE_KIND_IMPLEMENTATION,
-            ]
-        )
-        self.assertEqual(args.lane_kind, LANE_KIND_IMPLEMENTATION)
-        with self.assertRaises(SystemExit):
-            parser.parse_args(
-                [
-                    "sublane",
-                    "create",
-                    "--issue",
-                    ISSUE,
-                    "--lane-label",
-                    LANE,
-                    "--lane-kind",
-                    "grandchild",
-                ]
-            )
-        self.assertIsInstance(parser, argparse.ArgumentParser)
 
 
 if __name__ == "__main__":  # pragma: no cover

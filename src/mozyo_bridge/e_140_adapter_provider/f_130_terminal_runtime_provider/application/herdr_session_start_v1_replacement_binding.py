@@ -64,8 +64,19 @@ def prepare_actuator_lane_session(
     action_nonce: str = "",
     startup_fence: StartupTransactionFence | None = None,
     admission_lock_held: bool = False,
+    launch_context: object = None,
 ) -> SessionStartResult:
-    """Compose one actuator launch, optionally beneath its caller-held store lock."""
+    """Compose one actuator launch, optionally beneath its caller-held store lock.
+
+    ``launch_context`` (Redmine #13647 Tranche 1b, review j#85848 Finding 1) is the
+    caller-resolved :class:`LaneLaunchContext` carrying this lane's delegation-geometry
+    kind. It must arrive HERE — the single funnel every actuator launch (create, heal, v1
+    replacement) passes through — because the create path declares the lane's lifecycle row
+    only AFTER this launch returns: at a lane's FIRST launch there is no stored kind to heal
+    from, so without the caller's context the very launch that creates the panes would place
+    them by ``lane_class`` and only later relaunches would honour the configured lane-role
+    geometry. ``None`` (every pre-#13647 caller) is byte-for-byte the previous composition.
+    """
     from mozyo_bridge.application.repo_local_config_loader import (
         load_repo_local_config,
     )
@@ -89,6 +100,7 @@ def prepare_actuator_lane_session(
         replacement_action_id=replacement_action_id,
         action_nonce=action_nonce,
         startup_fence=startup_fence,
+        launch_context=launch_context,
     )
 
 
