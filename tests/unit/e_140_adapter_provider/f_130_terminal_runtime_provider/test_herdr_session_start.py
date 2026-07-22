@@ -73,6 +73,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
     LanePlacementConfig,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501
+    LaneLaunchContext,
+)
 
 HERDR_ENV = "MOZYO_HERDR_BINARY"
 
@@ -4563,6 +4566,272 @@ class SessionStartStartupHealthTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(claude["health"], HEALTH_PROVIDER_EXITED)
         self.assertEqual(claude["compensation"], "rollback_owed")
         self.assertTrue(claude["health_detail"].strip())
+
+
+class LaneRolePlacementLaunchTest(unittest.TestCase):
+    """Lane-ROLE (親/子/孫) aware pane placement (Redmine #13647, disposition j#85650).
+
+    ``lane_placement.by_lane_kind.{coordinator,delegated_coordinator,implementation}``
+    decides the split direction per delegation-geometry kind, resolved from the
+    caller-supplied :class:`LaneLaunchContext.lane_kind`. Precedence is
+    ``by_lane_kind[kind] > lane_class > legacy default``: a ``None`` context, an
+    unresolved kind, or a config with no matching kind all fall through to the
+    #13646 lane-class geometry, byte-for-byte. Like #13646 this is a FUTURE launch
+    policy — it constructs the ``agent start`` argv a fresh launch uses and never
+    moves a live pane. The lane-kind here is the caller-supplied fresh-launch
+    actuation authority (Tranche 1); the lifecycle-stored kind is the heal authority
+    (Tranche 1b, not exercised here).
+    """
+
+    @staticmethod
+    def _placement(**top):
+        """A `LanePlacementConfig` from a top-level `lane_placement` mapping."""
+        return LanePlacementConfig.from_record(top)
+
+    def _prepare(
+        self,
+        tmp,
+        *,
+        herdr,
+        providers,
+        lane,
+        lane_placement=None,
+        launch_context=None,
+    ):
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        home = Path(tmp) / "home"
+        home.mkdir()
+        binpath = Path(tmp) / "fake-herdr"
+        binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+            register_workspace(repo, home=home)
+            ws = read_anchor(repo)["workspace_id"]
+            result = prepare_session(
+                repo_root=repo,
+                providers=providers,
+                lane_id=lane,
+                env=_launch_env(binpath),
+                runner=herdr.run,
+                lane_placement=lane_placement,
+                launch_context=launch_context,
+            )
+        return result, ws
+
+    @staticmethod
+    def _second_split(herdr):
+        """The `--split` direction of the second (splitting) launch, or None."""
+        second = herdr.start_argvs[1]
+        return (
+            second[second.index("--split") + 1] if "--split" in second else None
+        )
+
+    # --- close condition 1: 親/子/孫 each reflect their own configured split ------
+
+    def test_child_and_grandchild_get_distinct_split(self) -> None:
+        # The core acceptance: one config declares a DIFFERENT split for the child
+        # (delegated_coordinator) and grandchild (implementation) lanes; each fresh
+        # launch reflects its own kind's direction. Same config, same lane class
+        # (both `sublane`), different `lane_kind` -> different geometry.
+        config = self._placement(
+            by_lane_kind={
+                "delegated_coordinator": {"split": "down"},
+                "implementation": {"split": "right"},
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wA", created_tab="wA:t1")
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-child",
+                lane_placement=config,
+                launch_context=LaneLaunchContext(lane_kind="delegated_coordinator"),
+            )
+            self.assertEqual(self._second_split(herdr), "down")
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wB", created_tab="wB:t1")
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-grandchild",
+                lane_placement=config,
+                launch_context=LaneLaunchContext(lane_kind="implementation"),
+            )
+            self.assertEqual(self._second_split(herdr), "right")
+
+    def test_coordinator_kind_splits_the_tabless_default_pair(self) -> None:
+        # The 親 ("このメインでは上下") case: `by_lane_kind.coordinator.split: down`
+        # makes the tab-less coordinator pair split vertically. The default lane
+        # never uses a tab, so `--split` rides the workspace pair.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ")
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="",
+                lane_placement=self._placement(
+                    by_lane_kind={"coordinator": {"split": "down"}}
+                ),
+                launch_context=LaneLaunchContext(lane_kind="coordinator"),
+            )
+        first, second = herdr.start_argvs
+        self.assertNotIn("--tab", second)
+        self.assertNotIn("--split", first)
+        self.assertEqual(second[second.index("--split") + 1], "down")
+
+    def test_by_lane_kind_order_reorders_launch_sequence(self) -> None:
+        # `order` on a lane-kind key reorders which provider occupies the container
+        # first, exactly like the lane-class `order` (#13646) — proving the kind axis
+        # reuses the same geometry engine, not a reimplementation.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            result, ws = self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    by_lane_kind={
+                        "implementation": {"split": "right", "order": ["claude", "codex"]}
+                    }
+                ),
+                launch_context=LaneLaunchContext(lane_kind="implementation"),
+            )
+        first, second = herdr.start_argvs
+        self.assertEqual(first[2], encode_assigned_name(ws, "claude", "lane-1"))
+        self.assertEqual(second[2], encode_assigned_name(ws, "codex", "lane-1"))
+        self.assertEqual([s.provider for s in result.slots], ["claude", "codex"])
+
+    # --- close condition 2: unresolved kind falls back to lane_class -------------
+
+    def test_none_context_falls_back_to_lane_class_geometry(self) -> None:
+        # No durable kind fact (`launch_context=None`) even with a `by_lane_kind`
+        # block present -> the sublane lane keeps its legacy `--split right`
+        # (byte-for-byte the pre-#13647 launch). The kind layer is never consulted.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    by_lane_kind={"delegated_coordinator": {"split": "down"}}
+                ),
+                launch_context=None,
+            )
+        self.assertEqual(self._second_split(herdr), "right")
+
+    def test_kind_absent_from_config_falls_back_to_lane_class(self) -> None:
+        # A resolved kind whose token the config's `by_lane_kind` does NOT declare
+        # falls through to the lane-class layer (the gate keys on the config
+        # DECLARING the kind, not merely on a kind being supplied).
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    by_lane_kind={"coordinator": {"split": "down"}}
+                ),
+                launch_context=LaneLaunchContext(lane_kind="implementation"),
+            )
+        self.assertEqual(self._second_split(herdr), "right")
+
+    # --- close condition 3: precedence role > lane_class > default ---------------
+
+    def test_lane_class_layer_applies_when_kind_unresolved(self) -> None:
+        # With BOTH axes configured and NO durable kind: the lane-class layer wins
+        # (its `down` overrides the legacy `right`), while the by_lane_kind entry is
+        # untouched. Proves the lane-class layer stays fully live under the new axis.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    by_lane_kind={"implementation": {"split": "right"}},
+                    sublane={"split": "down"},
+                ),
+                launch_context=None,
+            )
+        self.assertEqual(self._second_split(herdr), "down")
+
+    def test_by_lane_kind_wins_over_lane_class_when_kind_resolved(self) -> None:
+        # Same both-axes config, but WITH a resolved kind: the by_lane_kind entry
+        # (`right`) wins over the lane-class entry (`down`) — precedence
+        # `role > lane_class`.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    by_lane_kind={"implementation": {"split": "right"}},
+                    sublane={"split": "down"},
+                ),
+                launch_context=LaneLaunchContext(lane_kind="implementation"),
+            )
+        self.assertEqual(self._second_split(herdr), "right")
+
+
+class LaneKindPlacementSchemaTest(unittest.TestCase):
+    """`lane_placement.by_lane_kind` schema fail-closed contract (Redmine #13647)."""
+
+    def test_unknown_lane_kind_key_fails_closed(self) -> None:
+        # No `parent` / `child` / `grandchild` alias exists — the machine vocabulary
+        # is exactly the three canonical tokens (disposition j#85650 P3).
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (
+            LanePlacementError,
+        )
+
+        for bad in ("parent", "child", "grandchild", "coordinator_assistant"):
+            with self.assertRaises(LanePlacementError):
+                LanePlacementConfig.from_record({"by_lane_kind": {bad: {"split": "down"}}})
+
+    def test_invalid_split_and_order_fail_closed(self) -> None:
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (
+            LanePlacementError,
+        )
+
+        with self.assertRaises(LanePlacementError):
+            LanePlacementConfig.from_record(
+                {"by_lane_kind": {"coordinator": {"split": "sideways"}}}
+            )
+        with self.assertRaises(LanePlacementError):
+            LanePlacementConfig.from_record(
+                {"by_lane_kind": {"coordinator": {"order": ["claude"]}}}
+            )
+        with self.assertRaises(LanePlacementError):
+            LanePlacementConfig.from_record(
+                {"by_lane_kind": {"coordinator": {"unknown": "x"}}}
+            )
+
+    def test_absent_block_is_byte_invariant(self) -> None:
+        # No `by_lane_kind` block -> empty kind table -> every kind resolves to legacy.
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (
+            ResolvedPlacement,
+        )
+
+        config = LanePlacementConfig.from_record({"sublane": {"split": "down"}})
+        self.assertEqual(config.kind_placements, ())
+        self.assertFalse(config.has_lane_kind("coordinator"))
+        self.assertEqual(config.resolve_by_lane_kind("coordinator"), ResolvedPlacement())
+        # The lane-class axis is untouched.
+        self.assertEqual(config.resolve("sublane"), ResolvedPlacement(split="down"))
 
 
 if __name__ == "__main__":  # pragma: no cover

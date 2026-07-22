@@ -49,23 +49,19 @@ from typing import Iterable, Mapping
 # This is intentionally coarser than ``role_profile.py``'s four routing roles
 # (it folds implementation_gateway + implementation_worker into the single
 # display kind ``implementation``); it carries no routing authority.
-LANE_KIND_COORDINATOR = "coordinator"
-LANE_KIND_DELEGATED_COORDINATOR = "delegated_coordinator"
-LANE_KIND_IMPLEMENTATION = "implementation"
-
-# The closed contract enum. There is deliberately **no** ``unknown`` member: a
-# caller without a durable kind fact must fail closed
-# (:class:`DelegationProjectionError`) rather than emit an off-contract value
-# into the projection / ``@mozyo_lane_kind`` cache, which a downstream consumer
-# (#12466 writer / ``agents targets`` columns) could mistake for a new enum
-# value (Redmine #12465 review j#63800). The fail-closed error is itself the
-# diagnostic surface; an unknown kind is never carried as ``lane_kind``.
-LANE_KINDS = frozenset(
-    {
-        LANE_KIND_COORDINATOR,
-        LANE_KIND_DELEGATED_COORDINATOR,
-        LANE_KIND_IMPLEMENTATION,
-    }
+#
+# The canonical definition now lives in the neutral ``shared.lane_kind`` leaf
+# (Redmine #13647, Design Answer j#85645 point 4) so the herdr launch path can
+# resolve placement geometry by this key without reverse-importing this cockpit
+# display module. These names are re-exported unchanged for the existing display
+# consumers (``@mozyo_lane_kind`` cache / ``agents targets`` columns); the closed
+# ``LANE_KINDS`` contract (no ``unknown`` member — Redmine #12465 review j#63800)
+# is preserved verbatim by sharing the single source of truth.
+from mozyo_bridge.shared.lane_kind import (  # noqa: F401  (re-exported)
+    LANE_KIND_COORDINATOR,
+    LANE_KIND_DELEGATED_COORDINATOR,
+    LANE_KIND_IMPLEMENTATION,
+    LANE_KINDS,
 )
 
 # Shallow-delegation depth cap: parent (0) -> delegated (1) -> grandchild (2).

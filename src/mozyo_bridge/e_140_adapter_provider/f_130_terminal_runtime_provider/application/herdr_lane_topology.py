@@ -657,6 +657,38 @@ def resolve_placement_policy(
     return resolved.split, resolved.order
 
 
+def resolve_placement_policy_for_role(
+    lane_placement: object, lane_class: str, lane_kind: "Optional[str]"
+) -> "tuple[Optional[str], Optional[tuple[str, ...]]]":
+    """The lane's configured ``(split, order)`` under the ``role > lane_class > default`` precedence.
+
+    Redmine #13647 (Design Answer j#85645, disposition j#85650). The precedence is a
+    typed fall-through over the SAME :class:`ResolvedPlacement` the lane-class layer
+    already returns, so it is a strict superset of :func:`resolve_placement_policy`:
+
+    1. **lane-kind layer** — consulted ONLY when a durable ``lane_kind`` is supplied
+       AND the config's ``by_lane_kind`` block explicitly declares that kind
+       (:meth:`LanePlacementConfig.has_lane_kind`). This is the only path that can
+       diverge from the pre-#13647 result.
+    2. **lane-class layer** — otherwise the existing ``default`` / ``sublane``
+       resolution (:func:`resolve_placement_policy`), byte-for-byte.
+    3. **legacy default** — no config yields ``(None, None)``.
+
+    Byte-invariance: ``lane_kind is None`` (no durable kind fact — the launch path's
+    fallback) OR a config with no matching ``by_lane_kind`` entry both fall straight
+    through to step 2, so every existing repo and every kind-unresolved launch keeps
+    today's exact ``(split, order)``. An unknown ``by_lane_kind`` key is rejected at
+    config parse time, not here; runtime "kind simply unresolved" is a fall-through,
+    never an error (the issue's close condition).
+    """
+    if lane_placement is None:
+        return None, None
+    if lane_kind is not None and lane_placement.has_lane_kind(lane_kind):  # type: ignore[attr-defined]
+        resolved = lane_placement.resolve_by_lane_kind(lane_kind)  # type: ignore[attr-defined]
+        return resolved.split, resolved.order
+    return resolve_placement_policy(lane_placement, lane_class)
+
+
 def resolve_focus_first_launch(
     *,
     config_split: Optional[str],

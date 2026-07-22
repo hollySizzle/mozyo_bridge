@@ -110,6 +110,9 @@ if TYPE_CHECKING:
         AgentLaunchConfig,
         LanePlacementConfig,
     )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501
+        LaneLaunchContext,
+    )
 
 from mozyo_bridge.core.state.workspace_registry import (
     ANCHOR_LEGACY_RELATIVE,
@@ -233,7 +236,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     herdr_workspace_segment,
     resolve_container_plan,
     resolve_launch_order,
-    resolve_placement_policy,
+    resolve_placement_policy_for_role,
     slot_placement,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
@@ -289,6 +292,7 @@ def prepare_session(
     claude_permission_mode_default: Optional[str] = None,
     agent_launch: "Optional[AgentLaunchConfig]" = None,
     lane_placement: "Optional[LanePlacementConfig]" = None,
+    launch_context: "Optional[LaneLaunchContext]" = None,
     coordinator_placement_mode: str = DEFAULT_COORDINATOR_PLACEMENT_MODE,
     attestation_reader: "Optional[Callable[[str], Optional[IdentityAttestationRecord]]]" = None,
     replacement_action_id: str = "",
@@ -332,6 +336,7 @@ def prepare_session(
         claude_permission_mode_default=claude_permission_mode_default,
         agent_launch=agent_launch,
         lane_placement=lane_placement,
+        launch_context=launch_context,
         coordinator_placement_mode=coordinator_placement_mode,
         attestation_reader=attestation_reader,
         replacement_action_id=replacement_action_id,
@@ -372,6 +377,7 @@ def _prepare_session_locked(
     claude_permission_mode_default: Optional[str] = None,
     agent_launch: "Optional[AgentLaunchConfig]" = None,
     lane_placement: "Optional[LanePlacementConfig]" = None,
+    launch_context: "Optional[LaneLaunchContext]" = None,
     coordinator_placement_mode: str = DEFAULT_COORDINATOR_PLACEMENT_MODE,
     attestation_reader: "Optional[Callable[[str], Optional[IdentityAttestationRecord]]]" = None,
     replacement_action_id: str = "",
@@ -526,8 +532,20 @@ def _prepare_session_locked(
     # `agent_launch` keys on, resolved independently (no merge). An unset config yields
     # `(None, None)`, so every downstream decision stays byte-for-byte pre-#13646. The
     # decisions are pure (`herdr_lane_topology`).
+    # Lane-role aware placement precedence (Redmine #13647, disposition j#85650): the
+    # caller-supplied `launch_context` carries the durable `lane_kind` (親/子/孫) resolved
+    # from governance at the create / heal boundary — never inferred here from provider /
+    # pane / display cache. Precedence is `by_lane_kind[kind] > lane_class > default`
+    # (`resolve_placement_policy_for_role`); a `None` context / unresolved kind / a config
+    # with no matching `by_lane_kind` entry all fall straight through to the pre-#13646
+    # lane-class resolution (byte-invariant). Fresh-launch actuation authority is this
+    # context, not any stored value (the lifecycle-stored kind is the heal authority,
+    # Tranche 1b).
     lane_class = "default" if result.lane_id == DEFAULT_LANE else "sublane"
-    config_split, config_order = resolve_placement_policy(lane_placement, lane_class)
+    lane_kind = launch_context.lane_kind if launch_context is not None else None
+    config_split, config_order = resolve_placement_policy_for_role(
+        lane_placement, lane_class, lane_kind
+    )
     providers = resolve_launch_order(providers, config_order)
 
     runner = runner or subprocess.run
