@@ -87,6 +87,8 @@ class LaneLaunchContextAuthorityFieldsTest(unittest.TestCase):
             {"anchors": "redmine"},
             {"slot_specs": {SPEC}},
             {"anchors": {ANCHOR}},
+            {"anchors": {ANCHOR: 1}},
+            {"slot_specs": {SPEC: 1}},
         ):
             with self.assertRaises(LaneLaunchPlanError):
                 LaneLaunchContext(**kwargs)

@@ -590,6 +590,96 @@ class _Shifting:
         return Shifting
 
 
+class AnchorContainerContractTest(unittest.TestCase):
+    """The exported anchor resolver owns its container contract (review j#85943 F1).
+
+    Split from the plan-level cases on purpose: `resolve_source_anchor` is exported and
+    callable on its own, and the two boundaries must fail independently — a previous round
+    showed one guard's removal hiding behind the other's.
+    """
+
+    def test_a_non_sequence_container_refuses_typed(self) -> None:
+        # `None` used to escape as a raw TypeError, which the launch's single `except`
+        # does not catch — so the "typed zero-start" contract did not hold for it.
+        for bad in (None, 7, {ANCHOR: 1}, "redmine"):
+            with self.assertRaises(LaneLaunchPlanError):
+                resolve_source_anchor(bad)
+
+    def test_an_unordered_container_refuses(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            resolve_source_anchor({ANCHOR})
+        self.assertIn("ordered sequence", str(caught.exception))
+
+    def test_a_none_element_is_refused_not_dropped(self) -> None:
+        # Dropping it would turn "an anchor should be here and could not be resolved" into
+        # "no anchor was supplied" — the exact distinction the one-anchor rule protects.
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            resolve_source_anchor([None, ANCHOR])
+        self.assertIn("must be a DecisionPointer", str(caught.exception))
+
+    def test_the_same_shapes_refuse_through_the_resolver(self) -> None:
+        for bad in (None, {ANCHOR}, [None, ANCHOR], {ANCHOR: 1}):
+            with self.assertRaises(LaneLaunchPlanError):
+                _resolve([_spec()], anchors=bad)
+
+    def test_a_valid_ordered_sequence_resolves(self) -> None:
+        self.assertEqual(resolve_source_anchor([ANCHOR]), ANCHOR)
+        self.assertEqual(resolve_source_anchor((ANCHOR, ANCHOR)), ANCHOR)
+
+
+class PlacementCarrierShapeTest(unittest.TestCase):
+    """The OUTER `(split, order)` carrier is a positional pair (review j#85943 F2).
+
+    R5 gave the inner order an ordered-sequence guard but left the outer carrier
+    unexamined, so a mapping destructured its KEYS into a geometry and dropped its values:
+    `{"right": 0, None: 0}` was stored as `("right", None)`.
+    """
+
+    # The two construction paths are pinned SEPARATELY, not looped over in one case: the
+    # review asked for both regressions, and a single case going red proves only that one
+    # of them still refuses.
+    def test_a_mapping_is_not_a_placement_pair_at_the_constructor(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            ResolvedLaneLaunchPlan(
+                lane_class="sublane", placement={"right": 0, None: 0}
+            )
+        self.assertIn("ordered sequence", str(caught.exception))
+
+    def test_a_mapping_is_not_a_placement_pair_through_the_resolver(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _resolve([_spec()], placement={"right": 0, None: 0})
+        self.assertIn("ordered sequence", str(caught.exception))
+
+    def test_unordered_and_string_carriers_refuse(self) -> None:
+        for bad in ({"right", "down"}, "rd", 7):
+            with self.assertRaises(LaneLaunchPlanError):
+                ResolvedLaneLaunchPlan(lane_class="sublane", placement=bad)
+
+    def test_a_wrong_length_pair_refuses(self) -> None:
+        for bad in (("right",), ("right", None, "extra"), ()):
+            with self.assertRaises(LaneLaunchPlanError) as caught:
+                ResolvedLaneLaunchPlan(lane_class="sublane", placement=bad)
+            self.assertIn("(split, order) pair", str(caught.exception))
+
+    def test_a_wrong_length_pair_refuses_through_the_resolver(self) -> None:
+        # Arity is checked on the resolver path too, and as THIS module's error: a bare
+        # `split, order = pair` leaks a raw ValueError, which the launch's single `except
+        # LaneLaunchPlanError` does not catch — so the zero-start would not be typed.
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _resolve([_spec()], placement=("right", None, "extra"))
+        self.assertIn("(split, order) pair", str(caught.exception))
+
+    def test_valid_pairs_are_owned(self) -> None:
+        plan = ResolvedLaneLaunchPlan(
+            lane_class="sublane", placement=["right", ["claude"]]
+        )
+        self.assertEqual(plan.placement, ("right", ("claude",)))
+        self.assertEqual(
+            ResolvedLaneLaunchPlan(lane_class="sublane", placement=None).placement,
+            (None, None),
+        )
+
+
 class LaneLaunchPlanSingleEvaluationTest(unittest.TestCase):
     """What was validated is what gets stored (review j#85885).
 

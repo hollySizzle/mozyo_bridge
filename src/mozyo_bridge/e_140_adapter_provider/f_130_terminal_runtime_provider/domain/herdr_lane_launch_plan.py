@@ -84,6 +84,28 @@ def _ordered_tokens(value: object, *, field: str) -> tuple[str, ...]:
     return tokens
 
 
+def _ordered_container(value: object, *, field: str, expected: str) -> tuple:
+    """``value`` as an owned tuple, from an ORDERED sequence — the OUTER shell check.
+
+    Separate from the element checks on purpose (review j#85943): every previous round
+    validated what was *inside* a container while the container itself stayed unexamined,
+    and the shells kept letting things through — a mapping destructured its KEYS into a
+    ``(split, order)`` geometry, and a set satisfied a declared ``Sequence``.
+
+    Deliberately NOT merged with :func:`_ordered_tokens`, which applies the same shape rule
+    to token sequences: they are separate boundaries, and folding them into one helper would
+    mean a single guard's removal broke every case at once — which is exactly the coupling
+    that lets one boundary's probe mask another's loss.
+    """
+    if isinstance(value, (str, bytes)) or not isinstance(value, abc.Sequence):
+        raise LaneLaunchPlanError(
+            f"{field} must be an ordered sequence of {expected}, got "
+            f"{type(value).__name__}: an unordered / mapping container is not a "
+            f"positional sequence"
+        )
+    return tuple(value)
+
+
 def _checked_vocabulary(value: object, *, field: str) -> frozenset[str]:
     """An injected vocabulary as an OWNED exact-token set (review j#85875 F1).
 
@@ -193,12 +215,21 @@ def _owned_placement(placement: object) -> tuple:
     """
     if placement is None:
         return (None, None)
-    try:
-        split, order = placement
-    except (TypeError, ValueError) as exc:
+    # The OUTER carrier first (review j#85943): a mapping unpacks its KEYS into
+    # `(split, order)` and silently drops its values, so `{"right": 0, None: 0}` was
+    # landing as the geometry `("right", None)`. Only a positional two-element ordered
+    # sequence is a `(split, order)` pair.
+    pair = _ordered_container(
+        placement,
+        field="plan placement",
+        expected="two positional elements (split, order)",
+    )
+    if len(pair) != 2:
         raise LaneLaunchPlanError(
-            f"plan placement must be a (split, order) pair, got {placement!r}"
-        ) from exc
+            f"plan placement must be a (split, order) pair, got {len(pair)} element(s): "
+            f"{placement!r}"
+        )
+    split, order = pair
     if split is not None and not isinstance(split, str):
         raise LaneLaunchPlanError(
             f"plan placement split must be a string or None, got {type(split).__name__}"
@@ -276,11 +307,15 @@ def resolve_source_anchor(
     one would be a guess about whose decision is live — so it refuses (Design Answer j#85645:
     "矛盾/複数 anchor で ambiguous なら guess せず zero-start").
     """
-    distinct = []
-    for anchor in anchors:
-        if anchor is None:
-            continue
+    distinct: list = []
+    for anchor in _ordered_container(
+        anchors, field="governance anchors", expected="DecisionPointer"
+    ):
         if not isinstance(anchor, DecisionPointer):
+            # `None` is refused like any other non-pointer (review j#85943): silently
+            # dropping it would turn "an anchor was supposed to be here and could not be
+            # resolved" into "no anchor was supplied", which is precisely the distinction
+            # the exact-one-anchor rule exists to keep.
             raise LaneLaunchPlanError(
                 f"a governance anchor must be a DecisionPointer, got "
                 f"{type(anchor).__name__} {anchor!r}"
