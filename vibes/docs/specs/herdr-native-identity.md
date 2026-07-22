@@ -526,11 +526,29 @@ startup action を 1 つも作らない)。
 1. slot の `workflow_role` / `profile_id` / `provider` / `launch_argv` が未解決
 2. 未知の `workflow_role` / 未登録 `provider` — **default へ degrade せず拒否**
 3. `workflow_role` の重複 (同一責務を 2 slot が主張)
-4. 同一 `physical_slot` への複数 entry
+4. 同一 `physical_slot` への複数 entry / **`physical_slot` が空** (空値は「未指定」ではなく
+   衝突検査の抜け穴。plan は各 slot の pair 位置を明示する)
 5. 同一 `(physical_slot, provider)` に **異なる profile / argv** (provider が違えば正当ゆえ
    same-slot 衝突のみ拒否)
-6. governance anchor が **ambiguous** (異なる durable record が複数 launch を主張) —
-   同一 record の重複は 1 件として解決、0 件は「plan を作らない」= 従来 launch
+6. governance anchor が **0 件または ambiguous**。非空 plan は **distinct anchor ちょうど 1 件**
+   を必須とする (同一 record の重複は 1 件へ集約)。責務を割り当てる plan がその割当を行った
+   durable decision を名指せないなら、推測由来の plan と区別できないので launch しない。
+   `slot_specs` 空 (= plan を作らない従来 caller) だけが anchor 不要
+7. **plan が「この launch」を過不足なく説明していない** — slot 数 / provider multiset が実
+   request と不一致 (partial / extra / request 外 provider)。plan が 2 slot 中 1 slot しか
+   説明しないまま launch すると、残る slot は「何者か誰も宣言していない」状態で live になる
+   = 本 gate が防ぐはずの partial lane そのもの
+
+launch **順序**は照合しない: placement 解決 (`resolve_launch_order`) が本 preflight の**後**に
+provider を並べ替えるため、順序一致を課すと正しい plan を誤って拒否する。個数 + multiset +
+位置一意で「pair を過不足なく説明する」を担保する。
+
+### 検証済み plan の不変性
+
+`SlotLaunchSpec` は construction 時に `launch_argv` を **tuple へ copy** する。`frozen=True` は
+属性の再束縛しか防がないため、caller が渡した list をそのまま保持すると **検証後に argv を
+書き換えられ**、「最初の write の前に固定する」という本 gate の前提が崩れる。argv 要素が str で
+ない場合・argv に文字列そのものを渡した場合も typed refusal。
 
 ### 境界
 

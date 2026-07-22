@@ -46,12 +46,23 @@ def _spec(**over) -> SlotLaunchSpec:
     return SlotLaunchSpec(**base)
 
 
+ANCHOR = DecisionPointer(source="redmine", issue_id="13647", journal_id="85859")
+
+
 def _resolve(specs, **over):
+    """Resolve with defaults that make the plan *valid*, so each test varies one thing.
+
+    The defaults mirror a real launch: the request starts exactly the providers the specs
+    describe, and the plan names the one durable decision it was resolved from.
+    """
+    specs = list(specs)
     kwargs = dict(
         lane_class="sublane",
         slot_specs=specs,
         known_providers=PROVIDERS,
         known_roles=ROLES,
+        request_providers=[s.provider for s in specs],
+        anchors=[ANCHOR] if specs else [],
     )
     kwargs.update(over)
     return resolve_lane_launch_plan(**kwargs)
@@ -76,8 +87,9 @@ class LaneLaunchPlanHappyPathTest(unittest.TestCase):
         self.assertEqual(plan.lane_class, "sublane")
 
     def test_no_slot_specs_is_an_empty_plan(self) -> None:
-        # The pre-#13647 caller: no role-bearing plan, nothing required, nothing refused.
-        plan = _resolve([])
+        # The pre-#13647 caller: no role-bearing plan, nothing required, nothing refused —
+        # not even an anchor or a matching request.
+        plan = _resolve([], request_providers=["claude", "codex"])
         self.assertEqual(plan.slots, ())
         self.assertIsNone(plan.source_anchor)
         self.assertIsNone(plan.lane_kind)
@@ -168,21 +180,104 @@ class LaneLaunchPlanRefusalTest(unittest.TestCase):
             _resolve([_spec(), _spec(workflow_role="auditor")])
         self.assertIn("planned twice", str(caught.exception))
 
-    def test_unpinned_positions_do_not_collide(self) -> None:
-        # A caller that pins no physical slot is not asserting a position, so two unpinned
-        # slots are not a position conflict (their roles still must differ).
+    def test_a_blank_position_refuses(self) -> None:
+        # Review j#85859 F2: a blank position was an escape hatch out of the collision check
+        # — two "unpinned" slots never collided — and an earlier revision of this suite
+        # pinned that hole as correct. A plan that claims to describe the pair states where
+        # each slot goes.
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _resolve(
+                [
+                    _spec(physical_slot=""),
+                    _spec(
+                        workflow_role="auditor",
+                        profile_id="profile.auditor",
+                        provider="codex",
+                        physical_slot="",
+                    ),
+                ]
+            )
+        self.assertIn("pins no physical slot", str(caught.exception))
+
+
+class LaneLaunchPlanRequestReconciliationTest(unittest.TestCase):
+    """The plan must account for EXACTLY the slots this launch starts (j#85859 F2)."""
+
+    def test_a_plan_describing_fewer_slots_refuses(self) -> None:
+        # The defect this closes: the peer slot would start with nothing having declared
+        # what it is — the partial lane the whole-plan gate exists to prevent.
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _resolve([_spec()], request_providers=["claude", "codex"])
+        message = str(caught.exception)
+        self.assertIn("describes 1 slot(s) but this launch starts 2", message)
+
+    def test_a_plan_describing_more_slots_refuses(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError):
+            _resolve(
+                [
+                    _spec(),
+                    _spec(
+                        workflow_role="coordinator",
+                        profile_id="profile.coordinator",
+                        provider="codex",
+                        physical_slot="second",
+                    ),
+                ],
+                request_providers=["claude"],
+            )
+
+    def test_a_plan_for_providers_this_launch_does_not_start_refuses(self) -> None:
+        # Same cardinality, wrong providers: the plan is internally consistent and still
+        # describes a different launch.
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _resolve([_spec(provider="codex")], request_providers=["claude"])
+        message = str(caught.exception)
+        self.assertIn("does not describe this launch's providers", message)
+        self.assertIn("unplanned: claude", message)
+        self.assertIn("planned but not launched: codex", message)
+
+    def test_launch_order_is_not_pinned(self) -> None:
+        # Placement reorders providers AFTER this preflight, so a plan listed in the other
+        # order is the same pair, not a defect.
         plan = _resolve(
             [
-                _spec(physical_slot=""),
+                _spec(),
                 _spec(
-                    workflow_role="auditor",
-                    profile_id="profile.auditor",
+                    workflow_role="coordinator",
+                    profile_id="profile.coordinator",
                     provider="codex",
-                    physical_slot="",
+                    physical_slot="second",
                 ),
-            ]
+            ],
+            request_providers=["codex", "claude"],
         )
         self.assertEqual(len(plan.slots), 2)
+
+
+class LaneLaunchPlanImmutabilityTest(unittest.TestCase):
+    """A validated plan cannot change afterwards (j#85859 F3)."""
+
+    def test_the_slot_copies_its_argv(self) -> None:
+        # `frozen=True` only stops re-binding: a caller who passed a list kept a live handle
+        # to the validated plan's command (measured: ['--model','x'] -> [] after clear()).
+        argv = ["--model", "x"]
+        plan = _resolve([_spec(launch_argv=argv)])
+        argv.clear()
+        self.assertEqual(plan.slots[0].launch_argv, ("--model", "x"))
+
+    def test_a_string_argv_refuses(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _spec(launch_argv="--model x")
+        self.assertIn("not an argv", str(caught.exception))
+
+    def test_a_non_string_token_refuses(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError):
+            _spec(launch_argv=["--model", 7])
+
+    def test_the_slot_sequence_is_a_tuple(self) -> None:
+        plan = _resolve([_spec()])
+        self.assertIsInstance(plan.slots, tuple)
+        self.assertIsInstance(plan.slots[0].launch_argv, tuple)
 
 
 class LaneLaunchPlanAnchorTest(unittest.TestCase):
@@ -190,8 +285,20 @@ class LaneLaunchPlanAnchorTest(unittest.TestCase):
     def _anchor(journal="85856", issue="13647") -> DecisionPointer:
         return DecisionPointer(source="redmine", issue_id=issue, journal_id=journal)
 
-    def test_no_anchor_resolves_to_none(self) -> None:
+    def test_no_anchor_resolves_to_none_when_not_required(self) -> None:
         self.assertIsNone(resolve_source_anchor(()))
+
+    def test_no_anchor_refuses_when_required(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            resolve_source_anchor((), required=True)
+        self.assertIn("requires the durable governance record", str(caught.exception))
+
+    def test_a_role_bearing_plan_requires_an_anchor(self) -> None:
+        # Review j#85859 F1: a plan that assigns governed responsibilities without naming
+        # the decision that assigned them cannot be told apart from a guessed one.
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _resolve([_spec()], anchors=[])
+        self.assertIn("requires the durable governance record", str(caught.exception))
 
     def test_one_anchor_resolves(self) -> None:
         anchor = self._anchor()

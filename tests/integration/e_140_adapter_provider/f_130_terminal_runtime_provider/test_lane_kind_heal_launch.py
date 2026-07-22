@@ -337,6 +337,9 @@ class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):
     create` — and that a launch WITHOUT a plan is untouched by the new gate.
     """
 
+    #: The harness launches this pair, so a plan that describes THIS launch names both.
+    ANCHOR = DecisionPointer(source="redmine", issue_id=ISSUE, journal_id="85859")
+
     @staticmethod
     def _slot(**over) -> SlotLaunchSpec:
         base = dict(
@@ -349,6 +352,17 @@ class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):
         base.update(over)
         return SlotLaunchSpec(**base)
 
+    def _pair(self, **over):
+        """A plan that accounts for exactly the harness's `(codex, claude)` launch."""
+        second = dict(
+            workflow_role="coordinator",
+            profile_id="profile.coordinator",
+            provider="codex",
+            physical_slot="second",
+        )
+        second.update(over)
+        return (self._slot(), self._slot(**second))
+
     def test_contradictory_plan_refuses_with_zero_side_effect(self) -> None:
         herdr = FakeHerdr()
         with self.assertRaises(HerdrSessionStartError) as caught:
@@ -356,12 +370,13 @@ class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):
                 lane="lane-plan-conflict",
                 stored_kind="",
                 launch_context=LaneLaunchContext(
+                    anchors=(self.ANCHOR,),
                     slot_specs=(
                         self._slot(),
                         # Same governed responsibility claimed twice — visible only across
                         # slots, which is why the pair is the validation unit.
                         self._slot(provider="codex", physical_slot="second"),
-                    )
+                    ),
                 ),
                 herdr=herdr,
             )
@@ -376,7 +391,11 @@ class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):
                 lane="lane-plan-role",
                 stored_kind="",
                 launch_context=LaneLaunchContext(
-                    slot_specs=(self._slot(workflow_role="coordinator_assistant"),)
+                    anchors=(self.ANCHOR,),
+                    slot_specs=self._pair(
+                        workflow_role="coordinator_assistant",
+                        profile_id="profile.assistant",
+                    ),
                 ),
                 herdr=herdr,
             )
@@ -386,17 +405,7 @@ class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):
         # The gate can only REFUSE: composing the plan into the argv build is a later
         # tranche, so a valid plan must leave the launched argv byte-identical to the same
         # launch with no plan at all.
-        planned = LaneLaunchContext(
-            slot_specs=(
-                self._slot(),
-                self._slot(
-                    workflow_role="coordinator",
-                    profile_id="profile.coordinator",
-                    provider="codex",
-                    physical_slot="second",
-                ),
-            )
-        )
+        planned = LaneLaunchContext(anchors=(self.ANCHOR,), slot_specs=self._pair())
         planned_root = self.root
         planned_result, with_plan = self._run(
             lane="lane-plan-ok", stored_kind="", launch_context=planned
@@ -422,6 +431,59 @@ class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):
             for argv in herdr.start_argvs
         ]
 
+    def test_a_plan_without_a_governance_anchor_refuses(self) -> None:
+        # Review j#85859 F1: a role-bearing plan with no durable decision behind it is
+        # indistinguishable from a guessed one — and it used to launch.
+        herdr = FakeHerdr()
+        with self.assertRaises(HerdrSessionStartError) as caught:
+            self._run(
+                lane="lane-plan-noanchor",
+                stored_kind="",
+                launch_context=LaneLaunchContext(slot_specs=self._pair()),
+                herdr=herdr,
+            )
+        self.assertIn("durable governance record", str(caught.exception))
+        self.assertEqual(self._writes(herdr), [])
+
+    def test_a_plan_that_does_not_describe_this_launch_refuses(self) -> None:
+        # Review j#85859 F2: a plan covering one slot of a two-slot launch used to be
+        # admitted, and the unexplained peer started anyway.
+        herdr = FakeHerdr()
+        with self.assertRaises(HerdrSessionStartError) as caught:
+            self._run(
+                lane="lane-plan-partial",
+                stored_kind="",
+                launch_context=LaneLaunchContext(
+                    anchors=(self.ANCHOR,), slot_specs=(self._slot(),)
+                ),
+                herdr=herdr,
+            )
+        self.assertIn("but this launch starts 2", str(caught.exception))
+        self.assertEqual(self._writes(herdr), [])
+
+    def test_a_plan_for_other_providers_refuses(self) -> None:
+        herdr = FakeHerdr()
+        with self.assertRaises(HerdrSessionStartError) as caught:
+            self._run(
+                lane="lane-plan-foreign",
+                stored_kind="",
+                launch_context=LaneLaunchContext(
+                    anchors=(self.ANCHOR,),
+                    slot_specs=(
+                        self._slot(provider="codex"),
+                        self._slot(
+                            workflow_role="coordinator",
+                            profile_id="profile.coordinator",
+                            provider="codex",
+                            physical_slot="second",
+                        ),
+                    ),
+                ),
+                herdr=herdr,
+            )
+        self.assertIn("does not describe this launch's providers", str(caught.exception))
+        self.assertEqual(self._writes(herdr), [])
+
     def test_ambiguous_governance_anchor_refuses(self) -> None:
         herdr = FakeHerdr()
         with self.assertRaises(HerdrSessionStartError) as caught:
@@ -429,7 +491,7 @@ class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):
                 lane="lane-plan-anchor",
                 stored_kind="",
                 launch_context=LaneLaunchContext(
-                    slot_specs=(self._slot(),),
+                    slot_specs=self._pair(),
                     anchors=(
                         DecisionPointer(
                             source="redmine", issue_id=ISSUE, journal_id="85856"

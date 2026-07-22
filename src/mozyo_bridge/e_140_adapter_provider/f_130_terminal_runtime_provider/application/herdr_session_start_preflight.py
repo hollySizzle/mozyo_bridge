@@ -109,6 +109,9 @@ def _validate_slot_plan(
     the adapter's provider vocabulary out of the domain (the plan takes its vocabularies as
     injected data — see ``herdr_lane_launch_plan``).
 
+    The plan is reconciled against ``providers`` — the exact slot set this launch starts —
+    so a partial / foreign plan cannot pass by being internally consistent.
+
     The resolved plan is deliberately NOT returned: Tranche 2 is the fail-closed gate, and
     the launch still builds its argv exactly as before. Composing the plan into the argv
     build is the later tranche, so this step can only refuse — never change a launch that
@@ -132,6 +135,10 @@ def _validate_slot_plan(
         resolve_lane_launch_plan(
             lane_class="default" if not _norm(lane_id) else "sublane",
             slot_specs=specs,
+            # The launch's ACTUAL slot set: the plan must account for exactly it (review
+            # j#85859 F2). Passing the request in is what makes this a whole-plan gate
+            # instead of a structural check on data unrelated to what will be started.
+            request_providers=tuple(providers),
             known_providers=AGENT_PROVIDERS,
             known_roles=WORKFLOW_ROLES,
             lane_kind=getattr(launch_context, "lane_kind", None),

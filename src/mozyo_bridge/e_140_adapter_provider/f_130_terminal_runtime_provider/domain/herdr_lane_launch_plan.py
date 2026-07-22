@@ -69,6 +69,34 @@ class SlotLaunchSpec:
     launch_argv: tuple[str, ...] = ()
     physical_slot: str = ""
 
+    def __post_init__(self) -> None:
+        # Copy the argv into a tuple at CONSTRUCTION (review j#85859 F3). ``frozen=True``
+        # only stops the attribute being re-bound; a caller that passed a list kept a live
+        # handle to the validated plan's command and could empty it afterwards (measured:
+        # ['--model','x'] -> [] after the caller's clear()). A plan that can change after
+        # it is validated is not "fixed before the first write", which is this type's whole
+        # reason to exist — so the value owns its own copy.
+        argv = self.launch_argv
+        if isinstance(argv, (str, bytes)):
+            raise LaneLaunchPlanError(
+                f"launch argv must be a sequence of tokens, got {type(argv).__name__} "
+                f"{argv!r}: a single string is a command line, not an argv"
+            )
+        try:
+            tokens = tuple(argv)
+        except TypeError as exc:
+            raise LaneLaunchPlanError(
+                f"launch argv is not iterable ({type(argv).__name__}); a slot plan carries "
+                "an explicit argv token sequence"
+            ) from exc
+        for token in tokens:
+            if not isinstance(token, str):
+                raise LaneLaunchPlanError(
+                    f"launch argv token {token!r} is {type(token).__name__}, not str; "
+                    "a plan never carries a token the launch cannot pass through"
+                )
+        object.__setattr__(self, "launch_argv", tokens)
+
 
 @dataclass(frozen=True)
 class ResolvedLaneLaunchPlan:
@@ -100,12 +128,18 @@ class ResolvedLaneLaunchPlan:
 
 def resolve_source_anchor(
     anchors: Sequence[DecisionPointer],
+    *,
+    required: bool = False,
 ) -> Optional[DecisionPointer]:
     """The ONE durable anchor this plan is resolved from, or fail closed.
 
-    ``()`` yields ``None`` — a caller with no governance anchor simply builds no
-    role-bearing plan (the pre-#13647 launch). One anchor, or several that name the exact
-    same durable record, resolves to that anchor. Two *different* anchors mean the governance
+    ``()`` yields ``None`` when the caller builds no role-bearing plan (the pre-#13647
+    launch). With ``required=True`` — which is what a NON-EMPTY plan asks for — zero anchors
+    is itself a refusal (review j#85859 F1): a plan that assigns governed responsibilities
+    without naming the durable decision that assigned them is exactly the un-anchored role
+    the design refuses to launch from ("durable governance から一意解決した caller の plan
+    だけ", j#85645). One anchor, or several that name the exact same durable record, resolves
+    to that anchor. Two *different* anchors mean the governance
     inputs contradict each other about which decision authorizes this launch, and picking
     one would be a guess about whose decision is live — so it refuses (Design Answer j#85645:
     "矛盾/複数 anchor で ambiguous なら guess せず zero-start").
@@ -117,6 +151,12 @@ def resolve_source_anchor(
         if anchor not in distinct:
             distinct.append(anchor)
     if not distinct:
+        if required:
+            raise LaneLaunchPlanError(
+                "a role-bearing launch plan requires the durable governance record it was "
+                "resolved from; none was supplied. A slot plan without provenance cannot be "
+                "distinguished from a guessed one, so it is not launched"
+            )
         return None
     if len(distinct) > 1:
         raise LaneLaunchPlanError(
@@ -135,6 +175,7 @@ def resolve_lane_launch_plan(
     slot_specs: Sequence[SlotLaunchSpec],
     known_providers: Collection[str],
     known_roles: Collection[str],
+    request_providers: Sequence[str],
     lane_kind: Optional[str] = None,
     placement: tuple[Optional[str], Optional[Sequence[str]]] = (None, None),
     anchors: Sequence[DecisionPointer] = (),
@@ -162,14 +203,28 @@ def resolve_lane_launch_plan(
     5. **same (physical slot, provider) with a different profile or argv** — the same slot
        asked to be two different things. Distinct providers legitimately carry distinct
        profiles, so only a *same-slot* conflict refuses;
-    6. **ambiguous governance anchor** — see :func:`resolve_source_anchor`.
+    6. **missing / ambiguous governance anchor** — a role-bearing plan must name exactly one
+       durable decision (see :func:`resolve_source_anchor`);
+    7. **a plan that does not describe THIS launch** (review j#85859 F2). ``request_providers``
+       is the launch's actual slot set, and the plan must account for it **exactly**: same
+       number of slots, same provider multiset, and every slot pinned to a distinct non-empty
+       physical position. This is what makes it a *whole-plan* preflight rather than a
+       structural check on unrelated data — a plan that describes one slot of a two-slot
+       launch leaves the other slot to start with nobody having declared what it is, which is
+       precisely the partial lane the gate exists to prevent.
 
-    ``slot_specs=()`` returns an empty plan (no roles, no anchor requirement): the launch is
-    byte-for-byte the pre-#13647 one, so an unconfigured / legacy caller is unaffected.
+       Launch ORDER is deliberately not pinned here: the placement policy reorders providers
+       AFTER this preflight (``resolve_launch_order``), so requiring the plan's order to
+       match the request's would reject correct plans. Cardinality + multiset + unique
+       positions is what "the plan accounts for exactly this pair" needs.
+
+    ``slot_specs=()`` returns an empty plan (no roles, no anchor requirement, no
+    reconciliation): the launch is byte-for-byte the pre-#13647 one, so an unconfigured /
+    legacy caller is unaffected.
     """
     kind = optional_lane_kind(lane_kind, source="ResolvedLaneLaunchPlan.lane_kind")
-    anchor = resolve_source_anchor(anchors)
     slots = tuple(slot_specs)
+    anchor = resolve_source_anchor(anchors, required=bool(slots))
     if not slots:
         return ResolvedLaneLaunchPlan(
             lane_class=lane_class,
@@ -178,6 +233,7 @@ def resolve_lane_launch_plan(
             source_anchor=anchor,
             slots=(),
         )
+    _reconcile_with_request(slots, request_providers)
     seen_roles: dict = {}
     by_position: dict = {}
     for index, slot in enumerate(slots):
@@ -216,7 +272,15 @@ def resolve_lane_launch_plan(
             )
         seen_roles[slot.workflow_role] = where
         position = slot.physical_slot
-        if position:
+        if not position:
+            # A blank position is not "unpinned", it is an unstated one — and a blank was an
+            # escape hatch out of the collision check below (review j#85859 F2). A plan that
+            # claims to describe the pair states where each slot goes.
+            raise LaneLaunchPlanError(
+                f"{where} pins no physical slot; a plan that describes this launch names "
+                "the pair position each slot occupies"
+            )
+        if True:
             previous = by_position.get(position)
             if previous is None:
                 by_position[position] = slot
@@ -248,6 +312,30 @@ def resolve_lane_launch_plan(
         source_anchor=anchor,
         slots=slots,
     )
+
+
+def _reconcile_with_request(
+    slots: Sequence[SlotLaunchSpec], request_providers: Sequence[str]
+) -> None:
+    """The plan must account for EXACTLY the slots this launch will start (j#85859 F2)."""
+    from collections import Counter
+
+    requested = Counter(request_providers)
+    planned = Counter(slot.provider for slot in slots)
+    if sum(planned.values()) != sum(requested.values()):
+        raise LaneLaunchPlanError(
+            f"the launch plan describes {sum(planned.values())} slot(s) but this launch "
+            f"starts {sum(requested.values())} ({', '.join(request_providers)}); an "
+            "unexplained slot would start with nothing having declared what it is"
+        )
+    if planned != requested:
+        missing = sorted((requested - planned).elements())
+        extra = sorted((planned - requested).elements())
+        raise LaneLaunchPlanError(
+            "the launch plan does not describe this launch's providers"
+            + (f"; unplanned: {', '.join(missing)}" if missing else "")
+            + (f"; planned but not launched: {', '.join(extra)}" if extra else "")
+        )
 
 
 __all__ = (
