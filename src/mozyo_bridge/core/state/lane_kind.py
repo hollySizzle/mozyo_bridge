@@ -2,9 +2,17 @@
 
 The single source of truth for the three-token lane-kind vocabulary
 ``coordinator | delegated_coordinator | implementation`` — the workflow-role
-*geometry* axis of a lane (親 / 子 / 孫, delegation depth 0 / 1 / 2). It lives in
-``shared`` — the lowest neutral layer — so every layer that needs it imports
-*downward* and no layer reverse-imports another:
+*geometry* axis of a lane (親 / 子 / 孫, delegation depth 0 / 1 / 2).
+
+It lives in ``core/state`` — not ``shared`` — per the shared-kernel freeze policy
+(``vibes/docs/logics/shared-kernel-freeze.md``, Redmine #12640): ``shared/**`` is a
+frozen kernel and a new cross-cutting value belongs in a bounded context or
+``core/state``. ``lane_kind`` is a **managed-state / lane-identity value** (a lane's
+delegation-tree position), co-located with the lifecycle authority record
+(:mod:`mozyo_bridge.core.state.lane_lifecycle_model`) that stores the resolved kind
+generation-bound for heal (Redmine #13647 Tranche 1b). ``core/state`` is a
+foundational layer below the ``e_*`` bounded contexts, so every layer that needs the
+vocabulary imports *downward* and no layer reverse-imports another:
 
 - the cockpit delegation projection (``e_110`` ``delegation_projection``) re-exports
   these tokens for its existing display consumers (``@mozyo_lane_kind`` cache /

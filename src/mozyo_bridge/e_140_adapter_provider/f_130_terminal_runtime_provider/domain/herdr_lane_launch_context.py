@@ -18,7 +18,7 @@ Authority model (kept enforced by what this type does and does NOT carry):
   caller has no durable kind fact (a legacy / bare launch); the launch path then
   resolves placement geometry by ``lane_class`` — the byte-for-byte pre-#13647
   fallback the issue's close condition fixes. A *present* value is always a
-  canonical :data:`~mozyo_bridge.shared.lane_kind.LANE_KINDS` token or fails closed.
+  canonical :data:`~mozyo_bridge.core.state.lane_kind.LANE_KINDS` token or fails closed.
 - **Geometry / plan input only.** This context selects placement geometry (Tranche
   1) and — later — per-slot role→profile (Tranche 2). It is never promoted to an
   mzb1 assigned name, ``MOZYO_AGENT_ROLE`` (a provider token), or a
@@ -35,7 +35,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from mozyo_bridge.shared.lane_kind import optional_lane_kind
+from mozyo_bridge.core.state.lane_kind import optional_lane_kind
 
 
 @dataclass(frozen=True)

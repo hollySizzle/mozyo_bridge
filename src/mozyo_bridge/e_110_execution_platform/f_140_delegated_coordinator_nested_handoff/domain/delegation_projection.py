@@ -50,14 +50,15 @@ from typing import Iterable, Mapping
 # (it folds implementation_gateway + implementation_worker into the single
 # display kind ``implementation``); it carries no routing authority.
 #
-# The canonical definition now lives in the neutral ``shared.lane_kind`` leaf
-# (Redmine #13647, Design Answer j#85645 point 4) so the herdr launch path can
-# resolve placement geometry by this key without reverse-importing this cockpit
-# display module. These names are re-exported unchanged for the existing display
-# consumers (``@mozyo_lane_kind`` cache / ``agents targets`` columns); the closed
-# ``LANE_KINDS`` contract (no ``unknown`` member — Redmine #12465 review j#63800)
-# is preserved verbatim by sharing the single source of truth.
-from mozyo_bridge.shared.lane_kind import (  # noqa: F401  (re-exported)
+# The canonical definition now lives in the neutral ``core.state.lane_kind`` leaf
+# (Redmine #13647, Design Answer j#85645 point 4; core/state per the shared-kernel
+# freeze policy #12640) so the herdr launch path can resolve placement geometry by
+# this key without reverse-importing this cockpit display module. These names are
+# re-exported unchanged for the existing display consumers (``@mozyo_lane_kind``
+# cache / ``agents targets`` columns); the closed ``LANE_KINDS`` contract (no
+# ``unknown`` member — Redmine #12465 review j#63800) is preserved verbatim by
+# sharing the single source of truth.
+from mozyo_bridge.core.state.lane_kind import (  # noqa: F401  (re-exported)
     LANE_KIND_COORDINATOR,
     LANE_KIND_DELEGATED_COORDINATOR,
     LANE_KIND_IMPLEMENTATION,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from mozyo_bridge.shared.lane_kind import (
+from mozyo_bridge.core.state.lane_kind import (
     LANE_KIND_COORDINATOR,
     LANE_KIND_DELEGATED_COORDINATOR,
     LANE_KIND_IMPLEMENTATION,

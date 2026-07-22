@@ -39,7 +39,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Optional
 
-from mozyo_bridge.shared.lane_kind import LANE_KINDS
+from mozyo_bridge.core.state.lane_kind import LANE_KINDS
 
 #: The closed lane-class vocabulary of ``lane_placement`` (Redmine #13646). Matches
 #: ``agent_launch``'s lane-class axis: ``default`` (the coordinator / auditor pair) and
@@ -66,7 +66,7 @@ LANE_PLACEMENT_CLASS_KEYS: frozenset[str] = frozenset({"split", "order"})
 #: The closed lane-KIND vocabulary of the ``by_lane_kind`` block (Redmine #13647,
 #: disposition j#85650 P3): the three canonical delegation-geometry tokens
 #: ``coordinator`` (親) / ``delegated_coordinator`` (子) / ``implementation`` (孫).
-#: The single source of truth is :data:`mozyo_bridge.shared.lane_kind.LANE_KINDS`;
+#: The single source of truth is :data:`mozyo_bridge.core.state.lane_kind.LANE_KINDS`;
 #: there is deliberately no ``parent`` / ``child`` / ``grandchild`` config alias
 #: (the machine vocabulary is exactly these three tokens).
 LANE_PLACEMENT_LANE_KINDS: frozenset[str] = LANE_KINDS
