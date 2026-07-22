@@ -95,7 +95,9 @@ def declare_created_lane_lifecycle(
             decision=decision,
             issue_id=issue_id,
             worktree_identity=worktree_identity,
-            lane_kind=_norm(lane_kind),
+            # Byte-exact (review j#85852 F1): the store's closed-vocabulary check is the
+            # boundary; a padded token is refused there rather than quietly repaired here.
+            lane_kind=lane_kind,
         )
     except (LaneLifecycleError, DecisionPointerError, LaneKindError, OSError) as exc:
         print(

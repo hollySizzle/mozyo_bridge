@@ -358,8 +358,10 @@ class LaneLifecycleStore:
             )
         worktree = norm(worktree_identity)
         # Fail closed BEFORE the connection opens: an off-vocabulary kind never reaches the
-        # store, and the refusal costs no lock / no schema-ensuring write open.
-        kind = optional_lane_kind(norm(lane_kind), source="declare_active(lane_kind=)") or ""
+        # store, and the refusal costs no lock / no schema-ensuring write open. The token is
+        # checked EXACTLY as given (review j#85852 F1) — normalizing first would store a
+        # value the caller did not supply and would let `" implementation "` in.
+        kind = optional_lane_kind(lane_kind, source="declare_active(lane_kind=)") or ""
         stamp = now or _utc_now()
         conn = self._connect_write(key)
         try:

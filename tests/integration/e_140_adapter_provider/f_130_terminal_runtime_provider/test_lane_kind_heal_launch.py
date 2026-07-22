@@ -273,6 +273,39 @@ class LaneKindHealAuthorityLaunchTest(unittest.TestCase):
             )
         self.assertEqual(self._writes(herdr), [])
 
+    def test_padded_stored_token_refuses_and_is_never_normalized(self) -> None:
+        # Review j#85852 F1: a validator that runs AFTER a trim decides the closed
+        # vocabulary on a value the store does not hold. `" implementation "` is NOT the
+        # canonical token — the row says something this build cannot interpret, and a
+        # launch must not quietly repair an authority value on the way out of the store.
+        for padded in (" implementation ", "implementation\n", "\timplementation"):
+            self.setUp()
+            with self.assertRaises(HerdrSessionStartError) as caught:
+                self._run(
+                    lane="lane-padded",
+                    stored_kind="implementation",
+                    tamper=padded,
+                    config=self._placement(
+                        by_lane_kind={"implementation": {"split": "right"}}
+                    ),
+                )
+            self.assertIn("cannot interpret", str(caught.exception))
+
+    def test_whitespace_only_stored_token_is_not_the_legacy_blank(self) -> None:
+        # The other half of the same defect: trimming first turned `"   "` into `""`, so a
+        # present-but-unreadable token masqueraded as "this lane never had a kind" and
+        # silently took the lane_class fallback. Only an EXACTLY empty value is absence.
+        herdr = FakeHerdr()
+        with self.assertRaises(HerdrSessionStartError) as caught:
+            self._run(
+                lane="lane-whitespace",
+                stored_kind="implementation",
+                tamper="   ",
+                herdr=herdr,
+            )
+        self.assertIn("cannot interpret", str(caught.exception))
+        self.assertEqual(self._writes(herdr), [])
+
     def test_blank_stored_token_still_falls_back(self) -> None:
         # The one legitimate absence: a legacy / pre-v7 lane has no durable kind fact, so it
         # keeps the pre-#13647 lane-class geometry rather than refusing.

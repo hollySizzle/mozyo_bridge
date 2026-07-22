@@ -1428,7 +1428,7 @@ allowlist:
     expires: "2027-10-08"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_actuator_herdr_ops.py
-    lines: 1027
+    lines: 1029
     reason: >-
       herdr-backend creation-side actuation IO port for `sublane start --execute`
       (the sibling of the tmux LiveSublaneActuatorOps). A cohesive IO adapter — launch

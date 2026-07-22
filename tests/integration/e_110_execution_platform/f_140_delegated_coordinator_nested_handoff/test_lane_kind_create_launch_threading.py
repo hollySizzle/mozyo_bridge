@@ -214,6 +214,16 @@ class FreshCreateLaunchThreadingTest(unittest.TestCase):
         self.assertEqual(orders[LANE_KIND_IMPLEMENTATION], ["claude", "codex"])
         self.assertEqual(orders[LANE_KIND_DELEGATED_COORDINATOR], ["codex", "claude"])
 
+    def test_padded_caller_kind_fails_closed_before_any_launch(self) -> None:
+        # Review j#85852 F1 applies to the caller side too: the actuator must hand its token
+        # to the context UNTRIMMED, so a padded value is refused at the closed-vocabulary
+        # boundary instead of being quietly repaired into a valid kind. Zero launch.
+        from mozyo_bridge.core.state.lane_kind import LaneKindError
+
+        self._config("lane_placement:\n  sublane:\n    split: right\n")
+        with self.assertRaises(LaneKindError):
+            self._create(lane_kind=" implementation ")
+
     def test_create_without_a_kind_is_byte_invariant(self) -> None:
         # No `--lane-kind`: the by_lane_kind block is present but never consulted, so the
         # create keeps its pre-#13647 lane-class geometry exactly.

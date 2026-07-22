@@ -107,6 +107,57 @@ class LaneKindStorageTest(unittest.TestCase):
             ).applied
         )
 
+    def test_padded_kind_is_refused_not_trimmed(self) -> None:
+        # Review j#85852 F1: the write surfaces validated a TRIMMED token, so
+        # `" implementation "` was silently stored as the canonical one. The closed
+        # vocabulary is exact — a padded token is a caller error, surfaced, never repaired.
+        store = LaneLifecycleStore(home=self.home)
+        for padded in (" implementation ", "implementation\n", "   "):
+            with self.assertRaises(LaneKindError):
+                store.declare_active(
+                    self.key, decision=_decision(), issue_id=ISSUE, lane_kind=padded
+                )
+        self.assertIsNone(store.get(self.key))  # every refusal was zero-write
+
+    def test_padded_kind_is_refused_by_every_write_surface(self) -> None:
+        declarations = LaneDeclarationStore(home=self.home)
+        with self.assertRaises(LaneKindError):
+            declarations.declare_lane(
+                self.key,
+                decision=_decision(),
+                issue_id=ISSUE,
+                lane_kind=" delegated_coordinator ",
+            )
+        # ...and the one sanctioned re-bind point refuses it too.
+        store = LaneLifecycleStore(home=self.home)
+        store.declare_active(
+            self.key,
+            decision=_decision(),
+            issue_id=ISSUE,
+            lane_kind=LANE_KIND_IMPLEMENTATION,
+        )
+        for target in (DISPOSITION_HIBERNATED, DISPOSITION_RETIRED):
+            record = store.get(self.key)
+            store.transition_disposition(
+                self.key,
+                expected_disposition=record.lane_disposition,
+                expected_revision=record.revision,
+                target=target,
+                decision=_decision(),
+            )
+        record = store.get(self.key)
+        with self.assertRaises(LaneKindError):
+            declarations.open_next_generation(
+                self.key,
+                expected_revision=record.revision,
+                expected_generation=record.lane_generation,
+                decision=_decision(),
+                lane_kind=" coordinator ",
+            )
+        unchanged = store.get(self.key)
+        self.assertEqual(unchanged.lane_kind, LANE_KIND_IMPLEMENTATION)
+        self.assertEqual(unchanged.lane_generation, 1)
+
     def test_declare_lane_stores_the_kind_and_redeclare_is_idempotent(self) -> None:
         store = LaneDeclarationStore(home=self.home)
         first = store.declare_lane(

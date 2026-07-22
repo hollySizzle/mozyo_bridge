@@ -51,10 +51,15 @@ def _checked_stored_lane_kind(
 ) -> Optional[str]:
     """The row's ``lane_kind`` as a CANONICAL token, or fail closed (#13647 review j#85848 F2).
 
-    ``""`` is the one legitimate absence: a pre-v7 / legacy lane simply has no durable kind
-    fact, so the launch falls back to ``lane_class`` geometry exactly as before. Anything
-    ELSE that is not one of the three canonical tokens is an authority value this build
-    cannot interpret — a tampered row, a foreign writer, or a vocabulary from a future build
+    ``stored`` is the row's byte-exact value: it is never trimmed or otherwise normalized
+    before the check (review j#85852 F1), because normalizing first would decide the closed
+    vocabulary on a value the store does not hold — ``" implementation "`` would pass as a
+    canonical kind and ``"   "`` would pass as the legacy blank.
+
+    EXACTLY ``""`` is the one legitimate absence: a pre-v7 / legacy lane simply has no
+    durable kind fact, so the launch falls back to ``lane_class`` geometry exactly as
+    before. Anything ELSE that is not one of the three canonical tokens — including a padded
+    or whitespace-only token — is an authority value this build cannot interpret — a tampered row, a foreign writer, or a vocabulary from a future build
     — and this component's standing rule is that uninterpretable is NOT absent. Silently
     treating it as "no kind" would place the pair by a geometry the durable record does not
     actually say, which is the guess the whole design exists to prevent (disposition j#85650:
@@ -63,7 +68,7 @@ def _checked_stored_lane_kind(
     Raised here, at the same pre-side-effect boundary as the disposition refusal, so the
     refusal costs no workspace / tab / agent.
     """
-    if not stored:
+    if stored == "":
         return None  # no durable kind fact: the sanctioned lane_class fallback
     try:
         return checked_lane_kind(stored, source=f"lane {lane!r} stored lane_kind")
@@ -132,8 +137,12 @@ def _admitted_lane_kind(
         return None  # a rowless lane (scratch / not yet declared): unchanged
     disposition = _norm(record.lane_disposition)
     if disposition in LAUNCH_ADMISSIBLE_DISPOSITIONS:
+        # The RAW stored token — deliberately NOT trimmed (review j#85852 F1). Trimming
+        # first would make the closed-vocabulary check judge a value the store does not
+        # actually hold, so `' implementation '` would be silently normalized into a valid
+        # kind and a whitespace-only token would masquerade as the legacy blank.
         return _checked_stored_lane_kind(
-            _norm(getattr(record, "lane_kind", "")), lane=lane, error_type=error_type
+            getattr(record, "lane_kind", "") or "", lane=lane, error_type=error_type
         )
     raise error_type(
         f"managed-launch admission refused: lane {lane!r} is durably {disposition!r} and a "
@@ -184,7 +193,9 @@ def admit_launch_against_lifecycle(
     run is side-effect free *and* store-free by contract (Redmine #13595 / #14242 — it does
     not consult the disposition either), so it plans from fresh-launch authority only.
     """
-    context_kind = _norm(getattr(launch_context, "lane_kind", "") or "") or None
+    # The context validated its own token on construction (`LaneLaunchContext` runs the same
+    # closed-vocabulary check), so it is already canonical or None — nothing to normalize.
+    context_kind = getattr(launch_context, "lane_kind", None) or None
     if dry_run:
         return context_kind
     stored_kind = _admitted_lane_kind(

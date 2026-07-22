@@ -151,8 +151,9 @@ class LaneDeclarationStore:
         pinned = validate_declared_slots(tuple(declared_slots))
         encoded_slots = encode_declared_slots(pinned)
         # v7 (#13647): fail closed on an off-vocabulary kind before any connection opens.
+        # Checked byte-exact, never trimmed first (review j#85852 F1).
         geometry_kind = (
-            optional_lane_kind(norm(lane_kind), source="declare_lane(lane_kind=)") or ""
+            optional_lane_kind(lane_kind, source="declare_lane(lane_kind=)") or ""
         )
         if kind == BINDING_KIND_ISSUE:
             if scope:
@@ -442,7 +443,7 @@ class LaneDeclarationStore:
             if lane_kind is None
             else (
                 optional_lane_kind(
-                    norm(lane_kind), source="open_next_generation(lane_kind=)"
+                    lane_kind, source="open_next_generation(lane_kind=)"
                 )
                 or ""
             )

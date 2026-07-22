@@ -424,13 +424,15 @@ class HerdrSublaneActuatorOps:
         records a kind resolves it from that row instead (and a disagreement between the two
         is refused at the launch admission, never silently resolved).
         """
-        if not _norm(self.lane_kind):
+        if self.lane_kind == "":
             return None
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501
             LaneLaunchContext,
         )
 
-        return LaneLaunchContext(lane_kind=_norm(self.lane_kind))
+        # UNTRIMMED (review j#85852 F1): the context's closed-vocabulary check is the
+        # boundary; a padded token is a caller error to surface, never to repair here.
+        return LaneLaunchContext(lane_kind=self.lane_kind)
 
     def _record_lane_metadata(self, worktree_path: str) -> None:
         """Upsert the lane's display-metadata record (best-effort, never raises)."""
