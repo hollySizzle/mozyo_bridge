@@ -921,5 +921,225 @@ class MaterializationFailureContractTest(unittest.TestCase):
                 self.assertEqual(bad.reads, 1)
 
 
+class _Unprintable:
+    """An arbitrary caller value whose repr() raises — refusals interpolate it."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr exploded")
+
+
+class _UnprintableError(Exception):
+    """An ordinary exception that cannot be stringified (review j#86049's input)."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("exception __str__ exploded")
+
+
+class _UnreadableUnprintable(abc.Sequence):
+    """A read failure whose exception cannot itself be printed."""
+
+    def __len__(self) -> int:
+        return 1
+
+    def __iter__(self):
+        raise _UnprintableError()
+
+    def __getitem__(self, index):
+        raise _UnprintableError()
+
+
+class _Hostile(str):
+    """A genuine `str` — every isinstance check says yes — with weaponised dunders.
+
+    This is the case that shows the defect is not exotic: a value can pass every type check
+    the module makes and still carry arbitrary code on the operations the module performs on
+    it afterwards (printing it, hashing it, ordering it, testing it for truth).
+    """
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr")
+
+    def __format__(self, spec) -> str:
+        raise RuntimeError("format")
+
+    def __str__(self) -> str:
+        raise RuntimeError("str")
+
+    def __hash__(self):
+        raise RuntimeError("hash")
+
+    def __eq__(self, other):
+        raise RuntimeError("eq")
+
+    def __lt__(self, other):
+        raise RuntimeError("lt")
+
+    def __bool__(self):
+        raise RuntimeError("bool")
+
+
+class _Sortable(str):
+    """Hash / eq work, so it reaches the vocabulary; printing and ordering explode."""
+
+    def __repr__(self) -> str:
+        raise RuntimeError("repr")
+
+    def __format__(self, spec) -> str:
+        raise RuntimeError("format")
+
+    def __str__(self) -> str:
+        raise RuntimeError("str")
+
+    def __lt__(self, other):
+        raise RuntimeError("lt")
+
+
+class RefusalNeverRunsCallerCodeTest(unittest.TestCase):
+    """Building a refusal must not let the caller's code decide the outcome (j#86049).
+
+    `repr()` runs `__repr__`, `f"{exc}"` runs `__str__`, a vocabulary lookup runs `__hash__`
+    — so the act of REFUSING used to be able to replace the typed refusal with a raw
+    exception, at exactly the moment the plan was trying to fail closed.
+    """
+
+    def test_an_unprintable_read_failure_still_refuses_typed(self) -> None:
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _spec(launch_argv=_UnreadableUnprintable())
+        # The type survives in the message and the whole exception in the cause, so retyping
+        # costs no diagnosis.
+        self.assertIn("_UnprintableError", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, _UnprintableError)
+
+    def test_unprintable_values_refuse_typed(self) -> None:
+        for name, build in {
+            "_checked_str": lambda bad: _spec(provider=bad),
+            "slots element": lambda bad: ResolvedLaneLaunchPlan(
+                lane_class="sublane", slots=[bad]
+            ),
+            "anchor element": lambda bad: resolve_source_anchor([bad]),
+            "source_anchor": lambda bad: ResolvedLaneLaunchPlan(
+                lane_class="sublane", source_anchor=bad
+            ),
+        }.items():
+            with self.subTest(surface=name):
+                with self.assertRaises(LaneLaunchPlanError) as caught:
+                    build(_Unprintable())
+                self.assertIn("unprintable", str(caught.exception))
+
+    def test_a_hostile_string_refuses_typed_on_every_surface(self) -> None:
+        # Each surface gets the token that actually reaches ITS refusal: a single shared
+        # value would leave some cases resolving happily and asserting nothing.
+        for name, token, build in (
+            ("bare-string argv", "--model", lambda bad: _spec(launch_argv=bad)),
+            (
+                "bare-string vocabulary",
+                "implementer",
+                lambda bad: _resolve([_spec()], known_roles=bad),
+            ),
+            ("unknown role", "ghost", lambda bad: _resolve([_spec(workflow_role=bad)])),
+            (
+                "unknown lane class",
+                "foreign",
+                lambda bad: _resolve([_spec()], lane_class=bad),
+            ),
+            (
+                "unknown split",
+                "diagonal",
+                lambda bad: _resolve([_spec()], placement=(bad, None)),
+            ),
+            (
+                "unknown lane kind",
+                "grandchild",
+                lambda bad: _resolve([_spec()], lane_kind=bad),
+            ),
+            (
+                "duplicate physical slot",
+                "first",
+                lambda bad: _resolve(
+                    [_spec(), _spec(workflow_role="auditor", physical_slot=bad)]
+                ),
+            ),
+            (
+                "request provider",
+                "codex",
+                lambda bad: _resolve([_spec()], request_providers=[bad]),
+            ),
+            (
+                "placement order entry",
+                "foreign",
+                lambda bad: _resolve([_spec()], placement=("right", [bad])),
+            ),
+        ):
+            with self.subTest(surface=name):
+                with self.assertRaises(LaneLaunchPlanError):
+                    build(_Hostile(token))
+
+    def test_a_hostile_vocabulary_refuses_typed(self) -> None:
+        # Handed over as a list: a set literal would hash in the TEST, measuring this file
+        # rather than the module.
+        for name, vocabulary in (
+            ("unhashable", [_Hostile("implementer"), _Hostile("auditor")]),
+            ("unsortable", [_Sortable("implementer"), _Sortable("auditor")]),
+        ):
+            with self.subTest(vocabulary=name):
+                with self.assertRaises(LaneLaunchPlanError):
+                    _resolve([_spec(workflow_role="ghost")], known_roles=vocabulary)
+
+
+class AcceptedStringsAreOwnedTest(unittest.TestCase):
+    """An ACCEPTED string is owned, not just checked (review j#86049).
+
+    The module already copies every sequence it is handed, for the reason that a validated
+    plan must not be able to change afterwards. A `str` subclass is the same problem one
+    level down: the characters are fine, but the *behaviour* still belongs to the caller, and
+    it runs every time the plan is later printed, hashed, sorted or tested for truth. So the
+    accepted value is an exact `str` with the same characters — validate, then own what you
+    validated.
+    """
+
+    def _hostile_plan(self):
+        return _resolve(
+            [
+                _spec(
+                    workflow_role=_Hostile("implementer"),
+                    profile_id=_Hostile("profile.implementer"),
+                    provider=_Hostile("claude"),
+                    physical_slot=_Hostile("first"),
+                    launch_argv=[_Hostile("--model")],
+                )
+            ],
+            request_providers=[_Hostile("claude")],
+            lane_class=_Hostile("sublane"),
+            placement=(_Hostile("right"), [_Hostile("claude")]),
+        )
+
+    def test_every_stored_string_is_an_exact_str(self) -> None:
+        plan = self._hostile_plan()
+        slot = plan.slots[0]
+        for name, value in (
+            ("lane_class", plan.lane_class),
+            ("placement split", plan.placement[0]),
+            ("placement order entry", plan.placement[1][0]),
+            ("workflow_role", slot.workflow_role),
+            ("profile_id", slot.profile_id),
+            ("provider", slot.provider),
+            ("physical_slot", slot.physical_slot),
+            ("launch_argv entry", slot.launch_argv[0]),
+        ):
+            with self.subTest(field=name):
+                self.assertIs(type(value), str)
+
+    def test_the_stored_plan_is_inert(self) -> None:
+        # The characters are kept and every operation the hostile class weaponised now works
+        # — which is the point: nothing the caller wrote is still running inside the plan.
+        plan = self._hostile_plan()
+        self.assertEqual(plan.lane_class, "sublane")
+        self.assertEqual(f"{plan.lane_class}", "sublane")
+        self.assertEqual(repr(plan.slots[0].provider), "'claude'")
+        self.assertEqual(sorted(plan.providers), ["claude"])
+        self.assertTrue(plan.slots[0].physical_slot)
+        self.assertEqual(plan.placement, ("right", ("claude",)))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

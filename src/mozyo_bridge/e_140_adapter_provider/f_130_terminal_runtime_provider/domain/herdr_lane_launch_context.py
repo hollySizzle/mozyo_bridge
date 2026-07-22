@@ -43,6 +43,29 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 
 
+def _kind(value: object) -> str:
+    """The type name of a caller's value, for a message — never a way to fail (j#86049)."""
+    try:
+        return type(value).__name__
+    except Exception:  # pragma: no cover - a type whose own name cannot be read
+        return "<unnameable type>"
+
+
+def _shown(value: object) -> str:
+    """``repr(value)`` for a refusal message, unable to change the OUTCOME (j#86049).
+
+    Building a refusal must not re-enter the caller's code in a way that can replace the
+    refusal: ``repr()`` runs ``__repr__``, ``f"{exc}"`` runs ``__str__``, and either raising
+    turns this carrier's typed refusal into a raw exception. Re-stated here rather than
+    imported from the plan module for the same reason its retype is: one module's guard must
+    not be what makes the other module's tests pass.
+    """
+    try:
+        return repr(value)
+    except Exception:
+        return f"<unprintable {_kind(value)}>"
+
+
 def _checked_elements(value: object, expected: type, *, field: str) -> tuple:
     """An owned ordered tuple whose every element is ``expected``, or a typed refusal.
 
@@ -54,7 +77,7 @@ def _checked_elements(value: object, expected: type, *, field: str) -> tuple:
     if isinstance(value, (str, bytes)) or not isinstance(value, abc.Sequence):
         raise LaneLaunchPlanError(
             f"{field} must be an ordered sequence of {expected.__name__}, got "
-            f"{type(value).__name__}"
+            f"{_kind(value)}"
         )
     # Reading the caller's sequence can itself fail even when its SHAPE is impeccable — an
     # `abc.Sequence` whose `__iter__` raises satisfies every guard above and then explodes
@@ -66,13 +89,13 @@ def _checked_elements(value: object, expected: type, *, field: str) -> tuple:
         owned = tuple(value)
     except Exception as exc:  # not BaseException: an interrupt is not a refusal
         raise LaneLaunchPlanError(
-            f"{field} could not be read ({type(exc).__name__}: {exc}); the context is not "
-            "built from an input it cannot even materialise"
+            f"{field} could not be read ({_kind(exc)}); the context is not built from "
+            "an input it cannot even materialise"
         ) from exc
     for element in owned:
         if not isinstance(element, expected):
             raise LaneLaunchPlanError(
-                f"{field} entry {element!r} is {type(element).__name__}, not "
+                f"{field} entry {_shown(element)} is {_kind(element)}, not "
                 f"{expected.__name__}"
             )
     return owned

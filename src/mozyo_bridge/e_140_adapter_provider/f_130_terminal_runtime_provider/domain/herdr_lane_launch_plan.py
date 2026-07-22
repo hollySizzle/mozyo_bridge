@@ -57,6 +57,44 @@ class LaneLaunchPlanError(ValueError):
     """
 
 
+def _kind(value: object) -> str:
+    """The type name of a caller's value, for a message — never a way to fail (j#86049)."""
+    try:
+        return type(value).__name__
+    except Exception:  # pragma: no cover - a type whose own name cannot be read
+        return "<unnameable type>"
+
+
+def _shown(value: object) -> str:
+    """``repr(value)`` for a refusal message, with the caller's code unable to change the outcome.
+
+    Interpolating a caller-supplied value into a refusal RE-ENTERS that caller's code:
+    ``repr()`` runs ``__repr__`` and ``f"{exc}"`` runs ``__str__``. When that code raises, the
+    refusal being built is replaced by a raw exception — the plan fails, but not in the way it
+    promised to, and precisely at the moment it was trying to fail closed (review j#86049).
+
+    A ``str`` subclass is the case that shows this is not exotic: it satisfies every
+    ``isinstance`` check the module makes, so a value can be fully "type-validated" and still
+    carry arbitrary code on its ``__repr__`` (measured on 5 such surfaces).
+
+    Diagnostic text must never decide the OUTCOME. Nothing is swallowed: the value's failure
+    is reported in place of the value, and the original exception of a failed READ is kept as
+    ``__cause__`` by :func:`_read_once`.
+    """
+    try:
+        return repr(value)
+    except Exception:
+        return f"<unprintable {_kind(value)}>"
+
+
+def _text(value: object) -> str:
+    """``str(value)`` for a message, unable to change the outcome (review j#86049)."""
+    try:
+        return "" + str(value)
+    except Exception:
+        return f"<unprintable {_kind(value)}>"
+
+
 def _read_once(value: object, factory, *, field: str):
     """Materialize a caller's collection EXACTLY once, as THIS module's error either way.
 
@@ -76,8 +114,8 @@ def _read_once(value: object, factory, *, field: str):
         return factory(value)
     except Exception as exc:
         raise LaneLaunchPlanError(
-            f"{field} could not be read ({type(exc).__name__}: {exc}); the plan is not "
-            "built from an input it cannot even materialise"
+            f"{field} could not be read ({_kind(exc)}); the plan is not built from an "
+            "input it cannot even materialise"
         ) from exc
 
 
@@ -93,19 +131,17 @@ def _ordered_tokens(value: object, *, field: str) -> tuple[str, ...]:
     """
     if isinstance(value, (str, bytes)):
         raise LaneLaunchPlanError(
-            f"{field} must be a sequence of tokens, got {type(value).__name__} {value!r}: "
+            f"{field} must be a sequence of tokens, got {_kind(value)} {_shown(value)}: "
             "a single string is a command line, not an ordered token sequence"
         )
     if not isinstance(value, abc.Sequence):
         raise LaneLaunchPlanError(
             f"{field} must be an ordered sequence (list / tuple), got "
-            f"{type(value).__name__}: an unordered container cannot express launch order "
+            f"{_kind(value)}: an unordered container cannot express launch order "
             "— its iteration order is not part of the value"
         )
     tokens = _read_once(value, tuple, field=field)
-    for token in tokens:
-        _checked_str(token, field=f"{field} entry")
-    return tokens
+    return tuple(_checked_str(token, field=f"{field} entry") for token in tokens)
 
 
 def _ordered_container(value: object, *, field: str, expected: str) -> tuple:
@@ -124,7 +160,7 @@ def _ordered_container(value: object, *, field: str, expected: str) -> tuple:
     if isinstance(value, (str, bytes)) or not isinstance(value, abc.Sequence):
         raise LaneLaunchPlanError(
             f"{field} must be an ordered sequence of {expected}, got "
-            f"{type(value).__name__}: an unordered / mapping container is not a "
+            f"{_kind(value)}: an unordered / mapping container is not a "
             f"positional sequence"
         )
     return _read_once(value, tuple, field=field)
@@ -140,16 +176,16 @@ def _checked_vocabulary(value: object, *, field: str) -> frozenset[str]:
     """
     if isinstance(value, (str, bytes)):
         raise LaneLaunchPlanError(
-            f"{field} must be a collection of tokens, got {type(value).__name__} {value!r}: "
+            f"{field} must be a collection of tokens, got {_kind(value)} {_shown(value)}: "
             "membership in a bare string is a substring test, not a vocabulary check"
         )
     # Covers BOTH "not iterable at all" and "iterable that fails while being read":
     # each is a vocabulary the plan was not actually given, and neither may leave as a
     # raw exception (review j#86008).
     tokens = _read_once(value, frozenset, field=field)
-    for token in tokens:
-        _checked_str(token, field=f"{field} entry")
-    return tokens
+    return frozenset(
+        _checked_str(token, field=f"{field} entry") for token in tokens
+    )
 
 
 def _checked_str(value: object, *, field: str) -> str:
@@ -162,9 +198,17 @@ def _checked_str(value: object, *, field: str) -> str:
     """
     if not isinstance(value, str):
         raise LaneLaunchPlanError(
-            f"{field} must be a string, got {type(value).__name__} {value!r}"
+            f"{field} must be a string, got {_kind(value)} {_shown(value)}"
         )
-    return value
+    # OWN the string, not just its characters (review j#86049). `isinstance` admits a `str`
+    # SUBCLASS, which satisfies every check this module makes while carrying arbitrary code
+    # on `__repr__` / `__format__` / `__hash__` / `__eq__` / `__bool__` / `__lt__`. Those run
+    # later — in a message, a vocabulary lookup, a truthiness test — and a raising one
+    # replaces a typed refusal with a raw exception, or turns a decision into a failure.
+    # Concatenation yields an exact, inert `str` with the same characters, so nothing
+    # downstream can re-enter the caller. This is the same discipline the sequences already
+    # follow: validate, then own what you validated.
+    return "" + value
 
 
 @dataclass(frozen=True)
@@ -196,7 +240,13 @@ class SlotLaunchSpec:
         # This is deliberately TYPE-only — whether a role exists in the vocabulary, or a
         # position collides with a peer's, is contextual and belongs to the resolver.
         for field_name in ("workflow_role", "profile_id", "provider", "physical_slot"):
-            _checked_str(getattr(self, field_name), field=f"SlotLaunchSpec.{field_name}")
+            object.__setattr__(
+                self,
+                field_name,
+                _checked_str(
+                    getattr(self, field_name), field=f"SlotLaunchSpec.{field_name}"
+                ),
+            )
         # Copy the argv into a tuple at CONSTRUCTION (review j#85859 F3). ``frozen=True``
         # only stops the attribute being re-bound; a caller that passed a list kept a live
         # handle to the validated plan's command and could empty it afterwards (measured:
@@ -215,13 +265,13 @@ def _owned_slots(slots: object) -> tuple:
     if isinstance(slots, (str, bytes)) or not isinstance(slots, abc.Sequence):
         raise LaneLaunchPlanError(
             "plan slots must be an ordered sequence of SlotLaunchSpec, got "
-            f"{type(slots).__name__}: launch order is part of the plan"
+            f"{_kind(slots)}: launch order is part of the plan"
         )
     owned = _read_once(slots, tuple, field="plan slots")
     for slot in owned:
         if not isinstance(slot, SlotLaunchSpec):
             raise LaneLaunchPlanError(
-                f"plan slot {slot!r} is {type(slot).__name__}, not SlotLaunchSpec; the plan "
+                f"plan slot {_shown(slot)} is {_kind(slot)}, not SlotLaunchSpec; the plan "
                 "does not carry a slot it cannot validate"
             )
     return owned
@@ -248,13 +298,15 @@ def _owned_placement(placement: object) -> tuple:
     if len(pair) != 2:
         raise LaneLaunchPlanError(
             f"plan placement must be a (split, order) pair, got {len(pair)} element(s): "
-            f"{placement!r}"
+            f"{_shown(placement)}"
         )
     split, order = pair
-    if split is not None and not isinstance(split, str):
-        raise LaneLaunchPlanError(
-            f"plan placement split must be a string or None, got {type(split).__name__}"
-        )
+    if split is not None:
+        if not isinstance(split, str):
+            raise LaneLaunchPlanError(
+                f"plan placement split must be a string or None, got {_kind(split)}"
+            )
+        split = _checked_str(split, field="plan placement split")
     if order is None:
         return (split, None)
     return (split, _ordered_tokens(order, field="plan placement order"))
@@ -284,9 +336,17 @@ class ResolvedLaneLaunchPlan:
     slots: tuple[SlotLaunchSpec, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
-        _checked_str(self.lane_class, field="ResolvedLaneLaunchPlan.lane_class")
+        object.__setattr__(
+            self,
+            "lane_class",
+            _checked_str(self.lane_class, field="ResolvedLaneLaunchPlan.lane_class"),
+        )
         if self.lane_kind is not None:
-            _checked_str(self.lane_kind, field="ResolvedLaneLaunchPlan.lane_kind")
+            object.__setattr__(
+                self,
+                "lane_kind",
+                _checked_str(self.lane_kind, field="ResolvedLaneLaunchPlan.lane_kind"),
+            )
         if self.source_anchor is not None and not isinstance(
             self.source_anchor, DecisionPointer
         ):
@@ -295,7 +355,7 @@ class ResolvedLaneLaunchPlan:
             # never issued (review j#85870 measured `source_anchor='not a pointer'`).
             raise LaneLaunchPlanError(
                 "ResolvedLaneLaunchPlan.source_anchor must be a DecisionPointer, got "
-                f"{type(self.source_anchor).__name__} {self.source_anchor!r}"
+                f"{_kind(self.source_anchor)} {_shown(self.source_anchor)}"
             )
         object.__setattr__(self, "slots", _owned_slots(self.slots))
         object.__setattr__(self, "placement", _owned_placement(self.placement))
@@ -339,7 +399,7 @@ def resolve_source_anchor(
             # the exact-one-anchor rule exists to keep.
             raise LaneLaunchPlanError(
                 f"a governance anchor must be a DecisionPointer, got "
-                f"{type(anchor).__name__} {anchor!r}"
+                f"{_kind(anchor)} {_shown(anchor)}"
             )
         if anchor not in distinct:
             distinct.append(anchor)
@@ -427,13 +487,21 @@ def resolve_lane_launch_plan(
     function returned has been checked against the pair it belongs to.
     """
     try:
-        kind = optional_lane_kind(lane_kind, source="ResolvedLaneLaunchPlan.lane_kind")
+        # Owned BEFORE it crosses into the vocabulary module (review j#86049): a hostile
+        # `str` subclass would otherwise run its own code inside THAT module's checks and
+        # message building, where this boundary's retype cannot reach it.
+        kind = optional_lane_kind(
+            lane_kind if lane_kind is None else _checked_str(
+                lane_kind, field="ResolvedLaneLaunchPlan.lane_kind"
+            ),
+            source="ResolvedLaneLaunchPlan.lane_kind",
+        )
     except LaneKindError as exc:
         # Re-typed at the plan boundary (review j#85870): the launch catches this module's
         # error to produce its typed zero-start, so a vocabulary refusal that escaped as a
         # different type would leave the caller with an untyped failure instead. The cause
         # chain keeps the original vocabulary error visible.
-        raise LaneLaunchPlanError(str(exc)) from exc
+        raise LaneLaunchPlanError(_text(exc)) from exc
     slots = _owned_slots(slot_specs)
     request = _checked_request_providers(request_providers)
     providers_vocabulary = _checked_vocabulary(known_providers, field="known providers")
@@ -473,23 +541,23 @@ def resolve_lane_launch_plan(
                 )
         if not slot.launch_argv:
             raise LaneLaunchPlanError(
-                f"{where} resolved no launch argv for profile {slot.profile_id!r}; "
+                f"{where} resolved no launch argv for profile {_shown(slot.profile_id)}; "
                 "refusing to launch a slot whose command is unresolved"
             )
         if slot.workflow_role not in roles_vocabulary:
             raise LaneLaunchPlanError(
-                f"{where} carries unknown workflow role {slot.workflow_role!r}; known "
+                f"{where} carries unknown workflow role {_shown(slot.workflow_role)}; known "
                 f"roles: {', '.join(sorted(roles_vocabulary))}. A supplied-but-unregistered "
                 "role fails closed rather than falling back to a default responsibility"
             )
         if slot.provider not in providers_vocabulary:
             raise LaneLaunchPlanError(
-                f"{where} names unregistered provider {slot.provider!r}; known providers: "
+                f"{where} names unregistered provider {_shown(slot.provider)}; known providers: "
                 f"{', '.join(sorted(providers_vocabulary))}"
             )
         if slot.workflow_role in seen_roles:
             raise LaneLaunchPlanError(
-                f"workflow role {slot.workflow_role!r} is claimed by two slots "
+                f"workflow role {_shown(slot.workflow_role)} is claimed by two slots "
                 f"({seen_roles[slot.workflow_role]} and {where}); one responsibility "
                 "cannot be carried by two slots of the same pair"
             )
@@ -512,19 +580,19 @@ def resolve_lane_launch_plan(
                 or previous.launch_argv != slot.launch_argv
             ):
                 raise LaneLaunchPlanError(
-                    f"physical slot {position!r} is planned twice for provider "
-                    f"{slot.provider!r} with different profile / argv "
-                    f"({previous.profile_id!r} vs {slot.profile_id!r}); the plan does "
+                    f"physical slot {_shown(position)} is planned twice for provider "
+                    f"{_shown(slot.provider)} with different profile / argv "
+                    f"({_shown(previous.profile_id)} vs {_shown(slot.profile_id)}); the plan does "
                     "not choose between them"
                 )
             raise LaneLaunchPlanError(
-                f"physical slot {position!r} is planned twice for provider "
-                f"{slot.provider!r}; one pair position holds one slot"
+                f"physical slot {_shown(position)} is planned twice for provider "
+                f"{_shown(slot.provider)}; one pair position holds one slot"
             )
         else:
             raise LaneLaunchPlanError(
-                f"physical slot {position!r} is claimed by two providers "
-                f"({previous.provider!r} and {slot.provider!r}); one pair position "
+                f"physical slot {_shown(position)} is claimed by two providers "
+                f"({_shown(previous.provider)} and {_shown(slot.provider)}); one pair position "
                 "holds one slot"
             )
     return ResolvedLaneLaunchPlan(
@@ -564,17 +632,17 @@ def _checked_geometry(
     F2 and is unchanged): this checks only that the geometry VALUES are ones the system
     recognises — each order entry a known provider, named at most once.
     """
-    _checked_str(lane_class, field="ResolvedLaneLaunchPlan.lane_class")
+    lane_class = _checked_str(lane_class, field="ResolvedLaneLaunchPlan.lane_class")
     if lane_class not in known_lane_classes:
         raise LaneLaunchPlanError(
-            f"unknown lane class {lane_class!r}; known classes: "
+            f"unknown lane class {_shown(lane_class)}; known classes: "
             f"{', '.join(sorted(known_lane_classes))}"
         )
     owned = _owned_placement(placement)
     split, order = owned
     if split is not None and split not in known_splits:
         raise LaneLaunchPlanError(
-            f"unknown placement split {split!r}; known splits: "
+            f"unknown placement split {_shown(split)}; known splits: "
             f"{', '.join(sorted(known_splits))}"
         )
     if order is None:
@@ -583,12 +651,12 @@ def _checked_geometry(
     for provider in order:
         if provider not in known_providers:
             raise LaneLaunchPlanError(
-                f"placement order names unregistered provider {provider!r}; known "
+                f"placement order names unregistered provider {_shown(provider)}; known "
                 f"providers: {', '.join(sorted(known_providers))}"
             )
         if provider in seen:
             raise LaneLaunchPlanError(
-                f"placement order names provider {provider!r} twice; an order is a "
+                f"placement order names provider {_shown(provider)} twice; an order is a "
                 "permutation, not a multiset"
             )
         seen.add(provider)

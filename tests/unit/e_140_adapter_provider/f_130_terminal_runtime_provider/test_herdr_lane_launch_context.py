@@ -194,5 +194,49 @@ class LaneLaunchContextMaterializationFailureTest(unittest.TestCase):
                 self.assertEqual(bad.reads, 1)
 
 
+class LaneLaunchContextRefusalNeverRunsCallerCodeTest(unittest.TestCase):
+    """Building the carrier's refusal must not re-enter the caller's code (j#86049).
+
+    Pinned on the CONTEXT independently of the plan module: the two carriers render their
+    refusals separately, so one module's safe rendering must not be what makes the other
+    module's cases pass.
+    """
+
+    class _UnprintableError(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("exception __str__ exploded")
+
+    class _UnreadableUnprintable(abc.Sequence):
+        def __len__(self) -> int:
+            return 1
+
+        def __iter__(self):
+            raise LaneLaunchContextRefusalNeverRunsCallerCodeTest._UnprintableError()
+
+        def __getitem__(self, index):
+            raise LaneLaunchContextRefusalNeverRunsCallerCodeTest._UnprintableError()
+
+    class _Unprintable:
+        def __repr__(self) -> str:
+            raise RuntimeError("repr exploded")
+
+    def test_an_unprintable_read_failure_still_refuses_typed(self) -> None:
+        for field in ("anchors", "slot_specs"):
+            with self.subTest(field=field):
+                with self.assertRaises(LaneLaunchPlanError) as caught:
+                    LaneLaunchContext(**{field: self._UnreadableUnprintable()})
+                self.assertIn("_UnprintableError", str(caught.exception))
+                self.assertIsInstance(
+                    caught.exception.__cause__, self._UnprintableError
+                )
+
+    def test_an_unprintable_element_still_refuses_typed(self) -> None:
+        for field in ("anchors", "slot_specs"):
+            with self.subTest(field=field):
+                with self.assertRaises(LaneLaunchPlanError) as caught:
+                    LaneLaunchContext(**{field: [self._Unprintable()]})
+                self.assertIn("unprintable", str(caught.exception))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
