@@ -610,7 +610,54 @@ resolver と `coordinator_shared_create_lock` fence をそのまま使う。
 unit / integration は共有 fake (`support.herdr_fake.FakeHerdr`、face H `workspace list` を追加) で駆動し、実 live smoke
 (実 herdr binary + disposable instance) は Review 承認・integration・CI 後に #14185 が同 `SharedSpaceSmokeHarness` を
 真の `multiprocessing` driver で再駆動して行う。CLI `mozyo-bridge herdr smoke-shared-space --isolated-home PATH` は
-**read-only preflight** (isolation + clean-slate 証明) のみで agent を actuate しない。
+既定で **read-only preflight** (isolation + clean-slate 証明) のみで agent を actuate せず、live 実行は
+`--execute` の明示 opt-in で §5.1.2 の disposable instance 上でのみ行う。
+
+### 5.1.2 disposable Herdr instance — endpoint は capability である (Redmine #14187)
+
+`shared_space` の live smoke は自前の Herdr server を持つ。その lifecycle 正本は
+`e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_herdr_instance.py`
+(`DisposableHerdrInstance` / `OwnedEndpointCapability` / `EndpointBoundHerdrRunner`) であり、
+driver は同 package の `disposable_shared_space_smoke.py`。
+
+**Threat model (incident 正本 = #14187 journal。時系列は journal を読み、本 spec に複製しない)**
+
+managed agent は operator の ambient `HERDR_SOCKET_PATH` を継承する。したがって endpoint は設定値ではなく
+**破壊権限**である: disposable binding が一度でも欠落すると、同一の `herdr server stop` argv が
+operator server への control request に変わる。実測 incident では、binding を落とす mutation probe を
+live capability を持つ process 内で実行した結果、実 operator Herdr が graceful shutdown した。
+
+**契約 (fail-closed)**
+
+- **socket path 一致は ownership 証明ではない。** environment は継承・上書き・mutation され得る。
+  cleanup authority は `OwnedEndpointCapability` に bind する: `DisposableHerdrInstance.start()` が
+  自プロセスで `Popen` した server の handle を得た後にのみ mint し、module-private mint token +
+  identity 比較 (`eq=False` + mint registry) で hand-built / clone を拒否し、owned child の `pid` を保持する。
+  `DisposableHerdrBinding` は path 記録に過ぎず authority ではない。
+- **判定は actuation の前。** `EndpointBoundHerdrRunner` は、これから渡す **effective env** の
+  `HERDR_SOCKET_PATH` に対して 4 連言 (capability 存在 / mint 済み / owned socket と exact 一致 /
+  owned root 配下 かつ operator endpoint でない) を評価し、いずれか欠ければ **inner runner を呼ぶ前に**
+  `SmokeEndpointEscapeError` を raise する。refusal reason は closed vocabulary
+  (`capability_absent` / `capability_not_minted` / `endpoint_unbound` /
+  `endpoint_outside_owned_root` / `operator_endpoint_target`)。事後 boolean (`all_calls_bound=false`) は
+  **その時点で request が送信済みなら安全性を担保しない**ため、判定を dispatch 前へ移す。
+- **operator endpoint は base_env と真の ambient (`os.environ`) の双方から capture する。** incident の
+  unbound call は `base_env` ではなく `os.environ` を継承していた。
+- **gate が発火しても cleanup は完了する。** graceful `server stop` は gate 経由。refuse された場合は
+  external request 0 のまま、exact owned process handle への signal に fallback する
+  (`graceful_stop_refused=true`)。handle は他 server を指し得ない。
+- **evidence は 2 方向の負証明を持つ。** `operator_endpoint_requests` (実際に dispatch された
+  operator endpoint 宛 request 数) と `endpoint_escape_refusals` (dispatch 前に拒否した数) は
+  互いに独立で、健全な run では双方 0。binding を落とすと後者が、gate を落とすと前者が動く。
+  どちらも定数では満たせない (#14247 vacuity の教訓)。
+- **guard-removal mutation は live capability を持つ process で行わない。** mutation / negative test は
+  module の *copy* に対し、fake inner runner を注入し、ambient `HERDR_SOCKET_PATH` を到達不能な poison path に
+  scrub した状態でのみ実行する (`tests/unit/.../test_disposable_herdr_instance.py`)。
+  live 経路 (`run_disposable_shared_space_smoke`) を probe 対象にしてはならない。
+- **live actuation は opt-in。** `tests/integration/.../test_disposable_shared_space_smoke.py` は
+  `MOZYO_SMOKE_LIVE_HERDR=1` が無ければ skip する。同 test は operator 役の stand-in disposable server を
+  先に起動して その socket を ambient に植え、smoke 後に stand-in が生存し応答し続けること
+  (operator process / state 不変) と `operator_endpoint_requests == 0` を assert する。
 
 ## 5.2 mutating-heal runtime fence + `pair_split` projection (Redmine #13705)
 

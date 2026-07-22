@@ -1944,6 +1944,23 @@ file_conventions:
       - skill-safety-reference
       - rule-release-distribution
 
+  - id: fc-disposable-herdr-lifecycle
+    name: disposable Herdr instance lifecycle and shared-space live smoke actuation
+    patterns:
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_herdr_instance.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_shared_space_smoke.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_harness.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_observation.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_cli.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_disposable_herdr_instance.py
+      - tests/integration/e_140_adapter_provider/f_130_terminal_runtime_provider/test_disposable_shared_space_smoke.py
+    severity: block
+    document_refs:
+      - spec-herdr-native-identity
+      - skill-safety-reference
+      - rule-project-agent-workflow
+      - spec-project-map
+
   - id: fc-smoke-tests
     name: real tmux and distribution smoke checks
     patterns:

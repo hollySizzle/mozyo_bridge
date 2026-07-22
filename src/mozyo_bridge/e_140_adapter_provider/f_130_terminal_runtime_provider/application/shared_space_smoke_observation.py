@@ -196,6 +196,40 @@ class RecordingHerdrRunner:
                 workspace_id, _root_pane = parsed
                 self.created_workspaces[workspace_id] = _flag_value(rest, "--label")
 
+    def merge_receipts(
+        self,
+        *,
+        launched_locators: Sequence[str],
+        created_workspaces: dict[str, str],
+        agent_start_names: Sequence[str],
+        coordinators_create_count: int,
+    ) -> None:
+        """Merge redacted receipts returned by an owned forked smoke worker.
+
+        Only the exact identity tokens the recorder already owns are accepted.  This
+        is the parent-side recovery seam for the true cross-process driver: cleanup
+        remains receipt-driven even though each child had its own address space.
+        """
+        with self._lock:
+            self.launched_locators.extend(
+                locator for locator in launched_locators if _norm(locator)
+            )
+            self.created_workspaces.update(
+                {
+                    _norm(workspace): _norm(label)
+                    for workspace, label in created_workspaces.items()
+                    if _norm(workspace)
+                }
+            )
+            self.agent_start_names.extend(
+                _norm(name) for name in agent_start_names if _norm(name)
+            )
+            # Request-count evidence is independent of parseable create receipts.
+            self.workspace_create_labels.extend(
+                [SHARED_COORDINATOR_WORKSPACE_LABEL]
+                * max(0, int(coordinators_create_count))
+            )
+
     @property
     def coordinators_create_count(self) -> int:
         """How many workspaces were created carrying the exact ``coordinators`` label."""

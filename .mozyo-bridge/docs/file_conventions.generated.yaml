@@ -457,6 +457,22 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: disposable Herdr instance lifecycle and shared-space live smoke actuation
+  patterns:
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_herdr_instance.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_shared_space_smoke.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_harness.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_observation.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_cli.py
+  - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_disposable_herdr_instance.py
+  - tests/integration/e_140_adapter_provider/f_130_terminal_runtime_provider/test_disposable_shared_space_smoke.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/herdr-native-identity.md と @skills/mozyo-bridge-agent/references/safety.md と
+    @vibes/docs/rules/agent-workflow.md と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: real tmux and distribution smoke checks
   patterns:
   - smoke/**
