@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from collections import abc
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -790,6 +791,134 @@ class LaneLaunchPlanAnchorTest(unittest.TestCase):
                 [_spec()], anchors=[self._anchor(), self._anchor(issue="13646")]
             )
         self.assertIn("ambiguous", str(caught.exception))
+
+
+class _Exploding(abc.Sequence):
+    """A genuine ordered Sequence whose READ fails — every shape guard says yes.
+
+    The shape guards answer "is this the right kind of container". This is the input that
+    passes all of them and then raises anyway, which is a different question and used to be
+    answered with a raw exception (review j#86008).
+    """
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def __len__(self) -> int:
+        return 2
+
+    def _explode(self):
+        self.reads += 1
+        raise RuntimeError("sequence read exploded")
+
+    def __iter__(self):
+        return self._explode()
+
+    def __getitem__(self, index):
+        return self._explode()
+
+
+class _ExplodingVocabulary(abc.Collection):
+    """The same, for an injected vocabulary — a valid Collection that cannot be read."""
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def __len__(self) -> int:
+        return 1
+
+    def __contains__(self, item) -> bool:
+        return False
+
+    def __iter__(self):
+        self.reads += 1
+        raise RuntimeError("collection read exploded")
+
+
+class _Interrupting(_Exploding):
+    """A read that is the OPERATOR stopping the process, not the plan refusing an input."""
+
+    def _explode(self):
+        self.reads += 1
+        raise KeyboardInterrupt
+
+
+class MaterializationFailureContractTest(unittest.TestCase):
+    """A read that fails still fails as THIS module's error (review j#86008 R7-F1).
+
+    Every public collection surface is listed individually rather than exercised through one
+    representative: the retype has to hold at each boundary on its own, and a single case
+    would let one surface's guard stand in for another's.
+    """
+
+    def _surfaces(self):
+        return {
+            "SlotLaunchSpec.launch_argv": lambda bad: _spec(launch_argv=bad),
+            "plan.slots": lambda bad: ResolvedLaneLaunchPlan(
+                lane_class="sublane", slots=bad
+            ),
+            "plan.placement outer": lambda bad: ResolvedLaneLaunchPlan(
+                lane_class="sublane", placement=bad
+            ),
+            "resolve_source_anchor": lambda bad: resolve_source_anchor(bad),
+            "resolver slot_specs": lambda bad: _resolve([_spec()], slot_specs=bad),
+            "resolver anchors": lambda bad: _resolve([_spec()], anchors=bad),
+            "resolver placement outer": lambda bad: _resolve([_spec()], placement=bad),
+            "resolver placement order": lambda bad: _resolve(
+                [_spec()], placement=("right", bad)
+            ),
+            "resolver request_providers": lambda bad: _resolve(
+                [_spec()], request_providers=bad
+            ),
+        }
+
+    def _vocabulary_surfaces(self):
+        return {
+            "known_roles": lambda bad: _resolve([_spec()], known_roles=bad),
+            "known_providers": lambda bad: _resolve([_spec()], known_providers=bad),
+            "known_splits": lambda bad: _resolve([_spec()], known_splits=bad),
+            "known_lane_classes": lambda bad: _resolve([_spec()], known_lane_classes=bad),
+        }
+
+    def test_every_sequence_surface_refuses_typed(self) -> None:
+        for name, build in self._surfaces().items():
+            with self.subTest(surface=name):
+                with self.assertRaises(LaneLaunchPlanError) as caught:
+                    build(_Exploding())
+                self.assertIn("could not be read", str(caught.exception))
+
+    def test_every_vocabulary_surface_refuses_typed(self) -> None:
+        for name, build in self._vocabulary_surfaces().items():
+            with self.subTest(surface=name):
+                with self.assertRaises(LaneLaunchPlanError) as caught:
+                    build(_ExplodingVocabulary())
+                self.assertIn("could not be read", str(caught.exception))
+
+    def test_the_original_failure_stays_visible_as_the_cause(self) -> None:
+        # Retyping must not destroy the diagnosis: the launch reports a typed zero-start,
+        # and whoever debugs it still needs to see what actually went wrong in the read.
+        with self.assertRaises(LaneLaunchPlanError) as caught:
+            _spec(launch_argv=_Exploding())
+        self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+        self.assertIn("sequence read exploded", str(caught.exception.__cause__))
+
+    def test_an_interrupt_is_not_swallowed_as_a_refusal(self) -> None:
+        # The retype catches `Exception`, never `BaseException`: turning the operator's
+        # Ctrl-C into "the plan refused your input" would be a lie about what happened.
+        for name, build in self._surfaces().items():
+            with self.subTest(surface=name):
+                with self.assertRaises(KeyboardInterrupt):
+                    build(_Interrupting())
+
+    def test_the_failing_read_still_happens_only_once(self) -> None:
+        # The single-evaluation discipline (review j#85885) is not relaxed by the retype:
+        # a caller object is read once, and refusing does not read it again.
+        for name, build in self._surfaces().items():
+            with self.subTest(surface=name):
+                bad = _Exploding()
+                with self.assertRaises(LaneLaunchPlanError):
+                    build(bad)
+                self.assertEqual(bad.reads, 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

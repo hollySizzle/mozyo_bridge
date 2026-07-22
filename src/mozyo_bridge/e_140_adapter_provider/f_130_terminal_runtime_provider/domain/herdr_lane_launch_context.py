@@ -56,7 +56,19 @@ def _checked_elements(value: object, expected: type, *, field: str) -> tuple:
             f"{field} must be an ordered sequence of {expected.__name__}, got "
             f"{type(value).__name__}"
         )
-    owned = tuple(value)
+    # Reading the caller's sequence can itself fail even when its SHAPE is impeccable — an
+    # `abc.Sequence` whose `__iter__` raises satisfies every guard above and then explodes
+    # here (review j#86008). That refusal has to arrive as the plan module's error like every
+    # other one, or the launch's single `except` misses it. Deliberately re-stated here
+    # rather than shared with the plan module's helper: these are two boundaries, and one
+    # module's retype must not be what makes the other module's tests pass.
+    try:
+        owned = tuple(value)
+    except Exception as exc:  # not BaseException: an interrupt is not a refusal
+        raise LaneLaunchPlanError(
+            f"{field} could not be read ({type(exc).__name__}: {exc}); the context is not "
+            "built from an input it cannot even materialise"
+        ) from exc
     for element in owned:
         if not isinstance(element, expected):
             raise LaneLaunchPlanError(

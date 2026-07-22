@@ -57,6 +57,30 @@ class LaneLaunchPlanError(ValueError):
     """
 
 
+def _read_once(value: object, factory, *, field: str):
+    """Materialize a caller's collection EXACTLY once, as THIS module's error either way.
+
+    The shape guards answer "is this the right kind of container"; they cannot answer "can
+    it actually be read". A value that satisfies :class:`abc.Sequence` / :class:`abc.Collection`
+    perfectly well may still raise from its own ``__iter__`` / ``__getitem__`` — a lazily
+    backed sequence, a property that reaches for something no longer there — and that raw
+    exception used to travel straight out of the plan (review j#86008: measured on all 15
+    public collection surfaces). The launch turns a refusal into a typed zero-start with a
+    single ``except LaneLaunchPlanError``, so anything escaping as another type is not the
+    contract this module advertises, however correct the eventual failure looks.
+
+    ``BaseException`` is deliberately NOT caught: a ``KeyboardInterrupt`` during a read is
+    the operator stopping the process, not the plan refusing an input.
+    """
+    try:
+        return factory(value)
+    except Exception as exc:
+        raise LaneLaunchPlanError(
+            f"{field} could not be read ({type(exc).__name__}: {exc}); the plan is not "
+            "built from an input it cannot even materialise"
+        ) from exc
+
+
 def _ordered_tokens(value: object, *, field: str) -> tuple[str, ...]:
     """``value`` as an OWNED tuple of strings, from an ORDERED sequence (review j#85875 F3).
 
@@ -78,7 +102,7 @@ def _ordered_tokens(value: object, *, field: str) -> tuple[str, ...]:
             f"{type(value).__name__}: an unordered container cannot express launch order "
             "— its iteration order is not part of the value"
         )
-    tokens = tuple(value)
+    tokens = _read_once(value, tuple, field=field)
     for token in tokens:
         _checked_str(token, field=f"{field} entry")
     return tokens
@@ -103,7 +127,7 @@ def _ordered_container(value: object, *, field: str, expected: str) -> tuple:
             f"{type(value).__name__}: an unordered / mapping container is not a "
             f"positional sequence"
         )
-    return tuple(value)
+    return _read_once(value, tuple, field=field)
 
 
 def _checked_vocabulary(value: object, *, field: str) -> frozenset[str]:
@@ -119,13 +143,10 @@ def _checked_vocabulary(value: object, *, field: str) -> frozenset[str]:
             f"{field} must be a collection of tokens, got {type(value).__name__} {value!r}: "
             "membership in a bare string is a substring test, not a vocabulary check"
         )
-    try:
-        tokens = frozenset(value)  # type: ignore[arg-type]
-    except TypeError as exc:
-        raise LaneLaunchPlanError(
-            f"{field} is not iterable ({type(value).__name__}); the plan cannot check a "
-            "vocabulary it was not given"
-        ) from exc
+    # Covers BOTH "not iterable at all" and "iterable that fails while being read":
+    # each is a vocabulary the plan was not actually given, and neither may leave as a
+    # raw exception (review j#86008).
+    tokens = _read_once(value, frozenset, field=field)
     for token in tokens:
         _checked_str(token, field=f"{field} entry")
     return tokens
@@ -196,7 +217,7 @@ def _owned_slots(slots: object) -> tuple:
             "plan slots must be an ordered sequence of SlotLaunchSpec, got "
             f"{type(slots).__name__}: launch order is part of the plan"
         )
-    owned = tuple(slots)
+    owned = _read_once(slots, tuple, field="plan slots")
     for slot in owned:
         if not isinstance(slot, SlotLaunchSpec):
             raise LaneLaunchPlanError(

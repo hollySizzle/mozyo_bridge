@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from collections import abc
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -134,6 +135,63 @@ class LaneLaunchContextSingleEvaluationTest(unittest.TestCase):
         context = LaneLaunchContext(slot_specs=Shifting([SPEC]))
         self.assertEqual(context.slot_specs, (SPEC,))
         self.assertEqual(Shifting.reads, 1)
+
+
+class LaneLaunchContextMaterializationFailureTest(unittest.TestCase):
+    """A read that fails is still a plan-shaped refusal (review j#86008 R7-F1).
+
+    Pinned on the CONTEXT independently of the plan module's own cases: the two carriers
+    retype separately, and this must go red if the context's retype is the one that is lost.
+    """
+
+    class _Exploding(abc.Sequence):
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def __len__(self) -> int:
+            return 1
+
+        def _explode(self):
+            self.reads += 1
+            raise RuntimeError("sequence read exploded")
+
+        def __iter__(self):
+            return self._explode()
+
+        def __getitem__(self, index):
+            return self._explode()
+
+    class _Interrupting(abc.Sequence):
+        def __len__(self) -> int:
+            return 1
+
+        def __iter__(self):
+            raise KeyboardInterrupt
+
+        def __getitem__(self, index):
+            raise KeyboardInterrupt
+
+    def test_both_carrier_fields_refuse_typed(self) -> None:
+        for field in ("anchors", "slot_specs"):
+            with self.subTest(field=field):
+                with self.assertRaises(LaneLaunchPlanError) as caught:
+                    LaneLaunchContext(**{field: self._Exploding()})
+                self.assertIn("could not be read", str(caught.exception))
+                self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+
+    def test_an_interrupt_is_not_swallowed_as_a_refusal(self) -> None:
+        for field in ("anchors", "slot_specs"):
+            with self.subTest(field=field):
+                with self.assertRaises(KeyboardInterrupt):
+                    LaneLaunchContext(**{field: self._Interrupting()})
+
+    def test_the_failing_read_still_happens_only_once(self) -> None:
+        for field in ("anchors", "slot_specs"):
+            with self.subTest(field=field):
+                bad = self._Exploding()
+                with self.assertRaises(LaneLaunchPlanError):
+                    LaneLaunchContext(**{field: bad})
+                self.assertEqual(bad.reads, 1)
 
 
 if __name__ == "__main__":  # pragma: no cover
