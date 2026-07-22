@@ -259,5 +259,59 @@ class LaneLaunchContextRefusalNeverRunsCallerCodeTest(unittest.TestCase):
                 self.assertIn("unprintable", str(caught.exception))
 
 
+class LaneLaunchContextOwnsItsLaneKindTest(unittest.TestCase):
+    """The carrier owns its kind token, not just checks it (review j#86081).
+
+    `lane_kind` was the one accepted string the previous round left belonging to the caller.
+    That matters because of WHO reads it next: the vocabulary check compares it
+    (`value == ""`) and the launch's lifecycle admission tests the stored value for truth, so
+    a `str` subclass got to run its `__eq__` and `__bool__` inside a carrier whose docstring
+    promises construction-time validation. The plan resolver owning its own copy does not
+    help — admission reads THIS value first.
+
+    Order is the contract: own (without dispatching to the subclass) -> validate against the
+    closed vocabulary -> store the exact token.
+    """
+
+    class _EqRaises(str):
+        def __eq__(self, other):
+            raise RuntimeError("__eq__ exploded")
+
+        def __hash__(self):
+            return str.__hash__(self)
+
+    class _BoolRaises(str):
+        def __bool__(self):
+            raise RuntimeError("__bool__ exploded")
+
+    class _RaddRaises(str):
+        def __radd__(self, other):
+            raise RuntimeError("__radd__ exploded")
+
+    def test_a_hostile_kind_token_never_raises_raw(self) -> None:
+        for name, value in (
+            ("__eq__", self._EqRaises("coordinator")),
+            ("__bool__", self._BoolRaises("coordinator")),
+            ("__radd__", self._RaddRaises("coordinator")),
+        ):
+            with self.subTest(hook=name):
+                # Accepted, because "coordinator" IS a canonical token — the stronger
+                # assertion: nothing of the caller's ran on the way in.
+                context = LaneLaunchContext(lane_kind=value)
+                self.assertIs(type(context.lane_kind), str)
+                self.assertEqual(context.lane_kind, "coordinator")
+
+    def test_a_hostile_foreign_token_still_fails_closed(self) -> None:
+        # Owning the token must not weaken the closed vocabulary: an off-vocabulary value is
+        # still refused, and as the same error the create boundary has always raised.
+        with self.assertRaises(LaneKindError):
+            LaneLaunchContext(lane_kind=self._EqRaises("grandchild"))
+
+    def test_an_absent_kind_is_still_absent(self) -> None:
+        for absent in (None, ""):
+            with self.subTest(value=repr(absent)):
+                self.assertIsNone(LaneLaunchContext(lane_kind=absent).lane_kind)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

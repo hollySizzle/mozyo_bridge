@@ -225,8 +225,11 @@ def _checked_str(value: object, *, field: str) -> str:
     # on `__repr__` / `__format__` / `__hash__` / `__eq__` / `__bool__` / `__lt__`. Those run
     # later — in a message, a vocabulary lookup, a truthiness test — and a raising one
     # replaces a typed refusal with a raw exception, or turns a decision into a failure.
-    # Concatenation yields an exact, inert `str` with the same characters, so nothing
-    # downstream can re-enter the caller. This is the same discipline the sequences already
+    # `_owned_str` yields an exact, inert `str` with the same characters, so nothing
+    # downstream can re-enter the caller. Concatenation was the FIRST attempt at this and was
+    # wrong in the most direct way — `"" + value` gives a subclass right operand priority and
+    # calls its `__radd__` (review j#86068) — so see that helper for why the conversion is a
+    # base method invoked explicitly. This is the same discipline the sequences already
     # follow: validate, then own what you validated.
     return _owned_str(value)
 

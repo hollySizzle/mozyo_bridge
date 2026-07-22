@@ -43,6 +43,21 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 
 
+def _owned_str(value: str) -> str:
+    """An exact, inert ``str`` with the same characters — no subclass hook runs (j#86081).
+
+    The base method invoked explicitly does not dispatch on the value's own type, which is
+    the caller's. Everything that looks equivalent does: ``"" + value`` reaches ``__radd__``
+    (a subclass right operand takes priority), ``str(value)`` reaches ``__str__``,
+    ``value[:]`` reaches ``__getitem__``.
+
+    Re-stated here rather than imported from the plan module for the same reason this
+    carrier's other guards are: one module's ownership must not be what makes the other
+    module's cases pass.
+    """
+    return str.__str__(value)
+
+
 def _kind(value: object) -> str:
     """The type name of a caller's value, for a message — never a way to fail (j#86049)."""
     try:
@@ -61,9 +76,7 @@ def _shown(value: object) -> str:
     not be what makes the other module's tests pass.
     """
     try:
-        # The base method explicitly, never `str()` / `+` / slicing: those dispatch on the
-        # caller's own type, which is how a `str` subclass's `__radd__` escaped (j#86068).
-        return str.__str__(repr(value))
+        return _owned_str(repr(value))
     except Exception:
         return f"<unprintable {_kind(value)}>"
 
@@ -126,12 +139,19 @@ class LaneLaunchContext:
     slot_specs: tuple[SlotLaunchSpec, ...] = ()
 
     def __post_init__(self) -> None:
-        # Normalize + fail-closed validate the one field: a present value must be a
-        # canonical lane-kind token; absent (None / "") stays None (no-kind marker).
+        # OWN the token BEFORE validating it, and store what was validated (review
+        # j#86081). The order is the whole point: the vocabulary check itself compares
+        # (`value == ""`) and the launch's admission boundary later tests the stored value
+        # for truth, so a caller's `str` subclass got to run its `__eq__` / `__bool__` at
+        # both — raising out of a carrier whose docstring promises construction-time
+        # validation. The plan resolver owning ITS copy does not help: admission reads this
+        # value first. Own (no dispatch) -> validate -> store the exact token.
+        kind = self.lane_kind
+        if isinstance(kind, str):
+            kind = _owned_str(kind)
+        kind = optional_lane_kind(kind, source="LaneLaunchContext.lane_kind")
         object.__setattr__(
-            self,
-            "lane_kind",
-            optional_lane_kind(self.lane_kind, source="LaneLaunchContext.lane_kind"),
+            self, "lane_kind", kind if kind is None else _owned_str(kind)
         )
 
         # This value is an AUTHORITY carrier, so it verifies what it carries (review

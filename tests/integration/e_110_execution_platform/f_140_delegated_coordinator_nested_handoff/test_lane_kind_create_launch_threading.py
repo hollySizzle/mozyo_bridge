@@ -239,5 +239,42 @@ class FreshCreateLaunchThreadingTest(unittest.TestCase):
         self.assertEqual(self._second_split(herdr), "right")
 
 
+class HostileKindReachesLifecycleAdmissionTest(unittest.TestCase):
+    """The context's kind survives the boundary that actually READS it (review j#86081).
+
+    The unit cases pin what the carrier stores; this pins the consequence, with the real
+    admission boundary and a real on-disk lifecycle store. Admission resolves the fresh-launch
+    authority with `getattr(launch_context, "lane_kind", None) or None` — a truth test on the
+    stored value — so a carrier that kept the caller's `str` subclass turned a dry-run
+    admission into a raw `RuntimeError`. Pinned separately from the unit case on purpose: the
+    defect was invisible from inside the carrier, and only this side shows the cost.
+    """
+
+    class _BoolRaises(str):
+        def __bool__(self):
+            raise RuntimeError("__bool__ exploded")
+
+    def test_a_dry_run_admission_survives_a_hostile_caller_kind(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_lifecycle_admission import (  # noqa: E501
+            admit_launch_against_lifecycle,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501
+            LaneLaunchContext,
+        )
+
+        context = LaneLaunchContext(lane_kind=self._BoolRaises(LANE_KIND_IMPLEMENTATION))
+        self.assertIs(type(context.lane_kind), str)
+        with tempfile.TemporaryDirectory() as home:
+            admitted = admit_launch_against_lifecycle(
+                workspace_id=WS,
+                lane_id=LANE,
+                store_home=home,
+                launch_context=context,
+                dry_run=True,
+            )
+        self.assertEqual(admitted, LANE_KIND_IMPLEMENTATION)
+        self.assertIs(type(admitted), str)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
