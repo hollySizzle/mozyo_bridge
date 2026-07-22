@@ -447,7 +447,7 @@ def _prepare_session_locked(
             )
     # Argument-level fail-closed validation, BEFORE any side effect: unknown placement mode
     # (#14139), duplicate (provider, lane) slot (spec §5), invalid managed permission policy
-    # (j#73404). Extracted verbatim to a leaf for the module-health budget (#14242 j#85316).
+    # (j#73404), whole-plan role/profile/argv resolution (#13647 T2). Leafed for module health.
     validate_session_request(
         providers=providers,
         lane_id=lane_id,
@@ -455,6 +455,7 @@ def _prepare_session_locked(
         claude_permission_mode_default=claude_permission_mode_default,
         env=env,
         error_type=HerdrSessionStartError,
+        launch_context=launch_context,
     )
     binary = _resolve_binary_or_die(env)
     # The mozyo-bridge launcher the #13637 self-check wraps the provider through
@@ -538,13 +539,12 @@ def _prepare_session_locked(
     # `(None, None)`, so every downstream decision stays byte-for-byte pre-#13646. The
     # decisions are pure (`herdr_lane_topology`).
     # Lane-role aware placement precedence (Redmine #13647, disposition j#85650): the
-    # caller-supplied `launch_context` carries the durable `lane_kind` (親/子/孫) resolved
-    # from governance at the create / heal boundary — never inferred here from provider /
-    # pane / display cache. Precedence is `by_lane_kind[kind] > lane_class > default`
-    # (`resolve_placement_policy_for_role`); a `None` context / unresolved kind / a config
-    # with no matching `by_lane_kind` entry all fall straight through to the pre-#13646
-    # lane-class resolution (byte-invariant). Fresh-launch actuation authority is that
-    # context, the stored kind is the HEAL authority — reconciled above (Tranche 1b).
+    # caller-supplied `launch_context` carries the durable `lane_kind` (親/子/孫) resolved from
+    # governance at the create / heal boundary — never inferred from provider / pane / display
+    # cache here. Precedence is `by_lane_kind[kind] > lane_class > default`
+    # (`resolve_placement_policy_for_role`); a `None` context / unresolved kind / a config with
+    # no matching `by_lane_kind` entry all fall through to the pre-#13646 lane-class resolution
+    # (byte-invariant). Fresh launch = that context, heal = the stored kind (reconciled above).
     lane_class = "default" if result.lane_id == DEFAULT_LANE else "sublane"
     config_split, config_order = resolve_placement_policy_for_role(
         lane_placement, lane_class, lane_kind

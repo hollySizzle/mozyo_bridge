@@ -506,6 +506,46 @@ engine は無改修)。
   (disposition j#85650)。`--dry-run` は durable state を一切参照せず caller context だけで plan する
   (#13595 / #14242 と同じく dry run は store-free)。
 
+## 5.2.1 ResolvedLaneLaunchPlan — whole-plan preflight (Redmine #13647 Tranche 2)
+
+§5.2 が pair の **幾何**を決めるのに対し、こちらは **per-slot の責務**を launch 前に一括で
+固める。caller が slot ごとに `workflow_role` / `profile_id` / `provider` /
+`resolved_launch_argv` / `physical_slot` を供給し、pair 全体を 1 つの plan として検証してから
+最初の不可逆操作へ進む (Design Answer j#85645 「whole-plan preflight」)。
+
+### なぜ pair 単位か
+
+launch は pair を作る。slot を launch しながら個別検証すると、2 番目で異常を見つけた時点で
+1 番目は既に live = **partial lane** になる。さらに「同一 role を 2 slot が主張」「1 つの
+physical slot に 2 entry」「同一 slot に別 profile」といった欠陥は **plan 全体を見ないと不可視**。
+したがって plan が検証単位であり、下記はすべて **typed zero-start** (workspace / tab / agent /
+startup action を 1 つも作らない)。
+
+### 検証項目 (すべて zero-start)
+
+1. slot の `workflow_role` / `profile_id` / `provider` / `launch_argv` が未解決
+2. 未知の `workflow_role` / 未登録 `provider` — **default へ degrade せず拒否**
+3. `workflow_role` の重複 (同一責務を 2 slot が主張)
+4. 同一 `physical_slot` への複数 entry
+5. 同一 `(physical_slot, provider)` に **異なる profile / argv** (provider が違えば正当ゆえ
+   same-slot 衝突のみ拒否)
+6. governance anchor が **ambiguous** (異なる durable record が複数 launch を主張) —
+   同一 record の重複は 1 件として解決、0 件は「plan を作らない」= 従来 launch
+
+### 境界
+
+- `workflow_role` / `profile_id` は **plan-only**。mzb1 assigned name /
+  `MOZYO_AGENT_ROLE` (= provider token) / route / attestation / retire identity へ昇格しない
+  (j#84266)。
+- role は**推測しない**。durable governance から一意に解決した caller だけが供給し、供給された
+  が未登録なら fallback せず zero-start。`coordinator_assistant` を偽の `implementer` へ写像
+  しない (本 US non-goal、別 issue)。
+- anchor 語彙は lifecycle authority record と同じ `DecisionPointer` を再利用する (並行語彙を
+  作らない)。
+- **本 tranche の gate は「拒否」しかしない**: plan を argv 構築へ合成するのは後続 tranche で
+  あり、valid な plan を渡しても launch argv は plan 無しと byte 一致する。
+- `slot_specs` 未指定 (既存の全 caller) は検証自体を行わず、pre-#13647 と byte 一致。
+
 ## 5.1.1 coordinator placement mode — operator-scoped 配置 (Redmine #14139)
 
 coordinator pair (default lane) を **どの herdr workspace に置くか**を operator ごとに切り替える

@@ -63,6 +63,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501,E402
     LaneLaunchContext,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_plan import (  # noqa: E501,E402
+    SlotLaunchSpec,
+)
 
 ISSUE = "13647"
 JOURNAL = "85826"
@@ -323,6 +326,123 @@ class LaneKindHealAuthorityLaunchTest(unittest.TestCase):
         _, herdr = self._run(lane="lane-scratch", stored_kind=None, launch_context=None)
         self.assertEqual(len(herdr.start_argvs), 2)
         self.assertEqual(self._second_split(herdr), "right")
+
+
+class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):
+    """The Tranche 2 whole-plan gate at the real launch chokepoint (#13647, j#85645).
+
+    Inherits the harness (same real `prepare_session`, real lifecycle store, shared fake
+    herdr) and asserts the property the pure resolver cannot: that a contradictory plan is
+    refused with the pair still unbuilt — no `agent start`, no `workspace create`, no `tab
+    create` — and that a launch WITHOUT a plan is untouched by the new gate.
+    """
+
+    @staticmethod
+    def _slot(**over) -> SlotLaunchSpec:
+        base = dict(
+            workflow_role="implementer",
+            profile_id="profile.implementer",
+            provider="claude",
+            launch_argv=("--model", "x"),
+            physical_slot="first",
+        )
+        base.update(over)
+        return SlotLaunchSpec(**base)
+
+    def test_contradictory_plan_refuses_with_zero_side_effect(self) -> None:
+        herdr = FakeHerdr()
+        with self.assertRaises(HerdrSessionStartError) as caught:
+            self._run(
+                lane="lane-plan-conflict",
+                stored_kind="",
+                launch_context=LaneLaunchContext(
+                    slot_specs=(
+                        self._slot(),
+                        # Same governed responsibility claimed twice — visible only across
+                        # slots, which is why the pair is the validation unit.
+                        self._slot(provider="codex", physical_slot="second"),
+                    )
+                ),
+                herdr=herdr,
+            )
+        self.assertIn("managed-launch plan refused", str(caught.exception))
+        self.assertIn("claimed by two slots", str(caught.exception))
+        self.assertEqual(self._writes(herdr), [])
+
+    def test_unknown_role_in_the_plan_refuses_before_the_first_write(self) -> None:
+        herdr = FakeHerdr()
+        with self.assertRaises(HerdrSessionStartError):
+            self._run(
+                lane="lane-plan-role",
+                stored_kind="",
+                launch_context=LaneLaunchContext(
+                    slot_specs=(self._slot(workflow_role="coordinator_assistant"),)
+                ),
+                herdr=herdr,
+            )
+        self.assertEqual(self._writes(herdr), [])
+
+    def test_a_valid_plan_launches_and_changes_no_argv(self) -> None:
+        # The gate can only REFUSE: composing the plan into the argv build is a later
+        # tranche, so a valid plan must leave the launched argv byte-identical to the same
+        # launch with no plan at all.
+        planned = LaneLaunchContext(
+            slot_specs=(
+                self._slot(),
+                self._slot(
+                    workflow_role="coordinator",
+                    profile_id="profile.coordinator",
+                    provider="codex",
+                    physical_slot="second",
+                ),
+            )
+        )
+        planned_root = self.root
+        planned_result, with_plan = self._run(
+            lane="lane-plan-ok", stored_kind="", launch_context=planned
+        )
+        self.setUp()
+        bare_result, without_plan = self._run(lane="lane-plan-ok", stored_kind="")
+        self.assertEqual(len(with_plan.start_argvs), 2)
+        # Each run gets its own temp root and therefore its own workspace id; those are the
+        # only tokens allowed to differ, so they are the only ones normalized.
+        self.assertEqual(
+            self._portable(with_plan, planned_root, planned_result.workspace_id),
+            self._portable(without_plan, self.root, bare_result.workspace_id),
+        )
+
+    @staticmethod
+    def _portable(herdr, root, workspace_id):
+        """Every launched argv with this run's temp root / workspace id redacted."""
+        return [
+            [
+                token.replace(str(root), "<ROOT>").replace(workspace_id, "<WS>")
+                for token in argv
+            ]
+            for argv in herdr.start_argvs
+        ]
+
+    def test_ambiguous_governance_anchor_refuses(self) -> None:
+        herdr = FakeHerdr()
+        with self.assertRaises(HerdrSessionStartError) as caught:
+            self._run(
+                lane="lane-plan-anchor",
+                stored_kind="",
+                launch_context=LaneLaunchContext(
+                    slot_specs=(self._slot(),),
+                    anchors=(
+                        DecisionPointer(
+                            source="redmine", issue_id=ISSUE, journal_id="85856"
+                        ),
+                        DecisionPointer(
+                            source="redmine", issue_id=ISSUE, journal_id="85857"
+                        ),
+                    ),
+                ),
+                herdr=herdr,
+            )
+        self.assertIn("ambiguous", str(caught.exception))
+        self.assertEqual(self._writes(herdr), [])
 
 
 if __name__ == "__main__":  # pragma: no cover

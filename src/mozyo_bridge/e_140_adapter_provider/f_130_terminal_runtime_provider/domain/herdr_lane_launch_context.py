@@ -24,18 +24,21 @@ Authority model (kept enforced by what this type does and does NOT carry):
   mzb1 assigned name, ``MOZYO_AGENT_ROLE`` (a provider token), or a
   route / attestation / retire authority; those stay provider-token-bound.
 
-Pure: a frozen dataclass validated on construction; no I/O. The per-slot
-role-profile fields (``source_anchor`` / ``slot_specs``) land in Tranche 2 —
-this Tranche-1 shape carries only the geometry axis so the default (no context)
-stays byte-invariant.
+Pure: a frozen dataclass validated on construction; no I/O. Tranche 2 adds the
+per-slot role-profile axis (``source_anchor`` / ``slot_specs``); both default to
+absent, so a geometry-only or context-free launch stays byte-invariant.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Sequence
 
 from mozyo_bridge.core.state.lane_kind import optional_lane_kind
+from mozyo_bridge.core.state.lane_lifecycle_model import DecisionPointer
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_plan import (  # noqa: E501
+    SlotLaunchSpec,
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,15 @@ class LaneLaunchContext:
     """
 
     lane_kind: Optional[str] = None
+    #: The durable governance record(s) this context was resolved from (Tranche 2). A
+    #: caller that resolved the plan from more than one *different* anchor is refused at
+    #: plan time rather than guessing which decision authorizes the launch; one anchor (or
+    #: several naming the same record) resolves. Empty for a geometry-only context.
+    anchors: tuple[DecisionPointer, ...] = ()
+    #: The per-slot role -> profile -> provider -> argv intents this launch must satisfy
+    #: (Tranche 2). Empty (the default) means the caller supplies no role-bearing plan and
+    #: the launch is byte-for-byte the pre-#13647 one.
+    slot_specs: tuple[SlotLaunchSpec, ...] = ()
 
     def __post_init__(self) -> None:
         # Normalize + fail-closed validate the one field: a present value must be a
@@ -60,10 +72,18 @@ class LaneLaunchContext:
             optional_lane_kind(self.lane_kind, source="LaneLaunchContext.lane_kind"),
         )
 
+        object.__setattr__(self, "anchors", tuple(self.anchors))
+        object.__setattr__(self, "slot_specs", tuple(self.slot_specs))
+
     @property
     def has_lane_kind(self) -> bool:
         """True iff a durable lane-kind fact was supplied (a concrete token)."""
         return self.lane_kind is not None
+
+    @property
+    def has_slot_plan(self) -> bool:
+        """True iff the caller supplied a role-bearing per-slot plan (Tranche 2)."""
+        return bool(self.slot_specs)
 
 
 __all__ = ("LaneLaunchContext",)
