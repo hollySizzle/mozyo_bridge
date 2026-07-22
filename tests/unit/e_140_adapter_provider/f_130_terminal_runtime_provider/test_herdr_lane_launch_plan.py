@@ -953,7 +953,14 @@ class _Hostile(str):
 
     This is the case that shows the defect is not exotic: a value can pass every type check
     the module makes and still carry arbitrary code on the operations the module performs on
-    it afterwards (printing it, hashing it, ordering it, testing it for truth).
+    it afterwards (printing it, hashing it, ordering it, testing it for truth, CONVERTING it).
+
+    Every hook is listed deliberately. The previous round's version omitted `__radd__`, and
+    that single omission is exactly what let a defect through a green suite (review j#86068):
+    the fix under test converted with `"" + value`, which gives this class's `__radd__`
+    priority because it is a `str` subclass. A hostile fixture that is missing a hook is a
+    test that quietly agrees with the implementation, so the list is exhaustive rather than
+    "the ones the current code happens to use".
     """
 
     def __repr__(self) -> str:
@@ -971,15 +978,63 @@ class _Hostile(str):
     def __eq__(self, other):
         raise RuntimeError("eq")
 
+    def __ne__(self, other):
+        raise RuntimeError("ne")
+
     def __lt__(self, other):
         raise RuntimeError("lt")
+
+    def __gt__(self, other):
+        raise RuntimeError("gt")
 
     def __bool__(self):
         raise RuntimeError("bool")
 
+    def __len__(self):
+        raise RuntimeError("len")
+
+    def __add__(self, other):
+        raise RuntimeError("add")
+
+    def __radd__(self, other):
+        raise RuntimeError("radd")
+
+    def __mod__(self, other):
+        raise RuntimeError("mod")
+
+    def __rmod__(self, other):
+        raise RuntimeError("rmod")
+
+    def __contains__(self, other):
+        raise RuntimeError("contains")
+
+    def __getitem__(self, index):
+        raise RuntimeError("getitem")
+
+    def __iter__(self):
+        raise RuntimeError("iter")
+
+    def __reduce__(self):
+        raise RuntimeError("reduce")
+
+    def __copy__(self):
+        raise RuntimeError("copy")
+
+    def encode(self, *args, **kwargs):
+        raise RuntimeError("encode")
+
 
 class _Sortable(str):
-    """Hash / eq work, so it reaches the vocabulary; printing and ordering explode."""
+    """Hash / eq work, so it reaches the vocabulary; everything else explodes."""
+
+    def __radd__(self, other):
+        raise RuntimeError("radd")
+
+    def __add__(self, other):
+        raise RuntimeError("add")
+
+    def __getitem__(self, index):
+        raise RuntimeError("getitem")
 
     def __repr__(self) -> str:
         raise RuntimeError("repr")
@@ -1074,6 +1129,21 @@ class RefusalNeverRunsCallerCodeTest(unittest.TestCase):
                 with self.assertRaises(LaneLaunchPlanError):
                     build(_Hostile(token))
 
+    def test_a_repr_that_returns_a_hostile_string_still_refuses_typed(self) -> None:
+        """`repr()` may return a `str` SUBCLASS, which the message then formats.
+
+        Found by a guard-removal probe that nothing else covered: the description helper
+        owns `repr()`'s RESULT as well as calling it safely, and without that second step a
+        `__repr__` returning a weaponised subclass escaped again (measured).
+        """
+
+        class ReprReturnsHostile:
+            def __repr__(self):
+                return _Hostile("<hostile>")
+
+        with self.assertRaises(LaneLaunchPlanError):
+            _spec(provider=ReprReturnsHostile())
+
     def test_a_hostile_vocabulary_refuses_typed(self) -> None:
         # Handed over as a list: a set literal would hash in the TEST, measuring this file
         # rather than the module.
@@ -1128,6 +1198,56 @@ class AcceptedStringsAreOwnedTest(unittest.TestCase):
         ):
             with self.subTest(field=name):
                 self.assertIs(type(value), str)
+
+    def test_a_reflected_operator_is_never_reached(self) -> None:
+        """The review's exact input (j#86068): a subclass that only weaponises `__radd__`.
+
+        This value is otherwise a perfectly good provider, so it is ACCEPTED — which is the
+        stronger assertion: the conversion has to run no caller code on the way IN, not just
+        refuse cleanly on the way out. `"" + value` failed exactly here, because a subclass
+        right-hand operand takes priority over `str.__add__`.
+        """
+
+        class RightAddRaises(str):
+            def __radd__(self, other):
+                raise RuntimeError("__radd__ exploded")
+
+        plan = _resolve(
+            [_spec(provider=RightAddRaises("claude"))],
+            request_providers=[RightAddRaises("claude")],
+        )
+        self.assertIs(type(plan.slots[0].provider), str)
+        self.assertEqual(plan.slots[0].provider, "claude")
+
+    def test_the_conversion_runs_no_caller_code_at_all(self) -> None:
+        # Not "the result has the right type" — that is what the previous round asserted, and
+        # it passed while the conversion itself was calling into the caller. This records
+        # whether any hook was entered.
+        entered = []
+
+        class Tattling(str):
+            def _tattle(self, name):
+                entered.append(name)
+                raise RuntimeError(name)
+
+            def __radd__(self, other):
+                self._tattle("__radd__")
+
+            def __add__(self, other):
+                self._tattle("__add__")
+
+            def __str__(self):
+                self._tattle("__str__")
+
+            def __getitem__(self, index):
+                self._tattle("__getitem__")
+
+            def __iter__(self):
+                self._tattle("__iter__")
+
+        spec = _spec(provider=Tattling("claude"))
+        self.assertEqual(entered, [])
+        self.assertIs(type(spec.provider), str)
 
     def test_the_stored_plan_is_inert(self) -> None:
         # The characters are kept and every operation the hostile class weaponised now works

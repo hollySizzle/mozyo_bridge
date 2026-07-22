@@ -230,6 +230,27 @@ class LaneLaunchContextRefusalNeverRunsCallerCodeTest(unittest.TestCase):
                     caught.exception.__cause__, self._UnprintableError
                 )
 
+    class _HostileText(str):
+        def __format__(self, spec) -> str:
+            raise RuntimeError("format")
+
+        def __str__(self) -> str:
+            raise RuntimeError("str")
+
+    def test_a_repr_that_returns_a_hostile_string_still_refuses_typed(self) -> None:
+        # `repr()` is allowed to return a `str` subclass; the message then formats it. The
+        # carrier owns the RESULT of repr(), not just the call.
+        outer = self
+
+        class ReprReturnsHostile:
+            def __repr__(self):
+                return outer._HostileText("<hostile>")
+
+        for field in ("anchors", "slot_specs"):
+            with self.subTest(field=field):
+                with self.assertRaises(LaneLaunchPlanError):
+                    LaneLaunchContext(**{field: [ReprReturnsHostile()]})
+
     def test_an_unprintable_element_still_refuses_typed(self) -> None:
         for field in ("anchors", "slot_specs"):
             with self.subTest(field=field):

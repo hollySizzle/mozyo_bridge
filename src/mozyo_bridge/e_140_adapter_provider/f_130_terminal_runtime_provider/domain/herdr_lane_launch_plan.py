@@ -57,6 +57,26 @@ class LaneLaunchPlanError(ValueError):
     """
 
 
+def _owned_str(value: str) -> str:
+    """An exact, inert ``str`` with the same characters — no subclass hook runs (j#86068).
+
+    ``"" + value`` looked like a conversion that bypasses the caller's class and was the
+    opposite: Python gives the RIGHT operand priority when its type is a subclass of the
+    left one's, so a ``__radd__`` on the caller's ``str`` subclass ran and escaped as a raw
+    exception. Every "obviously safe" conversion has that same shape — ``str(value)``
+    dispatches to ``__str__``, ``value[:]`` to ``__getitem__`` — because they all dispatch on
+    the VALUE's type, which is the caller's.
+
+    The base method invoked explicitly does not dispatch, so nothing a subclass defines can
+    run. Measured against a subclass that raises from ``__radd__``, ``__add__``, ``__str__``,
+    ``__repr__``, ``__format__``, ``__getitem__``, ``__iter__``, ``__hash__``, ``__eq__``,
+    ``__lt__``, ``__bool__``, ``__len__``, ``__mod__``, ``encode``, ``__reduce__`` and
+    ``__copy__``: this returns an exact ``str`` with identical characters, and none of them
+    is called.
+    """
+    return str.__str__(value)
+
+
 def _kind(value: object) -> str:
     """The type name of a caller's value, for a message — never a way to fail (j#86049)."""
     try:
@@ -82,7 +102,7 @@ def _shown(value: object) -> str:
     ``__cause__`` by :func:`_read_once`.
     """
     try:
-        return repr(value)
+        return _owned_str(repr(value))
     except Exception:
         return f"<unprintable {_kind(value)}>"
 
@@ -90,7 +110,7 @@ def _shown(value: object) -> str:
 def _text(value: object) -> str:
     """``str(value)`` for a message, unable to change the outcome (review j#86049)."""
     try:
-        return "" + str(value)
+        return _owned_str(str(value))
     except Exception:
         return f"<unprintable {_kind(value)}>"
 
@@ -208,7 +228,7 @@ def _checked_str(value: object, *, field: str) -> str:
     # Concatenation yields an exact, inert `str` with the same characters, so nothing
     # downstream can re-enter the caller. This is the same discipline the sequences already
     # follow: validate, then own what you validated.
-    return "" + value
+    return _owned_str(value)
 
 
 @dataclass(frozen=True)

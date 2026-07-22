@@ -61,7 +61,9 @@ def _shown(value: object) -> str:
     not be what makes the other module's tests pass.
     """
     try:
-        return repr(value)
+        # The base method explicitly, never `str()` / `+` / slicing: those dispatch on the
+        # caller's own type, which is how a `str` subclass's `__radd__` escaped (j#86068).
+        return str.__str__(repr(value))
     except Exception:
         return f"<unprintable {_kind(value)}>"
 
