@@ -81,6 +81,15 @@ _KIND_ISSUER = {
     EVIDENCE_PARK_DECLARED: ISSUER_LANE_WORKER,
 }
 
+def contract_writer_role(gate: str) -> str:
+    """The ONE role the ruling names as ``gate``'s canonical writer (j#85530 Q3), else unknown.
+
+    The single gate->role authority: the issuer-policy resolution (Redmine #14219 T2c Fork A)
+    reads it from here so no second mapping can drift from the producer's own expectation.
+    """
+    return _KIND_ISSUER.get(gate, ISSUER_UNKNOWN)
+
+
 # Typed refusals (both are zero-actuation gaps, and they stay distinguishable: "we do not know who
 # wrote it" is a different operational problem from "the wrong actor wrote it").
 ISSUER_UNRESOLVED = "evidence_issuer_unresolved"
@@ -239,6 +248,7 @@ __all__ = [
     "ISSUER_UNKNOWN",
     "ISSUER_UNRESOLVED",
     "MARKER_GATE_REVIEW_RESULT",
+    "contract_writer_role",
     "EvidenceJournal",
     "as_pairs",
     "check_issuer",
