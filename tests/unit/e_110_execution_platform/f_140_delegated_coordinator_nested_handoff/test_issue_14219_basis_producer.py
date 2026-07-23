@@ -984,6 +984,43 @@ class CorroborationTests(unittest.TestCase):
                 )
                 self.assertEqual(produced.gaps, ())
 
+    def test_a_documented_ignored_root_flag_is_still_the_canonical_invocation(self):
+        # checkpoint j#86671 R17-F1: `mozyo-bridge --json handoff send ...` is a command the
+        # canonical CLI runs — `--json` / `--no-attach` / `--cc` are root flags whose help marks
+        # them "Ignored when a subcommand is given". Requiring `handoff send` at exactly tokens
+        # 1-2 refused these real deliveries.
+        for prefix in ("--json", "--no-attach", "--cc", "--json --no-attach"):
+            with self.subTest(prefix=prefix):
+                detail = (
+                    "- target: coordinator\n"
+                    "- on sent: mozyo-bridge "
+                    f"{prefix} handoff send --to codex --source redmine --kind reply"
+                    " --issue 14219 --journal 85500 --target coordinator"
+                    " / observed landing marker"
+                    " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+                )
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
+    def test_a_documented_ignored_root_flag_in_the_retry_is_accepted_too(self):
+        fields = _park_fields(
+            result="blocked",
+            detail=(
+                "- target: coordinator (`--target coordinator`)\n"
+                "- on blocked: coordinator pane unresolved"
+                " / candidates (`agents targets` rows): %14 codex w3F:p4"
+                " / retry command: mozyo-bridge --json handoff send --to codex --source redmine"
+                " --kind reply --issue 14219 --journal 85500 --target %14 --target-repo auto\n"
+            ),
+        )
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=fields)), basis=BASIS_DEPENDENCY_PARK
+        )
+        self.assertEqual(produced.gaps, ())
+
     def test_posix_escapes_survive_the_boundary(self):
         # checkpoint j#86649 R12-F2: `--summary park\/callback` is ONE argv value (`park/callback`)
         # to the shell; the home-grown boundary FSM split it at the escaped slash. The second case
@@ -1487,6 +1524,30 @@ class CorroborationTests(unittest.TestCase):
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
                         f" / retry command: {RETRY_COMMAND} --summary |\n"),
+            # -- checkpoint j#86671 R17-F1: root options refused BY NAME -----------------------
+            # `--version` exits before any send (zero-send); the root `--repo` re-composes the
+            # CLI from the target repo's config, so the record alone no longer pins the argv
+            # that ran; `--session` is a bare-`mozyo` override with no documented ignore.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge --version handoff send --to codex --source redmine"
+                     " --kind reply --issue 14219 --journal 85500 --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge --repo . handoff send --to codex --source redmine"
+                     " --kind reply --issue 14219 --journal 85500 --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge --session demo handoff send --to codex --source redmine"
+                     " --kind reply --issue 14219 --journal 85500 --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge --repo . handoff send --to codex"
+                        " --source redmine --kind reply --issue 14219 --journal 85500"
+                        " --target %14 --target-repo auto\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
@@ -1737,6 +1798,38 @@ class SendGrammarDriftGuardTests(unittest.TestCase):
 
         canonical_specs = [spec(action) for action in canonical._actions]
         self.assertEqual(list(_SEND_OPTIONS), canonical_specs)
+
+    def test_mirrored_root_prefix_matches_the_canonical_parser(self):
+        # checkpoint j#86671 R17-F1: the ROOT options (before the subcommand) are canonical
+        # grammar too. The mirror classifies every one of them — accepted-ignored or refused by
+        # name — and this guard asserts the classification covers the real root parser EXACTLY:
+        # a new root option lands in neither tuple and this test fails until it is classified
+        # (unknown prefixes already fail closed in the record parser).
+        import argparse
+
+        from mozyo_bridge.application.cli import build_parser
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_park_record import (  # noqa: E501
+            _ROOT_PREFIX_IGNORED,
+            _ROOT_PREFIX_REFUSED,
+        )
+
+        root = {}
+        help_text = {}
+        for action in build_parser()._actions:
+            if isinstance(action, (argparse._HelpAction, argparse._SubParsersAction)):
+                continue
+            option = action.option_strings[0]
+            root[option] = action.nargs
+            help_text[option] = action.help or ""
+
+        self.assertEqual(
+            set(root), set(_ROOT_PREFIX_IGNORED) | set(_ROOT_PREFIX_REFUSED)
+        )
+        for option in _ROOT_PREFIX_IGNORED:
+            # The acceptance rests on BOTH facts: the flag takes no value (the prefix walk
+            # consumes single tokens) and the canonical help itself documents the ignore.
+            self.assertEqual(root[option], 0, option)
+            self.assertIn("Ignored when a subcommand is given", help_text[option], option)
 
 
 class ModuleDefinitionHygieneTests(unittest.TestCase):

@@ -179,6 +179,22 @@ def canonical_target(value: str) -> str:
 #: The CLI's own entry points (``pyproject`` console scripts).
 _CLI_ENTRYPOINTS = ("mozyo-bridge", "mozyo")
 
+#: The canonical ROOT-prefix grammar (``build_parser``'s own options, allowed before the
+#: subcommand), mirrored as data and split by what a subcommand invocation MEANS with them
+#: (checkpoint j#86671 R17-F1: requiring ``handoff send`` at exactly tokens 1-2 refused commands
+#: the canonical CLI runs). A drift-guard test asserts the two tuples together cover the real
+#: root parser's options EXACTLY — a new root option lands in neither and fails closed here
+#: until it is classified.
+#:
+#: Accepted: zero-arg flags the canonical help itself marks "Ignored when a subcommand is
+#: given" — they change nothing about the delivery.
+_ROOT_PREFIX_IGNORED = ("--json", "--no-attach", "--cc")
+#: Refused BY NAME (not blind-skipped): ``--version`` exits before any send (zero-send); the
+#: root ``--repo`` changes which CLI composes via the target repo's config — the record alone no
+#: longer pins the argv that ran — and ``--session`` is a bare-``mozyo`` override the canonical
+#: help does not mark ignored. Evidence stays fail-closed on all three.
+_ROOT_PREFIX_REFUSED = ("--version", "--repo", "--session")
+
 #: The canonical ``handoff send`` grammar, mirrored as DATA: ``(flag, required, choices, value)``
 #: where ``value`` is ``str`` / ``float`` / ``int`` for a value option, ``"flag"`` for a bare
 #: switch and ``"append"`` for a repeatable option. The domain must not import the
@@ -492,9 +508,15 @@ def _send_invocation(tokens: "list[_Token] | None") -> "argparse.Namespace | Non
         return None
     if any(value in _CLI_ENTRYPOINTS for value in values[1:]):
         return None
-    if values[1:3] != ["handoff", "send"]:
+    # The canonical root prefix: only the documented subcommand-ignored flags may sit between
+    # the entry point and ``handoff send``. Anything else — a refused root option, an unknown
+    # token, a value — fails closed (checkpoint j#86671 R17-F1).
+    index = 1
+    while index < len(values) and values[index] in _ROOT_PREFIX_IGNORED:
+        index += 1
+    if values[index:index + 2] != ["handoff", "send"]:
         return None
-    arguments = values[3:]
+    arguments = values[index + 2:]
     if _conflicting_store_flags(arguments):
         return None
     try:
