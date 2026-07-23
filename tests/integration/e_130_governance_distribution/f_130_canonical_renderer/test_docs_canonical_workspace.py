@@ -617,6 +617,30 @@ class AlwaysRuleDigestTest(unittest.TestCase):
                 "appending (workflow-docs-boundary.md `## 規則の activation 軸`).",
             )
 
+    @staticmethod
+    def _heading_lines(body: str) -> list[str]:
+        # Pointer targets must be matched against real *heading lines*.
+        # A plain substring search over the whole body is vacuous here:
+        # every activation tag embeds its own pointer text (``... の
+        # `### <section>` 節``), so the tag satisfies the search even after
+        # the heading it points at has been renamed away.
+        return [
+            line.rstrip()
+            for line in body.splitlines()
+            if line.startswith("#") and not line.lstrip("#").startswith("#")
+        ]
+
+    def _assert_section_heading_exists(
+        self, body: str, section: str, where: str
+    ) -> None:
+        headings = self._heading_lines(body)
+        self.assertTrue(
+            any(heading.startswith(section) for heading in headings),
+            f"digest points at {where} section {section!r}, but no heading "
+            "line starts with it; rename the digest pointer in the same "
+            "commit as the section.",
+        )
+
     def test_digest_pointer_targets_exist(self) -> None:
         # Each digest entry is a pointer, not the rule body. Pin that the
         # named canonical sections still exist so a rename can't silently
@@ -630,22 +654,18 @@ class AlwaysRuleDigestTest(unittest.TestCase):
             / "src/mozyo_bridge/scaffold/presets/redmine-governed/agent-workflow.md"
         ).read_text(encoding="utf-8")
 
-        self.assertIn(
+        for section in (
             "### Narrative の issue 参照は",
-            skill_body,
-            "digest points at a skill section that no longer exists.",
-        )
+            "### 未定義の project 固有語を定義済み用語として使わない",
+        ):
+            self._assert_section_heading_exists(skill_body, section, "skill")
         for section in (
             "### 応答言語ポリシー",
             "### Review Finding Verdict Obligation (迎合禁止)",
             "### 根拠出所分類",
             "### 回答前 Doc 解決 (Answer-Time Resolution)",
         ):
-            self.assertIn(
-                section,
-                preset_body,
-                f"digest points at preset section {section!r} that no longer exists.",
-            )
+            self._assert_section_heading_exists(preset_body, section, "preset")
 
     def test_boundary_doc_defines_activation_axis(self) -> None:
         # The placement rule + line cap the digest cites must be reachable
@@ -678,6 +698,7 @@ class AlwaysRuleDigestTest(unittest.TestCase):
             "response-language",
             "no-sycophancy-evidence-provenance",
             "answer-time-doc-resolution",
+            "canonical-terminology-discipline",
         }
     )
 
