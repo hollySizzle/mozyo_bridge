@@ -48,6 +48,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     workspace_hibernate_leg as _hibernate,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import default_hibernate_leg_fn  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (
     CallbackOutboxProcessor,
 )
@@ -118,15 +119,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IssueSupervisionOutcome,
     SupervisorReport,
     WorkspaceSupervisionOutcome,
+    _utc_now_iso,
     fence_candidates_to_anchor,
     partition_authoritative,
     partition_delivery_receipts,
     select_supervised_issues,
 )
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 # ``_NullSource`` / ``_NULL_SOURCE`` (unconfigured-Redmine degrade) and ``_CountingSource`` (the
@@ -972,6 +970,9 @@ def build_supervisor(
         reconcile_mark_fn=_reconcile_mark_fn,
         provider_counter_fn=lambda wsid: _counter_for(wsid),
         reconcile_incremental_fn=_reconcile_incremental_fn,
+        hibernate_leg_fn=default_hibernate_leg_fn(
+            home=home, outbox=outbox, source_fn=lambda ws: default_redmine_source(ws, home=home)
+        ),
     )
 
 

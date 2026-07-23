@@ -867,6 +867,13 @@ def build_service_definition(
     )
 
 
+def _utc_now_iso() -> str:
+    """UTC now in ISO form (moved from the application supervisor — line-budget leaf move)."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
 def group_wake_hints(wake_hints) -> "dict[str, tuple[str, ...]]":
     """Group ``(workspace_id, issue)`` wake hints by workspace (order-preserving, de-duplicated).
 
@@ -888,6 +895,7 @@ def group_wake_hints(wake_hints) -> "dict[str, tuple[str, ...]]":
 
 __all__ = (
     "group_wake_hints",
+    "_utc_now_iso",
     "SUPERVISION_BOUNDED_RECONCILIATION",
     "SUPERVISION_LOCAL_WAKE",
     "SUPERVISION_LOCAL_DRAIN",
