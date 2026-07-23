@@ -1021,6 +1021,78 @@ class CorroborationTests(unittest.TestCase):
         )
         self.assertEqual(produced.gaps, ())
 
+    def test_a_bare_template_label_is_stripped(self):
+        # Positive counterpart of the label-provenance rule (checkpoint j#86675 R18-F1): the
+        # template's own bare `command:` label before the invocation is a label, and the record
+        # still satisfies the basis.
+        detail = (
+            "- target: coordinator\n"
+            f"- on sent: command: {SEND_COMMAND}"
+            " / observed landing marker"
+            " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+        )
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+            basis=BASIS_DEPENDENCY_PARK,
+        )
+        self.assertEqual(produced.gaps, ())
+
+    def test_an_entrypoint_valued_argument_is_not_a_second_invocation(self):
+        # checkpoint j#86675 R18-F4: `--summary mozyo` is a value the canonical CLI takes; a
+        # membership scan over every token called it a second invocation and refused the record.
+        for summary in ("mozyo", "mozyo-bridge"):
+            with self.subTest(summary=summary):
+                detail = (
+                    "- target: coordinator\n"
+                    f"- on sent: {SEND_COMMAND} --summary {summary}"
+                    " / observed landing marker"
+                    " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+                )
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
+    def test_an_entrypoint_valued_argument_in_the_retry_is_content_too(self):
+        fields = _park_fields(
+            result="blocked",
+            detail=(
+                "- target: coordinator (`--target coordinator`)\n"
+                "- on blocked: coordinator pane unresolved"
+                " / candidates (`agents targets` rows): %14 codex w3F:p4"
+                f" / retry command: {RETRY_COMMAND} --summary mozyo\n"
+            ),
+        )
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=fields)), basis=BASIS_DEPENDENCY_PARK
+        )
+        self.assertEqual(produced.gaps, ())
+
+    def test_a_reason_mentioning_panes_or_the_send_is_still_a_reason(self):
+        # checkpoint j#86675 R18-F5: the reason is non-empty free text. The candidates and the
+        # retry are judged exactly on their own parts, so prose like "handoff send could not
+        # resolve coordinator" or a pane id inside the reason proves nothing and forbids nothing.
+        for reason in (
+            "handoff send could not resolve coordinator",
+            "pane %15 vanished before the send",
+        ):
+            with self.subTest(reason=reason):
+                fields = _park_fields(
+                    result="blocked",
+                    detail=(
+                        "- target: coordinator (`--target coordinator`)\n"
+                        f"- on blocked: {reason}"
+                        " / candidates (`agents targets` rows): %14 codex w3F:p4"
+                        f" / retry command: {RETRY_COMMAND}\n"
+                    ),
+                )
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=fields)),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
     def test_posix_escapes_survive_the_boundary(self):
         # checkpoint j#86649 R12-F2: `--summary park\/callback` is ONE argv value (`park/callback`)
         # to the shell; the home-grown boundary FSM split it at the escaped slash. The second case
@@ -1548,6 +1620,51 @@ class CorroborationTests(unittest.TestCase):
                         " / retry command: mozyo-bridge --repo . handoff send --to codex"
                         " --source redmine --kind reply --issue 14219 --journal 85500"
                         " --target %14 --target-repo auto\n"),
+            # -- checkpoint j#86675 R18-F1: a QUOTED/ESCAPED label is a literal command name ----
+            # `'command:'` / `command\:` on the shell is argv[0] of a wrapper; the handoff that
+            # follows is its argument, not an executed invocation.
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: 'command:' {SEND_COMMAND}"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: command\\: {SEND_COMMAND}"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        f" / 'retry' command: {RETRY_COMMAND}\n"),
+            # -- checkpoint j#86675 R18-F2: the sent record has EXACTLY one bare separator ------
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} / junk"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} /"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} / && mozyo"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # -- checkpoint j#86675 R18-F3: every marker component must BE a field --------------
+            # A bare fragment or an empty component is a marker no canonical sender draws;
+            # dropping it made the garbage marker collapse onto the canonical one.
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND}"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:garbage:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND}"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219::journal=85500:kind=reply:to=codex]\n"),
+            # Two RAW-different spellings that parse to the same fields are two markers, not an
+            # identical duplicate — only byte-identical repeats collapse.
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND}"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]"
+                     " [mozyo:handoff:issue=14219:source=redmine:journal=85500:kind=reply:to=codex]\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"

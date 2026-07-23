@@ -480,9 +480,20 @@ _LABEL_TOKEN_SEQUENCES = (("retry", "command:"), ("retry:",), ("command:",))
 
 
 def _strip_label_tokens(tokens: "list[_Token]") -> "list[_Token]":
-    """Drop one template label from the FRONT of the token list (pure)."""
+    """Drop one template label from the FRONT of the token list (pure).
+
+    A label is a label only when it is BARE: ``'command:'`` or ``command\\:`` is a literal
+    command name on the shell, and whatever follows it is that command's argv, not an executed
+    invocation (checkpoint j#86675 R18-F1 — value-only comparison stripped the quoted form and
+    promoted the wrapper to evidence).
+    """
     for sequence in _LABEL_TOKEN_SEQUENCES:
-        if tuple(token.value for token in tokens[: len(sequence)]) == sequence:
+        head = tokens[: len(sequence)]
+        if (
+            len(head) == len(sequence)
+            and all(token.plain for token in head)
+            and tuple(token.value for token in head) == sequence
+        ):
             return tokens[len(sequence):]
     return tokens
 
@@ -504,9 +515,11 @@ def _send_invocation(tokens: "list[_Token] | None") -> "argparse.Namespace | Non
     if not tokens or _command_tokens_unsafe(tokens):
         return None
     values = [token.value for token in tokens]
+    # The entry-point check binds token 0 ONLY. An entry-point literal elsewhere is an argument
+    # value the canonical CLI happily takes (``--summary mozyo``); a real second invocation is
+    # closed by the layers that own it — a bare control operator by the lexer safety, a bare
+    # second command by argparse's unknown-argument refusal (checkpoint j#86675 R18-F4).
     if values[0] not in _CLI_ENTRYPOINTS:
-        return None
-    if any(value in _CLI_ENTRYPOINTS for value in values[1:]):
         return None
     # The canonical root prefix: only the documented subcommand-ignored flags may sit between
     # the entry point and ``handoff send``. Anything else — a refused root option, an unknown
@@ -563,10 +576,13 @@ def _raw_marker_fields(body: str) -> "dict | None":
     """
     fields: dict = {}
     for token in body.split(":"):
-        key, sep, value = token.strip().partition("=")
-        if not sep:
-            continue
-        key, value = key.strip(), value.strip()
+        key, sep, value = token.partition("=")
+        # Every component must BE a well-formed field: the canonical ``build_marker`` renders
+        # nothing else, so an empty component, a component without ``=``, an empty key or any
+        # whitespace is a marker no real sender drew — dropping such fragments made a garbage
+        # marker collapse onto the canonical one (checkpoint j#86675 R18-F3).
+        if not sep or not key or any(char.isspace() for char in token):
+            return None
         if key in fields and fields[key] != value:
             return None
         fields[key] = value
@@ -578,17 +594,16 @@ def _observed_marker_fields(detail: str) -> "dict | None":
 
     Every marker in the detail is read, not just a matching one; identical repeats collapse and
     differing ones conflict — the same rule the governed fields follow (checkpoint j#86577 R9-F3).
+    "Identical" means the RAW text: two spellings that happen to parse to the same fields are two
+    different markers saying the same thing, and a record carrying both is not the canonical
+    producer's output (checkpoint j#86675 R18-F3).
     """
-    markers = []
-    for match in _HANDOFF_MARKER_RE.finditer(detail):
-        fields = _raw_marker_fields(match.group("body"))
-        if fields is None:
-            return None
-        markers.append(fields)
-    distinct = {tuple(sorted(fields.items())) for fields in markers}
-    if len(distinct) != 1:
+    raw_forms = {match.group(0) for match in _HANDOFF_MARKER_RE.finditer(detail)}
+    if len(raw_forms) != 1:
         return None
-    return dict(distinct.pop())
+    return _raw_marker_fields(
+        _HANDOFF_MARKER_RE.match(raw_forms.pop()).group("body")
+    )
 
 
 def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: str) -> Optional[str]:
@@ -609,15 +624,19 @@ def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: st
     tokens = _lex_detail(detail)
     if tokens is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    boundary = next(
-        (
-            index
-            for index, token in enumerate(tokens)
-            if token.plain and token.value in _BOUNDARY_TOKENS
-        ),
-        None,
-    )
-    if boundary is None:
+    # EXACTLY one bare separator with a non-empty part on each side, judged BEFORE any other
+    # reading — the same pre-normalisation structure rule the blocked record applies (checkpoint
+    # j#86675 R18-F2: taking merely the FIRST separator let `command / junk / marker` pass with
+    # a third part no template defines).
+    separators = [
+        index
+        for index, token in enumerate(tokens)
+        if token.plain and token.value in _BOUNDARY_TOKENS
+    ]
+    if len(separators) != 1:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    boundary = separators[0]
+    if boundary == 0 or boundary == len(tokens) - 1:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     namespace = _send_invocation(_strip_label_tokens(tokens[:boundary]))
     if namespace is None:
@@ -670,7 +689,8 @@ def _blocked_detail_gap(detail: str, *, source_issue: str, journal: str) -> Opti
 
     Lexed once, split on BARE ``/`` tokens into EXACTLY three parts, each with its own job:
 
-    * part 1 — the reason, which must be text and not evidence standing in for one;
+    * part 1 — the reason: non-empty free text (the proving parts are judged on their own parts,
+      so the reason's words are never read as evidence);
     * part 2 — the candidate rows, which must actually name at least one pane;
     * part 3 — a retry the CLI would actually run and send (same invocation + shared semantics as
       ``sent``), delivering ``--to codex``, pinned at ONE of those candidates and at
@@ -695,14 +715,14 @@ def _blocked_detail_gap(detail: str, *, source_issue: str, journal: str) -> Opti
             parts[-1].append(token)
     if len(parts) != 3 or any(not part for part in parts):
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    reason = [token.value for token in parts[0]]
+    # Part 1 is the reason: non-empty free text, nothing more. What the record must PROVE lives
+    # in the parts that prove it — the candidates and the retry are judged exactly, on their own
+    # parts, so a pane id or a `handoff send` phrase inside the reason's prose cannot stand in
+    # for either (checkpoint j#86675 R18-F5: substring heuristics here refused legitimate
+    # reasons like "handoff send could not resolve coordinator").
     candidates = [token.value for token in parts[1]]
     retry = parts[2]
 
-    if any(_PANE_TOKEN_RE.match(value.strip("`(),")) for value in reason):
-        return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    if any(first == "handoff" and second == "send" for first, second in zip(reason, reason[1:])):
-        return GAP_PARK_CALLBACK_DETAIL_ABSENT
     candidate_panes = {
         value.strip("`(),")
         for value in candidates
