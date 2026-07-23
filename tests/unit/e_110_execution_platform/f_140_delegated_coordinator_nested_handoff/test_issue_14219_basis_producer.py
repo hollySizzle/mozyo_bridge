@@ -854,6 +854,67 @@ class CorroborationTests(unittest.TestCase):
         )
         self.assertEqual(produced.gaps, ())
 
+    def test_a_separator_valued_summary_is_not_a_boundary(self):
+        # checkpoint j#86653 R13-F3: `--summary \\/` and `--summary '/'` both deliver the VALUE
+        # `/`; only a bare `/` is template structure. Value-only tokens made the three
+        # indistinguishable and refused correctly-recorded executed commands.
+        for summary in ("\\/", "'/'"):
+            with self.subTest(summary=summary):
+                detail = (
+                    "- target: coordinator\n"
+                    f"- on sent: {SEND_COMMAND} --summary {summary}"
+                    " / observed landing marker"
+                    " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+                )
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
+    def test_a_separator_valued_summary_in_the_retry_is_not_a_boundary(self):
+        fields = _park_fields(
+            result="blocked",
+            detail=(
+                "- target: coordinator (`--target coordinator`)\n"
+                "- on blocked: coordinator pane unresolved"
+                " / candidates (`agents targets` rows): %14 codex w3F:p4"
+                f" / retry command: {RETRY_COMMAND} --summary \\/\n"
+            ),
+        )
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=fields)), basis=BASIS_DEPENDENCY_PARK
+        )
+        self.assertEqual(produced.gaps, ())
+
+    def test_an_empty_part_is_not_normalised_away(self):
+        # checkpoint j#86653 R13-F4: dropping empty parts let a FOUR-part record pass as three.
+        # The separator count and per-part non-emptiness are judged before any normalisation.
+        for detail in (
+            # double separator before the candidates
+            ("- target: coordinator\n- on blocked: pane unresolved"
+             " / / candidates (`agents targets` rows): %14"
+             f" / retry command: {RETRY_COMMAND}\n"),
+            # double separator before the retry
+            ("- target: coordinator\n- on blocked: pane unresolved"
+             " / candidates (`agents targets` rows): %14"
+             f" / / retry command: {RETRY_COMMAND}\n"),
+            # trailing separator
+            ("- target: coordinator\n- on blocked: pane unresolved"
+             " / candidates (`agents targets` rows): %14"
+             f" / retry command: {RETRY_COMMAND} /\n"),
+        ):
+            with self.subTest(detail=detail[:60]):
+                journals = _park_journals(
+                    park=_park_note(park_fields=_park_fields(result="blocked", detail=detail))
+                )
+                self.assertEqual(
+                    _gaps(_produce(journals, basis=BASIS_DEPENDENCY_PARK)).get(
+                        CONJUNCT_PARK_DECLARED
+                    ),
+                    bp.GAP_PARK_CALLBACK_DETAIL_ABSENT,
+                )
+
     def test_posix_escapes_survive_the_boundary(self):
         # checkpoint j#86649 R12-F2: `--summary park\/callback` is ONE argv value (`park/callback`)
         # to the shell; the home-grown boundary FSM split it at the escaped slash. The second case
@@ -1481,12 +1542,22 @@ class SendSemanticsSharedAuthorityTests(unittest.TestCase):
 
         self.assertIn("send_semantic_gap", inspect.getsource(handoff_admission_pipeline))
 
+    def test_build_notification_body_consults_the_authority(self):
+        # Source-level wiring guard (checkpoint j#86653 R13-F1): behavioural equivalence alone
+        # does not make one of two implementations THE authority. The line budget for this wiring
+        # was funded by extracting default_body_for_kind out of the allowlisted module rather
+        # than bumping its baseline.
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            build_notification_body,
+        )
+
+        self.assertIn("send_semantic_gap", inspect.getsource(build_notification_body))
+
     def test_build_notification_body_matches_the_authority(self):
-        # This one rule is pinned behaviourally rather than by call-site wiring:
-        # build_notification_body lives in an allowlisted module at its exact line baseline, and
-        # the project rule is to never self-approve a baseline bump. The guard asserts the body
-        # builder raises EXACTLY when the authority says the custom summary is missing, so the two
-        # cannot drift silently.
+        # Behavioural matrix kept alongside the wiring guard: the builder raises EXACTLY when the
+        # authority reports the missing custom summary.
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             AnchorError,
             build_notification_body,
@@ -1566,6 +1637,95 @@ class SendGrammarDriftGuardTests(unittest.TestCase):
 
         canonical_specs = [spec(action) for action in canonical._actions]
         self.assertEqual(list(_SEND_OPTIONS), canonical_specs)
+
+
+class ModuleDefinitionHygieneTests(unittest.TestCase):
+    """No authority-bearing module carries duplicate top-level definitions.
+
+    Checkpoint j#86653 R13-F2: slice-based edits twice left stale copies of parser definitions in
+    ``hibernate_park_record``, and the LATER copy silently won at import time — so the checks that
+    had just been written were effectively absent. A hand grep proved unreliable (it checked only
+    the names just edited); this guard checks every top-level name mechanically.
+    """
+
+    _MODULES = (
+        "hibernate_park_record",
+        "hibernate_basis_producer",
+        "hibernate_evidence_authority",
+        "hibernate_evidence_marker",
+        "hibernate_evidence_envelope",
+        "hibernate_evidence_integration",
+    )
+
+    def test_no_duplicate_top_level_definitions(self):
+        import ast
+        import importlib
+        import inspect
+
+        for name in self._MODULES:
+            with self.subTest(module=name):
+                module = importlib.import_module(
+                    "mozyo_bridge.e_110_execution_platform."
+                    "f_140_delegated_coordinator_nested_handoff.domain." + name
+                )
+                tree = ast.parse(inspect.getsource(module))
+                seen: list = []
+                for node in tree.body:
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        seen.append(node.name)
+                    elif isinstance(node, ast.Assign):
+                        seen.extend(
+                            target.id
+                            for target in node.targets
+                            if isinstance(target, ast.Name)
+                        )
+                duplicates = sorted({item for item in seen if seen.count(item) > 1})
+                self.assertEqual(duplicates, [])
+
+
+class LexerDriftGuardTests(unittest.TestCase):
+    """The provenance-preserving lexer's VALUES match ``shlex`` exactly.
+
+    The lexer exists because ``shlex`` discards provenance (checkpoint j#86653 R13-F3); this guard
+    is what keeps it from becoming a second, diverging value authority.
+    """
+
+    CORPUS = (
+        "mozyo-bridge handoff send --to codex --summary 'park callback delivered'",
+        "cmd --summary park\\/callback / observed",
+        "cmd --summary '/' / observed",
+        'a "b \\" / c" d',
+        "plain / boundary + plus",
+        "--flag=value --other 'x y'",
+        "a;b | c && d",
+        "  leading and   multiple   spaces ",
+        "escaped\\ space and 'quoted part'",
+    )
+
+    def test_values_match_shlex(self):
+        import shlex as shlex_module
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_park_record import (  # noqa: E501
+            _lex_detail,
+        )
+
+        for text in self.CORPUS:
+            with self.subTest(text=text):
+                lexer = shlex_module.shlex(text, posix=True, punctuation_chars=";|&<>()")
+                lexer.whitespace_split = True
+                self.assertEqual(
+                    [token.value for token in _lex_detail(text)], list(lexer)
+                )
+
+    def test_unclosed_quote_and_trailing_escape_are_fail_closed(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_park_record import (  # noqa: E501
+            _lex_detail,
+        )
+
+        self.assertIsNone(_lex_detail("a 'unclosed"))
+        self.assertIsNone(_lex_detail('a "unclosed'))
+        self.assertIsNone(_lex_detail("a trailing\\"))
+        self.assertIsNone(_lex_detail("two\nlines"))
 
 
 if __name__ == "__main__":  # pragma: no cover

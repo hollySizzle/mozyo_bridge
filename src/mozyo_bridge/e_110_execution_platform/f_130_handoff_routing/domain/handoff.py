@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Sequence
 # are re-exported below (see ``__all__``) so every existing import site that
 # reaches them via ``...domain.handoff`` (``commands.py``, the ticketless tests)
 # keeps working unchanged.
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import SEND_SEMANTIC_CUSTOM_SUMMARY, default_body_for_kind, send_semantic_gap  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_anchors import (
     SOURCE_TICKETLESS,
     TicketlessAnchor,
@@ -588,22 +589,6 @@ def build_execution_root(
     )
 
 
-def _default_body_for_kind(kind: str, receiver: str) -> str:
-    if kind == "implementation_request":
-        return f"implementation request ready for {receiver}"
-    if kind == "design_consultation":
-        return f"design consultation ready for {receiver}"
-    if kind == "review_request":
-        return f"review request ready for {receiver}"
-    if kind == "review_result":
-        return f"review result ready for {receiver}"
-    if kind == "implementation_done":
-        return f"implementation done; review handoff ready for {receiver}"
-    if kind == "reply":
-        return f"reply ready for {receiver}"
-    return f"handoff ready for {receiver}"
-
-
 def build_notification_body(
     anchor: NormalizedAnchor,
     kind: str,
@@ -647,9 +632,9 @@ def build_notification_body(
     """
     if kind not in KIND_LABELS:
         raise AnchorError(f"unknown handoff kind: {kind!r}; expected one of {sorted(KIND_LABELS)}")
-    if kind == "custom" and not summary:
+    if send_semantic_gap(kind=kind, summary=summary) == SEND_SEMANTIC_CUSTOM_SUMMARY:
         raise AnchorError("--summary is required when --kind custom")
-    intent = summary if summary else _default_body_for_kind(kind, receiver)
+    intent = summary if summary else default_body_for_kind(kind, receiver)
     pointer = anchor.human_pointer()
     if anchor.source == SOURCE_TICKETLESS:
         # Redmine #12703 / #12740: there is no ticket anchor to "read from the

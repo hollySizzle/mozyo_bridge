@@ -57,10 +57,34 @@ def send_semantic_gap(
     return None
 
 
+def default_body_for_kind(kind: str, receiver: str) -> str:
+    """The deterministic default notification body for a non-``custom`` kind (pure).
+
+    Moved here from ``handoff.py`` (which sits exactly at its module-health baseline) to fund the
+    line budget for wiring ``build_notification_body`` to :func:`send_semantic_gap` — the wiring
+    the shared-authority contract requires (#14219 j#86653 R13-F1). It is a send-time semantic in
+    its own right: the body a kind implies when the operator supplies no summary.
+    """
+    if kind == "implementation_request":
+        return f"implementation request ready for {receiver}"
+    if kind == "design_consultation":
+        return f"design consultation ready for {receiver}"
+    if kind == "review_request":
+        return f"review request ready for {receiver}"
+    if kind == "review_result":
+        return f"review result ready for {receiver}"
+    if kind == "implementation_done":
+        return f"implementation done; review handoff ready for {receiver}"
+    if kind == "reply":
+        return f"reply ready for {receiver}"
+    return f"handoff ready for {receiver}"
+
+
 __all__ = [
     "SEND_SEMANTIC_CUSTOM_SUMMARY",
     "SEND_SEMANTIC_PROJECT_REPO",
     "SEND_SEMANTIC_REASONS",
     "SEND_SEMANTIC_SELECT_TARGET",
+    "default_body_for_kind",
     "send_semantic_gap",
 ]

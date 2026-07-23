@@ -310,32 +310,110 @@ def _conflicting_store_flags(tokens: "list[str]") -> bool:
     return False
 
 
-def _lex_detail(text: str) -> "list[str] | None":
-    """``text`` as the shell would lex it, or ``None`` on an unlexable record (pure).
+class _Token:
+    """One lexed token: its VALUE (as the shell would deliver it to argv) and its PROVENANCE.
 
-    ONE lexical authority for the whole record (checkpoint j#86649 R12-F2): tokenization AND every
-    boundary decision run over these tokens. The previous round lexed the command with ``shlex``
-    but recognised the ``/`` boundaries with a home-grown quote FSM that knew nothing of POSIX
-    escapes, so ``--summary park\\/callback`` — one argv value to the shell — split in the middle
-    and a correctly-recorded executed command stopped satisfying the basis. An escaped or quoted
-    separator now simply stays inside its token and is never a boundary.
+    ``plain`` is True only when no quoting or escaping took part in the token — which is what a
+    boundary decision needs: a bare ``/`` is template structure, while ``\\/`` and ``'/'`` deliver
+    the same VALUE and are argument content (checkpoint j#86653 R13-F3: value-only tokens made
+    those three indistinguishable, so a summary whose value IS the separator was refused).
+    """
 
-    This lexes LENIENTLY: the template's prose parts legitimately carry backticks and parentheses
-    (``candidates (`agents targets` rows)``), so shell-control strictness is applied to the
-    COMMAND tokens only (:func:`_command_tokens_unsafe`). What fails the whole record here is what
-    makes it unlexable: an unclosed quote, or a multi-line value.
+    __slots__ = ("value", "plain")
+
+    def __init__(self, value: str, plain: bool) -> None:
+        self.value = value
+        self.plain = plain
+
+
+_PUNCTUATION = ";|&<>()"
+
+
+def _lex_detail(text: str) -> "list[_Token] | None":
+    """``text`` lexed as the shell would, with per-token provenance, or ``None`` (pure).
+
+    The ONE lexer for this record: values match POSIX shell lexing (a drift-guard test asserts the
+    value sequence equals ``shlex``'s over the fixtures and a corpus, so this cannot quietly become
+    a second, diverging authority), and each token additionally carries whether quoting/escaping
+    was involved — the provenance ``shlex`` discards and boundaries require.
+
+    Lexing rules mirrored: whitespace splits; ``'...'`` is literal; ``"..."`` honours ``\\``
+    before ``"`` ``\\`` `````` ``$``; a backslash outside quotes escapes the next character;
+    punctuation characters outside quotes form their own tokens (``shlex`` ``punctuation_chars``).
+    Unclosed quotes, trailing escapes and multi-line values are fail-closed.
     """
     if "\n" in text:
         return None
-    lexer = shlex.shlex(text, posix=True, punctuation_chars=";|&<>()")
-    lexer.whitespace_split = True
-    try:
-        return list(lexer)
-    except ValueError:
-        return None
+    tokens: list = []
+    value: list = []
+    plain = True
+    started = False
+
+    def flush():
+        nonlocal value, plain, started
+        if started:
+            tokens.append(_Token("".join(value), plain))
+        value, plain, started = [], True, False
+
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char in " \t":
+            flush()
+            index += 1
+            continue
+        if char in _PUNCTUATION:
+            flush()
+            run = index
+            while run < length and text[run] in _PUNCTUATION:
+                run += 1
+            tokens.append(_Token(text[index:run], True))
+            index = run
+            continue
+        if char == "'":
+            plain = False
+            started = True
+            close = text.find("'", index + 1)
+            if close < 0:
+                return None
+            value.append(text[index + 1:close])
+            index = close + 1
+            continue
+        if char == '"':
+            plain = False
+            started = True
+            index += 1
+            while True:
+                if index >= length:
+                    return None
+                char = text[index]
+                if char == '"':
+                    index += 1
+                    break
+                if char == "\\" and index + 1 < length and text[index + 1] in '"\\`$':
+                    value.append(text[index + 1])
+                    index += 2
+                    continue
+                value.append(char)
+                index += 1
+            continue
+        if char == "\\":
+            if index + 1 >= length:
+                return None
+            plain = False
+            started = True
+            value.append(text[index + 1])
+            index += 2
+            continue
+        started = True
+        value.append(char)
+        index += 1
+    flush()
+    return tokens
 
 
-def _command_tokens_unsafe(tokens: "list[str]") -> bool:
+def _command_tokens_unsafe(values: "list[str]") -> bool:
     """Whether the COMMAND tokens carry shell control or substitution (pure).
 
     Control operators outside quotes surface as punctuation tokens; substitution characters are
@@ -343,10 +421,10 @@ def _command_tokens_unsafe(tokens: "list[str]") -> bool:
     quotes, and refusing the single-quoted false positive is the fail-closed direction.
     """
     return any(
-        (token and all(char in ";|&<>()" for char in token))
-        or "`" in token
-        or "$(" in token
-        for token in tokens
+        (value and all(char in _PUNCTUATION for char in value))
+        or "`" in value
+        or "$(" in value
+        for value in values
     )
 
 
@@ -416,168 +494,6 @@ def _send_invocation(tokens: "list[str] | None") -> "argparse.Namespace | None":
     return namespace
 
 
-def canonical_target(value: str) -> str:
-    """The canonical coordinator target a ``target:`` field names, or ``""`` (pure).
-
-    The template writes the two permitted forms as ``coordinator (`--target coordinator`)`` and
-    ``<coordinator_codex_%pane>`` — both of which SAY they are the coordinator's. So the field must
-    name the coordinator, and the effective target is then either that natural token or the one
-    pane it resolves to.
-
-    Two ways this was wrong before. It asked whether ``"coordinator" in value.lower()``, so
-    ``noncoordinator`` and ``the-coordinator-ish`` read as the coordinator; and once whole-token
-    matching landed, a bare pane still passed on shape alone — ``same-lane worker w3F:p3`` is a
-    well-formed pane, and nothing in it claims to be the coordinator (checkpoint j#86562 R7-F1).
-    A pane is a target only when the record says whose it is, and only when there is exactly one:
-    two panes name no single place the callback went.
-    """
-    tokens = [token.strip("`(),") for token in str(value).split()]
-    if not any(token == _COORDINATOR_TARGET for token in tokens):
-        return ""
-    panes = {token for token in tokens if _PANE_TOKEN_RE.match(token)}
-    if len(panes) > 1:
-        return ""
-    return panes.pop() if panes else _COORDINATOR_TARGET
-
-
-#: A record's command is one invocation that WAS run (``sent``) or WILL
-#: be replayed (``blocked``); anything that composes, conditions, redirects or substitutes commands
-#: means the token sequence is not that invocation. Control detection lives in
-#: :func:`_lex_command` (punctuation tokens outside quotes + inline substitution characters).
-#: The CLI's own entry points (``pyproject`` console scripts).
-_CLI_ENTRYPOINTS = ("mozyo-bridge", "mozyo")
-
-#: The canonical ``handoff send`` grammar, mirrored as DATA: ``(flag, required, choices, value)``
-#: where ``value`` is ``str`` / ``float`` / ``int`` for a value option, ``"flag"`` for a bare
-#: switch and ``"append"`` for a repeatable option. The domain must not import the
-#: application-layer parser builder, so this table exists — and a drift-guard test builds the REAL
-#: parser (``configure_handoff_parser`` + ``add_handoff_select_args``) and asserts this table
-#: matches it action for action, the same pattern ``callback_delivery`` uses for its tokens.
-#: An invocation this grammar rejects is one the CLI would refuse to run, and a command that never
-#: ran is not delivery evidence (checkpoint j#86626 R10-F1 — the previous check looked at token 0
-#: and ``handoff send`` only, and its own positive fixture was missing the required ``--source`` /
-#: ``--kind``).
-_SEND_OPTIONS: tuple = (
-    ("--to", True, ("claude", "codex"), str),
-    ("--source", True, ("asana", "redmine"), str),
-    ("--kind", True, tuple(sorted(KIND_LABELS)), str),
-    ("--task-id", False, None, str),
-    ("--comment-id", False, None, str),
-    ("--anchor-url", False, None, str),
-    ("--issue", False, None, str),
-    ("--journal", False, None, str),
-    ("--target", False, None, str),
-    ("--target-repo", False, None, str),
-    ("--target-lane", False, None, str),
-    ("--target-project", False, None, str),
-    ("--allow-direct-worker", False, None, "flag"),
-    ("--workdir", False, None, str),
-    (
-        "--role-profile",
-        False,
-        ("coordinator", "delegated_coordinator", "implementation_gateway", "implementation_worker"),
-        str,
-    ),
-    ("--profile-field", False, None, "append"),
-    ("--main-lane-exception", False, None, str),
-    ("--mode", False, ("pending", "queue-enter", "standard"), str),
-    ("--summary", False, None, str),
-    ("--force", False, None, "flag"),
-    ("--landing-timeout", False, None, float),
-    ("--submit-delay", False, None, float),
-    ("--read-lines", False, None, int),
-    ("--queue-enter-retry-window", False, None, float),
-    ("--queue-enter-retry-interval", False, None, float),
-    ("--no-target-activation", False, None, "flag"),
-    ("--restore-previous-active", False, None, "flag"),
-    ("--record-format", False, ("both", "json", "text"), str),
-    ("--record-command", False, None, str),
-    ("--persist-delivery", False, None, "flag"),
-    ("--select", False, None, "flag"),
-    ("--target-session", False, None, str),
-)
-
-#: Options that legitimately repeat (argparse append) — exempt from the conflict rule.
-_APPEND_FLAGS = frozenset(
-    flag for flag, _required, _choices, value in _SEND_OPTIONS if value == "append"
-)
-_VALUE_FLAGS = frozenset(
-    flag for flag, _required, _choices, value in _SEND_OPTIONS if value not in ("flag",)
-)
-
-
-class _GrammarRefusal(Exception):
-    """Raised instead of argparse's stderr-print-and-exit — the check is side-effect free."""
-
-
-class _RefusingParser(argparse.ArgumentParser):
-    def error(self, message):  # pragma: no cover - trivial override
-        raise _GrammarRefusal(message)
-
-
-def _build_send_parser() -> argparse.ArgumentParser:
-    # ``allow_abbrev=False``: the canonical CLI accepts long-option abbreviation, but an
-    # abbreviated flag in a durable record reintroduces the very ambiguity the conflict rule
-    # exists to refuse — ``--ki review_request --kind reply`` declares two values for one
-    # logical option while wearing two names (checkpoint j#86645 R11-F3). Evidence is written
-    # unabbreviated.
-    parser = _RefusingParser(prog="handoff-send-evidence", add_help=False, allow_abbrev=False)
-    for flag, required, choices, value in _SEND_OPTIONS:
-        dest = flag[2:].replace("-", "_")
-        if value == "flag":
-            parser.add_argument(flag, dest=dest, required=required, action="store_true")
-        elif value == "append":
-            parser.add_argument(flag, dest=dest, required=required, action="append")
-        else:
-            parser.add_argument(
-                flag,
-                dest=dest,
-                required=required,
-                choices=list(choices) if choices else None,
-                type=None if value is str else value,
-            )
-    return parser
-
-
-_SEND_PARSER = _build_send_parser()
-
-
-def _conflicting_store_flags(tokens: "list[str]") -> bool:
-    """Whether any single-valued flag repeats with DIFFERING values (pure).
-
-    Argparse itself is last-write-wins, but a durable record whose command says two things has no
-    single meaning to trust (the R8 rule). Append options (``--profile-field``) repeat by design
-    and are exempt; identical repeats collapse.
-    """
-    seen: dict = {}
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if not token.startswith("--"):
-            index += 1
-            continue
-        flag, eq, inline = token.partition("=")
-        if flag in _APPEND_FLAGS:
-            index += 1 if eq else 2
-            continue
-        if flag in _VALUE_FLAGS:
-            if eq:
-                value = inline
-                index += 1
-            elif index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
-                value = tokens[index + 1]
-                index += 2
-            else:
-                index += 1
-                continue  # missing value: the grammar parse refuses it
-            if flag in seen and seen[flag] != value:
-                return True
-            seen[flag] = value
-        else:
-            index += 1
-    return False
-
-
 #: ``[mozyo:handoff:<body>]`` read RAW — the shared scanner folds duplicate keys last-write-wins,
 #: which is exactly what has to be refused here.
 _HANDOFF_MARKER_RE = re.compile(r"\[mozyo:handoff:(?P<body>[^\]]*)\]")
@@ -642,11 +558,18 @@ def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: st
     if tokens is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     boundary = next(
-        (index for index, token in enumerate(tokens) if token in _BOUNDARY_TOKENS), None
+        (
+            index
+            for index, token in enumerate(tokens)
+            if token.plain and token.value in _BOUNDARY_TOKENS
+        ),
+        None,
     )
     if boundary is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    namespace = _send_invocation(_strip_label_tokens(tokens[:boundary]))
+    namespace = _send_invocation(
+        _strip_label_tokens([token.value for token in tokens[:boundary]])
+    )
     if namespace is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     if namespace.to != _RECEIVER_CODEX:
@@ -656,7 +579,9 @@ def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: st
     if namespace.mode == "pending":
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
 
-    observed = _observed_marker_fields(" ".join(tokens[boundary + 1:]))
+    observed = _observed_marker_fields(
+        " ".join(token.value for token in tokens[boundary + 1:])
+    )
     if observed is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     if observed.get("source") != _MARKER_SOURCE:
@@ -706,14 +631,16 @@ def _blocked_detail_gap(detail: str, *, source_issue: str, journal: str) -> Opti
     tokens = _lex_detail(detail)
     if tokens is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    # EXACTLY two bare separators, and every part non-empty, judged BEFORE any normalisation:
+    # dropping empty parts first let `reason / / candidates / retry` — four parts — pass as three
+    # (checkpoint j#86653 R13-F4).
     parts: list = [[]]
     for token in tokens:
-        if token == "/":
+        if token.plain and token.value == "/":
             parts.append([])
         else:
-            parts[-1].append(token)
-    parts = [part for part in parts if part]
-    if len(parts) != 3:
+            parts[-1].append(token.value)
+    if len(parts) != 3 or any(not part for part in parts):
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     reason, candidates, retry = parts
 
