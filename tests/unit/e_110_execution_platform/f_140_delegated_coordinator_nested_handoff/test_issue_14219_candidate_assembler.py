@@ -41,6 +41,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BASIS_EARLY_HIBERNATE,
     NON_CANDIDATE_BASIS_PARTIALLY_UNKNOWN,
     NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH,
+    NON_CANDIDATE_HEAD_MALFORMED,
     NON_CANDIDATE_HEAD_UNBOUND,
     NON_CANDIDATE_LIFECYCLE_UNREADABLE,
     PROVENANCE_GIT_REMOTE,
@@ -316,6 +317,36 @@ class CandidateAssemblerTests(unittest.TestCase):
         got, _ = self._assemble(journals=_early_journals(), push=_push(reachable=False))
         self.assertIsInstance(got.verdict, HibernateNonCandidate)
         self.assertEqual(got.verdict.reason, "basis_unsatisfied")
+
+    def test_a_malformed_observed_head_is_refused_under_every_basis(self):
+        # Checkpoint j#86525 R4-F4: under early hibernate a malformed head was rejected only as a
+        # side effect (the head-bearing conjuncts carry full SHAs, so nothing matched it), but a
+        # dependency park has no head-bearing conjunct and the same head sailed through. The head
+        # contract cannot depend on which basis happens to be declared.
+        for basis, journals in (
+            (BASIS_DEPENDENCY_PARK, [EvidenceJournal("85010", _park_note(), _issuer(ISSUER_LANE_WORKER))]),
+            (BASIS_EARLY_HIBERNATE, _early_journals()),
+        ):
+            for bad in ("not-a-full-sha", "a" * 39, ("A" * 40), "a" * 41):
+                with self.subTest(basis=basis, head=bad):
+                    ports = _Ports(journals=journals, push=_push(head=bad))
+                    got = ports.assembler().assemble(
+                        AssemblyRequest(selected=_selected(), basis=basis)
+                    )
+                    self.assertIsInstance(got.verdict, HibernateNonCandidate)
+                    self.assertEqual(got.verdict.reason, NON_CANDIDATE_HEAD_MALFORMED)
+
+    def test_a_sha256_head_is_still_accepted(self):
+        # Negative control for the head shape: the repo's canonical predicate accepts 40 OR 64 hex,
+        # so the guard must not narrow the contract to sha1 while closing the malformed case.
+        ports = _Ports(
+            journals=[EvidenceJournal("85010", _park_note(), _issuer(ISSUER_LANE_WORKER))],
+            push=_push(head="b" * 64),
+        )
+        got = ports.assembler().assemble(
+            AssemblyRequest(selected=_selected(), basis=BASIS_DEPENDENCY_PARK)
+        )
+        self.assertIsInstance(got.verdict, HibernateCandidate)
 
     def test_unreadable_lifecycle_store_is_typed(self):
         got, _ = self._assemble(journals=_early_journals(), records=None)

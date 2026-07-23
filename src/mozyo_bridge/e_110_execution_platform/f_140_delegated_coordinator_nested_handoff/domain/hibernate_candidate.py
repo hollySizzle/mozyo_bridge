@@ -35,6 +35,8 @@ from typing import Optional, Sequence
 
 from mozyo_bridge.core.state.lane_lifecycle_model import DISPOSITION_ACTIVE
 
+from .hibernate_evidence_envelope import is_full_sha
+
 # --------------------------------------------------------------------------------------------------
 # Authority provenance — where a bound fact came from. Each anchor field and each basis conjunct
 # carries one of these, so a reviewer (and the code) can see the authority behind every value.
@@ -146,6 +148,9 @@ NON_CANDIDATE_LANE_IDENTITY_MISMATCH = "selected_lane_mismatch"
 NON_CANDIDATE_GENERATION_MISMATCH = "lane_generation_mismatch"
 NON_CANDIDATE_REVISION_MISMATCH = "lifecycle_revision_mismatch"
 NON_CANDIDATE_HEAD_UNBOUND = "head_authority_absent"
+#: The head is bound from a legitimate authority but is not a canonical full commit hash. Kept
+#: separate from "unbound": the authority answered, it just did not answer with a commit.
+NON_CANDIDATE_HEAD_MALFORMED = "head_malformed"
 NON_CANDIDATE_DECLARED_BASIS_INVALID = "declared_basis_invalid"
 NON_CANDIDATE_CONJUNCT_AUTHORITY_MISMATCH = "conjunct_authority_mismatch"
 NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH = "conjunct_anchor_mismatch"
@@ -161,6 +166,7 @@ HIBERNATE_NON_CANDIDATE_REASONS = frozenset({
     NON_CANDIDATE_GENERATION_MISMATCH,
     NON_CANDIDATE_REVISION_MISMATCH,
     NON_CANDIDATE_HEAD_UNBOUND,
+    NON_CANDIDATE_HEAD_MALFORMED,
     NON_CANDIDATE_DECLARED_BASIS_INVALID,
     NON_CANDIDATE_CONJUNCT_AUTHORITY_MISMATCH,
     NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH,
@@ -481,6 +487,13 @@ def classify_hibernate_candidate(
 
     if head is None or not head.value.strip() or head.provenance not in HEAD_AUTHORITIES:
         return HibernateNonCandidate(issue_id, NON_CANDIDATE_HEAD_UNBOUND)
+    # The head must be a canonical full commit hash for EVERY basis (checkpoint j#86525 R4-F4).
+    # Under early hibernate a malformed head was rejected only as a side effect — the head-bearing
+    # conjuncts carry full SHAs, so nothing matched it — but a dependency park has no head-bearing
+    # conjunct, so the same malformed head sailed through. The action intent is bound to an exact
+    # head by contract; that cannot depend on which basis happens to be declared.
+    if not is_full_sha(head.value):
+        return HibernateNonCandidate(issue_id, NON_CANDIDATE_HEAD_MALFORMED)
 
     basis_reason = _evaluate_basis(
         declared_basis, conjuncts, anchor=anchor, candidate_head=head.value

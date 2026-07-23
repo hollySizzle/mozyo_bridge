@@ -725,17 +725,84 @@ class CorroborationTests(unittest.TestCase):
                     bp.GAP_PARK_JOURNAL_FIELDS_INVALID,
                 )
 
-    def test_every_governed_callback_result_value_is_accepted(self):
+    def test_every_governed_callback_result_value_is_accepted_when_recorded(self):
         # Negative control for the closed vocabulary: it refuses inventions, not the real values.
-        # `blocked` / `not-attempted` are legitimate outcomes — the guardrail requires a RECORD of
-        # the callback, not a successful one.
-        for value in ("sent", "blocked", "not-attempted"):
+        # `blocked` / `not-attempted` are legitimate outcomes — but legitimate WHEN RECORDED, which
+        # is what the previous version of this test missed (checkpoint j#86525 R4-F2): it accepted
+        # the bare tokens and so asserted the defect rather than the contract.
+        for value, detail in (
+            ("sent", ""),
+            ("blocked", "- callback_reason: coordinator pane unresolved\n"
+                        "- retry_command: mozyo-bridge handoff send --mode standard\n"),
+            ("not-attempted", "- callback_reason: 依存 issue の判断待ちで送信対象が未確定\n"),
+        ):
             with self.subTest(callback_result=value):
-                fields = PARK_FIELDS.replace("- callback_result: sent", f"- callback_result: {value}")
+                fields = PARK_FIELDS.replace(
+                    "- callback_result: sent", f"- callback_result: {value}"
+                ) + detail
                 journals = _park_journals(park=_park_note(park_fields=fields))
                 produced = _produce(journals, basis=BASIS_DEPENDENCY_PARK)
                 self.assertEqual(produced.gaps, ())
                 self.assertTrue(_by_key(produced)[CONJUNCT_PARK_DECLARED].satisfied)
+
+    def test_a_bare_blocked_or_not_attempted_outcome_is_a_gap(self):
+        # The token without the record. `blocked` needs its reason AND a replayable retry command;
+        # `not-attempted` needs its reason. Accepting the token alone re-admits the exact
+        # "parked and nobody was told" state the completion rule exists to prevent.
+        for value, detail in (
+            ("blocked", ""),
+            ("blocked", "- callback_reason: coordinator pane unresolved\n"),  # reason, no retry
+            ("not-attempted", ""),
+        ):
+            with self.subTest(callback_result=value, detail=bool(detail)):
+                fields = PARK_FIELDS.replace(
+                    "- callback_result: sent", f"- callback_result: {value}"
+                ) + detail
+                journals = _park_journals(park=_park_note(park_fields=fields))
+                self.assertEqual(
+                    _gaps(_produce(journals, basis=BASIS_DEPENDENCY_PARK)).get(
+                        CONJUNCT_PARK_DECLARED
+                    ),
+                    bp.GAP_PARK_CALLBACK_DETAIL_ABSENT,
+                )
+
+    def test_an_anchor_naming_another_journal_of_this_issue_is_a_gap(self):
+        # Checkpoint j#86525 R4-F1: the shape and the issue were checked, but not WHICH journal.
+        # An older callback journal of the same issue is not this park declaration's own anchor.
+        fields = PARK_FIELDS.replace("- durable_anchor: #14219 j#85500", "- durable_anchor: #14219 j#1")
+        journals = _park_journals(park=_park_note(park_fields=fields))
+        self.assertEqual(
+            _gaps(_produce(journals, basis=BASIS_DEPENDENCY_PARK)).get(CONJUNCT_PARK_DECLARED),
+            bp.GAP_PARK_ANCHOR_NOT_THIS_DECLARATION,
+        )
+
+    def test_conflicting_duplicate_governed_fields_are_a_gap(self):
+        # Checkpoint j#86525 R4-F3: first-write-wins had no order authority behind it. Every other
+        # layer of this surface folds duplicates as collapse-or-conflict; the governed fields now
+        # do too.
+        for extra in (
+            "- callback_result: invented\n",
+            "- durable_anchor: #14219 j#1\n",
+            "- resume_owner: worker\n",
+        ):
+            with self.subTest(duplicate=extra.strip()):
+                journals = _park_journals(park=_park_note(park_fields=PARK_FIELDS + extra))
+                self.assertEqual(
+                    _gaps(_produce(journals, basis=BASIS_DEPENDENCY_PARK)).get(
+                        CONJUNCT_PARK_DECLARED
+                    ),
+                    bp.GAP_PARK_JOURNAL_FIELDS_INVALID,
+                )
+
+    def test_an_identical_duplicate_field_collapses(self):
+        # Negative control for the conflict rule: a re-stated identical field is not a conflict,
+        # so the rule refuses contradiction rather than repetition.
+        journals = _park_journals(
+            park=_park_note(park_fields=PARK_FIELDS + "- callback_result: sent\n")
+        )
+        produced = _produce(journals, basis=BASIS_DEPENDENCY_PARK)
+        self.assertEqual(produced.gaps, ())
+        self.assertTrue(_by_key(produced)[CONJUNCT_PARK_DECLARED].satisfied)
 
     def test_a_fully_recorded_park_still_satisfies(self):
         produced = _produce(_park_journals(), basis=BASIS_DEPENDENCY_PARK)

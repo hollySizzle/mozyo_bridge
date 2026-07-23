@@ -144,6 +144,12 @@ GAP_DOGFOOD_RECEIPT_ABSENT = "dogfood_receipt_absent"
 GAP_DOGFOOD_RECEIPT_MISMATCH = "dogfood_receipt_mismatch"
 #: The park marker is not accompanied by the governed fixed-field park journal.
 GAP_PARK_JOURNAL_FIELDS_ABSENT = "park_journal_fields_absent"
+#: The park record's ``durable_anchor`` is well-formed and names this issue, but points at another
+#: journal — so it is some other record's anchor, not this park declaration's own.
+GAP_PARK_ANCHOR_NOT_THIS_DECLARATION = "park_anchor_not_this_declaration"
+#: A ``blocked`` / ``not-attempted`` callback outcome without the record the guardrail requires
+#: alongside it (a reason, and for ``blocked`` a replayable retry command).
+GAP_PARK_CALLBACK_DETAIL_ABSENT = "park_callback_detail_absent"
 #: The governed park fields are all THERE but one carries a value outside its fixed shape (an
 #: invented ``callback_result``, a non-coordinator ``resume_owner``, an anchor pointing elsewhere).
 #: Kept distinct from "absent" for the same reason every other readable-but-wrong record is: the
@@ -493,18 +499,42 @@ def _produce_staging_integrated(markers: Sequence[Mapping[str, str]]):
     ), None
 
 
-def _governed_field(notes: str, name: str) -> str:
-    """One governed ``- <name>: <value>`` field line's value (pure, structured — never prose).
+#: Returned when one governed field is declared more than once with DIFFERING values.
+_FIELD_CONFLICT = object()
 
-    The same shape the glance reads its disposition fields from: a list marker, emphasis, backticks
-    and an ASCII or fullwidth colon are tolerated, and only a real field line matches.
+
+def _field_pattern(*names: str) -> "re.Pattern[str]":
+    """A line-anchored governed ``- <name>: <value>`` matcher accepting any of ``names`` (pure).
+
+    The same shape the glance reads its disposition fields from — a list marker, emphasis,
+    backticks and an ASCII or fullwidth colon are tolerated — and, like the glance, several
+    spellings of the same field are accepted rather than one being imposed.
     """
-    pattern = re.compile(
-        r"^\s*[-*]?\s*\**\s*" + re.escape(name) + r"\**\s*[:：]\s*(?P<value>.+?)\s*$",
+    alternation = "|".join(re.escape(name) for name in names)
+    return re.compile(
+        r"^\s*[-*]?\s*\**\s*(?:" + alternation + r")\**\s*[:：]\s*(?P<value>.+?)\s*$",
         re.MULTILINE | re.IGNORECASE,
     )
-    match = pattern.search(notes or "")
-    return match.group("value").strip().strip("`") if match else ""
+
+
+def _governed_field(notes: str, *names: str):
+    """The governed field's single value, ``""`` if absent, or :data:`_FIELD_CONFLICT` (pure).
+
+    Reading only the FIRST match made a note self-contradictory-but-passing: appending
+    ``callback_result: invented`` after ``callback_result: sent`` left the first one authoritative
+    with nothing to justify that order (checkpoint j#86525 R4-F3). Every other layer of this
+    surface folds duplicates the same way — identical repeats collapse, differing ones are a typed
+    conflict — so the governed fields do too.
+    """
+    values = {
+        match.group("value").strip().strip("`")
+        for match in _field_pattern(*names).finditer(notes or "")
+    }
+    if not values:
+        return ""
+    if len(values) > 1:
+        return _FIELD_CONFLICT
+    return values.pop()
 
 
 #: The governed fixed fields a parked-state journal records, per the skill's own fixed field shape
@@ -518,20 +548,32 @@ def _governed_field(notes: str, name: str) -> str:
 #: park was handed off" are one durable state in that contract, so the producer requires the whole
 #: record rather than leaving half of it to an action-time obligation.
 #: Fields whose presence is what the record needs (their content is free text by contract).
-_PARK_FREE_FIELDS = ("blocked_by", "resume_condition")
+_PARK_FREE_FIELDS = (("blocked_by",), ("resume_condition",))
 _PARK_STATE_BLOCKED = "blocked"
 #: ``callback_result: sent | blocked | not-attempted`` — the skill fixes the vocabulary, and
 #: "silence is not allowed" is the whole point of the field. An invented value is silence wearing a
 #: token, so it is refused rather than counted as a callback.
-_PARK_CALLBACK_RESULTS = frozenset({"sent", "blocked", "not-attempted"})
+_CALLBACK_SENT = "sent"
+_CALLBACK_BLOCKED = "blocked"
+_CALLBACK_NOT_ATTEMPTED = "not-attempted"
+_PARK_CALLBACK_RESULTS = frozenset({_CALLBACK_SENT, _CALLBACK_BLOCKED, _CALLBACK_NOT_ATTEMPTED})
 #: ``resume_owner: coordinator`` — the guardrail assigns re-dispatch to the coordinator by name; a
 #: park that nominates anyone else has not handed resume ownership to who actually owns it.
 _PARK_RESUME_OWNER = "coordinator"
 #: ``durable_anchor: #<issue_id> j#<gate_journal_id>``.
 _DURABLE_ANCHOR_RE = re.compile(r"^#(?P<issue>\d+)\s+j#(?P<journal>\d+)$")
 
+#: The accepted spellings for the detail a non-``sent`` callback outcome must carry. The skill's
+#: fixed field block does not enumerate these (it names the outcome token only), so rather than
+#: imposing one spelling the reader accepts the forms a governed record plausibly uses — the same
+#: alternation approach the glance takes for its disposition fields.
+_CALLBACK_REASON_FIELDS = ("callback_reason", "callback_blocked_reason", "reason")
+_CALLBACK_RETRY_FIELDS = ("callback_retry_command", "retry_command", "retry")
 
-def _park_journal_gap(notes: str, *, source_issue: str = "") -> Optional[str]:
+
+def _park_journal_gap(
+    notes: str, *, source_issue: str = "", declaration_journal: str = ""
+) -> Optional[str]:
     """The typed reason the note is not a valid governed parked-state journal, else ``None`` (pure).
 
     Presence is not the contract (checkpoint j#86503 R3-F3): the skill's fixed field shape pins the
@@ -540,29 +582,69 @@ def _park_journal_gap(notes: str, *, source_issue: str = "") -> Optional[str]:
     park basis rests on. Reading those as satisfied is the same class of defect as reading a
     marker's self-declared authority: the shape looked right, so the content went unchecked.
 
-    ``source_issue`` is the issue whose journals these are, so the anchor can be confirmed to point
-    at THIS issue — an anchor naming another issue's journal is a pointer to someone else's record.
-    Empty ``source_issue`` checks the anchor's shape only.
+    Two things the value alone still does not settle (checkpoint j#86525):
+
+    * **which record the anchor names** (R4-F1). ``#<issue> j#<journal>`` has to point at THIS park
+      declaration, not merely at some journal of this issue — otherwise any older callback journal
+      on the same issue can stand in for this park's own handoff.
+    * **whether the outcome was actually recorded** (R4-F2). ``blocked`` and ``not-attempted`` are
+      legitimate outcomes, but the guardrail's point is that they are legitimate WHEN RECORDED: a
+      blocked callback carries its reason and a replayable retry command, a not-attempted one
+      carries its reason. Accepting the bare token re-admits exactly the "parked and nobody was
+      told" state the completion rule exists to prevent — the token would be the silence, not the
+      record of it.
+
+    ``source_issue`` / ``declaration_journal`` are the issue and journal these notes came from —
+    the SCOPE of the read, not the candidate's lane or head, so the producer's no-target-binding
+    invariant is untouched. Either being empty relaxes only that comparison.
     """
     state = _governed_field(notes, "state")
     callback_result = _governed_field(notes, "callback_result")
     resume_owner = _governed_field(notes, "resume_owner")
     anchor_raw = _governed_field(notes, "durable_anchor")
-    present = [state, callback_result, resume_owner, anchor_raw]
-    present.extend(_governed_field(notes, name) for name in _PARK_FREE_FIELDS)
-    if not all(present):
+    free = [_governed_field(notes, *names) for names in _PARK_FREE_FIELDS]
+
+    fields = [state, callback_result, resume_owner, anchor_raw, *free]
+    # A field declared twice with differing values has no order authority (R4-F3): refuse before
+    # any of them is read as the value.
+    if any(value is _FIELD_CONFLICT for value in fields):
+        return GAP_PARK_JOURNAL_FIELDS_INVALID
+    if not all(fields):
         return GAP_PARK_JOURNAL_FIELDS_ABSENT
+
     if state.lower() != _PARK_STATE_BLOCKED:
         return GAP_PARK_JOURNAL_FIELDS_INVALID
-    if callback_result.lower() not in _PARK_CALLBACK_RESULTS:
+    outcome = callback_result.lower()
+    if outcome not in _PARK_CALLBACK_RESULTS:
         return GAP_PARK_JOURNAL_FIELDS_INVALID
     if resume_owner.lower() != _PARK_RESUME_OWNER:
         return GAP_PARK_JOURNAL_FIELDS_INVALID
+
+    detail_gap = _callback_outcome_gap(notes, outcome)
+    if detail_gap is not None:
+        return detail_gap
+
     anchor = _DURABLE_ANCHOR_RE.match(anchor_raw)
     if anchor is None:
         return GAP_PARK_JOURNAL_FIELDS_INVALID
     if source_issue and anchor.group("issue") != str(source_issue).strip():
         return GAP_PARK_JOURNAL_FIELDS_INVALID
+    if declaration_journal and anchor.group("journal") != str(declaration_journal).strip():
+        return GAP_PARK_ANCHOR_NOT_THIS_DECLARATION
+    return None
+
+
+def _callback_outcome_gap(notes: str, outcome: str) -> Optional[str]:
+    """The reason a non-``sent`` callback outcome is not a complete record, else ``None`` (pure)."""
+    if outcome == _CALLBACK_SENT:
+        return None
+    reason = _governed_field(notes, *_CALLBACK_REASON_FIELDS)
+    if reason is _FIELD_CONFLICT or not reason:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if outcome == _CALLBACK_BLOCKED:
+        retry = _governed_field(notes, *_CALLBACK_RETRY_FIELDS)
+        if retry is _FIELD_CONFLICT or not retry:
+            return GAP_PARK_CALLBACK_DETAIL_ABSENT
     return None
 
 
@@ -593,6 +675,7 @@ def _produce_evidence_kind(
     kind: str,
     notes: str = "",
     source_issue: str = "",
+    declaration_journal: str = "",
     receipts: Optional[Mapping[str, DogfoodReceipt]] = None,
 ):
     """``required_ci_green`` / ``dogfood_delegated`` / ``park_declared`` from their evidence marker.
@@ -612,7 +695,9 @@ def _produce_evidence_kind(
         if gap is not None:
             return None, gap
     if kind == EVIDENCE_PARK_DECLARED:
-        park_gap = _park_journal_gap(notes, source_issue=source_issue)
+        park_gap = _park_journal_gap(
+            notes, source_issue=source_issue, declaration_journal=declaration_journal
+        )
         if park_gap is not None:
             return None, EvidenceGap(key, park_gap)
     return _conjunct(
@@ -723,6 +808,7 @@ def produce_basis_conjuncts(
                 kind=gate,
                 notes=declaration.notes,
                 source_issue=source_issue,
+                declaration_journal=declaration.journal,
                 receipts=dogfood_receipts,
             )
         if gap is not None:
