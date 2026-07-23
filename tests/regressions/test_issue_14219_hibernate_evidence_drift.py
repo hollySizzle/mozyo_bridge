@@ -57,7 +57,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ActionTimeObligations,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_basis_producer import (  # noqa: E501
+    DogfoodReceipt,
     PushObservation,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+    ISSUER_COORDINATOR,
+    ISSUER_LANE_WORKER,
+    ISSUER_REVIEW_GATEWAY,
+    EvidenceJournal,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_candidate import (  # noqa: E501
     BASIS_EARLY_HIBERNATE,
@@ -84,6 +91,8 @@ SEED_JOURNAL = "85508"
 HEAD = "a" * 40
 NEW_HEAD = "d" * 40
 STAGING_HEAD = "b" * 40
+REQ_JOURNAL = "85000"
+RELEASE_ISSUE = "14184"
 
 
 class _FakeOps:
@@ -116,11 +125,15 @@ def _env(*, lane=LANE, gen, head=HEAD) -> LaneEvidenceEnvelope:
     return LaneEvidenceEnvelope(workspace=WS, lane=lane, lane_generation=gen, head=head)
 
 
+def _request(*, head=HEAD) -> str:
+    return "review request\n" + render_workflow_event_marker("review_request", target_head=head)
+
+
 def _review(*, gen, conclusion="approved", head=HEAD, lane=LANE) -> str:
     return "review\n" + render_workflow_event_marker(
         "review_result",
         target_head=head,
-        review_request_journal="85400",
+        review_request_journal=REQ_JOURNAL,
         conclusion=conclusion,
         evidence_workspace=WS,
         evidence_lane=lane,
@@ -139,7 +152,10 @@ def _integration(*, gen, head=HEAD, lane=LANE) -> str:
 
 def _ci(*, gen, head=HEAD, lane=LANE, run="299") -> str:
     return "ci\n" + render_hibernate_evidence(
-        EVIDENCE_REQUIRED_CI_GREEN, envelope=_env(gen=gen, head=head, lane=lane), run=run
+        EVIDENCE_REQUIRED_CI_GREEN,
+        envelope=_env(gen=gen, head=head, lane=lane),
+        workflow="test.yml",
+        run=run,
     )
 
 
@@ -147,17 +163,19 @@ def _dogfood(*, gen, head=HEAD, lane=LANE) -> str:
     return "dogfood\n" + render_hibernate_evidence(
         EVIDENCE_DOGFOOD_DELEGATED,
         envelope=_env(gen=gen, head=head, lane=lane),
-        release_issue="14184",
+        release_issue=RELEASE_ISSUE,
+        acceptance="85431",
     )
 
 
 def _evidenced(*, gen, head=HEAD, lane=LANE) -> list:
-    """The four durable records a fully-evidenced early-hibernate lane carries."""
+    """The durable records a fully-evidenced early-hibernate lane carries, with their writers."""
     return [
-        ("85001", _review(gen=gen, head=head, lane=lane)),
-        ("85002", _integration(gen=gen, head=head, lane=lane)),
-        ("85003", _ci(gen=gen, head=head, lane=lane)),
-        ("85004", _dogfood(gen=gen, head=head, lane=lane)),
+        EvidenceJournal(REQ_JOURNAL, _request(head=head), ISSUER_LANE_WORKER),
+        EvidenceJournal("85001", _review(gen=gen, head=head, lane=lane), ISSUER_REVIEW_GATEWAY),
+        EvidenceJournal("85002", _integration(gen=gen, head=head, lane=lane), ISSUER_COORDINATOR),
+        EvidenceJournal("85003", _ci(gen=gen, head=head, lane=lane), ISSUER_COORDINATOR),
+        EvidenceJournal("85004", _dogfood(gen=gen, head=head, lane=lane), ISSUER_COORDINATOR),
     ]
 
 
@@ -182,6 +200,7 @@ class _World:
     store: LaneLifecycleStore
     journals: list
     head: str = HEAD
+    receipt_head: str = HEAD
 
     def push(self, selected) -> PushObservation:
         return PushObservation(
@@ -192,12 +211,21 @@ class _World:
             reachable=True,
         )
 
+    def receipts(self, issue: str) -> dict:
+        """The release issue's receipt, which tracks the head the delegation was recorded at."""
+        return {
+            RELEASE_ISSUE: DogfoodReceipt(
+                release_issue=RELEASE_ISSUE, source_issue=issue, head=self.receipt_head
+            )
+        }
+
     def assembler(self) -> HibernateCandidateAssembler:
         return HibernateCandidateAssembler(
             records_fn=lambda: read_lifecycle_records(home=self.home),
             journals_fn=lambda issue: list(self.journals),
             push_fn=self.push,
             obligations_fn=lambda candidate: _obligations(),
+            dogfood_receipts_fn=self.receipts,
         )
 
 
@@ -284,7 +312,9 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
     def test_review_supersession_actuates_nothing(self):
         def mutate(world):
             gen = world.store.get(LaneLifecycleKey(WS, LANE)).lane_generation
-            world.journals.append(("85009", _review(gen=gen, conclusion="changes_requested")))
+            world.journals.append(EvidenceJournal(
+                "85009", _review(gen=gen, conclusion="changes_requested"), ISSUER_REVIEW_GATEWAY
+            ))
 
         self._drift(mutate)
 
@@ -292,9 +322,11 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
         # A heading-form deferral carries no enveloped marker. It must still SUPERSEDE the older
         # merge record (declaration wins by existing), not be skipped as unreadable.
         def mutate(world):
-            world.journals.append(
-                ("85010", "## Integration disposition: explicit_deferral\n- reason: waiting")
-            )
+            world.journals.append(EvidenceJournal(
+                "85010",
+                "## Integration disposition: explicit_deferral\n- reason: waiting",
+                ISSUER_COORDINATOR,
+            ))
 
         self._drift(mutate)
 
@@ -322,6 +354,7 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
         def mutate(world):
             gen = world.store.get(LaneLifecycleKey(WS, LANE)).lane_generation
             world.head = NEW_HEAD
+            world.receipt_head = NEW_HEAD
             world.journals[:] = _evidenced(gen=gen, head=NEW_HEAD)
 
         self._drift(mutate)
@@ -331,9 +364,11 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
         # preferred, so the conjunct is a typed gap.
         def mutate(world):
             gen = world.store.get(LaneLifecycleKey(WS, LANE)).lane_generation
-            world.journals.append(
-                ("85011", _ci(gen=gen, run="300") + "\n" + _ci(gen=gen, head=NEW_HEAD, run="301"))
-            )
+            world.journals.append(EvidenceJournal(
+                "85011",
+                _ci(gen=gen, run="300") + "\n" + _ci(gen=gen, head=NEW_HEAD, run="301"),
+                ISSUER_COORDINATOR,
+            ))
 
         self._drift(mutate)
 
@@ -346,10 +381,33 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
             world = self._world(Path(raw))
             candidate = self._build(world)
             gen = world.store.get(LaneLifecycleKey(WS, LANE)).lane_generation
-            world.journals.append(("85011", _ci(gen=gen, run="300")))
+            world.journals.append(
+                EvidenceJournal("85011", _ci(gen=gen, run="300"), ISSUER_COORDINATOR)
+            )
             result = self._run(world, candidate)
             self.assertEqual(result.mutations, 1)
             self.assertEqual(self._disposition(world), DISPOSITION_HIBERNATED)
+
+    def test_a_new_review_request_supersedes_the_approval(self):
+        # The most ordinary drift there is: a re-review is requested between build and actuation.
+        # The old approval answers the old question, so the lane stops qualifying at once.
+        def mutate(world):
+            world.journals.append(
+                EvidenceJournal("85020", _request(), ISSUER_LANE_WORKER)
+            )
+
+        self._drift(mutate)
+
+    def test_evidence_rewritten_by_the_wrong_actor_actuates_nothing(self):
+        # A newer CI record from an actor without that authority supersedes the coordinator's by
+        # EXISTING, and then fails the issuer check — it does not fall back to the older good one.
+        def mutate(world):
+            gen = world.store.get(LaneLifecycleKey(WS, LANE)).lane_generation
+            world.journals.append(
+                EvidenceJournal("85021", _ci(gen=gen), ISSUER_LANE_WORKER)
+            )
+
+        self._drift(mutate)
 
     def test_lifecycle_handover_actuates_nothing(self):
         def mutate(world):

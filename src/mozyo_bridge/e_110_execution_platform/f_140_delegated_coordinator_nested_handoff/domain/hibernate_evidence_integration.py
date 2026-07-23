@@ -33,6 +33,7 @@ from .glance_integration_disposition import (
     canonical_disposition,
 )
 from .hibernate_evidence_envelope import (
+    MARKER_FORBIDDEN_CHARS,
     EnvelopeParseError,
     LaneEvidenceEnvelope,
     is_full_sha,
@@ -74,7 +75,9 @@ INTEGRATION_EVIDENCE_REASONS = frozenset({
 
 #: Characters a branch ref may never contain, because the marker body is split on ``:`` and
 #: terminated by ``]`` — a value carrying either would silently truncate into a different field set.
-_BRANCH_FORBIDDEN = (":", "]", "[", " ", "\t")
+#: The envelope's own rule (step 1) is the single definition; this alias keeps the two renderers
+#: from drifting apart.
+_BRANCH_FORBIDDEN = MARKER_FORBIDDEN_CHARS
 
 
 @dataclass(frozen=True)

@@ -129,15 +129,58 @@ def parse_lane_envelope(
     )
 
 
+#: Characters no marker-field VALUE may contain: the body is split on ``:``, delimited by ``[``
+#: / ``]``, and whitespace ends a token. A value carrying one would silently split into a bogus
+#: extra field or truncate the marker — field injection from a producer-supplied id. One tuple for
+#: the whole hibernate-evidence surface (the integration branch check reads it too) so the rule
+#: cannot drift apart between renderers.
+MARKER_FORBIDDEN_CHARS = (":", "]", "[", " ", "\t")
+
+
+def reject_marker_separator(value: str, *, field: str) -> None:
+    """Raise when ``value`` carries a marker separator (pure guard for every renderer).
+
+    One rule for every producer-supplied token — the envelope's workspace / lane and the
+    integration marker's branch — so a value that would truncate or inject a field can never be
+    rendered from any of them.
+    """
+    for separator in MARKER_FORBIDDEN_CHARS:
+        if separator in str(value):
+            raise ValueError(f"{field} must not contain the marker separator {separator!r}")
+
+
 def render_lane_envelope(envelope: LaneEvidenceEnvelope) -> str:
-    """Render the envelope to the ``key=value:...`` marker-field form (``head`` omitted if empty)."""
+    """Render the envelope to the ``key=value:...`` marker-field form, fail-closed.
+
+    Validates exactly what :func:`parse_lane_envelope` requires — non-empty workspace / lane, a
+    POSITIVE generation, a full-SHA-or-absent head — plus separator rejection, and raises
+    ``ValueError`` rather than emitting the marker. A renderer that accepts what its own parser
+    refuses is not a strict grammar: it produces records that read back as a typed zero (so the
+    evidence silently does not count) or, worse, splits a separator-carrying id into an extra field.
+    The producer's programming error must surface at write time, not as unreadable durable evidence.
+    """
+    workspace = str(envelope.workspace or "").strip()
+    if not workspace:
+        raise ValueError("lane envelope requires a workspace")
+    reject_marker_separator(workspace, field=FIELD_WORKSPACE)
+    lane = str(envelope.lane or "").strip()
+    if not lane:
+        raise ValueError("lane envelope requires a lane")
+    reject_marker_separator(lane, field=FIELD_LANE)
+    generation = envelope.lane_generation
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
+        raise ValueError(f"lane envelope requires a positive lane_generation, got {generation!r}")
+    head = str(envelope.head or "").strip()
+    if head and not is_full_sha(head):
+        raise ValueError("lane envelope head must be a full lowercase commit SHA")
+
     parts = [
-        f"{FIELD_WORKSPACE}={envelope.workspace}",
-        f"{FIELD_LANE}={envelope.lane}",
-        f"{FIELD_LANE_GENERATION}={envelope.lane_generation}",
+        f"{FIELD_WORKSPACE}={workspace}",
+        f"{FIELD_LANE}={lane}",
+        f"{FIELD_LANE_GENERATION}={generation}",
     ]
-    if envelope.head:
-        parts.append(f"{FIELD_HEAD}={envelope.head}")
+    if head:
+        parts.append(f"{FIELD_HEAD}={head}")
     return ":".join(parts)
 
 

@@ -30,16 +30,42 @@ Three invariants make this safe, and each of them is a defect this project alrea
 
 ``commits_pushed`` has no durable marker by design (ruling j#85530 Q3): it is an action-time git
 remote observation, supplied here as :class:`PushObservation` and transcribed with the same rules.
+
+Three further checks close the gap between "a marker of the right shape exists" and "the authority
+actually attested this" (checkpoint review j#86389 F1–F3). A marker is a claim; each of these binds
+the claim to something outside the marker that can be audited:
+
+* **Who wrote it** (F2). The authority provenance comes from the record's WRITER — the
+  ``issuer_role`` the journal port resolved from the durable source's author metadata — not from
+  the marker's own ``gate=``. Otherwise the marker asserts its own authority and any actor's
+  coordinator-shaped CI record reads as ``durable_ci_record``. Unresolved / wrong actor is a typed
+  gap (:mod:`.hibernate_evidence_authority`).
+* **Which review it answers** (F1). The Review Generation Marker Contract v2 requires ``req``; a
+  ``review_result`` is evidence only of the review_request it names, so the conclusion is accepted
+  only when ``req`` matches the issue's CURRENT ``review_request`` declaration and both name the
+  same head. Without it, a superseded, hand-written or entirely uncorrelated approval satisfies the
+  conjunct.
+* **What corroborates it** (F3). A delegation names a release issue, so the release issue must
+  carry the matching receipt (source issue + exact head); a park declaration must sit in the same
+  note as the governed fixed-field park journal it claims. Both are records the issuing actor does
+  not solely control, which is what makes them corroboration rather than restatement.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence, Tuple
 
 from .glance_integration_disposition import (
     MARKER_GATE_INTEGRATION_DISPOSITION,
     fold_integration_disposition,
+)
+from .hibernate_evidence_authority import (
+    MARKER_GATE_REVIEW_RESULT,
+    EvidenceJournal,
+    as_pairs,
+    check_issuer,
 )
 from .hibernate_candidate import (
     BASIS_DEPENDENCY_PARK,
@@ -70,6 +96,7 @@ from .hibernate_evidence_marker import (
     EVIDENCE_DOGFOOD_DELEGATED,
     EVIDENCE_PARK_DECLARED,
     EVIDENCE_REQUIRED_CI_GREEN,
+    FIELD_RELEASE_ISSUE,
     EvidenceParseError,
     HibernateEvidence,
     resolve_hibernate_evidence,
@@ -77,14 +104,31 @@ from .hibernate_evidence_marker import (
 from .redmine_journal_source import MARKER_CHANNEL_WORKFLOW_EVENT, marker_fields_in_note
 from .sublane_admission import REVIEW_APPROVED
 
-MARKER_GATE_REVIEW_RESULT = "review_result"
+#: The gate whose marker declares the review generation a ``review_result`` must answer.
+MARKER_GATE_REVIEW_REQUEST = "review_request"
 
 FIELD_CONCLUSION = "conclusion"
+FIELD_REQ = "req"
+FIELD_HEAD = "head"
 
 # Gap reasons that are NOT already a marker-grammar reason.
 GAP_EVIDENCE_ABSENT = "evidence_absent"
 GAP_PUSH_OBSERVATION_ABSENT = "push_observation_absent"
 GAP_REVIEW_MISSING_CONCLUSION = "review_missing_conclusion"
+#: The approval does not name the review_request it answers (contract v2 requires ``req``).
+GAP_REVIEW_MISSING_REQ = "review_missing_request_correlation"
+#: No ``review_request`` was ever declared, so no approval can be correlated to one.
+GAP_REVIEW_REQUEST_ABSENT = "review_request_absent"
+#: The approval answers a review_request that is not the current one (a superseded generation).
+GAP_REVIEW_REQUEST_SUPERSEDED = "review_request_superseded"
+#: The approval and the request it names do not agree on the head under review.
+GAP_REVIEW_REQUEST_HEAD_MISMATCH = "review_request_head_mismatch"
+#: The delegation's release issue carries no matching receipt (or none was supplied to check).
+GAP_DOGFOOD_RECEIPT_ABSENT = "dogfood_receipt_absent"
+#: The release issue's receipt names a different source issue or head.
+GAP_DOGFOOD_RECEIPT_MISMATCH = "dogfood_receipt_mismatch"
+#: The park marker is not accompanied by the governed fixed-field park journal.
+GAP_PARK_JOURNAL_FIELDS_ABSENT = "park_journal_fields_absent"
 #: The CURRENT disposition journal exists but carries no enveloped marker (e.g. a heading-only
 #: deferral). Distinct from :data:`GAP_EVIDENCE_ABSENT`, which means no disposition was ever recorded.
 GAP_DISPOSITION_UNENVELOPED = "integration_evidence_unenveloped"
@@ -114,6 +158,20 @@ _BASIS_CONJUNCTS = {
     BASIS_EARLY_HIBERNATE: EARLY_HIBERNATE_CONJUNCTS,
     BASIS_DEPENDENCY_PARK: DEPENDENCY_PARK_CONJUNCTS,
 }
+
+
+@dataclass(frozen=True)
+class DogfoodReceipt:
+    """The release issue's own record that it accepted a dogfood delegation (ruling j#85530 Q3).
+
+    Read from the RELEASE issue, not from the source issue's marker: a delegation that only the
+    delegating actor recorded is an intention, not a handover. ``source_issue`` and ``head`` are
+    what the receipt says it received — the producer checks they are the ones being claimed.
+    """
+
+    release_issue: str
+    source_issue: str
+    head: str
 
 
 @dataclass(frozen=True)
@@ -181,59 +239,80 @@ def _journal_int(journal_id: object) -> Optional[int]:
         return None
 
 
-def _latest_gate_markers(
-    journals: Sequence[Tuple[object, str]], *, gate: str
-) -> "tuple[str, tuple[dict, ...]]":
-    """The markers of ``gate`` in the HIGHEST-numbered journal that carries any (pure).
+@dataclass(frozen=True)
+class _Declaration:
+    """The current declaration of one gate: its journal, its markers, and who wrote it."""
+
+    journal: str = ""
+    markers: tuple = ()
+    issuer_role: str = ""
+    notes: str = ""
+
+    @property
+    def exists(self) -> bool:
+        return bool(self.journal)
+
+
+def _markers_of(notes: str, gate: str) -> tuple:
+    return tuple(
+        fields
+        for channel, fields in marker_fields_in_note(notes or "")
+        if channel == MARKER_CHANNEL_WORKFLOW_EVENT
+        and str(fields.get("gate", "") or fields.get("kind", "") or "").strip() == gate
+    )
+
+
+def _latest_gate_declaration(
+    journals: Sequence[EvidenceJournal], *, gate: str
+) -> _Declaration:
+    """The ``gate`` declaration in the HIGHEST-numbered journal that carries one (pure).
 
     Latest-wins by existence: a journal that declares the gate supersedes every earlier one, however
-    its marker turns out to parse. Returns ``("", ())`` when no journal declares the gate.
+    its marker turns out to parse. The winning journal's writer travels with it — the issuer check
+    must judge the record that is CURRENT, not whichever earlier record happens to have an
+    acceptable author.
     """
-    latest: Optional[Tuple[int, tuple]] = None
-    for journal_id, notes in journals or ():
-        jint = _journal_int(journal_id)
+    latest: Optional[Tuple[int, _Declaration]] = None
+    for journal in journals or ():
+        jint = _journal_int(journal.journal_id)
         if jint is None:
             continue
-        found = tuple(
-            fields
-            for channel, fields in marker_fields_in_note(notes or "")
-            if channel == MARKER_CHANNEL_WORKFLOW_EVENT
-            and str(fields.get("gate", "") or fields.get("kind", "") or "").strip() == gate
-        )
+        found = _markers_of(journal.notes, gate)
         if not found:
             continue
         if latest is None or jint > latest[0]:
-            latest = (jint, found)
-    return ("", ()) if latest is None else (str(latest[0]), latest[1])
+            latest = (jint, _Declaration(
+                journal=str(jint),
+                markers=found,
+                issuer_role=journal.issuer_role,
+                notes=journal.notes or "",
+            ))
+    return _Declaration() if latest is None else latest[1]
 
 
-def _latest_disposition_markers(
-    journals: Sequence[Tuple[object, str]],
-) -> "tuple[str, tuple[dict, ...]]":
-    """The integration-disposition markers of the latest journal that DECLARES a disposition (pure).
+def _latest_disposition_declaration(journals: Sequence[EvidenceJournal]) -> _Declaration:
+    """The integration-disposition declaration of the latest journal that DECLARES one (pure).
 
     Supersession is decided by the glance's own fold, so the two surfaces agree on which journal is
     current. A newer disposition journal that declares itself by heading alone (no marker, or a
     legacy marker) therefore shadows an older enveloped one, and its lack of enveloped evidence
     becomes a typed gap — never a silent fallback to the stale merge record.
     """
-    facts = fold_integration_disposition(journals)
+    facts = fold_integration_disposition(as_pairs(journals))
     if not facts.journal:
-        return "", ()
-    for journal_id, notes in journals or ():
-        if str(journal_id).strip() != facts.journal:
+        return _Declaration()
+    for journal in journals or ():
+        if str(journal.journal_id).strip() != facts.journal:
             continue
-        markers = tuple(
-            fields
-            for channel, fields in marker_fields_in_note(notes or "")
-            if channel == MARKER_CHANNEL_WORKFLOW_EVENT
-            and str(fields.get("gate", "") or fields.get("kind", "") or "").strip()
-            == MARKER_GATE_INTEGRATION_DISPOSITION
-        )
         # A heading-only disposition journal has no marker at all: report the journal with an empty
         # marker set so the caller emits ``evidence_absent`` for THIS journal (not for the issue).
-        return facts.journal, markers
-    return "", ()
+        return _Declaration(
+            journal=facts.journal,
+            markers=_markers_of(journal.notes, MARKER_GATE_INTEGRATION_DISPOSITION),
+            issuer_role=journal.issuer_role,
+            notes=journal.notes or "",
+        )
+    return _Declaration()
 
 
 def _conjunct(
@@ -250,13 +329,40 @@ def _conjunct(
     )
 
 
-def _produce_review_approved(markers: Sequence[Mapping[str, str]]):
-    """``review_approved`` from the latest ``review_result`` marker.
+def _current_review_request(journals: Sequence[EvidenceJournal]) -> Tuple[str, str]:
+    """The issue's CURRENT ``review_request`` declaration as ``(journal_id, head)`` (pure).
+
+    Latest-wins by existence, like every other declaration here: a new review_request opens a new
+    review generation, so an approval that answers an earlier one is answering a superseded
+    question. The request's own writer is deliberately not issuer-checked — it is the correlation
+    anchor being pointed at, not an authority asserting a conjunct.
+    """
+    declaration = _latest_gate_declaration(journals, gate=MARKER_GATE_REVIEW_REQUEST)
+    if not declaration.exists:
+        return "", ""
+    heads = {
+        str(fields.get(FIELD_HEAD, "") or "").strip() for fields in declaration.markers
+    }
+    # A request journal whose markers disagree about the head names no single head: an empty head
+    # cannot match any approval, which is the fail-closed direction.
+    return declaration.journal, heads.pop() if len(heads) == 1 else ""
+
+
+def _produce_review_approved(
+    markers: Sequence[Mapping[str, str]], *, request_journal: str, request_head: str
+):
+    """``review_approved`` from the latest ``review_result`` marker, correlated to its request.
 
     The review conclusion is part of the review-generation identity (#13974), so it is read from the
     marker rather than re-derived: ``approved`` satisfies the conjunct, any other EXPLICIT conclusion
     leaves it unsatisfied, and a missing conclusion is a gap (intake normalises a missing conclusion
     to ``pending``, which is not a real review outcome and must never read as one).
+
+    The conclusion counts only for the review generation it answers (Review Generation Marker
+    Contract v2, checkpoint j#86389 F1): ``req`` must be present, must name the issue's CURRENT
+    review_request, and that request must be about the same head. An approval that names no request,
+    or names a superseded one, or disagrees with it about the head, is a typed gap — the marker is
+    then a genuine record of some other review, not of this one.
     """
     envelopes = []
     for fields in markers:
@@ -266,14 +372,25 @@ def _produce_review_approved(markers: Sequence[Mapping[str, str]]):
         conclusion = str(fields.get(FIELD_CONCLUSION, "") or "").strip()
         if not conclusion:
             return None, EvidenceGap(CONJUNCT_REVIEW_APPROVED, GAP_REVIEW_MISSING_CONCLUSION)
-        envelopes.append((bound, conclusion))
+        req = str(fields.get(FIELD_REQ, "") or "").strip()
+        if not req:
+            return None, EvidenceGap(CONJUNCT_REVIEW_APPROVED, GAP_REVIEW_MISSING_REQ)
+        envelopes.append((bound, conclusion, req))
     if not envelopes:
         return None, EvidenceGap(CONJUNCT_REVIEW_APPROVED, GAP_EVIDENCE_ABSENT)
     first = envelopes[0]
     for other in envelopes[1:]:
         if other != first:
             return None, EvidenceGap(CONJUNCT_REVIEW_APPROVED, "review_evidence_conflict")
-    bound, conclusion = first
+    bound, conclusion, req = first
+
+    if not request_journal:
+        return None, EvidenceGap(CONJUNCT_REVIEW_APPROVED, GAP_REVIEW_REQUEST_ABSENT)
+    if req != request_journal:
+        return None, EvidenceGap(CONJUNCT_REVIEW_APPROVED, GAP_REVIEW_REQUEST_SUPERSEDED, req)
+    if not request_head or request_head != bound.head:
+        return None, EvidenceGap(CONJUNCT_REVIEW_APPROVED, GAP_REVIEW_REQUEST_HEAD_MISMATCH)
+
     return _conjunct(
         CONJUNCT_REVIEW_APPROVED,
         satisfied=conclusion == REVIEW_APPROVED,
@@ -308,13 +425,81 @@ def _produce_staging_integrated(markers: Sequence[Mapping[str, str]]):
     ), None
 
 
-def _produce_evidence_kind(key: str, markers: Sequence[Mapping[str, str]], *, kind: str):
-    """``required_ci_green`` / ``dogfood_delegated`` / ``park_declared`` from their evidence marker."""
+def _governed_field(notes: str, name: str) -> str:
+    """One governed ``- <name>: <value>`` field line's value (pure, structured — never prose).
+
+    The same shape the glance reads its disposition fields from: a list marker, emphasis, backticks
+    and an ASCII or fullwidth colon are tolerated, and only a real field line matches.
+    """
+    pattern = re.compile(
+        r"^\s*[-*]?\s*\**\s*" + re.escape(name) + r"\**\s*[:：]\s*(?P<value>.+?)\s*$",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    match = pattern.search(notes or "")
+    return match.group("value").strip().strip("`") if match else ""
+
+
+#: The governed fixed fields a park journal records (skill ``references/workflow.md``: dependency
+#: hold is parked on a durable record with these fields). The park marker claims the lane is parked;
+#: these are the record that claim has to sit in.
+_PARK_REQUIRED_FIELDS = ("blocked_by", "resume_condition", "resume_owner")
+_PARK_STATE_BLOCKED = "blocked"
+
+
+def _park_journal_recorded(notes: str) -> bool:
+    """Whether the note carries the governed fixed-field park journal (pure)."""
+    if _governed_field(notes, "state").lower() != _PARK_STATE_BLOCKED:
+        return False
+    return all(_governed_field(notes, name) for name in _PARK_REQUIRED_FIELDS)
+
+
+def _dogfood_receipt_gap(
+    evidence: HibernateEvidence,
+    *,
+    source_issue: str,
+    receipts: Optional[Mapping[str, DogfoodReceipt]],
+) -> Optional[EvidenceGap]:
+    """The typed gap when the release issue does not corroborate this delegation, else ``None``."""
+    release_issue = str(evidence.extra.get(FIELD_RELEASE_ISSUE, "") or "").strip()
+    receipt = (receipts or {}).get(release_issue)
+    if receipt is None:
+        return EvidenceGap(CONJUNCT_DOGFOOD_DELEGATED, GAP_DOGFOOD_RECEIPT_ABSENT, release_issue)
+    if (
+        str(receipt.release_issue).strip() != release_issue
+        or str(receipt.source_issue).strip() != str(source_issue).strip()
+        or str(receipt.head).strip() != evidence.envelope.head
+    ):
+        return EvidenceGap(CONJUNCT_DOGFOOD_DELEGATED, GAP_DOGFOOD_RECEIPT_MISMATCH)
+    return None
+
+
+def _produce_evidence_kind(
+    key: str,
+    markers: Sequence[Mapping[str, str]],
+    *,
+    kind: str,
+    notes: str = "",
+    source_issue: str = "",
+    receipts: Optional[Mapping[str, DogfoodReceipt]] = None,
+):
+    """``required_ci_green`` / ``dogfood_delegated`` / ``park_declared`` from their evidence marker.
+
+    Beyond the marker grammar, the two kinds whose claim can be checked against a record the issuing
+    actor does not solely control are checked against it (checkpoint j#86389 F3): a delegation needs
+    the release issue's receipt for this exact source issue and head, and a park declaration needs
+    the governed fixed-field park journal in the same note.
+    """
     got = resolve_hibernate_evidence(markers, kind=kind)
     if isinstance(got, EvidenceParseError):
         # Includes EVIDENCE_CI_NOT_SUCCESS — a run that did not conclude success keeps that reason.
         return None, EvidenceGap(key, got.reason, got.detail)
     assert isinstance(got, HibernateEvidence)
+    if kind == EVIDENCE_DOGFOOD_DELEGATED:
+        gap = _dogfood_receipt_gap(got, source_issue=source_issue, receipts=receipts)
+        if gap is not None:
+            return None, gap
+    if kind == EVIDENCE_PARK_DECLARED and not _park_journal_recorded(notes):
+        return None, EvidenceGap(key, GAP_PARK_JOURNAL_FIELDS_ABSENT)
     return _conjunct(
         key,
         satisfied=True,
@@ -326,20 +511,29 @@ def _produce_evidence_kind(key: str, markers: Sequence[Mapping[str, str]], *, ki
 
 
 def produce_basis_conjuncts(
-    journals: Sequence[Tuple[object, str]],
+    journals: Sequence[EvidenceJournal],
     *,
     basis: str,
+    source_issue: str = "",
     push: Optional[PushObservation] = None,
+    dogfood_receipts: Optional[Mapping[str, DogfoodReceipt]] = None,
 ) -> ProducedBasis:
     """Produce every conjunct ``basis`` requires from the issue's durable journals (pure).
 
-    Each conjunct is read from its OWN authority's latest declaration and bound to the identity that
-    evidence declares. Nothing here compares against a candidate: T1 does that, so a mismatch
-    surfaces as ``conjunct_anchor_mismatch`` instead of being absorbed by the producer.
+    Each conjunct is read from its OWN authority's latest declaration, written by the actor that
+    authority belongs to, and bound to the identity that evidence declares. Nothing here compares
+    against a candidate: T1 does that, so a mismatch surfaces as ``conjunct_anchor_mismatch``
+    instead of being absorbed by the producer.
+
+    ``source_issue`` is the issue whose journals these are — the SCOPE of the read, not the
+    candidate's anchor — and is used only to confirm that a release issue's dogfood receipt is about
+    this issue. Passing the candidate's lane or head here would be the tautology the producer exists
+    to avoid; passing the issue being read is not.
     """
     conjuncts: list[BasisConjunct] = []
     gaps: list[EvidenceGap] = []
     evidence_journals: dict[str, str] = {}
+    request_journal, request_head = _current_review_request(journals)
 
     for key in _BASIS_CONJUNCTS.get(basis, ()):
         if key == CONJUNCT_COMMITS_PUSHED:
@@ -358,26 +552,43 @@ def produce_basis_conjuncts(
 
         gate = _CONJUNCT_GATE[key]
         if key == CONJUNCT_STAGING_INTEGRATED:
-            journal, markers = _latest_disposition_markers(journals)
-            if journal and not markers:
-                gaps.append(EvidenceGap(key, GAP_DISPOSITION_UNENVELOPED, journal))
+            declaration = _latest_disposition_declaration(journals)
+            if declaration.exists and not declaration.markers:
+                gaps.append(EvidenceGap(key, GAP_DISPOSITION_UNENVELOPED, declaration.journal))
                 continue
         else:
-            journal, markers = _latest_gate_markers(journals, gate=gate)
-        if not markers:
+            declaration = _latest_gate_declaration(journals, gate=gate)
+        if not declaration.markers:
             gaps.append(EvidenceGap(key, GAP_EVIDENCE_ABSENT))
             continue
+
+        # WHO wrote the current declaration, judged before anything it says is read. The marker's
+        # own `gate=` cannot confer the authority its content is about to be credited with.
+        issuer_gap = check_issuer(gate, declaration.issuer_role)
+        if issuer_gap is not None:
+            gaps.append(EvidenceGap(key, issuer_gap, declaration.journal))
+            continue
+
         if key == CONJUNCT_REVIEW_APPROVED:
-            produced, gap = _produce_review_approved(markers)
+            produced, gap = _produce_review_approved(
+                declaration.markers, request_journal=request_journal, request_head=request_head
+            )
         elif key == CONJUNCT_STAGING_INTEGRATED:
-            produced, gap = _produce_staging_integrated(markers)
+            produced, gap = _produce_staging_integrated(declaration.markers)
         else:
-            produced, gap = _produce_evidence_kind(key, markers, kind=gate)
+            produced, gap = _produce_evidence_kind(
+                key,
+                declaration.markers,
+                kind=gate,
+                notes=declaration.notes,
+                source_issue=source_issue,
+                receipts=dogfood_receipts,
+            )
         if gap is not None:
             gaps.append(gap)
             continue
         conjuncts.append(produced)
-        evidence_journals[key] = journal
+        evidence_journals[key] = declaration.journal
 
     return ProducedBasis(
         basis=basis,
@@ -388,7 +599,9 @@ def produce_basis_conjuncts(
 
 
 __all__ = (
+    "DogfoodReceipt",
     "EvidenceGap",
+    "MARKER_GATE_REVIEW_REQUEST",
     "MARKER_GATE_REVIEW_RESULT",
     "ProducedBasis",
     "PushObservation",

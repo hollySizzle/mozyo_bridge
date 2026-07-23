@@ -7,12 +7,22 @@ from ``GATE_BEARING_KINDS`` so they never trigger a callback). This module is th
 renderer + strict parser, deliberately separate from the gate-bearing ``render_workflow_event_marker``
 (which raises for a non-gate-bearing kind) and from the #14213 glance vocabulary.
 
-Every marker carries the common lane envelope (step 1) plus its kind-specific authority field, all
-fail-closed:
+Every marker carries the common lane envelope (step 1) plus its kind-specific authority fields, all
+fail-closed. Each kind names not just its authority's VERDICT but the record that verdict can be
+audited against (ruling j#85530 Q3) — a bare "it was green" / "it was delegated" is not evidence
+anyone can go and check:
 
-  * ``required_ci_green`` — head-bearing; ``run=<run_id>`` (non-empty) and ``conclusion=success``.
-  * ``dogfood_delegated`` — head-bearing (the exact delegated SHA); ``release_issue=<id>`` (non-empty).
-  * ``park_declared`` — lane-anchored only (no head); the envelope IS the affirmative basis.
+  * ``required_ci_green`` — head-bearing; ``workflow=<workflow/check identity>`` and
+    ``run=<run_id>`` (both non-empty) and ``conclusion=success``. The run id alone does not say
+    WHICH required check ran, so without the workflow identity an unrelated green run satisfies the
+    conjunct.
+  * ``dogfood_delegated`` — head-bearing (the exact delegated SHA); ``release_issue=<id>`` and
+    ``acceptance=<acceptance/resume anchor>`` (both non-empty). The acceptance anchor is what the
+    delegation can later be resumed and checked from; the release-issue-side receipt is corroborated
+    by the producer (it lives on the other issue, not in this marker).
+  * ``park_declared`` — lane-anchored only (no head). The envelope alone is NOT the basis: the
+    producer additionally requires the governed fixed-field park journal to be recorded in the same
+    note (``state`` / ``blocked_by`` / ``resume_condition`` / ``resume_owner``).
 
 Missing / malformed / wrong-conclusion / conflicting evidence is a typed zero — never a lenient
 default, never prose.
@@ -27,6 +37,7 @@ from .hibernate_evidence_envelope import (
     EnvelopeParseError,
     LaneEvidenceEnvelope,
     parse_lane_envelope,
+    reject_marker_separator,
     render_lane_envelope,
 )
 
@@ -45,8 +56,10 @@ HIBERNATE_EVIDENCE_KINDS = frozenset({
 _HEAD_BEARING_EVIDENCE = frozenset({EVIDENCE_REQUIRED_CI_GREEN, EVIDENCE_DOGFOOD_DELEGATED})
 
 FIELD_RUN = "run"
+FIELD_WORKFLOW = "workflow"
 FIELD_CONCLUSION = "conclusion"
 FIELD_RELEASE_ISSUE = "release_issue"
+FIELD_ACCEPTANCE = "acceptance"
 
 _CI_CONCLUSION_SUCCESS = "success"
 
@@ -56,16 +69,20 @@ MARKER_CHANNEL_WORKFLOW_EVENT = "workflow-event"
 # Closed parse-failure reasons (in addition to the envelope's own).
 EVIDENCE_UNKNOWN_KIND = "evidence_unknown_kind"
 EVIDENCE_MISSING_RUN = "evidence_missing_run"
+EVIDENCE_MISSING_WORKFLOW = "evidence_missing_workflow"
 EVIDENCE_CI_NOT_SUCCESS = "evidence_ci_not_success"
 EVIDENCE_MISSING_RELEASE_ISSUE = "evidence_missing_release_issue"
+EVIDENCE_MISSING_ACCEPTANCE = "evidence_missing_acceptance"
 EVIDENCE_ABSENT = "evidence_absent"
 EVIDENCE_CONFLICT = "evidence_conflict"
 
 HIBERNATE_EVIDENCE_PARSE_REASONS = frozenset({
     EVIDENCE_UNKNOWN_KIND,
     EVIDENCE_MISSING_RUN,
+    EVIDENCE_MISSING_WORKFLOW,
     EVIDENCE_CI_NOT_SUCCESS,
     EVIDENCE_MISSING_RELEASE_ISSUE,
+    EVIDENCE_MISSING_ACCEPTANCE,
     EVIDENCE_ABSENT,
     EVIDENCE_CONFLICT,
 })
@@ -91,13 +108,24 @@ class EvidenceParseError:
     detail: str = ""
 
 
+def _required(value: object, *, kind: str, field: str) -> str:
+    """The stripped value, or a producer error — and never one carrying a marker separator."""
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{kind} evidence requires a {field}")
+    reject_marker_separator(text, field=field)
+    return text
+
+
 def render_hibernate_evidence(
     kind: str,
     *,
     envelope: LaneEvidenceEnvelope,
     run: str = "",
+    workflow: str = "",
     conclusion: str = "",
     release_issue: str = "",
+    acceptance: str = "",
 ) -> str:
     """Render a ``[mozyo:workflow-event:gate=<kind>:<envelope>:<extra>]`` marker, fail-closed.
 
@@ -111,14 +139,16 @@ def render_hibernate_evidence(
         raise ValueError(f"{kind} evidence requires a head-bearing envelope")
     fields = [f"gate={kind}", render_lane_envelope(envelope)]
     if kind == EVIDENCE_REQUIRED_CI_GREEN:
-        if not str(run).strip():
-            raise ValueError("required_ci_green evidence requires a run id")
-        fields.append(f"{FIELD_RUN}={str(run).strip()}")
+        fields.append(f"{FIELD_WORKFLOW}={_required(workflow, kind=kind, field=FIELD_WORKFLOW)}")
+        fields.append(f"{FIELD_RUN}={_required(run, kind=kind, field=FIELD_RUN)}")
         fields.append(f"{FIELD_CONCLUSION}={_CI_CONCLUSION_SUCCESS}")
     elif kind == EVIDENCE_DOGFOOD_DELEGATED:
-        if not str(release_issue).strip():
-            raise ValueError("dogfood_delegated evidence requires a release_issue")
-        fields.append(f"{FIELD_RELEASE_ISSUE}={str(release_issue).strip()}")
+        fields.append(
+            f"{FIELD_RELEASE_ISSUE}={_required(release_issue, kind=kind, field=FIELD_RELEASE_ISSUE)}"
+        )
+        fields.append(
+            f"{FIELD_ACCEPTANCE}={_required(acceptance, kind=kind, field=FIELD_ACCEPTANCE)}"
+        )
     return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{':'.join(fields)}]"
 
 
@@ -140,17 +170,27 @@ def parse_hibernate_evidence(
 
     extra: dict = {}
     if kind == EVIDENCE_REQUIRED_CI_GREEN:
+        workflow = str(fields.get(FIELD_WORKFLOW, "") or "").strip()
+        if not workflow:
+            return EvidenceParseError(EVIDENCE_MISSING_WORKFLOW)
         run = str(fields.get(FIELD_RUN, "") or "").strip()
         if not run:
             return EvidenceParseError(EVIDENCE_MISSING_RUN)
         if str(fields.get(FIELD_CONCLUSION, "") or "").strip() != _CI_CONCLUSION_SUCCESS:
             return EvidenceParseError(EVIDENCE_CI_NOT_SUCCESS)
-        extra = {FIELD_RUN: run, FIELD_CONCLUSION: _CI_CONCLUSION_SUCCESS}
+        extra = {
+            FIELD_WORKFLOW: workflow,
+            FIELD_RUN: run,
+            FIELD_CONCLUSION: _CI_CONCLUSION_SUCCESS,
+        }
     elif kind == EVIDENCE_DOGFOOD_DELEGATED:
         release_issue = str(fields.get(FIELD_RELEASE_ISSUE, "") or "").strip()
         if not release_issue:
             return EvidenceParseError(EVIDENCE_MISSING_RELEASE_ISSUE)
-        extra = {FIELD_RELEASE_ISSUE: release_issue}
+        acceptance = str(fields.get(FIELD_ACCEPTANCE, "") or "").strip()
+        if not acceptance:
+            return EvidenceParseError(EVIDENCE_MISSING_ACCEPTANCE)
+        extra = {FIELD_RELEASE_ISSUE: release_issue, FIELD_ACCEPTANCE: acceptance}
 
     return HibernateEvidence(kind=kind, envelope=bound, extra=extra)
 

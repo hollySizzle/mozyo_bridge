@@ -41,15 +41,17 @@ belong with the supervisor wiring that owns live observation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, Mapping, Optional, Sequence
 
 from ..domain.hibernate_actuation import ActionTimeObligations
 from ..domain.hibernate_basis_producer import (
     GAP_PUSH_OBSERVATION_ABSENT,
+    DogfoodReceipt,
     ProducedBasis,
     PushObservation,
     produce_basis_conjuncts,
 )
+from ..domain.hibernate_evidence_authority import EvidenceJournal
 from ..domain.hibernate_candidate import (
     NON_CANDIDATE_BASIS_PARTIALLY_UNKNOWN,
     NON_CANDIDATE_HEAD_UNBOUND,
@@ -61,13 +63,17 @@ from ..domain.hibernate_candidate import (
     classify_hibernate_candidate,
 )
 
-#: One journal as the producer reads it: its durable id and its verbatim note body.
-JournalPage = Sequence[Tuple[str, str]]
+#: The issue's journals as the producer reads them: durable id, verbatim note, and the writer the
+#: port resolved from the source's own author metadata (never from the note body).
+JournalPage = Sequence[EvidenceJournal]
 
 LifecycleRecordsReader = Callable[[], Optional[Sequence[object]]]
 JournalReader = Callable[[str], Optional[JournalPage]]
 PushObserver = Callable[[SelectedLane], Optional[PushObservation]]
 ObligationObserver = Callable[[HibernateCandidate], ActionTimeObligations]
+#: Reads the RELEASE issues' receipts for a dogfood delegation, keyed by release issue id. A port
+#: rather than a parameter because it reads a different issue than the candidate's own.
+DogfoodReceiptReader = Callable[[str], Mapping[str, DogfoodReceipt]]
 
 #: The journal source could not be read at all (distinct from "the issue has no such record").
 DETAIL_JOURNAL_SOURCE_UNREADABLE = "journal_source_unreadable"
@@ -150,11 +156,15 @@ class HibernateCandidateAssembler:
         journals_fn: JournalReader,
         push_fn: PushObserver,
         obligations_fn: ObligationObserver,
+        dogfood_receipts_fn: Optional[DogfoodReceiptReader] = None,
     ) -> None:
         self._records_fn = records_fn
         self._journals_fn = journals_fn
         self._push_fn = push_fn
         self._obligations_fn = obligations_fn
+        # No reader -> no receipts -> `dogfood_receipt_absent`. An unwired corroboration port
+        # blocks the delegation conjunct rather than waiving it.
+        self._dogfood_receipts_fn = dogfood_receipts_fn or (lambda issue: {})
 
     def assemble(self, request: AssemblyRequest) -> AssembledCandidate:
         """Read the three authorities once and classify — pure decision, injected reads.
@@ -183,7 +193,13 @@ class HibernateCandidateAssembler:
                 ),
             )
 
-        produced = produce_basis_conjuncts(journals, basis=request.basis, push=push)
+        produced = produce_basis_conjuncts(
+            journals,
+            basis=request.basis,
+            source_issue=issue,
+            push=push,
+            dogfood_receipts=self._dogfood_receipts_fn(issue),
+        )
         verdict = classify_hibernate_candidate(
             selected=selected,
             declared_basis=request.basis,
@@ -226,6 +242,7 @@ class HibernateCandidateAssembler:
 
 __all__ = [
     "DETAIL_JOURNAL_SOURCE_UNREADABLE",
+    "DogfoodReceiptReader",
     "AssembledCandidate",
     "AssemblyRequest",
     "HibernateCandidateAssembler",

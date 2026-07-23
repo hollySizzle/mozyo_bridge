@@ -141,5 +141,52 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(got.reason, env.ENVELOPE_CONFLICT)
 
 
+class RendererValidationTests(unittest.TestCase):
+    """Checkpoint review j#86389 F4: the renderer must refuse what the parser refuses.
+
+    Rendering an envelope the parser would reject produces durable evidence that silently does not
+    count; rendering a separator-bearing id is worse — it splits into a different field set.
+    """
+
+    def _envelope(self, **over):
+        base = dict(workspace=WS, lane=LANE, lane_generation=3, head=HEAD)
+        base.update(over)
+        return env.LaneEvidenceEnvelope(**base)
+
+    def test_valid_envelope_still_round_trips(self):
+        # Negative control: the guard rejects the invalid, not the valid.
+        rendered = env.render_lane_envelope(self._envelope())
+        fields = dict(part.split("=", 1) for part in rendered.split(":"))
+        self.assertEqual(env.parse_lane_envelope(fields, require_head=True), self._envelope())
+
+    def test_non_positive_generation_is_refused(self):
+        for generation in (0, -1):
+            with self.subTest(generation=generation):
+                with self.assertRaises(ValueError):
+                    env.render_lane_envelope(self._envelope(lane_generation=generation))
+
+    def test_malformed_head_is_refused(self):
+        for head in ("not-a-sha", "A" * 40, "abc123"):
+            with self.subTest(head=head):
+                with self.assertRaises(ValueError):
+                    env.render_lane_envelope(self._envelope(head=head))
+
+    def test_empty_workspace_or_lane_is_refused(self):
+        with self.assertRaises(ValueError):
+            env.render_lane_envelope(self._envelope(workspace=""))
+        with self.assertRaises(ValueError):
+            env.render_lane_envelope(self._envelope(lane="  "))
+
+    def test_separator_bearing_identity_is_refused(self):
+        # Rendered unchecked, `ws:evil]x` became `workspace=ws` + a bogus `evil]x` field and
+        # truncated the marker there — field injection from a producer-supplied id.
+        for bad in ("ws:evil]x", "ws]x", "ws x", "ws[x"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    env.render_lane_envelope(self._envelope(workspace=bad))
+                with self.assertRaises(ValueError):
+                    env.render_lane_envelope(self._envelope(lane=bad))
+
+
 if __name__ == "__main__":
     unittest.main()

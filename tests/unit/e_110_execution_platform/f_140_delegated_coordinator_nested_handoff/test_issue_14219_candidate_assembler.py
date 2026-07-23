@@ -26,7 +26,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_basis_producer import (  # noqa: E501
     GAP_PUSH_OBSERVATION_ABSENT,
+    DogfoodReceipt,
     PushObservation,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+    ISSUER_COORDINATOR,
+    ISSUER_LANE_WORKER,
+    ISSUER_REVIEW_GATEWAY,
+    EvidenceJournal,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_candidate import (  # noqa: E501
     BASIS_DEPENDENCY_PARK,
@@ -64,6 +71,8 @@ REV = 7
 HEAD = "a" * 40
 OTHER_HEAD = "c" * 40
 STAGING_HEAD = "b" * 40
+REQ_JOURNAL = "85000"
+RELEASE_ISSUE = "14184"
 
 
 @dataclass(frozen=True)
@@ -82,11 +91,15 @@ def _env(workspace=WS, lane=LANE, gen=GEN, head=HEAD) -> LaneEvidenceEnvelope:
     return LaneEvidenceEnvelope(workspace=workspace, lane=lane, lane_generation=gen, head=head)
 
 
+def _request_note(head=HEAD) -> str:
+    return "review request\n" + render_workflow_event_marker("review_request", target_head=head)
+
+
 def _review_note(*, conclusion="approved", head=HEAD, gen=GEN, lane=LANE) -> str:
     return "review\n" + render_workflow_event_marker(
         "review_result",
         target_head=head,
-        review_request_journal="85400",
+        review_request_journal=REQ_JOURNAL,
         conclusion=conclusion,
         evidence_workspace=WS,
         evidence_lane=lane,
@@ -107,7 +120,10 @@ def _integration_note(**overrides) -> str:
 
 def _ci_note(**overrides) -> str:
     return "ci\n" + render_hibernate_evidence(
-        EVIDENCE_REQUIRED_CI_GREEN, envelope=overrides.pop("envelope", _env()), run="299"
+        EVIDENCE_REQUIRED_CI_GREEN,
+        envelope=overrides.pop("envelope", _env()),
+        workflow="test.yml",
+        run="299",
     )
 
 
@@ -115,25 +131,44 @@ def _dogfood_note(**overrides) -> str:
     return "dogfood\n" + render_hibernate_evidence(
         EVIDENCE_DOGFOOD_DELEGATED,
         envelope=overrides.pop("envelope", _env()),
-        release_issue="14184",
+        release_issue=RELEASE_ISSUE,
+        acceptance="85431",
     )
+
+
+#: A park marker must sit in the governed fixed-field park journal it claims.
+PARK_FIELDS = (
+    "- state: blocked\n- blocked_by: 14150\n"
+    "- resume_condition: callback outcome journal\n- resume_owner: coordinator\n"
+)
 
 
 def _park_note(**overrides) -> str:
-    return "park\n" + render_hibernate_evidence(
+    return "park\n" + PARK_FIELDS + render_hibernate_evidence(
         EVIDENCE_PARK_DECLARED, envelope=overrides.pop("envelope", _env(head=""))
     )
+
+
+def _receipts(issue=ISSUE, head=HEAD) -> dict:
+    return {
+        RELEASE_ISSUE: DogfoodReceipt(
+            release_issue=RELEASE_ISSUE, source_issue=issue, head=head
+        )
+    }
 
 
 def _early_journals(**overrides) -> list:
     """A fully-evidenced early-hibernate issue; ``overrides`` replace one note by journal id."""
     journals = [
-        ("85001", _review_note()),
-        ("85002", _integration_note()),
-        ("85003", _ci_note()),
-        ("85004", _dogfood_note()),
+        (REQ_JOURNAL, _request_note(), ISSUER_LANE_WORKER),
+        ("85001", _review_note(), ISSUER_REVIEW_GATEWAY),
+        ("85002", _integration_note(), ISSUER_COORDINATOR),
+        ("85003", _ci_note(), ISSUER_COORDINATOR),
+        ("85004", _dogfood_note(), ISSUER_COORDINATOR),
     ]
-    return [(jid, overrides.get(jid, note)) for jid, note in journals]
+    return [
+        EvidenceJournal(jid, overrides.get(jid, note), role) for jid, note, role in journals
+    ]
 
 
 def _selected(**over) -> SelectedLane:
@@ -158,9 +193,10 @@ class _Ports:
     #: path (it did, until this sentinel).
     _DEFAULT = object()
 
-    def __init__(self, *, journals=None, records=(_Rec(),), push=_DEFAULT):
+    def __init__(self, *, journals=None, records=(_Rec(),), push=_DEFAULT, receipts=None):
         self.journals = journals
         self.records = records
+        self.receipts = _receipts() if receipts is None else receipts
         self.push = _push() if push is self._DEFAULT else push
         self.journal_calls = 0
         self.push_calls = 0
@@ -184,6 +220,7 @@ class _Ports:
             journals_fn=self.journals_fn,
             push_fn=self.push_fn,
             obligations_fn=obligations_fn,
+            dogfood_receipts_fn=lambda issue: self.receipts,
         )
 
 
@@ -220,7 +257,10 @@ class CandidateAssemblerTests(unittest.TestCase):
         # would still "match" its own stale review. The observation is the head authority, so the
         # marker is compared against it -> anchor mismatch, zero actuation.
         got, _ = self._assemble(
-            journals=_early_journals(**{"85001": _review_note(head=OTHER_HEAD)})
+            journals=_early_journals(**{
+                REQ_JOURNAL: _request_note(head=OTHER_HEAD),
+                "85001": _review_note(head=OTHER_HEAD),
+            })
         )
         self.assertIsInstance(got.verdict, HibernateNonCandidate)
         self.assertEqual(got.verdict.reason, NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
@@ -231,15 +271,18 @@ class CandidateAssemblerTests(unittest.TestCase):
         # fully evidenced and hibernate at a head that no longer exists on the lane; bound from the
         # observation, it is an anchor mismatch. (A single disagreeing marker cannot tell the two
         # rules apart — the other conjuncts would mismatch either way.)
+        # The delegation's receipt agrees with the markers too — every durable record is
+        # internally consistent, and only the observation disagrees.
         stale = _early_journals(
             **{
+                REQ_JOURNAL: _request_note(head=OTHER_HEAD),
                 "85001": _review_note(head=OTHER_HEAD),
                 "85002": _integration_note(envelope=_env(head=OTHER_HEAD)),
                 "85003": _ci_note(envelope=_env(head=OTHER_HEAD)),
                 "85004": _dogfood_note(envelope=_env(head=OTHER_HEAD)),
             }
         )
-        got, _ = self._assemble(journals=stale)
+        got, _ = self._assemble(journals=stale, receipts=_receipts(head=OTHER_HEAD))
         self.assertIsInstance(got.verdict, HibernateNonCandidate)
         self.assertEqual(got.verdict.reason, NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
 
@@ -271,13 +314,13 @@ class CandidateAssemblerTests(unittest.TestCase):
 
     def test_dependency_park_needs_only_its_own_declaration(self):
         got, _ = self._assemble(
-            journals=[("85010", _park_note())], basis=BASIS_DEPENDENCY_PARK
+            journals=[EvidenceJournal("85010", _park_note(), ISSUER_LANE_WORKER)], basis=BASIS_DEPENDENCY_PARK
         )
         self.assertIsInstance(got.verdict, HibernateCandidate)
         self.assertEqual(got.decision_journal, "85010")
 
     def test_assemble_all_keeps_non_candidates(self):
-        ports = _Ports(journals=[("85010", _park_note())])
+        ports = _Ports(journals=[EvidenceJournal("85010", _park_note(), ISSUER_LANE_WORKER)])
         got = ports.assembler().assemble_all([
             AssemblyRequest(selected=_selected(), basis=BASIS_DEPENDENCY_PARK),
             AssemblyRequest(selected=_selected(), basis=BASIS_EARLY_HIBERNATE),
@@ -321,7 +364,11 @@ class PassSeamTests(unittest.TestCase):
         ports = _Ports(journals=_early_journals())
         assembler, candidate = self._seams_for(ports)
         # Between build and actuation the reviewer supersedes the approval.
-        ports.journals = _early_journals() + [("85009", _review_note(conclusion="changes_requested"))]
+        ports.journals = _early_journals() + [
+            EvidenceJournal(
+                "85009", _review_note(conclusion="changes_requested"), ISSUER_REVIEW_GATEWAY
+            )
+        ]
         seams = assembler.pass_seams()
         self.assertEqual(seams.journal_fn(candidate), "")
         self.assertIsNone(seams.refresh_fn(candidate))
