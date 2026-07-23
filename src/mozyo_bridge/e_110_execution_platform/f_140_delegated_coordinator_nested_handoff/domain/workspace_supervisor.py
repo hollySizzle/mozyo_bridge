@@ -56,9 +56,20 @@ SUPERVISION_LOCAL_WAKE = "local_wake"
 #: dispatch anchor / retirement cannot be safely attested from local state is NOT blind-sent: it is
 #: left for the provider reconciliation leg (:func:`select_drain_delivery_route`).
 SUPERVISION_LOCAL_DRAIN = "local_drain"
+#: The **auto-hibernate** leg (Redmine #14219 T2c): under the same per-workspace lease fence, run
+#: ONE bounded hibernate pass (T2a ``run_hibernate_pass`` over the T2b evidence-assembled
+#: candidates) — at most one lifecycle mutation across the whole pass, zero on any doubt. The
+#: pass makes no callback deliveries and never touches the outbox; it is a distinct early-return
+#: leg exactly like ``local_drain``, never a second supervisor.
+SUPERVISION_HIBERNATE = "hibernate"
 
 SUPERVISION_MODES = frozenset(
-    {SUPERVISION_BOUNDED_RECONCILIATION, SUPERVISION_LOCAL_WAKE, SUPERVISION_LOCAL_DRAIN}
+    {
+        SUPERVISION_BOUNDED_RECONCILIATION,
+        SUPERVISION_LOCAL_WAKE,
+        SUPERVISION_LOCAL_DRAIN,
+        SUPERVISION_HIBERNATE,
+    }
 )
 
 #: Portable default bounded-reconciliation interval (seconds). Coarser than the callback wake
@@ -81,6 +92,13 @@ SKIP_NO_ACTIVE_ISSUES = "no_active_issues_to_supervise"  # roster read OK but no
 #: The renew fence tripped mid-sweep: this workspace's lease was lost (taken over after expiry),
 #: so the supervisor stopped before the next issue's side-effects (Redmine #13683 review R1-F1).
 SKIP_LEASE_LOST = "lease_lost_midsweep"
+#: The hibernate mode was requested but no leg is wired (Redmine #14219 T2c): fail-closed —
+#: nothing is acquired and nothing actuates; the report says WHY instead of silently no-opping.
+SKIP_HIBERNATE_UNWIRED = "hibernate_leg_unwired"
+#: The wired hibernate leg raised (fail-open per workspace, like a per-issue pass error): the
+#: sweep continues, the workspace reports the error token. The leg's own budget/fences bound any
+#: partial effect to at most the one audited mutation.
+SKIP_HIBERNATE_LEG_ERROR = "hibernate_leg_error"
 
 #: A per-issue supply error token: the Redmine source could not be read for durable-event supply /
 #: candidate discovery (fail-open per issue — the callback drain still ran).
@@ -541,6 +559,15 @@ class WorkspaceSupervisionOutcome:
     backlog_blocked: int = 0
     backlog_recovered: int = 0
     backlog_transient_skipped: int = 0
+    #: The hibernate mode leg (Redmine #14219 T2c). ``hibernate_ran`` marks that the leg executed
+    #: under this workspace's held lease (an EMPTY pass included — distinguishing "ran, nothing to
+    #: do" from every other mode's default); ``hibernate_mutations`` is the authoritative
+    #: ``transition.applied`` count for the bounded pass (0 or 1); ``hibernate_attempts`` carries
+    #: each candidate's redaction-safe typed attempt payload (issue / lane / kind / closed reason
+    #: token / revision — no paths, no secrets).
+    hibernate_ran: bool = False
+    hibernate_mutations: int = 0
+    hibernate_attempts: tuple[dict, ...] = ()
 
     @property
     def events_supplied(self) -> int:
@@ -840,10 +867,31 @@ def build_service_definition(
     )
 
 
+def group_wake_hints(wake_hints) -> "dict[str, tuple[str, ...]]":
+    """Group ``(workspace_id, issue)`` wake hints by workspace (order-preserving, de-duplicated).
+
+    Pure; moved from the application supervisor (Redmine #14219 T2c line-budget leaf move).
+    """
+    grouped: dict[str, list[str]] = {}
+    for hint in wake_hints or ():
+        try:
+            wsid, issue = str(hint[0]).strip(), str(hint[1]).strip()
+        except (IndexError, TypeError):
+            continue
+        if not wsid or not issue:
+            continue
+        bucket = grouped.setdefault(wsid, [])
+        if issue not in bucket:
+            bucket.append(issue)
+    return {wsid: tuple(issues) for wsid, issues in grouped.items()}
+
+
 __all__ = (
+    "group_wake_hints",
     "SUPERVISION_BOUNDED_RECONCILIATION",
     "SUPERVISION_LOCAL_WAKE",
     "SUPERVISION_LOCAL_DRAIN",
+    "SUPERVISION_HIBERNATE",
     "SUPERVISION_MODES",
     "DEFAULT_RECONCILIATION_INTERVAL_SECONDS",
     "DEFAULT_LOCAL_DRAIN_INTERVAL_SECONDS",
@@ -851,6 +899,8 @@ __all__ = (
     "SKIP_ROSTER_UNREADABLE",
     "SKIP_NO_ACTIVE_ISSUES",
     "SKIP_LEASE_LOST",
+    "SKIP_HIBERNATE_UNWIRED",
+    "SKIP_HIBERNATE_LEG_ERROR",
     "ISSUE_SOURCE_UNREADABLE",
     "ISSUE_PASS_ERROR",
     "ISSUE_LEASE_LOST",
