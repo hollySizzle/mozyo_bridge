@@ -38,6 +38,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
     send_semantic_gap,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (  # noqa: E501
+    RoleProfileError,
+    parse_profile_fields,
+)
 
 #: The park marker is not accompanied by the governed fixed-field park journal.
 GAP_PARK_JOURNAL_FIELDS_ABSENT = "park_journal_fields_absent"
@@ -578,6 +582,14 @@ def _send_invocation(tokens: "list[_Token] | None") -> "argparse.Namespace | Non
         force=bool(namespace.force),
     ) is not None:
         return None
+    if namespace.role_profile:
+        # The canonical planner parses the profile fields with the SAME shared validator before
+        # anything is typed, and only when a role profile is asked for — a malformed
+        # ``--profile-field`` is blocked/invalid_args, zero-send (checkpoint j#86683 R20-F1).
+        try:
+            parse_profile_fields(namespace.profile_field)
+        except RoleProfileError:
+            return None
     return namespace
 
 

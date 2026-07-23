@@ -1090,6 +1090,29 @@ class CorroborationTests(unittest.TestCase):
                 )
                 self.assertEqual(produced.gaps, ())
 
+    def test_well_formed_profile_fields_are_a_delivery(self):
+        # Positive control for the profile-field syntax authority (checkpoint j#86683 R20-F1):
+        # repeatable KEY=VALUE pairs — values may themselves contain `=` — parse with the SAME
+        # canonical validator and the command delivers. Without --role-profile the canonical
+        # planner never reads the fields at all, so the field alone changes nothing.
+        for suffix in (
+            " --role-profile implementation_worker --profile-field issue=14219"
+            " --profile-field note=a=b",
+            " --profile-field malformed",
+        ):
+            with self.subTest(suffix=suffix):
+                detail = (
+                    "- target: coordinator\n"
+                    f"- on sent: {SEND_COMMAND}{suffix}"
+                    " / observed landing marker"
+                    " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+                )
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
     def test_a_reason_mentioning_panes_or_the_send_is_still_a_reason(self):
         # checkpoint j#86675 R18-F5: the reason is non-empty free text. The candidates and the
         # retry are judged exactly on their own parts, so prose like "handoff send could not
@@ -1745,6 +1768,28 @@ class CorroborationTests(unittest.TestCase):
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
                         f" / retry command: {RETRY_COMMAND} --force\n"),
+            # -- checkpoint j#86683 R20-F1: malformed --profile-field is zero-send -------------
+            # With --role-profile, the canonical planner parses the fields with the shared
+            # validator (parse_profile_fields) before typing: no `=` or an empty key is
+            # blocked/invalid_args, nothing was sent.
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --role-profile implementation_worker"
+                     " --profile-field malformed"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --role-profile implementation_worker"
+                     " --profile-field =value"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        f" / retry command: {RETRY_COMMAND} --role-profile implementation_worker"
+                        " --profile-field malformed\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        f" / retry command: {RETRY_COMMAND} --role-profile implementation_worker"
+                        " --profile-field =value\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
@@ -1972,6 +2017,30 @@ class SendSemanticsSharedAuthorityTests(unittest.TestCase):
         source = inspect.getsource(orchestrate_handoff)
         self.assertIn("send_semantic_gap", source)
         self.assertIn("effective_send_mode", source)
+
+    def test_the_evidence_parser_shares_the_profile_field_validator(self):
+        # checkpoint j#86683 R20-F1: the profile-field syntax authority is the canonical
+        # parse_profile_fields, consulted under the SAME condition the canonical planner uses
+        # (only when a role profile is asked for) — not an ad-hoc re-enumeration.
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (  # noqa: E501
+            RoleProfileError,
+            parse_profile_fields,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_park_record import (  # noqa: E501
+            _send_invocation,
+        )
+
+        source = inspect.getsource(_send_invocation)
+        self.assertIn("parse_profile_fields", source)
+        self.assertIn("if namespace.role_profile:", source)
+        # The authority itself refuses exactly what the canonical planner refuses.
+        with self.assertRaises(RoleProfileError):
+            parse_profile_fields(["malformed"])
+        with self.assertRaises(RoleProfileError):
+            parse_profile_fields(["=value"])
+        self.assertEqual(parse_profile_fields(["note=a=b"]), {"note": "a=b"})
 
     def test_the_authority_matches_the_canonical_queue_enter_force_rule(self):
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
