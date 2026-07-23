@@ -157,7 +157,7 @@ def canonical_target(value: str) -> str:
     two panes name no single place the callback went.
     """
     tokens = [token.strip("`(),") for token in str(value).split()]
-    if not any(token.lower() == _COORDINATOR_TARGET for token in tokens):
+    if not any(token == _COORDINATOR_TARGET for token in tokens):
         return ""
     panes = {token for token in tokens if _PANE_TOKEN_RE.match(token)}
     if len(panes) > 1:
@@ -173,36 +173,40 @@ _SHELL_CONTROL = ("&&", "||", ";", "|", "&", ">", "<", "$(", "`", "\n")
 _CLI_ENTRYPOINTS = ("mozyo-bridge", "mozyo")
 
 
+#: The exact labels the template puts before a command. Anything else preceding the invocation is
+#: a wrapper, not a label — ``echo command:`` reads as a label to a pattern that only asks for
+#: "words then a colon" (checkpoint j#86577 R9-F1), and a wrapped command is the one that did not
+#: run. The label is stripped by the CALLER, so the parser has no guessing to do.
+_COMMAND_LABEL_RE = re.compile(r"^(?:retry\s+command|retry|command)\s*:\s*", re.IGNORECASE)
+
+
+def _strip_command_label(text: str) -> str:
+    """Drop one template label from the FRONT of ``text`` (pure). Nothing else is removed."""
+    return _COMMAND_LABEL_RE.sub("", text.strip(), count=1)
+
+
 def _send_invocation(text: str) -> "list[str] | None":
     """The ``mozyo-bridge handoff send ...`` invocation ``text`` IS, or ``None`` (pure).
 
-    R8 said the command was parsed as one invocation; it was not — flags were harvested from the
-    whole string and ``handoff send`` merely had to appear somewhere, so
-    ``echo mozyo-bridge handoff send --to codex --target coordinator`` and
-    ``false && mozyo-bridge handoff send …`` were accepted as delivery evidence (checkpoint
-    j#86569 R8-F1). A wrapped command is precisely the one that did NOT run.
+    ``text`` must BE the invocation: the caller has already cut the command component out of the
+    record (the label, the marker, the neighbouring parts), so token 0 is the CLI entry point or
+    this is not a command. Earlier versions harvested flags from the whole string and then, once
+    that was fixed, accepted any word-sequence-plus-colon as a label — both let a wrapped command
+    stand in for one that ran.
 
-    So the boundaries are checked, not just the contents: no shell control anywhere; nothing before
-    the invocation except a label (``retry command:``), which is how the template writes it; the
-    invocation itself starting at the CLI entry point with ``handoff send``; and no second
-    invocation after it.
+    Still refused outright: shell control anywhere (composition, conditionals, redirection,
+    substitution) and a second entry point, since neither is one invocation.
     """
     if any(control in text for control in _SHELL_CONTROL):
         return None
     tokens = text.split()
-    starts = [i for i, token in enumerate(tokens) if token in _CLI_ENTRYPOINTS]
-    if len(starts) != 1:
+    if not tokens or tokens[0] not in _CLI_ENTRYPOINTS:
         return None
-    start = starts[0]
-    # Only a label may precede the invocation, and it must read as one: the token immediately
-    # before the entry point ends the label with a colon.
-    if start and not tokens[start - 1].endswith(":"):
+    if any(token in _CLI_ENTRYPOINTS for token in tokens[1:]):
         return None
-    if any(not re.fullmatch(r"[A-Za-z][\w-]*:?", token) for token in tokens[:start]):
+    if tokens[1:3] != ["handoff", "send"]:
         return None
-    if tokens[start + 1 : start + 3] != ["handoff", "send"]:
-        return None
-    return tokens[start:]
+    return tokens
 
 
 def _flag_value(tokens: "list[str]", flag: str) -> "str | None | object":
@@ -236,7 +240,7 @@ def _delivery_command_gap(command: str, *, target: str) -> Optional[str]:
     receiver = _flag_value(tokens, "--to")
     if receiver is _FIELD_CONFLICT or receiver is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    if str(receiver).lower() != _RECEIVER_CODEX:
+    if str(receiver) != _RECEIVER_CODEX:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     commanded = _flag_value(tokens, "--target")
     if commanded is _FIELD_CONFLICT or commanded is None:
@@ -289,7 +293,11 @@ def _landing_marker_matches(detail: str, *, source_issue: str, journal: str) -> 
         if fields is None:
             return False
         markers.append(fields)
-    if len(markers) != 1:
+    # Identical repeats collapse and differing ones conflict — the same rule the governed fields
+    # follow. R9 refused any repeat outright, which is safe but not the contract: a record that
+    # states one fact twice would never satisfy the park basis (checkpoint j#86577 R9-F3).
+    distinct = {tuple(sorted(fields.items())) for fields in markers}
+    if len(distinct) != 1:
         return False
 
     # Each mandatory field of the canonical producer is checked INDIVIDUALLY below — `source`,
@@ -297,11 +305,11 @@ def _landing_marker_matches(detail: str, *, source_issue: str, journal: str) -> 
     # blanket "all present" loop over the same names would be unobservable. Absence fails the same
     # comparison as a wrong value.
     fields = markers[0]
-    if str(fields.get("source", "")).strip().lower() != _MARKER_SOURCE:
+    if str(fields.get("source", "")).strip() != _MARKER_SOURCE:
         return False
     if str(fields.get("kind", "")).strip() not in KIND_LABELS:
         return False
-    if str(fields.get("to", "")).strip().lower() != _RECEIVER_CODEX:
+    if str(fields.get("to", "")).strip() != _RECEIVER_CODEX:
         return False
     return (
         str(fields.get("issue", "")).strip() == str(source_issue).strip()
@@ -309,12 +317,26 @@ def _landing_marker_matches(detail: str, *, source_issue: str, journal: str) -> 
     )
 
 
+#: The template joins the command and the observed marker (``command + observed landing marker``).
+#: Either separator the governed records use ends the command component.
+_COMMAND_COMPONENT_RE = re.compile(r"[/+]")
+
+
 def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: str) -> Optional[str]:
-    """Whether a ``sent`` record is THIS callback's delivery evidence (pure)."""
-    gap = _delivery_command_gap(detail, target=target)
+    """Whether a ``sent`` record is THIS callback's delivery evidence (pure).
+
+    The command component is everything before the first separator; the observation is what
+    follows. Cutting it here is what lets :func:`_send_invocation` demand that the component BE the
+    invocation rather than guess where one starts (checkpoint j#86577 R9-F1).
+    """
+    parts = _COMMAND_COMPONENT_RE.split(detail, maxsplit=1)
+    if len(parts) != 2:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    command, observation = parts
+    gap = _delivery_command_gap(_strip_command_label(command), target=target)
     if gap is not None:
         return gap
-    if not _landing_marker_matches(detail, source_issue=source_issue, journal=journal):
+    if not _landing_marker_matches(observation, source_issue=source_issue, journal=journal):
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     return None
 
@@ -349,19 +371,19 @@ def _blocked_detail_gap(detail: str) -> Optional[str]:
     if not candidate_panes:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
 
-    tokens = _send_invocation(retry)
+    tokens = _send_invocation(_strip_command_label(retry))
     if tokens is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     receiver = _flag_value(tokens, "--to")
     if receiver is _FIELD_CONFLICT or receiver is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    if str(receiver).lower() != _RECEIVER_CODEX:
+    if str(receiver) != _RECEIVER_CODEX:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     pinned = _flag_value(tokens, "--target")
     if pinned is _FIELD_CONFLICT or pinned is None or pinned not in candidate_panes:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     repo = _flag_value(tokens, "--target-repo")
-    if repo is _FIELD_CONFLICT or str(repo or "").lower() != "auto":
+    if repo is _FIELD_CONFLICT or str(repo or "") != "auto":
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     return None
 

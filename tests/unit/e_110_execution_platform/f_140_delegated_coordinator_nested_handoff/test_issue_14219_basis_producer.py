@@ -769,6 +769,46 @@ class CorroborationTests(unittest.TestCase):
                 self.assertEqual(produced.gaps, ())
                 self.assertTrue(_by_key(produced)[CONJUNCT_PARK_DECLARED].satisfied)
 
+    def test_an_identical_duplicate_landing_marker_collapses(self):
+        # The marker/governed-field rule is collapse-identical / conflict-differing. R9 refused any
+        # repeat outright, which is safe but not the contract: a record stating one fact twice
+        # would never satisfy the basis (checkpoint j#86577 R9-F3). The differing case stays a gap
+        # (see `test_an_outcome_without_its_record_is_a_gap`).
+        marker = ("[mozyo:handoff:source=redmine:issue=14219:journal=85500"
+                  ":kind=reply:to=codex]")
+        fields = _park_fields(
+            result="sent",
+            detail=(
+                "- target: coordinator\n"
+                "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                f" / observed landing marker {marker} {marker}\n"
+            ),
+        )
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=fields)), basis=BASIS_DEPENDENCY_PARK
+        )
+        self.assertEqual(produced.gaps, ())
+
+    def test_the_observation_part_may_restate_the_command(self):
+        # The command component is cut at the separator, so text AFTER it belongs to the
+        # observation and is not parsed as part of the invocation. Operators do quote the command
+        # next to the marker; without the cut, that second mention reads as a second invocation.
+        marker = ("[mozyo:handoff:source=redmine:issue=14219:journal=85500"
+                  ":kind=reply:to=codex]")
+        fields = _park_fields(
+            result="sent",
+            detail=(
+                "- target: coordinator\n"
+                "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                f" / observed landing marker {marker}"
+                " (delivered via mozyo-bridge handoff send)\n"
+            ),
+        )
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=fields)), basis=BASIS_DEPENDENCY_PARK
+        )
+        self.assertEqual(produced.gaps, ())
+
     def test_the_templates_coordinator_pane_fallback_is_accepted(self):
         # The template's second target form: `<coordinator_codex_%pane>`. It is a pane, and the
         # record says whose — which is what distinguishes it from any other pane on the cockpit.
@@ -1027,6 +1067,32 @@ class CorroborationTests(unittest.TestCase):
                      "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
                      " / [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]"
                      " [mozyo:handoff:source=redmine:issue=99999:journal=1:kind=reply:to=claude]\n"),
+            # -- checkpoint j#86577 R9-F1: a wrapper is not a label ---------------------------
+            # `echo command:` reads as a label to a pattern that only wants "words then a colon",
+            # so the command that ran was `echo` — everything else here is canonical.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: echo command: mozyo-bridge handoff send --to codex"
+                     " --target coordinator / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / echo retry command: mozyo-bridge handoff send --to codex --target %14"
+                        " --target-repo auto\n"),
+            # -- checkpoint j#86577 R9-F2: the canonical vocabularies are lowercase literals ----
+            # The producer cannot emit these, and the CLI refuses `--to CODEX` outright, so
+            # case-folding the comparison accepted tokens no run could have produced.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / [mozyo:handoff:source=REDMINE:issue=14219:journal=85500:kind=reply"
+                     ":to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply"
+                     ":to=CODEX]\n"),
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to CODEX --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
