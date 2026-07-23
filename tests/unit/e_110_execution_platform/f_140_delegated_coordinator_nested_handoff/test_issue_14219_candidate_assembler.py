@@ -34,6 +34,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ISSUER_LANE_WORKER,
     ISSUER_REVIEW_GATEWAY,
     EvidenceJournal,
+    ResolvedIssuer,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_candidate import (  # noqa: E501
     BASIS_DEPENDENCY_PARK,
@@ -138,7 +139,8 @@ def _dogfood_note(**overrides) -> str:
 
 #: A park marker must sit in the governed fixed-field park journal it claims.
 PARK_FIELDS = (
-    "- state: blocked\n- blocked_by: 14150\n"
+    "- state: blocked\n- durable_anchor: #14219 j#85010\n- callback_result: sent\n"
+    "- blocked_by: 14150\n"
     "- resume_condition: callback outcome journal\n- resume_owner: coordinator\n"
 )
 
@@ -146,6 +148,13 @@ PARK_FIELDS = (
 def _park_note(**overrides) -> str:
     return "park\n" + PARK_FIELDS + render_hibernate_evidence(
         EVIDENCE_PARK_DECLARED, envelope=overrides.pop("envelope", _env(head=""))
+    )
+
+
+def _issuer(role, *, lane=LANE, gen=GEN) -> ResolvedIssuer:
+    """A port-resolved writer: the role AND the lane that writer holds it over."""
+    return ResolvedIssuer(
+        role=role, workspace=WS, lane=lane, lane_generation=gen, authority_anchor="j#84900"
     )
 
 
@@ -167,7 +176,8 @@ def _early_journals(**overrides) -> list:
         ("85004", _dogfood_note(), ISSUER_COORDINATOR),
     ]
     return [
-        EvidenceJournal(jid, overrides.get(jid, note), role) for jid, note, role in journals
+        EvidenceJournal(jid, overrides.get(jid, note), _issuer(role))
+        for jid, note, role in journals
     ]
 
 
@@ -314,13 +324,13 @@ class CandidateAssemblerTests(unittest.TestCase):
 
     def test_dependency_park_needs_only_its_own_declaration(self):
         got, _ = self._assemble(
-            journals=[EvidenceJournal("85010", _park_note(), ISSUER_LANE_WORKER)], basis=BASIS_DEPENDENCY_PARK
+            journals=[EvidenceJournal("85010", _park_note(), _issuer(ISSUER_LANE_WORKER))], basis=BASIS_DEPENDENCY_PARK
         )
         self.assertIsInstance(got.verdict, HibernateCandidate)
         self.assertEqual(got.decision_journal, "85010")
 
     def test_assemble_all_keeps_non_candidates(self):
-        ports = _Ports(journals=[EvidenceJournal("85010", _park_note(), ISSUER_LANE_WORKER)])
+        ports = _Ports(journals=[EvidenceJournal("85010", _park_note(), _issuer(ISSUER_LANE_WORKER))])
         got = ports.assembler().assemble_all([
             AssemblyRequest(selected=_selected(), basis=BASIS_DEPENDENCY_PARK),
             AssemblyRequest(selected=_selected(), basis=BASIS_EARLY_HIBERNATE),
@@ -366,7 +376,9 @@ class PassSeamTests(unittest.TestCase):
         # Between build and actuation the reviewer supersedes the approval.
         ports.journals = _early_journals() + [
             EvidenceJournal(
-                "85009", _review_note(conclusion="changes_requested"), ISSUER_REVIEW_GATEWAY
+                "85009",
+                _review_note(conclusion="changes_requested"),
+                _issuer(ISSUER_REVIEW_GATEWAY),
             )
         ]
         seams = assembler.pass_seams()

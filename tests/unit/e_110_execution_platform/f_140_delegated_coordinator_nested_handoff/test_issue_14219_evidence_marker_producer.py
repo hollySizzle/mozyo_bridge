@@ -109,6 +109,21 @@ class BuilderEnvelopeTests(unittest.TestCase):
         self.assertEqual(refusal, "evidence_envelope_incomplete")
         self.assertEqual(fields, {})
 
+    def test_a_separator_bearing_identity_is_a_typed_refusal(self):
+        # The CLI is operator input, so it gets a fixed refusal token rather than the renderer's
+        # exception — but it refuses the same values (checkpoint j#86443 R2-F3).
+        for bad in ({"evidence_workspace": "ws:forged"}, {"evidence_lane": "lane]cut"}):
+            with self.subTest(**bad):
+                args = dict(
+                    evidence_workspace=WS, evidence_lane=LANE, evidence_lane_generation="4"
+                )
+                args.update(bad)
+                fields, refusal = _review_gate_marker_fields(
+                    self._args(**args), "review_result"
+                )
+                self.assertEqual(refusal, "evidence_envelope_malformed_identity")
+                self.assertEqual(fields, {})
+
     def test_a_non_positive_generation_is_refused(self):
         _, refusal = _review_gate_marker_fields(
             self._args(evidence_workspace=WS, evidence_lane=LANE, evidence_lane_generation="0"),
@@ -131,6 +146,75 @@ class BuilderEnvelopeTests(unittest.TestCase):
             "review_result",
         )
         self.assertEqual(refusal, "review_marker_missing_target_head")
+
+
+class ReviewMarkerStrictRendererTests(unittest.TestCase):
+    """Checkpoint j#86443 R2-F3: review_result is an evidence kind, so its renderer is strict too.
+
+    Before this, the envelope fields were concatenated straight into the marker body, so an
+    identity carrying a separator injected a second field ahead of the real one and closed the
+    marker early — from a producer-supplied id.
+    """
+
+    HEAD = "a" * 40
+
+    def _render(self, **envelope):
+        return render_workflow_event_marker(
+            "review_result",
+            target_head=self.HEAD,
+            review_request_journal="85400",
+            conclusion="approved",
+            **envelope,
+        )
+
+    def test_a_valid_envelope_still_renders(self):
+        marker = self._render(
+            evidence_workspace="ws-1", evidence_lane="lane-abc", evidence_lane_generation=4
+        )
+        self.assertIn(":workspace=ws-1:lane=lane-abc:lane_generation=4]", marker)
+
+    def test_a_separator_bearing_identity_is_refused(self):
+        # The exact reproduction from the finding: this used to render
+        # `workspace=ws:lane=forged:lane=lane]truncated` — a forged `lane` field, then truncation.
+        with self.assertRaises(ValueError):
+            self._render(
+                evidence_workspace="ws:lane=forged",
+                evidence_lane="lane-abc",
+                evidence_lane_generation=4,
+            )
+        with self.assertRaises(ValueError):
+            self._render(
+                evidence_workspace="ws-1",
+                evidence_lane="lane]truncated",
+                evidence_lane_generation=4,
+            )
+
+    def test_a_non_positive_generation_is_refused(self):
+        for generation in (0, -3):
+            with self.subTest(generation=generation):
+                with self.assertRaises(ValueError):
+                    self._render(
+                        evidence_workspace="ws-1",
+                        evidence_lane="lane-abc",
+                        evidence_lane_generation=generation,
+                    )
+
+    def test_a_partial_envelope_is_refused(self):
+        # Each shape separately: without the all-or-none guard, a missing LANE renders the literal
+        # `lane=None` (str(None) is non-empty), i.e. silent garbage rather than a refusal.
+        for partial in (
+            dict(evidence_workspace="ws-1"),
+            dict(evidence_workspace="ws-1", evidence_lane_generation=4),
+            dict(evidence_lane="lane-abc", evidence_lane_generation=4),
+        ):
+            with self.subTest(**partial):
+                with self.assertRaises(ValueError):
+                    self._render(**partial)
+
+    def test_no_envelope_still_renders_a_legacy_marker(self):
+        marker = self._render()
+        self.assertNotIn("workspace=", marker)
+        self.assertIn("req=85400", marker)
 
 
 if __name__ == "__main__":

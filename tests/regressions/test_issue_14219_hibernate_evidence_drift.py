@@ -65,6 +65,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ISSUER_LANE_WORKER,
     ISSUER_REVIEW_GATEWAY,
     EvidenceJournal,
+    ResolvedIssuer,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_candidate import (  # noqa: E501
     BASIS_EARLY_HIBERNATE,
@@ -168,14 +169,38 @@ def _dogfood(*, gen, head=HEAD, lane=LANE) -> str:
     )
 
 
+def _issuer(role, *, gen, lane=LANE) -> ResolvedIssuer:
+    return ResolvedIssuer(
+        role=role, workspace=WS, lane=lane, lane_generation=gen, authority_anchor="j#84900"
+    )
+
+
 def _evidenced(*, gen, head=HEAD, lane=LANE) -> list:
     """The durable records a fully-evidenced early-hibernate lane carries, with their writers."""
     return [
-        EvidenceJournal(REQ_JOURNAL, _request(head=head), ISSUER_LANE_WORKER),
-        EvidenceJournal("85001", _review(gen=gen, head=head, lane=lane), ISSUER_REVIEW_GATEWAY),
-        EvidenceJournal("85002", _integration(gen=gen, head=head, lane=lane), ISSUER_COORDINATOR),
-        EvidenceJournal("85003", _ci(gen=gen, head=head, lane=lane), ISSUER_COORDINATOR),
-        EvidenceJournal("85004", _dogfood(gen=gen, head=head, lane=lane), ISSUER_COORDINATOR),
+        EvidenceJournal(
+            REQ_JOURNAL, _request(head=head), _issuer(ISSUER_LANE_WORKER, gen=gen, lane=lane)
+        ),
+        EvidenceJournal(
+            "85001",
+            _review(gen=gen, head=head, lane=lane),
+            _issuer(ISSUER_REVIEW_GATEWAY, gen=gen, lane=lane),
+        ),
+        EvidenceJournal(
+            "85002",
+            _integration(gen=gen, head=head, lane=lane),
+            _issuer(ISSUER_COORDINATOR, gen=gen, lane=lane),
+        ),
+        EvidenceJournal(
+            "85003",
+            _ci(gen=gen, head=head, lane=lane),
+            _issuer(ISSUER_COORDINATOR, gen=gen, lane=lane),
+        ),
+        EvidenceJournal(
+            "85004",
+            _dogfood(gen=gen, head=head, lane=lane),
+            _issuer(ISSUER_COORDINATOR, gen=gen, lane=lane),
+        ),
     ]
 
 
@@ -313,7 +338,9 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
         def mutate(world):
             gen = world.store.get(LaneLifecycleKey(WS, LANE)).lane_generation
             world.journals.append(EvidenceJournal(
-                "85009", _review(gen=gen, conclusion="changes_requested"), ISSUER_REVIEW_GATEWAY
+                "85009",
+                _review(gen=gen, conclusion="changes_requested"),
+                _issuer(ISSUER_REVIEW_GATEWAY, gen=gen),
             ))
 
         self._drift(mutate)
@@ -322,10 +349,11 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
         # A heading-form deferral carries no enveloped marker. It must still SUPERSEDE the older
         # merge record (declaration wins by existing), not be skipped as unreadable.
         def mutate(world):
+            gen = world.store.get(LaneLifecycleKey(WS, LANE)).lane_generation
             world.journals.append(EvidenceJournal(
                 "85010",
                 "## Integration disposition: explicit_deferral\n- reason: waiting",
-                ISSUER_COORDINATOR,
+                _issuer(ISSUER_COORDINATOR, gen=gen),
             ))
 
         self._drift(mutate)
@@ -367,7 +395,7 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
             world.journals.append(EvidenceJournal(
                 "85011",
                 _ci(gen=gen, run="300") + "\n" + _ci(gen=gen, head=NEW_HEAD, run="301"),
-                ISSUER_COORDINATOR,
+                _issuer(ISSUER_COORDINATOR, gen=gen),
             ))
 
         self._drift(mutate)
@@ -382,7 +410,9 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
             candidate = self._build(world)
             gen = world.store.get(LaneLifecycleKey(WS, LANE)).lane_generation
             world.journals.append(
-                EvidenceJournal("85011", _ci(gen=gen, run="300"), ISSUER_COORDINATOR)
+                EvidenceJournal(
+                    "85011", _ci(gen=gen, run="300"), _issuer(ISSUER_COORDINATOR, gen=gen)
+                )
             )
             result = self._run(world, candidate)
             self.assertEqual(result.mutations, 1)
@@ -392,8 +422,9 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
         # The most ordinary drift there is: a re-review is requested between build and actuation.
         # The old approval answers the old question, so the lane stops qualifying at once.
         def mutate(world):
+            gen = world.store.get(LaneLifecycleKey(WS, LANE)).lane_generation
             world.journals.append(
-                EvidenceJournal("85020", _request(), ISSUER_LANE_WORKER)
+                EvidenceJournal("85020", _request(), _issuer(ISSUER_LANE_WORKER, gen=gen))
             )
 
         self._drift(mutate)
@@ -404,7 +435,7 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
         def mutate(world):
             gen = world.store.get(LaneLifecycleKey(WS, LANE)).lane_generation
             world.journals.append(
-                EvidenceJournal("85021", _ci(gen=gen), ISSUER_LANE_WORKER)
+                EvidenceJournal("85021", _ci(gen=gen), _issuer(ISSUER_LANE_WORKER, gen=gen))
             )
 
         self._drift(mutate)

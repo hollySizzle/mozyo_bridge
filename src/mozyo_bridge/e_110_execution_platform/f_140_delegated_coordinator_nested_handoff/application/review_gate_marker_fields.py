@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 from typing import Optional
 
+from ..domain.hibernate_evidence_envelope import MARKER_FORBIDDEN_CHARS
+
 _REVIEW_REQUEST_GATE = "review_request"
 _REVIEW_RESULT_GATE = "review_result"
 
@@ -69,6 +71,11 @@ def lane_envelope_marker_fields(args: argparse.Namespace) -> "tuple[dict, Option
 
     Returns ``({}, None)`` when none of the three is supplied (a legacy marker). When ANY is supplied,
     all three are required and the generation must be a positive integer, else a fixed refusal token.
+
+    An identity carrying a marker separator is refused HERE with a typed token as well as by the
+    renderer (checkpoint j#86443 R2-F3): the renderer raises, which is right for a producer bug, but
+    a CLI argument is operator input and deserves the same fixed refusal vocabulary as the other
+    malformed inputs.
     """
     ws = (getattr(args, "evidence_workspace", None) or "").strip()
     lane = (getattr(args, "evidence_lane", None) or "").strip()
@@ -77,6 +84,8 @@ def lane_envelope_marker_fields(args: argparse.Namespace) -> "tuple[dict, Option
         return {}, None
     if not ws or not lane or not gen_raw:
         return {}, "evidence_envelope_incomplete"
+    if any(bad in value for value in (ws, lane) for bad in MARKER_FORBIDDEN_CHARS):
+        return {}, "evidence_envelope_malformed_identity"
     if not gen_raw.isdigit() or int(gen_raw) <= 0:
         return {}, "evidence_envelope_malformed_generation"
     return {

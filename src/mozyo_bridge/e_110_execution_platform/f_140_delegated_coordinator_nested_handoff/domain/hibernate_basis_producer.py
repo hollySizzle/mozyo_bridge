@@ -64,8 +64,10 @@ from .glance_integration_disposition import (
 from .hibernate_evidence_authority import (
     MARKER_GATE_REVIEW_RESULT,
     EvidenceJournal,
+    ResolvedIssuer,
     as_pairs,
-    check_issuer,
+    check_issuer_lane,
+    check_issuer_resolution,
 )
 from .hibernate_candidate import (
     BASIS_DEPENDENCY_PARK,
@@ -86,7 +88,11 @@ from .hibernate_candidate import (
     PROVENANCE_REVIEW_RECORD,
     BasisConjunct,
 )
-from .hibernate_evidence_envelope import EnvelopeParseError, parse_lane_envelope
+from .hibernate_evidence_envelope import (
+    EnvelopeParseError,
+    LaneEvidenceEnvelope,
+    parse_lane_envelope,
+)
 from .hibernate_evidence_integration import (
     IntegrationEvidence,
     IntegrationEvidenceError,
@@ -119,8 +125,13 @@ GAP_REVIEW_MISSING_CONCLUSION = "review_missing_conclusion"
 GAP_REVIEW_MISSING_REQ = "review_missing_request_correlation"
 #: No ``review_request`` was ever declared, so no approval can be correlated to one.
 GAP_REVIEW_REQUEST_ABSENT = "review_request_absent"
-#: The approval answers a review_request that is not the current one (a superseded generation).
+#: A NEWER review_request was filed after this result: the review generation has moved on, so the
+#: approval — genuine for its own round — is no longer current evidence.
 GAP_REVIEW_REQUEST_SUPERSEDED = "review_request_superseded"
+#: The approval's ``req`` does not name the request this result actually answers (the greatest
+#: request strictly before it). A ``req`` pointing at a LATER journal lands here too: a result
+#: cannot answer a question that did not exist yet.
+GAP_REVIEW_REQUEST_UNCORRELATED = "review_request_uncorrelated"
 #: The approval and the request it names do not agree on the head under review.
 GAP_REVIEW_REQUEST_HEAD_MISMATCH = "review_request_head_mismatch"
 #: The delegation's release issue carries no matching receipt (or none was supplied to check).
@@ -245,7 +256,7 @@ class _Declaration:
 
     journal: str = ""
     markers: tuple = ()
-    issuer_role: str = ""
+    issuer: ResolvedIssuer = ResolvedIssuer()
     notes: str = ""
 
     @property
@@ -284,7 +295,7 @@ def _latest_gate_declaration(
             latest = (jint, _Declaration(
                 journal=str(jint),
                 markers=found,
-                issuer_role=journal.issuer_role,
+                issuer=journal.issuer,
                 notes=journal.notes or "",
             ))
     return _Declaration() if latest is None else latest[1]
@@ -309,10 +320,19 @@ def _latest_disposition_declaration(journals: Sequence[EvidenceJournal]) -> _Dec
         return _Declaration(
             journal=facts.journal,
             markers=_markers_of(journal.notes, MARKER_GATE_INTEGRATION_DISPOSITION),
-            issuer_role=journal.issuer_role,
+            issuer=journal.issuer,
             notes=journal.notes or "",
         )
     return _Declaration()
+
+
+def _issuer_scope(conjunct: BasisConjunct) -> LaneEvidenceEnvelope:
+    """The lane identity a produced conjunct was bound to, for the issuer's lane comparison."""
+    return LaneEvidenceEnvelope(
+        workspace=conjunct.bound_workspace,
+        lane=conjunct.bound_lane,
+        lane_generation=conjunct.bound_generation,
+    )
 
 
 def _conjunct(
@@ -329,23 +349,62 @@ def _conjunct(
     )
 
 
-def _current_review_request(journals: Sequence[EvidenceJournal]) -> Tuple[str, str]:
-    """The issue's CURRENT ``review_request`` declaration as ``(journal_id, head)`` (pure).
+def _answered_review_request(
+    journals: Sequence[EvidenceJournal], *, result_journal: str
+) -> Tuple[str, str]:
+    """The ``review_request`` the result on ``result_journal`` answers, as ``(journal_id, head)``.
 
-    Latest-wins by existence, like every other declaration here: a new review_request opens a new
-    review generation, so an approval that answers an earlier one is answering a superseded
-    question. The request's own writer is deliberately not issuer-checked — it is the correlation
-    anchor being pointed at, not an authority asserting a conjunct.
+    The repo already has this rule, twice — :func:`correlated_review_request_journal` (the review
+    return route) and the glance's canonical review outcome both define the answered request as the
+    GREATEST request journal STRICTLY BEFORE the result. This producer must not become a third,
+    looser definition of the same relation (checkpoint j#86443 R2-F1): reading "the issue's latest
+    request" instead let a result written at journal 100 name ``req=200``, and a request arriving
+    later at journal 200 then activated that pre-written approval retroactively. A request in the
+    SAME journal as the result is excluded for the same reason — Redmine ids are monotonic, so an
+    answer cannot share a record with the question it answers.
+
+    The request's own writer is deliberately not issuer-checked: it is the correlation anchor being
+    pointed at, not an authority asserting a conjunct.
     """
-    declaration = _latest_gate_declaration(journals, gate=MARKER_GATE_REVIEW_REQUEST)
-    if not declaration.exists:
+    result_id = _journal_int(result_journal)
+    if result_id is None:
         return "", ""
-    heads = {
-        str(fields.get(FIELD_HEAD, "") or "").strip() for fields in declaration.markers
-    }
+    best: Optional[Tuple[int, tuple]] = None
+    for journal in journals or ():
+        jint = _journal_int(journal.journal_id)
+        if jint is None or jint >= result_id:
+            continue
+        markers = _markers_of(journal.notes, MARKER_GATE_REVIEW_REQUEST)
+        if not markers:
+            continue
+        if best is None or jint > best[0]:
+            best = (jint, markers)
+    if best is None:
+        return "", ""
+    heads = {str(fields.get(FIELD_HEAD, "") or "").strip() for fields in best[1]}
     # A request journal whose markers disagree about the head names no single head: an empty head
     # cannot match any approval, which is the fail-closed direction.
-    return declaration.journal, heads.pop() if len(heads) == 1 else ""
+    return str(best[0]), heads.pop() if len(heads) == 1 else ""
+
+
+def _review_request_after(
+    journals: Sequence[EvidenceJournal], *, result_journal: str
+) -> bool:
+    """Whether a ``review_request`` was filed AFTER the result on ``result_journal`` (pure).
+
+    A re-review request re-opens the round. The old approval remains a true record of the round it
+    closed, but it is no longer evidence that the lane is currently approved — the same
+    "latest declaration wins by existing" rule the rest of this producer runs on.
+    """
+    result_id = _journal_int(result_journal)
+    if result_id is None:
+        return False
+    return any(
+        _journal_int(journal.journal_id) is not None
+        and _journal_int(journal.journal_id) > result_id
+        and _markers_of(journal.notes, MARKER_GATE_REVIEW_REQUEST)
+        for journal in journals or ()
+    )
 
 
 def _produce_review_approved(
@@ -387,7 +446,7 @@ def _produce_review_approved(
     if not request_journal:
         return None, EvidenceGap(CONJUNCT_REVIEW_APPROVED, GAP_REVIEW_REQUEST_ABSENT)
     if req != request_journal:
-        return None, EvidenceGap(CONJUNCT_REVIEW_APPROVED, GAP_REVIEW_REQUEST_SUPERSEDED, req)
+        return None, EvidenceGap(CONJUNCT_REVIEW_APPROVED, GAP_REVIEW_REQUEST_UNCORRELATED, req)
     if not request_head or request_head != bound.head:
         return None, EvidenceGap(CONJUNCT_REVIEW_APPROVED, GAP_REVIEW_REQUEST_HEAD_MISMATCH)
 
@@ -439,15 +498,28 @@ def _governed_field(notes: str, name: str) -> str:
     return match.group("value").strip().strip("`") if match else ""
 
 
-#: The governed fixed fields a park journal records (skill ``references/workflow.md``: dependency
-#: hold is parked on a durable record with these fields). The park marker claims the lane is parked;
-#: these are the record that claim has to sit in.
-_PARK_REQUIRED_FIELDS = ("blocked_by", "resume_condition", "resume_owner")
+#: The governed fixed fields a parked-state journal records, per the skill's own fixed field shape
+#: (``references/workflow.md`` ``## Sublane 完了 guardrail``): the parked state is a handoff-worthy
+#: ``blocked`` state, so besides the dependency fields it carries the ``durable_anchor`` it is filed
+#: against and the ``callback_result`` that makes the state complete.
+#:
+#: The COMPLETE set is required, not a convenient subset (checkpoint j#86443 R2-F4). Checking four
+#: of the six let a note that never called back — the exact failure the guardrail was written for
+#: (`progress_without_callback`) — read as an affirmative park basis. "The lane is parked" and "the
+#: park was handed off" are one durable state in that contract, so the producer requires the whole
+#: record rather than leaving half of it to an action-time obligation.
+_PARK_REQUIRED_FIELDS = (
+    "blocked_by",
+    "resume_condition",
+    "resume_owner",
+    "durable_anchor",
+    "callback_result",
+)
 _PARK_STATE_BLOCKED = "blocked"
 
 
 def _park_journal_recorded(notes: str) -> bool:
-    """Whether the note carries the governed fixed-field park journal (pure)."""
+    """Whether the note carries the COMPLETE governed fixed-field parked-state journal (pure)."""
     if _governed_field(notes, "state").lower() != _PARK_STATE_BLOCKED:
         return False
     return all(_governed_field(notes, name) for name in _PARK_REQUIRED_FIELDS)
@@ -533,7 +605,6 @@ def produce_basis_conjuncts(
     conjuncts: list[BasisConjunct] = []
     gaps: list[EvidenceGap] = []
     evidence_journals: dict[str, str] = {}
-    request_journal, request_head = _current_review_request(journals)
 
     for key in _BASIS_CONJUNCTS.get(basis, ()):
         if key == CONJUNCT_COMMITS_PUSHED:
@@ -563,16 +634,34 @@ def produce_basis_conjuncts(
             continue
 
         # WHO wrote the current declaration, judged before anything it says is read. The marker's
-        # own `gate=` cannot confer the authority its content is about to be credited with.
-        issuer_gap = check_issuer(gate, declaration.issuer_role)
+        # own `gate=` cannot confer the authority its content is about to be credited with. The
+        # second half of the check — whether that authority is over the lane the evidence is ABOUT
+        # — needs the parsed envelope and runs once the conjunct exists.
+        issuer_gap = check_issuer_resolution(gate, declaration.issuer)
         if issuer_gap is not None:
             gaps.append(EvidenceGap(key, issuer_gap, declaration.journal))
             continue
 
         if key == CONJUNCT_REVIEW_APPROVED:
-            produced, gap = _produce_review_approved(
-                declaration.markers, request_journal=request_journal, request_head=request_head
-            )
+            # Two independent questions about the same approval:
+            #   1. does it answer the request it claims to (the one immediately before it)?
+            #   2. is that round still the current one, or has a re-review been requested since?
+            # (1) is the canonical correlation rule; (2) is what keeps an approval from outliving
+            # its round. A later request cannot retroactively validate an earlier approval (it is
+            # not the answered request), and it also invalidates the round that approval closed.
+            if _review_request_after(journals, result_journal=declaration.journal):
+                produced, gap = None, EvidenceGap(
+                    CONJUNCT_REVIEW_APPROVED, GAP_REVIEW_REQUEST_SUPERSEDED, declaration.journal
+                )
+            else:
+                request_journal, request_head = _answered_review_request(
+                    journals, result_journal=declaration.journal
+                )
+                produced, gap = _produce_review_approved(
+                    declaration.markers,
+                    request_journal=request_journal,
+                    request_head=request_head,
+                )
         elif key == CONJUNCT_STAGING_INTEGRATED:
             produced, gap = _produce_staging_integrated(declaration.markers)
         else:
@@ -587,6 +676,15 @@ def produce_basis_conjuncts(
         if gap is not None:
             gaps.append(gap)
             continue
+
+        # Lane-scoped authority: the writer's own lane must be the lane the evidence declares
+        # (checkpoint j#86443 R2-F2). Compared against what the producer TRANSCRIBED, so a foreign
+        # lane's worker cannot acquire this lane's authority by writing this lane's envelope.
+        lane_gap = check_issuer_lane(gate, declaration.issuer, _issuer_scope(produced))
+        if lane_gap is not None:
+            gaps.append(EvidenceGap(key, lane_gap, declaration.journal))
+            continue
+
         conjuncts.append(produced)
         evidence_journals[key] = declaration.journal
 

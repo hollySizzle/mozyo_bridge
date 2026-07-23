@@ -43,6 +43,10 @@ import re
 from dataclasses import dataclass
 from typing import ClassVar, Iterable, Mapping, Protocol, Sequence
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
+    LaneEvidenceEnvelope,
+    render_lane_envelope,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
     JournalMarker,
     JournalMarkerError,
@@ -504,6 +508,38 @@ def dispatch_entry_journal_from_source(
     )
 
 
+def _render_evidence_envelope(
+    workspace: object, lane: object, lane_generation: object
+) -> str:
+    """The hibernate-evidence lane envelope fields, or ``""`` when none was supplied (pure).
+
+    All-or-none: supplying part of the envelope is a producer error, not a partial envelope — a
+    marker carrying ``workspace`` but no ``lane`` would read as unenveloped evidence while looking
+    enveloped to a human. The values themselves go through the shared strict renderer
+    (:func:`render_lane_envelope`), which refuses a non-positive generation, an empty identity, and
+    any value carrying a marker separator.
+    """
+    supplied = [v for v in (workspace, lane, lane_generation) if v is not None]
+    if not supplied:
+        return ""
+    if len(supplied) != 3:
+        raise ValueError(
+            "the hibernate-evidence lane envelope is all-or-none: "
+            "workspace, lane and lane_generation must be supplied together"
+        )
+    try:
+        generation = int(lane_generation)
+    except (TypeError, ValueError):
+        raise ValueError(f"lane_generation must be an integer, got {lane_generation!r}") from None
+    return render_lane_envelope(
+        LaneEvidenceEnvelope(
+            workspace=str(workspace).strip(),
+            lane=str(lane).strip(),
+            lane_generation=generation,
+        )
+    )
+
+
 def render_workflow_event_marker(
     gate: str,
     *,
@@ -575,14 +611,17 @@ def render_workflow_event_marker(
     # (``workspace``/``lane``/``lane_generation``). ADDITIVE and opt-in — a marker without it is
     # unchanged for the review generation fence / glance (which never read these keys), and simply
     # fails closed as auto-hibernate evidence (a superseded generation's evidence cannot be reused).
-    # workspace/lane are identifiers and the generation an integer, so none collides with the
-    # ``:``/``=`` grammar.
-    if evidence_workspace is not None:
-        fields.append(f"workspace={str(evidence_workspace).strip()}")
-    if evidence_lane is not None:
-        fields.append(f"lane={str(evidence_lane).strip()}")
-    if evidence_lane_generation is not None:
-        fields.append(f"lane_generation={int(evidence_lane_generation)}")
+    #
+    # Rendered through the SAME strict renderer as every other hibernate-evidence marker
+    # (checkpoint j#86443 R2-F3). Concatenating these fields directly is what let
+    # ``evidence_workspace='ws:lane=forged'`` inject a second ``lane`` field ahead of the real one
+    # and ``evidence_lane='lane]truncated'`` close the marker early. review_result is one of the
+    # evidence kinds, so it is not exempt from "a renderer must refuse what its parser refuses".
+    envelope_fields = _render_evidence_envelope(
+        evidence_workspace, evidence_lane, evidence_lane_generation
+    )
+    if envelope_fields:
+        fields.append(envelope_fields)
     return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{':'.join(fields)}]"
 
 

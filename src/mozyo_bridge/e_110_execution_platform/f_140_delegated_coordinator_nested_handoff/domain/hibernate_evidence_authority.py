@@ -8,21 +8,38 @@ issuer — any actor able to write a journal could emit a coordinator-shaped ``r
 and it would be read as ``durable_ci_record``. A marker's self-declared authority is not authority.
 
 So the WRITER travels with the record, not inside it. A :class:`EvidenceJournal` carries the
-``issuer_role`` the journal PORT resolved from the durable source's own author metadata (the
-Redmine journal's user), and :func:`check_issuer` refuses a record whose writer is not the actor
-that kind's authority belongs to.
+:class:`ResolvedIssuer` the journal PORT resolved for that record, and :func:`check_issuer` refuses
+a record whose writer is not the actor that kind's authority belongs to.
 
-Fail-closed twice over:
+**A role alone is not the authority** (checkpoint j#86443 R2-F2). The ruling fixes the review result
+to the SAME-LANE gateway and the park declaration to THAT lane's worker, so an issuer that is only
+``lane_worker`` cannot express the contract: a worker on a different lane (or on a superseded
+generation of this one) carries the identical token, and by writing the target lane's envelope it
+would pass. The resolved issuer therefore carries its own ``workspace`` / ``lane`` /
+``lane_generation``, and the check requires them to EXACT-MATCH the envelope the evidence declares.
+The evidence says which lane it is about; the issuer says which lane its writer holds authority
+over; only when those agree is the record that lane's authority speaking.
+
+``authority_anchor`` is the durable record the port resolved that binding FROM, and it is required
+to be non-empty. This is deliberately not decorative: in this very workspace every governed journal
+— gateway-written and worker-written alike — carries the same source-system author, so "the Redmine
+user who wrote it" cannot by itself identify the actor (measured on #14219's own journals). A port
+that cannot name the record binding a writer to a lane role has not resolved the writer, and
+:data:`ISSUER_UNRESOLVED` is the honest answer.
+
+Fail-closed three times over:
 
 * :data:`ISSUER_UNKNOWN` is the default. A port that cannot resolve the writer — or a caller that
   supplies bare ``(journal_id, notes)`` pairs — yields evidence that satisfies nothing. Blocking is
   the safe direction: an unresolved writer means we do not know whether the authority holds.
 * The role vocabulary is closed. An unrecognised role is not passed through to be compared
   hopefully against the expected one; it is the same typed zero as a mismatch.
+* An issuer with no lane identity, no positive generation, or no authority anchor is unresolved —
+  a partially-filled issuer never counts as a partially-satisfied authority.
 
-The mapping from a concrete durable identity (a Redmine user) to one of these roles is the PORT's
-job, not this module's: it depends on the workspace's role bindings, which live in configuration
-rather than in the evidence grammar.
+Which durable record binds a writer to a lane role is the PORT's decision (it depends on the
+workspace's role bindings and dispatch records, not on the evidence grammar). What this module
+fixes is that such a record must exist, must be named, and must be about THIS lane.
 """
 
 from __future__ import annotations
@@ -71,16 +88,64 @@ ISSUER_MISMATCH = "evidence_issuer_mismatch"
 
 
 @dataclass(frozen=True)
+class ResolvedIssuer:
+    """Who wrote a record, and over WHICH lane they hold that role.
+
+    Resolved by the journal port from durable records, never from the note body: a note can claim
+    anything. ``authority_anchor`` names the record the port resolved the binding from, so the
+    claim "this writer is that lane's worker" is itself traceable to something durable.
+    """
+
+    role: str = ISSUER_UNKNOWN
+    workspace: str = ""
+    lane: str = ""
+    lane_generation: int = 0
+    authority_anchor: str = ""
+
+    @property
+    def is_lane_bound(self) -> bool:
+        """Whether the issuer names a complete, positively-generationed lane with an anchor."""
+        return bool(
+            self.workspace
+            and self.lane
+            and isinstance(self.lane_generation, int)
+            and not isinstance(self.lane_generation, bool)
+            and self.lane_generation > 0
+            and self.authority_anchor
+        )
+
+    def covers(self, envelope) -> bool:
+        """Whether this writer's authority is over the exact lane the evidence is about."""
+        return (
+            self.is_lane_bound
+            and self.workspace == getattr(envelope, "workspace", "")
+            and self.lane == getattr(envelope, "lane", "")
+            and self.lane_generation == getattr(envelope, "lane_generation", 0)
+        )
+
+
+#: The roles whose authority is lane-scoped: the ruling binds the review result to the SAME-LANE
+#: gateway and the park declaration to THAT lane's worker. The coordinator's authority is
+#: workspace-level (integration / CI / dogfood are not the lane's own claims about itself), so it is
+#: not required to name a lane.
+_LANE_SCOPED_ROLES = frozenset({ISSUER_REVIEW_GATEWAY, ISSUER_LANE_WORKER})
+
+
+@dataclass(frozen=True)
 class EvidenceJournal:
     """One durable journal as the hibernate-evidence producer reads it.
 
-    ``issuer_role`` is resolved by the journal port from the record's own author, NOT from the note
-    body: a note can claim anything, while the author is the source system's fact.
+    ``issuer`` is resolved by the journal port from the record's own author and the durable records
+    binding that author to a lane role — NOT from the note body.
     """
 
     journal_id: str
     notes: str
-    issuer_role: str = ISSUER_UNKNOWN
+    issuer: ResolvedIssuer = ResolvedIssuer()
+
+    @property
+    def issuer_role(self) -> str:
+        return self.issuer.role
 
     def as_pair(self) -> Tuple[str, str]:
         """The ``(journal_id, notes)`` shape the pure marker folds consume."""
@@ -105,18 +170,52 @@ def unattributed(pairs: Sequence[Tuple[object, str]]) -> tuple[EvidenceJournal, 
     )
 
 
-def check_issuer(kind: str, role: str) -> "str | None":
-    """The typed refusal reason for a ``kind`` record written by ``role``, or ``None`` if allowed."""
+def check_issuer_resolution(kind: str, issuer: ResolvedIssuer) -> "str | None":
+    """The refusal knowable WITHOUT the evidence's envelope: is this writer that kind's authority?
+
+    Checked before a word of the record's content is read, so the marker never gets to influence
+    who is treated as its author:
+
+    1. the kind must be one this module has an authority for at all;
+    2. the writer must be RESOLVED — a known role, and for a lane-scoped role a complete lane
+       identity with an authority anchor (an unresolved writer is not a wrong writer);
+    3. the role must be the one that kind's authority belongs to.
+
+    The remaining question — whether that authority is over the lane the evidence is ABOUT — needs
+    the envelope and is :func:`check_issuer_lane`.
+    """
     expected = _KIND_ISSUER.get(kind)
     if expected is None:
         return ISSUER_MISMATCH
+    role = issuer.role
     if role not in ISSUER_ROLES or role == ISSUER_UNKNOWN:
+        return ISSUER_UNRESOLVED
+    if role in _LANE_SCOPED_ROLES and not issuer.is_lane_bound:
         return ISSUER_UNRESOLVED
     return None if role == expected else ISSUER_MISMATCH
 
 
+def check_issuer_lane(kind: str, issuer: ResolvedIssuer, envelope) -> "str | None":
+    """The refusal that needs the evidence's envelope: is the authority over THIS lane?
+
+    Checkpoint j#86443 R2-F2: a worker on another lane — or on a superseded generation of this one
+    — holds the same role token, so role equality alone let a foreign writer declare this lane
+    parked simply by writing this lane's envelope. Lane-scoped authority must cover the exact lane
+    the evidence declares. The coordinator's authority is workspace-level and is not lane-compared.
+    """
+    if _KIND_ISSUER.get(kind) not in _LANE_SCOPED_ROLES:
+        return None
+    return None if issuer.covers(envelope) else ISSUER_MISMATCH
+
+
+def check_issuer(kind: str, issuer: ResolvedIssuer, *, envelope) -> "str | None":
+    """Both halves of the issuer check. ``envelope`` is required — there is no lenient default."""
+    return check_issuer_resolution(kind, issuer) or check_issuer_lane(kind, issuer, envelope)
+
+
 __all__ = [
     "ISSUER_COORDINATOR",
+    "ResolvedIssuer",
     "ISSUER_LANE_WORKER",
     "ISSUER_MISMATCH",
     "ISSUER_REVIEW_GATEWAY",
@@ -127,5 +226,7 @@ __all__ = [
     "EvidenceJournal",
     "as_pairs",
     "check_issuer",
+    "check_issuer_lane",
+    "check_issuer_resolution",
     "unattributed",
 ]

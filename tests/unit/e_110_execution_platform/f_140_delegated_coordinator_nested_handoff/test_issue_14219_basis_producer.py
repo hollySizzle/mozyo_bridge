@@ -49,6 +49,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ISSUER_LANE_WORKER,
     ISSUER_REVIEW_GATEWAY,
     EvidenceJournal,
+    ResolvedIssuer,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
     LaneEvidenceEnvelope,
@@ -143,6 +144,8 @@ def _receipts(**overrides):
 #: The governed fixed-field park journal a park declaration must sit in.
 PARK_FIELDS = (
     "- state: blocked\n"
+    "- durable_anchor: #14219 j#85500\n"
+    "- callback_result: sent\n"
     "- blocked_by: 14150\n"
     "- resume_condition: #14150 の callback outcome journal 到達\n"
     "- resume_owner: coordinator\n"
@@ -168,8 +171,17 @@ def _push(reachable=True, head=HEAD, lane=LANE, gen=GEN):
     )
 
 
-def _journal(journal_id, notes, role):
-    return EvidenceJournal(journal_id=journal_id, notes=notes, issuer_role=role)
+def _issuer(role, *, workspace=WS, lane=LANE, gen=GEN, anchor="j#85300"):
+    """A port-resolved issuer: the role AND the lane that writer holds it over."""
+    return ResolvedIssuer(
+        role=role, workspace=workspace, lane=lane, lane_generation=gen, authority_anchor=anchor
+    )
+
+
+def _journal(journal_id, notes, role, **issuer_over):
+    return EvidenceJournal(
+        journal_id=journal_id, notes=notes, issuer=_issuer(role, **issuer_over)
+    )
 
 
 def _review_only_journals():
@@ -184,11 +196,20 @@ def _park_journals(**overrides):
     return [_journal("85500", overrides.get("park", _park_note()), ISSUER_LANE_WORKER)]
 
 
-def _early_journals(**overrides):
-    """The durable evidence journals an early-hibernate lane rests on, with their writers."""
+def _early_journals(*, review_issuer=None, **overrides):
+    """The durable evidence journals an early-hibernate lane rests on, with their writers.
+
+    ``review_issuer`` overrides the review record's resolved writer — needed whenever the review
+    itself is about another lane / generation, because that lane's gateway (not this one's) is the
+    actor who would have written it.
+    """
     return [
         _journal(REQ_JOURNAL, overrides.get("request", _request_note()), ISSUER_LANE_WORKER),
-        _journal("85400", overrides.get("review", _review_note()), ISSUER_REVIEW_GATEWAY),
+        EvidenceJournal(
+            "85400",
+            overrides.get("review", _review_note()),
+            review_issuer or _issuer(ISSUER_REVIEW_GATEWAY),
+        ),
         _journal("85410", overrides.get("integration", _integration_note()), ISSUER_COORDINATOR),
         _journal("85420", overrides.get("ci", _ci_note()), ISSUER_COORDINATOR),
         _journal("85430", overrides.get("dogfood", _dogfood_note()), ISSUER_COORDINATOR),
@@ -345,11 +366,19 @@ class ProducerNeverBindsToTheTargetTests(unittest.TestCase):
     """A drifted record must reach T1 with the identity IT declares, not the candidate's."""
 
     def test_cross_lane_review_is_transcribed_as_the_other_lane(self):
-        produced = _produce(_early_journals(review=_review_note(lane="other-lane")))
+        # Written by the OTHER lane's gateway about the other lane — a genuine record, correctly
+        # issued, simply not about this candidate. It reaches T1 carrying the lane it declares.
+        produced = _produce(_early_journals(
+            review=_review_note(lane="other-lane"),
+            review_issuer=_issuer(ISSUER_REVIEW_GATEWAY, lane="other-lane"),
+        ))
         self.assertEqual(_by_key(produced)[CONJUNCT_REVIEW_APPROVED].bound_lane, "other-lane")
 
     def test_old_generation_review_is_transcribed_as_the_old_generation(self):
-        produced = _produce(_early_journals(review=_review_note(gen=GEN - 1)))
+        produced = _produce(_early_journals(
+            review=_review_note(gen=GEN - 1),
+            review_issuer=_issuer(ISSUER_REVIEW_GATEWAY, gen=GEN - 1),
+        ))
         self.assertEqual(_by_key(produced)[CONJUNCT_REVIEW_APPROVED].bound_generation, GEN - 1)
 
     def test_drifted_head_is_transcribed_as_the_drifted_head(self):
@@ -387,6 +416,52 @@ class ReviewRequestCorrelationTests(unittest.TestCase):
     def test_an_approval_with_no_review_request_at_all_is_a_gap(self):
         journals = [j for j in _early_journals() if j.journal_id != REQ_JOURNAL]
         self.assertEqual(self._review_gap(journals), bp.GAP_REVIEW_REQUEST_ABSENT)
+
+    def test_an_approval_written_before_the_request_it_names_is_a_gap(self):
+        # Checkpoint j#86443 R2-F1: a result at journal 100 naming `req=200`, with the request
+        # arriving later at 200, previously became a satisfied conjunct — a pre-written approval
+        # activated retroactively by a future request. A result answers the request BEFORE it.
+        result = _journal("100", _review_note(), ISSUER_REVIEW_GATEWAY)
+        later_request = _journal("200", _request_note(), ISSUER_LANE_WORKER)
+        journals = [result, later_request]
+        gaps = _gaps(_produce(journals))
+        self.assertIn(gaps.get(CONJUNCT_REVIEW_APPROVED), {
+            bp.GAP_REVIEW_REQUEST_SUPERSEDED, bp.GAP_REVIEW_REQUEST_UNCORRELATED
+        })
+
+    def test_a_request_in_the_same_journal_as_the_result_does_not_correlate(self):
+        # Redmine ids are monotonic: an answer cannot share a record with its own question. The
+        # result NAMES its own journal, so only the strictly-before rule refuses it — a rule that
+        # accepted `>=` would find a matching request and call the approval correlated.
+        review = "review\n" + render_workflow_event_marker(
+            "review_result",
+            target_head=HEAD,
+            review_request_journal="300",
+            conclusion="approved",
+            evidence_workspace=WS,
+            evidence_lane=LANE,
+            evidence_lane_generation=GEN,
+        )
+        note = _request_note() + "\n" + review
+        self.assertEqual(
+            _gaps(_produce([_journal("300", note, ISSUER_REVIEW_GATEWAY)])).get(
+                CONJUNCT_REVIEW_APPROVED
+            ),
+            bp.GAP_REVIEW_REQUEST_ABSENT,
+        )
+
+    def test_the_answered_request_is_the_nearest_preceding_one(self):
+        # Two rounds: the result must correlate with round 2's request, not round 1's.
+        journals = [
+            _journal("100", _request_note(), ISSUER_LANE_WORKER),
+            _journal("200", _request_note(), ISSUER_LANE_WORKER),
+            _journal("300", _review_note(), ISSUER_REVIEW_GATEWAY),
+        ]
+        # `_review_note` names REQ_JOURNAL, which is neither: uncorrelated.
+        self.assertEqual(
+            _gaps(_produce(journals)).get(CONJUNCT_REVIEW_APPROVED),
+            bp.GAP_REVIEW_REQUEST_UNCORRELATED,
+        )
 
     def test_an_approval_answering_a_superseded_request_is_a_gap(self):
         # A newer review_request opens a new review generation; the old approval answers the old
@@ -443,6 +518,56 @@ class IssuerAuthorityTests(unittest.TestCase):
         gaps = _gaps(_produce(list(journals)))
         self.assertEqual(gaps.get(CONJUNCT_REVIEW_APPROVED), "evidence_issuer_unresolved")
 
+    def test_a_foreign_lanes_worker_cannot_declare_this_lane_parked(self):
+        # Checkpoint j#86443 R2-F2: role equality alone let ANY lane's worker declare THIS lane
+        # parked, simply by writing this lane's envelope. The writer's own lane must be the lane
+        # the evidence is about.
+        journals = [EvidenceJournal(
+            "85500", _park_note(), _issuer(ISSUER_LANE_WORKER, lane="other-lane")
+        )]
+        self.assertEqual(
+            _gaps(_produce(journals, basis=BASIS_DEPENDENCY_PARK)).get(CONJUNCT_PARK_DECLARED),
+            "evidence_issuer_mismatch",
+        )
+
+    def test_a_superseded_generations_worker_cannot_declare_this_lane_parked(self):
+        journals = [EvidenceJournal(
+            "85500", _park_note(), _issuer(ISSUER_LANE_WORKER, gen=GEN - 1)
+        )]
+        self.assertEqual(
+            _gaps(_produce(journals, basis=BASIS_DEPENDENCY_PARK)).get(CONJUNCT_PARK_DECLARED),
+            "evidence_issuer_mismatch",
+        )
+
+    def test_a_foreign_lanes_gateway_cannot_approve_this_lanes_review(self):
+        journals = _early_journals(
+            review_issuer=_issuer(ISSUER_REVIEW_GATEWAY, lane="other-lane")
+        )
+        self.assertEqual(
+            _gaps(_produce(journals)).get(CONJUNCT_REVIEW_APPROVED), "evidence_issuer_mismatch"
+        )
+
+    def test_an_issuer_without_an_authority_anchor_is_unresolved(self):
+        # The port must name the durable record it resolved the lane-role binding FROM: in this
+        # workspace every governed journal shares one source-system author, so an unanchored
+        # "this is the lane worker" is not a resolution.
+        journals = [EvidenceJournal(
+            "85500", _park_note(), _issuer(ISSUER_LANE_WORKER, anchor="")
+        )]
+        self.assertEqual(
+            _gaps(_produce(journals, basis=BASIS_DEPENDENCY_PARK)).get(CONJUNCT_PARK_DECLARED),
+            "evidence_issuer_unresolved",
+        )
+
+    def test_the_coordinators_authority_is_not_lane_scoped(self):
+        # Negative control for the lane comparison: the coordinator writes integration / CI /
+        # dogfood records that are not the lane's own claims about itself, so requiring a lane
+        # identity there would block every legitimate coordinator record.
+        journals = _early_journals()
+        produced = _produce(journals)
+        self.assertEqual(produced.gaps, ())
+        self.assertTrue(_by_key(produced)[CONJUNCT_REQUIRED_CI_GREEN].satisfied)
+
     def test_the_issuer_of_the_current_declaration_is_the_one_judged(self):
         # A newer CI record written by the wrong actor is not rescued by the older well-written one.
         journals = _early_journals()
@@ -490,6 +615,26 @@ class CorroborationTests(unittest.TestCase):
             bp.GAP_PARK_JOURNAL_FIELDS_ABSENT,
         )
 
+    def test_a_park_journal_that_never_called_back_is_a_gap(self):
+        # Checkpoint j#86443 R2-F4: the parked state is a handoff-worthy `blocked` state, so the
+        # governed record includes `callback_result` (and the `durable_anchor` it is filed
+        # against). Checking only the dependency fields let exactly the failure the guardrail was
+        # written for -- a park nobody was told about -- read as an affirmative basis.
+        for missing in ("callback_result", "durable_anchor"):
+            with self.subTest(missing=missing):
+                fields = "".join(
+                    line + "\n"
+                    for line in PARK_FIELDS.strip().split("\n")
+                    if not line.startswith(f"- {missing}:")
+                )
+                journals = _park_journals(park=_park_note(park_fields=fields))
+                self.assertEqual(
+                    _gaps(_produce(journals, basis=BASIS_DEPENDENCY_PARK)).get(
+                        CONJUNCT_PARK_DECLARED
+                    ),
+                    bp.GAP_PARK_JOURNAL_FIELDS_ABSENT,
+                )
+
     def test_a_fully_recorded_park_still_satisfies(self):
         produced = _produce(_park_journals(), basis=BASIS_DEPENDENCY_PARK)
         self.assertEqual(produced.gaps, ())
@@ -525,11 +670,17 @@ class EndToEndClassificationTests(unittest.TestCase):
         self.assertEqual(got.reason, NON_CANDIDATE_BASIS_UNSATISFIED)
 
     def test_cross_lane_evidence_is_an_anchor_mismatch(self):
-        got = self._classify(_produce(_early_journals(review=_review_note(lane="other-lane"))))
+        got = self._classify(_produce(_early_journals(
+            review=_review_note(lane="other-lane"),
+            review_issuer=_issuer(ISSUER_REVIEW_GATEWAY, lane="other-lane"),
+        )))
         self.assertEqual(got.reason, NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
 
     def test_old_generation_evidence_is_an_anchor_mismatch(self):
-        got = self._classify(_produce(_early_journals(review=_review_note(gen=GEN - 1))))
+        got = self._classify(_produce(_early_journals(
+            review=_review_note(gen=GEN - 1),
+            review_issuer=_issuer(ISSUER_REVIEW_GATEWAY, gen=GEN - 1),
+        )))
         self.assertEqual(got.reason, NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
 
     def test_head_drifted_evidence_is_an_anchor_mismatch(self):
