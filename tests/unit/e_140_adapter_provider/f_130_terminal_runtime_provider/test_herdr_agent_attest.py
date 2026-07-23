@@ -50,6 +50,48 @@ _GOOD_ENV = {
 }
 
 
+# The CLI's own diagnostics, verbatim (`die` / `warn` in mozyo_bridge.shared.errors emit
+# exactly one prefixed line each). Kept as constants so the fail-closed contract has ONE
+# spelling that a mutation has to break.
+MISSING_PROVIDER_ARGV_ERROR = (
+    "error: herdr agent-attest requires a provider command after `--` to exec "
+    "(usage: herdr agent-attest --assigned-name ... -- <provider> [args...])"
+)
+ARGV0_ALIAS_UNBOUND_ERROR = (
+    "error: MOZYO_PROVIDER_ARGV0 did not verify as a trusted alias bound to the "
+    "provider exec target (an absolute exec-target realpath named by an absolute "
+    "same-file alias); refusing to launch with an unverified argv[0]"
+)
+
+# `die` / `warn` are the only ways this CLI writes to stderr, and both prefix their one
+# line. Everything else in a captured buffer came from the host or the interpreter.
+_CLI_DIAGNOSTIC_PREFIXES = ("error: ", "warning: ")
+
+
+def cli_diagnostic_lines(captured_stderr: str) -> list[str]:
+    """The lines the CLI itself wrote, separated from host / interpreter stderr noise.
+
+    Redmine #14250: ``contextlib.redirect_stderr`` captures the whole process-level
+    ``sys.stderr`` for the duration of the block, so an interpreter warning that happens
+    to fire during the call under test (``warnings.warn`` writes through ``sys.stderr``,
+    once per location — hence order-dependent and invisible to a focused run) lands in
+    the same buffer. Asserting equality on that buffer made an execution-environment
+    artifact part of the verdict and turned the full suite non-deterministically red.
+
+    So classify instead of compare-everything: return only the CLI's own prefixed
+    diagnostic lines, in order. Callers still assert **exact list equality** against the
+    expected message, so the fail-closed contract is not loosened one character — a
+    reworded, extra, missing, or duplicated CLI diagnostic is still red. What is excluded
+    is only what the CLI did not write. Noise that does start with a CLI prefix is kept
+    deliberately: this filter may never make the assertion weaker than it looks.
+    """
+    return [
+        line
+        for line in captured_stderr.splitlines()
+        if line.startswith(_CLI_DIAGNOSTIC_PREFIXES)
+    ]
+
+
 def _runner(*rows):
     """A fake subprocess runner returning ``rows`` as an `agent list` JSON payload."""
     import json as _json
@@ -400,9 +442,7 @@ class CmdAgentAttestTest(unittest.TestCase):
             execvp.assert_not_called()
         self.assertEqual(raised.exception.code, 2)
         self.assertEqual(
-            stderr.getvalue(),
-            "error: herdr agent-attest requires a provider command after `--` to exec "
-            "(usage: herdr agent-attest --assigned-name ... -- <provider> [args...])\n",
+            cli_diagnostic_lines(stderr.getvalue()), [MISSING_PROVIDER_ARGV_ERROR]
         )
 
 
@@ -555,7 +595,10 @@ class CmdAgentAttestArgv0DecouplingTest(unittest.TestCase):
 
     def _assert_alias_fails_closed(self, provider_argv, alias) -> None:
         # A set-but-unbound alias dies typed/value-free: NEITHER exec runs (no launch),
-        # and the value is dropped from the env even on the failure path.
+        # and the value is dropped from the env even on the failure path. The diagnostic
+        # is asserted structurally (#14250): exactly one CLI line, exactly this text —
+        # host / interpreter stderr that shares the capture buffer is not part of the
+        # verdict. See :func:`cli_diagnostic_lines`.
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             execv, execvp, leftover = self._run(
@@ -565,10 +608,7 @@ class CmdAgentAttestArgv0DecouplingTest(unittest.TestCase):
         execvp.assert_not_called()
         self.assertIsNone(leftover)
         self.assertEqual(
-            stderr.getvalue(),
-            "error: MOZYO_PROVIDER_ARGV0 did not verify as a trusted alias bound to "
-            "the provider exec target (an absolute exec-target realpath named by an "
-            "absolute same-file alias); refusing to launch with an unverified argv[0]\n",
+            cli_diagnostic_lines(stderr.getvalue()), [ARGV0_ALIAS_UNBOUND_ERROR]
         )
 
     def test_relative_alias_fails_closed(self) -> None:
