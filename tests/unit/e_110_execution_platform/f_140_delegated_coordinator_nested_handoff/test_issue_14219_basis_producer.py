@@ -1135,9 +1135,10 @@ class CorroborationTests(unittest.TestCase):
                 self.assertEqual(produced.gaps, ())
 
     def test_a_finite_submit_delay_is_a_delivery(self):
-        # Positive control for the submit-delay rule (checkpoint j#86687 R21-F2): the rail
-        # clamps then sleeps a finite delay and presses Enter.
-        for suffix in (" --submit-delay 0", " --submit-delay 0.5"):
+        # Positive control for the submit-delay rule (checkpoint j#86687 R21-F2 / j#86693
+        # R22-F1): the rail clamps then sleeps an in-domain delay and presses Enter — the
+        # contract bound itself is the last deliverable value.
+        for suffix in (" --submit-delay 0", " --submit-delay 0.5", " --submit-delay 3600"):
             with self.subTest(suffix=suffix):
                 detail = (
                     "- target: coordinator\n"
@@ -1869,6 +1870,22 @@ class CorroborationTests(unittest.TestCase):
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
                         f" / retry command: {RETRY_COMMAND} --submit-delay inf\n"),
+            # -- checkpoint j#86693 R22-F1: huge FINITE delays never reach Enter either --------
+            # The host's time_t line is a moving, host-dependent boundary, so the contract
+            # bound MAX_SUBMIT_DELAY_SECONDS is what the record is judged against.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine"
+                     " --kind reply --issue 14219 --journal 85500 --target coordinator"
+                     " --mode queue-enter --submit-delay 1e308"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --submit-delay 3600.01"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        f" / retry command: {RETRY_COMMAND} --submit-delay 1e12\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
@@ -2152,23 +2169,39 @@ class SendSemanticsSharedAuthorityTests(unittest.TestCase):
         check_explicit_profile_fields("coordinator", {"redmine_project": "proj-a"})
         check_explicit_profile_fields("coordinator", {})
 
-    def test_the_authority_matches_the_canonical_submit_delay_clamp(self):
-        # checkpoint j#86687 R21-F2: the rule mirrors the rail's own clamp expression, so
-        # negative and nan clamp to zero and DELIVER while positive infinity is refused.
+    def test_the_authority_matches_the_canonical_submit_delay_domain(self):
+        # checkpoint j#86687 R21-F2 / j#86693 R22-F1: the rule mirrors the rail's own clamp and
+        # requires the executable domain [0, MAX_SUBMIT_DELAY_SECONDS] — huge finite values past
+        # the host's time_t line never reach Enter either, and the platform line moves with the
+        # clock, hence the fixed contract bound. It fires only where the delay is CONSUMED: the
+        # pending rail returns before the sleep and the herdr standard rail has no delay field.
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
-            SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE,
+            MAX_SUBMIT_DELAY_SECONDS,
+            SEND_SEMANTIC_SUBMIT_DELAY_UNEXECUTABLE,
             send_semantic_gap,
         )
 
-        self.assertEqual(
-            send_semantic_gap(submit_delay=float("inf")),
-            SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE,
-        )
+        for value in (float("inf"), 1e308, 1e12, MAX_SUBMIT_DELAY_SECONDS + 0.01):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    send_semantic_gap(submit_delay=value),
+                    SEND_SEMANTIC_SUBMIT_DELAY_UNEXECUTABLE,
+                )
+        self.assertIsNone(send_semantic_gap(submit_delay=MAX_SUBMIT_DELAY_SECONDS))
         self.assertIsNone(send_semantic_gap(submit_delay=float("-inf")))
         self.assertIsNone(send_semantic_gap(submit_delay=float("nan")))
         self.assertIsNone(send_semantic_gap(submit_delay=0.0))
         self.assertIsNone(send_semantic_gap(submit_delay=0.5))
         self.assertIsNone(send_semantic_gap(submit_delay=None))
+        # Applicability: unconsumed delays keep their rails' behavior.
+        self.assertIsNone(send_semantic_gap(mode="pending", submit_delay=float("inf")))
+        self.assertIsNone(
+            send_semantic_gap(submit_delay=float("inf"), submit_delay_consumed=False)
+        )
+        # Consumed still wins over an explicit flag when the mode is pending.
+        self.assertIsNone(
+            send_semantic_gap(mode="pending", submit_delay=1e308, submit_delay_consumed=True)
+        )
 
     def test_the_canonical_sender_passes_the_submit_delay(self):
         # The wiring: orchestrate_handoff hands submit_delay to the shared authority and keys
@@ -2183,6 +2216,12 @@ class SendSemanticsSharedAuthorityTests(unittest.TestCase):
         # AUTHORITY receives the value (probe M7 slipped through exactly that way).
         self.assertIn(
             "mode=inp.mode, force=bool(inp.force), submit_delay=inp.submit_delay", source
+        )
+        # The applicability wiring (checkpoint j#86693 R22-F1): the canonical sender is the one
+        # party that KNOWS the backend, and only the herdr standard rail leaves the delay
+        # unconsumed.
+        self.assertIn(
+            "submit_delay_consumed=not (herdr_send and mode == MODE_STANDARD)", source
         )
         self.assertIn("send_semantic_message", source)
 

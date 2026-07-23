@@ -1719,7 +1719,8 @@ def orchestrate_handoff(
         die(f"--mode must be one of {sorted(MODES)}; got {mode!r}")
 
     send_gap = send_semantic_gap(
-        mode=inp.mode, force=bool(inp.force), submit_delay=inp.submit_delay
+        mode=inp.mode, force=bool(inp.force), submit_delay=inp.submit_delay,
+        submit_delay_consumed=not (herdr_send and mode == MODE_STANDARD),
     )
     if send_gap is not None:
         # Shared send-semantics authority: queue-enter refuses --force, and a

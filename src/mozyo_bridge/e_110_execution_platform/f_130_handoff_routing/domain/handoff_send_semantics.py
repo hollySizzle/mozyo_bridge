@@ -1,10 +1,14 @@
 """Send-time semantic preconditions for ``handoff send`` — the ONE list (Redmine #14219 T2b).
 
-Four zero-send rules the application layer enforces after argparse has accepted the tokens:
+Five zero-send rules the application layer enforces after argparse has accepted the tokens:
 
 * the effective mode (the canonical default is ``queue-enter`` when ``--mode`` is not given)
   refuses ``--force`` under ``queue-enter`` — the rail is restricted to agent panes and the
   canonical sender exits ``blocked``/``invalid_args`` before any delivery;
+* a ``--submit-delay`` that the delivering rail cannot actually sleep — outside the executable
+  domain ``[0, MAX_SUBMIT_DELAY_SECONDS]`` after the rail's own clamp — is refused, but ONLY
+  where the delay is consumed: the ``pending`` rail returns before the sleep and the herdr
+  ``standard`` rail carries no delay at all, so those keep their behavior;
 * a ``custom`` kind carries its ``--summary`` (:func:`..handoff.build_notification_body` refuses
   the body otherwise);
 * ``--select`` resolves the target semantically and is mutually exclusive with an explicit
@@ -30,17 +34,25 @@ from typing import Optional
 #: queue-enter/force rule lives here and ``handoff`` already imports this module (importing the
 #: constant back from ``handoff`` would be circular); ``handoff`` re-exports it unchanged.
 MODE_QUEUE_ENTER = "queue-enter"
+MODE_PENDING = "pending"
+
+#: The executable submit-delay domain's upper bound (seconds), a CONTRACT constant. The real
+#: platform limit (epoch time_t overflow at ``now + delay``) moves with the host and the clock,
+#: so it cannot anchor a record-static judgment; one hour sits far above any real settling delay
+#: and far below every platform limit, and both the canonical sender and the evidence reader
+#: refuse beyond it (#14219 j#86693 R22-F1).
+MAX_SUBMIT_DELAY_SECONDS = 3600.0
 
 #: Closed reason tokens, one per rule — the consumers key their own messages off these.
 SEND_SEMANTIC_QUEUE_ENTER_FORCE = "queue_enter_refuses_force"
-SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE = "submit_delay_not_finite"
+SEND_SEMANTIC_SUBMIT_DELAY_UNEXECUTABLE = "submit_delay_unexecutable"
 SEND_SEMANTIC_CUSTOM_SUMMARY = "custom_kind_requires_summary"
 SEND_SEMANTIC_SELECT_TARGET = "select_conflicts_with_explicit_target"
 SEND_SEMANTIC_PROJECT_REPO = "target_project_requires_target_repo"
 
 SEND_SEMANTIC_REASONS = frozenset({
     SEND_SEMANTIC_QUEUE_ENTER_FORCE,
-    SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE,
+    SEND_SEMANTIC_SUBMIT_DELAY_UNEXECUTABLE,
     SEND_SEMANTIC_CUSTOM_SUMMARY,
     SEND_SEMANTIC_SELECT_TARGET,
     SEND_SEMANTIC_PROJECT_REPO,
@@ -68,6 +80,7 @@ def send_semantic_gap(
     mode: Optional[str] = None,
     force: bool = False,
     submit_delay: Optional[float] = None,
+    submit_delay_consumed: bool = True,
 ) -> Optional[str]:
     """The FIRST zero-send precondition the supplied fields violate, or ``None`` (pure).
 
@@ -78,16 +91,27 @@ def send_semantic_gap(
     the canonical default is applied here so every consumer normalizes identically.
 
     ``submit_delay`` mirrors the transport rail's own clamp (``max(0.0, ...)``, same argument
-    order) and refuses a non-finite result: the rail sleeps for the delay BEFORE pressing
-    Enter, so a positive-infinite delay never reaches Enter and nothing is delivered (#14219
-    j#86687 R21-F2). Negative and ``nan`` delays clamp to zero under that very expression
-    (``max`` keeps its first argument against an unordered ``nan``) and DELIVER, so refusing
-    them would be stricter than the rail — they pass.
+    order) and requires the clamped delay to sit inside the executable domain
+    ``[0, MAX_SUBMIT_DELAY_SECONDS]``: the rail sleeps for the delay BEFORE pressing Enter, so
+    a delay the platform cannot sleep (``inf``, or a huge finite value past the host's time_t
+    epoch — a moving, host-dependent line, hence the fixed contract bound) never reaches Enter
+    (#14219 j#86687 R21-F2 / j#86693 R22-F1). Negative and ``nan`` delays clamp to zero under
+    that very expression and DELIVER, so they pass. The rule applies ONLY where the delay is
+    consumed: the ``pending`` rail returns before the sleep (skipped here, by mode), and the
+    herdr ``standard`` rail has no delay field — the canonical sender passes
+    ``submit_delay_consumed=False`` for that backend; a reader that cannot know the backend
+    keeps the fail-closed default ``True``.
     """
     if effective_send_mode(mode) == MODE_QUEUE_ENTER and force:
         return SEND_SEMANTIC_QUEUE_ENTER_FORCE
-    if submit_delay is not None and not math.isfinite(max(0.0, submit_delay)):
-        return SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE
+    if (
+        submit_delay is not None
+        and submit_delay_consumed
+        and effective_send_mode(mode) != MODE_PENDING
+    ):
+        clamped = max(0.0, submit_delay)
+        if not math.isfinite(clamped) or clamped > MAX_SUBMIT_DELAY_SECONDS:
+            return SEND_SEMANTIC_SUBMIT_DELAY_UNEXECUTABLE
     if kind == "custom" and not summary:
         return SEND_SEMANTIC_CUSTOM_SUMMARY
     if select and target:
@@ -109,10 +133,11 @@ def send_semantic_message(reason: str) -> str:
             "restricted to Claude/Codex agent panes and rejects non-agent "
             "targets even with operator override."
         )
-    if reason == SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE:
+    if reason == SEND_SEMANTIC_SUBMIT_DELAY_UNEXECUTABLE:
         return (
-            "--submit-delay must be a finite number of seconds; the rail sleeps "
-            "for the delay before pressing Enter, so a non-finite delay never "
+            "--submit-delay must be a finite number of seconds no greater than "
+            f"{MAX_SUBMIT_DELAY_SECONDS:.0f}; the rail sleeps for the delay "
+            "before pressing Enter, so a delay outside that domain never "
             "delivers."
         )
     return f"handoff send refused: {reason}"
@@ -147,7 +172,9 @@ __all__ = [
     "SEND_SEMANTIC_QUEUE_ENTER_FORCE",
     "SEND_SEMANTIC_REASONS",
     "SEND_SEMANTIC_SELECT_TARGET",
-    "SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE",
+    "SEND_SEMANTIC_SUBMIT_DELAY_UNEXECUTABLE",
+    "MAX_SUBMIT_DELAY_SECONDS",
+    "MODE_PENDING",
     "default_body_for_kind",
     "effective_send_mode",
     "send_semantic_gap",
