@@ -946,6 +946,44 @@ class CorroborationTests(unittest.TestCase):
                 )
                 self.assertEqual(produced.gaps, ())
 
+    def test_a_quoted_or_escaped_operator_valued_summary_is_content(self):
+        # checkpoint j#86667 R16-F1: `--summary ';'` / `'|'` / `'&&'` / `'('` / `\\;` all deliver
+        # ONE literal argv value to /bin/sh — control characters are operators only when their
+        # provenance is bare. Judging plain values refused these commands the shell actually runs.
+        for summary in ("';'", "'|'", "'&&'", "'('", "\\;"):
+            with self.subTest(summary=summary):
+                detail = (
+                    "- target: coordinator\n"
+                    f"- on sent: {SEND_COMMAND} --summary {summary}"
+                    " / observed landing marker"
+                    " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+                )
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
+    def test_a_quoted_or_escaped_operator_in_the_retry_is_content(self):
+        # The blocked retry runs through the SAME single safety judgment: stripping the
+        # provenance from the parts refused a replayable retry too (checkpoint j#86667 R16-F1).
+        for summary in ("';'", "\\;"):
+            with self.subTest(summary=summary):
+                fields = _park_fields(
+                    result="blocked",
+                    detail=(
+                        "- target: coordinator (`--target coordinator`)\n"
+                        "- on blocked: coordinator pane unresolved"
+                        " / candidates (`agents targets` rows): %14 codex w3F:p4"
+                        f" / retry command: {RETRY_COMMAND} --summary {summary}\n"
+                    ),
+                )
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=fields)),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
     def test_posix_escapes_survive_the_boundary(self):
         # checkpoint j#86649 R12-F2: `--summary park\/callback` is ONE argv value (`park/callback`)
         # to the shell; the home-grown boundary FSM split it at the escaped slash. The second case
@@ -1444,6 +1482,11 @@ class CorroborationTests(unittest.TestCase):
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
                         f" / retry command: {RETRY_COMMAND} --summary $MOZYO_UNSET_VAR\n"),
+            # A BARE operator in the retry's value position (checkpoint j#86667 R16-F1's negative
+            # counterpart): the shell ends the retry at `|`, so the replay never carried a value.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        f" / retry command: {RETRY_COMMAND} --summary |\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
@@ -1795,6 +1838,9 @@ class LexerDriftGuardTests(unittest.TestCase):
     FRAGMENTS = (
         "plain", "--flag=value", "'quoted part'", '"dq \\" part"', "\\ escaped",
         "/", "+", ";", "|", "(", "%14", "--summary",
+        # Quoted / escaped operators deliver the operator CHARACTER as a value (checkpoint
+        # j#86667 R16-F1) — the values still match shlex; only the provenance differs.
+        "';'", "\\;",
     )
 
     @staticmethod

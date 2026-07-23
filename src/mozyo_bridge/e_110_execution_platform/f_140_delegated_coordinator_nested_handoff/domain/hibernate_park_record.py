@@ -433,16 +433,24 @@ def _lex_detail(text: str) -> "list[_Token] | None":
 _EXPANSION_CHARS = "`$*?["
 
 
-def _command_tokens_unsafe(values: "list[str]") -> bool:
+def _command_tokens_unsafe(tokens: "list[_Token]") -> bool:
     """Whether the COMMAND tokens carry shell control, substitution or expansion (pure).
 
-    Control operators outside quotes surface as punctuation tokens; expansion-bearing characters
-    (:data:`_EXPANSION_CHARS`) are refused wherever they appear in a command token.
+    Two distinct policies, judged on the lexed tokens BEFORE their provenance is dropped
+    (checkpoint j#86667 R16-F1: judging plain values refused ``--summary ';'`` — a command the
+    shell delivers as one literal argv):
+
+    * control operators are operators only outside quotes, so a punctuation run is unsafe only
+      when its provenance is bare (``plain``) — quoted or escaped, the same value is argument
+      content;
+    * expansion-bearing characters (:data:`_EXPANSION_CHARS`) are refused wherever they appear,
+      quoted or not (checkpoint j#86662 R15-F1's explicit fail-closed policy — do not conflate
+      the two rules).
     """
     return any(
-        (value and all(char in _PUNCTUATION for char in value))
-        or any(char in _EXPANSION_CHARS for char in value)
-        for value in values
+        (token.plain and token.value and all(char in _PUNCTUATION for char in token.value))
+        or any(char in _EXPANSION_CHARS for char in token.value)
+        for token in tokens
     )
 
 
@@ -455,34 +463,38 @@ _BOUNDARY_TOKENS = frozenset({"/", "+"})
 _LABEL_TOKEN_SEQUENCES = (("retry", "command:"), ("retry:",), ("command:",))
 
 
-def _strip_label_tokens(tokens: "list[str]") -> "list[str]":
+def _strip_label_tokens(tokens: "list[_Token]") -> "list[_Token]":
     """Drop one template label from the FRONT of the token list (pure)."""
     for sequence in _LABEL_TOKEN_SEQUENCES:
-        if tuple(tokens[: len(sequence)]) == sequence:
+        if tuple(token.value for token in tokens[: len(sequence)]) == sequence:
             return tokens[len(sequence):]
     return tokens
 
 
-def _send_invocation(tokens: "list[str] | None") -> "argparse.Namespace | None":
+def _send_invocation(tokens: "list[_Token] | None") -> "argparse.Namespace | None":
     """The executable ``mozyo-bridge handoff send ...`` invocation ``tokens`` ARE, or ``None`` (pure).
 
-    ``tokens`` must BE the invocation (already lexed, label already stripped): token 0 is the CLI
-    entry point or this is not a command. The arguments are validated against the mirrored
-    canonical grammar — required options, choices, unknown arguments, value types, both spellings
-    (abbreviations refused) — the anchor against the canonical ``normalize_anchor``, and the
-    POST-PARSE send semantics against the SHARED :func:`send_semantic_gap` authority the canonical
-    call sites themselves consult (checkpoint j#86649 R12-F1: enumerating individual conditions
-    here is how the select/target and project/repo gates got missed).
+    ``tokens`` must BE the invocation (already lexed with provenance, label already stripped):
+    token 0 is the CLI entry point or this is not a command. The safety judgment runs ONCE, here,
+    on the tokens themselves — callers hand over ``_Token``s, not values, because dropping the
+    provenance first is what turned quoted operators into refused commands (checkpoint j#86667
+    R16-F1). The arguments are then validated against the mirrored canonical grammar — required
+    options, choices, unknown arguments, value types, both spellings (abbreviations refused) —
+    the anchor against the canonical ``normalize_anchor``, and the POST-PARSE send semantics
+    against the SHARED :func:`send_semantic_gap` authority the canonical call sites themselves
+    consult (checkpoint j#86649 R12-F1: enumerating individual conditions here is how the
+    select/target and project/repo gates got missed).
     """
     if not tokens or _command_tokens_unsafe(tokens):
         return None
-    if tokens[0] not in _CLI_ENTRYPOINTS:
+    values = [token.value for token in tokens]
+    if values[0] not in _CLI_ENTRYPOINTS:
         return None
-    if any(token in _CLI_ENTRYPOINTS for token in tokens[1:]):
+    if any(value in _CLI_ENTRYPOINTS for value in values[1:]):
         return None
-    if tokens[1:3] != ["handoff", "send"]:
+    if values[1:3] != ["handoff", "send"]:
         return None
-    arguments = tokens[3:]
+    arguments = values[3:]
     if _conflicting_store_flags(arguments):
         return None
     try:
@@ -585,9 +597,7 @@ def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: st
     )
     if boundary is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    namespace = _send_invocation(
-        _strip_label_tokens([token.value for token in tokens[:boundary]])
-    )
+    namespace = _send_invocation(_strip_label_tokens(tokens[:boundary]))
     if namespace is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     if namespace.to != _RECEIVER_CODEX:
@@ -657,19 +667,24 @@ def _blocked_detail_gap(detail: str, *, source_issue: str, journal: str) -> Opti
         if token.plain and token.value == "/":
             parts.append([])
         else:
-            parts[-1].append(token.value)
+            # The token itself, not its value: the retry part goes back through the ONE safety
+            # judgment in `_send_invocation`, which needs the provenance (checkpoint j#86667
+            # R16-F1: value-only parts refused a retry whose quoted operator the shell delivers).
+            parts[-1].append(token)
     if len(parts) != 3 or any(not part for part in parts):
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    reason, candidates, retry = parts
+    reason = [token.value for token in parts[0]]
+    candidates = [token.value for token in parts[1]]
+    retry = parts[2]
 
-    if any(_PANE_TOKEN_RE.match(token.strip("`(),")) for token in reason):
+    if any(_PANE_TOKEN_RE.match(value.strip("`(),")) for value in reason):
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     if any(first == "handoff" and second == "send" for first, second in zip(reason, reason[1:])):
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     candidate_panes = {
-        token.strip("`(),")
-        for token in candidates
-        if _PANE_TOKEN_RE.match(token.strip("`(),"))
+        value.strip("`(),")
+        for value in candidates
+        if _PANE_TOKEN_RE.match(value.strip("`(),"))
     }
     if not candidate_panes:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
