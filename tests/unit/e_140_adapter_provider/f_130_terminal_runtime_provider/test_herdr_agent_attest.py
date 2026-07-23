@@ -50,46 +50,108 @@ _GOOD_ENV = {
 }
 
 
-# The CLI's own diagnostics, verbatim (`die` / `warn` in mozyo_bridge.shared.errors emit
-# exactly one prefixed line each). Kept as constants so the fail-closed contract has ONE
-# spelling that a mutation has to break.
-MISSING_PROVIDER_ARGV_ERROR = (
-    "error: herdr agent-attest requires a provider command after `--` to exec "
+# The messages the CLI hands to `die`, verbatim — the `error: ` prefix belongs to `die`,
+# not to the message. Constants so the fail-closed contract has ONE spelling to break.
+MISSING_PROVIDER_ARGV_MESSAGE = (
+    "herdr agent-attest requires a provider command after `--` to exec "
     "(usage: herdr agent-attest --assigned-name ... -- <provider> [args...])"
 )
-ARGV0_ALIAS_UNBOUND_ERROR = (
-    "error: MOZYO_PROVIDER_ARGV0 did not verify as a trusted alias bound to the "
-    "provider exec target (an absolute exec-target realpath named by an absolute "
-    "same-file alias); refusing to launch with an unverified argv[0]"
+ARGV0_ALIAS_UNBOUND_MESSAGE = (
+    "MOZYO_PROVIDER_ARGV0 did not verify as a trusted alias bound to the provider exec "
+    "target (an absolute exec-target realpath named by an absolute same-file alias); "
+    "refusing to launch with an unverified argv[0]"
 )
 
-# `die` / `warn` are the only ways this CLI writes to stderr, and both prefix their one
-# line. Everything else in a captured buffer came from the host or the interpreter.
 _CLI_DIAGNOSTIC_PREFIXES = ("error: ", "warning: ")
 
 
-def cli_diagnostic_lines(captured_stderr: str) -> list[str]:
-    """The lines the CLI itself wrote, separated from host / interpreter stderr noise.
+class ObservedCliDiagnostics:
+    """What the CLI reported, recorded at the point it reported it."""
+
+    def __init__(self) -> None:
+        # (kind, message, exit_code); exit_code is None for a non-fatal `warn`.
+        self.diagnostics: list[tuple[str, str, "int | None"]] = []
+        self.stderr = io.StringIO()
+
+    def rendered(self) -> list[str]:
+        """Each recorded diagnostic as `die` / `warn` render it onto stderr."""
+        return [f"{kind}: {message}\n" for kind, message, _ in self.diagnostics]
+
+
+@contextlib.contextmanager
+def observed_cli_diagnostics():
+    """Observe the CLI's diagnostics by **provenance**, not by the shape of stderr text.
 
     Redmine #14250: ``contextlib.redirect_stderr`` captures the whole process-level
-    ``sys.stderr`` for the duration of the block, so an interpreter warning that happens
-    to fire during the call under test (``warnings.warn`` writes through ``sys.stderr``,
-    once per location — hence order-dependent and invisible to a focused run) lands in
-    the same buffer. Asserting equality on that buffer made an execution-environment
-    artifact part of the verdict and turned the full suite non-deterministically red.
+    ``sys.stderr`` for the duration of the block, so an interpreter warning firing during
+    the call under test (``warnings.warn`` renders through ``sys.stderr``, and the default
+    filter emits it once per location — so which test pays for it depends on suite order)
+    lands in the same buffer. Asserting equality on that buffer made an
+    execution-environment artifact part of the verdict: green alone, red about one full
+    suite in four.
 
-    So classify instead of compare-everything: return only the CLI's own prefixed
-    diagnostic lines, in order. Callers still assert **exact list equality** against the
-    expected message, so the fail-closed contract is not loosened one character — a
-    reworded, extra, missing, or duplicated CLI diagnostic is still red. What is excluded
-    is only what the CLI did not write. Noise that does start with a CLI prefix is kept
-    deliberately: this filter may never make the assertion weaker than it looks.
+    Classifying the captured text by line prefix was the first attempt and was wrong
+    (R1-F1, j#86284): ``die`` does not forbid newlines in its message, so a diagnostic
+    that grows a continuation line renders prefix-less physical lines — the filter dropped
+    them and a real contract change stayed green.
+
+    So do not infer *who wrote it* from *what it looks like*. Wrap ``die`` / ``warn``
+    themselves and record the exact message (newlines included) and exit code the CLI
+    passed, then delegate to the real implementation so the behaviour under test — the
+    ``SystemExit``, the text on stderr — is unchanged. Host noise shares the buffer but
+    can never enter this record.
     """
-    return [
-        line
-        for line in captured_stderr.splitlines()
-        if line.startswith(_CLI_DIAGNOSTIC_PREFIXES)
-    ]
+    from mozyo_bridge.shared import errors
+
+    record = ObservedCliDiagnostics()
+    real_die, real_warn = errors.die, errors.warn
+
+    def _die(message, code=2):
+        record.diagnostics.append(("error", message, code))
+        real_die(message, code)
+
+    def _warn(message):
+        record.diagnostics.append(("warning", message, None))
+        real_warn(message)
+
+    with patch.object(errors, "die", _die), patch.object(errors, "warn", _warn):
+        with contextlib.redirect_stderr(record.stderr):
+            yield record
+
+
+def assert_cli_diagnostics(testcase, record, expected) -> None:
+    """The CLI reported exactly ``expected`` — and actually said it out loud.
+
+    ``expected`` is a list of ``(kind, message, exit_code)``. Three checks, in order of
+    what carries the contract:
+
+    1. **exact equality on the recorded diagnostics.** This is the contract: message text
+       (continuation lines included), exit code, count, and order. Reworded, extra,
+       missing, duplicated, or multi-line-grown — all red.
+    2. **each recorded diagnostic reached stderr verbatim.** A diagnostic that is recorded
+       but never emitted, or emitted as different text, is not a diagnostic.
+    3. **no CLI-shaped line survives in the residue.** Pure hardening on top of (1): it
+       can only ever add redness. The exactness lives in (1), so a prefix-less line the
+       CLI wrote through some third path is a gap in this check, not a hole in the
+       contract — unlike the R1 filter, which is what F1 broke.
+
+    Layering: (1) fixes *what the CLI reported*; how ``die`` / ``warn`` turn that into
+    bytes is the renderer's own contract, pinned separately (see
+    ``tests/regressions/test_issue_14250_herdr_agent_attest_warning.py``'s
+    ``DieRenderingContractTest``). The two together determine the observable, and neither
+    depends on stderr the CLI did not produce.
+    """
+    testcase.assertEqual(record.diagnostics, list(expected))
+    captured = record.stderr.getvalue()
+    residue = captured
+    for block in record.rendered():
+        testcase.assertIn(block, captured, "the CLI's diagnostic never reached stderr")
+        residue = residue.replace(block, "", 1)
+    testcase.assertEqual(
+        [line for line in residue.splitlines() if line.startswith(_CLI_DIAGNOSTIC_PREFIXES)],
+        [],
+        "the CLI emitted a diagnostic beyond the expected ones",
+    )
 
 
 def _runner(*rows):
@@ -435,14 +497,14 @@ class CmdAgentAttestTest(unittest.TestCase):
             )
 
     def test_missing_provider_argv_fails_closed(self) -> None:
-        stderr = io.StringIO()
-        with patch("os.execvp") as execvp, contextlib.redirect_stderr(stderr):
-            with self.assertRaises(SystemExit) as raised:
-                cmd_herdr_agent_attest(self._args([]))
-            execvp.assert_not_called()
+        with observed_cli_diagnostics() as diagnostics:
+            with patch("os.execvp") as execvp:
+                with self.assertRaises(SystemExit) as raised:
+                    cmd_herdr_agent_attest(self._args([]))
+                execvp.assert_not_called()
         self.assertEqual(raised.exception.code, 2)
-        self.assertEqual(
-            cli_diagnostic_lines(stderr.getvalue()), [MISSING_PROVIDER_ARGV_ERROR]
+        assert_cli_diagnostics(
+            self, diagnostics, [("error", MISSING_PROVIDER_ARGV_MESSAGE, 2)]
         )
 
 
@@ -596,19 +658,18 @@ class CmdAgentAttestArgv0DecouplingTest(unittest.TestCase):
     def _assert_alias_fails_closed(self, provider_argv, alias) -> None:
         # A set-but-unbound alias dies typed/value-free: NEITHER exec runs (no launch),
         # and the value is dropped from the env even on the failure path. The diagnostic
-        # is asserted structurally (#14250): exactly one CLI line, exactly this text —
-        # host / interpreter stderr that shares the capture buffer is not part of the
-        # verdict. See :func:`cli_diagnostic_lines`.
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
+        # is asserted by provenance (#14250 R2): the exact message and exit code the CLI
+        # handed to `die`, not the shape of the shared stderr buffer. See
+        # :func:`observed_cli_diagnostics` / :func:`assert_cli_diagnostics`.
+        with observed_cli_diagnostics() as diagnostics:
             execv, execvp, leftover = self._run(
                 provider_argv, {MOZYO_PROVIDER_ARGV0_ENV: alias}
             )
         execv.assert_not_called()
         execvp.assert_not_called()
         self.assertIsNone(leftover)
-        self.assertEqual(
-            cli_diagnostic_lines(stderr.getvalue()), [ARGV0_ALIAS_UNBOUND_ERROR]
+        assert_cli_diagnostics(
+            self, diagnostics, [("error", ARGV0_ALIAS_UNBOUND_MESSAGE, 2)]
         )
 
     def test_relative_alias_fails_closed(self) -> None:
