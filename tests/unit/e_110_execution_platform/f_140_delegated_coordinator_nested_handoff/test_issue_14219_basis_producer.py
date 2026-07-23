@@ -854,6 +854,57 @@ class CorroborationTests(unittest.TestCase):
         )
         self.assertEqual(produced.gaps, ())
 
+    def test_posix_escapes_survive_the_boundary(self):
+        # checkpoint j#86649 R12-F2: `--summary park\/callback` is ONE argv value (`park/callback`)
+        # to the shell; the home-grown boundary FSM split it at the escaped slash. The second case
+        # escapes a literal double quote before a separator inside the summary. Both are commands
+        # the CLI runs, and both must satisfy the basis when correctly recorded.
+        for summary in ("park\\/callback", '"park \\" / delivered"'):
+            with self.subTest(summary=summary):
+                detail = (
+                    "- target: coordinator\n"
+                    f"- on sent: {SEND_COMMAND} --summary {summary}"
+                    " / observed landing marker"
+                    " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+                )
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
+    def test_project_scope_with_its_repo_gate_is_still_a_delivery(self):
+        # Negative control for the shared semantics: the project/repo rule refuses the LAYERING
+        # violation, not the layered use.
+        detail = (
+            "- target: coordinator\n"
+            f"- on sent: {SEND_COMMAND} --target-repo auto --target-project proj-a"
+            " / observed landing marker"
+            " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+        )
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+            basis=BASIS_DEPENDENCY_PARK,
+        )
+        self.assertEqual(produced.gaps, ())
+
+    def test_a_quoted_separator_in_the_retry_survives_the_three_part_split(self):
+        # The blocked boundary is a BARE `/` token too: a quoted separator inside the retry's own
+        # summary is content, and a naive text split would cut the record into four parts.
+        fields = _park_fields(
+            result="blocked",
+            detail=(
+                "- target: coordinator (`--target coordinator`)\n"
+                "- on blocked: coordinator pane unresolved"
+                " / candidates (`agents targets` rows): %14 codex w3F:p4"
+                f" / retry command: {RETRY_COMMAND} --summary 'retry / replay'\n"
+            ),
+        )
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=fields)), basis=BASIS_DEPENDENCY_PARK
+        )
+        self.assertEqual(produced.gaps, ())
+
     def test_the_equals_spelling_is_the_same_invocation(self):
         # checkpoint j#86626 R10-F3: canonical argparse accepts `--flag=value`, and the contract
         # is the flag's effective value, not its spelling.
@@ -1262,6 +1313,19 @@ class CorroborationTests(unittest.TestCase):
                      f"- on sent: {SEND_COMMAND} --summary ;"
                      " / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # -- checkpoint j#86649 R12-F1: the shared send-semantics authority ----------------
+            # `--select` is mutually exclusive with an explicit `--target`: the canonical
+            # apply_handoff_selection dies before sending, so nothing was delivered.
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --select"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # `--target-project` without `--target-repo`: the canonical admission pipeline refuses
+            # invalid_args / zero-send.
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --target-project proj-a"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
@@ -1389,6 +1453,79 @@ class EndToEndClassificationTests(unittest.TestCase):
             request=_request_note(head=other), review=_review_note(head=other)
         )))
         self.assertEqual(got.reason, NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
+
+
+class SendSemanticsSharedAuthorityTests(unittest.TestCase):
+    """The canonical call sites and the evidence parser consult the SAME semantic authority.
+
+    R11 re-enumerated individual send-time conditions in the evidence parser and drifted from the
+    application semantics (j#86649 R12-F1). The rules now live in
+    ``handoff_send_semantics.send_semantic_gap`` and these tests pin that the canonical consumers
+    actually call it — so a rule added there reaches every consumer, including this evidence
+    surface, at once.
+    """
+
+    def test_apply_handoff_selection_consults_the_authority(self):
+        import inspect
+
+        from mozyo_bridge.application.commands_target_select import apply_handoff_selection
+
+        self.assertIn("send_semantic_gap", inspect.getsource(apply_handoff_selection))
+
+    def test_admission_pipeline_consults_the_authority(self):
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application import (
+            handoff_admission_pipeline,
+        )
+
+        self.assertIn("send_semantic_gap", inspect.getsource(handoff_admission_pipeline))
+
+    def test_build_notification_body_matches_the_authority(self):
+        # This one rule is pinned behaviourally rather than by call-site wiring:
+        # build_notification_body lives in an allowlisted module at its exact line baseline, and
+        # the project rule is to never self-approve a baseline bump. The guard asserts the body
+        # builder raises EXACTLY when the authority says the custom summary is missing, so the two
+        # cannot drift silently.
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            AnchorError,
+            build_notification_body,
+            normalize_anchor,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+            SEND_SEMANTIC_CUSTOM_SUMMARY,
+            send_semantic_gap,
+        )
+
+        anchor = normalize_anchor("redmine", issue="14219", journal="85500")
+        for kind, summary in (
+            ("custom", None),
+            ("custom", ""),
+            ("custom", "a summary"),
+            ("reply", None),
+        ):
+            with self.subTest(kind=kind, summary=summary):
+                expected_gap = (
+                    send_semantic_gap(kind=kind, summary=summary)
+                    == SEND_SEMANTIC_CUSTOM_SUMMARY
+                )
+                try:
+                    build_notification_body(
+                        anchor=anchor, kind=kind, receiver="codex", summary=summary
+                    )
+                    raised = False
+                except AnchorError:
+                    raised = True
+                self.assertEqual(raised, expected_gap)
+
+    def test_the_evidence_parser_consults_the_authority(self):
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_park_record import (  # noqa: E501
+            _send_invocation,
+        )
+
+        self.assertIn("send_semantic_gap", inspect.getsource(_send_invocation))
 
 
 class SendGrammarDriftGuardTests(unittest.TestCase):

@@ -35,6 +35,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     build_marker,
     normalize_anchor,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+    send_semantic_gap,
+)
 
 #: The park marker is not accompanied by the governed fixed-field park journal.
 GAP_PARK_JOURNAL_FIELDS_ABSENT = "park_journal_fields_absent"
@@ -138,8 +141,6 @@ _CALLBACK_DETAIL_FIELDS = {
 _PANE_TOKEN_RE = re.compile(r"(?:%\d+|\w+:p\w+)\Z")
 #: The coordinator's natural target (`--target coordinator`), the normal route.
 _COORDINATOR_TARGET = "coordinator"
-#: The delivery command and the receiver a coordinator callback must name.
-_HANDOFF_SEND_RE = re.compile(r"\bhandoff\s+send\b", re.IGNORECASE)
 _RECEIVER_CODEX = "codex"
 #: The canonical handoff marker's mandatory fields (``handoff.build_marker``): the source system,
 #: the anchor, the kind, and the receiver. A token missing any of them was never produced by the
@@ -309,53 +310,77 @@ def _conflicting_store_flags(tokens: "list[str]") -> bool:
     return False
 
 
-def _lex_command(text: str) -> "list[str] | None":
-    """``text`` as the CLI would receive it after shell lexing, or ``None`` (pure).
+def _lex_detail(text: str) -> "list[str] | None":
+    """``text`` as the shell would lex it, or ``None`` on an unlexable record (pure).
 
-    ``text.split()`` broke every quoted argument — ``--summary \'park callback delivered\'`` is one
-    value to the shell and three tokens to a naive split, so a correctly-recorded executed command
-    stopped satisfying the basis (checkpoint j#86645 R11-F4). ``shlex`` in posix mode is the
-    side-effect-free equivalent of that lexing; an unclosed quote is fail-closed.
+    ONE lexical authority for the whole record (checkpoint j#86649 R12-F2): tokenization AND every
+    boundary decision run over these tokens. The previous round lexed the command with ``shlex``
+    but recognised the ``/`` boundaries with a home-grown quote FSM that knew nothing of POSIX
+    escapes, so ``--summary park\\/callback`` — one argv value to the shell — split in the middle
+    and a correctly-recorded executed command stopped satisfying the basis. An escaped or quoted
+    separator now simply stays inside its token and is never a boundary.
 
-    Shell CONTROL is detected as punctuation tokens outside quotes (``;`` ``|`` ``&`` ``<`` ``>``
-    ``(`` ``)``), so a quoted separator inside a summary is content, not composition. Command
-    substitution (``$(`` and backtick) stays refused wherever it appears: inside double quotes it
-    still executes, and refusing the single-quoted false positive is the fail-closed direction.
+    This lexes LENIENTLY: the template's prose parts legitimately carry backticks and parentheses
+    (``candidates (`agents targets` rows)``), so shell-control strictness is applied to the
+    COMMAND tokens only (:func:`_command_tokens_unsafe`). What fails the whole record here is what
+    makes it unlexable: an unclosed quote, or a multi-line value.
     """
-    if "`" in text or "$(" in text or "\n" in text:
+    if "\n" in text:
         return None
     lexer = shlex.shlex(text, posix=True, punctuation_chars=";|&<>()")
     lexer.whitespace_split = True
     try:
-        tokens = list(lexer)
+        return list(lexer)
     except ValueError:
         return None
-    # With ``punctuation_chars`` set, operators outside quotes surface as their own tokens made
-    # entirely of those characters.
-    if any(token and all(char in ";|&<>()" for char in token) for token in tokens):
-        return None
+
+
+def _command_tokens_unsafe(tokens: "list[str]") -> bool:
+    """Whether the COMMAND tokens carry shell control or substitution (pure).
+
+    Control operators outside quotes surface as punctuation tokens; substitution characters are
+    refused wherever they appear in a command token — ``$(`` and backtick execute inside double
+    quotes, and refusing the single-quoted false positive is the fail-closed direction.
+    """
+    return any(
+        (token and all(char in ";|&<>()" for char in token))
+        or "`" in token
+        or "$(" in token
+        for token in tokens
+    )
+
+
+#: The template's boundary between record parts: a BARE separator token. Quoted or escaped
+#: separators are content and never leave their token.
+_BOUNDARY_TOKENS = frozenset({"/", "+"})
+
+#: The exact label token sequences the template puts before a command (checkpoint j#86577 R9-F1:
+#: anything else preceding the invocation is a wrapper, not a label).
+_LABEL_TOKEN_SEQUENCES = (("retry", "command:"), ("retry:",), ("command:",))
+
+
+def _strip_label_tokens(tokens: "list[str]") -> "list[str]":
+    """Drop one template label from the FRONT of the token list (pure)."""
+    for sequence in _LABEL_TOKEN_SEQUENCES:
+        if tuple(tokens[: len(sequence)]) == sequence:
+            return tokens[len(sequence):]
     return tokens
 
 
-def _send_invocation(text: str) -> "argparse.Namespace | None":
-    """The executable ``mozyo-bridge handoff send ...`` invocation ``text`` IS, or ``None`` (pure).
+def _send_invocation(tokens: "list[str] | None") -> "argparse.Namespace | None":
+    """The executable ``mozyo-bridge handoff send ...`` invocation ``tokens`` ARE, or ``None`` (pure).
 
-    ``text`` must BE the invocation: the caller has already cut the command component out of the
-    record, so token 0 is the CLI entry point or this is not a command. The arguments are then
-    validated against the mirrored canonical grammar — required options, choices, unknown
-    arguments, value types, both ``--flag value`` and ``--flag=value`` spellings (abbreviations
-    refused, see the parser) — the anchor against the canonical ``normalize_anchor``, and the
-    POST-PARSE semantics the CLI itself enforces after argparse: ``--kind custom`` without
-    ``--summary`` is refused by ``build_notification_body`` before anything is sent, so it is not
-    an executable delivery either (checkpoint j#86645 R11-F2).
-
-    Still refused outright: shell control outside quotes, an unclosed quote, a second entry point,
-    and a single-valued flag repeated with differing values.
+    ``tokens`` must BE the invocation (already lexed, label already stripped): token 0 is the CLI
+    entry point or this is not a command. The arguments are validated against the mirrored
+    canonical grammar — required options, choices, unknown arguments, value types, both spellings
+    (abbreviations refused) — the anchor against the canonical ``normalize_anchor``, and the
+    POST-PARSE send semantics against the SHARED :func:`send_semantic_gap` authority the canonical
+    call sites themselves consult (checkpoint j#86649 R12-F1: enumerating individual conditions
+    here is how the select/target and project/repo gates got missed).
     """
-    tokens = _lex_command(text)
-    if tokens is None:
+    if not tokens or _command_tokens_unsafe(tokens):
         return None
-    if not tokens or tokens[0] not in _CLI_ENTRYPOINTS:
+    if tokens[0] not in _CLI_ENTRYPOINTS:
         return None
     if any(token in _CLI_ENTRYPOINTS for token in tokens[1:]):
         return None
@@ -379,21 +404,178 @@ def _send_invocation(text: str) -> "argparse.Namespace | None":
         )
     except AnchorError:
         return None
-    # Canonical post-parse rule (``build_notification_body``): a custom kind carries its summary.
-    if namespace.kind == "custom" and not namespace.summary:
+    if send_semantic_gap(
+        kind=namespace.kind,
+        summary=namespace.summary,
+        select=namespace.select,
+        target=namespace.target,
+        target_project=namespace.target_project,
+        target_repo=namespace.target_repo,
+    ) is not None:
         return None
     return namespace
 
 
-#: The exact labels the template puts before a command. Anything else preceding the invocation is
-#: a wrapper, not a label (checkpoint j#86577 R9-F1). The label is stripped by the CALLER, so the
-#: parser has no guessing to do.
-_COMMAND_LABEL_RE = re.compile(r"^(?:retry\s+command|retry|command)\s*:\s*", re.IGNORECASE)
+def canonical_target(value: str) -> str:
+    """The canonical coordinator target a ``target:`` field names, or ``""`` (pure).
+
+    The template writes the two permitted forms as ``coordinator (`--target coordinator`)`` and
+    ``<coordinator_codex_%pane>`` — both of which SAY they are the coordinator's. So the field must
+    name the coordinator, and the effective target is then either that natural token or the one
+    pane it resolves to.
+
+    Two ways this was wrong before. It asked whether ``"coordinator" in value.lower()``, so
+    ``noncoordinator`` and ``the-coordinator-ish`` read as the coordinator; and once whole-token
+    matching landed, a bare pane still passed on shape alone — ``same-lane worker w3F:p3`` is a
+    well-formed pane, and nothing in it claims to be the coordinator (checkpoint j#86562 R7-F1).
+    A pane is a target only when the record says whose it is, and only when there is exactly one:
+    two panes name no single place the callback went.
+    """
+    tokens = [token.strip("`(),") for token in str(value).split()]
+    if not any(token == _COORDINATOR_TARGET for token in tokens):
+        return ""
+    panes = {token for token in tokens if _PANE_TOKEN_RE.match(token)}
+    if len(panes) > 1:
+        return ""
+    return panes.pop() if panes else _COORDINATOR_TARGET
 
 
-def _strip_command_label(text: str) -> str:
-    """Drop one template label from the FRONT of ``text`` (pure). Nothing else is removed."""
-    return _COMMAND_LABEL_RE.sub("", text.strip(), count=1)
+#: A record's command is one invocation that WAS run (``sent``) or WILL
+#: be replayed (``blocked``); anything that composes, conditions, redirects or substitutes commands
+#: means the token sequence is not that invocation. Control detection lives in
+#: :func:`_lex_command` (punctuation tokens outside quotes + inline substitution characters).
+#: The CLI's own entry points (``pyproject`` console scripts).
+_CLI_ENTRYPOINTS = ("mozyo-bridge", "mozyo")
+
+#: The canonical ``handoff send`` grammar, mirrored as DATA: ``(flag, required, choices, value)``
+#: where ``value`` is ``str`` / ``float`` / ``int`` for a value option, ``"flag"`` for a bare
+#: switch and ``"append"`` for a repeatable option. The domain must not import the
+#: application-layer parser builder, so this table exists — and a drift-guard test builds the REAL
+#: parser (``configure_handoff_parser`` + ``add_handoff_select_args``) and asserts this table
+#: matches it action for action, the same pattern ``callback_delivery`` uses for its tokens.
+#: An invocation this grammar rejects is one the CLI would refuse to run, and a command that never
+#: ran is not delivery evidence (checkpoint j#86626 R10-F1 — the previous check looked at token 0
+#: and ``handoff send`` only, and its own positive fixture was missing the required ``--source`` /
+#: ``--kind``).
+_SEND_OPTIONS: tuple = (
+    ("--to", True, ("claude", "codex"), str),
+    ("--source", True, ("asana", "redmine"), str),
+    ("--kind", True, tuple(sorted(KIND_LABELS)), str),
+    ("--task-id", False, None, str),
+    ("--comment-id", False, None, str),
+    ("--anchor-url", False, None, str),
+    ("--issue", False, None, str),
+    ("--journal", False, None, str),
+    ("--target", False, None, str),
+    ("--target-repo", False, None, str),
+    ("--target-lane", False, None, str),
+    ("--target-project", False, None, str),
+    ("--allow-direct-worker", False, None, "flag"),
+    ("--workdir", False, None, str),
+    (
+        "--role-profile",
+        False,
+        ("coordinator", "delegated_coordinator", "implementation_gateway", "implementation_worker"),
+        str,
+    ),
+    ("--profile-field", False, None, "append"),
+    ("--main-lane-exception", False, None, str),
+    ("--mode", False, ("pending", "queue-enter", "standard"), str),
+    ("--summary", False, None, str),
+    ("--force", False, None, "flag"),
+    ("--landing-timeout", False, None, float),
+    ("--submit-delay", False, None, float),
+    ("--read-lines", False, None, int),
+    ("--queue-enter-retry-window", False, None, float),
+    ("--queue-enter-retry-interval", False, None, float),
+    ("--no-target-activation", False, None, "flag"),
+    ("--restore-previous-active", False, None, "flag"),
+    ("--record-format", False, ("both", "json", "text"), str),
+    ("--record-command", False, None, str),
+    ("--persist-delivery", False, None, "flag"),
+    ("--select", False, None, "flag"),
+    ("--target-session", False, None, str),
+)
+
+#: Options that legitimately repeat (argparse append) — exempt from the conflict rule.
+_APPEND_FLAGS = frozenset(
+    flag for flag, _required, _choices, value in _SEND_OPTIONS if value == "append"
+)
+_VALUE_FLAGS = frozenset(
+    flag for flag, _required, _choices, value in _SEND_OPTIONS if value not in ("flag",)
+)
+
+
+class _GrammarRefusal(Exception):
+    """Raised instead of argparse's stderr-print-and-exit — the check is side-effect free."""
+
+
+class _RefusingParser(argparse.ArgumentParser):
+    def error(self, message):  # pragma: no cover - trivial override
+        raise _GrammarRefusal(message)
+
+
+def _build_send_parser() -> argparse.ArgumentParser:
+    # ``allow_abbrev=False``: the canonical CLI accepts long-option abbreviation, but an
+    # abbreviated flag in a durable record reintroduces the very ambiguity the conflict rule
+    # exists to refuse — ``--ki review_request --kind reply`` declares two values for one
+    # logical option while wearing two names (checkpoint j#86645 R11-F3). Evidence is written
+    # unabbreviated.
+    parser = _RefusingParser(prog="handoff-send-evidence", add_help=False, allow_abbrev=False)
+    for flag, required, choices, value in _SEND_OPTIONS:
+        dest = flag[2:].replace("-", "_")
+        if value == "flag":
+            parser.add_argument(flag, dest=dest, required=required, action="store_true")
+        elif value == "append":
+            parser.add_argument(flag, dest=dest, required=required, action="append")
+        else:
+            parser.add_argument(
+                flag,
+                dest=dest,
+                required=required,
+                choices=list(choices) if choices else None,
+                type=None if value is str else value,
+            )
+    return parser
+
+
+_SEND_PARSER = _build_send_parser()
+
+
+def _conflicting_store_flags(tokens: "list[str]") -> bool:
+    """Whether any single-valued flag repeats with DIFFERING values (pure).
+
+    Argparse itself is last-write-wins, but a durable record whose command says two things has no
+    single meaning to trust (the R8 rule). Append options (``--profile-field``) repeat by design
+    and are exempt; identical repeats collapse.
+    """
+    seen: dict = {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("--"):
+            index += 1
+            continue
+        flag, eq, inline = token.partition("=")
+        if flag in _APPEND_FLAGS:
+            index += 1 if eq else 2
+            continue
+        if flag in _VALUE_FLAGS:
+            if eq:
+                value = inline
+                index += 1
+            elif index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
+                value = tokens[index + 1]
+                index += 2
+            else:
+                index += 1
+                continue  # missing value: the grammar parse refuses it
+            if flag in seen and seen[flag] != value:
+                return True
+            seen[flag] = value
+        else:
+            index += 1
+    return False
 
 
 #: ``[mozyo:handoff:<body>]`` read RAW — the shared scanner folds duplicate keys last-write-wins,
@@ -441,71 +623,40 @@ def _observed_marker_fields(detail: str) -> "dict | None":
     return dict(distinct.pop())
 
 
-def _split_outside_quotes(text: str, separators: str) -> "tuple[str, str] | None":
-    """Split ``text`` at the FIRST separator that sits outside any quote, or ``None`` (pure).
-
-    The command/observation boundary and the blocked three-part boundary are template structure,
-    so a ``/`` inside a quoted summary is content, not a boundary (checkpoint j#86645 R11-F4).
-    """
-    quote = ""
-    for index, char in enumerate(text):
-        if quote:
-            if char == quote:
-                quote = ""
-            continue
-        if char in "'\"":
-            quote = char
-            continue
-        if char in separators:
-            return text[:index], text[index + 1:]
-    return None
-
-
-def _parts_outside_quotes(text: str, separator: str) -> "list[str]":
-    """Every ``separator``-delimited part of ``text``, quote-aware (pure)."""
-    parts = []
-    remainder = text
-    while True:
-        split = _split_outside_quotes(remainder, separator)
-        if split is None:
-            parts.append(remainder)
-            return parts
-        head, remainder = split
-        parts.append(head)
-
-
 def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: str) -> Optional[str]:
     """Whether a ``sent`` record is THIS callback's delivery evidence (pure).
 
-    Three authorities, each with its own comparison:
+    The whole detail is lexed ONCE; the command/observation boundary is the first BARE separator
+    token, so an escaped or quoted separator inside an argument never splits the command
+    (checkpoint j#86649 R12-F2). Three authorities then apply:
 
-    * the COMMAND must be an invocation the CLI would actually run
-      (:func:`_send_invocation`), delivering ``--to codex`` at the target the record declares;
-    * the MARKER must be about this park declaration — this durable source, a known kind, the
-      coordinator's Codex, this issue and this journal;
-    * the two must be the SAME delivery: the marker the command composes — via the canonical
-      ``normalize_anchor`` + ``build_marker``, not a re-implementation — must field-for-field
-      equal the marker observed (checkpoint j#86626 R10-F2; an executable command for a DIFFERENT
-      anchor or kind can otherwise borrow another handoff's landing observation).
+    * the COMMAND must be an invocation the CLI would actually run and send
+      (:func:`_send_invocation`, grammar + anchor + shared send semantics), delivering
+      ``--to codex`` at the target the record declares, and not in ``pending`` mode (pending
+      places the body without pressing Enter — nothing was sent);
+    * the MARKER must be about this park declaration;
+    * the two must be the SAME delivery: the marker the command composes via the canonical
+      ``normalize_anchor`` + ``build_marker`` must field-for-field equal the marker observed.
     """
-    split = _split_outside_quotes(detail, "/+")
-    if split is None:
+    tokens = _lex_detail(detail)
+    if tokens is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    command, observation = split
-    namespace = _send_invocation(_strip_command_label(command))
+    boundary = next(
+        (index for index, token in enumerate(tokens) if token in _BOUNDARY_TOKENS), None
+    )
+    if boundary is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    namespace = _send_invocation(_strip_label_tokens(tokens[:boundary]))
     if namespace is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     if namespace.to != _RECEIVER_CODEX:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     if namespace.target != target:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    # ``--mode pending`` places the body in the composer WITHOUT pressing Enter — the canonical
-    # rail returns ``pending_input``, not a delivery. A pending command sent nothing (checkpoint
-    # j#86645 R11-F2).
     if namespace.mode == "pending":
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
 
-    observed = _observed_marker_fields(observation)
+    observed = _observed_marker_fields(" ".join(tokens[boundary + 1:]))
     if observed is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     if observed.get("source") != _MARKER_SOURCE:
@@ -542,37 +693,43 @@ def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: st
 def _blocked_detail_gap(detail: str, *, source_issue: str, journal: str) -> Optional[str]:
     """Whether a ``blocked`` record carries reason / candidates / retry command (pure).
 
-    Read as the template writes it — EXACTLY three ``/``-separated parts (quote-aware), each with
-    its own job:
+    Lexed once, split on BARE ``/`` tokens into EXACTLY three parts, each with its own job:
 
     * part 1 — the reason, which must be text and not evidence standing in for one;
     * part 2 — the candidate rows, which must actually name at least one pane;
-    * part 3 — a retry the CLI would actually run (same invocation rules as ``sent``), delivering
-      ``--to codex``, pinned at ONE of those candidates and at ``--target-repo auto`` — and
-      anchored at THIS park declaration: a replay of this callback carries this callback's anchor,
-      and an executable retry for another issue or journal is a handoff to a different ticket
-      (checkpoint j#86645 R11-F1). A ``--mode pending`` retry is likewise refused: replaying it
-      would place the body without submitting, which is not the delivery the record promises.
+    * part 3 — a retry the CLI would actually run and send (same invocation + shared semantics as
+      ``sent``), delivering ``--to codex``, pinned at ONE of those candidates and at
+      ``--target-repo auto``, not in ``pending`` mode (a pending replay places without
+      submitting), and anchored at THIS park declaration — an executable retry for another issue
+      or journal is a handoff to a different ticket (checkpoint j#86645 R11-F1).
     """
-    parts = [part.strip() for part in _parts_outside_quotes(detail, "/")]
+    tokens = _lex_detail(detail)
+    if tokens is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    parts: list = [[]]
+    for token in tokens:
+        if token == "/":
+            parts.append([])
+        else:
+            parts[-1].append(token)
     parts = [part for part in parts if part]
     if len(parts) != 3:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     reason, candidates, retry = parts
 
-    if any(_PANE_TOKEN_RE.match(token.strip("`(),")) for token in reason.split()):
+    if any(_PANE_TOKEN_RE.match(token.strip("`(),")) for token in reason):
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    if _HANDOFF_SEND_RE.search(reason):
+    if any(first == "handoff" and second == "send" for first, second in zip(reason, reason[1:])):
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     candidate_panes = {
         token.strip("`(),")
-        for token in candidates.split()
+        for token in candidates
         if _PANE_TOKEN_RE.match(token.strip("`(),"))
     }
     if not candidate_panes:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
 
-    namespace = _send_invocation(_strip_command_label(retry))
+    namespace = _send_invocation(_strip_label_tokens(retry))
     if namespace is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     if namespace.to != _RECEIVER_CODEX:
