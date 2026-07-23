@@ -146,7 +146,8 @@ PARK_FIELDS = (
     # The callback outcome record the skill's template requires alongside the token.
     "- target: coordinator (`--target coordinator`)\n"
     "- on sent: mozyo-bridge handoff send --to codex --target coordinator --mode standard"
-    " / observed landing marker [mozyo:handoff:issue=14219:journal=85010:kind=reply:to=codex]\n"
+    " / observed landing marker"
+    " [mozyo:handoff:source=redmine:issue=14219:journal=85010:kind=reply:to=codex]\n"
 )
 
 

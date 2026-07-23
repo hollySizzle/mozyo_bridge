@@ -819,6 +819,72 @@ class CorroborationTests(unittest.TestCase):
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates %14 and retry mozyo-bridge handoff send --target %14"
                         " --target-repo auto\n"),
+            # -- checkpoint j#86558 R6-F1: the record must be about THIS callback ---------------
+            # A same-lane note to the lane's own Claude, carrying another issue's marker. Every
+            # string the previous version looked for is present; none of it is this callback.
+            ("sent", "- target: same-lane worker w3F:p3\n"
+                     "- on sent: mozyo-bridge handoff send --to claude --target w3F:p3"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=99999:journal=1:kind=reply:to=claude]\n"),
+            # Prose mentioning the command, and a bracketed token that carries no fields.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: we did a handoff send at some point / [mozyo:handoff:x]\n"),
+            # Delivered to the coordinator, but the marker names a different journal — so it is
+            # not the landing observation for THIS park declaration.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=1:kind=reply:to=codex]\n"),
+            # The command targets somewhere other than the target the record declares.
+            ("sent", "- target: %14\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # -- checkpoint j#86558 R6-F2: each part carries its own authority -----------------
+            # The candidate part names no pane; the pane inside the retry command used to stand
+            # in for it.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates: none found"
+                        " / retry command: mozyo-bridge handoff send --to codex --target %14"
+                        " --target-repo auto\n"),
+            # Candidates named, but the retry pins a natural name rather than one of them.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14 codex w3F:p4"
+                        " / retry command: mozyo-bridge handoff send --to codex"
+                        " --target coordinator --target-repo auto\n"),
+            # `--target` immediately followed by the next flag: the flag is not the target.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge handoff send --to codex --target"
+                        " --target-repo auto\n"),
+            # Each of the next four isolates ONE rule: everything else about the record is
+            # correct, so only the named rule can be what refuses it (the mutation probe caught
+            # that the earlier cases each broke several rules at once and so proved none of them).
+            # Delivered to the lane's own Claude rather than the coordinator's Codex.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to claude --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # The marker observed belongs to another issue.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=99999:journal=85500:kind=reply:to=codex]\n"),
+            # The marker observed was addressed to a Claude, so it is not the coordinator callback.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=claude]\n"),
+            # A target that is neither the natural coordinator target nor a resolved pane.
+            ("sent", "- target: mainlane\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target mainlane"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # A retry pinned at a pane that was never a candidate.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge handoff send --to codex --target %99"
+                        " --target-repo auto\n"),
         ):
             with self.subTest(callback_result=value, detail=detail[:40]):
                 journals = _park_journals(
