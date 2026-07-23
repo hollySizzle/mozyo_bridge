@@ -142,17 +142,28 @@ def _receipts(**overrides):
 
 
 #: The callback-outcome detail lines, in the skill template's own shape.
+#: The executable delivery command for THIS declaration — required flags and the anchor included.
+#: R10-F1's most basic lesson: the previous fixture (`--to codex --target coordinator` only) was
+#: itself a command the CLI refuses to run.
+SEND_COMMAND = (
+    "mozyo-bridge handoff send --to codex --source redmine --kind reply"
+    " --issue 14219 --journal 85500 --target coordinator --mode standard"
+)
 CALLBACK_SENT_DETAIL = (
     "- target: coordinator (`--target coordinator`)\n"
-    "- on sent: mozyo-bridge handoff send --to codex --target coordinator --mode standard"
+    f"- on sent: {SEND_COMMAND}"
     " / observed landing marker"
     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+)
+RETRY_COMMAND = (
+    "mozyo-bridge handoff send --to codex --source redmine --kind reply"
+    " --issue 14219 --journal 85500 --target %14 --target-repo auto"
 )
 CALLBACK_BLOCKED_DETAIL = (
     "- target: coordinator (`--target coordinator`)\n"
     "- on blocked: coordinator pane unresolved"
     " / candidates (`agents targets` rows): %14 codex w3F:p4"
-    " / retry command: mozyo-bridge handoff send --to codex --target %14 --target-repo auto\n"
+    f" / retry command: {RETRY_COMMAND}\n"
 )
 CALLBACK_NOT_ATTEMPTED_DETAIL = (
     "- target: coordinator\n"
@@ -780,7 +791,7 @@ class CorroborationTests(unittest.TestCase):
             result="sent",
             detail=(
                 "- target: coordinator\n"
-                "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                 f" / observed landing marker {marker} {marker}\n"
             ),
         )
@@ -799,13 +810,29 @@ class CorroborationTests(unittest.TestCase):
             result="sent",
             detail=(
                 "- target: coordinator\n"
-                "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                 f" / observed landing marker {marker}"
                 " (delivered via mozyo-bridge handoff send)\n"
             ),
         )
         produced = _produce(
             _park_journals(park=_park_note(park_fields=fields)), basis=BASIS_DEPENDENCY_PARK
+        )
+        self.assertEqual(produced.gaps, ())
+
+    def test_the_equals_spelling_is_the_same_invocation(self):
+        # checkpoint j#86626 R10-F3: canonical argparse accepts `--flag=value`, and the contract
+        # is the flag's effective value, not its spelling.
+        detail = (
+            "- target: coordinator\n"
+            "- on sent: mozyo-bridge handoff send --to=codex --source=redmine --kind=reply"
+            " --issue=14219 --journal=85500 --target=coordinator"
+            " / observed landing marker"
+            " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+        )
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+            basis=BASIS_DEPENDENCY_PARK,
         )
         self.assertEqual(produced.gaps, ())
 
@@ -816,7 +843,8 @@ class CorroborationTests(unittest.TestCase):
             result="sent",
             detail=(
                 "- target: coordinator codex pane %14\n"
-                "- on sent: mozyo-bridge handoff send --to codex --target %14"
+                "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply"
+                " --issue 14219 --journal 85500 --target %14"
                 " --target-repo auto / observed landing marker"
                 " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
             ),
@@ -843,10 +871,10 @@ class CorroborationTests(unittest.TestCase):
             ("blocked", ""),
             ("not-attempted", ""),
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator\n"),
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator\n"),
             ("sent", "- target: coordinator\n- on sent: [mozyo:handoff:issue=14219:kind=reply]\n"),
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
-                        " / retry command: mozyo-bridge handoff send --target-repo auto\n"),
+                        " / retry command: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target-repo auto\n"),
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates: %14 / retry command: nope\n"),
             ("blocked", "- target: coordinator\n- on blocked: %14"
@@ -889,12 +917,12 @@ class CorroborationTests(unittest.TestCase):
             # Delivered to the coordinator, but the marker names a different journal — so it is
             # not the landing observation for THIS park declaration.
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=1:kind=reply:to=codex]\n"),
             # The command targets somewhere other than the target the record declares.
             ("sent", "- target: %14\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # -- checkpoint j#86558 R6-F2: each part carries its own authority -----------------
@@ -924,12 +952,12 @@ class CorroborationTests(unittest.TestCase):
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # The marker observed belongs to another issue.
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=99999:journal=85500:kind=reply:to=codex]\n"),
             # The marker observed was addressed to a Claude, so it is not the coordinator callback.
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=claude]\n"),
             # A target that is neither the natural coordinator target nor a resolved pane.
@@ -959,13 +987,13 @@ class CorroborationTests(unittest.TestCase):
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # The effective target is the pane; reading only the first `--target` said coordinator.
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " --target w3F:p3 / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # A marker missing the fields the canonical producer always emits (`source` / `kind`)
             # was never built by the sender, so it is not the landing observation.
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / [mozyo:handoff:issue=14219:journal=85500:to=codex]\n"),
             # The retry is a command that will be REPLAYED — `echo` will not deliver anything.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
@@ -984,7 +1012,7 @@ class CorroborationTests(unittest.TestCase):
             # A retry command with no `--target-repo auto` is not replayable as specified.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
-                        " / retry command: mozyo-bridge handoff send --to codex --target %14\n"),
+                        " / retry command: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target %14\n"),
             # A target field naming two panes: no single target to have delivered to.
             ("sent", "- target: coordinator pane %99 %14\n"
                      "- on sent: mozyo-bridge handoff send --to codex --target %14"
@@ -1003,7 +1031,7 @@ class CorroborationTests(unittest.TestCase):
             # A wrapped command is precisely the one that did not run. The `handoff send` string
             # is present in all three — which is why the earlier check passed them.
             ("sent", "- target: coordinator\n"
-                     "- on sent: echo mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: echo mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             ("sent", "- target: coordinator\n"
@@ -1018,32 +1046,32 @@ class CorroborationTests(unittest.TestCase):
             # A key declared twice says two things and proves neither; the shared scanner's
             # last-write-wins quietly resolved both of these to the acceptable value.
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / [mozyo:handoff:source=redmine:issue=14219:journal=1:journal=85500"
                      ":kind=reply:to=codex]\n"),
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply"
                      ":to=claude:to=codex]\n"),
             # A foreign marker riding along beside a valid one: two observations, no single one.
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / [mozyo:handoff:source=redmine:issue=99999:journal=1:kind=reply:to=claude]"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # Combinations the canonical producer cannot emit: another source system carrying this
             # Redmine anchor, and a kind outside the handoff vocabulary.
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / [mozyo:handoff:source=asana:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=banana"
                      ":to=codex]\n"),
             # Each of the next five isolates ONE invocation/marker rule: everything else about the
             # record is canonical, so only the named rule can refuse it.
             # A shell operator with no prefix word: the invocation is composed, not run alone.
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " && true / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # A prefix that ends in a colon but is not a label.
@@ -1058,13 +1086,13 @@ class CorroborationTests(unittest.TestCase):
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # Two invocations in one line: which one is the delivery?
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " mozyo-bridge handoff send --mode standard / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # The valid marker FIRST and a foreign one after it — "any one matches" would stop at
             # the first and never see the second.
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]"
                      " [mozyo:handoff:source=redmine:issue=99999:journal=1:kind=reply:to=claude]\n"),
             # -- checkpoint j#86577 R9-F1: a wrapper is not a label ---------------------------
@@ -1082,16 +1110,66 @@ class CorroborationTests(unittest.TestCase):
             # The producer cannot emit these, and the CLI refuses `--to CODEX` outright, so
             # case-folding the comparison accepted tokens no run could have produced.
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / [mozyo:handoff:source=REDMINE:issue=14219:journal=85500:kind=reply"
                      ":to=codex]\n"),
             ("sent", "- target: coordinator\n"
-                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind reply --issue 14219 --journal 85500 --target coordinator"
                      " / [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply"
                      ":to=CODEX]\n"),
             ("sent", "- target: coordinator\n"
                      "- on sent: mozyo-bridge handoff send --to CODEX --target coordinator"
                      " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # -- checkpoint j#86626 R10-F1: the command must be one the CLI would actually run --
+            # The exact previous positive fixture: required `--source` / `--kind` are missing, so
+            # the canonical argparse refuses it — a command that cannot run delivered nothing.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # Fully-flagged, plus one token the CLI would reject as unrecognized.
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} definitely-not-a-cli-arg"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # The retry side of the same rule.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge handoff send --to codex --target %14"
+                        " --target-repo auto\n"),
+            # -- checkpoint j#86626 R10-F2: the command must compose THIS marker ----------------
+            # Executable commands whose canonical build_marker output is a DIFFERENT marker than
+            # the one observed: another anchor, another kind, another source system.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine"
+                     " --kind reply --issue 99999 --journal 1 --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine"
+                     " --kind review_request --issue 14219 --journal 85500 --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --source asana"
+                     " --task-id 123 --comment-id 456 --kind reply --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # Passes argparse (both flags optional) but fails the canonical anchor semantics:
+            # a redmine anchor requires BOTH --issue and --journal. The retry path is the
+            # discriminating one — the sent path re-derives the anchor for the marker comparison,
+            # so only here is `normalize_anchor` the sole refusing rule.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge handoff send --to codex --source redmine"
+                        " --kind reply --issue 14219 --target %14 --target-repo auto\n"),
+            # A conflicting duplicate ACROSS spellings whose argparse-effective (last) value is the
+            # acceptable one: only the spelling-aware conflict scan can refuse it.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine"
+                     " --kind reply --issue 14219 --journal 85500 --target w3F:p3"
+                     " --target=coordinator / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
@@ -1220,6 +1298,46 @@ class EndToEndClassificationTests(unittest.TestCase):
             request=_request_note(head=other), review=_review_note(head=other)
         )))
         self.assertEqual(got.reason, NON_CANDIDATE_CONJUNCT_ANCHOR_MISMATCH)
+
+
+class SendGrammarDriftGuardTests(unittest.TestCase):
+    """The park record's mirrored ``handoff send`` grammar matches the canonical parser.
+
+    The domain must not import the application-layer parser builder, so the grammar lives as data
+    (``_SEND_OPTIONS``) — and this test builds the REAL parser and asserts the mirror matches it
+    action for action, the same drift-guard pattern ``callback_delivery`` uses. If this fails, the
+    canonical CLI grammar changed and the mirror must be updated with it.
+    """
+
+    def test_mirrored_grammar_matches_the_canonical_parser(self):
+        import argparse
+
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff import (  # noqa: E501
+            configure_handoff_parser,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff_select import (  # noqa: E501
+            add_handoff_select_args,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_park_record import (  # noqa: E501
+            _SEND_OPTIONS,
+        )
+
+        canonical = argparse.ArgumentParser(add_help=False)
+        configure_handoff_parser(canonical, kind_required=True)
+        add_handoff_select_args(canonical)
+
+        def spec(action):
+            if type(action).__name__ == "_StoreTrueAction":
+                value = "flag"
+            elif type(action).__name__ == "_AppendAction":
+                value = "append"
+            else:
+                value = action.type or str
+            choices = tuple(action.choices) if action.choices else None
+            return (action.option_strings[0], bool(action.required), choices, value)
+
+        canonical_specs = [spec(action) for action in canonical._actions]
+        self.assertEqual(list(_SEND_OPTIONS), canonical_specs)
 
 
 if __name__ == "__main__":  # pragma: no cover

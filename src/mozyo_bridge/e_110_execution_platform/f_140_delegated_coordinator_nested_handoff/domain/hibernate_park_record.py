@@ -26,8 +26,13 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+import argparse
+
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
     KIND_LABELS,
+    AnchorError,
+    build_marker,
+    normalize_anchor,
 )
 
 #: The park marker is not accompanied by the governed fixed-field park journal.
@@ -171,31 +176,151 @@ def canonical_target(value: str) -> str:
 _SHELL_CONTROL = ("&&", "||", ";", "|", "&", ">", "<", "$(", "`", "\n")
 #: The CLI's own entry points (``pyproject`` console scripts).
 _CLI_ENTRYPOINTS = ("mozyo-bridge", "mozyo")
+#: The coordinator's natural target (`--target coordinator`), the normal route.
+_COORDINATOR_TARGET = "coordinator"
+#: The receiver a coordinator callback must name: the coordinator's window actor is Codex.
+_RECEIVER_CODEX = "codex"
+#: A pane token as ``agents targets`` prints one: ``%14`` or ``w3F:p4``, matched WHOLE.
+_PANE_TOKEN_RE = re.compile(r"(?:%\d+|\w+:p\w+)\Z")
+
+#: The canonical ``handoff send`` grammar, mirrored as DATA: ``(flag, required, choices, value)``
+#: where ``value`` is ``str`` / ``float`` / ``int`` for a value option, ``"flag"`` for a bare
+#: switch and ``"append"`` for a repeatable option. The domain must not import the
+#: application-layer parser builder, so this table exists — and a drift-guard test builds the REAL
+#: parser (``configure_handoff_parser`` + ``add_handoff_select_args``) and asserts this table
+#: matches it action for action, the same pattern ``callback_delivery`` uses for its tokens.
+#: An invocation this grammar rejects is one the CLI would refuse to run, and a command that never
+#: ran is not delivery evidence (checkpoint j#86626 R10-F1 — the previous check looked at token 0
+#: and ``handoff send`` only, and its own positive fixture was missing the required ``--source`` /
+#: ``--kind``).
+_SEND_OPTIONS: tuple = (
+    ("--to", True, ("claude", "codex"), str),
+    ("--source", True, ("asana", "redmine"), str),
+    ("--kind", True, tuple(sorted(KIND_LABELS)), str),
+    ("--task-id", False, None, str),
+    ("--comment-id", False, None, str),
+    ("--anchor-url", False, None, str),
+    ("--issue", False, None, str),
+    ("--journal", False, None, str),
+    ("--target", False, None, str),
+    ("--target-repo", False, None, str),
+    ("--target-lane", False, None, str),
+    ("--target-project", False, None, str),
+    ("--allow-direct-worker", False, None, "flag"),
+    ("--workdir", False, None, str),
+    (
+        "--role-profile",
+        False,
+        ("coordinator", "delegated_coordinator", "implementation_gateway", "implementation_worker"),
+        str,
+    ),
+    ("--profile-field", False, None, "append"),
+    ("--main-lane-exception", False, None, str),
+    ("--mode", False, ("pending", "queue-enter", "standard"), str),
+    ("--summary", False, None, str),
+    ("--force", False, None, "flag"),
+    ("--landing-timeout", False, None, float),
+    ("--submit-delay", False, None, float),
+    ("--read-lines", False, None, int),
+    ("--queue-enter-retry-window", False, None, float),
+    ("--queue-enter-retry-interval", False, None, float),
+    ("--no-target-activation", False, None, "flag"),
+    ("--restore-previous-active", False, None, "flag"),
+    ("--record-format", False, ("both", "json", "text"), str),
+    ("--record-command", False, None, str),
+    ("--persist-delivery", False, None, "flag"),
+    ("--select", False, None, "flag"),
+    ("--target-session", False, None, str),
+)
+
+#: Options that legitimately repeat (argparse append) — exempt from the conflict rule.
+_APPEND_FLAGS = frozenset(
+    flag for flag, _required, _choices, value in _SEND_OPTIONS if value == "append"
+)
+_VALUE_FLAGS = frozenset(
+    flag for flag, _required, _choices, value in _SEND_OPTIONS if value not in ("flag",)
+)
 
 
-#: The exact labels the template puts before a command. Anything else preceding the invocation is
-#: a wrapper, not a label — ``echo command:`` reads as a label to a pattern that only asks for
-#: "words then a colon" (checkpoint j#86577 R9-F1), and a wrapped command is the one that did not
-#: run. The label is stripped by the CALLER, so the parser has no guessing to do.
-_COMMAND_LABEL_RE = re.compile(r"^(?:retry\s+command|retry|command)\s*:\s*", re.IGNORECASE)
+class _GrammarRefusal(Exception):
+    """Raised instead of argparse's stderr-print-and-exit — the check is side-effect free."""
 
 
-def _strip_command_label(text: str) -> str:
-    """Drop one template label from the FRONT of ``text`` (pure). Nothing else is removed."""
-    return _COMMAND_LABEL_RE.sub("", text.strip(), count=1)
+class _RefusingParser(argparse.ArgumentParser):
+    def error(self, message):  # pragma: no cover - trivial override
+        raise _GrammarRefusal(message)
 
 
-def _send_invocation(text: str) -> "list[str] | None":
-    """The ``mozyo-bridge handoff send ...`` invocation ``text`` IS, or ``None`` (pure).
+def _build_send_parser() -> argparse.ArgumentParser:
+    parser = _RefusingParser(prog="handoff-send-evidence", add_help=False)
+    for flag, required, choices, value in _SEND_OPTIONS:
+        dest = flag[2:].replace("-", "_")
+        if value == "flag":
+            parser.add_argument(flag, dest=dest, required=required, action="store_true")
+        elif value == "append":
+            parser.add_argument(flag, dest=dest, required=required, action="append")
+        else:
+            parser.add_argument(
+                flag,
+                dest=dest,
+                required=required,
+                choices=list(choices) if choices else None,
+                type=None if value is str else value,
+            )
+    return parser
+
+
+_SEND_PARSER = _build_send_parser()
+
+
+def _conflicting_store_flags(tokens: "list[str]") -> bool:
+    """Whether any single-valued flag repeats with DIFFERING values (pure).
+
+    Argparse itself is last-write-wins, but a durable record whose command says two things has no
+    single meaning to trust (the R8 rule). Append options (``--profile-field``) repeat by design
+    and are exempt; identical repeats collapse.
+    """
+    seen: dict = {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("--"):
+            index += 1
+            continue
+        flag, eq, inline = token.partition("=")
+        if flag in _APPEND_FLAGS:
+            index += 1 if eq else 2
+            continue
+        if flag in _VALUE_FLAGS:
+            if eq:
+                value = inline
+                index += 1
+            elif index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
+                value = tokens[index + 1]
+                index += 2
+            else:
+                index += 1
+                continue  # missing value: the grammar parse refuses it
+            if flag in seen and seen[flag] != value:
+                return True
+            seen[flag] = value
+        else:
+            index += 1
+    return False
+
+
+def _send_invocation(text: str) -> "argparse.Namespace | None":
+    """The executable ``mozyo-bridge handoff send ...`` invocation ``text`` IS, or ``None`` (pure).
 
     ``text`` must BE the invocation: the caller has already cut the command component out of the
-    record (the label, the marker, the neighbouring parts), so token 0 is the CLI entry point or
-    this is not a command. Earlier versions harvested flags from the whole string and then, once
-    that was fixed, accepted any word-sequence-plus-colon as a label — both let a wrapped command
-    stand in for one that ran.
+    record, so token 0 is the CLI entry point or this is not a command. The arguments are then
+    validated against the mirrored canonical grammar — required options, choices, unknown
+    arguments, value types, both ``--flag value`` and ``--flag=value`` spellings — and the anchor
+    against the canonical ``normalize_anchor``. A token sequence the CLI would refuse to run never
+    delivered anything (checkpoint j#86626 R10-F1/F3).
 
-    Still refused outright: shell control anywhere (composition, conditionals, redirection,
-    substitution) and a second entry point, since neither is one invocation.
+    Still refused outright: shell control anywhere, a second entry point, and a single-valued flag
+    repeated with differing values (an invocation cannot mean two things at once).
     """
     if any(control in text for control in _SHELL_CONTROL):
         return None
@@ -206,56 +331,63 @@ def _send_invocation(text: str) -> "list[str] | None":
         return None
     if tokens[1:3] != ["handoff", "send"]:
         return None
-    return tokens
-
-
-def _flag_value(tokens: "list[str]", flag: str) -> "str | None | object":
-    """The invocation's EFFECTIVE value for ``flag``, ``None`` if absent, ``_FIELD_CONFLICT`` if it
-    is given more than once with differing values (pure).
-
-    A command is one invocation, so a flag repeated with two values has no single meaning a reader
-    may pick from: ``--to codex --to claude`` delivers to claude, and ``--target coordinator
-    --target w3F:p3`` targets the pane (checkpoint j#86562 R7-F2). A value that is itself a flag is
-    not a value — subsumed by the comparisons downstream, but it keeps the parse honest.
-    """
-    values = set()
-    for index, token in enumerate(tokens):
-        if token != flag:
-            continue
-        if index + 1 >= len(tokens) or tokens[index + 1].startswith("--"):
-            return _FIELD_CONFLICT
-        values.add(tokens[index + 1].strip("`(),"))
-    if not values:
+    arguments = tokens[3:]
+    if _conflicting_store_flags(arguments):
         return None
-    if len(values) > 1:
-        return _FIELD_CONFLICT
-    return values.pop()
+    try:
+        namespace = _SEND_PARSER.parse_args(arguments)
+    except _GrammarRefusal:
+        return None
+    try:
+        normalize_anchor(
+            namespace.source,
+            task_id=namespace.task_id,
+            comment_id=namespace.comment_id,
+            anchor_url=namespace.anchor_url,
+            issue=namespace.issue,
+            journal=namespace.journal,
+        )
+    except AnchorError:
+        return None
+    return namespace
 
 
-def _delivery_command_gap(command: str, *, target: str) -> Optional[str]:
-    """Whether ``command`` is a handoff delivery to the coordinator's Codex at ``target`` (pure)."""
-    tokens = _send_invocation(command)
-    if tokens is None:
-        return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    receiver = _flag_value(tokens, "--to")
-    if receiver is _FIELD_CONFLICT or receiver is None:
-        return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    if str(receiver) != _RECEIVER_CODEX:
-        return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    commanded = _flag_value(tokens, "--target")
-    if commanded is _FIELD_CONFLICT or commanded is None:
-        return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    if str(commanded) != target:
-        return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    return None
+def canonical_target(value: str) -> str:
+    """The canonical coordinator target a ``target:`` field names, or ``""`` (pure).
+
+    The template writes the two permitted forms as ``coordinator (`--target coordinator`)`` and
+    ``<coordinator_codex_%pane>`` — both of which SAY they are the coordinator's. So the field must
+    name the coordinator, and the effective target is then either that natural token or the one
+    pane it resolves to. Substring matching and bare panes were both refused before this shape
+    (checkpoints j#86562 R7-F1, j#86577 R9-F1); two panes name no single place the callback went.
+    """
+    tokens = [token.strip("`(),") for token in str(value).split()]
+    if not any(token == _COORDINATOR_TARGET for token in tokens):
+        return ""
+    panes = {token for token in tokens if _PANE_TOKEN_RE.match(token)}
+    if len(panes) > 1:
+        return ""
+    return panes.pop() if panes else _COORDINATOR_TARGET
+
+
+#: The exact labels the template puts before a command. Anything else preceding the invocation is
+#: a wrapper, not a label (checkpoint j#86577 R9-F1). The label is stripped by the CALLER, so the
+#: parser has no guessing to do.
+_COMMAND_LABEL_RE = re.compile(r"^(?:retry\s+command|retry|command)\s*:\s*", re.IGNORECASE)
+
+
+def _strip_command_label(text: str) -> str:
+    """Drop one template label from the FRONT of ``text`` (pure). Nothing else is removed."""
+    return _COMMAND_LABEL_RE.sub("", text.strip(), count=1)
 
 
 #: ``[mozyo:handoff:<body>]`` read RAW — the shared scanner folds duplicate keys last-write-wins,
 #: which is exactly what has to be refused here.
 _HANDOFF_MARKER_RE = re.compile(r"\[mozyo:handoff:(?P<body>[^\]]*)\]")
-#: The durable source this evidence surface is anchored in. A marker claiming another source cannot
-#: also be carrying this issue's Redmine anchor.
+#: The durable source this evidence surface is anchored in.
 _MARKER_SOURCE = "redmine"
+#: The delivery phrase — used only to keep the blocked REASON from doubling as evidence.
+_HANDOFF_SEND_RE = re.compile(r"\bhandoff\s+send\b", re.IGNORECASE)
 
 
 def _raw_marker_fields(body: str) -> "dict | None":
@@ -264,8 +396,7 @@ def _raw_marker_fields(body: str) -> "dict | None":
 
     The shared scanner's last-write-wins is right for a lenient reader and wrong for evidence:
     ``journal=1:journal=85500`` and ``to=claude:to=codex`` both resolved to the acceptable value
-    and passed (checkpoint j#86569 R8-F2). The same exactly-one rule the governed fields already
-    follow applies here — a token that says two things proves neither.
+    and passed (checkpoint j#86569 R8-F2). A token that says two things proves neither.
     """
     fields: dict = {}
     for token in body.split(":"):
@@ -279,42 +410,22 @@ def _raw_marker_fields(body: str) -> "dict | None":
     return fields
 
 
-def _landing_marker_matches(detail: str, *, source_issue: str, journal: str) -> bool:
-    """Whether ``detail`` carries THIS callback's canonical landing marker, and only that (pure).
+def _observed_marker_fields(detail: str) -> "dict | None":
+    """THE landing marker's fields in ``detail``, or ``None`` (pure).
 
-    Every marker in the detail is read, not just a matching one: accepting "any one of them"
-    let a foreign marker ride along beside a valid one. Each must be canonical — every field the
-    producer emits, this durable source, a known kind, the coordinator's Codex — and they must all
-    agree, because two different landing observations in one record name no single delivery.
+    Every marker in the detail is read, not just a matching one; identical repeats collapse and
+    differing ones conflict — the same rule the governed fields follow (checkpoint j#86577 R9-F3).
     """
     markers = []
     for match in _HANDOFF_MARKER_RE.finditer(detail):
         fields = _raw_marker_fields(match.group("body"))
         if fields is None:
-            return False
+            return None
         markers.append(fields)
-    # Identical repeats collapse and differing ones conflict — the same rule the governed fields
-    # follow. R9 refused any repeat outright, which is safe but not the contract: a record that
-    # states one fact twice would never satisfy the park basis (checkpoint j#86577 R9-F3).
     distinct = {tuple(sorted(fields.items())) for fields in markers}
     if len(distinct) != 1:
-        return False
-
-    # Each mandatory field of the canonical producer is checked INDIVIDUALLY below — `source`,
-    # `kind` and `to` against their vocabularies, `issue` and `journal` against this anchor — so a
-    # blanket "all present" loop over the same names would be unobservable. Absence fails the same
-    # comparison as a wrong value.
-    fields = markers[0]
-    if str(fields.get("source", "")).strip() != _MARKER_SOURCE:
-        return False
-    if str(fields.get("kind", "")).strip() not in KIND_LABELS:
-        return False
-    if str(fields.get("to", "")).strip() != _RECEIVER_CODEX:
-        return False
-    return (
-        str(fields.get("issue", "")).strip() == str(source_issue).strip()
-        and str(fields.get("journal", "")).strip() == str(journal).strip()
-    )
+        return None
+    return dict(distinct.pop())
 
 
 #: The template joins the command and the observed marker (``command + observed landing marker``).
@@ -325,18 +436,59 @@ _COMMAND_COMPONENT_RE = re.compile(r"[/+]")
 def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: str) -> Optional[str]:
     """Whether a ``sent`` record is THIS callback's delivery evidence (pure).
 
-    The command component is everything before the first separator; the observation is what
-    follows. Cutting it here is what lets :func:`_send_invocation` demand that the component BE the
-    invocation rather than guess where one starts (checkpoint j#86577 R9-F1).
+    Three authorities, each with its own comparison:
+
+    * the COMMAND must be an invocation the CLI would actually run
+      (:func:`_send_invocation`), delivering ``--to codex`` at the target the record declares;
+    * the MARKER must be about this park declaration — this durable source, a known kind, the
+      coordinator's Codex, this issue and this journal;
+    * the two must be the SAME delivery: the marker the command composes — via the canonical
+      ``normalize_anchor`` + ``build_marker``, not a re-implementation — must field-for-field
+      equal the marker observed (checkpoint j#86626 R10-F2; an executable command for a DIFFERENT
+      anchor or kind can otherwise borrow another handoff's landing observation).
     """
     parts = _COMMAND_COMPONENT_RE.split(detail, maxsplit=1)
     if len(parts) != 2:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     command, observation = parts
-    gap = _delivery_command_gap(_strip_command_label(command), target=target)
-    if gap is not None:
-        return gap
-    if not _landing_marker_matches(observation, source_issue=source_issue, journal=journal):
+    namespace = _send_invocation(_strip_command_label(command))
+    if namespace is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if namespace.to != _RECEIVER_CODEX:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if namespace.target != target:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+
+    observed = _observed_marker_fields(observation)
+    if observed is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if observed.get("source") != _MARKER_SOURCE:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if observed.get("kind") not in KIND_LABELS:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if observed.get("to") != _RECEIVER_CODEX:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if (
+        observed.get("issue") != str(source_issue).strip()
+        or observed.get("journal") != str(journal).strip()
+    ):
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+
+    anchor = normalize_anchor(
+        namespace.source,
+        task_id=namespace.task_id,
+        comment_id=namespace.comment_id,
+        anchor_url=namespace.anchor_url,
+        issue=namespace.issue,
+        journal=namespace.journal,
+    )
+    built_body_match = _HANDOFF_MARKER_RE.fullmatch(
+        build_marker(anchor, namespace.kind, namespace.to)
+    )
+    if built_body_match is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    built = _raw_marker_fields(built_body_match.group("body"))
+    if built != observed:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     return None
 
@@ -344,16 +496,13 @@ def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: st
 def _blocked_detail_gap(detail: str) -> Optional[str]:
     """Whether a ``blocked`` record carries reason / candidates / retry command (pure).
 
-    Read as the template writes it — EXACTLY three ``/``-separated parts, each with its own job.
-    Each earlier version stopped one step short: scoring the reason as leftover prose, then
-    splitting the parts but searching across them, and then accepting any string with the right
-    flags in it. The retry is a command that will be REPLAYED, so it has to be one:
+    Read as the template writes it — EXACTLY three ``/``-separated parts, each with its own job:
 
     * part 1 — the reason, which must be text and not evidence standing in for one;
     * part 2 — the candidate rows, which must actually name at least one pane;
-    * part 3 — a real ``handoff send`` to ``--to codex``, pinned at ONE of those candidates and at
-      ``--target-repo auto``. A conflicting repeat of any of those flags is fail-closed: an
-      invocation cannot mean two things at once.
+    * part 3 — a retry the CLI would actually run (same invocation rules as ``sent``), delivering
+      ``--to codex``, pinned at ONE of those candidates and at ``--target-repo auto``, which is
+      what makes it replayable from the durable record.
     """
     parts = [part.strip() for part in detail.split("/")]
     parts = [part for part in parts if part]
@@ -361,7 +510,9 @@ def _blocked_detail_gap(detail: str) -> Optional[str]:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     reason, candidates, retry = parts
 
-    if _PANE_TOKEN_RE.search(reason) or _HANDOFF_SEND_RE.search(reason):
+    if any(_PANE_TOKEN_RE.match(token.strip("`(),")) for token in reason.split()):
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if _HANDOFF_SEND_RE.search(reason):
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     candidate_panes = {
         token.strip("`(),")
@@ -371,19 +522,14 @@ def _blocked_detail_gap(detail: str) -> Optional[str]:
     if not candidate_panes:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
 
-    tokens = _send_invocation(_strip_command_label(retry))
-    if tokens is None:
+    namespace = _send_invocation(_strip_command_label(retry))
+    if namespace is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    receiver = _flag_value(tokens, "--to")
-    if receiver is _FIELD_CONFLICT or receiver is None:
+    if namespace.to != _RECEIVER_CODEX:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    if str(receiver) != _RECEIVER_CODEX:
+    if namespace.target not in candidate_panes:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    pinned = _flag_value(tokens, "--target")
-    if pinned is _FIELD_CONFLICT or pinned is None or pinned not in candidate_panes:
-        return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    repo = _flag_value(tokens, "--target-repo")
-    if repo is _FIELD_CONFLICT or str(repo or "") != "auto":
+    if namespace.target_repo != "auto":
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     return None
 
