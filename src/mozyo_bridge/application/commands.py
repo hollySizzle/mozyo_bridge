@@ -138,6 +138,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     make_outcome,
     resolve_queue_enter_retry_policy,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import effective_send_mode, send_semantic_gap  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_command_input_adapter import (
     HandoffNamespaceAdapter,
 )
@@ -1713,15 +1714,13 @@ def orchestrate_handoff(
             die(f"--source must be one of {sorted(SOURCES)}; got {source!r}")
 
     kind = inp.kind or inp.default_kind
-    mode = inp.mode or MODE_QUEUE_ENTER
+    mode = effective_send_mode(inp.mode)
     if mode not in MODES:
         die(f"--mode must be one of {sorted(MODES)}; got {mode!r}")
 
-    if mode == MODE_QUEUE_ENTER and bool(inp.force):
-        # Per the relaxed queue-enter rail contract, the agent gate must be
-        # stricter than strict `standard`: `--force` cannot be used to bypass
-        # non-agent target checks under this rail. The rail only makes sense
-        # for Claude/Codex agent panes whose prompt queue accepts Enter.
+    if send_semantic_gap(mode=inp.mode, force=bool(inp.force)) is not None:
+        # Queue-enter refuses --force (shared send-semantics authority): the rail
+        # is agent-pane-only and must stay stricter than strict `standard`.
         _emit(
             make_outcome(
                 status="blocked",

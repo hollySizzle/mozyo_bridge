@@ -148,28 +148,45 @@ _RECEIVER_CODEX = "codex"
 _MARKER_REQUIRED_FIELDS = ("source", "issue", "journal", "kind", "to")
 
 
+#: The pane form's permitted filler words between ``coordinator`` and its pane — the closed
+#: vocabulary the template's ``<coordinator_codex_%pane>`` placeholder spells out.
+_COORDINATOR_PANE_FILLER = frozenset({"codex", "pane"})
+
+
 def canonical_target(value: str) -> str:
     """The canonical coordinator target a ``target:`` field names, or ``""`` (pure).
 
-    The template writes the two permitted forms as ``coordinator (`--target coordinator`)`` and
-    ``<coordinator_codex_%pane>`` — both of which SAY they are the coordinator's. So the field must
-    name the coordinator, and the effective target is then either that natural token or the one
-    pane it resolves to.
+    The template's two permitted forms — ``coordinator (`--target coordinator`)`` and
+    ``<coordinator_codex_%pane>`` — are a CLOSED grammar, not a vocabulary hint. Token presence
+    was tried twice and lost twice: substring matching read ``noncoordinator`` as the coordinator,
+    whole-token matching accepted any prose that happened to contain the word — ``same-lane
+    worker w3F:p3 coordinator`` and ``not coordinator actually worker w3F:p3`` both promoted a
+    worker's pane to the coordinator's callback (checkpoint j#86675 → j#86679 R19-F2). So the
+    field parses as one of exactly:
 
-    Two ways this was wrong before. It asked whether ``"coordinator" in value.lower()``, so
-    ``noncoordinator`` and ``the-coordinator-ish`` read as the coordinator; and once whole-token
-    matching landed, a bare pane still passed on shape alone — ``same-lane worker w3F:p3`` is a
-    well-formed pane, and nothing in it claims to be the coordinator (checkpoint j#86562 R7-F1).
-    A pane is a target only when the record says whose it is, and only when there is exactly one:
-    two panes name no single place the callback went.
+    * the natural form: ``coordinator``, optionally restating its own flag
+      (``coordinator (`--target coordinator`)``);
+    * the pane form: ``coordinator`` FIRST, then only the closed filler vocabulary, ending in
+      exactly one pane — the record saying whose pane it is, in the template's own words.
+
+    Anything else — the word elsewhere than first, free prose around it, negations — is not the
+    template's declaration and resolves to no target.
     """
-    tokens = [token.strip("`(),") for token in str(value).split()]
-    if not any(token == _COORDINATOR_TARGET for token in tokens):
-        return ""
-    panes = {token for token in tokens if _PANE_TOKEN_RE.match(token)}
-    if len(panes) > 1:
-        return ""
-    return panes.pop() if panes else _COORDINATOR_TARGET
+    tokens = tuple(
+        stripped
+        for token in str(value).split()
+        if (stripped := token.strip("`(),"))
+    )
+    if tokens in ((_COORDINATOR_TARGET,), (_COORDINATOR_TARGET, "--target", _COORDINATOR_TARGET)):
+        return _COORDINATOR_TARGET
+    if (
+        len(tokens) >= 2
+        and tokens[0] == _COORDINATOR_TARGET
+        and all(token in _COORDINATOR_PANE_FILLER for token in tokens[1:-1])
+        and _PANE_TOKEN_RE.match(tokens[-1])
+    ):
+        return tokens[-1]
+    return ""
 
 
 #: A record's command is one invocation that WAS run (``sent``) or WILL
@@ -440,13 +457,16 @@ def _lex_detail(text: str) -> "list[_Token] | None":
 
 
 #: Characters through which the shell rewrites argv before the CLI ever runs: command/parameter/
-#: arithmetic substitution (`` ` `` / ``$``) and pathname expansion (``*`` ``?`` ``[``). A command
-#: token carrying one does not have the argv the record shows — an unset ``$VAR`` deletes or
-#: empties the value and ``*`` fans out into whatever the cwd holds (checkpoint j#86662 R15-F1,
-#: where all three passed as sent deliveries). ONE explicit policy, refused even when quoted: the
-#: boolean ``plain`` provenance cannot distinguish the single-quoted safe literal from the
-#: double-quoted expanding one, so the false positive lands on the fail-closed side.
-_EXPANSION_CHARS = "`$*?["
+#: arithmetic substitution (`` ` `` / ``$``), pathname expansion (``*`` ``?`` ``[``) and tilde
+#: expansion (``~`` — word-start only in POSIX, but enumerated here like the rest; checkpoint
+#: j#86679 R19-F1, where ``--target-repo ~`` read as a literal while ``/bin/sh`` handed the CLI
+#: the home path). A command token carrying one does not have the argv the record shows — an
+#: unset ``$VAR`` deletes or empties the value and ``*`` fans out into whatever the cwd holds
+#: (checkpoint j#86662 R15-F1, where all three passed as sent deliveries). ONE explicit policy,
+#: refused even when quoted: the boolean ``plain`` provenance cannot distinguish the
+#: single-quoted safe literal from the double-quoted expanding one, so the false positive lands
+#: on the fail-closed side.
+_EXPANSION_CHARS = "`$*?[~"
 
 
 def _command_tokens_unsafe(tokens: "list[_Token]") -> bool:
@@ -554,6 +574,8 @@ def _send_invocation(tokens: "list[_Token] | None") -> "argparse.Namespace | Non
         target=namespace.target,
         target_project=namespace.target_project,
         target_repo=namespace.target_repo,
+        mode=namespace.mode,
+        force=bool(namespace.force),
     ) is not None:
         return None
     return namespace

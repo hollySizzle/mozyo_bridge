@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Sequence
 # are re-exported below (see ``__all__``) so every existing import site that
 # reaches them via ``...domain.handoff`` (``commands.py``, the ticketless tests)
 # keeps working unchanged.
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import SEND_SEMANTIC_CUSTOM_SUMMARY, default_body_for_kind, send_semantic_gap  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import MODE_QUEUE_ENTER, SEND_SEMANTIC_CUSTOM_SUMMARY, default_body_for_kind, send_semantic_gap  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_anchors import (
     SOURCE_TICKETLESS,
     TicketlessAnchor,
@@ -87,7 +87,7 @@ SOURCES: frozenset[str] = frozenset({SOURCE_ASANA, SOURCE_REDMINE})
 
 MODE_STANDARD = "standard"
 MODE_PENDING = "pending"
-MODE_QUEUE_ENTER = "queue-enter"
+# MODE_QUEUE_ENTER is re-exported from handoff_send_semantics (the rule that owns it).
 MODES: frozenset[str] = frozenset({MODE_STANDARD, MODE_PENDING, MODE_QUEUE_ENTER})
 
 RECEIVERS: frozenset[str] = frozenset({"claude", "codex"})

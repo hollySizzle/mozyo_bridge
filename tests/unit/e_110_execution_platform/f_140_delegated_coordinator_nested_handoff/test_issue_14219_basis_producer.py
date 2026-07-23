@@ -1069,6 +1069,27 @@ class CorroborationTests(unittest.TestCase):
         )
         self.assertEqual(produced.gaps, ())
 
+    def test_standard_mode_with_force_is_still_a_delivery(self):
+        # Positive control for the queue-enter/force rule (checkpoint j#86679 R19-F3): the
+        # canonical CLI allows --force under --mode standard, so the record satisfies the basis.
+        for detail in (
+            ("- target: coordinator\n"
+             f"- on sent: {SEND_COMMAND} --force"
+             " / observed landing marker"
+             " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("- target: coordinator (`--target coordinator`)\n"
+             "- on blocked: coordinator pane unresolved"
+             " / candidates (`agents targets` rows): %14 codex w3F:p4"
+             f" / retry command: {RETRY_COMMAND} --mode standard --force\n"),
+        ):
+            result = "sent" if "on sent" in detail else "blocked"
+            with self.subTest(result=result):
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=_park_fields(result=result, detail=detail))),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
     def test_a_reason_mentioning_panes_or_the_send_is_still_a_reason(self):
         # checkpoint j#86675 R18-F5: the reason is non-empty free text. The candidates and the
         # retry are judged exactly on their own parts, so prose like "handoff send could not
@@ -1665,6 +1686,65 @@ class CorroborationTests(unittest.TestCase):
                      " / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]"
                      " [mozyo:handoff:issue=14219:source=redmine:journal=85500:kind=reply:to=codex]\n"),
+            # -- checkpoint j#86679 R19-F1: tilde expansion rewrites argv too -------------------
+            # `/bin/sh` hands the CLI the HOME path where the record shows `~`; --target-repo
+            # and --workdir change resolution and execution context. Refused even quoted, like
+            # every expansion character.
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --summary ~"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --target-repo ~"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --workdir ~"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --summary '~'"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        f" / retry command: {RETRY_COMMAND} --summary ~\n"),
+            # -- checkpoint j#86679 R19-F2: the target field is a CLOSED grammar ----------------
+            # Sprinkling the word `coordinator` into a worker description does not make the
+            # worker's pane the coordinator's callback target.
+            ("sent", "- target: same-lane worker w3F:p3 coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine"
+                     " --kind reply --issue 14219 --journal 85500 --target w3F:p3"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: not coordinator actually worker w3F:p3\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine"
+                     " --kind reply --issue 14219 --journal 85500 --target w3F:p3"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("blocked", "- target: same-lane worker w3F:p3 coordinator\n"
+                        "- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        f" / retry command: {RETRY_COMMAND}\n"),
+            ("not-attempted", "- target: not coordinator actually worker w3F:p3\n"
+                              "- on not-attempted: this lane IS the coordinator lane\n"),
+            # -- checkpoint j#86679 R19-F3: queue-enter (the canonical default) refuses --force -
+            # The canonical sender exits blocked/invalid_args before any delivery; the shared
+            # authority owns the rule AND the mode default.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine"
+                     " --kind reply --issue 14219 --journal 85500 --target coordinator --force"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine"
+                     " --kind reply --issue 14219 --journal 85500 --target coordinator"
+                     " --mode queue-enter --force"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        f" / retry command: {RETRY_COMMAND} --force\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
@@ -1874,7 +1954,41 @@ class SendSemanticsSharedAuthorityTests(unittest.TestCase):
             _send_invocation,
         )
 
-        self.assertIn("send_semantic_gap", inspect.getsource(_send_invocation))
+        source = inspect.getsource(_send_invocation)
+        self.assertIn("send_semantic_gap", source)
+        # The queue-enter/force rule fires off the RAW mode (the authority applies the canonical
+        # default itself), so the parser must hand over mode and force (checkpoint j#86679 R19-F3).
+        self.assertIn("mode=namespace.mode", source)
+        self.assertIn("force=bool(namespace.force)", source)
+
+    def test_the_canonical_sender_consults_the_authority(self):
+        # checkpoint j#86679 R19-F3: the queue-enter/force refusal and the mode default lived
+        # only inline in cmd_handoff_send — the shared list's own origin story, repeated from
+        # the canonical side. Both now come from the authority.
+        import inspect
+
+        from mozyo_bridge.application.commands import orchestrate_handoff
+
+        source = inspect.getsource(orchestrate_handoff)
+        self.assertIn("send_semantic_gap", source)
+        self.assertIn("effective_send_mode", source)
+
+    def test_the_authority_matches_the_canonical_queue_enter_force_rule(self):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+            SEND_SEMANTIC_QUEUE_ENTER_FORCE,
+            send_semantic_gap,
+        )
+
+        # Unspecified mode IS queue-enter (the canonical default) — a bare --force is zero-send.
+        self.assertEqual(
+            send_semantic_gap(mode=None, force=True), SEND_SEMANTIC_QUEUE_ENTER_FORCE
+        )
+        self.assertEqual(
+            send_semantic_gap(mode="queue-enter", force=True), SEND_SEMANTIC_QUEUE_ENTER_FORCE
+        )
+        # The canonical CLI allows --force under the other modes.
+        self.assertIsNone(send_semantic_gap(mode="standard", force=True))
+        self.assertIsNone(send_semantic_gap(mode=None, force=False))
 
 
 class SendGrammarDriftGuardTests(unittest.TestCase):
