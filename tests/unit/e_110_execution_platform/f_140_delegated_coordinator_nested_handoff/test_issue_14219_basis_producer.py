@@ -915,6 +915,21 @@ class CorroborationTests(unittest.TestCase):
                     bp.GAP_PARK_CALLBACK_DETAIL_ABSENT,
                 )
 
+    def test_a_mid_word_hash_is_literal_as_in_the_shell(self):
+        # checkpoint j#86662 R15-F2: `park#callback` is ONE argv value to /bin/sh. Following
+        # Python shlex's mid-word truncation rejected this command the shell actually delivers.
+        detail = (
+            "- target: coordinator\n"
+            f"- on sent: {SEND_COMMAND} --summary park#callback"
+            " / observed landing marker"
+            " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+        )
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+            basis=BASIS_DEPENDENCY_PARK,
+        )
+        self.assertEqual(produced.gaps, ())
+
     def test_an_escaped_or_quoted_hash_is_a_value_not_a_comment(self):
         # Positive counterpart of the comment rule: `\\#` and `'#'` deliver the VALUE `#`.
         for summary in ("\\#", "'#'"):
@@ -1410,6 +1425,25 @@ class CorroborationTests(unittest.TestCase):
                      f"- on sent: {SEND_COMMAND} --summary #"
                      " / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # -- checkpoint j#86662 R15-F1: expansion rewrites argv before the CLI runs ---------
+            # An unset variable deletes the summary value (unquoted) or empties it (double-quoted)
+            # -> parse refusal / custom-summary refusal; a glob fans out into unknown arguments.
+            # All three are zero-send; the record's literal text is not the argv that ran.
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --summary $MOZYO_UNSET_VAR"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f'- on sent: {SEND_COMMAND} --summary "$MOZYO_UNSET_VAR"'
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --summary *"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        f" / retry command: {RETRY_COMMAND} --summary $MOZYO_UNSET_VAR\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
@@ -1752,19 +1786,25 @@ class LexerDriftGuardTests(unittest.TestCase):
         "escaped\\ space and 'quoted part'",
     )
 
-    #: Fragments whose pairwise combinations exercise every lexer state transition — including
-    #: the comment boundary the fixed corpus missed (checkpoint j#86657 R14-F1: the guard's
-    #: coverage is exactly its corpus's coverage, so the corpus is generated, not curated).
+    #: Fragments whose pairwise combinations cover the quote / escape / punctuation / separator
+    #: transitions (checkpoint j#86657 R14-F1: a curated corpus covers only what it curates, so
+    #: this one is generated). Comment and expansion characters are NOT here: Python shlex is not
+    #: the shell for either (checkpoint j#86662 R15-F2 — shlex comments mid-word where sh does
+    #: not), so comment semantics are checked against /bin/sh itself below, and expansion-bearing
+    #: tokens are policy-refused before lexing fidelity matters.
     FRAGMENTS = (
         "plain", "--flag=value", "'quoted part'", '"dq \\" part"', "\\ escaped",
-        "/", "+", ";", "|", "(", "%14", "#", "\\#", "'#'", "a#b", "--summary",
+        "/", "+", ";", "|", "(", "%14", "--summary",
     )
 
     @staticmethod
     def _reference(text: str):
         import shlex as shlex_module
 
+        # ``commenters=""``: this oracle answers for TOKENIZATION only. Its default comment rule
+        # is Python's, not POSIX's, and mirroring it rejected commands the shell delivers.
         lexer = shlex_module.shlex(text, posix=True, punctuation_chars=";|&<>()")
+        lexer.commenters = ""
         lexer.whitespace_split = True
         try:
             return list(lexer)
@@ -1799,6 +1839,43 @@ class LexerDriftGuardTests(unittest.TestCase):
                     None if got is None else [token.value for token in got],
                     self._reference(text),
                     text,
+                )
+
+    def test_comment_boundaries_match_the_shell_itself(self):
+        # The comment contract is POSIX sh's, not Python shlex's: `#` comments only at word start;
+        # mid-word, escaped and quoted hashes are literal. The oracle here is /bin/sh's actual
+        # argv, because following shlex's own default rejected commands the shell delivers
+        # (checkpoint j#86662 R15-F2).
+        import os
+        import subprocess
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_park_record import (  # noqa: E501
+            _lex_detail,
+        )
+
+        if not os.path.exists("/bin/sh"):  # pragma: no cover - POSIX hosts only
+            self.skipTest("/bin/sh not available")
+
+        cases = (
+            "a # b",
+            "a #b",
+            "a park#callback",
+            "a \\# b",
+            "a '#' b",
+            'a "#" b',
+            "#lead",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                result = subprocess.run(
+                    ["/bin/sh", "-c", f'set -- {text}\nfor a; do printf "%s\\0" "$a"; done'],
+                    capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0)
+                out = result.stdout.decode()
+                shell_argv = out.split("\0")[:-1] if out else []
+                self.assertEqual(
+                    [token.value for token in _lex_detail(text)], shell_argv
                 )
 
     def test_unclosed_quote_and_trailing_escape_are_fail_closed(self):

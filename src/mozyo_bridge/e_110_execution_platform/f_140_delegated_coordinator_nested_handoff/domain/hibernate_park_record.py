@@ -340,7 +340,7 @@ def _lex_detail(text: str) -> "list[_Token] | None":
     Lexing rules mirrored: whitespace splits; ``'...'`` is literal; ``"..."`` honours ``\\``
     before ``"`` ``\\`` `````` ``$``; a backslash outside quotes escapes the next character;
     punctuation characters outside quotes form their own tokens (``shlex`` ``punctuation_chars``); an
-    unquoted ``#`` starts a comment and discards the rest of the line, even mid-word.
+    unquoted ``#`` AT WORD START begins a comment (mid-word it is literal, as in POSIX sh).
     Unclosed quotes, trailing escapes and multi-line values are fail-closed.
     """
     if "\n" in text:
@@ -407,13 +407,14 @@ def _lex_detail(text: str) -> "list[_Token] | None":
             value.append(text[index + 1])
             index += 2
             continue
-        if char == "#":
-            # An unquoted, unescaped ``#`` starts a comment — everything after it never reached
-            # the shell's argv (checkpoint j#86657 R14-F1: without this, ``--summary #`` kept its
-            # ``#`` token and a command whose real argv the CLI refuses read as a delivery). The
-            # reference lexer truncates even mid-word (``b#c`` -> ``b``), so this check sits after
-            # the quote/escape branches and before the ordinary character.
-            flush()
+        if char == "#" and not started:
+            # An unquoted, unescaped ``#`` AT WORD START begins a comment — everything after it
+            # never reached the shell's argv (checkpoint j#86657 R14-F1: without this,
+            # ``--summary #`` kept its ``#`` token and a zero-send command read as a delivery).
+            # POSIX limits the comment to word starts: mid-word, ``#`` is literal
+            # (``park#callback`` is ONE argv value — checkpoint j#86662 R15-F2, where following
+            # Python shlex's own default of truncating mid-word rejected commands the shell
+            # actually delivers; the shell, not shlex, is the contract).
             break
         started = True
         value.append(char)
@@ -422,17 +423,25 @@ def _lex_detail(text: str) -> "list[_Token] | None":
     return tokens
 
 
-def _command_tokens_unsafe(values: "list[str]") -> bool:
-    """Whether the COMMAND tokens carry shell control or substitution (pure).
+#: Characters through which the shell rewrites argv before the CLI ever runs: command/parameter/
+#: arithmetic substitution (`` ` `` / ``$``) and pathname expansion (``*`` ``?`` ``[``). A command
+#: token carrying one does not have the argv the record shows — an unset ``$VAR`` deletes or
+#: empties the value and ``*`` fans out into whatever the cwd holds (checkpoint j#86662 R15-F1,
+#: where all three passed as sent deliveries). ONE explicit policy, refused even when quoted: the
+#: boolean ``plain`` provenance cannot distinguish the single-quoted safe literal from the
+#: double-quoted expanding one, so the false positive lands on the fail-closed side.
+_EXPANSION_CHARS = "`$*?["
 
-    Control operators outside quotes surface as punctuation tokens; substitution characters are
-    refused wherever they appear in a command token — ``$(`` and backtick execute inside double
-    quotes, and refusing the single-quoted false positive is the fail-closed direction.
+
+def _command_tokens_unsafe(values: "list[str]") -> bool:
+    """Whether the COMMAND tokens carry shell control, substitution or expansion (pure).
+
+    Control operators outside quotes surface as punctuation tokens; expansion-bearing characters
+    (:data:`_EXPANSION_CHARS`) are refused wherever they appear in a command token.
     """
     return any(
         (value and all(char in _PUNCTUATION for char in value))
-        or "`" in value
-        or "$(" in value
+        or any(char in _EXPANSION_CHARS for char in value)
         for value in values
     )
 
