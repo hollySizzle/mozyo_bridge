@@ -563,12 +563,74 @@ _PARK_RESUME_OWNER = "coordinator"
 #: ``durable_anchor: #<issue_id> j#<gate_journal_id>``.
 _DURABLE_ANCHOR_RE = re.compile(r"^#(?P<issue>\d+)\s+j#(?P<journal>\d+)$")
 
-#: The accepted spellings for the detail a non-``sent`` callback outcome must carry. The skill's
-#: fixed field block does not enumerate these (it names the outcome token only), so rather than
-#: imposing one spelling the reader accepts the forms a governed record plausibly uses — the same
-#: alternation approach the glance takes for its disposition fields.
-_CALLBACK_REASON_FIELDS = ("callback_reason", "callback_blocked_reason", "reason")
-_CALLBACK_RETRY_FIELDS = ("callback_retry_command", "retry_command", "retry")
+#: The canonical callback-outcome record, verbatim from the skill's own template
+#: (``references/workflow.md`` ``### Callback outcome journal テンプレート``):
+#:
+#:     - target: coordinator (`--target coordinator`) | <coordinator_codex_%pane>
+#:     - result: sent | blocked | not-attempted
+#:     - on sent: command + observed landing marker
+#:     - on blocked: reason / candidates (`agents targets` rows) / retry command (`--target %pane
+#:       --target-repo auto`)
+#:     - on not-attempted: explicit reason
+#:
+#: R4 invented its own spellings for these because the fixed-field block does not list them — but
+#: the template does, and not finding it is not the same as it not existing (checkpoint j#86548
+#: R5-F2). The invented aliases REJECTED canonical records while ACCEPTING values that had nothing
+#: to do with a callback, which is the meaning of the check inverted. The template is the contract;
+#: only the parked-state fold-in spelling ``callback_result`` is accepted alongside ``result``
+#: because the fixed-field shape itself uses it.
+_CALLBACK_RESULT_FIELDS = ("result", "callback_result")
+_CALLBACK_TARGET_FIELD = "target"
+_CALLBACK_DETAIL_FIELDS = {
+    _CALLBACK_SENT: ("on sent",),
+    _CALLBACK_BLOCKED: ("on blocked",),
+    _CALLBACK_NOT_ATTEMPTED: ("on not-attempted",),
+}
+
+#: A pane token as ``agents targets`` prints one: ``%14`` or ``w3F:p4``.
+_PANE_TOKEN_RE = re.compile(r"(?:%\d+|\b\w+:p\w+\b)")
+#: The command that actually delivers a callback.
+_HANDOFF_SEND_RE = re.compile(r"handoff\s+send\b", re.IGNORECASE)
+#: The landing marker a delivered callback leaves — the same handoff token the watcher reads.
+_LANDING_MARKER_RE = re.compile(r"\[mozyo:handoff:[^\]]*\]")
+#: A retry command is replayable only if it pins the target it will retry against.
+_RETRY_TARGET_RE = re.compile(r"--target\s+\S+")
+_RETRY_REPO_RE = re.compile(r"--target-repo\s+auto\b")
+
+
+def _blocked_detail_gap(detail: str) -> Optional[str]:
+    """Whether a ``blocked`` record carries reason / candidates / retry command (pure).
+
+    Read as the template writes it — three ``/``-separated parts — rather than by hunting for words
+    in one blob. A first attempt scored the reason as "whatever text is left once the evidence is
+    removed", and its own negative control walked straight through it: a detail that was nothing
+    but a pane id and a command still left the word ``mozyo-bridge`` behind and counted as a
+    reason. Structure the contract already specifies beats a heuristic over prose.
+
+    So: the reason is the FIRST part and must be text that is not itself evidence; some part must
+    carry a candidate pane (an ``agents targets`` row); some part must carry a retry command that
+    pins both ``--target`` and ``--target-repo auto``, which is what makes it replayable.
+    """
+    parts = [part.strip() for part in detail.split("/")]
+    parts = [part for part in parts if part]
+    if len(parts) < 3:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    reason = parts[0]
+    if (
+        not reason
+        or _PANE_TOKEN_RE.search(reason)
+        or _HANDOFF_SEND_RE.search(reason)
+        or _RETRY_TARGET_RE.search(reason)
+    ):
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    evidence = parts[1:]
+    if not any(_PANE_TOKEN_RE.search(part) for part in evidence):
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if not any(
+        _RETRY_TARGET_RE.search(part) and _RETRY_REPO_RE.search(part) for part in evidence
+    ):
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    return None
 
 
 def _park_journal_gap(
@@ -599,7 +661,7 @@ def _park_journal_gap(
     invariant is untouched. Either being empty relaxes only that comparison.
     """
     state = _governed_field(notes, "state")
-    callback_result = _governed_field(notes, "callback_result")
+    callback_result = _governed_field(notes, *_CALLBACK_RESULT_FIELDS)
     resume_owner = _governed_field(notes, "resume_owner")
     anchor_raw = _governed_field(notes, "durable_anchor")
     free = [_governed_field(notes, *names) for names in _PARK_FREE_FIELDS]
@@ -635,16 +697,35 @@ def _park_journal_gap(
 
 
 def _callback_outcome_gap(notes: str, outcome: str) -> Optional[str]:
-    """The reason a non-``sent`` callback outcome is not a complete record, else ``None`` (pure)."""
-    if outcome == _CALLBACK_SENT:
-        return None
-    reason = _governed_field(notes, *_CALLBACK_REASON_FIELDS)
-    if reason is _FIELD_CONFLICT or not reason:
+    """The reason the callback outcome is not a complete record, else ``None`` (pure).
+
+    Every outcome — ``sent`` included (checkpoint j#86548 R5-F1) — has to be a RECORD, not a token.
+    The completion checklist requires the target for all three, and then:
+
+    * ``sent`` — the command that delivered it AND the landing marker that was observed. A ``sent``
+      nobody can check is the same silence the outcome field exists to forbid; R5 accepted it
+      because the canonical body had been amended to say ``sent`` needs nothing more, which
+      contradicted the skill it was supposed to encode.
+    * ``blocked`` — the reason, the candidate panes (``agents targets`` rows) and a concrete retry
+      command pinning ``--target`` and ``--target-repo auto``, so the next attempt is replayable
+      from the durable record.
+    * ``not-attempted`` — an explicit reason.
+    """
+    target = _governed_field(notes, _CALLBACK_TARGET_FIELD)
+    if target is _FIELD_CONFLICT or not target:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    if outcome == _CALLBACK_BLOCKED:
-        retry = _governed_field(notes, *_CALLBACK_RETRY_FIELDS)
-        if retry is _FIELD_CONFLICT or not retry:
+
+    detail = _governed_field(notes, *_CALLBACK_DETAIL_FIELDS[outcome])
+    if detail is _FIELD_CONFLICT or not detail:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+
+    if outcome == _CALLBACK_SENT:
+        if not (_HANDOFF_SEND_RE.search(detail) and _LANDING_MARKER_RE.search(detail)):
             return GAP_PARK_CALLBACK_DETAIL_ABSENT
+        return None
+    if outcome == _CALLBACK_BLOCKED:
+        return _blocked_detail_gap(detail)
+    # not-attempted: an explicit reason, which is the whole field.
     return None
 
 

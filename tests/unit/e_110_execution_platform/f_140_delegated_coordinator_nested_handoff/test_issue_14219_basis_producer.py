@@ -141,7 +141,26 @@ def _receipts(**overrides):
     return {base["release_issue"]: bp.DogfoodReceipt(**base)}
 
 
-#: The governed fixed-field park journal a park declaration must sit in.
+#: The callback-outcome detail lines, in the skill template's own shape.
+CALLBACK_SENT_DETAIL = (
+    "- target: coordinator (`--target coordinator`)\n"
+    "- on sent: mozyo-bridge handoff send --to codex --target coordinator --mode standard"
+    " / observed landing marker"
+    " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+)
+CALLBACK_BLOCKED_DETAIL = (
+    "- target: coordinator (`--target coordinator`)\n"
+    "- on blocked: coordinator pane unresolved"
+    " / candidates (`agents targets` rows): %14 codex w3F:p4"
+    " / retry command: mozyo-bridge handoff send --to codex --target %14 --target-repo auto\n"
+)
+CALLBACK_NOT_ATTEMPTED_DETAIL = (
+    "- target: coordinator\n"
+    "- on not-attempted: this lane IS the coordinator lane, no cross-lane hop applies\n"
+)
+
+#: The governed fixed-field park journal a park declaration must sit in — including the callback
+#: outcome record the skill's template requires alongside the outcome token.
 PARK_FIELDS = (
     "- state: blocked\n"
     "- durable_anchor: #14219 j#85500\n"
@@ -149,7 +168,15 @@ PARK_FIELDS = (
     "- blocked_by: 14150\n"
     "- resume_condition: #14150 の callback outcome journal 到達\n"
     "- resume_owner: coordinator\n"
-)
+) + CALLBACK_SENT_DETAIL
+
+
+def _park_fields(*, result="sent", detail=None):
+    """PARK_FIELDS with a different callback outcome and its record."""
+    if detail is None:
+        detail = CALLBACK_SENT_DETAIL
+    base = PARK_FIELDS.replace(CALLBACK_SENT_DETAIL, "")
+    return base.replace("- callback_result: sent", f"- callback_result: {result}") + detail
 
 
 def _review_note_answering(req, *, head=HEAD):
@@ -725,40 +752,96 @@ class CorroborationTests(unittest.TestCase):
                     bp.GAP_PARK_JOURNAL_FIELDS_INVALID,
                 )
 
-    def test_every_governed_callback_result_value_is_accepted_when_recorded(self):
-        # Negative control for the closed vocabulary: it refuses inventions, not the real values.
-        # `blocked` / `not-attempted` are legitimate outcomes — but legitimate WHEN RECORDED, which
-        # is what the previous version of this test missed (checkpoint j#86525 R4-F2): it accepted
-        # the bare tokens and so asserted the defect rather than the contract.
+    def test_every_canonical_callback_outcome_record_is_accepted(self):
+        # The skill's own template, in its own field names (checkpoint j#86548 R5-F2). R4 invented
+        # spellings for these and so REJECTED the canonical records while accepting values that had
+        # nothing to do with a callback — the check's meaning inverted.
         for value, detail in (
-            ("sent", ""),
-            ("blocked", "- callback_reason: coordinator pane unresolved\n"
-                        "- retry_command: mozyo-bridge handoff send --mode standard\n"),
-            ("not-attempted", "- callback_reason: 依存 issue の判断待ちで送信対象が未確定\n"),
+            ("sent", CALLBACK_SENT_DETAIL),
+            ("blocked", CALLBACK_BLOCKED_DETAIL),
+            ("not-attempted", CALLBACK_NOT_ATTEMPTED_DETAIL),
         ):
             with self.subTest(callback_result=value):
-                fields = PARK_FIELDS.replace(
-                    "- callback_result: sent", f"- callback_result: {value}"
-                ) + detail
-                journals = _park_journals(park=_park_note(park_fields=fields))
+                journals = _park_journals(
+                    park=_park_note(park_fields=_park_fields(result=value, detail=detail))
+                )
                 produced = _produce(journals, basis=BASIS_DEPENDENCY_PARK)
                 self.assertEqual(produced.gaps, ())
                 self.assertTrue(_by_key(produced)[CONJUNCT_PARK_DECLARED].satisfied)
 
-    def test_a_bare_blocked_or_not_attempted_outcome_is_a_gap(self):
-        # The token without the record. `blocked` needs its reason AND a replayable retry command;
-        # `not-attempted` needs its reason. Accepting the token alone re-admits the exact
-        # "parked and nobody was told" state the completion rule exists to prevent.
+    def test_the_template_spelling_result_is_accepted_too(self):
+        # The callback template writes `result:`; the parked-state fixed-field block folds it in as
+        # `callback_result:`. Both are the contract's own spellings, so both are read.
+        fields = _park_fields().replace("- callback_result: sent", "- result: sent")
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=fields)), basis=BASIS_DEPENDENCY_PARK
+        )
+        self.assertEqual(produced.gaps, ())
+
+    def test_an_outcome_without_its_record_is_a_gap(self):
+        # Every outcome is a RECORD, not a token — `sent` included (R5-F1). A `sent` with no
+        # target, no command and no observed marker is the same silence the field exists to forbid.
         for value, detail in (
+            ("sent", ""),
             ("blocked", ""),
-            ("blocked", "- callback_reason: coordinator pane unresolved\n"),  # reason, no retry
             ("not-attempted", ""),
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator\n"),
+            ("sent", "- target: coordinator\n- on sent: [mozyo:handoff:issue=14219:kind=reply]\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / retry command: mozyo-bridge handoff send --target-repo auto\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates: %14 / retry command: nope\n"),
+            ("blocked", "- target: coordinator\n- on blocked: %14"
+                        " mozyo-bridge handoff send --target %14 --target-repo auto\n"),
+            ("sent", "- on sent: mozyo-bridge handoff send / [mozyo:handoff:kind=reply]\n"),
+            # `not-attempted` with its target but NO `on not-attempted` field: the outcome field
+            # itself is the explicit reason the contract asks for, so its absence is the gap.
+            # (Without this case the detail-field requirement is only load-bearing for the other
+            # two outcomes, which the mutation probe caught.)
+            ("not-attempted", "- target: coordinator\n"),
+            # The R4 alias spelling supplying the reason for `not-attempted`: not the contract's
+            # field, so it must not stand in for it.
+            ("not-attempted", "- target: coordinator\n- reason: this lane is the coordinator\n"),
+            # Three parts, but the candidate rows are missing and the retry targets a NAME rather
+            # than a pane — so no part carries an `agents targets` row.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates: none found"
+                        " / retry command: mozyo-bridge handoff send --target coordinator"
+                        " --target-repo auto\n"),
+            # The reason slot filled with evidence rather than a reason.
+            ("blocked", "- target: coordinator\n- on blocked: %14 unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge handoff send --target %14"
+                        " --target-repo auto\n"),
+            # Reason plus evidence, but the evidence is not separated into candidates AND retry —
+            # two parts, so the record does not carry the three the template requires.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates %14 and retry mozyo-bridge handoff send --target %14"
+                        " --target-repo auto\n"),
         ):
-            with self.subTest(callback_result=value, detail=bool(detail)):
-                fields = PARK_FIELDS.replace(
-                    "- callback_result: sent", f"- callback_result: {value}"
-                ) + detail
-                journals = _park_journals(park=_park_note(park_fields=fields))
+            with self.subTest(callback_result=value, detail=detail[:40]):
+                journals = _park_journals(
+                    park=_park_note(park_fields=_park_fields(result=value, detail=detail))
+                )
+                self.assertEqual(
+                    _gaps(_produce(journals, basis=BASIS_DEPENDENCY_PARK)).get(
+                        CONJUNCT_PARK_DECLARED
+                    ),
+                    bp.GAP_PARK_CALLBACK_DETAIL_ABSENT,
+                )
+
+    def test_the_r4_invented_aliases_are_no_longer_evidence(self):
+        # The exact shapes R4 accepted: field names absent from the contract, carrying values with
+        # nothing to do with a callback. They are not the record; they never were.
+        for detail in (
+            "- callback_reason: x\n- retry_command: nope\n",
+            "- reason: dependency waiting\n- retry: later\n",
+        ):
+            with self.subTest(detail=detail.strip()):
+                journals = _park_journals(
+                    park=_park_note(park_fields=_park_fields(result="blocked", detail=detail))
+                )
                 self.assertEqual(
                     _gaps(_produce(journals, basis=BASIS_DEPENDENCY_PARK)).get(
                         CONJUNCT_PARK_DECLARED

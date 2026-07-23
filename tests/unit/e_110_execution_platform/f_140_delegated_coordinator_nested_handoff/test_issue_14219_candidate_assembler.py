@@ -143,6 +143,10 @@ PARK_FIELDS = (
     "- state: blocked\n- durable_anchor: #14219 j#85010\n- callback_result: sent\n"
     "- blocked_by: 14150\n"
     "- resume_condition: callback outcome journal\n- resume_owner: coordinator\n"
+    # The callback outcome record the skill's template requires alongside the token.
+    "- target: coordinator (`--target coordinator`)\n"
+    "- on sent: mozyo-bridge handoff send --to codex --target coordinator --mode standard"
+    " / observed landing marker [mozyo:handoff:issue=14219:journal=85010:kind=reply:to=codex]\n"
 )
 
 
