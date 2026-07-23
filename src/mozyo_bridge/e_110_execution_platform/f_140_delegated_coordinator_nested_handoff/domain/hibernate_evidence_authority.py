@@ -103,6 +103,19 @@ class ResolvedIssuer:
     authority_anchor: str = ""
 
     @property
+    def is_anchored(self) -> bool:
+        """Whether the port named the durable record it resolved this role from.
+
+        Required of EVERY role, not only the lane-scoped ones (checkpoint j#86503 R3-F2). The
+        coordinator's authority is workspace-level rather than lane-level, but that says nothing
+        about how the WRITER was identified: with one source-system author behind several roles, a
+        bare ``role="coordinator"`` is an assertion, not a resolution. Leaving the anchor optional
+        for the coordinator left the shared-author ambiguity open on three of the five gates
+        (integration / CI / dogfood) — the very ambiguity the anchor exists to close.
+        """
+        return bool(self.authority_anchor)
+
+    @property
     def is_lane_bound(self) -> bool:
         """Whether the issuer names a complete, positively-generationed lane with an anchor."""
         return bool(
@@ -111,7 +124,7 @@ class ResolvedIssuer:
             and isinstance(self.lane_generation, int)
             and not isinstance(self.lane_generation, bool)
             and self.lane_generation > 0
-            and self.authority_anchor
+            and self.is_anchored
         )
 
     def covers(self, envelope) -> bool:
@@ -177,8 +190,9 @@ def check_issuer_resolution(kind: str, issuer: ResolvedIssuer) -> "str | None":
     who is treated as its author:
 
     1. the kind must be one this module has an authority for at all;
-    2. the writer must be RESOLVED — a known role, and for a lane-scoped role a complete lane
-       identity with an authority anchor (an unresolved writer is not a wrong writer);
+    2. the writer must be RESOLVED — a known role, an authority anchor naming the record the role
+       was resolved from (EVERY role, including the coordinator), and for a lane-scoped role a
+       complete lane identity as well (an unresolved writer is not a wrong writer);
     3. the role must be the one that kind's authority belongs to.
 
     The remaining question — whether that authority is over the lane the evidence is ABOUT — needs
@@ -189,6 +203,8 @@ def check_issuer_resolution(kind: str, issuer: ResolvedIssuer) -> "str | None":
         return ISSUER_MISMATCH
     role = issuer.role
     if role not in ISSUER_ROLES or role == ISSUER_UNKNOWN:
+        return ISSUER_UNRESOLVED
+    if not issuer.is_anchored:
         return ISSUER_UNRESOLVED
     if role in _LANE_SCOPED_ROLES and not issuer.is_lane_bound:
         return ISSUER_UNRESOLVED

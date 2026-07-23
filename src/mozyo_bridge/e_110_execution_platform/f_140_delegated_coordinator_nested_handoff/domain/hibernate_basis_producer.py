@@ -134,12 +134,21 @@ GAP_REVIEW_REQUEST_SUPERSEDED = "review_request_superseded"
 GAP_REVIEW_REQUEST_UNCORRELATED = "review_request_uncorrelated"
 #: The approval and the request it names do not agree on the head under review.
 GAP_REVIEW_REQUEST_HEAD_MISMATCH = "review_request_head_mismatch"
+#: One journal carries BOTH the result and a review_request: it claims an old round's outcome and
+#: opens a fresh one at once, with no order authority to resolve which. Same rule as the glance's
+#: canonical review outcome (#13952 R8 F9) — a contradictory record is not an action authority.
+GAP_REVIEW_JOURNAL_CONTRADICTORY = "review_result_journal_contradictory"
 #: The delegation's release issue carries no matching receipt (or none was supplied to check).
 GAP_DOGFOOD_RECEIPT_ABSENT = "dogfood_receipt_absent"
 #: The release issue's receipt names a different source issue or head.
 GAP_DOGFOOD_RECEIPT_MISMATCH = "dogfood_receipt_mismatch"
 #: The park marker is not accompanied by the governed fixed-field park journal.
 GAP_PARK_JOURNAL_FIELDS_ABSENT = "park_journal_fields_absent"
+#: The governed park fields are all THERE but one carries a value outside its fixed shape (an
+#: invented ``callback_result``, a non-coordinator ``resume_owner``, an anchor pointing elsewhere).
+#: Kept distinct from "absent" for the same reason every other readable-but-wrong record is: the
+#: operator's next move differs.
+GAP_PARK_JOURNAL_FIELDS_INVALID = "park_journal_fields_invalid"
 #: The CURRENT disposition journal exists but carries no enveloped marker (e.g. a heading-only
 #: deferral). Distinct from :data:`GAP_EVIDENCE_ABSENT`, which means no disposition was ever recorded.
 GAP_DISPOSITION_UNENVELOPED = "integration_evidence_unenveloped"
@@ -508,21 +517,53 @@ def _governed_field(notes: str, name: str) -> str:
 #: (`progress_without_callback`) — read as an affirmative park basis. "The lane is parked" and "the
 #: park was handed off" are one durable state in that contract, so the producer requires the whole
 #: record rather than leaving half of it to an action-time obligation.
-_PARK_REQUIRED_FIELDS = (
-    "blocked_by",
-    "resume_condition",
-    "resume_owner",
-    "durable_anchor",
-    "callback_result",
-)
+#: Fields whose presence is what the record needs (their content is free text by contract).
+_PARK_FREE_FIELDS = ("blocked_by", "resume_condition")
 _PARK_STATE_BLOCKED = "blocked"
+#: ``callback_result: sent | blocked | not-attempted`` — the skill fixes the vocabulary, and
+#: "silence is not allowed" is the whole point of the field. An invented value is silence wearing a
+#: token, so it is refused rather than counted as a callback.
+_PARK_CALLBACK_RESULTS = frozenset({"sent", "blocked", "not-attempted"})
+#: ``resume_owner: coordinator`` — the guardrail assigns re-dispatch to the coordinator by name; a
+#: park that nominates anyone else has not handed resume ownership to who actually owns it.
+_PARK_RESUME_OWNER = "coordinator"
+#: ``durable_anchor: #<issue_id> j#<gate_journal_id>``.
+_DURABLE_ANCHOR_RE = re.compile(r"^#(?P<issue>\d+)\s+j#(?P<journal>\d+)$")
 
 
-def _park_journal_recorded(notes: str) -> bool:
-    """Whether the note carries the COMPLETE governed fixed-field parked-state journal (pure)."""
-    if _governed_field(notes, "state").lower() != _PARK_STATE_BLOCKED:
-        return False
-    return all(_governed_field(notes, name) for name in _PARK_REQUIRED_FIELDS)
+def _park_journal_gap(notes: str, *, source_issue: str = "") -> Optional[str]:
+    """The typed reason the note is not a valid governed parked-state journal, else ``None`` (pure).
+
+    Presence is not the contract (checkpoint j#86503 R3-F3): the skill's fixed field shape pins the
+    VALUES too, and a record whose ``callback_result`` is an invented word, whose ``resume_owner``
+    is not the coordinator, or whose ``durable_anchor`` points somewhere else is not the record the
+    park basis rests on. Reading those as satisfied is the same class of defect as reading a
+    marker's self-declared authority: the shape looked right, so the content went unchecked.
+
+    ``source_issue`` is the issue whose journals these are, so the anchor can be confirmed to point
+    at THIS issue — an anchor naming another issue's journal is a pointer to someone else's record.
+    Empty ``source_issue`` checks the anchor's shape only.
+    """
+    state = _governed_field(notes, "state")
+    callback_result = _governed_field(notes, "callback_result")
+    resume_owner = _governed_field(notes, "resume_owner")
+    anchor_raw = _governed_field(notes, "durable_anchor")
+    present = [state, callback_result, resume_owner, anchor_raw]
+    present.extend(_governed_field(notes, name) for name in _PARK_FREE_FIELDS)
+    if not all(present):
+        return GAP_PARK_JOURNAL_FIELDS_ABSENT
+    if state.lower() != _PARK_STATE_BLOCKED:
+        return GAP_PARK_JOURNAL_FIELDS_INVALID
+    if callback_result.lower() not in _PARK_CALLBACK_RESULTS:
+        return GAP_PARK_JOURNAL_FIELDS_INVALID
+    if resume_owner.lower() != _PARK_RESUME_OWNER:
+        return GAP_PARK_JOURNAL_FIELDS_INVALID
+    anchor = _DURABLE_ANCHOR_RE.match(anchor_raw)
+    if anchor is None:
+        return GAP_PARK_JOURNAL_FIELDS_INVALID
+    if source_issue and anchor.group("issue") != str(source_issue).strip():
+        return GAP_PARK_JOURNAL_FIELDS_INVALID
+    return None
 
 
 def _dogfood_receipt_gap(
@@ -570,8 +611,10 @@ def _produce_evidence_kind(
         gap = _dogfood_receipt_gap(got, source_issue=source_issue, receipts=receipts)
         if gap is not None:
             return None, gap
-    if kind == EVIDENCE_PARK_DECLARED and not _park_journal_recorded(notes):
-        return None, EvidenceGap(key, GAP_PARK_JOURNAL_FIELDS_ABSENT)
+    if kind == EVIDENCE_PARK_DECLARED:
+        park_gap = _park_journal_gap(notes, source_issue=source_issue)
+        if park_gap is not None:
+            return None, EvidenceGap(key, park_gap)
     return _conjunct(
         key,
         satisfied=True,
@@ -649,7 +692,16 @@ def produce_basis_conjuncts(
             # (1) is the canonical correlation rule; (2) is what keeps an approval from outliving
             # its round. A later request cannot retroactively validate an earlier approval (it is
             # not the answered request), and it also invalidates the round that approval closed.
-            if _review_request_after(journals, result_journal=declaration.journal):
+            if _markers_of(declaration.notes, MARKER_GATE_REVIEW_REQUEST):
+                # Contradictory in ONE record: answering an earlier round while opening a new one.
+                # Neither the strictly-before correlation (which looks before this journal) nor the
+                # supersession check (which looks after it) can see a request filed in the result's
+                # own journal — the two rules meet exactly here, so this case is refused on its own
+                # terms, matching the glance's canonical rule rather than inventing a third.
+                produced, gap = None, EvidenceGap(
+                    CONJUNCT_REVIEW_APPROVED, GAP_REVIEW_JOURNAL_CONTRADICTORY, declaration.journal
+                )
+            elif _review_request_after(journals, result_journal=declaration.journal):
                 produced, gap = None, EvidenceGap(
                     CONJUNCT_REVIEW_APPROVED, GAP_REVIEW_REQUEST_SUPERSEDED, declaration.journal
                 )

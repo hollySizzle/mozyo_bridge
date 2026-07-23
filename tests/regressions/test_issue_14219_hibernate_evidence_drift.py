@@ -429,6 +429,38 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
 
         self._drift(mutate)
 
+    def test_a_result_journal_that_also_opens_a_fresh_round_actuates_nothing(self):
+        # The mixed-round shape end to end: the approval record is amended to ALSO carry a fresh
+        # review_request. It answers the round it answered and opens another in one record, so it
+        # is no longer a clean authority — and the lane must not hibernate on it.
+        def mutate(world):
+            gen = world.store.get(LaneLifecycleKey(WS, LANE)).lane_generation
+            world.journals[:] = [
+                EvidenceJournal(
+                    j.journal_id,
+                    j.notes + "\n" + _request(),
+                    _issuer(ISSUER_REVIEW_GATEWAY, gen=gen),
+                )
+                if j.journal_id == "85001"
+                else j
+                for j in world.journals
+            ]
+
+        self._drift(mutate)
+
+    def test_an_unanchored_coordinator_actuates_nothing(self):
+        # The port stopped being able to say WHICH durable record makes this writer the
+        # coordinator. That is an unresolved writer, not a resolved one with less detail.
+        def mutate(world):
+            world.journals[:] = [
+                EvidenceJournal(j.journal_id, j.notes, ResolvedIssuer(role=ISSUER_COORDINATOR))
+                if j.journal_id == "85003"
+                else j
+                for j in world.journals
+            ]
+
+        self._drift(mutate)
+
     def test_evidence_rewritten_by_the_wrong_actor_actuates_nothing(self):
         # A newer CI record from an actor without that authority supersedes the coordinator's by
         # EXISTING, and then fails the issuer check — it does not fall back to the older good one.

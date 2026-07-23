@@ -152,6 +152,19 @@ PARK_FIELDS = (
 )
 
 
+def _review_note_answering(req, *, head=HEAD):
+    """A review_result naming an explicit request journal (for the ordering / mixed-round cases)."""
+    return "review\n" + render_workflow_event_marker(
+        "review_result",
+        target_head=head,
+        review_request_journal=req,
+        conclusion="approved",
+        evidence_workspace=WS,
+        evidence_lane=LANE,
+        evidence_lane_generation=GEN,
+    )
+
+
 def _request_note(head=HEAD):
     return "review request\n" + render_workflow_event_marker(
         "review_request", target_head=head
@@ -447,8 +460,37 @@ class ReviewRequestCorrelationTests(unittest.TestCase):
             _gaps(_produce([_journal("300", note, ISSUER_REVIEW_GATEWAY)])).get(
                 CONJUNCT_REVIEW_APPROVED
             ),
-            bp.GAP_REVIEW_REQUEST_ABSENT,
+            bp.GAP_REVIEW_JOURNAL_CONTRADICTORY,
         )
+
+    def test_a_result_that_also_opens_a_fresh_round_is_contradictory(self):
+        # Checkpoint j#86503 R3-F1: the mixed-round shape — this journal ANSWERS the round opened
+        # at 100 and OPENS a new one in the same record. The strictly-before correlation looks only
+        # before this journal and the supersession check only after it, so the two rules meet
+        # exactly here and neither saw it. Refused on its own terms, as the glance already does.
+        journals = [
+            _journal("100", _request_note(), ISSUER_LANE_WORKER),
+            _journal(
+                "200",
+                _review_note_answering("100") + "\n" + _request_note(),
+                ISSUER_REVIEW_GATEWAY,
+            ),
+        ]
+        self.assertEqual(
+            _gaps(_produce(journals)).get(CONJUNCT_REVIEW_APPROVED),
+            bp.GAP_REVIEW_JOURNAL_CONTRADICTORY,
+        )
+
+    def test_the_same_result_without_the_fresh_request_still_correlates(self):
+        # Negative control: it is the CO-PRESENCE that is contradictory, not the shape of a result
+        # answering an earlier journal.
+        journals = [
+            _journal("100", _request_note(), ISSUER_LANE_WORKER),
+            _journal("200", _review_note_answering("100"), ISSUER_REVIEW_GATEWAY),
+        ]
+        produced = _produce(journals)
+        self.assertNotIn(CONJUNCT_REVIEW_APPROVED, _gaps(produced))
+        self.assertTrue(_by_key(produced)[CONJUNCT_REVIEW_APPROVED].satisfied)
 
     def test_the_answered_request_is_the_nearest_preceding_one(self):
         # Two rounds: the result must correlate with round 2's request, not round 1's.
@@ -559,6 +601,28 @@ class IssuerAuthorityTests(unittest.TestCase):
             "evidence_issuer_unresolved",
         )
 
+    def test_an_unanchored_coordinator_is_unresolved_on_every_gate_it_owns(self):
+        # Checkpoint j#86503 R3-F2: the anchor requirement reached only the lane-scoped roles, so a
+        # bare ResolvedIssuer(role="coordinator") — no workspace, no lane, no anchor — satisfied
+        # integration, CI and dogfood. The coordinator's authority is workspace-level, but that is
+        # about SCOPE, not about whether the writer was identified at all.
+        bare = ResolvedIssuer(role=ISSUER_COORDINATOR)
+        for journal_id, key in (
+            ("85410", CONJUNCT_STAGING_INTEGRATED),
+            ("85420", CONJUNCT_REQUIRED_CI_GREEN),
+            ("85430", CONJUNCT_DOGFOOD_DELEGATED),
+        ):
+            with self.subTest(conjunct=key):
+                journals = [
+                    EvidenceJournal(j.journal_id, j.notes, bare)
+                    if j.journal_id == journal_id
+                    else j
+                    for j in _early_journals()
+                ]
+                self.assertEqual(
+                    _gaps(_produce(journals)).get(key), "evidence_issuer_unresolved"
+                )
+
     def test_the_coordinators_authority_is_not_lane_scoped(self):
         # Negative control for the lane comparison: the coordinator writes integration / CI /
         # dogfood records that are not the lane's own claims about itself, so requiring a lane
@@ -634,6 +698,44 @@ class CorroborationTests(unittest.TestCase):
                     ),
                     bp.GAP_PARK_JOURNAL_FIELDS_ABSENT,
                 )
+
+    def test_a_park_journal_with_an_invented_field_value_is_a_gap(self):
+        # Checkpoint j#86503 R3-F3: presence is not the contract. The skill's fixed field shape
+        # pins the VALUES — `callback_result: sent | blocked | not-attempted`,
+        # `resume_owner: coordinator`, `durable_anchor: #<issue> j#<journal>` — and a record that
+        # merely has the field names is the same class of defect as a marker asserting its own
+        # authority: the shape looked right, so nobody read the content.
+        for field, bad in (
+            ("callback_result", "invented"),
+            ("callback_result", "SENT-ish"),
+            ("resume_owner", "worker"),
+            ("durable_anchor", "totally unrelated text"),
+            ("durable_anchor", "#99999 j#85500"),   # a real shape, but another issue's record
+        ):
+            with self.subTest(field=field, value=bad):
+                fields = "".join(
+                    (f"- {field}: {bad}\n" if line.startswith(f"- {field}:") else line + "\n")
+                    for line in PARK_FIELDS.strip().split("\n")
+                )
+                journals = _park_journals(park=_park_note(park_fields=fields))
+                self.assertEqual(
+                    _gaps(_produce(journals, basis=BASIS_DEPENDENCY_PARK)).get(
+                        CONJUNCT_PARK_DECLARED
+                    ),
+                    bp.GAP_PARK_JOURNAL_FIELDS_INVALID,
+                )
+
+    def test_every_governed_callback_result_value_is_accepted(self):
+        # Negative control for the closed vocabulary: it refuses inventions, not the real values.
+        # `blocked` / `not-attempted` are legitimate outcomes — the guardrail requires a RECORD of
+        # the callback, not a successful one.
+        for value in ("sent", "blocked", "not-attempted"):
+            with self.subTest(callback_result=value):
+                fields = PARK_FIELDS.replace("- callback_result: sent", f"- callback_result: {value}")
+                journals = _park_journals(park=_park_note(park_fields=fields))
+                produced = _produce(journals, basis=BASIS_DEPENDENCY_PARK)
+                self.assertEqual(produced.gaps, ())
+                self.assertTrue(_by_key(produced)[CONJUNCT_PARK_DECLARED].satisfied)
 
     def test_a_fully_recorded_park_still_satisfies(self):
         produced = _produce(_park_journals(), basis=BASIS_DEPENDENCY_PARK)
