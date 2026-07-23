@@ -820,6 +820,40 @@ class CorroborationTests(unittest.TestCase):
         )
         self.assertEqual(produced.gaps, ())
 
+    def test_a_quoted_summary_is_the_executed_command(self):
+        # checkpoint j#86645 R11-F4: `--summary 'park callback delivered'` is ONE value after
+        # shell lexing, and a naive split broke it into three tokens — so a correctly-recorded
+        # executed command stopped satisfying the basis. The second case puts the separator
+        # character inside the quotes, which the quote-aware boundary must not split on.
+        for summary in ("'park callback delivered'", "'delivered / observed'"):
+            with self.subTest(summary=summary):
+                detail = (
+                    "- target: coordinator\n"
+                    f"- on sent: {SEND_COMMAND} --summary {summary}"
+                    " / observed landing marker"
+                    " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+                )
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
+    def test_a_custom_kind_with_its_summary_is_executable(self):
+        # Positive control for the post-parse rule: custom + summary IS a delivery the CLI runs.
+        detail = (
+            "- target: coordinator\n"
+            "- on sent: mozyo-bridge handoff send --to codex --source redmine --kind custom"
+            " --issue 14219 --journal 85500 --target coordinator --summary 'park callback'"
+            " / observed landing marker"
+            " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=custom:to=codex]\n"
+        )
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+            basis=BASIS_DEPENDENCY_PARK,
+        )
+        self.assertEqual(produced.gaps, ())
+
     def test_the_equals_spelling_is_the_same_invocation(self):
         # checkpoint j#86626 R10-F3: canonical argparse accepts `--flag=value`, and the contract
         # is the flag's effective value, not its spelling.
@@ -1170,6 +1204,63 @@ class CorroborationTests(unittest.TestCase):
                      "- on sent: mozyo-bridge handoff send --to codex --source redmine"
                      " --kind reply --issue 14219 --journal 85500 --target w3F:p3"
                      " --target=coordinator / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # -- checkpoint j#86645 R11-F1: the retry replays THIS callback ---------------------
+            # Executable, codex, candidate-pinned, replayable — and anchored at another ticket.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge handoff send --to codex --source redmine"
+                        " --kind reply --issue 99999 --journal 85500 --target %14"
+                        " --target-repo auto\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge handoff send --to codex --source redmine"
+                        " --kind reply --issue 14219 --journal 1 --target %14"
+                        " --target-repo auto\n"),
+            # -- checkpoint j#86645 R11-F2: argparse acceptance is not a sent delivery ----------
+            # `--mode pending` places the body without pressing Enter: the rail reports
+            # pending_input, so nothing was sent.
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND.replace('--mode standard', '--mode pending')}"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # `--kind custom` without `--summary` is refused by build_notification_body before
+            # anything is sent — argparse alone cannot see it.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine"
+                     " --kind custom --issue 14219 --journal 85500 --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=custom:to=codex]\n"),
+            # A pending-mode retry would place the body without submitting on replay.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge handoff send --to codex --source redmine"
+                        " --kind reply --issue 14219 --journal 85500 --target %14"
+                        " --target-repo auto --mode pending\n"),
+            # -- checkpoint j#86645 R11-F3: abbreviation would bypass the conflict rule ---------
+            # `--ki` abbreviates `--kind` under argparse's default; two names, one logical option,
+            # two values. The evidence grammar refuses abbreviation outright.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine"
+                     " --ki review_request --kind reply --issue 14219 --journal 85500"
+                     " --target coordinator / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --source redmine"
+                     " --kind reply --issu 99999 --issue 14219 --journal 85500"
+                     " --target coordinator / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # -- checkpoint j#86645 R11-F4: an unclosed quote is not a lexable command ----------
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --summary 'unclosed"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # A control operator in value position: the shell would have ended the command at
+            # `;`, so `--summary ;` never carried a value — only the punctuation-token check can
+            # refuse it (argparse itself would happily take ";" as the summary).
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --summary ;"
+                     " / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
