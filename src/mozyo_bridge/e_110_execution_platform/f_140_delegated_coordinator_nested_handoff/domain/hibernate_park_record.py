@@ -339,7 +339,8 @@ def _lex_detail(text: str) -> "list[_Token] | None":
 
     Lexing rules mirrored: whitespace splits; ``'...'`` is literal; ``"..."`` honours ``\\``
     before ``"`` ``\\`` `````` ``$``; a backslash outside quotes escapes the next character;
-    punctuation characters outside quotes form their own tokens (``shlex`` ``punctuation_chars``).
+    punctuation characters outside quotes form their own tokens (``shlex`` ``punctuation_chars``); an
+    unquoted ``#`` starts a comment and discards the rest of the line, even mid-word.
     Unclosed quotes, trailing escapes and multi-line values are fail-closed.
     """
     if "\n" in text:
@@ -406,6 +407,14 @@ def _lex_detail(text: str) -> "list[_Token] | None":
             value.append(text[index + 1])
             index += 2
             continue
+        if char == "#":
+            # An unquoted, unescaped ``#`` starts a comment — everything after it never reached
+            # the shell's argv (checkpoint j#86657 R14-F1: without this, ``--summary #`` kept its
+            # ``#`` token and a command whose real argv the CLI refuses read as a delivery). The
+            # reference lexer truncates even mid-word (``b#c`` -> ``b``), so this check sits after
+            # the quote/escape branches and before the ordinary character.
+            flush()
+            break
         started = True
         value.append(char)
         index += 1

@@ -915,6 +915,22 @@ class CorroborationTests(unittest.TestCase):
                     bp.GAP_PARK_CALLBACK_DETAIL_ABSENT,
                 )
 
+    def test_an_escaped_or_quoted_hash_is_a_value_not_a_comment(self):
+        # Positive counterpart of the comment rule: `\\#` and `'#'` deliver the VALUE `#`.
+        for summary in ("\\#", "'#'"):
+            with self.subTest(summary=summary):
+                detail = (
+                    "- target: coordinator\n"
+                    f"- on sent: {SEND_COMMAND} --summary {summary}"
+                    " / observed landing marker"
+                    " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+                )
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
     def test_posix_escapes_survive_the_boundary(self):
         # checkpoint j#86649 R12-F2: `--summary park\/callback` is ONE argv value (`park/callback`)
         # to the shell; the home-grown boundary FSM split it at the escaped slash. The second case
@@ -1387,6 +1403,13 @@ class CorroborationTests(unittest.TestCase):
                      f"- on sent: {SEND_COMMAND} --target-project proj-a"
                      " / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # -- checkpoint j#86657 R14-F1: an unquoted `#` comments out the rest ---------------
+            # The shell delivers `--summary` with NO value (parse refusal, zero send); reading the
+            # `#` as a token made the record look like a delivery.
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --summary #"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
@@ -1657,8 +1680,45 @@ class ModuleDefinitionHygieneTests(unittest.TestCase):
         "hibernate_evidence_integration",
     )
 
-    def test_no_duplicate_top_level_definitions(self):
+    @staticmethod
+    def _duplicate_top_level_names(source: str) -> list:
+        """Every duplicated top-level name in ``source`` (defs, classes, plain AND annotated
+        assignments to a Name; tuple-unpacking targets are out of scope and none exist here).
+
+        Checkpoint j#86657 R14-F2: the first version collected ``ast.Assign`` only, and the very
+        authority it existed to protect — ``_SEND_OPTIONS: tuple = ...`` — is an ``AnnAssign``,
+        so an annotated duplicate sailed through the guard.
+        """
         import ast
+
+        seen: list = []
+        for node in ast.parse(source).body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                seen.append(node.name)
+            elif isinstance(node, ast.Assign):
+                seen.extend(
+                    target.id for target in node.targets if isinstance(target, ast.Name)
+                )
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                seen.append(node.target.id)
+        return sorted({item for item in seen if seen.count(item) > 1})
+
+    def test_the_guard_detects_what_it_exists_to_detect(self):
+        # The guard's own guard: synthetic duplicates of every node shape it claims to cover.
+        # A guard whose detection power is never measured is the defect that created this test.
+        cases = {
+            "annotated": "X: tuple = ()\nX: tuple = (1,)",
+            "plain": "Y = 1\nY = 2",
+            "def": "def f():\n    pass\n\ndef f():\n    pass",
+            "class": "class C:\n    pass\n\nclass C:\n    pass",
+            "mixed": "Z = 1\nZ: int = 2",
+        }
+        for shape, source in cases.items():
+            with self.subTest(shape=shape):
+                self.assertNotEqual(self._duplicate_top_level_names(source), [])
+        self.assertEqual(self._duplicate_top_level_names("A = 1\nB: int = 2\ndef c(): pass"), [])
+
+    def test_no_duplicate_top_level_definitions(self):
         import importlib
         import inspect
 
@@ -1668,19 +1728,9 @@ class ModuleDefinitionHygieneTests(unittest.TestCase):
                     "mozyo_bridge.e_110_execution_platform."
                     "f_140_delegated_coordinator_nested_handoff.domain." + name
                 )
-                tree = ast.parse(inspect.getsource(module))
-                seen: list = []
-                for node in tree.body:
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                        seen.append(node.name)
-                    elif isinstance(node, ast.Assign):
-                        seen.extend(
-                            target.id
-                            for target in node.targets
-                            if isinstance(target, ast.Name)
-                        )
-                duplicates = sorted({item for item in seen if seen.count(item) > 1})
-                self.assertEqual(duplicates, [])
+                self.assertEqual(
+                    self._duplicate_top_level_names(inspect.getsource(module)), []
+                )
 
 
 class LexerDriftGuardTests(unittest.TestCase):
@@ -1702,19 +1752,53 @@ class LexerDriftGuardTests(unittest.TestCase):
         "escaped\\ space and 'quoted part'",
     )
 
-    def test_values_match_shlex(self):
+    #: Fragments whose pairwise combinations exercise every lexer state transition — including
+    #: the comment boundary the fixed corpus missed (checkpoint j#86657 R14-F1: the guard's
+    #: coverage is exactly its corpus's coverage, so the corpus is generated, not curated).
+    FRAGMENTS = (
+        "plain", "--flag=value", "'quoted part'", '"dq \\" part"', "\\ escaped",
+        "/", "+", ";", "|", "(", "%14", "#", "\\#", "'#'", "a#b", "--summary",
+    )
+
+    @staticmethod
+    def _reference(text: str):
         import shlex as shlex_module
 
+        lexer = shlex_module.shlex(text, posix=True, punctuation_chars=";|&<>()")
+        lexer.whitespace_split = True
+        try:
+            return list(lexer)
+        except ValueError:
+            return None
+
+    def test_values_match_shlex(self):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_park_record import (  # noqa: E501
             _lex_detail,
         )
 
         for text in self.CORPUS:
             with self.subTest(text=text):
-                lexer = shlex_module.shlex(text, posix=True, punctuation_chars=";|&<>()")
-                lexer.whitespace_split = True
+                got = _lex_detail(text)
                 self.assertEqual(
-                    [token.value for token in _lex_detail(text)], list(lexer)
+                    None if got is None else [token.value for token in got],
+                    self._reference(text),
+                )
+
+    def test_values_match_shlex_over_the_fragment_cross_product(self):
+        from itertools import product
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_park_record import (  # noqa: E501
+            _lex_detail,
+        )
+
+        for left, right in product(self.FRAGMENTS, repeat=2):
+            text = f"{left} {right}"
+            with self.subTest(text=text):
+                got = _lex_detail(text)
+                self.assertEqual(
+                    None if got is None else [token.value for token in got],
+                    self._reference(text),
+                    text,
                 )
 
     def test_unclosed_quote_and_trailing_escape_are_fail_closed(self):
