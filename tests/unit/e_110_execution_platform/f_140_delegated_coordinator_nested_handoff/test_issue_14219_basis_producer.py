@@ -1113,6 +1113,44 @@ class CorroborationTests(unittest.TestCase):
                 )
                 self.assertEqual(produced.gaps, ())
 
+    def test_role_specific_field_rules_do_not_over_reject(self):
+        # Positive controls for the template-dependent explicit-field rule (checkpoint j#86687
+        # R21-F1): roles WITHOUT the redmine_project placeholder never consult it, and a
+        # non-empty value on a role WITH it is the explicit-wins delivery.
+        for suffix in (
+            " --role-profile implementation_worker --profile-field redmine_project=",
+            " --role-profile coordinator --profile-field redmine_project=proj-a",
+        ):
+            with self.subTest(suffix=suffix):
+                detail = (
+                    "- target: coordinator\n"
+                    f"- on sent: {SEND_COMMAND}{suffix}"
+                    " / observed landing marker"
+                    " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+                )
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
+    def test_a_finite_submit_delay_is_a_delivery(self):
+        # Positive control for the submit-delay rule (checkpoint j#86687 R21-F2): the rail
+        # clamps then sleeps a finite delay and presses Enter.
+        for suffix in (" --submit-delay 0", " --submit-delay 0.5"):
+            with self.subTest(suffix=suffix):
+                detail = (
+                    "- target: coordinator\n"
+                    f"- on sent: {SEND_COMMAND}{suffix}"
+                    " / observed landing marker"
+                    " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+                )
+                produced = _produce(
+                    _park_journals(park=_park_note(park_fields=_park_fields(result="sent", detail=detail))),
+                    basis=BASIS_DEPENDENCY_PARK,
+                )
+                self.assertEqual(produced.gaps, ())
+
     def test_a_reason_mentioning_panes_or_the_send_is_still_a_reason(self):
         # checkpoint j#86675 R18-F5: the reason is non-empty free text. The candidates and the
         # retry are judged exactly on their own parts, so prose like "handoff send could not
@@ -1790,6 +1828,47 @@ class CorroborationTests(unittest.TestCase):
                         " / candidates (`agents targets` rows): %14"
                         f" / retry command: {RETRY_COMMAND} --role-profile implementation_worker"
                         " --profile-field =value\n"),
+            # -- checkpoint j#86687 R21-F1: template-dependent explicit-blank refusal ----------
+            # coordinator / delegated_coordinator templates carry the redmine_project
+            # placeholder; the canonical resolver refuses an EXPLICIT empty / whitespace-only
+            # value before typing (zero-send).
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --role-profile coordinator"
+                     " --profile-field redmine_project="
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --role-profile delegated_coordinator"
+                     " --profile-field 'redmine_project=  '"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        f" / retry command: {RETRY_COMMAND} --role-profile coordinator"
+                        " --profile-field redmine_project=\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        f" / retry command: {RETRY_COMMAND} --role-profile delegated_coordinator"
+                        " --profile-field 'redmine_project=  '\n"),
+            # -- checkpoint j#86687 R21-F2: a non-finite submit delay never reaches Enter ------
+            # The rail sleeps for the clamped delay BEFORE pressing Enter; a positive-infinite
+            # value (spelled inf / Infinity / an overflowing literal) waits forever or breaks
+            # the sleep — zero-send either way.
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --submit-delay inf"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --submit-delay Infinity"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     f"- on sent: {SEND_COMMAND} --submit-delay 1e309"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        f" / retry command: {RETRY_COMMAND} --submit-delay inf\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
@@ -2041,6 +2120,71 @@ class SendSemanticsSharedAuthorityTests(unittest.TestCase):
         with self.assertRaises(RoleProfileError):
             parse_profile_fields(["=value"])
         self.assertEqual(parse_profile_fields(["note=a=b"]), {"note": "a=b"})
+
+    def test_the_explicit_field_rule_is_shared_with_the_canonical_resolver(self):
+        # checkpoint j#86687 R21-F1: the template-dependent explicit-blank refusal is ONE domain
+        # function; the canonical resolver and the evidence parser both consult it.
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.role_profile_field_resolution import (  # noqa: E501
+            _autofill_redmine_project,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (  # noqa: E501
+            RoleProfileError,
+            check_explicit_profile_fields,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_park_record import (  # noqa: E501
+            _send_invocation,
+        )
+
+        self.assertIn(
+            "check_explicit_profile_fields", inspect.getsource(_send_invocation)
+        )
+        self.assertIn(
+            "check_explicit_profile_fields", inspect.getsource(_autofill_redmine_project)
+        )
+        # The authority itself: explicit blank refused on placeholder-bearing roles only.
+        with self.assertRaises(RoleProfileError):
+            check_explicit_profile_fields("coordinator", {"redmine_project": ""})
+        with self.assertRaises(RoleProfileError):
+            check_explicit_profile_fields("delegated_coordinator", {"redmine_project": "  "})
+        check_explicit_profile_fields("implementation_worker", {"redmine_project": ""})
+        check_explicit_profile_fields("coordinator", {"redmine_project": "proj-a"})
+        check_explicit_profile_fields("coordinator", {})
+
+    def test_the_authority_matches_the_canonical_submit_delay_clamp(self):
+        # checkpoint j#86687 R21-F2: the rule mirrors the rail's own clamp expression, so
+        # negative and nan clamp to zero and DELIVER while positive infinity is refused.
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+            SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE,
+            send_semantic_gap,
+        )
+
+        self.assertEqual(
+            send_semantic_gap(submit_delay=float("inf")),
+            SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE,
+        )
+        self.assertIsNone(send_semantic_gap(submit_delay=float("-inf")))
+        self.assertIsNone(send_semantic_gap(submit_delay=float("nan")))
+        self.assertIsNone(send_semantic_gap(submit_delay=0.0))
+        self.assertIsNone(send_semantic_gap(submit_delay=0.5))
+        self.assertIsNone(send_semantic_gap(submit_delay=None))
+
+    def test_the_canonical_sender_passes_the_submit_delay(self):
+        # The wiring: orchestrate_handoff hands submit_delay to the shared authority and keys
+        # its die text off the authority's own message table.
+        import inspect
+
+        from mozyo_bridge.application.commands import orchestrate_handoff
+
+        source = inspect.getsource(orchestrate_handoff)
+        # The full authority-call fragment: a bare "submit_delay=inp.submit_delay" also appears
+        # where the rail request is built, so asserting it alone cannot tell whether the
+        # AUTHORITY receives the value (probe M7 slipped through exactly that way).
+        self.assertIn(
+            "mode=inp.mode, force=bool(inp.force), submit_delay=inp.submit_delay", source
+        )
+        self.assertIn("send_semantic_message", source)
 
     def test_the_authority_matches_the_canonical_queue_enter_force_rule(self):
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501

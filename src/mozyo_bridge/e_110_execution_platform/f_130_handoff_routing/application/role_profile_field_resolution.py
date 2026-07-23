@@ -32,13 +32,14 @@ from typing import Iterable, Optional
 
 from mozyo_bridge.core.state.workspace_defaults import resolve_default_project
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
+    REDMINE_PROJECT_FIELD,
     RoleProfileError,
+    check_explicit_profile_fields,
     parse_profile_fields,
     template_placeholders,
 )
 
-# Structured role-profile placeholder names with a send-time auto-fill source.
-REDMINE_PROJECT_FIELD = "redmine_project"
+# Structured role-profile placeholder name with a send-time auto-fill source only.
 DURABLE_ANCHOR_FIELD = "durable_anchor"
 
 
@@ -69,24 +70,14 @@ def _autofill_redmine_project(
     if REDMINE_PROJECT_FIELD not in template_placeholders(role):
         return
     # Explicit wins: a valid operator-supplied value is authoritative and is
-    # never overridden by the workspace default (parity with the issue-creation
-    # default-project priority — an explicit value never falls back to the
-    # default). But an explicit empty / whitespace-only value is NOT a valid
-    # project identifier: the pure resolver would leave an empty value unresolved
-    # (silent, not blocked) and substitute a whitespace value as if resolved.
-    # Both defeat the "missing -> fail closed" contract, so an explicit blank
-    # value fails closed before send exactly like a missing default, rather than
-    # silently bypassing the verified-default gate (Redmine #13477 review j#74496
-    # finding_1).
+    # never overridden by the workspace default. The RECORD-STATIC part of that
+    # rule — an explicit empty / whitespace-only value is not a valid project
+    # identifier and fails closed (Redmine #13477 review j#74496 finding_1) —
+    # lives in the shared domain authority so the auto-hibernate evidence reader
+    # applies the very same refusal (#14219 j#86687 R21-F1); only the
+    # host-state-dependent default resolution below stays in this seam.
+    check_explicit_profile_fields(role, fields)
     if REDMINE_PROJECT_FIELD in fields:
-        if not fields[REDMINE_PROJECT_FIELD].strip():
-            raise RoleProfileError(
-                f"explicit --profile-field {REDMINE_PROJECT_FIELD}= is empty or "
-                "whitespace-only, which is not a valid project identifier. Pass a "
-                f"non-empty --profile-field {REDMINE_PROJECT_FIELD}=<id>, or omit "
-                "it to auto-resolve from the verified workspace-local Redmine "
-                "default."
-            )
         return
     resolution = resolve_default_project(repo_root)
     if resolution.is_verified and resolution.identifier:

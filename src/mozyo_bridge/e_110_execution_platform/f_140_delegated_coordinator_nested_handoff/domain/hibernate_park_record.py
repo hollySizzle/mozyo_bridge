@@ -40,6 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (  # noqa: E501
     RoleProfileError,
+    check_explicit_profile_fields,
     parse_profile_fields,
 )
 
@@ -580,14 +581,20 @@ def _send_invocation(tokens: "list[_Token] | None") -> "argparse.Namespace | Non
         target_repo=namespace.target_repo,
         mode=namespace.mode,
         force=bool(namespace.force),
+        submit_delay=namespace.submit_delay,
     ) is not None:
         return None
     if namespace.role_profile:
-        # The canonical planner parses the profile fields with the SAME shared validator before
-        # anything is typed, and only when a role profile is asked for — a malformed
-        # ``--profile-field`` is blocked/invalid_args, zero-send (checkpoint j#86683 R20-F1).
+        # The canonical planner runs the SAME shared validators before anything is typed, and
+        # only when a role profile is asked for: the field syntax (checkpoint j#86683 R20-F1)
+        # and the template-dependent explicit-blank refusal (checkpoint j#86687 R21-F1 — an
+        # explicit empty ``redmine_project=`` on a role whose template carries the placeholder
+        # is blocked/invalid_args, zero-send). The absent-field auto-fill reads host state and
+        # is deliberately not judged here.
         try:
-            parse_profile_fields(namespace.profile_field)
+            check_explicit_profile_fields(
+                namespace.role_profile, parse_profile_fields(namespace.profile_field)
+            )
         except RoleProfileError:
             return None
     return namespace

@@ -216,6 +216,35 @@ def resolve_role_profile(
     )
 
 
+#: Structured placeholder name with a send-time auto-fill source AND a record-static explicit
+#: rule. Defined here (the application resolver re-exports it) so the rule below and its field
+#: name live in one place.
+REDMINE_PROJECT_FIELD = "redmine_project"
+
+
+def check_explicit_profile_fields(role: str, fields: "Mapping[str, str]") -> None:
+    """Refuse an EXPLICIT field value the canonical sender always refuses, before typing (pure).
+
+    Template-dependent and record-static (checkpoint #14219 j#86687 R21-F1): for a role whose
+    template carries the ``redmine_project`` placeholder, an explicitly supplied empty /
+    whitespace-only value is never a valid project identifier — the sender fails closed instead
+    of letting a blank bypass the verified-default gate. The ABSENT-field auto-fill (the
+    verified workspace-local default) reads host state and deliberately does NOT live here;
+    this function answers only what the record alone decides.
+    """
+    if REDMINE_PROJECT_FIELD not in template_placeholders(role):
+        return
+    value = fields.get(REDMINE_PROJECT_FIELD)
+    if value is not None and not value.strip():
+        raise RoleProfileError(
+            f"explicit --profile-field {REDMINE_PROJECT_FIELD}= is empty or "
+            "whitespace-only, which is not a valid project identifier. Pass a "
+            f"non-empty --profile-field {REDMINE_PROJECT_FIELD}=<id>, or omit "
+            "it to auto-resolve from the verified workspace-local Redmine "
+            "default."
+        )
+
+
 def parse_profile_fields(pairs: Optional[Iterable[str]]) -> dict[str, str]:
     """Parse ``KEY=VALUE`` CLI pairs into a profile-field mapping.
 
@@ -255,4 +284,6 @@ __all__: Iterable[str] = (
     "template_placeholders",
     "resolve_role_profile",
     "parse_profile_fields",
+    "REDMINE_PROJECT_FIELD",
+    "check_explicit_profile_fields",
 )

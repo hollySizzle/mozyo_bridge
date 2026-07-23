@@ -138,7 +138,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     make_outcome,
     resolve_queue_enter_retry_policy,
 )
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import effective_send_mode, send_semantic_gap  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import effective_send_mode, send_semantic_gap, send_semantic_message  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_command_input_adapter import (
     HandoffNamespaceAdapter,
 )
@@ -1718,9 +1718,13 @@ def orchestrate_handoff(
     if mode not in MODES:
         die(f"--mode must be one of {sorted(MODES)}; got {mode!r}")
 
-    if send_semantic_gap(mode=inp.mode, force=bool(inp.force)) is not None:
-        # Queue-enter refuses --force (shared send-semantics authority): the rail
-        # is agent-pane-only and must stay stricter than strict `standard`.
+    send_gap = send_semantic_gap(
+        mode=inp.mode, force=bool(inp.force), submit_delay=inp.submit_delay
+    )
+    if send_gap is not None:
+        # Shared send-semantics authority: queue-enter refuses --force, and a
+        # non-finite submit delay never reaches Enter. Message text comes from
+        # the same authority so it cannot drift from the rule.
         _emit(
             make_outcome(
                 status="blocked",
@@ -1736,11 +1740,7 @@ def orchestrate_handoff(
             record_format=record_format,
             command=record_command,
         )
-        die(
-            "--force is not allowed under --mode queue-enter; queue-enter is "
-            "restricted to Claude/Codex agent panes and rejects non-agent "
-            "targets even with operator override."
-        )
+        die(send_semantic_message(send_gap))
 
     if kind not in KIND_LABELS:
         _emit(

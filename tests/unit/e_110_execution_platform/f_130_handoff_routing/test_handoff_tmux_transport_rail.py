@@ -247,6 +247,7 @@ def _request(
     queue_enter_retry_interval: Optional[float] = None,
     target_activation: Optional[TargetActivationOutcome] = None,
     restore_previous_active: bool = False,
+    submit_delay: Optional[float] = None,
 ) -> TmuxTransportRailRequest:
     """Build a request; the envelope value objects are ``None`` (the slice only threads them)."""
     return TmuxTransportRailRequest(
@@ -274,7 +275,7 @@ def _request(
         herdr_send=herdr_send,
         read_lines=50,
         landing_timeout=None,
-        submit_delay=None,
+        submit_delay=submit_delay,
         queue_enter_retry_window=queue_enter_retry_window,
         queue_enter_retry_interval=queue_enter_retry_interval,
         target_activation=target_activation,
@@ -393,6 +394,17 @@ class TmuxTransportRailStandardConfirmTest(unittest.TestCase):
 
 
 class TmuxTransportRailQueueEnterTest(unittest.TestCase):
+    def test_submit_delay_sleeps_before_the_enter_press(self) -> None:
+        # checkpoint #14219 j#86687 R21-F2: the choreography is inject -> delay sleep -> Enter.
+        # A positive-infinite delay therefore never reaches Enter, which is why the shared
+        # send-semantics authority refuses it before anything is typed.
+        ops = _FakeOps(marker_observed=True)
+        code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, submit_delay=0.5))
+        self.assertIsNone(died)
+        self.assertEqual(code, 0)
+        self.assertIn("sleep", ops.events)
+        self.assertLess(ops.events.index("sleep"), ops.events.index("enter"))
+
     def test_queue_enter_marker_observed_sends_ok_without_retry(self) -> None:
         ops = _FakeOps(marker_observed=True)
         code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER))

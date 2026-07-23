@@ -23,6 +23,7 @@ from here, and a new rule added here reaches every consumer at once.
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 #: The canonical queue-enter mode token. Defined HERE — the shared-semantics leaf — because the
@@ -32,12 +33,14 @@ MODE_QUEUE_ENTER = "queue-enter"
 
 #: Closed reason tokens, one per rule — the consumers key their own messages off these.
 SEND_SEMANTIC_QUEUE_ENTER_FORCE = "queue_enter_refuses_force"
+SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE = "submit_delay_not_finite"
 SEND_SEMANTIC_CUSTOM_SUMMARY = "custom_kind_requires_summary"
 SEND_SEMANTIC_SELECT_TARGET = "select_conflicts_with_explicit_target"
 SEND_SEMANTIC_PROJECT_REPO = "target_project_requires_target_repo"
 
 SEND_SEMANTIC_REASONS = frozenset({
     SEND_SEMANTIC_QUEUE_ENTER_FORCE,
+    SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE,
     SEND_SEMANTIC_CUSTOM_SUMMARY,
     SEND_SEMANTIC_SELECT_TARGET,
     SEND_SEMANTIC_PROJECT_REPO,
@@ -64,17 +67,27 @@ def send_semantic_gap(
     target_repo: Optional[str] = None,
     mode: Optional[str] = None,
     force: bool = False,
+    submit_delay: Optional[float] = None,
 ) -> Optional[str]:
     """The FIRST zero-send precondition the supplied fields violate, or ``None`` (pure).
 
     Fields a caller does not have are left at their defaults and their rules simply cannot fire —
     ``apply_handoff_selection`` asks with ``select``/``target`` only, the admission pipeline with
-    ``target_project``/``target_repo`` only, ``cmd_handoff_send`` with ``mode``/``force`` only,
-    and the evidence parser with everything. ``mode`` is the RAW option value; the canonical
-    default is applied here so every consumer normalizes identically.
+    ``target_project``/``target_repo`` only, ``cmd_handoff_send`` with ``mode``/``force``/
+    ``submit_delay``, and the evidence parser with everything. ``mode`` is the RAW option value;
+    the canonical default is applied here so every consumer normalizes identically.
+
+    ``submit_delay`` mirrors the transport rail's own clamp (``max(0.0, ...)``, same argument
+    order) and refuses a non-finite result: the rail sleeps for the delay BEFORE pressing
+    Enter, so a positive-infinite delay never reaches Enter and nothing is delivered (#14219
+    j#86687 R21-F2). Negative and ``nan`` delays clamp to zero under that very expression
+    (``max`` keeps its first argument against an unordered ``nan``) and DELIVER, so refusing
+    them would be stricter than the rail — they pass.
     """
     if effective_send_mode(mode) == MODE_QUEUE_ENTER and force:
         return SEND_SEMANTIC_QUEUE_ENTER_FORCE
+    if submit_delay is not None and not math.isfinite(max(0.0, submit_delay)):
+        return SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE
     if kind == "custom" and not summary:
         return SEND_SEMANTIC_CUSTOM_SUMMARY
     if select and target:
@@ -82,6 +95,27 @@ def send_semantic_gap(
     if target_project and not target_repo:
         return SEND_SEMANTIC_PROJECT_REPO
     return None
+
+
+def send_semantic_message(reason: str) -> str:
+    """The canonical operator-facing message for a send-semantic refusal (pure).
+
+    Lives beside the rules so a call site keying its ``die`` text off the reason cannot drift
+    from the rule it renders. The force message is byte-identical to the pre-authority text.
+    """
+    if reason == SEND_SEMANTIC_QUEUE_ENTER_FORCE:
+        return (
+            "--force is not allowed under --mode queue-enter; queue-enter is "
+            "restricted to Claude/Codex agent panes and rejects non-agent "
+            "targets even with operator override."
+        )
+    if reason == SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE:
+        return (
+            "--submit-delay must be a finite number of seconds; the rail sleeps "
+            "for the delay before pressing Enter, so a non-finite delay never "
+            "delivers."
+        )
+    return f"handoff send refused: {reason}"
 
 
 def default_body_for_kind(kind: str, receiver: str) -> str:
@@ -113,7 +147,9 @@ __all__ = [
     "SEND_SEMANTIC_QUEUE_ENTER_FORCE",
     "SEND_SEMANTIC_REASONS",
     "SEND_SEMANTIC_SELECT_TARGET",
+    "SEND_SEMANTIC_SUBMIT_DELAY_NOT_FINITE",
     "default_body_for_kind",
     "effective_send_mode",
     "send_semantic_gap",
+    "send_semantic_message",
 ]
