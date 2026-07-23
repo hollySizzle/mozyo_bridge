@@ -121,6 +121,26 @@ def send_semantic_gap(
     return None
 
 
+def submit_delay_help() -> str:
+    """The operator-facing ``--submit-delay`` help, derived from the rule it explains (pure).
+
+    Hand-written help drifted from the clamp contract the very round it was added (#14219
+    j#86702 R24-F1: it claimed "must be finite" while negative and NaN values clamp to zero and
+    deliver) — so the ONE text lives beside the rule and every parser site calls this.
+    """
+    return (
+        "Seconds to sleep after the text is observed and BEFORE Enter is "
+        "pressed, on the rails that consume it (tmux standard / queue-enter; "
+        "`--mode pending` parks without Enter and the herdr standard rail "
+        "has no delay, so both ignore it). The value is judged AFTER the "
+        "rail's own clamp, max(0.0, value): a negative or NaN value clamps "
+        "to 0 and is accepted; the clamped delay must be at most "
+        f"{MAX_SUBMIT_DELAY_SECONDS:.0f} seconds, and anything beyond that "
+        "(inf, or a larger finite value) is refused before any text is "
+        "typed."
+    )
+
+
 def send_semantic_message(reason: str) -> str:
     """The canonical operator-facing message for a send-semantic refusal (pure).
 
@@ -179,4 +199,5 @@ __all__ = [
     "effective_send_mode",
     "send_semantic_gap",
     "send_semantic_message",
+    "submit_delay_help",
 ]

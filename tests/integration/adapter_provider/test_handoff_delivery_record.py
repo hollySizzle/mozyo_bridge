@@ -849,6 +849,19 @@ class SubmitDelayRailApplicabilityTest(unittest.TestCase):
         self.assertIn('"status": "sent"', stdout)
         self.assertTrue([call for call in sent if call[-1] == "Enter"])
 
+    def test_negative_and_nan_delays_clamp_to_zero_and_deliver(self) -> None:
+        # checkpoint j#86702 R24-F1: the judgment is on the CLAMPED effective value — the
+        # rail's max(0.0, value) turns a negative or NaN delay into zero, sleeps nothing,
+        # and presses Enter. Refusing them would be stricter than the rail; the help says so.
+        for delay in ("nan", "-1"):
+            with self.subTest(delay=delay):
+                result, sent, stdout = self._run(
+                    self._argv(mode="standard", submit_delay=delay)
+                )
+                self.assertEqual(0, result)
+                self.assertIn('"status": "sent"', stdout)
+                self.assertTrue([call for call in sent if call[-1] == "Enter"])
+
 
 class HerdrTurnStartRecordWordingTest(unittest.TestCase):
     """Redmine #13255 j#72695: the herdr rail's ``delivered_not_started`` reuses the

@@ -22,7 +22,7 @@ import argparse
 
 from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
-    MAX_SUBMIT_DELAY_SECONDS,
+    submit_delay_help,
 )
 from mozyo_bridge.application.commands import (
     cmd_handoff_cross_workspace_consult,
@@ -94,14 +94,7 @@ def add_notify_delivery_options(parser: argparse.ArgumentParser, issue_required:
         "--submit-delay",
         type=float,
         default=0.2,
-        help=(
-            "Seconds to sleep after the text is observed and BEFORE Enter is "
-            "pressed, on the rails that consume it (tmux standard / "
-            "queue-enter). `--mode pending` parks without Enter and the herdr "
-            "standard rail has no delay, so they ignore it. Must be finite "
-            f"and at most {MAX_SUBMIT_DELAY_SECONDS:.0f} seconds; anything "
-            "else is refused before any text is typed (zero-send)."
-        ),
+        help=submit_delay_help(),
     )
     parser.add_argument("--force", action="store_true", help="Allow sending to a non-agent-looking pane")
 
@@ -367,14 +360,7 @@ def configure_handoff_parser(
         dest="submit_delay",
         type=float,
         default=0.2,
-        help=(
-            "Seconds to sleep after the text is observed and BEFORE Enter is "
-            "pressed, on the rails that consume it (tmux standard / "
-            "queue-enter). `--mode pending` parks without Enter and the herdr "
-            "standard rail has no delay, so they ignore it. Must be finite "
-            f"and at most {MAX_SUBMIT_DELAY_SECONDS:.0f} seconds; anything "
-            "else is refused before any text is typed (zero-send)."
-        ),
+        help=submit_delay_help(),
     )
     parser_.add_argument("--read-lines", dest="read_lines", type=int, default=50)
     parser_.add_argument(

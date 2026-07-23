@@ -2239,6 +2239,11 @@ class SendSemanticsSharedAuthorityTests(unittest.TestCase):
             MAX_SUBMIT_DELAY_SECONDS,
         )
 
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+            submit_delay_help,
+        )
+
+        texts = {}
         for site in ("handoff", "notify"):
             with self.subTest(site=site):
                 parser = argparse.ArgumentParser(add_help=False)
@@ -2252,9 +2257,21 @@ class SendSemanticsSharedAuthorityTests(unittest.TestCase):
                     if "--submit-delay" in action.option_strings
                 )
                 help_text = action.help or ""
+                texts[site] = help_text
                 self.assertIn(f"{MAX_SUBMIT_DELAY_SECONDS:.0f}", help_text)
                 self.assertIn("pending", help_text)
                 self.assertIn("herdr", help_text)
+                # The clamp semantics (checkpoint j#86702 R24-F1): the judgment is on the
+                # CLAMPED effective value, negative / NaN clamp to zero and are ACCEPTED —
+                # a "must be finite" claim inverted the contract the same round it landed.
+                self.assertIn("clamp", help_text)
+                self.assertIn("negative", help_text.lower())
+                self.assertIn("nan", help_text.lower())
+                self.assertIn("accepted", help_text)
+                self.assertNotIn("Must be finite", help_text)
+        # ONE helper feeds both sites — byte equality is the anti-drift pin.
+        self.assertEqual(texts["handoff"], texts["notify"])
+        self.assertEqual(texts["handoff"], submit_delay_help())
 
     def test_the_authority_matches_the_canonical_queue_enter_force_rule(self):
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
