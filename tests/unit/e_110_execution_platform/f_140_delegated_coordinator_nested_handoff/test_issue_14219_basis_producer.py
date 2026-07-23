@@ -769,6 +769,23 @@ class CorroborationTests(unittest.TestCase):
                 self.assertEqual(produced.gaps, ())
                 self.assertTrue(_by_key(produced)[CONJUNCT_PARK_DECLARED].satisfied)
 
+    def test_the_templates_coordinator_pane_fallback_is_accepted(self):
+        # The template's second target form: `<coordinator_codex_%pane>`. It is a pane, and the
+        # record says whose — which is what distinguishes it from any other pane on the cockpit.
+        fields = _park_fields(
+            result="sent",
+            detail=(
+                "- target: coordinator codex pane %14\n"
+                "- on sent: mozyo-bridge handoff send --to codex --target %14"
+                " --target-repo auto / observed landing marker"
+                " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"
+            ),
+        )
+        produced = _produce(
+            _park_journals(park=_park_note(park_fields=fields)), basis=BASIS_DEPENDENCY_PARK
+        )
+        self.assertEqual(produced.gaps, ())
+
     def test_the_template_spelling_result_is_accepted_too(self):
         # The callback template writes `result:`; the parked-state fixed-field block folds it in as
         # `callback_result:`. Both are the contract's own spellings, so both are read.
@@ -880,6 +897,68 @@ class CorroborationTests(unittest.TestCase):
                      "- on sent: mozyo-bridge handoff send --to codex --target mainlane"
                      " / observed landing marker"
                      " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # -- checkpoint j#86562 R7-F1: the target rule is COMMON to all three outcomes -----
+            # The rule was written in the contract for every outcome but wired inside the `sent`
+            # branch, so these two named any target they liked.
+            ("blocked", "- target: same-lane worker w3F:p3\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge handoff send --to codex --target %14"
+                        " --target-repo auto\n"),
+            ("not-attempted", "- target: same-lane worker w3F:p3\n"
+                              "- on not-attempted: this lane IS the coordinator lane\n"),
+            # `noncoordinator` contains `coordinator`; a substring test read it as the coordinator.
+            ("sent", "- target: noncoordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target noncoordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # -- checkpoint j#86562 R7-F2: the command is ONE invocation ------------------------
+            # The effective receiver is claude; reading only the first `--to` said codex.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --to claude"
+                     " --target coordinator / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # The effective target is the pane; reading only the first `--target` said coordinator.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " --target w3F:p3 / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # A marker missing the fields the canonical producer always emits (`source` / `kind`)
+            # was never built by the sender, so it is not the landing observation.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / [mozyo:handoff:issue=14219:journal=85500:to=codex]\n"),
+            # The retry is a command that will be REPLAYED — `echo` will not deliver anything.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: echo --target %14 --target-repo auto\n"),
+            # A retry that pins two targets has no single meaning to replay.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge handoff send --to codex --target %14"
+                        " --target %99 --target-repo auto\n"),
+            # A retry that does not name the coordinator's Codex is not the callback's retry.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge handoff send --to claude --target %14"
+                        " --target-repo auto\n"),
+            # A retry command with no `--target-repo auto` is not replayable as specified.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: mozyo-bridge handoff send --to codex --target %14\n"),
+            # A target field naming two panes: no single target to have delivered to.
+            ("sent", "- target: coordinator pane %99 %14\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target %14"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # One `--target`, but not the one the record declares.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target %14"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # A retry naming the right receiver and flags, but not a delivery command.
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: echo --to codex --target %14 --target-repo auto\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"

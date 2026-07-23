@@ -125,96 +125,134 @@ _CALLBACK_DETAIL_FIELDS = {
     _CALLBACK_NOT_ATTEMPTED: ("on not-attempted",),
 }
 
-#: A pane token as ``agents targets`` prints one: ``%14`` or ``w3F:p4``.
-_PANE_TOKEN_RE = re.compile(r"(?:%\d+|\b\w+:p\w+\b)")
+#: A pane token as ``agents targets`` prints one: ``%14`` or ``w3F:p4``, matched WHOLE. A target is
+#: one of these or the natural coordinator token — never a phrase that merely mentions one.
+_PANE_TOKEN_RE = re.compile(r"(?:%\d+|\w+:p\w+)\Z")
 #: The coordinator's natural target (`--target coordinator`), the normal route.
 _COORDINATOR_TARGET = "coordinator"
-#: The command that actually delivers a callback, and the receiver it must name: the coordinator's
-#: window actor is Codex, and a callback is never addressed to another lane's Claude.
-_HANDOFF_SEND_RE = re.compile(r"handoff\s+send\b", re.IGNORECASE)
-_RECEIVER_CODEX_RE = re.compile(r"--to\s+codex\b", re.IGNORECASE)
-#: ``--target <value>`` where the value is NOT another flag — ``--target --target-repo auto`` must
-#: not read the next flag as the target it claims to pin.
-_TARGET_VALUE_RE = re.compile(r"--target\s+(?!--)(?P<value>\S+)")
-_RETRY_REPO_RE = re.compile(r"--target-repo\s+auto\b")
-#: The handoff channel a landing marker belongs to.
+#: The delivery command and the receiver a coordinator callback must name.
+_HANDOFF_SEND_RE = re.compile(r"\bhandoff\s+send\b", re.IGNORECASE)
+_RECEIVER_CODEX = "codex"
+#: The canonical handoff marker's mandatory fields (``handoff.build_marker``): the source system,
+#: the anchor, the kind, and the receiver. A token missing any of them was never produced by the
+#: sender, so it is not the landing observation.
+_MARKER_REQUIRED_FIELDS = ("source", "issue", "journal", "kind", "to")
 _HANDOFF_CHANNEL = "handoff"
 
 
-def _target_token(value: str) -> str:
-    """The canonical target a ``target:`` field names, or ``""`` (pure).
+def canonical_target(value: str) -> str:
+    """The canonical coordinator target a ``target:`` field names, or ``""`` (pure).
 
-    Either the natural coordinator target or a resolved pane; anything else is not a shape the
-    contract routes a callback to.
+    The template writes the two permitted forms as ``coordinator (`--target coordinator`)`` and
+    ``<coordinator_codex_%pane>`` — both of which SAY they are the coordinator's. So the field must
+    name the coordinator, and the effective target is then either that natural token or the one
+    pane it resolves to.
+
+    Two ways this was wrong before. It asked whether ``"coordinator" in value.lower()``, so
+    ``noncoordinator`` and ``the-coordinator-ish`` read as the coordinator; and once whole-token
+    matching landed, a bare pane still passed on shape alone — ``same-lane worker w3F:p3`` is a
+    well-formed pane, and nothing in it claims to be the coordinator (checkpoint j#86562 R7-F1).
+    A pane is a target only when the record says whose it is, and only when there is exactly one:
+    two panes name no single place the callback went.
     """
-    if _COORDINATOR_TARGET in value.lower():
-        return _COORDINATOR_TARGET
-    pane = _PANE_TOKEN_RE.search(value)
-    return pane.group(0) if pane else ""
+    tokens = [token.strip("`(),") for token in str(value).split()]
+    if not any(token.lower() == _COORDINATOR_TARGET for token in tokens):
+        return ""
+    panes = {token for token in tokens if _PANE_TOKEN_RE.match(token)}
+    if len(panes) > 1:
+        return ""
+    return panes.pop() if panes else _COORDINATOR_TARGET
 
 
-def _landing_marker_fields(detail: str) -> tuple:
-    """The handoff-channel marker field maps in ``detail`` (pure).
+def _flag_value(command: str, flag: str) -> "str | None | object":
+    """The command's EFFECTIVE value for ``flag``, ``None`` if absent, ``_FIELD_CONFLICT`` if it is
+    given more than once with differing values (pure).
 
-    Parsed with the same scanner the watcher uses, so a ``[mozyo:handoff:x]`` that carries no
-    fields yields an empty map and cannot pass for an observation.
+    A command is one invocation, so a flag repeated with two values has no single meaning that a
+    reader may pick from: ``--to codex --to claude`` delivers to claude, and
+    ``--target coordinator --target w3F:p3`` targets the pane (checkpoint j#86562 R7-F2). Reading
+    only the first occurrence let both pass as if the first were authoritative. A value that is
+    itself a flag is not a value — that guard is subsumed by the comparisons below (a flag never
+    equals the declared target or a candidate pane), but it keeps the parse honest.
     """
-    return tuple(
+    tokens = command.split()
+    values = set()
+    for index, token in enumerate(tokens):
+        if token != flag:
+            continue
+        if index + 1 >= len(tokens) or tokens[index + 1].startswith("--"):
+            return _FIELD_CONFLICT
+        values.add(tokens[index + 1].strip("`(),"))
+    if not values:
+        return None
+    if len(values) > 1:
+        return _FIELD_CONFLICT
+    return values.pop()
+
+
+def _delivery_command_gap(command: str, *, target: str) -> Optional[str]:
+    """Whether ``command`` is a handoff delivery to the coordinator's Codex at ``target`` (pure)."""
+    if not _HANDOFF_SEND_RE.search(command):
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    receiver = _flag_value(command, "--to")
+    if receiver is _FIELD_CONFLICT or receiver is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if str(receiver).lower() != _RECEIVER_CODEX:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    commanded = _flag_value(command, "--target")
+    if commanded is _FIELD_CONFLICT or commanded is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if str(commanded) != target:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    return None
+
+
+def _landing_marker_matches(detail: str, *, source_issue: str, journal: str) -> bool:
+    """Whether ``detail`` carries THIS callback's canonical landing marker (pure).
+
+    Every mandatory field the canonical producer emits must be present — a bare
+    ``[mozyo:handoff:issue=…:journal=…:to=codex]`` was never built by the sender — and the anchor
+    and receiver must be this issue, this park declaration, and the coordinator's Codex.
+    """
+    for fields in (
         fields
         for channel, fields in marker_fields_in_note(detail)
         if channel == _HANDOFF_CHANNEL
-    )
-
-
-def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: str) -> Optional[str]:
-    """Whether a ``sent`` record is THIS callback's delivery evidence (pure).
-
-    R5 closed "a command-shaped string and a bracketed token are present". That is not the same as
-    "this callback was delivered" (checkpoint j#86558 R6-F1): a same-lane note to the lane's own
-    Claude, carrying another issue's marker, satisfied it. The contract routes a coordinator
-    callback to the coordinator's CODEX — never to another lane's Claude — and the landing
-    observation is of the marker the send itself composed. So the three parts must agree:
-
-    * the command delivers (``handoff send``) to ``--to codex``, and the ``--target`` it names is
-      the same target the record declares;
-    * the marker is a real handoff marker whose ``issue`` / ``journal`` are this issue and THIS
-      park declaration, addressed ``to=codex``.
-    """
-    declared = _target_token(target)
-    if not declared:
-        return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    if not (_HANDOFF_SEND_RE.search(detail) and _RECEIVER_CODEX_RE.search(detail)):
-        return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    commanded = _TARGET_VALUE_RE.search(detail)
-    if commanded is None or _target_token(commanded.group("value")) != declared:
-        return GAP_PARK_CALLBACK_DETAIL_ABSENT
-
-    for fields in _landing_marker_fields(detail):
+    ):
+        if any(not str(fields.get(name, "")).strip() for name in _MARKER_REQUIRED_FIELDS):
+            continue
         if (
             str(fields.get("issue", "")).strip() == str(source_issue).strip()
             and str(fields.get("journal", "")).strip() == str(journal).strip()
-            and str(fields.get("to", "")).strip().lower() == "codex"
+            and str(fields.get("to", "")).strip().lower() == _RECEIVER_CODEX
         ):
-            return None
-    return GAP_PARK_CALLBACK_DETAIL_ABSENT
+            return True
+    return False
+
+
+def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: str) -> Optional[str]:
+    """Whether a ``sent`` record is THIS callback's delivery evidence (pure)."""
+    gap = _delivery_command_gap(detail, target=target)
+    if gap is not None:
+        return gap
+    if not _landing_marker_matches(detail, source_issue=source_issue, journal=journal):
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    return None
 
 
 def _blocked_detail_gap(detail: str) -> Optional[str]:
     """Whether a ``blocked`` record carries reason / candidates / retry command (pure).
 
     Read as the template writes it — EXACTLY three ``/``-separated parts, each with its own job.
-    Two earlier attempts stopped short of that: the first scored the reason as "whatever text is
-    left once the evidence is removed" (its own negative control walked through it), and the second
-    split the parts but then searched ACROSS them, so a pane id inside the retry command satisfied
-    the candidate requirement and a retry that pinned no pane at all still passed (checkpoint
-    j#86558 R6-F2). Splitting a record into parts does nothing unless each part has to carry its
-    own authority:
+    Each earlier version stopped one step short: scoring the reason as leftover prose, then
+    splitting the parts but searching across them, and then accepting any string with the right
+    flags in it. The retry is a command that will be REPLAYED, so it has to be one:
 
     * part 1 — the reason, which must be text and not evidence standing in for one;
     * part 2 — the candidate rows, which must actually name at least one pane;
-    * part 3 — the retry command, which must pin ``--target <pane>`` at one of THOSE candidates
-      (not a flag, not a natural name) and ``--target-repo auto``, which is what makes it
-      replayable from the durable record.
+    * part 3 — a real ``handoff send`` to ``--to codex``, pinned at ONE of those candidates and at
+      ``--target-repo auto``. A conflicting repeat of any of those flags is fail-closed: an
+      invocation cannot mean two things at once.
     """
     parts = [part.strip() for part in detail.split("/")]
     parts = [part for part in parts if part]
@@ -224,20 +262,26 @@ def _blocked_detail_gap(detail: str) -> Optional[str]:
 
     if _PANE_TOKEN_RE.search(reason) or _HANDOFF_SEND_RE.search(reason):
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    candidate_panes = set(_PANE_TOKEN_RE.findall(candidates))
+    candidate_panes = {
+        token.strip("`(),")
+        for token in candidates.split()
+        if _PANE_TOKEN_RE.match(token.strip("`(),"))
+    }
     if not candidate_panes:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
 
-    target = _TARGET_VALUE_RE.search(retry)
-    if target is None:
+    if not _HANDOFF_SEND_RE.search(retry):
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    # Membership in the candidate set is the whole check: it implies the pinned value is a pane
-    # (the set only ever holds pane tokens), so a separate shape test would be unobservable. The
-    # negative lookahead in :data:`_TARGET_VALUE_RE` is what keeps ``--target --target-repo auto``
-    # from parsing its own next flag as the target — also subsumed here, but the parse is right.
-    if target.group("value") not in candidate_panes:
+    receiver = _flag_value(retry, "--to")
+    if receiver is _FIELD_CONFLICT or receiver is None:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
-    if not _RETRY_REPO_RE.search(retry):
+    if str(receiver).lower() != _RECEIVER_CODEX:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    pinned = _flag_value(retry, "--target")
+    if pinned is _FIELD_CONFLICT or pinned is None or pinned not in candidate_panes:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    repo = _flag_value(retry, "--target-repo")
+    if repo is _FIELD_CONFLICT or str(repo or "").lower() != "auto":
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
     return None
 
@@ -327,8 +371,15 @@ def _callback_outcome_gap(
     ``on not-attempted``    the explicit reason
     ======================  ==================================================================
     """
-    target = governed_field(notes, _CALLBACK_TARGET_FIELD)
-    if target is _FIELD_CONFLICT or not target:
+    declared = governed_field(notes, _CALLBACK_TARGET_FIELD)
+    if declared is _FIELD_CONFLICT or not declared:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    # The contract's first line is "EVERY outcome: the target is the coordinator's natural target
+    # or a resolved pane". R7 wrote that in the contract but wired the check inside the ``sent``
+    # branch only, so a blocked / not-attempted record could name any target at all (checkpoint
+    # j#86562 R7-F1). It is a common rule, so it is applied once, here, before the branch.
+    target = canonical_target(declared)
+    if not target:
         return GAP_PARK_CALLBACK_DETAIL_ABSENT
 
     detail = governed_field(notes, *_CALLBACK_DETAIL_FIELDS[outcome])
