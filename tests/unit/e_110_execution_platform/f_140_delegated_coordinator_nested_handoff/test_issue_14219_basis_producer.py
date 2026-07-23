@@ -959,6 +959,74 @@ class CorroborationTests(unittest.TestCase):
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
                         " / retry command: echo --to codex --target %14 --target-repo auto\n"),
+            # -- checkpoint j#86569 R8-F1: the command is ONE INVOCATION, boundaries included ---
+            # A wrapped command is precisely the one that did not run. The `handoff send` string
+            # is present in all three — which is why the earlier check passed them.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: echo mozyo-bridge handoff send --to codex --target coordinator"
+                     " / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     "- on sent: false && mozyo-bridge handoff send --to codex"
+                     " --target coordinator / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
+                        " / candidates (`agents targets` rows): %14"
+                        " / retry command: echo mozyo-bridge handoff send --to codex --target %14"
+                        " --target-repo auto\n"),
+            # -- checkpoint j#86569 R8-F2: the landing marker is canonical and unambiguous -------
+            # A key declared twice says two things and proves neither; the shared scanner's
+            # last-write-wins quietly resolved both of these to the acceptable value.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / [mozyo:handoff:source=redmine:issue=14219:journal=1:journal=85500"
+                     ":kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply"
+                     ":to=claude:to=codex]\n"),
+            # A foreign marker riding along beside a valid one: two observations, no single one.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / [mozyo:handoff:source=redmine:issue=99999:journal=1:kind=reply:to=claude]"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # Combinations the canonical producer cannot emit: another source system carrying this
+            # Redmine anchor, and a kind outside the handoff vocabulary.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / [mozyo:handoff:source=asana:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=banana"
+                     ":to=codex]\n"),
+            # Each of the next five isolates ONE invocation/marker rule: everything else about the
+            # record is canonical, so only the named rule can refuse it.
+            # A shell operator with no prefix word: the invocation is composed, not run alone.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " && true / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # A prefix that ends in a colon but is not a label.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: sudo -u root cmd: mozyo-bridge handoff send --to codex"
+                     " --target coordinator / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # The entry point is there, and so are the words — but not as `handoff send`.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge workflow callbacks handoff send --to codex"
+                     " --target coordinator / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # Two invocations in one line: which one is the delivery?
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " mozyo-bridge handoff send --mode standard / observed landing marker"
+                     " [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]\n"),
+            # The valid marker FIRST and a foreign one after it — "any one matches" would stop at
+            # the first and never see the second.
+            ("sent", "- target: coordinator\n"
+                     "- on sent: mozyo-bridge handoff send --to codex --target coordinator"
+                     " / [mozyo:handoff:source=redmine:issue=14219:journal=85500:kind=reply:to=codex]"
+                     " [mozyo:handoff:source=redmine:issue=99999:journal=1:kind=reply:to=claude]\n"),
             # A retry pinned at a pane that was never a candidate.
             ("blocked", "- target: coordinator\n- on blocked: pane unresolved"
                         " / candidates (`agents targets` rows): %14"
