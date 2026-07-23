@@ -19,6 +19,10 @@ from __future__ import annotations
 
 import argparse
 
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
+    submit_delay_help,
+)
+
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_provider_runtime_snapshot import (
     AgentProviderRuntimeSnapshot,
 )
@@ -111,7 +115,13 @@ def _add_ticketless_delivery_options(
         "--landing-timeout", dest="landing_timeout", type=float, default=8.0,
         help="Seconds to wait for the landing marker before pressing Enter.",
     )
-    parser_.add_argument("--submit-delay", dest="submit_delay", type=float, default=0.2)
+    parser_.add_argument(
+        "--submit-delay",
+        dest="submit_delay",
+        type=float,
+        default=0.2,
+        help=submit_delay_help(),
+    )
     parser_.add_argument("--read-lines", dest="read_lines", type=int, default=50)
     parser_.add_argument(
         "--queue-enter-retry-window", dest="queue_enter_retry_window",

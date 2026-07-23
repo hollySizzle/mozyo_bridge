@@ -155,10 +155,12 @@ def send_semantic_message(reason: str) -> str:
         )
     if reason == SEND_SEMANTIC_SUBMIT_DELAY_UNEXECUTABLE:
         return (
-            "--submit-delay must be a finite number of seconds no greater than "
-            f"{MAX_SUBMIT_DELAY_SECONDS:.0f}; the rail sleeps for the delay "
-            "before pressing Enter, so a delay outside that domain never "
-            "delivers."
+            "the effective --submit-delay after the rail's clamp, "
+            "max(0.0, value), must be a finite number of seconds no greater "
+            f"than {MAX_SUBMIT_DELAY_SECONDS:.0f} (negative and NaN values "
+            "clamp to 0 and are accepted); the rail sleeps for the effective "
+            "delay before pressing Enter, so a delay beyond that domain "
+            "never delivers."
         )
     return f"handoff send refused: {reason}"
 

@@ -2239,39 +2239,89 @@ class SendSemanticsSharedAuthorityTests(unittest.TestCase):
             MAX_SUBMIT_DELAY_SECONDS,
         )
 
+        from mozyo_bridge.application.cli import build_parser
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
             submit_delay_help,
         )
 
-        texts = {}
-        for site in ("handoff", "notify"):
-            with self.subTest(site=site):
-                parser = argparse.ArgumentParser(add_help=False)
-                if site == "handoff":
-                    configure_handoff_parser(parser, kind_required=True)
-                else:
-                    add_notify_delivery_options(parser)
-                action = next(
-                    action
-                    for action in parser._actions
-                    if "--submit-delay" in action.option_strings
-                )
-                help_text = action.help or ""
-                texts[site] = help_text
-                self.assertIn(f"{MAX_SUBMIT_DELAY_SECONDS:.0f}", help_text)
-                self.assertIn("pending", help_text)
-                self.assertIn("herdr", help_text)
-                # The clamp semantics (checkpoint j#86702 R24-F1): the judgment is on the
-                # CLAMPED effective value, negative / NaN clamp to zero and are ACCEPTED —
-                # a "must be finite" claim inverted the contract the same round it landed.
-                self.assertIn("clamp", help_text)
-                self.assertIn("negative", help_text.lower())
-                self.assertIn("nan", help_text.lower())
-                self.assertIn("accepted", help_text)
-                self.assertNotIn("Must be finite", help_text)
-        # ONE helper feeds both sites — byte equality is the anti-drift pin.
-        self.assertEqual(texts["handoff"], texts["notify"])
-        self.assertEqual(texts["handoff"], submit_delay_help())
+        del add_notify_delivery_options, configure_handoff_parser  # superseded by the full walk
+
+        # The FULL parser tree, recursively (checkpoint j#86706 R25-F1: a hard-coded two-site
+        # list missed the three ticketless entrypoints that register the very same option for
+        # the very same rail). Every `--submit-delay` registration must carry the ONE helper's
+        # text — a new surface is covered the day it appears.
+        #: `mozyo-bridge message` types an ad-hoc line with its own delay semantics and its own
+        #: wording — deliberately NOT the canonical send rail's contract (review j#86706).
+        intended_exceptions = {"mozyo-bridge message"}
+
+        found = {}
+        seen: set = set()
+
+        def walk(parser, path):
+            if id(parser) in seen:
+                return
+            seen.add(id(parser))
+            for action in parser._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    visited = set()
+                    for name, sub in action.choices.items():
+                        if id(sub) in visited:
+                            continue
+                        visited.add(id(sub))
+                        walk(sub, f"{path} {name}")
+                elif "--submit-delay" in action.option_strings:
+                    found[path] = action.help
+
+        walk(build_parser(), "mozyo-bridge")
+        self.assertGreaterEqual(len(found), 15, sorted(found))
+        canonical = submit_delay_help()
+        for path, help_text in sorted(found.items()):
+            if path in intended_exceptions:
+                self.assertNotEqual(help_text, canonical, path)
+                continue
+            with self.subTest(site=path):
+                self.assertEqual(help_text, canonical)
+        # The helper's own contract: clamp semantics, acceptance of negative/NaN, the bound,
+        # the applicability — and no inverted "must be finite" claim (checkpoint j#86702).
+        self.assertIn(f"{MAX_SUBMIT_DELAY_SECONDS:.0f}", canonical)
+        for needle in ("pending", "herdr", "clamp", "accepted"):
+            self.assertIn(needle, canonical)
+        for needle in ("negative", "nan"):
+            self.assertIn(needle, canonical.lower())
+        self.assertNotIn("Must be finite", canonical)
+
+    def test_the_ticketless_entrypoint_renders_the_canonical_help(self):
+        # checkpoint j#86706 R25-F1: the public `--help` of a ticketless entrypoint — one of
+        # the three sites the single authority missed — must render the helper's text.
+        import contextlib
+        import io
+
+        from mozyo_bridge.application.cli import build_parser
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+            submit_delay_help,
+        )
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), self.assertRaises(SystemExit):
+            build_parser().parse_args(["handoff", "ticketless-callback", "--help"])
+        rendered = " ".join(buffer.getvalue().split())
+        self.assertIn(" ".join(submit_delay_help().split()), rendered)
+
+    def test_the_submit_delay_refusal_message_speaks_in_clamped_terms(self):
+        # checkpoint j#86706 R25-F2: the refusal diagnostic must describe the rule that fired —
+        # the CLAMPED effective delay against the bound — not a raw-finite requirement the
+        # authority itself does not impose (negative / NaN / -inf are accepted).
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+            MAX_SUBMIT_DELAY_SECONDS,
+            SEND_SEMANTIC_SUBMIT_DELAY_UNEXECUTABLE,
+            send_semantic_message,
+        )
+
+        message = send_semantic_message(SEND_SEMANTIC_SUBMIT_DELAY_UNEXECUTABLE)
+        self.assertIn("clamp", message)
+        self.assertIn(f"{MAX_SUBMIT_DELAY_SECONDS:.0f}", message)
+        self.assertIn("accepted", message)
+        self.assertNotIn("--submit-delay must be a finite number", message)
 
     def test_the_authority_matches_the_canonical_queue_enter_force_rule(self):
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501

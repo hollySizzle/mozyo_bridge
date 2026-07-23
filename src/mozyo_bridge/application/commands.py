@@ -1725,7 +1725,7 @@ def orchestrate_handoff(
     if send_gap is not None:
         # Shared send-semantics authority: queue-enter refuses --force; on the
         # delay-consuming rails (pending parks pre-sleep, herdr standard has none)
-        # --submit-delay must sit in [0, MAX_SUBMIT_DELAY_SECONDS]. Die text too.
+        # the CLAMPED delay max(0.0, value) must stay within the bound. Die text too.
         _emit(
             make_outcome(
                 status="blocked",
