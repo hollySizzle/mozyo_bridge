@@ -52,6 +52,7 @@ LEG_REASON_LEASE_LOST = "supervisor_lease_lost"
 LEG_REASON_SUCCESS_WITHHELD = "release_success_withheld"
 LEG_REASON_NOT_ACTUATED = "not_actuated"
 LEG_REASON_BASIS_STALE = "basis_stale_since_build"
+LEG_REASON_WORKTREE_UNRESOLVED = "candidate_worktree_unresolved"
 
 
 @dataclass(frozen=True)
@@ -120,8 +121,9 @@ def run_hibernate_pass(
     refresh_fn: Callable[[HibernateCandidate], Optional[HibernateCandidate]],
     obligations_fn: Callable[[HibernateCandidate], ActionTimeObligations],
     journal_fn: Callable[[HibernateCandidate], str],
-    use_case: SublaneHibernateUseCase,
+    use_case: Optional[SublaneHibernateUseCase] = None,
     lease_renew_fn: Callable[[], bool],
+    use_case_fn: Optional[Callable[[HibernateCandidate], Optional[SublaneHibernateUseCase]]] = None,
 ) -> HibernatePassResult:
     """Run one bounded hibernate pass, actuating at most one lifecycle mutation.
 
@@ -186,7 +188,18 @@ def run_hibernate_pass(
             stopped = True
             continue
 
-        outcome = use_case.run(_to_request(fields), execute=True)
+        # Per-candidate actuation binding (checkpoint j#86726 R1-F2): the public rail's
+        # worktree fingerprint / lane-activity authority is the use case's own repo_root, so a
+        # multi-lane workspace must bind each candidate to ITS canonical worktree. An
+        # unresolvable binding (missing / foreign / ambiguous worktree) is a typed zero-call —
+        # never a fallback to a shared root that could inspect a sibling lane.
+        bound_use_case = use_case_fn(candidate) if use_case_fn is not None else use_case
+        if bound_use_case is None:
+            attempts.append(HibernateAttempt(
+                issue, lane, ATTEMPT_BLOCKED, LEG_REASON_WORKTREE_UNRESOLVED
+            ))
+            continue
+        outcome = bound_use_case.run(_to_request(fields), execute=True)
 
         # A lease lost at the use case's commit boundary committed nothing; stop the pass.
         if outcome.lease_lost:

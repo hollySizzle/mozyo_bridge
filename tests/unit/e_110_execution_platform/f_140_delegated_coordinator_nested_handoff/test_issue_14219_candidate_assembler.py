@@ -422,10 +422,55 @@ class PassSeamTests(unittest.TestCase):
         self.assertEqual(seams.journal_fn(candidate), "")
         self.assertIsNone(seams.refresh_fn(candidate))
 
-    def test_obligations_are_passed_through_untouched(self):
+    def test_obligations_transcribe_only_the_early_fresh_conjuncts(self):
+        # Ruling j#86730 superseded the T2b pass-through premise for the EARLY basis: the two
+        # transcribed flags come from the SAME fresh memo the refresh uses; every other flag is
+        # the injected observer's value untouched.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_actuation import (  # noqa: E501
+            ActionTimeObligations,
+        )
+
         ports = _Ports(journals=_early_journals())
-        assembler, candidate = self._seams_for(ports)
-        self.assertEqual(assembler.pass_seams().obligations_fn(candidate), "obligations")
+        assembler = ports.assembler(
+            obligations_fn=lambda c: ActionTimeObligations(callbacks_drained=True)
+        )
+        candidate = assembler.assemble(
+            AssemblyRequest(selected=_selected(), basis=BASIS_EARLY_HIBERNATE)
+        ).candidate
+        self.assertIsNotNone(candidate)
+        flags = assembler.pass_seams().obligations_fn(candidate)
+        self.assertTrue(flags.callbacks_drained)  # observer value untouched
+        self.assertTrue(flags.no_review_pending)  # transcribed from the fresh conjunct
+        self.assertTrue(flags.no_integration_pending)
+        self.assertFalse(flags.no_owner_approval_pending)  # never transcribed
+        self.assertFalse(flags.boundary_recorded)
+
+    def test_transcription_reads_the_fresh_memo_not_the_build_snapshot(self):
+        # Ruling j#86730 required test 3, at the assembler's OWN contract level (the leg's
+        # refresh-first ordering must not be the only thing standing): after the world gains a
+        # later review_request, the SAME obligations_fn call answers from the fresh re-assembly
+        # — base observer values, never the build-time snapshot's satisfied conjuncts.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_actuation import (  # noqa: E501
+            ActionTimeObligations,
+        )
+
+        ports = _Ports(journals=_early_journals())
+        assembler = ports.assembler(
+            obligations_fn=lambda c: ActionTimeObligations(callbacks_drained=True)
+        )
+        candidate = assembler.assemble(
+            AssemblyRequest(selected=_selected(), basis=BASIS_EARLY_HIBERNATE)
+        ).candidate
+        self.assertIsNotNone(candidate)
+        ports.journals = ports.journals + [
+            EvidenceJournal(
+                "85010", _request_note(), _issuer(ISSUER_LANE_WORKER)
+            )
+        ]
+        flags = assembler.pass_seams().obligations_fn(candidate)
+        self.assertFalse(flags.no_review_pending)
+        self.assertFalse(flags.no_integration_pending)
+        self.assertTrue(flags.callbacks_drained)  # the observer value is untouched
 
 
 if __name__ == "__main__":  # pragma: no cover

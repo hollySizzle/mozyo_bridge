@@ -560,6 +560,23 @@ def _produce_evidence_kind(
     ), None
 
 
+def current_dogfood_delegation(
+    journals: Sequence[EvidenceJournal],
+) -> "HibernateEvidence | None":
+    """The CURRENT (latest-declaration) strictly-parsed dogfood evidence, or ``None`` (pure).
+
+    The supervisor wiring derives its release-issue receipt READ SET from this — the producer's
+    own supersession + strict resolution, not a raw field scan — so a malformed, conflicting or
+    superseded delegation never triggers an external read (#14219 j#86726 R1-F3). No verdict is
+    reached here: the produced conjunct still runs the full issuer / receipt / anchor checks.
+    """
+    declaration = _latest_gate_declaration(journals or (), gate=EVIDENCE_DOGFOOD_DELEGATED)
+    if not declaration.journal:
+        return None
+    got = resolve_hibernate_evidence(declaration.markers, kind=EVIDENCE_DOGFOOD_DELEGATED)
+    return got if isinstance(got, HibernateEvidence) else None
+
+
 def produce_basis_conjuncts(
     journals: Sequence[EvidenceJournal],
     *,
@@ -686,6 +703,7 @@ def produce_basis_conjuncts(
 
 __all__ = (
     "DogfoodReceipt",
+    "current_dogfood_delegation",
     "EvidenceGap",
     "MARKER_GATE_REVIEW_REQUEST",
     "MARKER_GATE_REVIEW_RESULT",

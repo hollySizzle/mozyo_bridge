@@ -162,7 +162,7 @@ class ObligationObserverTest(unittest.TestCase):
     def _sources(self, **overrides):
         base = dict(
             outbox_pending_fn=lambda workspace: 0,
-            runtime_fn=lambda workspace, lane: "idle",
+            runtime_fn=lambda workspace, lane: "awaiting_input",
             worktree_clean_fn=lambda candidate: True,
             projection_fn=lambda candidate: {},
         )
@@ -207,12 +207,58 @@ class ObligationObserverTest(unittest.TestCase):
         self.assertFalse(flags.not_working)
         self.assertFalse(flags.worktree_clean)
 
-    def test_a_working_runtime_is_not_idle(self):
+    def test_unsettled_runtimes_leave_the_flags_false(self):
+        # The canonical normalized vocabulary (checkpoint j#86726 R1-F4): settled is
+        # awaiting_input / turn_ended; working / blocked / unknown — and the RAW herdr spellings
+        # idle / done, which never reach this layer — leave the flags False.
+        for runtime in ("working", "blocked", "unknown", "idle", "done"):
+            with self.subTest(runtime=runtime):
+                flags = observe_obligations(
+                    self._candidate(),
+                    self._sources(runtime_fn=lambda workspace, lane, r=runtime: r),
+                )
+                self.assertFalse(flags.not_working)
+                self.assertFalse(flags.no_pending_prompt)
+
+    def test_turn_ended_is_settled(self):
         flags = observe_obligations(
-            self._candidate(), self._sources(runtime_fn=lambda workspace, lane: "working")
+            self._candidate(), self._sources(runtime_fn=lambda workspace, lane: "turn_ended")
         )
-        self.assertFalse(flags.not_working)
-        self.assertFalse(flags.no_pending_prompt)
+        self.assertTrue(flags.not_working)
+        self.assertTrue(flags.no_pending_prompt)
+
+    def test_production_shape_observed_agents_drive_the_flags(self):
+        # Production-shape pin (checkpoint j#86726 R1-F4): the runtime travels through
+        # lane_worker_runtime over ObservedAgent-shaped rows — herdr raw idle/done arrive as
+        # the NORMALIZED awaiting_input/turn_ended, never raw.
+        from types import SimpleNamespace
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.reconcile_live_source import (  # noqa: E501
+            lane_worker_runtime,
+        )
+
+        def agent(state):
+            return SimpleNamespace(
+                workspace_id=WS, lane_id=LANE, role="claude", runtime_state=state
+            )
+
+        for state, settled in (
+            ("awaiting_input", True),
+            ("turn_ended", True),
+            ("working", False),
+            ("blocked", False),
+            ("unknown", False),
+        ):
+            with self.subTest(state=state):
+                runtime = lane_worker_runtime(
+                    WS, LANE, "implementation_worker", agents_fn=lambda s=state: [agent(s)]
+                )
+                self.assertEqual(runtime, state)
+                flags = observe_obligations(
+                    self._candidate(),
+                    self._sources(runtime_fn=lambda workspace, lane, r=runtime: r),
+                )
+                self.assertEqual(flags.not_working, settled)
 
 
 class DogfoodReceiptReaderTest(unittest.TestCase):
@@ -221,27 +267,194 @@ class DogfoodReceiptReaderTest(unittest.TestCase):
         f":lane_generation={GEN}:head={HEAD}:release_issue=900:acceptance=glance]"
     )
 
+    def _selected(self):
+        return SelectedLane(
+            issue_id="500", repo_workspace_id=WS, lane_id=LANE,
+            lane_generation=GEN, revision=4,
+        )
+
+    def _journals(self, *notes):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+            EvidenceJournal,
+        )
+
+        return [
+            EvidenceJournal(journal_id=str(index + 1), notes=note)
+            for index, note in enumerate(notes)
+        ]
+
+    def _counting(self, **by_issue):
+        calls = []
+
+        def entries_fn(issue):
+            calls.append(str(issue))
+            return by_issue.get(str(issue))
+
+        return entries_fn, calls
+
     def test_a_matching_receipt_is_read_from_the_release_issue(self):
         receipt = f"[mozyo:workflow-event:gate=dogfood_receipt:source_issue=500:head={HEAD}]"
-        pages = _pages(**{"500": (_entry(1, self.DOGFOOD),), "900": (_entry(2, receipt),)})
-        receipts = read_dogfood_receipts("500", pages)
+        entries_fn, calls = self._counting(**{"900": (_entry(2, receipt),)})
+        receipts = read_dogfood_receipts(self._journals(self.DOGFOOD), self._selected(), entries_fn)
         self.assertEqual(receipts["900"].source_issue, "500")
         self.assertEqual(receipts["900"].head, HEAD)
+        self.assertEqual(calls, ["900"])  # exactly ONE release read
 
     def test_conflicting_receipt_claims_prove_nothing(self):
         one = f"[mozyo:workflow-event:gate=dogfood_receipt:source_issue=500:head={HEAD}]"
         two = f"[mozyo:workflow-event:gate=dogfood_receipt:source_issue=500:head={'c' * 40}]"
-        pages = _pages(**{"500": (_entry(1, self.DOGFOOD),), "900": (_entry(2, one + two),)})
-        self.assertEqual(read_dogfood_receipts("500", pages), {})
+        entries_fn, _calls = self._counting(**{"900": (_entry(2, one + two),)})
+        self.assertEqual(
+            read_dogfood_receipts(self._journals(self.DOGFOOD), self._selected(), entries_fn), {}
+        )
 
     def test_an_unreadable_release_issue_yields_no_receipt(self):
-        pages = _pages(**{"500": (_entry(1, self.DOGFOOD),)})
-        self.assertEqual(read_dogfood_receipts("500", pages), {})
+        entries_fn, _calls = self._counting()
+        self.assertEqual(
+            read_dogfood_receipts(self._journals(self.DOGFOOD), self._selected(), entries_fn), {}
+        )
 
     def test_a_malformed_head_is_not_a_receipt(self):
         receipt = "[mozyo:workflow-event:gate=dogfood_receipt:source_issue=500:head=short]"
-        pages = _pages(**{"500": (_entry(1, self.DOGFOOD),), "900": (_entry(2, receipt),)})
-        self.assertEqual(read_dogfood_receipts("500", pages), {})
+        entries_fn, _calls = self._counting(**{"900": (_entry(2, receipt),)})
+        self.assertEqual(
+            read_dogfood_receipts(self._journals(self.DOGFOOD), self._selected(), entries_fn), {}
+        )
+
+    def test_a_foreign_lane_delegation_triggers_zero_reads(self):
+        # Review j#86726 R1-F3: the read set derives from the current STRICT delegation bound to
+        # the enumerated lane. A delegation for another lane reads nothing at all.
+        foreign = self.DOGFOOD.replace(f"lane={LANE}", "lane=lane_other")
+        entries_fn, calls = self._counting(**{"900": ()})
+        self.assertEqual(
+            read_dogfood_receipts(self._journals(foreign), self._selected(), entries_fn), {}
+        )
+        self.assertEqual(calls, [])
+
+    def test_a_superseded_delegation_reads_only_the_current_release_issue(self):
+        # The producer's own latest-declaration supersession picks the read set: the OLD
+        # delegation's release issue is never read.
+        newer = self.DOGFOOD.replace("release_issue=900", "release_issue=901")
+        entries_fn, calls = self._counting(**{"901": ()})
+        read_dogfood_receipts(
+            self._journals(self.DOGFOOD, newer), self._selected(), entries_fn
+        )
+        self.assertEqual(calls, ["901"])
+
+    def test_a_malformed_current_delegation_triggers_zero_reads(self):
+        malformed = (
+            f"[mozyo:workflow-event:gate=dogfood_delegated:workspace={WS}:lane={LANE}"
+            f":lane_generation={GEN}:head={HEAD}:acceptance=glance]"  # release_issue missing
+        )
+        entries_fn, calls = self._counting()
+        self.assertEqual(
+            read_dogfood_receipts(self._journals(malformed), self._selected(), entries_fn), {}
+        )
+        self.assertEqual(calls, [])
+
+
+
+class WorktreeResolverTest(unittest.TestCase):
+    """resolve_candidate_worktree (review j#86726 R1-F2): token -> metadata path -> round-trip."""
+
+    def setUp(self):
+        import tempfile
+
+        from mozyo_bridge.core.state.lane_metadata import record_lane_created
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            derive_lane_workspace_token,
+        )
+
+        self.home = Path(tempfile.mkdtemp())
+        self.worktree = self.home / "wt-a"
+        self.worktree.mkdir()
+        self.token = derive_lane_workspace_token(str(self.worktree.resolve()))
+        record_lane_created(
+            lane_workspace_token=self.token,
+            repo_workspace_id=WS,
+            issue_id="500",
+            lane_label=LANE,
+            worktree_path=str(self.worktree.resolve()),
+            home=self.home,
+        )
+
+    def _candidate(self):
+        anchor = LifecycleAnchor(
+            issue_id="500", repo_workspace_id=WS, lane_id=LANE,
+            lane_generation=GEN, revision=4,
+        )
+        return HibernateCandidate(
+            issue_id="500", anchor=anchor, basis=BASIS_EARLY_HIBERNATE,
+            head=BoundField(value=HEAD, provenance="git_remote"), conjuncts=(),
+        )
+
+    def _rows(self, token=None):
+        return [_Row()] if token is None else [
+            type(_Row())(**{**_Row().__dict__})  # placeholder, replaced below
+        ]
+
+    def test_a_bound_row_resolves_through_the_round_trip(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            resolve_candidate_worktree,
+        )
+
+        row = _Row()
+        row.worktree_identity = self.token
+        resolved = resolve_candidate_worktree([row], self._candidate(), home=self.home)
+        self.assertEqual(resolved, self.worktree.resolve())
+
+    def test_a_metadata_path_that_fails_the_round_trip_binds_nothing(self):
+        # The stored path no longer derives the row's token (a moved / foreign directory):
+        # fail-closed, zero actuation for the candidate.
+        from mozyo_bridge.core.state.lane_metadata import record_lane_created
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            resolve_candidate_worktree,
+        )
+
+        foreign = self.home / "elsewhere"
+        foreign.mkdir()
+        record_lane_created(
+            lane_workspace_token=self.token,
+            repo_workspace_id=WS,
+            issue_id="500",
+            lane_label=LANE,
+            worktree_path=str(foreign.resolve()),
+            home=self.home,
+        )
+        row = _Row()
+        row.worktree_identity = self.token
+        self.assertIsNone(
+            resolve_candidate_worktree([row], self._candidate(), home=self.home)
+        )
+
+    def test_missing_row_token_or_record_binds_nothing(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            resolve_candidate_worktree,
+        )
+
+        self.assertIsNone(
+            resolve_candidate_worktree([], self._candidate(), home=self.home)
+        )
+        bare = _Row()  # worktree_identity absent on the fake row
+        self.assertIsNone(
+            resolve_candidate_worktree([bare], self._candidate(), home=self.home)
+        )
+        row = _Row()
+        row.worktree_identity = "wt_never_recorded"
+        self.assertIsNone(
+            resolve_candidate_worktree([row], self._candidate(), home=self.home)
+        )
+
+    def test_a_generation_mismatched_row_binds_nothing(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            resolve_candidate_worktree,
+        )
+
+        row = _Row(lane_generation=GEN + 1)
+        row.worktree_identity = self.token
+        self.assertIsNone(
+            resolve_candidate_worktree([row], self._candidate(), home=self.home)
+        )
 
 
 class GitObservationTest(unittest.TestCase):

@@ -40,7 +40,7 @@ belong with the supervisor wiring that owns live observation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, Mapping, Optional, Sequence
 
 from ..domain.hibernate_actuation import ActionTimeObligations
@@ -53,6 +53,9 @@ from ..domain.hibernate_basis_producer import (
 )
 from ..domain.hibernate_evidence_authority import EvidenceJournal
 from ..domain.hibernate_candidate import (
+    BASIS_EARLY_HIBERNATE,
+    CONJUNCT_REVIEW_APPROVED,
+    CONJUNCT_STAGING_INTEGRATED,
     NON_CANDIDATE_BASIS_PARTIALLY_UNKNOWN,
     NON_CANDIDATE_HEAD_UNBOUND,
     PROVENANCE_GIT_REMOTE,
@@ -221,7 +224,20 @@ class HibernateCandidateAssembler:
         return tuple(self.assemble(request) for request in requests)
 
     def pass_seams(self) -> PassSeams:
-        """Bind the T2a seams for one bounded pass (fresh memo per call)."""
+        """Bind the T2a seams for one bounded pass (fresh memo per call).
+
+        ``obligations_fn`` layers the ruling j#86730 transcription over the injected observer for
+        the EARLY basis only: ``no_review_pending`` / ``no_integration_pending`` are True exactly
+        when the SAME fresh re-assembly this pass's refresh uses (one memoised observation, never
+        the build-time snapshot) yields the candidate EXACTLY EQUAL and its produced
+        ``review_approved`` / ``staging_integrated`` conjunct is ``satisfied=True`` bound to the
+        candidate's exact workspace/lane/generation/head. This transcribes an already-established
+        fresh authority fact one way into the public preflight obligation — no second grammar, no
+        new authority. Every other flag passes through the observer unchanged (owner/boundary stay
+        the observer's fail-closed values), and the DEPENDENCY basis transcribes nothing: its
+        producer proves only the park declaration, so those obligations keep their observer values
+        (a park marker never implies "no review pending").
+        """
         memo: Dict[HibernateCandidate, AssembledCandidate] = {}
 
         def fresh(candidate: HibernateCandidate) -> AssembledCandidate:
@@ -233,9 +249,35 @@ class HibernateCandidateAssembler:
                 memo[candidate] = got
             return got
 
+        def obligations(candidate: HibernateCandidate) -> ActionTimeObligations:
+            base = self._obligations_fn(candidate)
+            if candidate.basis != BASIS_EARLY_HIBERNATE:
+                return base
+            assembled = fresh(candidate)
+            if assembled.candidate != candidate or assembled.produced is None:
+                return base
+
+            def transcribed(key: str) -> bool:
+                anchor = candidate.anchor
+                return any(
+                    conjunct.key == key
+                    and conjunct.satisfied
+                    and conjunct.bound_workspace == anchor.repo_workspace_id
+                    and conjunct.bound_lane == anchor.lane_id
+                    and conjunct.bound_generation == anchor.lane_generation
+                    and conjunct.bound_head == candidate.head.value
+                    for conjunct in assembled.produced.conjuncts
+                )
+
+            return replace(
+                base,
+                no_review_pending=transcribed(CONJUNCT_REVIEW_APPROVED),
+                no_integration_pending=transcribed(CONJUNCT_STAGING_INTEGRATED),
+            )
+
         return PassSeams(
             refresh_fn=lambda candidate: fresh(candidate).candidate,
-            obligations_fn=self._obligations_fn,
+            obligations_fn=obligations,
             journal_fn=lambda candidate: fresh(candidate).decision_journal,
         )
 

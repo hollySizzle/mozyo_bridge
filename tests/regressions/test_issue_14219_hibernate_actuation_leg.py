@@ -414,5 +414,29 @@ class HibernateActuationLegTests(unittest.TestCase):
             self.assertEqual(ops.executed_reads, 0)
 
 
+class WorktreeBoundUseCaseSeamTest(unittest.TestCase):
+    def test_an_unresolvable_worktree_is_a_typed_zero_call(self):
+        # Review j#86726 R1-F2: use_case_fn returning None never touches any use case.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_actuation_leg import (  # noqa: E501
+            ATTEMPT_BLOCKED,
+            LEG_REASON_WORKTREE_UNRESOLVED,
+            run_hibernate_pass,
+        )
+
+        candidate = _candidate()
+        result = run_hibernate_pass(
+            [candidate],
+            refresh_fn=lambda c: c,
+            obligations_fn=lambda c: _obligations(),
+            journal_fn=lambda c: JOURNAL,
+            use_case_fn=lambda c: None,
+            lease_renew_fn=lambda: True,
+        )
+        self.assertEqual(result.mutations, 0)
+        attempt = result.attempts[0]
+        self.assertEqual(attempt.kind, ATTEMPT_BLOCKED)
+        self.assertEqual(attempt.reason, LEG_REASON_WORKTREE_UNRESOLVED)
+
+
 if __name__ == "__main__":
     unittest.main()

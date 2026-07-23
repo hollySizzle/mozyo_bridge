@@ -42,9 +42,17 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
 )
 from mozyo_bridge.core.state.lane_lifecycle_readonly import load_lane_lifecycle_readonly
 from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
+    RUNTIME_AWAITING_INPUT,
+    RUNTIME_TURN_ENDED,
+)
 
 from ..domain.hibernate_actuation import ActionTimeObligations
-from ..domain.hibernate_basis_producer import DogfoodReceipt, PushObservation
+from ..domain.hibernate_basis_producer import (
+    DogfoodReceipt,
+    PushObservation,
+    current_dogfood_delegation,
+)
 from ..domain.hibernate_candidate import (
     BASIS_DEPENDENCY_PARK,
     BASIS_EARLY_HIBERNATE,
@@ -66,6 +74,11 @@ from ..domain.hibernate_issuer_policy import (
 from ..domain.redmine_journal_source import RedmineJournalEntry, marker_fields_in_note
 from .hibernate_actuation_leg import HibernatePassResult, run_hibernate_pass
 from .hibernate_candidate_assembler import AssemblyRequest, HibernateCandidateAssembler
+from mozyo_bridge.core.state.lane_metadata import LaneMetadataStore
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    derive_directory_lane_token,
+    derive_lane_workspace_token,
+)
 from .sublane_hibernate import LiveSublaneHibernateOps, SublaneHibernateUseCase
 
 #: The release issue's receipt gate (ruling j#85530 Q3: the delegation is a delegation only when
@@ -73,10 +86,21 @@ from .sublane_hibernate import LiveSublaneHibernateOps, SublaneHibernateUseCase
 #: the strict receipt reader; NOT a callback-bearing gate.
 DOGFOOD_RECEIPT_GATE = "dogfood_receipt"
 
-#: The lane owner's live runtime states that explicitly express each live obligation. Closed,
-#: conservative vocabulary: an unlisted / blank runtime observation leaves the flag ``False``.
-RUNTIME_NOT_WORKING = frozenset({"idle", "turn_ended", "done"})
-RUNTIME_NO_PENDING_PROMPT = frozenset({"idle", "turn_ended", "done"})
+#: The EXPLICIT per-pass ticket-provider read budget (ruling j#86718 Fork B / review j#86726
+#: R1-F3): one page per enumerated issue plus at most one receipt page per issue with a current
+#: strictly-resolved delegation, bounded well below this. At the budget every further read is
+#: refused WITHOUT touching the provider — the affected issue reads as the typed unreadable
+#: (zero-actuation), never a partial page.
+MAX_PROVIDER_READS_PER_PASS = 64
+
+#: The lane owner's live runtime states that explicitly express each live obligation — the
+#: CANONICAL normalized receiver-state vocabulary (``agent_state.map_agent_status`` output),
+#: imported rather than re-spelled (checkpoint j#86726 R1-F4: a raw-herdr spelling made the
+#: ordinary ``awaiting_input`` receiver read as working, and unreachable tokens sat in the
+#: set). Settled = quietly waiting for input, or the assistant turn just finished; anything
+#: else (working / blocked / unknown / blank) leaves the flags ``False``.
+RUNTIME_NOT_WORKING = frozenset({RUNTIME_AWAITING_INPUT, RUNTIME_TURN_ENDED})
+RUNTIME_NO_PENDING_PROMPT = frozenset({RUNTIME_AWAITING_INPUT, RUNTIME_TURN_ENDED})
 
 _HEX = frozenset("0123456789abcdef")
 
@@ -198,46 +222,116 @@ def enumerate_requests(
 
 
 def read_dogfood_receipts(
-    source_issue: str, entries_fn: EntriesReader
+    journals, selected: SelectedLane, entries_fn: EntriesReader
 ) -> Mapping[str, DogfoodReceipt]:
-    """Strict receipts for ``source_issue``'s delegations (ruling j#85530 Q3).
+    """Strict receipts for the CURRENT delegation only (review j#86726 R1-F3).
 
-    The source issue's own dogfood evidence names the release issues; each release issue is then
-    read for ``gate=dogfood_receipt`` markers carrying ``source_issue`` + a full-SHA ``head``.
-    Identical duplicates collapse; DIFFERING receipt claims on one release issue prove nothing
-    (that release issue yields no receipt), and an unreadable release issue yields none.
+    The read set derives from the producer's own supersession + strict resolution
+    (:func:`current_dogfood_delegation`) — never a raw field scan — and only when the current
+    delegation's envelope is EXACTLY the enumerated lane. That yields AT MOST ONE release-issue
+    read per issue per pass; a malformed / conflicting / superseded / foreign-lane delegation
+    triggers zero external reads. On the release issue, identical receipt claims collapse and
+    DIFFERING claims prove nothing (that release issue yields no receipt).
     """
-    page = entries_fn(source_issue)
-    if page is None:
+    evidence = current_dogfood_delegation(journals or ())
+    if evidence is None:
         return {}
-    release_ids: set[str] = set()
-    for entry in page:
+    envelope = evidence.envelope
+    if (
+        envelope.workspace != selected.repo_workspace_id
+        or envelope.lane != selected.lane_id
+        or envelope.lane_generation != selected.lane_generation
+    ):
+        return {}
+    release_issue = str(evidence.extra.get("release_issue", "") or "").strip()
+    if not release_issue:
+        return {}
+    release_page = entries_fn(release_issue)
+    if release_page is None:
+        return {}
+    claims: set[tuple[str, str]] = set()
+    for entry in release_page:
         for _channel, fields in marker_fields_in_note(entry.notes or ""):
-            if str(fields.get("gate", "") or "").strip() != EVIDENCE_DOGFOOD_DELEGATED:
+            if str(fields.get("gate", "") or "").strip() != DOGFOOD_RECEIPT_GATE:
                 continue
-            release_issue = str(fields.get("release_issue", "") or "").strip()
-            if release_issue:
-                release_ids.add(release_issue)
-    receipts: dict[str, DogfoodReceipt] = {}
-    for release_issue in sorted(release_ids):
-        release_page = entries_fn(release_issue)
-        if release_page is None:
-            continue
-        claims: set[tuple[str, str]] = set()
-        for entry in release_page:
-            for _channel, fields in marker_fields_in_note(entry.notes or ""):
-                if str(fields.get("gate", "") or "").strip() != DOGFOOD_RECEIPT_GATE:
-                    continue
-                claimed_source = str(fields.get("source_issue", "") or "").strip()
-                head = str(fields.get("head", "") or "").strip()
-                if claimed_source and _full_sha(head):
-                    claims.add((claimed_source, head))
-        if len(claims) == 1:
-            claimed_source, head = claims.pop()
-            receipts[release_issue] = DogfoodReceipt(
-                release_issue=release_issue, source_issue=claimed_source, head=head
-            )
-    return receipts
+            claimed_source = str(fields.get("source_issue", "") or "").strip()
+            head = str(fields.get("head", "") or "").strip()
+            if claimed_source and _full_sha(head):
+                claims.add((claimed_source, head))
+    if len(claims) != 1:
+        return {}
+    claimed_source, head = claims.pop()
+    return {
+        release_issue: DogfoodReceipt(
+            release_issue=release_issue, source_issue=claimed_source, head=head
+        )
+    }
+
+
+def resolve_candidate_worktree(
+    rows, candidate: HibernateCandidate, *, home: Optional[Path]
+) -> Optional[Path]:
+    """The candidate lane's CANONICAL worktree path, or ``None`` (fail-closed).
+
+    Review j#86726 R1-F2: the public rail's worktree fingerprint / lane-activity authority is
+    the use case's own ``repo_root``, so each candidate must bind to ITS canonical worktree —
+    resolved from the lifecycle row's ``worktree_identity`` token through the home-scoped lane
+    metadata record, and verified by RE-DERIVING the token from the resolved path (round-trip):
+    a missing row/token/record/path, a retired record, or a round-trip mismatch resolves
+    nothing, and the actuation for that candidate is a typed zero-call.
+    """
+    anchor = candidate.anchor
+    row = next(
+        (
+            record
+            for record in rows or ()
+            if getattr(record, "repo_workspace_id", "") == anchor.repo_workspace_id
+            and getattr(record, "lane_id", "") == anchor.lane_id
+            and int(getattr(record, "lane_generation", 0) or 0) == anchor.lane_generation
+        ),
+        None,
+    )
+    if row is None:
+        return None
+    token = str(getattr(row, "worktree_identity", "") or "").strip()
+    if not token:
+        return None
+    try:
+        record = LaneMetadataStore(home=home).get(token)
+    except Exception:  # noqa: BLE001 - an unreadable metadata store binds nothing
+        return None
+    if record is None or record.retired or not str(record.worktree_path or "").strip():
+        return None
+    try:
+        resolved = Path(record.worktree_path).expanduser().resolve()
+    except OSError:
+        return None
+    if not resolved.is_dir():
+        return None
+    derived = derive_lane_workspace_token(str(resolved))
+    if derived != token:
+        label = str(getattr(record, "lane_label", "") or "").strip()
+        if not label or derive_directory_lane_token(str(resolved), label) != token:
+            return None
+    return resolved
+
+
+def observe_worktree_clean(worktree: Optional[Path]) -> Optional[bool]:
+    """Whether the candidate-bound worktree is clean (``None`` = unresolvable/unreadable)."""
+    if worktree is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(worktree), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() == ""
 
 
 @dataclass(frozen=True)
@@ -321,13 +415,17 @@ def build_hibernate_leg_fn(
             source = None
 
         entries_cache: dict[str, Optional[tuple[RedmineJournalEntry, ...]]] = {}
+        reads = {"count": 0}
 
         def entries_fn(issue: str) -> Optional[tuple[RedmineJournalEntry, ...]]:
             issue = str(issue).strip()
             if issue not in entries_cache:
-                if source is None:
+                # The EXPLICIT provider-read budget (review j#86726 R1-F3): at the budget the
+                # provider is not touched and the page reads as the typed unreadable.
+                if source is None or reads["count"] >= MAX_PROVIDER_READS_PER_PASS:
                     entries_cache[issue] = None
                 else:
+                    reads["count"] += 1
                     try:
                         entries_cache[issue] = tuple(source.read_entries(issue))
                     except Exception:  # noqa: BLE001 - unreadable page is typed, not empty
@@ -366,28 +464,66 @@ def build_hibernate_leg_fn(
         )
 
         rows = load_lane_lifecycle_readonly(home=home)
+        requests = enumerate_requests(rows or (), str(ws.workspace_id), entries_fn)
+        # The receipt read set derives from the CURRENT strictly-resolved delegation of the
+        # issue's one enumerated lane (review j#86726 R1-F3). An issue enumerated for two
+        # different lane identities would be ambiguous — none is here (one active row per
+        # issue-lane), and a missing mapping reads zero receipts.
+        lane_by_issue: dict[str, SelectedLane] = {}
+        for request in requests:
+            lane_by_issue.setdefault(request.selected.issue_id, request.selected)
+
+        def receipts_fn(issue: str) -> Mapping[str, DogfoodReceipt]:
+            selected = lane_by_issue.get(str(issue).strip())
+            page = journals_fn(issue)
+            if selected is None or page is None:
+                return {}
+            return read_dogfood_receipts(page, selected, entries_fn)
+
+        def worktree_of(candidate: HibernateCandidate) -> Optional[Path]:
+            return resolve_candidate_worktree(rows, candidate, home=home)
+
+        pass_sources = sources
+        if worktree_clean_fn is None:
+            pass_sources = ObligationSources(
+                outbox_pending_fn=sources.outbox_pending_fn,
+                runtime_fn=sources.runtime_fn,
+                worktree_clean_fn=lambda candidate: observe_worktree_clean(
+                    worktree_of(candidate)
+                ),
+                projection_fn=sources.projection_fn,
+            )
+
         assembler = HibernateCandidateAssembler(
             records_fn=lambda: rows,
             journals_fn=journals_fn,
             push_fn=lambda selected: observe_lane_push(repo_root, selected),
-            obligations_fn=lambda candidate: observe_obligations(candidate, sources),
-            dogfood_receipts_fn=lambda issue: read_dogfood_receipts(issue, entries_fn),
+            obligations_fn=lambda candidate: observe_obligations(candidate, pass_sources),
+            dogfood_receipts_fn=receipts_fn,
         )
-        requests = enumerate_requests(rows or (), str(ws.workspace_id), entries_fn)
         assembled = assembler.assemble_all(requests)
         candidates = [item.candidate for item in assembled if item.candidate is not None]
         seams = assembler.pass_seams()
-        use_case = SublaneHibernateUseCase(
-            ops=LiveSublaneHibernateOps(repo_root=repo_root, env=dict(os.environ)),
-            store=LaneLifecycleStore(home=home),
-            lease_guard=renew,
-        )
+
+        def use_case_for(candidate: HibernateCandidate) -> Optional[SublaneHibernateUseCase]:
+            # Per-candidate actuation binding (review j#86726 R1-F2): the use case's repo_root
+            # IS the public rail's worktree/lane-activity authority, so it must be the
+            # candidate's own canonical worktree — unresolvable binds nothing (typed zero-call).
+            worktree = worktree_of(candidate)
+            if worktree is None:
+                return None
+            return SublaneHibernateUseCase(
+                ops=LiveSublaneHibernateOps(repo_root=worktree, env=dict(os.environ)),
+                store=LaneLifecycleStore(home=home),
+                lease_guard=renew,
+            )
+
         return run_hibernate_pass(
             candidates,
             refresh_fn=seams.refresh_fn,
             obligations_fn=seams.obligations_fn,
             journal_fn=seams.journal_fn,
-            use_case=use_case,
+            use_case_fn=use_case_for,
             lease_renew_fn=renew,
         )
 
