@@ -241,6 +241,8 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         tmux_pane=None,
         herdr=None,
         observe_spy=False,
+        submit_delay="0",
+        extra_argv=None,
     ):
         from mozyo_bridge.application import commands  # noqa: F401 (import side effects)
         from mozyo_bridge.application.cli import build_parser
@@ -272,7 +274,8 @@ class PureHerdrEndToEndTest(unittest.TestCase):
                 "--source", "asana", "--kind", "implementation_request",
                 "--task-id", "T1", "--comment-id", "C1",
                 "--mode", mode,
-                "--landing-timeout", "0.05", "--submit-delay", "0",
+                "--landing-timeout", "0.05", "--submit-delay", submit_delay,
+                *(extra_argv or []),
             ]
             args = build_parser().parse_args(argv)
             args.repo = str(repo)
@@ -470,6 +473,41 @@ class PureHerdrEndToEndTest(unittest.TestCase):
             [op for op in herdr.sends if op[0] == "send_keys"], msg=herdr.sends
         )
         self.assertIn("snapshot turn_ended", out)
+
+    def test_standard_infinite_submit_delay_still_sends_on_the_herdr_rail(self) -> None:
+        # #14219 j#86693 R22-F1 / j#86698 R23-F1: the herdr standard rail has no submit-delay
+        # field, so the executable-domain rule must NOT fire for it — the event rail delivers,
+        # body typed once and Enter sent, the delay unconsumed.
+        herdr = _FakeHerdr([], get_states=["idle"], wait_results=[(0, "")])
+        result, herdr, ws, out, err = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=herdr, submit_delay="inf"
+        )
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
+        outcome = _outcome_from(out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertEqual(
+            len([op for op in herdr.sends if op[0] == "send_text"]), 1, msg=herdr.sends
+        )
+        self.assertTrue(
+            [op for op in herdr.sends if op[0] == "send_keys"], msg=herdr.sends
+        )
+
+    def test_an_explicit_pane_target_leaves_the_herdr_backend(self) -> None:
+        # The SAME herdr workspace with an explicit %pane target falls out of the herdr
+        # backend selection (#13320) toward the tmux rail: the herdr event rail is never
+        # driven (this pure-herdr session has no tmux, so the send fails on the tmux
+        # requirement with zero herdr injections — the routing boundary this pins).
+        herdr = _FakeHerdr([], get_states=["idle"], wait_results=[(0, "")])
+        result, herdr, ws, out, err = self._run(
+            agent_rows_fn=_same_lane_rows(), herdr=herdr, submit_delay="inf",
+            extra_argv=["--target", "%2"],
+        )
+        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        self.assertEqual(
+            [op for op in herdr.sends if op[0] in ("send_text", "send_keys")],
+            [],
+            msg=herdr.sends,
+        )
 
     def test_delivered_not_started_projects_to_turn_start_unconfirmed(self) -> None:
         # Wait times out; re-snapshot stays idle (no runtime block); the composer

@@ -2225,6 +2225,37 @@ class SendSemanticsSharedAuthorityTests(unittest.TestCase):
         )
         self.assertIn("send_semantic_message", source)
 
+    def test_the_submit_delay_help_carries_the_bound_and_applicability(self):
+        # checkpoint j#86698 R23-F2: the operator must see the executable domain and the
+        # consuming-rail applicability BEFORE running; both --submit-delay sites derive the
+        # text from the shared constant so the help cannot drift from the rule.
+        import argparse
+
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.cli_handoff import (  # noqa: E501
+            add_notify_delivery_options,
+            configure_handoff_parser,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+            MAX_SUBMIT_DELAY_SECONDS,
+        )
+
+        for site in ("handoff", "notify"):
+            with self.subTest(site=site):
+                parser = argparse.ArgumentParser(add_help=False)
+                if site == "handoff":
+                    configure_handoff_parser(parser, kind_required=True)
+                else:
+                    add_notify_delivery_options(parser)
+                action = next(
+                    action
+                    for action in parser._actions
+                    if "--submit-delay" in action.option_strings
+                )
+                help_text = action.help or ""
+                self.assertIn(f"{MAX_SUBMIT_DELAY_SECONDS:.0f}", help_text)
+                self.assertIn("pending", help_text)
+                self.assertIn("herdr", help_text)
+
     def test_the_authority_matches_the_canonical_queue_enter_force_rule(self):
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
             SEND_SEMANTIC_QUEUE_ENTER_FORCE,
