@@ -578,15 +578,41 @@ class AlwaysRuleDigestTest(unittest.TestCase):
     END = "<!-- mozyo-bridge:always-digest:end -->"
     DIGEST_ENTRY_CAP = 10
 
-    def _digest_entries(self, router_name: str) -> list[str]:
-        body = (ROOT / self.ROUTER_DIR / router_name).read_text(encoding="utf-8")
-        self.assertIn(self.DIGEST_HEADING, body, f"{router_name} missing digest heading")
-        self.assertIn(self.BEGIN, body, f"{router_name} missing digest begin marker")
-        self.assertIn(self.END, body, f"{router_name} missing digest end marker")
+    def _digest_block_entries(self, body: str, label: str) -> list[str]:
+        self.assertIn(self.DIGEST_HEADING, body, f"{label} missing digest heading")
+        self.assertIn(self.BEGIN, body, f"{label} missing digest begin marker")
+        self.assertIn(self.END, body, f"{label} missing digest end marker")
         block = body.split(self.BEGIN, 1)[1].split(self.END, 1)[0]
         return [
             line for line in block.splitlines() if line.startswith("- ")
         ]
+
+    def _digest_entries(self, router_name: str) -> list[str]:
+        body = (ROOT / self.ROUTER_DIR / router_name).read_text(encoding="utf-8")
+        return self._digest_block_entries(body, router_name)
+
+    def test_repo_root_routers_carry_the_rendered_digest(self) -> None:
+        # Redmine #14332 finding 1. The packaged templates are only the
+        # *render*; this repo's own agents read the scaffolded routers at
+        # the repo root. Nothing gated those: `scaffold status` compares
+        # tracked-file bookkeeping, not digest content, so an always rule
+        # could ship in the template while every fresh session here kept
+        # loading a four-entry digest. Pin root == template, which is what
+        # `mozyo-bridge scaffold apply` produces.
+        #
+        # Recovery on failure: re-run `mozyo-bridge scaffold apply
+        # redmine-governed --repo . --repo-local --backup`. Never hand-edit
+        # the digest block into the root routers.
+        for router_name in ("AGENTS.md", "CLAUDE.md"):
+            root_body = (ROOT / router_name).read_text(encoding="utf-8")
+            self.assertEqual(
+                self._digest_entries(router_name),
+                self._digest_block_entries(root_body, f"repo root {router_name}"),
+                f"repo root {router_name} always-digest differs from the "
+                "packaged template; this repo's fresh sessions would miss an "
+                "always rule that the distribution already ships. Re-run "
+                "`mozyo-bridge scaffold apply` (do not hand-edit).",
+            )
 
     def test_digest_ships_in_both_tool_routers(self) -> None:
         for router_name in ("AGENTS.md", "CLAUDE.md"):
