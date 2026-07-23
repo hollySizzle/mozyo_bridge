@@ -13,7 +13,7 @@ anchor.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from mozyo_bridge.core.state.lane_lifecycle import load_lane_lifecycle_readonly
 
@@ -24,6 +24,17 @@ from ..domain.hibernate_candidate import (
     SelectedLane,
     bind_lifecycle_anchor,
 )
+
+
+def read_lifecycle_records(*, home: Optional[Path] = None) -> Optional[Sequence[object]]:
+    """The read-only lifecycle rows, for callers that classify them themselves (T2b step 4b).
+
+    The candidate assembler passes the rows straight to :func:`classify_hibernate_candidate`, which
+    does its own binding, so it needs the rows rather than a bound anchor. Same read, same
+    fail-closed contract: ``None`` means the store was unreadable (unknown / newer / malformed /
+    partial schema) and is NEVER an empty record set.
+    """
+    return load_lane_lifecycle_readonly(home=home)
 
 
 def bind_active_lifecycle_anchor(

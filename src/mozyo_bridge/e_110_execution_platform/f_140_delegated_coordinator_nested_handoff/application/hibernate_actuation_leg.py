@@ -161,18 +161,22 @@ def run_hibernate_pass(
             ))
             continue
 
+        # Action-time revalidation FIRST: a fresh re-production of the candidate must be EXACTLY
+        # equal — lifecycle anchor AND every durable basis conjunct/head still current
+        # (fail-closed). It precedes the request derivation so that a lane whose basis has lapsed
+        # reports THAT (``stale_basis``), rather than the ``no_basis_journal`` its now-empty
+        # decision journal would otherwise produce: both are zero-actuation, but only one of them
+        # names what actually happened. Neither check mutates, so the order is free.
+        if refresh_fn(candidate) != candidate:
+            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_STALE, LEG_REASON_BASIS_STALE))
+            continue
+
         fields = derive_actuation_request(
             candidate, obligations_fn(candidate), decision_journal=journal_fn(candidate)
         )
         if isinstance(fields, str):
             # A missing basis-event journal is fail-closed for THIS candidate only; others proceed.
             attempts.append(HibernateAttempt(issue, lane, ATTEMPT_NO_JOURNAL, fields))
-            continue
-
-        # Action-time revalidation: a fresh re-production of the candidate must be EXACTLY equal —
-        # lifecycle anchor AND every durable basis conjunct/head still current (fail-closed).
-        if refresh_fn(candidate) != candidate:
-            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_STALE, LEG_REASON_BASIS_STALE))
             continue
 
         # Wrapper lease fence: renew immediately before the mutation (auxiliary to the use case's
