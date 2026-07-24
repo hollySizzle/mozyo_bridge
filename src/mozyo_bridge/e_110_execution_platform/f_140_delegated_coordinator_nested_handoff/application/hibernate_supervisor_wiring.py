@@ -717,18 +717,35 @@ def build_hibernate_leg_fn(
         # times).
         intent_store = HibernateRedriveIntentStore(home=home)
 
+        def _resolve_valid_intent(row):
+            # The row's durable redrive intent, ONLY when it is the SAME action authority the redrive
+            # would resume — bound to the row's exact identity (workspace / lane / generation) AND its
+            # ``matches_row`` cycle (issue / decision journal / action id). A foreign-cycle intent (same
+            # row identity, different cycle) is refused: the request derivation rejects it as
+            # ``redrive_intent_mismatch``, so the drain-ready start MUST NOT trust it either (review
+            # j#87244 R7-F1). Raises :class:`HibernateRedriveIntentError` on an unreadable / corrupt DB.
+            intent = intent_store.get(
+                str(getattr(row, "repo_workspace_id", "")),
+                str(getattr(row, "lane_id", "")),
+                int(getattr(row, "lane_generation", 0) or 0),
+            )
+            if intent is None:
+                return None
+            if not intent.matches_row(
+                issue_id=str(getattr(row, "issue_id", "")),
+                decision_journal=str(getattr(row, "decision_journal", "")),
+                action_id=f"hibernate:{str(getattr(row, 'lane_id', ''))}",
+            ):
+                return None
+            return intent
+
         def _redrive_drain_ready(row) -> str:
-            # R2-F2(a) item 4 / review j#87236 R6-F1: a redrive's ORIGINAL drain-ready start is THIS
-            # row's own durable intent, bound to its EXACT identity (workspace / lane / generation) —
-            # never an issue-collapsed map (two hibernated rows can share an issue). Read per row so a
-            # DEFERRED row (deferred before its request ran) still stamps its own start. Home-scoped,
-            # zero provider reads; an absent / unreadable intent is a blank start (a later unavailable).
+            # R2-F2(a) item 4 / j#87236 R6-F1 / j#87244 R7-F1: a redrive's ORIGINAL drain-ready start is
+            # THIS row's own VALIDATED intent (same-cycle authority) — never an issue-collapsed map and
+            # never a foreign-cycle intent's start. A deferred row (deferred before its request ran) is
+            # resolved the same way. Absent / mismatched / unreadable -> a blank start (later unavailable).
             try:
-                intent = intent_store.get(
-                    str(getattr(row, "repo_workspace_id", "")),
-                    str(getattr(row, "lane_id", "")),
-                    int(getattr(row, "lane_generation", 0) or 0),
-                )
+                intent = _resolve_valid_intent(row)
             except HibernateRedriveIntentError:
                 return ""
             return str(getattr(intent, "drain_ready_at", "") or "") if intent is not None else ""

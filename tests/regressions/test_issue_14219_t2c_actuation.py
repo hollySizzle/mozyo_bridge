@@ -855,6 +855,29 @@ class T2cProductionActuationTest(unittest.TestCase):
         self.assertEqual(after.process_release, before.process_release)
         self.assertEqual(after.revision, before.revision)
 
+    def test_a_foreign_cycle_intent_start_is_not_trusted_for_latency(self):
+        # Review j#87244 R7-F1: a foreign-cycle intent (SAME row identity, DIFFERENT decision journal)
+        # is rejected as redrive_intent_mismatch. Its drain_ready_at must NOT be trusted as the
+        # time-to-drain START either — the metric never derives a duration from another cycle's
+        # authority. Before the fix the start resolver read the intent WITHOUT matches_row, so the
+        # foreign start leaked into time_to_disposition_ms.
+        from mozyo_bridge.core.state.lane_lifecycle_model import RELEASE_PARTIAL
+
+        self._hibernate_row_with_release(RELEASE_PARTIAL, seed_intent=False)
+        # A foreign decision (70000 != the row's 84999) that DOES carry a (foreign) start.
+        self._seed_redrive_intent(
+            decision_journal="70000", drain_ready_at="2026-07-24T00:00:00+00:00"
+        )
+        report, _ = self._run_supervisor({})
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        blocked = next(
+            a for a in outcome.hibernate_attempts if a["reason"] == "redrive_intent_mismatch"
+        )
+        # The foreign start is NOT adopted -> no derived duration (start unavailable).
+        self.assertIsNone(blocked["time_to_drain_ms"])
+        self.assertIsNone(blocked["time_to_disposition_ms"])
+
     # ------------------------------------------------------------------ R5-F5
     def test_an_unknown_release_state_is_a_typed_uncertain_block(self):
         # Review j#86776 R5-F5: a hibernated row whose process_release is a non-canonical token is
