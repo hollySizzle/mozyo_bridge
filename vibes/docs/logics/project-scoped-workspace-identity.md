@@ -81,10 +81,14 @@ not start one (#13379). Explicit `--repo` / `MOZYO_REPO` overrides are unchanged
 The preferred model is self-describing project directories plus a generated
 root discovery cache.
 
-Each project owns its local `project.yaml` as the source of truth for project
+Each project owns its local `project.env` as the source of truth for project
 metadata that belongs to the project itself. The root workspace may keep an
 index, but that index should not become a second hand-maintained source of
 truth for the same fields.
+
+`project.env` uses Docker/Compose env-file syntax deliberately. Project
+discovery and the DevContainer consume the same tracked, non-secret file; a
+generated or hand-maintained YAML mirror is not permitted.
 
 Discovery therefore has two distinct outputs:
 
@@ -119,16 +123,16 @@ discovery_cache:
   generated_at: "<timestamp>"
   entries:
     - cache_key: "project:cloud-drive-management@projects/cloud-drive-management"
-      source: "projects/cloud-drive-management/project.yaml"
+      source: "projects/cloud-drive-management/project.env"
       path: "projects/cloud-drive-management"
       redmine_project: "cloud-drive-management"
       display_label: "クラウドドライブ管理"
       runtime_identity_enabled: true
-      fingerprint: "sha256:<project-yaml-fingerprint>"
+      fingerprint: "sha256:<project-env-fingerprint>"
 ```
 
 The cache is an acceleration and review aid. It is not allowed to silently
-override the local `project.yaml`. If cache and source disagree, the runtime
+override the local `project.env`. If cache and source disagree, the runtime
 must surface drift instead of choosing whichever value is convenient.
 
 Generated cache fields are generator-owned. Operators should edit the local
@@ -146,22 +150,25 @@ Cache key requirements:
 ## Runtime Identity Marker
 
 A project directory should not become a routable project unit merely because a
-file named `project.yaml` exists. Runtime identity needs an explicit marker.
+file named `project.env` exists. Runtime identity needs an explicit marker.
 
 Conceptual fields:
 
-```yaml
-runtime_identity:
-  enabled: true
-  kind: project_scope
-  display_label: "クラウドドライブ管理"
-  parent_workspace: "gk-3500-it-operations"
-  workdir: "."
+```dotenv
+PROJECT_SCHEMA=mozyo.project/v1
+PROJECT_REDMINE_PROJECT=cloud-drive-management
+PROJECT_RUNTIME_IDENTITY_ENABLED=true
+PROJECT_RUNTIME_IDENTITY_KIND=project_scope
+PROJECT_DISPLAY_LABEL=クラウドドライブ管理
+PROJECT_PARENT_WORKSPACE=gk-3500-it-operations
+PROJECT_WORKDIR=.
 ```
 
-The exact schema belongs to implementation specs and tests. This document fixes
-the policy: self-description is local to the project, and cockpit adoption is
-explicit.
+The descriptor accepts only single-line `KEY=VALUE` assignments, blank lines,
+and whole-line comments. Keys are unique portable environment-variable names.
+Interpolation, `export`, multiline values, and inline comments are rejected so
+Docker and discovery cannot derive different identities. Self-description is
+local to the project, and cockpit adoption is explicit.
 
 ## Pane And Target Projection
 

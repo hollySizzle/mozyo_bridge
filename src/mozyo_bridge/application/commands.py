@@ -2446,7 +2446,7 @@ def orchestrate_handoff(
             # within the verified Git repo root (Redmine #12658 review j#66481
             # blocker 1) — a stale / wrong option can never bypass the
             # cwd-under-project condition. Otherwise (or on no stamp) the scope is
-            # re-derived from the live project.yaml sources, which is itself
+            # re-derived from the live project.env sources, which is itself
             # cwd-under-project by construction and fail-closes on cache drift.
             if stamped_scope and stamped_path and path_under_repo_relative(
                 target_cwd, repo_root=git_root, project_path=stamped_path
