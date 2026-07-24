@@ -607,7 +607,7 @@ class LiveGatewayRecoveryOps:
         """
         if self._governed_sender_resolves():
             return True
-        return self._oneshot_transport() is not None
+        return self._build_oneshot_rail() is not None
 
     def _resume_argv(self, continuation: ContinuationPointer, locator: str) -> list[str]:
         """The recovery-family resume argv: ONE ``handoff send --kind reply`` pointer at the
@@ -757,14 +757,42 @@ class LiveGatewayRecoveryOps:
             == _norm(self.request.action_id)
         )
 
-    def _drive_oneshot_turn_start(self, locator: str, body: str):
-        """Resolve + drive the high-level turn-start rail for the one-shot injection."""
+    def _build_oneshot_rail(self):
+        """The high-level turn-start rail over the EXACT resolved herdr transport, or ``None``.
+
+        j#87384 F1: never resolved through ``resolve_turn_start_rail(config=None)`` — that
+        contract defaults to the tmux backend and returns ``None``, leaving the one-shot rail
+        permanently off in production. The rail is constructed DIRECTLY from the same
+        already-resolved transport (:meth:`_oneshot_transport`), so the transport, the state
+        reader, and the wait primitive all share ONE binary resolution authority, and
+        :meth:`resume_rail_ready`'s one-shot branch judges the SAME capability actually used
+        at send time.
+        """
+        transport = self._oneshot_transport()
+        if transport is None:
+            return None
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (  # noqa: E501
+            HerdrTurnStartRail,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (  # noqa: E501
+            HerdrCliAgentStateReader,
+        )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_turn_start import (  # noqa: E501
-            resolve_turn_start_rail,
+            HerdrCliWaitPrimitive,
         )
 
         try:
-            rail = resolve_turn_start_rail(env=self.env, runner=self.runner)
+            binary = transport.binary
+            reader = HerdrCliAgentStateReader(binary, runner=self.runner)
+            wait = HerdrCliWaitPrimitive(binary)
+            return HerdrTurnStartRail(transport=transport, reader=reader, wait=wait)
+        except Exception:  # noqa: BLE001 - an unconstructible rail is unavailable
+            return None
+
+    def _drive_oneshot_turn_start(self, locator: str, body: str):
+        """Drive the one-shot injection through the high-level turn-start rail."""
+        try:
+            rail = self._build_oneshot_rail()
             if rail is None:
                 return None
             return rail.drive_turn_start(locator, body)

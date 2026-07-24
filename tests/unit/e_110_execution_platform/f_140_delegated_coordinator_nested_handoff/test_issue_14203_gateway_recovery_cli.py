@@ -316,9 +316,9 @@ class ReviewR2AdversarialTests(unittest.TestCase):
         with patch.object(live_mod, "repo_scope_workspace_id", return_value="real_ws"):
             self.assertFalse(foreign._governed_sender_resolves())
             # …and rail readiness then depends ONLY on the operator-capable one-shot rail.
-            with patch.object(foreign, "_oneshot_transport", return_value=None):
+            with patch.object(foreign, "_build_oneshot_rail", return_value=None):
                 self.assertFalse(foreign.resume_rail_ready(foreign.request))
-            with patch.object(foreign, "_oneshot_transport", return_value=object()):
+            with patch.object(foreign, "_build_oneshot_rail", return_value=object()):
                 self.assertTrue(foreign.resume_rail_ready(foreign.request))
         # A matching-workspace attested context resolves through the same resolver.
         attested = LiveGatewayRecoveryOps(
@@ -350,6 +350,42 @@ class ReviewR2AdversarialTests(unittest.TestCase):
         transport = ops._oneshot_transport()
         self.assertIsInstance(transport, HerdrCliTransport)
         self.assertEqual(transport.binary, str(fake_bin))  # the .path, not the resolution
+
+    def test_f1_the_oneshot_rail_builds_from_the_exact_resolved_transport(self):
+        # j#87384 F1: with a resolvable herdr binary the rail constructs (non-None) from the
+        # SAME transport authority; with none it is None — and rail readiness judges the
+        # SAME capability. Never resolved via the default (tmux) config path.
+        import os
+        import stat
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (  # noqa: E501
+            HerdrTurnStartRail,
+        )
+
+        fake_bin = self.repo / "herdr"
+        fake_bin.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(fake_bin, os.stat(fake_bin).st_mode | stat.S_IXUSR)
+        ops = LiveGatewayRecoveryOps(
+            repo_root=self.repo, request=_request(),
+            env={"MOZYO_HERDR_BINARY": str(fake_bin)},
+        )
+        rail = ops._build_oneshot_rail()
+        self.assertIsInstance(rail, HerdrTurnStartRail)
+        with patch.object(ops, "_governed_sender_resolves", return_value=False):
+            self.assertTrue(ops.resume_rail_ready(ops.request))
+
+    def test_f2_a_clean_env_without_herdr_is_rail_unavailable_and_green(self):
+        # j#87384 F2: with MOZYO_HERDR_BINARY unset and no herdr on PATH, the rail is
+        # unavailable (None) and readiness is False — asserted hermetically so the suite
+        # never depends on the host's herdr installation.
+        ops = LiveGatewayRecoveryOps(
+            repo_root=self.repo, request=_request(),
+            env={"PATH": str(self.repo / "empty-path")},
+        )
+        self.assertIsNone(ops._oneshot_transport())
+        self.assertIsNone(ops._build_oneshot_rail())
+        self.assertIsNone(ops._drive_oneshot_turn_start("w:9", "body"))
+        with patch.object(ops, "_governed_sender_resolves", return_value=False):
+            self.assertFalse(ops.resume_rail_ready(ops.request))
 
     def test_f2_oneshot_requires_action_bound_attestation_and_generation(self):
         # j#87378 F2(a): a fresh row without a readable revision, or an attestation that is
@@ -429,6 +465,8 @@ class ReviewR2AdversarialTests(unittest.TestCase):
                                 ops, "_fresh_gateway_bound_to_action", return_value=True
                             ):
                                 with patch.object(
+                                    ops, "_oneshot_transport", return_value=object()
+                                ), patch.object(
                                     ops, "_drive_oneshot_turn_start",
                                     return_value=(
                                         None if rail_outcome is None
