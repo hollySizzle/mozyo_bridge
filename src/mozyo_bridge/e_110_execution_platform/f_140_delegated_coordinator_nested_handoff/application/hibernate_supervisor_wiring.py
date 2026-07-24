@@ -454,7 +454,7 @@ def build_hibernate_leg_fn(
     fail-closed — a not_requested row is still enumerated as debt).
     """
 
-    def leg(ws, renew, budget=None) -> HibernatePassResult:
+    def leg(ws, renew, budget=None, restrict_issues=None) -> HibernatePassResult:
         repo_root = Path(str(ws.canonical_path or "") or ".")
         pointer = committed_config_policy_pointer(repo_root)
 
@@ -595,6 +595,12 @@ def build_hibernate_leg_fn(
         build_entries = make_entries_fn()
         rows_build = load_lane_lifecycle_readonly(home=home)
         requests = enumerate_requests(rows_build or (), str(ws.workspace_id), build_entries)
+        if restrict_issues is not None:
+            # Redmine #14219 T3 review j#87154 R1-F2: a wake-bound pass (``local_wake``) hibernates
+            # ONLY the lanes of the exact woken issues — an unrelated drain-ready lane is out of this
+            # pass's authority scope. The whole-workspace candidate scan is the timer fallback alone.
+            allowed = frozenset(str(i).strip() for i in restrict_issues)
+            requests = [r for r in requests if str(r.selected.issue_id).strip() in allowed]
         for request in requests:
             lane_by_issue.setdefault(request.selected.issue_id, request.selected)
 

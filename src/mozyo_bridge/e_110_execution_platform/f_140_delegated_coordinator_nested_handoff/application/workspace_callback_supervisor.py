@@ -47,6 +47,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     workspace_hibernate_leg as _hibernate,
+    workspace_delivery_leg as _delivery,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import default_hibernate_leg_fn  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (
@@ -304,19 +305,22 @@ class WorkspaceCallbackSupervisor:
                 authoritative = dict(self._authoritative_fn() or {})
             except Exception:  # noqa: BLE001 - an owner-map read never breaks the sweep
                 authoritative = {}
+        # Redmine #14219 T3 (Answer j#87108, review j#87154 R1-F1): ONE external-mutation budget for
+        # the WHOLE pass, threaded through every workspace's delivery/reconcile and folded hibernate
+        # legs. Deterministic (workspace-id) order so an earlier workspace's mutation / uncertainty
+        # defers every later workspace's hibernate and a re-driven pass re-attempts the same one.
+        pass_budget: dict = {"reads": 0, "mutated": False, "uncertain": False}
         outcomes: list[WorkspaceSupervisionOutcome] = []
-        for ws in self._workspaces_fn():
+        for ws in sorted(self._workspaces_fn(), key=lambda w: str(w.workspace_id or "")):
             outcomes.append(
                 self._supervise_workspace(
                     ws,
                     mode=mode,
                     wake_issues=wake_by_ws.get(ws.workspace_id, ()),
                     authoritative=authoritative,
+                    pass_budget=pass_budget,
                 )
             )
-        # Redmine #14219 T3 (Answer j#87108): fold the auto-hibernate leg into the SAME bounded
-        # pass, after delivery/reconcile, for the event-wake + timer paths (see maybe_fold_hibernate).
-        outcomes = _hibernate.maybe_fold_hibernate(self, mode, outcomes)
         return SupervisorReport(mode=mode, holder=self._holder, workspaces=tuple(outcomes))
 
     def _drain_wake_for(self, workspace_id: str) -> tuple[str, ...]:
@@ -342,6 +346,7 @@ class WorkspaceCallbackSupervisor:
         mode: str,
         wake_issues: Sequence[str],
         authoritative: Optional[dict[str, str]] = None,
+        pass_budget: Optional[dict] = None,
     ) -> WorkspaceSupervisionOutcome:
         wsid = str(ws.workspace_id or "").strip()
         # A FRESH clock per workspace (R1-F1): a single sweep-start clock would make a later
@@ -364,169 +369,28 @@ class WorkspaceCallbackSupervisor:
             # lease-refused duplicate can never consume another owner's wakes. Merge the
             # lease-owned drained wakes with any explicit hints for this workspace.
             wake_issues = tuple(wake_issues) + self._drain_wake_for(wsid)
-            roster, roster_error = self._roster_fn(ws)
-            if roster_error:
-                # A roster read that failed is degraded, not "nothing active" — fail closed on the
-                # workspace (supervise nothing) rather than guess an empty active set.
-                return WorkspaceSupervisionOutcome(
-                    workspace_id=wsid,
-                    lease_acquired=True,
-                    lease_reason=lease.reason,
-                    skipped_reason=SKIP_ROSTER_UNREADABLE,
-                )
-            selection = select_supervised_issues(roster, mode=mode, wake_issues=wake_issues)
-            # Redmine #13968 F1: keep only the issues THIS workspace uniquely owns per the durable
-            # lifecycle authority. An issue owned by another workspace, unowned, or ambiguously
-            # owned is dropped and surfaced (``non_authoritative_issues``) — so the same issue is
-            # never supervised (ingested / delivered) from two workspaces. When no authoritative
-            # resolver is wired the roster is unchanged (pre-#13968 / unit-fake behaviour).
-            if authoritative is not None:
-                supervised, non_authoritative = partition_authoritative(
-                    selection.supervised, authoritative, wsid
-                )
-            else:
-                supervised, non_authoritative = selection.supervised, ()
-            # #13974 R2: a workspace with NO active issues but own-partition backlog (every owning lane
-            # hibernated) must STILL drain it — empty roster short-circuits ONLY when nothing is drainable.
-            if not supervised and not (
-                self._backlog_drain_fn is not None and self._has_pending_backlog(wsid)
-            ):
-                return WorkspaceSupervisionOutcome(
-                    workspace_id=wsid,
-                    lease_acquired=True,
-                    lease_reason=lease.reason,
-                    ignored_wake_issues=selection.ignored_wake,
-                    non_authoritative_issues=non_authoritative,
-                    skipped_reason=SKIP_NO_ACTIVE_ISSUES,
-                )
-            # Redmine #14150 provider-reconciliation cadence: if this workspace is NOT due for a
-            # provider reconcile (its durable watermark is still inside the backoff window), DOWNGRADE
-            # it to a LOCAL drain this pass — zero provider reads — instead of re-reading every journal.
-            # This is what stops "全workspace・全journal再読を常時の既定にする". The gate applies ONLY to
-            # bounded reconciliation (local_wake / drain modes never reach here) and only when a due-fn
-            # is wired; a due-check failure fails toward reconciling, never suppressing the fallback.
-            if mode == SUPERVISION_BOUNDED_RECONCILIATION and self._reconcile_due_fn is not None:
-                try:
-                    reconcile_due = bool(self._reconcile_due_fn(wsid))
-                except Exception:  # noqa: BLE001 - a due-check failure fails toward reconciling
-                    reconcile_due = True
-                if not reconcile_due:
-                    drain_sender = (
-                        self._drain_sender_fn(ws) if self._drain_sender_fn is not None else None
-                    )
-                    drain_outcomes, drain_lease_lost = self._drain_issues_from_outbox(
-                        wsid, drain_sender
-                    )
-                    return WorkspaceSupervisionOutcome(
-                        workspace_id=wsid,
-                        lease_acquired=True,
-                        lease_reason=lease.reason,
-                        supervised_issues=supervised,
-                        ignored_wake_issues=selection.ignored_wake,
-                        non_authoritative_issues=non_authoritative,
-                        issues=tuple(drain_outcomes),
-                        skipped_reason=SKIP_LEASE_LOST if drain_lease_lost else "",
-                    )
-            raw_source = self._redmine_source_fn(ws)
-            # Redmine #14150 review F1: count the ACTUAL provider reads via the shared counter (spans
-            # the reconcile source + the sender's send-edge round-fence source). Reset per pass.
-            counter = (
-                self._provider_counter_fn(wsid)
-                if self._provider_counter_fn is not None
-                else _ProviderCallCounter()
+            outcome = _delivery.deliver_under_lease(
+                self, ws, wsid, lease, mode=mode, wake_issues=wake_issues,
+                authoritative=authoritative,
             )
-            counter.n = 0
-            source = _CountingSource(raw_source, counter) if raw_source is not None else None
-            sender = self._sender_fn(ws)
-            binding = self._binding_fn(ws) if self._binding_fn is not None else None
-            # Redmine #14150 review F2: changed-work incremental read — provider-reconcile only the
-            # changed / locally-changed / has-work roster subset; skip the rest (drained locally). A
-            # selector failure fails OPEN to the full roster. Bounded reconciliation only.
-            reconcile_skipped: tuple[str, ...] = ()
-            reconcile_commit: Optional[Callable[[Sequence[str]], None]] = None
-            reconcile_targets: Sequence[str] = supervised
-            if mode == SUPERVISION_BOUNDED_RECONCILIATION and self._reconcile_incremental_fn:
-                try:
-                    reconcile_targets, reconcile_skipped, reconcile_commit = (
-                        self._reconcile_incremental_fn(wsid, supervised))
-                except Exception:  # noqa: BLE001 - a selector failure fails open to the full roster
-                    reconcile_targets, reconcile_skipped, reconcile_commit = supervised, (), None
-            issue_outcomes: list[IssueSupervisionOutcome] = []
-            lease_lost = False
-            for index, issue in enumerate(reconcile_targets):
-                # Issue-boundary renew fence (R1-F1): before each issue's side-effects (after the
-                # first, which the acquire above already fenced) re-establish lease ownership with a
-                # FRESH clock. renew() is holder-conditional: it returns False iff another supervisor
-                # took the lease over after expiry — stop before the next issue so a stale holder
-                # never delivers past a takeover. A live owner's renew also extends the deadline, so
-                # a slow multi-issue sweep does not spuriously expire its own lease.
-                if index > 0 and not self._lease_store.renew(
-                    wsid, self._holder, now=self._clock(), ttl_seconds=self._ttl
-                ):
-                    lease_lost = True
-                    break
-                issue_outcome = self._supervise_issue(wsid, issue, source, sender, binding)
-                issue_outcomes.append(issue_outcome)
-                if issue_outcome.error == ISSUE_LEASE_LOST:
-                    # The send-boundary fence tripped mid-issue (a takeover during this issue's
-                    # source reads): the lease is gone, so stop before any further workspace work.
-                    lease_lost = True
-                    break
-            # Redmine #14150: a completed provider reconcile advances this workspace's durable
-            # watermark (and feeds the empty-pass backoff), so the next passes within the backoff
-            # window downgrade to a local drain. ``produced`` = this pass supplied an event or
-            # delivered a callback (non-empty), which resets the backoff toward the floor.
-            if (
-                mode == SUPERVISION_BOUNDED_RECONCILIATION
-                and self._reconcile_mark_fn is not None
-                and not lease_lost
-            ):
-                produced = any(o.events_supplied or o.delivered for o in issue_outcomes)
-                try:
-                    self._reconcile_mark_fn(wsid, produced)
-                except Exception:  # noqa: BLE001 - a watermark write never breaks the sweep
-                    pass
-            # Redmine #14150 review F2: commit the changed-work cursor ONLY on a successful pass, for
-            # the issues that reconciled without a source error — a transient provider failure never
-            # advances the watermark past an un-read issue (recovery contract).
-            if not lease_lost and reconcile_commit is not None:
-                try:
-                    reconcile_commit([o.issue for o in issue_outcomes if not o.error])
-                except Exception:  # noqa: BLE001 - a cursor commit never breaks the sweep
-                    pass
-            # Redmine #13974 R2: while we still hold the lease, drain THIS workspace's own pending +
-            # stale-inflight backlog (issues NOT in the active roster) through the same action-time fence
-            # (renew guard stops before a send on takeover; own-partition only; skip supervised issues).
-            # Fail-open. F4: capture ALL dispositions (delivered is a real send the report must not zero).
-            backlog: Optional[BacklogDrainOutcome] = None
-            if not lease_lost and self._backlog_drain_fn is not None:
-                try:
-                    backlog = self._backlog_drain_fn(
-                        wsid, source=source, sender=sender, skip_issues=frozenset(supervised),
-                        lease_guard_fn=lambda: self._lease_store.renew(
+            # Redmine #14219 T3 (Answer j#87108, review j#87154 R1-F1/F2/F3): fold the auto-
+            # hibernate after-leg into THIS pass under the lease we STILL HOLD (no release then
+            # re-acquire), sharing the pass's ONE external-mutation budget with the delivery legs
+            # and binding a local_wake candidate to the woken issues. One authority marks the budget.
+            if pass_budget is not None:
+                def _renew() -> bool:
+                    return bool(
+                        self._lease_store.renew(
                             wsid, self._holder, now=self._clock(), ttl_seconds=self._ttl
-                        ),
+                        )
                     )
-                    lease_lost = lease_lost or backlog.lease_lost
-                except Exception:  # noqa: BLE001 - a backlog drain never breaks the sweep
-                    backlog = None
-            return WorkspaceSupervisionOutcome(
-                workspace_id=wsid,
-                lease_acquired=True,
-                lease_reason=lease.reason,
-                supervised_issues=supervised,
-                ignored_wake_issues=selection.ignored_wake,
-                non_authoritative_issues=non_authoritative,
-                reconcile_skipped_issues=tuple(reconcile_skipped),
-                issues=tuple(issue_outcomes),
-                skipped_reason=SKIP_LEASE_LOST if lease_lost else "",
-                provider_calls=counter.n,
-                backlog_fenced=backlog.fenced if backlog else 0,
-                backlog_delivered=backlog.delivered if backlog else 0,
-                backlog_blocked=backlog.blocked if backlog else 0,
-                backlog_recovered=backlog.recovered if backlog else 0,
-                backlog_transient_skipped=backlog.transient_skipped if backlog else 0,
-            )
+
+                outcome = _hibernate.run_folded_hibernate(
+                    self, ws, outcome, mode=mode, pass_budget=pass_budget,
+                    bound_issues=wake_issues, renew=_renew,
+                )
+                _hibernate.mark_pass_budget(pass_budget, outcome)
+            return outcome
         finally:
             # A bounded run-once releases each workspace at the end of its sweep so the next
             # invocation (a fresh process, a different holder) can re-acquire; a long-lived daemon
@@ -534,7 +398,6 @@ class WorkspaceCallbackSupervisor:
             # taken-over previous owner can never evict a new owner here.
             if self._release_after:
                 self._lease_store.release(wsid, self._holder)
-
     def _has_pending_backlog(self, workspace_id: str) -> bool:
         """True iff THIS workspace's partition holds a drainable pending OR stale-inflight row (F1 gate)."""
         wsid = str(workspace_id or "").strip()

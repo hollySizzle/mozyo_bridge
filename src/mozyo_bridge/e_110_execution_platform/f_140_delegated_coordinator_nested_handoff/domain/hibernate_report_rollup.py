@@ -1,29 +1,56 @@
-"""Auto-hibernate observability roll-up (Redmine #14219 T3, Design Consultation Answer j#87108).
+"""Auto-hibernate observability roll-up (Redmine #14219 T3, Answer j#87108 item 4; review j#87154 R1-F3/F4).
 
 Pure classification of the folded hibernate leg's per-workspace outcomes into the secret-free
-report metrics the T3 acceptance asks for — ``ran`` / candidate / applied / blocked / uncertain /
-deferred / released capacity / closed reason / time-to-drain. Split out of ``workspace_supervisor``
-to keep that module under the module-health line ceiling; it reads only the redaction-safe
-``hibernate_attempts`` dicts (issue / lane / kind / reason / revision) + ``hibernate_mutations`` /
-``hibernate_ran`` a :class:`WorkspaceSupervisionOutcome` carries, so it stays domain-pure and
-imports no outcome type.
+report metrics the T3 acceptance asks for — ``ran`` / candidate / claimed / applied / blocked /
+uncertain / deferred / released capacity / release-incomplete / closed reason. Split out of
+``workspace_supervisor`` to keep that module under the module-health line ceiling.
 
-The attempt-``kind`` tokens are the application ``hibernate_actuation_leg`` vocabulary, kept as
-literals so the domain imports no application leg (a drift-guard test pins them against the leg).
+Two redaction-safe inputs per workspace, both carried on a :class:`WorkspaceSupervisionOutcome`
+(this leaf imports no outcome type — it duck-types):
+
+* ``hibernate_attempts`` — the leg's typed per-candidate dicts (issue / lane / kind / reason /
+  revision), classified by their ``kind`` token.
+* ``hibernate_disposition`` — WHY the folded leg did or did not actuate when it produced NO typed
+  attempts (review j#87154 R1-F3): a RAISED leg (``hibernate_leg_error``) is an UNCERTAIN mutation
+  status that must surface as ``uncertain > 0`` / never an empty pass even though it yields zero
+  attempts; the budget / delivery-uncertain / wake-unbound / unwired defers surface WHY hibernate
+  stood down this pass. Without this a fail-closed leg looked empty and healthy.
+
+The attempt-``kind`` tokens are the application ``hibernate_actuation_leg`` vocabulary and the
+disposition tokens are the domain ``SKIP_HIBERNATE_*`` constants; both are kept here as literals so
+the domain imports no application leg and this leaf is not circular with ``workspace_supervisor``
+(a drift-guard test pins them against their definitions).
 """
 
 from __future__ import annotations
 
 from typing import Iterable, Sequence
 
-_HIBERNATE_APPLIED_KINDS = frozenset(
-    {"actuated", "actuated_release_incomplete", "redriven", "redriven_success_withheld"}
-)
+# -- attempt-kind classification (``hibernate_actuation_leg`` ATTEMPT_* token literals) -----------
+#: A candidate actually hibernated/redriven this pass (the lane state MUTATED). Split into the
+#: capacity that was actually freed vs. the mutations that freed NO slot (review j#87154 R1-F4).
+_FULLY_RELEASED_KINDS = frozenset({"actuated", "redriven"})
+_RELEASE_INCOMPLETE_KINDS = frozenset({"actuated_release_incomplete", "redriven_success_withheld"})
+_HIBERNATE_APPLIED_KINDS = _FULLY_RELEASED_KINDS | _RELEASE_INCOMPLETE_KINDS
 _HIBERNATE_BLOCKED_KINDS = frozenset(
     {"blocked", "redrive_blocked", "no_basis_journal", "release_state_unknown"}
 )
 _HIBERNATE_UNCERTAIN_KINDS = frozenset({"lease_lost"})
 _HIBERNATE_DEFERRED_KINDS = frozenset({"deferred", "stale_basis"})
+
+# -- folded-leg disposition classification (domain ``SKIP_HIBERNATE_*`` token literals) -----------
+#: A RAISED leg — an UNCERTAIN mutation status (it may have mutated before throwing).
+_DISPOSITION_LEG_ERROR = "hibernate_leg_error"
+#: The leg stood down WITHOUT actuating (a typed defer): the pass's one mutation was already spent,
+#: the delivery leg was uncertain, this local_wake pass had no wake binding, or no leg is wired.
+_DISPOSITION_DEFER_TOKENS = frozenset(
+    {
+        "hibernate_budget_deferred",
+        "hibernate_delivery_uncertain",
+        "hibernate_wake_unbound",
+        "hibernate_leg_unwired",
+    }
+)
 
 
 def _attempts(workspaces: Sequence) -> "list[dict]":
@@ -35,13 +62,36 @@ def _count_kinds(workspaces: Sequence, kinds: Iterable[str]) -> int:
     return sum(1 for a in _attempts(workspaces) if str(a.get("kind") or "") in allowed)
 
 
+def _dispositions(workspaces: Sequence) -> "list[str]":
+    return [str(getattr(w, "hibernate_disposition", "") or "") for w in workspaces]
+
+
+def _leg_error_workspaces(workspaces: Sequence) -> int:
+    return sum(1 for d in _dispositions(workspaces) if d == _DISPOSITION_LEG_ERROR)
+
+
 def ran(workspaces: Sequence) -> bool:
-    return any(w.hibernate_ran for w in workspaces)
+    """True iff the folded leg engaged this pass — a typed run OR a RAISED (uncertain) leg.
+
+    A pure defer (budget / delivery-uncertain / wake-unbound / unwired) did NOT run.
+    """
+    return any(w.hibernate_ran for w in workspaces) or _leg_error_workspaces(workspaces) > 0
 
 
 def candidates(workspaces: Sequence) -> int:
-    """Every candidate the folded hibernate leg evaluated this pass (one typed attempt each)."""
+    """Every candidate the folded hibernate leg evaluated to a typed attempt this pass."""
     return sum(len(w.hibernate_attempts) for w in workspaces)
+
+
+def claimed(workspaces: Sequence) -> int:
+    """Candidates the leg actually ACTED ON — applied, blocked at actuation, or uncertain.
+
+    Distinct from every enumerated candidate (a deferred/stale candidate was never claimed) and
+    from the applied-lane count. A RAISED leg claimed a candidate whose outcome is unknown, so each
+    ``hibernate_leg_error`` workspace counts as one claimed candidate.
+    """
+    claimable = _HIBERNATE_APPLIED_KINDS | _HIBERNATE_BLOCKED_KINDS | _HIBERNATE_UNCERTAIN_KINDS
+    return _count_kinds(workspaces, claimable) + _leg_error_workspaces(workspaces)
 
 
 def applied(workspaces: Sequence) -> int:
@@ -49,20 +99,40 @@ def applied(workspaces: Sequence) -> int:
     return sum(w.hibernate_mutations for w in workspaces)
 
 
+def released_capacity(workspaces: Sequence) -> int:
+    """Process capacity ACTUALLY freed — only fully-released actuations (review j#87154 R1-F4).
+
+    ``actuated_release_incomplete`` / ``redriven_success_withheld`` MUTATED the lane (they count in
+    ``applied``) but freed no slot, so they are excluded here and surfaced in
+    :func:`release_incomplete` instead — the report never conflates a lane mutation with a freed
+    process slot.
+    """
+    return _count_kinds(workspaces, _FULLY_RELEASED_KINDS)
+
+
+def release_incomplete(workspaces: Sequence) -> int:
+    """Mutations that changed the lane but did NOT free a process slot (partial / withheld)."""
+    return _count_kinds(workspaces, _RELEASE_INCOMPLETE_KINDS)
+
+
 def blocked(workspaces: Sequence) -> int:
     return _count_kinds(workspaces, _HIBERNATE_BLOCKED_KINDS)
 
 
 def uncertain(workspaces: Sequence) -> int:
-    return _count_kinds(workspaces, _HIBERNATE_UNCERTAIN_KINDS)
+    """Actuations of UNKNOWN effect — a lease lost mid-actuation OR a RAISED leg (review R1-F3)."""
+    return _count_kinds(workspaces, _HIBERNATE_UNCERTAIN_KINDS) + _leg_error_workspaces(workspaces)
 
 
 def deferred(workspaces: Sequence) -> int:
-    return _count_kinds(workspaces, _HIBERNATE_DEFERRED_KINDS)
+    """Candidates/passes that stood down without actuating — typed defers, observable by reason."""
+    attempt_defers = _count_kinds(workspaces, _HIBERNATE_DEFERRED_KINDS)
+    disposition_defers = sum(1 for d in _dispositions(workspaces) if d in _DISPOSITION_DEFER_TOKENS)
+    return attempt_defers + disposition_defers
 
 
 def closed_reasons(workspaces: Sequence) -> "tuple[str, ...]":
-    """The distinct, redaction-safe closed block-reason tokens (no paths, no secrets)."""
+    """The distinct, redaction-safe BLOCKED block-reason tokens (no paths, no secrets)."""
     reasons = {
         str(a.get("reason") or "")
         for a in _attempts(workspaces)
@@ -71,28 +141,51 @@ def closed_reasons(workspaces: Sequence) -> "tuple[str, ...]":
     return tuple(sorted(reasons))
 
 
+def deferred_reasons(workspaces: Sequence) -> "tuple[str, ...]":
+    """The distinct, redaction-safe reasons the leg deferred (attempt tokens + disposition tokens)."""
+    reasons = {
+        str(a.get("reason") or "")
+        for a in _attempts(workspaces)
+        if str(a.get("kind") or "") in _HIBERNATE_DEFERRED_KINDS and a.get("reason")
+    }
+    reasons |= {d for d in _dispositions(workspaces) if d in _DISPOSITION_DEFER_TOKENS}
+    return tuple(sorted(reasons))
+
+
 def payload(workspaces: Sequence, duration_ms: int) -> dict:
-    """The secret-free auto-hibernate observability roll-up for this pass."""
+    """The secret-free auto-hibernate observability roll-up for this pass.
+
+    ``pass_duration_ms`` is the whole run-once sweep's wall-clock (review j#87154 R1-F4): it is
+    NAMED for what it measures and is NOT mislabelled a candidate drain-ready → terminal-disposition
+    latency, which needs a drain-ready-timestamp authority this pass roll-up does not carry.
+    """
     return {
         "ran": ran(workspaces),
         "candidates": candidates(workspaces),
+        "claimed": claimed(workspaces),
         "applied": applied(workspaces),
         "blocked": blocked(workspaces),
         "uncertain": uncertain(workspaces),
         "deferred": deferred(workspaces),
-        "released_capacity": applied(workspaces),
+        "released_capacity": released_capacity(workspaces),
+        "release_incomplete": release_incomplete(workspaces),
         "closed_reasons": list(closed_reasons(workspaces)),
-        "time_to_drain_ms": duration_ms,
+        "deferred_reasons": list(deferred_reasons(workspaces)),
+        "pass_duration_ms": duration_ms,
     }
 
 
 __all__ = (
     "ran",
     "candidates",
+    "claimed",
     "applied",
+    "released_capacity",
+    "release_incomplete",
     "blocked",
     "uncertain",
     "deferred",
     "closed_reasons",
+    "deferred_reasons",
     "payload",
 )

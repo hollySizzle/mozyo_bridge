@@ -9,16 +9,23 @@ mutation budget — never a second supervisor, a second queue, or a third schedu
 Two entry shapes delegate to the SAME :func:`run_hibernate_phase` primitive, so the folded and
 the standalone paths can never diverge:
 
+* :func:`run_folded_hibernate` — the folded after-leg, called by ``_supervise_workspace`` WHILE IT
+  STILL HOLDS this workspace's lease (review j#87154 R1-F1: no release-then-re-acquire), handed the
+  ONE pass-wide ``pass_budget`` the delivery/reconcile legs already threaded. It is a typed
+  zero-actuation DEFER (leaving the delivery outcome unchanged, recording WHY in
+  ``hibernate_disposition``) when an earlier workspace already spent the pass mutation or was
+  uncertain, when THIS workspace's own delivery mutated / was uncertain, or (``local_wake`` only)
+  when the pass has no wake binding; otherwise it runs the leg via :func:`run_hibernate_phase`.
 * :func:`run_hibernate_phase` — run the wired leg under an ALREADY-HELD lease, handed a ``renew``
-  callable bound to THIS workspace/holder and the pass-wide shared ``budget``. It acquires and
-  releases NOTHING (the caller owns the lease); it only runs the leg and returns a typed result.
-  This is what the folded ``_supervise_workspace`` calls under the lease it already holds.
-* :func:`hibernate_workspace` / :func:`hibernate_sweep` — the standalone
-  ``SUPERVISION_HIBERNATE`` mode: acquire the lease (the duplicate-supervisor fence), delegate to
-  :func:`run_hibernate_phase`, finally release. T3 keeps this as a **production-unreachable
-  internal / focused-test compatibility seam** (no CLI / event-pump / scheduler surface selects
-  it — pinned by test); it delegates to the same primitive so it stays equivalent to the folded
-  path.
+  callable bound to THIS workspace/holder, the pass-wide shared ``budget``, and (``local_wake``) a
+  ``restrict_issues`` scope binding the candidate set to the woken issues (review j#87154 R1-F2). It
+  acquires and releases NOTHING (the caller owns the lease); it only runs the leg and returns a
+  typed result.
+* :func:`hibernate_workspace` / :func:`hibernate_sweep` — the standalone ``SUPERVISION_HIBERNATE``
+  mode: acquire the lease (the duplicate-supervisor fence), delegate to :func:`run_hibernate_phase`,
+  finally release. T3 keeps this as a **production-unreachable internal / focused-test compatibility
+  seam** (no CLI / event-pump / scheduler surface selects it — pinned by test); it delegates to the
+  same primitive so it stays equivalent to the folded path.
 
 An UNWIRED leg fails closed (``SKIP_HIBERNATE_UNWIRED``) instead of silently no-opping. A leg
 that RAISES is an UNCERTAIN mutation status (``SKIP_HIBERNATE_LEG_ERROR``; review j#86739 R3-F1):
@@ -34,8 +41,10 @@ from dataclasses import dataclass, replace
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
     SKIP_HIBERNATE_BUDGET_DEFERRED,
+    SKIP_HIBERNATE_DELIVERY_UNCERTAIN,
     SKIP_HIBERNATE_LEG_ERROR,
     SKIP_HIBERNATE_UNWIRED,
+    SKIP_HIBERNATE_WAKE_UNBOUND,
     SKIP_LEASE_LOST,
     SKIP_LEASE_REFUSED,
     SKIP_ROSTER_UNREADABLE,
@@ -50,21 +59,87 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 #: fold it.
 _FOLDED_MODES = frozenset({SUPERVISION_LOCAL_WAKE, SUPERVISION_BOUNDED_RECONCILIATION})
 
-
-def maybe_fold_hibernate(sup, mode, base_outcomes):
-    """Fold the auto-hibernate after-stage into ``run_once`` for the folded modes only (j#87108).
-
-    A no-op (returns the outcomes unchanged) when the mode is not a folded mode or no hibernate leg
-    is wired; otherwise runs :func:`fold_hibernate_stage`.
-    """
-    if mode not in _FOLDED_MODES or sup._hibernate_leg_fn is None:
-        return base_outcomes
-    return fold_hibernate_stage(sup, base_outcomes)
-
 #: The delivery-stage skip tokens that mean the pass was UNCERTAIN / fail-closed for a workspace
 #: (a lost lease mid-delivery, an unreadable roster). Hibernate NEVER actuates behind one — no
 #: blind continuation after an uncertain prior action (Design Consultation Answer j#87108 §2).
 _UNCERTAIN_DELIVERY_SKIPS = frozenset({SKIP_LEASE_LOST, SKIP_ROSTER_UNREADABLE})
+
+
+def run_folded_hibernate(sup, ws, base_outcome, *, mode, pass_budget, bound_issues, renew):
+    """The folded hibernate after-leg for ONE workspace under its ALREADY-HELD lease (j#87154 R1).
+
+    Called from ``_supervise_workspace`` while the caller still holds ``ws``'s lease and BEFORE it
+    releases (R1-F1: never a release-then-re-acquire), sharing the ONE ``pass_budget`` the delivery
+    legs already threaded. Returns ``base_outcome`` unchanged when the mode does not fold hibernate
+    or no leg is wired; otherwise a :func:`dataclasses.replace` with the hibernate fields +
+    ``hibernate_disposition`` merged in. Per workspace it is a typed zero-actuation DEFER (delivery
+    outcome unchanged, ``hibernate_ran=False``, a redaction-safe disposition token) when:
+
+    * an EARLIER workspace already spent the pass's one mutation (``pass_budget["mutated"]``) or was
+      UNCERTAIN (``pass_budget["uncertain"]``) — the whole pass shares one external-mutation budget
+      and never actuates behind an uncertain prior action;
+    * THIS workspace's own delivery was uncertain (:data:`_UNCERTAIN_DELIVERY_SKIPS`) or already
+      mutated (delivered / blocked / supplied an event — delivery keeps priority);
+    * (``local_wake`` only, R1-F2) the pass has NO wake binding — a ``local_wake`` pass hibernates
+      only the lanes of the exact woken issues; the whole-roster candidate scan is the timer /
+      ``bounded_reconciliation`` fallback alone.
+
+    It does NOT write ``pass_budget`` — the caller marks it from the merged outcome via
+    :func:`mark_pass_budget` so a single authority updates the shared budget for later workspaces.
+    """
+    if mode not in _FOLDED_MODES or sup._hibernate_leg_fn is None:
+        return base_outcome
+    if pass_budget.get("mutated"):
+        return replace(base_outcome, hibernate_disposition=SKIP_HIBERNATE_BUDGET_DEFERRED)
+    if pass_budget.get("uncertain"):
+        return replace(base_outcome, hibernate_disposition=SKIP_HIBERNATE_DELIVERY_UNCERTAIN)
+    if base_outcome.skipped_reason in _UNCERTAIN_DELIVERY_SKIPS:
+        return replace(base_outcome, hibernate_disposition=SKIP_HIBERNATE_DELIVERY_UNCERTAIN)
+    if base_outcome.delivered > 0 or base_outcome.blocked > 0 or base_outcome.events_supplied > 0:
+        return replace(base_outcome, hibernate_disposition=SKIP_HIBERNATE_BUDGET_DEFERRED)
+    restrict = None
+    if mode == SUPERVISION_LOCAL_WAKE:
+        bound = frozenset(str(i).strip() for i in (bound_issues or ()) if str(i).strip())
+        if not bound:
+            return replace(base_outcome, hibernate_disposition=SKIP_HIBERNATE_WAKE_UNBOUND)
+        restrict = bound
+    phase = run_hibernate_phase(
+        sup, ws, budget=pass_budget, renew=renew, restrict_issues=restrict
+    )
+    if phase.skipped_reason == SKIP_HIBERNATE_LEG_ERROR:
+        # UNCERTAIN mutation status: surfaced (never an empty pass) AND consumes the pass budget.
+        return replace(base_outcome, hibernate_disposition=SKIP_HIBERNATE_LEG_ERROR)
+    if phase.skipped_reason == SKIP_HIBERNATE_UNWIRED:
+        return replace(base_outcome, hibernate_disposition=SKIP_HIBERNATE_UNWIRED)
+    return replace(
+        base_outcome,
+        hibernate_ran=phase.ran,
+        hibernate_mutations=phase.mutations,
+        hibernate_attempts=phase.attempts,
+        hibernate_disposition="",
+    )
+
+
+def mark_pass_budget(pass_budget, outcome) -> None:
+    """Update the ONE shared ``pass_budget`` from a finished workspace outcome (j#87154 R1-F1).
+
+    The single authority that advances the pass-wide budget so LATER workspaces defer: an external
+    mutation (a delivered / blocked / supplied-event delivery leg OR a hibernate mutation) spends the
+    one-mutation budget; an uncertain delivery OR a RAISED (leg-error) hibernate marks the pass
+    UNCERTAIN so no later workspace actuates behind an unknown partial effect.
+    """
+    if (
+        outcome.delivered > 0
+        or outcome.blocked > 0
+        or outcome.events_supplied > 0
+        or outcome.hibernate_mutations > 0
+    ):
+        pass_budget["mutated"] = True
+    if (
+        outcome.skipped_reason in _UNCERTAIN_DELIVERY_SKIPS
+        or outcome.hibernate_disposition == SKIP_HIBERNATE_LEG_ERROR
+    ):
+        pass_budget["uncertain"] = True
 
 
 @dataclass(frozen=True)
@@ -84,22 +159,31 @@ class HibernatePhaseResult:
     skipped_reason: str = ""
 
 
-def run_hibernate_phase(sup, ws, *, budget, renew) -> HibernatePhaseResult:
+def run_hibernate_phase(
+    sup, ws, *, budget, renew, restrict_issues=None
+) -> HibernatePhaseResult:
     """Run one workspace's hibernate leg under an ALREADY-HELD lease (no acquire / no release).
 
     The single shared primitive both the folded pass and the standalone seam use. ``renew`` is the
     caller's lease-renew callable (bound to this workspace/holder); ``budget`` is the pass-wide
     shared dict (``{"reads", "mutated"}``) the T2a leg threads its provider-read cap and one-
-    mutation fence through. An unwired leg fails closed; a raised leg is the typed uncertain status
-    that consumes the budget (review j#86739 R3-F1).
+    mutation fence through. ``restrict_issues`` (review j#87154 R1-F2), when not ``None``, binds the
+    leg's candidate set to exactly those issue ids — the ``local_wake`` wake-target scope; ``None``
+    is the whole-workspace candidate scan (``bounded_reconciliation`` / standalone). An unwired leg
+    fails closed; a raised leg is the typed uncertain status that consumes the budget (j#86739 R3-F1).
     """
     if sup._hibernate_leg_fn is None:
         return HibernatePhaseResult(skipped_reason=SKIP_HIBERNATE_UNWIRED)
+    leg = sup._hibernate_leg_fn
+    params = _leg_params(leg)
+    kwargs: dict = {}
+    if restrict_issues is not None and "restrict_issues" in params:
+        kwargs["restrict_issues"] = frozenset(restrict_issues)
     try:
-        if budget is not None and _leg_accepts_budget(sup._hibernate_leg_fn):
-            result = sup._hibernate_leg_fn(ws, renew, budget)
+        if budget is not None and len(params) >= 3:
+            result = leg(ws, renew, budget, **kwargs)
         else:
-            result = sup._hibernate_leg_fn(ws, renew)
+            result = leg(ws, renew, **kwargs)
     except Exception:  # noqa: BLE001 - one workspace's leg error never aborts the pass
         # Uncertain mutation status: consumes the budget so no blind continuation follows.
         return HibernatePhaseResult(
@@ -151,66 +235,11 @@ def hibernate_sweep(sup) -> "list[WorkspaceSupervisionOutcome]":
     return outcomes
 
 
-def fold_hibernate_stage(sup, base_outcomes):
-    """The AFTER-stage hibernate leg of one bounded ``run_once`` pass (Design Answer j#87108).
-
-    Folded into the ``local_wake`` / ``bounded_reconciliation`` pass AFTER the callback/outbox
-    delivery + reconcile legs, over the SAME leased workspaces, sharing ONE pass-wide external
-    mutation budget — never a separate mode / cadence / queue. Deterministic (workspace-id order)
-    so a re-driven pass re-attempts the same workspace. Per workspace, hibernate is a typed
-    zero-actuation DEFER (it leaves the delivery outcome unchanged, ``hibernate_ran=False``) when:
-
-    * the workspace had no lease (a duplicate-supervisor skip) — nothing to actuate under;
-    * the delivery stage was UNCERTAIN (:data:`_UNCERTAIN_DELIVERY_SKIPS`) — no blind actuation
-      behind a lost lease / unreadable roster;
-    * a PRIOR leg mutated this pass — either this workspace's own delivery/reconcile produced a
-      side effect (delivered / blocked / supplied an event: "callback/outbox delivery ... の
-      優先度を先に保つ"), or an earlier workspace's hibernate already spent the pass's one
-      lifecycle mutation (``budget["mutated"]``).
-
-    Otherwise it runs the SAME :func:`hibernate_workspace` primitive under the (re-acquired,
-    idempotent same-holder) lease, threading the shared ``budget``; a mutation OR an uncertain
-    leg (raised) consumes the pass budget so total lifecycle mutations across ALL workspaces /
-    candidates never exceed one. Returns the outcomes in their original (delivery) order with the
-    hibernate fields merged in.
-    """
-    budget: dict = {"reads": 0, "mutated": False}
-    by_id = {o.workspace_id: o for o in base_outcomes}
-    merged = list(base_outcomes)
-    index_of = {id(o): i for i, o in enumerate(base_outcomes)}
-    for ws in sorted(sup._workspaces_fn(), key=lambda w: str(w.workspace_id or "")):
-        wsid = str(ws.workspace_id or "").strip()
-        base = by_id.get(wsid)
-        if base is None or not base.lease_acquired:
-            continue  # a lease-refused / unknown workspace never actuates
-        if base.skipped_reason in _UNCERTAIN_DELIVERY_SKIPS:
-            continue  # uncertain delivery -> hibernate defers (no blind continuation)
-        if budget["mutated"]:
-            continue  # the pass already spent its one lifecycle mutation
-        if base.delivered > 0 or base.blocked > 0 or base.events_supplied > 0:
-            continue  # a prior leg mutated this workspace this pass -> hibernate defers
-        hib = hibernate_workspace(sup, ws, budget=budget)
-        if hib.hibernate_mutations > 0 or hib.skipped_reason == SKIP_HIBERNATE_LEG_ERROR:
-            # A mutation OR an uncertain (raised) leg consumes the pass-wide one-mutation budget.
-            budget["mutated"] = True
-        if not (hib.hibernate_ran or hib.hibernate_mutations):
-            # An unwired leg / a refused re-acquire actuated nothing: leave the delivery outcome
-            # untouched rather than stamping a spurious hibernate skip over it.
-            continue
-        merged[index_of[id(base)]] = replace(
-            base,
-            hibernate_ran=hib.hibernate_ran,
-            hibernate_mutations=hib.hibernate_mutations,
-            hibernate_attempts=hib.hibernate_attempts,
-        )
-    return merged
-
-
-def _leg_accepts_budget(leg) -> bool:
+def _leg_params(leg) -> "frozenset[str]":
     try:
-        return len(inspect.signature(leg).parameters) >= 3
+        return frozenset(inspect.signature(leg).parameters)
     except (TypeError, ValueError):  # pragma: no cover - exotic callables fail closed
-        return False
+        return frozenset()
 
 
 def hibernate_workspace(sup, ws, budget=None) -> WorkspaceSupervisionOutcome:
@@ -265,8 +294,8 @@ def hibernate_workspace(sup, ws, budget=None) -> WorkspaceSupervisionOutcome:
 __all__ = (
     "HibernatePhaseResult",
     "run_hibernate_phase",
-    "fold_hibernate_stage",
-    "maybe_fold_hibernate",
+    "run_folded_hibernate",
+    "mark_pass_budget",
     "hibernate_sweep",
     "hibernate_workspace",
 )

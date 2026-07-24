@@ -106,6 +106,16 @@ SKIP_HIBERNATE_LEG_ERROR = "hibernate_leg_error"
 #: workspace (Redmine #14219 j#86734 R2-F2): this workspace's leg did not run at all this pass
 #: (typed defer, zero reads, zero actuation) — the next pass picks it up.
 SKIP_HIBERNATE_BUDGET_DEFERRED = "hibernate_budget_deferred"
+#: The folded hibernate leg deferred because THIS pass's delivery/reconcile leg was UNCERTAIN
+#: (a lost lease mid-delivery, an unreadable roster) in this or an earlier workspace (Redmine
+#: #14219 T3 review j#87154 R1-F1/F3): no blind actuation follows an uncertain prior action. A
+#: typed defer, distinct from the budget-consumed defer so the reason is observable.
+SKIP_HIBERNATE_DELIVERY_UNCERTAIN = "hibernate_delivery_uncertain"
+#: The folded hibernate leg was NOT wake-bound this local_wake pass (Redmine #14219 T3 review
+#: j#87154 R1-F2): a ``local_wake`` pass hibernates ONLY the lanes of the exact issues it was
+#: woken for (lease-owned durable wake + explicit hint). A workspace with no wake binding this
+#: pass actuates nothing — only the timer/reconciliation fallback does full candidate selection.
+SKIP_HIBERNATE_WAKE_UNBOUND = "hibernate_wake_unbound"
 
 #: A per-issue supply error token: the Redmine source could not be read for durable-event supply /
 #: candidate discovery (fail-open per issue — the callback drain still ran).
@@ -575,6 +585,15 @@ class WorkspaceSupervisionOutcome:
     hibernate_ran: bool = False
     hibernate_mutations: int = 0
     hibernate_attempts: tuple[dict, ...] = ()
+    #: Why the FOLDED hibernate leg did or did not actuate this pass (Redmine #14219 T3 review
+    #: j#87154 R1-F3), a closed-vocabulary redaction-safe token: ``""`` means it either ran to a
+    #: typed pass result (see ``hibernate_ran`` / ``hibernate_attempts``) or the mode did not fold
+    #: hibernate at all; otherwise one of :data:`SKIP_HIBERNATE_LEG_ERROR` (raised — UNCERTAIN, may
+    #: have mutated), :data:`SKIP_HIBERNATE_BUDGET_DEFERRED`, :data:`SKIP_HIBERNATE_DELIVERY_UNCERTAIN`,
+    #: :data:`SKIP_HIBERNATE_WAKE_UNBOUND`, or :data:`SKIP_HIBERNATE_UNWIRED`. The roll-up reads this
+    #: so a fail-closed (raised) leg surfaces as ``uncertain`` and is NEVER an empty pass, and every
+    #: defer reason is observable.
+    hibernate_disposition: str = ""
 
     @property
     def events_supplied(self) -> int:
@@ -626,6 +645,7 @@ class WorkspaceSupervisionOutcome:
             "hibernate_ran": self.hibernate_ran,
             "hibernate_mutations": self.hibernate_mutations,
             "hibernate_attempts": [dict(a) for a in self.hibernate_attempts],
+            "hibernate_disposition": self.hibernate_disposition,
             "issues": [i.as_payload() for i in self.issues],
         }
 
@@ -695,6 +715,9 @@ class SupervisorReport:
             and self.provider_calls == 0
             and self.hibernate_mutations == 0
             and self.hibernate_candidates == 0
+            # R1-F3: a folded leg that RAISED consumed the budget under an unknown partial effect —
+            # an UNCERTAIN pass is never "empty" even though it produced zero typed candidates.
+            and self.hibernate_uncertain == 0
         )
 
     # -- auto-hibernate roll-up (Redmine #14219 T3, Answer j#87108 item 4): thin delegations to
@@ -717,8 +740,20 @@ class SupervisorReport:
         return _hib_rollup.applied(self.workspaces)
 
     @property
+    def hibernate_claimed(self) -> int:
+        # R1-F4: candidates the leg actually acted on (applied OR blocked-at-actuation OR uncertain),
+        # distinct from every enumerated candidate and from the applied-lane count.
+        return _hib_rollup.claimed(self.workspaces)
+
+    @property
     def hibernate_released_capacity(self) -> int:
-        return _hib_rollup.applied(self.workspaces)
+        # R1-F4: process capacity ACTUALLY released — only fully-released actuations, NOT the
+        # release-incomplete / success-withheld mutations (those mutated the lane but freed no slot).
+        return _hib_rollup.released_capacity(self.workspaces)
+
+    @property
+    def hibernate_release_incomplete(self) -> int:
+        return _hib_rollup.release_incomplete(self.workspaces)
 
     @property
     def hibernate_blocked(self) -> int:
@@ -729,8 +764,16 @@ class SupervisorReport:
         return _hib_rollup.uncertain(self.workspaces)
 
     @property
+    def hibernate_deferred(self) -> int:
+        return _hib_rollup.deferred(self.workspaces)
+
+    @property
     def hibernate_closed_reasons(self) -> "tuple[str, ...]":
         return _hib_rollup.closed_reasons(self.workspaces)
+
+    @property
+    def hibernate_deferred_reasons(self) -> "tuple[str, ...]":
+        return _hib_rollup.deferred_reasons(self.workspaces)
 
     def hibernate_payload(self) -> dict[str, object]:
         return _hib_rollup.payload(self.workspaces, self.duration_ms)
@@ -766,77 +809,13 @@ class SupervisorReport:
 
 
 # ---------------------------------------------------------------------------
-# Provider reconciliation cadence: watermark gate + jitter/backoff (Redmine #14150).
+# Provider reconciliation cadence (Redmine #14150): extracted to the ``reconcile_cadence`` leaf
+# (Redmine #14219 T3 review j#87154 R1 module-health split); re-exported for a stable import surface.
 # ---------------------------------------------------------------------------
-
-
-def _parse_iso(value: object) -> "datetime | None":
-    """Parse an ISO-8601 timestamp to an aware UTC ``datetime`` (``None`` if unparseable; pure)."""
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text)
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
-def reconcile_backoff_seconds(
-    base_interval_seconds: int,
-    consecutive_empty_passes: int,
-    *,
-    max_interval_seconds: int,
-    jitter_unit: float = 0.0,
-    jitter_fraction: float = 0.0,
-) -> int:
-    """The next provider-reconcile due delay (seconds), backed off + jittered (Redmine #14150; pure).
-
-    The provider reconciliation leg must not re-read every workspace / every journal on a fixed tight
-    cadence. When consecutive passes find nothing new, the due interval backs off exponentially from
-    ``base_interval_seconds`` (doubling per empty pass) up to ``max_interval_seconds``, so an idle
-    fleet quiesces toward the ceiling instead of polling the provider at the floor. ``jitter_unit`` is
-    an injected value in ``[0, 1)`` (a seam — the caller supplies a deterministic value in tests and a
-    real RNG draw in production, so this stays pure and reproducible); it spreads the due time by up to
-    ``jitter_fraction`` of the backed-off interval so a fleet of workspaces does not thunder the
-    provider in lockstep. Returns an int in ``[base, max]`` (jitter only ADDS, never below base).
-    """
-    base = max(1, int(base_interval_seconds))
-    ceiling = max(base, int(max_interval_seconds))
-    empties = max(0, int(consecutive_empty_passes))
-    # Exponential backoff, capped — guard the shift so a large empty count never overflows.
-    backed = min(ceiling, base * (2 ** min(empties, 30)))
-    unit = min(max(float(jitter_unit), 0.0), 0.999999)
-    fraction = min(max(float(jitter_fraction), 0.0), 1.0)
-    jitter = int(backed * fraction * unit)
-    return min(ceiling, backed + jitter)
-
-
-def should_reconcile_source(
-    last_reconciled_at: object,
-    now: object,
-    due_after_seconds: int,
-) -> bool:
-    """True iff the provider reconcile watermark for a source is DUE (Redmine #14150; pure).
-
-    ``last_reconciled_at`` is the durable watermark of the last completed provider read for a source
-    (blank / unparseable -> never reconciled -> due). ``now`` is the current ISO timestamp; the source
-    is due when ``due_after_seconds`` have elapsed since the watermark. This is the differential-fetch
-    gate: a drain-only tick never sets the watermark (it made no provider read), so it never suppresses
-    a genuine reconcile; only a completed provider read advances it. An unparseable ``now`` fails toward
-    reconciling (never silently skips the provider fallback).
-    """
-    now_dt = _parse_iso(now)
-    if now_dt is None:
-        return True
-    last_dt = _parse_iso(last_reconciled_at)
-    if last_dt is None:
-        return True
-    return (now_dt - last_dt).total_seconds() >= max(0, int(due_after_seconds))
-
-
+from .reconcile_cadence import (  # noqa: E402  (re-export: kept at original position)
+    reconcile_backoff_seconds,
+    should_reconcile_source,
+)
 # ---------------------------------------------------------------------------
 # Service lifecycle contract (declarative; NO secrets).
 # ---------------------------------------------------------------------------
@@ -964,6 +943,8 @@ __all__ = (
     "SKIP_HIBERNATE_UNWIRED",
     "SKIP_HIBERNATE_LEG_ERROR",
     "SKIP_HIBERNATE_BUDGET_DEFERRED",
+    "SKIP_HIBERNATE_DELIVERY_UNCERTAIN",
+    "SKIP_HIBERNATE_WAKE_UNBOUND",
     "ISSUE_SOURCE_UNREADABLE",
     "ISSUE_PASS_ERROR",
     "ISSUE_LEASE_LOST",
