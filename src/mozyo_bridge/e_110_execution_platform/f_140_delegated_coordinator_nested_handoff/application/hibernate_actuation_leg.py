@@ -67,7 +67,10 @@ TTD_UNCERTAIN = "uncertain"
 TTD_UNAVAILABLE = "unavailable"
 
 _TTD_COMPLETED_KINDS = frozenset({ATTEMPT_ACTUATED, ATTEMPT_REDRIVEN})
-_TTD_UNCERTAIN_KINDS = frozenset({ATTEMPT_LEASE_LOST})
+# A lost lease AND a non-canonical / unknown process-release are OUTCOME-UNKNOWN, not deterministic
+# blocks (review j#87226 / answers j#87181 j#87182 j#87188): time-to-drain classifies them
+# ``uncertain`` (no trusted terminal end -> null latency), never ``pending``.
+_TTD_UNCERTAIN_KINDS = frozenset({ATTEMPT_LEASE_LOST, ATTEMPT_RELEASE_STATE_UNKNOWN})
 
 
 def _parse_iso(value: object) -> "Optional[datetime]":
@@ -432,11 +435,15 @@ def run_hibernate_redrives(
     for row in ordered:
         issue = str(getattr(row, "issue_id", ""))
         lane = str(getattr(row, "lane_id", ""))
-        drain_ready = str(drain_ready_fn(issue) if drain_ready_fn is not None else "")
 
-        def _append(attempt, _dr=drain_ready):
+        def _append(attempt, _issue=issue):
+            # Review j#87224 R5-F1: read the ORIGINAL drain-ready start LAZILY, at stamp time — the
+            # production ``request_fn`` reads the row's intent and only THEN records its
+            # ``drain_ready_at``, so capturing it before ``request_fn`` would always stamp an empty
+            # start. Reading it here (after the request resolved) inherits the crash-redrive's start.
+            dr = str(drain_ready_fn(_issue) if drain_ready_fn is not None else "")
             attempts.append(stamp_drain_metrics(
-                attempt, _dr, clock_fn() if clock_fn is not None else ""
+                attempt, dr, clock_fn() if clock_fn is not None else ""
             ))
         if mutated or stopped:
             _append(HibernateAttempt(

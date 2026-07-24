@@ -339,6 +339,13 @@ def combine_hibernate_pass_results(
     nothing (they neither count as mutations nor mark the pass non-empty on their own... though a
     non-empty attempt list is a non-empty pass).
     """
+    # Review j#87224 R5-F2: the R5-F5 ``unknown_attempts`` are built raw (they never run the
+    # actuation loop), so stamp their closed-vocabulary time-to-drain status here — otherwise they
+    # carry an empty status outside the ``completed|pending|uncertain|unavailable`` enum. They have no
+    # trusted start/end (an unknown-release row), so the kind alone drives the status, latency null.
+    stamped_unknown = tuple(
+        stamp_drain_metrics(attempt, "", "") for attempt in unknown_attempts
+    )
     if fresh_pass is None:
         # Review j#87214 R4-F2/F3: stamp each stopped-redrive lease-lost attempt with ITS candidate's
         # exact ``drain_ready_at`` — an uncertain end (no trusted terminal), so a null latency.
@@ -356,12 +363,12 @@ def combine_hibernate_pass_results(
             for candidate in order_candidates(deferred_candidates)
         )
         return HibernatePassResult(
-            attempts=unknown_attempts + redrive_result.attempts + fresh_attempts,
+            attempts=stamped_unknown + redrive_result.attempts + fresh_attempts,
             mutations=redrive_result.mutations,
             empty_pass=False,
         )
     return HibernatePassResult(
-        attempts=unknown_attempts + redrive_result.attempts + fresh_pass.attempts,
+        attempts=stamped_unknown + redrive_result.attempts + fresh_pass.attempts,
         mutations=redrive_result.mutations + fresh_pass.mutations,
         empty_pass=(
             fresh_pass.empty_pass

@@ -387,7 +387,8 @@ class T2cProductionActuationTest(unittest.TestCase):
         self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
         self.assertEqual(self._lane_row().lane_disposition, "active")
 
-    def _seed_redrive_intent(self, *, decision_journal="84999", lane=LANE, issue=ISSUE):
+    def _seed_redrive_intent(self, *, decision_journal="84999", lane=LANE, issue=ISSUE,
+                             drain_ready_at=""):
         # Review j#86776 R5-F3: a hibernated crash-window row that came from a REAL fresh
         # actuation carries a durable redrive intent persisted pre-CAS. The store-level crash
         # fixtures below model that by seeding the matching intent (the early-hibernate durable
@@ -423,10 +424,11 @@ class T2cProductionActuationTest(unittest.TestCase):
                     "worktree_clean": True,
                     "boundary_recorded": False,
                 },
+                drain_ready_at=drain_ready_at,
             )
         )
 
-    def _hibernate_row_with_release(self, target, *, seed_intent=True):
+    def _hibernate_row_with_release(self, target, *, seed_intent=True, drain_ready_at=""):
         # The crash window through the CANONICAL store rail: the fresh CAS landed, the release
         # generation opened (its pins already actuated), and the terminal outcome record is
         # where the prior run stopped — exactly what a post-CAS crash / partial close leaves.
@@ -443,7 +445,7 @@ class T2cProductionActuationTest(unittest.TestCase):
         )
         assert cas.applied, cas
         if seed_intent:
-            self._seed_redrive_intent()
+            self._seed_redrive_intent(drain_ready_at=drain_ready_at)
         # The pinned slot is ALREADY closed (absent from the live inventory): the crash hit
         # between the close and the outcome record — the redrive re-actuates nothing.
         pin = ReleasePin(
@@ -492,6 +494,22 @@ class T2cProductionActuationTest(unittest.TestCase):
             (row2.lane_disposition, row2.process_release, row2.revision),
             (row.lane_disposition, row.process_release, row.revision),
         )
+
+    def test_a_redrive_inherits_the_original_drain_ready_start(self):
+        # Review j#87224 R5-F1: a crash-redrive measures time-to-drain from the ORIGINAL drain-ready
+        # start the fresh actuation persisted to its intent — not an empty start read before the
+        # redrive request resolved (which stamped 'unavailable').
+        from mozyo_bridge.core.state.lane_lifecycle_model import RELEASE_PARTIAL
+
+        self._hibernate_row_with_release(RELEASE_PARTIAL, drain_ready_at="2026-07-24T00:00:00+00:00")
+        report, _ = self._run_supervisor({})
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 1, outcome.hibernate_attempts)
+        redriven = next(a for a in outcome.hibernate_attempts if a["kind"] == "redriven")
+        # It inherited the intent's ORIGINAL start -> a completed status + a real latency (not null).
+        self.assertEqual(redriven["time_to_drain_status"], "completed")
+        self.assertIsNotNone(redriven["time_to_drain_ms"])
+        self.assertEqual(report.hibernate_time_to_drain_status, "completed")
 
     def test_a_released_row_is_terminal_and_never_redriven(self):
         # released is terminal: no redrive attempt, no store write, no provider read.
@@ -877,6 +895,19 @@ class T2cProductionActuationTest(unittest.TestCase):
             self.assertNotIn("redriven", kinds)
             self.assertNotIn("released", kinds)
             self.assertEqual(source.reads, [])  # never handed to the provider rail
+            # Review j#87224 R5-F2 + clarification j#87226: an unknown-RELEASE outcome is OUTCOME
+            # UNKNOWN, so its closed-enum time-to-drain status is ``uncertain`` (no trusted terminal
+            # end -> null latencies) — never ``pending`` and never the empty string outside the enum.
+            unknown = next(
+                a for a in outcome.hibernate_attempts if a["kind"] == "release_state_unknown"
+            )
+            self.assertIn(
+                unknown["time_to_drain_status"],
+                {"completed", "pending", "uncertain", "unavailable"},
+            )
+            self.assertEqual(unknown["time_to_drain_status"], "uncertain")  # outcome unknown
+            self.assertIsNone(unknown["time_to_drain_ms"])
+            self.assertIsNone(unknown["time_to_disposition_ms"])
 
     # ------------------------------------------------------------------ R5-F4
     def _run_leg_directly(self, *, renew, pages, runtime="awaiting_input", inventory=None):
@@ -945,7 +976,7 @@ class T2cProductionActuationTest(unittest.TestCase):
         self.assertEqual(self._lane_row(LANE).lane_disposition, "hibernated")
 
     # ------------------------------------------------------------------ R5-F2
-    def _hibernate_row_not_requested(self, *, seed_intent=True):
+    def _hibernate_row_not_requested(self, *, seed_intent=True, drain_ready_at=""):
         # The post-CAS crash window: the CAS landed (active -> hibernated) but the release was
         # NEVER opened (process_release stays not_requested). A real fresh actuation persisted its
         # intent pre-CAS, so this seeds the matching intent too.
@@ -957,7 +988,7 @@ class T2cProductionActuationTest(unittest.TestCase):
         )
         assert cas.applied, cas
         if seed_intent:
-            self._seed_redrive_intent()
+            self._seed_redrive_intent(drain_ready_at=drain_ready_at)
         return key
 
     def test_a_not_requested_crash_with_a_live_slot_is_redriven_to_released(self):
