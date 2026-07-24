@@ -34,18 +34,23 @@ ruling's conditions (j#86718):
 from __future__ import annotations
 
 import os
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+from mozyo_bridge.core.state.hibernate_redrive_intent import (
+    HibernateRedriveIntentError,
+    HibernateRedriveIntentStore,
+    RedriveIntent,
+)
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     BINDING_KIND_ISSUE,
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
     RELEASE_NOT_REQUESTED,
     RELEASE_RELEASED,
+    RELEASE_STATES,
 )
 from mozyo_bridge.core.state.lane_lifecycle_readonly import load_lane_lifecycle_readonly
 from mozyo_bridge.core.state.workflow_runtime_store import (
@@ -59,10 +64,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     RUNTIME_TURN_ENDED,
 )
 
-from ..domain.hibernate_actuation import ActionTimeObligations
+from ..domain.hibernate_actuation import ActionTimeObligations, order_candidates
 from ..domain.hibernate_basis_producer import (
     DogfoodReceipt,
-    PushObservation,
     current_dogfood_delegation,
 )
 from ..domain.hibernate_candidate import (
@@ -78,21 +82,34 @@ from ..domain.hibernate_evidence_marker import (
     HibernateEvidence,
     parse_hibernate_evidence,
 )
-from ..domain.hibernate_issuer_policy import (
-    CONFIG_RELPATH,
-    config_policy_pointer,
-    resolve_journal_issuer,
-)
+from ..domain.hibernate_issuer_policy import resolve_journal_issuer
 from ..domain.redmine_journal_source import RedmineJournalEntry, marker_fields_in_note
+from .hibernate_lane_topology import (
+    LaneTopologyObservation,
+    _full_sha,
+    committed_config_policy_pointer,
+    observe_branch_origin_head,
+    observe_lane_push,
+    observe_lane_topology,
+    observe_worktree_clean,
+    observe_worktree_head,
+    push_from_topology,
+    resolve_candidate_worktree,
+)
 from .hibernate_actuation_leg import (
+    ATTEMPT_LEASE_LOST,
+    ATTEMPT_RELEASE_STATE_UNKNOWN,
+    LEG_REASON_LEASE_LOST,
+    LEG_REASON_REDRIVE_INTENT_ABSENT,
+    LEG_REASON_REDRIVE_INTENT_MISMATCH,
+    HibernateAttempt,
     HibernatePassResult,
+    RedriveResult,
     run_hibernate_pass,
     run_hibernate_redrives,
 )
 from .hibernate_candidate_assembler import AssemblyRequest, HibernateCandidateAssembler
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-    derive_lane_workspace_token,
-)
+from .sublane_process_release import unit_slots
 from .sublane_hibernate import HibernateRequest, LiveSublaneHibernateOps, SublaneHibernateUseCase
 from .sublane_hibernate_assertions import HibernateAssertions
 
@@ -128,32 +145,7 @@ _UNRESOLVED_CALLBACK_STATES = (
 RUNTIME_NOT_WORKING = frozenset({RUNTIME_AWAITING_INPUT, RUNTIME_TURN_ENDED})
 RUNTIME_NO_PENDING_PROMPT = frozenset({RUNTIME_AWAITING_INPUT, RUNTIME_TURN_ENDED})
 
-_HEX = frozenset("0123456789abcdef")
-
 EntriesReader = Callable[[str], Optional[Sequence[RedmineJournalEntry]]]
-
-
-def _full_sha(value: str) -> bool:
-    return len(value) == 40 and set(value) <= _HEX
-
-
-def committed_config_policy_pointer(repo_root: Path) -> str:
-    """The Fork A policy pointer from the COMMITTED config blob at HEAD, or ``""`` (fail-closed)."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", f"HEAD:{CONFIG_RELPATH}"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    blob = proc.stdout.strip()
-    if proc.returncode != 0 or not _full_sha(blob):
-        return ""
-    return config_policy_pointer(blob)
-
-
 
 
 def _park_evidences(notes: str) -> "list[HibernateEvidence]":
@@ -261,20 +253,46 @@ def read_dogfood_receipts(
     }
 
 
-_TERMINAL_RELEASE_STATES = frozenset({RELEASE_RELEASED, RELEASE_NOT_REQUESTED})
+@dataclass(frozen=True)
+class RedriveEnumeration:
+    """The hibernated-row triage for one workspace pass (review j#86776 R5-F2 / R5-F5).
+
+    ``redrives`` are the rows to finish through the public ``already_hibernated`` path;
+    ``unknown_release`` are rows whose ``process_release`` is not a canonical token — a typed
+    uncertain state the wiring refuses to hand the release rail (R5-F5), never a redrive.
+    """
+
+    redrives: tuple
+    unknown_release: tuple
 
 
-def enumerate_hibernated_redrives(rows: Sequence[object], workspace_id: str) -> tuple:
-    """Issue-lane rows whose hibernate release is still UNRESOLVED (review j#86757 R4-F2).
+def enumerate_hibernated_redrives(
+    rows: Sequence[object],
+    workspace_id: str,
+    *,
+    live_slot_fn: Optional[Callable[[object], Optional[bool]]] = None,
+) -> RedriveEnumeration:
+    """Triage hibernated issue-lane rows into redrive debt vs uncertain state (R4-F2 / R5-F2/F5).
 
     A partial or crashed prior actuation leaves ``lane_disposition=hibernated`` with a
-    ``process_release`` short of a terminal state — a row the ACTIVE-only enumeration would
-    otherwise skip forever, stranding live processes behind a hibernated row until a manual
-    sweep. ``released`` / ``not_requested`` are terminal and never enumerated; every other
-    value (``requested``, ``partial``, or an unknown token) is unresolved release debt and
-    fails toward the typed redrive, where the public use case's own gates decide.
+    ``process_release`` short of ``released`` — a row the ACTIVE-only enumeration would otherwise
+    skip forever, stranding live processes behind a hibernated row until a manual sweep. The
+    triage, per canonical release token:
+
+    * ``released`` — terminal (the generation finished); never enumerated.
+    * ``requested`` / ``partial`` — unresolved release debt; a redrive.
+    * ``not_requested`` (review j#86776 R5-F2) — the crash landed the CAS but never opened the
+      release, so the lane's slots may still be live. Enumerated as debt ONLY when the lane still
+      has a live managed slot, OR the inventory is unreadable (fail-closed via ``live_slot_fn``
+      returning ``None`` — or no ``live_slot_fn`` supplied). A CONFIRMED-empty inventory
+      (``live_slot_fn`` -> ``False``) is terminal: the processes are already gone, there is no
+      release to finish, and re-opening one every pass would be a false mutation.
+    * any other token (review j#86776 R5-F5) — a non-canonical / uncertain ``process_release``.
+      NEVER a redrive (the public rail's else-branch would falsely report it ``released``); it is
+      returned as ``unknown_release`` for a typed uncertain block (zero execute, zero mutation).
     """
-    debts = []
+    redrives = []
+    unknown = []
     for row in rows or ():
         if getattr(row, "binding_kind", "") != BINDING_KIND_ISSUE:
             continue
@@ -285,10 +303,63 @@ def enumerate_hibernated_redrives(rows: Sequence[object], workspace_id: str) -> 
         if not str(getattr(row, "issue_id", "") or "").strip():
             continue
         release = str(getattr(row, "process_release", "") or "").strip()
-        if release in _TERMINAL_RELEASE_STATES:
+        if release == RELEASE_RELEASED:
+            continue  # terminal for the generation
+        if release == RELEASE_NOT_REQUESTED:
+            live = live_slot_fn(row) if live_slot_fn is not None else None
+            if live is False:
+                continue  # confirmed no live slot -> terminal (processes already gone)
+            redrives.append(row)  # live slot present, or unreadable inventory (fail-closed)
             continue
-        debts.append(row)
-    return tuple(debts)
+        if release in RELEASE_STATES:  # requested / partial
+            redrives.append(row)
+            continue
+        unknown.append(row)  # non-canonical token -> typed uncertain (R5-F5)
+    return RedriveEnumeration(redrives=tuple(redrives), unknown_release=tuple(unknown))
+
+
+def combine_hibernate_pass_results(
+    *,
+    unknown_attempts: tuple,
+    redrive_result: RedriveResult,
+    fresh_pass: Optional[HibernatePassResult],
+    deferred_candidates: Sequence[HibernateCandidate],
+) -> HibernatePassResult:
+    """Fold the redrive prelude, the (optional) fresh pass, and the R5-F5 uncertain attempts.
+
+    Review j#86776 R5-F4: when the redrive prelude STOPPED (a lease lost at renew or at the
+    commit boundary), the fresh pass is NOT run at all — ``fresh_pass`` is ``None`` and every
+    fresh candidate becomes a typed ``lease_lost`` attempt (zero use-case call, zero provider
+    read, zero further mutation): a taken-over runner must not double-actuate. Otherwise the two
+    passes' attempts / mutations add up as before. The R5-F5 ``unknown_attempts`` are
+    informational — surfaced so an uncertain row is never silently dropped, but consuming
+    nothing (they neither count as mutations nor mark the pass non-empty on their own... though a
+    non-empty attempt list is a non-empty pass).
+    """
+    if fresh_pass is None:
+        fresh_attempts = tuple(
+            HibernateAttempt(
+                candidate.issue_id,
+                candidate.anchor.lane_id,
+                ATTEMPT_LEASE_LOST,
+                LEG_REASON_LEASE_LOST,
+            )
+            for candidate in order_candidates(deferred_candidates)
+        )
+        return HibernatePassResult(
+            attempts=unknown_attempts + redrive_result.attempts + fresh_attempts,
+            mutations=redrive_result.mutations,
+            empty_pass=False,
+        )
+    return HibernatePassResult(
+        attempts=unknown_attempts + redrive_result.attempts + fresh_pass.attempts,
+        mutations=redrive_result.mutations + fresh_pass.mutations,
+        empty_pass=(
+            fresh_pass.empty_pass
+            and not redrive_result.attempts
+            and not unknown_attempts
+        ),
+    )
 
 
 def unresolved_callback_debt(outbox, workspace_id: str) -> Optional[int]:
@@ -306,218 +377,6 @@ def unresolved_callback_debt(outbox, workspace_id: str) -> Optional[int]:
     return sum(
         1 for row in rows if getattr(row.key, "workspace_id", "") == workspace_id
     )
-
-
-@dataclass(frozen=True)
-class LaneTopologyObservation:
-    """One lane worktree's SINGLE fresh Git topology fact (review j#86757 R4-F1).
-
-    Every observation of the same physical worktree — its canonical path, its ACTUAL
-    checked-out branch, its local ``HEAD`` and that branch's origin head — is derived from
-    this one typed capture, never from separate re-reads that could describe two different
-    states of the same entity. ``origin_head`` is ``""`` when the branch is not observable
-    on origin (absent ref / unreadable remote); every other field is always solid.
-    """
-
-    worktree: Path
-    branch: str
-    local_head: str
-    origin_head: str = ""
-
-    @property
-    def pushed(self) -> bool:
-        """The worktree's CURRENT local HEAD is exactly the origin head of its branch.
-
-        This — not the mere existence of an origin branch — is the proof the lane's work
-        is origin-reachable (review j#86757 R4-F1): a clean local commit ahead of origin,
-        a behind checkout, or a diverged branch all read ``False`` (fail-closed).
-        """
-        return bool(self.origin_head) and self.local_head == self.origin_head
-
-
-def _git_lines(args, *, cwd: Path) -> Optional[list[str]]:
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=60
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.splitlines()
-
-
-def observe_worktree_head(worktree: Path) -> "Optional[tuple[str, str]]":
-    """The worktree's CURRENT ``(local HEAD sha, checked-out branch)``, or ``None``.
-
-    The commit-point re-read of the same two Git facts the topology observation captured —
-    a detached HEAD, a malformed sha, or an unreadable worktree resolves nothing (fail-closed).
-    """
-    head_lines = _git_lines(["rev-parse", "HEAD"], cwd=worktree)
-    if head_lines is None or len(head_lines) != 1 or not _full_sha(head_lines[0].strip()):
-        return None
-    branch_lines = _git_lines(["symbolic-ref", "--quiet", "HEAD"], cwd=worktree)
-    prefix = "refs/heads/"
-    if (
-        branch_lines is None
-        or len(branch_lines) != 1
-        or not branch_lines[0].strip().startswith(prefix)
-    ):
-        return None  # detached HEAD carries no branch authority (fail-closed)
-    return head_lines[0].strip(), branch_lines[0].strip()[len(prefix):]
-
-
-def observe_lane_topology(
-    repo_root: Path, rows, *, workspace: str, lane: str, generation: int
-) -> Optional[LaneTopologyObservation]:
-    """The lane's single typed topology observation from FRESH Git facts, or ``None``.
-
-    Review j#86739 R3-F2: ``lane_label`` and ``branch`` are INDEPENDENT caller-supplied fields
-    of the public create contract, so the lane id is never inferred to be the branch. The join
-    key is the lifecycle row's authoritative ``worktree_identity`` token alone: among the
-    workspace repo's own ``git worktree list --porcelain`` entries, exactly one path must
-    RE-DERIVE that token, and the branch is THAT entry's current Git fact — a detached HEAD,
-    a missing row/token, a pruned path, or a non-unique match resolves nothing.
-
-    Review j#86757 R4-F1: the observation also captures the worktree's local ``HEAD`` (required,
-    fail-closed) and the branch's origin head (best-effort, ``""`` when unobservable), so pushed
-    means ``local HEAD == origin head`` — never the mere existence of an origin ref.
-    """
-    row = next(
-        (
-            record
-            for record in rows or ()
-            if getattr(record, "repo_workspace_id", "") == workspace
-            and getattr(record, "lane_id", "") == lane
-            and int(getattr(record, "lane_generation", 0) or 0) == generation
-        ),
-        None,
-    )
-    if row is None:
-        return None
-    token = str(getattr(row, "worktree_identity", "") or "").strip()
-    if not token:
-        return None
-    listing = _git_lines(["worktree", "list", "--porcelain"], cwd=repo_root)
-    if listing is None:
-        return None
-    entries: list[tuple[str, str]] = []
-    current_path: Optional[str] = None
-    current_branch = ""
-    for line in listing + [""]:
-        line = line.strip()
-        if line.startswith("worktree "):
-            current_path = line[len("worktree "):].strip()
-            current_branch = ""
-        elif line.startswith("branch ") and current_path:
-            current_branch = line[len("branch "):].strip()
-        elif not line and current_path:
-            entries.append((current_path, current_branch))
-            current_path, current_branch = None, ""
-    matches: list[tuple[Path, str]] = []
-    for path_text, branch_ref in entries:
-        try:
-            resolved = Path(path_text).expanduser().resolve()
-        except OSError:
-            continue
-        if not resolved.is_dir():
-            continue
-        if derive_lane_workspace_token(str(resolved)) == token:
-            matches.append((resolved, branch_ref))
-    if len(matches) != 1:
-        return None
-    resolved, branch_ref = matches[0]
-    prefix = "refs/heads/"
-    if not branch_ref.startswith(prefix):
-        return None  # detached HEAD carries no branch authority (fail-closed)
-    branch = branch_ref[len(prefix):]
-    current = observe_worktree_head(resolved)
-    if current is None or current[1] != branch:
-        # The worktree's own HEAD must corroborate the SAME topology fact — an unreadable
-        # local HEAD, or a branch that moved between the two reads, observes nothing.
-        return None
-    local_head = current[0]
-    origin_head = ""
-    remote = _git_lines(["ls-remote", "origin", f"refs/heads/{branch}"], cwd=repo_root)
-    if remote is not None:
-        refs = [line for line in remote if line.strip()]
-        if len(refs) == 1:
-            sha = refs[0].split()[0].strip()
-            if _full_sha(sha):
-                origin_head = sha
-    return LaneTopologyObservation(
-        worktree=resolved, branch=branch, local_head=local_head, origin_head=origin_head
-    )
-
-
-def observe_lane_push(
-    repo_root: Path, rows, selected: SelectedLane
-) -> Optional[PushObservation]:
-    """The action-time observation of the lane's ACTUAL branch head, worktree-bound.
-
-    The branch comes from the same typed topology observation the worktree binding uses
-    (:func:`observe_lane_topology`) — never inferred from the lane id (review j#86739 R3-F2)
-    — and the head binds ONLY when the worktree's current local ``HEAD`` equals that branch's
-    origin head (review j#86757 R4-F1): a clean local commit ahead of origin, a behind or
-    diverged checkout, a detached worktree, or an absent origin ref binds no head — the lane
-    is a typed ``head_unbound`` non-candidate.
-    """
-    observation = observe_lane_topology(
-        repo_root,
-        rows,
-        workspace=selected.repo_workspace_id,
-        lane=selected.lane_id,
-        generation=selected.lane_generation,
-    )
-    return push_from_topology(observation, selected)
-
-
-def push_from_topology(
-    observation: Optional[LaneTopologyObservation], selected: SelectedLane
-) -> Optional[PushObservation]:
-    """The push observation derived from an already-taken topology observation."""
-    if observation is None or not observation.pushed:
-        return None
-    return PushObservation(
-        workspace=selected.repo_workspace_id,
-        lane=selected.lane_id,
-        lane_generation=selected.lane_generation,
-        head=observation.origin_head,
-        reachable=True,
-    )
-
-
-def resolve_candidate_worktree(
-    workspace_root: Path, rows, candidate: HibernateCandidate
-) -> Optional[Path]:
-    """The candidate lane's canonical worktree via the same typed topology join (or ``None``)."""
-    anchor = candidate.anchor
-    observation = observe_lane_topology(
-        workspace_root,
-        rows,
-        workspace=anchor.repo_workspace_id,
-        lane=anchor.lane_id,
-        generation=anchor.lane_generation,
-    )
-    return None if observation is None else observation.worktree
-
-
-def observe_worktree_clean(worktree: Optional[Path]) -> Optional[bool]:
-    """Whether the candidate-bound worktree is clean (``None`` = unresolvable/unreadable)."""
-    if worktree is None:
-        return None
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(worktree), "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.strip() == ""
 
 
 @dataclass(frozen=True)
@@ -580,6 +439,7 @@ def build_hibernate_leg_fn(
     runtime_fn: Optional[Callable[[str, str], str]] = None,
     worktree_clean_fn: Optional[Callable[[HibernateCandidate], Optional[bool]]] = None,
     projection_fn: Optional[Callable[[HibernateCandidate], Mapping[str, bool]]] = None,
+    inventory_fn: Optional[Callable[[], "tuple[Sequence[Mapping[str, object]], bool]"]] = None,
 ):
     """Build the production ``hibernate_leg_fn`` for :func:`build_supervisor`.
 
@@ -587,7 +447,10 @@ def build_hibernate_leg_fn(
     ``outbox`` its shared callback outbox. The optional observer ports default to the
     fail-closed concretes: no runtime observer -> blank runtime -> ``False`` flags; no worktree
     resolver -> ``False``; no projection -> the projection four stay ``False`` (see
-    :class:`ObligationSources`).
+    :class:`ObligationSources`). ``inventory_fn`` supplies the live herdr inventory
+    ``(rows, readable)`` the R5-F2 not_requested-redrive triage reads for live-slot presence;
+    the default reads it once per pass from the live herdr binary (an unreadable inventory is
+    fail-closed — a not_requested row is still enumerated as debt).
     """
 
     def leg(ws, renew, budget=None) -> HibernatePassResult:
@@ -603,6 +466,21 @@ def build_hibernate_leg_fn(
         # The provider-read budget is SHARED across the whole supervisor pass when the sweep
         # supplies it (review j#86734 R2-F3) — never reset per workspace.
         shared = budget if budget is not None else {"reads": 0}
+
+        # The live herdr inventory, read at most ONCE per workspace pass (review j#86776 R5-F2):
+        # the not_requested-redrive triage's live-slot check reads this snapshot. The default
+        # reads the live binary; an unreadable inventory is ``(rows, False)`` (fail-closed).
+        inventory_box: dict = {}
+
+        def inventory_snapshot() -> "tuple[Sequence[Mapping[str, object]], bool]":
+            if "inv" not in inventory_box:
+                if inventory_fn is not None:
+                    inventory_box["inv"] = inventory_fn()
+                else:
+                    inventory_box["inv"] = LiveSublaneHibernateOps(
+                        repo_root=repo_root, env=dict(os.environ)
+                    ).read_inventory()
+            return inventory_box["inv"]
 
         def make_entries_fn():
             cache: dict[str, Optional[tuple[RedmineJournalEntry, ...]]] = {}
@@ -744,22 +622,34 @@ def build_hibernate_leg_fn(
         def bound_use_case(
             observation: LaneTopologyObservation, *, head_fence: bool
         ) -> SublaneHibernateUseCase:
-            # Commit-point guard (review j#86757 R4-F1): the use case's ``lease_guard`` fires
-            # immediately before the irreversible CAS / redrive close, so composing the
-            # expected-head fence here closes the whole observation -> commit window — a clean
-            # rebranch or HEAD switch after the fresh observation refuses with zero transition
-            # / zero close, through the same commit-point-refusal channel as a lost lease.
-            # The redrive path (``head_fence=False``) keeps the lease-only guard: it resumes a
-            # STORED action authority (preservation, not head-bound evidence), and its live
-            # mutation safety is the use case's own T1 boundary fence.
+            # Commit-point guard (review j#86757 R4-F1 / review j#86776 R5-F1): the use case's
+            # ``lease_guard`` fires immediately before the irreversible CAS / redrive close, so
+            # composing the expected-head fence here closes the whole observation -> commit
+            # window. A clean rebranch or HEAD switch after the fresh observation refuses with
+            # zero transition / zero close, through the same commit-point-refusal channel as a
+            # lost lease. R5-F1: the guard also re-reads the branch's CURRENT origin head — the
+            # observation bound the candidate head from origin (``observation.pushed`` required
+            # ``local_head == origin_head``), so an origin advance / force-push / ref delete
+            # AFTER the fresh observation drifts the evidence head off origin even while the
+            # local worktree is untouched. Requiring ``local HEAD == current origin head ==
+            # observation.origin_head`` (and the local (head, branch) unchanged) binds the CAS to
+            # the exact still-origin-reachable evidence head. The redrive path
+            # (``head_fence=False``) keeps the lease-only guard: it resumes a STORED action
+            # authority (preservation, not head-bound evidence), and its live mutation safety is
+            # the use case's own T1 boundary fence.
             def commit_guard() -> bool:
                 if not renew():
                     return False
                 if not head_fence:
                     return True
-                return observe_worktree_head(observation.worktree) == (
+                if observe_worktree_head(observation.worktree) != (
                     observation.local_head,
                     observation.branch,
+                ):
+                    return False
+                return (
+                    observe_branch_origin_head(observation.worktree, observation.branch)
+                    == observation.origin_head
                 )
 
             return SublaneHibernateUseCase(
@@ -779,10 +669,68 @@ def build_hibernate_leg_fn(
                 return None
             return bound_use_case(observation, head_fence=True)
 
-        # Crash-redrive prelude (review j#86757 R4-F2): finish a prior pass's interrupted
-        # release BEFORE any fresh mutation — convergence precedes new work, under the same
-        # pass-wide one-mutation budget.
-        redrives = enumerate_hibernated_redrives(fresh_rows() or (), str(ws.workspace_id))
+        # The durable redrive-intent store (review j#86776 R5-F3): the fresh actuation records a
+        # typed intent pre-CAS; the redrive reconstructs the row's PROVEN basis from it (never
+        # fabricated), and reading it is a home-scoped read (the redrive touches the provider 0
+        # times).
+        intent_store = HibernateRedriveIntentStore(home=home)
+
+        def record_intent(candidate: HibernateCandidate, fields) -> None:
+            # Persist the fresh actuation's derived intent immediately before its CAS. Best-effort
+            # (review j#86776 R5-F3): a persist failure never blocks the fresh actuation — a later
+            # redrive with no intent simply fails closed (zero-close), never mis-acts.
+            try:
+                intent_store.record(
+                    RedriveIntent(
+                        workspace_id=candidate.anchor.repo_workspace_id,
+                        lane_id=candidate.anchor.lane_id,
+                        lane_generation=candidate.anchor.lane_generation,
+                        issue_id=candidate.issue_id,
+                        decision_journal=fields.journal,
+                        basis=candidate.basis,
+                        action_id=f"hibernate:{candidate.anchor.lane_id}",
+                        assertion_flags=fields.assertion_flags,
+                    )
+                )
+            except HibernateRedriveIntentError:
+                pass
+
+        # Crash-redrive prelude (review j#86757 R4-F2 / review j#86776 R5-F2/F3/F5): finish a
+        # prior pass's interrupted release BEFORE any fresh mutation — convergence precedes new
+        # work, under the same pass-wide one-mutation budget.
+        def live_slot(row) -> Optional[bool]:
+            # Review j#86776 R5-F2: does the hibernated lane still have a live managed slot? A
+            # readable inventory yields True/False; an unreadable one yields ``None`` (fail-closed
+            # — the not_requested row is still enumerated as debt).
+            rows_inv, readable = inventory_snapshot()
+            if not readable:
+                return None
+            return bool(
+                unit_slots(
+                    rows_inv,
+                    str(getattr(row, "repo_workspace_id", "")),
+                    str(getattr(row, "lane_id", "")),
+                )
+            )
+
+        enumeration = enumerate_hibernated_redrives(
+            fresh_rows() or (), str(ws.workspace_id), live_slot_fn=live_slot
+        )
+        redrives = enumeration.redrives
+
+        # Review j#86776 R5-F5: a hibernated row whose ``process_release`` is a non-canonical
+        # token is an UNCERTAIN state — never driven (the public rail's else-branch would falsely
+        # report it released). A typed uncertain block: zero execute, zero mutation, and it does
+        # not consume the pass budget.
+        unknown_attempts = tuple(
+            HibernateAttempt(
+                str(getattr(row, "issue_id", "")),
+                str(getattr(row, "lane_id", "")),
+                ATTEMPT_RELEASE_STATE_UNKNOWN,
+                ATTEMPT_RELEASE_STATE_UNKNOWN,
+            )
+            for row in enumeration.unknown_release
+        )
 
         def redrive_use_case(row) -> Optional[SublaneHibernateUseCase]:
             observation = topology_fresh(
@@ -794,45 +742,59 @@ def build_hibernate_leg_fn(
                 return None
             return bound_use_case(observation, head_fence=False)
 
-        def redrive_request(row) -> HibernateRequest:
-            # The durable basis flags are TRANSCRIBED from the stored hibernated disposition:
-            # the fresh CAS only landed after proving them, and the row + its decision anchor
-            # is the immutable action authority the redrive resumes (never a fresh claim, never
-            # a rebind to another cycle's approval). The LIVE gates are re-observed action-time
-            # — a lane that has since started working, gained a pending prompt, owes a callback,
-            # or dirtied its worktree is a typed redrive block — and the use case's own T1
-            # boundary fence re-probes busy/composer/worktree immediately before the close.
+        def redrive_request(row) -> "HibernateRequest | str":
+            # Review j#86776 R5-F3: the redrive's DURABLE basis flags come from the persisted
+            # intent (never fabricated from the generic hibernated disposition), and only when an
+            # intent EXISTS and matches the row's issue / decision journal / action. An absent
+            # intent (dependency-park / manual / pre-R5 crash) or a mismatch is a typed zero-close
+            # (a reason STRING, which the leg records as ``redrive_blocked`` without touching the
+            # use case). The LIVE gates are re-observed action-time — a lane that has since started
+            # working, gained a pending prompt, owes a callback, or dirtied its worktree is a typed
+            # redrive block — and the use case's own T1 boundary fence re-probes busy/composer/
+            # worktree immediately before the close. Reading the intent is home-scoped; ZERO
+            # provider reads.
             workspace = str(getattr(row, "repo_workspace_id", ""))
             lane = str(getattr(row, "lane_id", ""))
+            generation = int(getattr(row, "lane_generation", 0) or 0)
+            issue = str(getattr(row, "issue_id", ""))
+            journal = str(getattr(row, "decision_journal", ""))
+            action_id = f"hibernate:{lane}"
+            try:
+                intent = intent_store.get(workspace, lane, generation)
+            except HibernateRedriveIntentError:
+                intent = None  # unreadable / corrupt intent -> no usable basis (fail-closed)
+            if intent is None:
+                return LEG_REASON_REDRIVE_INTENT_ABSENT
+            if not intent.matches_row(
+                issue_id=issue, decision_journal=journal, action_id=action_id
+            ):
+                return LEG_REASON_REDRIVE_INTENT_MISMATCH
             debt = outbox_pending(workspace)
             runtime = sources.runtime_fn(workspace, lane)
             settled = runtime in RUNTIME_NOT_WORKING
-            observation = topology_fresh(
-                workspace, lane, int(getattr(row, "lane_generation", 0) or 0)
-            )
+            observation = topology_fresh(workspace, lane, generation)
             clean = (
                 observation is not None
                 and observe_worktree_clean(observation.worktree) is True
             )
+            flags = dict(intent.assertion_flags)
+            # Re-observe the LIVE gates fresh; every other (durable) flag is transcribed from the
+            # intent the fresh CAS proved. A live gate must never be trusted from the stale intent.
+            flags["callbacks_drained"] = debt == 0
+            flags["no_pending_prompt"] = settled
+            flags["not_working"] = settled
+            flags["worktree_clean"] = clean
+            try:
+                assertions = HibernateAssertions(**flags)
+            except TypeError:
+                # A malformed / partial stored flag set is not a usable basis -> zero-close.
+                return LEG_REASON_REDRIVE_INTENT_MISMATCH
             return HibernateRequest(
-                issue=str(getattr(row, "issue_id", "")),
+                issue=issue,
                 lane=lane,
-                journal=str(getattr(row, "decision_journal", "")),
-                assertions=HibernateAssertions(
-                    review_approved=True,
-                    staging_integrated=True,
-                    required_ci_green=True,
-                    dogfood_delegated=True,
-                    commits_pushed=True,
-                    no_review_pending=True,
-                    no_integration_pending=True,
-                    callbacks_drained=debt == 0,
-                    no_pending_prompt=settled,
-                    not_working=settled,
-                    worktree_clean=clean,
-                    boundary_recorded=False,
-                ),
-                expected_lane_generation=str(int(getattr(row, "lane_generation", 0) or 0)),
+                journal=journal,
+                assertions=assertions,
+                expected_lane_generation=str(generation),
                 expected_revision="",
             )
 
@@ -843,6 +805,17 @@ def build_hibernate_leg_fn(
             lease_renew_fn=renew,
         )
 
+        # Review j#86776 R5-F4: a redrive that lost its lease STOPS the whole pass — the fresh
+        # pass is not run (its use cases would double-actuate under a taken-over lease), and every
+        # fresh candidate is a typed lease_lost with zero use-case call / zero provider read.
+        if redrive_result.stopped:
+            return combine_hibernate_pass_results(
+                unknown_attempts=unknown_attempts,
+                redrive_result=redrive_result,
+                fresh_pass=None,
+                deferred_candidates=candidates,
+            )
+
         fresh_pass = run_hibernate_pass(
             candidates,
             refresh_fn=seams.refresh_fn,
@@ -850,12 +823,14 @@ def build_hibernate_leg_fn(
             journal_fn=seams.journal_fn,
             use_case_fn=use_case_for,
             lease_renew_fn=renew,
+            record_intent_fn=record_intent,
             budget_consumed=redrive_result.mutations > 0,
         )
-        return HibernatePassResult(
-            attempts=redrive_result.attempts + fresh_pass.attempts,
-            mutations=redrive_result.mutations + fresh_pass.mutations,
-            empty_pass=fresh_pass.empty_pass and not redrive_result.attempts,
+        return combine_hibernate_pass_results(
+            unknown_attempts=unknown_attempts,
+            redrive_result=redrive_result,
+            fresh_pass=fresh_pass,
+            deferred_candidates=candidates,
         )
 
     return leg
@@ -889,8 +864,11 @@ __all__ = [
     "committed_config_policy_pointer",
     "enumerate_requests",
     "enumerate_hibernated_redrives",
+    "RedriveEnumeration",
+    "combine_hibernate_pass_results",
     "LaneTopologyObservation",
     "observe_worktree_head",
+    "observe_branch_origin_head",
     "push_from_topology",
     "observe_lane_push",
     "observe_lane_topology",

@@ -42,6 +42,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SUPERVISION_HIBERNATE,
 )
 
+ROOT = Path(__file__).resolve().parents[2]
+
 ISSUE = "600"
 RELEASE_ISSUE = "900"
 LANE = "lane_t2c_1"
@@ -182,7 +184,7 @@ class T2cProductionActuationTest(unittest.TestCase):
                       f":source_issue={ISSUE}:head={self.head}]"),
         )
 
-    def _run_supervisor(self, pages, on_read=None):
+    def _run_supervisor(self, pages, on_read=None, herdr_binary=None, extra_env=None):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             workspace_callback_supervisor as sup_mod,
         )
@@ -196,7 +198,9 @@ class T2cProductionActuationTest(unittest.TestCase):
             if not key.startswith("MOZYO") and key not in ("TMUX", "TMUX_PANE")
         }
         env["MOZYO_BRIDGE_HOME"] = str(self.home)
-        env["MOZYO_HERDR_BINARY"] = str(self.herdr)
+        env["MOZYO_HERDR_BINARY"] = str(herdr_binary or self.herdr)
+        for key, value in (extra_env or {}).items():
+            env[key] = value
         with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(sup_mod, "default_redmine_source", lambda ws, home=None: source), \
                 mock.patch.object(
@@ -206,6 +210,35 @@ class T2cProductionActuationTest(unittest.TestCase):
             supervisor = sup_mod.build_supervisor(holder="t2c-test", home=self.home)
             report = supervisor.run_once(mode=SUPERVISION_HIBERNATE)
         return report, source
+
+    def _stateful_herdr_with_live_slot(self, *, lane=LANE, role="claude"):
+        # A CANONICAL stateful herdr binary (the smoke ``fake_herdr_cli.py`` adapter over
+        # ``FakeHerdr``) carrying ONE live managed slot for the lane — enough for the release rail
+        # to pin it, read it (idle -> quiescent), and close its pane. Returns (binary, state_env).
+        import json
+        from tests.support.herdr_fake import FakeHerdr
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            encode_assigned_name,
+        )
+
+        # A rendered composer prompt with an EMPTY body ("> " with no user input) reads as a
+        # readable, NON-pending composer (an empty string reads as *unreadable* and fails closed).
+        fake = FakeHerdr(read_text="> ")
+        ws_id = fake.seed_workspace(cwd=str(self.repo))
+        fake.seed_agent(
+            encode_assigned_name(self.workspace_id, role, lane),
+            workspace_id=ws_id,
+            status="idle",  # -> awaiting_input (quiescent, safe to release over)
+        )
+        state_path = self.dir / f"herdr-state-{lane}.json"
+        state_path.write_text(json.dumps(fake.to_state()), encoding="utf-8")
+        adapter = ROOT / "smoke" / "support" / "fake_herdr_cli.py"
+        binary = self.dir / "stateful-herdr"
+        binary.write_text(
+            f'#!/bin/sh\nexec python3 "{adapter}" "$@"\n', encoding="utf-8"
+        )
+        binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+        return binary, {"MOZYO_FAKE_HERDR_STATE": str(state_path)}
 
     def test_a_fully_evidenced_early_lane_hibernates_exactly_once(self):
         pages = {ISSUE: self._early_page(), RELEASE_ISSUE: self._receipt_page()}
@@ -315,7 +348,46 @@ class T2cProductionActuationTest(unittest.TestCase):
         self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
         self.assertEqual(self._lane_row().lane_disposition, "active")
 
-    def _hibernate_row_with_release(self, target):
+    def _seed_redrive_intent(self, *, decision_journal="84999", lane=LANE, issue=ISSUE):
+        # Review j#86776 R5-F3: a hibernated crash-window row that came from a REAL fresh
+        # actuation carries a durable redrive intent persisted pre-CAS. The store-level crash
+        # fixtures below model that by seeding the matching intent (the early-hibernate durable
+        # flags the fresh actuation would have derived) — without it the redrive is a typed
+        # zero-close (redrive_intent_absent), which the intent-gating tests pin separately.
+        from mozyo_bridge.core.state.hibernate_redrive_intent import (
+            HibernateRedriveIntentStore,
+            RedriveIntent,
+        )
+
+        HibernateRedriveIntentStore(home=self.home).record(
+            RedriveIntent(
+                workspace_id=self.workspace_id,
+                lane_id=lane,
+                lane_generation=1,
+                issue_id=issue,
+                decision_journal=decision_journal,
+                basis="early_hibernate",
+                action_id=f"hibernate:{lane}",
+                assertion_flags={
+                    "explicitly_parked": False,
+                    "review_approved": True,
+                    "staging_integrated": True,
+                    "required_ci_green": True,
+                    "dogfood_delegated": True,
+                    "commits_pushed": True,
+                    "callbacks_drained": True,
+                    "no_review_pending": True,
+                    "no_owner_approval_pending": True,
+                    "no_integration_pending": True,
+                    "no_pending_prompt": True,
+                    "not_working": True,
+                    "worktree_clean": True,
+                    "boundary_recorded": False,
+                },
+            )
+        )
+
+    def _hibernate_row_with_release(self, target, *, seed_intent=True):
         # The crash window through the CANONICAL store rail: the fresh CAS landed, the release
         # generation opened (its pins already actuated), and the terminal outcome record is
         # where the prior run stopped — exactly what a post-CAS crash / partial close leaves.
@@ -331,6 +403,8 @@ class T2cProductionActuationTest(unittest.TestCase):
             target="hibernated", decision=decision,
         )
         assert cas.applied, cas
+        if seed_intent:
+            self._seed_redrive_intent()
         # The pinned slot is ALREADY closed (absent from the live inventory): the crash hit
         # between the close and the outcome record — the redrive re-actuates nothing.
         pin = ReleasePin(
@@ -394,22 +468,19 @@ class T2cProductionActuationTest(unittest.TestCase):
         after = self._lane_row()
         self.assertEqual(after.revision, before.revision)
 
-    def test_a_redrive_consumes_the_pass_budget_before_any_fresh_mutation(self):
-        # Review j#86757 R4-F2 condition 4: the redrive's process-close side effect IS the
-        # pass's one mutation — a second, fully-evidenced fresh lane defers to the next pass.
-        from mozyo_bridge.core.state.lane_lifecycle_model import RELEASE_PARTIAL
-
-        self._hibernate_row_with_release(RELEASE_PARTIAL)
-        lane2 = "lane_t2c_2"
-        wt2 = self.dir / "wt-lane2"
-        _git(self.repo, "worktree", "add", "-q", str(wt2), "-b", "feature/second")
-        _git(self.repo, "push", "-q", "origin", "feature/second")
+    def _add_second_early_lane(
+        self, *, lane2="lane_t2c_2", issue2="601", branch2="feature/second"
+    ):
+        # A SECOND fully-evidenced early lane (its own real worktree + origin branch, declared
+        # active), plus its evidence page + receipt. Returns (lane2, issue2, page2, receipt2).
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
             derive_lane_workspace_token,
         )
 
+        wt2 = self.dir / f"wt-{lane2}"
+        _git(self.repo, "worktree", "add", "-q", str(wt2), "-b", branch2)
+        _git(self.repo, "push", "-q", "origin", branch2)
         token2 = derive_lane_workspace_token(str(wt2.resolve()))
-        issue2 = "601"
         self.store.declare_active(
             LaneLifecycleKey(repo_workspace_id=self.workspace_id, lane_id=lane2),
             decision=DecisionPointer(source="redmine", issue_id=issue2, journal_id="84999"),
@@ -457,6 +528,15 @@ class T2cProductionActuationTest(unittest.TestCase):
             ("90001", "receipt\n[mozyo:workflow-event:gate=dogfood_receipt"
                       f":source_issue={issue2}:head={head2}]"),
         )
+        return lane2, issue2, page2, receipt2
+
+    def test_a_redrive_consumes_the_pass_budget_before_any_fresh_mutation(self):
+        # Review j#86757 R4-F2 condition 4: the redrive's process-close side effect IS the
+        # pass's one mutation — a second, fully-evidenced fresh lane defers to the next pass.
+        from mozyo_bridge.core.state.lane_lifecycle_model import RELEASE_PARTIAL
+
+        self._hibernate_row_with_release(RELEASE_PARTIAL)
+        lane2, issue2, page2, receipt2 = self._add_second_early_lane()
         report, _source = self._run_supervisor(
             {issue2: page2, RELEASE_ISSUE: receipt2}
         )
@@ -632,6 +712,255 @@ class T2cProductionActuationTest(unittest.TestCase):
         self.assertTrue(outcome.hibernate_ran)
         self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
         self.assertEqual(source.reads, [])  # the provider was never touched
+
+
+    # ------------------------------------------------------------------ R5-F1
+    def test_an_origin_advance_after_the_fresh_observation_actuates_nothing(self):
+        # Review j#86776 R5-F1: origin/<branch> is force-advanced AFTER the fresh topology
+        # observation while the worktree's local HEAD is UNTOUCHED — the local (head, branch)
+        # guard passes, so ONLY the commit-point origin re-read catches the drifted evidence
+        # head. Zero transition / zero close. (Against the pre-R5 local-only guard this hibernates
+        # — the mutation probe.)
+        fired = []
+
+        def hook():
+            if fired:
+                return
+            fired.append(1)
+            _git(self.repo, "commit", "--allow-empty", "-qm", "origin-advance")
+            _git(self.repo, "push", "-q", "-f", "origin", f"main:{self.branch}")
+
+        pages = {ISSUE: self._early_page(), RELEASE_ISSUE: self._receipt_page()}
+        report = self._run_supervisor_with_runtime_hook(pages, hook)
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        self.assertNotIn(
+            "actuated", [attempt["kind"] for attempt in outcome.hibernate_attempts]
+        )
+        self.assertEqual(self._lane_row().lane_disposition, "active")
+
+    def test_an_origin_ref_delete_after_the_fresh_observation_actuates_nothing(self):
+        # Review j#86776 R5-F1: the origin ref is DELETED after the fresh observation (local HEAD
+        # untouched) — the evidence head is no longer origin-reachable at the commit point.
+        fired = []
+
+        def hook():
+            if fired:
+                return
+            fired.append(1)
+            _git(self.repo, "push", "-q", "origin", f":{self.branch}")
+
+        pages = {ISSUE: self._early_page(), RELEASE_ISSUE: self._receipt_page()}
+        report = self._run_supervisor_with_runtime_hook(pages, hook)
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        self.assertEqual(self._lane_row().lane_disposition, "active")
+
+    # ------------------------------------------------------------------ R5-F3
+    def test_a_redrive_with_no_durable_intent_is_a_typed_zero_close(self):
+        # Review j#86776 R5-F3: a hibernated row with an unresolved release but NO durable intent
+        # (a dependency-park / manual / pre-R5 crash row) is a typed zero-close — the redrive
+        # never fabricates the basis the row did not record. Zero mutation, zero store write, zero
+        # provider read; the release state is left exactly as it was.
+        from mozyo_bridge.core.state.lane_lifecycle_model import RELEASE_PARTIAL
+
+        self._hibernate_row_with_release(RELEASE_PARTIAL, seed_intent=False)
+        before = self._lane_row()
+        report, source = self._run_supervisor({})
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        kinds = [attempt["kind"] for attempt in outcome.hibernate_attempts]
+        self.assertIn("redrive_blocked", kinds)
+        reasons = [attempt["reason"] for attempt in outcome.hibernate_attempts]
+        self.assertIn("redrive_intent_absent", reasons)
+        self.assertEqual(source.reads, [])
+        after = self._lane_row()
+        self.assertEqual(
+            (after.lane_disposition, after.process_release, after.revision),
+            (before.lane_disposition, before.process_release, before.revision),
+        )
+
+    def test_a_redrive_with_a_foreign_decision_intent_is_a_typed_zero_close(self):
+        # Review j#86776 R5-F3: an intent that describes a DIFFERENT cycle (a foreign decision
+        # journal) than the row does not authorise this redrive — a typed mismatch zero-close.
+        from mozyo_bridge.core.state.lane_lifecycle_model import RELEASE_PARTIAL
+
+        self._hibernate_row_with_release(RELEASE_PARTIAL, seed_intent=False)
+        self._seed_redrive_intent(decision_journal="70000")  # row's is 84999
+        before = self._lane_row()
+        report, source = self._run_supervisor({})
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        reasons = [attempt["reason"] for attempt in outcome.hibernate_attempts]
+        self.assertIn("redrive_intent_mismatch", reasons)
+        self.assertEqual(source.reads, [])
+        after = self._lane_row()
+        self.assertEqual(after.process_release, before.process_release)
+        self.assertEqual(after.revision, before.revision)
+
+    # ------------------------------------------------------------------ R5-F5
+    def test_an_unknown_release_state_is_a_typed_uncertain_block(self):
+        # Review j#86776 R5-F5: a hibernated row whose process_release is a non-canonical token is
+        # NEVER handed to the public rail (whose else-branch would falsely report it released). It
+        # surfaces as a typed uncertain block across consecutive passes — zero mutation, zero
+        # store write, and it does not starve a fresh candidate. The row is injected at the
+        # lifecycle-read seam (the canonical store refuses to persist a non-canonical token).
+        from types import SimpleNamespace
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            hibernate_supervisor_wiring as wiring,
+        )
+
+        bogus = SimpleNamespace(
+            binding_kind="issue",
+            lane_disposition="hibernated",
+            repo_workspace_id=self.workspace_id,
+            issue_id=ISSUE,
+            lane_id=LANE,
+            lane_generation=1,
+            revision=3,
+            process_release="weird_unknown_token",
+            decision_journal="84999",
+            worktree_identity=self.token,
+        )
+
+        def _rows(*_a, **_k):
+            return [bogus]
+
+        for _pass in range(2):
+            with mock.patch.object(
+                wiring, "load_lane_lifecycle_readonly", _rows
+            ):
+                report, source = self._run_supervisor({})
+            outcome = self._workspace_outcome(report)
+            self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+            kinds = [attempt["kind"] for attempt in outcome.hibernate_attempts]
+            self.assertIn("release_state_unknown", kinds)
+            self.assertNotIn("redriven", kinds)
+            self.assertNotIn("released", kinds)
+            self.assertEqual(source.reads, [])  # never handed to the provider rail
+
+    # ------------------------------------------------------------------ R5-F4
+    def _run_leg_directly(self, *, renew, pages, runtime="awaiting_input", inventory=None):
+        # Build the production leg via build_hibernate_leg_fn and call it with a CALLER-controlled
+        # ``renew`` — the seam the leg-boundary composition test needs (the full supervisor hides
+        # the lease behind its own store).
+        from types import SimpleNamespace
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            build_hibernate_leg_fn,
+        )
+
+        source = _FakeSource(pages)
+
+        class _Outbox:
+            def read(self, states=None):
+                return []
+
+        inv = inventory if inventory is not None else ([], True)
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("MOZYO") and key not in ("TMUX", "TMUX_PANE")
+        }
+        env["MOZYO_BRIDGE_HOME"] = str(self.home)
+        env["MOZYO_HERDR_BINARY"] = str(self.herdr)
+        leg = build_hibernate_leg_fn(
+            home=self.home,
+            outbox=_Outbox(),
+            source_fn=lambda ws: source,
+            runtime_fn=lambda workspace_id, lane_id: runtime,
+            inventory_fn=lambda: inv,
+        )
+        ws = SimpleNamespace(
+            canonical_path=str(self.repo), workspace_id=self.workspace_id
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            result = leg(ws, renew, {"reads": 0})
+        return result, source
+
+    def test_a_stopped_redrive_skips_the_fresh_pass_entirely(self):
+        # Review j#86776 R5-F4 (leg-boundary composition): a redrivable row loses its lease at the
+        # redrive's pre-close check (renew False on the FIRST call), STOPPING the pass. A
+        # fully-evidenced fresh candidate is NOT actuated even though renew RECOVERS to True — the
+        # fresh pass is never run. Against the pre-R5 wiring (which ignored redrive_result.stopped)
+        # the fresh candidate hibernates once renew recovers — the mutation probe.
+        from mozyo_bridge.core.state.lane_lifecycle_model import RELEASE_PARTIAL
+
+        self._hibernate_row_with_release(RELEASE_PARTIAL)  # LANE hibernated + intent (redrivable)
+        lane2, issue2, page2, receipt2 = self._add_second_early_lane()
+
+        renew_calls = {"n": 0}
+
+        def renew():
+            renew_calls["n"] += 1
+            return renew_calls["n"] != 1  # False on the redrive's lease check, True afterwards
+
+        result, _source = self._run_leg_directly(
+            renew=renew, pages={issue2: page2, RELEASE_ISSUE: receipt2}
+        )
+        self.assertEqual(result.mutations, 0, result.attempts)
+        kinds = {(a.lane, a.kind) for a in result.attempts}
+        self.assertIn((lane2, "lease_lost"), kinds)
+        self.assertNotIn((lane2, "actuated"), kinds)
+        self.assertEqual(self._lane_row(lane2).lane_disposition, "active")
+        # The fresh candidate's use case was never even built (renew recovered but the pass was
+        # skipped): lane2's own worktree stays untouched.
+        self.assertEqual(self._lane_row(LANE).lane_disposition, "hibernated")
+
+    # ------------------------------------------------------------------ R5-F2
+    def _hibernate_row_not_requested(self, *, seed_intent=True):
+        # The post-CAS crash window: the CAS landed (active -> hibernated) but the release was
+        # NEVER opened (process_release stays not_requested). A real fresh actuation persisted its
+        # intent pre-CAS, so this seeds the matching intent too.
+        key = LaneLifecycleKey(repo_workspace_id=self.workspace_id, lane_id=LANE)
+        decision = DecisionPointer(source="redmine", issue_id=ISSUE, journal_id="84999")
+        cas = self.store.transition_disposition(
+            key, expected_disposition="active", expected_revision=1,
+            target="hibernated", decision=decision,
+        )
+        assert cas.applied, cas
+        if seed_intent:
+            self._seed_redrive_intent()
+        return key
+
+    def test_a_not_requested_crash_with_a_live_slot_is_redriven_to_released(self):
+        # Review j#86776 R5-F2 (fault injection): the CAS landed but the release was never opened
+        # (not_requested) and a managed slot is STILL LIVE — a crash right after the CAS. The next
+        # pass enumerates it as debt (live slot present), drives the public already_hibernated
+        # path, closes the residual slot, and settles to released — no manual sweep, no second
+        # disposition CAS. Against the pre-R5 wiring (not_requested unconditionally terminal) the
+        # live slot stranded forever — the mutation probe.
+        binary, extra_env = self._stateful_herdr_with_live_slot()
+        self._hibernate_row_not_requested()
+        before = self._lane_row()
+        self.assertEqual(before.process_release, "not_requested")
+        report, source = self._run_supervisor({}, herdr_binary=binary, extra_env=extra_env)
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 1, outcome.hibernate_attempts)
+        self.assertIn("redriven", [a["kind"] for a in outcome.hibernate_attempts])
+        row = self._lane_row()
+        self.assertEqual(row.lane_disposition, "hibernated")  # NO second disposition CAS
+        self.assertEqual(row.process_release, "released")
+        self.assertEqual(source.reads, [])  # stored authority: zero provider reads
+        # Convergence: released is terminal -> the next pass enumerates no debt, mutates nothing.
+        report2, _ = self._run_supervisor({}, herdr_binary=binary, extra_env=extra_env)
+        outcome2 = self._workspace_outcome(report2)
+        self.assertEqual(outcome2.hibernate_mutations, 0, outcome2.hibernate_attempts)
+
+    def test_a_not_requested_crash_with_no_live_slot_is_terminal(self):
+        # Review j#86776 R5-F2: the same not_requested crash but the processes are ALREADY gone
+        # (a confirmed-empty inventory) — terminal: no redrive, no store write, no false release
+        # re-opened every pass.
+        self._hibernate_row_not_requested()
+        before = self._lane_row()
+        report, source = self._run_supervisor({})  # default herdr binary -> empty inventory
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        self.assertEqual(list(outcome.hibernate_attempts), [])
+        self.assertEqual(source.reads, [])
+        after = self._lane_row()
+        self.assertEqual(
+            (after.process_release, after.revision),
+            (before.process_release, before.revision),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

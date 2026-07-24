@@ -50,6 +50,9 @@ ATTEMPT_STALE = "stale_basis"
 ATTEMPT_REDRIVEN = "redriven"
 ATTEMPT_REDRIVE_WITHHELD = "redriven_success_withheld"
 ATTEMPT_REDRIVE_BLOCKED = "redrive_blocked"
+# Review j#86776 R5-F5: a hibernated row whose ``process_release`` is not a canonical release
+# state token — an uncertain state the wiring refuses to hand the public rail (zero execute).
+ATTEMPT_RELEASE_STATE_UNKNOWN = "release_state_unknown"
 
 # Fixed reason tokens the leg emits itself (secret-free; the use case's own reasons are already a
 # closed vocabulary and are passed through verbatim).
@@ -58,6 +61,12 @@ LEG_REASON_SUCCESS_WITHHELD = "release_success_withheld"
 LEG_REASON_NOT_ACTUATED = "not_actuated"
 LEG_REASON_BASIS_STALE = "basis_stale_since_build"
 LEG_REASON_WORKTREE_UNRESOLVED = "candidate_worktree_unresolved"
+# Review j#86776 R5-F3: the redrive could not build an HONEST request — no durable intent
+# records the basis this hibernated row was CAS'd under (a dependency-park / manual / pre-R5
+# row), or the stored intent describes a different cycle than the row. Either is a typed
+# zero-close: the redrive never fabricates the basis the row failed to record.
+LEG_REASON_REDRIVE_INTENT_ABSENT = "redrive_intent_absent"
+LEG_REASON_REDRIVE_INTENT_MISMATCH = "redrive_intent_mismatch"
 
 
 @dataclass(frozen=True)
@@ -129,6 +138,9 @@ def run_hibernate_pass(
     use_case: Optional[SublaneHibernateUseCase] = None,
     lease_renew_fn: Callable[[], bool],
     use_case_fn: Optional[Callable[[HibernateCandidate], Optional[SublaneHibernateUseCase]]] = None,
+    record_intent_fn: Optional[
+        Callable[[HibernateCandidate, ActuationRequestFields], None]
+    ] = None,
     budget_consumed: bool = False,
 ) -> HibernatePassResult:
     """Run one bounded hibernate pass, actuating at most one lifecycle mutation.
@@ -207,6 +219,14 @@ def run_hibernate_pass(
                 issue, lane, ATTEMPT_BLOCKED, LEG_REASON_WORKTREE_UNRESOLVED
             ))
             continue
+        # Review j#86776 R5-F3: persist the durable redrive intent immediately BEFORE the
+        # irreversible CAS. If the CAS lands but the release then crashes, the next pass's
+        # redrive reconstructs THIS actuation's proven basis from the intent instead of
+        # fabricating it. Best-effort: a persist failure never blocks the fresh actuation (a
+        # missing intent only fails-closed a *future* redrive, never mis-acts), and the derived
+        # request the fence guards is unchanged.
+        if record_intent_fn is not None:
+            record_intent_fn(candidate, fields)
         outcome = bound_use_case.run(_to_request(fields), execute=True)
 
         # A lease lost at the use case's commit boundary committed nothing; stop the pass.
@@ -252,18 +272,24 @@ def run_hibernate_redrives(
     redrives: "Sequence[object]",
     *,
     use_case_fn: "Callable[[object], Optional[SublaneHibernateUseCase]]",
-    request_fn: "Callable[[object], HibernateRequest]",
+    request_fn: "Callable[[object], HibernateRequest | str]",
     lease_renew_fn: Callable[[], bool],
 ) -> RedriveResult:
     """Finish prior interrupted releases on already-hibernated rows (review j#86757 R4-F2).
 
     ``redrives`` are the lifecycle rows a caller enumerated as hibernated with an UNRESOLVED
-    process release (requested / partial / unknown — released and not_requested are terminal
-    and never reach here). Each is driven through the SAME public use case, whose
-    ``already_hibernated`` path resumes the row's STORED release action id / pins (the
-    immutable action authority) — no ACTIVE-basis re-derivation, no rebind to another cycle's
-    approval. Deterministic ``(issue, lane)`` order; the pass-wide one-mutation budget applies:
+    process release (requested / partial, or ``not_requested`` when the lane still has a live
+    slot / an unreadable inventory — review j#86776 R5-F2; released, and ``not_requested`` with
+    a confirmed-empty inventory, are terminal and never reach here). Each is driven through the
+    SAME public use case, whose ``already_hibernated`` path resumes the row's STORED release
+    action id / pins (the immutable action authority) — no ACTIVE-basis re-derivation, no rebind
+    to another cycle's approval. Deterministic ``(issue, lane)`` order; the pass-wide
+    one-mutation budget applies:
 
+    * ``request_fn`` returning a REASON STRING instead of a request is a typed zero-close
+      (review j#86776 R5-F3: no durable intent records this row's basis, or the intent describes
+      a different cycle) — recorded as ``redrive_blocked`` with that reason, consumes nothing,
+      never touches the use case;
     * an EXECUTED redrive (the release drive ran — settled or success-withheld) consumed the
       budget: its process-close / store-write side effects are a managed-environment mutation,
       so no fresh mutation may follow in the same pass;
@@ -289,6 +315,14 @@ def run_hibernate_redrives(
                 issue, lane, ATTEMPT_DEFERRED, NO_ACTUATION_DEFERRED_ONE_PER_PASS
             ))
             continue
+        request = request_fn(row)
+        if isinstance(request, str):
+            # A typed zero-close: no honest request could be built (no / mismatched intent).
+            # Zero use-case call, zero mutation — consumes nothing.
+            attempts.append(HibernateAttempt(
+                issue, lane, ATTEMPT_REDRIVE_BLOCKED, request
+            ))
+            continue
         use_case = use_case_fn(row)
         if use_case is None:
             attempts.append(HibernateAttempt(
@@ -299,7 +333,7 @@ def run_hibernate_redrives(
             attempts.append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
             stopped = True
             continue
-        outcome = use_case.run(request_fn(row), execute=True)
+        outcome = use_case.run(request, execute=True)
         if outcome.lease_lost:
             attempts.append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
             stopped = True
@@ -334,6 +368,10 @@ __all__ = [
     "ATTEMPT_REDRIVEN",
     "ATTEMPT_REDRIVE_WITHHELD",
     "ATTEMPT_REDRIVE_BLOCKED",
+    "ATTEMPT_RELEASE_STATE_UNKNOWN",
+    "LEG_REASON_LEASE_LOST",
+    "LEG_REASON_REDRIVE_INTENT_ABSENT",
+    "LEG_REASON_REDRIVE_INTENT_MISMATCH",
     "RedriveResult",
     "run_hibernate_redrives",
     "NO_ACTUATION_NO_CANDIDATE",

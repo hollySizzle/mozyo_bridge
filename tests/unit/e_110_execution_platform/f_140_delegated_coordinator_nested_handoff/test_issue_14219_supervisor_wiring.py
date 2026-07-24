@@ -701,8 +701,10 @@ class GitObservationTest(unittest.TestCase):
 
 
 class RedriveEnumerationTest(unittest.TestCase):
-    """enumerate_hibernated_redrives (review j#86757 R4-F2): hibernated issue-lane rows with an
-    UNRESOLVED process release are typed redrive debt; released / not_requested are terminal."""
+    """enumerate_hibernated_redrives triage (review j#86757 R4-F2 / review j#86776 R5-F2/F5):
+    requested/partial are redrive debt; released is terminal; not_requested is debt ONLY with a
+    live slot or an unreadable inventory (a confirmed-empty inventory is terminal); a
+    non-canonical token is a typed uncertain state, never a redrive."""
 
     def _row(self, **kw):
         row = _Row()
@@ -711,46 +713,76 @@ class RedriveEnumerationTest(unittest.TestCase):
             setattr(row, key, value)
         return row
 
-    def _enumerate(self, rows):
+    def _enumerate(self, rows, live_slot_fn=None):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
             enumerate_hibernated_redrives,
         )
 
-        return enumerate_hibernated_redrives(rows, WS)
+        return enumerate_hibernated_redrives(rows, WS, live_slot_fn=live_slot_fn)
 
-    def test_unresolved_release_states_enumerate(self):
-        for state in ("requested", "partial", "weird_unknown_token"):
+    def test_requested_and_partial_are_redrive_debt(self):
+        for state in ("requested", "partial"):
             with self.subTest(state=state):
-                rows = [self._row(process_release=state)]
-                self.assertEqual(len(self._enumerate(rows)), 1, state)
+                result = self._enumerate([self._row(process_release=state)])
+                self.assertEqual(len(result.redrives), 1, state)
+                self.assertEqual(result.unknown_release, ())
 
-    def test_terminal_release_states_never_enumerate(self):
-        for state in ("released", "not_requested"):
-            with self.subTest(state=state):
-                self.assertEqual(
-                    self._enumerate([self._row(process_release=state)]), ()
-                )
+    def test_released_is_terminal(self):
+        result = self._enumerate([self._row(process_release="released")])
+        self.assertEqual(result.redrives, ())
+        self.assertEqual(result.unknown_release, ())
+
+    def test_not_requested_with_a_live_slot_is_redrive_debt(self):
+        # R5-F2: the crash landed the CAS but never opened the release; a live slot remains.
+        result = self._enumerate(
+            [self._row(process_release="not_requested")], live_slot_fn=lambda row: True
+        )
+        self.assertEqual(len(result.redrives), 1)
+
+    def test_not_requested_with_a_confirmed_empty_inventory_is_terminal(self):
+        # R5-F2: confirmed no live slot -> the processes are already gone -> terminal (no false
+        # release re-opened every pass).
+        result = self._enumerate(
+            [self._row(process_release="not_requested")], live_slot_fn=lambda row: False
+        )
+        self.assertEqual(result.redrives, ())
+        self.assertEqual(result.unknown_release, ())
+
+    def test_not_requested_with_an_unreadable_inventory_fails_closed_to_debt(self):
+        # R5-F2: an unreadable inventory (None) never proves the slot is gone -> enumerate.
+        result = self._enumerate(
+            [self._row(process_release="not_requested")], live_slot_fn=lambda row: None
+        )
+        self.assertEqual(len(result.redrives), 1)
+
+    def test_not_requested_without_a_live_slot_fn_fails_closed_to_debt(self):
+        # No checker supplied -> cannot confirm the slot is gone -> fail-closed enumerate.
+        result = self._enumerate([self._row(process_release="not_requested")])
+        self.assertEqual(len(result.redrives), 1)
+
+    def test_a_non_canonical_token_is_uncertain_never_a_redrive(self):
+        # R5-F5: an unknown process_release is a typed uncertain state, NOT redrive debt (the
+        # public rail's else-branch would falsely report it released).
+        result = self._enumerate(
+            [self._row(process_release="weird_unknown_token")],
+            live_slot_fn=lambda row: True,
+        )
+        self.assertEqual(result.redrives, ())
+        self.assertEqual(len(result.unknown_release), 1)
 
     def test_active_foreign_and_non_issue_rows_never_enumerate(self):
-        self.assertEqual(
-            self._enumerate([self._row(lane_disposition="active", process_release="partial")]),
-            (),
-        )
-        self.assertEqual(
-            self._enumerate(
-                [self._row(process_release="partial", repo_workspace_id="other")]
-            ),
-            (),
-        )
-        self.assertEqual(
-            self._enumerate(
-                [self._row(process_release="partial", binding_kind="project_gateway")]
-            ),
-            (),
-        )
-        self.assertEqual(
-            self._enumerate([self._row(process_release="partial", issue_id="")]), ()
-        )
+        for kw in (
+            dict(lane_disposition="active", process_release="partial"),
+            dict(process_release="partial", repo_workspace_id="other"),
+            dict(process_release="partial", binding_kind="project_gateway"),
+            dict(process_release="partial", issue_id=""),
+            # A non-canonical token on a foreign/active row is dropped entirely (not uncertain).
+            dict(lane_disposition="active", process_release="weird_unknown_token"),
+        ):
+            with self.subTest(**kw):
+                result = self._enumerate([self._row(**kw)], live_slot_fn=lambda row: True)
+                self.assertEqual(result.redrives, ())
+                self.assertEqual(result.unknown_release, ())
 
 
 class RedriveRunnerTest(unittest.TestCase):
@@ -857,6 +889,119 @@ class RedriveRunnerTest(unittest.TestCase):
         self.assertEqual(result.mutations, 0)
         self.assertEqual(result.attempts[0].kind, "redrive_blocked")
         self.assertEqual(result.attempts[0].reason, "candidate_worktree_unresolved")
+
+
+class CombinePassResultsTest(unittest.TestCase):
+    """combine_hibernate_pass_results (review j#86776 R5-F4): a stopped redrive skips the fresh
+    pass and defers every fresh candidate as lease_lost; otherwise the passes fold together."""
+
+    def _candidate(self, issue, lane):
+        anchor = LifecycleAnchor(
+            issue_id=issue, repo_workspace_id=WS, lane_id=lane,
+            lane_generation=GEN, revision=4,
+        )
+        return HibernateCandidate(
+            issue_id=issue, anchor=anchor, basis=BASIS_EARLY_HIBERNATE,
+            head=BoundField(value=HEAD, provenance="git_remote"), conjuncts=(),
+        )
+
+    def _combine(self, **kw):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            combine_hibernate_pass_results,
+        )
+
+        return combine_hibernate_pass_results(**kw)
+
+    def _attempt(self, lane, kind, reason=""):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_actuation_leg import (  # noqa: E501
+            HibernateAttempt,
+        )
+
+        return HibernateAttempt("600", lane, kind, reason)
+
+    def _redrive(self, attempts=(), mutations=0, stopped=False):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_actuation_leg import (  # noqa: E501
+            RedriveResult,
+        )
+
+        return RedriveResult(attempts=tuple(attempts), mutations=mutations, stopped=stopped)
+
+    def _fresh(self, attempts=(), mutations=0, empty_pass=False):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_actuation_leg import (  # noqa: E501
+            HibernatePassResult,
+        )
+
+        return HibernatePassResult(
+            attempts=tuple(attempts), mutations=mutations, empty_pass=empty_pass
+        )
+
+    def test_a_stopped_redrive_defers_every_fresh_candidate_as_lease_lost(self):
+        # R5-F4: fresh_pass is None (never run); each fresh candidate -> a typed lease_lost, and
+        # the mutation count is the redrive's alone.
+        redrive = self._redrive(
+            attempts=(self._attempt("lane_a", "lease_lost", "supervisor_lease_lost"),),
+            mutations=0, stopped=True,
+        )
+        candidates = [self._candidate("601", "lane_b"), self._candidate("602", "lane_c")]
+        result = self._combine(
+            unknown_attempts=(), redrive_result=redrive, fresh_pass=None,
+            deferred_candidates=candidates,
+        )
+        self.assertEqual(result.mutations, 0)
+        self.assertFalse(result.empty_pass)
+        self.assertEqual(
+            [(a.lane, a.kind) for a in result.attempts],
+            [("lane_a", "lease_lost"), ("lane_b", "lease_lost"), ("lane_c", "lease_lost")],
+        )
+        # Every deferred fresh attempt carries the lease-lost reason (not a generic defer).
+        for attempt in result.attempts[1:]:
+            self.assertEqual(attempt.reason, "supervisor_lease_lost")
+
+    def test_a_stopped_redrive_with_no_fresh_candidates_is_just_the_redrive(self):
+        redrive = self._redrive(
+            attempts=(self._attempt("lane_a", "lease_lost", "supervisor_lease_lost"),),
+            mutations=0, stopped=True,
+        )
+        result = self._combine(
+            unknown_attempts=(), redrive_result=redrive, fresh_pass=None,
+            deferred_candidates=[],
+        )
+        self.assertEqual([a.kind for a in result.attempts], ["lease_lost"])
+        self.assertEqual(result.mutations, 0)
+
+    def test_an_unstopped_pass_folds_unknown_then_redrive_then_fresh(self):
+        redrive = self._redrive(
+            attempts=(self._attempt("lane_a", "redriven"),), mutations=1, stopped=False
+        )
+        fresh = self._fresh(
+            attempts=(self._attempt("lane_b", "deferred", "deferred_one_mutation_per_pass"),),
+            mutations=0, empty_pass=False,
+        )
+        unknown = (self._attempt("lane_c", "release_state_unknown", "release_state_unknown"),)
+        result = self._combine(
+            unknown_attempts=unknown, redrive_result=redrive, fresh_pass=fresh,
+            deferred_candidates=[self._candidate("601", "lane_b")],
+        )
+        self.assertEqual(result.mutations, 1)
+        self.assertEqual(
+            [a.kind for a in result.attempts],
+            ["release_state_unknown", "redriven", "deferred"],
+        )
+
+    def test_an_empty_pass_is_empty_only_with_no_redrive_and_no_unknown_attempts(self):
+        empty_fresh = self._fresh(attempts=(), mutations=0, empty_pass=True)
+        # Nothing anywhere -> empty pass.
+        result = self._combine(
+            unknown_attempts=(), redrive_result=self._redrive(), fresh_pass=empty_fresh,
+            deferred_candidates=[],
+        )
+        self.assertTrue(result.empty_pass)
+        # An unknown attempt (R5-F5) makes the pass non-empty even with an empty fresh pass.
+        result2 = self._combine(
+            unknown_attempts=(self._attempt("lane_c", "release_state_unknown"),),
+            redrive_result=self._redrive(), fresh_pass=empty_fresh, deferred_candidates=[],
+        )
+        self.assertFalse(result2.empty_pass)
 
 
 class ContractTextTest(unittest.TestCase):
