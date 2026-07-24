@@ -15,7 +15,7 @@ not answer the two questions the GK3500 exploratory smoke (#12698) surfaced:
    versus the GK3500 department root.
 
 This module is the **live lane identity** layer the issue asks for, kept separate
-from ``project.yaml`` metadata (the prohibition: no fixed pane id in project
+from ``project.env`` metadata (the prohibition: no fixed pane id in project
 metadata; project metadata and live runtime lane state stay separated). It is
 pure — it derives a :class:`GatewayLaneIdentity` *route registry* record from the
 already-adopted :class:`ProjectScope` (#12658) + the Git ``repo_root`` authority,
@@ -159,7 +159,7 @@ class GatewayLaneIdentity:
 
     The issue's ``project_gateway:`` example, derived from project metadata (an
     adopted :class:`ProjectScope` + the Git ``repo_root``) rather than stored in
-    ``project.yaml`` — project metadata and live lane state stay separated, and no
+    ``project.env`` — project metadata and live lane state stay separated, and no
     pane id is ever fixed here. ``repo_root`` is the Git authority; ``project_*``
     is the routing/presentation scope under it; ``role`` / ``target_kind`` /
     ``lane_kind`` / ``launch_policy`` / ``callback_to`` are the declarative
@@ -217,7 +217,7 @@ def gateway_lane_identity_from_scope(
     path / parent workspace); ``repo_root`` is the live Git worktree authority
     supplied by the caller. The role-class / policy fields take their gateway
     defaults. No pane id, no live state — the route registry record is derived,
-    never stored in ``project.yaml``.
+    never stored in ``project.env``.
     """
     return GatewayLaneIdentity(
         project_scope=scope.scope,

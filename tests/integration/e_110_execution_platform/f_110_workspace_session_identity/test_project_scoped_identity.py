@@ -2,8 +2,8 @@
 
 Pins the policy from ``vibes/docs/logics/project-scoped-workspace-identity.md``:
 
-- a project ``project.yaml`` candidate never replaces the Git repo root;
-- only an explicit ``runtime_identity.enabled: true`` marker adopts a project
+- a project ``project.env`` candidate never replaces the Git repo root;
+- only an explicit ``PROJECT_RUNTIME_IDENTITY_ENABLED=true`` marker adopts a project
   scope (scan is advisory, adoption is explicit);
 - the generated root discovery cache is keyed by stable repo-relative identity
   and a cache/source disagreement surfaces as fail-closed drift;
@@ -33,7 +33,7 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     build_discovery_cache,
     cache_key,
     detect_cache_drift,
-    parse_project_document,
+    parse_project_environment,
     repo_relative_path,
     resolve_project_scope_for_path,
     path_under_project,
@@ -42,71 +42,49 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.appl
     project_discovery as pd,
 )
 
-
 _ENABLED_DOC = """\
-schema: mozyo.project/v1
-redmine_project: giken-cloud-drive-management
-runtime_identity:
-  enabled: true
-  kind: project_scope
-  display_label: "クラウドドライブ管理"
-  parent_workspace: gk-3500-it-operations
-  workdir: "."
+PROJECT_SCHEMA=mozyo.project/v1
+PROJECT_REDMINE_PROJECT=giken-cloud-drive-management
+PROJECT_RUNTIME_IDENTITY_ENABLED=true
+PROJECT_RUNTIME_IDENTITY_KIND=project_scope
+PROJECT_DISPLAY_LABEL=クラウドドライブ管理
+PROJECT_PARENT_WORKSPACE=gk-3500-it-operations
+PROJECT_WORKDIR=.
 """
 
 _ADVISORY_DOC = """\
-schema: mozyo.project/v1
-redmine_project: giken-some-advisory-project
-display_label: Advisory Only
-runtime_identity:
-  enabled: false
+PROJECT_SCHEMA=mozyo.project/v1
+PROJECT_REDMINE_PROJECT=giken-some-advisory-project
+PROJECT_DISPLAY_LABEL="Advisory Only"
+PROJECT_RUNTIME_IDENTITY_ENABLED=false
 """
 
 _UNMARKED_DOC = """\
-name: not-a-mozyo-project
-some_tool: config
+PROJECT_NAME=not-a-mozyo-project
+SOME_TOOL=config
 """
 
-# Existing GK monorepo router shape (Redmine #12658 j#66473): top-level
-# `schema_version` + nested `project.*`, NO runtime_identity -> discovered but not
-# adopted (adoption stays explicit).
-_GK_UNADOPTED_DOC = """\
-schema_version: 1
-project:
-  redmine_project: giken-cloud-drive-management
-  path: projects/giken-cloud-drive-management
-  status: active
-"""
-
-# GK shape that opts in explicitly via a nested runtime_identity marker.
-_GK_ADOPTED_DOC = """\
-schema_version: 1
-project:
-  redmine_project: giken-cloud-drive-management
-  path: projects/giken-cloud-drive-management
-  status: active
-  display_label: "クラウドドライブ管理"
-  runtime_identity:
-    enabled: true
-    parent_workspace: gk-3500-it-operations
+_UNADOPTED_DOC = """\
+PROJECT_SCHEMA=mozyo.project/v1
+PROJECT_REDMINE_PROJECT=giken-cloud-drive-management
+PROJECT_DISPLAY_LABEL=クラウドドライブ管理
+PROJECT_RUNTIME_IDENTITY_ENABLED=false
 """
 
 
 class ParseAdoptionTests(unittest.TestCase):
     def test_enabled_marker_adopts_project_scope_with_label(self):
-        candidate = parse_project_document(
+        candidate = parse_project_environment(
             {
-                "schema": "mozyo.project/v1",
-                "redmine_project": "giken-cloud-drive-management",
-                "runtime_identity": {
-                    "enabled": True,
-                    "display_label": "クラウドドライブ管理",
-                    "parent_workspace": "gk-3500-it-operations",
-                    "workdir": ".",
-                },
+                "PROJECT_SCHEMA": "mozyo.project/v1",
+                "PROJECT_REDMINE_PROJECT": "giken-cloud-drive-management",
+                "PROJECT_RUNTIME_IDENTITY_ENABLED": "true",
+                "PROJECT_DISPLAY_LABEL": "クラウドドライブ管理",
+                "PROJECT_PARENT_WORKSPACE": "gk-3500-it-operations",
+                "PROJECT_WORKDIR": ".",
             },
             path="projects/giken-cloud-drive-management",
-            source="projects/giken-cloud-drive-management/project.yaml",
+            source="projects/giken-cloud-drive-management/project.env",
             raw_text=_ENABLED_DOC,
         )
         self.assertIsNotNone(candidate)
@@ -118,64 +96,85 @@ class ParseAdoptionTests(unittest.TestCase):
         self.assertEqual(scope.workdir, "projects/giken-cloud-drive-management")
 
     def test_unmarked_document_is_not_a_candidate(self):
-        # A file named project.yaml without the schema marker is ignored.
+        # A file named project.env without the schema marker is ignored.
         self.assertIsNone(
-            parse_project_document(
-                {"name": "not-a-mozyo-project"},
+            parse_project_environment(
+                {"PROJECT_NAME": "not-a-mozyo-project"},
                 path="vendor/thing",
-                source="vendor/thing/project.yaml",
+                source="vendor/thing/project.env",
                 raw_text=_UNMARKED_DOC,
             )
         )
 
-    def test_gk_nested_shape_discovered_but_not_adopted_without_optin(self):
-        # The existing GK `schema_version: 1` + nested `project.*` shape is a
-        # recognized candidate, but with no runtime_identity it is NOT adopted —
-        # an existing project is never silently routable (#12658 j#66473).
-        import yaml as _yaml
-
-        candidate = parse_project_document(
-            _yaml.safe_load(_GK_UNADOPTED_DOC),
+    def test_descriptor_is_discovered_but_not_adopted_without_optin(self):
+        candidate = parse_project_environment(
+            {
+                "PROJECT_SCHEMA": "mozyo.project/v1",
+                "PROJECT_REDMINE_PROJECT": "giken-cloud-drive-management",
+                "PROJECT_RUNTIME_IDENTITY_ENABLED": "false",
+            },
             path="projects/giken-cloud-drive-management",
-            source="projects/giken-cloud-drive-management/project.yaml",
-            raw_text=_GK_UNADOPTED_DOC,
+            source="projects/giken-cloud-drive-management/project.env",
+            raw_text=_UNADOPTED_DOC,
         )
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate.scope, "giken-cloud-drive-management")
         self.assertFalse(candidate.runtime_identity_enabled)
         self.assertEqual(adopt_scopes([candidate]), [])
 
-    def test_gk_nested_shape_adopts_with_explicit_optin(self):
-        import yaml as _yaml
-
-        candidate = parse_project_document(
-            _yaml.safe_load(_GK_ADOPTED_DOC),
-            path="projects/giken-cloud-drive-management",
-            source="projects/giken-cloud-drive-management/project.yaml",
-            raw_text=_GK_ADOPTED_DOC,
-        )
-        self.assertIsNotNone(candidate)
-        self.assertTrue(candidate.runtime_identity_enabled)
-        scope = candidate.as_scope()
-        self.assertEqual(scope.scope, "giken-cloud-drive-management")
-        self.assertEqual(scope.label, "クラウドドライブ管理")
-        self.assertEqual(scope.parent_workspace, "gk-3500-it-operations")
-
     def test_advisory_candidate_is_discovered_but_not_adopted(self):
-        candidate = parse_project_document(
+        candidate = parse_project_environment(
             {
-                "schema": "mozyo.project/v1",
-                "redmine_project": "giken-some-advisory-project",
-                "display_label": "Advisory Only",
-                "runtime_identity": {"enabled": False},
+                "PROJECT_SCHEMA": "mozyo.project/v1",
+                "PROJECT_REDMINE_PROJECT": "giken-some-advisory-project",
+                "PROJECT_DISPLAY_LABEL": "Advisory Only",
+                "PROJECT_RUNTIME_IDENTITY_ENABLED": "false",
             },
             path="projects/advisory",
-            source="projects/advisory/project.yaml",
+            source="projects/advisory/project.env",
             raw_text=_ADVISORY_DOC,
         )
         self.assertIsNotNone(candidate)
         self.assertFalse(candidate.runtime_identity_enabled)
         self.assertEqual(adopt_scopes([candidate]), [])
+
+
+class EnvFileParserTests(unittest.TestCase):
+    def test_comments_blank_lines_and_quoted_values_are_supported(self):
+        parsed = pd._parse_project_env(
+            "# identity\n\n"
+            "PROJECT_SCHEMA=mozyo.project/v1\n"
+            'PROJECT_DISPLAY_LABEL="社内 基盤"\n'
+        )
+        self.assertEqual(
+            parsed,
+            {
+                "PROJECT_SCHEMA": "mozyo.project/v1",
+                "PROJECT_DISPLAY_LABEL": "社内 基盤",
+            },
+        )
+
+    def test_duplicate_key_is_rejected(self):
+        self.assertIsNone(
+            pd._parse_project_env(
+                "PROJECT_SCHEMA=mozyo.project/v1\n" "PROJECT_SCHEMA=mozyo.project/v2\n"
+            )
+        )
+
+    def test_interpolation_is_rejected(self):
+        self.assertIsNone(
+            pd._parse_project_env(
+                "PROJECT_SCHEMA=mozyo.project/v1\n"
+                "PROJECT_PARENT_WORKSPACE=${WORKSPACE}\n"
+            )
+        )
+
+    def test_legacy_yaml_is_not_a_project_env(self):
+        self.assertIsNone(
+            pd._parse_project_env(
+                "schema_version: 1\n" "project:\n" "  redmine_project: legacy\n"
+            )
+        )
 
 
 class RepoRelativeTests(unittest.TestCase):
@@ -201,7 +200,7 @@ class CwdResolutionTests(unittest.TestCase):
             label="クラウドドライブ管理",
             workdir="projects/giken-cloud-drive-management",
             parent_workspace="gk-3500-it-operations",
-            source="projects/giken-cloud-drive-management/project.yaml",
+            source="projects/giken-cloud-drive-management/project.env",
             fingerprint="sha256:deadbeef",
         )
 
@@ -229,7 +228,7 @@ class CwdResolutionTests(unittest.TestCase):
             label="outer",
             workdir="projects",
             parent_workspace=None,
-            source="projects/project.yaml",
+            source="projects/project.env",
             fingerprint="sha256:1",
         )
         scope = resolve_project_scope_for_path(
@@ -258,14 +257,15 @@ class CwdResolutionTests(unittest.TestCase):
 
 class DriftTests(unittest.TestCase):
     def _candidate(self):
-        return parse_project_document(
+        return parse_project_environment(
             {
-                "schema": "mozyo.project/v1",
-                "redmine_project": "giken-cloud-drive-management",
-                "runtime_identity": {"enabled": True, "display_label": "クラウドドライブ管理"},
+                "PROJECT_SCHEMA": "mozyo.project/v1",
+                "PROJECT_REDMINE_PROJECT": "giken-cloud-drive-management",
+                "PROJECT_RUNTIME_IDENTITY_ENABLED": "true",
+                "PROJECT_DISPLAY_LABEL": "クラウドドライブ管理",
             },
             path="projects/giken-cloud-drive-management",
-            source="projects/giken-cloud-drive-management/project.yaml",
+            source="projects/giken-cloud-drive-management/project.env",
             raw_text=_ENABLED_DOC,
         )
 
@@ -300,14 +300,14 @@ class FilesystemScanTests(unittest.TestCase):
         (self.repo / ".git").mkdir()
         proj = self.repo / "projects" / "giken-cloud-drive-management"
         proj.mkdir(parents=True)
-        (proj / "project.yaml").write_text(_ENABLED_DOC, encoding="utf-8")
+        (proj / "project.env").write_text(_ENABLED_DOC, encoding="utf-8")
         advisory = self.repo / "projects" / "advisory"
         advisory.mkdir(parents=True)
-        (advisory / "project.yaml").write_text(_ADVISORY_DOC, encoding="utf-8")
+        (advisory / "project.env").write_text(_ADVISORY_DOC, encoding="utf-8")
         # A skipped directory must not contribute a candidate.
         vendored = self.repo / "node_modules" / "pkg"
         vendored.mkdir(parents=True)
-        (vendored / "project.yaml").write_text(_ENABLED_DOC, encoding="utf-8")
+        (vendored / "project.env").write_text(_ENABLED_DOC, encoding="utf-8")
 
     def tearDown(self):
         pd.clear_discovery_cache()
@@ -351,14 +351,10 @@ class NestedScaffoldGitRootTests(unittest.TestCase):
     """
 
     _DOC = (
-        "schema_version: 1\n"
-        "project:\n"
-        "  redmine_project: giken-cloud-drive-management\n"
-        "  path: projects/giken-cloud-drive-management\n"
-        "  status: active\n"
-        "  display_label: \"クラウドドライブ管理\"\n"
-        "  runtime_identity:\n"
-        "    enabled: true\n"
+        "PROJECT_SCHEMA=mozyo.project/v1\n"
+        "PROJECT_REDMINE_PROJECT=giken-cloud-drive-management\n"
+        "PROJECT_DISPLAY_LABEL=クラウドドライブ管理\n"
+        "PROJECT_RUNTIME_IDENTITY_ENABLED=true\n"
     )
 
     def setUp(self):
@@ -372,7 +368,7 @@ class NestedScaffoldGitRootTests(unittest.TestCase):
         (self.proj / ".mozyo-bridge" / "scaffold.json").write_text(
             "{}", encoding="utf-8"
         )  # nested project-local scaffold marker
-        (self.proj / "project.yaml").write_text(self._DOC, encoding="utf-8")
+        (self.proj / "project.env").write_text(self._DOC, encoding="utf-8")
 
     def tearDown(self):
         pd.clear_discovery_cache()
@@ -390,8 +386,8 @@ class NestedScaffoldGitRootTests(unittest.TestCase):
         from mozyo_bridge.application.commands import _resolve_project_scope_fields
 
         cwd = str(self.proj)
-        effective_root, (scope, path, label), launch_cwd = _resolve_project_scope_fields(
-            cwd, cwd
+        effective_root, (scope, path, label), launch_cwd = (
+            _resolve_project_scope_fields(cwd, cwd)
         )
         self.assertEqual(Path(effective_root), self.repo.resolve())
         self.assertEqual(scope, "giken-cloud-drive-management")
@@ -412,8 +408,8 @@ class NestedScaffoldGitRootTests(unittest.TestCase):
         )
 
         cwd = str(self.proj)
-        effective_root, (scope, path, label), launch_cwd = _resolve_project_scope_fields(
-            cwd, cwd
+        effective_root, (scope, path, label), launch_cwd = (
+            _resolve_project_scope_fields(cwd, cwd)
         )
         ws = CockpitWorkspace(
             workspace_id="gk-3500-it-operations",
@@ -463,7 +459,7 @@ class DriftFailClosedTests(unittest.TestCase):
         (self.repo / ".git").mkdir()
         self.proj = self.repo / "projects" / "giken-cloud-drive-management"
         self.proj.mkdir(parents=True)
-        (self.proj / "project.yaml").write_text(self._DOC, encoding="utf-8")
+        (self.proj / "project.env").write_text(self._DOC, encoding="utf-8")
         (self.proj / "src").mkdir()
 
     def tearDown(self):
@@ -477,15 +473,15 @@ class DriftFailClosedTests(unittest.TestCase):
             "projects: {}\n"
             "discovery_cache:\n"
             "  generated_by: mozyo-bridge project discovery\n"
-            "  generated_at: \"2026-06-27T00:00:00Z\"\n"
+            '  generated_at: "2026-06-27T00:00:00Z"\n'
             "  entries:\n"
-            "    - cache_key: \"project:giken-cloud-drive-management@projects/giken-cloud-drive-management\"\n"
-            "      source: projects/giken-cloud-drive-management/project.yaml\n"
+            '    - cache_key: "project:giken-cloud-drive-management@projects/giken-cloud-drive-management"\n'
+            "      source: projects/giken-cloud-drive-management/project.env\n"
             "      path: projects/giken-cloud-drive-management\n"
             "      redmine_project: giken-cloud-drive-management\n"
-            "      display_label: \"クラウドドライブ管理\"\n"
+            '      display_label: "クラウドドライブ管理"\n'
             "      runtime_identity_enabled: true\n"
-            f"      fingerprint: \"{fingerprint}\"\n",
+            f'      fingerprint: "{fingerprint}"\n',
             encoding="utf-8",
         )
 
@@ -531,7 +527,7 @@ class ScanProgressTests(unittest.TestCase):
         (self.repo / ".git").mkdir()
         proj = self.repo / "projects" / "giken-cloud-drive-management"
         proj.mkdir(parents=True)
-        (proj / "project.yaml").write_text(_ENABLED_DOC, encoding="utf-8")
+        (proj / "project.env").write_text(_ENABLED_DOC, encoding="utf-8")
 
     def tearDown(self):
         pd.clear_discovery_cache()

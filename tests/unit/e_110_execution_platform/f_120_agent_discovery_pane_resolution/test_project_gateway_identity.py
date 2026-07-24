@@ -113,7 +113,7 @@ def _scope():
         label=LABEL,
         workdir=PROJECT_PATH,
         parent_workspace=WORKSPACE,
-        source=f"{PROJECT_PATH}/project.yaml",
+        source=f"{PROJECT_PATH}/project.env",
         fingerprint="sha256:abc",
     )
 
