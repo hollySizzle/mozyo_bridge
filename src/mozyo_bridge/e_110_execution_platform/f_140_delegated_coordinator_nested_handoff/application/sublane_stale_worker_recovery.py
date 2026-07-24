@@ -47,24 +47,26 @@ from mozyo_bridge.core.state.replacement_transaction import (
     ReplacementTransactionStore,
 )
 from mozyo_bridge.core.state.replacement_transaction_model import (
-    CAS_GENERATION_MISMATCH,
-    CAS_LEASE_NOT_HELD,
-    CAS_NOT_FOUND,
-    CAS_STALE_REVISION,
     ContinuationPointerError,
     DecisionPointerError,
     ParticipantPinError,
-    PHASE_COMPLETED,
-    PHASE_DRAINING_CONTINUATION,
-    PHASE_REPLACING_NONSELF,
     norm,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.fresh_coordinator_drain import (  # noqa: E501
-    DRAIN_SEND_OK,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (  # noqa: E501
     DEFAULT_LEASE_TTL_SECONDS,
     ReplacementActuatorUseCase,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_continuation_drain import (  # noqa: E501
+    CONTINUATION_AUTHORITY_MOVED,
+    CONTINUATION_CONFIRMED,
+    CONTINUATION_GENERATION_MISMATCH,
+    CONTINUATION_LEASE_LOST,
+    CONTINUATION_NOT_FOUND,
+    CONTINUATION_RELEASE_REFUSED,
+    CONTINUATION_SEND_FAILED,
+    CONTINUATION_UNCERTAIN,
+    CONTINUATION_UNREADABLE,
+    drive_continuation_once,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator_ops import (  # noqa: E501
     ExactGenerationActuatorPort,
@@ -114,35 +116,21 @@ RECOVERY_COMPLETED = "completed"
 #: resumes. The underlying actuation / redispatch status is carried in ``detail``.
 RECOVERY_STOPPED = "stopped"
 
-#: Redispatch leg status (a closed vocabulary), riding the tranche C drain discipline.
-REDISPATCH_CONFIRMED = "confirmed"
-REDISPATCH_UNCERTAIN = "uncertain"
-REDISPATCH_SEND_FAILED = "send_failed"
-REDISPATCH_LEASE_LOST = "lease_lost"
-REDISPATCH_GENERATION_MISMATCH = "generation_mismatch"
-REDISPATCH_NOT_FOUND = "not_found"
-REDISPATCH_CONTINUATION_UNREADABLE = "continuation_unreadable"
-#: The live lane authority (lifecycle / worktree token / branch) moved between the launch and the
-#: send — a fail-closed ZERO send re-joined action-time immediately before the transport (Redmine
-#: #13806 R3-F1, Review j#82731). The phase stays not-attempted so a later re-run re-joins and
-#: sends once authority is restored; never a blind send into a lane the approval no longer governs.
-REDISPATCH_AUTHORITY_MOVED = "authority_moved"
-#: A PROVEN zero-send attempt's revert CAS could not complete (the retry cap was exhausted by a
-#: pathological concurrent refusal, an unexpected concurrent phase, or an unexpected refusal
-#: reason) — Redmine #13806 R3 Review j#82782 F1. DISTINCT from :data:`REDISPATCH_UNCERTAIN`: this
-#: invocation definitively did NOT send (the authority moved before the transport), so it is a
-#: **concrete zero-send CAS-recovery failure**, never conflated with the "attempted, a send may be
-#: in flight" ``uncertain`` state. It never claims a re-sendable state it did not reach; recovery
-#: is by operator diagnosis / a later re-run once the pathological contention clears, never a blind
-#: resend (the send is proven zero, so no gate ever went out on this path).
-REDISPATCH_RELEASE_REFUSED = "release_refused"
-
-#: Bounded re-read + retry cap for un-recording a proven zero-send attempt whose revert CAS was
-#: refused by a concurrent write (Redmine #13806 R3 Progress blocker j#82768). A lease-held revert
-#: converges in one or two iterations once the racing write settles; the cap only backstops a
-#: pathological loop, and hitting it reports :data:`REDISPATCH_RELEASE_REFUSED` (never a false
-#: ``authority_moved`` and never the send-in-flight ``uncertain``).
-_UN_RECORD_RETRY_CAP = 8
+#: Redispatch leg status (a closed vocabulary), riding the tranche C drain discipline. The
+#: single authority for these tokens — and for the exactly-once drive / typed zero-send revert
+#: (j#82768 / j#82782 F1) machinery behind them — is
+#: :mod:`.replacement_continuation_drain` (extracted for reuse by the #14203 gateway refresh);
+#: they are re-bound here under their original #13806 names so this module's public vocabulary
+#: is unchanged.
+REDISPATCH_CONFIRMED = CONTINUATION_CONFIRMED
+REDISPATCH_UNCERTAIN = CONTINUATION_UNCERTAIN
+REDISPATCH_SEND_FAILED = CONTINUATION_SEND_FAILED
+REDISPATCH_LEASE_LOST = CONTINUATION_LEASE_LOST
+REDISPATCH_GENERATION_MISMATCH = CONTINUATION_GENERATION_MISMATCH
+REDISPATCH_NOT_FOUND = CONTINUATION_NOT_FOUND
+REDISPATCH_CONTINUATION_UNREADABLE = CONTINUATION_UNREADABLE
+REDISPATCH_AUTHORITY_MOVED = CONTINUATION_AUTHORITY_MOVED
+REDISPATCH_RELEASE_REFUSED = CONTINUATION_RELEASE_REFUSED
 
 
 def _utc_now() -> str:
@@ -765,167 +753,18 @@ class StaleWorkerRecoveryUseCase:
         continuation = rec.continuation
         if continuation is None:
             return REDISPATCH_CONTINUATION_UNREADABLE
-        # Idempotency FIRST: if the original gate has already landed (a prior send that we could
-        # not confirm, or an out-of-band dispatch), advance to completion with ZERO send — even
-        # from ``replacing_nonself`` (which ``drain_state_for`` treats as not-yet-attempted
-        # regardless of the gate). This is what makes the redispatch exactly-once, never a
-        # duplicate dispatch.
-        if self._ops.gate_redispatched(continuation):
-            return self._finalize_confirmed(key, holder=holder, gen=gen)
-        # The gate is not confirmed; ride the drain state machine from the current phase.
-        state = drain_state_for(rec.phase, gate_confirmed=False)
-        if not may_attempt_drain(state):
-            # attempted / uncertain and the gate is NOT confirmed — a send may be in flight.
-            # Report uncertain; a later re-run re-checks the gate. Never blind-resend.
-            return REDISPATCH_UNCERTAIN
-        # not_attempted (phase replacing_nonself): record attempted (-> draining_continuation)
-        # BEFORE the send, so a crash here resumes as uncertain rather than re-sending.
-        attempt = self._store.transition_phase(
-            key, expected_revision=rec.revision, expected_action_generation=gen,
-            target=PHASE_DRAINING_CONTINUATION, holder=holder, now=self._clock(),
-        )
-        terminal = self._redispatch_terminal(attempt)
-        if terminal is not None:
-            return terminal
-        # Re-authenticate the lease immediately before the send (a live-holder CAS re-read on a
-        # fresh clock) — a lost lease yields ZERO send.
-        fresh = self._store.get(key)
-        effect_now = self._clock()
-        if (
-            fresh is None
-            or fresh.action_generation != gen
-            or fresh.lease_holder != holder
-            or not fresh.lease_is_live(effect_now)
-        ):
-            return REDISPATCH_LEASE_LOST
-        # R3-F1 (Review j#82760) — re-join the exact live lane authority as the LAST external
-        # observation, AFTER the attempted CAS + lease re-auth and IMMEDIATELY before the
-        # transport (nothing runs between this check and the send). A last-mile lifecycle /
-        # worktree / branch move is independent of the transaction lease, so the lease re-auth
-        # above cannot catch it. On a move the send provably has NOT happened, so un-record the
-        # attempt (``draining_continuation -> replacing_nonself``) rather than leaving it mistaken
-        # for a send-in-flight: a re-run re-attempts the redispatch exactly once, never a blind
-        # send into a lane the approval no longer governs. The lane-free-of-live fence is NOT
-        # applied here (the fresh worker is now live at the name by design; its already-confirmed
-        # action-bound attestation is what proves it is ours).
-        if not self._ops.resume_lane_authority(request):
-            return self._un_record_attempt(key, holder=holder, gen=gen)
-        if self._ops.redispatch_gate(continuation) != DRAIN_SEND_OK:
-            # Send failed; the state stays attempted/draining_continuation. A re-run re-checks
-            # the gate and only completes if it confirms — never a blind resend.
-            return REDISPATCH_SEND_FAILED
-        if not self._ops.gate_redispatched(continuation):
-            return REDISPATCH_UNCERTAIN
-        return self._finalize_confirmed(key, holder=holder, gen=gen)
-
-    def _un_record_attempt(self, key, *, holder, gen) -> str:
-        """Un-record a PROVEN zero-send attempt, handling the release CAS outcome (j#82768).
-
-        The lane authority moved immediately before the transport, so the redispatch did NOT
-        send. The attempt (``draining_continuation``) must be reverted to ``replacing_nonself`` so
-        a re-run re-attempts exactly once. The revert is a CAS that can be REFUSED — a concurrent
-        write raced the read that fed ``expected_revision`` — and its outcome must NEVER be
-        ignored (Progress blocker j#82768): a silently-refused revert leaves ``draining_continuation``,
-        which a re-run mistakes for a send-in-flight and gets stuck at ``uncertain`` forever.
-
-        So each attempt re-reads the CURRENT row and classifies it into a typed disposition:
-
-        - row gone / newer generation / lost lease -> a concrete typed blocker (never
-          ``authority_moved``, which would claim a re-sendable state that is not one);
-        - already ``replacing_nonself`` (a concurrent holder reverted, or it was never attempted)
-          -> ``authority_moved`` (re-sendable);
-        - ``completed`` (a concurrent holder dispatched + drained) -> ``confirmed``;
-        - still ``draining_continuation`` with the live lease at the current revision -> release
-          with THAT revision; a stale-revision refusal re-reads and retries (a lease-held revert
-          converges once the racing write settles). A bounded cap — and any unexpected concurrent
-          phase or refusal reason — reports :data:`REDISPATCH_RELEASE_REFUSED` (Review j#82782 F1):
-          a **distinct** zero-send CAS-recovery failure, never the send-in-flight ``uncertain`` and
-          never a false ``authority_moved``. The send is proven zero on this path, so recovery is
-          operator diagnosis / a later re-run, never a blind resend.
-        """
-        for _ in range(_UN_RECORD_RETRY_CAP):
-            rec = self._store.get(key)
-            if rec is None:
-                return REDISPATCH_NOT_FOUND
-            if rec.action_generation != gen:
-                return REDISPATCH_GENERATION_MISMATCH
-            if rec.phase == PHASE_REPLACING_NONSELF:
-                return REDISPATCH_AUTHORITY_MOVED  # re-sendable (reverted / never attempted)
-            if rec.phase == PHASE_COMPLETED:
-                return REDISPATCH_CONFIRMED  # a concurrent holder dispatched + drained
-            if rec.phase != PHASE_DRAINING_CONTINUATION:
-                # An unexpected concurrent phase (a self flow / mid-transition); never claim
-                # re-sendable — a distinct zero-send recovery failure, not send-in-flight uncertain.
-                return REDISPATCH_RELEASE_REFUSED
-            now = self._clock()
-            if rec.lease_holder != holder or not rec.lease_is_live(now):
-                return REDISPATCH_LEASE_LOST
-            out = self._store.release_drain_attempt(
-                key, expected_revision=rec.revision, expected_action_generation=gen,
-                holder=holder, now=now,
-            )
-            if out.applied:
-                return REDISPATCH_AUTHORITY_MOVED  # reverted -> re-sendable
-            if out.reason == CAS_GENERATION_MISMATCH:
-                return REDISPATCH_GENERATION_MISMATCH
-            if out.reason == CAS_LEASE_NOT_HELD:
-                return REDISPATCH_LEASE_LOST
-            if out.reason not in (CAS_STALE_REVISION, CAS_NOT_FOUND):
-                # An unexpected refusal reason — a distinct zero-send recovery failure, never a
-                # false re-sendable and never the send-in-flight uncertain.
-                return REDISPATCH_RELEASE_REFUSED
-            # CAS_STALE_REVISION / CAS_NOT_FOUND: a concurrent write moved the row — re-read + retry.
-        return REDISPATCH_RELEASE_REFUSED  # cap exhausted (a real lease-held revert converges quickly)
-
-    def _finalize_confirmed(self, key, *, holder, gen) -> str:
-        """Advance a gate-confirmed transaction to ``completed`` with ZERO send (idempotent).
-
-        Reached only when the original gate has landed (a confirmed send, an out-of-band
-        dispatch, or an already-``completed`` resume). Advances ``replacing_nonself ->
-        draining_continuation -> completed`` as needed and releases the lease — never issues a
-        send, so it can never duplicate the dispatch.
-        """
-        rec = self._store.get(key)
-        if rec is None:
-            return REDISPATCH_NOT_FOUND
-        if rec.phase == PHASE_REPLACING_NONSELF:
-            attempt = self._store.transition_phase(
-                key, expected_revision=rec.revision, expected_action_generation=gen,
-                target=PHASE_DRAINING_CONTINUATION, holder=holder, now=self._clock(),
-            )
-            terminal = self._redispatch_terminal(attempt)
-            if terminal is not None:
-                return terminal
-            rec = self._store.get(key)
-        if rec is not None and rec.phase == PHASE_DRAINING_CONTINUATION:
-            done = self._store.transition_phase(
-                key, expected_revision=rec.revision, expected_action_generation=gen,
-                target=PHASE_COMPLETED, holder=holder, now=self._clock(),
-            )
-            terminal = self._redispatch_terminal(done)
-            if terminal is not None:
-                return terminal
-        self._release(key, gen, holder)
-        return REDISPATCH_CONFIRMED
-
-    def _redispatch_terminal(self, outcome) -> Optional[str]:
-        if outcome.applied:
-            return None
-        if outcome.reason == CAS_LEASE_NOT_HELD:
-            return REDISPATCH_LEASE_LOST
-        if outcome.reason == CAS_GENERATION_MISMATCH:
-            return REDISPATCH_GENERATION_MISMATCH
-        # A benign stale revision (a concurrent read moved the row) — a re-run re-reads; report
-        # uncertain rather than assume the send state.
-        return REDISPATCH_UNCERTAIN
-
-    def _release(self, key, gen, holder) -> None:
-        rec = self._store.get(key)
-        if rec is None or rec.lease_holder != holder:
-            return
-        self._store.release(
-            key, expected_revision=rec.revision, expected_action_generation=gen,
-            holder=holder, now=self._clock(),
+        # The whole exactly-once drive — idempotency-first zero-send completion, record
+        # ``attempted`` BEFORE the send, lease re-auth + action-time lane-authority re-join
+        # immediately before the transport (R3-F1 / j#82760; the lane-free-of-live fence is NOT
+        # part of it — the fresh worker is now live at the name by design, its action-bound
+        # attestation proves it is ours), and the typed zero-send revert (j#82768 / j#82782 F1)
+        # — is the shared :func:`drive_continuation_once` authority, reused verbatim by the
+        # #14203 gateway refresh.
+        return drive_continuation_once(
+            self._store, self._clock, key, holder=holder, gen=gen,
+            authority_fn=lambda: self._ops.resume_lane_authority(request),
+            send_fn=lambda: self._ops.redispatch_gate(continuation),
+            confirmed_fn=lambda: self._ops.gate_redispatched(continuation),
         )
 
     @staticmethod
