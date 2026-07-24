@@ -14,9 +14,11 @@ workspace is exactly the lease contract the drain leg pins:
   (fresh candidate re-assembly, CAS revision pins, the one-mutation budget) make the redrive safe.
 
 An UNWIRED leg fails closed: nothing is acquired, nothing actuates, and the report says why
-(``SKIP_HIBERNATE_UNWIRED``) instead of silently no-opping. A leg that RAISES is fail-open per
-workspace (the sweep continues; ``SKIP_HIBERNATE_LEG_ERROR``) — parity with the per-issue pass
-error token; the leg's own budget bounds any partial effect to at most the one audited mutation.
+(``SKIP_HIBERNATE_UNWIRED``) instead of silently no-opping. A leg that RAISES is an UNCERTAIN
+mutation status (``SKIP_HIBERNATE_LEG_ERROR``; review j#86739 R3-F1): the exception may have
+fired after a side effect, so it consumes the sweep's pass-wide one-mutation budget exactly like
+a success — every remaining workspace is the typed budget defer, never a second actuation behind
+an unknown partial effect.
 """
 
 from __future__ import annotations

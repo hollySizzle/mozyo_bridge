@@ -45,6 +45,11 @@ ATTEMPT_DEFERRED = "deferred"
 ATTEMPT_LEASE_LOST = "lease_lost"
 ATTEMPT_NO_JOURNAL = "no_basis_journal"
 ATTEMPT_STALE = "stale_basis"
+# Crash-redrive attempt kinds (review j#86757 R4-F2): finishing a prior pass's interrupted
+# release on an already-hibernated row, via the public use case's own redrive path.
+ATTEMPT_REDRIVEN = "redriven"
+ATTEMPT_REDRIVE_WITHHELD = "redriven_success_withheld"
+ATTEMPT_REDRIVE_BLOCKED = "redrive_blocked"
 
 # Fixed reason tokens the leg emits itself (secret-free; the use case's own reasons are already a
 # closed vocabulary and are passed through verbatim).
@@ -124,6 +129,7 @@ def run_hibernate_pass(
     use_case: Optional[SublaneHibernateUseCase] = None,
     lease_renew_fn: Callable[[], bool],
     use_case_fn: Optional[Callable[[HibernateCandidate], Optional[SublaneHibernateUseCase]]] = None,
+    budget_consumed: bool = False,
 ) -> HibernatePassResult:
     """Run one bounded hibernate pass, actuating at most one lifecycle mutation.
 
@@ -153,7 +159,9 @@ def run_hibernate_pass(
         return HibernatePassResult(attempts=(), mutations=0, empty_pass=True)
 
     attempts: list[HibernateAttempt] = []
-    mutated = False
+    # Review j#86757 R4-F2 condition 4: a caller that already spent the pass's one-mutation
+    # budget on a crash redrive starts this fresh pass consumed — every candidate defers.
+    mutated = budget_consumed
     stopped = False
     for candidate in ordered:
         issue, lane = candidate.issue_id, candidate.anchor.lane_id
@@ -225,7 +233,93 @@ def run_hibernate_pass(
             attempts.append(HibernateAttempt(issue, lane, ATTEMPT_BLOCKED, _blocked_reason(outcome)))
 
     return HibernatePassResult(
-        attempts=tuple(attempts), mutations=1 if mutated else 0, empty_pass=False
+        attempts=tuple(attempts),
+        mutations=1 if mutated and not budget_consumed else 0,
+        empty_pass=False,
+    )
+
+
+@dataclass(frozen=True)
+class RedriveResult:
+    """The crash-redrive prelude's outcome: its attempts, and whether it consumed the budget."""
+
+    attempts: tuple[HibernateAttempt, ...]
+    mutations: int
+    stopped: bool
+
+
+def run_hibernate_redrives(
+    redrives: "Sequence[object]",
+    *,
+    use_case_fn: "Callable[[object], Optional[SublaneHibernateUseCase]]",
+    request_fn: "Callable[[object], HibernateRequest]",
+    lease_renew_fn: Callable[[], bool],
+) -> RedriveResult:
+    """Finish prior interrupted releases on already-hibernated rows (review j#86757 R4-F2).
+
+    ``redrives`` are the lifecycle rows a caller enumerated as hibernated with an UNRESOLVED
+    process release (requested / partial / unknown — released and not_requested are terminal
+    and never reach here). Each is driven through the SAME public use case, whose
+    ``already_hibernated`` path resumes the row's STORED release action id / pins (the
+    immutable action authority) — no ACTIVE-basis re-derivation, no rebind to another cycle's
+    approval. Deterministic ``(issue, lane)`` order; the pass-wide one-mutation budget applies:
+
+    * an EXECUTED redrive (the release drive ran — settled or success-withheld) consumed the
+      budget: its process-close / store-write side effects are a managed-environment mutation,
+      so no fresh mutation may follow in the same pass;
+    * a typed zero-close refusal (``redrive_blocked``: preservation gate unmet, unreadable
+      inventory, boundary divergence) consumes nothing — the fresh pass may proceed;
+    * a lease lost stops the pass (zero further actuation), mirroring the fresh path.
+    """
+    ordered = sorted(
+        redrives,
+        key=lambda row: (
+            str(getattr(row, "issue_id", "")),
+            str(getattr(row, "lane_id", "")),
+        ),
+    )
+    attempts: list[HibernateAttempt] = []
+    mutated = False
+    stopped = False
+    for row in ordered:
+        issue = str(getattr(row, "issue_id", ""))
+        lane = str(getattr(row, "lane_id", ""))
+        if mutated or stopped:
+            attempts.append(HibernateAttempt(
+                issue, lane, ATTEMPT_DEFERRED, NO_ACTUATION_DEFERRED_ONE_PER_PASS
+            ))
+            continue
+        use_case = use_case_fn(row)
+        if use_case is None:
+            attempts.append(HibernateAttempt(
+                issue, lane, ATTEMPT_REDRIVE_BLOCKED, LEG_REASON_WORKTREE_UNRESOLVED
+            ))
+            continue
+        if not lease_renew_fn():
+            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
+            stopped = True
+            continue
+        outcome = use_case.run(request_fn(row), execute=True)
+        if outcome.lease_lost:
+            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
+            stopped = True
+            continue
+        if outcome.release is not None:
+            # The release drive RAN: store writes / process closes may have landed (even a
+            # success-withheld one) — the authoritative side-effect fact consumes the budget.
+            mutated = True
+            if outcome.success_withheld:
+                attempts.append(HibernateAttempt(
+                    issue, lane, ATTEMPT_REDRIVE_WITHHELD, LEG_REASON_SUCCESS_WITHHELD
+                ))
+            else:
+                attempts.append(HibernateAttempt(issue, lane, ATTEMPT_REDRIVEN, ""))
+            continue
+        attempts.append(HibernateAttempt(
+            issue, lane, ATTEMPT_REDRIVE_BLOCKED, _blocked_reason(outcome)
+        ))
+    return RedriveResult(
+        attempts=tuple(attempts), mutations=1 if mutated else 0, stopped=stopped
     )
 
 
@@ -237,6 +331,11 @@ __all__ = [
     "ATTEMPT_LEASE_LOST",
     "ATTEMPT_NO_JOURNAL",
     "ATTEMPT_STALE",
+    "ATTEMPT_REDRIVEN",
+    "ATTEMPT_REDRIVE_WITHHELD",
+    "ATTEMPT_REDRIVE_BLOCKED",
+    "RedriveResult",
+    "run_hibernate_redrives",
     "NO_ACTUATION_NO_CANDIDATE",
     "HibernateAttempt",
     "HibernatePassResult",

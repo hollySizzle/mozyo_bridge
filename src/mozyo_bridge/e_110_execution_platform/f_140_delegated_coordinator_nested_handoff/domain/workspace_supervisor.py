@@ -95,9 +95,10 @@ SKIP_LEASE_LOST = "lease_lost_midsweep"
 #: The hibernate mode was requested but no leg is wired (Redmine #14219 T2c): fail-closed —
 #: nothing is acquired and nothing actuates; the report says WHY instead of silently no-opping.
 SKIP_HIBERNATE_UNWIRED = "hibernate_leg_unwired"
-#: The wired hibernate leg raised (fail-open per workspace, like a per-issue pass error): the
-#: sweep continues, the workspace reports the error token. The leg's own budget/fences bound any
-#: partial effect to at most the one audited mutation.
+#: The wired hibernate leg raised — an UNCERTAIN mutation status (review j#86739 R3-F1): the
+#: exception may have fired after a side effect, so the sweep consumes its pass-wide
+#: one-mutation budget exactly like a success and every remaining workspace is the typed
+#: budget defer. The workspace reports this error token.
 SKIP_HIBERNATE_LEG_ERROR = "hibernate_leg_error"
 #: The supervisor pass's SHARED one-mutation budget was already consumed by an earlier
 #: workspace (Redmine #14219 j#86734 R2-F2): this workspace's leg did not run at all this pass

@@ -647,6 +647,247 @@ class GitObservationTest(unittest.TestCase):
     def test_a_missing_lifecycle_row_observes_nothing(self):
         self.assertIsNone(observe_lane_push(self.repo, [], self._selected()))
 
+    def test_a_clean_local_commit_ahead_of_origin_binds_no_head(self):
+        # Review j#86757 R4-F1: the origin branch still exists at the OLD head, but the
+        # worktree carries a newer clean local commit — the head binds only on
+        # local HEAD == origin head, never on the origin ref's existence.
+        subprocess.run(
+            ["git", "-C", str(self.worktree), "commit", "--allow-empty", "-qm", "ahead"],
+            check=True, env=self._env,
+        )
+        self.assertIsNone(observe_lane_push(self.repo, self.rows, self._selected()))
+
+    def test_a_behind_or_diverged_checkout_binds_no_head(self):
+        # The origin branch advanced past the local HEAD: the equality is two-directional.
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "--allow-empty", "-qm", "advance"],
+            check=True, env=self._env,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "push", "-q", "-f", "origin", f"main:{self.branch}"],
+            check=True, env=self._env,
+        )
+        self.assertIsNone(observe_lane_push(self.repo, self.rows, self._selected()))
+
+    def test_the_topology_observation_is_one_typed_fact(self):
+        # Review j#86757 R4-F1: path, branch, local HEAD and origin head come from ONE capture.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            observe_lane_topology,
+        )
+
+        observation = observe_lane_topology(
+            self.repo, self.rows, workspace=WS, lane=LANE, generation=GEN
+        )
+        self.assertIsNotNone(observation)
+        self.assertEqual(observation.worktree, self.worktree.resolve())
+        self.assertEqual(observation.branch, self.branch)
+        self.assertEqual(observation.local_head, self.head)
+        self.assertEqual(observation.origin_head, self.head)
+        self.assertTrue(observation.pushed)
+
+    def test_observe_worktree_head_reads_the_current_head_and_branch(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            observe_worktree_head,
+        )
+
+        self.assertEqual(
+            observe_worktree_head(self.worktree), (self.head, self.branch)
+        )
+        subprocess.run(
+            ["git", "-C", str(self.worktree), "checkout", "-q", "--detach"],
+            check=True, capture_output=True, env=self._env,
+        )
+        self.assertIsNone(observe_worktree_head(self.worktree))
+
+
+class RedriveEnumerationTest(unittest.TestCase):
+    """enumerate_hibernated_redrives (review j#86757 R4-F2): hibernated issue-lane rows with an
+    UNRESOLVED process release are typed redrive debt; released / not_requested are terminal."""
+
+    def _row(self, **kw):
+        row = _Row()
+        row.lane_disposition = kw.pop("lane_disposition", "hibernated")
+        for key, value in kw.items():
+            setattr(row, key, value)
+        return row
+
+    def _enumerate(self, rows):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            enumerate_hibernated_redrives,
+        )
+
+        return enumerate_hibernated_redrives(rows, WS)
+
+    def test_unresolved_release_states_enumerate(self):
+        for state in ("requested", "partial", "weird_unknown_token"):
+            with self.subTest(state=state):
+                rows = [self._row(process_release=state)]
+                self.assertEqual(len(self._enumerate(rows)), 1, state)
+
+    def test_terminal_release_states_never_enumerate(self):
+        for state in ("released", "not_requested"):
+            with self.subTest(state=state):
+                self.assertEqual(
+                    self._enumerate([self._row(process_release=state)]), ()
+                )
+
+    def test_active_foreign_and_non_issue_rows_never_enumerate(self):
+        self.assertEqual(
+            self._enumerate([self._row(lane_disposition="active", process_release="partial")]),
+            (),
+        )
+        self.assertEqual(
+            self._enumerate(
+                [self._row(process_release="partial", repo_workspace_id="other")]
+            ),
+            (),
+        )
+        self.assertEqual(
+            self._enumerate(
+                [self._row(process_release="partial", binding_kind="project_gateway")]
+            ),
+            (),
+        )
+        self.assertEqual(
+            self._enumerate([self._row(process_release="partial", issue_id="")]), ()
+        )
+
+
+class RedriveRunnerTest(unittest.TestCase):
+    """run_hibernate_redrives budget/order semantics (review j#86757 R4-F2 condition 4)."""
+
+    def _stub_outcome(self, **kw):
+        from types import SimpleNamespace
+
+        base = dict(
+            lease_lost=False, release=None, success_withheld=False,
+            blocked_reasons=("some_block",),
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def _run(self, rows, outcomes, renew=lambda: True):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_actuation_leg import (  # noqa: E501
+            run_hibernate_redrives,
+        )
+        from types import SimpleNamespace
+
+        calls = []
+
+        def use_case_fn(row):
+            outcome = outcomes.get(row.lane_id)
+            if outcome is None:
+                return None
+            return SimpleNamespace(
+                run=lambda request, execute: calls.append(row.lane_id) or outcome
+            )
+
+        return calls, run_hibernate_redrives(
+            rows,
+            use_case_fn=use_case_fn,
+            request_fn=lambda row: object(),
+            lease_renew_fn=renew,
+        )
+
+    def _rows(self, *lanes):
+        out = []
+        for lane in lanes:
+            row = _Row()
+            row.lane_id = lane
+            row.lane_disposition = "hibernated"
+            out.append(row)
+        return out
+
+    def test_an_executed_redrive_consumes_the_budget_and_defers_the_rest(self):
+        rows = self._rows("lane_b", "lane_a")
+        outcomes = {
+            "lane_a": self._stub_outcome(release=object()),
+            "lane_b": self._stub_outcome(release=object()),
+        }
+        calls, result = self._run(rows, outcomes)
+        # Deterministic (issue, lane) order: lane_a runs first, lane_b defers.
+        self.assertEqual(calls, ["lane_a"])
+        self.assertEqual(result.mutations, 1)
+        self.assertEqual(
+            [(a.lane, a.kind) for a in result.attempts],
+            [("lane_a", "redriven"), ("lane_b", "deferred")],
+        )
+
+    def test_a_typed_zero_close_block_consumes_nothing(self):
+        rows = self._rows("lane_a", "lane_b")
+        outcomes = {
+            "lane_a": self._stub_outcome(),  # blocked: release None
+            "lane_b": self._stub_outcome(release=object()),
+        }
+        calls, result = self._run(rows, outcomes)
+        self.assertEqual(calls, ["lane_a", "lane_b"])
+        self.assertEqual(result.mutations, 1)
+        self.assertEqual(
+            [(a.lane, a.kind) for a in result.attempts],
+            [("lane_a", "redrive_blocked"), ("lane_b", "redriven")],
+        )
+
+    def test_a_withheld_success_still_consumes_the_budget(self):
+        rows = self._rows("lane_a", "lane_b")
+        outcomes = {
+            "lane_a": self._stub_outcome(release=object(), success_withheld=True),
+            "lane_b": self._stub_outcome(release=object()),
+        }
+        calls, result = self._run(rows, outcomes)
+        self.assertEqual(calls, ["lane_a"])
+        self.assertEqual(result.mutations, 1)
+        self.assertEqual(result.attempts[0].kind, "redriven_success_withheld")
+
+    def test_a_lost_lease_stops_the_redrives(self):
+        rows = self._rows("lane_a", "lane_b")
+        calls, result = self._run(
+            rows,
+            {"lane_a": self._stub_outcome(release=object())},
+            renew=lambda: False,
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(result.mutations, 0)
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.attempts[0].kind, "lease_lost")
+
+    def test_an_unresolvable_worktree_is_a_typed_block_not_a_fallback(self):
+        rows = self._rows("lane_a")
+        calls, result = self._run(rows, {})
+        self.assertEqual(calls, [])
+        self.assertEqual(result.mutations, 0)
+        self.assertEqual(result.attempts[0].kind, "redrive_blocked")
+        self.assertEqual(result.attempts[0].reason, "candidate_worktree_unresolved")
+
+
+class ContractTextTest(unittest.TestCase):
+    """R4-F3 (review j#86757): the load-bearing source contracts state the SHIPPED behavior —
+    the superseded vocabulary must not resurface."""
+
+    def _source(self, module):
+        import inspect
+
+        return inspect.getsource(module)
+
+    def test_the_wiring_contract_names_the_actual_branch_and_two_phase_reads(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            hibernate_supervisor_wiring,
+        )
+
+        text = self._source(hibernate_supervisor_wiring)
+        self.assertNotIn("refs/heads/<lane>", text)
+        self.assertIn("ACTUAL checked-out branch", text)
+        self.assertIn("TWO memoised page reads per enumerated issue per pass", text)
+        self.assertNotIn("one page per enumerated issue plus", text)
+
+    def test_the_leg_and_supervisor_contracts_state_the_uncertain_budget_rule(self):
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_hibernate_leg as leg_mod  # noqa: E501
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor as sup_mod  # noqa: E501
+
+        for module in (leg_mod, sup_mod):
+            text = " ".join(self._source(module).split())
+            self.assertNotIn("fail-open per workspace", text)
+            self.assertIn("UNCERTAIN mutation status", text)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -225,7 +225,252 @@ class T2cProductionActuationTest(unittest.TestCase):
         # Bounded provider reads: the issue page once (memoised) + the one receipt page.
         self.assertEqual(sorted(set(source.reads)), [ISSUE, RELEASE_ISSUE])
 
+    def _run_supervisor_with_runtime_hook(self, pages, runtime_hook):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            workspace_callback_supervisor as sup_mod,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            reconcile_live_source,
+        )
+
+        source = _FakeSource(pages)
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("MOZYO") and key not in ("TMUX", "TMUX_PANE")
+        }
+        env["MOZYO_BRIDGE_HOME"] = str(self.home)
+        env["MOZYO_HERDR_BINARY"] = str(self.herdr)
+
+        def runtime(workspace_id, lane_id, role, agents_fn=None):
+            runtime_hook()
+            return "awaiting_input"
+
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(sup_mod, "default_redmine_source", lambda ws, home=None: source), \
+                mock.patch.object(reconcile_live_source, "lane_worker_runtime", runtime):
+            supervisor = sup_mod.build_supervisor(holder="t2c-test", home=self.home)
+            report = supervisor.run_once(mode=SUPERVISION_HIBERNATE)
+        return report
+
+    def _workspace_outcome(self, report):
+        return next(
+            ws for ws in report.workspaces if ws.workspace_id == self.workspace_id
+        )
+
+    def _lane_row(self, lane=LANE):
+        return next(
+            record for record in LaneLifecycleStore(home=self.home).records()
+            if record.lane_id == lane
+        )
+
+    def test_a_clean_unpushed_local_commit_actuates_nothing(self):
+        # Review j#86757 R4-F1: origin still carries the branch at the evidence head, but the
+        # worktree has a NEWER clean local commit — local HEAD != origin head binds no head,
+        # so the lane is a typed non-candidate (unpushed work is never early-hibernated).
+        _git(self.worktree, "commit", "--allow-empty", "-qm", "ahead")
+        pages = {ISSUE: self._early_page(), RELEASE_ISSUE: self._receipt_page()}
+        report, _source = self._run_supervisor(pages)
+        outcome = self._workspace_outcome(report)
+        self.assertTrue(outcome.hibernate_ran)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        self.assertNotIn(
+            "actuated", [attempt["kind"] for attempt in outcome.hibernate_attempts]
+        )
+        self.assertEqual(self._lane_row().lane_disposition, "active")
+
+    def test_a_behind_or_diverged_checkout_actuates_nothing(self):
+        # The origin branch advanced past the worktree's local HEAD (behind/diverged) — the
+        # equality is required in BOTH directions, never "an origin ref exists".
+        _git(self.repo, "commit", "--allow-empty", "-qm", "advance")
+        _git(self.repo, "push", "-q", "-f", "origin", f"main:{self.branch}")
+        pages = {ISSUE: self._early_page(), RELEASE_ISSUE: self._receipt_page()}
+        report, _source = self._run_supervisor(pages)
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        self.assertEqual(self._lane_row().lane_disposition, "active")
+
+    def test_a_head_switch_after_the_fresh_observation_actuates_nothing(self):
+        # Review j#86757 R4-F1 condition 2: the worktree HEAD moves AFTER the fresh topology
+        # observation (the injected hook fires at the action-time obligations read — strictly
+        # after the fresh observation, strictly before the commit) — the commit-point guard
+        # re-reads the worktree and refuses with zero transition / zero close.
+        def hook():
+            _git(self.worktree, "commit", "--allow-empty", "-qm", "mid-flight")
+
+        pages = {ISSUE: self._early_page(), RELEASE_ISSUE: self._receipt_page()}
+        report = self._run_supervisor_with_runtime_hook(pages, hook)
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        self.assertEqual(self._lane_row().lane_disposition, "active")
+
+    def test_a_clean_rebranch_after_the_fresh_observation_actuates_nothing(self):
+        # Same window, same commit: a clean rebranch (branch switch WITHOUT a head change)
+        # must also be detected — the guard compares (head, branch), not the head alone.
+        def hook():
+            _git(self.worktree, "checkout", "-q", "-b", "hijack")
+
+        pages = {ISSUE: self._early_page(), RELEASE_ISSUE: self._receipt_page()}
+        report = self._run_supervisor_with_runtime_hook(pages, hook)
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        self.assertEqual(self._lane_row().lane_disposition, "active")
+
+    def _hibernate_row_with_release(self, target):
+        # The crash window through the CANONICAL store rail: the fresh CAS landed, the release
+        # generation opened (its pins already actuated), and the terminal outcome record is
+        # where the prior run stopped — exactly what a post-CAS crash / partial close leaves.
+        from mozyo_bridge.core.state.lane_lifecycle_model import ReleasePin
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            encode_assigned_name,
+        )
+
+        key = LaneLifecycleKey(repo_workspace_id=self.workspace_id, lane_id=LANE)
+        decision = DecisionPointer(source="redmine", issue_id=ISSUE, journal_id="84999")
+        cas = self.store.transition_disposition(
+            key, expected_disposition="active", expected_revision=1,
+            target="hibernated", decision=decision,
+        )
+        assert cas.applied, cas
+        # The pinned slot is ALREADY closed (absent from the live inventory): the crash hit
+        # between the close and the outcome record — the redrive re-actuates nothing.
+        pin = ReleasePin(
+            role="codex",
+            assigned_name=encode_assigned_name(self.workspace_id, "codex", LANE),
+            locator="%9",
+        )
+        opened = self.store.request_release(
+            key, expected_revision=cas.revision, action_id=f"hibernate:{LANE}", pins=[pin],
+        )
+        assert opened.applied, opened
+        if target is not None:
+            recorded = self.store.record_release_outcome(
+                key, action_id=f"hibernate:{LANE}",
+                expected_revision=opened.revision, target=target,
+            )
+            assert recorded.applied, recorded
+        return key
+
+    def test_a_partial_release_row_is_redriven_to_released_on_the_next_pass(self):
+        # Review j#86757 R4-F2: a hibernated row with an unresolved release is enumerated as
+        # typed redrive debt and driven through the public use case's already_hibernated path
+        # — settled to released with NO manual sweep, NO second disposition CAS.
+        from mozyo_bridge.core.state.lane_lifecycle_model import RELEASE_PARTIAL
+
+        self._hibernate_row_with_release(RELEASE_PARTIAL)
+        report, source = self._run_supervisor({})
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 1, outcome.hibernate_attempts)
+        kinds = [attempt["kind"] for attempt in outcome.hibernate_attempts]
+        self.assertIn("redriven", kinds)
+        row = self._lane_row()
+        self.assertEqual(row.lane_disposition, "hibernated")
+        self.assertEqual(row.process_release, "released")
+        # The redrive resumes STORED authority: zero ticket-provider reads.
+        self.assertEqual(source.reads, [])
+        # Convergence: the NEXT pass enumerates no redrive debt and re-actuates nothing.
+        report2, _source2 = self._run_supervisor({})
+        outcome2 = self._workspace_outcome(report2)
+        self.assertEqual(outcome2.hibernate_mutations, 0, outcome2.hibernate_attempts)
+        self.assertEqual(
+            [attempt["kind"] for attempt in outcome2.hibernate_attempts], []
+        )
+        row2 = self._lane_row()
+        self.assertEqual(
+            (row2.lane_disposition, row2.process_release, row2.revision),
+            (row.lane_disposition, row.process_release, row.revision),
+        )
+
+    def test_a_released_row_is_terminal_and_never_redriven(self):
+        # released is terminal: no redrive attempt, no store write, no provider read.
+        from mozyo_bridge.core.state.lane_lifecycle_model import RELEASE_RELEASED
+
+        self._hibernate_row_with_release(RELEASE_RELEASED)
+        before = self._lane_row()
+        report, source = self._run_supervisor({})
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        self.assertEqual(list(outcome.hibernate_attempts), [])
+        self.assertEqual(source.reads, [])
+        after = self._lane_row()
+        self.assertEqual(after.revision, before.revision)
+
+    def test_a_redrive_consumes_the_pass_budget_before_any_fresh_mutation(self):
+        # Review j#86757 R4-F2 condition 4: the redrive's process-close side effect IS the
+        # pass's one mutation — a second, fully-evidenced fresh lane defers to the next pass.
+        from mozyo_bridge.core.state.lane_lifecycle_model import RELEASE_PARTIAL
+
+        self._hibernate_row_with_release(RELEASE_PARTIAL)
+        lane2 = "lane_t2c_2"
+        wt2 = self.dir / "wt-lane2"
+        _git(self.repo, "worktree", "add", "-q", str(wt2), "-b", "feature/second")
+        _git(self.repo, "push", "-q", "origin", "feature/second")
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            derive_lane_workspace_token,
+        )
+
+        token2 = derive_lane_workspace_token(str(wt2.resolve()))
+        issue2 = "601"
+        self.store.declare_active(
+            LaneLifecycleKey(repo_workspace_id=self.workspace_id, lane_id=lane2),
+            decision=DecisionPointer(source="redmine", issue_id=issue2, journal_id="84999"),
+            issue_id=issue2,
+            worktree_identity=token2,
+        )
+        record_lane_created(
+            lane_workspace_token=token2,
+            repo_workspace_id=self.workspace_id,
+            issue_id=issue2,
+            lane_label=lane2,
+            worktree_path=str(wt2.resolve()),
+            home=self.home,
+        )
+        head2 = subprocess.run(
+            ["git", "-C", str(wt2), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        env2 = LaneEvidenceEnvelope(
+            workspace=self.workspace_id, lane=lane2, lane_generation=1, head=head2
+        )
+        page2 = (
+            (REQ_JOURNAL, "request\n" + render_workflow_event_marker(
+                "review_request", target_head=head2
+            )),
+            ("85001", "review\n" + render_workflow_event_marker(
+                "review_result", target_head=head2,
+                review_request_journal=REQ_JOURNAL, conclusion="approved",
+                evidence_workspace=self.workspace_id, evidence_lane=lane2,
+                evidence_lane_generation=1,
+            )),
+            ("85002", "## Integration disposition\n" + render_integration_evidence(
+                envelope=env2, integration_head="f" * 40,
+                integration_branch="main-next", disposition="merge",
+            )),
+            ("85003", "ci\n" + render_hibernate_evidence(
+                EVIDENCE_REQUIRED_CI_GREEN, envelope=env2, workflow="test.yml", run="299"
+            )),
+            ("85004", "dogfood\n" + render_hibernate_evidence(
+                EVIDENCE_DOGFOOD_DELEGATED, envelope=env2,
+                release_issue=RELEASE_ISSUE, acceptance="85431",
+            )),
+        )
+        receipt2 = (
+            ("90001", "receipt\n[mozyo:workflow-event:gate=dogfood_receipt"
+                      f":source_issue={issue2}:head={head2}]"),
+        )
+        report, _source = self._run_supervisor(
+            {issue2: page2, RELEASE_ISSUE: receipt2}
+        )
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 1, outcome.hibernate_attempts)
+        kinds = [attempt["kind"] for attempt in outcome.hibernate_attempts]
+        self.assertIn("redriven", kinds)
+        self.assertIn("deferred", kinds)
+        self.assertNotIn("actuated", kinds)
+        self.assertEqual(self._lane_row(LANE).process_release, "released")
+        self.assertEqual(self._lane_row(lane2).lane_disposition, "active")
+
     def test_a_later_review_request_flips_the_fresh_obligation_and_mutates_nothing(self):
+
         # Ruling j#86730 required tests 2+3: the transcription reads the SAME fresh memo — a
         # review_request newer than the approval means no fresh review_approved conjunct, so
         # the pass is zero-mutation even though the initial evidence looked complete.
