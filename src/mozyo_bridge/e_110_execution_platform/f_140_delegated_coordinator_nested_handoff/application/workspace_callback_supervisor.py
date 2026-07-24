@@ -305,10 +305,13 @@ class WorkspaceCallbackSupervisor:
                 authoritative = dict(self._authoritative_fn() or {})
             except Exception:  # noqa: BLE001 - an owner-map read never breaks the sweep
                 authoritative = {}
-        # Redmine #14219 T3 (Answer j#87108, review j#87154 R1-F1): ONE external-mutation budget for
-        # the WHOLE pass, threaded through every workspace's delivery/reconcile and folded hibernate
-        # legs. Deterministic (workspace-id) order so an earlier workspace's mutation / uncertainty
-        # defers every later workspace's hibernate and a re-driven pass re-attempts the same one.
+        # Redmine #14219 T3: ONE external-mutation budget shared across the WHOLE bounded pass in
+        # deterministic (workspace-id) order. It currently gates the folded HIBERNATE leg (hibernate
+        # defers behind any prior mutation/uncertain and actuates at most once across all workspaces).
+        # Final Design Disposition j#87188 (R2-F1 = B) extends the SAME budget to cap callback
+        # delivery + reconcile provider side-effects too — one external mutation total per pass, with
+        # delivery holding first priority for that single slot (co-verified as a #14150 residual).
+        # That delivery-gating extension is the pending piece of this round.
         pass_budget: dict = {"reads": 0, "mutated": False, "uncertain": False}
         outcomes: list[WorkspaceSupervisionOutcome] = []
         for ws in sorted(self._workspaces_fn(), key=lambda w: str(w.workspace_id or "")):

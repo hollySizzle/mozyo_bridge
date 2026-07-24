@@ -119,6 +119,7 @@ class HibernateModeTest(_HibernateModeHarness):
                     "kind": "hibernated",
                     "reason": "",
                     "revision": 7,
+                    "released": 0,
                 },
             ),
         )

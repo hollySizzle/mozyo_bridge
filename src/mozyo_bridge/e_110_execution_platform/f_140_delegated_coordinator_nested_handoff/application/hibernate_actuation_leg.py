@@ -76,13 +76,22 @@ LEG_REASON_INTENT_PERSIST_FAILED = "intent_persist_failed"
 
 @dataclass(frozen=True)
 class HibernateAttempt:
-    """One candidate's outcome this pass. ``reason`` is a closed token; no secrets/paths."""
+    """One candidate's outcome this pass. ``reason`` is a closed token; no secrets/paths.
+
+    ``released`` (review j#87176 R2-F2) is the number of process slots this attempt ACTUALLY closed
+    — ``len(ReleaseOutcome.closed)``. It is a count, not a status: a lane whose CAS applied but whose
+    release was ``not_requested`` (no live slot / dead process) mutated the lane yet freed ZERO
+    slots, so ``released == 0`` even though ``kind == actuated``. The report's released-capacity
+    metric sums THIS, never the count of actuated attempts, so it never reports freed capacity that
+    no process release produced.
+    """
 
     issue: str
     lane: str
     kind: str
     reason: str = ""
     revision: int = 0
+    released: int = 0
 
     def as_payload(self) -> dict:
         return {
@@ -91,6 +100,7 @@ class HibernateAttempt:
             "kind": self.kind,
             "reason": self.reason,
             "revision": self.revision,
+            "released": self.released,
         }
 
 
@@ -132,6 +142,19 @@ def _blocked_reason(outcome: HibernateOutcome) -> str:
     if outcome.success_withheld:
         return LEG_REASON_SUCCESS_WITHHELD
     return LEG_REASON_NOT_ACTUATED
+
+
+def _released_count(outcome: HibernateOutcome) -> int:
+    """The number of process slots this outcome ACTUALLY closed (review j#87176 R2-F2).
+
+    ``len(ReleaseOutcome.closed)`` — the real freed capacity. A ``not_requested`` release (no live
+    slot) closed nothing, so this is ``0`` even for an applied-lane success; a ``partial`` release
+    is its actual closed count. ``0`` when no release ran.
+    """
+    release = getattr(outcome, "release", None)
+    if release is None:
+        return 0
+    return len(getattr(release, "closed", ()) or ())
 
 
 def run_hibernate_pass(
@@ -251,13 +274,15 @@ def run_hibernate_pass(
         if applied:
             mutated = True
             revision = outcome.transition.revision
+            released = _released_count(outcome)
             if outcome.is_success:
-                attempts.append(
-                    HibernateAttempt(issue, lane, ATTEMPT_ACTUATED, "", revision=revision)
-                )
+                attempts.append(HibernateAttempt(
+                    issue, lane, ATTEMPT_ACTUATED, "", revision=revision, released=released
+                ))
             else:
                 attempts.append(HibernateAttempt(
-                    issue, lane, ATTEMPT_PARTIAL, _blocked_reason(outcome), revision=revision
+                    issue, lane, ATTEMPT_PARTIAL, _blocked_reason(outcome),
+                    revision=revision, released=released
                 ))
         else:
             attempts.append(HibernateAttempt(issue, lane, ATTEMPT_BLOCKED, _blocked_reason(outcome)))
@@ -352,12 +377,16 @@ def run_hibernate_redrives(
             # The release drive RAN: store writes / process closes may have landed (even a
             # success-withheld one) — the authoritative side-effect fact consumes the budget.
             mutated = True
+            released = _released_count(outcome)
             if outcome.success_withheld:
                 attempts.append(HibernateAttempt(
-                    issue, lane, ATTEMPT_REDRIVE_WITHHELD, LEG_REASON_SUCCESS_WITHHELD
+                    issue, lane, ATTEMPT_REDRIVE_WITHHELD, LEG_REASON_SUCCESS_WITHHELD,
+                    released=released
                 ))
             else:
-                attempts.append(HibernateAttempt(issue, lane, ATTEMPT_REDRIVEN, ""))
+                attempts.append(HibernateAttempt(
+                    issue, lane, ATTEMPT_REDRIVEN, "", released=released
+                ))
             continue
         attempts.append(HibernateAttempt(
             issue, lane, ATTEMPT_REDRIVE_BLOCKED, _blocked_reason(outcome)

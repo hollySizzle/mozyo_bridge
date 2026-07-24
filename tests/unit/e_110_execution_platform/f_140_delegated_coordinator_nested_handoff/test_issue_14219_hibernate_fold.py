@@ -368,29 +368,43 @@ class RaisedLegVisibilityTest(_FoldHarness):
 
 
 class ObservabilityMetricsTest(unittest.TestCase):
-    """R1-F4: released capacity != applied lanes; claimed is rolled up; the duration is named honestly."""
+    """R1-F4 / R2-F2: released capacity is the REAL close count (not the actuated-attempt count);
+    claimed is rolled up; the duration is named honestly."""
 
-    def _ws(self, wsid, kind, mutations):
+    def _ws(self, wsid, kind, mutations, released=0):
         return WorkspaceSupervisionOutcome(
             workspace_id=wsid, lease_acquired=True, lease_reason="g",
             hibernate_ran=True, hibernate_mutations=mutations,
             hibernate_attempts=(
-                {"issue": "1", "lane": "l", "kind": kind, "reason": "", "revision": 2},
+                {"issue": "1", "lane": "l", "kind": kind, "reason": "", "revision": 2,
+                 "released": released},
             ),
         )
 
-    def test_released_capacity_excludes_release_incomplete_mutations(self) -> None:
-        full = self._ws("wsA", "actuated", 1)
-        incomplete = self._ws("wsB", "actuated_release_incomplete", 1)
+    def test_released_capacity_is_the_real_close_count(self) -> None:
+        # wsA fully released 2 slots; wsB's CAS applied but released 0 (partial / withheld).
+        full = self._ws("wsA", "actuated", 1, released=2)
+        incomplete = self._ws("wsB", "actuated_release_incomplete", 1, released=0)
         report = SupervisorReport(
             mode=SUPERVISION_BOUNDED_RECONCILIATION, holder="h", workspaces=(full, incomplete)
         )
         self.assertEqual(report.hibernate_applied, 2)  # BOTH mutated the lane
-        self.assertEqual(report.hibernate_released_capacity, 1)  # only the fully-released one freed a slot
+        self.assertEqual(report.hibernate_released_capacity, 2)  # only wsA freed slots (2 of them)
+        self.assertEqual(report.hibernate_release_incomplete, 1)  # wsB mutated but freed nothing
+
+    def test_not_requested_success_reports_zero_freed_capacity(self) -> None:
+        # R2-F2 core: a not_requested release (no live slot) is `actuated` + mutation=1 but freed
+        # ZERO slots — released_capacity must NOT count it as freed capacity.
+        not_requested = self._ws("wsA", "actuated", 1, released=0)
+        report = SupervisorReport(
+            mode=SUPERVISION_BOUNDED_RECONCILIATION, holder="h", workspaces=(not_requested,)
+        )
+        self.assertEqual(report.hibernate_applied, 1)  # the lane was hibernated (CAS applied)
+        self.assertEqual(report.hibernate_released_capacity, 0)  # but no process slot was freed
         self.assertEqual(report.hibernate_release_incomplete, 1)
 
     def test_claimed_counts_acted_on_candidates(self) -> None:
-        applied = self._ws("wsA", "actuated", 1)
+        applied = self._ws("wsA", "actuated", 1, released=1)
         blocked = self._ws("wsB", "blocked", 0)
         report = SupervisorReport(
             mode=SUPERVISION_BOUNDED_RECONCILIATION, holder="h", workspaces=(applied, blocked)
@@ -400,7 +414,7 @@ class ObservabilityMetricsTest(unittest.TestCase):
     def test_payload_names_the_pass_duration_honestly(self) -> None:
         report = SupervisorReport(
             mode=SUPERVISION_BOUNDED_RECONCILIATION, holder="h",
-            workspaces=(self._ws("wsA", "actuated", 1),), duration_ms=42,
+            workspaces=(self._ws("wsA", "actuated", 1, released=1),), duration_ms=42,
         )
         payload = report.hibernate_payload()
         self.assertEqual(payload["pass_duration_ms"], 42)
@@ -461,7 +475,8 @@ class HibernateObservabilityRollupTest(_FoldHarness):
             workspace_id="wsA", lease_acquired=True, lease_reason="g",
             hibernate_ran=True, hibernate_mutations=1,
             hibernate_attempts=(
-                {"issue": "1", "lane": "l", "kind": "actuated", "reason": "", "revision": 2},
+                {"issue": "1", "lane": "l", "kind": "actuated", "reason": "", "revision": 2,
+                 "released": 1},
             ),
         )
         blocked = WorkspaceSupervisionOutcome(

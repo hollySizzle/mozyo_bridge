@@ -100,19 +100,29 @@ def applied(workspaces: Sequence) -> int:
 
 
 def released_capacity(workspaces: Sequence) -> int:
-    """Process capacity ACTUALLY freed — only fully-released actuations (review j#87154 R1-F4).
+    """Process slots ACTUALLY freed this pass (review j#87176 R2-F2): the sum of each attempt's
+    real ``released`` count (``len(ReleaseOutcome.closed)``), NOT the number of actuated attempts.
 
-    ``actuated_release_incomplete`` / ``redriven_success_withheld`` MUTATED the lane (they count in
-    ``applied``) but freed no slot, so they are excluded here and surfaced in
-    :func:`release_incomplete` instead — the report never conflates a lane mutation with a freed
-    process slot.
+    A lane whose CAS applied but whose release was ``not_requested`` (no live slot / dead process)
+    mutated the lane yet freed ZERO slots, so it contributes 0 here even though it counts in
+    :func:`applied`. The report therefore never reports freed capacity that no process release
+    produced, and this metric is on a different axis from the applied-lane count.
     """
-    return _count_kinds(workspaces, _FULLY_RELEASED_KINDS)
+    return sum(int(a.get("released") or 0) for a in _attempts(workspaces))
 
 
 def release_incomplete(workspaces: Sequence) -> int:
-    """Mutations that changed the lane but did NOT free a process slot (partial / withheld)."""
-    return _count_kinds(workspaces, _RELEASE_INCOMPLETE_KINDS)
+    """Applied lanes that mutated but freed FEWER-than-actuated slots — a real close count of 0.
+
+    An APPLIED attempt (``actuated`` / ``redriven`` / partial / withheld) whose real ``released``
+    count is 0 mutated the lifecycle row but released no process slot (``not_requested`` / withheld /
+    a wholly-failed partial). Surfaced so a lane mutation with no freed capacity is never invisible.
+    """
+    return sum(
+        1
+        for a in _attempts(workspaces)
+        if str(a.get("kind") or "") in _HIBERNATE_APPLIED_KINDS and int(a.get("released") or 0) == 0
+    )
 
 
 def blocked(workspaces: Sequence) -> int:
