@@ -96,6 +96,10 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.pane_resolver import (
     is_receiver_agent_process,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+    SEND_SEMANTIC_PROJECT_REPO,
+    send_semantic_gap,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     MODE_QUEUE_ENTER,
     DeliveryOutcome,
@@ -583,7 +587,9 @@ class AdmissionPipelineUseCase:
             # gate so the same adopted project id in an unrelated repo can never become
             # the sole identity gate. `--target-repo` has already been validated above
             # when present.
-            if not expected_target_repo:
+            if send_semantic_gap(
+                target_project=expected_project, target_repo=expected_target_repo
+            ) == SEND_SEMANTIC_PROJECT_REPO:
                 self._emit_blocked(request, reason="invalid_args")
                 ops.die(
                     "`--target-project` requires an explicit `--target-repo` "

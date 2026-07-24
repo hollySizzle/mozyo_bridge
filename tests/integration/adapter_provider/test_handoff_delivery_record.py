@@ -800,6 +800,69 @@ class HandoffRecordEmissionTest(unittest.TestCase):
         self.assertIn("Durable anchor: —", stdout)
 
 
+class SubmitDelayRailApplicabilityTest(unittest.TestCase):
+    """Public canonical behavior for the submit-delay executable domain (#14219 j#86693 R22-F1
+    / j#86698 R23-F1): the rule fires only on the rails that consume the delay, before any
+    text is typed — pinned by driving the real CLI over the fake tmux, not by source text.
+    """
+
+    def _argv(self, *, mode: str, submit_delay: str) -> list[str]:
+        return [
+            "handoff", "send", "--to", "claude", "--source", "asana",
+            "--kind", "implementation_request", "--task-id", "T1", "--comment-id", "C1",
+            "--target", "%2", "--mode", mode, "--submit-delay", submit_delay,
+        ]
+
+    def _run(self, argv, **kwargs):
+        return HandoffRecordEmissionTest.run_handoff_with_fake_tmux(self, argv, **kwargs)
+
+    def test_pending_parks_an_infinite_delay_without_enter(self) -> None:
+        # The pending rail returns before the sleep, so the delay is never consumed: an
+        # infinite value is NOT refused, the body is parked, and Enter is never pressed.
+        result, sent, stdout = self._run(self._argv(mode="pending", submit_delay="inf"))
+        self.assertEqual(0, result)
+        self.assertIn('"status": "pending_input"', stdout)
+        self.assertTrue(sent, "the body must be typed into the composer")
+        self.assertFalse(
+            [call for call in sent if call[-1] == "Enter"],
+            f"pending must never press Enter: {sent!r}",
+        )
+
+    def test_consuming_rails_refuse_out_of_domain_delays_before_typing(self) -> None:
+        # queue-enter and standard sleep the clamped delay BEFORE Enter, so a value outside
+        # [0, MAX_SUBMIT_DELAY_SECONDS] is zero-send: blocked/invalid_args with ZERO tmux
+        # typing calls.
+        for mode, delay in (("queue-enter", "3600.01"), ("standard", "1e308")):
+            with self.subTest(mode=mode, delay=delay):
+                result, sent, stdout = self._run(
+                    self._argv(mode=mode, submit_delay=delay), allow_exit=True
+                )
+                self.assertIsInstance(result, SystemExit)
+                self.assertIn('"status": "blocked"', stdout)
+                self.assertIn('"reason": "invalid_args"', stdout)
+                self.assertEqual([], sent, f"nothing may be typed: {sent!r}")
+
+    def test_the_bound_itself_still_delivers(self) -> None:
+        # The contract bound is the last deliverable value on a consuming rail.
+        result, sent, stdout = self._run(self._argv(mode="standard", submit_delay="3600"))
+        self.assertEqual(0, result)
+        self.assertIn('"status": "sent"', stdout)
+        self.assertTrue([call for call in sent if call[-1] == "Enter"])
+
+    def test_negative_and_nan_delays_clamp_to_zero_and_deliver(self) -> None:
+        # checkpoint j#86702 R24-F1: the judgment is on the CLAMPED effective value — the
+        # rail's max(0.0, value) turns a negative or NaN delay into zero, sleeps nothing,
+        # and presses Enter. Refusing them would be stricter than the rail; the help says so.
+        for delay in ("nan", "-1"):
+            with self.subTest(delay=delay):
+                result, sent, stdout = self._run(
+                    self._argv(mode="standard", submit_delay=delay)
+                )
+                self.assertEqual(0, result)
+                self.assertIn('"status": "sent"', stdout)
+                self.assertTrue([call for call in sent if call[-1] == "Enter"])
+
+
 class HerdrTurnStartRecordWordingTest(unittest.TestCase):
     """Redmine #13255 j#72695: the herdr rail's ``delivered_not_started`` reuses the
     ``turn_start_unconfirmed`` reason but must NOT be described with the tmux/capture

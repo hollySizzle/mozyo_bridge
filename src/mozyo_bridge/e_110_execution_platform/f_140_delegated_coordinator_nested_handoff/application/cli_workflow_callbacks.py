@@ -279,49 +279,11 @@ def _review_approval_refusal(
 #: The review gates that MUST carry Review Generation Marker Contract v2 marker fields (#13974 j#81487
 #: F2): the canonical producer refuses to write one head-less / req-less rather than emitting a marker
 #: the callback generation fence would fail closed.
-_REVIEW_REQUEST_GATE = "review_request"
-_REVIEW_RESULT_GATE = "review_result"
-
-
-def _review_gate_marker_fields(args: argparse.Namespace, gate: str) -> "tuple[dict, Optional[str]]":
-    """Build + fail-closed-validate the v2 marker fields for a review gate (#13974 j#81487 F2).
-
-    Returns ``(marker_fields, refusal)``. For a ``review_request`` gate ``--target-head`` is required
-    and must be a full commit head; for a ``review_result`` gate ``--target-head`` (full head) AND
-    ``--review-request-journal`` are required. A missing / malformed input yields a fixed refusal token
-    (nothing is written — the producer never emits a marker the fence would reject). A non-review gate
-    carries no v2 fields (``({}, None)``).
-    """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (  # noqa: E501
-        is_full_commit_head,
-    )
-
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
-        REVIEW_APPROVED,
-        REVIEW_CHANGES_REQUESTED,
-    )
-
-    if gate not in (_REVIEW_REQUEST_GATE, _REVIEW_RESULT_GATE):
-        return {}, None
-    head = (getattr(args, "target_head", None) or "").strip()
-    if not head:
-        return {}, "review_marker_missing_target_head"
-    if not is_full_commit_head(head):
-        return {}, "review_marker_malformed_target_head"
-    fields: dict = {"target_head": head}
-    if gate == _REVIEW_RESULT_GATE:
-        req = (getattr(args, "review_request_journal", None) or "").strip()
-        if not req:
-            return {}, "review_marker_missing_review_request_journal"
-        fields["review_request_journal"] = req
-        # v2 (`### Gate Schema`): a review_result marker carries its conclusion. The `--review-decision`
-        # maps to the marker vocabulary — an approval / unspecified decision is ``approved``, any
-        # explicit non-approval outcome (changes_requested / finding / progress) is ``changes_requested``.
-        decision = (getattr(args, "review_decision", None) or "").strip().lower()
-        fields["conclusion"] = (
-            REVIEW_APPROVED if decision in ("", "approval") else REVIEW_CHANGES_REQUESTED
-        )
-    return fields, None
+#: The review-gate marker-field builders live in a sibling leaf (module-health boundary, #14219
+#: T2b). Re-exported under the historical private name for the ``--emit-gate`` call site and tests.
+from .review_gate_marker_fields import (  # noqa: E402
+    review_gate_marker_fields as _review_gate_marker_fields,
+)
 
 
 def _live_journal_source(args: argparse.Namespace) -> LiveRedmineJournalSource:
@@ -952,6 +914,21 @@ def register_callbacks(sub) -> None:
         "--review-request-journal", dest="review_request_journal",
         help="Review Generation Marker Contract v2 (#13974): the review_request journal a review_result "
              "answers. Required for --emit-gate review_result.",
+    )
+    p.add_argument(
+        "--evidence-workspace", dest="evidence_workspace",
+        help="Redmine #14219 T2b (optional): the lane's repo_workspace_id, for the hibernate-evidence "
+             "lane envelope on a review gate marker. All-or-nothing with --evidence-lane / "
+             "--evidence-lane-generation; omit all three for a legacy marker.",
+    )
+    p.add_argument(
+        "--evidence-lane", dest="evidence_lane",
+        help="Redmine #14219 T2b (optional): the exact lane_id, for the hibernate-evidence lane envelope.",
+    )
+    p.add_argument(
+        "--evidence-lane-generation", dest="evidence_lane_generation",
+        help="Redmine #14219 T2b (optional): the positive lane_generation, for the hibernate-evidence "
+             "lane envelope.",
     )
     p.add_argument("--max-passes", dest="max_passes", type=int, default=1, help="Iterations for --watch.")
     p.add_argument(

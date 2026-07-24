@@ -21,6 +21,9 @@ from __future__ import annotations
 import argparse
 
 from mozyo_bridge.application.cli_common import add_repo_option
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
+    submit_delay_help,
+)
 from mozyo_bridge.application.commands import (
     cmd_handoff_cross_workspace_consult,
     cmd_handoff_reply,
@@ -87,7 +90,12 @@ def add_notify_delivery_options(parser: argparse.ArgumentParser, issue_required:
             "observed. Marker observation is not a delivery guarantee."
         ),
     )
-    parser.add_argument("--submit-delay", type=float, default=0.2, help="Seconds to wait after text is observed before pressing Enter")
+    parser.add_argument(
+        "--submit-delay",
+        type=float,
+        default=0.2,
+        help=submit_delay_help(),
+    )
     parser.add_argument("--force", action="store_true", help="Allow sending to a non-agent-looking pane")
 
 
@@ -347,7 +355,13 @@ def configure_handoff_parser(
             "delay; delivery proceeds as soon as the marker is observed."
         ),
     )
-    parser_.add_argument("--submit-delay", dest="submit_delay", type=float, default=0.2)
+    parser_.add_argument(
+        "--submit-delay",
+        dest="submit_delay",
+        type=float,
+        default=0.2,
+        help=submit_delay_help(),
+    )
     parser_.add_argument("--read-lines", dest="read_lines", type=int, default=50)
     parser_.add_argument(
         "--queue-enter-retry-window",

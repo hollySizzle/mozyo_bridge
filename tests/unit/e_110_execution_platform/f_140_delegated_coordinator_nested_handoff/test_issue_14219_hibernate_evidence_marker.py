@@ -1,0 +1,215 @@
+"""Hibernate-evidence marker grammar tests (Redmine #14219 T2b, step 3).
+
+Pins the dedicated CI / dogfood / park evidence renderer + strict parser:
+
+- **render / parse round-trip** per kind, carrying the common lane envelope + kind-specific fields;
+- **head requirement** — CI and dogfood are head-bearing (a head-less envelope is refused); park is
+  lane-anchored (no head);
+- **kind-specific fail-closed** — CI needs a run and ``conclusion=success`` (a missing run or a
+  non-success conclusion is refused); dogfood needs a release_issue;
+- **resolution** — absent evidence is typed, differing markers conflict, a malformed marker of the
+  kind is a hard parse error (never silently skipped).
+"""
+
+from __future__ import annotations
+
+import unittest
+
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (
+    hibernate_evidence_marker as ev,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
+    LaneEvidenceEnvelope,
+)
+
+WS = "ws-1"
+LANE = "lane-abc"
+HEAD = "a" * 40
+
+
+def _env(head=HEAD, gen=3):
+    return LaneEvidenceEnvelope(workspace=WS, lane=LANE, lane_generation=gen, head=head)
+
+
+def _fields(marker: str) -> dict:
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+        marker_fields_in_note,
+    )
+    (_, fields), = marker_fields_in_note(marker)
+    return fields
+
+
+class RenderParseRoundTripTests(unittest.TestCase):
+    def test_ci_green_round_trips(self):
+        marker = ev.render_hibernate_evidence(
+            ev.EVIDENCE_REQUIRED_CI_GREEN, envelope=_env(), workflow="test.yml", run="29860030313"
+        )
+        got = ev.parse_hibernate_evidence(_fields(marker), kind=ev.EVIDENCE_REQUIRED_CI_GREEN)
+        self.assertIsInstance(got, ev.HibernateEvidence)
+        self.assertEqual(got.envelope, _env())
+        self.assertEqual(
+            got.extra,
+            {"workflow": "test.yml", "run": "29860030313", "conclusion": "success"},
+        )
+
+    def test_dogfood_round_trips(self):
+        marker = ev.render_hibernate_evidence(
+            ev.EVIDENCE_DOGFOOD_DELEGATED, envelope=_env(), release_issue="14184",
+            acceptance="85431",
+        )
+        got = ev.parse_hibernate_evidence(_fields(marker), kind=ev.EVIDENCE_DOGFOOD_DELEGATED)
+        self.assertIsInstance(got, ev.HibernateEvidence)
+        self.assertEqual(got.extra, {"release_issue": "14184", "acceptance": "85431"})
+        self.assertEqual(got.envelope.head, HEAD)
+
+    def test_park_round_trips_without_head(self):
+        marker = ev.render_hibernate_evidence(
+            ev.EVIDENCE_PARK_DECLARED, envelope=_env(head="")
+        )
+        self.assertNotIn("head=", marker)
+        got = ev.parse_hibernate_evidence(_fields(marker), kind=ev.EVIDENCE_PARK_DECLARED)
+        self.assertIsInstance(got, ev.HibernateEvidence)
+        self.assertEqual(got.envelope.head, "")
+        self.assertEqual(got.extra, {})
+
+
+class RenderValidationTests(unittest.TestCase):
+    def test_ci_without_head_raises(self):
+        with self.assertRaises(ValueError):
+            ev.render_hibernate_evidence(
+                ev.EVIDENCE_REQUIRED_CI_GREEN, envelope=_env(head=""), workflow="w", run="1"
+            )
+
+    def test_ci_without_run_raises(self):
+        with self.assertRaises(ValueError):
+            ev.render_hibernate_evidence(ev.EVIDENCE_REQUIRED_CI_GREEN, envelope=_env())
+
+    def test_dogfood_without_release_issue_raises(self):
+        with self.assertRaises(ValueError):
+            ev.render_hibernate_evidence(ev.EVIDENCE_DOGFOOD_DELEGATED, envelope=_env())
+
+    def test_unknown_kind_raises(self):
+        with self.assertRaises(ValueError):
+            ev.render_hibernate_evidence("whatever", envelope=_env())
+
+
+class ParseFailClosedTests(unittest.TestCase):
+    def test_ci_missing_run_is_typed(self):
+        fields = {"gate": ev.EVIDENCE_REQUIRED_CI_GREEN, "workspace": WS, "lane": LANE,
+                  "lane_generation": "3", "head": HEAD, "workflow": "w", "conclusion": "success"}
+        got = ev.parse_hibernate_evidence(fields, kind=ev.EVIDENCE_REQUIRED_CI_GREEN)
+        self.assertEqual(got.reason, ev.EVIDENCE_MISSING_RUN)
+
+    def test_ci_non_success_conclusion_is_typed(self):
+        fields = {"gate": ev.EVIDENCE_REQUIRED_CI_GREEN, "workspace": WS, "lane": LANE,
+                  "lane_generation": "3", "head": HEAD, "workflow": "w", "run": "1", "conclusion": "failure"}
+        got = ev.parse_hibernate_evidence(fields, kind=ev.EVIDENCE_REQUIRED_CI_GREEN)
+        self.assertEqual(got.reason, ev.EVIDENCE_CI_NOT_SUCCESS)
+
+    def test_ci_head_less_envelope_is_refused(self):
+        fields = {"gate": ev.EVIDENCE_REQUIRED_CI_GREEN, "workspace": WS, "lane": LANE,
+                  "lane_generation": "3", "workflow": "w", "run": "1", "conclusion": "success"}
+        got = ev.parse_hibernate_evidence(fields, kind=ev.EVIDENCE_REQUIRED_CI_GREEN)
+        # the envelope's own missing-head reason surfaces.
+        self.assertEqual(got.reason, "envelope_missing_head")
+
+    def test_dogfood_missing_release_issue_is_typed(self):
+        fields = {"gate": ev.EVIDENCE_DOGFOOD_DELEGATED, "workspace": WS, "lane": LANE,
+                  "lane_generation": "3", "head": HEAD, "acceptance": "85431"}
+        got = ev.parse_hibernate_evidence(fields, kind=ev.EVIDENCE_DOGFOOD_DELEGATED)
+        self.assertEqual(got.reason, ev.EVIDENCE_MISSING_RELEASE_ISSUE)
+
+    def test_unknown_kind_is_typed(self):
+        got = ev.parse_hibernate_evidence({}, kind="nope")
+        self.assertEqual(got.reason, ev.EVIDENCE_UNKNOWN_KIND)
+
+
+class ResolveTests(unittest.TestCase):
+    def _ci(self, **over):
+        base = {"gate": ev.EVIDENCE_REQUIRED_CI_GREEN, "workspace": WS, "lane": LANE,
+                "lane_generation": "3", "head": HEAD, "workflow": "w", "run": "1",
+                "conclusion": "success"}
+        base.update(over)
+        return base
+
+    def test_absent_is_typed(self):
+        got = ev.resolve_hibernate_evidence([], kind=ev.EVIDENCE_REQUIRED_CI_GREEN)
+        self.assertEqual(got.reason, ev.EVIDENCE_ABSENT)
+
+    def test_other_kinds_are_ignored(self):
+        park = {"gate": ev.EVIDENCE_PARK_DECLARED, "workspace": WS, "lane": LANE, "lane_generation": "3"}
+        got = ev.resolve_hibernate_evidence([park], kind=ev.EVIDENCE_REQUIRED_CI_GREEN)
+        self.assertEqual(got.reason, ev.EVIDENCE_ABSENT)
+
+    def test_one_resolves(self):
+        got = ev.resolve_hibernate_evidence([self._ci()], kind=ev.EVIDENCE_REQUIRED_CI_GREEN)
+        self.assertIsInstance(got, ev.HibernateEvidence)
+
+    def test_identical_duplicates_collapse(self):
+        got = ev.resolve_hibernate_evidence([self._ci(), self._ci()], kind=ev.EVIDENCE_REQUIRED_CI_GREEN)
+        self.assertIsInstance(got, ev.HibernateEvidence)
+
+    def test_differing_generation_conflicts(self):
+        got = ev.resolve_hibernate_evidence(
+            [self._ci(), self._ci(lane_generation="4")], kind=ev.EVIDENCE_REQUIRED_CI_GREEN
+        )
+        self.assertEqual(got.reason, ev.EVIDENCE_CONFLICT)
+
+    def test_differing_run_conflicts(self):
+        got = ev.resolve_hibernate_evidence(
+            [self._ci(), self._ci(run="2")], kind=ev.EVIDENCE_REQUIRED_CI_GREEN
+        )
+        self.assertEqual(got.reason, ev.EVIDENCE_CONFLICT)
+
+    def test_a_malformed_marker_of_the_kind_is_a_hard_error(self):
+        got = ev.resolve_hibernate_evidence(
+            [self._ci(conclusion="failure")], kind=ev.EVIDENCE_REQUIRED_CI_GREEN
+        )
+        self.assertEqual(got.reason, ev.EVIDENCE_CI_NOT_SUCCESS)
+
+
+class AuthoritySpecificFieldTests(unittest.TestCase):
+    """Checkpoint review j#86389 F3: the verdict alone is not the evidence.
+
+    A CI record must name WHICH required check ran (a run id alone lets an unrelated green run
+    satisfy the conjunct), and a delegation must name the anchor it can be resumed / checked from.
+    """
+
+    def test_ci_without_workflow_identity_is_typed(self):
+        fields = {"gate": ev.EVIDENCE_REQUIRED_CI_GREEN, "workspace": WS, "lane": LANE,
+                  "lane_generation": "3", "head": HEAD, "run": "1", "conclusion": "success"}
+        got = ev.parse_hibernate_evidence(fields, kind=ev.EVIDENCE_REQUIRED_CI_GREEN)
+        self.assertEqual(got.reason, ev.EVIDENCE_MISSING_WORKFLOW)
+
+    def test_dogfood_without_acceptance_anchor_is_typed(self):
+        fields = {"gate": ev.EVIDENCE_DOGFOOD_DELEGATED, "workspace": WS, "lane": LANE,
+                  "lane_generation": "3", "head": HEAD, "release_issue": "14184"}
+        got = ev.parse_hibernate_evidence(fields, kind=ev.EVIDENCE_DOGFOOD_DELEGATED)
+        self.assertEqual(got.reason, ev.EVIDENCE_MISSING_ACCEPTANCE)
+
+    def test_renderer_refuses_the_fields_its_parser_requires(self):
+        # A renderer that emits what its own parser rejects writes durable records that read back
+        # as a typed zero — the producer error must surface at write time.
+        for kwargs in (
+            dict(kind=ev.EVIDENCE_REQUIRED_CI_GREEN, run="1"),                     # no workflow
+            dict(kind=ev.EVIDENCE_REQUIRED_CI_GREEN, workflow="w"),                # no run
+            dict(kind=ev.EVIDENCE_DOGFOOD_DELEGATED, release_issue="14184"),       # no acceptance
+            dict(kind=ev.EVIDENCE_DOGFOOD_DELEGATED, acceptance="85431"),          # no release
+        ):
+            kind = kwargs.pop("kind")
+            with self.subTest(kind=kind, supplied=sorted(kwargs)):
+                with self.assertRaises(ValueError):
+                    ev.render_hibernate_evidence(kind, envelope=_env(), **kwargs)
+
+    def test_renderer_refuses_a_separator_bearing_field(self):
+        # `:` would split the value into a bogus extra field; `]` would truncate the marker.
+        for bad in ("test:yml", "test]yml", "test yml"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    ev.render_hibernate_evidence(
+                        ev.EVIDENCE_REQUIRED_CI_GREEN, envelope=_env(), workflow=bad, run="1"
+                    )
+
+
+if __name__ == "__main__":
+    unittest.main()

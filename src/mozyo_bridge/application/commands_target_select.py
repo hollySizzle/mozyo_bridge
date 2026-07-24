@@ -228,7 +228,17 @@ def apply_handoff_selection(args) -> None:
     """
     if not getattr(args, "select", False):
         return
-    if getattr(args, "target", None):
+    # The condition is the shared send-semantics authority (Redmine #14219 T2b R12-F1) — this
+    # call site keeps only the operator-facing message.
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+        SEND_SEMANTIC_SELECT_TARGET,
+        send_semantic_gap,
+    )
+
+    if (
+        send_semantic_gap(select=True, target=getattr(args, "target", None))
+        == SEND_SEMANTIC_SELECT_TARGET
+    ):
         die(
             "--select resolves the target pane semantically and is mutually "
             "exclusive with an explicit --target; drop one of them."

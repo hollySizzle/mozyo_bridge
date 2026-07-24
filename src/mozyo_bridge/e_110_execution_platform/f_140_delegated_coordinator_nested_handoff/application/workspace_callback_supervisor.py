@@ -45,6 +45,10 @@ from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_DELIVERED, C
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     workspace_callback_drain as _drain,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+    workspace_hibernate_leg as _hibernate,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import default_hibernate_leg_fn  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (
     CallbackOutboxProcessor,
 )
@@ -101,6 +105,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RedmineJournalSource,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    group_wake_hints,
     ISSUE_LEASE_LOST,
     ISSUE_PASS_ERROR,
     ISSUE_SOURCE_UNREADABLE,
@@ -109,19 +114,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SKIP_NO_ACTIVE_ISSUES,
     SKIP_ROSTER_UNREADABLE,
     SUPERVISION_BOUNDED_RECONCILIATION,
+    SUPERVISION_HIBERNATE,
     SUPERVISION_LOCAL_DRAIN,
     IssueSupervisionOutcome,
     SupervisorReport,
     WorkspaceSupervisionOutcome,
+    _utc_now_iso,
     fence_candidates_to_anchor,
     partition_authoritative,
     partition_delivery_receipts,
     select_supervised_issues,
 )
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 # ``_NullSource`` / ``_NULL_SOURCE`` (unconfigured-Redmine degrade) and ``_CountingSource`` (the
@@ -175,6 +178,7 @@ class WorkspaceCallbackSupervisor:
         reconcile_incremental_fn: Optional[
             Callable[[str, Sequence[str]], "tuple[tuple[str, ...], tuple[str, ...], Callable[[Sequence[str]], None]]"]
         ] = None,
+        hibernate_leg_fn: Optional[Callable[[SupervisedWorkspace, Callable[[], bool]], object]] = None,
     ) -> None:
         holder = str(holder or "").strip()
         if not holder:
@@ -201,6 +205,9 @@ class WorkspaceCallbackSupervisor:
         # drain, on the same lease/wake path. Optional so the callback-only supervisor
         # (pre-#13758) is unchanged; the production leg is wired in build_supervisor.
         self._reconcile_leg_fn = reconcile_leg_fn
+        # Redmine #14219 T2c: the auto-hibernate mode leg — one bounded pass per leased
+        # workspace (`workspace_hibernate_leg`). Optional: unwired -> the mode fails closed.
+        self._hibernate_leg_fn = hibernate_leg_fn
         # Redmine #13968 F1: the authoritative-workspace resolver — a home-global
         # ``{issue -> sole actively-owning workspace}`` map from the durable lifecycle authority.
         # When wired, each workspace supervises ONLY the issues it uniquely owns (owned-elsewhere /
@@ -281,7 +288,14 @@ class WorkspaceCallbackSupervisor:
             return SupervisorReport(
                 mode=mode, holder=self._holder, workspaces=tuple(outcomes)
             )
-        wake_by_ws = _group_wake_hints(wake_hints)
+        # Redmine #14219 T2c: the auto-hibernate leg — same early-return shape as local_drain,
+        # same per-workspace lease fence, zero callback/outbox side effects.
+        if mode == SUPERVISION_HIBERNATE:
+            outcomes = _hibernate.hibernate_sweep(self)
+            return SupervisorReport(
+                mode=mode, holder=self._holder, workspaces=tuple(outcomes)
+            )
+        wake_by_ws = group_wake_hints(wake_hints)
         # Redmine #13968 F1: resolve the authoritative-workspace map ONCE per sweep (a single
         # home-global lifecycle read), so every workspace's authoritative filter reads the same
         # durable owner snapshot. ``None`` (no resolver wired) disables the filter — the pre-#13968
@@ -755,22 +769,6 @@ class WorkspaceCallbackSupervisor:
         return _supply_events(self._store, issue, source, binding)
 
 
-def _group_wake_hints(wake_hints: Iterable[tuple[str, str]]) -> dict[str, tuple[str, ...]]:
-    """Group ``(workspace_id, issue)`` wake hints by workspace (order-preserving, de-duplicated)."""
-    grouped: dict[str, list[str]] = {}
-    for hint in wake_hints or ():
-        try:
-            wsid, issue = str(hint[0]).strip(), str(hint[1]).strip()
-        except (IndexError, TypeError):
-            continue
-        if not wsid or not issue:
-            continue
-        bucket = grouped.setdefault(wsid, [])
-        if issue not in bucket:
-            bucket.append(issue)
-    return {wsid: tuple(issues) for wsid, issues in grouped.items()}
-
-
 def build_supervisor(
     *,
     holder: str,
@@ -972,6 +970,9 @@ def build_supervisor(
         reconcile_mark_fn=_reconcile_mark_fn,
         provider_counter_fn=lambda wsid: _counter_for(wsid),
         reconcile_incremental_fn=_reconcile_incremental_fn,
+        hibernate_leg_fn=default_hibernate_leg_fn(
+            home=home, outbox=outbox, source_fn=lambda ws: default_redmine_source(ws, home=home)
+        ),
     )
 
 

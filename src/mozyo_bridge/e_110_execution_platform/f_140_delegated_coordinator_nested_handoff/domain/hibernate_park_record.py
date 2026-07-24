@@ -1,0 +1,912 @@
+"""The governed parked-state record, and the callback outcome inside it (Redmine #14219 T2b).
+
+Split out of :mod:`.hibernate_basis_producer` when that module reached the module-health ceiling.
+It is the one place that reads a park declaration's PROSE-adjacent structure — the governed
+``- <field>: <value>`` lines the skill's fixed field shape defines — while the producer proper
+stays with markers and conjuncts.
+
+The park marker asserts that a lane is parked. This module checks the record that assertion has to
+sit in, and every rule here exists because a weaker version of it shipped and was caught:
+
+* the COMPLETE governed field set, not a convenient subset (j#86443 R2-F4);
+* the field VALUES, not merely their presence (j#86503 R3-F3);
+* the anchor naming THIS declaration, not merely this issue (j#86525 R4-F1);
+* each governed field declared exactly once, since a first-write-wins duplicate has no order
+  authority behind it (j#86525 R4-F3);
+* the callback outcome as a RECORD for all three outcomes, ``sent`` included (j#86548 R5-F1);
+* the record read through the canonical template's own field names rather than invented aliases,
+  which had inverted the check — refusing canonical records while accepting unrelated prose
+  (j#86548 R5-F2);
+* each field and each part carrying its OWN authority, rather than one cross-record search that
+  let a pane id inside a retry command stand in for the candidate rows (j#86558 R6-F1/F2).
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Optional
+
+import argparse
+import shlex
+
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+    KIND_LABELS,
+    AnchorError,
+    build_marker,
+    normalize_anchor,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+    send_semantic_gap,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (  # noqa: E501
+    RoleProfileError,
+    check_explicit_profile_fields,
+    parse_profile_fields,
+)
+
+#: The park marker is not accompanied by the governed fixed-field park journal.
+GAP_PARK_JOURNAL_FIELDS_ABSENT = "park_journal_fields_absent"
+#: journal — so it is some other record's anchor, not this park declaration's own.
+GAP_PARK_ANCHOR_NOT_THIS_DECLARATION = "park_anchor_not_this_declaration"
+#: alongside it (a reason, and for ``blocked`` a replayable retry command).
+GAP_PARK_CALLBACK_DETAIL_ABSENT = "park_callback_detail_absent"
+#: operator's next move differs.
+GAP_PARK_JOURNAL_FIELDS_INVALID = "park_journal_fields_invalid"
+
+#: Returned when one governed field is declared more than once with DIFFERING values.
+_FIELD_CONFLICT = object()
+
+
+def _field_pattern(*names: str) -> "re.Pattern[str]":
+    """A line-anchored governed ``- <name>: <value>`` matcher accepting any of ``names`` (pure).
+
+    The same shape the glance reads its disposition fields from — a list marker, emphasis,
+    backticks and an ASCII or fullwidth colon are tolerated — and, like the glance, several
+    spellings of the same field are accepted rather than one being imposed.
+    """
+    alternation = "|".join(re.escape(name) for name in names)
+    return re.compile(
+        r"^\s*[-*]?\s*\**\s*(?:" + alternation + r")\**\s*[:：]\s*(?P<value>.+?)\s*$",
+        re.MULTILINE | re.IGNORECASE,
+    )
+
+
+def governed_field(notes: str, *names: str):
+    """The governed field's single value, ``""`` if absent, or :data:`_FIELD_CONFLICT` (pure).
+
+    Reading only the FIRST match made a note self-contradictory-but-passing: appending
+    ``callback_result: invented`` after ``callback_result: sent`` left the first one authoritative
+    with nothing to justify that order (checkpoint j#86525 R4-F3). Every other layer of this
+    surface folds duplicates the same way — identical repeats collapse, differing ones are a typed
+    conflict — so the governed fields do too.
+    """
+    values = {
+        match.group("value").strip().strip("`")
+        for match in _field_pattern(*names).finditer(notes or "")
+    }
+    if not values:
+        return ""
+    if len(values) > 1:
+        return _FIELD_CONFLICT
+    return values.pop()
+
+
+#: The governed fixed fields a parked-state journal records, per the skill's own fixed field shape
+#: (``references/workflow.md`` ``## Sublane 完了 guardrail``): the parked state is a handoff-worthy
+#: ``blocked`` state, so besides the dependency fields it carries the ``durable_anchor`` it is filed
+#: against and the ``callback_result`` that makes the state complete.
+#:
+#: The COMPLETE set is required, not a convenient subset (checkpoint j#86443 R2-F4). Checking four
+#: of the six let a note that never called back — the exact failure the guardrail was written for
+#: (`progress_without_callback`) — read as an affirmative park basis. "The lane is parked" and "the
+#: park was handed off" are one durable state in that contract, so the producer requires the whole
+#: record rather than leaving half of it to an action-time obligation.
+#: Fields whose presence is what the record needs (their content is free text by contract).
+_PARK_FREE_FIELDS = (("blocked_by",), ("resume_condition",))
+_PARK_STATE_BLOCKED = "blocked"
+#: ``callback_result: sent | blocked | not-attempted`` — the skill fixes the vocabulary, and
+#: "silence is not allowed" is the whole point of the field. An invented value is silence wearing a
+#: token, so it is refused rather than counted as a callback.
+_CALLBACK_SENT = "sent"
+_CALLBACK_BLOCKED = "blocked"
+_CALLBACK_NOT_ATTEMPTED = "not-attempted"
+_PARK_CALLBACK_RESULTS = frozenset({_CALLBACK_SENT, _CALLBACK_BLOCKED, _CALLBACK_NOT_ATTEMPTED})
+#: ``resume_owner: coordinator`` — the guardrail assigns re-dispatch to the coordinator by name; a
+#: park that nominates anyone else has not handed resume ownership to who actually owns it.
+_PARK_RESUME_OWNER = "coordinator"
+#: ``durable_anchor: #<issue_id> j#<gate_journal_id>``.
+_DURABLE_ANCHOR_RE = re.compile(r"^#(?P<issue>\d+)\s+j#(?P<journal>\d+)$")
+
+#: The canonical callback-outcome record, verbatim from the skill's own template
+#: (``references/workflow.md`` ``### Callback outcome journal テンプレート``):
+#:
+#:     - target: coordinator (`--target coordinator`) | <coordinator_codex_%pane>
+#:     - result: sent | blocked | not-attempted
+#:     - on sent: command + observed landing marker
+#:     - on blocked: reason / candidates (`agents targets` rows) / retry command (`--target %pane
+#:       --target-repo auto`)
+#:     - on not-attempted: explicit reason
+#:
+#: R4 invented its own spellings for these because the fixed-field block does not list them — but
+#: the template does, and not finding it is not the same as it not existing (checkpoint j#86548
+#: R5-F2). The invented aliases REJECTED canonical records while ACCEPTING values that had nothing
+#: to do with a callback, which is the meaning of the check inverted. The template is the contract;
+#: only the parked-state fold-in spelling ``callback_result`` is accepted alongside ``result``
+#: because the fixed-field shape itself uses it.
+_CALLBACK_RESULT_FIELDS = ("result", "callback_result")
+_CALLBACK_TARGET_FIELD = "target"
+_CALLBACK_DETAIL_FIELDS = {
+    _CALLBACK_SENT: ("on sent",),
+    _CALLBACK_BLOCKED: ("on blocked",),
+    _CALLBACK_NOT_ATTEMPTED: ("on not-attempted",),
+}
+
+#: A pane token as ``agents targets`` prints one: ``%14`` or ``w3F:p4``, matched WHOLE. A target is
+#: one of these or the natural coordinator token — never a phrase that merely mentions one.
+_PANE_TOKEN_RE = re.compile(r"(?:%\d+|\w+:p\w+)\Z")
+#: The coordinator's natural target (`--target coordinator`), the normal route.
+_COORDINATOR_TARGET = "coordinator"
+_RECEIVER_CODEX = "codex"
+#: The canonical handoff marker's mandatory fields (``handoff.build_marker``): the source system,
+#: the anchor, the kind, and the receiver. A token missing any of them was never produced by the
+#: sender, so it is not the landing observation — each is checked individually where its value is.
+_MARKER_REQUIRED_FIELDS = ("source", "issue", "journal", "kind", "to")
+
+
+#: The pane form's permitted filler words between ``coordinator`` and its pane — the closed
+#: vocabulary the template's ``<coordinator_codex_%pane>`` placeholder spells out.
+_COORDINATOR_PANE_FILLER = frozenset({"codex", "pane"})
+
+
+def canonical_target(value: str) -> str:
+    """The canonical coordinator target a ``target:`` field names, or ``""`` (pure).
+
+    The template's two permitted forms — ``coordinator (`--target coordinator`)`` and
+    ``<coordinator_codex_%pane>`` — are a CLOSED grammar, not a vocabulary hint. Token presence
+    was tried twice and lost twice: substring matching read ``noncoordinator`` as the coordinator,
+    whole-token matching accepted any prose that happened to contain the word — ``same-lane
+    worker w3F:p3 coordinator`` and ``not coordinator actually worker w3F:p3`` both promoted a
+    worker's pane to the coordinator's callback (checkpoint j#86675 → j#86679 R19-F2). So the
+    field parses as one of exactly:
+
+    * the natural form: ``coordinator``, optionally restating its own flag
+      (``coordinator (`--target coordinator`)``);
+    * the pane form: ``coordinator`` FIRST, then only the closed filler vocabulary, ending in
+      exactly one pane — the record saying whose pane it is, in the template's own words.
+
+    Anything else — the word elsewhere than first, free prose around it, negations — is not the
+    template's declaration and resolves to no target.
+    """
+    tokens = tuple(
+        stripped
+        for token in str(value).split()
+        if (stripped := token.strip("`(),"))
+    )
+    if tokens in ((_COORDINATOR_TARGET,), (_COORDINATOR_TARGET, "--target", _COORDINATOR_TARGET)):
+        return _COORDINATOR_TARGET
+    if (
+        len(tokens) >= 2
+        and tokens[0] == _COORDINATOR_TARGET
+        and all(token in _COORDINATOR_PANE_FILLER for token in tokens[1:-1])
+        and _PANE_TOKEN_RE.match(tokens[-1])
+    ):
+        return tokens[-1]
+    return ""
+
+
+#: A record's command is one invocation that WAS run (``sent``) or WILL
+#: be replayed (``blocked``); anything that composes, conditions, redirects or substitutes commands
+#: means the token sequence is not that invocation. Control detection lives in
+#: :func:`_lex_command` (punctuation tokens outside quotes + inline substitution characters).
+#: The CLI's own entry points (``pyproject`` console scripts).
+_CLI_ENTRYPOINTS = ("mozyo-bridge", "mozyo")
+
+#: The canonical ROOT-prefix grammar (``build_parser``'s own options, allowed before the
+#: subcommand), mirrored as data and split by what a subcommand invocation MEANS with them
+#: (checkpoint j#86671 R17-F1: requiring ``handoff send`` at exactly tokens 1-2 refused commands
+#: the canonical CLI runs). A drift-guard test asserts the two tuples together cover the real
+#: root parser's options EXACTLY — a new root option lands in neither and fails closed here
+#: until it is classified.
+#:
+#: Accepted: zero-arg flags the canonical help itself marks "Ignored when a subcommand is
+#: given" — they change nothing about the delivery.
+_ROOT_PREFIX_IGNORED = ("--json", "--no-attach", "--cc")
+#: Refused BY NAME (not blind-skipped): ``--version`` exits before any send (zero-send); the
+#: root ``--repo`` changes which CLI composes via the target repo's config — the record alone no
+#: longer pins the argv that ran — and ``--session`` is a bare-``mozyo`` override the canonical
+#: help does not mark ignored. Evidence stays fail-closed on all three.
+_ROOT_PREFIX_REFUSED = ("--version", "--repo", "--session")
+
+#: The canonical ``handoff send`` grammar, mirrored as DATA: ``(flag, required, choices, value)``
+#: where ``value`` is ``str`` / ``float`` / ``int`` for a value option, ``"flag"`` for a bare
+#: switch and ``"append"`` for a repeatable option. The domain must not import the
+#: application-layer parser builder, so this table exists — and a drift-guard test builds the REAL
+#: parser (``configure_handoff_parser`` + ``add_handoff_select_args``) and asserts this table
+#: matches it action for action, the same pattern ``callback_delivery`` uses for its tokens.
+#: An invocation this grammar rejects is one the CLI would refuse to run, and a command that never
+#: ran is not delivery evidence (checkpoint j#86626 R10-F1 — the previous check looked at token 0
+#: and ``handoff send`` only, and its own positive fixture was missing the required ``--source`` /
+#: ``--kind``).
+_SEND_OPTIONS: tuple = (
+    ("--to", True, ("claude", "codex"), str),
+    ("--source", True, ("asana", "redmine"), str),
+    ("--kind", True, tuple(sorted(KIND_LABELS)), str),
+    ("--task-id", False, None, str),
+    ("--comment-id", False, None, str),
+    ("--anchor-url", False, None, str),
+    ("--issue", False, None, str),
+    ("--journal", False, None, str),
+    ("--target", False, None, str),
+    ("--target-repo", False, None, str),
+    ("--target-lane", False, None, str),
+    ("--target-project", False, None, str),
+    ("--allow-direct-worker", False, None, "flag"),
+    ("--workdir", False, None, str),
+    (
+        "--role-profile",
+        False,
+        ("coordinator", "delegated_coordinator", "implementation_gateway", "implementation_worker"),
+        str,
+    ),
+    ("--profile-field", False, None, "append"),
+    ("--main-lane-exception", False, None, str),
+    ("--mode", False, ("pending", "queue-enter", "standard"), str),
+    ("--summary", False, None, str),
+    ("--force", False, None, "flag"),
+    ("--landing-timeout", False, None, float),
+    ("--submit-delay", False, None, float),
+    ("--read-lines", False, None, int),
+    ("--queue-enter-retry-window", False, None, float),
+    ("--queue-enter-retry-interval", False, None, float),
+    ("--no-target-activation", False, None, "flag"),
+    ("--restore-previous-active", False, None, "flag"),
+    ("--record-format", False, ("both", "json", "text"), str),
+    ("--record-command", False, None, str),
+    ("--persist-delivery", False, None, "flag"),
+    ("--select", False, None, "flag"),
+    ("--target-session", False, None, str),
+)
+
+#: Options that legitimately repeat (argparse append) — exempt from the conflict rule.
+_APPEND_FLAGS = frozenset(
+    flag for flag, _required, _choices, value in _SEND_OPTIONS if value == "append"
+)
+_VALUE_FLAGS = frozenset(
+    flag for flag, _required, _choices, value in _SEND_OPTIONS if value not in ("flag",)
+)
+
+
+class _GrammarRefusal(Exception):
+    """Raised instead of argparse's stderr-print-and-exit — the check is side-effect free."""
+
+
+class _RefusingParser(argparse.ArgumentParser):
+    def error(self, message):  # pragma: no cover - trivial override
+        raise _GrammarRefusal(message)
+
+
+def _build_send_parser() -> argparse.ArgumentParser:
+    # ``allow_abbrev=False``: the canonical CLI accepts long-option abbreviation, but an
+    # abbreviated flag in a durable record reintroduces the very ambiguity the conflict rule
+    # exists to refuse — ``--ki review_request --kind reply`` declares two values for one
+    # logical option while wearing two names (checkpoint j#86645 R11-F3). Evidence is written
+    # unabbreviated.
+    parser = _RefusingParser(prog="handoff-send-evidence", add_help=False, allow_abbrev=False)
+    for flag, required, choices, value in _SEND_OPTIONS:
+        dest = flag[2:].replace("-", "_")
+        if value == "flag":
+            parser.add_argument(flag, dest=dest, required=required, action="store_true")
+        elif value == "append":
+            parser.add_argument(flag, dest=dest, required=required, action="append")
+        else:
+            parser.add_argument(
+                flag,
+                dest=dest,
+                required=required,
+                choices=list(choices) if choices else None,
+                type=None if value is str else value,
+            )
+    return parser
+
+
+_SEND_PARSER = _build_send_parser()
+
+
+def _conflicting_store_flags(tokens: "list[str]") -> bool:
+    """Whether any single-valued flag repeats with DIFFERING values (pure).
+
+    Argparse itself is last-write-wins, but a durable record whose command says two things has no
+    single meaning to trust (the R8 rule). Append options (``--profile-field``) repeat by design
+    and are exempt; identical repeats collapse.
+    """
+    seen: dict = {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("--"):
+            index += 1
+            continue
+        flag, eq, inline = token.partition("=")
+        if flag in _APPEND_FLAGS:
+            index += 1 if eq else 2
+            continue
+        if flag in _VALUE_FLAGS:
+            if eq:
+                value = inline
+                index += 1
+            elif index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
+                value = tokens[index + 1]
+                index += 2
+            else:
+                index += 1
+                continue  # missing value: the grammar parse refuses it
+            if flag in seen and seen[flag] != value:
+                return True
+            seen[flag] = value
+        else:
+            index += 1
+    return False
+
+
+class _Token:
+    """One lexed token: its VALUE (as the shell would deliver it to argv) and its PROVENANCE.
+
+    ``plain`` is True only when no quoting or escaping took part in the token — which is what a
+    boundary decision needs: a bare ``/`` is template structure, while ``\\/`` and ``'/'`` deliver
+    the same VALUE and are argument content (checkpoint j#86653 R13-F3: value-only tokens made
+    those three indistinguishable, so a summary whose value IS the separator was refused).
+    """
+
+    __slots__ = ("value", "plain")
+
+    def __init__(self, value: str, plain: bool) -> None:
+        self.value = value
+        self.plain = plain
+
+
+_PUNCTUATION = ";|&<>()"
+
+
+def _lex_detail(text: str) -> "list[_Token] | None":
+    """``text`` lexed as the shell would, with per-token provenance, or ``None`` (pure).
+
+    The ONE lexer for this record: values match POSIX shell lexing (a drift-guard test asserts the
+    value sequence equals ``shlex``'s over the fixtures and a corpus, so this cannot quietly become
+    a second, diverging authority), and each token additionally carries whether quoting/escaping
+    was involved — the provenance ``shlex`` discards and boundaries require.
+
+    Lexing rules mirrored: whitespace splits; ``'...'`` is literal; ``"..."`` honours ``\\``
+    before ``"`` ``\\`` `````` ``$``; a backslash outside quotes escapes the next character;
+    punctuation characters outside quotes form their own tokens (``shlex`` ``punctuation_chars``); an
+    unquoted ``#`` AT WORD START begins a comment (mid-word it is literal, as in POSIX sh).
+    Unclosed quotes, trailing escapes and multi-line values are fail-closed.
+    """
+    if "\n" in text:
+        return None
+    tokens: list = []
+    value: list = []
+    plain = True
+    started = False
+
+    def flush():
+        nonlocal value, plain, started
+        if started:
+            tokens.append(_Token("".join(value), plain))
+        value, plain, started = [], True, False
+
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char in " \t":
+            flush()
+            index += 1
+            continue
+        if char in _PUNCTUATION:
+            flush()
+            run = index
+            while run < length and text[run] in _PUNCTUATION:
+                run += 1
+            tokens.append(_Token(text[index:run], True))
+            index = run
+            continue
+        if char == "'":
+            plain = False
+            started = True
+            close = text.find("'", index + 1)
+            if close < 0:
+                return None
+            value.append(text[index + 1:close])
+            index = close + 1
+            continue
+        if char == '"':
+            plain = False
+            started = True
+            index += 1
+            while True:
+                if index >= length:
+                    return None
+                char = text[index]
+                if char == '"':
+                    index += 1
+                    break
+                if char == "\\" and index + 1 < length and text[index + 1] in '"\\`$':
+                    value.append(text[index + 1])
+                    index += 2
+                    continue
+                value.append(char)
+                index += 1
+            continue
+        if char == "\\":
+            if index + 1 >= length:
+                return None
+            plain = False
+            started = True
+            value.append(text[index + 1])
+            index += 2
+            continue
+        if char == "#" and not started:
+            # An unquoted, unescaped ``#`` AT WORD START begins a comment — everything after it
+            # never reached the shell's argv (checkpoint j#86657 R14-F1: without this,
+            # ``--summary #`` kept its ``#`` token and a zero-send command read as a delivery).
+            # POSIX limits the comment to word starts: mid-word, ``#`` is literal
+            # (``park#callback`` is ONE argv value — checkpoint j#86662 R15-F2, where following
+            # Python shlex's own default of truncating mid-word rejected commands the shell
+            # actually delivers; the shell, not shlex, is the contract).
+            break
+        started = True
+        value.append(char)
+        index += 1
+    flush()
+    return tokens
+
+
+#: Characters through which the shell rewrites argv before the CLI ever runs: command/parameter/
+#: arithmetic substitution (`` ` `` / ``$``), pathname expansion (``*`` ``?`` ``[``) and tilde
+#: expansion (``~`` — word-start only in POSIX, but enumerated here like the rest; checkpoint
+#: j#86679 R19-F1, where ``--target-repo ~`` read as a literal while ``/bin/sh`` handed the CLI
+#: the home path). A command token carrying one does not have the argv the record shows — an
+#: unset ``$VAR`` deletes or empties the value and ``*`` fans out into whatever the cwd holds
+#: (checkpoint j#86662 R15-F1, where all three passed as sent deliveries). ONE explicit policy,
+#: refused even when quoted: the boolean ``plain`` provenance cannot distinguish the
+#: single-quoted safe literal from the double-quoted expanding one, so the false positive lands
+#: on the fail-closed side.
+_EXPANSION_CHARS = "`$*?[~"
+
+
+def _command_tokens_unsafe(tokens: "list[_Token]") -> bool:
+    """Whether the COMMAND tokens carry shell control, substitution or expansion (pure).
+
+    Two distinct policies, judged on the lexed tokens BEFORE their provenance is dropped
+    (checkpoint j#86667 R16-F1: judging plain values refused ``--summary ';'`` — a command the
+    shell delivers as one literal argv):
+
+    * control operators are operators only outside quotes, so a punctuation run is unsafe only
+      when its provenance is bare (``plain``) — quoted or escaped, the same value is argument
+      content;
+    * expansion-bearing characters (:data:`_EXPANSION_CHARS`) are refused wherever they appear,
+      quoted or not (checkpoint j#86662 R15-F1's explicit fail-closed policy — do not conflate
+      the two rules).
+    """
+    return any(
+        (token.plain and token.value and all(char in _PUNCTUATION for char in token.value))
+        or any(char in _EXPANSION_CHARS for char in token.value)
+        for token in tokens
+    )
+
+
+#: The template's boundary between record parts: a BARE separator token. Quoted or escaped
+#: separators are content and never leave their token.
+_BOUNDARY_TOKENS = frozenset({"/", "+"})
+
+#: The exact label token sequences the template puts before a command (checkpoint j#86577 R9-F1:
+#: anything else preceding the invocation is a wrapper, not a label).
+_LABEL_TOKEN_SEQUENCES = (("retry", "command:"), ("retry:",), ("command:",))
+
+
+def _strip_label_tokens(tokens: "list[_Token]") -> "list[_Token]":
+    """Drop one template label from the FRONT of the token list (pure).
+
+    A label is a label only when it is BARE: ``'command:'`` or ``command\\:`` is a literal
+    command name on the shell, and whatever follows it is that command's argv, not an executed
+    invocation (checkpoint j#86675 R18-F1 — value-only comparison stripped the quoted form and
+    promoted the wrapper to evidence).
+    """
+    for sequence in _LABEL_TOKEN_SEQUENCES:
+        head = tokens[: len(sequence)]
+        if (
+            len(head) == len(sequence)
+            and all(token.plain for token in head)
+            and tuple(token.value for token in head) == sequence
+        ):
+            return tokens[len(sequence):]
+    return tokens
+
+
+def _send_invocation(tokens: "list[_Token] | None") -> "argparse.Namespace | None":
+    """The executable ``mozyo-bridge handoff send ...`` invocation ``tokens`` ARE, or ``None`` (pure).
+
+    ``tokens`` must BE the invocation (already lexed with provenance, label already stripped):
+    token 0 is the CLI entry point or this is not a command. The safety judgment runs ONCE, here,
+    on the tokens themselves — callers hand over ``_Token``s, not values, because dropping the
+    provenance first is what turned quoted operators into refused commands (checkpoint j#86667
+    R16-F1). The arguments are then validated against the mirrored canonical grammar — required
+    options, choices, unknown arguments, value types, both spellings (abbreviations refused) —
+    the anchor against the canonical ``normalize_anchor``, and the POST-PARSE send semantics
+    against the SHARED :func:`send_semantic_gap` authority the canonical call sites themselves
+    consult (checkpoint j#86649 R12-F1: enumerating individual conditions here is how the
+    select/target and project/repo gates got missed).
+    """
+    if not tokens or _command_tokens_unsafe(tokens):
+        return None
+    values = [token.value for token in tokens]
+    # The entry-point check binds token 0 ONLY. An entry-point literal elsewhere is an argument
+    # value the canonical CLI happily takes (``--summary mozyo``); a real second invocation is
+    # closed by the layers that own it — a bare control operator by the lexer safety, a bare
+    # second command by argparse's unknown-argument refusal (checkpoint j#86675 R18-F4).
+    if values[0] not in _CLI_ENTRYPOINTS:
+        return None
+    # The canonical root prefix: only the documented subcommand-ignored flags may sit between
+    # the entry point and ``handoff send``. Anything else — a refused root option, an unknown
+    # token, a value — fails closed (checkpoint j#86671 R17-F1).
+    index = 1
+    while index < len(values) and values[index] in _ROOT_PREFIX_IGNORED:
+        index += 1
+    if values[index:index + 2] != ["handoff", "send"]:
+        return None
+    arguments = values[index + 2:]
+    if _conflicting_store_flags(arguments):
+        return None
+    try:
+        namespace = _SEND_PARSER.parse_args(arguments)
+    except _GrammarRefusal:
+        return None
+    try:
+        normalize_anchor(
+            namespace.source,
+            task_id=namespace.task_id,
+            comment_id=namespace.comment_id,
+            anchor_url=namespace.anchor_url,
+            issue=namespace.issue,
+            journal=namespace.journal,
+        )
+    except AnchorError:
+        return None
+    if send_semantic_gap(
+        kind=namespace.kind,
+        summary=namespace.summary,
+        select=namespace.select,
+        target=namespace.target,
+        target_project=namespace.target_project,
+        target_repo=namespace.target_repo,
+        mode=namespace.mode,
+        force=bool(namespace.force),
+        submit_delay=namespace.submit_delay,
+    ) is not None:
+        return None
+    if namespace.role_profile:
+        # The canonical planner runs the SAME shared validators before anything is typed, and
+        # only when a role profile is asked for: the field syntax (checkpoint j#86683 R20-F1)
+        # and the template-dependent explicit-blank refusal (checkpoint j#86687 R21-F1 — an
+        # explicit empty ``redmine_project=`` on a role whose template carries the placeholder
+        # is blocked/invalid_args, zero-send). The absent-field auto-fill reads host state and
+        # is deliberately not judged here.
+        try:
+            check_explicit_profile_fields(
+                namespace.role_profile, parse_profile_fields(namespace.profile_field)
+            )
+        except RoleProfileError:
+            return None
+    return namespace
+
+
+#: ``[mozyo:handoff:<body>]`` read RAW — the shared scanner folds duplicate keys last-write-wins,
+#: which is exactly what has to be refused here.
+_HANDOFF_MARKER_RE = re.compile(r"\[mozyo:handoff:(?P<body>[^\]]*)\]")
+#: The durable source this evidence surface is anchored in.
+_MARKER_SOURCE = "redmine"
+
+
+def _raw_marker_fields(body: str) -> "dict | None":
+    """One marker body as ``{key: value}``, or ``None`` when a key is declared twice with
+    differing values (pure).
+
+    The shared scanner's last-write-wins is right for a lenient reader and wrong for evidence:
+    ``journal=1:journal=85500`` and ``to=claude:to=codex`` both resolved to the acceptable value
+    and passed (checkpoint j#86569 R8-F2). A token that says two things proves neither.
+    """
+    fields: dict = {}
+    for token in body.split(":"):
+        key, sep, value = token.partition("=")
+        # Every component must BE a well-formed field: the canonical ``build_marker`` renders
+        # nothing else, so an empty component, a component without ``=``, an empty key or any
+        # whitespace is a marker no real sender drew — dropping such fragments made a garbage
+        # marker collapse onto the canonical one (checkpoint j#86675 R18-F3).
+        if not sep or not key or any(char.isspace() for char in token):
+            return None
+        if key in fields and fields[key] != value:
+            return None
+        fields[key] = value
+    return fields
+
+
+def _observed_marker_fields(detail: str) -> "dict | None":
+    """THE landing marker's fields in ``detail``, or ``None`` (pure).
+
+    Every marker in the detail is read, not just a matching one; identical repeats collapse and
+    differing ones conflict — the same rule the governed fields follow (checkpoint j#86577 R9-F3).
+    "Identical" means the RAW text: two spellings that happen to parse to the same fields are two
+    different markers saying the same thing, and a record carrying both is not the canonical
+    producer's output (checkpoint j#86675 R18-F3).
+    """
+    raw_forms = {match.group(0) for match in _HANDOFF_MARKER_RE.finditer(detail)}
+    if len(raw_forms) != 1:
+        return None
+    return _raw_marker_fields(
+        _HANDOFF_MARKER_RE.match(raw_forms.pop()).group("body")
+    )
+
+
+def _sent_detail_gap(detail: str, *, target: str, source_issue: str, journal: str) -> Optional[str]:
+    """Whether a ``sent`` record is THIS callback's delivery evidence (pure).
+
+    The whole detail is lexed ONCE; the command/observation boundary is the first BARE separator
+    token, so an escaped or quoted separator inside an argument never splits the command
+    (checkpoint j#86649 R12-F2). Three authorities then apply:
+
+    * the COMMAND must be an invocation the CLI would actually run and send
+      (:func:`_send_invocation`, grammar + anchor + shared send semantics), delivering
+      ``--to codex`` at the target the record declares, and not in ``pending`` mode (pending
+      places the body without pressing Enter — nothing was sent);
+    * the MARKER must be about this park declaration;
+    * the two must be the SAME delivery: the marker the command composes via the canonical
+      ``normalize_anchor`` + ``build_marker`` must field-for-field equal the marker observed.
+    """
+    tokens = _lex_detail(detail)
+    if tokens is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    # EXACTLY one bare separator with a non-empty part on each side, judged BEFORE any other
+    # reading — the same pre-normalisation structure rule the blocked record applies (checkpoint
+    # j#86675 R18-F2: taking merely the FIRST separator let `command / junk / marker` pass with
+    # a third part no template defines).
+    separators = [
+        index
+        for index, token in enumerate(tokens)
+        if token.plain and token.value in _BOUNDARY_TOKENS
+    ]
+    if len(separators) != 1:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    boundary = separators[0]
+    if boundary == 0 or boundary == len(tokens) - 1:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    namespace = _send_invocation(_strip_label_tokens(tokens[:boundary]))
+    if namespace is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if namespace.to != _RECEIVER_CODEX:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if namespace.target != target:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if namespace.mode == "pending":
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+
+    observed = _observed_marker_fields(
+        " ".join(token.value for token in tokens[boundary + 1:])
+    )
+    if observed is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if observed.get("source") != _MARKER_SOURCE:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if observed.get("kind") not in KIND_LABELS:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if observed.get("to") != _RECEIVER_CODEX:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if (
+        observed.get("issue") != str(source_issue).strip()
+        or observed.get("journal") != str(journal).strip()
+    ):
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+
+    anchor = normalize_anchor(
+        namespace.source,
+        task_id=namespace.task_id,
+        comment_id=namespace.comment_id,
+        anchor_url=namespace.anchor_url,
+        issue=namespace.issue,
+        journal=namespace.journal,
+    )
+    built_body_match = _HANDOFF_MARKER_RE.fullmatch(
+        build_marker(anchor, namespace.kind, namespace.to)
+    )
+    if built_body_match is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    built = _raw_marker_fields(built_body_match.group("body"))
+    if built != observed:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    return None
+
+
+def _blocked_detail_gap(detail: str, *, source_issue: str, journal: str) -> Optional[str]:
+    """Whether a ``blocked`` record carries reason / candidates / retry command (pure).
+
+    Lexed once, split on BARE ``/`` tokens into EXACTLY three parts, each with its own job:
+
+    * part 1 — the reason: non-empty free text (the proving parts are judged on their own parts,
+      so the reason's words are never read as evidence);
+    * part 2 — the candidate rows, which must actually name at least one pane;
+    * part 3 — a retry the CLI would actually run and send (same invocation + shared semantics as
+      ``sent``), delivering ``--to codex``, pinned at ONE of those candidates and at
+      ``--target-repo auto``, not in ``pending`` mode (a pending replay places without
+      submitting), and anchored at THIS park declaration — an executable retry for another issue
+      or journal is a handoff to a different ticket (checkpoint j#86645 R11-F1).
+    """
+    tokens = _lex_detail(detail)
+    if tokens is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    # EXACTLY two bare separators, and every part non-empty, judged BEFORE any normalisation:
+    # dropping empty parts first let `reason / / candidates / retry` — four parts — pass as three
+    # (checkpoint j#86653 R13-F4).
+    parts: list = [[]]
+    for token in tokens:
+        if token.plain and token.value == "/":
+            parts.append([])
+        else:
+            # The token itself, not its value: the retry part goes back through the ONE safety
+            # judgment in `_send_invocation`, which needs the provenance (checkpoint j#86667
+            # R16-F1: value-only parts refused a retry whose quoted operator the shell delivers).
+            parts[-1].append(token)
+    if len(parts) != 3 or any(not part for part in parts):
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    # Part 1 is the reason: non-empty free text, nothing more. What the record must PROVE lives
+    # in the parts that prove it — the candidates and the retry are judged exactly, on their own
+    # parts, so a pane id or a `handoff send` phrase inside the reason's prose cannot stand in
+    # for either (checkpoint j#86675 R18-F5: substring heuristics here refused legitimate
+    # reasons like "handoff send could not resolve coordinator").
+    candidates = [token.value for token in parts[1]]
+    retry = parts[2]
+
+    candidate_panes = {
+        value.strip("`(),")
+        for value in candidates
+        if _PANE_TOKEN_RE.match(value.strip("`(),"))
+    }
+    if not candidate_panes:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+
+    namespace = _send_invocation(_strip_label_tokens(retry))
+    if namespace is None:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if namespace.to != _RECEIVER_CODEX:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if namespace.target not in candidate_panes:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if namespace.target_repo != "auto":
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if namespace.mode == "pending":
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    if (
+        namespace.source != _MARKER_SOURCE
+        or str(namespace.issue or "").strip() != str(source_issue).strip()
+        or str(namespace.journal or "").strip() != str(journal).strip()
+    ):
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    return None
+
+
+def park_journal_gap(
+    notes: str, *, source_issue: str = "", declaration_journal: str = ""
+) -> Optional[str]:
+    """The typed reason the note is not a valid governed parked-state journal, else ``None`` (pure).
+
+    Presence is not the contract (checkpoint j#86503 R3-F3): the skill's fixed field shape pins the
+    VALUES too, and a record whose ``callback_result`` is an invented word, whose ``resume_owner``
+    is not the coordinator, or whose ``durable_anchor`` points somewhere else is not the record the
+    park basis rests on. Reading those as satisfied is the same class of defect as reading a
+    marker's self-declared authority: the shape looked right, so the content went unchecked.
+
+    Two things the value alone still does not settle (checkpoint j#86525):
+
+    * **which record the anchor names** (R4-F1). ``#<issue> j#<journal>`` has to point at THIS park
+      declaration, not merely at some journal of this issue — otherwise any older callback journal
+      on the same issue can stand in for this park's own handoff.
+    * **whether the outcome was actually recorded** (R4-F2). ``blocked`` and ``not-attempted`` are
+      legitimate outcomes, but the guardrail's point is that they are legitimate WHEN RECORDED: a
+      blocked callback carries its reason and a replayable retry command, a not-attempted one
+      carries its reason. Accepting the bare token re-admits exactly the "parked and nobody was
+      told" state the completion rule exists to prevent — the token would be the silence, not the
+      record of it.
+
+    ``source_issue`` / ``declaration_journal`` are the issue and journal these notes came from —
+    the SCOPE of the read, not the candidate's lane or head, so the producer's no-target-binding
+    invariant is untouched. Either being empty relaxes only that comparison.
+    """
+    state = governed_field(notes, "state")
+    callback_result = governed_field(notes, *_CALLBACK_RESULT_FIELDS)
+    resume_owner = governed_field(notes, "resume_owner")
+    anchor_raw = governed_field(notes, "durable_anchor")
+    free = [governed_field(notes, *names) for names in _PARK_FREE_FIELDS]
+
+    fields = [state, callback_result, resume_owner, anchor_raw, *free]
+    # A field declared twice with differing values has no order authority (R4-F3): refuse before
+    # any of them is read as the value.
+    if any(value is _FIELD_CONFLICT for value in fields):
+        return GAP_PARK_JOURNAL_FIELDS_INVALID
+    if not all(fields):
+        return GAP_PARK_JOURNAL_FIELDS_ABSENT
+
+    if state.lower() != _PARK_STATE_BLOCKED:
+        return GAP_PARK_JOURNAL_FIELDS_INVALID
+    outcome = callback_result.lower()
+    if outcome not in _PARK_CALLBACK_RESULTS:
+        return GAP_PARK_JOURNAL_FIELDS_INVALID
+    if resume_owner.lower() != _PARK_RESUME_OWNER:
+        return GAP_PARK_JOURNAL_FIELDS_INVALID
+
+    detail_gap = _callback_outcome_gap(
+        notes, outcome, source_issue=source_issue, journal=declaration_journal
+    )
+    if detail_gap is not None:
+        return detail_gap
+
+    anchor = _DURABLE_ANCHOR_RE.match(anchor_raw)
+    if anchor is None:
+        return GAP_PARK_JOURNAL_FIELDS_INVALID
+    if source_issue and anchor.group("issue") != str(source_issue).strip():
+        return GAP_PARK_JOURNAL_FIELDS_INVALID
+    if declaration_journal and anchor.group("journal") != str(declaration_journal).strip():
+        return GAP_PARK_ANCHOR_NOT_THIS_DECLARATION
+    return None
+
+
+def _callback_outcome_gap(
+    notes: str, outcome: str, *, source_issue: str = "", journal: str = ""
+) -> Optional[str]:
+    """The reason the callback outcome is not a complete record, else ``None`` (pure).
+
+    Every outcome — ``sent`` included — has to be a RECORD, not a token, and the record has to be
+    about THIS callback. Each requirement is carried by one named place:
+
+    ======================  ==================================================================
+    field / part            what it must prove
+    ======================  ==================================================================
+    ``target``              the callback was routed to the coordinator (natural target or pane)
+    ``on sent`` command     it was delivered, to the coordinator's Codex, at that same target
+    ``on sent`` marker      the landing marker observed is THIS issue + THIS declaration, to codex
+    ``on blocked`` part 1   the reason
+    ``on blocked`` part 2   the candidate panes (``agents targets`` rows)
+    ``on blocked`` part 3   a retry pinned to one of those panes, replayable
+    ``on not-attempted``    the explicit reason
+    ======================  ==================================================================
+    """
+    declared = governed_field(notes, _CALLBACK_TARGET_FIELD)
+    if declared is _FIELD_CONFLICT or not declared:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+    # The contract's first line is "EVERY outcome: the target is the coordinator's natural target
+    # or a resolved pane". R7 wrote that in the contract but wired the check inside the ``sent``
+    # branch only, so a blocked / not-attempted record could name any target at all (checkpoint
+    # j#86562 R7-F1). It is a common rule, so it is applied once, here, before the branch.
+    target = canonical_target(declared)
+    if not target:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+
+    detail = governed_field(notes, *_CALLBACK_DETAIL_FIELDS[outcome])
+    if detail is _FIELD_CONFLICT or not detail:
+        return GAP_PARK_CALLBACK_DETAIL_ABSENT
+
+    if outcome == _CALLBACK_SENT:
+        return _sent_detail_gap(
+            detail, target=target, source_issue=source_issue, journal=journal
+        )
+    if outcome == _CALLBACK_BLOCKED:
+        return _blocked_detail_gap(detail, source_issue=source_issue, journal=journal)
+    # not-attempted: an explicit reason, which is the whole field.
+    return None
+
+
+__all__ = [
+    "GAP_PARK_ANCHOR_NOT_THIS_DECLARATION",
+    "GAP_PARK_CALLBACK_DETAIL_ABSENT",
+    "GAP_PARK_JOURNAL_FIELDS_ABSENT",
+    "GAP_PARK_JOURNAL_FIELDS_INVALID",
+    "governed_field",
+    "park_journal_gap",
+]
