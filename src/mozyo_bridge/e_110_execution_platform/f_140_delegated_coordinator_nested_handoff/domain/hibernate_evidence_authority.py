@@ -164,6 +164,10 @@ class EvidenceJournal:
     journal_id: str
     notes: str
     issuer: ResolvedIssuer = ResolvedIssuer()
+    #: The journal record's provider ``created_on`` (Redmine #14219 T3 review j#87196 R2-F2(a)) —
+    #: propagated from :class:`RedmineJournalEntry` so the basis decision journal's timestamp is the
+    #: drain-ready start authority. Blank when the provider projection carried none.
+    created_on: str = ""
 
     @property
     def issuer_role(self) -> str:

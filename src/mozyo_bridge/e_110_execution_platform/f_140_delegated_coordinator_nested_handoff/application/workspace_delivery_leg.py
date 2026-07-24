@@ -10,6 +10,7 @@ RELEASES nothing, and drains no wakes — the caller owns the lease lifecycle an
 
 from __future__ import annotations
 
+import inspect
 from typing import Callable, Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_wiring import (  # noqa: E501
@@ -35,6 +36,18 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     partition_authoritative,
     select_supervised_issues,
 )
+
+def _accepts_defer_fence(fn) -> bool:
+    """True iff ``fn`` declares a ``defer_fence_fn`` parameter (or ``**kwargs``) — so the pass-budget
+    defer is only handed to a backlog drain that can use it (Final Design Disposition j#87188 = B)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic callables
+        return False
+    return "defer_fence_fn" in params or any(
+        p.kind == p.VAR_KEYWORD for p in params.values()
+    )
+
 
 def deliver_under_lease(
     sup,
@@ -213,14 +226,19 @@ def deliver_under_lease(
     # Fail-open. F4: capture ALL dispositions (delivered is a real send the report must not zero).
     backlog: Optional[BacklogDrainOutcome] = None
     if not lease_lost and sup._backlog_drain_fn is not None:
+        backlog_kwargs = dict(
+            source=source, sender=sender, skip_issues=frozenset(supervised),
+            lease_guard_fn=lambda: sup._lease_store.renew(
+                wsid, sup._holder, now=sup._clock(), ttl_seconds=sup._ttl
+            ),
+        )
+        # Pass the pass-budget defer only to a backlog drain that ACCEPTS it — an injected drain
+        # (test double / pre-B factory) without the kwarg is not budget-gated here rather than
+        # crashing (the ``except`` below would otherwise swallow a TypeError as a silent zero-drain).
+        if budget_defer is not None and _accepts_defer_fence(sup._backlog_drain_fn):
+            backlog_kwargs["defer_fence_fn"] = budget_defer
         try:
-            backlog = sup._backlog_drain_fn(
-                wsid, source=source, sender=sender, skip_issues=frozenset(supervised),
-                lease_guard_fn=lambda: sup._lease_store.renew(
-                    wsid, sup._holder, now=sup._clock(), ttl_seconds=sup._ttl
-                ),
-                defer_fence_fn=budget_defer,
-            )
+            backlog = sup._backlog_drain_fn(wsid, **backlog_kwargs)
             lease_lost = lease_lost or backlog.lease_lost
         except Exception:  # noqa: BLE001 - a backlog drain never breaks the sweep
             backlog = None

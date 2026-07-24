@@ -262,5 +262,59 @@ class HibernateRedriveIntentStoreTest(unittest.TestCase):
             self.store.record(_intent())  # a write must also refuse to rewrite it
 
 
+class RedriveIntentDrainReadyMigrationTest(unittest.TestCase):
+    """Redmine #14219 T3 review j#87196 R2-F2(a) item 4: the intent carries the ORIGINAL drain-ready
+    start across a crash-redrive; the v1 -> v2 schema migration is backward-compatible + idempotent."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.path = self.dir / "hibernate-redrive-intent.sqlite"
+
+    def test_round_trip_preserves_drain_ready_at(self) -> None:
+        store = HibernateRedriveIntentStore(path=self.path)
+        store.record(_intent(drain_ready_at="2026-07-20T00:00:00Z"))
+        self.assertEqual(store.get("wsW", "lane_1", 2).drain_ready_at, "2026-07-20T00:00:00Z")
+
+    def _seed_v1(self) -> None:
+        conn = sqlite3.connect(self.path)
+        conn.execute(
+            "CREATE TABLE hibernate_redrive_intent ("
+            " workspace_id TEXT NOT NULL, lane_id TEXT NOT NULL, lane_generation INTEGER NOT NULL,"
+            " issue_id TEXT NOT NULL, decision_journal TEXT NOT NULL, basis TEXT NOT NULL,"
+            " action_id TEXT NOT NULL, assertion_flags TEXT NOT NULL, recorded_at TEXT NOT NULL,"
+            " PRIMARY KEY (workspace_id, lane_id, lane_generation))"
+        )
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute(
+            "INSERT INTO hibernate_redrive_intent VALUES (?,?,?,?,?,?,?,?,?)",
+            ("wsW", "lane_1", 2, "500", "84999", "early_hibernate", "hibernate:lane_1",
+             json.dumps(_FLAGS, sort_keys=True), "2026-07-19T00:00:00Z"),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_v1_legacy_row_reads_blank_without_error(self) -> None:
+        # A read on an UNMIGRATED v1 store (no drain_ready_at column) never fails — the legacy row's
+        # start is blank (a later ``unavailable`` status), never a guessed time.
+        self._seed_v1()
+        got = HibernateRedriveIntentStore(path=self.path).get("wsW", "lane_1", 2)
+        self.assertIsNotNone(got)
+        self.assertEqual(got.drain_ready_at, "")
+
+    def test_a_write_migrates_v1_to_v2_backward_compatibly(self) -> None:
+        self._seed_v1()
+        store = HibernateRedriveIntentStore(path=self.path)
+        store.record(_intent(lane_generation=3, drain_ready_at="2026-07-20T00:00:00Z"))
+        # The new row carries the start; the legacy row is PRESERVED with a blank start.
+        self.assertEqual(store.get("wsW", "lane_1", 3).drain_ready_at, "2026-07-20T00:00:00Z")
+        self.assertEqual(store.get("wsW", "lane_1", 2).drain_ready_at, "")
+        conn = sqlite3.connect(self.path)
+        self.assertEqual(int(conn.execute("PRAGMA user_version").fetchone()[0]), 2)  # advanced
+        conn.close()
+        # Idempotent: a second open never re-errors on the already-added column.
+        store.record(_intent(lane_generation=4, drain_ready_at="2026-07-21T00:00:00Z"))
+        self.assertEqual(store.get("wsW", "lane_1", 4).drain_ready_at, "2026-07-21T00:00:00Z")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

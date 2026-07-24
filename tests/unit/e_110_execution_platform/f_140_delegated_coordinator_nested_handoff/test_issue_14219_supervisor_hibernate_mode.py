@@ -120,6 +120,9 @@ class HibernateModeTest(_HibernateModeHarness):
                     "reason": "",
                     "revision": 7,
                     "released": 0,
+                    "time_to_drain_status": "",
+                    "time_to_drain_ms": None,
+                    "time_to_disposition_ms": None,
                 },
             ),
         )

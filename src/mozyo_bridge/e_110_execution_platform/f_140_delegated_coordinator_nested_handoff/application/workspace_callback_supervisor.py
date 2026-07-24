@@ -858,7 +858,8 @@ def build_supervisor(
         provider_counter_fn=lambda wsid: _counter_for(wsid),
         reconcile_incremental_fn=_reconcile_incremental_fn,
         hibernate_leg_fn=default_hibernate_leg_fn(
-            home=home, outbox=outbox, source_fn=lambda ws: default_redmine_source(ws, home=home)
+            home=home, outbox=outbox, source_fn=lambda ws: default_redmine_source(ws, home=home),
+            clock_fn=_utc_now_iso,
         ),
     )
 

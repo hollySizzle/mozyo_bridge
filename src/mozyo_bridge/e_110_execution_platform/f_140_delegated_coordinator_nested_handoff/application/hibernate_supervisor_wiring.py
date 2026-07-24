@@ -34,7 +34,7 @@ ruling's conditions (j#86718):
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -108,6 +108,7 @@ from .hibernate_actuation_leg import (
     RedriveResult,
     run_hibernate_pass,
     run_hibernate_redrives,
+    stamp_drain_metrics,
 )
 from .hibernate_candidate_assembler import AssemblyRequest, HibernateCandidateAssembler
 from .sublane_process_release import unit_slots
@@ -441,6 +442,7 @@ def build_hibernate_leg_fn(
     worktree_clean_fn: Optional[Callable[[HibernateCandidate], Optional[bool]]] = None,
     projection_fn: Optional[Callable[[HibernateCandidate], Mapping[str, bool]]] = None,
     inventory_fn: Optional[Callable[[], "tuple[Sequence[Mapping[str, object]], bool]"]] = None,
+    clock_fn: Optional[Callable[[], str]] = None,
 ):
     """Build the production ``hibernate_leg_fn`` for :func:`build_supervisor`.
 
@@ -505,6 +507,11 @@ def build_hibernate_leg_fn(
             return unresolved_callback_debt(outbox, workspace_id)
 
         lane_by_issue: dict[str, SelectedLane] = {}
+        # Redmine #14219 T3 review j#87196 R2-F2(a): the provider ``created_on`` of every journal read
+        # this pass, keyed by journal id — the authority for a candidate's drain-ready start. Populated
+        # as ``journals_fn`` projects the evidence; a candidate's ``drain_ready_at`` is the created_on
+        # of its EXACT basis decision journal (never guessed from the id, never a local observation).
+        created_on_by_jid: dict[str, str] = {}
 
         def make_topology_fn(records_fn):
             # ONE typed topology observation per lane identity per phase (review j#86757
@@ -537,16 +544,20 @@ def build_hibernate_leg_fn(
                 page = entries_fn(issue)
                 if page is None:
                     return None
-                return [
-                    EvidenceJournal(
+                journals = []
+                for entry in page:
+                    created = str(getattr(entry, "created_on", "") or "")
+                    if created:
+                        created_on_by_jid.setdefault(str(entry.journal_id), created)
+                    journals.append(EvidenceJournal(
                         journal_id=str(entry.journal_id),
                         notes=entry.notes,
                         issuer=resolve_journal_issuer(
                             str(entry.journal_id), entry.notes, policy_pointer=pointer
                         ),
-                    )
-                    for entry in page
-                ]
+                        created_on=created,
+                    ))
+                return journals
 
             def receipts_fn(issue: str) -> Mapping[str, DogfoodReceipt]:
                 selected = lane_by_issue.get(str(issue).strip())
@@ -607,7 +618,17 @@ def build_hibernate_leg_fn(
         topology_build = make_topology_fn(lambda: rows_build)
         assembler_build = make_assembler(build_entries, lambda: rows_build, topology_build)
         assembled = assembler_build.assemble_all(requests)
-        candidates = [item.candidate for item in assembled if item.candidate is not None]
+        # R2-F2(a): bind each candidate's drain-ready START to the provider ``created_on`` of its
+        # EXACT basis decision journal (``AssembledCandidate.decision_journal``). ``created_on_by_jid``
+        # was populated as the assembler read the evidence above; an absent / unread created_on leaves
+        # ``drain_ready_at`` blank (a later ``unavailable`` status, never a guessed or substituted time).
+        candidates = []
+        for item in assembled:
+            cand = item.candidate
+            if cand is None:
+                continue
+            drain_ready = created_on_by_jid.get(str(item.decision_journal), "")
+            candidates.append(replace(cand, drain_ready_at=drain_ready) if drain_ready else cand)
 
         # ACTUATION phase (review j#86734 R2-F1): a SECOND assembler whose caches start empty,
         # so the pass seams' one-fresh-observation memo actually re-reads the provider pages
@@ -681,6 +702,10 @@ def build_hibernate_leg_fn(
         # fabricated), and reading it is a home-scoped read (the redrive touches the provider 0
         # times).
         intent_store = HibernateRedriveIntentStore(home=home)
+        # R2-F2(a) item 4: a redrive's ORIGINAL drain-ready start, carried from its stored intent and
+        # keyed by issue, so a redriven attempt measures time-to-drain from the FIRST drain-ready
+        # moment (never the redrive's own time). Populated as ``redrive_request`` reads each intent.
+        redrive_drain_ready: dict[str, str] = {}
 
         def record_intent(candidate: HibernateCandidate, fields) -> bool:
             # Persist the fresh actuation's derived intent immediately before its CAS, and REPORT
@@ -699,6 +724,9 @@ def build_hibernate_leg_fn(
                         basis=candidate.basis,
                         action_id=f"hibernate:{candidate.anchor.lane_id}",
                         assertion_flags=fields.assertion_flags,
+                        # R2-F2(a): persist the ORIGINAL drain-ready start pre-CAS so a crash-redrive
+                        # measures time-to-drain from when the lane FIRST became drain-ready.
+                        drain_ready_at=str(getattr(candidate, "drain_ready_at", "") or ""),
                     )
                 )
             except HibernateRedriveIntentError:
@@ -782,6 +810,9 @@ def build_hibernate_leg_fn(
                 issue_id=issue, decision_journal=journal, action_id=action_id
             ):
                 return LEG_REASON_REDRIVE_INTENT_MISMATCH
+            # Carry the ORIGINAL drain-ready start so the redriven attempt's latency is measured from
+            # when the lane first became drain-ready (R2-F2(a) item 4).
+            redrive_drain_ready[str(issue)] = str(getattr(intent, "drain_ready_at", "") or "")
             debt = outbox_pending(workspace)
             runtime = sources.runtime_fn(workspace, lane)
             settled = runtime in RUNTIME_NOT_WORKING
@@ -811,6 +842,30 @@ def build_hibernate_leg_fn(
                 expected_revision="",
             )
 
+        # R2-F2(a): stamp each attempt's drain-latency (status + durations) from its candidate's
+        # decision-journal ``drain_ready_at`` START and the injected supervisor clock read at the
+        # terminal disposition END. Raw timestamps are discarded here — only the derived, redaction-
+        # safe status + ms reach the attempt. A redriven attempt whose original start was never bound
+        # (legacy / no intent) stamps UNAVAILABLE, never a guessed latency.
+        drain_ready_by_issue = {
+            str(c.issue_id): str(getattr(c, "drain_ready_at", "") or "") for c in candidates
+        }
+
+        def _stamped(result):
+            if clock_fn is None or not result.attempts:
+                return result
+            completed_at = clock_fn()
+            return replace(result, attempts=tuple(
+                stamp_drain_metrics(
+                    a,
+                    # A fresh candidate's start; else the ORIGINAL start the redrive carried from its
+                    # intent (R2-F2(a) item 4) — never reset to the redrive's own time.
+                    drain_ready_by_issue.get(str(a.issue)) or redrive_drain_ready.get(str(a.issue), ""),
+                    completed_at,
+                )
+                for a in result.attempts
+            ))
+
         redrive_result = run_hibernate_redrives(
             redrives,
             use_case_fn=redrive_use_case,
@@ -822,12 +877,12 @@ def build_hibernate_leg_fn(
         # pass is not run (its use cases would double-actuate under a taken-over lease), and every
         # fresh candidate is a typed lease_lost with zero use-case call / zero provider read.
         if redrive_result.stopped:
-            return combine_hibernate_pass_results(
+            return _stamped(combine_hibernate_pass_results(
                 unknown_attempts=unknown_attempts,
                 redrive_result=redrive_result,
                 fresh_pass=None,
                 deferred_candidates=candidates,
-            )
+            ))
 
         fresh_pass = run_hibernate_pass(
             candidates,
@@ -839,17 +894,17 @@ def build_hibernate_leg_fn(
             record_intent_fn=record_intent,
             budget_consumed=redrive_result.mutations > 0,
         )
-        return combine_hibernate_pass_results(
+        return _stamped(combine_hibernate_pass_results(
             unknown_attempts=unknown_attempts,
             redrive_result=redrive_result,
             fresh_pass=fresh_pass,
             deferred_candidates=candidates,
-        )
+        ))
 
     return leg
 
 
-def default_hibernate_leg_fn(*, home, outbox, source_fn):
+def default_hibernate_leg_fn(*, home, outbox, source_fn, clock_fn=None):
     """The production leg with the default observer ports (one call site in build_supervisor).
 
     The lane owner's runtime is read from the live herdr inventory for the WORKER provider
@@ -865,6 +920,7 @@ def default_hibernate_leg_fn(*, home, outbox, source_fn):
         runtime_fn=lambda workspace_id, lane_id: lane_worker_runtime(
             workspace_id, lane_id, "implementation_worker"
         ),
+        clock_fn=clock_fn,
     )
 
 

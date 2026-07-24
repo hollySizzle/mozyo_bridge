@@ -774,6 +774,18 @@ class SupervisorReport:
         return _hib_rollup.deferred(self.workspaces)
 
     @property
+    def hibernate_time_to_drain_status(self) -> str:
+        return _hib_rollup.time_to_drain_status(self.workspaces)
+
+    @property
+    def hibernate_time_to_drain_ms(self) -> "Optional[int]":
+        return _hib_rollup.time_to_drain_ms(self.workspaces)
+
+    @property
+    def hibernate_time_to_disposition_ms(self) -> "Optional[int]":
+        return _hib_rollup.time_to_disposition_ms(self.workspaces)
+
+    @property
     def hibernate_closed_reasons(self) -> "tuple[str, ...]":
         return _hib_rollup.closed_reasons(self.workspaces)
 

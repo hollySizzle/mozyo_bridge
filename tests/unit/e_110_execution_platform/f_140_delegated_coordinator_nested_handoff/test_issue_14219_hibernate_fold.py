@@ -417,10 +417,13 @@ class ObservabilityMetricsTest(unittest.TestCase):
             workspaces=(self._ws("wsA", "actuated", 1, released=1),), duration_ms=42,
         )
         payload = report.hibernate_payload()
-        self.assertEqual(payload["pass_duration_ms"], 42)
-        self.assertNotIn("time_to_drain_ms", payload)  # not mislabelled a drain-latency
+        self.assertEqual(payload["pass_duration_ms"], 42)  # named for what it measures
         self.assertIn("claimed", payload)
         self.assertIn("release_incomplete", payload)
+        # R2-F2(a): the REAL drain-latency is a separate, honestly-defined metric (start = basis
+        # decision-journal created_on) with a closed status enum — never the pass duration.
+        self.assertIn("time_to_drain_status", payload)
+        self.assertIn("time_to_drain_ms", payload)
 
 
 class FoldDeferUnitTest(_FoldHarness):

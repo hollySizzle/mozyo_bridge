@@ -150,6 +150,11 @@ class RedmineJournalEntry:
     issue_id: str
     journal_id: str
     notes: str
+    #: The journal record's own provider ``created_on`` timestamp (Redmine #14219 T3 review j#87196
+    #: R2-F2(a)), verbatim from the provider — the durable authority for a candidate's drain-ready
+    #: start time (the basis decision journal's ``created_on``). Blank when the provider projection
+    #: did not carry one; NEVER inferred from the journal id or a local observation.
+    created_on: str = ""
 
 
 def _gate_marker_from_fields(
@@ -365,7 +370,10 @@ class MappingRedmineJournalSource:
             if not jid or not notes:
                 continue
             entries.append(
-                RedmineJournalEntry(issue_id=resolved, journal_id=jid, notes=notes)
+                RedmineJournalEntry(
+                    issue_id=resolved, journal_id=jid, notes=notes,
+                    created_on=str(journal.get("created_on", "") or "").strip(),
+                )
             )
         return entries
 

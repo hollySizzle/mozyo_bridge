@@ -162,6 +162,53 @@ def deferred_reasons(workspaces: Sequence) -> "tuple[str, ...]":
     return tuple(sorted(reasons))
 
 
+# -- time-to-drain (review j#87196 R2-F2(a)): a closed status enum (the leg ``TTD_*`` tokens as
+# literals so the domain imports no application leg — a drift-guard test pins them) + nullable ms.
+_TTD_COMPLETED = "completed"
+_TTD_PENDING = "pending"
+_TTD_UNCERTAIN = "uncertain"
+_TTD_UNAVAILABLE = "unavailable"
+#: The pass-level status precedence: a real completion wins; else a completed-but-untimed actuation
+#: (unavailable); else an uncertain end; else a pending disposition.
+_TTD_PRECEDENCE = (_TTD_COMPLETED, _TTD_UNAVAILABLE, _TTD_UNCERTAIN, _TTD_PENDING)
+
+
+def _ttd_rows(workspaces: Sequence) -> "list[tuple]":
+    return [
+        (
+            str(a.get("time_to_drain_status") or ""),
+            a.get("time_to_drain_ms"),
+            a.get("time_to_disposition_ms"),
+        )
+        for a in _attempts(workspaces)
+    ]
+
+
+def time_to_drain_status(workspaces: Sequence) -> str:
+    """The pass's drain status — the highest-precedence attempt status (``""`` when none seen)."""
+    present = {s for s, _, _ in _ttd_rows(workspaces) if s}
+    for status in _TTD_PRECEDENCE:
+        if status in present:
+            return status
+    return ""
+
+
+def time_to_drain_ms(workspaces: Sequence) -> "Optional[int]":
+    """The drain-ready -> terminal-success latency (ms) of the completed actuation; ``None`` else."""
+    for status, drain_ms, _disp in _ttd_rows(workspaces):
+        if status == _TTD_COMPLETED and drain_ms is not None:
+            return int(drain_ms)
+    return None
+
+
+def time_to_disposition_ms(workspaces: Sequence) -> "Optional[int]":
+    """The drain-ready -> typed-terminal-disposition latency (ms) of a claimed candidate; else None."""
+    for _status, _drain, disp in _ttd_rows(workspaces):
+        if disp is not None:
+            return int(disp)
+    return None
+
+
 def payload(workspaces: Sequence, duration_ms: int) -> dict:
     """The secret-free auto-hibernate observability roll-up for this pass.
 
@@ -182,6 +229,9 @@ def payload(workspaces: Sequence, duration_ms: int) -> dict:
         "closed_reasons": list(closed_reasons(workspaces)),
         "deferred_reasons": list(deferred_reasons(workspaces)),
         "pass_duration_ms": duration_ms,
+        "time_to_drain_status": time_to_drain_status(workspaces),
+        "time_to_drain_ms": time_to_drain_ms(workspaces),
+        "time_to_disposition_ms": time_to_disposition_ms(workspaces),
     }
 
 
@@ -197,5 +247,8 @@ __all__ = (
     "deferred",
     "closed_reasons",
     "deferred_reasons",
+    "time_to_drain_status",
+    "time_to_drain_ms",
+    "time_to_disposition_ms",
     "payload",
 )

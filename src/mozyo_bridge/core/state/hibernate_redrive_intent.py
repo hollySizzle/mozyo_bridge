@@ -45,9 +45,15 @@ HIBERNATE_REDRIVE_INTENT_FILENAME = "hibernate-redrive-intent.sqlite"
 
 #: Schema version stamped into ``PRAGMA user_version``. An unrecognized version fails closed
 #: (a downgraded build never silently drops or rewrites a newer intent table).
-HIBERNATE_REDRIVE_INTENT_SCHEMA_VERSION = 1
+#: v2 (Redmine #14219 T3 review j#87196 R2-F2(a)) adds ``drain_ready_at`` — the ORIGINAL basis
+#: decision-journal ``created_on`` a fresh actuation records pre-CAS, so a crash-redrive carries the
+#: SAME drain-ready start time (never reset to the redrive's ``recorded_at`` / pass start). The
+#: migration is backward-compatible and idempotent: a v1 store is ALTERed in place (the column
+#: defaults to ``''`` for legacy rows -> a legacy redrive reports ``unavailable``, never a guessed
+#: time); v1 is still a RECOGNIZED read version so a pre-migration read never fails closed.
+HIBERNATE_REDRIVE_INTENT_SCHEMA_VERSION = 2
 
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2})
 
 _INTENT_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS hibernate_redrive_intent (
@@ -60,9 +66,16 @@ CREATE TABLE IF NOT EXISTS hibernate_redrive_intent (
     action_id        TEXT NOT NULL,
     assertion_flags  TEXT NOT NULL,
     recorded_at      TEXT NOT NULL,
+    drain_ready_at   TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (workspace_id, lane_id, lane_generation)
 )
 """
+
+
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(
+        str(row[1]) == column for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    )
 
 
 class HibernateRedriveIntentError(RuntimeError):
@@ -165,6 +178,10 @@ class RedriveIntent:
     action_id: str
     assertion_flags: Mapping[str, bool] = field(default_factory=dict)
     recorded_at: str = ""
+    #: The ORIGINAL basis decision-journal ``created_on`` (R2-F2(a)) — the drain-ready START a
+    #: crash-redrive re-uses so time-to-drain is measured from when the lane FIRST became drain-ready,
+    #: not from the redrive. Blank for a legacy (pre-v2) row -> the redrive reports ``unavailable``.
+    drain_ready_at: str = ""
 
     def matches_row(
         self, *, issue_id: str, decision_journal: str, action_id: str
@@ -193,6 +210,7 @@ class RedriveIntent:
             "action_id": self.action_id,
             "assertion_flags": dict(self.assertion_flags),
             "recorded_at": self.recorded_at,
+            "drain_ready_at": self.drain_ready_at,
         }
 
 
@@ -241,6 +259,17 @@ class HibernateRedriveIntentStore:
                 )
             else:
                 conn.execute(_INTENT_TABLE_SQL)  # self-heal a table lost under a valid version
+                # R2-F2(a) v1 -> v2: add ``drain_ready_at`` in place (idempotent — guarded by a
+                # column-existence check so a re-run never errors), then stamp the new version.
+                if version < HIBERNATE_REDRIVE_INTENT_SCHEMA_VERSION:
+                    if not _has_column(conn, "hibernate_redrive_intent", "drain_ready_at"):
+                        conn.execute(
+                            "ALTER TABLE hibernate_redrive_intent "
+                            "ADD COLUMN drain_ready_at TEXT NOT NULL DEFAULT ''"
+                        )
+                    conn.execute(
+                        f"PRAGMA user_version = {HIBERNATE_REDRIVE_INTENT_SCHEMA_VERSION}"
+                    )
             return conn
         except HibernateRedriveIntentError:
             raise  # the downgrade-safe foreign-schema refusal — already typed, conn closed
@@ -302,12 +331,13 @@ class HibernateRedriveIntentStore:
             conn.execute(
                 "INSERT INTO hibernate_redrive_intent "
                 "(workspace_id, lane_id, lane_generation, issue_id, decision_journal, "
-                " basis, action_id, assertion_flags, recorded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                " basis, action_id, assertion_flags, recorded_at, drain_ready_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(workspace_id, lane_id, lane_generation) DO UPDATE SET "
                 "issue_id=excluded.issue_id, decision_journal=excluded.decision_journal, "
                 "basis=excluded.basis, action_id=excluded.action_id, "
-                "assertion_flags=excluded.assertion_flags, recorded_at=excluded.recorded_at",
+                "assertion_flags=excluded.assertion_flags, recorded_at=excluded.recorded_at, "
+                "drain_ready_at=excluded.drain_ready_at",
                 (
                     ws,
                     lane,
@@ -318,6 +348,7 @@ class HibernateRedriveIntentStore:
                     str(intent.action_id or "").strip(),
                     flags_json,
                     stamp,
+                    str(intent.drain_ready_at or "").strip(),
                 ),
             )
             conn.execute("COMMIT")
@@ -348,9 +379,13 @@ class HibernateRedriveIntentStore:
         if conn is None:
             return None
         try:
+            # v1 (unmigrated, read-only) has no ``drain_ready_at`` column; select it only when
+            # present so a pre-migration read never fails (legacy -> blank -> ``unavailable``).
+            has_drain = _has_column(conn, "hibernate_redrive_intent", "drain_ready_at")
+            drain_col = "drain_ready_at" if has_drain else "'' AS drain_ready_at"
             row = conn.execute(
                 "SELECT workspace_id, lane_id, lane_generation, issue_id, decision_journal, "
-                "basis, action_id, assertion_flags, recorded_at "
+                f"basis, action_id, assertion_flags, recorded_at, {drain_col} "
                 "FROM hibernate_redrive_intent "
                 "WHERE workspace_id=? AND lane_id=? AND lane_generation=?",
                 (ws, lane, int(lane_generation)),
@@ -386,6 +421,7 @@ class HibernateRedriveIntentStore:
             action_id=row[6],
             assertion_flags=validated,
             recorded_at=row[8],
+            drain_ready_at=str(row[9] or ""),
         )
 
 

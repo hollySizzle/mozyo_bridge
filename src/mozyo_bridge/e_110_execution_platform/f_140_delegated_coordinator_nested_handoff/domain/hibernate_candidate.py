@@ -279,6 +279,12 @@ class HibernateCandidate:
     head: BoundField
     basis: str
     conjuncts: tuple[BasisConjunct, ...]
+    #: The basis decision journal's provider ``created_on`` (Redmine #14219 T3 review j#87196
+    #: R2-F2(a)) — the candidate's drain-ready START time, bound at the leg from the exact decision
+    #: journal (never guessed from a journal id or a local observation). Blank when unavailable. It
+    #: is an INTERNAL computation input and is deliberately NOT surfaced in :meth:`as_payload` — the
+    #: report exposes only the DERIVED, redaction-safe latency + status, never the raw timestamp.
+    drain_ready_at: str = ""
 
     def as_payload(self) -> dict:
         return {

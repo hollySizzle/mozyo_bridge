@@ -22,7 +22,8 @@ The obligation flags and the basis-event journal are supplied by injected seams 
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
 
 from ..domain.hibernate_actuation import (
@@ -53,6 +54,68 @@ ATTEMPT_REDRIVE_BLOCKED = "redrive_blocked"
 # Review j#86776 R5-F5: a hibernated row whose ``process_release`` is not a canonical release
 # state token — an uncertain state the wiring refuses to hand the public rail (zero execute).
 ATTEMPT_RELEASE_STATE_UNKNOWN = "release_state_unknown"
+
+# Time-to-drain status (Redmine #14219 T3 review j#87196 R2-F2(a); ruling j#87182 / j#87181): a
+# closed enum. ``completed`` = a successful fresh actuation OR a terminal successful redrive with a
+# trusted start+end. ``pending`` = blocked / deferred / partial / success-withheld (not a drain
+# completion). ``uncertain`` = a lost lease / raised leg (no trusted end). ``unavailable`` = a
+# completed actuation whose drain-ready start / end timestamp is missing / malformed / clock-skewed
+# (never a guessed 0). No blind completion is inferred.
+TTD_COMPLETED = "completed"
+TTD_PENDING = "pending"
+TTD_UNCERTAIN = "uncertain"
+TTD_UNAVAILABLE = "unavailable"
+
+_TTD_COMPLETED_KINDS = frozenset({ATTEMPT_ACTUATED, ATTEMPT_REDRIVEN})
+_TTD_UNCERTAIN_KINDS = frozenset({ATTEMPT_LEASE_LOST})
+
+
+def _parse_iso(value: object) -> "Optional[datetime]":
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def drain_metrics(kind: str, drain_ready_at: str, completed_at: str):
+    """The (status, time_to_drain_ms, time_to_disposition_ms) for one attempt — pure, secret-free.
+
+    ``drain_ready_at`` is the basis decision journal's provider ``created_on``; ``completed_at`` is
+    the injected supervisor clock read at the attempt's terminal disposition. A missing / malformed /
+    skewed pair yields no trusted latency (``None``): a completed actuation then reports
+    :data:`TTD_UNAVAILABLE`, never a guessed 0; a pending / uncertain attempt keeps its status with a
+    null disposition latency.
+    """
+    if kind in _TTD_COMPLETED_KINDS:
+        base = TTD_COMPLETED
+    elif kind in _TTD_UNCERTAIN_KINDS:
+        base = TTD_UNCERTAIN
+    else:
+        base = TTD_PENDING
+    start = _parse_iso(drain_ready_at)
+    end = _parse_iso(completed_at)
+    if start is None or end is None or end < start:
+        return (TTD_UNAVAILABLE if base == TTD_COMPLETED else base), None, None
+    delta_ms = int((end - start).total_seconds() * 1000)
+    if base == TTD_COMPLETED:
+        return TTD_COMPLETED, delta_ms, delta_ms
+    return base, None, delta_ms
+
+
+def stamp_drain_metrics(attempt: "HibernateAttempt", drain_ready_at: str, completed_at: str) -> "HibernateAttempt":
+    """Return ``attempt`` with its drain-latency status + durations bound (raw timestamps discarded)."""
+    status, drain_ms, disp_ms = drain_metrics(attempt.kind, drain_ready_at, completed_at)
+    return replace(
+        attempt, time_to_drain_status=status, time_to_drain_ms=drain_ms,
+        time_to_disposition_ms=disp_ms,
+    )
+
 
 # Fixed reason tokens the leg emits itself (secret-free; the use case's own reasons are already a
 # closed vocabulary and are passed through verbatim).
@@ -92,6 +155,16 @@ class HibernateAttempt:
     reason: str = ""
     revision: int = 0
     released: int = 0
+    #: The drain-latency observability for this candidate (Redmine #14219 T3 review j#87196 R2-F2(a)).
+    #: ``time_to_drain_status`` is the closed enum :data:`TTD_COMPLETED` / :data:`TTD_PENDING` /
+    #: :data:`TTD_UNCERTAIN` / :data:`TTD_UNAVAILABLE`. ``time_to_drain_ms`` is the drain-ready ->
+    #: terminal-success latency in ms, set ONLY for a completed actuation/redrive with a trusted
+    #: start+end; ``None`` otherwise. ``time_to_disposition_ms`` is the drain-ready -> typed-terminal
+    #: (applied/blocked/uncertain) latency. Both are DERIVED durations, never raw timestamps — the
+    #: payload is redaction-safe (no provider ``created_on``, no path).
+    time_to_drain_status: str = ""
+    time_to_drain_ms: Optional[int] = None
+    time_to_disposition_ms: Optional[int] = None
 
     def as_payload(self) -> dict:
         return {
@@ -101,6 +174,9 @@ class HibernateAttempt:
             "reason": self.reason,
             "revision": self.revision,
             "released": self.released,
+            "time_to_drain_status": self.time_to_drain_status,
+            "time_to_drain_ms": self.time_to_drain_ms,
+            "time_to_disposition_ms": self.time_to_disposition_ms,
         }
 
 
