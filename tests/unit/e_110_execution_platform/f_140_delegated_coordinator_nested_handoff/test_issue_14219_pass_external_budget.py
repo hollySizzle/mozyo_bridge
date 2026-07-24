@@ -76,6 +76,19 @@ class BudgetPrimitivesTest(unittest.TestCase):
         self.assertEqual(pxb.compose_defer_fences(a, c, None)("row"), (True, "c"))
         self.assertIsNone(pxb.compose_defer_fences(None, None))
 
+    def test_a_sender_raise_consumes_the_budget_as_uncertain(self) -> None:
+        # R4-F1: the sender is called AFTER the send-edge, so a raise = UNKNOWN external effect. The
+        # wrapper spends the budget as uncertain (so no later row/workspace continues) then re-raises.
+        b = {"mutated": False, "uncertain": False}
+
+        def _boom(row):
+            raise RuntimeError("transport blew up mid-send")
+
+        with self.assertRaises(RuntimeError):
+            pxb.budgeted_sender(_boom, b)("row")
+        self.assertTrue(b["uncertain"])
+        self.assertTrue(pxb.budget_spent(b))
+
 
 class _Harness(unittest.TestCase):
     def setUp(self) -> None:

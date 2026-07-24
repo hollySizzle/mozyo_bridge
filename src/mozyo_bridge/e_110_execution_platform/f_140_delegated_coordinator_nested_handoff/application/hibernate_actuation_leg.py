@@ -246,6 +246,7 @@ def run_hibernate_pass(
         Callable[[HibernateCandidate, ActuationRequestFields], bool]
     ] = None,
     budget_consumed: bool = False,
+    clock_fn: Optional[Callable[[], str]] = None,
 ) -> HibernatePassResult:
     """Run one bounded hibernate pass, actuating at most one lifecycle mutation.
 
@@ -281,8 +282,16 @@ def run_hibernate_pass(
     stopped = False
     for candidate in ordered:
         issue, lane = candidate.issue_id, candidate.anchor.lane_id
+        drain_ready = str(getattr(candidate, "drain_ready_at", "") or "")
+
+        def _append(attempt, _dr=drain_ready):
+            # Stamp each attempt at ITS terminal disposition (review j#87214 R4-F2/F3): START =
+            # THIS candidate's exact basis drain_ready_at; END = the clock read now, not once per pass.
+            attempts.append(stamp_drain_metrics(
+                attempt, _dr, clock_fn() if clock_fn is not None else ""
+            ))
         if mutated or stopped:
-            attempts.append(HibernateAttempt(
+            _append(HibernateAttempt(
                 issue, lane, ATTEMPT_DEFERRED, NO_ACTUATION_DEFERRED_ONE_PER_PASS
             ))
             continue
@@ -294,7 +303,7 @@ def run_hibernate_pass(
         # decision journal would otherwise produce: both are zero-actuation, but only one of them
         # names what actually happened. Neither check mutates, so the order is free.
         if refresh_fn(candidate) != candidate:
-            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_STALE, LEG_REASON_BASIS_STALE))
+            _append(HibernateAttempt(issue, lane, ATTEMPT_STALE, LEG_REASON_BASIS_STALE))
             continue
 
         fields = derive_actuation_request(
@@ -302,13 +311,13 @@ def run_hibernate_pass(
         )
         if isinstance(fields, str):
             # A missing basis-event journal is fail-closed for THIS candidate only; others proceed.
-            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_NO_JOURNAL, fields))
+            _append(HibernateAttempt(issue, lane, ATTEMPT_NO_JOURNAL, fields))
             continue
 
         # Wrapper lease fence: renew immediately before the mutation (auxiliary to the use case's
         # own commit-point lease_guard).
         if not lease_renew_fn():
-            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
+            _append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
             stopped = True
             continue
 
@@ -319,7 +328,7 @@ def run_hibernate_pass(
         # never a fallback to a shared root that could inspect a sibling lane.
         bound_use_case = use_case_fn(candidate) if use_case_fn is not None else use_case
         if bound_use_case is None:
-            attempts.append(HibernateAttempt(
+            _append(HibernateAttempt(
                 issue, lane, ATTEMPT_BLOCKED, LEG_REASON_WORKTREE_UNRESOLVED
             ))
             continue
@@ -332,7 +341,7 @@ def run_hibernate_pass(
         # never be recovered would strand the live process forever (R6-F1). ``record_intent_fn``
         # returns whether the intent is durably stored.
         if record_intent_fn is not None and not record_intent_fn(candidate, fields):
-            attempts.append(HibernateAttempt(
+            _append(HibernateAttempt(
                 issue, lane, ATTEMPT_BLOCKED, LEG_REASON_INTENT_PERSIST_FAILED
             ))
             continue
@@ -340,7 +349,7 @@ def run_hibernate_pass(
 
         # A lease lost at the use case's commit boundary committed nothing; stop the pass.
         if outcome.lease_lost:
-            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
+            _append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
             stopped = True
             continue
 
@@ -352,16 +361,16 @@ def run_hibernate_pass(
             revision = outcome.transition.revision
             released = _released_count(outcome)
             if outcome.is_success:
-                attempts.append(HibernateAttempt(
+                _append(HibernateAttempt(
                     issue, lane, ATTEMPT_ACTUATED, "", revision=revision, released=released
                 ))
             else:
-                attempts.append(HibernateAttempt(
+                _append(HibernateAttempt(
                     issue, lane, ATTEMPT_PARTIAL, _blocked_reason(outcome),
                     revision=revision, released=released
                 ))
         else:
-            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_BLOCKED, _blocked_reason(outcome)))
+            _append(HibernateAttempt(issue, lane, ATTEMPT_BLOCKED, _blocked_reason(outcome)))
 
     return HibernatePassResult(
         attempts=tuple(attempts),
@@ -385,6 +394,8 @@ def run_hibernate_redrives(
     use_case_fn: "Callable[[object], Optional[SublaneHibernateUseCase]]",
     request_fn: "Callable[[object], HibernateRequest | str]",
     lease_renew_fn: Callable[[], bool],
+    clock_fn: Optional[Callable[[], str]] = None,
+    drain_ready_fn: "Optional[Callable[[str], str]]" = None,
 ) -> RedriveResult:
     """Finish prior interrupted releases on already-hibernated rows (review j#86757 R4-F2).
 
@@ -421,8 +432,14 @@ def run_hibernate_redrives(
     for row in ordered:
         issue = str(getattr(row, "issue_id", ""))
         lane = str(getattr(row, "lane_id", ""))
+        drain_ready = str(drain_ready_fn(issue) if drain_ready_fn is not None else "")
+
+        def _append(attempt, _dr=drain_ready):
+            attempts.append(stamp_drain_metrics(
+                attempt, _dr, clock_fn() if clock_fn is not None else ""
+            ))
         if mutated or stopped:
-            attempts.append(HibernateAttempt(
+            _append(HibernateAttempt(
                 issue, lane, ATTEMPT_DEFERRED, NO_ACTUATION_DEFERRED_ONE_PER_PASS
             ))
             continue
@@ -430,23 +447,23 @@ def run_hibernate_redrives(
         if isinstance(request, str):
             # A typed zero-close: no honest request could be built (no / mismatched intent).
             # Zero use-case call, zero mutation — consumes nothing.
-            attempts.append(HibernateAttempt(
+            _append(HibernateAttempt(
                 issue, lane, ATTEMPT_REDRIVE_BLOCKED, request
             ))
             continue
         use_case = use_case_fn(row)
         if use_case is None:
-            attempts.append(HibernateAttempt(
+            _append(HibernateAttempt(
                 issue, lane, ATTEMPT_REDRIVE_BLOCKED, LEG_REASON_WORKTREE_UNRESOLVED
             ))
             continue
         if not lease_renew_fn():
-            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
+            _append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
             stopped = True
             continue
         outcome = use_case.run(request, execute=True)
         if outcome.lease_lost:
-            attempts.append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
+            _append(HibernateAttempt(issue, lane, ATTEMPT_LEASE_LOST, LEG_REASON_LEASE_LOST))
             stopped = True
             continue
         if outcome.release is not None:
@@ -455,16 +472,16 @@ def run_hibernate_redrives(
             mutated = True
             released = _released_count(outcome)
             if outcome.success_withheld:
-                attempts.append(HibernateAttempt(
+                _append(HibernateAttempt(
                     issue, lane, ATTEMPT_REDRIVE_WITHHELD, LEG_REASON_SUCCESS_WITHHELD,
                     released=released
                 ))
             else:
-                attempts.append(HibernateAttempt(
+                _append(HibernateAttempt(
                     issue, lane, ATTEMPT_REDRIVEN, "", released=released
                 ))
             continue
-        attempts.append(HibernateAttempt(
+        _append(HibernateAttempt(
             issue, lane, ATTEMPT_REDRIVE_BLOCKED, _blocked_reason(outcome)
         ))
     return RedriveResult(

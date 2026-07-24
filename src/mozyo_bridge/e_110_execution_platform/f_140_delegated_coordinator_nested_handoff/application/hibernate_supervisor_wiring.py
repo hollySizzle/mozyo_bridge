@@ -326,6 +326,7 @@ def combine_hibernate_pass_results(
     redrive_result: RedriveResult,
     fresh_pass: Optional[HibernatePassResult],
     deferred_candidates: Sequence[HibernateCandidate],
+    clock_fn: "Optional[Callable[[], str]]" = None,
 ) -> HibernatePassResult:
     """Fold the redrive prelude, the (optional) fresh pass, and the R5-F5 uncertain attempts.
 
@@ -339,12 +340,18 @@ def combine_hibernate_pass_results(
     non-empty attempt list is a non-empty pass).
     """
     if fresh_pass is None:
+        # Review j#87214 R4-F2/F3: stamp each stopped-redrive lease-lost attempt with ITS candidate's
+        # exact ``drain_ready_at`` — an uncertain end (no trusted terminal), so a null latency.
         fresh_attempts = tuple(
-            HibernateAttempt(
-                candidate.issue_id,
-                candidate.anchor.lane_id,
-                ATTEMPT_LEASE_LOST,
-                LEG_REASON_LEASE_LOST,
+            stamp_drain_metrics(
+                HibernateAttempt(
+                    candidate.issue_id,
+                    candidate.anchor.lane_id,
+                    ATTEMPT_LEASE_LOST,
+                    LEG_REASON_LEASE_LOST,
+                ),
+                str(getattr(candidate, "drain_ready_at", "") or ""),
+                "",
             )
             for candidate in order_candidates(deferred_candidates)
         )
@@ -842,47 +849,34 @@ def build_hibernate_leg_fn(
                 expected_revision="",
             )
 
-        # R2-F2(a): stamp each attempt's drain-latency (status + durations) from its candidate's
-        # decision-journal ``drain_ready_at`` START and the injected supervisor clock read at the
-        # terminal disposition END. Raw timestamps are discarded here — only the derived, redaction-
-        # safe status + ms reach the attempt. A redriven attempt whose original start was never bound
-        # (legacy / no intent) stamps UNAVAILABLE, never a guessed latency.
-        drain_ready_by_issue = {
-            str(c.issue_id): str(getattr(c, "drain_ready_at", "") or "") for c in candidates
-        }
-
-        def _stamped(result):
-            if clock_fn is None or not result.attempts:
-                return result
-            completed_at = clock_fn()
-            return replace(result, attempts=tuple(
-                stamp_drain_metrics(
-                    a,
-                    # A fresh candidate's start; else the ORIGINAL start the redrive carried from its
-                    # intent (R2-F2(a) item 4) — never reset to the redrive's own time.
-                    drain_ready_by_issue.get(str(a.issue)) or redrive_drain_ready.get(str(a.issue), ""),
-                    completed_at,
-                )
-                for a in result.attempts
-            ))
+        # R2-F2(a) + review j#87214 R4-F2/F3: the drain-latency is stamped PER ATTEMPT at its terminal
+        # disposition inside ``run_hibernate_pass`` / ``run_hibernate_redrives`` — each attempt uses ITS
+        # candidate's EXACT basis ``drain_ready_at`` (never an issue-collapsed one) and the clock read at
+        # THAT terminal (never one pass-wide read). The redrive path resolves the ORIGINAL start from the
+        # intent the ``redrive_request`` closure recorded, keyed by issue (one hibernated row per issue).
+        def _redrive_drain_ready(issue: str) -> str:
+            return str(redrive_drain_ready.get(str(issue), ""))
 
         redrive_result = run_hibernate_redrives(
             redrives,
             use_case_fn=redrive_use_case,
             request_fn=redrive_request,
             lease_renew_fn=renew,
+            clock_fn=clock_fn,
+            drain_ready_fn=_redrive_drain_ready,
         )
 
         # Review j#86776 R5-F4: a redrive that lost its lease STOPS the whole pass — the fresh
         # pass is not run (its use cases would double-actuate under a taken-over lease), and every
         # fresh candidate is a typed lease_lost with zero use-case call / zero provider read.
         if redrive_result.stopped:
-            return _stamped(combine_hibernate_pass_results(
+            return combine_hibernate_pass_results(
                 unknown_attempts=unknown_attempts,
                 redrive_result=redrive_result,
                 fresh_pass=None,
                 deferred_candidates=candidates,
-            ))
+                clock_fn=clock_fn,
+            )
 
         fresh_pass = run_hibernate_pass(
             candidates,
@@ -893,13 +887,15 @@ def build_hibernate_leg_fn(
             lease_renew_fn=renew,
             record_intent_fn=record_intent,
             budget_consumed=redrive_result.mutations > 0,
+            clock_fn=clock_fn,
         )
-        return _stamped(combine_hibernate_pass_results(
+        return combine_hibernate_pass_results(
             unknown_attempts=unknown_attempts,
             redrive_result=redrive_result,
             fresh_pass=fresh_pass,
             deferred_candidates=candidates,
-        ))
+            clock_fn=clock_fn,
+        )
 
     return leg
 

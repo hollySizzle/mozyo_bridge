@@ -128,14 +128,15 @@ def _decision(journal=JOURNAL, issue=ISSUE) -> DecisionPointer:
     return DecisionPointer(source="redmine", issue_id=issue, journal_id=journal)
 
 
-def _candidate(*, lane=LANE, issue=ISSUE, ws=WS, gen=1, rev=1, basis=hc.BASIS_DEPENDENCY_PARK):
+def _candidate(*, lane=LANE, issue=ISSUE, ws=WS, gen=1, rev=1, basis=hc.BASIS_DEPENDENCY_PARK,
+               drain_ready_at=""):
     anchor = hc.LifecycleAnchor(
         issue_id=issue, repo_workspace_id=ws, lane_id=lane, lane_generation=gen, revision=rev
     )
     return hc.HibernateCandidate(
         issue_id=issue, anchor=anchor,
         head=hc.BoundField(value="a" * 40, provenance=hc.PROVENANCE_GIT_REMOTE),
-        basis=basis, conjuncts=(),
+        basis=basis, conjuncts=(), drain_ready_at=drain_ready_at,
     )
 
 
@@ -151,7 +152,7 @@ def _obligations(**over):
 
 class HibernateActuationLegTests(unittest.TestCase):
     def _run(self, store, candidates, *, obligations=None, journal=JOURNAL, lease=True,
-             fresh=True, ops=None, lease_guard=None):
+             fresh=True, ops=None, lease_guard=None, clock_fn=None):
         ops = ops or _FakeOps()
         use_case = SublaneHibernateUseCase(ops=ops, store=store, lease_guard=lease_guard)
         # refresh_fn re-produces the candidate; `fresh=True` -> exact same candidate (current);
@@ -167,6 +168,7 @@ class HibernateActuationLegTests(unittest.TestCase):
             journal_fn=lambda c: journal,
             use_case=use_case,
             lease_renew_fn=lambda: lease,
+            clock_fn=clock_fn,
         )
         return result, ops
 
@@ -219,6 +221,31 @@ class HibernateActuationLegTests(unittest.TestCase):
             # one actuated; lane-a (issue 14219) is deferred.
             self.assertEqual(self._disposition(store, lane="lane-b"), DISPOSITION_HIBERNATED)
             self.assertEqual(self._disposition(store, lane="lane-a"), DISPOSITION_ACTIVE)
+
+    def test_dual_basis_uses_each_candidates_own_start_and_a_per_attempt_clock(self):
+        # Review j#87214 R4-F2/F3: a SAME issue/lane dual-basis pair (early + park) with DIFFERENT
+        # drain-ready starts. Pre-fix the leg collapsed the start to {issue: drain_ready_at} (the
+        # LAST candidate wins), so the actuated attempt got the WRONG start; and the END clock was
+        # read once per pass. This pins per-attempt START (exact candidate) + per-attempt END (clock).
+        with TemporaryDirectory() as raw:
+            home = Path(raw)
+            store = self._seed(home)
+            cands = [
+                _candidate(basis=hc.BASIS_EARLY_HIBERNATE,   # sorts + processed first -> actuated
+                           drain_ready_at="2026-07-24T00:00:00+00:00"),
+                _candidate(basis=hc.BASIS_DEPENDENCY_PARK,   # deferred (budget spent)
+                           drain_ready_at="2026-07-24T01:00:00+00:00"),
+            ]
+            clocks = iter(["2026-07-24T02:00:00+00:00", "2026-07-24T02:00:05+00:00"])
+            result, _ = self._run(store, cands, clock_fn=lambda: next(clocks))
+            actuated = next(a for a in result.attempts if a.kind == ATTEMPT_ACTUATED)
+            deferred = next(a for a in result.attempts if a.kind == ATTEMPT_DEFERRED)
+            # R4-F2: the actuated attempt used ITS OWN start (00:00), not the park candidate's (01:00).
+            self.assertEqual(actuated.time_to_drain_status, "completed")
+            self.assertEqual(actuated.time_to_drain_ms, 7_200_000)  # 00:00 -> 02:00 (first clock read)
+            # The deferred attempt used ITS OWN start (01:00) and the SECOND clock read (R4-F3).
+            self.assertEqual(deferred.time_to_disposition_ms, 3_605_000)  # 01:00:00 -> 02:00:05
+            self.assertIsNone(deferred.time_to_drain_ms)  # a defer is not a drain completion
 
     def test_a_partial_release_consumes_the_one_mutation_budget(self):
         # R1-F1: the first candidate's CAS applies (row hibernated) but its release is incomplete,

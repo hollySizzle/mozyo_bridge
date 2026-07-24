@@ -183,6 +183,43 @@ class LocalDrainZeroProviderTest(_DrainHarness):
         sup.run_once(mode=SUPERVISION_LOCAL_DRAIN)                 # remainder next pass
         self.assertEqual(calls, ["wsA", "wsB"])   # wsB now delivered; wsA NOT re-sent (no duplicate)
 
+    def test_local_drain_a_raised_sender_defers_the_next_workspace(self) -> None:
+        # Review j#87214 R4-F1: the sender is invoked AFTER the outbox crossed the send edge, so a
+        # RAISE leaves the external effect UNKNOWN. The pass budget must be spent (uncertain) so the
+        # next workspace never sends behind it, even though the raise is folded to a typed per-issue
+        # error.
+        for wsid, issue, journal in (("wsA", "14219", "100"), ("wsB", "14220", "200")):
+            self.outbox.enqueue(
+                CallbackOutboxKey(
+                    source="redmine", issue=issue, journal=journal,
+                    normalized_gate="review_request", callback_route="coordinator", workspace_id=wsid,
+                ),
+                initial_state=CALLBACK_PENDING, target_lane="lane_" + wsid,
+                target_receiver="coordinator", enqueue_lane_generation="5", now=CLOCK,
+            )
+        calls: list = []
+
+        def _sender(row):
+            calls.append(row.workspace_id)
+            if row.workspace_id == "wsA":
+                raise RuntimeError("wsA transport blew up mid-send")
+            return SEND_DELIVERED
+
+        sup = WorkspaceCallbackSupervisor(
+            holder="superX", lease_store=self.lease_store, store=self.store, outbox=self.outbox,
+            workspaces_fn=lambda: [
+                SupervisedWorkspace(workspace_id="wsB", canonical_path=str(self.dir / "b")),
+                SupervisedWorkspace(workspace_id="wsA", canonical_path=str(self.dir / "a")),
+            ],
+            roster_fn=lambda ws: ((), ""), redmine_source_fn=_boom_source,
+            sender_fn=lambda ws: _RecordingSender(), clock=lambda: CLOCK,
+            lane_generation_fn=lambda wsid, issue: "5", drain_sender_fn=lambda ws: _sender,
+        )
+        report = sup.run_once(mode=SUPERVISION_LOCAL_DRAIN)
+        self.assertEqual(calls, ["wsA"])          # wsA raised at the send edge; wsB NEVER attempted
+        by = {w.workspace_id: w for w in report.workspaces}
+        self.assertEqual(by["wsB"].skipped_reason, SKIP_PASS_BUDGET_SPENT)  # deferred behind unknown
+
     # -- close condition: defer, never blind-send --------------------------
 
     def test_mismatched_generation_is_deferred_not_sent(self) -> None:

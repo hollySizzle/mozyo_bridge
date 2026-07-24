@@ -64,10 +64,21 @@ def compose_defer_fences(*fences):
 
 def budgeted_sender(inner_sender, pass_budget):
     """Wrap a delivery sender so the FIRST real receiver wake (``delivered``) OR an UNCERTAIN send
-    spends the pass's one external-mutation budget; a deterministic ``not_sent`` never does."""
+    spends the pass's one external-mutation budget; a deterministic ``not_sent`` never does.
+
+    A sender that RAISES is called AFTER the outbox already moved the row to the send edge
+    (``mark_sending``), so the external effect is UNKNOWN (review j#87214 R4-F1): the budget is spent
+    as UNCERTAIN before the exception propagates, so no later row / issue / workspace continues behind
+    a possibly-landed send. The wrapper never swallows the raise — the caller's own fail-open still
+    records the typed error; it only fences the pass budget first.
+    """
 
     def send(row):
-        result = inner_sender(row)
+        try:
+            result = inner_sender(row)
+        except BaseException:
+            pass_budget["uncertain"] = True
+            raise
         outcome = normalize_send_result(result).outcome
         if outcome == SEND_DELIVERED:
             pass_budget["mutated"] = True
