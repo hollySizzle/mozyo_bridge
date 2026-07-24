@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_outbox import CallbackOutbox
-from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_UNCERTAIN
+from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING, CALLBACK_UNCERTAIN
 from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleReader, LaneLifecycleStore
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (  # noqa: E501
     CallbackCandidate,
@@ -386,28 +386,51 @@ class MultiIssueAnchorScopeTest(unittest.TestCase):
             (r.issue, r.journal): r.state for r in self.outbox.read()
         }.get((issue, str(journal)))
 
+    def _row(self, issue, journal):
+        return {(r.issue, r.journal): r for r in self.outbox.read()}.get((issue, str(journal)))
+
     def test_b_current_row_not_misfenced_by_a_newer_anchor(self) -> None:
         # (a) A anchor j500 (newer) would fence B's current j200 (200<500) if mis-applied; with
-        # per-issue scoping B is judged by ITS anchor j100, so B j200 is current and delivered.
+        # per-issue scoping B is judged by ITS anchor j100, so B j200 is current.
+        #
+        # Design Answer j#87266: the pass's ONE external mutation is A j600 (pass 1); B j200 is
+        # budget-DEFERRED at the pre-send edge — its claim released back to pending with attempts NOT
+        # consumed — never fenced or sent this pass. Pass 2 (fresh budget) delivers B j200 under its
+        # OWN anchor j100. The per-issue anchor scoping is what this test pins, now across two passes.
         self._seed_pending(_B, "200")
-        ws = self._run(
-            source_by_issue={_A: ["600"], _B: ["200"]},
-            anchors={_A: "500", _B: "100"},
-        )
-        sent = {(r.issue, r.journal) for r in self.sender.calls}
-        self.assertIn((_B, "200"), sent)  # B current delivered, NOT fenced by A's anchor
+        kwargs = dict(source_by_issue={_A: ["600"], _B: ["200"]}, anchors={_A: "500", _B: "100"})
+
+        self._run(**kwargs)  # pass 1
+        sent1 = {(r.issue, r.journal) for r in self.sender.calls}
+        self.assertNotIn((_B, "200"), sent1)  # B deferred behind A's one mutation, NOT sent
+        self.assertEqual(self._state(_B, "200"), CALLBACK_PENDING)  # deferred, not fenced
+        self.assertEqual(self._row(_B, "200").attempts, 0)  # budget defer consumed no retry
+        self.assertFalse(self._row(_B, "200").send_attempted)
+
+        self._run(**kwargs)  # pass 2: fresh budget
+        sent2 = {(r.issue, r.journal) for r in self.sender.calls}
+        self.assertIn((_B, "200"), sent2)  # B current delivered, NOT fenced by A's anchor
         self.assertEqual(self._state(_B, "200"), "delivered")
 
     def test_b_historical_row_not_passed_by_a_older_anchor(self) -> None:
         # (b) A anchor j100 (older) would pass B's historical j200 (200>=100) if mis-applied; with
         # per-issue scoping B is judged by ITS anchor j500, so B j200 is historical and fenced.
+        #
+        # Design Answer j#87266: pass 1 spends the ONE external mutation on A; B j200 is budget-
+        # DEFERRED at the pre-send edge (released to pending, attempts NOT consumed) — the historical
+        # fence is downstream of the defer, so it is NOT applied yet. Pass 2 (fresh budget) reaches
+        # B's send edge and its OWN anchor j500 fences j200 as historical (uncertain).
         self._seed_pending(_B, "200")
-        by = {w.issue: w for w in self._run(
-            source_by_issue={_A: ["150"], _B: ["600"]},
-            anchors={_A: "100", _B: "500"},
-        ).issues}
+        kwargs = dict(source_by_issue={_A: ["150"], _B: ["600"]}, anchors={_A: "100", _B: "500"})
+
+        self._run(**kwargs)  # pass 1: A delivers, B deferred BEFORE the historical fence
+        self.assertNotIn((_B, "200"), {(r.issue, r.journal) for r in self.sender.calls})
+        self.assertEqual(self._state(_B, "200"), CALLBACK_PENDING)  # deferred, NOT yet fenced
+        self.assertEqual(self._row(_B, "200").attempts, 0)
+
+        by = {w.issue: w for w in self._run(**kwargs).issues}  # pass 2: fresh budget
         sent = {(r.issue, r.journal) for r in self.sender.calls}
-        self.assertNotIn((_B, "200"), sent)  # B historical NOT sent under A's older anchor
+        self.assertNotIn((_B, "200"), sent)  # B historical NOT sent under B's own anchor
         self.assertEqual(self._state(_B, "200"), CALLBACK_UNCERTAIN)  # fenced by B's own anchor
         # (c) the fence is attributed to B's outcome, not A's.
         self.assertGreaterEqual(by[_B].historical_fenced, 1)

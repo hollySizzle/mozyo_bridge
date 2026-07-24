@@ -128,7 +128,10 @@ class _Harness(unittest.TestCase):
 class PassBudgetRunOnceTest(_Harness):
     def test_two_workspaces_deliver_at_most_one_callback(self) -> None:
         # Both wsA and wsB have a deliverable review_request. Deterministic (id) order: wsA delivers,
-        # spending the pass's one external mutation; wsB is budget-deferred BEFORE any side effect.
+        # spending the pass's one external mutation; wsB is budget-deferred at the PRE-SEND edge with
+        # its row left PENDING. Design Answer j#87266: budget bounds only the external send — wsB is
+        # NOT wholesale-skipped (it still reads / partitions / supplies events), so its skipped_reason
+        # is blank and its deferred row is delivered on the NEXT pass with no duplicate.
         calls: list = []
         sup = self._supervisor(
             workspaces=[self._ws("wsB"), self._ws("wsA")],
@@ -141,8 +144,12 @@ class PassBudgetRunOnceTest(_Harness):
         self.assertEqual(report.delivered, 1)
         by = {w.workspace_id: w for w in report.workspaces}
         self.assertEqual(by["wsA"].delivered, 1)
-        self.assertEqual(by["wsB"].skipped_reason, SKIP_PASS_BUDGET_SPENT)  # no side effect at all
+        self.assertEqual(by["wsB"].skipped_reason, "")  # NOT wholesale-skipped; deferred at send edge
         self.assertEqual(by["wsB"].delivered, 0)
+        self.assertEqual(len(self.outbox.read(states=[CALLBACK_PENDING])), 1)  # wsB row still pending
+        report2 = sup.run_once(mode=SUPERVISION_BOUNDED_RECONCILIATION)  # remainder next pass
+        self.assertEqual(len(calls), 2)  # wsB now delivered; wsA NOT re-sent (no duplicate)
+        self.assertEqual(report2.delivered, 1)
 
     def test_a_deterministic_block_does_not_consume_the_budget(self) -> None:
         # wsA's send is a deterministic zero-send (not_sent): it does NOT spend the budget, so wsB
@@ -169,8 +176,10 @@ class PassBudgetRunOnceTest(_Harness):
         self.assertEqual(len(delivered_rows), 1)
 
     def test_an_uncertain_send_consumes_the_budget(self) -> None:
-        # wsA's send is UNCERTAIN (unknown outcome) -> spends the budget -> wsB is skipped (no blind
-        # continuation behind an unknown external effect).
+        # wsA's send is UNCERTAIN (unknown outcome) -> spends the budget -> wsB performs no external
+        # send this pass (no blind continuation behind an unknown external effect). Design Answer
+        # j#87266: wsB is budget-deferred at the pre-send edge (row left pending), NOT wholesale-
+        # skipped — its skipped_reason is blank and it delivered nothing.
         sup = self._supervisor(
             workspaces=[self._ws("wsA"), self._ws("wsB")],
             rosters={"wsA": ("100",), "wsB": ("200",)},
@@ -179,7 +188,9 @@ class PassBudgetRunOnceTest(_Harness):
         )
         report = sup.run_once(mode=SUPERVISION_BOUNDED_RECONCILIATION)
         by = {w.workspace_id: w for w in report.workspaces}
-        self.assertEqual(by["wsB"].skipped_reason, SKIP_PASS_BUDGET_SPENT)
+        self.assertEqual(by["wsB"].skipped_reason, "")  # NOT wholesale-skipped; deferred at send edge
+        self.assertEqual(by["wsB"].delivered, 0)
+        self.assertEqual(len(self.outbox.read(states=[CALLBACK_PENDING])), 1)  # wsB row still pending
 
     def test_a_delivery_defers_the_folded_hibernate(self) -> None:
         # Delivery + hibernate share the ONE budget: wsA delivers, so its folded hibernate defers.

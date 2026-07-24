@@ -25,6 +25,7 @@ from mozyo_bridge.core.state.callback_outbox import CallbackOutbox
 from mozyo_bridge.core.state.supervisor_lease import SupervisorLeaseStore, supervisor_lease_path
 from mozyo_bridge.core.state.workflow_runtime_store import (
     CALLBACK_DELIVERED,
+    CALLBACK_PENDING,
     WorkflowRuntimeStore,
     workflow_runtime_store_path,
 )
@@ -100,18 +101,36 @@ class WorkspaceSupervisorScenarioTest(unittest.TestCase):
         )
 
     def test_sweep_supplies_events_and_drains_all_registered_workspaces(self) -> None:
-        report = self._supervisor(holder="superX").run_once()
+        # Design Answer j#87266: the pass's ONE external-mutation budget bounds only the callback
+        # SEND. Every registered workspace is still swept — roster read, provider read, and durable
+        # event supply (#13683) run for BOTH workspaces even after the budget is spent. Only ONE
+        # callback is delivered per pass; the other workspace's row is budget-deferred (pending,
+        # attempts NOT consumed) and delivered on the next pass, with zero duplicate.
+        sup = self._supervisor(holder="superX")
+
+        report = sup.run_once()  # pass 1
         self.assertEqual(len(report.workspaces), 2)
         self.assertEqual(report.workspaces_supervised, 2)
-        self.assertGreaterEqual(report.events_supplied, 2)  # one gate per workspace's issue
-        self.assertEqual(report.delivered, 2)
-        # Both issues' events are persisted for glance/resume.
+        self.assertGreaterEqual(report.events_supplied, 2)  # one gate per workspace's issue — BOTH
+        self.assertEqual(report.delivered, 1)  # ONE external mutation for the whole pass
+        # Both issues' events are persisted for glance/resume regardless of the delivery budget.
         persisted = {e.issue for e in self.store.read_events()}
         self.assertEqual(persisted, {"13683", "13684"})
-        # Both callbacks delivered, each partitioned to its own workspace.
+        # Exactly one callback delivered this pass; the other workspace's row is deferred (pending,
+        # attempts NOT consumed).
+        self.assertEqual(len(self.outbox.read(states=[CALLBACK_DELIVERED])), 1)
+        pending = self.outbox.read(states=[CALLBACK_PENDING])
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].attempts, 0)
+
+        report2 = sup.run_once()  # pass 2: fresh budget delivers the remainder
+        self.assertEqual(report2.delivered, 1)
+        # Both callbacks now delivered across the two passes, each partitioned to its own workspace,
+        # with no duplicate (two sends total).
         delivered = self.outbox.read(states=[CALLBACK_DELIVERED])
         self.assertEqual(len(delivered), 2)
         self.assertEqual({d.workspace_id for d in delivered}, set(self.issue_by_ws))
+        self.assertEqual(len(self.sender.calls), 2)
 
     def test_concurrent_duplicate_daemon_is_fenced_across_whole_registry(self) -> None:
         # Supervisor A holds all leases (release_after=False, still running).

@@ -29,7 +29,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     IssueSupervisionOutcome,
     SKIP_LEASE_LOST,
     SKIP_NO_ACTIVE_ISSUES,
-    SKIP_PASS_BUDGET_SPENT,
     SKIP_ROSTER_UNREADABLE,
     SUPERVISION_BOUNDED_RECONCILIATION,
     WorkspaceSupervisionOutcome,
@@ -64,20 +63,18 @@ def deliver_under_lease(
 
     Extracted (review j#87154 R1-F1) so the folded hibernate after-leg can run before the lease is
     released. No acquire, no release, no wake drain — the caller owns all three. ``pass_budget``
-    (Final Design Disposition j#87188 = B) is the pass's ONE external-mutation budget: if an earlier
-    workspace already spent it this workspace performs NO external side effect (its rows stay pending
-    for the next pass); otherwise the delivery sender is budget-wrapped and every deliver path carries
-    a budget defer fence, so the pass delivers at most one callback total.
+    (Final Design Disposition j#87188 = B) is the pass's ONE external-mutation budget, and it bounds
+    ONLY external side effects (Design Answer j#87266): a budget already spent by an earlier workspace
+    does NOT skip this workspace's provider READ, roster/authority partition, or internal durable event
+    fold/supply — those are non-external (boundary 1) and #13968's ``non_authoritative_issues`` safety
+    observation + #13683's all-registered-workspace event supply must still be produced this pass.
+    The single external mutation is capped at the send edge instead: the delivery sender is
+    budget-wrapped (:func:`pass_external_budget.budgeted_sender`) and every deliver path carries the
+    pre-send :func:`pass_external_budget.external_budget_defer_fence`, which — once the budget is
+    spent — RELEASES each claimed row back to ``pending`` (no ``send_attempted``, no attempt bump)
+    before the send. So the pass reads/partitions/supplies for every workspace yet delivers at most
+    one callback total, and a budget-deferred row is delivered on the next pass.
     """
-    if pass_budget is not None and _pxb.budget_spent(pass_budget):
-        # An earlier workspace already used the pass's one external mutation — skip even the provider
-        # read (the next pass re-decides this workspace's rows against the durable authority).
-        return WorkspaceSupervisionOutcome(
-            workspace_id=wsid,
-            lease_acquired=True,
-            lease_reason=lease.reason,
-            skipped_reason=SKIP_PASS_BUDGET_SPENT,
-        )
     budget_defer = (
         _pxb.external_budget_defer_fence(pass_budget) if pass_budget is not None else None
     )
