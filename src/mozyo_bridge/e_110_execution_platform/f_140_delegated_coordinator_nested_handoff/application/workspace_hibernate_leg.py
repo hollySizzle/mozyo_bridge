@@ -39,7 +39,9 @@ def hibernate_sweep(sup) -> "list[WorkspaceSupervisionOutcome]":
     not to a workspace: workspaces run in DETERMINISTIC order (workspace id), every leg shares
     one read counter, and once any workspace's pass applies a mutation the remaining workspaces
     are typed-deferred WITHOUT running their legs (zero reads, zero actuation) — the next pass
-    picks them up. Total external mutations per supervisor pass therefore never exceed one.
+    picks them up. A leg that raises consumes the budget too (its mutation status is
+    UNKNOWN — review j#86739 R3-F1), so total external mutations per pass never exceed one
+    even when an exception hides one.
     """
     budget: dict = {"reads": 0, "mutated": False}
     outcomes: "list[WorkspaceSupervisionOutcome]" = []
@@ -56,7 +58,12 @@ def hibernate_sweep(sup) -> "list[WorkspaceSupervisionOutcome]":
             )
             continue
         outcome = hibernate_workspace(sup, ws, budget=budget)
-        if outcome.hibernate_mutations > 0:
+        if outcome.hibernate_mutations > 0 or outcome.skipped_reason == SKIP_HIBERNATE_LEG_ERROR:
+            # Review j#86739 R3-F1: a leg that RAISED cannot prove it mutated nothing — the
+            # public use case has post-CAS work, so the exception may be post-mutation. An
+            # uncertain outcome consumes the pass budget exactly like a confirmed mutation
+            # (uncertain prior action -> no blind continuation), and the remaining workspaces
+            # are typed-deferred to the next pass.
             budget["mutated"] = True
         outcomes.append(outcome)
     return outcomes

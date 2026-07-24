@@ -11,10 +11,12 @@ ruling's conditions (j#86718):
   own journals carry a strictly-parsed canonical park evidence marker whose envelope matches the
   row's EXACT (workspace, lane, generation) — nothing is synthesized from idle/open/releasable,
   and a marker for another lane or a stale generation enumerates nothing.
-* **Bounded provider reads.** One journal fetch per enumerated issue per pass (memoised), plus
-  the dogfood receipt reads for the release issues that issue's own evidence names. No unbounded
-  N+1 sweep; an unreadable fetch is ``None`` (the assembler's typed unreadable), never retried
-  within the pass.
+* **Bounded provider reads.** TWO memoised fetches per enumerated issue per pass — one for the
+  BUILD phase and one fresh for the ACTUATION phase (review j#86734 R2-F1) — plus at most one
+  receipt read per issue with a current strictly-resolved delegation, all counted against ONE
+  pass-wide budget the supervisor sweep shares across every workspace (review j#86734 R2-F3).
+  At the budget the provider is not touched; an unreadable fetch is ``None`` (the assembler's
+  typed unreadable), never retried within the pass.
 * **Policy anchor (Fork A).** The issuer policy pointer is the COMMITTED config blob at the
   workspace HEAD (:func:`committed_config_policy_pointer`); an unreadable pointer resolves every
   issuer unknown — zero actuation, fail-closed.
@@ -140,39 +142,6 @@ def committed_config_policy_pointer(repo_root: Path) -> str:
     return config_policy_pointer(blob)
 
 
-def observe_lane_push(repo_root: Path, selected: SelectedLane) -> Optional[PushObservation]:
-    """The action-time git-remote observation of the lane branch head (``None`` = unobservable).
-
-    Independent of every durable marker: the candidate head AND ``commits_pushed`` bind here. An
-    absent remote ref binds no head, so the lane is a typed ``head_unbound`` non-candidate.
-    """
-    try:
-        proc = subprocess.run(
-            [
-                "git", "-C", str(repo_root),
-                "ls-remote", "origin", f"refs/heads/{selected.lane_id}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    lines = [line for line in proc.stdout.strip().splitlines() if line.strip()]
-    if len(lines) != 1:
-        return None
-    sha = lines[0].split()[0].strip()
-    if not _full_sha(sha):
-        return None
-    return PushObservation(
-        workspace=selected.repo_workspace_id,
-        lane=selected.lane_id,
-        lane_generation=selected.lane_generation,
-        head=sha,
-        reachable=True,
-    )
 
 
 def _park_evidences(notes: str) -> "list[HibernateEvidence]":
@@ -297,27 +266,26 @@ def unresolved_callback_debt(outbox, workspace_id: str) -> Optional[int]:
     )
 
 
-def resolve_candidate_worktree(
-    workspace_root: Path, rows, candidate: HibernateCandidate
-) -> Optional[Path]:
-    """The candidate lane's canonical worktree from FRESH authoritative Git topology, or ``None``.
+def observe_lane_topology(
+    repo_root: Path, rows, *, workspace: str, lane: str, generation: int
+) -> "Optional[tuple[Path, str]]":
+    """The lane's ``(canonical worktree path, actual checked-out branch)`` from FRESH Git
+    topology, or ``None`` (fail-closed).
 
-    Review j#86734 R2-F5: the lane metadata store is a display join and must not decide the
-    actuation target. The authority is Git's own worktree topology, read fresh at action time
-    (``git worktree list --porcelain`` on the workspace repo), joined EXACTLY and UNIQUELY to
-    the candidate identity: the worktree whose checked-out branch IS the lane id, of which
-    there must be exactly one, whose path RE-DERIVES the lifecycle row's own
-    ``worktree_identity`` token. A removed / reused / re-branched / topologically foreign path
-    fails one of those joins and resolves nothing — the actuation is a typed zero-call.
+    Review j#86739 R3-F2: ``lane_label`` and ``branch`` are INDEPENDENT caller-supplied fields
+    of the public create contract, so the lane id is never inferred to be the branch. The join
+    key is the lifecycle row's authoritative ``worktree_identity`` token alone: among the
+    workspace repo's own ``git worktree list --porcelain`` entries, exactly one path must
+    RE-DERIVE that token, and the branch is THAT entry's current Git fact — a detached HEAD,
+    a missing row/token, a pruned path, or a non-unique match resolves nothing.
     """
-    anchor = candidate.anchor
     row = next(
         (
             record
             for record in rows or ()
-            if getattr(record, "repo_workspace_id", "") == anchor.repo_workspace_id
-            and getattr(record, "lane_id", "") == anchor.lane_id
-            and int(getattr(record, "lane_generation", 0) or 0) == anchor.lane_generation
+            if getattr(record, "repo_workspace_id", "") == workspace
+            and getattr(record, "lane_id", "") == lane
+            and int(getattr(record, "lane_generation", 0) or 0) == generation
         ),
         None,
     )
@@ -328,7 +296,7 @@ def resolve_candidate_worktree(
         return None
     try:
         proc = subprocess.run(
-            ["git", "-C", str(workspace_root), "worktree", "list", "--porcelain"],
+            ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
             capture_output=True,
             text=True,
             timeout=60,
@@ -337,28 +305,97 @@ def resolve_candidate_worktree(
         return None
     if proc.returncode != 0:
         return None
-    matches: list[Path] = []
+    entries: list[tuple[str, str]] = []
     current_path: Optional[str] = None
-    for line in proc.stdout.splitlines():
+    current_branch = ""
+    for line in proc.stdout.splitlines() + [""]:
         line = line.strip()
         if line.startswith("worktree "):
             current_path = line[len("worktree "):].strip()
+            current_branch = ""
         elif line.startswith("branch ") and current_path:
-            branch = line[len("branch "):].strip()
-            if branch == f"refs/heads/{anchor.lane_id}":
-                matches.append(Path(current_path))
-            current_path = None if line == "" else current_path
+            current_branch = line[len("branch "):].strip()
+        elif not line and current_path:
+            entries.append((current_path, current_branch))
+            current_path, current_branch = None, ""
+    matches: list[tuple[Path, str]] = []
+    for path_text, branch_ref in entries:
+        try:
+            resolved = Path(path_text).expanduser().resolve()
+        except OSError:
+            continue
+        if not resolved.is_dir():
+            continue
+        if derive_lane_workspace_token(str(resolved)) == token:
+            matches.append((resolved, branch_ref))
     if len(matches) != 1:
         return None
+    resolved, branch_ref = matches[0]
+    prefix = "refs/heads/"
+    if not branch_ref.startswith(prefix):
+        return None  # detached HEAD carries no branch authority (fail-closed)
+    return resolved, branch_ref[len(prefix):]
+
+
+def observe_lane_push(
+    repo_root: Path, rows, selected: SelectedLane
+) -> Optional[PushObservation]:
+    """The action-time git-remote observation of the lane's ACTUAL branch head.
+
+    The branch comes from the same fresh topology join the worktree binding uses
+    (:func:`observe_lane_topology`) — never inferred from the lane id (review j#86739 R3-F2).
+    An unobservable topology, a detached worktree, or an origin that does not carry the branch
+    binds no head: the lane is a typed ``head_unbound`` non-candidate.
+    """
+    topology = observe_lane_topology(
+        repo_root,
+        rows,
+        workspace=selected.repo_workspace_id,
+        lane=selected.lane_id,
+        generation=selected.lane_generation,
+    )
+    if topology is None:
+        return None
+    _worktree, branch = topology
     try:
-        resolved = matches[0].expanduser().resolve()
-    except OSError:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-remote", "origin", f"refs/heads/{branch}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
-    if not resolved.is_dir():
+    if proc.returncode != 0:
         return None
-    if derive_lane_workspace_token(str(resolved)) != token:
+    lines = [line for line in proc.stdout.strip().splitlines() if line.strip()]
+    if len(lines) != 1:
         return None
-    return resolved
+    sha = lines[0].split()[0].strip()
+    if not _full_sha(sha):
+        return None
+    return PushObservation(
+        workspace=selected.repo_workspace_id,
+        lane=selected.lane_id,
+        lane_generation=selected.lane_generation,
+        head=sha,
+        reachable=True,
+    )
+
+
+def resolve_candidate_worktree(
+    workspace_root: Path, rows, candidate: HibernateCandidate
+) -> Optional[Path]:
+    """The candidate lane's canonical worktree via the same fresh topology join (or ``None``)."""
+    anchor = candidate.anchor
+    topology = observe_lane_topology(
+        workspace_root,
+        rows,
+        workspace=anchor.repo_workspace_id,
+        lane=anchor.lane_id,
+        generation=anchor.lane_generation,
+    )
+    return None if topology is None else topology[0]
 
 
 def observe_worktree_clean(worktree: Optional[Path]) -> Optional[bool]:
@@ -522,7 +559,7 @@ def build_hibernate_leg_fn(
             return HibernateCandidateAssembler(
                 records_fn=records_fn,
                 journals_fn=journals_fn,
-                push_fn=lambda selected: observe_lane_push(repo_root, selected),
+                push_fn=lambda selected: observe_lane_push(repo_root, records_fn(), selected),
                 obligations_fn=lambda candidate: observe_obligations(
                     candidate, pass_sources
                 ),
@@ -622,6 +659,7 @@ __all__ = [
     "committed_config_policy_pointer",
     "enumerate_requests",
     "observe_lane_push",
+    "observe_lane_topology",
     "observe_obligations",
     "read_dogfood_receipts",
 ]

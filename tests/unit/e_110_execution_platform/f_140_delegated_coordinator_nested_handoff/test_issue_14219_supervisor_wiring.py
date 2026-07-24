@@ -418,9 +418,10 @@ class UnresolvedCallbackDebtTest(unittest.TestCase):
 
 
 class WorktreeResolverTest(unittest.TestCase):
-    """resolve_candidate_worktree (review j#86734 R2-F5): FRESH Git worktree topology, joined
-    exactly and uniquely to the candidate identity — the display-only lane metadata store is
-    never consulted."""
+    """resolve_candidate_worktree (reviews j#86734 R2-F5 / j#86739 R3-F2): FRESH Git worktree
+    topology joined by the lifecycle row's ``worktree_identity`` token ALONE — the lane id is
+    never assumed to be the branch, and the display-only lane metadata store is never
+    consulted."""
 
     def setUp(self):
         import os
@@ -446,7 +447,9 @@ class WorktreeResolverTest(unittest.TestCase):
         git("add", "-A")
         git("commit", "-qm", "c1")
         self.worktree = self.dir / "wt-lane"
-        git("worktree", "add", "-q", str(self.worktree), "-b", LANE)
+        # Review j#86739 R3-F2: lane_label and branch are independent create-contract fields,
+        # so the fixture's checked-out branch deliberately differs from the lane id.
+        git("worktree", "add", "-q", str(self.worktree), "-b", "feature/decoupled_name")
         self.token = derive_lane_workspace_token(str(self.worktree.resolve()))
         self._git = git
 
@@ -472,7 +475,9 @@ class WorktreeResolverTest(unittest.TestCase):
 
         return resolve_candidate_worktree(self.repo, rows, self._candidate())
 
-    def test_the_lane_branch_worktree_resolves_through_the_topology_join(self):
+    def test_the_token_join_resolves_a_lane_whose_branch_differs_from_its_id(self):
+        # The worktree's branch is feature/decoupled_name, not the lane id — the token join
+        # must still bind it (review j#86739 R3-F2).
         self.assertEqual(self._resolve([self._row()]), self.worktree.resolve())
 
     def test_a_row_token_that_does_not_rederive_binds_nothing(self):
@@ -487,14 +492,30 @@ class WorktreeResolverTest(unittest.TestCase):
         self._git("worktree", "prune")
         self.assertIsNone(self._resolve([self._row()]))
 
-    def test_a_rebranched_worktree_binds_nothing(self):
-        # The path still exists and still derives the token, but its checked-out branch is no
-        # longer the lane — the exact join (branch == lane id) refuses it.
+    def test_a_rebranched_worktree_still_binds_through_its_token(self):
+        # Review j#86739 R3-F2 (superseding the R2 round's branch-join reading): switching
+        # the checked-out branch does NOT unbind the worktree — the join key is the identity
+        # token, and the branch drift is caught downstream where the observed origin head is
+        # matched against the durable evidence heads.
         import os
         import subprocess
 
         subprocess.run(
             ["git", "-C", str(self.worktree), "checkout", "-q", "-b", "other_branch"],
+            check=True, capture_output=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"},
+        )
+        self.assertEqual(self._resolve([self._row()]), self.worktree.resolve())
+
+    def test_a_detached_worktree_binds_nothing(self):
+        # A detached HEAD carries no branch authority for the downstream head observation —
+        # the topology observation fails closed as a whole.
+        import os
+        import subprocess
+
+        subprocess.run(
+            ["git", "-C", str(self.worktree), "checkout", "-q", "--detach"],
             check=True, capture_output=True,
             env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
                  "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"},
@@ -523,6 +544,10 @@ class WorktreeResolverTest(unittest.TestCase):
 
 class GitObservationTest(unittest.TestCase):
     def setUp(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            derive_lane_workspace_token,
+        )
+
         self.dir = Path(tempfile.mkdtemp())
         self.repo = self.dir / "repo"
         self.origin = self.dir / "origin.git"
@@ -532,22 +557,35 @@ class GitObservationTest(unittest.TestCase):
         (self.repo / ".mozyo-bridge" / "config.yaml").write_text("version: 2\n")
         env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
                "GIT_COMMITTER_EMAIL": "t@x", "PATH": "/usr/bin:/bin"}
+        self._env = env
         subprocess.run(["git", "-C", str(self.repo), "add", "-A"], check=True, env=env)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "c1"], check=True, env=env)
         subprocess.run(
             ["git", "-C", str(self.repo), "remote", "add", "origin", str(self.origin)],
             check=True,
         )
+        # Review j#86739 R3-F2: the lane's worktree is checked out on a branch whose name has
+        # nothing to do with the lane id — the head must be observed from the ACTUAL branch.
+        self.branch = "feature/decoupled_name"
+        self.worktree = self.dir / "wt-lane"
         subprocess.run(
-            ["git", "-C", str(self.repo), "push", "-q", "origin", "main:laneX"], check=True,
-            env=env,
+            ["git", "-C", str(self.repo), "worktree", "add", "-q", str(self.worktree),
+             "-b", self.branch],
+            check=True, env=env,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "push", "-q", "origin", self.branch],
+            check=True, env=env,
         )
         self.head = subprocess.run(
             ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
+        row = _Row()
+        row.worktree_identity = derive_lane_workspace_token(str(self.worktree.resolve()))
+        self.rows = [row]
 
-    def _selected(self, lane="laneX"):
+    def _selected(self, lane=LANE):
         return SelectedLane(
             issue_id="500", repo_workspace_id=WS, lane_id=lane,
             lane_generation=GEN, revision=4,
@@ -564,18 +602,50 @@ class GitObservationTest(unittest.TestCase):
     def test_an_uncommitted_config_binds_nothing(self):
         self.assertEqual(committed_config_policy_pointer(self.dir / "nowhere"), "")
 
-    def test_the_remote_lane_head_is_observed(self):
-        observation = observe_lane_push(self.repo, self._selected())
+    def test_the_remote_head_of_the_actual_branch_is_observed(self):
+        # The lane id is NOT a branch name here; the observation must come from the topology
+        # entry's own branch (review j#86739 R3-F2).
+        observation = observe_lane_push(self.repo, self.rows, self._selected())
         self.assertIsNotNone(observation)
         self.assertEqual(observation.head, self.head)
         self.assertTrue(observation.reachable)
         self.assertEqual(
             (observation.workspace, observation.lane, observation.lane_generation),
-            (WS, "laneX", GEN),
+            (WS, LANE, GEN),
         )
 
-    def test_an_absent_remote_ref_observes_nothing(self):
-        self.assertIsNone(observe_lane_push(self.repo, self._selected(lane="ghost")))
+    def test_a_lane_id_named_branch_is_never_read(self):
+        # A stale same-named branch exists on origin at a DIFFERENT head; the observation
+        # must still return the actual branch's head, not the lane-id ref.
+        (self.repo / "drift").write_text("x")
+        subprocess.run(["git", "-C", str(self.repo), "add", "-A"], check=True, env=self._env)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-qm", "c2"], check=True, env=self._env
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "push", "-q", "origin", f"main:{LANE}"],
+            check=True, env=self._env,
+        )
+        observation = observe_lane_push(self.repo, self.rows, self._selected())
+        self.assertIsNotNone(observation)
+        self.assertEqual(observation.head, self.head)
+
+    def test_an_unpushed_actual_branch_observes_nothing(self):
+        subprocess.run(
+            ["git", "-C", str(self.repo), "push", "-q", "origin", f":{self.branch}"],
+            check=True, env=self._env,
+        )
+        self.assertIsNone(observe_lane_push(self.repo, self.rows, self._selected()))
+
+    def test_a_detached_worktree_observes_nothing(self):
+        subprocess.run(
+            ["git", "-C", str(self.worktree), "checkout", "-q", "--detach"],
+            check=True, capture_output=True, env=self._env,
+        )
+        self.assertIsNone(observe_lane_push(self.repo, self.rows, self._selected()))
+
+    def test_a_missing_lifecycle_row_observes_nothing(self):
+        self.assertIsNone(observe_lane_push(self.repo, [], self._selected()))
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -388,9 +388,12 @@ class HibernateRequest:
     #: MUST be supplied and the FRESH (active -> hibernated) disposition CAS is bound to it,
     #: so an approval whose process authority has since advanced within the same generation
     #: (pin repair / replacement / decision update) fails closed pre-CAS rather than
-    #: re-binding to the current revision / pins. Ignored for an issue lane; the
-    #: already-hibernated redrive resumes the row's STORED release action id / pins (the
-    #: immutable action authority), so it does not re-check this advanced revision.
+    #: re-binding to the current revision / pins. For an ISSUE lane it is optional: when
+    #: SUPPLIED (the auto-hibernate path always supplies the approved revision, Redmine #14219
+    #: j#86734 R2-F1) the fresh CAS is bound to it the same way; when absent (the interactive
+    #: CLI's default) the CAS uses the current revision as before. The already-hibernated
+    #: redrive resumes the row's STORED release action id / pins (the immutable action
+    #: authority), so it does not re-check this advanced revision.
     expected_revision: str = ""
 
 
@@ -659,7 +662,8 @@ class SublaneHibernateUseCase:
         # active -> hibernated CAS is bound to it, so an approval whose process authority
         # advanced WITHIN the same generation (pin repair / replacement / decision update)
         # since the approval fails closed pre-CAS rather than re-binding to the current
-        # revision / pins. An issue lane is unchanged (the CAS uses the current revision). The
+        # revision / pins. An issue lane pins the SAME way when a revision is supplied
+        # (see the elif below); without one it keeps the current-revision CAS. The
         # already-hibernated redrive above does NOT apply this — it resumes the stored release
         # action id / pins (the row's revision has advanced past the approval by the hibernate
         # itself), so re-asserting the approval's revision there would wrongly block resume.

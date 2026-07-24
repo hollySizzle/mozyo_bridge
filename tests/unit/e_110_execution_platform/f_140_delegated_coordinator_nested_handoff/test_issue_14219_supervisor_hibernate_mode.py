@@ -159,13 +159,20 @@ class HibernateModeTest(_HibernateModeHarness):
         self.assertEqual(leg.calls, [])
         self.assertFalse(outcome.hibernate_ran)
 
-    def test_a_raising_leg_releases_the_lease_and_the_sweep_continues(self) -> None:
+    def test_a_raising_leg_releases_the_lease_and_defers_the_rest(self) -> None:
+        # Contract updated by review j#86739 R3-F1: a raise is an UNCERTAIN mutation status —
+        # it consumes the pass budget (the sweep no longer continues) and the lease is still
+        # released in finally.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
+            SKIP_HIBERNATE_BUDGET_DEFERRED,
+        )
+
         ws_b = SupervisedWorkspace(
             workspace_id="wsB", canonical_path=str(self.dir / "repoB")
         )
         calls: list = []
 
-        def leg(ws, renew):
+        def leg(ws, renew, budget=None):
             calls.append(ws.workspace_id)
             if ws.workspace_id == "wsA":
                 raise RuntimeError("boom")
@@ -174,11 +181,11 @@ class HibernateModeTest(_HibernateModeHarness):
         report = self._supervisor(leg=leg, workspaces=[self.ws, ws_b]).run_once(
             mode=SUPERVISION_HIBERNATE
         )
-        self.assertEqual(calls, ["wsA", "wsB"])
+        self.assertEqual(calls, ["wsA"])
         first, second = report.workspaces
         self.assertEqual(first.skipped_reason, SKIP_HIBERNATE_LEG_ERROR)
         self.assertFalse(first.hibernate_ran)
-        self.assertTrue(second.hibernate_ran)
+        self.assertEqual(second.skipped_reason, SKIP_HIBERNATE_BUDGET_DEFERRED)
         # finally released even on the raise: a foreign holder can acquire wsA now.
         self.assertTrue(
             self.lease_store.acquire("wsA", "other", now=CLOCK, ttl_seconds=60).acquired
@@ -232,6 +239,45 @@ class HibernateModeTest(_HibernateModeHarness):
             by_id["wsB"].skipped_reason, SKIP_HIBERNATE_BUDGET_DEFERRED
         )
         self.assertFalse(by_id["wsB"].hibernate_ran)
+
+    def test_a_raising_leg_consumes_the_budget_as_uncertain(self) -> None:
+        # Review j#86739 R3-F1: wsA's leg performs its authoritative side effect and THEN
+        # raises — its mutation status is unknown, so the pass budget is consumed and wsB's
+        # leg never runs (actual side effects stay at one).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
+            SKIP_HIBERNATE_BUDGET_DEFERRED,
+            SKIP_HIBERNATE_LEG_ERROR,
+        )
+
+        ws_b = SupervisedWorkspace(
+            workspace_id="wsB", canonical_path=str(self.dir / "repoB")
+        )
+        side_effects: list = []
+
+        def leg(ws, renew, budget=None):
+            side_effects.append(ws.workspace_id)
+            if ws.workspace_id == "wsA":
+                raise RuntimeError("post-mutation crash")
+            return HibernatePassResult(
+                attempts=(
+                    HibernateAttempt(issue="1", lane="l", kind="actuated", revision=2),
+                ),
+                mutations=1,
+                empty_pass=False,
+            )
+
+        report = self._supervisor(leg=leg, workspaces=[self.ws, ws_b]).run_once(
+            mode=SUPERVISION_HIBERNATE
+        )
+        self.assertEqual(side_effects, ["wsA"])  # wsB's leg never ran
+        by_id = {ws.workspace_id: ws for ws in report.workspaces}
+        self.assertEqual(by_id["wsA"].skipped_reason, SKIP_HIBERNATE_LEG_ERROR)
+        self.assertEqual(by_id["wsB"].skipped_reason, SKIP_HIBERNATE_BUDGET_DEFERRED)
+        self.assertEqual(sum(ws.hibernate_mutations for ws in report.workspaces), 0)
+        # The lease was still released in finally: a foreign holder acquires wsA.
+        self.assertTrue(
+            self.lease_store.acquire("wsA", "other", now=CLOCK, ttl_seconds=60).acquired
+        )
 
     def test_the_read_budget_object_is_shared_across_workspaces(self) -> None:
         # Review j#86734 R2-F3: every leg in one run_once pass receives the SAME budget object,

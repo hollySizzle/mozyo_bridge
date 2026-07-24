@@ -104,16 +104,19 @@ class T2cProductionActuationTest(unittest.TestCase):
         self.origin = self.dir / "origin.git"
         subprocess.run(["git", "init", "-q", "--bare", str(self.origin)], check=True)
         _git(self.repo, "remote", "add", "origin", str(self.origin))
-        _git(self.repo, "push", "-q", "origin", f"main:{LANE}")
+        # The lane's canonical WORKTREE: a real `git worktree` of the WORKSPACE repo, so the
+        # live ops' workspace-segment derivation (git topology) resolves back to the registered
+        # workspace — exactly the production lane shape. Review j#86739 R3-F2: lane_label and
+        # branch are independent create-contract fields, so the checked-out branch deliberately
+        # differs from the lane id, and the head observation must follow the ACTUAL branch.
+        self.branch = "feature/t2c_decoupled"
+        self.worktree = self.dir / "wt-lane"
+        _git(self.repo, "worktree", "add", "-q", str(self.worktree), "-b", self.branch)
+        _git(self.repo, "push", "-q", "origin", self.branch)
         self.head = subprocess.run(
             ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        # The lane's canonical WORKTREE: a real `git worktree` of the WORKSPACE repo, so the
-        # live ops' workspace-segment derivation (git topology) resolves back to the registered
-        # workspace — exactly the production lane shape.
-        self.worktree = self.dir / "wt-lane"
-        _git(self.repo, "worktree", "add", "-q", str(self.worktree), "-b", LANE)
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
             derive_lane_workspace_token,
         )
