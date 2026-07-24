@@ -86,6 +86,20 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 
 _STATUS_KEYS = ("agent_status", "status", "state")
 
+_LANE_ISSUE_RE = __import__("re").compile(r"^issue_?(\d+)(?:_|$)")
+
+
+def _lane_owning_issue(lane_id: object) -> str:
+    """The lane label's owning issue id, EXACT-parsed (review j#87364 F3). (pure)
+
+    ``issue_13490_single_entry_e2e_r1`` -> ``13490``. The id component is bounded by a
+    ``_`` separator (or end), so a prefix (``1349``) can never match — the destructive
+    authorization boundary compares parsed-id equality, never substring containment.
+    An unparsable label yields ``""`` (never equal to a real issue; fail-closed).
+    """
+    m = _LANE_ISSUE_RE.match(_norm_lane(lane_id))
+    return m.group(1) if m else ""
+
 
 def port_pin_request(request: GatewayRefreshRequest) -> RecoveryRequest:
     """Adapt the gateway refresh pin to the #13806 port/probe request shape. (pure)
@@ -215,16 +229,14 @@ class LiveGatewayRecoveryOps:
             and _norm(request.provider) == gateway_provider
             and _norm(request.provider) != worker_provider
         )
-        issue = _norm(request.issue)
-        lane = _norm_lane(identity.lane_id)
-        issue_lane_matches = bool(issue) and (
-            f"issue_{issue}" in lane or f"issue{issue}" in lane
-        )
+        issue_lane_matches = _lane_owning_issue(identity.lane_id) == _norm(request.issue)
         revision_raw = row.get("revision")
         row_revision = _norm(revision_raw) if not isinstance(revision_raw, bool) else ""
+        # Review j#87364 F5: the pinned gateway inventory row revision is a REQUIRED exact
+        # authority — an empty pin never matches (fail-closed), so a destructive refresh can
+        # never ride an unpinned generation.
         generation_matches = bool(row_revision) and (
             row_revision == _norm(request.gateway_revision)
-            or _norm(request.gateway_revision) == ""
         )
         runtime_state = _row_runtime_state(row)
         settled_idle = runtime_state in (RUNTIME_TURN_ENDED, RUNTIME_AWAITING_INPUT)
@@ -292,6 +304,10 @@ class LiveGatewayRecoveryOps:
 
     # -- live turn observation -------------------------------------------------
 
+    def _anchor_issue(self) -> str:
+        """The issue carrying the anchor/approval journals (F1 authority split)."""
+        return self.request.effective_anchor_issue
+
     def _ledger(self) -> HerdrDeliveryLedger:
         return self.ledger if self.ledger is not None else HerdrDeliveryLedger()
 
@@ -303,7 +319,7 @@ class LiveGatewayRecoveryOps:
 
         return build_marker(
             RedmineAnchor(
-                issue=_norm(self.request.issue),
+                issue=self._anchor_issue(),
                 journal=_norm(self.request.resume_anchor_journal),
             ),
             _norm(self.request.resume_gate),
@@ -323,7 +339,7 @@ class LiveGatewayRecoveryOps:
             if (
                 _norm(rec.notification_marker) == marker
                 and _norm(rec.source) == "redmine"
-                and _norm(rec.issue_id) == _norm(self.request.issue)
+                and _norm(rec.issue_id) == self._anchor_issue()
                 and _norm(rec.journal_id) == _norm(self.request.resume_anchor_journal)
                 and _norm(rec.receiver) == gateway_provider
                 and _norm(rec.target) == _norm(self.request.locator)
@@ -400,9 +416,14 @@ class LiveGatewayRecoveryOps:
     ) -> tuple[bool, bool, bool]:
         """(landed, absent, fresh): the anchored + ordered fresh durable re-read (#13889).
 
-        A qualifying gate is any ``[mozyo:workflow-event:gate=...]`` journal STRICTLY after
-        the resume anchor (ordered durable journal-id comparison, never wall-clock). No
-        reader wired / an unreadable read leaves all facts ``False`` (turn_unobservable).
+        A qualifying gate is ONLY one causally linked to the anchor (review j#87364 F4) —
+        never "any workflow gate after it" (an unrelated concurrent journal must not read as
+        the failed turn's response and suppress a needed recovery). The v1 closed causal
+        contract: a ``review_request`` anchor's expected response is a ``review_result``
+        marker carrying ``req=<anchor>``. Anchor kinds without a defined causal-response
+        vocabulary classify UNOBSERVABLE (fail-closed in BOTH directions: no fabricated
+        productivity, no fabricated failure). Comparison stays ordered on durable journal
+        ids, never wall-clock. No reader / an unreadable read leaves all facts ``False``.
         """
         reader = self.journal_reader
         if reader is None or not self.journal_reader_fresh:
@@ -412,9 +433,15 @@ class LiveGatewayRecoveryOps:
         except (TypeError, ValueError):
             return False, False, False
         try:
-            entries = reader(_norm(request.issue))
+            entries = reader(request.effective_anchor_issue)
         except Exception:  # noqa: BLE001 - unreadable durable source => unobservable
             return False, False, False
+        if _norm(request.resume_gate) != "review_request":
+            # No defined causal-response vocabulary for this anchor kind yet — unobservable
+            # (fail-closed), never a guess in either direction.
+            return False, False, False
+        needle_gate = "gate=review_result"
+        needle_req = f":req={anchor}"
         landed = False
         for entry in entries:
             try:
@@ -422,7 +449,7 @@ class LiveGatewayRecoveryOps:
                 notes = str(getattr(entry, "notes", "") or "")
             except (TypeError, ValueError):
                 continue
-            if jid > anchor and "[mozyo:workflow-event:gate=" in notes:
+            if jid > anchor and needle_gate in notes and needle_req in notes:
                 landed = True
                 break
         return landed, not landed, True
@@ -443,10 +470,25 @@ class LiveGatewayRecoveryOps:
             return ""
         return _agent_locator(matches[0])
 
+    _SENDER_ENV_TRIAD = ("MOZYO_WORKSPACE_ID", "MOZYO_AGENT_ROLE", "MOZYO_LANE_ID")
+
+    def resume_rail_ready(self, request: GatewayRefreshRequest) -> bool:
+        """Pre-close resume-rail capability (review j#87364 F2). (read-only, fail-closed)
+
+        The governed send rail requires the attested launch-time sender identity; a shell
+        without it would only discover ``missing_sender_env`` AFTER the destructive close.
+        Verified up front: every triad var must be present and non-empty in THIS process
+        env. An operator runs the execute from an attested pane context (the documented
+        contract) — env spoofing is never performed here.
+        """
+        return all(_norm(self.env.get(name, "")) for name in self._SENDER_ENV_TRIAD)
+
     def _resume_argv(self, continuation: ContinuationPointer, locator: str) -> list[str]:
-        """The governed ``handoff send`` argv for the anchor resume — the coordinator→lane-
-        gateway leg shape (:meth:`HerdrSublaneActuatorOps.dispatch_argv`), with the
-        continuation's immutable gate kind instead of a regenerated request."""
+        """The recovery-family resume argv: ONE ``handoff send --kind reply`` pointer at the
+        EXISTING anchor (the #14203 j#84223 owner-approved resume shape — the anchor journal
+        is the truth, the notification a pointer; no gate is regenerated). Same governed rail
+        the callback-recovery family drives (:func:`...callback_sweep.build_recovery_sender`
+        precedent), lane- and target-pinned."""
         _worker, gateway_provider = self._providers()
         return [
             "handoff", "send",
@@ -454,7 +496,7 @@ class LiveGatewayRecoveryOps:
             "--source", "redmine",
             "--issue", _norm(continuation.issue_id),
             "--journal", _norm(continuation.journal_id),
-            "--kind", _norm(continuation.expected_gate),
+            "--kind", "reply",
             "--target", locator,
             "--target-repo", str(self.repo_root),
             "--target-lane", _norm(self.request.lane),
@@ -507,11 +549,14 @@ class LiveGatewayRecoveryOps:
             build_marker,
         )
 
+        # The resume DELIVERY is a reply pointer at the anchor (the j#84223 shape), so the
+        # confirmation marker is the reply-kind marker — the anchor's own gate kind stays the
+        # continuation authority, never the transport kind.
         marker = build_marker(
             RedmineAnchor(
                 issue=_norm(continuation.issue_id), journal=_norm(continuation.journal_id)
             ),
-            _norm(continuation.expected_gate),
+            "reply",
             gateway_provider,
         )
         try:

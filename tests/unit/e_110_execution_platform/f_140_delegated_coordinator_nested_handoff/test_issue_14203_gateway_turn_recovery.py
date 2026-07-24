@@ -225,20 +225,34 @@ class RefreshDecisionTests(unittest.TestCase):
 
 
 class ActionIdTests(unittest.TestCase):
-    def test_the_exact_id_shape(self):
+    def test_the_exact_id_shape_pins_the_row_revision(self):
+        # Review j#87364 F5: the live inventory row revision is a REQUIRED authority
+        # component — a recycled generation derives a DIFFERENT transaction key.
         self.assertEqual(
             gateway_refresh_action_id(
                 lane_id="l", role="codex", provider="codex", assigned_name="gw",
-                locator="w:3",
+                locator="w:3", revision="4",
             ),
-            "refresh-gateway:l:codex:codex:gw:w:3",
+            "refresh-gateway:l:codex:codex:gw:w:3:r4",
+        )
+        self.assertNotEqual(
+            gateway_refresh_action_id(
+                lane_id="l", role="codex", provider="codex", assigned_name="gw",
+                locator="w:3", revision="4",
+            ),
+            gateway_refresh_action_id(
+                lane_id="l", role="codex", provider="codex", assigned_name="gw",
+                locator="w:3", revision="5",
+            ),
         )
 
     def test_a_missing_component_raises(self):
-        for missing in ("lane_id", "role", "provider", "assigned_name", "locator"):
+        for missing in (
+            "lane_id", "role", "provider", "assigned_name", "locator", "revision",
+        ):
             parts = dict(
                 lane_id="l", role="codex", provider="codex", assigned_name="gw",
-                locator="w:3",
+                locator="w:3", revision="4",
             )
             parts[missing] = ""
             with self.subTest(missing=missing):
@@ -248,12 +262,15 @@ class ActionIdTests(unittest.TestCase):
     def test_never_collides_with_a_worker_recovery_key(self):
         # The same slot-shape must yield DIFFERENT transaction action ids for a gateway
         # refresh vs a stale-worker recovery — the two authorities never share a key.
-        kwargs = dict(
-            lane_id="l", role="codex", provider="codex", assigned_name="gw", locator="w:3",
-        )
         self.assertNotEqual(
-            gateway_refresh_action_id(**kwargs),
-            stale_worker_recovery_action_id(**kwargs),
+            gateway_refresh_action_id(
+                lane_id="l", role="codex", provider="codex", assigned_name="gw",
+                locator="w:3", revision="4",
+            ),
+            stale_worker_recovery_action_id(
+                lane_id="l", role="codex", provider="codex", assigned_name="gw",
+                locator="w:3",
+            ),
         )
 
 

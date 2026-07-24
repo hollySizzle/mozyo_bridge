@@ -388,13 +388,16 @@ def is_refresh_actionable(verdict: str) -> bool:
 
 
 def gateway_refresh_action_id(
-    *, lane_id: str, role: str, provider: str, assigned_name: str, locator: str
+    *, lane_id: str, role: str, provider: str, assigned_name: str, locator: str,
+    revision: str,
 ) -> str:
     """The deterministic action id that names ONE exact gateway generation. (pure)
 
     The transaction key's ``action_id`` for a gateway refresh:
-    ``refresh-gateway:<lane>:<role>:<provider>:<assigned_name>:<locator>`` pinned to the exact
-    live generation the approval names. The distinct ``refresh-gateway:`` prefix keeps a
+    ``refresh-gateway:<lane>:<role>:<provider>:<assigned_name>:<locator>:r<revision>`` pinned
+    to the exact live inventory row generation the approval names (review j#87364 F5: the row
+    ``revision`` is a REQUIRED authority component — a same-name/-locator slot recycled at a new
+    process generation derives a DIFFERENT key, so an old approval can never close it). The distinct ``refresh-gateway:`` prefix keeps a
     gateway refresh and a worker recovery of the same slot-shape from ever sharing a
     transaction key. Every component must be present — an under-specified target could never
     identify one exact receiver, so it raises (the ``stale_worker_recovery_action_id``
@@ -406,16 +409,17 @@ def gateway_refresh_action_id(
         "provider": norm(provider),
         "assigned_name": norm(assigned_name),
         "locator": norm(locator),
+        "revision": norm(revision),
     }
     missing = [name for name, value in parts.items() if not value]
     if missing:
         raise ValueError(
             "a gateway refresh action id requires a non-empty lane_id / role / provider / "
-            f"assigned_name / locator (missing: {', '.join(missing)})"
+            f"assigned_name / locator / revision (missing: {', '.join(missing)})"
         )
     return "refresh-gateway:" + ":".join(
         parts[name] for name in ("lane_id", "role", "provider", "assigned_name", "locator")
-    )
+    ) + ":r" + parts["revision"]
 
 
 # -- Part C: the resume continuation (item 4 — reuse, never regenerate) ---------

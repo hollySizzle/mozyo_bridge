@@ -138,7 +138,7 @@ class LiveOpsObservationTests(unittest.TestCase):
         self.assertEqual(self.ops._expected_gate_facts(_request()), (False, False, False))
 
     def test_expected_gate_facts_are_anchored_and_ordered(self):
-        marker = "[mozyo:workflow-event:gate=review_result:conclusion=approved]"
+        marker = "[mozyo:workflow-event:gate=review_result:conclusion=approved:req=87251]"
         self.ops.journal_reader_fresh = True
         # A gate BEFORE/AT the anchor does not count; absence is positively confirmed.
         self.ops.journal_reader = lambda issue: [
@@ -200,7 +200,7 @@ class LiveOpsObservationTests(unittest.TestCase):
         self.assertEqual(argv[:2], ["handoff", "send"])
         self.assertIn("--journal", argv)
         self.assertEqual(argv[argv.index("--journal") + 1], "87251")
-        self.assertEqual(argv[argv.index("--kind") + 1], "review_request")
+        self.assertEqual(argv[argv.index("--kind") + 1], "reply")  # the j#84223 pointer shape
         self.assertEqual(argv[argv.index("--target") + 1], "w:9")
         self.assertEqual(argv[argv.index("--target-lane") + 1], "issue_x_lane")
 
@@ -211,6 +211,106 @@ class LiveOpsObservationTests(unittest.TestCase):
         self.assertEqual(pin.lane_revision, "5")
         self.assertEqual(pin.lane_generation, "2")
         self.assertEqual(pin.assigned_name, "gw")
+
+
+class ReviewR2AdversarialTests(unittest.TestCase):
+    """The j#87364 F1-F5 adversarial shapes, pinned at the live-adapter seams."""
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        self.ops = LiveGatewayRecoveryOps(repo_root=self.repo, request=_request())
+
+    def test_f3_lane_owning_issue_is_exact_parsed_never_prefix(self):
+        lane = "issue_13490_single_entry_e2e_r1"
+        self.assertEqual(live_mod._lane_owning_issue(lane), "13490")
+        self.assertNotEqual(live_mod._lane_owning_issue(lane), "1349")  # prefix never matches
+        self.assertEqual(live_mod._lane_owning_issue("not_a_lane"), "")  # unparsable => ""
+
+    def test_f4_an_unrelated_gate_after_the_anchor_is_not_landed(self):
+        # An owner_approval (or any non-causal gate) after a review_request anchor must NOT
+        # read as the failed turn's response — absence stays positively confirmed.
+        self.ops.journal_reader_fresh = True
+        self.ops.journal_reader = lambda issue: [
+            _Entry("87300", "[mozyo:workflow-event:gate=owner_approval]"),
+        ]
+        self.assertEqual(self.ops._expected_gate_facts(_request()), (False, True, True))
+        # Only the causally-linked review_result (req=<anchor>) lands.
+        self.ops.journal_reader = lambda issue: [
+            _Entry("87300",
+                   "[mozyo:workflow-event:gate=review_result:conclusion=approved:req=87251]"),
+        ]
+        self.assertEqual(self.ops._expected_gate_facts(_request()), (True, False, True))
+        # A review_result correlated to a DIFFERENT request does not land.
+        self.ops.journal_reader = lambda issue: [
+            _Entry("87300",
+                   "[mozyo:workflow-event:gate=review_result:conclusion=approved:req=99999]"),
+        ]
+        self.assertEqual(self.ops._expected_gate_facts(_request()), (False, True, True))
+
+    def test_f4_an_uncorrelatable_anchor_kind_is_unobservable(self):
+        self.ops.journal_reader_fresh = True
+        self.ops.journal_reader = lambda issue: []
+        req = _request(resume_gate="reply")
+        self.assertEqual(self.ops._expected_gate_facts(req), (False, False, False))
+
+    def test_f1_the_anchor_issue_is_a_separate_authority(self):
+        # The parent-lane/child-issue topology: lane owned by 13490, anchors on 14203.
+        ops = LiveGatewayRecoveryOps(
+            repo_root=self.repo,
+            request=_request(issue="13490", anchor_issue="14203"),
+        )
+        seen: list = []
+        ops.journal_reader_fresh = True
+        ops.journal_reader = lambda issue: seen.append(issue) or []
+        ops._expected_gate_facts(ops.request)
+        self.assertEqual(seen, ["14203"])  # the durable read targets the ANCHOR issue
+        self.assertEqual(ops._anchor_issue(), "14203")
+        # Empty anchor_issue falls back to the lane-owning issue.
+        self.assertEqual(
+            LiveGatewayRecoveryOps(
+                repo_root=self.repo, request=_request(issue="13490")
+            )._anchor_issue(),
+            "13490",
+        )
+
+    def test_f5_an_empty_pinned_revision_never_matches(self):
+        rows = [{
+            "name": "gw", "pane_id": "w:3", "status": "done", "revision": "4",
+            "cwd": str(self.repo),
+        }]
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows):
+            with patch.object(live_mod, "repo_scope_workspace_id", return_value="ws"):
+                ops = LiveGatewayRecoveryOps(
+                    repo_root=self.repo, request=_request(gateway_revision="")
+                )
+                with patch.object(
+                    live_mod, "decode_assigned_name",
+                    return_value=type("D", (), {
+                        "ok": True,
+                        "identity": type("I", (), {
+                            "workspace_id": "ws", "lane_id": "issue_x_lane",
+                            "role": "codex",
+                        })(),
+                    })(),
+                ):
+                    with patch.object(
+                        ops, "_providers", return_value=("claude", "codex")
+                    ):
+                        with patch.object(ops, "_composer_clear", return_value=True):
+                            obs = ops.observe_target(ops.request)
+        self.assertFalse(obs.generation_matches)  # empty pin is NEVER a match
+
+    def test_f2_resume_rail_ready_requires_the_attested_sender_env_triad(self):
+        bare = LiveGatewayRecoveryOps(repo_root=self.repo, request=_request(), env={})
+        self.assertFalse(bare.resume_rail_ready(bare.request))
+        attested = LiveGatewayRecoveryOps(
+            repo_root=self.repo, request=_request(),
+            env={
+                "MOZYO_WORKSPACE_ID": "ws", "MOZYO_AGENT_ROLE": "claude",
+                "MOZYO_LANE_ID": "issue_x_lane",
+            },
+        )
+        self.assertTrue(attested.resume_rail_ready(attested.request))
 
 
 if __name__ == "__main__":  # pragma: no cover

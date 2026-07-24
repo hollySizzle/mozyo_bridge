@@ -66,7 +66,8 @@ class GatewayRefreshResumeScenario(unittest.TestCase):
             issue="14203", lane=GATEWAY["lane_id"], role=GATEWAY["role"],
             provider=GATEWAY["provider"], assigned_name=GATEWAY["assigned_name"],
             locator=GATEWAY["old_locator"], journal="84223", action_id=ACTION_ID,
-            action_generation=GEN, lane_revision="5", lane_generation="2",
+            action_generation=GEN, gateway_revision="4",
+            lane_revision="5", lane_generation="2",
             resume_anchor_journal="83755", resume_gate="review_request",
         )
 

@@ -107,6 +107,7 @@ def _run_live_refresh(
         action_id = gateway_refresh_action_id(
             lane_id=request.lane, role=request.role, provider=request.provider,
             assigned_name=request.assigned_name, locator=request.locator,
+            revision=request.gateway_revision,
         )
         key = ReplacementTransactionKey(workspace_id, action_id)
     except Exception:  # noqa: BLE001 - incomplete identity => the use case refuses downstream
@@ -155,6 +156,7 @@ def cmd_sublane_recover_gateway(args: argparse.Namespace) -> int:
         gateway_revision=getattr(args, "gateway_revision", "") or "",
         lane_revision=getattr(args, "lane_revision", "") or "",
         lane_generation=getattr(args, "lane_generation", "") or "",
+        anchor_issue=getattr(args, "anchor_issue", "") or "",
         resume_anchor_journal=getattr(args, "resume_anchor_journal", "") or "",
         resume_gate=getattr(args, "resume_gate", "") or "",
         reason_token=getattr(args, "reason_token", "") or "",
@@ -221,6 +223,13 @@ def register_sublane_recover_gateway_parser(sublane_sub: Any) -> None:
     parser.add_argument(
         "--action-generation", dest="action_generation", type=int, default=0,
         help="the immutable approved generation counter (>= 1)",
+    )
+    parser.add_argument(
+        "--anchor-issue", dest="anchor_issue", default="",
+        help=(
+            "the issue carrying the anchor/approval journals when it differs from the "
+            "lane's owning --issue (parent-lane/child-issue topology); default = --issue"
+        ),
     )
     parser.add_argument(
         "--resume-anchor-journal", dest="resume_anchor_journal", default="",

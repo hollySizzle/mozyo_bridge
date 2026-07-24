@@ -133,6 +133,12 @@ class GatewayRefreshRequest:
     #: the close-boundary preservation fence re-verifies against the live lifecycle store.
     lane_revision: str = ""
     lane_generation: str = ""
+    #: The issue carrying the durable ANCHOR + approval journals — a SEPARATE authority
+    #: from :attr:`issue` (review j#87364 F1): :attr:`issue` is the lane's OWNING issue (the
+    #: destructive authorization boundary the issue-lane fence compares), while a child issue
+    #: worked ON that lane (the #14203-on-#13490 topology) carries the anchors. Empty falls
+    #: back to :attr:`issue` (a lane whose own issue carries the work).
+    anchor_issue: str = ""
     #: The EXISTING durable anchor the fresh gateway must resume — the undelivered gate's
     #: Redmine journal id. A SEPARATE authority from :attr:`journal` (the approval): the
     #: resume re-delivers this anchor exactly once and never regenerates a gate.
@@ -143,6 +149,11 @@ class GatewayRefreshRequest:
     #: Optional structured turn-failure reason-evidence token (normalized to the closed
     #: secret-safe set; anything unrecognized collapses to ``unknown`` — fail-closed).
     reason_token: str = ""
+
+    @property
+    def effective_anchor_issue(self) -> str:
+        """The issue whose journals carry the approval + resume anchor (F1 authority split)."""
+        return norm(self.anchor_issue) or norm(self.issue)
 
     @property
     def holder(self) -> str:
@@ -249,6 +260,15 @@ class GatewayRecoveryOps(Protocol):
         """
         ...
 
+    def resume_rail_ready(self, request: GatewayRefreshRequest) -> bool:
+        """Can THIS execution context deliver the anchor resume? (read-only, pre-close)
+
+        Verified BEFORE the destructive close (review j#87364 F2) so a context that cannot
+        resume — e.g. a shell without the attested launch-time sender identity — is a typed
+        up-front refusal, never a post-close ``stopped`` discovery. Fail-closed.
+        """
+        ...
+
     def resume_confirmed(self, continuation: ContinuationPointer) -> bool:
         """Has the resume's durable effect already landed? (fresh read, never a snapshot)
 
@@ -347,6 +367,7 @@ class GatewayRefreshUseCase:
             expected_action = gateway_refresh_action_id(
                 lane_id=request.lane, role=request.role, provider=request.provider,
                 assigned_name=request.assigned_name, locator=request.locator,
+                revision=request.gateway_revision,
             )
         except ValueError:
             return None
@@ -397,7 +418,7 @@ class GatewayRefreshUseCase:
         #    before any write.
         try:
             decision = DecisionPointer(
-                source="redmine", issue_id=norm(request.issue),
+                source="redmine", issue_id=request.effective_anchor_issue,
                 journal_id=norm(request.journal),
             )
         except DecisionPointerError:
@@ -406,9 +427,13 @@ class GatewayRefreshUseCase:
             expected_action = gateway_refresh_action_id(
                 lane_id=request.lane, role=request.role, provider=request.provider,
                 assigned_name=request.assigned_name, locator=request.locator,
+                revision=request.gateway_revision,
             )
         except ValueError:
-            return refused("refresh inputs do not identify one exact gateway")
+            return refused(
+                "refresh inputs do not identify one exact gateway generation (a non-empty "
+                "gateway inventory row revision is required)"
+            )
         if norm(request.action_id) != expected_action:
             return refused("action id does not match the exact approved gateway")
         if not isinstance(request.action_generation, int) or isinstance(
@@ -420,6 +445,14 @@ class GatewayRefreshUseCase:
                 "lane lifecycle revision / generation evidence is required for a "
                 "destructive gateway refresh; zero close"
             )
+        # Review j#87364 F2: the resume rail's capability is verified BEFORE any write /
+        # close — a context that cannot deliver the anchor resume (e.g. a sender-identity-
+        # less shell) is refused up front, never discovered as a post-close ``stopped``.
+        if not self._ops.resume_rail_ready(request):
+            return refused(
+                "the anchor-resume rail is not available from this execution context "
+                "(resume_rail_unavailable); run from an attested pane context — zero close"
+            )
         # The resume continuation: the EXISTING durable anchor (a journal DISTINCT from the
         # approval) + a closed resumable gate kind + the ONE fixed resume action. A refresh
         # whose continuation cannot name the exact anchor to resume never closes anything.
@@ -430,7 +463,7 @@ class GatewayRefreshUseCase:
             )
         try:
             continuation = ContinuationPointer(
-                source="redmine", issue_id=norm(request.issue),
+                source="redmine", issue_id=request.effective_anchor_issue,
                 journal_id=norm(request.resume_anchor_journal),
                 expected_gate=norm(request.resume_gate),
                 next_semantic_action=RESUME_VIA_CALLBACK_RECOVERY,

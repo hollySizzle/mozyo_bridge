@@ -68,7 +68,7 @@ GATEWAY = dict(
     lane_id="issue_x_lane", role="codex", provider="codex", assigned_name="gw",
     old_locator="w:3",
 )
-ACTION_ID = "refresh-gateway:issue_x_lane:codex:codex:gw:w:3"
+ACTION_ID = "refresh-gateway:issue_x_lane:codex:codex:gw:w:3:r4"
 
 
 def _turn(**overrides) -> GatewayTurnObservation:
@@ -132,6 +132,7 @@ class FakeGatewayOps:
         already_landed=False,
         lane_authority=True,
         name_free=True,
+        rail_ready=True,
     ):
         self._turn = turn if turn is not None else _turn()
         self._target = target if target is not None else _target()
@@ -143,6 +144,7 @@ class FakeGatewayOps:
         self.authority_checks: list = []
         self._name_free = name_free
         self.name_free_checks: list = []
+        self._rail_ready = rail_ready
 
     def observe_turn(self, request) -> GatewayTurnObservation:
         return self._turn
@@ -160,6 +162,9 @@ class FakeGatewayOps:
     def gateway_name_free_of_live_process(self, request) -> bool:
         self.name_free_checks.append(request)
         return self._name_free
+
+    def resume_rail_ready(self, request) -> bool:
+        return self._rail_ready
 
     def resume_confirmed(self, continuation) -> bool:
         return self._landed
@@ -183,7 +188,8 @@ class _RefreshCase(unittest.TestCase):
             issue="14203", lane=GATEWAY["lane_id"], role=GATEWAY["role"],
             provider=GATEWAY["provider"], assigned_name=GATEWAY["assigned_name"],
             locator=GATEWAY["old_locator"], journal="84223", action_id=ACTION_ID,
-            action_generation=GEN, lane_revision="5", lane_generation="2",
+            action_generation=GEN, gateway_revision="4",
+            lane_revision="5", lane_generation="2",
             resume_anchor_journal="87251", resume_gate="review_request",
         )
         base.update(overrides)
@@ -270,6 +276,20 @@ class ExecuteRefusalTests(_RefreshCase):
             FakeGatewayOps(), self._request(resume_anchor_journal=""),
             "resume anchor pointer is incomplete",
         )
+
+    def test_a_missing_gateway_revision_refuses_before_any_write(self):
+        # Review j#87364 F5: the row revision is a REQUIRED destructive authority component.
+        self._refused(
+            FakeGatewayOps(),
+            self._request(gateway_revision="", action_id="refresh-gateway:x"),
+            "exact gateway generation",
+        )
+
+    def test_an_unready_resume_rail_refuses_before_any_close(self):
+        # Review j#87364 F2: the resume capability is verified BEFORE the destructive close.
+        ops = FakeGatewayOps(rail_ready=False)
+        outcome = self._refused(ops, self._request(), "resume_rail_unavailable")
+        self.assertEqual(outcome.status, REFRESH_STATUS_REFUSED)
 
     def test_a_diverged_preexisting_row_is_an_authority_conflict(self):
         ops = FakeGatewayOps()
