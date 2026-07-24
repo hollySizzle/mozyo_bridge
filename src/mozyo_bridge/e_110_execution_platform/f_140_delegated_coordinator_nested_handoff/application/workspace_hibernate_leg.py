@@ -21,7 +21,10 @@ error token; the leg's own budget bounds any partial effect to at most the one a
 
 from __future__ import annotations
 
+import inspect
+
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
+    SKIP_HIBERNATE_BUDGET_DEFERRED,
     SKIP_HIBERNATE_LEG_ERROR,
     SKIP_HIBERNATE_UNWIRED,
     SKIP_LEASE_REFUSED,
@@ -29,7 +32,44 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 
-def hibernate_workspace(sup, ws) -> WorkspaceSupervisionOutcome:
+def hibernate_sweep(sup) -> "list[WorkspaceSupervisionOutcome]":
+    """The supervisor pass's budgeted hibernate sweep (review j#86734 R2-F2/R2-F3).
+
+    The ONE-MUTATION budget and the provider-read budget belong to the whole ``run_once`` pass,
+    not to a workspace: workspaces run in DETERMINISTIC order (workspace id), every leg shares
+    one read counter, and once any workspace's pass applies a mutation the remaining workspaces
+    are typed-deferred WITHOUT running their legs (zero reads, zero actuation) — the next pass
+    picks them up. Total external mutations per supervisor pass therefore never exceed one.
+    """
+    budget: dict = {"reads": 0, "mutated": False}
+    outcomes: "list[WorkspaceSupervisionOutcome]" = []
+    ordered = sorted(sup._workspaces_fn(), key=lambda ws: str(ws.workspace_id or ""))
+    for ws in ordered:
+        if budget["mutated"]:
+            outcomes.append(
+                WorkspaceSupervisionOutcome(
+                    workspace_id=str(ws.workspace_id or "").strip(),
+                    lease_acquired=False,
+                    lease_reason="",
+                    skipped_reason=SKIP_HIBERNATE_BUDGET_DEFERRED,
+                )
+            )
+            continue
+        outcome = hibernate_workspace(sup, ws, budget=budget)
+        if outcome.hibernate_mutations > 0:
+            budget["mutated"] = True
+        outcomes.append(outcome)
+    return outcomes
+
+
+def _leg_accepts_budget(leg) -> bool:
+    try:
+        return len(inspect.signature(leg).parameters) >= 3
+    except (TypeError, ValueError):  # pragma: no cover - exotic callables fail closed
+        return False
+
+
+def hibernate_workspace(sup, ws, budget=None) -> WorkspaceSupervisionOutcome:
     """Run one workspace's bounded hibernate pass under its lease (acquire -> try -> finally)."""
     wsid = str(ws.workspace_id or "").strip()
     if sup._hibernate_leg_fn is None:
@@ -58,7 +98,10 @@ def hibernate_workspace(sup, ws) -> WorkspaceSupervisionOutcome:
             )
 
         try:
-            result = sup._hibernate_leg_fn(ws, renew)
+            if budget is not None and _leg_accepts_budget(sup._hibernate_leg_fn):
+                result = sup._hibernate_leg_fn(ws, renew, budget)
+            else:
+                result = sup._hibernate_leg_fn(ws, renew)
         except Exception:  # noqa: BLE001 - one workspace's leg error never aborts the sweep
             return WorkspaceSupervisionOutcome(
                 workspace_id=wsid,
@@ -81,4 +124,4 @@ def hibernate_workspace(sup, ws) -> WorkspaceSupervisionOutcome:
             sup._lease_store.release(wsid, sup._holder)
 
 
-__all__ = ("hibernate_workspace",)
+__all__ = ("hibernate_sweep", "hibernate_workspace")

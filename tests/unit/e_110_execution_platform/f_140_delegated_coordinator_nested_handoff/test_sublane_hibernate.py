@@ -218,6 +218,7 @@ def _request(**kw) -> HibernateRequest:
         lane=kw.get("lane", LANE),
         journal=kw.get("journal", JOURNAL),
         assertions=assertions,
+        expected_revision=kw.get("expected_revision", ""),
     )
 
 
@@ -236,6 +237,58 @@ class SublaneHibernateTest(unittest.TestCase):
             _row("claude", LANE, f"{WS}:p3"),
         ]
         return _FakeOps(rows=rows, **kw)
+
+    def test_issue_lane_supplied_revision_pin_blocks_a_stale_approval(self) -> None:
+        # Redmine #14219 j#86734 R2-F1: an ISSUE lane with a SUPPLIED expected_revision must
+        # bind the CAS to it — a row whose revision advanced since the approval fails closed
+        # pre-CAS instead of being silently re-bound to the current revision.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
+            from mozyo_bridge.core.state.lane_lifecycle_model import ProcessGenerationPin
+
+            bump = LaneDeclarationStore(home=Path(tmp)).backfill_active_binding(
+                LaneLifecycleKey(WS, LANE),
+                expected_revision=1,
+                issue_id=ISSUE,
+                worktree_identity="wt_pin_test",
+                declared_slots=[
+                    ProcessGenerationPin(
+                        role="implementation", provider="claude",
+                        assigned_name="a1", locator="%1", runtime_revision="r1",
+                    )
+                ],
+            )
+            self.assertTrue(bump.applied)
+            self.assertEqual(bump.revision, 2)
+            outcome = SublaneHibernateUseCase(ops=self._live_ops(), store=store).run(
+                _request(expected_revision="1"), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_STALE_ACTION_REVISION, outcome.preflight.blocked_reasons)
+            rec = store.get(LaneLifecycleKey(WS, LANE))
+            self.assertEqual(rec.lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_issue_lane_supplied_matching_revision_pins_the_cas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            outcome = SublaneHibernateUseCase(ops=self._live_ops(), store=store).run(
+                _request(expected_revision="1"), execute=True
+            )
+            self.assertFalse(outcome.is_blocked, outcome.preflight.blocked_reasons)
+            self.assertTrue(outcome.transition.applied)
+
+    def test_issue_lane_without_a_supplied_revision_keeps_prior_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            outcome = SublaneHibernateUseCase(ops=self._live_ops(), store=store).run(
+                _request(), execute=True
+            )
+            self.assertFalse(outcome.is_blocked)
+            self.assertTrue(outcome.transition.applied)
 
     def test_happy_path_hibernates_and_releases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

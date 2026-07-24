@@ -291,7 +291,7 @@ class WorkspaceCallbackSupervisor:
         # Redmine #14219 T2c: the auto-hibernate leg — same early-return shape as local_drain,
         # same per-workspace lease fence, zero callback/outbox side effects.
         if mode == SUPERVISION_HIBERNATE:
-            outcomes = [_hibernate.hibernate_workspace(self, ws) for ws in self._workspaces_fn()]
+            outcomes = _hibernate.hibernate_sweep(self)
             return SupervisorReport(
                 mode=mode, holder=self._holder, workspaces=tuple(outcomes)
             )

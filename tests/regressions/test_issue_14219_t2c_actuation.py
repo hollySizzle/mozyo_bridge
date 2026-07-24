@@ -53,17 +53,30 @@ _GIT_ENV = {
 
 
 class _FakeSource:
-    """A per-issue journal-page source (the ONE external Redmine boundary)."""
+    """A per-issue journal-page source (the ONE external Redmine boundary).
 
-    def __init__(self, pages):
+    ``on_read`` (issue, nth) runs BEFORE serving each page and may return a replacement page —
+    the seam the freshness regressions use to change the world between the build read and the
+    actuation-phase fresh read (review j#86734 R2-F1).
+    """
+
+    def __init__(self, pages, on_read=None):
         self.pages = pages
         self.reads = []
+        self.on_read = on_read
 
     def read_entries(self, issue_id):
-        self.reads.append(str(issue_id))
+        issue = str(issue_id)
+        nth = sum(1 for read in self.reads if read == issue)
+        self.reads.append(issue)
+        page = self.pages.get(issue, ())
+        if self.on_read is not None:
+            replaced = self.on_read(issue, nth)
+            if replaced is not None:
+                page = replaced
         return [
-            RedmineJournalEntry(issue_id=str(issue_id), journal_id=str(jid), notes=notes)
-            for jid, notes in self.pages.get(str(issue_id), ())
+            RedmineJournalEntry(issue_id=issue, journal_id=str(jid), notes=notes)
+            for jid, notes in page
         ]
 
 
@@ -166,7 +179,7 @@ class T2cProductionActuationTest(unittest.TestCase):
                       f":source_issue={ISSUE}:head={self.head}]"),
         )
 
-    def _run_supervisor(self, pages):
+    def _run_supervisor(self, pages, on_read=None):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             workspace_callback_supervisor as sup_mod,
         )
@@ -174,7 +187,7 @@ class T2cProductionActuationTest(unittest.TestCase):
             reconcile_live_source,
         )
 
-        source = _FakeSource(pages)
+        source = _FakeSource(pages, on_read=on_read)
         env = {
             key: value for key, value in os.environ.items()
             if not key.startswith("MOZYO") and key not in ("TMUX", "TMUX_PANE")
@@ -224,6 +237,80 @@ class T2cProductionActuationTest(unittest.TestCase):
             ws for ws in report.workspaces if ws.workspace_id == self.workspace_id
         )
         self.assertTrue(outcome.hibernate_ran)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        row = next(
+            record for record in LaneLifecycleStore(home=self.home).records()
+            if record.lane_id == LANE
+        )
+        self.assertEqual(row.lane_disposition, "active")
+
+    def test_a_review_request_arriving_AFTER_build_is_seen_by_the_fresh_read(self):
+        # Review j#86734 R2-F1 (reproduced defect 1): the provider serves a clean page at
+        # build, then a page with a LATER review_request — the actuation phase's own fresh
+        # read (not the build cache) must see it: stale, zero mutation.
+        clean = self._early_page()
+        reopened = clean + (
+            ("85009", "reopened\n" + render_workflow_event_marker(
+                "review_request", target_head=self.head
+            )),
+        )
+
+        def on_read(issue, nth):
+            if issue == ISSUE and nth >= 1:
+                return reopened
+            return None
+
+        pages = {ISSUE: clean, RELEASE_ISSUE: self._receipt_page()}
+        report, source = self._run_supervisor(pages, on_read=on_read)
+        outcome = next(
+            ws for ws in report.workspaces if ws.workspace_id == self.workspace_id
+        )
+        self.assertGreaterEqual(source.reads.count(ISSUE), 2)  # build + fresh
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        kinds = [attempt["kind"] for attempt in outcome.hibernate_attempts]
+        self.assertIn("stale_basis", kinds)
+        row = next(
+            record for record in LaneLifecycleStore(home=self.home).records()
+            if record.lane_id == LANE
+        )
+        self.assertEqual(row.lane_disposition, "active")
+
+    def test_a_lifecycle_revision_advancing_after_build_mutates_nothing(self):
+        # Review j#86734 R2-F1 (reproduced defect 2): a legitimate lifecycle operation
+        # advances the active revision between build and actuation — the fresh lifecycle
+        # re-read (and the issue-lane CAS revision pin) must refuse it.
+        def on_read(issue, nth):
+            if issue == ISSUE and nth == 1:
+                # The actuation-phase fresh page read fires BEFORE the fresh lifecycle read
+                # within the same re-assembly: advance the revision now (re-declare with a
+                # newer decision journal — the canonical revision-bumping write).
+                from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
+                from mozyo_bridge.core.state.lane_lifecycle_model import (
+                    ProcessGenerationPin,
+                )
+
+                outcome = LaneDeclarationStore(home=self.home).backfill_active_binding(
+                    LaneLifecycleKey(
+                        repo_workspace_id=self.workspace_id, lane_id=LANE
+                    ),
+                    expected_revision=1,
+                    issue_id=ISSUE,
+                    worktree_identity=self.token,
+                    declared_slots=[
+                        ProcessGenerationPin(
+                            role="implementation", provider="claude",
+                            assigned_name="a1", locator="%1", runtime_revision="r1",
+                        )
+                    ],
+                )
+                assert outcome.applied and outcome.revision == 2, outcome
+            return None
+
+        pages = {ISSUE: self._early_page(), RELEASE_ISSUE: self._receipt_page()}
+        report, _source = self._run_supervisor(pages, on_read=on_read)
+        outcome = next(
+            ws for ws in report.workspaces if ws.workspace_id == self.workspace_id
+        )
         self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
         row = next(
             record for record in LaneLifecycleStore(home=self.home).records()

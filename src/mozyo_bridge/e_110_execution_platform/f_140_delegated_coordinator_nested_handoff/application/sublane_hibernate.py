@@ -673,6 +673,20 @@ class SublaneHibernateUseCase:
             )
             if action_revision_current:
                 cas_expected_revision = int(expected_revision)
+        elif (
+            expected_revision.isdigit()
+            and rec is not None
+            and record_matches_binding(rec, issue_id=issue)
+        ):
+            # Issue-lane revision pin (Redmine #14219 j#86734 R2-F1): when the caller SUPPLIES
+            # the approved revision (the auto-hibernate path always does), the fresh CAS binds
+            # to IT — a row whose revision advanced since the approval fails closed pre-CAS
+            # instead of being silently re-bound to the current revision. A caller that
+            # supplies none (the interactive CLI's default) keeps the prior current-revision
+            # behavior unchanged.
+            action_revision_current = int(expected_revision) == rec.revision
+            if action_revision_current:
+                cas_expected_revision = int(expected_revision)
 
         original_identity_known = (
             rec is not None

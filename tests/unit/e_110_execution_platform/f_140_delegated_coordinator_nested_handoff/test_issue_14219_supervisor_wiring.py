@@ -354,29 +354,101 @@ class DogfoodReceiptReaderTest(unittest.TestCase):
 
 
 
+class UnresolvedCallbackDebtTest(unittest.TestCase):
+    """Review j#86734 R2-F4: every unresolved callback state blocks the drain obligation."""
+
+    class _FakeOutbox:
+        def __init__(self, rows=None, raises=False):
+            self.rows = rows or []
+            self.raises = raises
+            self.asked_states = None
+
+        def read(self, states=None):
+            self.asked_states = tuple(states or ())
+            if self.raises:
+                raise OSError("unreadable")
+            return [row for row in self.rows if row[0] in (states or ())]
+
+    def _row(self, state, workspace="wsW"):
+        from types import SimpleNamespace
+
+        return (state, SimpleNamespace(key=SimpleNamespace(workspace_id=workspace)))
+
+    def _debt(self, outbox):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            unresolved_callback_debt,
+        )
+
+        class _Adapter:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def read(self, states=None):
+                return [row[1] for row in self.inner.read(states=states)]
+
+        if outbox.raises:
+            return unresolved_callback_debt(outbox, "wsW")
+        return unresolved_callback_debt(_Adapter(outbox), "wsW")
+
+    def test_every_unresolved_state_counts_as_debt(self):
+        for state in ("pending", "inflight", "uncertain", "dead_letter"):
+            with self.subTest(state=state):
+                outbox = self._FakeOutbox(rows=[self._row(state)])
+                self.assertEqual(self._debt(outbox), 1)
+
+    def test_a_delivered_only_partition_is_drained(self):
+        outbox = self._FakeOutbox(rows=[self._row("delivered")])
+        self.assertEqual(self._debt(outbox), 0)
+
+    def test_an_unreadable_outbox_is_not_drained(self):
+        outbox = self._FakeOutbox(raises=True)
+        self.assertIsNone(self._debt(outbox))
+
+    def test_the_read_asks_for_exactly_the_unresolved_states(self):
+        outbox = self._FakeOutbox()
+        self._debt(outbox)
+        self.assertEqual(
+            sorted(outbox.asked_states),
+            ["dead_letter", "inflight", "pending", "uncertain"],
+        )
+
+    def test_a_foreign_workspaces_debt_does_not_count(self):
+        outbox = self._FakeOutbox(rows=[self._row("uncertain", workspace="other")])
+        self.assertEqual(self._debt(outbox), 0)
+
+
 class WorktreeResolverTest(unittest.TestCase):
-    """resolve_candidate_worktree (review j#86726 R1-F2): token -> metadata path -> round-trip."""
+    """resolve_candidate_worktree (review j#86734 R2-F5): FRESH Git worktree topology, joined
+    exactly and uniquely to the candidate identity — the display-only lane metadata store is
+    never consulted."""
 
     def setUp(self):
+        import os
+        import subprocess
         import tempfile
 
-        from mozyo_bridge.core.state.lane_metadata import record_lane_created
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
             derive_lane_workspace_token,
         )
 
-        self.home = Path(tempfile.mkdtemp())
-        self.worktree = self.home / "wt-a"
-        self.worktree.mkdir()
+        self.dir = Path(tempfile.mkdtemp())
+        self.repo = self.dir / "repo"
+        self.repo.mkdir()
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(*args, cwd=self.repo):
+            subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                           capture_output=True, env=env)
+
+        git("init", "-q", "-b", "main")
+        (self.repo / "seed").write_text("x")
+        git("add", "-A")
+        git("commit", "-qm", "c1")
+        self.worktree = self.dir / "wt-lane"
+        git("worktree", "add", "-q", str(self.worktree), "-b", LANE)
         self.token = derive_lane_workspace_token(str(self.worktree.resolve()))
-        record_lane_created(
-            lane_workspace_token=self.token,
-            repo_workspace_id=WS,
-            issue_id="500",
-            lane_label=LANE,
-            worktree_path=str(self.worktree.resolve()),
-            home=self.home,
-        )
+        self._git = git
 
     def _candidate(self):
         anchor = LifecycleAnchor(
@@ -388,72 +460,64 @@ class WorktreeResolverTest(unittest.TestCase):
             head=BoundField(value=HEAD, provenance="git_remote"), conjuncts=(),
         )
 
-    def _rows(self, token=None):
-        return [_Row()] if token is None else [
-            type(_Row())(**{**_Row().__dict__})  # placeholder, replaced below
-        ]
+    def _row(self, token=None, generation=GEN):
+        row = _Row(lane_generation=generation)
+        row.worktree_identity = self.token if token is None else token
+        return row
 
-    def test_a_bound_row_resolves_through_the_round_trip(self):
+    def _resolve(self, rows):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
             resolve_candidate_worktree,
         )
 
-        row = _Row()
-        row.worktree_identity = self.token
-        resolved = resolve_candidate_worktree([row], self._candidate(), home=self.home)
-        self.assertEqual(resolved, self.worktree.resolve())
+        return resolve_candidate_worktree(self.repo, rows, self._candidate())
 
-    def test_a_metadata_path_that_fails_the_round_trip_binds_nothing(self):
-        # The stored path no longer derives the row's token (a moved / foreign directory):
-        # fail-closed, zero actuation for the candidate.
-        from mozyo_bridge.core.state.lane_metadata import record_lane_created
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
-            resolve_candidate_worktree,
-        )
+    def test_the_lane_branch_worktree_resolves_through_the_topology_join(self):
+        self.assertEqual(self._resolve([self._row()]), self.worktree.resolve())
 
-        foreign = self.home / "elsewhere"
-        foreign.mkdir()
-        record_lane_created(
-            lane_workspace_token=self.token,
-            repo_workspace_id=WS,
-            issue_id="500",
-            lane_label=LANE,
-            worktree_path=str(foreign.resolve()),
-            home=self.home,
-        )
-        row = _Row()
-        row.worktree_identity = self.token
-        self.assertIsNone(
-            resolve_candidate_worktree([row], self._candidate(), home=self.home)
-        )
+    def test_a_row_token_that_does_not_rederive_binds_nothing(self):
+        # The topology names the path, but the lifecycle row's own token disagrees — a reused
+        # or foreign directory never binds.
+        self.assertIsNone(self._resolve([self._row(token="wt_other")]))
 
-    def test_missing_row_token_or_record_binds_nothing(self):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
-            resolve_candidate_worktree,
-        )
+    def test_a_removed_worktree_binds_nothing(self):
+        import shutil
 
-        self.assertIsNone(
-            resolve_candidate_worktree([], self._candidate(), home=self.home)
-        )
-        bare = _Row()  # worktree_identity absent on the fake row
-        self.assertIsNone(
-            resolve_candidate_worktree([bare], self._candidate(), home=self.home)
-        )
-        row = _Row()
-        row.worktree_identity = "wt_never_recorded"
-        self.assertIsNone(
-            resolve_candidate_worktree([row], self._candidate(), home=self.home)
-        )
+        shutil.rmtree(self.worktree)
+        self._git("worktree", "prune")
+        self.assertIsNone(self._resolve([self._row()]))
 
-    def test_a_generation_mismatched_row_binds_nothing(self):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
-            resolve_candidate_worktree,
+    def test_a_rebranched_worktree_binds_nothing(self):
+        # The path still exists and still derives the token, but its checked-out branch is no
+        # longer the lane — the exact join (branch == lane id) refuses it.
+        import os
+        import subprocess
+
+        subprocess.run(
+            ["git", "-C", str(self.worktree), "checkout", "-q", "-b", "other_branch"],
+            check=True, capture_output=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"},
+        )
+        self.assertIsNone(self._resolve([self._row()]))
+
+    def test_missing_row_or_token_or_generation_mismatch_binds_nothing(self):
+        self.assertIsNone(self._resolve([]))
+        bare = _Row()  # no worktree_identity attribute value
+        self.assertIsNone(self._resolve([bare]))
+        self.assertIsNone(self._resolve([self._row(generation=GEN + 1)]))
+
+    def test_the_display_only_metadata_store_is_never_consulted(self):
+        # Review j#86734 R2-F5 structural pin: the resolver module no longer imports the
+        # display-join store at all.
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            hibernate_supervisor_wiring,
         )
 
-        row = _Row(lane_generation=GEN + 1)
-        row.worktree_identity = self.token
-        self.assertIsNone(
-            resolve_candidate_worktree([row], self._candidate(), home=self.home)
+        self.assertNotIn(
+            "LaneMetadataStore", inspect.getsource(hibernate_supervisor_wiring)
         )
 
 

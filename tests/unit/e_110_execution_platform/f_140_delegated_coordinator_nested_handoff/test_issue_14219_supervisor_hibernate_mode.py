@@ -197,6 +197,62 @@ class HibernateModeTest(_HibernateModeHarness):
         self._supervisor(leg=leg).run_once(mode=SUPERVISION_LOCAL_DRAIN)
         self.assertEqual(leg.calls, [])
 
+    def test_the_one_mutation_budget_spans_the_whole_pass(self) -> None:
+        # Review j#86734 R2-F2: two eligible workspaces, each leg WOULD mutate — the shared
+        # supervisor budget lets exactly one run; the other is typed-deferred with its leg
+        # never called (zero reads, zero actuation).
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
+            SKIP_HIBERNATE_BUDGET_DEFERRED,
+        )
+
+        ws_b = SupervisedWorkspace(
+            workspace_id="wsB", canonical_path=str(self.dir / "repoB")
+        )
+        calls: list = []
+
+        def leg(ws, renew, budget=None):
+            calls.append(ws.workspace_id)
+            return HibernatePassResult(
+                attempts=(
+                    HibernateAttempt(issue="1", lane="l", kind="actuated", revision=2),
+                ),
+                mutations=1,
+                empty_pass=False,
+            )
+
+        report = self._supervisor(leg=leg, workspaces=[ws_b, self.ws]).run_once(
+            mode=SUPERVISION_HIBERNATE
+        )
+        # Deterministic order: wsA before wsB regardless of workspaces_fn order.
+        self.assertEqual(calls, ["wsA"])
+        total = sum(ws.hibernate_mutations for ws in report.workspaces)
+        self.assertEqual(total, 1)
+        by_id = {ws.workspace_id: ws for ws in report.workspaces}
+        self.assertEqual(
+            by_id["wsB"].skipped_reason, SKIP_HIBERNATE_BUDGET_DEFERRED
+        )
+        self.assertFalse(by_id["wsB"].hibernate_ran)
+
+    def test_the_read_budget_object_is_shared_across_workspaces(self) -> None:
+        # Review j#86734 R2-F3: every leg in one run_once pass receives the SAME budget object,
+        # so the provider-read counter can never reset per workspace.
+        ws_b = SupervisedWorkspace(
+            workspace_id="wsB", canonical_path=str(self.dir / "repoB")
+        )
+        seen: list = []
+
+        def leg(ws, renew, budget=None):
+            seen.append(budget)
+            budget["reads"] += 3
+            return HibernatePassResult(attempts=(), mutations=0, empty_pass=True)
+
+        self._supervisor(leg=leg, workspaces=[self.ws, ws_b]).run_once(
+            mode=SUPERVISION_HIBERNATE
+        )
+        self.assertEqual(len(seen), 2)
+        self.assertIs(seen[0], seen[1])
+        self.assertEqual(seen[0]["reads"], 6)
+
     def test_the_pass_makes_zero_outbox_or_provider_side_effects(self) -> None:
         # The provider source is a booby trap (raises on resolve) and the leg is a pure fake:
         # a green run IS the zero-provider proof, and the outbox stays empty.

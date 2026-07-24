@@ -99,6 +99,10 @@ SKIP_HIBERNATE_UNWIRED = "hibernate_leg_unwired"
 #: sweep continues, the workspace reports the error token. The leg's own budget/fences bound any
 #: partial effect to at most the one audited mutation.
 SKIP_HIBERNATE_LEG_ERROR = "hibernate_leg_error"
+#: The supervisor pass's SHARED one-mutation budget was already consumed by an earlier
+#: workspace (Redmine #14219 j#86734 R2-F2): this workspace's leg did not run at all this pass
+#: (typed defer, zero reads, zero actuation) — the next pass picks it up.
+SKIP_HIBERNATE_BUDGET_DEFERRED = "hibernate_budget_deferred"
 
 #: A per-issue supply error token: the Redmine source could not be read for durable-event supply /
 #: candidate discovery (fail-open per issue — the callback drain still ran).
@@ -909,6 +913,7 @@ __all__ = (
     "SKIP_LEASE_LOST",
     "SKIP_HIBERNATE_UNWIRED",
     "SKIP_HIBERNATE_LEG_ERROR",
+    "SKIP_HIBERNATE_BUDGET_DEFERRED",
     "ISSUE_SOURCE_UNREADABLE",
     "ISSUE_PASS_ERROR",
     "ISSUE_LEASE_LOST",
