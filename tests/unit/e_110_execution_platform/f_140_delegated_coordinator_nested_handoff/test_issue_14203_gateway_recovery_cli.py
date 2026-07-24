@@ -586,5 +586,104 @@ class RowRevisionCloseBoundaryTests(unittest.TestCase):
         self.assertNotIn("row_revision_drift", obs2.detail or "")
 
 
+class TurnStartAuthorityTests(unittest.TestCase):
+    """j#87397: the turn-start authority is the ANCHOR delivery record's own rail telemetry."""
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        self.ops = LiveGatewayRecoveryOps(repo_root=self.repo, request=_request())
+
+    def _rec(self, **overrides):
+        from types import SimpleNamespace
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            RedmineAnchor,
+            build_marker,
+        )
+
+        marker = build_marker(
+            RedmineAnchor(issue="14203", journal="87251"), "review_request", "codex",
+        )
+        base = dict(
+            notification_marker=marker, source="redmine", issue_id="14203",
+            journal_id="87251", receiver="codex", target="w:3", status="sent",
+            reason="ok", recorded_at="2026-07-24T17:14:34+00:00",
+            turn_start_outcome=None, queue_enter_observation=None,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def _facts_with(self, records):
+        class _Ledger:
+            def records_for_marker(self, marker):
+                return records
+
+        self.ops.ledger = _Ledger()
+        with patch.object(self.ops, "_providers", return_value=("claude", "codex")):
+            obs_record = self.ops._anchor_delivery_record("codex")
+        started = (
+            obs_record is not None
+            and self.ops._record_observed_turn_start(obs_record)
+        )
+        return obs_record is not None, started
+
+    def test_only_the_exact_anchor_record_confirms_delivery(self):
+        confirmed, _ = self._facts_with([self._rec()])
+        self.assertTrue(confirmed)
+        # A foreign target / different journal record never confirms.
+        confirmed, _ = self._facts_with([self._rec(target="w:FOREIGN")])
+        self.assertFalse(confirmed)
+        confirmed, _ = self._facts_with([self._rec(journal_id="99999")])
+        self.assertFalse(confirmed)
+
+    def test_started_only_from_the_records_own_rail_observation(self):
+        # Unobserved telemetry (both None) => NOT started (turn_unconfirmed downstream).
+        _, started = self._facts_with([self._rec()])
+        self.assertFalse(started)
+        # The armed-wait rail observed the start.
+        _, started = self._facts_with(
+            [self._rec(turn_start_outcome={"outcome": "started"})]
+        )
+        self.assertTrue(started)
+        # Any non-started rail outcome stays unobserved.
+        _, started = self._facts_with(
+            [self._rec(turn_start_outcome={"outcome": "delivered_not_started"})]
+        )
+        self.assertFalse(started)
+        # The queue-enter snapshot mechanically read the receiver WORKING.
+        _, started = self._facts_with(
+            [self._rec(queue_enter_observation={
+                "read_ok": True, "runtime_state": "busy",
+            })]
+        )
+        self.assertTrue(started)
+        # A settled / unread snapshot never counts.
+        _, started = self._facts_with(
+            [self._rec(queue_enter_observation={
+                "read_ok": True, "runtime_state": "turn_ended",
+            })]
+        )
+        self.assertFalse(started)
+        _, started = self._facts_with(
+            [self._rec(queue_enter_observation={
+                "read_ok": False, "runtime_state": "busy",
+            })]
+        )
+        self.assertFalse(started)
+
+    def test_a_later_unrelated_record_never_supplies_the_start(self):
+        # j#87397 F2: an unrelated later delivery (different marker/journal) with an observed
+        # start must NOT leak into this anchor's classification.
+        unrelated = self._rec(
+            journal_id="99999", turn_start_outcome={"outcome": "started"},
+        )
+        confirmed, started = self._facts_with([unrelated])
+        self.assertFalse(confirmed)
+        self.assertFalse(started)
+
+    def test_the_otel_timeline_authority_is_gone(self):
+        self.assertFalse(hasattr(self.ops, "_turn_started_after"))
+        self.assertFalse(hasattr(self.ops, "otel_store"))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

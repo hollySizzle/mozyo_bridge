@@ -65,6 +65,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_AWAITING_INPUT,
+    RUNTIME_BUSY,
     RUNTIME_TURN_ENDED,
     map_agent_status,
 )
@@ -150,7 +151,6 @@ class LiveGatewayRecoveryOps:
     #: Isolated store homes for tests; ``None`` = the real state homes.
     attestation_home: Optional[Path] = None
     lifecycle_home: Optional[Path] = None
-    otel_store: Optional[object] = None
     #: A FRESH durable journal reader: ``journal_reader(issue) -> Sequence[entry]`` where each
     #: entry carries ``journal_id`` + ``notes`` (the RedmineJournalSource shape). ``None`` =
     #: no live durable source is wired in this environment — the turn observation then leaves
@@ -326,15 +326,17 @@ class LiveGatewayRecoveryOps:
             gateway_provider,
         )
 
-    def _delivery_recorded_at(self, gateway_provider: str) -> str:
-        """The durable callback-outcome boundary: the anchor's confirmed delivery to the
-        pinned (old) gateway locator — ``status=sent`` with an accepted reason. Empty when no
-        such record exists / the ledger is unreadable (fail-closed)."""
+    def _anchor_delivery_record(self, gateway_provider: str):
+        """The durable callback-outcome record: the anchor's confirmed delivery to the pinned
+        (old) gateway locator — ``status=sent`` with the accepted reason. ``None`` when no
+        such record exists / the ledger is unreadable (fail-closed). This SAME record is the
+        turn-start authority's carrier (j#87397): the observation is bound to the exact
+        anchor marker + exact target, never a global timeline."""
         marker = self._anchor_marker(gateway_provider)
         try:
             records = self._ledger().records_for_marker(marker)
         except Exception:  # noqa: BLE001 - unreadable ledger => unconfirmed
-            return ""
+            return None
         for rec in records:
             if (
                 _norm(rec.notification_marker) == marker
@@ -346,45 +348,40 @@ class LiveGatewayRecoveryOps:
                 and _norm(rec.status) == "sent"
                 and _norm(rec.reason) == "ok"
             ):
-                return str(rec.recorded_at or "")
-        return ""
+                return rec
+        return None
 
-    def _turn_started_after(self, boundary: str, gateway_provider: str) -> bool:
-        """OTel turn-start evidence: an activity event from the gateway provider in THIS lane
-        worktree strictly after the delivery boundary. Best-effort telemetry — a quiet source
-        leaves this ``False`` (classifies unconfirmed, never failed). Fail-closed."""
-        if not boundary:
-            return False
-        store = self.otel_store
-        if store is None:
-            try:
-                from mozyo_bridge.core.state.otel_store import OtelEventStore
+    @staticmethod
+    def _record_observed_turn_start(rec) -> bool:
+        """Did the ANCHOR delivery's own rail OBSERVE the turn start? (j#87397 F1/F2)
 
-                store = OtelEventStore()
-            except Exception:  # noqa: BLE001 - no telemetry store => unconfirmed
-                return False
-        try:
-            rows = store.query_events(since=boundary)
-        except Exception:  # noqa: BLE001 - unreadable telemetry => unconfirmed
-            return False
-        lane_cwd = str(self.repo_root)
-        for _row_id, event in rows:
-            try:
-                service = _norm(event.service_name)
-                cwd = str(event.cwd or "")
-            except Exception:  # noqa: BLE001 - a malformed event never confirms
-                continue
-            if cwd == lane_cwd and gateway_provider and gateway_provider in service:
-                return True
+        The positive authority is the durable rail telemetry persisted ON the exact anchor
+        delivery record — never a global timeline: the #13255 armed-wait rail's
+        ``turn_start_outcome.outcome == "started"``, or the #13292 queue-enter
+        post-choreography snapshot that mechanically read the receiver WORKING
+        (``read_ok`` + ``runtime_state == busy``). Anything else — absent telemetry, an
+        unread snapshot, a settled snapshot — stays unobserved (``turn_unconfirmed``);
+        nothing is ever self-generated.
+        """
+        ts = getattr(rec, "turn_start_outcome", None)
+        if isinstance(ts, dict) and _norm(str(ts.get("outcome") or "")) == "started":
+            return True
+        qe = getattr(rec, "queue_enter_observation", None)
+        if (
+            isinstance(qe, dict)
+            and qe.get("read_ok") is True
+            and _norm(str(qe.get("runtime_state") or "")) == RUNTIME_BUSY
+        ):
+            return True
         return False
 
     def observe_turn(self, request: GatewayRefreshRequest) -> GatewayTurnObservation:
         _worker_provider, gateway_provider = self._providers()
         if not gateway_provider:
             return GatewayTurnObservation()  # unresolvable binding => unobservable
-        boundary = self._delivery_recorded_at(gateway_provider)
-        delivery_confirmed = bool(boundary)
-        turn_started = self._turn_started_after(boundary, gateway_provider)
+        record = self._anchor_delivery_record(gateway_provider)
+        delivery_confirmed = record is not None
+        turn_started = record is not None and self._record_observed_turn_start(record)
         settled = False
         try:
             rows = self._rows()
