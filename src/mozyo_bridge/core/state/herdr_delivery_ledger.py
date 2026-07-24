@@ -153,7 +153,13 @@ def herdr_delivery_ledger_path(home: Path | None = None) -> Path:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Microsecond precision (#14203 / #13806): the recorded_at feeds STRICT-after ordering
+    # against the microsecond-precision startup-attestation boundary (`_recorded_after`); a
+    # seconds-truncated stamp makes a genuinely-later record in the same wall-clock second
+    # compare as not-after and flips a confirmed redispatch to `uncertain` (a real race,
+    # reproduced by the #14097 installed harness once the queue-enter observation work
+    # shifted the drive inside one second). ISO-8601 either way — readers parse both.
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _json_or_none(value: object) -> Optional[str]:

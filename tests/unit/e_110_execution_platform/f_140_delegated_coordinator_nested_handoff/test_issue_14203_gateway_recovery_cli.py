@@ -635,40 +635,86 @@ class TurnStartAuthorityTests(unittest.TestCase):
         confirmed, _ = self._facts_with([self._rec(journal_id="99999")])
         self.assertFalse(confirmed)
 
-    def test_started_only_from_the_records_own_rail_observation(self):
-        # Unobserved telemetry (both None) => NOT started (turn_unconfirmed downstream).
+    def _binding(self, **overrides):
+        base = dict(
+            provider="codex", assigned_name="gw", locator="w:3", row_revision="4",
+            attestation_observed_at="2026-07-24T17:00:00+00:00",
+        )
+        base.update(overrides)
+        return base
+
+    def test_started_requires_an_observed_start_and_the_generation_binding(self):
+        # Design j#87409: BOTH an observed start AND the persisted process binding matching
+        # the request pins (assigned_name / locator / row_revision) are required.
+        # (The request fixture pins gateway_revision="" -> use a revision-pinned request.)
+        self.ops = LiveGatewayRecoveryOps(
+            repo_root=self.repo, request=_request(gateway_revision="4"),
+        )
+        # Unobserved telemetry (both None) => never started.
         _, started = self._facts_with([self._rec()])
         self.assertFalse(started)
-        # The armed-wait rail observed the start.
-        _, started = self._facts_with(
-            [self._rec(turn_start_outcome={"outcome": "started"})]
-        )
+        # v2 fast-turn shape: pre-Enter armed wait collected ``changed`` while the snapshot
+        # settled — started WITH the binding.
+        _, started = self._facts_with([self._rec(queue_enter_observation={
+            "read_ok": True, "runtime_state": "turn_ended",
+            "event_wait_kind": "changed", "observation_version": 2,
+            "gateway_binding": self._binding(),
+        })])
         self.assertTrue(started)
-        # Any non-started rail outcome stays unobserved.
-        _, started = self._facts_with(
-            [self._rec(turn_start_outcome={"outcome": "delivered_not_started"})]
-        )
+        # The same observed start WITHOUT a binding (legacy record) never starts.
+        _, started = self._facts_with([self._rec(queue_enter_observation={
+            "read_ok": True, "runtime_state": "turn_ended",
+            "event_wait_kind": "changed",
+        })])
         self.assertFalse(started)
-        # The queue-enter snapshot mechanically read the receiver WORKING.
-        _, started = self._facts_with(
-            [self._rec(queue_enter_observation={
-                "read_ok": True, "runtime_state": "busy",
-            })]
-        )
+        # armed-wait rail outcome started + binding => started; without binding => not.
+        _, started = self._facts_with([self._rec(
+            turn_start_outcome={"outcome": "started"},
+            queue_enter_observation={"gateway_binding": self._binding()},
+        )])
         self.assertTrue(started)
-        # A settled / unread snapshot never counts.
-        _, started = self._facts_with(
-            [self._rec(queue_enter_observation={
-                "read_ok": True, "runtime_state": "turn_ended",
-            })]
-        )
+        _, started = self._facts_with([self._rec(
+            turn_start_outcome={"outcome": "started"},
+        )])
         self.assertFalse(started)
-        _, started = self._facts_with(
-            [self._rec(queue_enter_observation={
-                "read_ok": False, "runtime_state": "busy",
-            })]
-        )
+        # A recycled generation: same locator/name, DIFFERENT row revision in the binding —
+        # an old observed start can never combine with the current process (j#87403 F2).
+        _, started = self._facts_with([self._rec(queue_enter_observation={
+            "event_wait_kind": "changed",
+            "gateway_binding": self._binding(row_revision="9"),
+        })])
         self.assertFalse(started)
+        # A blank attestation observed_at never binds.
+        _, started = self._facts_with([self._rec(queue_enter_observation={
+            "event_wait_kind": "changed",
+            "gateway_binding": self._binding(attestation_observed_at=""),
+        })])
+        self.assertFalse(started)
+        # Timeout / settled snapshot / unread snapshot never start even with a binding.
+        for qe in (
+            {"event_wait_kind": "timeout", "gateway_binding": self._binding()},
+            {"read_ok": True, "runtime_state": "turn_ended",
+             "gateway_binding": self._binding()},
+            {"read_ok": False, "runtime_state": "busy",
+             "gateway_binding": self._binding()},
+        ):
+            _, started = self._facts_with([self._rec(queue_enter_observation=qe)])
+            self.assertFalse(started, qe)
+
+    def test_the_j87393_shape_legacy_record_stays_unconfirmed(self):
+        # The actual dogfood record shape (entry 3033): sent/ok, no event-rail outcome,
+        # post-hoc snapshot read_ok/turn_ended, NO v2 fields — pinned turn-unconfirmed.
+        self.ops = LiveGatewayRecoveryOps(
+            repo_root=self.repo, request=_request(gateway_revision="4"),
+        )
+        confirmed, started = self._facts_with([self._rec(queue_enter_observation={
+            "observation_kind": "post_choreography_snapshot",
+            "source": "herdr_agent_get",
+            "runtime_state": "turn_ended", "read_ok": True, "read_reason": None,
+            "poll_attempts": 1,
+        })])
+        self.assertTrue(confirmed)   # the delivery itself is confirmed
+        self.assertFalse(started)    # but the turn stays unconfirmed (fail-closed)
 
     def test_a_later_unrelated_record_never_supplies_the_start(self):
         # j#87397 F2: an unrelated later delivery (different marker/journal) with an observed

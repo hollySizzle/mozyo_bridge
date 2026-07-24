@@ -351,29 +351,65 @@ class LiveGatewayRecoveryOps:
                 return rec
         return None
 
-    @staticmethod
-    def _record_observed_turn_start(rec) -> bool:
-        """Did the ANCHOR delivery's own rail OBSERVE the turn start? (j#87397 F1/F2)
+    def _record_observed_turn_start(self, rec) -> bool:
+        """Did the ANCHOR delivery's own rail OBSERVE the turn start, GENERATION-BOUND?
 
-        The positive authority is the durable rail telemetry persisted ON the exact anchor
-        delivery record — never a global timeline: the #13255 armed-wait rail's
-        ``turn_start_outcome.outcome == "started"``, or the #13292 queue-enter
-        post-choreography snapshot that mechanically read the receiver WORKING
-        (``read_ok`` + ``runtime_state == busy``). Anything else — absent telemetry, an
-        unread snapshot, a settled snapshot — stays unobserved (``turn_unconfirmed``);
-        nothing is ever self-generated.
+        (j#87397 F1/F2 + design j#87409.) Two requirements, BOTH on the exact anchor
+        delivery record — never a global timeline, never a settled-snapshot guess:
+
+        1. an observed start: the pre-Enter observation-only armed wait collected the
+           ``working`` transition (v2 ``queue_enter_observation.event_wait_kind ==
+           "changed"``), OR the #13255 armed-wait rail's ``turn_start_outcome.outcome ==
+           "started"``, OR the #13292 snapshot mechanically read the receiver WORKING
+           (``read_ok`` + ``runtime_state == busy``);
+        2. the record's persisted GATEWAY PROCESS BINDING (v2
+           ``queue_enter_observation.gateway_binding``) matches THIS request's pinned
+           gateway process — assigned name, locator, and inventory row revision all exact.
+           A legacy / binding-less / mismatched record (incl. every pre-j#87409 record,
+           e.g. the j#87393 dogfood delivery) stays ``turn_unconfirmed`` — a recycled
+           generation at the same locator can never combine an old observed start with the
+           current process.
         """
+        qe = getattr(rec, "queue_enter_observation", None)
+        observed = False
+        if isinstance(qe, dict) and _norm(str(qe.get("event_wait_kind") or "")) == "changed":
+            observed = True
         ts = getattr(rec, "turn_start_outcome", None)
         if isinstance(ts, dict) and _norm(str(ts.get("outcome") or "")) == "started":
-            return True
-        qe = getattr(rec, "queue_enter_observation", None)
+            observed = True
         if (
             isinstance(qe, dict)
             and qe.get("read_ok") is True
             and _norm(str(qe.get("runtime_state") or "")) == RUNTIME_BUSY
         ):
-            return True
-        return False
+            observed = True
+        if not observed:
+            return False
+        return self._record_generation_bound(rec)
+
+    def _record_generation_bound(self, rec) -> bool:
+        """The record's persisted binding matches THIS request's pinned gateway process.
+
+        Fail-closed (design j#87409 item 3): the binding must be present and every axis —
+        ``assigned_name`` / ``locator`` / ``row_revision`` — must exactly equal the request
+        pin (all non-empty), with a non-empty locator-matched attestation ``observed_at``.
+        Absent / legacy / partial / mismatched bindings never bind.
+        """
+        qe = getattr(rec, "queue_enter_observation", None)
+        if not isinstance(qe, dict):
+            return False
+        binding = qe.get("gateway_binding")
+        if not isinstance(binding, dict):
+            return False
+        pin_rev = _norm(self.request.gateway_revision)
+        return bool(
+            _norm(str(binding.get("assigned_name") or ""))
+            == _norm(self.request.assigned_name)
+            and _norm(str(binding.get("locator") or "")) == _norm(self.request.locator)
+            and pin_rev
+            and _norm(str(binding.get("row_revision") or "")) == pin_rev
+            and _norm(str(binding.get("attestation_observed_at") or "")) != ""
+        )
 
     def observe_turn(self, request: GatewayRefreshRequest) -> GatewayTurnObservation:
         _worker_provider, gateway_provider = self._providers()
