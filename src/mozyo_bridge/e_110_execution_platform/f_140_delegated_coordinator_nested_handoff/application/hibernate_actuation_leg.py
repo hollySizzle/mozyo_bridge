@@ -398,7 +398,7 @@ def run_hibernate_redrives(
     request_fn: "Callable[[object], HibernateRequest | str]",
     lease_renew_fn: Callable[[], bool],
     clock_fn: Optional[Callable[[], str]] = None,
-    drain_ready_fn: "Optional[Callable[[str], str]]" = None,
+    drain_ready_fn: "Optional[Callable[[object], str]]" = None,
 ) -> RedriveResult:
     """Finish prior interrupted releases on already-hibernated rows (review j#86757 R4-F2).
 
@@ -436,12 +436,13 @@ def run_hibernate_redrives(
         issue = str(getattr(row, "issue_id", ""))
         lane = str(getattr(row, "lane_id", ""))
 
-        def _append(attempt, _issue=issue):
-            # Review j#87224 R5-F1: read the ORIGINAL drain-ready start LAZILY, at stamp time — the
-            # production ``request_fn`` reads the row's intent and only THEN records its
-            # ``drain_ready_at``, so capturing it before ``request_fn`` would always stamp an empty
-            # start. Reading it here (after the request resolved) inherits the crash-redrive's start.
-            dr = str(drain_ready_fn(_issue) if drain_ready_fn is not None else "")
+        def _append(attempt, _row=row):
+            # Review j#87224 R5-F1 / j#87236 R6-F1: read the ORIGINAL drain-ready start from THIS row's
+            # OWN durable intent, bound to its exact identity (workspace / lane / generation), never an
+            # issue-collapsed map — two hibernated rows can share an issue. Reading it per row also
+            # covers a DEFERRED row (one deferred before ``request_fn`` ran), which still stamps its own
+            # start, not a same-issue sibling's.
+            dr = str(drain_ready_fn(_row) if drain_ready_fn is not None else "")
             attempts.append(stamp_drain_metrics(
                 attempt, dr, clock_fn() if clock_fn is not None else ""
             ))

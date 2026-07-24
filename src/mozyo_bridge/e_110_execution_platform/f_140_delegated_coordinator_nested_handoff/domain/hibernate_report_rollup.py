@@ -33,9 +33,12 @@ _FULLY_RELEASED_KINDS = frozenset({"actuated", "redriven"})
 _RELEASE_INCOMPLETE_KINDS = frozenset({"actuated_release_incomplete", "redriven_success_withheld"})
 _HIBERNATE_APPLIED_KINDS = _FULLY_RELEASED_KINDS | _RELEASE_INCOMPLETE_KINDS
 _HIBERNATE_BLOCKED_KINDS = frozenset(
-    {"blocked", "redrive_blocked", "no_basis_journal", "release_state_unknown"}
+    {"blocked", "redrive_blocked", "no_basis_journal"}
 )
-_HIBERNATE_UNCERTAIN_KINDS = frozenset({"lease_lost"})
+# ``release_state_unknown`` is an OUTCOME-UNKNOWN process release (review j#87236 R6-F2 / clarification
+# j#87226), NOT a deterministic block: the pass-level roll-up classifies it ``uncertain`` — the SAME
+# outcome-unknown classification the attempt-level time-to-drain status uses — never ``blocked``.
+_HIBERNATE_UNCERTAIN_KINDS = frozenset({"lease_lost", "release_state_unknown"})
 _HIBERNATE_DEFERRED_KINDS = frozenset({"deferred", "stale_basis"})
 
 # -- folded-leg disposition classification (domain ``SKIP_HIBERNATE_*`` token literals) -----------

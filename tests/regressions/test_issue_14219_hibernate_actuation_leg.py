@@ -53,8 +53,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ATTEMPT_LEASE_LOST,
     ATTEMPT_NO_JOURNAL,
     ATTEMPT_PARTIAL,
+    ATTEMPT_REDRIVEN,
     ATTEMPT_STALE,
     run_hibernate_pass,
+    run_hibernate_redrives,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_candidate_source import (  # noqa: E501
     still_current,
@@ -246,6 +248,41 @@ class HibernateActuationLegTests(unittest.TestCase):
             # The deferred attempt used ITS OWN start (01:00) and the SECOND clock read (R4-F3).
             self.assertEqual(deferred.time_to_disposition_ms, 3_605_000)  # 01:00:00 -> 02:00:05
             self.assertIsNone(deferred.time_to_drain_ms)  # a defer is not a drain completion
+
+    def test_redrive_binds_each_rows_start_by_identity_not_issue(self):
+        # Review j#87236 R6-F1: two hibernated rows can SHARE an issue (the store's unique index is
+        # only on the ACTIVE owner). The redriven row stamps ITS start; the DEFERRED row — deferred
+        # before its request ever ran — still stamps ITS OWN start, never the same-issue sibling's.
+        from types import SimpleNamespace
+
+        rows = [
+            SimpleNamespace(issue_id="600", lane_id="lane_a", lane_generation=1,
+                            repo_workspace_id="wsA", decision_journal="700"),
+            SimpleNamespace(issue_id="600", lane_id="lane_b", lane_generation=1,
+                            repo_workspace_id="wsA", decision_journal="701"),
+        ]
+        starts = {"lane_a": "2026-07-24T00:00:00+00:00", "lane_b": "2026-07-24T01:00:00+00:00"}
+        fake_uc = SimpleNamespace(run=lambda request, execute: SimpleNamespace(
+            lease_lost=False, release=SimpleNamespace(closed=()), success_withheld=False,
+            transition=None,
+        ))
+        clocks = iter(["2026-07-24T02:00:00+00:00", "2026-07-24T02:00:05+00:00"])
+        result = run_hibernate_redrives(
+            rows,
+            use_case_fn=lambda row: fake_uc,
+            request_fn=lambda row: object(),   # a non-str -> the redrive proceeds
+            lease_renew_fn=lambda: True,
+            clock_fn=lambda: next(clocks),
+            drain_ready_fn=lambda row: starts.get(row.lane_id, ""),
+        )
+        by_lane = {a.lane: a for a in result.attempts}
+        # lane_a redriven with ITS start 00:00 -> END 02:00 (first clock read) = 7,200,000 ms.
+        self.assertEqual(by_lane["lane_a"].kind, ATTEMPT_REDRIVEN)
+        self.assertEqual(by_lane["lane_a"].time_to_drain_ms, 7_200_000)
+        # lane_b deferred with ITS OWN start 01:00 (not lane_a's) -> END 02:00:05 = 3,605,000 ms.
+        self.assertEqual(by_lane["lane_b"].kind, ATTEMPT_DEFERRED)
+        self.assertEqual(by_lane["lane_b"].time_to_disposition_ms, 3_605_000)
+        self.assertIsNone(by_lane["lane_b"].time_to_drain_ms)
 
     def test_a_partial_release_consumes_the_one_mutation_budget(self):
         # R1-F1: the first candidate's CAS applies (row hibernated) but its release is incomplete,

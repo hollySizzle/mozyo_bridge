@@ -908,6 +908,11 @@ class T2cProductionActuationTest(unittest.TestCase):
             self.assertEqual(unknown["time_to_drain_status"], "uncertain")  # outcome unknown
             self.assertIsNone(unknown["time_to_drain_ms"])
             self.assertIsNone(unknown["time_to_disposition_ms"])
+            # Review j#87236 R6-F2: the pass-level roll-up uses the SAME outcome-unknown
+            # classification — the unknown release counts as UNCERTAIN, never blocked.
+            self.assertEqual(report.hibernate_uncertain, 1)
+            self.assertEqual(report.hibernate_blocked, 0)
+            self.assertEqual(report.hibernate_time_to_drain_status, "uncertain")
 
     # ------------------------------------------------------------------ R5-F4
     def _run_leg_directly(self, *, renew, pages, runtime="awaiting_input", inventory=None):

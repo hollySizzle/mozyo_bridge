@@ -716,10 +716,22 @@ def build_hibernate_leg_fn(
         # fabricated), and reading it is a home-scoped read (the redrive touches the provider 0
         # times).
         intent_store = HibernateRedriveIntentStore(home=home)
-        # R2-F2(a) item 4: a redrive's ORIGINAL drain-ready start, carried from its stored intent and
-        # keyed by issue, so a redriven attempt measures time-to-drain from the FIRST drain-ready
-        # moment (never the redrive's own time). Populated as ``redrive_request`` reads each intent.
-        redrive_drain_ready: dict[str, str] = {}
+
+        def _redrive_drain_ready(row) -> str:
+            # R2-F2(a) item 4 / review j#87236 R6-F1: a redrive's ORIGINAL drain-ready start is THIS
+            # row's own durable intent, bound to its EXACT identity (workspace / lane / generation) —
+            # never an issue-collapsed map (two hibernated rows can share an issue). Read per row so a
+            # DEFERRED row (deferred before its request ran) still stamps its own start. Home-scoped,
+            # zero provider reads; an absent / unreadable intent is a blank start (a later unavailable).
+            try:
+                intent = intent_store.get(
+                    str(getattr(row, "repo_workspace_id", "")),
+                    str(getattr(row, "lane_id", "")),
+                    int(getattr(row, "lane_generation", 0) or 0),
+                )
+            except HibernateRedriveIntentError:
+                return ""
+            return str(getattr(intent, "drain_ready_at", "") or "") if intent is not None else ""
 
         def record_intent(candidate: HibernateCandidate, fields) -> bool:
             # Persist the fresh actuation's derived intent immediately before its CAS, and REPORT
@@ -824,9 +836,6 @@ def build_hibernate_leg_fn(
                 issue_id=issue, decision_journal=journal, action_id=action_id
             ):
                 return LEG_REASON_REDRIVE_INTENT_MISMATCH
-            # Carry the ORIGINAL drain-ready start so the redriven attempt's latency is measured from
-            # when the lane first became drain-ready (R2-F2(a) item 4).
-            redrive_drain_ready[str(issue)] = str(getattr(intent, "drain_ready_at", "") or "")
             debt = outbox_pending(workspace)
             runtime = sources.runtime_fn(workspace, lane)
             settled = runtime in RUNTIME_NOT_WORKING
@@ -856,14 +865,12 @@ def build_hibernate_leg_fn(
                 expected_revision="",
             )
 
-        # R2-F2(a) + review j#87214 R4-F2/F3: the drain-latency is stamped PER ATTEMPT at its terminal
-        # disposition inside ``run_hibernate_pass`` / ``run_hibernate_redrives`` — each attempt uses ITS
-        # candidate's EXACT basis ``drain_ready_at`` (never an issue-collapsed one) and the clock read at
-        # THAT terminal (never one pass-wide read). The redrive path resolves the ORIGINAL start from the
-        # intent the ``redrive_request`` closure recorded, keyed by issue (one hibernated row per issue).
-        def _redrive_drain_ready(issue: str) -> str:
-            return str(redrive_drain_ready.get(str(issue), ""))
-
+        # R2-F2(a) + review j#87214 R4-F2/F3 / j#87236 R6-F1: the drain-latency is stamped PER ATTEMPT
+        # at its terminal disposition inside ``run_hibernate_pass`` / ``run_hibernate_redrives`` — each
+        # attempt uses ITS candidate's / row's EXACT ``drain_ready_at`` (never an issue-collapsed one)
+        # and the clock read at THAT terminal (never one pass-wide read). The redrive path resolves the
+        # ORIGINAL start from THIS row's own intent (bound to workspace/lane/generation) via
+        # :func:`_redrive_drain_ready` above — including a deferred row that never ran its request.
         redrive_result = run_hibernate_redrives(
             redrives,
             use_case_fn=redrive_use_case,
