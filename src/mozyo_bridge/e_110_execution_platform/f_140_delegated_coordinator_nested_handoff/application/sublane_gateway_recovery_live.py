@@ -425,6 +425,15 @@ class LiveGatewayRecoveryOps:
         productivity, no fabricated failure). Comparison stays ordered on durable journal
         ids, never wall-clock. No reader / an unreadable read leaves all facts ``False``.
         """
+        kind = _norm(request.resume_gate)
+        if kind == "implementation_request":
+            # j#87370 F3: an IR's causal expected result is the gateway→worker forward — an
+            # existing durable fact (the delivery ledger's worker-forward record for the
+            # EXACT anchor), never "any journal after it". Judged from the LEDGER, not the
+            # journal read (so it needs no journal reader).
+            if not _norm(request.resume_anchor_journal):
+                return False, False, False
+            return self._worker_forward_facts(request)
         reader = self.journal_reader
         if reader is None or not self.journal_reader_fresh:
             return False, False, False
@@ -436,8 +445,8 @@ class LiveGatewayRecoveryOps:
             entries = reader(request.effective_anchor_issue)
         except Exception:  # noqa: BLE001 - unreadable durable source => unobservable
             return False, False, False
-        if _norm(request.resume_gate) != "review_request":
-            # No defined causal-response vocabulary for this anchor kind yet — unobservable
+        if kind != "review_request":
+            # No defined causal-result vocabulary for this anchor kind yet — unobservable
             # (fail-closed), never a guess in either direction.
             return False, False, False
         needle_gate = "gate=review_result"
@@ -453,6 +462,49 @@ class LiveGatewayRecoveryOps:
                 landed = True
                 break
         return landed, not landed, True
+
+    def _worker_forward_facts(self, request: GatewayRefreshRequest) -> tuple[bool, bool, bool]:
+        """(landed, absent, fresh) for an implementation_request anchor (j#87370 F3).
+
+        The causal expected result: the same-lane gateway forwarded the EXACT anchor to the
+        worker — a delivery-ledger record whose marker is the anchor's worker-forward marker
+        (kind=implementation_request, receiver=the worker provider), ``status=sent`` with the
+        accepted reason. The marker pins the exact anchor, so an unrelated forward can never
+        read as this one. The ledger is a live DB read (always fresh); an unreadable ledger /
+        unresolvable worker binding is unobservable, never "absent".
+        """
+        worker_provider, _gateway = self._providers()
+        if not worker_provider:
+            return False, False, False
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            RedmineAnchor,
+            build_marker,
+        )
+
+        marker = build_marker(
+            RedmineAnchor(
+                issue=self._anchor_issue(),
+                journal=_norm(request.resume_anchor_journal),
+            ),
+            "implementation_request",
+            worker_provider,
+        )
+        try:
+            records = self._ledger().records_for_marker(marker)
+        except Exception:  # noqa: BLE001 - unreadable ledger => unobservable
+            return False, False, False
+        for rec in records:
+            if (
+                _norm(rec.notification_marker) == marker
+                and _norm(rec.source) == "redmine"
+                and _norm(rec.issue_id) == self._anchor_issue()
+                and _norm(rec.journal_id) == _norm(request.resume_anchor_journal)
+                and _norm(rec.receiver) == worker_provider
+                and _norm(rec.status) == "sent"
+                and _norm(rec.reason) == "ok"
+            ):
+                return True, False, True
+        return False, True, True
 
     # -- exactly-once anchor resume (the governed rail + the REAL ledger oracle) ---
 
@@ -470,18 +522,56 @@ class LiveGatewayRecoveryOps:
             return ""
         return _agent_locator(matches[0])
 
-    _SENDER_ENV_TRIAD = ("MOZYO_WORKSPACE_ID", "MOZYO_AGENT_ROLE", "MOZYO_LANE_ID")
+    def _governed_sender_resolves(self) -> bool:
+        """Does the GOVERNED send rail resolve from THIS context? (read-only)
+
+        Review j#87370 F1: verified with the SAME authority the real send uses —
+        :func:`resolve_sender_identity` over this process env + the repo anchor workspace —
+        never a bare env-presence check (a non-empty foreign-workspace triad resolves
+        ``env_anchor_workspace_mismatch`` here exactly as it would at send time).
+        """
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (  # noqa: E501
+            resolve_sender_identity,
+        )
+
+        try:
+            anchor_ws = repo_scope_workspace_id(self.repo_root)
+        except Exception:  # noqa: BLE001 - unreadable anchor => the resolver fails closed
+            anchor_ws = None
+        try:
+            return bool(
+                resolve_sender_identity(
+                    self.env, anchor_workspace_id=anchor_ws
+                ).ok
+            )
+        except Exception:  # noqa: BLE001 - a resolver error is a non-resolving context
+            return False
+
+    def _oneshot_transport(self):
+        """The herdr transport for the operator-capable one-shot rail, or ``None``."""
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
+            HerdrCliTransport,
+            resolve_herdr_binary,
+        )
+
+        try:
+            binary = resolve_herdr_binary(self.env)
+            return HerdrCliTransport(binary, runner=self.runner, timeout=self.timeout)
+        except Exception:  # noqa: BLE001 - no reachable transport => rail unavailable
+            return None
 
     def resume_rail_ready(self, request: GatewayRefreshRequest) -> bool:
-        """Pre-close resume-rail capability (review j#87364 F2). (read-only, fail-closed)
+        """Pre-close resume-rail capability (reviews j#87364 F2 / j#87370 F1). (read-only)
 
-        The governed send rail requires the attested launch-time sender identity; a shell
-        without it would only discover ``missing_sender_env`` AFTER the destructive close.
-        Verified up front: every triad var must be present and non-empty in THIS process
-        env. An operator runs the execute from an attested pane context (the documented
-        contract) — env spoofing is never performed here.
+        True when EITHER rail can deliver from THIS context: the governed send rail
+        (verified through the REAL sender-identity resolver, same authority as the send),
+        or the operator-capable guarded one-shot rail (j#85972 / j#85891 — sender-env
+        independent; needs only a reachable herdr transport, with the exact target identity
+        verified action-time at the send). Fail-closed when neither resolves.
         """
-        return all(_norm(self.env.get(name, "")) for name in self._SENDER_ENV_TRIAD)
+        if self._governed_sender_resolves():
+            return True
+        return self._oneshot_transport() is not None
 
     def _resume_argv(self, continuation: ContinuationPointer, locator: str) -> list[str]:
         """The recovery-family resume argv: ONE ``handoff send --kind reply`` pointer at the
@@ -511,11 +601,115 @@ class LiveGatewayRecoveryOps:
         _worker, gateway_provider = self._providers()
         if not gateway_provider:
             return DRAIN_SEND_ERROR
-        try:
-            rc = self._drive_cli(self._resume_argv(continuation, locator))
-        except Exception:  # noqa: BLE001 - a failed drive is a failed send, ledger untouched
+        if self._governed_sender_resolves():
+            try:
+                rc = self._drive_cli(self._resume_argv(continuation, locator))
+            except Exception:  # noqa: BLE001 - a failed drive is a failed send
+                return DRAIN_SEND_ERROR
+            return DRAIN_SEND_OK if rc == 0 else DRAIN_SEND_ERROR
+        # Operator-capable guarded one-shot (reviews j#87370 F1 / j#85972): sender-env
+        # independent, target-identity verified action-time, read-back before Enter, real
+        # ledger writer — the formalization of the owner-approved break-glass shape
+        # (j#87298 / j#87305).
+        return self._oneshot_resume(continuation, locator, gateway_provider)
+
+    def _oneshot_resume(
+        self, continuation: ContinuationPointer, locator: str, gateway_provider: str
+    ) -> str:
+        transport = self._oneshot_transport()
+        if transport is None:
             return DRAIN_SEND_ERROR
-        return DRAIN_SEND_OK if rc == 0 else DRAIN_SEND_ERROR
+        # Action-time target identity: the FRESH gateway row must decode to THIS workspace /
+        # lane / gateway role, be LIVE, and be settled — never a blind injection.
+        try:
+            workspace_id = repo_scope_workspace_id(self.repo_root)
+            rows = self._rows()
+        except Exception:  # noqa: BLE001
+            return DRAIN_SEND_ERROR
+        row = None
+        for candidate in rows:
+            if (
+                isinstance(candidate, Mapping)
+                and _norm(candidate.get(AGENT_KEY_NAME)) == _norm(self.request.assigned_name)
+                and _agent_locator(candidate) == locator
+            ):
+                row = candidate
+                break
+        if row is None:
+            return DRAIN_SEND_ERROR
+        decoded = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decoded.ok or decoded.identity is None:
+            return DRAIN_SEND_ERROR
+        identity = decoded.identity
+        if not (
+            identity.workspace_id == workspace_id
+            and _norm_lane(identity.lane_id) == _norm_lane(self.request.lane)
+            and identity.role == gateway_provider
+            and classify_named_slot(row) == SLOT_LIVE
+            and _row_runtime_state(row)
+            in (RUNTIME_TURN_ENDED, RUNTIME_AWAITING_INPUT)
+        ):
+            return DRAIN_SEND_ERROR
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            RedmineAnchor,
+            build_marker,
+        )
+
+        marker = build_marker(
+            RedmineAnchor(
+                issue=_norm(continuation.issue_id), journal=_norm(continuation.journal_id)
+            ),
+            "reply",
+            gateway_provider,
+        )
+        body = (
+            f"{marker} reply ready for {gateway_provider}. Redmine "
+            f"#{_norm(continuation.issue_id)} journal #{_norm(continuation.journal_id)} is "
+            "the durable anchor; read it from the source-of-truth system before acting."
+        )
+        try:
+            sent = transport.send_text(locator, body)
+            if not getattr(sent, "ok", False):
+                return DRAIN_SEND_ERROR
+            # Read-back BEFORE Enter (the j#87298 fence): the exact marker must be visible
+            # in the composer; a mismatch aborts with zero submit (no C-u, no retry).
+            view = transport.read_pane(locator)
+            if marker not in str(getattr(view, "text", "") or ""):
+                self._record_oneshot(marker, continuation, locator, gateway_provider,
+                                     status="blocked", reason="readback_mismatch")
+                return DRAIN_SEND_ERROR
+            entered = transport.send_keys(locator, "Enter")
+            if not getattr(entered, "ok", False):
+                self._record_oneshot(marker, continuation, locator, gateway_provider,
+                                     status="uncertain", reason="enter_failed")
+                return DRAIN_SEND_ERROR
+        except Exception:  # noqa: BLE001 - any transport fault is a failed send
+            return DRAIN_SEND_ERROR
+        self._record_oneshot(marker, continuation, locator, gateway_provider,
+                             status="sent", reason="ok")
+        return DRAIN_SEND_OK
+
+    def _record_oneshot(
+        self, marker: str, continuation: ContinuationPointer, locator: str,
+        gateway_provider: str, *, status: str, reason: str,
+    ) -> None:
+        """Record the one-shot send boundary to the REAL ledger writer (best-effort)."""
+        from types import SimpleNamespace
+
+        from mozyo_bridge.core.state.herdr_delivery_ledger import record_herdr_delivery
+
+        record_herdr_delivery(
+            SimpleNamespace(
+                status=status, reason=reason,
+                notification_marker=marker, source="redmine",
+                anchor={
+                    "issue": _norm(continuation.issue_id),
+                    "journal": _norm(continuation.journal_id),
+                },
+                receiver=gateway_provider, target=locator, mode="oneshot",
+            ),
+            provider=gateway_provider, backend="herdr",
+        )
 
     def _drive_cli(self, argv: list[str]) -> int:
         """Parse + run through the composed CLI (the ``dispatch_argv`` precedent) so the

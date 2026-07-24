@@ -214,6 +214,23 @@ class LiveRecoveryActuatorPort:
         if len(exact) != 1 or len(matches) != 1:
             return PreservationObservation(identity_matches=False, detail="ambiguous_or_absent")
         row = exact[0]
+        # #14203 review j#87370 F2: re-verify the pinned live-inventory ROW revision at the
+        # close boundary. A NON-EMPTY pin must exactly equal the live row's own revision — a
+        # same-name/-locator slot recycled at a new process generation blocks HERE (action-time,
+        # immediately before the close) instead of being closed under the old approval. An empty
+        # pin preserves the #13806 recover-stale contract (the row shape may not carry one).
+        pinned_row_rev = _norm(getattr(self.request, "worker_revision", ""))
+        if pinned_row_rev:
+            raw_rev = row.get("revision")
+            live_row_rev = _norm(raw_rev) if not isinstance(raw_rev, bool) else ""
+            if live_row_rev != pinned_row_rev:
+                return PreservationObservation(
+                    identity_matches=False,
+                    detail=(
+                        "row_revision_drift:pinned=" + pinned_row_rev
+                        + ":live=" + (live_row_rev or "absent")
+                    ),
+                )
         decoded = decode_assigned_name(row.get(AGENT_KEY_NAME))
         # Re-verify the pinned lane lifecycle (revision, generation) against the LIVE lane
         # lifecycle at the close boundary (Redmine #13806 R1-F2): an unreadable / absent /

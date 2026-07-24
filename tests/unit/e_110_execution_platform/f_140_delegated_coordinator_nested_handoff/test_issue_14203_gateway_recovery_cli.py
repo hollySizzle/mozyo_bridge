@@ -191,7 +191,10 @@ class LiveOpsObservationTests(unittest.TestCase):
                 with patch.object(
                     self.ops, "_providers", return_value=("claude", "codex")
                 ):
-                    result = self.ops.resume_once(continuation)
+                    with patch.object(
+                        self.ops, "_governed_sender_resolves", return_value=True
+                    ):
+                        result = self.ops.resume_once(continuation)
         self.assertEqual(result, DRAIN_SEND_OK)
         self.assertEqual(len(driven), 1)
         argv = driven[0]
@@ -300,17 +303,167 @@ class ReviewR2AdversarialTests(unittest.TestCase):
                             obs = ops.observe_target(ops.request)
         self.assertFalse(obs.generation_matches)  # empty pin is NEVER a match
 
-    def test_f2_resume_rail_ready_requires_the_attested_sender_env_triad(self):
-        bare = LiveGatewayRecoveryOps(repo_root=self.repo, request=_request(), env={})
-        self.assertFalse(bare.resume_rail_ready(bare.request))
-        attested = LiveGatewayRecoveryOps(
+    def test_f1_rail_ready_uses_the_real_resolver_never_env_presence(self):
+        # j#87370 F1 adversarial: a NON-EMPTY but foreign-workspace triad must NOT read as
+        # governed-rail capable — the check is the SAME resolver the real send uses.
+        foreign = LiveGatewayRecoveryOps(
             repo_root=self.repo, request=_request(),
             env={
-                "MOZYO_WORKSPACE_ID": "ws", "MOZYO_AGENT_ROLE": "claude",
+                "MOZYO_WORKSPACE_ID": "foreign_workspace", "MOZYO_AGENT_ROLE": "claude",
                 "MOZYO_LANE_ID": "issue_x_lane",
             },
         )
-        self.assertTrue(attested.resume_rail_ready(attested.request))
+        with patch.object(live_mod, "repo_scope_workspace_id", return_value="real_ws"):
+            self.assertFalse(foreign._governed_sender_resolves())
+            # …and rail readiness then depends ONLY on the operator-capable one-shot rail.
+            with patch.object(foreign, "_oneshot_transport", return_value=None):
+                self.assertFalse(foreign.resume_rail_ready(foreign.request))
+            with patch.object(foreign, "_oneshot_transport", return_value=object()):
+                self.assertTrue(foreign.resume_rail_ready(foreign.request))
+        # A matching-workspace attested context resolves through the same resolver.
+        attested = LiveGatewayRecoveryOps(
+            repo_root=self.repo, request=_request(),
+            env={
+                "MOZYO_WORKSPACE_ID": "real_ws", "MOZYO_AGENT_ROLE": "claude",
+                "MOZYO_LANE_ID": "issue_x_lane",
+            },
+        )
+        with patch.object(live_mod, "repo_scope_workspace_id", return_value="real_ws"):
+            self.assertTrue(attested._governed_sender_resolves())
+
+    def test_f1_oneshot_resume_reads_back_before_enter_and_records_real_ledger(self):
+        # The operator-capable rail: identity-verified target, read-back BEFORE Enter, one
+        # Enter, the REAL ledger writer records the boundary. A read-back mismatch aborts
+        # with zero submit.
+        from types import SimpleNamespace
+
+        continuation = ContinuationPointer(
+            source="redmine", issue_id="14203", journal_id="87251",
+            expected_gate="implementation_request",
+            next_semantic_action="callback_recovery_once",
+        )
+        ops = LiveGatewayRecoveryOps(repo_root=self.repo, request=_request())
+        row = {"name": "gw", "pane_id": "w:9", "status": "done", "detected_agent": "codex"}
+        sent_texts, keys = [], []
+
+        class _T:
+            def send_text(self, target, text):
+                sent_texts.append((target, text))
+                return SimpleNamespace(ok=True)
+
+            def read_pane(self, target):
+                return SimpleNamespace(text=sent_texts[-1][1])
+
+            def send_keys(self, target, k):
+                keys.append((target, k))
+                return SimpleNamespace(ok=True)
+
+        recorded = []
+        ident = type("I", (), {
+            "workspace_id": "ws", "lane_id": "issue_x_lane", "role": "codex",
+        })()
+        with patch.object(live_mod, "repo_scope_workspace_id", return_value="ws"):
+            with patch.object(live_mod, "list_herdr_agent_rows", return_value=[row]):
+                with patch.object(
+                    live_mod, "decode_assigned_name",
+                    return_value=type("D", (), {"ok": True, "identity": ident})(),
+                ):
+                    with patch.object(live_mod, "classify_named_slot",
+                                      return_value=live_mod.SLOT_LIVE):
+                        with patch.object(ops, "_oneshot_transport", return_value=_T()):
+                            with patch.object(
+                                ops, "_record_oneshot",
+                                side_effect=lambda *a, **k: recorded.append(k),
+                            ):
+                                result = ops._oneshot_resume(
+                                    continuation, "w:9", "codex"
+                                )
+        self.assertEqual(result, DRAIN_SEND_OK)
+        self.assertEqual(len(sent_texts), 1)
+        self.assertIn("journal=87251", sent_texts[0][1])  # the EXISTING anchor pointer
+        self.assertEqual(keys, [("w:9", "Enter")])        # exactly one Enter
+        self.assertEqual(recorded[-1]["status"], "sent")
+
+    def test_f3_an_implementation_request_anchor_lands_on_the_worker_forward_record(self):
+        # j#87370 F3: the IR's causal result is the exact-anchor gateway→worker forward in
+        # the REAL ledger — readable-but-empty confirms absence; a record for a DIFFERENT
+        # anchor never lands.
+        from types import SimpleNamespace
+
+        req = _request(resume_gate="implementation_request")
+        ops = LiveGatewayRecoveryOps(repo_root=self.repo, request=req)
+        marker_hits: dict = {}
+
+        class _Ledger:
+            def records_for_marker(self, marker):
+                return marker_hits.get(marker, [])
+
+        ops.ledger = _Ledger()
+        with patch.object(ops, "_providers", return_value=("claude", "codex")):
+            # Readable, no forward record -> absence positively confirmed.
+            self.assertEqual(ops._expected_gate_facts(req), (False, True, True))
+            # The exact-anchor worker-forward record lands.
+            from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+                RedmineAnchor,
+                build_marker,
+            )
+
+            marker = build_marker(
+                RedmineAnchor(issue="14203", journal="87251"),
+                "implementation_request", "claude",
+            )
+            marker_hits[marker] = [SimpleNamespace(
+                notification_marker=marker, source="redmine", issue_id="14203",
+                journal_id="87251", receiver="claude", status="sent", reason="ok",
+            )]
+            self.assertEqual(ops._expected_gate_facts(req), (True, False, True))
+
+
+class RowRevisionCloseBoundaryTests(unittest.TestCase):
+    """j#87370 F2: the pinned row revision is re-verified at the CLOSE boundary."""
+
+    def test_a_row_revision_drift_blocks_the_close_boundary(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_stale_worker_recovery_live as stale_live,
+        )
+        from mozyo_bridge.core.state.replacement_transaction import (
+            ParticipantPin,
+            ReplacementTransactionKey,
+            ReplacementTransactionStore,
+        )
+
+        repo = Path(tempfile.mkdtemp())
+        store = ReplacementTransactionStore(home=repo)
+        # Approval pinned at row revision 1; the live row was recycled to revision 2 with the
+        # SAME name + locator. The close boundary must block (identity_matches=False) with the
+        # drift axis named — never close the new generation under the old approval.
+        request = port_pin_request(_request(gateway_revision="1"))
+        port = stale_live.LiveRecoveryActuatorPort(
+            repo_root=repo, request=request, store=store,
+            key=ReplacementTransactionKey("ws", "refresh-gateway:t"),
+        )
+        pin = ParticipantPin(
+            lane_id="issue_x_lane", role="codex", provider="codex",
+            assigned_name="gw", old_locator="w:3", is_self=False,
+            lane_revision="5", lane_generation="2",
+        )
+        drifted_row = {"name": "gw", "pane_id": "w:3", "status": "done", "revision": "2"}
+        with patch.object(
+            port, "_exact_and_matches", return_value=([drifted_row], [drifted_row], [drifted_row])
+        ):
+            obs = port.observe_preservation(pin)
+        self.assertFalse(obs.identity_matches)
+        self.assertIn("row_revision_drift", obs.detail)
+        self.assertIn("pinned=1", obs.detail)
+        self.assertIn("live=2", obs.detail)
+        # The exact pinned revision passes this axis (later axes evaluate normally).
+        matching_row = {"name": "gw", "pane_id": "w:3", "status": "done", "revision": "1"}
+        with patch.object(
+            port, "_exact_and_matches",
+            return_value=([matching_row], [matching_row], [matching_row]),
+        ):
+            obs2 = port.observe_preservation(pin)
+        self.assertNotIn("row_revision_drift", obs2.detail or "")
 
 
 if __name__ == "__main__":  # pragma: no cover
