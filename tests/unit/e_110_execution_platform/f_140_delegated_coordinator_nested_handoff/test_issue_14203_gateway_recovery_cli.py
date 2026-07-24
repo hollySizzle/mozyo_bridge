@@ -331,10 +331,76 @@ class ReviewR2AdversarialTests(unittest.TestCase):
         with patch.object(live_mod, "repo_scope_workspace_id", return_value="real_ws"):
             self.assertTrue(attested._governed_sender_resolves())
 
-    def test_f1_oneshot_resume_reads_back_before_enter_and_records_real_ledger(self):
-        # The operator-capable rail: identity-verified target, read-back BEFORE Enter, one
-        # Enter, the REAL ledger writer records the boundary. A read-back mismatch aborts
-        # with zero submit.
+    def test_f1_oneshot_transport_unwraps_the_production_resolution_path(self):
+        # j#87378 F1: the resolver returns a REAL HerdrBinaryResolution; the transport must
+        # receive its ``.path`` — pinned with the production type, not a fake shape.
+        import os
+        import stat
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
+            HerdrCliTransport,
+        )
+
+        fake_bin = self.repo / "herdr"
+        fake_bin.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(fake_bin, os.stat(fake_bin).st_mode | stat.S_IXUSR)
+        ops = LiveGatewayRecoveryOps(
+            repo_root=self.repo, request=_request(),
+            env={"MOZYO_HERDR_BINARY": str(fake_bin)},
+        )
+        transport = ops._oneshot_transport()
+        self.assertIsInstance(transport, HerdrCliTransport)
+        self.assertEqual(transport.binary, str(fake_bin))  # the .path, not the resolution
+
+    def test_f2_oneshot_requires_action_bound_attestation_and_generation(self):
+        # j#87378 F2(a): a fresh row without a readable revision, or an attestation that is
+        # absent / at a different locator / bound to a DIFFERENT action, is a zero-send.
+        from types import SimpleNamespace
+
+        ops = LiveGatewayRecoveryOps(
+            repo_root=self.repo, request=_request(action_id="refresh-gateway:a:r4"),
+        )
+        no_rev_row = {"name": "gw", "pane_id": "w:9", "status": "done"}
+        self.assertFalse(ops._fresh_gateway_bound_to_action(no_rev_row, "w:9"))
+        row = {"name": "gw", "pane_id": "w:9", "status": "done", "revision": "2"}
+
+        def _with_record(record):
+            class _Store:
+                def __init__(self, home=None):
+                    pass
+
+                def read(self, name):
+                    return record
+
+            return patch(
+                "mozyo_bridge.core.state.herdr_identity_attestation."
+                "HerdrIdentityAttestationStore", _Store,
+            )
+
+        with _with_record(None):
+            self.assertFalse(ops._fresh_gateway_bound_to_action(row, "w:9"))
+        foreign = SimpleNamespace(
+            locator="w:OLD", observed_at="2026-07-24T00:00:00+00:00",
+            replacement_action_id="refresh-gateway:a:r4",
+        )
+        with _with_record(foreign):
+            self.assertFalse(ops._fresh_gateway_bound_to_action(row, "w:9"))
+        unbound = SimpleNamespace(
+            locator="w:9", observed_at="2026-07-24T00:00:00+00:00",
+            replacement_action_id="other-action",
+        )
+        with _with_record(unbound):
+            self.assertFalse(ops._fresh_gateway_bound_to_action(row, "w:9"))
+        bound = SimpleNamespace(
+            locator="w:9", observed_at="2026-07-24T00:00:00+00:00",
+            replacement_action_id="refresh-gateway:a:r4",
+        )
+        with _with_record(bound):
+            self.assertTrue(ops._fresh_gateway_bound_to_action(row, "w:9"))
+
+    def test_f2_oneshot_records_ok_only_on_an_observed_turn_start(self):
+        # j#87378 F2(b): the send rides the high-level turn-start rail; ``sent/ok`` is
+        # recorded ONLY on an OBSERVED ``started``; delivered_not_started records uncertain
+        # and NEVER completes; an unresolvable rail is a plain failed send.
         from types import SimpleNamespace
 
         continuation = ContinuationPointer(
@@ -343,46 +409,48 @@ class ReviewR2AdversarialTests(unittest.TestCase):
             next_semantic_action="callback_recovery_once",
         )
         ops = LiveGatewayRecoveryOps(repo_root=self.repo, request=_request())
-        row = {"name": "gw", "pane_id": "w:9", "status": "done", "detected_agent": "codex"}
-        sent_texts, keys = [], []
-
-        class _T:
-            def send_text(self, target, text):
-                sent_texts.append((target, text))
-                return SimpleNamespace(ok=True)
-
-            def read_pane(self, target):
-                return SimpleNamespace(text=sent_texts[-1][1])
-
-            def send_keys(self, target, k):
-                keys.append((target, k))
-                return SimpleNamespace(ok=True)
-
-        recorded = []
+        row = {"name": "gw", "pane_id": "w:9", "status": "done", "revision": "2"}
         ident = type("I", (), {
             "workspace_id": "ws", "lane_id": "issue_x_lane", "role": "codex",
         })()
-        with patch.object(live_mod, "repo_scope_workspace_id", return_value="ws"):
-            with patch.object(live_mod, "list_herdr_agent_rows", return_value=[row]):
-                with patch.object(
-                    live_mod, "decode_assigned_name",
-                    return_value=type("D", (), {"ok": True, "identity": ident})(),
-                ):
-                    with patch.object(live_mod, "classify_named_slot",
-                                      return_value=live_mod.SLOT_LIVE):
-                        with patch.object(ops, "_oneshot_transport", return_value=_T()):
+        recorded = []
+
+        def _run(rail_outcome):
+            recorded.clear()
+            with patch.object(live_mod, "repo_scope_workspace_id", return_value="ws"):
+                with patch.object(live_mod, "list_herdr_agent_rows", return_value=[row]):
+                    with patch.object(
+                        live_mod, "decode_assigned_name",
+                        return_value=type("D", (), {"ok": True, "identity": ident})(),
+                    ):
+                        with patch.object(live_mod, "classify_named_slot",
+                                          return_value=live_mod.SLOT_LIVE):
                             with patch.object(
-                                ops, "_record_oneshot",
-                                side_effect=lambda *a, **k: recorded.append(k),
+                                ops, "_fresh_gateway_bound_to_action", return_value=True
                             ):
-                                result = ops._oneshot_resume(
-                                    continuation, "w:9", "codex"
-                                )
-        self.assertEqual(result, DRAIN_SEND_OK)
-        self.assertEqual(len(sent_texts), 1)
-        self.assertIn("journal=87251", sent_texts[0][1])  # the EXISTING anchor pointer
-        self.assertEqual(keys, [("w:9", "Enter")])        # exactly one Enter
-        self.assertEqual(recorded[-1]["status"], "sent")
+                                with patch.object(
+                                    ops, "_drive_oneshot_turn_start",
+                                    return_value=(
+                                        None if rail_outcome is None
+                                        else SimpleNamespace(outcome=rail_outcome)
+                                    ),
+                                ):
+                                    with patch.object(
+                                        ops, "_record_oneshot",
+                                        side_effect=lambda *a, **k: recorded.append(k),
+                                    ):
+                                        return ops._oneshot_resume(
+                                            continuation, "w:9", "codex"
+                                        )
+
+        self.assertEqual(_run("started"), DRAIN_SEND_OK)
+        self.assertEqual(recorded[-1], {"status": "sent", "reason": "ok"})
+        self.assertEqual(_run("delivered_not_started"), DRAIN_SEND_ERROR)
+        self.assertEqual(
+            recorded[-1], {"status": "uncertain", "reason": "delivered_not_started"}
+        )
+        self.assertEqual(_run(None), DRAIN_SEND_ERROR)
+        self.assertEqual(recorded, [])  # no rail => no record, plain failed send
 
     def test_f3_an_implementation_request_anchor_lands_on_the_worker_forward_record(self):
         # j#87370 F3: the IR's causal result is the exact-anchor gateway→worker forward in
@@ -399,7 +467,8 @@ class ReviewR2AdversarialTests(unittest.TestCase):
                 return marker_hits.get(marker, [])
 
         ops.ledger = _Ledger()
-        with patch.object(ops, "_providers", return_value=("claude", "codex")):
+        with patch.object(ops, "_providers", return_value=("claude", "codex")), \
+                patch.object(ops, "_same_lane_worker_locator", return_value="w:4"):
             # Readable, no forward record -> absence positively confirmed.
             self.assertEqual(ops._expected_gate_facts(req), (False, True, True))
             # The exact-anchor worker-forward record lands.
@@ -412,11 +481,24 @@ class ReviewR2AdversarialTests(unittest.TestCase):
                 RedmineAnchor(issue="14203", journal="87251"),
                 "implementation_request", "claude",
             )
+            # j#87378 F3 adversarial: a record for the SAME anchor sent to a FOREIGN
+            # target never lands — only the current same-lane worker's exact locator.
             marker_hits[marker] = [SimpleNamespace(
                 notification_marker=marker, source="redmine", issue_id="14203",
-                journal_id="87251", receiver="claude", status="sent", reason="ok",
+                journal_id="87251", receiver="claude", backend="herdr",
+                target="w:FOREIGN", status="sent", reason="ok",
+            )]
+            self.assertEqual(ops._expected_gate_facts(req), (False, True, True))
+            marker_hits[marker] = [SimpleNamespace(
+                notification_marker=marker, source="redmine", issue_id="14203",
+                journal_id="87251", receiver="claude", backend="herdr",
+                target="w:4", status="sent", reason="ok",
             )]
             self.assertEqual(ops._expected_gate_facts(req), (True, False, True))
+        # An unresolvable same-lane worker is UNOBSERVABLE, never a guess.
+        with patch.object(ops, "_providers", return_value=("claude", "codex")), \
+                patch.object(ops, "_same_lane_worker_locator", return_value=""):
+            self.assertEqual(ops._expected_gate_facts(req), (False, False, False))
 
 
 class RowRevisionCloseBoundaryTests(unittest.TestCase):

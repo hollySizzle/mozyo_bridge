@@ -476,6 +476,12 @@ class LiveGatewayRecoveryOps:
         worker_provider, _gateway = self._providers()
         if not worker_provider:
             return False, False, False
+        # j#87378 F3: the forward must have been delivered to the CURRENT same-lane worker's
+        # exact locator — a record targeting a foreign / wrong pane never lands. An
+        # unresolvable / ambiguous worker is unobservable, never a guess.
+        worker_locator = self._same_lane_worker_locator(worker_provider)
+        if not worker_locator:
+            return False, False, False
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             RedmineAnchor,
             build_marker,
@@ -500,11 +506,37 @@ class LiveGatewayRecoveryOps:
                 and _norm(rec.issue_id) == self._anchor_issue()
                 and _norm(rec.journal_id) == _norm(request.resume_anchor_journal)
                 and _norm(rec.receiver) == worker_provider
+                and _norm(rec.backend) == "herdr"
+                and _norm(rec.target) == worker_locator
                 and _norm(rec.status) == "sent"
                 and _norm(rec.reason) == "ok"
             ):
                 return True, False, True
         return False, True, True
+
+    def _same_lane_worker_locator(self, worker_provider: str) -> str:
+        """The CURRENT same-lane worker's exact live locator, or ``""`` (fail-closed)."""
+        try:
+            workspace_id = repo_scope_workspace_id(self.repo_root)
+            rows = self._rows()
+        except Exception:  # noqa: BLE001
+            return ""
+        found = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            decoded = decode_assigned_name(row.get(AGENT_KEY_NAME))
+            if not decoded.ok or decoded.identity is None:
+                continue
+            identity = decoded.identity
+            if (
+                identity.workspace_id == workspace_id
+                and _norm_lane(identity.lane_id) == _norm_lane(self.request.lane)
+                and identity.role == worker_provider
+                and classify_named_slot(row) == SLOT_LIVE
+            ):
+                found.append(_agent_locator(row))
+        return found[0] if len(found) == 1 else ""
 
     # -- exactly-once anchor resume (the governed rail + the REAL ledger oracle) ---
 
@@ -555,8 +587,12 @@ class LiveGatewayRecoveryOps:
         )
 
         try:
-            binary = resolve_herdr_binary(self.env)
-            return HerdrCliTransport(binary, runner=self.runner, timeout=self.timeout)
+            resolution = resolve_herdr_binary(self.env)
+            # j#87378 F1: the resolver returns a HerdrBinaryResolution; the transport takes
+            # its ``.path`` (the resolved absolute executable), never the resolution object.
+            return HerdrCliTransport(
+                resolution.path, runner=self.runner, timeout=self.timeout
+            )
         except Exception:  # noqa: BLE001 - no reachable transport => rail unavailable
             return None
 
@@ -650,6 +686,13 @@ class LiveGatewayRecoveryOps:
             in (RUNTIME_TURN_ENDED, RUNTIME_AWAITING_INPUT)
         ):
             return DRAIN_SEND_ERROR
+        # j#87378 F2(a): re-join the FRESH gateway's action-bound attestation + current row
+        # generation IMMEDIATELY before the transport — the fresh slot must carry a startup
+        # attestation whose locator is THIS fresh locator AND whose replacement action binding
+        # is THIS refresh action, and the live row must carry a readable revision. A missing /
+        # foreign / unbound attestation or an unpinned generation is a zero-send.
+        if not self._fresh_gateway_bound_to_action(row, locator):
+            return DRAIN_SEND_ERROR
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             RedmineAnchor,
             build_marker,
@@ -667,27 +710,66 @@ class LiveGatewayRecoveryOps:
             f"#{_norm(continuation.issue_id)} journal #{_norm(continuation.journal_id)} is "
             "the durable anchor; read it from the source-of-truth system before acting."
         )
-        try:
-            sent = transport.send_text(locator, body)
-            if not getattr(sent, "ok", False):
-                return DRAIN_SEND_ERROR
-            # Read-back BEFORE Enter (the j#87298 fence): the exact marker must be visible
-            # in the composer; a mismatch aborts with zero submit (no C-u, no retry).
-            view = transport.read_pane(locator)
-            if marker not in str(getattr(view, "text", "") or ""):
-                self._record_oneshot(marker, continuation, locator, gateway_provider,
-                                     status="blocked", reason="readback_mismatch")
-                return DRAIN_SEND_ERROR
-            entered = transport.send_keys(locator, "Enter")
-            if not getattr(entered, "ok", False):
-                self._record_oneshot(marker, continuation, locator, gateway_provider,
-                                     status="uncertain", reason="enter_failed")
-                return DRAIN_SEND_ERROR
-        except Exception:  # noqa: BLE001 - any transport fault is a failed send
+        # j#87378 F2(b): the send is driven through the EXISTING high-level turn-start rail
+        # (snapshot → inject → wait for the working transition → classify) — never a manual
+        # Enter whose success is self-certified. ``sent/ok`` is recorded ONLY when the rail
+        # OBSERVED the turn start; an unconfirmed injection records ``uncertain`` and never
+        # completes the transaction.
+        result = self._drive_oneshot_turn_start(locator, body)
+        if result is None:
+            return DRAIN_SEND_ERROR
+        outcome = _norm(getattr(result, "outcome", ""))
+        if outcome == "started":
+            self._record_oneshot(marker, continuation, locator, gateway_provider,
+                                 status="sent", reason="ok")
+            return DRAIN_SEND_OK
+        if outcome == "delivered_not_started":
+            self._record_oneshot(marker, continuation, locator, gateway_provider,
+                                 status="uncertain", reason=outcome)
             return DRAIN_SEND_ERROR
         self._record_oneshot(marker, continuation, locator, gateway_provider,
-                             status="sent", reason="ok")
-        return DRAIN_SEND_OK
+                             status="blocked", reason=outcome or "inject_failed")
+        return DRAIN_SEND_ERROR
+
+    def _fresh_gateway_bound_to_action(self, row: Mapping[str, object], locator: str) -> bool:
+        """The fresh slot's attestation binds THIS refresh action at THIS locator, and the
+        live row carries a readable generation (j#87378 F2(a)). Fail-closed."""
+        raw_rev = row.get("revision")
+        live_rev = _norm(raw_rev) if not isinstance(raw_rev, bool) else ""
+        if not live_rev:
+            return False
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+        )
+
+        try:
+            record = HerdrIdentityAttestationStore(home=self.attestation_home).read(
+                _norm(self.request.assigned_name)
+            )
+        except Exception:  # noqa: BLE001 - unreadable attestation => unbound
+            return False
+        if record is None:
+            return False
+        return (
+            _norm(getattr(record, "locator", "")) == _norm(locator)
+            and _norm(getattr(record, "observed_at", "") or "") != ""
+            and _norm(getattr(record, "replacement_action_id", ""))
+            == _norm(self.request.action_id)
+        )
+
+    def _drive_oneshot_turn_start(self, locator: str, body: str):
+        """Resolve + drive the high-level turn-start rail for the one-shot injection."""
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_turn_start import (  # noqa: E501
+            resolve_turn_start_rail,
+        )
+
+        try:
+            rail = resolve_turn_start_rail(env=self.env, runner=self.runner)
+            if rail is None:
+                return None
+            return rail.drive_turn_start(locator, body)
+        except Exception:  # noqa: BLE001 - an unresolvable rail is a failed send
+            return None
 
     def _record_oneshot(
         self, marker: str, continuation: ContinuationPointer, locator: str,
