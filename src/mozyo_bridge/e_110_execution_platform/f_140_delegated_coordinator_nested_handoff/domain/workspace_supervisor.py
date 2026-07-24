@@ -116,6 +116,12 @@ SKIP_HIBERNATE_DELIVERY_UNCERTAIN = "hibernate_delivery_uncertain"
 #: woken for (lease-owned durable wake + explicit hint). A workspace with no wake binding this
 #: pass actuates nothing — only the timer/reconciliation fallback does full candidate selection.
 SKIP_HIBERNATE_WAKE_UNBOUND = "hibernate_wake_unbound"
+#: The whole bounded pass already spent its ONE external mutation (Redmine #14219 T3 Final Design
+#: Disposition j#87188 = B): a callback delivery / reconcile side-effect / hibernate mutation (or an
+#: UNCERTAIN one) fired in an earlier workspace, so this workspace performs NO external side effect —
+#: its delivery/reconcile/hibernate boundaries are not called and its rows stay pending for the next
+#: event-wake / timer pass (row-level exactly-once preserved). An internal-only defer, not a failure.
+SKIP_PASS_BUDGET_SPENT = "pass_external_mutation_budget_spent"
 
 #: A per-issue supply error token: the Redmine source could not be read for durable-event supply /
 #: candidate discovery (fail-open per issue — the callback drain still ran).
@@ -945,6 +951,7 @@ __all__ = (
     "SKIP_HIBERNATE_BUDGET_DEFERRED",
     "SKIP_HIBERNATE_DELIVERY_UNCERTAIN",
     "SKIP_HIBERNATE_WAKE_UNBOUND",
+    "SKIP_PASS_BUDGET_SPENT",
     "ISSUE_SOURCE_UNREADABLE",
     "ISSUE_PASS_ERROR",
     "ISSUE_LEASE_LOST",

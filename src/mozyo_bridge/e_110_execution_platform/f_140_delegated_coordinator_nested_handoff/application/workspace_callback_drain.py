@@ -135,10 +135,14 @@ def drain_issues_under_held_lease(
     workspace_id: str,
     drain_issues: Sequence[str],
     sender: Optional[Callable[[CallbackOutboxRow], str]],
+    *,
+    defer_fence_fn: "Optional[Callable[[CallbackOutboxRow], tuple[bool, str]]]" = None,
 ) -> tuple[list[IssueSupervisionOutcome], bool]:
     """Drain the given issues under an ALREADY-HELD lease — shared by the drain mode and the
     bounded-reconciliation watermark downgrade (Redmine #14150). Returns ``(outcomes, lease_lost)``;
     a takeover between issues stops before the next send (parity with the reconciliation loop).
+    ``defer_fence_fn`` (Final Design Disposition j#87188 = B) is composed with the local-attestation
+    fence so a pass that already spent its one external mutation defers the rest to the next pass.
     """
     issue_outcomes: list[IssueSupervisionOutcome] = []
     lease_lost = False
@@ -148,7 +152,9 @@ def drain_issues_under_held_lease(
         ):
             lease_lost = True
             break
-        issue_outcome = drain_issue_locally(sup, workspace_id, issue, sender)
+        issue_outcome = drain_issue_locally(
+            sup, workspace_id, issue, sender, defer_fence_fn=defer_fence_fn
+        )
         issue_outcomes.append(issue_outcome)
         if issue_outcome.error == ISSUE_LEASE_LOST:
             lease_lost = True
@@ -157,7 +163,8 @@ def drain_issues_under_held_lease(
 
 
 def drain_issues_from_outbox(
-    sup, workspace_id: str, sender: Optional[Callable[[CallbackOutboxRow], str]]
+    sup, workspace_id: str, sender: Optional[Callable[[CallbackOutboxRow], str]],
+    *, defer_fence_fn: "Optional[Callable[[CallbackOutboxRow], tuple[bool, str]]]" = None,
 ) -> tuple[list[IssueSupervisionOutcome], bool]:
     """Read the LOCAL outbox and drain this workspace's attestable issues under a held lease."""
     try:
@@ -165,7 +172,9 @@ def drain_issues_from_outbox(
     except Exception:  # noqa: BLE001 - an unreadable outbox drains nothing (fail-open)
         pending = ()
     drain_issues = select_drain_issues(pending, workspace_id)
-    return drain_issues_under_held_lease(sup, workspace_id, drain_issues, sender)
+    return drain_issues_under_held_lease(
+        sup, workspace_id, drain_issues, sender, defer_fence_fn=defer_fence_fn
+    )
 
 
 def drain_issue_locally(
@@ -173,6 +182,8 @@ def drain_issue_locally(
     workspace_id: str,
     issue: str,
     sender: Optional[Callable[[CallbackOutboxRow], str]],
+    *,
+    defer_fence_fn: "Optional[Callable[[CallbackOutboxRow], tuple[bool, str]]]" = None,
 ) -> IssueSupervisionOutcome:
     """Deliver one issue's locally-attestable coordinator rows — ZERO provider reads (#14150).
 
@@ -200,6 +211,12 @@ def drain_issue_locally(
         if str(getattr(row, "enqueue_lane_generation", "") or "").strip() != current_gen:
             # Enqueued under a different (previous / blank) generation -> not locally attestable.
             return (True, DRAIN_DEFER_NOT_ATTESTABLE)
+        # Final Design Disposition j#87188 = B: once the pass spent its one external mutation, defer
+        # every further row (released to pending) so the next pass delivers it — never blind-sent.
+        if defer_fence_fn is not None:
+            deferred, reason = defer_fence_fn(row)
+            if deferred:
+                return (True, reason)
         return (False, "")
 
     # Send-boundary ownership fence (parity with _supervise_issue): re-verify + extend the lease

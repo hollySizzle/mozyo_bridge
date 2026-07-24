@@ -331,7 +331,15 @@ class SupervisorLeaseFenceTest(unittest.TestCase):
         w = report.workspaces[0]
         self.assertEqual(w.skipped_reason, "")
         self.assertEqual(len(w.issues), 2)  # both issues supervised (renew kept ownership)
-        self.assertEqual(len(calls), 2)
+        # #14219 Final Design Disposition j#87188 = B: one bounded pass performs AT MOST ONE external
+        # mutation. The first issue's callback delivers (spending the budget); the second issue's row
+        # is budget-deferred at the pre-send edge (released back to pending) — so it is delivered on
+        # the NEXT pass, never dropped. The renew still fired for the second issue (ownership kept).
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(w.delivered, 1)
+        # The deferred row is still pending (exactly-once preserved): a second pass delivers it.
+        from mozyo_bridge.core.state.workflow_runtime_store import CALLBACK_PENDING
+        self.assertEqual(len(self.outbox.read(states=[CALLBACK_PENDING])), 1)
 
 
 class SupervisorWakeConsumeTest(unittest.TestCase):

@@ -558,6 +558,7 @@ def drain_review_return_backlog(
     restrict_issues: "Optional[frozenset]" = None,
     limit: "Optional[int]" = None,
     now: "Optional[str]" = None,
+    defer_fence_fn: "Optional[Callable[[CallbackOutboxRow], tuple[bool, str]]]" = None,
 ) -> BacklogDrainOutcome:
     """Terminally fence a workspace's PRE-EXISTING previous-generation / hibernated-owner review_return
     backlog rows that active-issue discovery never revisits (Redmine #13974 R2).
@@ -677,6 +678,7 @@ def drain_review_return_backlog(
         report = CallbackOutboxProcessor(outbox, source, workspace_id=wsid).deliver(
             sender, send_fence_fn=send_fence_fn, issue=issue,
             limit=(remaining if remaining is not None else 32), now=now,
+            defer_fence_fn=defer_fence_fn,
         )
         fenced += len(report.fenced)
         # Receipt truth (Redmine #13683 R2): count a real delivery ONLY when the row's durable state is

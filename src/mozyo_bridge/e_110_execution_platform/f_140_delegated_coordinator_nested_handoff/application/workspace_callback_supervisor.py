@@ -48,6 +48,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     workspace_hibernate_leg as _hibernate,
     workspace_delivery_leg as _delivery,
+    pass_external_budget as _pxb,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import default_hibernate_leg_fn  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (
@@ -374,7 +375,7 @@ class WorkspaceCallbackSupervisor:
             wake_issues = tuple(wake_issues) + self._drain_wake_for(wsid)
             outcome = _delivery.deliver_under_lease(
                 self, ws, wsid, lease, mode=mode, wake_issues=wake_issues,
-                authoritative=authoritative,
+                authoritative=authoritative, pass_budget=pass_budget,
             )
             # Redmine #14219 T3 (Answer j#87108, review j#87154 R1-F1/F2/F3): fold the auto-
             # hibernate after-leg into THIS pass under the lease we STILL HOLD (no release then
@@ -423,9 +424,12 @@ class WorkspaceCallbackSupervisor:
         return _drain.drain_workspace_locally(self, ws)
 
     def _drain_issues_from_outbox(
-        self, workspace_id: str, sender: Optional[Callable[[CallbackOutboxRow], str]]
+        self, workspace_id: str, sender: Optional[Callable[[CallbackOutboxRow], str]],
+        *, defer_fence_fn=None,
     ) -> tuple[list[IssueSupervisionOutcome], bool]:
-        return _drain.drain_issues_from_outbox(self, workspace_id, sender)
+        return _drain.drain_issues_from_outbox(
+            self, workspace_id, sender, defer_fence_fn=defer_fence_fn
+        )
 
     # -- per-issue ---------------------------------------------------------
 
@@ -436,12 +440,21 @@ class WorkspaceCallbackSupervisor:
         source: Optional[RedmineJournalSource],
         sender: Callable[[CallbackOutboxRow], str],
         binding: object,
+        *,
+        defer_fence_fn: "Optional[Callable[[CallbackOutboxRow], tuple[bool, str]]]" = None,
+        pass_budget: Optional[dict] = None,
     ) -> IssueSupervisionOutcome:
         """Supply durable events + drain the callback outbox for one issue (fail-open per issue).
 
         Any Redmine read / store error for one issue is caught and recorded as a token — one bad
         issue never aborts the workspace or the whole sweep (the outbox fence makes every pass
         idempotent, so a skipped issue loses nothing; the next sweep re-reads it).
+
+        ``defer_fence_fn`` (Final Design Disposition j#87188 = B) is the pass's external-mutation
+        budget defer fed to the deliver edge: once the pass spent its one external mutation, every
+        further row is released back to pending (delivered next pass). ``pass_budget`` gates the
+        event-driven reconcile after-leg — it never fires a second external side effect once the
+        pass's one mutation is spent.
         """
         events_supplied = 0
         error = ""
@@ -580,7 +593,8 @@ class WorkspaceCallbackSupervisor:
             # dispatch-anchor fence is never applied to another issue's rows (each issue's
             # generation baseline is independent) and ``historical_fenced`` is attributed correctly.
             report = run_once(
-                processor, sender, candidates=candidates, send_fence_fn=send_fence_fn, issue=issue
+                processor, sender, candidates=candidates, send_fence_fn=send_fence_fn,
+                issue=issue, defer_fence_fn=defer_fence_fn,
             )
         except Exception:  # noqa: BLE001 - a store / send failure is recorded, not fatal to the sweep
             return IssueSupervisionOutcome(
@@ -595,8 +609,12 @@ class WorkspaceCallbackSupervisor:
         # lease/wake path, re-read the issue's structured gate + run one reconcile cycle
         # (turn-ended -> gate re-read -> deliver / self-heal / escalate). Fail-open — the leg
         # never aborts the sweep, and its durable effects (reconcile-state rows, outbox rows)
-        # are observable via `workflow glance`. Disabled when no leg was wired.
-        if self._reconcile_leg_fn is not None:
+        # are observable via `workflow glance`. Disabled when no leg was wired. Final Design
+        # Disposition j#87188 = B: skip it once the pass has spent its one external mutation — it
+        # is another external side-effect boundary, so it never fires a second one this pass.
+        if self._reconcile_leg_fn is not None and not (
+            pass_budget is not None and _pxb.budget_spent(pass_budget)
+        ):
             try:
                 self._reconcile_leg_fn(workspace_id, issue, source)
             except Exception:  # noqa: BLE001 - a reconcile failure never breaks the sweep
@@ -751,13 +769,16 @@ def build_supervisor(
     _candidate_fence_fn = build_candidate_anchor_fn(lifecycle_store)
 
     def _backlog_drain_fn(
-        workspace_id: str, *, source, sender, skip_issues, lease_guard_fn
+        workspace_id: str, *, source, sender, skip_issues, lease_guard_fn, defer_fence_fn=None
     ) -> BacklogDrainOutcome:
         # #13974 R2: drain the own-workspace backlog over the shared outbox + lifecycle authority.
+        # #14219 j#87188 = B: carry the pass external-mutation budget defer so the backlog never
+        # spends a second external mutation once delivery already used the pass's one slot.
         return drain_review_return_backlog(
             outbox, workspace_id, source=source, sender=sender,
             lifecycle_store=lifecycle_store, route=DEFAULT_CALLBACK_ROUTE,
             lease_guard_fn=lease_guard_fn, skip_issues=skip_issues,
+            defer_fence_fn=defer_fence_fn,
         )
 
     reconcile_leg_fn = build_reconcile_leg_fn(

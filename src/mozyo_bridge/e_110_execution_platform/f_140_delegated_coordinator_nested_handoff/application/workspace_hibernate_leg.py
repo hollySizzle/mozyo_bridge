@@ -121,19 +121,17 @@ def run_folded_hibernate(sup, ws, base_outcome, *, mode, pass_budget, bound_issu
 
 
 def mark_pass_budget(pass_budget, outcome) -> None:
-    """Update the ONE shared ``pass_budget`` from a finished workspace outcome (j#87154 R1-F1).
+    """Fold a finished workspace outcome into the ONE shared ``pass_budget`` (j#87154 R1; j#87188 = B).
 
-    The single authority that advances the pass-wide budget so LATER workspaces defer: an external
-    mutation (a delivered / blocked / supplied-event delivery leg OR a hibernate mutation) spends the
-    one-mutation budget; an uncertain delivery OR a RAISED (leg-error) hibernate marks the pass
-    UNCERTAIN so no later workspace actuates behind an unknown partial effect.
+    Callback DELIVERY spends the external budget at the send edge (``budgeted_sender``), per row, so
+    a later row / issue / workspace in the same pass defers immediately — this fold does not need to
+    re-count ``delivered`` (kept as a defensive net for a delivery path that predates the wrapper).
+    A deterministic BLOCK and an internal durable-event supply are NOT external mutations (Final
+    Design Disposition j#87188 boundary 1/4), so they never consume the budget. A HIBERNATE mutation
+    spends it; an UNCERTAIN delivery (lost lease / unreadable roster) OR a RAISED (leg-error)
+    hibernate marks the pass UNCERTAIN so no later workspace actuates behind an unknown partial effect.
     """
-    if (
-        outcome.delivered > 0
-        or outcome.blocked > 0
-        or outcome.events_supplied > 0
-        or outcome.hibernate_mutations > 0
-    ):
+    if outcome.delivered > 0 or outcome.hibernate_mutations > 0:
         pass_budget["mutated"] = True
     if (
         outcome.skipped_reason in _UNCERTAIN_DELIVERY_SKIPS

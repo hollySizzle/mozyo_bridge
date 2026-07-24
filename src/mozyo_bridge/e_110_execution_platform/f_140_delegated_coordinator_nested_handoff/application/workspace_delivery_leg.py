@@ -20,11 +20,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_review_return import (  # noqa: E501
     BacklogDrainOutcome,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+    pass_external_budget as _pxb,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
     ISSUE_LEASE_LOST,
     IssueSupervisionOutcome,
     SKIP_LEASE_LOST,
     SKIP_NO_ACTIVE_ISSUES,
+    SKIP_PASS_BUDGET_SPENT,
     SKIP_ROSTER_UNREADABLE,
     SUPERVISION_BOUNDED_RECONCILIATION,
     WorkspaceSupervisionOutcome,
@@ -41,12 +45,35 @@ def deliver_under_lease(
     mode: str,
     wake_issues: Sequence[str],
     authoritative: Optional[dict[str, str]] = None,
+    pass_budget: Optional[dict] = None,
 ) -> WorkspaceSupervisionOutcome:
     """The callback/outbox delivery + reconcile legs under the caller's HELD lease.
 
-    Extracted (review j#87154 R1-F1) so the folded hibernate after-leg can run before the
-    lease is released. No acquire, no release, no wake drain — the caller owns all three.
+    Extracted (review j#87154 R1-F1) so the folded hibernate after-leg can run before the lease is
+    released. No acquire, no release, no wake drain — the caller owns all three. ``pass_budget``
+    (Final Design Disposition j#87188 = B) is the pass's ONE external-mutation budget: if an earlier
+    workspace already spent it this workspace performs NO external side effect (its rows stay pending
+    for the next pass); otherwise the delivery sender is budget-wrapped and every deliver path carries
+    a budget defer fence, so the pass delivers at most one callback total.
     """
+    if pass_budget is not None and _pxb.budget_spent(pass_budget):
+        # An earlier workspace already used the pass's one external mutation — skip even the provider
+        # read (the next pass re-decides this workspace's rows against the durable authority).
+        return WorkspaceSupervisionOutcome(
+            workspace_id=wsid,
+            lease_acquired=True,
+            lease_reason=lease.reason,
+            skipped_reason=SKIP_PASS_BUDGET_SPENT,
+        )
+    budget_defer = (
+        _pxb.external_budget_defer_fence(pass_budget) if pass_budget is not None else None
+    )
+
+    def _wrap_sender(inner):
+        if inner is None or pass_budget is None:
+            return inner
+        return _pxb.budgeted_sender(inner, pass_budget)
+
     roster, roster_error = sup._roster_fn(ws)
     if roster_error:
         # A roster read that failed is degraded, not "nothing active" — fail closed on the
@@ -94,11 +121,11 @@ def deliver_under_lease(
         except Exception:  # noqa: BLE001 - a due-check failure fails toward reconciling
             reconcile_due = True
         if not reconcile_due:
-            drain_sender = (
+            drain_sender = _wrap_sender(
                 sup._drain_sender_fn(ws) if sup._drain_sender_fn is not None else None
             )
             drain_outcomes, drain_lease_lost = sup._drain_issues_from_outbox(
-                wsid, drain_sender
+                wsid, drain_sender, defer_fence_fn=budget_defer
             )
             return WorkspaceSupervisionOutcome(
                 workspace_id=wsid,
@@ -120,7 +147,7 @@ def deliver_under_lease(
     )
     counter.n = 0
     source = _CountingSource(raw_source, counter) if raw_source is not None else None
-    sender = sup._sender_fn(ws)
+    sender = _wrap_sender(sup._sender_fn(ws))
     binding = sup._binding_fn(ws) if sup._binding_fn is not None else None
     # Redmine #14150 review F2: changed-work incremental read — provider-reconcile only the
     # changed / locally-changed / has-work roster subset; skip the rest (drained locally). A
@@ -148,7 +175,10 @@ def deliver_under_lease(
         ):
             lease_lost = True
             break
-        issue_outcome = sup._supervise_issue(wsid, issue, source, sender, binding)
+        issue_outcome = sup._supervise_issue(
+            wsid, issue, source, sender, binding,
+            defer_fence_fn=budget_defer, pass_budget=pass_budget,
+        )
         issue_outcomes.append(issue_outcome)
         if issue_outcome.error == ISSUE_LEASE_LOST:
             # The send-boundary fence tripped mid-issue (a takeover during this issue's
@@ -189,6 +219,7 @@ def deliver_under_lease(
                 lease_guard_fn=lambda: sup._lease_store.renew(
                     wsid, sup._holder, now=sup._clock(), ttl_seconds=sup._ttl
                 ),
+                defer_fence_fn=budget_defer,
             )
             lease_lost = lease_lost or backlog.lease_lost
         except Exception:  # noqa: BLE001 - a backlog drain never breaks the sweep
