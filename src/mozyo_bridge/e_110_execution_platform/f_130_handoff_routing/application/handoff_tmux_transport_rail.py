@@ -407,8 +407,20 @@ class TmuxTransportRailUseCase:
         # ``next_action_owner``, and the injection / Enter / Enter-only-retry choreography
         # below stays untouched (no double input). Ops without the seam (legacy fakes) are
         # silently unarmed — the observation is additive telemetry only.
+        # Redmine #14203 review j#87418 F1: the `working` observation is only generation-COHERENT
+        # if the gateway process did NOT change across the arm/Enter/collect window. Capture the
+        # generation-bound gateway binding BEFORE arming (the pre-generation), so a post-collect
+        # re-read can confirm it is the SAME process — a same-name/-locator recycle mid-window
+        # would otherwise let an old process's `working` event pair with a new process's binding.
         queue_enter_armed_wait = None
+        queue_enter_pre_binding = None
         if request.herdr_send and request.mode == MODE_QUEUE_ENTER:
+            _bind = getattr(ops, "observe_queue_enter_gateway_binding", None)
+            if _bind is not None:
+                try:
+                    queue_enter_pre_binding = _bind(request.target)
+                except Exception:  # noqa: BLE001 - observation-only; never breaks the send
+                    queue_enter_pre_binding = None
             _arm = getattr(ops, "arm_queue_enter_turn_wait", None)
             if _arm is not None:
                 try:
@@ -510,21 +522,31 @@ class TmuxTransportRailUseCase:
                         queue_enter_wait_kind = _collect(queue_enter_armed_wait)
                     except Exception:  # noqa: BLE001 - observation-only
                         queue_enter_wait_kind = None
-            queue_enter_binding = None
+            # j#87418 F1: the POST-collect generation. The observed start + binding are only
+            # persisted as one generation-coherent authority when the pre-arm and post-collect
+            # generations are BOTH present and EXACTLY equal — the process did not change across
+            # the observation window. A None / mismatched pair drops BOTH the event_wait_kind and
+            # the binding (an old-process start can never pair with a new-process binding).
+            queue_enter_post_binding = None
             _bind = getattr(ops, "observe_queue_enter_gateway_binding", None)
             if _bind is not None:
                 try:
-                    queue_enter_binding = _bind(request.target)
+                    queue_enter_post_binding = _bind(request.target)
                 except Exception:  # noqa: BLE001 - observation-only
-                    queue_enter_binding = None
+                    queue_enter_post_binding = None
+            generation_coherent = (
+                queue_enter_pre_binding is not None
+                and queue_enter_post_binding is not None
+                and queue_enter_pre_binding == queue_enter_post_binding
+            )
             snapshot = ops.observe_queue_enter_turn_start(request.target)
             if snapshot is not None:  # always installed under herdr; skip defensively if not
                 queue_enter_observation = snapshot.to_telemetry_dict()
                 extra = {}
-                if queue_enter_wait_kind:
-                    extra["event_wait_kind"] = queue_enter_wait_kind
-                if queue_enter_binding:
-                    extra["gateway_binding"] = queue_enter_binding
+                if generation_coherent:
+                    if queue_enter_wait_kind:
+                        extra["event_wait_kind"] = queue_enter_wait_kind
+                    extra["gateway_binding"] = queue_enter_post_binding
                 if extra:
                     extra["observation_version"] = 2
                     queue_enter_observation = {**queue_enter_observation, **extra}
@@ -710,22 +732,26 @@ class LiveTmuxTransportRailOps:
             return None
 
     def observe_queue_enter_gateway_binding(self, target: str) -> Optional[dict]:
-        """The action-time gateway process binding for ``target`` (redaction-safe tokens).
+        """The action-time gateway process GENERATION binding for ``target`` (j#87418 F2).
 
-        provider / assigned_name / locator / live inventory row revision (when carried) /
-        the locator-matched startup self-attestation ``observed_at``. ``None`` on any
-        unresolvable axis — the binding is additive telemetry; the gateway recovery is the
-        sole consumer and fails closed on absence.
+        A generation authority, not a loose annotation: it is emitted ONLY when a
+        ``verdict=present`` startup self-attestation exists whose workspace / lane / role /
+        assigned-name / locator ALL match the live inventory row's decoded identity + this
+        target. Any missing / non-present / mismatched axis yields ``None`` (fail-closed) —
+        so the recovery can trust ``attestation_observed_at`` as the exact generation pin.
+        Redaction-safe tokens / timestamps only.
         """
         import os
 
         from mozyo_bridge.core.state.herdr_identity_attestation import (
             HerdrIdentityAttestationStore,
+            VERDICT_PRESENT,
         )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
             AGENT_KEY_NAME,
             _agent_locator,
             _norm,
+            _norm_lane,
             decode_assigned_name,
         )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (  # noqa: E501
@@ -751,17 +777,31 @@ class LiveTmuxTransportRailOps:
         decoded = decode_assigned_name(name)
         if not decoded.ok or decoded.identity is None:
             return None
+        identity = decoded.identity
         revision_raw = row.get("revision")
         row_revision = _norm(str(revision_raw)) if not isinstance(revision_raw, bool) else ""
-        observed_at = ""
+        # A generation-bound, verdict=present attestation whose EVERY identity axis matches the
+        # decoded live-inventory identity AND this target locator — otherwise no binding.
         try:
             record = HerdrIdentityAttestationStore().read(name)
-            if record is not None and _norm(record.locator) == _norm(target):
-                observed_at = _norm(str(record.observed_at or ""))
-        except Exception:  # noqa: BLE001 - unreadable attestation stays blank
-            observed_at = ""
+        except Exception:  # noqa: BLE001 - unreadable attestation => no binding
+            return None
+        if record is None:
+            return None
+        if not (
+            _norm(getattr(record, "verdict", "")) == VERDICT_PRESENT
+            and _norm(getattr(record, "workspace_id", "")) == _norm(identity.workspace_id)
+            and _norm_lane(getattr(record, "lane_id", "")) == _norm_lane(identity.lane_id)
+            and _norm(getattr(record, "role", "")) == _norm(identity.role)
+            and _norm(getattr(record, "assigned_name", "")) == name
+            and _norm(getattr(record, "locator", "")) == _norm(target)
+        ):
+            return None
+        observed_at = _norm(str(getattr(record, "observed_at", "") or ""))
+        if not observed_at:
+            return None
         return {
-            "provider": decoded.identity.role,
+            "provider": identity.role,
             "assigned_name": name,
             "locator": _norm(target),
             "row_revision": row_revision,

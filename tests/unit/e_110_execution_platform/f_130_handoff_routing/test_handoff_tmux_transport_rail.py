@@ -628,15 +628,46 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         self.assertEqual(obs.get("observation_version"), 2)
 
     def test_a_wait_timeout_is_persisted_without_changing_the_delivery(self) -> None:
+        binding = {
+            "provider": "codex", "assigned_name": "gw", "locator": "w:3",
+            "row_revision": "4", "attestation_observed_at": "2026-07-24T17:00:00+00:00",
+        }
         ops = _V2FakeOps(
             marker_observed=True, queue_enter_snapshot=self._snapshot(),
-            wait_kind="timeout", binding=None,
+            wait_kind="timeout", binding=binding,
         )
         code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
         self.assertIsNone(died)
         self.assertEqual(code, 0)  # the observation NEVER fails a normal delivery
         obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
-        self.assertEqual(obs.get("event_wait_kind"), "timeout")
+        self.assertEqual(obs.get("event_wait_kind"), "timeout")  # non-``changed`` diagnostic
+        self.assertEqual(obs.get("gateway_binding"), binding)
+
+    def test_a_generation_change_across_the_window_drops_the_v2_authority(self) -> None:
+        # j#87418 F1: the pre-arm and post-collect generations differ (a same-name/-locator
+        # recycle mid-window) -> the observed start + binding are NOT persisted as one
+        # authority; the record keeps only the settled snapshot.
+        class _RecycleOps(_V2FakeOps):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self._bind_calls = 0
+
+            def observe_queue_enter_gateway_binding(self, target):
+                self.events.append("bind_qe")
+                self._bind_calls += 1
+                return {
+                    "provider": "codex", "assigned_name": "gw", "locator": "w:3",
+                    "row_revision": str(self._bind_calls),  # DIFFERENT each read
+                    "attestation_observed_at": f"2026-07-24T17:0{self._bind_calls}:00+00:00",
+                }
+
+        ops = _RecycleOps(
+            marker_observed=True, queue_enter_snapshot=self._snapshot(), wait_kind="changed",
+        )
+        code, _died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
+        self.assertEqual(code, 0)
+        obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
+        self.assertNotIn("event_wait_kind", obs)
         self.assertNotIn("gateway_binding", obs)
 
     def test_a_legacy_ops_without_the_seam_stays_green_and_unversioned(self) -> None:

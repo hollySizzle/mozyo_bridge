@@ -352,48 +352,46 @@ class LiveGatewayRecoveryOps:
         return None
 
     def _record_observed_turn_start(self, rec) -> bool:
-        """Did the ANCHOR delivery's own rail OBSERVE the turn start, GENERATION-BOUND?
+        """Did the ANCHOR delivery's own QUEUE-ENTER rail OBSERVE the turn start, GENERATION-BOUND?
 
-        (j#87397 F1/F2 + design j#87409.) Two requirements, BOTH on the exact anchor
-        delivery record — never a global timeline, never a settled-snapshot guess:
+        (j#87397 / design j#87409 / j#87418.) SCOPE: the herdr queue-enter rail only — the
+        design decision's observation-only pre-Enter wait lives there and is the standard
+        sublane dispatch default. A ``--mode standard`` delivery has its own turn-start death
+        contract and carries NO generation binding, so it is never classifiable here (F3:
+        the unreachable ``turn_start_outcome`` branch is removed rather than left as a
+        false capability). Two requirements, BOTH on the exact anchor delivery record:
 
-        1. an observed start: the pre-Enter observation-only armed wait collected the
-           ``working`` transition (v2 ``queue_enter_observation.event_wait_kind ==
-           "changed"``), OR the #13255 armed-wait rail's ``turn_start_outcome.outcome ==
-           "started"``, OR the #13292 snapshot mechanically read the receiver WORKING
-           (``read_ok`` + ``runtime_state == busy``);
-        2. the record's persisted GATEWAY PROCESS BINDING (v2
-           ``queue_enter_observation.gateway_binding``) matches THIS request's pinned
-           gateway process — assigned name, locator, and inventory row revision all exact.
-           A legacy / binding-less / mismatched record (incl. every pre-j#87409 record,
-           e.g. the j#87393 dogfood delivery) stays ``turn_unconfirmed`` — a recycled
-           generation at the same locator can never combine an old observed start with the
-           current process.
+        1. an observed start on the v2 queue-enter observation — the pre-Enter armed wait
+           collected the ``working`` transition (``event_wait_kind == "changed"``) OR the
+           #13292 snapshot mechanically read the receiver WORKING (``read_ok`` +
+           ``runtime_state == busy``);
+        2. the record's persisted GATEWAY PROCESS BINDING is generation-coherent with THIS
+           request's live gateway (:meth:`_record_generation_bound`).
         """
         qe = getattr(rec, "queue_enter_observation", None)
-        observed = False
-        if isinstance(qe, dict) and _norm(str(qe.get("event_wait_kind") or "")) == "changed":
-            observed = True
-        ts = getattr(rec, "turn_start_outcome", None)
-        if isinstance(ts, dict) and _norm(str(ts.get("outcome") or "")) == "started":
-            observed = True
-        if (
-            isinstance(qe, dict)
-            and qe.get("read_ok") is True
+        if not isinstance(qe, dict):
+            return False
+        observed = _norm(str(qe.get("event_wait_kind") or "")) == "changed" or (
+            qe.get("read_ok") is True
             and _norm(str(qe.get("runtime_state") or "")) == RUNTIME_BUSY
-        ):
-            observed = True
+        )
         if not observed:
             return False
         return self._record_generation_bound(rec)
 
     def _record_generation_bound(self, rec) -> bool:
-        """The record's persisted binding matches THIS request's pinned gateway process.
+        """The record's persisted binding is the SAME generation as THIS request's LIVE gateway.
 
-        Fail-closed (design j#87409 item 3): the binding must be present and every axis —
-        ``assigned_name`` / ``locator`` / ``row_revision`` — must exactly equal the request
-        pin (all non-empty), with a non-empty locator-matched attestation ``observed_at``.
-        Absent / legacy / partial / mismatched bindings never bind.
+        Fail-closed generation authority (design j#87409 item 3, tightened by review j#87418
+        F2): the binding must be present and its ``assigned_name`` / ``locator`` /
+        ``row_revision`` / ``provider`` must all exactly equal the request pins (all
+        non-empty), AND its ``attestation_observed_at`` must exactly equal the CURRENT live
+        startup attestation's ``observed_at`` for the pinned gateway (read now, at recovery
+        time, at the pinned locator). A non-empty timestamp is NOT authority — only equality
+        to the live current-generation attestation proves the delivery's observed start and
+        the process about to be closed are ONE generation. A recycle between delivery and
+        recovery changes the live ``observed_at`` and fails closed; a foreign provider or a
+        stale hand-written timestamp never binds.
         """
         qe = getattr(rec, "queue_enter_observation", None)
         if not isinstance(qe, dict):
@@ -402,14 +400,46 @@ class LiveGatewayRecoveryOps:
         if not isinstance(binding, dict):
             return False
         pin_rev = _norm(self.request.gateway_revision)
-        return bool(
+        if not (
             _norm(str(binding.get("assigned_name") or ""))
             == _norm(self.request.assigned_name)
             and _norm(str(binding.get("locator") or "")) == _norm(self.request.locator)
             and pin_rev
             and _norm(str(binding.get("row_revision") or "")) == pin_rev
-            and _norm(str(binding.get("attestation_observed_at") or "")) != ""
+            and _norm(str(binding.get("provider") or "")) == _norm(self.request.provider)
+        ):
+            return False
+        binding_observed_at = _norm(str(binding.get("attestation_observed_at") or ""))
+        if not binding_observed_at:
+            return False
+        return binding_observed_at == self._current_request_attestation_observed_at()
+
+    def _current_request_attestation_observed_at(self) -> str:
+        """The LIVE startup attestation ``observed_at`` for THIS request's pinned gateway.
+
+        Read at recovery time (the failed gateway is still live, pre-close): a
+        ``verdict=present`` attestation for the pinned assigned-name whose locator matches the
+        pinned locator. ``""`` on any absent / non-present / mismatched axis (fail-closed) —
+        so a record whose binding cannot be equated to the live generation never binds.
+        """
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+            VERDICT_PRESENT,
         )
+
+        try:
+            record = HerdrIdentityAttestationStore(home=self.attestation_home).read(
+                _norm(self.request.assigned_name)
+            )
+        except Exception:  # noqa: BLE001 - unreadable attestation => no live generation
+            return ""
+        if record is None:
+            return ""
+        if _norm(getattr(record, "verdict", "")) != VERDICT_PRESENT:
+            return ""
+        if _norm(getattr(record, "locator", "")) != _norm(self.request.locator):
+            return ""
+        return _norm(str(getattr(record, "observed_at", "") or ""))
 
     def observe_turn(self, request: GatewayRefreshRequest) -> GatewayTurnObservation:
         _worker_provider, gateway_provider = self._providers()

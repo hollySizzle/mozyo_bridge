@@ -612,6 +612,11 @@ class TurnStartAuthorityTests(unittest.TestCase):
         base.update(overrides)
         return SimpleNamespace(**base)
 
+    #: The live current-generation attestation observed_at the recovery reads at recovery time
+    #: (patched in _facts_with; equals the default binding's timestamp so a matching binding
+    #: is generation-coherent). A test sets it differently to simulate a recycle.
+    live_attestation_observed_at = "2026-07-24T17:00:00+00:00"
+
     def _facts_with(self, records):
         class _Ledger:
             def records_for_marker(self, marker):
@@ -620,10 +625,14 @@ class TurnStartAuthorityTests(unittest.TestCase):
         self.ops.ledger = _Ledger()
         with patch.object(self.ops, "_providers", return_value=("claude", "codex")):
             obs_record = self.ops._anchor_delivery_record("codex")
-        started = (
-            obs_record is not None
-            and self.ops._record_observed_turn_start(obs_record)
-        )
+            with patch.object(
+                self.ops, "_current_request_attestation_observed_at",
+                return_value=self.live_attestation_observed_at,
+            ):
+                started = (
+                    obs_record is not None
+                    and self.ops._record_observed_turn_start(obs_record)
+                )
         return obs_record is not None, started
 
     def test_only_the_exact_anchor_record_confirms_delivery(self):
@@ -644,17 +653,17 @@ class TurnStartAuthorityTests(unittest.TestCase):
         return base
 
     def test_started_requires_an_observed_start_and_the_generation_binding(self):
-        # Design j#87409: BOTH an observed start AND the persisted process binding matching
-        # the request pins (assigned_name / locator / row_revision) are required.
-        # (The request fixture pins gateway_revision="" -> use a revision-pinned request.)
+        # Design j#87409 + review j#87418: BOTH an observed start on the v2 QUEUE-ENTER
+        # observation AND a generation-coherent binding (pins + provider + the binding's
+        # attestation_observed_at == the live current-generation attestation) are required.
         self.ops = LiveGatewayRecoveryOps(
             repo_root=self.repo, request=_request(gateway_revision="4"),
         )
-        # Unobserved telemetry (both None) => never started.
+        # Unobserved telemetry => never started.
         _, started = self._facts_with([self._rec()])
         self.assertFalse(started)
-        # v2 fast-turn shape: pre-Enter armed wait collected ``changed`` while the snapshot
-        # settled — started WITH the binding.
+        # v2 fast-turn: pre-Enter armed wait collected ``changed`` while the snapshot settled
+        # — started WITH a generation-coherent binding.
         _, started = self._facts_with([self._rec(queue_enter_observation={
             "read_ok": True, "runtime_state": "turn_ended",
             "event_wait_kind": "changed", "observation_version": 2,
@@ -667,29 +676,50 @@ class TurnStartAuthorityTests(unittest.TestCase):
             "event_wait_kind": "changed",
         })])
         self.assertFalse(started)
-        # armed-wait rail outcome started + binding => started; without binding => not.
+        # F3: the strict event-rail turn_start_outcome branch is UNREACHABLE / removed — a
+        # standard-rail record (turn_start_outcome only, no queue-enter binding) never starts,
+        # even with a binding grafted on (it is not a v2 queue-enter observed start).
         _, started = self._facts_with([self._rec(
             turn_start_outcome={"outcome": "started"},
             queue_enter_observation={"gateway_binding": self._binding()},
         )])
-        self.assertTrue(started)
-        _, started = self._facts_with([self._rec(
-            turn_start_outcome={"outcome": "started"},
-        )])
         self.assertFalse(started)
-        # A recycled generation: same locator/name, DIFFERENT row revision in the binding —
-        # an old observed start can never combine with the current process (j#87403 F2).
+        # F2: a recycled generation — same locator/name but a DIFFERENT row revision — never
+        # binds.
         _, started = self._facts_with([self._rec(queue_enter_observation={
             "event_wait_kind": "changed",
             "gateway_binding": self._binding(row_revision="9"),
         })])
         self.assertFalse(started)
-        # A blank attestation observed_at never binds.
+        # F2: a FOREIGN provider in the binding never binds (provider is now an axis).
+        _, started = self._facts_with([self._rec(queue_enter_observation={
+            "event_wait_kind": "changed",
+            "gateway_binding": self._binding(provider="claude"),
+        })])
+        self.assertFalse(started)
+        # F2: a stale hand-written attestation_observed_at that does NOT equal the live
+        # current-generation attestation never binds (non-empty is not authority).
+        _, started = self._facts_with([self._rec(queue_enter_observation={
+            "event_wait_kind": "changed",
+            "gateway_binding": self._binding(
+                attestation_observed_at="2000-01-01T00:00:00+00:00"
+            ),
+        })])
+        self.assertFalse(started)
+        # F2: a blank attestation observed_at never binds.
         _, started = self._facts_with([self._rec(queue_enter_observation={
             "event_wait_kind": "changed",
             "gateway_binding": self._binding(attestation_observed_at=""),
         })])
         self.assertFalse(started)
+        # F1 (recovery side): a recycle BETWEEN delivery and recovery changes the LIVE
+        # attestation — the same binding no longer equates and fails closed.
+        self.live_attestation_observed_at = "2026-07-24T18:00:00+00:00"
+        _, started = self._facts_with([self._rec(queue_enter_observation={
+            "event_wait_kind": "changed", "gateway_binding": self._binding(),
+        })])
+        self.assertFalse(started)
+        self.live_attestation_observed_at = "2026-07-24T17:00:00+00:00"
         # Timeout / settled snapshot / unread snapshot never start even with a binding.
         for qe in (
             {"event_wait_kind": "timeout", "gateway_binding": self._binding()},
