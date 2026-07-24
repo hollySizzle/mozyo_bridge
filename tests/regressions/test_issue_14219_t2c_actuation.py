@@ -1034,5 +1034,55 @@ class T2cProductionActuationTest(unittest.TestCase):
         )
 
 
+    # ------------------------------------------------------------------ R7-F1
+    def _make_intent_db_a_directory(self):
+        # The reviewer's own raw-error probe: the intent DB path is a DIRECTORY, so the store's
+        # own sqlite3.connect raises a raw OperationalError ("unable to open" on write / "disk I/O
+        # error" on read) that the store boundary must normalize to HibernateRedriveIntentError.
+        from mozyo_bridge.core.state.hibernate_redrive_intent import (
+            hibernate_redrive_intent_path,
+        )
+
+        hibernate_redrive_intent_path(self.home).mkdir(parents=True, exist_ok=True)
+
+    def test_a_raw_sqlite_write_failure_normalizes_to_intent_persist_failed(self):
+        # Review j#86975 R7-F1: a REAL SQLite open failure during the fresh actuation's pre-CAS
+        # intent write is normalized to the typed intent_persist_failed and refuses the CAS —
+        # NOT a raw exception that aborts the whole hibernate leg (skipped_reason=hibernate_leg_
+        # error). Against the pre-R7 un-normalized store the raw error escapes and no typed
+        # attempt is produced — the probe.
+        self._make_intent_db_a_directory()
+        pages = {ISSUE: self._early_page(), RELEASE_ISSUE: self._receipt_page()}
+        report, _source = self._run_supervisor(pages)
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        reasons = [attempt["reason"] for attempt in outcome.hibernate_attempts]
+        self.assertIn("intent_persist_failed", reasons)
+        self.assertNotIn(
+            "actuated", [attempt["kind"] for attempt in outcome.hibernate_attempts]
+        )
+        self.assertEqual(self._lane_row().lane_disposition, "active")
+
+    def test_a_raw_sqlite_read_failure_normalizes_to_redrive_intent_unreadable(self):
+        # Review j#86975 R7-F1: a REAL SQLite read failure during a redrive's intent read is
+        # normalized to the typed redrive_intent_unreadable zero-close — NOT a raw exception.
+        from mozyo_bridge.core.state.lane_lifecycle_model import RELEASE_PARTIAL
+
+        self._hibernate_row_with_release(RELEASE_PARTIAL, seed_intent=False)
+        self._make_intent_db_a_directory()
+        before = self._lane_row()
+        report, source = self._run_supervisor({})
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        reasons = [attempt["reason"] for attempt in outcome.hibernate_attempts]
+        self.assertIn("redrive_intent_unreadable", reasons)
+        self.assertEqual(source.reads, [])
+        after = self._lane_row()
+        self.assertEqual(
+            (after.process_release, after.revision),
+            (before.process_release, before.revision),
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

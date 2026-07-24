@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.hibernate_redrive_intent import (
+    HIBERNATE_REDRIVE_INTENT_SCHEMA_VERSION,
     REQUIRED_ASSERTION_FLAG_KEYS,
     HibernateRedriveIntentError,
     HibernateRedriveIntentStore,
@@ -221,6 +222,31 @@ class HibernateRedriveIntentStoreTest(unittest.TestCase):
 
         fields = {f.name for f in dataclasses.fields(HibernateAssertions)}
         self.assertEqual(set(REQUIRED_ASSERTION_FLAG_KEYS), fields)
+
+    # ------------------------------------------------------------------ R7-F1
+    def test_raw_io_failures_normalize_to_typed_error(self) -> None:
+        # Review j#86975 R7-F1: real SQLite open / write / read failures are a typed
+        # HibernateRedriveIntentError at the store boundary, NEVER a raw sqlite3.Error / OSError
+        # that would escape the caller's fail-closed handling.
+        # (1) write + read where the DB path is a DIRECTORY (raw OperationalError at connect).
+        dbdir = self.dir / "as-a-dir.sqlite"
+        dbdir.mkdir()
+        store = HibernateRedriveIntentStore(path=dbdir)
+        with self.assertRaises(HibernateRedriveIntentError):
+            store.record(_intent())
+        with self.assertRaises(HibernateRedriveIntentError):
+            store.get("wsW", "lane_1", 2)
+        # (2) read where the container is valid-versioned but the table is gone (raw
+        #     OperationalError: no such table at the SELECT).
+        p = self.dir / "no-table.sqlite"
+        conn = sqlite3.connect(p)
+        try:
+            conn.execute(f"PRAGMA user_version = {HIBERNATE_REDRIVE_INTENT_SCHEMA_VERSION}")
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(HibernateRedriveIntentError):
+            HibernateRedriveIntentStore(path=p).get("wsW", "lane_1", 2)
 
     def test_a_foreign_schema_version_fails_closed(self) -> None:
         self.store.record(_intent())

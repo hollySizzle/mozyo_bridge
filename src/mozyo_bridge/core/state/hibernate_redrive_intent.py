@@ -207,45 +207,75 @@ class HibernateRedriveIntentStore:
     def __init__(self, path: Optional[Path] = None, *, home: Optional[Path] = None) -> None:
         self.path = Path(path) if path is not None else hibernate_redrive_intent_path(home)
 
+    @staticmethod
+    def _safe_close(conn: Optional[sqlite3.Connection]) -> None:
+        if conn is not None:
+            try:
+                conn.close()
+            except (sqlite3.Error, OSError):  # a close failure must not mask the real error
+                pass
+
     def _connect_rw(self) -> sqlite3.Connection:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path, isolation_level=None)
-        conn.execute("PRAGMA busy_timeout = 2000")
-        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version == 0:
-            conn.execute(_INTENT_TABLE_SQL)
-            conn.execute(
-                f"PRAGMA user_version = {HIBERNATE_REDRIVE_INTENT_SCHEMA_VERSION}"
-            )
-        elif version not in _RECOGNIZED_SCHEMA_VERSIONS:
-            conn.close()
+        # Review j#86975 R7-F1: every real open / parent-creation / PRAGMA / DDL failure is
+        # normalized to a typed HibernateRedriveIntentError (never a raw sqlite3.Error / OSError
+        # that would escape the wiring's fail-closed handling and crash the whole hibernate leg),
+        # and any partially-opened connection is closed before raising.
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self.path, isolation_level=None)
+            conn.execute("PRAGMA busy_timeout = 2000")
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version == 0:
+                conn.execute(_INTENT_TABLE_SQL)
+                conn.execute(
+                    f"PRAGMA user_version = {HIBERNATE_REDRIVE_INTENT_SCHEMA_VERSION}"
+                )
+            elif version not in _RECOGNIZED_SCHEMA_VERSIONS:
+                conn.close()
+                raise HibernateRedriveIntentError(
+                    f"redrive intent store {self.path} has unsupported schema version "
+                    f"{version}; this build understands {sorted(_RECOGNIZED_SCHEMA_VERSIONS)}. "
+                    "The DB is left untouched (downgrade-safe); use a newer build or move it "
+                    "aside."
+                )
+            else:
+                conn.execute(_INTENT_TABLE_SQL)  # self-heal a table lost under a valid version
+            return conn
+        except HibernateRedriveIntentError:
+            raise  # the downgrade-safe foreign-schema refusal — already typed, conn closed
+        except (sqlite3.Error, OSError) as exc:
+            self._safe_close(conn)
             raise HibernateRedriveIntentError(
-                f"redrive intent store {self.path} has unsupported schema version {version}; "
-                f"this build understands {sorted(_RECOGNIZED_SCHEMA_VERSIONS)}. The DB is left "
-                "untouched (downgrade-safe); use a newer build or move it aside."
-            )
-        else:
-            conn.execute(_INTENT_TABLE_SQL)  # self-heal a table lost under a valid version
-        return conn
+                f"redrive intent store {self.path} could not be opened for write "
+                f"({type(exc).__name__}); fail closed"
+            ) from exc
 
     def _connect_ro(self) -> Optional[sqlite3.Connection]:
         if not self.path.exists():
             return None
-        conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        # Review j#86975 R7-F1: normalize the open / PRAGMA read failures too (a corrupt
+        # container, a directory-as-path, a disk I/O error) to a typed HibernateRedriveIntentError,
+        # closing any partial connection.
+        conn: Optional[sqlite3.Connection] = None
         try:
+            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
-            conn.close()
+            if version not in _RECOGNIZED_SCHEMA_VERSIONS:
+                conn.close()
+                raise HibernateRedriveIntentError(
+                    f"redrive intent store {self.path} has unsupported schema version "
+                    f"{version}; this build understands {sorted(_RECOGNIZED_SCHEMA_VERSIONS)}."
+                )
+            return conn
+        except HibernateRedriveIntentError:
+            raise
+        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+            self._safe_close(conn)
             raise HibernateRedriveIntentError(
-                f"redrive intent store {self.path} is unreadable: {exc}"
+                f"redrive intent store {self.path} is unreadable "
+                f"({type(exc).__name__}); fail closed"
             ) from exc
-        if version not in _RECOGNIZED_SCHEMA_VERSIONS:
-            conn.close()
-            raise HibernateRedriveIntentError(
-                f"redrive intent store {self.path} has unsupported schema version {version}; "
-                f"this build understands {sorted(_RECOGNIZED_SCHEMA_VERSIONS)}."
-            )
-        return conn
 
     def record(self, intent: RedriveIntent, *, now: Optional[str] = None) -> None:
         """Persist (upsert) the fresh actuation's intent, keyed by (workspace, lane, generation).
@@ -291,10 +321,10 @@ class HibernateRedriveIntentStore:
                 ),
             )
             conn.execute("COMMIT")
-        except sqlite3.DatabaseError as exc:
+        except (sqlite3.Error, OSError) as exc:
             try:
                 conn.execute("ROLLBACK")
-            except sqlite3.DatabaseError:
+            except (sqlite3.Error, OSError):
                 pass
             raise HibernateRedriveIntentError(
                 f"redrive intent record failed ({type(exc).__name__}); fail closed"
@@ -325,6 +355,12 @@ class HibernateRedriveIntentStore:
                 "WHERE workspace_id=? AND lane_id=? AND lane_generation=?",
                 (ws, lane, int(lane_generation)),
             ).fetchone()
+        except (sqlite3.Error, OSError) as exc:
+            # Review j#86975 R7-F1: a SELECT / read failure is a typed unreadable, not a raw
+            # exception that would escape the redrive's fail-closed zero-close.
+            raise HibernateRedriveIntentError(
+                f"redrive intent read failed ({type(exc).__name__}); fail closed"
+            ) from exc
         finally:
             conn.close()
         if row is None:
