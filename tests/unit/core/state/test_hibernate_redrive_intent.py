@@ -10,6 +10,7 @@ basis), and a foreign schema version (must fail closed, never rewrite).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import tempfile
@@ -20,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.hibernate_redrive_intent import (
+    REQUIRED_ASSERTION_FLAG_KEYS,
     HibernateRedriveIntentError,
     HibernateRedriveIntentStore,
     RedriveIntent,
@@ -155,6 +157,70 @@ class HibernateRedriveIntentStoreTest(unittest.TestCase):
             self.store.record(_intent(workspace_id="  "))
         with self.assertRaises(HibernateRedriveIntentError):
             self.store.record(_intent(lane_id=""))
+
+    # ------------------------------------------------------------------ R6-F2
+    def _tamper_flags(self, flags_obj) -> None:
+        conn = sqlite3.connect(self.store.path)
+        try:
+            conn.execute(
+                "UPDATE hibernate_redrive_intent SET assertion_flags=?",
+                (json.dumps(flags_obj),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_string_false_flags_are_not_coerced_to_true(self) -> None:
+        # Review j#86928 R6-F2 (the exact defect): a corrupt blob whose every required gate is the
+        # JSON STRING "false" must NOT be truthiness-promoted to a satisfied basis. It fails closed.
+        self.store.record(_intent())
+        self._tamper_flags({k: "false" for k in REQUIRED_ASSERTION_FLAG_KEYS})
+        with self.assertRaises(HibernateRedriveIntentError):
+            self.store.get("wsW", "lane_1", 2)
+
+    def test_non_bool_flag_values_fail_closed(self) -> None:
+        # No coercion: a string, int (0/1), or null in any flag is corrupt derived state.
+        for bad in ("false", "true", 0, 1, None, [], {}):
+            with self.subTest(bad=bad):
+                self.store.record(_intent())
+                self._tamper_flags({**{k: True for k in REQUIRED_ASSERTION_FLAG_KEYS},
+                                    "review_approved": bad})
+                with self.assertRaises(HibernateRedriveIntentError):
+                    self.store.get("wsW", "lane_1", 2)
+
+    def test_unknown_key_and_missing_key_fail_closed(self) -> None:
+        self.store.record(_intent())
+        self._tamper_flags({**{k: True for k in REQUIRED_ASSERTION_FLAG_KEYS},
+                            "bogus_flag": True})
+        with self.assertRaises(HibernateRedriveIntentError):
+            self.store.get("wsW", "lane_1", 2)
+        self.store.record(_intent())
+        partial = {k: True for k in REQUIRED_ASSERTION_FLAG_KEYS if k != "review_approved"}
+        self._tamper_flags(partial)
+        with self.assertRaises(HibernateRedriveIntentError):
+            self.store.get("wsW", "lane_1", 2)
+
+    def test_record_rejects_a_non_conforming_intent_at_write(self) -> None:
+        # Writer-side validation (R6-F2 condition 1): a non-bool value is refused before storage.
+        with self.assertRaises(HibernateRedriveIntentError):
+            self.store.record(_intent(assertion_flags={**_FLAGS, "review_approved": "false"}))
+        with self.assertRaises(HibernateRedriveIntentError):
+            self.store.record(_intent(assertion_flags={**_FLAGS, "bogus": True}))
+        missing = {k: v for k, v in _FLAGS.items() if k != "commits_pushed"}
+        with self.assertRaises(HibernateRedriveIntentError):
+            self.store.record(_intent(assertion_flags=missing))
+
+    def test_vocabulary_matches_hibernate_assertions_fields(self) -> None:
+        # Drift guard: the store's literal closed vocabulary IS exactly the HibernateAssertions
+        # flag set, so the two never diverge (the store stays domain-agnostic; the test bridges).
+        import dataclasses
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_assertions import (  # noqa: E501
+            HibernateAssertions,
+        )
+
+        fields = {f.name for f in dataclasses.fields(HibernateAssertions)}
+        self.assertEqual(set(REQUIRED_ASSERTION_FLAG_KEYS), fields)
 
     def test_a_foreign_schema_version_fails_closed(self) -> None:
         self.store.record(_intent())

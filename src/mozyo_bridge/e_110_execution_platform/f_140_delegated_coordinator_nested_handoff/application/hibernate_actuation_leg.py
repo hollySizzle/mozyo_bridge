@@ -67,6 +67,11 @@ LEG_REASON_WORKTREE_UNRESOLVED = "candidate_worktree_unresolved"
 # zero-close: the redrive never fabricates the basis the row failed to record.
 LEG_REASON_REDRIVE_INTENT_ABSENT = "redrive_intent_absent"
 LEG_REASON_REDRIVE_INTENT_MISMATCH = "redrive_intent_mismatch"
+LEG_REASON_REDRIVE_INTENT_UNREADABLE = "redrive_intent_unreadable"
+# Review j#86928 R6-F1: the fresh actuation could NOT durably persist its redrive intent, so the
+# irreversible CAS is refused — persisting the intent pre-CAS is what makes a post-CAS crash
+# recoverable, and a hibernate that cannot be recovered would strand the live process forever.
+LEG_REASON_INTENT_PERSIST_FAILED = "intent_persist_failed"
 
 
 @dataclass(frozen=True)
@@ -139,7 +144,7 @@ def run_hibernate_pass(
     lease_renew_fn: Callable[[], bool],
     use_case_fn: Optional[Callable[[HibernateCandidate], Optional[SublaneHibernateUseCase]]] = None,
     record_intent_fn: Optional[
-        Callable[[HibernateCandidate, ActuationRequestFields], None]
+        Callable[[HibernateCandidate, ActuationRequestFields], bool]
     ] = None,
     budget_consumed: bool = False,
 ) -> HibernatePassResult:
@@ -219,14 +224,19 @@ def run_hibernate_pass(
                 issue, lane, ATTEMPT_BLOCKED, LEG_REASON_WORKTREE_UNRESOLVED
             ))
             continue
-        # Review j#86776 R5-F3: persist the durable redrive intent immediately BEFORE the
-        # irreversible CAS. If the CAS lands but the release then crashes, the next pass's
-        # redrive reconstructs THIS actuation's proven basis from the intent instead of
-        # fabricating it. Best-effort: a persist failure never blocks the fresh actuation (a
-        # missing intent only fails-closed a *future* redrive, never mis-acts), and the derived
-        # request the fence guards is unchanged.
-        if record_intent_fn is not None:
-            record_intent_fn(candidate, fields)
+        # Review j#86776 R5-F3 / review j#86928 R6-F1: persist the durable redrive intent
+        # immediately BEFORE the irreversible CAS, and make that persist a PRECONDITION of the
+        # CAS. If the CAS landed but the release then crashed, the next pass's redrive
+        # reconstructs THIS actuation's proven basis from the intent; if the intent could NOT be
+        # persisted (a write / unreadable / schema / validation failure) the CAS is refused with
+        # a typed zero-transition / zero-close, leaving the lane active — a hibernate that could
+        # never be recovered would strand the live process forever (R6-F1). ``record_intent_fn``
+        # returns whether the intent is durably stored.
+        if record_intent_fn is not None and not record_intent_fn(candidate, fields):
+            attempts.append(HibernateAttempt(
+                issue, lane, ATTEMPT_BLOCKED, LEG_REASON_INTENT_PERSIST_FAILED
+            ))
+            continue
         outcome = bound_use_case.run(_to_request(fields), execute=True)
 
         # A lease lost at the use case's commit boundary committed nothing; stop the pass.
@@ -372,6 +382,8 @@ __all__ = [
     "LEG_REASON_LEASE_LOST",
     "LEG_REASON_REDRIVE_INTENT_ABSENT",
     "LEG_REASON_REDRIVE_INTENT_MISMATCH",
+    "LEG_REASON_REDRIVE_INTENT_UNREADABLE",
+    "LEG_REASON_INTENT_PERSIST_FAILED",
     "RedriveResult",
     "run_hibernate_redrives",
     "NO_ACTUATION_NO_CANDIDATE",

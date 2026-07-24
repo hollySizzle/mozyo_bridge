@@ -257,6 +257,13 @@ class T2cProductionActuationTest(unittest.TestCase):
         self.assertEqual(row.lane_disposition, "hibernated")
         # Bounded provider reads: the issue page once (memoised) + the one receipt page.
         self.assertEqual(sorted(set(source.reads)), [ISSUE, RELEASE_ISSUE])
+        # Review j#86928 R6-F1: the fresh actuation durably persisted its redrive intent (the
+        # basis a post-CAS crash redrive would reconstruct) before the CAS.
+        from mozyo_bridge.core.state.hibernate_redrive_intent import HibernateRedriveIntentStore
+
+        intent = HibernateRedriveIntentStore(home=self.home).get(self.workspace_id, LANE, 1)
+        self.assertIsNotNone(intent)
+        self.assertEqual((intent.issue_id, intent.basis), (ISSUE, "early_hibernate"))
 
     def _run_supervisor_with_runtime_hook(self, pages, runtime_hook):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
@@ -955,6 +962,70 @@ class T2cProductionActuationTest(unittest.TestCase):
         outcome = self._workspace_outcome(report)
         self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
         self.assertEqual(list(outcome.hibernate_attempts), [])
+        self.assertEqual(source.reads, [])
+        after = self._lane_row()
+        self.assertEqual(
+            (after.process_release, after.revision),
+            (before.process_release, before.revision),
+        )
+
+
+    # ------------------------------------------------------------------ R6-F1
+    def test_an_intent_write_failure_refuses_the_cas(self):
+        # Review j#86928 R6-F1 (fault injection): the pre-CAS redrive-intent write fails, so the
+        # irreversible disposition CAS must be REFUSED — a hibernate whose intent could not be
+        # persisted would strand the live process forever (a post-CAS crash could never be
+        # redriven). Zero transition / zero close; the lane stays active. Against the pre-R6
+        # best-effort swallow the lane hibernates despite the failed write — the mutation probe.
+        from mozyo_bridge.core.state.hibernate_redrive_intent import (
+            HibernateRedriveIntentError,
+            HibernateRedriveIntentStore,
+        )
+
+        def boom(self, intent, *args, **kwargs):
+            raise HibernateRedriveIntentError("injected intent write failure")
+
+        pages = {ISSUE: self._early_page(), RELEASE_ISSUE: self._receipt_page()}
+        with mock.patch.object(HibernateRedriveIntentStore, "record", boom):
+            report, _source = self._run_supervisor(pages)
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        kinds = [attempt["kind"] for attempt in outcome.hibernate_attempts]
+        reasons = [attempt["reason"] for attempt in outcome.hibernate_attempts]
+        self.assertNotIn("actuated", kinds)
+        self.assertIn("intent_persist_failed", reasons)
+        self.assertEqual(self._lane_row().lane_disposition, "active")
+
+    # ------------------------------------------------------------------ R6-F2
+    def test_a_corrupt_intent_blob_is_a_typed_zero_close(self):
+        # Review j#86928 R6-F2: a hibernated row with a redrivable release but a CORRUPT intent
+        # blob (every gate the JSON string "false") is a typed zero-close — the reader refuses to
+        # truthiness-coerce it into a satisfied basis, so the redrive never runs. Against the
+        # pre-R6 coercion the "false" strings decode to True and the redrive releases — the probe.
+        import json
+        import sqlite3
+        from mozyo_bridge.core.state.lane_lifecycle_model import RELEASE_PARTIAL
+        from mozyo_bridge.core.state.hibernate_redrive_intent import (
+            REQUIRED_ASSERTION_FLAG_KEYS,
+            hibernate_redrive_intent_path,
+        )
+
+        self._hibernate_row_with_release(RELEASE_PARTIAL)  # seeds a VALID intent
+        conn = sqlite3.connect(hibernate_redrive_intent_path(self.home))
+        try:
+            conn.execute(
+                "UPDATE hibernate_redrive_intent SET assertion_flags=?",
+                (json.dumps({k: "false" for k in REQUIRED_ASSERTION_FLAG_KEYS}),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        before = self._lane_row()
+        report, source = self._run_supervisor({})
+        outcome = self._workspace_outcome(report)
+        self.assertEqual(outcome.hibernate_mutations, 0, outcome.hibernate_attempts)
+        reasons = [attempt["reason"] for attempt in outcome.hibernate_attempts]
+        self.assertIn("redrive_intent_unreadable", reasons)
         self.assertEqual(source.reads, [])
         after = self._lane_row()
         self.assertEqual(

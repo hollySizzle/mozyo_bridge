@@ -69,6 +69,69 @@ class HibernateRedriveIntentError(RuntimeError):
     """The redrive-intent DB could not be opened / read at a recognized schema (fail-closed)."""
 
 
+#: The CLOSED assertion-flag vocabulary an intent's ``assertion_flags`` must carry EXACTLY
+#: (review j#86928 R6-F2). Kept as a literal set here so the store stays domain-agnostic (it
+#: imports no ``f_140`` domain type); a drift-guard test pins it against the
+#: ``HibernateAssertions`` dataclass fields so the two never diverge. The store validates
+#: membership + literal JSON boolean TYPE and NEVER coerces — a corrupt blob (e.g. the string
+#: ``"false"`` or ``0``) is derived state that must not be promoted to a satisfied basis.
+REQUIRED_ASSERTION_FLAG_KEYS = frozenset(
+    {
+        "explicitly_parked",
+        "callbacks_drained",
+        "no_review_pending",
+        "no_owner_approval_pending",
+        "no_integration_pending",
+        "no_pending_prompt",
+        "not_working",
+        "worktree_clean",
+        "boundary_recorded",
+        "review_approved",
+        "staging_integrated",
+        "required_ci_green",
+        "dogfood_delegated",
+        "commits_pushed",
+    }
+)
+
+
+def _validate_assertion_flags(flags: object) -> dict[str, bool]:
+    """Validate the closed flag vocabulary and literal JSON boolean type (review j#86928 R6-F2).
+
+    NEVER coerces: a value that is not a literal ``bool`` (``isinstance(v, bool)`` — which
+    rejects the string ``"false"``, the ints ``0`` / ``1``, and ``None``), an unknown key, or a
+    missing required flag raises :class:`HibernateRedriveIntentError`. A corrupt / tampered local
+    blob is malformed derived state, and malformed state must never be promoted to a satisfied
+    hibernate basis. Applied on BOTH write (reject a non-conforming intent) and read (reject a
+    corrupt blob).
+    """
+    if not isinstance(flags, dict):
+        raise HibernateRedriveIntentError(
+            f"assertion_flags must be a JSON object; got {type(flags).__name__}"
+        )
+    seen: set[str] = set()
+    for key, value in flags.items():
+        name = str(key)
+        if name not in REQUIRED_ASSERTION_FLAG_KEYS:
+            raise HibernateRedriveIntentError(
+                f"assertion_flags carries an unknown key {name!r}; fail closed"
+            )
+        if not isinstance(value, bool):
+            # A literal JSON boolean ONLY — the string "false" / 0 / 1 / null is corrupt, never
+            # a truthiness-coerced True/False.
+            raise HibernateRedriveIntentError(
+                f"assertion flag {name!r} is not a boolean ({type(value).__name__}); "
+                "fail closed (no coercion)"
+            )
+        seen.add(name)
+    missing = REQUIRED_ASSERTION_FLAG_KEYS - seen
+    if missing:
+        raise HibernateRedriveIntentError(
+            f"assertion_flags is missing required flags {sorted(missing)}; fail closed"
+        )
+    return {str(k): bool(v) for k, v in flags.items()}
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -198,9 +261,10 @@ class HibernateRedriveIntentStore:
                 f"got workspace_id={intent.workspace_id!r} lane_id={intent.lane_id!r}"
             )
         stamp = now or _utc_now_iso()
+        # Review j#86928 R6-F2: validate the closed vocabulary + literal boolean type at write
+        # too, so a non-conforming intent is refused (never coerced) before it can be stored.
         flags_json = json.dumps(
-            {str(k): bool(v) for k, v in dict(intent.assertion_flags).items()},
-            sort_keys=True,
+            _validate_assertion_flags(dict(intent.assertion_flags)), sort_keys=True
         )
         conn = self._connect_rw()
         try:
@@ -272,11 +336,10 @@ class HibernateRedriveIntentStore:
                 f"redrive intent for {ws}/{lane}@{lane_generation} has a corrupt "
                 f"assertion_flags blob; fail closed ({exc})"
             ) from exc
-        if not isinstance(flags, dict):
-            raise HibernateRedriveIntentError(
-                f"redrive intent for {ws}/{lane}@{lane_generation} has a non-object "
-                "assertion_flags blob; fail closed"
-            )
+        # Review j#86928 R6-F2: validate the closed vocabulary + literal boolean type WITHOUT
+        # coercion — a blob whose flags are the string "false" / 0 / null / an unknown key is
+        # corrupt derived state and fails closed, never a truthiness-promoted satisfied basis.
+        validated = _validate_assertion_flags(flags)
         return RedriveIntent(
             workspace_id=row[0],
             lane_id=row[1],
@@ -285,12 +348,13 @@ class HibernateRedriveIntentStore:
             decision_journal=row[4],
             basis=row[5],
             action_id=row[6],
-            assertion_flags={str(k): bool(v) for k, v in flags.items()},
+            assertion_flags=validated,
             recorded_at=row[8],
         )
 
 
 __all__ = (
+    "REQUIRED_ASSERTION_FLAG_KEYS",
     "HIBERNATE_REDRIVE_INTENT_FILENAME",
     "HIBERNATE_REDRIVE_INTENT_SCHEMA_VERSION",
     "HibernateRedriveIntentError",

@@ -102,6 +102,7 @@ from .hibernate_actuation_leg import (
     LEG_REASON_LEASE_LOST,
     LEG_REASON_REDRIVE_INTENT_ABSENT,
     LEG_REASON_REDRIVE_INTENT_MISMATCH,
+    LEG_REASON_REDRIVE_INTENT_UNREADABLE,
     HibernateAttempt,
     HibernatePassResult,
     RedriveResult,
@@ -675,10 +676,12 @@ def build_hibernate_leg_fn(
         # times).
         intent_store = HibernateRedriveIntentStore(home=home)
 
-        def record_intent(candidate: HibernateCandidate, fields) -> None:
-            # Persist the fresh actuation's derived intent immediately before its CAS. Best-effort
-            # (review j#86776 R5-F3): a persist failure never blocks the fresh actuation — a later
-            # redrive with no intent simply fails closed (zero-close), never mis-acts.
+        def record_intent(candidate: HibernateCandidate, fields) -> bool:
+            # Persist the fresh actuation's derived intent immediately before its CAS, and REPORT
+            # whether it was durably stored (review j#86928 R6-F1). A write / unreadable / schema
+            # / validation failure returns ``False`` so the leg refuses the irreversible CAS —
+            # a hibernate whose intent could not be persisted would strand the live process on a
+            # post-CAS crash (the redrive could never reconstruct the basis).
             try:
                 intent_store.record(
                     RedriveIntent(
@@ -693,7 +696,8 @@ def build_hibernate_leg_fn(
                     )
                 )
             except HibernateRedriveIntentError:
-                pass
+                return False
+            return True
 
         # Crash-redrive prelude (review j#86757 R4-F2 / review j#86776 R5-F2/F3/F5): finish a
         # prior pass's interrupted release BEFORE any fresh mutation — convergence precedes new
@@ -762,7 +766,10 @@ def build_hibernate_leg_fn(
             try:
                 intent = intent_store.get(workspace, lane, generation)
             except HibernateRedriveIntentError:
-                intent = None  # unreadable / corrupt intent -> no usable basis (fail-closed)
+                # Unreadable / corrupt intent (review j#86928 R6-F2: a non-bool / unknown-key /
+                # malformed blob raises) -> no usable basis, a typed zero-close DISTINCT from a
+                # genuinely absent intent.
+                return LEG_REASON_REDRIVE_INTENT_UNREADABLE
             if intent is None:
                 return LEG_REASON_REDRIVE_INTENT_ABSENT
             if not intent.matches_row(
