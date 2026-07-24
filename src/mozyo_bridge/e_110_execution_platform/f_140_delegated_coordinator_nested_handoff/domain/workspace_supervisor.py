@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable, Sequence
 
+from . import hibernate_report_rollup as _hib_rollup
+
 # ---------------------------------------------------------------------------
 # Supervision modes (machine-readable; literal regardless of UI language).
 # ---------------------------------------------------------------------------
@@ -621,6 +623,9 @@ class WorkspaceSupervisionOutcome:
             "backlog_blocked": self.backlog_blocked,
             "backlog_recovered": self.backlog_recovered,
             "backlog_transient_skipped": self.backlog_transient_skipped,
+            "hibernate_ran": self.hibernate_ran,
+            "hibernate_mutations": self.hibernate_mutations,
+            "hibernate_attempts": [dict(a) for a in self.hibernate_attempts],
             "issues": [i.as_payload() for i in self.issues],
         }
 
@@ -675,17 +680,60 @@ class SupervisorReport:
 
     @property
     def empty_pass(self) -> bool:
-        """True iff this pass produced no delivery, no supply, and no provider read (Redmine #14150).
+        """True iff this pass produced no delivery, supply, provider read, OR hibernate work.
 
         The observability signal the issue asks for: an empty drain pass (nothing to deliver) is
-        visible as ``empty_pass`` with ``provider_calls == 0``.
+        visible as ``empty_pass`` with ``provider_calls == 0``. Redmine #14219 T3 (Answer j#87108
+        item 4): a folded hibernate leg that applied a mutation OR even evaluated a candidate is
+        NOT an empty pass — ``empty_pass`` must never falsely report a hibernate mutation/attempt
+        as empty.
         """
         return (
             self.delivered == 0
             and self.blocked == 0
             and self.events_supplied == 0
             and self.provider_calls == 0
+            and self.hibernate_mutations == 0
+            and self.hibernate_candidates == 0
         )
+
+    # -- auto-hibernate roll-up (Redmine #14219 T3, Answer j#87108 item 4): thin delegations to
+    #    the pure ``hibernate_report_rollup`` leaf (module-health line split).
+
+    @property
+    def hibernate_ran(self) -> bool:
+        return _hib_rollup.ran(self.workspaces)
+
+    @property
+    def hibernate_candidates(self) -> int:
+        return _hib_rollup.candidates(self.workspaces)
+
+    @property
+    def hibernate_applied(self) -> int:
+        return _hib_rollup.applied(self.workspaces)
+
+    @property
+    def hibernate_mutations(self) -> int:
+        return _hib_rollup.applied(self.workspaces)
+
+    @property
+    def hibernate_released_capacity(self) -> int:
+        return _hib_rollup.applied(self.workspaces)
+
+    @property
+    def hibernate_blocked(self) -> int:
+        return _hib_rollup.blocked(self.workspaces)
+
+    @property
+    def hibernate_uncertain(self) -> int:
+        return _hib_rollup.uncertain(self.workspaces)
+
+    @property
+    def hibernate_closed_reasons(self) -> "tuple[str, ...]":
+        return _hib_rollup.closed_reasons(self.workspaces)
+
+    def hibernate_payload(self) -> dict[str, object]:
+        return _hib_rollup.payload(self.workspaces, self.duration_ms)
 
     @property
     def backlog_fenced(self) -> int:
@@ -712,6 +760,7 @@ class SupervisorReport:
             "empty_pass": self.empty_pass,
             "backlog_fenced": self.backlog_fenced,
             "backlog_recovered": self.backlog_recovered,
+            "hibernate": self.hibernate_payload(),
             "workspaces": [w.as_payload() for w in self.workspaces],
         }
 

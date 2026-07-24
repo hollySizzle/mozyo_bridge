@@ -285,16 +285,13 @@ class WorkspaceCallbackSupervisor:
         # duplicate-supervisor lease fence is unchanged (a live duplicate owner still skips).
         if mode == SUPERVISION_LOCAL_DRAIN:
             outcomes = [self._drain_workspace_locally(ws) for ws in self._workspaces_fn()]
-            return SupervisorReport(
-                mode=mode, holder=self._holder, workspaces=tuple(outcomes)
-            )
-        # Redmine #14219 T2c: the auto-hibernate leg — same early-return shape as local_drain,
-        # same per-workspace lease fence, zero callback/outbox side effects.
+            return SupervisorReport(mode=mode, holder=self._holder, workspaces=tuple(outcomes))
+        # Redmine #14219: the standalone auto-hibernate seam — a production-unreachable internal /
+        # test compatibility mode (T3 folds hibernate into the wake/reconcile passes instead; the
+        # scheduler never selects this mode). Same per-workspace lease fence, zero outbox effects.
         if mode == SUPERVISION_HIBERNATE:
             outcomes = _hibernate.hibernate_sweep(self)
-            return SupervisorReport(
-                mode=mode, holder=self._holder, workspaces=tuple(outcomes)
-            )
+            return SupervisorReport(mode=mode, holder=self._holder, workspaces=tuple(outcomes))
         wake_by_ws = group_wake_hints(wake_hints)
         # Redmine #13968 F1: resolve the authoritative-workspace map ONCE per sweep (a single
         # home-global lifecycle read), so every workspace's authoritative filter reads the same
@@ -317,6 +314,9 @@ class WorkspaceCallbackSupervisor:
                     authoritative=authoritative,
                 )
             )
+        # Redmine #14219 T3 (Answer j#87108): fold the auto-hibernate leg into the SAME bounded
+        # pass, after delivery/reconcile, for the event-wake + timer paths (see maybe_fold_hibernate).
+        outcomes = _hibernate.maybe_fold_hibernate(self, mode, outcomes)
         return SupervisorReport(mode=mode, holder=self._holder, workspaces=tuple(outcomes))
 
     def _drain_wake_for(self, workspace_id: str) -> tuple[str, ...]:
