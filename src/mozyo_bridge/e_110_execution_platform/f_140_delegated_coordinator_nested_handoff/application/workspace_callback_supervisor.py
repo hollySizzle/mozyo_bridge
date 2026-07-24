@@ -286,7 +286,15 @@ class WorkspaceCallbackSupervisor:
         # safe-pending pass both reach the ticket provider ZERO times (close condition 1). The
         # duplicate-supervisor lease fence is unchanged (a live duplicate owner still skips).
         if mode == SUPERVISION_LOCAL_DRAIN:
-            outcomes = [self._drain_workspace_locally(ws) for ws in self._workspaces_fn()]
+            # Redmine #14219 review j#87204 R3-F1: the LOCAL_DRAIN sweep shares the SAME pass-wide
+            # one-external-mutation budget as every other bounded pass (Final Disposition j#87188 = B).
+            # Deterministic (workspace-id) order so the first workspace to deliver spends the budget and
+            # the rest defer their rows to the next pass (row-level exactly-once preserved).
+            drain_budget: dict = {"reads": 0, "mutated": False, "uncertain": False}
+            outcomes = [
+                self._drain_workspace_locally(ws, pass_budget=drain_budget)
+                for ws in sorted(self._workspaces_fn(), key=lambda w: str(w.workspace_id or ""))
+            ]
             return SupervisorReport(mode=mode, holder=self._holder, workspaces=tuple(outcomes))
         # Redmine #14219: the standalone auto-hibernate seam — a production-unreachable internal /
         # test compatibility mode (T3 folds hibernate into the wake/reconcile passes instead; the
@@ -420,8 +428,10 @@ class WorkspaceCallbackSupervisor:
     def release_all_leases(self) -> tuple[str, ...]:
         return _drain.release_all_leases(self)
 
-    def _drain_workspace_locally(self, ws: SupervisedWorkspace) -> WorkspaceSupervisionOutcome:
-        return _drain.drain_workspace_locally(self, ws)
+    def _drain_workspace_locally(
+        self, ws: SupervisedWorkspace, *, pass_budget=None
+    ) -> WorkspaceSupervisionOutcome:
+        return _drain.drain_workspace_locally(self, ws, pass_budget=pass_budget)
 
     def _drain_issues_from_outbox(
         self, workspace_id: str, sender: Optional[Callable[[CallbackOutboxRow], str]],

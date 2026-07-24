@@ -62,10 +62,14 @@ class _FakeSource:
     actuation-phase fresh read (review j#86734 R2-F1).
     """
 
-    def __init__(self, pages, on_read=None):
+    def __init__(self, pages, on_read=None, created_on=""):
         self.pages = pages
         self.reads = []
         self.on_read = on_read
+        # Review j#87204 R3-F2: when set, every projected entry carries this provider ``created_on``
+        # (the drain-ready START authority) — the regression that a real timestamp must NOT falsify
+        # candidate freshness. The default "" reproduces the pre-R2-F2(a) provider projection.
+        self.created_on = created_on
 
     def read_entries(self, issue_id):
         issue = str(issue_id)
@@ -77,7 +81,9 @@ class _FakeSource:
             if replaced is not None:
                 page = replaced
         return [
-            RedmineJournalEntry(issue_id=issue, journal_id=str(jid), notes=notes)
+            RedmineJournalEntry(
+                issue_id=issue, journal_id=str(jid), notes=notes, created_on=self.created_on
+            )
             for jid, notes in page
         ]
 
@@ -184,7 +190,7 @@ class T2cProductionActuationTest(unittest.TestCase):
                       f":source_issue={ISSUE}:head={self.head}]"),
         )
 
-    def _run_supervisor(self, pages, on_read=None, herdr_binary=None, extra_env=None):
+    def _run_supervisor(self, pages, on_read=None, herdr_binary=None, extra_env=None, created_on=""):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             workspace_callback_supervisor as sup_mod,
         )
@@ -192,7 +198,7 @@ class T2cProductionActuationTest(unittest.TestCase):
             reconcile_live_source,
         )
 
-        source = _FakeSource(pages, on_read=on_read)
+        source = _FakeSource(pages, on_read=on_read, created_on=created_on)
         env = {
             key: value for key, value in os.environ.items()
             if not key.startswith("MOZYO") and key not in ("TMUX", "TMUX_PANE")
@@ -264,6 +270,32 @@ class T2cProductionActuationTest(unittest.TestCase):
         intent = HibernateRedriveIntentStore(home=self.home).get(self.workspace_id, LANE, 1)
         self.assertIsNotNone(intent)
         self.assertEqual((intent.issue_id, intent.basis), (ISSUE, "early_hibernate"))
+
+    def test_a_provider_created_on_actuates_and_measures_time_to_drain(self):
+        # Review j#87204 R3-F2 regression: a candidate whose journals carry a REAL provider
+        # ``created_on`` must still fresh-actuate (the observability-only drain-ready timestamp must
+        # NOT falsify candidate freshness identity) AND its time-to-drain must be measured from that
+        # start. The pre-fix code failed this as ``stale_basis`` because ``drain_ready_at`` was part
+        # of the candidate's dataclass equality and only the BUILD candidate was stamped.
+        pages = {ISSUE: self._early_page(), RELEASE_ISSUE: self._receipt_page()}
+        report, _ = self._run_supervisor(pages, created_on="2026-07-24T00:00:00+00:00")
+        outcome = next(
+            ws for ws in report.workspaces if ws.workspace_id == self.workspace_id
+        )
+        # It actuates exactly once (NOT stale_basis) despite the real created_on.
+        self.assertEqual(outcome.hibernate_mutations, 1, outcome.hibernate_attempts)
+        self.assertIn("actuated", [a["kind"] for a in outcome.hibernate_attempts])
+        self.assertNotIn("stale_basis", [a["kind"] for a in outcome.hibernate_attempts])
+        # And time-to-drain is measured: the START was the decision journal's created_on, the END
+        # the supervisor clock at the terminal actuation -> a completed, non-null latency.
+        self.assertEqual(report.hibernate_time_to_drain_status, "completed")
+        self.assertIsNotNone(report.hibernate_time_to_drain_ms)
+        self.assertGreaterEqual(report.hibernate_time_to_drain_ms, 0)
+        # The redrive intent carried the same drain-ready start (crash-redrive keeps the original).
+        from mozyo_bridge.core.state.hibernate_redrive_intent import HibernateRedriveIntentStore
+
+        intent = HibernateRedriveIntentStore(home=self.home).get(self.workspace_id, LANE, 1)
+        self.assertEqual(intent.drain_ready_at, "2026-07-24T00:00:00+00:00")
 
     def _run_supervisor_with_runtime_hook(self, pages, runtime_hook):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501

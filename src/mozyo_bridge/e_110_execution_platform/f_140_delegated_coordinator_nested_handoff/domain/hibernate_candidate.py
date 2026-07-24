@@ -30,7 +30,7 @@ declaration) and driving the public preflight is tranche T2.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 from mozyo_bridge.core.state.lane_lifecycle_model import DISPOSITION_ACTIVE
@@ -284,7 +284,14 @@ class HibernateCandidate:
     #: journal (never guessed from a journal id or a local observation). Blank when unavailable. It
     #: is an INTERNAL computation input and is deliberately NOT surfaced in :meth:`as_payload` — the
     #: report exposes only the DERIVED, redaction-safe latency + status, never the raw timestamp.
-    drain_ready_at: str = ""
+    #:
+    #: ``compare=False`` (review j#87204 R3-F2): this is OBSERVABILITY-ONLY and is NOT part of the
+    #: candidate's freshness identity. The action-time re-validation (``run_hibernate_pass``) requires
+    #: a fresh re-production to be EXACTLY equal to the built candidate; only the build candidate is
+    #: stamped (the fresh assembler is not), so including this field in equality would make EVERY
+    #: candidate carrying a real ``created_on`` fail as ``stale_basis`` and never actuate. Excluding it
+    #: from ``__eq__`` / ``__hash__`` keeps the lifecycle-anchor + basis-conjunct identity authoritative.
+    drain_ready_at: str = field(default="", compare=False)
 
     def as_payload(self) -> dict:
         return {

@@ -26,6 +26,9 @@ from mozyo_bridge.core.state.workflow_runtime_store import (
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_outbox_processor import (
     CallbackOutboxProcessor,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+    pass_external_budget as _pxb,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
     COORDINATOR_ROUTE,
     DRAIN_DEFER_ANCHOR_UNRESOLVED,
@@ -35,6 +38,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SKIP_LEASE_LOST,
     SKIP_LEASE_REFUSED,
     SKIP_NO_ACTIVE_ISSUES,
+    SKIP_PASS_BUDGET_SPENT,
     IssueSupervisionOutcome,
     WorkspaceSupervisionOutcome,
     partition_delivery_receipts,
@@ -81,13 +85,18 @@ def release_all_leases(sup) -> tuple[str, ...]:
     return tuple(released)
 
 
-def drain_workspace_locally(sup, ws) -> WorkspaceSupervisionOutcome:
+def drain_workspace_locally(sup, ws, *, pass_budget=None) -> WorkspaceSupervisionOutcome:
     """Drain one workspace's locally-attestable pending rows — ZERO provider reads (#14150).
 
     Acquires the workspace lease (the same duplicate-supervisor fence: a live duplicate owner is
     skipped, delivers nothing), reads the LOCAL outbox partition, and delivers the coordinator rows it
     can attest as current from local state. It never resolves a Redmine source, so an empty pass and a
     safe-pending pass both read the provider zero times.
+
+    ``pass_budget`` (Final Design Disposition j#87188 = B; review j#87204 R3-F1) is the whole
+    LOCAL_DRAIN pass's ONE external-mutation budget: a workspace whose pass already spent it performs
+    NO send (its rows stay pending for the next pass), and within a workspace the budget-wrapped
+    sender + defer fence cap the delivery at the pass's one external mutation total.
     """
     wsid = str(ws.workspace_id or "").strip()
     lease = sup._lease_store.acquire(
@@ -101,6 +110,15 @@ def drain_workspace_locally(sup, ws) -> WorkspaceSupervisionOutcome:
             skipped_reason=SKIP_LEASE_REFUSED,
         )
     try:
+        if pass_budget is not None and _pxb.budget_spent(pass_budget):
+            # An earlier workspace already used the pass's one external mutation — deliver nothing
+            # (this workspace's rows stay pending, delivered next pass).
+            return WorkspaceSupervisionOutcome(
+                workspace_id=wsid,
+                lease_acquired=True,
+                lease_reason=lease.reason,
+                skipped_reason=SKIP_PASS_BUDGET_SPENT,
+            )
         try:
             pending = sup._outbox.read(states=[CALLBACK_PENDING])
         except Exception:  # noqa: BLE001 - an unreadable outbox drains nothing (fail-open)
@@ -114,10 +132,15 @@ def drain_workspace_locally(sup, ws) -> WorkspaceSupervisionOutcome:
                 skipped_reason=SKIP_NO_ACTIVE_ISSUES,
             )
         sender = sup._drain_sender_fn(ws) if sup._drain_sender_fn is not None else None
+        budget_defer = None
+        if pass_budget is not None:
+            budget_defer = _pxb.external_budget_defer_fence(pass_budget)
+            if sender is not None:
+                sender = _pxb.budgeted_sender(sender, pass_budget)
         issue_outcomes, lease_lost = drain_issues_under_held_lease(
-            sup, wsid, drain_issues, sender
+            sup, wsid, drain_issues, sender, defer_fence_fn=budget_defer
         )
-        return WorkspaceSupervisionOutcome(
+        outcome = WorkspaceSupervisionOutcome(
             workspace_id=wsid,
             lease_acquired=True,
             lease_reason=lease.reason,
@@ -125,6 +148,12 @@ def drain_workspace_locally(sup, ws) -> WorkspaceSupervisionOutcome:
             issues=tuple(issue_outcomes),
             skipped_reason=SKIP_LEASE_LOST if lease_lost else "",
         )
+        if pass_budget is not None:
+            # The budgeted sender already spent the budget on a real send; fold in a lost-lease
+            # uncertain so a later workspace never continues behind an unknown external effect.
+            if outcome.skipped_reason == SKIP_LEASE_LOST:
+                pass_budget["uncertain"] = True
+        return outcome
     finally:
         if sup._release_after:
             sup._lease_store.release(wsid, sup._holder)
