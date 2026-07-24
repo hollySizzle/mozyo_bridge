@@ -415,18 +415,34 @@ class LiveGatewayRecoveryOps:
         return binding_observed_at == self._current_request_attestation_observed_at()
 
     def _current_request_attestation_observed_at(self) -> str:
-        """The LIVE startup attestation ``observed_at`` for THIS request's pinned gateway.
+        """The LIVE startup attestation ``observed_at`` for THIS request's pinned gateway,
+        gated by a SINGLE VERIFIED IDENTITY JOIN (review j#87424 F1). (read-only, fail-closed)
 
-        Read at recovery time (the failed gateway is still live, pre-close): a
-        ``verdict=present`` attestation for the pinned assigned-name whose locator matches the
-        pinned locator. ``""`` on any absent / non-present / mismatched axis (fail-closed) —
-        so a record whose binding cannot be equated to the live generation never binds.
+        Read at recovery time (the failed gateway is still live, pre-close). The returned
+        timestamp is the generation authority the record binding must equal, so EVERY identity
+        axis of the attestation must be verified — not just verdict + locator, which a foreign
+        workspace / lane / role record sharing the same assigned-name key + locator + timestamp
+        would otherwise satisfy. Required, all exact:
+
+        - ``verdict == present`` and a non-empty ``observed_at``;
+        - ``assigned_name`` / ``role`` (== the request provider) / ``lane_id`` / ``locator``
+          equal the request pins;
+        - ``workspace_id`` equals the repo workspace (:func:`repo_scope_workspace_id`).
+
+        ``""`` on an unreadable store, an absent record, or ANY mismatched axis — so a record
+        whose binding cannot be joined to THIS exact live generation never binds.
         """
         from mozyo_bridge.core.state.herdr_identity_attestation import (
             HerdrIdentityAttestationStore,
             VERDICT_PRESENT,
         )
 
+        try:
+            repo_workspace = repo_scope_workspace_id(self.repo_root)
+        except Exception:  # noqa: BLE001 - unresolvable workspace => no verified join
+            return ""
+        if not _norm(repo_workspace):
+            return ""
         try:
             record = HerdrIdentityAttestationStore(home=self.attestation_home).read(
                 _norm(self.request.assigned_name)
@@ -435,11 +451,18 @@ class LiveGatewayRecoveryOps:
             return ""
         if record is None:
             return ""
-        if _norm(getattr(record, "verdict", "")) != VERDICT_PRESENT:
+        observed_at = _norm(str(getattr(record, "observed_at", "") or ""))
+        if not (
+            _norm(getattr(record, "verdict", "")) == VERDICT_PRESENT
+            and observed_at
+            and _norm(getattr(record, "assigned_name", "")) == _norm(self.request.assigned_name)
+            and _norm(getattr(record, "role", "")) == _norm(self.request.provider)
+            and _norm_lane(getattr(record, "lane_id", "")) == _norm_lane(self.request.lane)
+            and _norm(getattr(record, "locator", "")) == _norm(self.request.locator)
+            and _norm(getattr(record, "workspace_id", "")) == _norm(repo_workspace)
+        ):
             return ""
-        if _norm(getattr(record, "locator", "")) != _norm(self.request.locator):
-            return ""
-        return _norm(str(getattr(record, "observed_at", "") or ""))
+        return observed_at
 
     def observe_turn(self, request: GatewayRefreshRequest) -> GatewayTurnObservation:
         _worker_provider, gateway_provider = self._providers()

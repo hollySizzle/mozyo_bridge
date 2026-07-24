@@ -589,9 +589,39 @@ class RowRevisionCloseBoundaryTests(unittest.TestCase):
 class TurnStartAuthorityTests(unittest.TestCase):
     """j#87397: the turn-start authority is the ANCHOR delivery record's own rail telemetry."""
 
+    #: The default legitimate live attestation observed_at (equals the default binding's, so a
+    #: matching binding is generation-coherent). A recycle test re-seeds it differently.
+    live_attestation_observed_at = "2026-07-24T17:00:00+00:00"
+    WS = "ws"
+
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp())
-        self.ops = LiveGatewayRecoveryOps(repo_root=self.repo, request=_request())
+        self.attn_home = Path(tempfile.mkdtemp())
+        self.ops = LiveGatewayRecoveryOps(
+            repo_root=self.repo, request=_request(gateway_revision="4"),
+            attestation_home=self.attn_home,
+        )
+        # A REAL startup attestation store (review j#87424 F1: the identity join must run
+        # against real records, not a mocked timestamp). Seed the legitimate current
+        # generation for the pinned gateway.
+        self._seed_attestation()
+
+    def _seed_attestation(self, **overrides):
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+            IdentityAttestationRecord,
+            VERDICT_PRESENT,
+        )
+
+        base = dict(
+            assigned_name="gw", workspace_id=self.WS, role="codex",
+            lane_id="issue_x_lane", locator="w:3", verdict=VERDICT_PRESENT,
+            observed_at=self.live_attestation_observed_at,
+        )
+        base.update(overrides)
+        HerdrIdentityAttestationStore(home=self.attn_home).upsert(
+            IdentityAttestationRecord(**base)
+        )
 
     def _rec(self, **overrides):
         from types import SimpleNamespace
@@ -612,27 +642,21 @@ class TurnStartAuthorityTests(unittest.TestCase):
         base.update(overrides)
         return SimpleNamespace(**base)
 
-    #: The live current-generation attestation observed_at the recovery reads at recovery time
-    #: (patched in _facts_with; equals the default binding's timestamp so a matching binding
-    #: is generation-coherent). A test sets it differently to simulate a recycle.
-    live_attestation_observed_at = "2026-07-24T17:00:00+00:00"
-
     def _facts_with(self, records):
+        # The recovery-time attestation identity join runs for REAL against the seeded store;
+        # only the repo workspace resolution (a separate concern) is fixed to self.WS.
         class _Ledger:
             def records_for_marker(self, marker):
                 return records
 
         self.ops.ledger = _Ledger()
-        with patch.object(self.ops, "_providers", return_value=("claude", "codex")):
+        with patch.object(self.ops, "_providers", return_value=("claude", "codex")), \
+                patch.object(live_mod, "repo_scope_workspace_id", return_value=self.WS):
             obs_record = self.ops._anchor_delivery_record("codex")
-            with patch.object(
-                self.ops, "_current_request_attestation_observed_at",
-                return_value=self.live_attestation_observed_at,
-            ):
-                started = (
-                    obs_record is not None
-                    and self.ops._record_observed_turn_start(obs_record)
-                )
+            started = (
+                obs_record is not None
+                and self.ops._record_observed_turn_start(obs_record)
+            )
         return obs_record is not None, started
 
     def test_only_the_exact_anchor_record_confirms_delivery(self):
@@ -655,10 +679,8 @@ class TurnStartAuthorityTests(unittest.TestCase):
     def test_started_requires_an_observed_start_and_the_generation_binding(self):
         # Design j#87409 + review j#87418: BOTH an observed start on the v2 QUEUE-ENTER
         # observation AND a generation-coherent binding (pins + provider + the binding's
-        # attestation_observed_at == the live current-generation attestation) are required.
-        self.ops = LiveGatewayRecoveryOps(
-            repo_root=self.repo, request=_request(gateway_revision="4"),
-        )
+        # attestation_observed_at == the live current-generation attestation, verified against
+        # the REAL seeded attestation store) are required.
         # Unobserved telemetry => never started.
         _, started = self._facts_with([self._rec()])
         self.assertFalse(started)
@@ -713,13 +735,13 @@ class TurnStartAuthorityTests(unittest.TestCase):
         })])
         self.assertFalse(started)
         # F1 (recovery side): a recycle BETWEEN delivery and recovery changes the LIVE
-        # attestation — the same binding no longer equates and fails closed.
-        self.live_attestation_observed_at = "2026-07-24T18:00:00+00:00"
+        # attestation observed_at (re-seeded) — the same binding no longer equates, fail-closed.
+        self._seed_attestation(observed_at="2026-07-24T18:00:00+00:00")
         _, started = self._facts_with([self._rec(queue_enter_observation={
             "event_wait_kind": "changed", "gateway_binding": self._binding(),
         })])
         self.assertFalse(started)
-        self.live_attestation_observed_at = "2026-07-24T17:00:00+00:00"
+        self._seed_attestation()  # restore the legitimate current generation
         # Timeout / settled snapshot / unread snapshot never start even with a binding.
         for qe in (
             {"event_wait_kind": "timeout", "gateway_binding": self._binding()},
@@ -734,9 +756,6 @@ class TurnStartAuthorityTests(unittest.TestCase):
     def test_the_j87393_shape_legacy_record_stays_unconfirmed(self):
         # The actual dogfood record shape (entry 3033): sent/ok, no event-rail outcome,
         # post-hoc snapshot read_ok/turn_ended, NO v2 fields — pinned turn-unconfirmed.
-        self.ops = LiveGatewayRecoveryOps(
-            repo_root=self.repo, request=_request(gateway_revision="4"),
-        )
         confirmed, started = self._facts_with([self._rec(queue_enter_observation={
             "observation_kind": "post_choreography_snapshot",
             "source": "herdr_agent_get",
@@ -745,6 +764,46 @@ class TurnStartAuthorityTests(unittest.TestCase):
         })])
         self.assertTrue(confirmed)   # the delivery itself is confirmed
         self.assertFalse(started)    # but the turn stays unconfirmed (fail-closed)
+
+    def test_j87424_a_foreign_identity_attestation_never_binds_the_generation(self):
+        # Review j#87424 F1: the recovery-time attestation identity join must verify EVERY
+        # axis against a REAL store record — a record sharing the assigned-name key / locator /
+        # observed_at but a FOREIGN workspace / lane / role never establishes the generation
+        # authority for THIS request (which is codex / ws / issue_x_lane). A mocked timestamp
+        # would have hidden this; the store is real.
+        observed = {
+            "event_wait_kind": "changed",
+            "gateway_binding": self._binding(),  # observed_at matches the seeded timestamp
+        }
+        # Baseline: the legitimate record (seeded in setUp) binds.
+        _, started = self._facts_with([self._rec(queue_enter_observation=observed)])
+        self.assertTrue(started)
+        # Foreign workspace: same key/locator/observed_at, but workspace_id != repo workspace.
+        for override in (
+            dict(workspace_id="foreign-workspace"),
+            dict(lane_id="foreign-lane"),
+            dict(role="claude"),  # a claude attestation for a codex gateway request
+        ):
+            with self.subTest(override=override):
+                self._seed_attestation(**override)
+                _, started = self._facts_with(
+                    [self._rec(queue_enter_observation=observed)]
+                )
+                self.assertFalse(started)
+                self._seed_attestation()  # restore the legitimate record
+
+    def test_j87424_no_attestation_or_absent_verdict_never_binds(self):
+        observed = {
+            "event_wait_kind": "changed", "gateway_binding": self._binding(),
+        }
+        # A verdict=missing record (real store) never binds.
+        self._seed_attestation(verdict="missing")
+        _, started = self._facts_with([self._rec(queue_enter_observation=observed)])
+        self.assertFalse(started)
+        # A completely EMPTY store (fresh home, no record) never binds.
+        self.ops.attestation_home = Path(tempfile.mkdtemp())
+        _, started = self._facts_with([self._rec(queue_enter_observation=observed)])
+        self.assertFalse(started)
 
     def test_a_later_unrelated_record_never_supplies_the_start(self):
         # j#87397 F2: an unrelated later delivery (different marker/journal) with an observed
