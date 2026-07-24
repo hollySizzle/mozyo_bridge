@@ -2,13 +2,18 @@
 
 The owner-facing command wiring for the guarded gateway refresh use case
 (:mod:`...application.sublane_gateway_recovery`) — the argument parser, the request builder,
-the seam construction, and the text/JSON rendering (the codebase's ``*_cli.py`` split).
+the LIVE composition-root construction, and the text/JSON rendering (the codebase's
+``*_cli.py`` split; review j#87356 F1 — the surface must connect the live use case, never a
+staged seam).
 
-The live observation / actuation ops are **deliberately not wired yet** (the #13806 tranche D
-precedent: live process mutation lands as a follow-up once the deterministic machinery is
-reviewed). Until then every invocation — preflight AND execute — returns a fail-closed typed
-:data:`SEAM_UNAVAILABLE_VERDICT` outcome with ZERO process effect and a non-zero exit, so a
-broken / premature invocation can never read as a clean preflight or a completed refresh.
+The live composition (the #13806 recover-stale precedent, reused): the exact-generation
+close / relaunch / attestation port is the #13806 :class:`LiveRecoveryActuatorPort` over the
+field-adapted pin; the observations + resume rail are :class:`LiveGatewayRecoveryOps`; the
+FRESH durable journal boundary is :class:`LiveRedmineJournalSource` — when the trusted
+credentials are unconfigured the turn classification honestly reports ``turn_unobservable``
+(fail-closed: a refresh is then never actionable; nothing is fabricated). A construction
+error — a repo / workspace identity that cannot be resolved — is a fail-closed typed outcome
+with a non-zero exit, never a fabricated preflight.
 """
 
 from __future__ import annotations
@@ -16,23 +21,29 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
+from mozyo_bridge.core.state.replacement_transaction import (
+    ReplacementTransactionKey,
+    ReplacementTransactionStore,
+)
 from mozyo_bridge.core.state.replacement_transaction_model import norm
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_gateway_recovery import (  # noqa: E501
     GatewayRefreshOutcome,
     GatewayRefreshRequest,
+    GatewayRefreshUseCase,
     REFRESH_STATUS_REFUSED,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_turn_recovery import (  # noqa: E501
     TURN_CLASS_UNOBSERVABLE,
     TURN_REASON_UNKNOWN,
+    gateway_refresh_action_id,
 )
 
-#: The verdict the fail-closed staged seam surfaces: the live gateway observation / actuation
-#: ops are not wired yet, so NO invocation observes or mutates anything — never a fabricated
-#: preflight, never a silent no-op exit 0.
-SEAM_UNAVAILABLE_VERDICT = "gateway_refresh_seam_unavailable"
+#: The verdict a fail-closed construction error surfaces (a missing repo / workspace
+#: identity), so a broken invocation never silently reads as a clean preflight.
+SEAM_UNAVAILABLE_VERDICT = "gateway_refresh_seam_error"
 
 
 def format_recover_gateway_text(outcome: GatewayRefreshOutcome) -> str:
@@ -56,6 +67,80 @@ def format_recover_gateway_text(outcome: GatewayRefreshOutcome) -> str:
     return "\n".join(lines)
 
 
+def _run_live_refresh(
+    args: argparse.Namespace, request: GatewayRefreshRequest, *, execute: bool
+) -> GatewayRefreshOutcome:
+    """Construct the LIVE use case (real inventory + actuation + resume rail) and run it.
+
+    The live adapters are imported lazily (they import the use case module for the request /
+    ops types). A construction error — an unresolvable repo / workspace identity — is a
+    fail-closed typed outcome, never a fabricated preflight (the recover-stale precedent).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        repo_scope_workspace_id,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_gateway_recovery_live import (  # noqa: E501
+        LiveGatewayRecoveryOps,
+        port_pin_request,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery_live import (  # noqa: E501
+        LiveRecoveryActuatorPort,
+    )
+
+    repo = getattr(args, "repo", None)
+    repo_root = Path(repo).expanduser() if repo else Path.cwd()
+    try:
+        workspace_id = repo_scope_workspace_id(repo_root)
+    except Exception:  # noqa: BLE001 - an unresolvable workspace identity fails closed
+        workspace_id = ""
+    if not norm(workspace_id):
+        return GatewayRefreshOutcome(
+            issue=norm(request.issue), lane=norm(request.lane), role=norm(request.role),
+            turn_class=TURN_CLASS_UNOBSERVABLE, turn_reason=TURN_REASON_UNKNOWN,
+            verdict=SEAM_UNAVAILABLE_VERDICT, status=REFRESH_STATUS_REFUSED,
+            executed=execute,
+            detail="could not resolve the repo workspace identity; zero process effect",
+        )
+    # The transaction key the use case will derive (best-effort; the use case re-derives and
+    # refuses on incomplete inputs before the port is ever exercised).
+    try:
+        action_id = gateway_refresh_action_id(
+            lane_id=request.lane, role=request.role, provider=request.provider,
+            assigned_name=request.assigned_name, locator=request.locator,
+        )
+        key = ReplacementTransactionKey(workspace_id, action_id)
+    except Exception:  # noqa: BLE001 - incomplete identity => the use case refuses downstream
+        key = ReplacementTransactionKey(workspace_id, "refresh-gateway:pending")
+    store = ReplacementTransactionStore()
+    actuation_port = LiveRecoveryActuatorPort(
+        repo_root=repo_root, request=port_pin_request(request), store=store, key=key,
+    )
+    # The FRESH durable journal boundary (#13889): the credential-gated live Redmine source.
+    # Unconfigured credentials leave the reader unwired — the turn classification then
+    # honestly reports ``turn_unobservable`` (fail-closed), never a fabricated absence.
+    journal_reader = None
+    journal_reader_fresh = False
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+            LiveRedmineJournalSource,
+        )
+
+        source = LiveRedmineJournalSource.from_environment()
+        journal_reader = source.read_entries
+        journal_reader_fresh = True
+    except Exception:  # noqa: BLE001 - no live durable boundary => turn_unobservable
+        journal_reader = None
+        journal_reader_fresh = False
+    ops = LiveGatewayRecoveryOps(
+        repo_root=repo_root, request=request,
+        journal_reader=journal_reader, journal_reader_fresh=journal_reader_fresh,
+    )
+    use_case = GatewayRefreshUseCase(
+        store, actuation_port, ops, workspace_id=workspace_id,
+    )
+    return use_case.run(request, execute=execute)
+
+
 def cmd_sublane_recover_gateway(args: argparse.Namespace) -> int:
     request = GatewayRefreshRequest(
         issue=getattr(args, "issue", "") or "",
@@ -75,24 +160,14 @@ def cmd_sublane_recover_gateway(args: argparse.Namespace) -> int:
         reason_token=getattr(args, "reason_token", "") or "",
     )
     execute = bool(getattr(args, "execute", False))
-    # Fail-closed staged seam (the #13806 tranche D precedent): the live observation /
-    # actuation ops are a follow-up, so NOTHING is observed or mutated — the turn class is the
-    # honest ``turn_unobservable`` (never a fabricated classification) and the outcome is a
-    # typed refusal with a non-zero exit.
-    outcome = GatewayRefreshOutcome(
-        issue=norm(request.issue), lane=norm(request.lane), role=norm(request.role),
-        turn_class=TURN_CLASS_UNOBSERVABLE, turn_reason=TURN_REASON_UNKNOWN,
-        verdict=SEAM_UNAVAILABLE_VERDICT, status=REFRESH_STATUS_REFUSED, executed=execute,
-        detail=(
-            "live gateway observation / actuation ops are not wired yet (follow-up); "
-            "zero observation, zero process effect"
-        ),
-    )
+    outcome = _run_live_refresh(args, request, execute=execute)
     if bool(getattr(args, "json", False)):
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(format_recover_gateway_text(outcome), file=sys.stdout)
-    return 1
+    # A construction-error refusal is a non-zero exit so a caller never mistakes it for a
+    # completed refresh; a preflight that merely reports a blocker is exit 0.
+    return 1 if outcome.is_blocked or outcome.verdict == SEAM_UNAVAILABLE_VERDICT else 0
 
 
 def register_sublane_recover_gateway_parser(sublane_sub: Any) -> None:
@@ -107,7 +182,7 @@ def register_sublane_recover_gateway_parser(sublane_sub: Any) -> None:
             "authority; an unconfirmed delivery / turn start is never a failure) and — with "
             "a positive owner approval — close ONLY the exact approved gateway generation, "
             "relaunch the same durable slot, verify its action-bound attestation, and resume "
-            "the EXISTING durable anchor exactly once via the callback recovery rail. The "
+            "the EXISTING durable anchor exactly once via the governed handoff rail. The "
             "worker, worktree, branch, and durable route are preserved; the worker / default "
             "coordinator / foreign slots are protected by ordered fail-closed fences."
         ),

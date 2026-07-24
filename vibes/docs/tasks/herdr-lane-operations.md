@@ -87,6 +87,18 @@ dispatch / handoff / retire可否は、Git branch/worktree、metadata record、g
 - relaunch した worker は「⏵⏵ auto mode on」footer を確認 (permission parity #13360)。旧 pane は先に `herdr pane close`。
 - relaunch 後、gateway に worker route の再駆動を指示 (worker の pane id は変わるが解決は assigned name 経由で自動追従)。
 
+## gateway の guarded refresh (`sublane recover-gateway`, #14203)
+
+same-lane implementation_gateway が **callback delivery 確認済みの provider turn を即時終了し、期待 durable gate が着地しないまま live `turn_ended` を占有し続ける** 場合の標準回復。`recover-stale` は gateway を保護し (worker 専用)、`recover-pair` は hibernated lane 専用のため、この形は本 command だけが扱う。raw Herdr/tmux close・blind resend は使わない。
+
+- **preflight (既定, read-only)**: `sublane recover-gateway --issue <owning issue> --lane <label> --role codex --provider codex --assigned-name <mzb1_…> --locator <live locator> --resume-anchor-journal <j> --resume-gate <gate> --json`。provider turn を closed 分類 (`turn_productive` / `turn_failed_no_durable_gate` / `turn_unconfirmed` / `turn_not_settled` / `turn_unobservable`) し、slot fence 9 軸 (identity / gateway-only / issue-lane / generation / settled / composer / resume-anchor / worker 保全 / authority) を実状態から判定する。
+  - **durable journal が authority**: anchor より後に gate が着地していれば `turn_productive` — runtime がどう見えても refresh は拒否される。
+  - **`delivered_not_started` 等の未確認 delivery/turn start は failure ではない** (`turn_unconfirmed`)。fresh durable read が構成されていない env (Redmine credential 無し) は `turn_unobservable` で fail-closed。
+  - reason (`rate_limit`/`auth`/`session_stale`) は構造化 evidence token の注入のみ。不明は `unknown` (herdr は turn 終了理由を公開しない)。
+- **execute (destructive, owner approval 必須)**: 上記に加え `--journal <owner approval j>` `--action-id refresh-gateway:<lane>:<role>:<provider>:<name>:<locator>` `--action-generation <n>` `--lane-revision <r>` `--lane-generation <g>` `--execute`。`turn_failed_no_durable_gate` + 全 fence green のときだけ、**exact gateway generation のみ** close → same-slot fresh launch → action-bound attestation → **既存 anchor を governed handoff rail で exactly-once resume** (IR/RR は再生成しない)。worker / default coordinator / foreign slot は ordered fence が保護する。
+- **partial failure**: replacement transaction が replay fence を保持し、re-run が resume する。close 後 crash の replay は `identity_unknown` + committed-close transaction のみ admit。
+- 実装正本: `domain/gateway_turn_recovery.py` / `application/sublane_gateway_recovery*.py` (#14203)。
+
 ## Host reboot recovery (#13518)
 
 host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit するが、`herdr agent list` の durable assigned-name row は残る (foreground は `-zsh` のみ、detected agent 無し)。**複数正本を照合する fail-closed recovery reconciler** を使い、DB 単独を authority にしない (設計正本: #13520 j#75276)。
