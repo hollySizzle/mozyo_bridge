@@ -205,15 +205,27 @@ def run_launch_generation_store_status(
 
 
 def _blocked_by_lock(exc: Exception) -> LaunchGenerationStoreMaintenanceResult:
-    """Report a rebuild that never started because the store was locked (in use)."""
-    return LaunchGenerationStoreMaintenanceResult(
-        intent="rebuild",
-        state=BLOCKED_FAILED,
-        detail=(
+    """Report a rebuild that never started because the lock could not be taken.
+
+    Two typed acquisition outcomes, rendered as a structured public refusal (never a raw
+    traceback across the recovery boundary, review j#87496 F1): the store is in use (a live
+    managed-launch write holds it), or the lock itself is unavailable (an unwritable home / a
+    filesystem without advisory locks). In BOTH cases nothing was published or removed.
+    """
+    if isinstance(exc, LaunchGenerationStoreLockBusy):
+        detail = (
             f"the launch-generation store is in use and this rebuild did not start ({exc}). "
             f"Nothing was published and nothing was removed. Maintenance never queues ahead "
             f"of an in-flight managed launch write; re-run once it finishes"
-        ),
+        )
+    else:
+        detail = (
+            f"the launch-generation store lock could not be acquired and this rebuild did "
+            f"not start ({exc}). Nothing was published and nothing was removed. Check the "
+            f"home's permissions / filesystem, then re-run"
+        )
+    return LaunchGenerationStoreMaintenanceResult(
+        intent="rebuild", state=BLOCKED_FAILED, detail=detail
     )
 
 

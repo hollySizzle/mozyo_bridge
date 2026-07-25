@@ -137,6 +137,57 @@ def _seed_v1_attestation_store(home: Path) -> Path:
     return path
 
 
+# --- Cross-process workers (module level so they pickle under the spawn start method). -----
+def _mp_paused_writer(home_str, name, token, in_body_evt, release_evt, result_q):
+    """A REAL ``reserve_pending`` whose locked BODY pauses — holding the SHARED store lock —
+    until released. Proves a rebuild is blocked while a real cross-process write is in flight.
+    The pause is patched in THIS child process only."""
+    import pathlib
+
+    from mozyo_bridge.core.state.herdr_launch_generation import (
+        HerdrLaunchGenerationStore,
+    )
+
+    store = HerdrLaunchGenerationStore(home=pathlib.Path(home_str))
+    orig = store._reserve_pending_locked
+
+    def _paused(**kw):
+        in_body_evt.set()  # the SHARED lock is held now (we are inside the locked body)
+        release_evt.wait(timeout=30)
+        return orig(**kw)
+
+    store._reserve_pending_locked = _paused
+    try:
+        store.reserve_pending(
+            assigned_name=name, startup_action_id=token, workspace_id="wsA",
+            role="codex", lane_id="lane",
+        )
+        result_q.put(("ok", token))
+    except BaseException as exc:  # noqa: BLE001 - report any failure to the parent
+        result_q.put(("err", repr(exc)))
+
+
+def _mp_blocking_writer(home_str, name, token, attempting_evt, result_q):
+    """A REAL ``reserve_pending`` that BLOCKS on the shared lock while the parent holds the
+    store EXCLUSIVE mid-rebuild; it completes (creating a fresh store) only after release."""
+    import pathlib
+
+    from mozyo_bridge.core.state.herdr_launch_generation import (
+        HerdrLaunchGenerationStore,
+    )
+
+    store = HerdrLaunchGenerationStore(home=pathlib.Path(home_str))
+    attempting_evt.set()  # about to take the shared lock (which the parent's EX holds off)
+    try:
+        store.reserve_pending(
+            assigned_name=name, startup_action_id=token, workspace_id="wsA",
+            role="codex", lane_id="lane",
+        )
+        result_q.put(("ok", token))
+    except BaseException as exc:  # noqa: BLE001
+        result_q.put(("err", repr(exc)))
+
+
 class R1UnmigratedAttestationHome(unittest.TestCase):
     """1. A real v1/v2 attestation home keeps admitting normal launches — NO migration."""
 
@@ -771,6 +822,191 @@ class R10RebuildAtomicityAndLock(unittest.TestCase):
         self.assertEqual(r.state, m.APPLIED)
         self.assertIn("v", peer_write_admitted)  # the spy actually ran
         self.assertFalse(peer_write_admitted["v"])  # the peer write was excluded
+
+
+class R11RealMultiProcessAndSidecar(unittest.TestCase):
+    """R13 (j#87496 F2): the concurrency / partial-mutation claims fixed as REAL repository
+    regressions — a separate process through the real writer API, and a real sidecar removed
+    before the injected failure — not an in-process lock-primitive stub."""
+
+    def _view(self, *, live=(), ok=True, backend=True):
+        agents = tuple(SimpleNamespace(name=n) for n in live)
+        return SimpleNamespace(
+            backend_selected=backend, ok=ok, managed_agents=agents,
+            reason="unreadable", detail="probe failed",
+        )
+
+    def _corrupt(self, home):
+        herdr_launch_generation_path(home).parent.mkdir(parents=True, exist_ok=True)
+        herdr_launch_generation_path(home).write_bytes(b"not a sqlite database")
+
+    def _maint(self):
+        import mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_launch_generation_store_maintenance as m  # noqa: E501
+        return m
+
+    def test_a_real_cross_process_write_in_flight_blocks_the_rebuild(self):
+        # A REAL reserve_pending in a SEPARATE process holds the SHARED store lock mid-write;
+        # a rebuild in this process cannot take the store EXCLUSIVE and reports blocked_failed
+        # with nothing removed — then the real write completes after release.
+        import multiprocessing as mp
+
+        ctx = mp.get_context()
+        home = _tmp()  # a fresh (writable) store: the rebuild is blocked at lock acquisition,
+        # before it ever probes, so the store's shape is irrelevant to this test.
+        in_body, release, q = ctx.Event(), ctx.Event(), ctx.Queue()
+        p = ctx.Process(
+            target=_mp_paused_writer,
+            args=(str(home), "gw", "startup-A", in_body, release, q),
+        )
+        p.start()
+        try:
+            self.assertTrue(in_body.wait(timeout=30), "child never entered the write body")
+            m = self._maint()
+            r = m.run_launch_generation_store_rebuild(
+                home=home, view=self._view(), write=True
+            )
+            self.assertEqual(r.state, m.BLOCKED_FAILED)
+            self.assertIn("in use", r.detail)
+        finally:
+            release.set()
+            outcome = q.get(timeout=30)
+            p.join(timeout=30)
+        self.assertEqual(outcome[0], "ok", outcome)  # the real cross-process write completed
+
+    def test_a_rebuild_holds_ex_so_a_real_peer_write_serializes_after_and_survives(self):
+        # The path-ABA closure with the REAL writer API across processes: while THIS process's
+        # rebuild holds the store EXCLUSIVE and rotates the corrupt store, a separate process's
+        # real reserve_pending is blocked; it completes only AFTER the rebuild releases,
+        # creating a fresh store the rebuild did NOT clobber.
+        import multiprocessing as mp
+        import time
+        from unittest.mock import patch
+
+        ctx = mp.get_context()
+        home = _tmp()
+        self._corrupt(home)
+        attempting, q = ctx.Event(), ctx.Queue()
+        child = ctx.Process(
+            target=_mp_blocking_writer,
+            args=(str(home), "gw", "startup-PEER", attempting, q),
+        )
+
+        m = self._maint()
+        real_quarantine = m.quarantine_attestation_store_artifacts
+
+        def _coordinated_quarantine(path):
+            # We are now inside the rebuild, holding the store EXCLUSIVE. Let the peer try its
+            # real reserve_pending; it must block on the shared lock until we release.
+            child.start()
+            self.assertTrue(attempting.wait(timeout=30), "peer never attempted its write")
+            time.sleep(0.5)  # let the peer reach its (blocked) flock before we rotate
+            return real_quarantine(path)
+
+        with patch.object(m, "quarantine_attestation_store_artifacts", _coordinated_quarantine):
+            r = m.run_launch_generation_store_rebuild(
+                home=home, view=self._view(), write=True
+            )
+        self.assertEqual(r.state, m.APPLIED)  # the rebuild rotated the CORRUPT store
+
+        outcome = q.get(timeout=30)  # the peer unblocked once EX released
+        child.join(timeout=30)
+        self.assertEqual(outcome, ("ok", "startup-PEER"), outcome)
+
+        # The peer's fresh store SURVIVED (the rebuild removed the corrupt store, not this):
+        gen = HerdrLaunchGenerationStore(home=home).read("gw")
+        self.assertIsNotNone(gen)
+        self.assertEqual(gen.startup_action_id, "startup-PEER")
+
+    def test_partial_unlink_removes_a_real_sidecar_and_reports_partial_mutation_truth(self):
+        # A REAL sidecar is removed before the interruption: the published backup holds both
+        # main + sidecar, the main file remains as the completion sentinel, and a re-run
+        # converges to applied.
+        from unittest.mock import patch
+
+        m = self._maint()
+        home = _tmp()
+        self._corrupt(home)
+        path = herdr_launch_generation_path(home)
+        wal = path.with_name(path.name + "-wal")
+        wal.write_bytes(b"stale wal bytes")  # a real sidecar to preserve + remove
+
+        real_remove = m.remove_attestation_store_artifacts
+
+        def _remove_sidecar_then_fail(p):
+            # Remove ONE real sidecar (as the real sidecars-first removal would), then fail
+            # before the main file — a genuine partial mutation.
+            wal.unlink()
+            raise OSError("disk gone after the sidecar unlink, before the main file")
+
+        with patch.object(m, "remove_attestation_store_artifacts", _remove_sidecar_then_fail):
+            r = m.run_launch_generation_store_rebuild(
+                home=home, view=self._view(), write=True
+            )
+        self.assertEqual(r.state, m.BLOCKED_FAILED)
+        self.assertTrue(r.executed)
+        self.assertIn("NOT untouched", r.detail)
+        # The backup was taken BEFORE removal, so it holds BOTH artifacts.
+        backup = Path(r.backup_dir)
+        self.assertTrue((backup / path.name).exists())
+        self.assertTrue((backup / wal.name).exists())
+        # Partial-mutation truth: the sidecar is gone, but the main file (the completion
+        # sentinel) remains, so the store still probes as existing and the run is resumable.
+        self.assertFalse(wal.exists())
+        self.assertTrue(path.exists())
+
+        # Re-run with the real removal converges to applied (the store is rotated away).
+        r2 = m.run_launch_generation_store_rebuild(home=home, view=self._view(), write=True)
+        self.assertEqual(r2.state, m.APPLIED)
+        self.assertFalse(path.exists())
+
+    def test_a_lock_acquisition_failure_is_a_structured_refusal_not_a_raw_exception(self):
+        # F1: an OSError taking the lock (an unwritable home / IO failure) becomes a public
+        # blocked_failed payload, never a raw traceback across the recovery boundary.
+        from unittest.mock import patch
+
+        import mozyo_bridge.core.state.herdr_launch_generation as glm
+
+        m = self._maint()
+        home = _tmp()
+        self._corrupt(home)
+        real_open = glm.os.open
+
+        def _refuse_lock_open(p, *a, **k):
+            if str(p).endswith(".herdr-launch-generation.lock"):
+                raise PermissionError("injected lock open refusal")
+            return real_open(p, *a, **k)
+
+        with patch.object(glm.os, "open", _refuse_lock_open):
+            r = m.run_launch_generation_store_rebuild(
+                home=home, view=self._view(), write=True
+            )  # must NOT raise
+        self.assertEqual(r.state, m.BLOCKED_FAILED)
+        self.assertIn("could not be acquired", r.detail)
+        self.assertTrue(herdr_launch_generation_path(home).exists())  # untouched
+
+    def test_a_post_body_cleanup_failure_never_relabels_a_completed_operation(self):
+        # F1: a failure in the lock's CLEANUP phase (unlock / close), which happens AFTER the
+        # body completed, is swallowed — a finished operation is never reported as failed.
+        import fcntl
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            launch_generation_store_lock,
+        )
+
+        home = _tmp()
+        body_ran = {}
+        real_flock = fcntl.flock
+
+        def _flock(fd, flags):
+            if flags == fcntl.LOCK_UN:
+                raise OSError("injected unlock failure after the body")
+            return real_flock(fd, flags)
+
+        with patch("fcntl.flock", _flock):
+            with launch_generation_store_lock(home, exclusive=True, blocking=False):
+                body_ran["v"] = True  # the operation completed inside the lock
+        self.assertTrue(body_ran.get("v"))  # no exception escaped the cleanup phase
 
 
 if __name__ == "__main__":

@@ -208,10 +208,20 @@ def launch_generation_store_lock(home: Path, *, exclusive: bool, blocking: bool)
     """Hold the home's launch-generation-store advisory lock (Redmine #14203 j#87488 P1).
 
     Mirrors ``attestation_store_lock``: the store's generation cannot be replaced underneath
-    an operation because the three boundaries that touch it are coordinated through one lock.
-    A holder's crash releases it at the OS level. Where ``fcntl.flock`` is unavailable the
-    protocol cannot be honored, so this raises :class:`LaunchGenerationStoreLockUnavailable`
-    rather than silently proceeding unlocked.
+    an operation because the boundaries that touch it are coordinated through one lock. A
+    holder's crash releases it at the OS level.
+
+    Three explicit phases, so a lock failure is a TYPED outcome a public rail can render as a
+    structured refusal — never a raw traceback across the recovery boundary (review j#87496
+    F1):
+
+    * **acquire** (``mkdir`` / ``os.open`` / ``flock``): any :class:`OSError` here is a
+      fail-closed :class:`LaunchGenerationStoreLockUnavailable` (contention →
+      :class:`LaunchGenerationStoreLockBusy`). Nothing has been yielded, so nothing was done.
+    * **body** (``yield``): the caller's operation runs; ITS errors propagate unchanged.
+    * **cleanup** (``flock`` unlock / ``os.close``): best-effort and swallowed. A failure here
+      happens AFTER the body completed, so raising it would relabel a finished operation (e.g.
+      an already-committed rotation) as failed — the exact mislabel the finding forbids.
     """
     try:
         import fcntl
@@ -223,27 +233,44 @@ def launch_generation_store_lock(home: Path, *, exclusive: bool, blocking: bool)
         ) from exc
 
     path = launch_generation_store_lock_path(home)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    flags = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (
-        0 if blocking else fcntl.LOCK_NB
-    )
+    # --- acquire phase: every OSError is a typed refusal, nothing has happened yet. ---------
+    fd: Optional[int] = None
     try:
-        try:
-            fcntl.flock(fd, flags)
-        except OSError as exc:
-            if not blocking and exc.errno in (errno.EACCES, errno.EAGAIN):
-                raise LaunchGenerationStoreLockBusy(
-                    "the launch-generation store is locked by another operation on this "
-                    "home (maintenance, or a managed launch's reserve / finalize write)"
-                ) from exc
-            raise
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        flags = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (
+            0 if blocking else fcntl.LOCK_NB
+        )
+        fcntl.flock(fd, flags)
+    except OSError as exc:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if not blocking and getattr(exc, "errno", None) in (errno.EACCES, errno.EAGAIN):
+            raise LaunchGenerationStoreLockBusy(
+                "the launch-generation store is locked by another operation on this home "
+                "(maintenance, or a managed launch's reserve / finalize write)"
+            ) from exc
+        raise LaunchGenerationStoreLockUnavailable(
+            f"the launch-generation store lock could not be acquired at {path.name} "
+            f"({exc.__class__.__name__}: {exc}); the home may be unwritable or its filesystem "
+            f"may not support advisory locks"
+        ) from exc
+    # --- body phase: the caller's error, if any, is theirs and propagates as-is. ------------
+    try:
+        yield
     finally:
-        os.close(fd)
+        # --- cleanup phase: best-effort; a post-body failure must NOT relabel the result. ---
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def probe_launch_generation_store(path: Path) -> tuple[str, str]:
@@ -465,12 +492,11 @@ class HerdrLaunchGenerationStore:
         except (
             LaunchGenerationStoreLockBusy,
             LaunchGenerationStoreLockUnavailable,
-            OSError,
         ) as exc:
-            # Lock ACQUISITION failed (busy / unavailable / the home is not a writable dir).
-            # The locked write body converts its own sqlite/OS errors to
-            # HerdrLaunchGenerationError, so an OSError here is only from taking the lock —
-            # a fail-closed write refusal, never a mislabeled write error.
+            # Lock acquisition failed (busy / unavailable / an unwritable home) — the lock
+            # normalizes every acquire OSError to these typed outcomes, so this is a
+            # fail-closed write refusal. The locked write body's own sqlite/OS errors are
+            # already HerdrLaunchGenerationError and never reach here.
             raise HerdrLaunchGenerationError(
                 f"the launch-generation store lock could not be taken for a write ({exc})"
             ) from exc
