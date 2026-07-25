@@ -41,7 +41,10 @@ from mozyo_bridge.core.state.herdr_launch_generation import (
     GENERATION_STORE_HEALTHY,
     HERDR_LAUNCH_GENERATION_SCHEMA_VERSION,
     HerdrLaunchGenerationStore,
+    LaunchGenerationStoreLockBusy,
+    LaunchGenerationStoreLockUnavailable,
     herdr_launch_generation_path,
+    launch_generation_store_lock,
     probe_launch_generation_store,
 )
 from mozyo_bridge.core.state.state_store import StateStoreError
@@ -201,14 +204,29 @@ def run_launch_generation_store_status(
     )
 
 
-def run_launch_generation_store_rebuild(
-    *, home: Path, view, write: bool = False
+def _blocked_by_lock(exc: Exception) -> LaunchGenerationStoreMaintenanceResult:
+    """Report a rebuild that never started because the store was locked (in use)."""
+    return LaunchGenerationStoreMaintenanceResult(
+        intent="rebuild",
+        state=BLOCKED_FAILED,
+        detail=(
+            f"the launch-generation store is in use and this rebuild did not start ({exc}). "
+            f"Nothing was published and nothing was removed. Maintenance never queues ahead "
+            f"of an in-flight managed launch write; re-run once it finishes"
+        ),
+    )
+
+
+def _run_rebuild_locked(
+    *, home: Path, view, write: bool
 ) -> LaunchGenerationStoreMaintenanceResult:
     """Rotate a CORRUPT store into ``backups/`` and remove it (backup-first, consumer-gated).
 
-    Only a corrupt store is a rebuild target: an absent store is already the rebuilt state,
-    and a healthy store holds live generations that rebuild would discard (refused — this is
-    not a shortcut). The next managed launch re-creates the store.
+    On the ``write`` path this runs UNDER the exclusive store lock, and it re-probes HERE (not
+    before the lock) so the generation it acts on cannot be replaced underneath it — the path
+    ABA that let a stale rebuild quarantine a peer's fresh, healthy store (review j#87488 P1).
+    Only a corrupt store is a rebuild target: an absent store is already the rebuilt state, and
+    a healthy store holds live generations that rebuild would discard (refused).
     """
     path = herdr_launch_generation_path(home)
     state, detail = probe_launch_generation_store(path)
@@ -252,18 +270,54 @@ def run_launch_generation_store_rebuild(
             notes=(f"probe: {detail}",),
         )
 
+    # Raw quarantine of the whole artifact set — the store is proven corrupt above, so its
+    # bytes ARE the evidence and there is nothing to snapshot logically.
     try:
         backup_dir = quarantine_attestation_store_artifacts(path)
-        remove_attestation_store_artifacts(path)
-    except StateStoreError as exc:
+    except (StateStoreError, OSError) as exc:
+        # Nothing was removed yet, so "untouched" is a true statement HERE and only here.
         return LaunchGenerationStoreMaintenanceResult(
             intent="rebuild",
             state=BLOCKED_FAILED,
             store_state=state,
             detail=(
-                f"rebuild aborted: {exc}. The store was NOT removed (backup-first); nothing "
-                f"was lost. Free space / permissions, then re-run"
+                f"rebuild aborted before any removal: {exc}. The store is untouched and "
+                f"nothing was lost; free space / permissions, then re-run"
             ),
+        )
+    if backup_dir is None:
+        # The probe above proved a store was here, so ``None`` means it vanished between the
+        # probe and the quarantine (a peer rotated it, or something outside this rail removed
+        # it) — backup-first could NOT be proven. Reporting APPLIED would fabricate a backup
+        # that never existed. Re-running converges (a subsequent probe sees ABSENT ->
+        # ALREADY_CURRENT).
+        return LaunchGenerationStoreMaintenanceResult(
+            intent="rebuild",
+            state=BLOCKED_FAILED,
+            store_state=state,
+            detail=(
+                "the store disappeared after this rebuild's probe and before it could be "
+                "preserved, so backup-first cannot be proven. Nothing was published and "
+                "nothing was removed by this run. Re-run to converge"
+            ),
+        )
+    try:
+        remove_attestation_store_artifacts(path)
+    except OSError as exc:
+        # The rotation began, so the store is NOT untouched and must not be reported as such.
+        # Sidecars are removed before the main file, so an interruption leaves the main file
+        # present, the store still probes as existing, and re-running finishes the rotation.
+        return LaunchGenerationStoreMaintenanceResult(
+            intent="rebuild",
+            state=BLOCKED_FAILED,
+            store_state=state,
+            detail=(
+                f"rebuild was interrupted partway through rotating the store away ({exc}); "
+                f"the backup is complete and published, but some artifacts may already be "
+                f"removed — the store is NOT untouched. Re-run this same command to finish"
+            ),
+            backup_dir=backup_dir,
+            executed=True,
         )
     return LaunchGenerationStoreMaintenanceResult(
         intent="rebuild",
@@ -276,6 +330,25 @@ def run_launch_generation_store_rebuild(
         backup_dir=backup_dir,
         executed=True,
     )
+
+
+def run_launch_generation_store_rebuild(
+    *, home: Path, view, write: bool = False
+) -> LaunchGenerationStoreMaintenanceResult:
+    """Rotate a CORRUPT store into ``backups/`` and remove it (backup-first, consumer-gated).
+
+    A read-only plan mutates nothing and takes no lock. The ``--write`` path holds the store
+    lock EXCLUSIVE (non-blocking) across the whole run — acquired BEFORE the probe — so the
+    generation cannot be replaced underneath it and a live managed-launch write can never be
+    clobbered (review j#87488 P1). Contention reports blocked with nothing removed.
+    """
+    if not write:
+        return _run_rebuild_locked(home=home, view=view, write=False)
+    try:
+        with launch_generation_store_lock(home, exclusive=True, blocking=False):
+            return _run_rebuild_locked(home=home, view=view, write=True)
+    except (LaunchGenerationStoreLockBusy, LaunchGenerationStoreLockUnavailable) as exc:
+        return _blocked_by_lock(exc)
 
 
 def format_maintenance_text(result: LaunchGenerationStoreMaintenanceResult) -> str:

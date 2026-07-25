@@ -661,5 +661,117 @@ class R9RebuildableCacheRecovery(unittest.TestCase):
         self.assertTrue(herdr_launch_generation_path(home).exists())  # untouched
 
 
+class R10RebuildAtomicityAndLock(unittest.TestCase):
+    """R12 (j#87488 P1): the rebuild pins the generation under an exclusive lock, proves
+    backup-first, and reports side-effect truth — a mature rail, not a raw quarantine."""
+
+    def _view(self, *, live=(), ok=True, backend=True):
+        agents = tuple(SimpleNamespace(name=n) for n in live)
+        return SimpleNamespace(
+            backend_selected=backend, ok=ok, managed_agents=agents,
+            reason="unreadable", detail="probe failed",
+        )
+
+    def _corrupt(self, home):
+        herdr_launch_generation_path(home).parent.mkdir(parents=True, exist_ok=True)
+        herdr_launch_generation_path(home).write_bytes(b"not a sqlite database")
+
+    def _maint(self):
+        import mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_launch_generation_store_maintenance as m  # noqa: E501
+        return m
+
+    def test_vanished_after_probe_is_blocked_never_a_fabricated_backup(self):
+        # The store disappears between probe and quarantine: quarantine returns None (nothing
+        # preserved). Reporting APPLIED with backup_dir=null would fabricate a recovery point.
+        from unittest.mock import patch
+
+        m = self._maint()
+        home = _tmp()
+        self._corrupt(home)
+        with patch.object(m, "quarantine_attestation_store_artifacts", lambda p: None):
+            r = m.run_launch_generation_store_rebuild(
+                home=home, view=self._view(), write=True
+            )
+        self.assertEqual(r.state, m.BLOCKED_FAILED)
+        self.assertFalse(r.ok)
+        self.assertIsNone(r.backup_dir)
+        self.assertFalse(r.executed)
+        self.assertIn("disappeared", r.detail)
+
+    def test_partial_unlink_is_a_structured_removal_interruption_not_a_raw_oserror(self):
+        # The backup published, but removal is interrupted (an OSError mid-unlink). The result
+        # is structured (backup_dir + executed=true + "NOT untouched"), never a raw traceback.
+        from unittest.mock import patch
+
+        m = self._maint()
+        home = _tmp()
+        self._corrupt(home)
+
+        def _boom(path):
+            raise OSError("disk gone mid-unlink")
+
+        with patch.object(m, "remove_attestation_store_artifacts", _boom):
+            r = m.run_launch_generation_store_rebuild(
+                home=home, view=self._view(), write=True
+            )  # must NOT raise
+        self.assertEqual(r.state, m.BLOCKED_FAILED)
+        self.assertTrue(r.executed)
+        self.assertIsNotNone(r.backup_dir)
+        self.assertIn("NOT untouched", r.detail)
+
+    def test_rebuild_is_blocked_while_a_managed_write_holds_the_lock(self):
+        # An in-flight managed-launch write holds the store lock SHARED; the rebuild's
+        # exclusive non-blocking acquire fails, so it does not start — the store is untouched.
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            launch_generation_store_lock,
+        )
+
+        m = self._maint()
+        home = _tmp()
+        self._corrupt(home)
+        with launch_generation_store_lock(home, exclusive=False, blocking=True):
+            r = m.run_launch_generation_store_rebuild(
+                home=home, view=self._view(), write=True
+            )
+        self.assertEqual(r.state, m.BLOCKED_FAILED)
+        self.assertIn("in use", r.detail)
+        self.assertTrue(herdr_launch_generation_path(home).exists())  # untouched
+
+    def test_the_exclusive_lock_excludes_a_peer_write_across_the_whole_rotation(self):
+        # The path-ABA closure, proven with the REAL lock: while the rebuild holds the store
+        # EXCLUSIVE and is mid-quarantine, a peer managed-launch write (SHARED) cannot start —
+        # so no peer can replace the store between the probe and the removal.
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            LaunchGenerationStoreLockBusy,
+            launch_generation_store_lock,
+        )
+
+        m = self._maint()
+        home = _tmp()
+        self._corrupt(home)
+        real_quarantine = m.quarantine_attestation_store_artifacts
+        peer_write_admitted = {}
+
+        def _spy(path):
+            # A peer managed-launch write takes the SHARED lock; while rebuild holds EXCLUSIVE
+            # it must be refused.
+            try:
+                with launch_generation_store_lock(home, exclusive=False, blocking=False):
+                    peer_write_admitted["v"] = True
+            except LaunchGenerationStoreLockBusy:
+                peer_write_admitted["v"] = False
+            return real_quarantine(path)
+
+        with patch.object(m, "quarantine_attestation_store_artifacts", _spy):
+            r = m.run_launch_generation_store_rebuild(
+                home=home, view=self._view(), write=True
+            )
+        self.assertEqual(r.state, m.APPLIED)
+        self.assertIn("v", peer_write_admitted)  # the spy actually ran
+        self.assertFalse(peer_write_admitted["v"])  # the peer write was excluded
+
+
 if __name__ == "__main__":
     unittest.main()

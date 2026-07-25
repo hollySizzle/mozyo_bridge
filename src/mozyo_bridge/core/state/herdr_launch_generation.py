@@ -49,10 +49,12 @@ an unknown shape: pure stdlib + sqlite, so the dependency never points core -> p
 
 from __future__ import annotations
 
+import errno
 import os
 import sqlite3
 import stat
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -177,6 +179,71 @@ def _rollback_quietly(conn: sqlite3.Connection) -> None:
 
 def herdr_launch_generation_path(home: Path | None = None) -> Path:
     return (home or mozyo_bridge_home()) / HERDR_LAUNCH_GENERATION_FILENAME
+
+
+class LaunchGenerationStoreLockBusy(RuntimeError):
+    """The store lock is held by a peer, so this operation must not proceed."""
+
+
+class LaunchGenerationStoreLockUnavailable(RuntimeError):
+    """Advisory locking is not available, so the protocol cannot be honored."""
+
+
+#: Home-scoped advisory lock coordinating the two boundaries that touch this store (Redmine
+#: #14203 review j#87488 P1). Its own file: it is neither store content nor a backup
+#: artifact, carries no credential, and is private (0600). A managed launch's reserve /
+#: finalize write takes it SHARED (blocking); public maintenance (rebuild) takes it EXCLUSIVE
+#: (non-blocking) from BEFORE its probe through completion, so the generation the probe
+#: observed cannot be replaced underneath it — the path ABA that let a stale rebuild
+#: quarantine and delete a fresh, valid store the reviewer reproduced.
+HERDR_LAUNCH_GENERATION_LOCK_FILENAME = ".herdr-launch-generation.lock"
+
+
+def launch_generation_store_lock_path(home: Path | None = None) -> Path:
+    return (home or mozyo_bridge_home()) / HERDR_LAUNCH_GENERATION_LOCK_FILENAME
+
+
+@contextmanager
+def launch_generation_store_lock(home: Path, *, exclusive: bool, blocking: bool):
+    """Hold the home's launch-generation-store advisory lock (Redmine #14203 j#87488 P1).
+
+    Mirrors ``attestation_store_lock``: the store's generation cannot be replaced underneath
+    an operation because the three boundaries that touch it are coordinated through one lock.
+    A holder's crash releases it at the OS level. Where ``fcntl.flock`` is unavailable the
+    protocol cannot be honored, so this raises :class:`LaunchGenerationStoreLockUnavailable`
+    rather than silently proceeding unlocked.
+    """
+    try:
+        import fcntl
+    except ImportError as exc:  # pragma: no cover - POSIX-only platforms in practice
+        raise LaunchGenerationStoreLockUnavailable(
+            "advisory file locking (fcntl.flock) is unavailable on this platform, so the "
+            "launch-generation-store lock protocol cannot be honored; refusing to proceed "
+            "unlocked"
+        ) from exc
+
+    path = launch_generation_store_lock_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    flags = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (
+        0 if blocking else fcntl.LOCK_NB
+    )
+    try:
+        try:
+            fcntl.flock(fd, flags)
+        except OSError as exc:
+            if not blocking and exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise LaunchGenerationStoreLockBusy(
+                    "the launch-generation store is locked by another operation on this "
+                    "home (maintenance, or a managed launch's reserve / finalize write)"
+                ) from exc
+            raise
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def probe_launch_generation_store(path: Path) -> tuple[str, str]:
@@ -382,6 +449,32 @@ class HerdrLaunchGenerationStore:
             (assigned_name,),
         ).fetchone()
 
+    def _with_shared_write_lock(self, run):
+        """Run a mutating write while holding the home's store lock SHARED (blocking).
+
+        Redmine #14203 review j#87488 P1: a managed launch's reserve / finalize takes the
+        lock shared so it coexists with peer writes but is excluded during exclusive
+        maintenance — the ABA that let a stale rebuild rotate a fresh store away. A lock the
+        platform cannot honor is a fail-closed :class:`HerdrLaunchGenerationError`.
+        """
+        try:
+            with launch_generation_store_lock(
+                self.path.parent, exclusive=False, blocking=True
+            ):
+                return run()
+        except (
+            LaunchGenerationStoreLockBusy,
+            LaunchGenerationStoreLockUnavailable,
+            OSError,
+        ) as exc:
+            # Lock ACQUISITION failed (busy / unavailable / the home is not a writable dir).
+            # The locked write body converts its own sqlite/OS errors to
+            # HerdrLaunchGenerationError, so an OSError here is only from taking the lock —
+            # a fail-closed write refusal, never a mislabeled write error.
+            raise HerdrLaunchGenerationError(
+                f"the launch-generation store lock could not be taken for a write ({exc})"
+            ) from exc
+
     def read(self, assigned_name: str) -> Optional[LaunchGeneration]:
         """The current generation row for ``assigned_name``, or ``None`` (fail-closed).
 
@@ -440,10 +533,30 @@ class HerdrLaunchGenerationStore:
 
         Atomically supersedes any prior row for ``assigned_name`` — the newer generation
         invalidates the old ``attested`` current pointer at once, closing the relaunch ABA
-        window (the row reads ``pending`` until this generation itself attests). A store
-        write that cannot proceed raises :class:`HerdrLaunchGenerationError`, which the
-        caller turns into a typed zero-actuation launch refusal.
+        window (the row reads ``pending`` until this generation itself attests). Held under
+        the home's SHARED store lock so maintenance cannot rotate the store mid-write. A store
+        write (or lock) that cannot proceed raises :class:`HerdrLaunchGenerationError`, which
+        the caller turns into a typed zero-actuation launch refusal.
         """
+        return self._with_shared_write_lock(
+            lambda: self._reserve_pending_locked(
+                assigned_name=assigned_name,
+                startup_action_id=startup_action_id,
+                workspace_id=workspace_id,
+                role=role,
+                lane_id=lane_id,
+            )
+        )
+
+    def _reserve_pending_locked(
+        self,
+        *,
+        assigned_name: str,
+        startup_action_id: str,
+        workspace_id: str,
+        role: str,
+        lane_id: str,
+    ) -> LaunchGeneration:
         fields = {
             "assigned_name": _token(assigned_name, "assigned_name"),
             "startup_action_id": _token(startup_action_id, "startup_action_id"),
@@ -513,8 +626,34 @@ class HerdrLaunchGenerationStore:
         identity/locator). This store performs only the byte-exact CAS on
         ``(assigned_name, startup_action_id, phase='pending')`` and the reserved identity, so
         an older launch's late finalize after a *newer* ``pending`` reservation matches zero
-        rows and is refused — never overwriting the newer generation.
+        rows and is refused — never overwriting the newer generation. Held under the home's
+        SHARED store lock so maintenance cannot rotate the store mid-write.
         """
+        return self._with_shared_write_lock(
+            lambda: self._finalize_locked(
+                assigned_name=assigned_name,
+                startup_action_id=startup_action_id,
+                workspace_id=workspace_id,
+                role=role,
+                lane_id=lane_id,
+                locator=locator,
+                verdict=verdict,
+                observed_at=observed_at,
+            )
+        )
+
+    def _finalize_locked(
+        self,
+        *,
+        assigned_name: str,
+        startup_action_id: str,
+        workspace_id: str,
+        role: str,
+        lane_id: str,
+        locator: str,
+        verdict: str,
+        observed_at: str,
+    ) -> LaunchGeneration:
         fields = {
             "assigned_name": _token(assigned_name, "assigned_name"),
             "startup_action_id": _token(startup_action_id, "startup_action_id"),
@@ -655,13 +794,18 @@ __all__ = (
     "GENERATION_STORE_CORRUPT",
     "GENERATION_STORE_HEALTHY",
     "HERDR_LAUNCH_GENERATION_FILENAME",
+    "HERDR_LAUNCH_GENERATION_LOCK_FILENAME",
     "HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION",
     "HERDR_LAUNCH_GENERATION_RECOVERY_POLICY",
     "HERDR_LAUNCH_GENERATION_SCHEMA_VERSION",
     "HerdrLaunchGenerationError",
     "HerdrLaunchGenerationStore",
     "LaunchGeneration",
+    "LaunchGenerationStoreLockBusy",
+    "LaunchGenerationStoreLockUnavailable",
     "herdr_launch_generation_path",
+    "launch_generation_store_lock",
+    "launch_generation_store_lock_path",
     "probe_launch_generation_store",
     "verified_generation_token",
 )
