@@ -47,9 +47,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (
     LauncherCapabilityObservation,
+    decide_generation_protocol_capability,
     decide_launcher_capability,
     decide_store_compatibility,
     parse_launcher_capability_output,
+)
+from mozyo_bridge.core.state.herdr_launch_generation import (
+    HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION,
 )
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
@@ -272,6 +276,37 @@ def preflight_attest_store_schema(
         )
 
 
+def preflight_generation_protocol_capability(
+    observation: LauncherCapabilityObservation,
+) -> None:
+    """Fail closed unless the probed launcher speaks this runtime's generation protocol.
+
+    Redmine #14203 review j#87479 F1 — the check the #13847 / #13882 attestation preflights
+    structurally cannot make. Those prove the launcher writes an attestation of a compatible
+    schema into the selected store; they say NOTHING about whether the wrapper emits the
+    ``attestation_write_succeeded`` startup execution event the parent's launch-generation
+    finalize requires. A launcher carrying ``agent-attest`` + a matching attestation schema
+    but predating that event passes both, lets the parent reserve a ``pending`` generation,
+    the pair actuates, and only then is the finalize discovered impossible — stranding the
+    generation and blocking the very gateway recovery #14203 adds.
+
+    Decided on the SAME probe observation as the attestation checks (no second subprocess),
+    and called next to them — before the caller reserves the generation and issues its first
+    ``workspace`` / ``tab`` / ``agent`` write — so an incompatible generation protocol aborts
+    with zero herdr side effect. The error is raised, never persisted, so no personal path is
+    written to a durable store.
+    """
+    verdict = decide_generation_protocol_capability(
+        observation, required_version=HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION
+    )
+    if not verdict.ok:
+        raise HerdrLauncherIncompatibleError(
+            f"managed-launch preflight refused the selected launcher's generation protocol: "
+            f"{verdict.detail}. No workspace / tab / agent was created.",
+            reason=verdict.reason,
+        )
+
+
 def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[str, object]]:
     """Run herdr ``agent list`` and return raw rows (fail-closed)."""
     completed = _invoke(binary, ["agent", "list"], runner, timeout, env=None)
@@ -406,4 +441,6 @@ __all__ = (
     "_invoke",
     "_list_rows",
     "preflight_attest_launcher_capability",
+    "preflight_attest_store_schema",
+    "preflight_generation_protocol_capability",
 )

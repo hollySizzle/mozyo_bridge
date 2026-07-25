@@ -437,5 +437,229 @@ class R7DiagnosticOnlyEvents(unittest.TestCase):
             )
 
 
+class R8GenerationProtocolCapability(unittest.TestCase):
+    """F1 (j#87479): generation protocol is an INDEPENDENT launcher capability, preflighted
+    before the first Herdr side effect — not inferred from the attestation schema."""
+
+    def _help(self, *, attest=True, stores=True, generation=None):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            build_attest_capability_contract_line,
+            build_attest_capability_stores_line,
+            build_generation_protocol_capability_line,
+        )
+
+        parts = ["usage: mozyo-bridge herdr agent-attest [--assigned-name NAME]"]
+        if attest:
+            parts.append(build_attest_capability_contract_line(2))
+        if stores:
+            parts.append(build_attest_capability_stores_line({1, 2}))
+        if generation is not None:
+            parts.append(build_generation_protocol_capability_line(generation))
+        return "\n".join(parts) + "\n"
+
+    def test_the_canonical_epilog_advertises_the_generation_marker(self):
+        # The real launcher auto-advertises from the const, so a released launcher is capable.
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION as V,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            build_agent_attest_epilog,
+            decide_generation_protocol_capability,
+            parse_launcher_capability_output,
+        )
+
+        obs = parse_launcher_capability_output(
+            "--assigned-name\n" + build_agent_attest_epilog()
+        )
+        self.assertEqual(obs.advertised_generation_protocol_version, V)
+        self.assertTrue(
+            decide_generation_protocol_capability(obs, required_version=V).ok
+        )
+
+    def test_an_installed_launcher_with_attestation_but_no_generation_is_refused(self):
+        # The exact skew j#87479 F1 names: a launcher whose attestation schema/store contract
+        # landed (`450c77dc`) but predates the generation event (`69764b7e`) advertises the
+        # attest markers and NOT the generation one — attestation-capable, generation-incapable.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            GENERATION_PROTOCOL_CONTRACT_ABSENT,
+            LAUNCHER_CAPABILITY_OK,
+            decide_generation_protocol_capability,
+            decide_launcher_capability,
+            parse_launcher_capability_output,
+        )
+
+        obs = parse_launcher_capability_output(self._help(generation=None))
+        # It PASSES the attestation decision (schema v2 matches) ...
+        self.assertEqual(
+            decide_launcher_capability(obs, required_schema_version=2).reason,
+            LAUNCHER_CAPABILITY_OK,
+        )
+        # ... but is refused fail-closed by the independent generation decision.
+        verdict = decide_generation_protocol_capability(obs, required_version=1)
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, GENERATION_PROTOCOL_CONTRACT_ABSENT)
+
+    def test_a_version_mismatch_is_refused(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            GENERATION_PROTOCOL_VERSION_MISMATCH,
+            decide_generation_protocol_capability,
+            parse_launcher_capability_output,
+        )
+
+        obs = parse_launcher_capability_output(self._help(generation=2))
+        verdict = decide_generation_protocol_capability(obs, required_version=1)
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, GENERATION_PROTOCOL_VERSION_MISMATCH)
+
+    def test_a_malformed_or_conflicting_marker_is_unprovable(self):
+        # Strict token discipline (#13847 j#80000 finding 3): a malformed spelling is not
+        # salvaged, and two conflicting versions arbitrate to neither — both fail closed.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            GENERATION_PROTOCOL_CONTRACT_ABSENT,
+            decide_generation_protocol_capability,
+            parse_launcher_capability_output,
+        )
+
+        for bad in (
+            "--assigned-name\nmozyo_generation_protocol_capability=1x\n",  # trailing garbage
+            "--assigned-name\nmozyo_generation_protocol_capability=1\n"
+            "mozyo_generation_protocol_capability=2\n",  # conflicting
+            "--assigned-name\nxmozyo_generation_protocol_capability=1\n",  # not whole token
+        ):
+            obs = parse_launcher_capability_output(bad)
+            self.assertIsNone(obs.advertised_generation_protocol_version, bad)
+            self.assertEqual(
+                decide_generation_protocol_capability(obs, required_version=1).reason,
+                GENERATION_PROTOCOL_CONTRACT_ABSENT,
+                bad,
+            )
+
+
+class R9RebuildableCacheRecovery(unittest.TestCase):
+    """F2 (j#87479): a corrupt store degrades (rebuildable_cache) with a PUBLIC backup-first
+    rebuild — it never bricks future launches, and never repairs implicitly."""
+
+    def _view(self, *, live=(), ok=True, backend=True):
+        agents = tuple(SimpleNamespace(name=n) for n in live)
+        return SimpleNamespace(
+            backend_selected=backend, ok=ok, managed_agents=agents,
+            reason="unreadable", detail="probe failed",
+        )
+
+    def _corrupt(self, home):
+        herdr_launch_generation_path(home).parent.mkdir(parents=True, exist_ok=True)
+        herdr_launch_generation_path(home).write_bytes(b"not a sqlite database")
+
+    def test_a_corrupt_store_refuses_every_launch_operation_fail_closed(self):
+        home = _tmp()
+        self._corrupt(home)
+        # binding/recovery authority degrades to no token (never a stale generation) ...
+        self.assertEqual(_token_for(home), "")
+        # ... and reserve/read raise a typed error (not a silent repair).
+        with self.assertRaises(HerdrLaunchGenerationError):
+            HerdrLaunchGenerationStore(home=home).read(NAME)
+
+    def test_status_classifies_absent_healthy_corrupt(self):
+        from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_launch_generation_store_maintenance import (  # noqa: E501
+            run_launch_generation_store_status,
+        )
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            GENERATION_STORE_ABSENT,
+            GENERATION_STORE_CORRUPT,
+            GENERATION_STORE_HEALTHY,
+        )
+
+        home = _tmp()
+        self.assertEqual(
+            run_launch_generation_store_status(home=home).store_state,
+            GENERATION_STORE_ABSENT,
+        )
+        _seed_generation(home, _seed_fence_success(home, nonce="A"))
+        self.assertEqual(
+            run_launch_generation_store_status(home=home).store_state,
+            GENERATION_STORE_HEALTHY,
+        )
+        self._corrupt(_tmp2 := _tmp())
+        r = run_launch_generation_store_status(home=_tmp2)
+        self.assertEqual(r.store_state, GENERATION_STORE_CORRUPT)
+        self.assertTrue(r.ok)  # status always reports
+        self.assertTrue(any("rebuild --write" in n for n in r.notes))
+
+    def test_backup_first_rebuild_recovers_and_only_relaunch_mints_a_new_generation(self):
+        from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_launch_generation_store_maintenance import (  # noqa: E501
+            APPLIED,
+            PLANNED,
+            run_launch_generation_store_rebuild,
+        )
+
+        home = _tmp()
+        self._corrupt(home)
+        path = herdr_launch_generation_path(home)
+
+        # A dry-run plan performs no removal.
+        plan = run_launch_generation_store_rebuild(home=home, view=self._view(), write=False)
+        self.assertEqual(plan.state, PLANNED)
+        self.assertTrue(path.exists())
+
+        # --write: backup-first, then the corrupt store is removed. The rebuild itself does
+        # NOT mint a generation — the store is simply absent again (fail-closed) ...
+        applied = run_launch_generation_store_rebuild(
+            home=home, view=self._view(), write=True
+        )
+        self.assertEqual(applied.state, APPLIED)
+        self.assertTrue(applied.executed)
+        self.assertIsNotNone(applied.backup_dir)
+        self.assertTrue(Path(applied.backup_dir).exists())  # the prior bytes are preserved
+        self.assertFalse(path.exists())
+        self.assertEqual(_token_for(home), "")  # still fail-closed, no fabricated generation
+
+        # ... only the NEXT managed launch (reserve + finalize) re-creates a live generation.
+        token = _seed_fence_success(home, nonce="A")
+        _seed_generation(home, token)
+        self.assertEqual(_token_for(home), token)
+
+    def test_rebuild_is_refused_while_a_live_consumer_holds_a_generation(self):
+        # A healthy store IS enumerable, so a live agent holding a row blocks a (misdirected)
+        # rebuild — discarding a live agent's generation is refused.
+        from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_launch_generation_store_maintenance import (  # noqa: E501
+            BLOCKED_CONSUMERS_UNMEASURABLE,
+            BLOCKED_STORE_HEALTHY,
+            run_launch_generation_store_rebuild,
+        )
+
+        home = _tmp()
+        _seed_generation(home, _seed_fence_success(home, nonce="A"))  # gw holds a generation
+        # Healthy store -> refused outright (nothing corrupt; rebuild would discard rows).
+        healthy = run_launch_generation_store_rebuild(
+            home=home, view=self._view(live=["gw"]), write=True
+        )
+        self.assertEqual(healthy.state, BLOCKED_STORE_HEALTHY)
+
+        # Corrupt store WITH a live agent -> rows unmeasurable, so it cannot be proven the
+        # agent does not consume it: refused fail-closed with a public next action.
+        self._corrupt(home)
+        blocked = run_launch_generation_store_rebuild(
+            home=home, view=self._view(live=["gw"]), write=True
+        )
+        self.assertEqual(blocked.state, BLOCKED_CONSUMERS_UNMEASURABLE)
+        self.assertFalse(blocked.ok)
+        self.assertIn("Retire / close", blocked.detail)  # public next action
+        self.assertTrue(herdr_launch_generation_path(home).exists())  # not removed
+
+    def test_an_unreadable_inventory_refuses_the_rebuild(self):
+        from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_launch_generation_store_maintenance import (  # noqa: E501
+            BLOCKED_INVENTORY_UNREADABLE,
+            run_launch_generation_store_rebuild,
+        )
+
+        home = _tmp()
+        self._corrupt(home)
+        r = run_launch_generation_store_rebuild(
+            home=home, view=self._view(ok=False), write=True
+        )
+        self.assertEqual(r.state, BLOCKED_INVENTORY_UNREADABLE)
+        self.assertTrue(herdr_launch_generation_path(home).exists())  # untouched
+
+
 if __name__ == "__main__":
     unittest.main()

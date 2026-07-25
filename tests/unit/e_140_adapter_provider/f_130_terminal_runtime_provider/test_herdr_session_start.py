@@ -38,8 +38,12 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
 )
 from mozyo_bridge.core.state.workspace_registry import read_anchor
+from mozyo_bridge.core.state.herdr_launch_generation import (
+    HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (
     build_attest_capability_contract_line,
+    build_generation_protocol_capability_line,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     derive_lane_workspace_token,
@@ -198,6 +202,7 @@ class _Herdr:
         start_fails=False,
         close_fails=False,
         attest_capable=True,
+        generation_capable=True,
     ):
         # Redmine #13748: whether the resolved launcher's CLI can run the wrapper
         # subcommand. `True` (default) makes `<launcher> herdr agent-attest --help`
@@ -205,6 +210,10 @@ class _Herdr:
         # tests byte-invariant; `False` models the installed-launcher-lags-source skew
         # (argparse `invalid choice` / exit 2) the capability preflight must catch.
         self.attest_capable = attest_capable
+        # #14203 F1: whether the launcher also advertises the generation-protocol marker.
+        # `True` (default) keeps every existing wrap test byte-invariant; `False` models an
+        # attest-capable launcher predating the launch-generation event protocol.
+        self.generation_capable = generation_capable
         self.attest_probes: list = []
         self.existing_rows = existing_rows or []
         # By default the launched agent lands in the workspace it was told to via
@@ -290,6 +299,14 @@ class _Herdr:
                         "capability contract (Redmine #13847):\n"
                         + build_attest_capability_contract_line(
                             HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
+                        )
+                        + (
+                            "\ngeneration protocol (Redmine #14203):\n"
+                            + build_generation_protocol_capability_line(
+                                HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION
+                            )
+                            if self.generation_capable
+                            else ""
                         )
                     ),
                     stderr="",
@@ -674,6 +691,40 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(start[start.index("--") + 1], launcher)
         self.assertIn("agent-attest", start)
         self.assertEqual(result.slots[0].outcome, SLOT_LAUNCHED)
+
+    def test_generation_incapable_launcher_refuses_before_any_actuation(self) -> None:
+        # #14203 review j#87479 F1: a launcher that carries `agent-attest` + a matching
+        # attestation schema but predates the generation-protocol event marker is refused at
+        # the SAME probe, BEFORE the first Herdr side effect — the generation reserve and
+        # every workspace / tab / agent write. Without it the pair would actuate and only
+        # then strand its generation `pending`, blocking recovery. Zero-actuation regression.
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            herdr_launch_generation_path,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            GENERATION_PROTOCOL_CONTRACT_ABSENT,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            HerdrLauncherIncompatibleError,
+        )
+
+        herdr = _Herdr(attest_capable=True, generation_capable=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher_env, launcher = self._fake_launcher_env(tmp)
+            with self.assertRaises(HerdrLauncherIncompatibleError) as ctx:
+                self._prepare(
+                    tmp, providers=["claude"], herdr=herdr, extra_env=launcher_env
+                )
+            # A typed refusal naming the generation-protocol gap.
+            self.assertEqual(ctx.exception.reason, GENERATION_PROTOCOL_CONTRACT_ABSENT)
+            # The probe ran, but NOTHING actuated: no workspace create, no agent start,
+            # and no generation reservation was ever written.
+            self.assertEqual(herdr.attest_probes[0][:3], [launcher, "herdr", "agent-attest"])
+            self.assertEqual(herdr.start_argvs, [])
+            self.assertEqual(herdr.workspace_creates, [])
+            self.assertFalse(
+                herdr_launch_generation_path(Path(tmp) / "home").exists()
+            )
 
     def test_unresolvable_launcher_skips_capability_probe(self) -> None:
         # Redmine #13748 / #13637: no resolvable launcher -> `attest_launcher == ""`

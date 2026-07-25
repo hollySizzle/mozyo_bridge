@@ -221,6 +221,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _list_workspace_labels,
     preflight_attest_launcher_capability,
     preflight_attest_store_schema,
+    preflight_generation_protocol_capability,
     HerdrLauncherIncompatibleError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
@@ -667,6 +668,8 @@ def _prepare_session_locked(
             store_home=Path(store_home),
             replacement_launch=bool((replacement_action_id or "").strip()),
         )
+        # #14203 F1: generation-protocol capability (same probe), refused before reserve.
+        preflight_generation_protocol_capability(observation)
 
     # Reserve BOTH pre-side-effect identity records — the immutable startup action (#13948,
     # Answer j#80989) and each wrapped slot's launch generation (#14203 j#87472) — the LAST

@@ -49,8 +49,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
     RuntimePlacementFingerprint,
 )
+from mozyo_bridge.core.state.herdr_launch_generation import (
+    HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
     build_attest_capability_contract_line,
+    build_generation_protocol_capability_line,
 )
 
 from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
@@ -106,6 +110,10 @@ class _StatefulHerdr:
                     "usage: mozyo-bridge herdr agent-attest --assigned-name ...\n"
                     + build_attest_capability_contract_line(
                         HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
+                    )
+                    + "\n"
+                    + build_generation_protocol_capability_line(
+                        HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION
                     )
                 ),
                 stderr="",

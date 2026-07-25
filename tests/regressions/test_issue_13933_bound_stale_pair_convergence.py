@@ -955,6 +955,8 @@ class _V1AttestingHerdr(_AttestingHerdr):
                     "usage: mozyo-bridge herdr agent-attest --assigned-name NAME\n"
                     "mozyo_attest_capability_schema=2\n"
                     "mozyo_attest_capability_stores=1_2\n"
+                    # #14203 F1: this launcher speaks the generation protocol too.
+                    "mozyo_generation_protocol_capability=1\n"
                 ),
                 stderr="",
             )

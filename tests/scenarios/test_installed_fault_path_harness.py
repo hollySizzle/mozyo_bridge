@@ -468,6 +468,31 @@ class StaleWorkerRecoveryThroughPublicCli(unittest.TestCase):
         self.assertEqual(outcome.redispatch_attempt_count, 1)
         self.assertEqual(outcome.redispatch_ok_count, 1)
 
+    def test_an_installed_launcher_lacking_generation_protocol_refuses_the_heal_launch(self):
+        # #14203 review j#87479 F1 (installed-launcher fault harness): an installed launcher
+        # whose attestation schema/store contract landed but that predates the generation
+        # protocol event is refused when a heal tries to launch a fresh worker THROUGH it —
+        # the launch effect fails fail-closed and no fresh worker comes up, rather than
+        # launching a pair whose generation could never be finalized.
+        #
+        # Baseline (non-vacuous control): a fully-capable installed launcher heals — the first
+        # `--execute` pass owns and lands a fresh worker.
+        capable = InstalledFaultHarness(self)
+        cap_ctx = capable.recover_stale_git_lane("issue_14203_gen_capable", issue="14203")
+        capable.recover_stale_cli(cap_ctx, execute=True)
+        self.assertTrue(capable._fresh_worker_locator(cap_ctx))
+
+        # Fault: the SAME heal through a generation-incapable launcher stops at effect_failed
+        # with no fresh worker and no fresh attestation (the launch preflight refused it).
+        faulty = InstalledFaultHarness(self)
+        ctx = faulty.recover_stale_git_lane("issue_14203_gen_incapable", issue="14203")
+        faulty.make_launcher_generation_incapable()
+
+        outcome = faulty.recover_stale_cli(ctx, execute=True).json()
+        self.assertEqual(outcome["recovery_status"], "effect_failed")
+        self.assertFalse(outcome["fresh_slot_attested"])
+        self.assertFalse(faulty._fresh_worker_locator(ctx))
+
     def test_injected_uncertain_redispatch_is_rejected_by_the_shared_predicate(self):
         # The negative CONTROL: an attestation landing OUTSIDE the redispatch's durable window makes
         # the confirm fence reject the send, so the drive stops at ``redispatch_status=uncertain`` —

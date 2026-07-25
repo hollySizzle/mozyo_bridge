@@ -63,6 +63,17 @@ from mozyo_bridge.shared.paths import mozyo_bridge_home
 HERDR_LAUNCH_GENERATION_FILENAME = "herdr-launch-generation.sqlite"
 HERDR_LAUNCH_GENERATION_SCHEMA_VERSION = 1
 
+#: The wire version of the *generation protocol* a managed launcher must implement for the
+#: parent to be able to finalize a launch generation (Redmine #14203 review j#87479 F1):
+#: the wrapped child emits the ``attestation_write_succeeded`` startup execution event
+#: keyed by its own assigned name, so the parent's finalize can require that composite
+#: evidence. This is advertised and preflighted INDEPENDENTLY of the attestation-store
+#: schema version — a launcher can carry ``agent-attest`` + a matching attestation schema
+#: yet predate the wrapper event, in which case a generation reserved before the first
+#: Herdr side effect would only ever be discovered un-finalizable AFTER actuation. Bumping
+#: this refuses such a launcher before any side effect.
+HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION = 1
+
 #: Recovery policy (``managed-state-model.md`` ``### recovery policy vocabulary``): losing
 #: it degrades to fail-closed (binding + recovery refuse) and the next managed relaunch
 #: re-reserves it. It is never speculatively rebuilt from a live process.
@@ -70,6 +81,16 @@ HERDR_LAUNCH_GENERATION_RECOVERY_POLICY = "rebuildable_cache"
 
 GENERATION_PENDING = "pending"
 GENERATION_ATTESTED = "attested"
+
+# --- Store status vocabulary (for the public maintenance rail, Redmine #14203 F2). ----
+#: No store file yet — a fresh / rebuilt home. The next managed launch creates it.
+GENERATION_STORE_ABSENT = "generation_store_absent"
+#: The file exists and presents the exact recognized v1 schema — usable.
+GENERATION_STORE_HEALTHY = "generation_store_healthy"
+#: The file exists but cannot be opened / validated (corrupt, partial, foreign, or a
+#: non-database). Reads fail closed; the ``rebuildable_cache`` policy admits a backup-first
+#: public rebuild to recover, never an implicit repair.
+GENERATION_STORE_CORRUPT = "generation_store_corrupt"
 
 _TABLE = "herdr_launch_generations"
 _COLUMNS = (
@@ -156,6 +177,28 @@ def _rollback_quietly(conn: sqlite3.Connection) -> None:
 
 def herdr_launch_generation_path(home: Path | None = None) -> Path:
     return (home or mozyo_bridge_home()) / HERDR_LAUNCH_GENERATION_FILENAME
+
+
+def probe_launch_generation_store(path: Path) -> tuple[str, str]:
+    """Read-only classify the store at ``path`` -> ``(state, detail)`` (never mutates).
+
+    The read side of the public maintenance rail (Redmine #14203 F2). An absent file is a
+    legitimate fresh / rebuilt home; a file that opens and presents the exact v1 schema is
+    healthy; anything else (unopenable, wrong shape, wrong version) is corrupt and fails
+    closed — the ``rebuildable_cache`` state a backup-first rebuild recovers.
+    """
+    if not path.exists():
+        return GENERATION_STORE_ABSENT, "no store yet"
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            HerdrLaunchGenerationStore._validate_schema(conn)
+        finally:
+            conn.close()
+    except (HerdrLaunchGenerationError, sqlite3.DatabaseError, OSError) as exc:
+        return GENERATION_STORE_CORRUPT, f"{exc.__class__.__name__}: {exc}"
+    return GENERATION_STORE_HEALTHY, f"recognized v{HERDR_LAUNCH_GENERATION_SCHEMA_VERSION}"
 
 
 @dataclass(frozen=True)
@@ -363,6 +406,26 @@ class HerdrLaunchGenerationStore:
                 "herdr launch-generation store is unreadable"
             ) from exc
         return _decode(row) if row is not None else None
+
+    def assigned_names(self) -> Optional[frozenset]:
+        """Every ``assigned_name`` this store holds, or ``None`` if it cannot be read.
+
+        The live-consumer evidence the public maintenance rail intersects with the live
+        fleet (Redmine #14203 F2). ``None`` is a measured "unreadable", never folded into an
+        empty set — a corrupt store while agents are live must fail the rebuild gate closed.
+        """
+        if not self.path.exists():
+            return frozenset()
+        try:
+            conn = self._connect_existing(readonly=True)
+            try:
+                conn.execute("BEGIN")
+                rows = conn.execute(f"SELECT assigned_name FROM {_TABLE}").fetchall()
+            finally:
+                conn.close()
+        except (HerdrLaunchGenerationError, sqlite3.DatabaseError, OSError):
+            return None
+        return frozenset(str(row[0]) for row in rows)
 
     def reserve_pending(
         self,
@@ -588,12 +651,17 @@ def verified_generation_token(
 __all__ = (
     "GENERATION_ATTESTED",
     "GENERATION_PENDING",
+    "GENERATION_STORE_ABSENT",
+    "GENERATION_STORE_CORRUPT",
+    "GENERATION_STORE_HEALTHY",
     "HERDR_LAUNCH_GENERATION_FILENAME",
+    "HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION",
     "HERDR_LAUNCH_GENERATION_RECOVERY_POLICY",
     "HERDR_LAUNCH_GENERATION_SCHEMA_VERSION",
     "HerdrLaunchGenerationError",
     "HerdrLaunchGenerationStore",
     "LaunchGeneration",
     "herdr_launch_generation_path",
+    "probe_launch_generation_store",
     "verified_generation_token",
 )
