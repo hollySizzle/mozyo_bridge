@@ -171,7 +171,24 @@ class ProbeFailureIsZeroActuationTest(unittest.TestCase):
             # The preflight raised; no herdr verb was ever issued by it.
             self.assertEqual(herdr_calls, [])
             self.assertTrue(callable(_explode))
-            self.assertTrue(hasattr(ss, "preflight_attest_launcher_capability"))
+            # The launch path must still WIRE that preflight, and still hand it the lane's
+            # own cwd — this test's whole subject. Redmine #14258 folded the launcher
+            # conjunction into `preflight_launcher_compatibility`, so the wiring is pinned
+            # through it: the session-start module calls the composite, and the composite
+            # forwards `repo_root` to the cwd-sensitive probe. Both links, so neither can
+            # be dropped while this test still passes.
+            import inspect
+
+            from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+                herdr_pane_lifecycle,
+            )
+
+            self.assertTrue(hasattr(ss, "preflight_launcher_compatibility"))
+            composite = inspect.getsource(
+                herdr_pane_lifecycle.preflight_launcher_compatibility
+            )
+            self.assertIn("preflight_attest_launcher_capability", composite)
+            self.assertIn("repo_root=repo_root", composite)
 
 
 class RealSubprocessCwdSensitivityTest(unittest.TestCase):

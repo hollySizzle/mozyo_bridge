@@ -54,6 +54,9 @@ from mozyo_bridge.core.state.workspace_registry import read_anchor, register_wor
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (  # noqa: E501
+    CONFIG_PARSE_SUBCOMMAND,
+)
 
 from tests.support.agent_provider_binaries import FakeAgentBinaries
 from tests.support.herdr_fake import (
@@ -148,33 +151,53 @@ class CliResult(NamedTuple):
 def _attest_launcher_capability_help() -> str:
     """The exact ``<launcher> herdr agent-attest --help`` capability epilog, built canonically.
 
-    A managed fresh-worker launch (Redmine #13806 heal) runs a #13847 launcher-capability
+    A managed fresh-worker launch (Redmine #13806 heal) runs the launcher-capability
     preflight — ``<attest-launcher> herdr agent-attest --help`` — before ``agent start``, so a
     hermetic launch must answer that probe. The installed layer runs the REAL wheel's binary
     (which carries the capability); in-process there is no such subprocess, so this reproduces the
-    SAME epilog the source ``cli_core`` renders, from the SAME source builders + schema constants
-    (never a copied literal — a schema bump re-renders here automatically). Carries the
-    ``--assigned-name`` subcommand marker, the advertised schema token, and the writable-store set,
-    so :func:`parse_launcher_capability_output` reads a compatible launcher.
+    SAME epilog the source ``cli_core`` renders — by calling the SAME canonical composer, never a
+    copied literal. That is deliberate (Redmine #14258): when a new capability token was added,
+    every hand-rolled copy of the epilog silently advertised an incomplete contract and failed
+    closed somewhere else, looking like a launcher defect. One producer means a token added
+    upstream appears here automatically.
     """
-    from mozyo_bridge.core.state.herdr_identity_attestation import (
-        HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
-        RECOGNIZED_SCHEMA_VERSIONS,
-    )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
         ATTEST_CAPABILITY_MARKER,
-        build_attest_capability_contract_line,
-        build_attest_capability_stores_line,
+        build_attest_capability_epilog,
     )
 
     return (
         f"usage: mozyo-bridge herdr agent-attest [{ATTEST_CAPABILITY_MARKER} ASSIGNED_NAME]\n\n"
-        "capability contract (Redmine #13847):\n"
-        + build_attest_capability_contract_line(HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION)
-        + "\nwritable attestation store shapes (Redmine #13882):\n"
-        + build_attest_capability_stores_line(RECOGNIZED_SCHEMA_VERSIONS)
+        + build_attest_capability_epilog()
         + "\n"
     )
+
+
+def _config_check_parse_result(argv: list) -> "subprocess.CompletedProcess[str]":
+    """Answer ``<launcher> config check-parse --file <path>`` with THIS build's real verdict.
+
+    The installed layer execs the wheel's binary, which runs exactly this parser; in-process
+    the harness runs it directly rather than canning a ``0``, so the harness can never report
+    a launcher as config-compatible when this build's own grammar would reject the document.
+    """
+    from mozyo_bridge.application.repo_local_config_loader import (
+        RepoLocalConfigError,
+        load_repo_local_config_from_path,
+    )
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application.cli_config import (  # noqa: E501
+        CONFIG_CHECK_PARSE_REJECTED,
+    )
+
+    path = Path(argv[argv.index("--file") + 1]) if "--file" in argv else None
+    try:
+        if path is None or not path.is_file():
+            raise RepoLocalConfigError(f"no such config file: {path}")
+        load_repo_local_config_from_path(path)
+    except RepoLocalConfigError as exc:
+        return subprocess.CompletedProcess(
+            argv, CONFIG_CHECK_PARSE_REJECTED, stdout="", stderr=str(exc)
+        )
+    return subprocess.CompletedProcess(argv, 0, stdout="parsed", stderr="")
 
 
 class _HerdrRunner:
@@ -216,6 +239,14 @@ class _HerdrRunner:
             return subprocess.CompletedProcess(
                 list(argv), 0, stdout=_attest_launcher_capability_help(), stderr=""
             )
+        if list(argv[1:3]) == list(CONFIG_PARSE_SUBCOMMAND):
+            # Redmine #14258 R4: the launcher preflight makes the candidate launcher parse the
+            # target config with its OWN grammar. In-process there is no wheel binary to exec,
+            # so run THIS build's parser — which is exactly what the installed binary would do,
+            # since the harness's launcher IS this build. Answering with the real verdict (not a
+            # canned 0) keeps the harness honest: a config this build rejects is reported
+            # rejected here too.
+            return _config_check_parse_result(list(argv))
         if head in ("sh", "/bin/sh", "bash", "/bin/bash"):
             # ``require_tmux`` runs ``sh -c 'command -v tmux'``; report tmux absent so a
             # misrouted send fails closed exactly as a pure-herdr session would.

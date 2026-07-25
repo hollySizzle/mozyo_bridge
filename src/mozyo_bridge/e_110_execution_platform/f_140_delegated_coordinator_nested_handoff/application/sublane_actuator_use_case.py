@@ -71,7 +71,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_gates import (  # noqa: E501
     pair_attestation_admission,
     pair_split_admission,
-    runtime_placement_gate,
+    pre_mutation_admission,
     startup_health_admission,
 )
 
@@ -240,9 +240,10 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 4b. Action-time runtime fingerprint gate; includes ``--no-dispatch`` (#13705).
+        # 4b. Pre-mutation admission: runtime fingerprint (#13705) + managed-launch launcher
+        # compatibility (#14258), before the worktree. Includes ``--no-dispatch``.
         if execute:
-            gate_outcome = runtime_placement_gate(
+            request, gate_outcome = pre_mutation_admission(
                 self, request, launch_action=launch.action, dispatch=dispatch,
                 fill_decision=fill_decision_token, fill_override_reason=fill_override_reason,
             )

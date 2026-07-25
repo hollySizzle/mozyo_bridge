@@ -107,6 +107,62 @@ _STORES_RE = re.compile(
     r"(?:^|\s)" + re.escape(ATTEST_CAPABILITY_STORES_PREFIX) + r"(\d+(?:_\d+)*)(?=\s|$)"
 )
 
+# --- Target-scoped read capability (Redmine #14258). -----------------------------------
+# The three tokens above are all about ONE authority: the attestation store the wrapper
+# writes. The launcher must also *read* two authorities it did not write, and neither is
+# covered by them:
+#
+# 1. the TARGET REPO's `.mozyo-bridge/config.yaml` — the wrapper starts with
+#    `--cwd <lane worktree>` and a mozyo-bridge CLI parses that config at startup, so a
+#    launcher predating a config schema bump exits before `exec`ing the provider (measured:
+#    `unknown key 'agents'` / exit 2 against the v2 config, #14258 j#85834);
+# 2. the HOME-SCOPED SHARED lane lifecycle authority — a launcher whose reader predates the
+#    shared store's component schema zero-starts with `LaneLifecycleReaderUpgradeRequired`
+#    (measured on the v7 store vs a v6 reader, #14258 j#85890).
+#
+# Both were previously invisible to the preflight, so the pair was created and only then
+# failed. They are advertised the same way as the store set — declared, wrap-proof tokens —
+# so the join is a *declaration* check rather than the incidental exit-code discriminant
+# #14231 relies on. That matters beyond honesty: a declaration can be verified BEFORE the
+# lane worktree exists, which is what lets `sublane create` refuse without creating one.
+
+#: The version of the read-only config-parse contract this launcher provides — i.e. that it
+#: registers ``config check-parse --file <path>`` and answers with the documented exit codes
+#: (Redmine #14258, review j#87752 R4).
+#:
+#: This token deliberately replaced an earlier pair that advertised the *supported config
+#: versions* and the *recognized top-level keys*. Both were summaries of the grammar, and a
+#: summary cannot answer the question: commit ``d28e59e2`` added the nested
+#: ``lane_placement.by_lane_kind`` key without changing either, so a launcher predating it
+#: advertised an identical contract and still rejected the config (measured against real
+#: pre-``d28e59e2`` source). Rather than enumerate a third summary, the contract now says
+#: only "I can be ASKED", and the answer comes from the launcher's own parser running on the
+#: exact target bytes — which covers version, top-level, nested, and any axis added later.
+ATTEST_CAPABILITY_CONFIG_PARSE_PREFIX = "mozyo_attest_capability_config_parse="
+
+#: The config-parse contract version this build both advertises and requires. Bump only if
+#: the probe's argv or exit-code meaning changes (never for a config *grammar* change — the
+#: whole point is that grammar changes need no token bump).
+CONFIG_PARSE_CONTRACT_VERSION = 1
+
+#: The lane lifecycle component schema versions this launcher's READER understands (its
+#: ``_RECOGNIZED_SCHEMA_VERSIONS``). Read capability, not write: the launch never migrates
+#: the shared authority, so what matters is whether the launcher can read the shape that is
+#: already there.
+ATTEST_CAPABILITY_LIFECYCLE_PREFIX = "mozyo_attest_capability_lifecycle="
+
+_CONFIG_PARSE_RE = re.compile(
+    r"(?:^|\s)"
+    + re.escape(ATTEST_CAPABILITY_CONFIG_PARSE_PREFIX)
+    + r"(\d+)(?=\s|$)"
+)
+
+_LIFECYCLE_RE = re.compile(
+    r"(?:^|\s)"
+    + re.escape(ATTEST_CAPABILITY_LIFECYCLE_PREFIX)
+    + r"(\d+(?:_\d+)*)(?=\s|$)"
+)
+
 # --- Verdict vocabulary (fail-closed; only LAUNCHER_CAPABILITY_OK proceeds). ----------
 #: Subcommand marker present AND advertised schema == the required source schema.
 LAUNCHER_CAPABILITY_OK = "launcher_capability_ok"
@@ -133,11 +189,18 @@ class LauncherCapabilityObservation:
     ``None`` when the launcher advertises no contract (a pre-#13847 build).
     ``advertised_store_versions`` — the store shapes the launcher declares it can WRITE
     (Redmine #13882), or ``None`` when it advertises no such set (a pre-#13882 build).
+    ``advertised_config_parse_contract`` — the version of the read-only config-parse
+    contract the launcher provides (so the preflight can ASK it to parse a document rather
+    than summarize its grammar), and ``advertised_lifecycle_versions`` — the shared lane
+    lifecycle component schemas its READER understands (both Redmine #14258); each is
+    ``None`` on a build predating that token, which is unprovable and therefore fails closed.
     """
 
     subcommand_marker_present: bool
     advertised_schema_version: Optional[int]
     advertised_store_versions: Optional[frozenset] = None
+    advertised_config_parse_contract: Optional[int] = None
+    advertised_lifecycle_versions: Optional[frozenset] = None
 
     @property
     def writable_store_versions(self) -> frozenset:
@@ -183,19 +246,84 @@ def build_attest_capability_stores_line(store_versions) -> str:
     advertised set can never drift from the shapes the writer actually accepts.
     Underscore-separated and sorted for a stable, wrap-proof rendering.
     """
-    joined = "_".join(str(int(v)) for v in sorted(store_versions))
-    return f"{ATTEST_CAPABILITY_STORES_PREFIX}{joined}"
+    return _version_set_token(ATTEST_CAPABILITY_STORES_PREFIX, store_versions)
+
+
+def build_attest_capability_config_parse_line(contract_version: int) -> str:
+    """The config-parse contract token the source advertises (pure, Redmine #14258 R4)."""
+    return f"{ATTEST_CAPABILITY_CONFIG_PARSE_PREFIX}{int(contract_version)}"
+
+
+def build_attest_capability_lifecycle_line(lifecycle_versions) -> str:
+    """The readable-lane-lifecycle-version token the source advertises (pure, #14258)."""
+    return _version_set_token(ATTEST_CAPABILITY_LIFECYCLE_PREFIX, lifecycle_versions)
+
+
+def build_attest_capability_epilog() -> str:
+    """The complete ``herdr agent-attest --help`` capability epilog (Redmine #14258).
+
+    The single canonical composer of every advertised capability token, so the CLI parser
+    and any harness that must answer the probe render the *same* contract. Adding a token
+    used to mean editing every producer, and a producer left behind silently advertised an
+    incomplete contract — which fails closed at some *other* call site, looking like a
+    launcher defect. Each token is built from the constant of the authority it describes, so
+    a schema bump anywhere re-renders here with no edit.
+
+    Imported lazily: the epilog is composed when a CLI parser is built, and this pure module
+    must not pull the config / lifecycle schema graphs in at import time.
+    """
+    from mozyo_bridge.core.state.herdr_identity_attestation import (
+        HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+        RECOGNIZED_SCHEMA_VERSIONS,
+    )
+    from mozyo_bridge.core.state.lane_lifecycle_schema import (
+        readable_lane_lifecycle_versions,
+    )
+
+    return (
+        "capability contract (Redmine #13847):\n"
+        + build_attest_capability_contract_line(
+            HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
+        )
+        + "\nwritable attestation store shapes (Redmine #13882):\n"
+        + build_attest_capability_stores_line(RECOGNIZED_SCHEMA_VERSIONS)
+        + "\nrepo-local config parse contract (Redmine #14258):\n"
+        + build_attest_capability_config_parse_line(CONFIG_PARSE_CONTRACT_VERSION)
+        + "\nreadable shared lane lifecycle schema (Redmine #14258):\n"
+        + build_attest_capability_lifecycle_line(readable_lane_lifecycle_versions())
+    )
+
+
+def _version_set_token(prefix: str, versions) -> str:
+    """Render ``<prefix><v>_<v>…`` — sorted, underscore-separated, wrap-proof (pure)."""
+    return f"{prefix}{'_'.join(str(int(v)) for v in sorted(versions))}"
+
+
+def _parse_version_set(haystack: str, pattern) -> Optional[frozenset]:
+    """The one whole-token, conflict-refusing parse every advertised version SET uses.
+
+    Shared by the store / config / lifecycle sets so the hardening review j#80000 finding 3
+    established for the first of them cannot drift away from the others: only a **whole
+    canonical token** counts, and two *different* advertisements of the same fact are not
+    arbitrated — a launcher that said two things has clearly said neither, so the fact stays
+    ``None`` and the join fails closed.
+    """
+    found = {
+        frozenset(int(part) for part in match.split("_"))
+        for match in pattern.findall(haystack)
+    }
+    return found.pop() if len(found) == 1 else None
 
 
 def parse_launcher_capability_output(text: str) -> LauncherCapabilityObservation:
     """Parse a launcher's capability probe output into observed facts (pure).
 
-    Reads the combined stdout+stderr of ``<launcher> herdr agent-attest --help``. The
-    subcommand marker, the advertised schema, and the advertised writable store set are
-    looked up independently: a launcher can carry the subcommand yet advertise no schema
-    (the pre-#13847 installed launcher), or advertise a schema but no store set (a
-    pre-#13882 build). Each unprovable fact stays ``None`` → fail closed, never a guessed
-    default.
+    Reads the combined stdout+stderr of ``<launcher> herdr agent-attest --help``. Every
+    advertised fact is looked up independently: a launcher can carry the subcommand yet
+    advertise no schema (the pre-#13847 installed launcher), advertise a schema but no store
+    set (a pre-#13882 build), or advertise both but neither the config nor the lane lifecycle
+    read capability (any pre-#14258 build). Each unprovable fact stays ``None`` → fail
+    closed, never a guessed default.
 
     "Unprovable" is strict (review j#80000 finding 3). Only a **whole canonical token**
     counts; a malformed spelling is not salvaged into a capability, and **conflicting**
@@ -208,16 +336,15 @@ def parse_launcher_capability_output(text: str) -> LauncherCapabilityObservation
     schema_values = {int(m) for m in _CONTRACT_RE.findall(haystack)}
     if len(schema_values) == 1:
         advertised = schema_values.pop()
-    stores: Optional[frozenset] = None
-    store_sets = {
-        frozenset(int(p) for p in m.split("_")) for m in _STORES_RE.findall(haystack)
-    }
-    if len(store_sets) == 1:
-        stores = store_sets.pop()
+    parse_contracts = {int(m) for m in _CONFIG_PARSE_RE.findall(haystack)}
     return LauncherCapabilityObservation(
         subcommand_marker_present=ATTEST_CAPABILITY_MARKER in haystack,
         advertised_schema_version=advertised,
-        advertised_store_versions=stores,
+        advertised_store_versions=_parse_version_set(haystack, _STORES_RE),
+        advertised_config_parse_contract=(
+            parse_contracts.pop() if len(parse_contracts) == 1 else None
+        ),
+        advertised_lifecycle_versions=_parse_version_set(haystack, _LIFECYCLE_RE),
     )
 
 
@@ -392,9 +519,295 @@ def decide_store_compatibility(
     )
 
 
+# --- Target-authority join vocabulary (Redmine #14258; fail-closed). ------------------
+#: The target repo declares no config at all — there is nothing for the launcher to parse.
+TARGET_SCHEMA_ABSENT = "target_schema_absent"
+#: The target authority declares a schema this runtime read successfully.
+TARGET_SCHEMA_DECLARED = "target_schema_declared"
+#: The target authority exists but this runtime could not read its schema at all.
+TARGET_SCHEMA_UNREADABLE = "target_schema_unreadable"
+#: The target authority declares a schema THIS runtime does not understand.
+TARGET_SCHEMA_UNSUPPORTED = "target_schema_unsupported"
+
+#: The target repo's config is parsable by the probed launcher.
+CONFIG_JOIN_OK = "target_config_ok"
+#: The target config does not parse under THIS runtime either. Not a launcher problem — the
+#: config itself is broken — and reported as such so an operator is never told to upgrade a
+#: launcher over their own malformed config (review j#87752's explicit requirement).
+TARGET_CONFIG_INVALID = "target_config_invalid"
+#: The launcher advertises no read-only config-parse contract (any pre-#14258 build), so it
+#: cannot be asked whether it can read the target. Unprovable fails closed.
+LAUNCHER_CONFIG_VALIDATOR_ABSENT = "launcher_config_validator_absent"
+#: The launcher's own parser REJECTED the exact target bytes — the direct measurement.
+LAUNCHER_CANNOT_PARSE_TARGET_CONFIG = "launcher_cannot_parse_target_config"
+#: The launcher advertises the contract but its validator could not be run / answered with
+#: an exit code outside the contract. Unknowable, so fail closed.
+LAUNCHER_CONFIG_VALIDATOR_UNUSABLE = "launcher_config_validator_unusable"
+
+#: The shared lane lifecycle authority is readable by the probed launcher.
+LIFECYCLE_JOIN_OK = "shared_lane_lifecycle_ok"
+#: The shared lifecycle store exists but its schema could not be read.
+LIFECYCLE_UNREADABLE = "shared_lane_lifecycle_unreadable"
+#: The shared lifecycle store's shape is not one THIS runtime understands.
+LIFECYCLE_UNSUPPORTED = "shared_lane_lifecycle_unsupported"
+#: The launcher advertises no lane lifecycle read capability (any pre-#14258 build).
+LAUNCHER_LIFECYCLE_CONTRACT_ABSENT = "launcher_lane_lifecycle_contract_absent"
+#: The launcher's reader cannot read the shared lifecycle store's current shape.
+LAUNCHER_CANNOT_READ_LIFECYCLE = "launcher_cannot_read_lane_lifecycle"
+
+#: The operator-facing recovery for every launcher-side refusal. Both supported actions are
+#: named in full (review j#87746 R3: the earlier wording trailed off after "that does", which
+#: is not an actionable instruction), and the sentence is terminated so a caller can append
+#: nothing and still emit a complete message.
+_LAUNCHER_HINT = (
+    "Recovery: either install / release a mozyo-bridge whose CLI advertises the required "
+    "capability, or set `MOZYO_BRIDGE_LAUNCHER` to the absolute path of a launcher built "
+    "from a source tree that advertises it."
+)
+
+
+#: The target repo declares no config at all — nothing for any launcher to parse.
+CONFIG_PARSE_TARGET_ABSENT = "config_parse_target_absent"
+#: Both this runtime and the launcher parsed the exact target bytes.
+CONFIG_PARSE_BOTH_OK = "config_parse_both_ok"
+#: This runtime itself rejected the target bytes.
+CONFIG_PARSE_SELF_REJECTED = "config_parse_self_rejected"
+#: This runtime parsed them; the launcher's own parser rejected them.
+CONFIG_PARSE_LAUNCHER_REJECTED = "config_parse_launcher_rejected"
+#: The launcher's validator could not be run, or answered outside the contract.
+CONFIG_PARSE_LAUNCHER_UNUSABLE = "config_parse_launcher_unusable"
+
+
+@dataclass(frozen=True)
+class ConfigParseObservation:
+    """The measured outcome of making BOTH parsers read the exact target bytes (#14258 R4).
+
+    Deliberately not a summary of the grammar. The earlier design advertised the supported
+    config versions and the recognized top-level keys and joined those — a *proxy*, and a
+    measured-insufficient one: commit ``d28e59e2`` added the nested
+    ``lane_placement.by_lane_kind`` key without changing either, so a launcher predating it
+    advertised an identical contract and still rejected the config. What a preflight needs is
+    the answer, not a description of the grammar that might produce it, so the probe hands
+    the same bytes to this runtime's loader and to the candidate launcher's own
+    ``config check-parse`` and records what each said.
+
+    ``launcher_detail`` carries a bounded excerpt of the launcher's own error so a refusal
+    names the real reason (``unknown key 'by_lane_kind'``) instead of a generic mismatch.
+    """
+
+    state: str
+    launcher_detail: str = ""
+
+
+def decide_config_parse_compatibility(
+    observation: LauncherCapabilityObservation,
+    config: ConfigParseObservation,
+    *,
+    required_contract_version: int,
+) -> LauncherCapabilityVerdict:
+    """Can the probed launcher parse the TARGET repo's config? (pure, #14258 R4).
+
+    The verdict is a product of two *measurements*, not of any advertised summary:
+
+    1. no config at all -> :data:`CONFIG_JOIN_OK`. Nothing to parse; a config-less repo is
+       exactly the case that worked before this check existed;
+    2. THIS runtime rejected the bytes -> :data:`TARGET_CONFIG_INVALID`. The config is broken
+       on its own terms, so the refusal must say that rather than blame the launcher — the
+       distinction review j#87752 required be preserved;
+    3. the launcher advertises no parse contract -> :data:`LAUNCHER_CONFIG_VALIDATOR_ABSENT`
+       (any pre-#14258 build: it cannot be asked, so it cannot be proven);
+    4. it advertises a contract this build does not speak ->
+       :data:`LAUNCHER_CONFIG_VALIDATOR_ABSENT` as well (the probe's argv / exit-code meaning
+       is what the version pins, so a different contract is not a contract we can invoke);
+    5. its validator could not be run / answered outside the contract ->
+       :data:`LAUNCHER_CONFIG_VALIDATOR_UNUSABLE`;
+    6. its parser rejected the bytes -> :data:`LAUNCHER_CANNOT_PARSE_TARGET_CONFIG`, quoting
+       the launcher's own error;
+    7. both parsed -> :data:`CONFIG_JOIN_OK`.
+    """
+    required = int(required_contract_version)
+    if config.state == CONFIG_PARSE_TARGET_ABSENT:
+        return LauncherCapabilityVerdict(
+            True,
+            CONFIG_JOIN_OK,
+            "the target repo declares no repo-local config, so the launcher parses none",
+        )
+    if config.state == CONFIG_PARSE_SELF_REJECTED:
+        return LauncherCapabilityVerdict(
+            False,
+            TARGET_CONFIG_INVALID,
+            f"the target repo's `.mozyo-bridge/config.yaml` does not parse under THIS "
+            f"runtime either, so this is a config defect rather than a launcher skew: "
+            f"{config.launcher_detail or 'see the config error above'}. Fix the config; "
+            f"changing the launcher will not help",
+        )
+    advertised = observation.advertised_config_parse_contract
+    if advertised is None or advertised != required:
+        said = (
+            "advertises no read-only config-parse contract"
+            if advertised is None
+            else f"advertises config-parse contract v{advertised}, not the v{required} "
+            f"this runtime invokes"
+        )
+        return LauncherCapabilityVerdict(
+            False,
+            LAUNCHER_CONFIG_VALIDATOR_ABSENT,
+            f"the launcher {said}, so it cannot be asked whether it can read the target "
+            f"repo's config. A launcher that rejects that config exits before `exec`ing the "
+            f"provider, leaving a partial / immediately-vanishing lane. {_LAUNCHER_HINT}",
+        )
+    if config.state == CONFIG_PARSE_LAUNCHER_UNUSABLE:
+        return LauncherCapabilityVerdict(
+            False,
+            LAUNCHER_CONFIG_VALIDATOR_UNUSABLE,
+            f"the launcher advertises the config-parse contract but its validator could not "
+            f"be run, or answered outside the contract: "
+            f"{config.launcher_detail or 'no usable answer'}. An unanswerable probe proves "
+            f"nothing, so the launch fails closed. {_LAUNCHER_HINT}",
+        )
+    if config.state == CONFIG_PARSE_LAUNCHER_REJECTED:
+        return LauncherCapabilityVerdict(
+            False,
+            LAUNCHER_CANNOT_PARSE_TARGET_CONFIG,
+            f"this runtime parses the target repo's config, but the selected launcher's own "
+            f"parser rejects it: {config.launcher_detail or 'no detail reported'}. It would "
+            f"exit before the provider starts. {_LAUNCHER_HINT}",
+        )
+    return LauncherCapabilityVerdict(
+        True,
+        CONFIG_JOIN_OK,
+        "the selected launcher parsed the target repo's exact config with its own grammar",
+    )
+
+
+@dataclass(frozen=True)
+class TargetSchemaObservation:
+    """The schema shape of an authority the LAUNCHER must read (Redmine #14258).
+
+    One value type for both target-scoped authorities — the repo's config record and the
+    home-scoped shared lane lifecycle store — because the join is the same shape in both
+    cases: what is actually there, versus what the launcher declared it can read.
+
+    ``state`` is one of :data:`TARGET_SCHEMA_ABSENT` / :data:`TARGET_SCHEMA_DECLARED` /
+    :data:`TARGET_SCHEMA_UNREADABLE` / :data:`TARGET_SCHEMA_UNSUPPORTED`. ``version`` is the
+    declared / recorded schema version when one could be read; ``keys`` carries the config
+    record's present top-level keys (config only); ``upgrade_required`` distinguishes "the
+    authority is newer than THIS runtime" from "the authority is corrupt", so a refusal names
+    the operator's real next action instead of dishonestly suggesting an upgrade.
+    """
+
+    state: str
+    version: Optional[int] = None
+    keys: Optional[frozenset] = None
+    upgrade_required: bool = False
+
+
+def decide_lifecycle_reader_compatibility(
+    observation: LauncherCapabilityObservation,
+    lifecycle: TargetSchemaObservation,
+) -> LauncherCapabilityVerdict:
+    """Can the probed launcher READ the shared lane lifecycle authority? (pure, #14258).
+
+    The second target-scoped authority, and the reason this check cannot be folded into the
+    attestation-store join: the lifecycle store is home-scoped and **shared across lanes**,
+    it is additively migrated by whichever lane's source CLI is newest, and the launch never
+    migrates it. So the question is not "can the launcher write this shape" but "can its
+    reader read the shape that is already there" — measured as a v7 store against a v6
+    reader, which zero-starts the named lane with ``LaneLifecycleReaderUpgradeRequired``
+    (#14258 j#85890).
+
+    Fail-closed precedence mirrors the config join: an absent store is fine (the first write
+    creates it at this runtime's version); unreadable / unsupported is unknowable and
+    refused; a launcher advertising no read capability is unprovable and refused; a recorded
+    version outside the launcher's readable set is :data:`LAUNCHER_CANNOT_READ_LIFECYCLE`.
+    """
+    if lifecycle.state == TARGET_SCHEMA_ABSENT:
+        return LauncherCapabilityVerdict(
+            True,
+            LIFECYCLE_JOIN_OK,
+            "the shared home holds no lane lifecycle authority yet; the first write creates "
+            "it at this runtime's schema",
+        )
+    if lifecycle.state == TARGET_SCHEMA_UNREADABLE:
+        return LauncherCapabilityVerdict(
+            False,
+            LIFECYCLE_UNREADABLE,
+            "the shared lane lifecycle authority exists but its schema could not be read "
+            "(corrupt, or not a database); an unreadable authority is not an absent one, so "
+            "no lane may be launched against it",
+        )
+    if lifecycle.state == TARGET_SCHEMA_UNSUPPORTED:
+        hint = (
+            "it is newer than this build; use a newer runtime"
+            if lifecycle.upgrade_required
+            else "its recorded version and on-disk shape disagree (partial / corrupt / "
+            "foreign); repair it before launching a lane"
+        )
+        return LauncherCapabilityVerdict(
+            False,
+            LIFECYCLE_UNSUPPORTED,
+            f"the shared lane lifecycle authority has a shape THIS runtime does not "
+            f"understand — {hint}",
+        )
+    if observation.advertised_lifecycle_versions is None:
+        return LauncherCapabilityVerdict(
+            False,
+            LAUNCHER_LIFECYCLE_CONTRACT_ABSENT,
+            f"the launcher advertises no lane lifecycle read capability, so it cannot be "
+            f"proven to read the shared authority's current schema v{lifecycle.version}; a "
+            f"launcher whose reader is older zero-starts the lane with a reader-upgrade "
+            f"refusal. {_LAUNCHER_HINT}",
+        )
+    version = int(lifecycle.version or 0)
+    if version not in observation.advertised_lifecycle_versions:
+        return LauncherCapabilityVerdict(
+            False,
+            LAUNCHER_CANNOT_READ_LIFECYCLE,
+            f"the shared lane lifecycle authority is at schema v{version}, but the launcher "
+            f"advertises readable schemas "
+            f"{sorted(observation.advertised_lifecycle_versions)}; its reader would refuse "
+            f"the shared authority and the lane could not be resolved. {_LAUNCHER_HINT}",
+        )
+    return LauncherCapabilityVerdict(
+        True,
+        LIFECYCLE_JOIN_OK,
+        f"the shared lane lifecycle authority is at schema v{version} and the launcher's "
+        f"reader understands that shape",
+    )
+
+
 __all__ = (
+    "ATTEST_CAPABILITY_CONFIG_PARSE_PREFIX",
     "ATTEST_CAPABILITY_CONTRACT_PREFIX",
+    "ATTEST_CAPABILITY_LIFECYCLE_PREFIX",
     "ATTEST_CAPABILITY_STORES_PREFIX",
+    "CONFIG_JOIN_OK",
+    "CONFIG_PARSE_BOTH_OK",
+    "CONFIG_PARSE_CONTRACT_VERSION",
+    "CONFIG_PARSE_LAUNCHER_REJECTED",
+    "CONFIG_PARSE_LAUNCHER_UNUSABLE",
+    "CONFIG_PARSE_SELF_REJECTED",
+    "CONFIG_PARSE_TARGET_ABSENT",
+    "ConfigParseObservation",
+    "LAUNCHER_CANNOT_PARSE_TARGET_CONFIG",
+    "LAUNCHER_CANNOT_READ_LIFECYCLE",
+    "LAUNCHER_CONFIG_VALIDATOR_ABSENT",
+    "LAUNCHER_CONFIG_VALIDATOR_UNUSABLE",
+    "LAUNCHER_LIFECYCLE_CONTRACT_ABSENT",
+    "LIFECYCLE_JOIN_OK",
+    "LIFECYCLE_UNREADABLE",
+    "LIFECYCLE_UNSUPPORTED",
+    "TARGET_CONFIG_INVALID",
+    "TARGET_SCHEMA_ABSENT",
+    "TARGET_SCHEMA_DECLARED",
+    "TARGET_SCHEMA_UNREADABLE",
+    "TARGET_SCHEMA_UNSUPPORTED",
+    "TargetSchemaObservation",
+    "build_attest_capability_config_parse_line",
+    "build_attest_capability_epilog",
+    "build_attest_capability_lifecycle_line",
+    "decide_config_parse_compatibility",
+    "decide_lifecycle_reader_compatibility",
     "LAUNCHER_CAPABILITY_OK",
     "LAUNCHER_SUBCOMMAND_ABSENT",
     "LAUNCHER_SCHEMA_CONTRACT_ABSENT",

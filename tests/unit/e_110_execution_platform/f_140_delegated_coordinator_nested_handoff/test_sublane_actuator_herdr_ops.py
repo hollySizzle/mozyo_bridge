@@ -50,7 +50,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RuntimePlacementFingerprint,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
-    build_attest_capability_contract_line,
+    build_attest_capability_epilog,
 )
 
 from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
@@ -104,9 +104,9 @@ class _StatefulHerdr:
                 0,
                 stdout=(
                     "usage: mozyo-bridge herdr agent-attest --assigned-name ...\n"
-                    + build_attest_capability_contract_line(
-                        HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
-                    )
+                    # Redmine #14258: the ONE canonical composer, so a capability token
+                    # added upstream is advertised here without editing this fake.
+                    + build_attest_capability_epilog()
                 ),
                 stderr="",
             )

@@ -293,6 +293,58 @@ flow:
    (release/install または明示 `MOZYO_BRIDGE_LAUNCHER` override) を示す (credential / 個人 path は
    durable log へ残さない)。unwrapped fallback (`attest_launcher == ""`) と adopt-only / dry-run は
    wrapper を走らせないため probe せず byte-invariant のままとする。
+   **launcher target-authority compatibility preflight (Redmine #14258)**: #13748 / #13847 / #13882 の
+   3 conjunct はいずれも launcher を **attestation store** に対して検証する。しかし launcher は自分が
+   書かない authority を 2 つ **読む**必要があり、どちらの skew も lane を作った**後**に殺す。
+   (a) **target repo の `.mozyo-bridge/config.yaml`** — wrapper は `--cwd <lane worktree>` で起動し
+   mozyo-bridge CLI は startup でその config を parse するため、config schema bump に遅れた launcher は
+   provider を exec する前に exit する (実測 j#85834: `unknown key 'agents'` / exit 2。`sublane create
+   --execute` は worktree を作った後で両 slot が `provider_exited / rollback_owed`)。
+   (b) **home-scoped shared lane lifecycle authority** — 最も新しい lane の source CLI が additive に
+   migrate するため、reader が古い launcher は named lane を `LaneLifecycleReaderUpgradeRequired` で
+   zero-start する (実測 j#85890: v7 store vs v6 reader)。
+   検証手段は 2 つの authority で異なる。**lane lifecycle は宣言 join**:
+   `agent-attest --help` epilog が `mozyo_attest_capability_lifecycle=<versions>` を wrap-proof
+   token で advertise し、shared store の recorded component version と join する。probe は実 reader と
+   **同一の known-signature authority** (`readonly_compatible_select`) を使う — metadata/version/table
+   が整合していても column signature が壊れていれば実 reader は拒否するため、弱い認識で credit すると
+   「reader が読める」を証明したことにならない (review j#87746 R2、実測: 健全な v7 store から
+   `lane_kind` を落とすと旧 probe は `recognized/7`、実 reader は partial/corrupt で拒否)。
+
+   **config は宣言でなく直接測定する**。grammar の *要約* は原理的に不足する: commit `d28e59e2` は
+   supported version 集合も top-level key 集合も変えずに nested key `lane_placement.by_lane_kind` を
+   追加したため、それ以前の launcher は同一 contract を advertise しながら当該 config を
+   `unknown key 'by_lane_kind'` で拒否する (review j#87752 R4、実 pre-`d28e59e2` source で実測)。
+   したがって epilog は `mozyo_attest_capability_config_parse=<contract version>` として
+   「**訊いてよい**」ことだけを advertise し、答えは launcher 自身の parser から取る: preflight は
+   join 対象の **exact bytes** を private temp file へ置き `<launcher> config check-parse --file <path>`
+   (read-only、parse 成功 0 / 拒否 2) を実行する。これは version / top-level / nested / **将来追加される軸**
+   を一度に覆う。判定は 2 つの測定の直積で、自 runtime も拒否 → `target_config_invalid`
+   (config 自体の欠陥。launcher を責めない) / 自 runtime OK・launcher 拒否 →
+   `launcher_cannot_parse_target_config` (launcher の実 error を引用) / 両者 OK → admit。
+   #14231 の cwd-sensitive probe は「launcher が偶然その cwd で非 0 終了する」ことに依存する
+   incidental discriminant であり、lane worktree が存在しないと問いを立てられない。宣言 join も直接測定も
+   **worktree 生成前**に評価できるため、`sublane create` は worktree を残さずに拒否できる
+   (close condition 1)。ただし worktree 生成前に config を読むには base を **immutable full commit へ
+   一度だけ pin** しなければならない: 文字列 ref は pin ではなく、branch / remote-tracking ref は preflight と
+   `git worktree add` の間に前進し得る (review j#87746 R1、実測: v2 config を admit した後 worktree には
+   v99 が materialize)。`pin_base_commit` が最初の mutation より前に `rev-parse --verify <ref>^{commit}`
+   で解決し、以降の config read と worktree 生成は**同一 object** を指す。解決不能 / ambiguous / 非 commit は
+   zero-mutation refusal (ref へ fallback しない)。ambiguity の判定は **git 自身に委ねる**: この 1 command に限り
+   `-c core.warnAmbiguousRefs=true` を強制し、「成功したのに stderr が非空か」だけを見る (文字列一致をしないので
+   locale 非依存、ambient config でも無効化されない)。pseudo-ref (`$GIT_DIR/<name>`) の候補規則を自前で模写しない —
+   模写は 2 度外した (解決順序の先頭欠落 j#87772 / casing による誤った一般化 j#87777。実際の境界は
+   `.git/<name>` の**内容が ref として有効か**であって大文字小文字ではない)。この規則は ambiguity 以外の警告でも
+   拒否する意図的な over-refusal であり、逃げ道は full SHA の明示 (常に無警告で pin される)。実際の conjunction (`preflight_launcher_compatibility`) は 2 箇所から呼ばれる:
+   `sublane create --execute` の pre-mutation gate (worktree より前) と `prepare_session` (first herdr
+   write より前、create を経由しない heal / 明示 `herdr session-start` で唯一到達する境界)。両者が
+   **同一関数**を呼ぶのは、conjunct が片方にしか存在しない状態が live failure として再出現するため。
+   両 authority は read-only で probe し、launch は shared authority を **migrate しない** (migrate すると
+   同じ形で古い installed launcher を壊す)。config 側の probe は宣言 version と top-level key のみを読み、
+   nested block の validation はしない — 無関係な nested error を「launcher を upgrade せよ」と誤報しない
+   ため。target が unreadable / unsupported、launcher が capability を advertise しない場合はすべて
+   fail-closed (unprovable は compatible でない)。config が存在しない repo は parse する対象が無いので
+   admit する (この check 以前に動いていた case を defect 無しに壊さない)。
 5. idempotency: 対象 slot の mzb1 名を既に持つ live agent があれば **adopt** (再 launch しない)。
    ただし adopt は live name-match だけでは足りず、その live locator に **generation-bind した
    `present` startup self-attestation record** (§2 / #13637) が必要である。record 不在 (legacy /

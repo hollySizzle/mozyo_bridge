@@ -931,25 +931,17 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     # self-inspect its injected identity env before `exec`ing the provider, and
     # record a generation-bound startup self-attestation. It is not an operator
     # command — it is the wrapper the launch argv points at.
-    # Redmine #13847: advertise the attestation-store schema/capability contract in this
-    # subcommand's `--help` so the managed-launch preflight can verify a probed launcher's
-    # store schema matches the source runtime's — not just that the subcommand exists. The
-    # token is built from the store's schema constant so it can never drift from the store
-    # it gates, and is whitespace-free so `--help` wrapping cannot split it. A launcher
-    # predating this token (e.g. the v1 installed launcher) advertises none and fails the
-    # preflight closed, before any process launch.
-    # The #13882 companion token advertises the store shapes this build can WRITE, built
-    # from the same store module's recognized-version set so it cannot drift either. The
-    # native-schema token alone cannot separate a pre-#13882 build (writes v2 only) from a
-    # v1-compatible one — both say `2` — yet only the latter is safe against a v1 shared
-    # home, so the store join consults the SET.
-    from mozyo_bridge.core.state.herdr_identity_attestation import (
-        HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
-        RECOGNIZED_SCHEMA_VERSIONS,
-    )
+    # This subcommand's `--help` is also the managed-launch **capability contract**: the
+    # preflight probes a candidate launcher with it and joins what the launcher advertises
+    # against what it will actually be pointed at — the attestation store schema it must
+    # write (#13847) and the store shapes it can write (#13882), plus the repo-local config
+    # it must parse and the shared lane lifecycle schema it must read (#14258). Every token
+    # is composed by the single canonical producer below, built from the constants of the
+    # authorities it describes, so a schema bump anywhere re-renders here with no edit and no
+    # producer can fall behind. A launcher predating a token advertises none, cannot be
+    # proven compatible, and fails the preflight closed before any process launch.
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (
-        build_attest_capability_contract_line,
-        build_attest_capability_stores_line,
+        build_attest_capability_epilog,
     )
 
     herdr_agent_attest = herdr_sub.add_parser(
@@ -959,20 +951,13 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
             "agent's injected identity env, record a generation-bound startup "
             "self-attestation, then exec the provider given after `--`."
         ),
-        # RawDescriptionHelpFormatter so the capability contract token in the epilog is
+        # RawDescriptionHelpFormatter so the capability contract tokens in the epilog are
         # emitted VERBATIM: argparse's default formatter reflows the epilog and would split
-        # the token across lines (measured), making a capable launcher's probe read as
-        # incapable. The token is on its own line, unwrapped, so a launcher's `--help` (the
-        # #13847 preflight probe input) carries it intact.
+        # a token across lines (measured), making a capable launcher's probe read as
+        # incapable. Each token is on its own line, unwrapped, so a launcher's `--help` (the
+        # preflight probe input) carries them intact.
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "capability contract (Redmine #13847):\n"
-            + build_attest_capability_contract_line(
-                HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
-            )
-            + "\nwritable attestation store shapes (Redmine #13882):\n"
-            + build_attest_capability_stores_line(RECOGNIZED_SCHEMA_VERSIONS)
-        ),
+        epilog=build_attest_capability_epilog(),
     )
     herdr_agent_attest.add_argument("--assigned-name", dest="assigned_name", default="")
     herdr_agent_attest.add_argument("--workspace-id", dest="workspace_id", default="")

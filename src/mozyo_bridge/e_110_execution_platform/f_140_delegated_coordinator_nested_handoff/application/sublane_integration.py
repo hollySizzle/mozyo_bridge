@@ -32,6 +32,7 @@ Three parts:
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,6 +64,28 @@ def policy_from_config(config: SublaneIntegrationConfig) -> SublaneIntegrationPo
         integration_branch=config.integration_branch,
         merge_on_retire=config.merge_on_retire,
     )
+
+
+# ---------------------------------------------------------------------------
+# Committed-blob read states (Redmine #14258). Separate tokens for "the ref resolves
+# and the path is not tracked there" and "the ref itself is unreadable": the first is a
+# legitimate absence, the second is unknowable and must fail closed.
+# ---------------------------------------------------------------------------
+
+#: A full commit SHA: exactly 40 lowercase hex digits. A pin that is not this shape is not a
+#: pin, so it is refused rather than passed on to `git worktree add`.
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+#: Forces git's own ambiguity warning ON for one command, whatever the repo config says.
+#: This is the whole of the pseudo-ref rule this code carries (#14258 R9): git decides what
+#: is ambiguous, and the only things controlled here are that the ambient config cannot
+#: silence it and that the verdict is read WITHOUT parsing the message (so it is
+#: locale-independent too).
+_FORCE_AMBIGUITY_WARNING: tuple[str, ...] = ("-c", "core.warnAmbiguousRefs=true")
+
+BLOB_PRESENT = "blob_present"
+BLOB_ABSENT = "blob_absent"
+BLOB_REF_UNRESOLVABLE = "blob_ref_unresolvable"
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +331,89 @@ class LiveSublaneGitOperations:
                 + f": {result.stderr.strip()}"
             )
 
+    def resolve_commit(self, ref: str) -> str:
+        """Resolve ``ref`` to a single immutable full commit SHA, or ``""`` (Redmine #14258 R1).
+
+        A **string** ref is not a pin. The launcher preflight reads the config at the lane's
+        base and ``git worktree add`` then materializes it, and between those two operations a
+        branch / remote-tracking ref can advance — measured: the preflight admitted a v2 config
+        and the worktree materialized a v99 one, defeating the gate that exists precisely to
+        keep an unverified config out of a new worktree (review j#87746 R1). Callers resolve
+        once, here, and use the returned commit for BOTH.
+
+        Fail-closed on everything that is not exactly one commit: an unresolvable ref, a
+        non-commit object, output that is not a single 40-hex line, or an **ambiguous** name.
+        ``""`` means "no pin", and every caller treats that as a zero-mutation refusal rather
+        than falling back to the ref.
+
+        Ambiguity is decided by **git**, not by a model of git kept here (reviews j#87762 R5,
+        j#87772 R8, j#87777 R9). Modelling it was wrong twice in ways only a reviewer found:
+        the resolution order's first entry (``$GIT_DIR/<name>``) was missed, and then the
+        pseudo-ref boundary was inferred to be upper-case names when the real criterion is
+        whether the file's *content* is a valid ref (``.git/config`` is unambiguous because it
+        is INI, not because it is lower-case). So the judgment is delegated to the authority
+        and this code controls only how the question is asked:
+
+        - :data:`_FORCE_AMBIGUITY_WARNING` turns git's own warning on for this one command, so
+          a repo's ``core.warnAmbiguousRefs=false`` cannot silence it;
+        - the verdict is "did git say anything at all while succeeding" — the message is never
+          parsed, so a translated warning reads the same as an English one.
+
+        An earlier revision also counted the ``refs/…`` candidates directly as a second
+        signal. A mutation probe showed no test could tell whether that code was present, and
+        it carried a partial model of the very rule this delegation exists to stop maintaining
+        — so it was removed rather than shipped unpinned.
+
+        Deliberate over-refusal: any warning git emits while succeeding fails this closed, not
+        just an ambiguity one. That is the intended trade — the refusal is zero-mutation, a pin
+        git cannot produce silently is not one to trust, and an explicit full SHA always
+        resolves without a warning (measured), so a caller who needs to proceed has an exact,
+        unambiguous way to say so.
+        """
+        result = self._run(
+            *_FORCE_AMBIGUITY_WARNING,
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{ref}^{{commit}}",
+        )
+        if result.returncode != 0:
+            return ""
+        if (result.stderr or "").strip():
+            return ""
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if len(lines) != 1:
+            return ""
+        commit = lines[0]
+        return commit if _FULL_SHA_RE.fullmatch(commit) else ""
+
+    def committed_blob(self, *, ref: str, relpath: str) -> tuple[str, str]:
+        """Read a committed file's text at ``ref`` without checking anything out (#14258).
+
+        Returns ``(state, text)`` where ``state`` is :data:`BLOB_PRESENT` (text is the blob),
+        :data:`BLOB_ABSENT` (the ref resolves and the path is simply not tracked there), or
+        :data:`BLOB_REF_UNRESOLVABLE` (the ref itself could not be read — nothing about the
+        path is knowable). The presence question is answered by ``ls-tree`` rather than by
+        interpreting ``git show``'s failure text, so "no such path at this ref" and "no such
+        ref" are never conflated into one fail-open "absent".
+
+        The ``sublane create`` launcher gate needs this: the lane worktree does not exist when
+        the gate must refuse, and the config the lane will get is the blob at its base ref —
+        reading the primary checkout's working file instead would be a proxy for the target.
+        Read-only: ``ls-tree`` / ``show`` touch no ref, index, or working tree.
+        """
+        listed = self._run("ls-tree", ref, "--", relpath)
+        if listed.returncode != 0:
+            return BLOB_REF_UNRESOLVABLE, ""
+        if not listed.stdout.strip():
+            return BLOB_ABSENT, ""
+        shown = self._run("show", f"{ref}:{relpath}")
+        if shown.returncode != 0:
+            # Listed but unreadable (a submodule / non-blob entry, or a git failure): the
+            # content is unknowable, which is not the same as absent.
+            return BLOB_REF_UNRESOLVABLE, ""
+        return BLOB_PRESENT, shown.stdout
+
     def worktree_dirty(self) -> bool:
         result = self._run("status", "--porcelain")
         if result.returncode != 0:
@@ -332,6 +438,9 @@ class LiveSublaneGitOperations:
 
 
 __all__ = (
+    "BLOB_ABSENT",
+    "BLOB_PRESENT",
+    "BLOB_REF_UNRESOLVABLE",
     "policy_from_config",
     "SublaneGitOperations",
     "RetireInvariants",

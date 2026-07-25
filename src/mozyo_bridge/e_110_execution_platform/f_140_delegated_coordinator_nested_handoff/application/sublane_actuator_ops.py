@@ -215,6 +215,14 @@ class LiveSublaneActuatorOps:
     def worktree_exists(self, branch: str) -> bool:
         return self._git().worktree_exists(branch)
 
+    def resolve_base_commit(self, ref: str) -> str:
+        """The lane base as a single immutable commit SHA, or ``""`` (Redmine #14258 R1).
+
+        Exposed here too, not only on the herdr adapter: the TOCTOU it closes is in
+        ``git worktree add``, which both adapters perform identically.
+        """
+        return self._git().resolve_commit(ref)
+
     def create_worktree(
         self, *, branch: str, worktree_path: str, base_ref: Optional[str] = None
     ) -> None:
