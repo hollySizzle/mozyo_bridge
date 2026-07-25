@@ -89,7 +89,7 @@ def _scope(scope: str, path: str) -> ProjectScope:
         label=scope,
         workdir=path,
         parent_workspace=None,
-        source="project.yaml",
+        source="project.env",
         fingerprint="fp",
     )
 
@@ -532,7 +532,7 @@ class ProjectScopeGateTest(unittest.TestCase):
 
     def test_stamped_scope_trusted_when_cwd_under_project(self) -> None:
         # A stamped pane-option scope whose cwd is under the stamped path is trusted directly,
-        # so the live project.yaml discovery is never consulted.
+        # so the live project.env discovery is never consulted.
         ops = _FakeOps(workspace_root="/repo")
         result = _run(
             ops,

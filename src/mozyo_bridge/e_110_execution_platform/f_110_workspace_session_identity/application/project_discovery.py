@@ -5,15 +5,15 @@ The thin *filesystem + YAML* layer over the pure
 policy. The domain owns meaning (parsing, cache shape, drift, cwd resolution) and
 does no IO; this layer:
 
-- bounded-scans a repository root for schema-marked ``project.yaml`` files,
-- loads each with ``yaml.safe_load`` (never ``yaml.load``) and hands the parsed
+- bounded-scans a repository root for schema-marked ``project.env`` files,
+- parses each as a strict Docker-compatible env file and hands the parsed
   mapping plus the raw text to the domain parser,
 - reads the optional generated discovery cache from the root ``projects.yaml``,
 - reconciles discovered candidates against that cache and returns adopted scopes
   together with any fail-closed drift.
 
 Everything here is read-only and fail-soft for *display* surfaces: a malformed or
-unreadable ``project.yaml`` is skipped (it cannot be a trustworthy routing source)
+unreadable ``project.env`` is skipped (it cannot be a trustworthy routing source)
 rather than aborting an ``agents targets`` / cockpit listing. The generated cache
 is only an acceleration aid — adoption always re-derives from the live sources, so
 a stale or missing cache never changes which scopes are adopted; it only feeds
@@ -23,6 +23,7 @@ a stale or missing cache never changes which scopes are adopted; it only feeds
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import time
@@ -40,28 +41,28 @@ from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.doma
     ProjectScope,
     adopt_scopes,
     detect_cache_drift,
-    parse_project_document,
+    parse_project_environment,
     repo_relative_path,
     resolve_project_scope_for_path,
 )
 from mozyo_bridge.shared.paths import infer_git_worktree_root
 
 #: The project-owned descriptor filename scanned for under the repository root.
-PROJECT_FILE_NAME = "project.yaml"
+PROJECT_FILE_NAME = "project.env"
 
 #: The root index / generated-cache file (human policy + generated discovery
 #: cache live together, visibly separated — design doc "Generated Root Cache").
 ROOT_INDEX_FILE_NAME = "projects.yaml"
 
 #: Bounded-scan depth (directories below the repo root). A monorepo project lives
-#: a few levels down (``projects/<name>/project.yaml``); a deep unbounded walk of
+#: a few levels down (``projects/<name>/project.env``); a deep unbounded walk of
 #: a large repo is both slow and a way to pick up vendored/test fixtures, so the
 #: scan stops past this depth.
 DEFAULT_MAX_DEPTH = 4
 
 #: Directory names never descended into during the scan (build output, VCS
 #: internals, dependency trees, caches). Keeps discovery cheap and avoids adopting
-#: a fixture ``project.yaml`` vendored inside a dependency.
+#: a fixture ``project.env`` vendored inside a dependency.
 _SKIP_DIRS = frozenset(
     {
         ".git",
@@ -164,19 +165,55 @@ def _read_text(path: Path) -> Optional[str]:
         return None
 
 
+_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _parse_project_env(raw_text: str) -> Optional[dict[str, str]]:
+    """Parse the strict env-file subset used by project identity.
+
+    Blank lines and whole-line comments are accepted. Each other line must be a
+    unique ``KEY=VALUE`` assignment with a portable environment-variable key.
+    Matching single or double quotes around a value are removed. Interpolation,
+    ``export`` directives, multiline values, and inline comments are deliberately
+    unsupported so discovery and Docker never derive different identities.
+    """
+    environment: dict[str, str] = {}
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            return None
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not _ENV_KEY.fullmatch(key) or key in environment:
+            return None
+        if value[:1] in {'"', "'"}:
+            if len(value) < 2 or value[-1] != value[0]:
+                return None
+            value = value[1:-1]
+        elif '"' in value or "'" in value:
+            return None
+        if "${" in value:
+            return None
+        environment[key] = value
+    return environment
+
+
 def discover_project_candidates(
     repo_root: str,
     *,
     max_depth: int = DEFAULT_MAX_DEPTH,
 ) -> list[ProjectCandidate]:
-    """Bounded-scan ``repo_root`` for schema-marked ``project.yaml`` descriptors.
+    """Bounded-scan ``repo_root`` for schema-marked ``project.env`` descriptors.
 
     Walks at most ``max_depth`` directories below the root, skipping VCS / build /
-    dependency directories. Each ``project.yaml`` is loaded with
-    ``yaml.safe_load`` and parsed by the domain; a non-mapping document, a missing
-    schema marker, a malformed YAML file, or an unreadable file yields no
+    dependency directories. Each ``project.env`` is parsed by the strict
+    env-file reader and then by the domain; a missing schema marker, malformed
+    assignment, duplicate key, interpolation, or unreadable file yields no
     candidate (fail-soft — a bad descriptor is never a routing source). The repo
-    root's own ``project.yaml`` (depth 0) is included so a single-project repo can
+    root's own ``project.env`` (depth 0) is included so a single-project repo can
     describe itself.
     """
     root = Path(repo_root)
@@ -199,16 +236,15 @@ def discover_project_candidates(
         raw_text = _read_text(source_path)
         if raw_text is None:
             continue
-        try:
-            document = yaml.safe_load(raw_text)
-        except yaml.YAMLError:
+        environment = _parse_project_env(raw_text)
+        if environment is None:
             continue
         rel_dir = repo_relative_path(str(Path(dirpath).resolve()), str(root.resolve()))
         rel_source = repo_relative_path(str(source_path.resolve()), str(root.resolve()))
         if rel_dir is None or rel_source is None:
             continue
-        candidate = parse_project_document(
-            document,
+        candidate = parse_project_environment(
+            environment,
             path=rel_dir,
             source=rel_source,
             raw_text=raw_text,
@@ -251,7 +287,7 @@ def resolve_project_scopes(
 ) -> tuple[list[ProjectScope], list[CacheDrift]]:
     """Discover adopted project scopes for ``repo_root`` and any cache drift.
 
-    Adoption always re-derives from the live ``project.yaml`` sources (the cache
+    Adoption always re-derives from the live ``project.env`` sources (the cache
     is never the authority). The generated cache, when present, is reconciled
     against the live candidates and any disagreement is returned as fail-closed
     :class:`CacheDrift` so the caller can surface it rather than trusting either
@@ -296,7 +332,7 @@ def _cached_adopted_scopes(repo_root: str, max_depth: int) -> tuple[ProjectScope
         # SURFACED, never silently resolved to whichever value is convenient. The
         # runtime-facing project lookup therefore refuses to project ANY scope from
         # a repo whose `projects.yaml` discovery cache disagrees with its live
-        # `project.yaml` sources, and emits a visible diagnostic (once per repo,
+        # `project.env` sources, and emits a visible diagnostic (once per repo,
         # this fn is memoized). Adoption resumes once the operator regenerates the
         # cache. A repo with NO generated cache has no drift and is unaffected.
         detail = "; ".join(f"{d.kind}:{d.cache_key}" for d in drift[:5])

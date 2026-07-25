@@ -1138,7 +1138,7 @@ class AgentsTargetsScanProgressTest(unittest.TestCase):
         # The previously-silent live scan announces itself on stderr...
         self.assertIn("note: scanning project scopes under", err.getvalue())
         # ...while stdout stays a parseable JSON document with the additive
-        # provenance key (no project.yaml here -> unresolved).
+        # provenance key (no project.env here -> unresolved).
         payload = json.loads(out.getvalue())
         self.assertEqual(1, len(payload))
         self.assertEqual(

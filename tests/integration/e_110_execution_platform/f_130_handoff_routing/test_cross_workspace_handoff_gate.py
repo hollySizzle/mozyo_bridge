@@ -408,16 +408,12 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
         self.assertEqual("target_repo_mismatch", outcome["reason"])
         self.assertIn("target pane is not in the expected repo", stderr)
 
-    _GK_PROJECT_DOC = (
-        "schema_version: 1\n"
-        "project:\n"
-        "  redmine_project: giken-cloud-drive-management\n"
-        "  path: projects/giken-cloud-drive-management\n"
-        "  status: active\n"
-        "  display_label: \"クラウドドライブ管理\"\n"
-        "  runtime_identity:\n"
-        "    enabled: true\n"
-        "    parent_workspace: gk-3500-it-operations\n"
+    _PROJECT_ENV = (
+        "PROJECT_SCHEMA=mozyo.project/v1\n"
+        "PROJECT_REDMINE_PROJECT=giken-cloud-drive-management\n"
+        "PROJECT_DISPLAY_LABEL=クラウドドライブ管理\n"
+        "PROJECT_RUNTIME_IDENTITY_ENABLED=true\n"
+        "PROJECT_PARENT_WORKSPACE=gk-3500-it-operations\n"
     )
 
     def _build_gk_monorepo(self, tmp_str):
@@ -430,7 +426,7 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
         proj = repo / "projects" / "giken-cloud-drive-management"
         proj.mkdir(parents=True)
         (repo / "pyproject.toml").write_text("", encoding="utf-8")
-        (proj / "project.yaml").write_text(self._GK_PROJECT_DOC, encoding="utf-8")
+        (proj / "project.env").write_text(self._PROJECT_ENV, encoding="utf-8")
         (proj / "src").mkdir()
         return repo, proj
 
