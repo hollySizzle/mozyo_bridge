@@ -40,6 +40,7 @@ Characterization only; the fix lives in ``herdr_launcher_capability.py`` (the pu
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -82,8 +83,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     parse_launcher_capability_output,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+    REPO_SELECTION_ENV_VARS,
     HerdrLauncherIncompatibleError,
     preflight_launcher_compatibility,
+    repo_neutral_env,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (  # noqa: E501
     LiveSublaneGitOperations,
@@ -91,6 +94,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
     HerdrSessionStartError,
 )
+
+from tests.support.private_path_fixtures import macos_home_path
 
 _MARKER = "--assigned-name"
 
@@ -1134,6 +1139,158 @@ class R7ProbePathRedactionTest(unittest.TestCase):
             self.assertNotIn(str(Path.home()), message)
             for token in ("mozyo-config-parse-", "/var/folders", "/private/var"):
                 self.assertNotIn(token, message)
+
+
+# ---------------------------------------------------------------------------
+# Review j#87786 blocking findings — R10 / R11 / R12.
+# ---------------------------------------------------------------------------
+
+
+class R10RepoSelectionIsolationTest(unittest.TestCase):
+    """R10: a probe's repo must be decided by its cwd alone, not by the ambient env."""
+
+    def _target(self, root: Path, config_text: str) -> Path:
+        target = root / "target"
+        (target / ".mozyo-bridge").mkdir(parents=True)
+        (target / ".mozyo-bridge" / "config.yaml").write_text(config_text, encoding="utf-8")
+        LaneLifecycleStore(home=root / "home").ensure_schema()
+        return target
+
+    def test_the_selection_env_axis_is_the_one_the_resolver_documents(self) -> None:
+        # DRIFT GUARD. The isolation below strips a specific set of variables; if the repo
+        # resolver ever consults another one, that new axis would silently re-open exactly
+        # the bypass R10 reported. Pin the set against the resolver's own source rather than
+        # against a remembered list.
+        import inspect
+
+        from mozyo_bridge.shared import paths
+
+        source = inspect.getsource(paths.resolve_repo_root)
+        consulted = set(re.findall(r"os\.environ(?:\.get)?\(\s*[\"']([^\"']+)", source))
+        self.assertEqual(
+            consulted,
+            set(REPO_SELECTION_ENV_VARS),
+            "resolve_repo_root consults a different env axis than the probes isolate; "
+            "add it to REPO_SELECTION_ENV_VARS or the ambient environment can re-bind a probe",
+        )
+
+    def test_repo_neutral_env_strips_only_the_selection_axis(self) -> None:
+        env = {"MOZYO_REPO": "/somewhere", "PATH": "/usr/bin", "HOME": "/home/x"}
+        self.assertEqual(repo_neutral_env(env), {"PATH": "/usr/bin", "HOME": "/home/x"})
+
+    def test_a_self_invalid_target_is_classified_despite_an_ambient_mozyo_repo(self) -> None:
+        # THE R10 regression: with `MOZYO_REPO` pointing at the target, the "neutral" cwd was
+        # not neutral — the advertisement probe resolved the target's config and died there,
+        # so the run reported a generic wrapper failure instead of the config classification.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = self._target(root, "version: 2\nbogus_top_level: 1\n")
+            launcher = _current_head_launcher(root)
+            env = dict(os.environ)
+            env["MOZYO_REPO"] = str(target)
+            with self.assertRaises(HerdrLauncherIncompatibleError) as caught:
+                preflight_launcher_compatibility(
+                    launcher, subprocess.run, 60.0, env,
+                    repo_root=target, store_home=root / "home",
+                )
+            self.assertEqual(caught.exception.reason, TARGET_CONFIG_INVALID)
+
+    def test_a_broken_ambient_repo_does_not_misclassify_a_compatible_target(self) -> None:
+        # The other direction: the measurement is about the target's bytes, so an unrelated
+        # broken repo in `MOZYO_REPO` must not make a good launcher / good target look bad.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = self._target(root, _V2_CONFIG)
+            broken = root / "broken"
+            (broken / ".mozyo-bridge").mkdir(parents=True)
+            (broken / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 2\nbogus_top_level: 1\n", encoding="utf-8"
+            )
+            launcher = _current_head_launcher(root)
+            env = dict(os.environ)
+            env["MOZYO_REPO"] = str(broken)
+            preflight_launcher_compatibility(
+                launcher, subprocess.run, 60.0, env,
+                repo_root=target, store_home=root / "home",
+            )
+
+
+class R11WindowsPathRedactionTest(unittest.TestCase):
+    """R11: the redaction backstop must cover the path shapes its contract claims."""
+
+    def test_every_absolute_root_shape_is_redacted(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            REDACTED_PROBE_PATH,
+            _redact_probe_paths,
+        )
+
+        # The home-shaped examples are COMPOSED, never written: `release check tree` fails a
+        # tracked home-path literal even inside a redaction fixture — which is precisely the
+        # leak this test is about, so writing one here would be the same defect one level up.
+        backslash = chr(92)
+        drive = "C:" + backslash + backslash.join(("Users", "alice", "c.yaml"))
+        drive_fwd = "C:" + macos_home_path("alice", "c.yaml")
+        unc = backslash * 2 + backslash.join(("server", "share", "c.yaml"))
+        cases = (
+            ("drive, backslash", f"error in {drive}: bad"),
+            ("drive, forward", f"error in {drive_fwd}: bad"),
+            ("UNC", f"error in {unc}: bad"),
+            ("POSIX", f"error in {macos_home_path('alice', 'probe', 'config.yaml')}: bad"),
+        )
+        for label, text in cases:
+            with self.subTest(shape=label):
+                out = _redact_probe_paths(text, Path("/nonexistent"))
+                self.assertIn(REDACTED_PROBE_PATH, out)
+                self.assertNotIn("alice", out)
+
+    def test_a_parse_reason_without_a_path_is_left_intact(self) -> None:
+        # The backstop must not be so broad that it eats the information the detail exists
+        # to carry — that is what makes the refusal actionable.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            REDACTED_PROBE_PATH,
+            _redact_probe_paths,
+        )
+
+        for text in (
+            "unknown key 'by_lane_kind'; allowed keys: ['default', 'sublane', 'version']",
+            'while parsing a flow sequence in "<unicode string>", line 1, column 10',
+            "lane_placement.by_lane_kind must be a mapping",
+        ):
+            with self.subTest(text=text[:40]):
+                out = _redact_probe_paths(text, Path("/nonexistent"))
+                self.assertEqual(out, text)
+                self.assertNotIn(REDACTED_PROBE_PATH, out)
+
+
+class R12ContractTextConsistencyTest(unittest.TestCase):
+    """R12: the config axis is a direct measurement, and the prose must not say otherwise."""
+
+    def test_no_surviving_declaration_join_claim_for_the_config_axis(self) -> None:
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_actuator_herdr_preflight,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_pane_lifecycle,
+        )
+
+        for module in (herdr_pane_lifecycle, sublane_actuator_herdr_preflight):
+            with self.subTest(module=module.__name__):
+                source = inspect.getsource(module)
+                self.assertNotIn("Both are *declaration* joins", source)
+                self.assertNotIn("DECLARED join", source)
+
+    def test_the_spec_describes_the_config_axis_as_a_measurement(self) -> None:
+        spec = (_SRC.parent / "vibes" / "docs" / "specs" / "herdr-native-identity.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("config axis は宣言 join ではなく直接測定である", spec)
+        self.assertNotIn(
+            "config 側の probe は宣言 version と top-level key のみを読み",
+            spec,
+            "the retired summary-join description must not survive the R4 redesign",
+        )
 
 
 def _agent_attest_help(parser) -> str:

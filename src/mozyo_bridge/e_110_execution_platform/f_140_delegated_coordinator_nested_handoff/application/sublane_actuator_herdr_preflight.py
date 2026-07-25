@@ -235,9 +235,10 @@ def evaluate_launcher_compatibility(
     # Probe in the wrapper's OWN cwd whenever that directory already exists (#14231: a
     # launcher's exit code is cwd-sensitive, so probing elsewhere hides a skew). For a
     # worktree this run will CREATE it does not exist yet, so the probe falls back to this
-    # checkout — and the config axis is carried by the DECLARED join above rather than by
-    # that incidental exit code, which is the whole reason the capability is advertised
-    # instead of inferred.
+    # checkout — and the config axis does not depend on that cwd at all, because it was
+    # already settled above by running the launcher's own parser against the exact target
+    # bytes (`measure_config_parse_compatibility`). That is a direct measurement, not a
+    # declaration join: no summary of the grammar can answer it (#14258 j#87752 R4).
     lane_dir = Path(lane_runtime_root) if (lane_runtime_root or "").strip() else None
     probe_cwd = lane_dir if lane_dir is not None and lane_dir.is_dir() else repo_root
     try:

@@ -340,9 +340,16 @@ flow:
    write より前、create を経由しない heal / 明示 `herdr session-start` で唯一到達する境界)。両者が
    **同一関数**を呼ぶのは、conjunct が片方にしか存在しない状態が live failure として再出現するため。
    両 authority は read-only で probe し、launch は shared authority を **migrate しない** (migrate すると
-   同じ形で古い installed launcher を壊す)。config 側の probe は宣言 version と top-level key のみを読み、
-   nested block の validation はしない — 無関係な nested error を「launcher を upgrade せよ」と誤報しない
-   ため。target が unreadable / unsupported、launcher が capability を advertise しない場合はすべて
+   同じ形で古い installed launcher を壊す)。**config axis は宣言 join ではなく直接測定である** — launcher
+   自身の parser に exact target bytes を parse させ、自 runtime の verdict との直積で分類する
+   (自 runtime も拒否 → `target_config_invalid` = config 自体の欠陥であり launcher を責めない /
+   自 OK・launcher 拒否 → `launcher_cannot_parse_target_config`)。「宣言 version と top-level key のみを
+   読み nested を見ない」旧記述は R4 で廃止した設計であり、要約では nested 追加を捕らえられない。
+   lane lifecycle authority のみが宣言 join である。
+   probe の repo 選択は **cwd 一軸に固定**する: `resolve_repo_root` は `--repo` > `MOZYO_REPO` > cwd の順で
+   解決するため、probe env から repo 選択 env を除去しないと ambient `MOZYO_REPO` が neutral cwd を
+   上書きし、直接測定へ到達する前に advertisement probe が target config で死ぬ (review j#87786 R10 実測)。
+   target が unreadable / unsupported、launcher が capability を advertise しない場合はすべて
    fail-closed (unprovable は compatible でない)。config が存在しない repo は parse する対象が無いので
    admit する (この check 以前に動いていた case を defect 無しに壊さない)。
 5. idempotency: 対象 slot の mzb1 名を既に持つ live agent があれば **adopt** (再 launch しない)。

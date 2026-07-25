@@ -210,7 +210,11 @@ def preflight_attest_launcher_capability(
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=dict(env),
+            # Redmine #14258 R10: strip the repo-selection env so `cwd` is the ONLY thing
+            # deciding which repo this probe resolves. With `MOZYO_REPO` left in place a
+            # "neutral" cwd is not neutral at all — measured, it re-bound the probe to the
+            # target and reproduced the mis-attribution the neutral cwd exists to prevent.
+            env=repo_neutral_env(env),
             cwd=str(repo_root) if repo_root else None,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -298,12 +302,46 @@ _CONFIG_PROBE_BASENAME = "config.yaml"
 #: What a redacted filesystem path is rendered as in a public verdict detail.
 REDACTED_PROBE_PATH = "<target config>"
 
-#: Matches an absolute filesystem path (POSIX or Windows) anywhere in a message. Applied
-#: AFTER the exact scratch paths are substituted, so it is the backstop rather than the
-#: primary rule: a parser can print a path this code never chose (a realpath, an ``include``
-#: target), and the issue's close condition forbids a private absolute path in public
-#: evidence regardless of who wrote it.
-_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:)?(?:/|\\\\)[^\s'\"]+")
+#: The environment variables that select which repo a mozyo-bridge CLI resolves. Derived
+#: from :func:`...shared.paths.resolve_repo_root`, whose precedence is explicit ``--repo`` >
+#: this env > a cwd-based search — and pinned against that function by a drift guard, because
+#: a *new* env axis added there would silently re-open the bypass this closes.
+#:
+#: Redmine #14258 R10: the probes below choose a repo by cwd, which is only decisive once
+#: this axis is removed. Measured — with ``MOZYO_REPO`` pointing at the target, an
+#: advertisement probe run in a neutral directory still resolved the target's config and died
+#: there, reproducing the very mis-attribution the neutral cwd was introduced to prevent.
+REPO_SELECTION_ENV_VARS: frozenset = frozenset({"MOZYO_REPO"})
+
+
+def repo_neutral_env(env: Mapping[str, str]) -> dict:
+    """``env`` with every repo-selection variable removed (Redmine #14258 R10).
+
+    A probe's repo must be decided by exactly one axis the caller controls — its cwd — so the
+    ambient environment cannot re-bind it. Only the *probe* environment is filtered; the real
+    launch env is untouched, so nothing about how the provider is started changes.
+    """
+    return {k: v for k, v in dict(env).items() if k not in REPO_SELECTION_ENV_VARS}
+
+#: Matches an absolute filesystem path anywhere in a message. Applied AFTER the exact scratch
+#: paths are substituted, so it is the backstop rather than the primary rule: a parser can
+#: print a path this code never chose (a realpath, an ``include`` target), and the issue's
+#: close condition forbids a private absolute path in public evidence regardless of who wrote
+#: it.
+#:
+#: Three root shapes, each pinned by a regression rather than asserted in prose (review
+#: j#87786 R11: the previous alternative required a *doubled* backslash, so an ordinary
+#: drive path with single separators passed straight through while the comment claimed Windows
+#: was covered — the same "docstring stronger than the implementation" defect as R1 and R7, in
+#: the same subject area): a UNC root, a drive root with either separator, and a POSIX root.
+#:
+#: A *relative* token is deliberately not matched. It carries no private location, and
+#: redacting it would eat the parse reason the detail exists to convey.
+_ABS_PATH_RE = re.compile(
+    r"\\\\[^\s'\"]+"        # UNC:   \\server\share\...
+    r"|[A-Za-z]:[\\/][^\s'\"]*"  # drive: C:\... or C:/...
+    r"|/[^\s'\"]+"          # POSIX: /var/...
+)
 
 
 def _redact_probe_paths(detail: str, *scratch: Path) -> str:
@@ -401,7 +439,16 @@ def measure_config_parse_compatibility(
         argv = build_config_parse_probe_argv(launcher, str(probe_path))
         try:
             completed = runner(
-                argv, capture_output=True, text=True, timeout=timeout, env=dict(env)
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                # The measurement must be about the `--file` bytes and nothing else: strip the
+                # repo-selection env and run inside the scratch directory, which holds no
+                # `.mozyo-bridge/` of its own. Otherwise a broken ambient repo makes a
+                # perfectly good launcher look unable to read a perfectly good config.
+                env=repo_neutral_env(env),
+                cwd=scratch,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return ConfigParseObservation(
@@ -500,12 +547,24 @@ def preflight_launcher_target_authorities(
       lane with ``LaneLifecycleReaderUpgradeRequired`` (measured: a v7 store against a v6
       reader, #14258 j#85890).
 
-    Both are *declaration* joins rather than exit-code observations. That is deliberate and is
-    what #14231 could not give: probing in the lane's own cwd catches a config skew only
-    because the launcher happens to read config at startup and happens to exit non-zero, and
-    only once the lane worktree exists to be probed in. A declared capability can be checked
-    **before the worktree is created**, which is what lets ``sublane create`` refuse without
-    leaving one behind.
+    The two authorities are checked by **different means**, and conflating them is what review
+    j#87786 (R12) found still described here after the config axis changed:
+
+    - **the shared lane lifecycle is a declaration join**: the launcher advertises the reader
+      schemas it understands and that set is joined against the store's recorded shape;
+    - **the config is a direct measurement**, not a declaration: the launcher's own parser is
+      run against the exact target bytes. A *summary* of the grammar was measured insufficient
+      — commit ``d28e59e2`` added a nested key without changing the version set or the
+      top-level key set, so a launcher predating it advertised an identical contract and still
+      rejected the config (#14258 j#87752 R4). What the launcher advertises about config is
+      therefore only that it *can be asked*.
+
+    Both means share the property that made them worth adopting, and it is the one #14231
+    could not give: probing in the lane's own cwd catches a config skew only because the
+    launcher happens to read config at startup and happens to exit non-zero, and only once the
+    lane worktree exists to be probed in. A declaration and a measurement over supplied bytes
+    can both be evaluated **before the worktree is created**, which is what lets ``sublane
+    create`` refuse without leaving one behind.
 
     Read-only on both authorities and never migrating either — a launch that migrated the
     shared home would break every older installed launcher the same way. Called on the same
