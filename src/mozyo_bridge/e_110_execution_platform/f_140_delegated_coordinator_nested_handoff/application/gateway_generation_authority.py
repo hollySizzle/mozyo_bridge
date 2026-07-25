@@ -3,9 +3,17 @@
 The pure-ish decision half of ``sublane recover-gateway``'s turn-start classification, split
 out of :mod:`.sublane_gateway_recovery_live` to keep that module under the module-health line
 ceiling. Given an exact anchor delivery record + the request pins + the recovery's stores
-(repo root, attestation home), it answers ONE question fail-closed: did the delivery's own
+(repo root, state home), it answers ONE question fail-closed: did the delivery's own
 queue-enter rail OBSERVE the turn start on a process generation that is COHERENT with — and
 IDENTICAL to — the gateway the refresh is about to close?
+
+The generation authority is the home-scoped :mod:`~mozyo_bridge.core.state.herdr_launch_generation`
+store (design consultation answer j#87472): a single ``attested`` row per ``assigned_name``
+holding the whole generation as one atomic fact — the collision-free per-launch token
+(``startup_action_id``, the reserved startup-transaction action id) plus the exact identity.
+Never the seconds-precision ``observed_at`` (two same-second launches share it, j#87445 F1),
+and never a token read separately from its identity (a torn pair could compose two
+generations, j#87472).
 
 The authority chain (each tightened by a review round, all fail-closed):
 
@@ -14,10 +22,10 @@ The authority chain (each tightened by a review round, all fail-closed):
   branch is unreachable and removed (j#87418 F3);
 * the record's persisted gateway binding must match the request pins AND the provider
   (j#87424 F1);
-* the binding's collision-free per-launch generation token (``startup_action_id``) must be
-  non-empty AND exactly equal the LIVE current-generation attestation's token, read now at
-  recovery time under a single verified identity join — never the ``observed_at`` timestamp
-  (two same-second launches share it, j#87445 F1).
+* the binding's ``startup_action_id`` token must be non-empty AND exactly equal the LIVE
+  current-generation token, read now at recovery time from the launch-generation store under
+  a single verified identity join — and that token's startup action must itself be a
+  terminally-successful startup transaction whose participant is this exact gateway (j#87472).
 
 These are module-level functions taking the request + stores explicitly (no ``self``), so the
 recovery ops delegate to them and the whole chain stays independently testable.
@@ -40,9 +48,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 def record_observed_turn_start(rec, *, request, repo_root, attestation_home) -> bool:
     """Did the ANCHOR delivery's QUEUE-ENTER rail OBSERVE the turn start, GENERATION-BOUND?
 
-    (j#87397 / design j#87409 / j#87418 / j#87424 / j#87445.) SCOPE: the herdr queue-enter
-    rail only — the design decision's observation-only pre-Enter wait lives there. Two
-    requirements, BOTH on the exact anchor delivery record:
+    (j#87397 / design j#87409 / j#87418 / j#87424 / j#87445 / j#87472.) SCOPE: the herdr
+    queue-enter rail only — the design decision's observation-only pre-Enter wait lives there.
+    Two requirements, BOTH on the exact anchor delivery record:
 
     1. an observed start on the v2 queue-enter observation (``event_wait_kind == "changed"``
        OR the #13292 snapshot's ``read_ok`` + ``runtime_state == busy``);
@@ -68,10 +76,10 @@ def record_generation_bound(rec, *, request, repo_root, attestation_home) -> boo
 
     Fail-closed generation authority: the binding must be present and its ``assigned_name`` /
     ``locator`` / ``row_revision`` / ``provider`` must all exactly equal the request pins (all
-    non-empty, j#87424 F1), AND its collision-free ``startup_action_id`` token must be
-    non-empty and exactly equal the LIVE current-generation attestation's token (j#87445 F1) —
-    never the ``observed_at`` timestamp (two same-second launches share it). A same-second
-    recycle, an ABA relaunch, a foreign provider, or a tokenless legacy record never binds.
+    non-empty, j#87424 F1), AND its ``startup_action_id`` token must be non-empty and exactly
+    equal the LIVE current-generation token (j#87472) — never the ``observed_at`` timestamp
+    (two same-second launches share it). A same-second recycle, an ABA relaunch, a foreign
+    provider, or a tokenless legacy record never binds.
     """
     qe = getattr(rec, "queue_enter_observation", None)
     if not isinstance(qe, dict):
@@ -98,20 +106,26 @@ def record_generation_bound(rec, *, request, repo_root, attestation_home) -> boo
 
 def current_request_generation_token(*, request, repo_root, attestation_home) -> str:
     """The LIVE startup GENERATION TOKEN for THIS request's pinned gateway, gated by a
-    SINGLE VERIFIED IDENTITY JOIN (j#87424 F1 + j#87445 F1). (read-only, fail-closed)
+    SINGLE VERIFIED IDENTITY JOIN + a terminally-successful startup transaction (j#87472).
+    (read-only, fail-closed)
 
-    Read at recovery time (the failed gateway is still live, pre-close). The collision-free
-    per-launch token (``startup_action_id``) is the generation authority the record binding
-    must equal; EVERY identity axis of the attestation must be verified AND the token
-    non-empty. Required, all exact: ``verdict == present`` + a non-empty
-    ``startup_action_id``; ``assigned_name`` / ``role`` (== the request provider) / ``lane_id``
-    / ``locator`` equal the request pins; ``workspace_id`` equals the repo workspace. ``""`` on
-    an unreadable store, an absent record, a tokenless (legacy / v2-store) row, or ANY
-    mismatched axis.
+    Read at recovery time (the failed gateway is still live, pre-close) from the home-scoped
+    launch-generation store. The collision-free per-launch token (``startup_action_id``) is
+    the generation authority the record binding must equal; the whole generation is ONE
+    atomic row, so identity and token can never be torn apart. Required, all exact:
+
+    * an ``attested`` generation row for ``request.assigned_name`` with a non-empty token;
+    * ``verdict == present``; ``role`` (== the request provider) / ``lane_id`` / ``locator``
+      equal the request pins; ``workspace_id`` equals the repo workspace;
+    * that token names a startup transaction that reached ``completed_success`` whose
+      participant for this provider is exactly this gateway (assigned_name + locator, not
+      closed) — so a rolled-back or foreign generation never lends its token.
+
+    Returns ``""`` on an unreadable / absent store, a pending / absent row, a tokenless row,
+    ANY mismatched axis, or a startup transaction that is not this gateway's terminal success.
     """
-    from mozyo_bridge.core.state.herdr_identity_attestation import (
-        HerdrIdentityAttestationStore,
-        VERDICT_PRESENT,
+    from mozyo_bridge.core.state.herdr_launch_generation import (
+        verified_generation_token,
     )
 
     try:
@@ -120,26 +134,16 @@ def current_request_generation_token(*, request, repo_root, attestation_home) ->
         return ""
     if not _norm(repo_workspace):
         return ""
-    try:
-        record = HerdrIdentityAttestationStore(home=attestation_home).read(
-            _norm(request.assigned_name)
-        )
-    except Exception:  # noqa: BLE001 - unreadable attestation => no live generation
-        return ""
-    if record is None:
-        return ""
-    token = _norm(str(getattr(record, "startup_action_id", "") or ""))
-    if not (
-        _norm(getattr(record, "verdict", "")) == VERDICT_PRESENT
-        and token
-        and _norm(getattr(record, "assigned_name", "")) == _norm(request.assigned_name)
-        and _norm(getattr(record, "role", "")) == _norm(request.provider)
-        and _norm_lane(getattr(record, "lane_id", "")) == _norm_lane(request.lane)
-        and _norm(getattr(record, "locator", "")) == _norm(request.locator)
-        and _norm(getattr(record, "workspace_id", "")) == _norm(repo_workspace)
-    ):
-        return ""
-    return token
+    return verified_generation_token(
+        attestation_home,
+        assigned_name=request.assigned_name,
+        workspace_id=repo_workspace,
+        role=request.provider,
+        lane_id=request.lane,
+        locator=request.locator,
+        norm=_norm,
+        norm_lane=_norm_lane,
+    )
 
 
 __all__ = (

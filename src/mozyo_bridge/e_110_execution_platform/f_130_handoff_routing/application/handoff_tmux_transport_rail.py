@@ -747,6 +747,9 @@ class LiveTmuxTransportRailOps:
             HerdrIdentityAttestationStore,
             VERDICT_PRESENT,
         )
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            verified_generation_token,
+        )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
             AGENT_KEY_NAME,
             _agent_locator,
@@ -798,11 +801,25 @@ class LiveTmuxTransportRailOps:
         ):
             return None
         observed_at = _norm(str(getattr(record, "observed_at", "") or ""))
-        # #14203 review j#87445: the COLLISION-FREE per-launch generation token is the
-        # authority (observed_at is demoted to ordering/diagnostic). A record with no token
-        # (a legacy launch / a store older than v3 that dropped it) yields NO binding — the
-        # recovery then fails closed rather than trusting a non-unique timestamp.
-        startup_action_id = _norm(str(getattr(record, "startup_action_id", "") or ""))
+        # #14203 design j#87472: the COLLISION-FREE per-launch generation token is sourced
+        # from the home-scoped launch-generation store, NOT the main attestation (whose
+        # seconds-precision observed_at cannot separate two same-second launches, and which
+        # must not carry a required token onto shared v1/v2 homes). The attestation above is
+        # an INDEPENDENT health prerequisite; the token is the launch-generation authority's,
+        # verified as an attested row for this exact identity whose startup transaction is a
+        # terminally-successful participant of this gateway. A pending / superseded / tokenless
+        # generation yields NO binding — recovery then fails closed rather than trusting a
+        # non-unique timestamp.
+        startup_action_id = verified_generation_token(
+            None,
+            assigned_name=name,
+            workspace_id=identity.workspace_id,
+            role=identity.role,
+            lane_id=identity.lane_id,
+            locator=target,
+            norm=_norm,
+            norm_lane=_norm_lane,
+        )
         if not observed_at or not startup_action_id:
             return None
         return {

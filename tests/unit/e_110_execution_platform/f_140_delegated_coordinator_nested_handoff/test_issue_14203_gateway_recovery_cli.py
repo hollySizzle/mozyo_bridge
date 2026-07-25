@@ -592,10 +592,9 @@ class RowRevisionCloseBoundaryTests(unittest.TestCase):
 class TurnStartAuthorityTests(unittest.TestCase):
     """j#87397: the turn-start authority is the ANCHOR delivery record's own rail telemetry."""
 
-    #: The default legitimate live attestation observed_at (equals the default binding's, so a
-    #: matching binding is generation-coherent). A recycle test re-seeds it differently.
+    #: The default legitimate live observed_at (a diagnostic field only; generations are
+    #: compared by the collision-free per-launch token, NEVER this timestamp).
     live_attestation_observed_at = "2026-07-24T17:00:00+00:00"
-    live_generation_token = "startup-GEN-A"
     WS = "ws"
 
     def setUp(self):
@@ -605,27 +604,69 @@ class TurnStartAuthorityTests(unittest.TestCase):
             repo_root=self.repo, request=_request(gateway_revision="4"),
             attestation_home=self.attn_home,
         )
-        # A REAL startup attestation store (review j#87424 F1: the identity join must run
-        # against real records, not a mocked timestamp). Seed the legitimate current
-        # generation for the pinned gateway.
-        self._seed_attestation()
+        # A REAL launch-generation store + startup-transaction fence (design j#87472: the
+        # generation authority is an ATTESTED row whose token names a completed-success
+        # startup transaction with this exact participant — not a mocked timestamp, and not
+        # the main attestation). Seed the legitimate current generation for the pinned
+        # gateway; ``live_generation_token`` is the fence-derived action id it produces.
+        self.live_generation_token = self._seed_fence_success(nonce="A")
+        self._seed_generation(self.live_generation_token)
 
-    def _seed_attestation(self, **overrides):
-        from mozyo_bridge.core.state.herdr_identity_attestation import (
-            HerdrIdentityAttestationStore,
-            IdentityAttestationRecord,
-            VERDICT_PRESENT,
+    def _seed_fence_success(
+        self, *, nonce, assigned_name="gw", role="codex", lane_id="issue_x_lane",
+        locator="w:3", workspace_id=None, closed=False, terminal_success=True,
+    ):
+        """Reserve a startup transaction, record this gateway as its participant, and drive
+        it to ``completed_success`` (or a non-terminal phase). Returns the fence action id —
+        the generation token every managed launch injects and binds on."""
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            PHASE_COMPLETED_SUCCESS,
+            PHASE_HEALTH_CHECK,
+            Participant,
+            StartupTransactionFence,
+            StartupUnit,
         )
 
-        base = dict(
-            assigned_name="gw", workspace_id=self.WS, role="codex",
-            lane_id="issue_x_lane", locator="w:3", verdict=VERDICT_PRESENT,
+        fence = StartupTransactionFence(home=self.attn_home)
+        unit = StartupUnit(
+            workspace_id=workspace_id or self.WS, lane_id=lane_id, providers=(role,)
+        )
+        action = fence.reserve(unit, f"nonce-{nonce}")
+        token = action.action_id
+        fence.record_participant(
+            token,
+            Participant(
+                role=role, assigned_name=assigned_name, locator=locator,
+                receipt="rcpt", closed=closed,
+            ),
+        )
+        fence.set_phase(
+            token, PHASE_COMPLETED_SUCCESS if terminal_success else PHASE_HEALTH_CHECK
+        )
+        return token
+
+    def _seed_generation(
+        self, token, *, assigned_name="gw", role="codex", lane_id="issue_x_lane",
+        locator="w:3", workspace_id=None, verdict=None,
+    ):
+        """Reserve + finalize the current-generation row for ``assigned_name`` at ``token``
+        (INSERT OR REPLACE supersedes any prior generation, so a recycle re-seeds cleanly)."""
+        from mozyo_bridge.core.state.herdr_identity_attestation import VERDICT_PRESENT
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            HerdrLaunchGenerationStore,
+        )
+
+        ws = workspace_id or self.WS
+        store = HerdrLaunchGenerationStore(home=self.attn_home)
+        store.reserve_pending(
+            assigned_name=assigned_name, startup_action_id=token,
+            workspace_id=ws, role=role, lane_id=lane_id,
+        )
+        store.finalize(
+            assigned_name=assigned_name, startup_action_id=token,
+            workspace_id=ws, role=role, lane_id=lane_id, locator=locator,
+            verdict=verdict or VERDICT_PRESENT,
             observed_at=self.live_attestation_observed_at,
-            startup_action_id=self.live_generation_token,
-        )
-        base.update(overrides)
-        HerdrIdentityAttestationStore(home=self.attn_home).upsert(
-            IdentityAttestationRecord(**base)
         )
 
     def _rec(self, **overrides):
@@ -677,7 +718,7 @@ class TurnStartAuthorityTests(unittest.TestCase):
         base = dict(
             provider="codex", assigned_name="gw", locator="w:3", row_revision="4",
             attestation_observed_at="2026-07-24T17:00:00+00:00",
-            startup_action_id="startup-GEN-A",
+            startup_action_id=self.live_generation_token,
         )
         base.update(overrides)
         return base
@@ -738,15 +779,17 @@ class TurnStartAuthorityTests(unittest.TestCase):
             "gateway_binding": self._binding(startup_action_id=""),
         })])
         self.assertFalse(started)
-        # F1 / j#87445 (recovery side): a recycle BETWEEN delivery and recovery re-seeds the
-        # LIVE attestation with a NEW generation token (even at the same observed_at) — the
+        # F1 / j#87445 / j#87472 (recovery side): a recycle BETWEEN delivery and recovery
+        # re-seeds the LIVE current generation with a NEW token (a fresh launch, even at the
+        # same observed_at) — the reservation supersedes the old attested pointer, so the
         # same binding no longer equates, fail-closed (the ABA / same-second recycle case).
-        self._seed_attestation(startup_action_id="startup-GEN-B")
+        recycled = self._seed_fence_success(nonce="B")
+        self._seed_generation(recycled)
         _, started = self._facts_with([self._rec(queue_enter_observation={
             "event_wait_kind": "changed", "gateway_binding": self._binding(),
         })])
         self.assertFalse(started)
-        self._seed_attestation()  # restore the legitimate current generation
+        self._seed_generation(self.live_generation_token)  # restore the legitimate current gen
         # Timeout / settled snapshot / unread snapshot never start even with a binding.
         for qe in (
             {"event_wait_kind": "timeout", "gateway_binding": self._binding()},
@@ -783,43 +826,42 @@ class TurnStartAuthorityTests(unittest.TestCase):
         # Baseline: the legitimate record (seeded in setUp) binds.
         _, started = self._facts_with([self._rec(queue_enter_observation=observed)])
         self.assertTrue(started)
-        # Foreign workspace: same key/locator/observed_at, but workspace_id != repo workspace.
+        # Foreign identity: the current-generation ROW keeps the same token but a FOREIGN
+        # workspace / lane / role — the reader compares each axis to the request pins, so any
+        # foreign axis yields no token and never binds.
         for override in (
             dict(workspace_id="foreign-workspace"),
             dict(lane_id="foreign-lane"),
-            dict(role="claude"),  # a claude attestation for a codex gateway request
+            dict(role="claude"),  # a claude generation for a codex gateway request
         ):
             with self.subTest(override=override):
-                self._seed_attestation(**override)
+                self._seed_generation(self.live_generation_token, **override)
                 _, started = self._facts_with(
                     [self._rec(queue_enter_observation=observed)]
                 )
                 self.assertFalse(started)
-                self._seed_attestation()  # restore the legitimate record
+                self._seed_generation(self.live_generation_token)  # restore legitimate gen
 
     def test_j87445_same_second_launches_never_join_by_the_timestamp(self):
-        # Review j#87445: two launches with the SAME name/workspace/lane/role/locator/
-        # row_revision AND the SAME observed_at second, differing ONLY in the collision-free
-        # startup generation token, must never be treated as one generation. Real store.
-        same_second = "2026-07-24T17:00:00+00:00"
-        # Generation A delivered (binding token A) and is still the live attestation -> binds.
-        self._seed_attestation(observed_at=same_second, startup_action_id="startup-A")
+        # Review j#87445 / design j#87472: two launches with the SAME name/workspace/lane/
+        # role/locator/row_revision AND the SAME observed_at second, differing ONLY in the
+        # collision-free per-launch token, must never be treated as one generation. Each
+        # launch reserves a distinct fence action id; the current-generation row holds exactly
+        # one, and the delivery-time binding must equal THAT — the shared second is irrelevant.
+        # Generation A (seeded in setUp) is live; the binding carries token A -> binds.
         observed_A = {
-            "event_wait_kind": "changed",
-            "gateway_binding": self._binding(
-                attestation_observed_at=same_second, startup_action_id="startup-A"
-            ),
+            "event_wait_kind": "changed", "gateway_binding": self._binding(),
         }
         _, started = self._facts_with([self._rec(queue_enter_observation=observed_A)])
         self.assertTrue(started)
-        # A same-second RECYCLE to generation B (identical timestamp, new token) is now live.
+        # A same-second RECYCLE to generation B (a new fence action id) is now the current row.
         # The delivery-time generation-A binding must NOT join the current generation B.
-        self._seed_attestation(observed_at=same_second, startup_action_id="startup-B")
+        self._seed_generation(self._seed_fence_success(nonce="B2"))
         _, started = self._facts_with([self._rec(queue_enter_observation=observed_A)])
         self.assertFalse(started)
         # ABA: a THIRD launch (A') at the same second reuses generation A's shape but a fresh
         # token — an old generation-A binding still never joins A' (each launch's nonce differs).
-        self._seed_attestation(observed_at=same_second, startup_action_id="startup-A-prime")
+        self._seed_generation(self._seed_fence_success(nonce="Aprime"))
         _, started = self._facts_with([self._rec(queue_enter_observation=observed_A)])
         self.assertFalse(started)
 
@@ -827,11 +869,11 @@ class TurnStartAuthorityTests(unittest.TestCase):
         observed = {
             "event_wait_kind": "changed", "gateway_binding": self._binding(),
         }
-        # A verdict=missing record (real store) never binds.
-        self._seed_attestation(verdict="missing")
+        # A verdict=missing generation row (real store) never binds.
+        self._seed_generation(self.live_generation_token, verdict="missing")
         _, started = self._facts_with([self._rec(queue_enter_observation=observed)])
         self.assertFalse(started)
-        # A completely EMPTY store (fresh home, no record) never binds.
+        # A completely EMPTY home (no generation store, no fence) never binds.
         self.ops.attestation_home = Path(tempfile.mkdtemp())
         _, started = self._facts_with([self._rec(queue_enter_observation=observed)])
         self.assertFalse(started)

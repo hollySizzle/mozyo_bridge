@@ -1,0 +1,599 @@
+"""Home-scoped current-generation pointer for managed launches (Redmine #14203).
+
+The #14203 gateway-recovery generation authority must answer, at recovery time, one
+question with no collision: *is the delivery record's persisted binding the SAME process
+generation as the gateway I am about to close?* Review j#87445 showed the seconds-precision
+``observed_at`` on the main attestation cannot answer it — two same-second launches of the
+same slot share that timestamp, so an ABA relaunch can be mistaken for the original. The
+design consultation answer (j#87472) rejected two weaker fixes:
+
+* option (b) — carrying the token on the main attestation (v2->v3) would make a v3 runtime
+  refuse every launch onto an un-migrated shared v1/v2 home, because a non-empty required
+  field cannot survive the conservative write policy #13882 depends on; and
+* a token-only sidecar read separately from the attestation — a torn write/read pair could
+  compose the identity of one generation with the token of another.
+
+This store is the sanctioned third design: a **single home-scoped row per ``assigned_name``**
+holding the whole generation as one atomic fact — the collision-free per-launch token
+(``startup_action_id``, the reserved startup-transaction action id) together with the exact
+identity a binding or a recovery must match. Binding and recovery read the destructive
+generation authority from *this one row*; the main attestation is verified independently as
+a health prerequisite but is never joined with this row as a single fact.
+
+Two phases, mirroring the reserved/bound discipline of the replacement-binding store:
+
+* ``pending`` — reserved by the parent **before the launch's first Herdr side effect**
+  (:func:`reserve_pending`). The reservation atomically supersedes any prior row for the
+  same ``assigned_name`` — a *newer* generation invalidates the old ``attested`` current
+  pointer at once, so the relaunch window reads ``pending`` (fail-closed), never the stale
+  ``attested`` generation.
+* ``attested`` — the parent launcher finalizes the reservation only after the launch
+  receipt, the startup-transaction participant, the wrapper's own
+  ``attestation_write_succeeded`` execution event, and the exact main-attestation
+  identity/locator all agree (:func:`HerdrLaunchGenerationStore.finalize`). The caller owns
+  that composite authority; this store performs only the byte-exact compare-and-set, so an
+  older launch's late finalize after a newer ``pending`` reservation is refused, and a
+  wrapper best-effort token-only write is never the thing that flips the phase.
+
+Recovery policy is ``rebuildable_cache`` (``managed-state-model.md`` ``### recovery policy
+vocabulary``): a lost / absent / corrupt store degrades to fail-closed (binding and recovery
+both refuse), never a speculative rebuild of a live process, and the next managed relaunch
+re-establishes the row. ``observed_at`` is carried for diagnostics only and is NEVER used to
+compare generations.
+
+The file holds identity tokens and timestamps only — no argv, environment, credential,
+message, or pane-content field. Initial publication is atomic and mode ``0600``; every
+mutation uses a SQLite ``BEGIN IMMEDIATE`` transaction. This store never migrates or repairs
+an unknown shape: pure stdlib + sqlite, so the dependency never points core -> provider.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import stat
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from mozyo_bridge.shared.paths import mozyo_bridge_home
+
+HERDR_LAUNCH_GENERATION_FILENAME = "herdr-launch-generation.sqlite"
+HERDR_LAUNCH_GENERATION_SCHEMA_VERSION = 1
+
+#: Recovery policy (``managed-state-model.md`` ``### recovery policy vocabulary``): losing
+#: it degrades to fail-closed (binding + recovery refuse) and the next managed relaunch
+#: re-reserves it. It is never speculatively rebuilt from a live process.
+HERDR_LAUNCH_GENERATION_RECOVERY_POLICY = "rebuildable_cache"
+
+GENERATION_PENDING = "pending"
+GENERATION_ATTESTED = "attested"
+
+_TABLE = "herdr_launch_generations"
+_COLUMNS = (
+    "assigned_name",
+    "startup_action_id",
+    "phase",
+    "workspace_id",
+    "role",
+    "lane_id",
+    "locator",
+    "verdict",
+    "observed_at",
+    "reserved_at",
+    "attested_at",
+)
+#: The exact ``PRAGMA table_info`` projection (name, TYPE, notnull, pk) a valid store must
+#: present. An extra / missing / reshaped column fails closed rather than being adopted.
+_EXPECTED_INFO = (
+    ("assigned_name", "TEXT", 1, 1),
+    ("startup_action_id", "TEXT", 1, 0),
+    ("phase", "TEXT", 1, 0),
+    ("workspace_id", "TEXT", 1, 0),
+    ("role", "TEXT", 1, 0),
+    ("lane_id", "TEXT", 1, 0),
+    ("locator", "TEXT", 1, 0),
+    ("verdict", "TEXT", 1, 0),
+    ("observed_at", "TEXT", 1, 0),
+    ("reserved_at", "TEXT", 1, 0),
+    ("attested_at", "TEXT", 1, 0),
+)
+#: One current row per ``assigned_name`` (the PRIMARY KEY). The phase CHECK makes an
+#: ``attested`` row structurally distinct from a ``pending`` one, so a partial write can
+#: never be decoded as a usable generation.
+_CREATE_SQL = f"""
+CREATE TABLE {_TABLE} (
+    assigned_name TEXT NOT NULL,
+    startup_action_id TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    lane_id TEXT NOT NULL,
+    locator TEXT NOT NULL DEFAULT '',
+    verdict TEXT NOT NULL DEFAULT '',
+    observed_at TEXT NOT NULL DEFAULT '',
+    reserved_at TEXT NOT NULL,
+    attested_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (assigned_name),
+    CHECK (phase IN ('pending', 'attested')),
+    CHECK (
+        (phase = 'pending'
+            AND locator = '' AND verdict = '' AND observed_at = '' AND attested_at = '')
+        OR
+        (phase = 'attested'
+            AND locator <> '' AND verdict <> '' AND observed_at <> '' AND attested_at <> '')
+    )
+)
+"""
+
+
+class HerdrLaunchGenerationError(RuntimeError):
+    """The launch-generation authority is absent, malformed, or its write was refused."""
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _token(value: object, field: str, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str):
+        raise HerdrLaunchGenerationError(f"{field} is not a text token")
+    if value != value.strip() or (not value and not allow_empty):
+        raise HerdrLaunchGenerationError(
+            f"{field} is empty or has surrounding whitespace"
+        )
+    return value
+
+
+def _rollback_quietly(conn: sqlite3.Connection) -> None:
+    try:
+        conn.rollback()
+    except sqlite3.DatabaseError:
+        pass
+
+
+def herdr_launch_generation_path(home: Path | None = None) -> Path:
+    return (home or mozyo_bridge_home()) / HERDR_LAUNCH_GENERATION_FILENAME
+
+
+@dataclass(frozen=True)
+class LaunchGeneration:
+    """The whole generation for one ``assigned_name`` as a single atomic fact."""
+
+    assigned_name: str
+    startup_action_id: str
+    phase: str
+    workspace_id: str
+    role: str
+    lane_id: str
+    locator: str = ""
+    verdict: str = ""
+    observed_at: str = ""
+    reserved_at: str = ""
+    attested_at: str = ""
+
+    def as_payload(self) -> dict:
+        return {
+            "assigned_name": self.assigned_name,
+            "startup_action_id": self.startup_action_id,
+            "phase": self.phase,
+            "workspace_id": self.workspace_id,
+            "role": self.role,
+            "lane_id": self.lane_id,
+            "locator": self.locator,
+            "verdict": self.verdict,
+            "observed_at": self.observed_at,
+            "reserved_at": self.reserved_at,
+            "attested_at": self.attested_at,
+        }
+
+
+def _decode(row: tuple) -> LaunchGeneration:
+    if len(row) != len(_COLUMNS):
+        raise HerdrLaunchGenerationError("generation row has an unexpected width")
+    values = tuple(
+        _token(
+            value,
+            name,
+            allow_empty=name in {"locator", "verdict", "observed_at", "attested_at"},
+        )
+        for name, value in zip(_COLUMNS, row)
+    )
+    generation = LaunchGeneration(**dict(zip(_COLUMNS, values)))
+    if generation.phase not in (GENERATION_PENDING, GENERATION_ATTESTED):
+        raise HerdrLaunchGenerationError("generation row has an unknown phase")
+    if generation.phase == GENERATION_PENDING and any(
+        (generation.locator, generation.verdict, generation.observed_at,
+         generation.attested_at)
+    ):
+        raise HerdrLaunchGenerationError("pending generation carries attested fields")
+    if generation.phase == GENERATION_ATTESTED and not all(
+        (generation.locator, generation.verdict, generation.observed_at,
+         generation.attested_at)
+    ):
+        raise HerdrLaunchGenerationError("attested generation is incomplete")
+    return generation
+
+
+class HerdrLaunchGenerationStore:
+    """Fail-closed, home-scoped current-generation pointer keyed by ``assigned_name``."""
+
+    def __init__(self, path: Path | None = None, *, home: Path | None = None):
+        self.path = path or herdr_launch_generation_path(home)
+
+    @staticmethod
+    def _validate_schema(conn: sqlite3.Connection) -> None:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        tables = tuple(
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        )
+        info = tuple(
+            (row[1], str(row[2]).upper(), row[3], row[5])
+            for row in conn.execute(f"PRAGMA table_info({_TABLE})").fetchall()
+        )
+        if (
+            version != HERDR_LAUNCH_GENERATION_SCHEMA_VERSION
+            or tables != (_TABLE,)
+            or info != _EXPECTED_INFO
+        ):
+            raise HerdrLaunchGenerationError(
+                "herdr launch-generation store has an unknown or partial schema; "
+                "refusing to migrate or repair it implicitly"
+            )
+
+    def _validate_file_security(self) -> None:
+        """Require an operator-owned regular 0600 file; never repair it implicitly."""
+        try:
+            metadata = self.path.lstat()
+        except OSError as exc:
+            raise HerdrLaunchGenerationError(
+                "herdr launch-generation store metadata is unreadable"
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode):
+            raise HerdrLaunchGenerationError(
+                "herdr launch-generation store is not a regular file"
+            )
+        if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+            raise HerdrLaunchGenerationError(
+                "herdr launch-generation store is not owned by the current operator"
+            )
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise HerdrLaunchGenerationError(
+                "herdr launch-generation store permissions are not exactly 0600"
+            )
+
+    def _publish_fresh(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw = tempfile.mkstemp(
+            prefix=".launch-generation-", suffix=".sqlite", dir=self.path.parent
+        )
+        candidate = Path(raw)
+        os.close(fd)
+        try:
+            os.chmod(candidate, 0o600)
+            conn = sqlite3.connect(candidate)
+            try:
+                conn.execute("PRAGMA journal_mode=DELETE")
+                conn.execute(
+                    f"PRAGMA user_version={HERDR_LAUNCH_GENERATION_SCHEMA_VERSION}"
+                )
+                conn.execute(_CREATE_SQL)
+                conn.commit()
+                self._validate_schema(conn)
+            finally:
+                conn.close()
+            try:
+                os.link(candidate, self.path)
+            except FileExistsError:
+                pass  # an atomically-published peer won; validate it below
+        finally:
+            candidate.unlink(missing_ok=True)
+
+    def _connect_existing(self, *, readonly: bool) -> sqlite3.Connection:
+        self._validate_file_security()
+        mode = "ro" if readonly else "rw"
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(f"file:{self.path}?mode={mode}", uri=True)
+            conn.execute("PRAGMA busy_timeout=2000")
+            self._validate_schema(conn)
+            return conn
+        except HerdrLaunchGenerationError:
+            if conn is not None:
+                conn.close()
+            raise
+        except (sqlite3.DatabaseError, OSError) as exc:
+            if conn is not None:
+                conn.close()
+            raise HerdrLaunchGenerationError(
+                "herdr launch-generation store is unreadable"
+            ) from exc
+        except BaseException:
+            if conn is not None:
+                conn.close()
+            raise
+
+    def _ensure_store(self) -> None:
+        try:
+            if not self.path.exists():
+                self._publish_fresh()
+            conn = self._connect_existing(readonly=True)
+            conn.close()
+        except HerdrLaunchGenerationError:
+            raise
+        except (sqlite3.DatabaseError, OSError) as exc:
+            raise HerdrLaunchGenerationError(
+                "herdr launch-generation store could not be published atomically"
+            ) from exc
+
+    @staticmethod
+    def _row(conn: sqlite3.Connection, assigned_name: str):
+        return conn.execute(
+            f"SELECT {', '.join(_COLUMNS)} FROM {_TABLE} WHERE assigned_name=?",
+            (assigned_name,),
+        ).fetchone()
+
+    def read(self, assigned_name: str) -> Optional[LaunchGeneration]:
+        """The current generation row for ``assigned_name``, or ``None`` (fail-closed).
+
+        An absent store is a legitimate fresh / rebuildable_cache home and returns ``None``;
+        an unreadable / partial store raises so the caller fails closed rather than treating
+        a corrupt file as "no generation".
+        """
+        name = _token(assigned_name, "assigned_name")
+        if not self.path.exists():
+            return None
+        try:
+            conn = self._connect_existing(readonly=True)
+            try:
+                conn.execute("BEGIN")
+                row = self._row(conn, name)
+            finally:
+                conn.close()
+        except HerdrLaunchGenerationError:
+            raise
+        except (sqlite3.DatabaseError, OSError) as exc:
+            raise HerdrLaunchGenerationError(
+                "herdr launch-generation store is unreadable"
+            ) from exc
+        return _decode(row) if row is not None else None
+
+    def reserve_pending(
+        self,
+        *,
+        assigned_name: str,
+        startup_action_id: str,
+        workspace_id: str,
+        role: str,
+        lane_id: str,
+    ) -> LaunchGeneration:
+        """Reserve a fresh ``pending`` generation BEFORE the launch's first Herdr side effect.
+
+        Atomically supersedes any prior row for ``assigned_name`` — the newer generation
+        invalidates the old ``attested`` current pointer at once, closing the relaunch ABA
+        window (the row reads ``pending`` until this generation itself attests). A store
+        write that cannot proceed raises :class:`HerdrLaunchGenerationError`, which the
+        caller turns into a typed zero-actuation launch refusal.
+        """
+        fields = {
+            "assigned_name": _token(assigned_name, "assigned_name"),
+            "startup_action_id": _token(startup_action_id, "startup_action_id"),
+            "workspace_id": _token(workspace_id, "workspace_id"),
+            "role": _token(role, "role"),
+            "lane_id": _token(lane_id, "lane_id"),
+        }
+        self._ensure_store()
+        conn = self._connect_existing(readonly=False)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = _utc_now()
+            # INSERT OR REPLACE on the assigned_name PK: a newer generation supersedes any
+            # prior pending/attested row for this slot in one statement, so no window
+            # exposes the stale attested pointer.
+            conn.execute(
+                f"INSERT OR REPLACE INTO {_TABLE} ({', '.join(_COLUMNS)}) "
+                f"VALUES ({', '.join('?' for _ in _COLUMNS)})",
+                (
+                    fields["assigned_name"],
+                    fields["startup_action_id"],
+                    GENERATION_PENDING,
+                    fields["workspace_id"],
+                    fields["role"],
+                    fields["lane_id"],
+                    "",  # locator
+                    "",  # verdict
+                    "",  # observed_at
+                    now,  # reserved_at
+                    "",  # attested_at
+                ),
+            )
+            conn.commit()
+            return LaunchGeneration(
+                phase=GENERATION_PENDING, reserved_at=now, **fields
+            )
+        except HerdrLaunchGenerationError:
+            _rollback_quietly(conn)
+            raise
+        except (sqlite3.DatabaseError, OSError) as exc:
+            _rollback_quietly(conn)
+            raise HerdrLaunchGenerationError(
+                "herdr launch-generation reservation write failed"
+            ) from exc
+        except BaseException:
+            _rollback_quietly(conn)
+            raise
+        finally:
+            conn.close()
+
+    def finalize(
+        self,
+        *,
+        assigned_name: str,
+        startup_action_id: str,
+        workspace_id: str,
+        role: str,
+        lane_id: str,
+        locator: str,
+        verdict: str,
+        observed_at: str,
+    ) -> LaunchGeneration:
+        """Compare-and-set the reserved generation to ``attested``.
+
+        The caller owns the composite authority (launch receipt + startup-transaction
+        participant + wrapper ``attestation_write_succeeded`` event + exact main-attestation
+        identity/locator). This store performs only the byte-exact CAS on
+        ``(assigned_name, startup_action_id, phase='pending')`` and the reserved identity, so
+        an older launch's late finalize after a *newer* ``pending`` reservation matches zero
+        rows and is refused — never overwriting the newer generation.
+        """
+        fields = {
+            "assigned_name": _token(assigned_name, "assigned_name"),
+            "startup_action_id": _token(startup_action_id, "startup_action_id"),
+            "workspace_id": _token(workspace_id, "workspace_id"),
+            "role": _token(role, "role"),
+            "lane_id": _token(lane_id, "lane_id"),
+            "locator": _token(locator, "locator"),
+            "verdict": _token(verdict, "verdict"),
+            "observed_at": _token(observed_at, "observed_at"),
+        }
+        if not self.path.exists():
+            raise HerdrLaunchGenerationError(
+                "cannot finalize a generation: the store does not exist (no reservation)"
+            )
+        conn = self._connect_existing(readonly=False)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = _utc_now()
+            conn.execute(
+                f"UPDATE {_TABLE} SET phase=?, locator=?, verdict=?, observed_at=?, "
+                "attested_at=? "
+                "WHERE assigned_name=? AND startup_action_id=? AND phase=? "
+                "AND workspace_id=? AND role=? AND lane_id=?",
+                (
+                    GENERATION_ATTESTED,
+                    fields["locator"],
+                    fields["verdict"],
+                    fields["observed_at"],
+                    now,
+                    fields["assigned_name"],
+                    fields["startup_action_id"],
+                    GENERATION_PENDING,
+                    fields["workspace_id"],
+                    fields["role"],
+                    fields["lane_id"],
+                ),
+            )
+            if conn.total_changes != 1:
+                raise HerdrLaunchGenerationError(
+                    "launch-generation finalize compare-and-set was refused (no matching "
+                    "pending reservation for this exact identity and token — a newer "
+                    "generation may have superseded it)"
+                )
+            row = self._row(conn, fields["assigned_name"])
+            conn.commit()
+            attested = _decode(row)
+            return attested
+        except HerdrLaunchGenerationError:
+            _rollback_quietly(conn)
+            raise
+        except (sqlite3.DatabaseError, OSError) as exc:
+            _rollback_quietly(conn)
+            raise HerdrLaunchGenerationError(
+                "launch-generation finalize write failed"
+            ) from exc
+        except BaseException:
+            _rollback_quietly(conn)
+            raise
+        finally:
+            conn.close()
+
+
+def verified_generation_token(
+    home: Path | None,
+    *,
+    assigned_name: str,
+    workspace_id: str,
+    role: str,
+    lane_id: str,
+    locator: str,
+    norm,
+    norm_lane,
+) -> str:
+    """The attested generation token for this exact gateway, or ``""`` (read-only, j#87472).
+
+    The ONE generation authority shared by the queue-enter binding (delivery time) and the
+    gateway recovery (recovery time), so the two can never drift. Returns the collision-free
+    per-launch token (``startup_action_id``) iff, all exact and fail-closed:
+
+    * an ``attested`` generation row exists for ``assigned_name`` with a non-empty token,
+      ``verdict == present``, and ``workspace_id`` / ``role`` / ``lane_id`` / ``locator``
+      equal to the expected identity (the whole generation is ONE atomic row — identity and
+      token are never read from two files that could tear); AND
+    * that token names a startup transaction that reached ``completed_success`` whose
+      participant for ``role`` is exactly this gateway (``assigned_name`` + ``locator``, not
+      closed) — a rolled-back / foreign / superseded generation never lends its token.
+
+    ``norm`` / ``norm_lane`` are injected by the caller so this core module never imports the
+    provider identity helpers (the dependency never points core -> provider). Any unreadable
+    / absent / pending / mismatched input yields ``""``.
+    """
+    from mozyo_bridge.core.state.herdr_identity_attestation import VERDICT_PRESENT
+    from mozyo_bridge.core.state.startup_transaction_fence import (
+        PHASE_COMPLETED_SUCCESS,
+        StartupTransactionError,
+        StartupTransactionFence,
+    )
+
+    try:
+        generation = HerdrLaunchGenerationStore(home=home).read(norm(assigned_name))
+    except (HerdrLaunchGenerationError, Exception):  # noqa: BLE001 - unreadable => none
+        return ""
+    if generation is None:
+        return ""
+    token = norm(getattr(generation, "startup_action_id", "") or "")
+    if not (
+        norm(getattr(generation, "phase", "")) == GENERATION_ATTESTED
+        and token
+        and norm(getattr(generation, "verdict", "")) == VERDICT_PRESENT
+        and norm(getattr(generation, "assigned_name", "")) == norm(assigned_name)
+        and norm(getattr(generation, "role", "")) == norm(role)
+        and norm_lane(getattr(generation, "lane_id", "")) == norm_lane(lane_id)
+        and norm(getattr(generation, "locator", "")) == norm(locator)
+        and norm(getattr(generation, "workspace_id", "")) == norm(workspace_id)
+    ):
+        return ""
+    try:
+        action = StartupTransactionFence(home=home).read(token)
+    except (StartupTransactionError, Exception):  # noqa: BLE001 - unreadable => none
+        return ""
+    if action is None or norm(getattr(action, "phase", "")) != PHASE_COMPLETED_SUCCESS:
+        return ""
+    participant = action.participant_for(norm(role))
+    if participant is None or getattr(participant, "closed", True):
+        return ""
+    if not (
+        norm(getattr(participant, "assigned_name", "")) == norm(assigned_name)
+        and norm(getattr(participant, "locator", "")) == norm(locator)
+    ):
+        return ""
+    return token
+
+
+__all__ = (
+    "GENERATION_ATTESTED",
+    "GENERATION_PENDING",
+    "HERDR_LAUNCH_GENERATION_FILENAME",
+    "HERDR_LAUNCH_GENERATION_RECOVERY_POLICY",
+    "HERDR_LAUNCH_GENERATION_SCHEMA_VERSION",
+    "HerdrLaunchGenerationError",
+    "HerdrLaunchGenerationStore",
+    "LaunchGeneration",
+    "herdr_launch_generation_path",
+    "verified_generation_token",
+)

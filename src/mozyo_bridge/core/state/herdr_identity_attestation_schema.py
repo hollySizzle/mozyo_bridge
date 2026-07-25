@@ -64,14 +64,13 @@ from mozyo_bridge.core.state.state_store import BACKUPS_DIRNAME, StateStoreError
 _TABLE = "herdr_identity_attestations"
 
 #: The shape this build writes for a fresh store and reads as native.
-HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION = 3
+HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION = 2
 
 #: The store shapes this build can read (and, per the write policy above, write
 #: *conservatively* without migrating). v1 = pre-#13806, v2 = additive
-#: ``replacement_action_id``, v3 = additive ``startup_action_id`` (Redmine #14203 review
-#: j#87445: a collision-free per-launch generation token). A version outside this set is
-#: unsupported and fails closed with the file byte-untouched.
-RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+#: ``replacement_action_id``. A version outside this set is unsupported and fails closed
+#: with the file byte-untouched.
+RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2})
 
 #: Recovery policy (``managed-state-model.md`` ``### recovery policy vocabulary``): a
 #: rebuildable projection — losing it degrades to fail-closed (adopt refuses, doctor
@@ -93,23 +92,17 @@ _V1_COLUMNS = frozenset(
 )
 #: v2 (#13806 tranche D R2-F2) is purely additive over v1.
 _V2_ADDS = frozenset({"replacement_action_id"})
-#: v3 (#14203 review j#87445) is purely additive over v2: a collision-free per-launch
-#: generation token (the startup action id / nonce), so two same-second same-identity
-#: launches are never confused for one process generation.
-_V3_ADDS = frozenset({"startup_action_id"})
 _SHAPE_V1 = _V1_COLUMNS
 _SHAPE_V2 = _V1_COLUMNS | _V2_ADDS
-_SHAPE_V3 = _SHAPE_V2 | _V3_ADDS
 
 _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     1: (_SHAPE_V1,),
     2: (_SHAPE_V2,),
-    3: (_SHAPE_V3,),
 }
 
 #: The current column vocabulary, in the order every read projects and every native write
 #: uses. Kept as an ordered tuple so a projection and a native SELECT decode identically.
-COLUMNS_V3 = (
+COLUMNS_V2 = (
     "assigned_name",
     "workspace_id",
     "role",
@@ -119,30 +112,23 @@ COLUMNS_V3 = (
     "detail",
     "observed_at",
     "replacement_action_id",
-    "startup_action_id",
 )
-#: The v2 write vocabulary — the same order minus the v3 additive column.
-COLUMNS_V2 = tuple(c for c in COLUMNS_V3 if c not in _V3_ADDS)
-#: The v1 write vocabulary — v2 minus its additive column.
+#: The v1 write vocabulary — the same order minus the additive column.
 COLUMNS_V1 = tuple(c for c in COLUMNS_V2 if c not in _V2_ADDS)
 
 #: ``column -> migration default literal`` for columns absent from an older shape. A
 #: column mapped to ``None`` has no proven default and makes a projection fail closed
-#: rather than invent a value. Both additive columns default to the empty string because a
-#: row written by an older runtime with no such concept has ``''`` as its TRUE value, not a
-#: fabrication (a v1/v2 launch carried no startup generation token at all).
-_COLUMN_DEFAULTS: dict[str, Optional[str]] = {
-    "replacement_action_id": "''",
-    "startup_action_id": "''",
-}
+#: rather than invent a value. ``replacement_action_id`` defaults to the empty string
+#: because a v1 row was written by a runtime with no replacement concept at all — ``''``
+#: is that row's true value, not a fabrication.
+_COLUMN_DEFAULTS: dict[str, Optional[str]] = {"replacement_action_id": "''"}
 
-#: The DDL each additive column is migrated in with (must agree with ``_TABLE_SQL_V3``).
+#: The DDL each additive column is migrated in with (must agree with ``_TABLE_SQL_V2``).
 _COLUMN_MIGRATION_DDL: dict[str, str] = {
     "replacement_action_id": "TEXT NOT NULL DEFAULT ''",
-    "startup_action_id": "TEXT NOT NULL DEFAULT ''",
 }
 
-_TABLE_SQL_V3 = f"""
+_TABLE_SQL_V2 = f"""
 CREATE TABLE IF NOT EXISTS {_TABLE} (
     assigned_name TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
@@ -152,8 +138,7 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     verdict TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT '',
     observed_at TEXT NOT NULL,
-    replacement_action_id TEXT NOT NULL DEFAULT '',
-    startup_action_id TEXT NOT NULL DEFAULT ''
+    replacement_action_id TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -355,7 +340,7 @@ def reader_upgrade_required(conn: sqlite3.Connection) -> bool:
 def readonly_compatible_select(conn: sqlite3.Connection) -> Optional[str]:
     """A SELECT list projecting any recognized shape onto :data:`COLUMNS_V2`, or ``None``.
 
-    Emits the full current column vocabulary in :data:`COLUMNS_V3` order, projecting a
+    Emits the full current column vocabulary in :data:`COLUMNS_V2` order, projecting a
     column absent from an older shape as its migration-default *literal* (``'' AS
     replacement_action_id`` for a v1 store) so the caller decodes a v1 row with exactly
     the same row-decoder as a native v2 row. Returns ``None`` — fail closed, never a
@@ -368,7 +353,7 @@ def readonly_compatible_select(conn: sqlite3.Connection) -> Optional[str]:
         return None
     present = _present_columns(conn)
     parts: list[str] = []
-    for column in COLUMNS_V3:
+    for column in COLUMNS_V2:
         if column in present:
             parts.append(column)
             continue
@@ -389,8 +374,6 @@ def writable_projection(version: int) -> Optional[tuple[str, ...]]:
     """
     if version not in RECOGNIZED_SCHEMA_VERSIONS:
         return None
-    if version >= 3:
-        return COLUMNS_V3
     return COLUMNS_V2 if version >= 2 else COLUMNS_V1
 
 
@@ -478,7 +461,7 @@ def probe_store_schema(path: Path) -> StoreSchemaObservation:
 
 def create_schema(conn: sqlite3.Connection) -> None:
     """Create a fresh store at the current version (used only when nothing exists)."""
-    conn.execute(_TABLE_SQL_V3)
+    conn.execute(_TABLE_SQL_V2)
     conn.execute(f"PRAGMA user_version = {HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}")
 
 
@@ -807,7 +790,7 @@ def migrate_attestation_store(path: Path) -> AttestationMigrationOutcome:
             ) from exc
         try:
             present = _present_columns(conn)
-            for column in COLUMNS_V3:
+            for column in COLUMNS_V2:
                 if column in present:
                     continue
                 ddl = _COLUMN_MIGRATION_DDL.get(column)

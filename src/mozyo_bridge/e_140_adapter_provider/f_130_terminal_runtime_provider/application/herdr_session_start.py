@@ -166,7 +166,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
     launch_receipt,
-    open_startup_transaction,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
+    finalize_session_launch_generations,
+    open_startup_transaction_and_reserve_generations,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (
     SLOT_ADOPTED,
@@ -266,18 +269,6 @@ def _resolve_binary_or_die(env: Mapping[str, str]) -> str:
         return resolve_herdr_binary(env).path
     except TerminalTransportError as exc:
         raise HerdrSessionStartError(str(exc)) from exc
-
-
-def _find_named_agent(
-    rows: Sequence[Mapping[str, object]], assigned_name: str
-) -> list:
-    """Rows whose durable name equals ``assigned_name`` (fail-closed on duplicates)."""
-    return [
-        row
-        for row in rows
-        if isinstance(row, Mapping) and _norm(row.get(AGENT_KEY_NAME)) == assigned_name
-    ]
-
 
 
 def prepare_session(
@@ -567,7 +558,11 @@ def _prepare_session_locked(
     plans: list = []
     for provider in providers:
         assigned_name = encode_assigned_name(workspace_id, provider, lane)
-        existing = _find_named_agent(rows, assigned_name)
+        # Rows whose durable name equals assigned_name (fail-closed on duplicates below).
+        existing = [
+            row for row in rows
+            if isinstance(row, Mapping) and _norm(row.get(AGENT_KEY_NAME)) == assigned_name
+        ]
         if len(existing) > 1:
             raise HerdrSessionStartError(
                 f"{len(existing)} live agents already carry {assigned_name!r}; herdr "
@@ -673,19 +668,14 @@ def _prepare_session_locked(
             replacement_launch=bool((replacement_action_id or "").strip()),
         )
 
-    # Reserve this run's immutable startup action (Redmine #13948, Answer j#80989) — the
-    # LAST thing before the first herdr write, and deliberately after every fail-closed
-    # preflight above (a run that aborts there started nothing and needs no identity).
-    # From here on, anything this run creates is recorded as that action's participant, so
-    # a partial pair has an owner instead of being indistinguishable from a stranger's.
-    transaction = open_startup_transaction(
-        workspace_id=workspace_id,
-        lane_id=result.lane_id,
-        providers=providers,
-        dry_run=dry_run,
-        home=Path(store_home),
-        fence=startup_fence,
-        nonce=action_nonce,
+    # Reserve BOTH pre-side-effect identity records — the immutable startup action (#13948,
+    # Answer j#80989) and each wrapped slot's launch generation (#14203 j#87472) — the LAST
+    # thing before the first herdr write, after every fail-closed preflight above. From here
+    # on, anything this run creates is that action's participant (see the binding module).
+    transaction = open_startup_transaction_and_reserve_generations(
+        workspace_id=workspace_id, lane_id=result.lane_id, providers=providers,
+        dry_run=dry_run, home=Path(store_home), fence=startup_fence, nonce=action_nonce,
+        launch_plans=launch_plans, attest_launcher=attest_launcher,
     )
     result.action_id = transaction.action_id if transaction else ""
 
@@ -949,6 +939,13 @@ def _prepare_session_locked(
             # so an unmanaged run (no transaction) composes the exact prior pipeline.
             action_id=transaction.action_id if transaction is not None else "",
         )
+    # Finalize each launched slot's generation to `attested` — best-effort, once startup
+    # health gathered the composite evidence (#14203 j#87472; see the binding module).
+    finalize_session_launch_generations(
+        store_home=Path(store_home), transaction=transaction, slots=result.slots,
+        workspace_id=workspace_id, lane_id=result.lane_id, attestation_read=attestation_read,
+        attest_launcher=attest_launcher, launch_plans=launch_plans, dry_run=dry_run,
+    )
     if transaction is not None:
         # Record the debt, never discharge it: closing what this run started is the
         # explicit public rollback rail's authority alone (Answer j#80991). The debt is

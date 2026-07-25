@@ -953,8 +953,8 @@ class _V1AttestingHerdr(_AttestingHerdr):
                 0,
                 stdout=(
                     "usage: mozyo-bridge herdr agent-attest --assigned-name NAME\n"
-                    "mozyo_attest_capability_schema=3\n"
-                    "mozyo_attest_capability_stores=1_2_3\n"
+                    "mozyo_attest_capability_schema=2\n"
+                    "mozyo_attest_capability_stores=1_2\n"
                 ),
                 stderr="",
             )

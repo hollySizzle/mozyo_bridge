@@ -163,11 +163,6 @@ class IdentityAttestationRecord:
     #: R2-F2), or empty on a normal (non-replacement) launch. A token only — never a secret /
     #: env value. A replacement recovery verifies its fresh worker by matching this exactly.
     replacement_action_id: str = ""
-    #: The collision-free per-launch generation token (the startup action id / nonce, #14203
-    #: review j#87445), or empty on a launch that carried none (a legacy / test path). Two
-    #: same-second same-identity launches differ HERE, so a recovery can tell one process
-    #: generation from another; ``observed_at`` is demoted to diagnostic / ordering only.
-    startup_action_id: str = ""
     schema_version: int = HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
 
     def as_payload(self) -> dict:
@@ -181,7 +176,6 @@ class IdentityAttestationRecord:
             "detail": self.detail,
             "observed_at": self.observed_at,
             "replacement_action_id": self.replacement_action_id,
-            "startup_action_id": self.startup_action_id,
             "schema_version": self.schema_version,
         }
 
@@ -410,7 +404,6 @@ class HerdrIdentityAttestationStore:
                 "detail": record.detail,
                 "observed_at": observed_at,
                 "replacement_action_id": record.replacement_action_id,
-                "startup_action_id": record.startup_action_id,
             }
             updatable = [c for c in columns if c != "assigned_name"]
             with conn:
@@ -517,7 +510,6 @@ class HerdrIdentityAttestationStore:
             detail=row[6],
             observed_at=row[7],
             replacement_action_id=row[8],
-            startup_action_id=row[9],
         )
 
 
