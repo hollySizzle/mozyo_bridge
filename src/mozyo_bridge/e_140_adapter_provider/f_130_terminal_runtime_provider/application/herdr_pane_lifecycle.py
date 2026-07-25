@@ -338,31 +338,23 @@ def repo_neutral_env(env: Mapping[str, str]) -> dict:
 #:
 #: A *relative* token is deliberately not matched. It carries no private location, and
 #: redacting it would eat the parse reason the detail exists to convey.
-#: The three absolute roots, as a shared fragment so the quoted and unquoted rules below
-#: cannot drift apart on what "absolute" means.
+#: The three absolute roots, as a shared fragment so every rule below agrees on what
+#: "absolute" means.
 _ABS_ROOT = r"(?:\\\\|[A-Za-z]:[\\/]|/)"
 
-#: A *quoted* absolute path, redacted whole. The quote supplies the terminator, which is what
-#: makes a path containing spaces redactable at all: measured (review j#87796 R15), the
-#: previous rule stopped at the first space and left the private tail — ``'<redacted> Team…'``
-#: — in a public error. The quotes are kept so the message still reads as a quoted value.
-_QUOTED_ABS_PATH_RE = re.compile(r"(['\"])(" + _ABS_ROOT + r"[^'\"]*)\1")
+#: A quoted absolute path, matched to the SAME closing quote. Two rules, not one character
+#: class: an earlier single rule excluded BOTH quote characters from the path body, so a
+#: double-quoted path containing an apostrophe fell out of the quoted case and leaked its tail
+#: (review j#87817 R18). The opposite quote is an ordinary path character.
+_QUOTED_ABS_PATH_RES = (
+    re.compile(r"'(" + _ABS_ROOT + r"[^']*)'"),
+    re.compile(r'"(' + _ABS_ROOT + r'[^"]*)"'),
+)
 
-#: An *unquoted* absolute path, anchored at a token boundary. The lookbehind is the whole
-#: point: without it the POSIX alternative matched the slash INSIDE ``relative/path.yaml``,
-#: ``down/right`` and ``https://…`` and redacted the tail of each — destroying exactly the
-#: parse reasons the detail exists to carry, and contradicting this module's own stated
-#: contract that a relative token is not a path leak (measured, same review).
-#:
-#: Honest limit, stated rather than over-claimed (the R1 / R7 / R11 lesson): an unquoted
-#: absolute path *containing spaces* has no reliable terminator, so only its first segment is
-#: redacted. The scratch paths this code actually creates are substituted exactly, before this
-#: backstop runs, so the residue is confined to paths a foreign parser prints unquoted.
-#: The delimiter set deliberately EXCLUDES ``:`` — including it let ``https://…`` match at
-#: the double slash and redact the URL, which is a documentation pointer, not a private
-#: location. ``key: /abs/path`` still redacts because the space before the slash is a
-#: delimiter; only the pathological ``key:/abs`` spelling is missed, and that leaks nothing a
-#: reader could not already see in the surrounding text.
+#: An unquoted absolute path, anchored at a token boundary. The lookbehind stops the POSIX
+#: alternative from matching the slash INSIDE ``relative/path.yaml``, ``down/right`` or
+#: ``https://…`` — redacting those would destroy the parse reason the detail exists to carry.
+#: ``:`` is excluded from the delimiter set for the URL case specifically.
 _ABS_PATH_RE = re.compile(r"(?<![^\s'\"(\[<>=,;])" + _ABS_ROOT + r"[^\s'\"]*")
 
 
@@ -389,12 +381,21 @@ def _redact_probe_paths(detail: str, *scratch: Path) -> str:
             spellings.add(str(candidate))
     for spelling in sorted(spellings, key=len, reverse=True):
         text = text.replace(spelling, REDACTED_PROBE_PATH)
-    # Quoted first: the quote gives a terminator, so a path with spaces is redacted whole
-    # rather than leaving its tail behind. Then the unquoted, boundary-anchored form.
-    text = _QUOTED_ABS_PATH_RE.sub(
-        lambda m: f"{m.group(1)}{REDACTED_PROBE_PATH}{m.group(1)}", text
-    )
-    return _ABS_PATH_RE.sub(REDACTED_PROBE_PATH, text)
+    # Quoted first: the closing quote is a proven terminator, so the whole path goes even when
+    # it contains spaces.
+    for pattern in _QUOTED_ABS_PATH_RES:
+        text = pattern.sub(REDACTED_PROBE_PATH, text)
+    # Then unquoted. An unquoted absolute path has NO proven terminator once it may contain
+    # spaces, so nothing after the root is kept: everything from the root to the end of that
+    # line is dropped (review j#87817 R18). Privacy wins over detail here — the close condition
+    # forbids a private absolute path in public evidence outright, and an earlier version that
+    # redacted only the first segment left the rest of the path visible. Text BEFORE the root
+    # is preserved, which is where the error class and parse reason sit.
+    lines = []
+    for line in text.splitlines() or [""]:
+        match = _ABS_PATH_RE.search(line)
+        lines.append(line[: match.start()] + REDACTED_PROBE_PATH if match else line)
+    return "\n".join(lines)
 
 #: The target declares no config document at all — nothing for any launcher to parse.
 CONFIG_TEXT_ABSENT = "config_text_absent"
@@ -424,6 +425,11 @@ CONFIG_TEXT_NOT_REGULAR = "config_text_not_regular"
 #: was observed would be untrue, and the operator's action differs (consultation j#87811).
 CONFIG_TEXT_TRANSFORM_UNKNOWN = "config_text_transform_unknown"
 
+#: The document's bytes are not decodable text, so no parser can be given a document. Same
+#: class again, and again a distinct cause: this says nothing about whether the config would
+#: be valid, only that its bytes could not be established (review j#87817 R19).
+CONFIG_TEXT_UNDECODABLE = "config_text_undecodable"
+
 #: Short, operator-safe cause phrases for the materialization-unverifiable refusal. They name
 #: WHAT could not be established and never a path, link target, attribute value or command.
 UNVERIFIABLE_CAUSES: dict = {
@@ -437,6 +443,12 @@ UNVERIFIABLE_CAUSES: dict = {
         "the committed config entry is not a regular file, so its object content is not what "
         "a checkout writes. Recovery: track the config as a regular file whose checkout bytes "
         "can be measured, or target a lane whose worktree already exists"
+    ),
+    CONFIG_TEXT_UNDECODABLE: (
+        "the committed config's bytes are not decodable as UTF-8 text, so no parser could be "
+        "given a document — nothing is claimed about whether the config would otherwise be "
+        "valid. Recovery: store the config as UTF-8 text, or target a lane whose worktree "
+        "already exists so its actual file can be measured"
     ),
     CONFIG_TEXT_TRANSFORM_UNKNOWN: (
         "this runtime could not establish whether a checkout converts that path — the "
@@ -925,6 +937,7 @@ __all__ = (
     "CONFIG_TEXT_PRESENT",
     "CONFIG_TEXT_NOT_REGULAR",
     "CONFIG_TEXT_TRANSFORM_UNKNOWN",
+    "CONFIG_TEXT_UNDECODABLE",
     "CONFIG_TEXT_TRANSFORM_UNVERIFIABLE",
     "UNVERIFIABLE_CAUSES",
     "CONFIG_TEXT_UNREADABLE",

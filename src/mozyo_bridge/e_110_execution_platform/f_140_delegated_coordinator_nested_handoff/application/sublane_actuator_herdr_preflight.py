@@ -38,6 +38,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOB_NOT_REGULAR,
     BLOB_PRESENT,
     BLOB_TRANSFORM_UNKNOWN,
+    BLOB_UNDECODABLE,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     REASON_LAUNCHER_INCOMPATIBLE,
@@ -165,6 +166,7 @@ def read_lane_target_config_text(
         CONFIG_TEXT_NOT_REGULAR,
         CONFIG_TEXT_TRANSFORM_UNKNOWN,
         CONFIG_TEXT_TRANSFORM_UNVERIFIABLE,
+        CONFIG_TEXT_UNDECODABLE,
         CONFIG_TEXT_UNREADABLE,
         classify_config_text,
         read_target_config_text,
@@ -186,6 +188,8 @@ def read_lane_target_config_text(
         # this must NOT be reported as a broken config (consultation j#87807). It travels as
         # its own state all the way to the public refusal.
         return CONFIG_TEXT_TRANSFORM_UNVERIFIABLE, None
+    if state == BLOB_UNDECODABLE:
+        return CONFIG_TEXT_UNDECODABLE, None
     if state == BLOB_TRANSFORM_UNKNOWN:
         # Unknown, not observed (j#87811): the public cause must not claim a conversion.
         return CONFIG_TEXT_TRANSFORM_UNKNOWN, None

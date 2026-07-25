@@ -105,13 +105,19 @@ BLOB_MAY_BE_TRANSFORMED = "blob_may_be_transformed"
 #: different (make the query answerable, not neutralize an attribute that may not exist).
 BLOB_TRANSFORM_UNKNOWN = "blob_transform_unknown"
 
+#: The object is a regular, untransformed blob, but its BYTES are not decodable text — so no
+#: parser can be handed a document (review j#87817 R19). A separate state because "we could not
+#: establish the bytes" is not "the config is broken", and because the worktree path already
+#: fails closed on the same condition: the two call sites must agree.
+BLOB_UNDECODABLE = "blob_undecodable"
+
 #: Tri-state answers from :meth:`LiveSublaneGitOperations._checkout_transform_state`.
 TRANSFORM_NONE = "transform_none"
 TRANSFORM_APPLIES = "transform_applies"
 TRANSFORM_UNKNOWN = "transform_unknown"
 
 #: The attributes that can make a checkout differ from the blob. Their MATCHING is delegated
-#: to `git check-attr --source=<pinned commit>` rather than modelled here — the gitattributes
+#: to `git check-attr --all --source=<pinned commit>` rather than modelled here — the gitattributes
 #: pattern rules are exactly the kind of external-tool rule this issue has repeatedly been
 #: wrong about (#14258 R8 / R9).
 _CONTENT_TRANSFORM_ATTRS: tuple[str, ...] = (
@@ -122,8 +128,12 @@ _CONTENT_TRANSFORM_ATTRS: tuple[str, ...] = (
     "working-tree-encoding",
 )
 
-#: `check-attr` values that mean "no transformation": unset explicitly, or never mentioned.
-_INERT_ATTR_VALUES: frozenset = frozenset({"unspecified", "unset"})
+# NOTE (review j#87817 R17): there is deliberately no table of "inert values" here. Any such
+# table reads a lexical sentinel as a type, and gitattributes lets a repo use those very words
+# as attribute VALUES — a filter driver may be named `unset` or `unspecified`, and the porcelain
+# output is identical either way (measured: both bypassed an earlier value-based check and
+# materialized an invalid config in the new worktree). `--all` instead lists only the
+# attributes that are actually SET, so PRESENCE — never the value — is what decides.
 
 #: The tree-entry modes whose blob content IS the bytes a checkout writes. Anything else is
 #: reported as :data:`BLOB_NOT_REGULAR` rather than read: this is the whole premise of the
@@ -457,27 +467,22 @@ class LiveSublaneGitOperations:
         """
         result = self._run(
             "check-attr",
+            "--all",
             f"--source={ref}",
-            *_CONTENT_TRANSFORM_ATTRS,
             "--",
             relpath,
         )
         if result.returncode != 0:
             return TRANSFORM_UNKNOWN
-        reported = 0
-        applies = False
         for line in (result.stdout or "").splitlines():
-            # `<path>: <attr>: <value>` — the value is what decides, and the path may itself
-            # contain ": ", so the split is anchored from the RIGHT.
-            if ": " not in line:
-                continue
-            reported += 1
-            if line.rsplit(": ", 1)[-1].strip() not in _INERT_ATTR_VALUES:
-                applies = True
-        # Every attribute must have been answered; a short answer is an unanswered question.
-        if reported < len(_CONTENT_TRANSFORM_ATTRS):
-            return TRANSFORM_UNKNOWN
-        return TRANSFORM_APPLIES if applies else TRANSFORM_NONE
+            # `<path>: <attr>: <value>`. Parsed from the RIGHT because the path may contain
+            # ": " — and only the NAME is read. The value is never interpreted, which is the
+            # whole point: a value can say "unset" without the attribute being unset.
+            parts = line.rsplit(": ", 2)
+            if len(parts) == 3 and parts[1].strip() in _CONTENT_TRANSFORM_ATTRS:
+                return TRANSFORM_APPLIES
+        # `--all` lists every attribute that IS set, so nothing listed means nothing applies.
+        return TRANSFORM_NONE
 
     def committed_blob(self, *, ref: str, relpath: str) -> tuple[str, str]:
         """Read a committed file's text at ``ref`` without checking anything out (#14258).
@@ -520,12 +525,23 @@ class LiveSublaneGitOperations:
             return BLOB_MAY_BE_TRANSFORMED, ""
         if transform != TRANSFORM_NONE:
             return BLOB_TRANSFORM_UNKNOWN, ""
-        shown = self._run("show", f"{ref}:{relpath}")
+        # Read BYTES, then decode explicitly. `text=True` would raise `UnicodeDecodeError` out
+        # of this method for a config containing invalid UTF-8, escaping the typed vocabulary
+        # entirely — while the worktree path already classified the same condition as
+        # unreadable. Both call sites now reach a closed state (review j#87817 R19).
+        shown = subprocess.run(
+            ["git", "show", f"{ref}:{relpath}"],
+            cwd=self.repo_root,
+            capture_output=True,
+        )
         if shown.returncode != 0:
             # Listed but unreadable (a git failure): the content is unknowable, which is not
             # the same as absent.
             return BLOB_REF_UNRESOLVABLE, ""
-        return BLOB_PRESENT, shown.stdout
+        try:
+            return BLOB_PRESENT, shown.stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            return BLOB_UNDECODABLE, ""
 
     def worktree_dirty(self) -> bool:
         result = self._run("status", "--porcelain")
@@ -555,6 +571,7 @@ __all__ = (
     "BLOB_MAY_BE_TRANSFORMED",
     "BLOB_NOT_REGULAR",
     "BLOB_TRANSFORM_UNKNOWN",
+    "BLOB_UNDECODABLE",
     "BLOB_PRESENT",
     "TRANSFORM_APPLIES",
     "TRANSFORM_NONE",

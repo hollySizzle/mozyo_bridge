@@ -1786,6 +1786,268 @@ class R13PublicReasonTest(unittest.TestCase):
                     self.assertIn(name, sublane_integration.__all__)
 
 
+class R17AttributeSentinelTest(unittest.TestCase):
+    """R17: an attribute VALUE that spells a sentinel must not read as a state."""
+
+    def _repo(self, root: Path, attribute_value: str) -> tuple[Path, str]:
+        repo = root / "primary"
+        (repo / ".mozyo-bridge").mkdir(parents=True)
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "config", "user.email", "t@example.invalid")
+        _git(repo, "config", "user.name", "t")
+        (repo / ".mozyo-bridge" / "config.yaml").write_text(_V2_CONFIG, encoding="utf-8")
+        (repo / ".gitattributes").write_text(
+            f".mozyo-bridge/config.yaml filter={attribute_value}\n", encoding="utf-8"
+        )
+        # A driver NAMED like the sentinel: legal, and it really converts.
+        _git(repo, "config", f"filter.{attribute_value}.smudge",
+             'sed "s/version: 2/version: [/"')
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "c1")
+        return repo, _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def test_sentinel_named_drivers_are_refused(self) -> None:
+        for value in ("unset", "unspecified"):
+            with self.subTest(value=value):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    repo, sha = self._repo(root, value)
+                    ops = LiveSublaneGitOperations(repo_root=repo)
+                    self.assertEqual(
+                        ops.committed_blob(ref=sha, relpath=".mozyo-bridge/config.yaml")[0],
+                        "blob_may_be_transformed",
+                        f"a filter driver named {value!r} really converts the checkout",
+                    )
+                    # And it really would have: prove the hazard, not just the verdict.
+                    lane = root / f"lane-{value}"
+                    _git(repo, "worktree", "add", "-q", str(lane), "-b", f"l_{value}", sha)
+                    self.assertIn(
+                        "version: [", (lane / ".mozyo-bridge" / "config.yaml").read_text()
+                    )
+
+    def test_a_repo_with_no_attributes_is_still_admitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _seed_repo(Path(tmp), _V2_CONFIG)
+            sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+            self.assertEqual(
+                LiveSublaneGitOperations(repo_root=repo).committed_blob(
+                    ref=sha, relpath=".mozyo-bridge/config.yaml"
+                )[0],
+                "blob_present",
+            )
+
+    def test_the_sentinel_repo_reaches_a_typed_refusal_with_zero_mutation(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
+            evaluate_launcher_compatibility,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_use_case import (  # noqa: E501
+            SublaneActuateUseCase,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+            SublaneCreateRequest,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            TARGET_CONFIG_UNVERIFIABLE,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, sha = self._repo(root, "unset")
+            LaneLifecycleStore(home=root / "home").ensure_schema()
+            git_ops = LiveSublaneGitOperations(repo_root=repo)
+
+            class _Ops:
+                def is_git_workspace(self) -> bool:
+                    return True
+
+                def worktree_exists(self, branch: str) -> bool:
+                    return False
+
+                def resolve_base_commit(self, ref: str) -> str:
+                    return git_ops.resolve_commit(ref)
+
+                def preflight_launcher_compatibility(self, **kwargs):
+                    return evaluate_launcher_compatibility(
+                        env=dict(os.environ), runner=subprocess.run, timeout=60.0,
+                        repo_root=repo, store_home=root / "home",
+                        replacement_action_id="",
+                        committed_blob=git_ops.committed_blob,
+                        base_commit=kwargs["base_commit"],
+                        lane_runtime_root=kwargs["lane_runtime_root"],
+                        from_base_ref=kwargs["from_base_ref"],
+                    )
+
+                def create_worktree(self, **kwargs):
+                    raise AssertionError("worktree created on a sentinel-attribute base")
+
+                def append_lane_column(self, worktree_path: str):
+                    raise AssertionError("pane created on a sentinel-attribute base")
+
+                def append_lane_argv(self, worktree_path: str) -> list:
+                    return []
+
+                def read_lane(self, worktree_path: str):
+                    raise AssertionError("read-back on a sentinel-attribute base")
+
+                def declare_adopted_lane_lifecycle(self, worktree_path, *, adopted):
+                    raise AssertionError("lifecycle write on a sentinel-attribute base")
+
+                def probe_gateway_ready(self, gateway_pane: str) -> bool:
+                    return False
+
+                def dispatch_implementation_request(self, **kwargs) -> int:
+                    raise AssertionError("dispatch on a sentinel-attribute base")
+
+            lane = root / "must-not-exist"
+            refs_before = _git(repo, "for-each-ref", "--format=%(refname)").stdout
+            outcome = SublaneActuateUseCase(_Ops(), gateway_ready_probes=0).run(
+                SublaneCreateRequest(
+                    issue="14258", lane_label="issue_14258_x", branch="issue_14258_x",
+                    worktree_path=str(lane), journal="87817", base_ref=sha,
+                ),
+                execute=True, dispatch=False, target_repo=str(lane),
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(TARGET_CONFIG_UNVERIFIABLE, outcome.blocked_reasons)
+            self.assertFalse(lane.exists())
+            self.assertEqual(
+                _git(repo, "for-each-ref", "--format=%(refname)").stdout, refs_before
+            )
+            # No attribute value in the public evidence.
+            for forbidden in ("unset", "filter", "gitattributes"):
+                self.assertNotIn(forbidden, outcome.reason)
+
+
+class R19UndecodableConfigTest(unittest.TestCase):
+    """R19: non-UTF-8 committed bytes must reach a typed state, not raise."""
+
+    def _repo(self, root: Path) -> tuple[Path, str]:
+        repo = root / "primary"
+        (repo / ".mozyo-bridge").mkdir(parents=True)
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "config", "user.email", "t@example.invalid")
+        _git(repo, "config", "user.name", "t")
+        (repo / ".mozyo-bridge" / "config.yaml").write_bytes(
+            b"version: 2\n\xff\xfe not utf-8\n"
+        )
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "c1")
+        return repo, _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def test_it_becomes_a_typed_state_rather_than_an_exception(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
+            read_lane_target_config_text,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, sha = self._repo(Path(tmp))
+            ops = LiveSublaneGitOperations(repo_root=repo)
+            self.assertEqual(
+                ops.committed_blob(ref=sha, relpath=".mozyo-bridge/config.yaml")[0],
+                "blob_undecodable",
+            )
+            state, text = read_lane_target_config_text(
+                ops.committed_blob, base_commit=sha, lane_runtime_root="",
+                from_base_ref=True,
+            )
+            self.assertEqual(state, "config_text_undecodable")
+            self.assertIsNone(text)
+
+    def test_both_call_sites_agree_on_undecodable_bytes(self) -> None:
+        # The asymmetry R19 reported: the worktree path already failed closed here.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            read_target_config_text,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".mozyo-bridge").mkdir()
+            (root / ".mozyo-bridge" / "config.yaml").write_bytes(b"version: 2\n\xff\xfe\n")
+            self.assertEqual(read_target_config_text(root)[0], "config_text_unreadable")
+
+    def test_the_public_reason_claims_nothing_about_validity(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            CONFIG_PARSE_CONTRACT_VERSION,
+            TARGET_CONFIG_UNVERIFIABLE,
+            decide_config_parse_compatibility,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            CONFIG_TEXT_UNDECODABLE,
+            measure_config_parse_compatibility,
+        )
+
+        observation = measure_config_parse_compatibility(
+            "/bin/true", lambda *a, **k: None, 5.0, {}, CONFIG_TEXT_UNDECODABLE, None
+        )
+        verdict = decide_config_parse_compatibility(
+            _observation(_capable_help()), observation,
+            required_contract_version=CONFIG_PARSE_CONTRACT_VERSION,
+        )
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, TARGET_CONFIG_UNVERIFIABLE)
+        self.assertIn("not decodable", verdict.detail)
+        self.assertIn("Recovery:", verdict.detail)
+        self.assertNotIn("does not parse under THIS runtime", verdict.detail)
+
+
+class R18PrivacyFirstRedactionTest(unittest.TestCase):
+    """R18: no private tail survives, in any of the shapes the contract covers."""
+
+    def _redact(self, text: str) -> str:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            _redact_probe_paths,
+        )
+
+        return _redact_probe_paths(text, Path("/nonexistent"))
+
+    def test_unquoted_paths_with_spaces_leave_no_tail(self) -> None:
+        backslash = chr(92)
+        cases = (
+            ("POSIX", "error in " + macos_home_path("Private Team", "c.yaml") + ": bad"),
+            ("drive", f"error in C:{backslash}Users{backslash}Ada Smith{backslash}c.yaml: x"),
+            ("UNC", f"error in {backslash * 2}srv{backslash}Ada Share{backslash}c.yaml: x"),
+        )
+        for label, text in cases:
+            with self.subTest(shape=label):
+                out = self._redact(text)
+                for leaked in ("Team", "Smith", "Share", "c.yaml", "Users"):
+                    self.assertNotIn(leaked, out)
+                # What comes BEFORE the path survives — that is where the reason sits.
+                self.assertTrue(out.startswith("error in "))
+
+    def test_a_quoted_path_may_contain_the_opposite_quote(self) -> None:
+        backslash, dquote, quote = chr(92), chr(34), chr(39)
+        cases = (
+            ("double-quoted, apostrophe inside",
+             f"error in {dquote}/srv/Ada{quote}s Team/c.yaml{dquote}: bad"),
+            ("single-quoted, dquote inside",
+             f"error in {quote}C:{backslash}Ada{dquote}s{backslash}c.yaml{quote}: bad"),
+        )
+        for label, text in cases:
+            with self.subTest(shape=label):
+                out = self._redact(text)
+                for leaked in ("Ada", "Team", "srv", "c.yaml"):
+                    self.assertNotIn(leaked, out)
+                # The quoted rule is what makes this PRECISE rather than merely safe: the
+                # closing quote terminates the path, so the trailing reason survives. Without
+                # the same-quote split these fall through to the unquoted rule, which is still
+                # leak-free but drops the rest of the line — so this assertion is what the
+                # split actually buys, and what pins it.
+                self.assertTrue(
+                    out.endswith(": bad"),
+                    f"text after the closing quote should survive: {out!r}",
+                )
+
+    def test_relative_tokens_and_urls_are_still_intact(self) -> None:
+        for text in (
+            "unknown key in relative/path.yaml",
+            "expected one of ['down/right'] for split",
+            "see https://example.invalid/docs/schema for the key list",
+        ):
+            with self.subTest(text=text[:34]):
+                self.assertEqual(self._redact(text), text)
+
+
 class R14DeclaresNothingTest(unittest.TestCase):
     """R14: 'declares nothing' is the canonical loader's answer, not a whitespace test."""
 
