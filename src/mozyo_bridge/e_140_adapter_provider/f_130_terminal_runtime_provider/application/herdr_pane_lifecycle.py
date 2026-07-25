@@ -57,6 +57,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     CONFIG_PARSE_LAUNCHER_UNUSABLE,
     CONFIG_PARSE_SELF_REJECTED,
     CONFIG_PARSE_TARGET_ABSENT,
+    CONFIG_PARSE_TARGET_UNVERIFIABLE,
     TARGET_SCHEMA_ABSENT,
     TARGET_SCHEMA_DECLARED,
     TARGET_SCHEMA_UNREADABLE,
@@ -69,6 +70,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     decide_lifecycle_reader_compatibility,
     decide_store_compatibility,
     parse_launcher_capability_output,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_probe_redaction import (  # noqa: E501
+    REDACTED_PROBE_PATH,
+    _redact_probe_paths,
 )
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
@@ -299,8 +304,6 @@ def preflight_attest_store_schema(
 #: it is given, but keeping the canonical basename makes any error it prints recognizable.
 _CONFIG_PROBE_BASENAME = "config.yaml"
 
-#: What a redacted filesystem path is rendered as in a public verdict detail.
-REDACTED_PROBE_PATH = "<target config>"
 
 #: The environment variables that select which repo a mozyo-bridge CLI resolves. Derived
 #: from :func:`...shared.paths.resolve_repo_root`, whose precedence is explicit ``--repo`` >
@@ -323,52 +326,6 @@ def repo_neutral_env(env: Mapping[str, str]) -> dict:
     """
     return {k: v for k, v in dict(env).items() if k not in REPO_SELECTION_ENV_VARS}
 
-#: Matches an absolute filesystem path anywhere in a message. Applied AFTER the exact scratch
-#: paths are substituted, so it is the backstop rather than the primary rule: a parser can
-#: print a path this code never chose (a realpath, an ``include`` target), and the issue's
-#: close condition forbids a private absolute path in public evidence regardless of who wrote
-#: it.
-#:
-#: Three root shapes, each pinned by a regression rather than asserted in prose (review
-#: j#87786 R11: the previous alternative required a *doubled* backslash, so an ordinary
-#: drive path with single separators passed straight through while the comment claimed Windows
-#: was covered — the same "docstring stronger than the implementation" defect as R1 and R7, in
-#: the same subject area): a UNC root, a drive root with either separator, and a POSIX root.
-#:
-#: A *relative* token is deliberately not matched. It carries no private location, and
-#: redacting it would eat the parse reason the detail exists to convey.
-_ABS_PATH_RE = re.compile(
-    r"\\\\[^\s'\"]+"        # UNC:   \\server\share\...
-    r"|[A-Za-z]:[\\/][^\s'\"]*"  # drive: C:\... or C:/...
-    r"|/[^\s'\"]+"          # POSIX: /var/...
-)
-
-
-def _redact_probe_paths(detail: str, *scratch: Path) -> str:
-    """Strip filesystem paths out of a parser's message, keeping WHY it failed (#14258 R7).
-
-    The config-parse measurement materializes the target document in a private temporary
-    directory, so both parsers name that path in their errors — and the detail is then
-    concatenated into a public, operator-facing refusal. Measured (review j#87766): the
-    self-parser's message carried the full ``/var/folders/.../mozyo-config-parse-*/config.yaml``
-    into the ``target_config_invalid`` error, which the issue's close condition forbids and
-    which the surrounding docstring wrongly claimed could not happen.
-
-    Each scratch path is substituted along with its ``realpath`` (on macOS ``/var`` resolves
-    to ``/private/var``, so the launcher prints a spelling this process never constructed),
-    and any remaining absolute path is replaced by the same placeholder. What survives is the
-    part that helps: the error class and the parse reason — ``unknown key 'by_lane_kind'``,
-    ``while parsing a flow sequence``.
-    """
-    text = detail or ""
-    spellings = set()
-    for path in scratch:
-        for candidate in (path, Path(os.path.realpath(path))):
-            spellings.add(str(candidate))
-    for spelling in sorted(spellings, key=len, reverse=True):
-        text = text.replace(spelling, REDACTED_PROBE_PATH)
-    return _ABS_PATH_RE.sub(REDACTED_PROBE_PATH, text)
-
 #: The target declares no config document at all — nothing for any launcher to parse.
 CONFIG_TEXT_ABSENT = "config_text_absent"
 #: The exact document the lane will present was obtained.
@@ -377,6 +334,59 @@ CONFIG_TEXT_PRESENT = "config_text_present"
 #: unresolvable ref). Deliberately NOT folded into "absent": absent admits every launcher,
 #: and a document nobody can read must never do that.
 CONFIG_TEXT_UNREADABLE = "config_text_unreadable"
+
+#: The document exists and may be perfectly valid, but the bytes the LANE will receive cannot
+#: be established — a checkout conversion applies to the path (consultation j#87807). Kept
+#: distinct from :data:`CONFIG_TEXT_UNREADABLE` all the way to the public refusal: folding it
+#: in produced a message asserting the config does not parse and that changing the launcher
+#: would not help, both false here, with a recovery that named neither real action.
+CONFIG_TEXT_TRANSFORM_UNVERIFIABLE = "config_text_transform_unverifiable"
+
+#: The committed entry is not a regular file (a symlink, a submodule), so its object content
+#: is not the document a checkout writes. Same *class* as the transform case — the bytes the
+#: lane gets cannot be established — and it travels to the same public reason with its own
+#: cause, rather than collapsing into "unreadable" and asserting a broken config
+#: (consultation j#87809, the other half of j#87807).
+CONFIG_TEXT_NOT_REGULAR = "config_text_not_regular"
+
+#: Whether a checkout converts the config could not be ESTABLISHED. Same class again — the
+#: lane's bytes are unknown — but a distinct cause from an observed conversion: claiming one
+#: was observed would be untrue, and the operator's action differs (consultation j#87811).
+CONFIG_TEXT_TRANSFORM_UNKNOWN = "config_text_transform_unknown"
+
+#: The document's bytes are not decodable text, so no parser can be given a document. Same
+#: class again, and again a distinct cause: this says nothing about whether the config would
+#: be valid, only that its bytes could not be established (review j#87817 R19).
+CONFIG_TEXT_UNDECODABLE = "config_text_undecodable"
+
+#: Short, operator-safe cause phrases for the materialization-unverifiable refusal. They name
+#: WHAT could not be established and never a path, link target, attribute value or command.
+UNVERIFIABLE_CAUSES: dict = {
+    CONFIG_TEXT_TRANSFORM_UNVERIFIABLE: (
+        "a checkout conversion applies to that path, so the committed document may differ "
+        "from the one the lane receives. Recovery: neutralize the checkout conversion for "
+        "that path, or target a lane whose worktree already exists so its actual file can "
+        "be measured"
+    ),
+    CONFIG_TEXT_NOT_REGULAR: (
+        "the committed config entry is not a regular file, so its object content is not what "
+        "a checkout writes. Recovery: track the config as a regular file whose checkout bytes "
+        "can be measured, or target a lane whose worktree already exists"
+    ),
+    CONFIG_TEXT_UNDECODABLE: (
+        "the committed config's bytes are not decodable as UTF-8 text, so no parser could be "
+        "given a document — nothing is claimed about whether the config would otherwise be "
+        "valid. Recovery: store the config as UTF-8 text, or target a lane whose worktree "
+        "already exists so its actual file can be measured"
+    ),
+    CONFIG_TEXT_TRANSFORM_UNKNOWN: (
+        "this runtime could not establish whether a checkout converts that path — the "
+        "read-only attribute query was unavailable or answered incompletely, so no conversion "
+        "was observed and none is claimed. Recovery: use a Git / runtime that supports that "
+        "query and repair whatever made it fail, or target a lane whose worktree already "
+        "exists so its actual file can be measured"
+    ),
+}
 
 
 def measure_config_parse_compatibility(
@@ -415,6 +425,12 @@ def measure_config_parse_compatibility(
 
     if config_state == CONFIG_TEXT_ABSENT:
         return ConfigParseObservation(CONFIG_PARSE_TARGET_ABSENT)
+    if config_state in UNVERIFIABLE_CAUSES:
+        # Neither parser can be asked: the question is about bytes that do not exist yet. The
+        # CAUSE travels with it so the public refusal names the real action (j#87807 / j#87809).
+        return ConfigParseObservation(
+            CONFIG_PARSE_TARGET_UNVERIFIABLE, UNVERIFIABLE_CAUSES[config_state]
+        )
     if config_state != CONFIG_TEXT_PRESENT or config_text is None:
         # A document exists but its bytes are unobtainable, so neither parser can be asked.
         # This runtime cannot read it either, which is exactly the "config defect, not a
@@ -483,9 +499,10 @@ def read_target_config_text(repo_root) -> tuple[str, Optional[str]]:
     must never collapse into it — a missing file and an unreadable one are different facts,
     and only one of them is safe.
 
-    An empty / comment-only document is absent: it declares nothing, so any launcher's
-    ``RepoLocalConfig.default()`` handles it. Imports are local so this provider module does
-    not pull the config loader (and its YAML dependency) in at import time.
+    A document that DECLARES nothing is absent, and what counts as declaring nothing is
+    decided by :func:`declares_nothing` rather than by a whitespace test (review j#87796 R14).
+    Imports are local so this provider module does not pull the config loader (and its YAML
+    dependency) in at import time.
     """
     from mozyo_bridge.application.repo_local_config_loader import CONFIG_FILE_RELPATH
 
@@ -498,7 +515,46 @@ def read_target_config_text(repo_root) -> tuple[str, Optional[str]]:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError, ValueError):
         return CONFIG_TEXT_UNREADABLE, None
-    return (CONFIG_TEXT_PRESENT, text) if text.strip() else (CONFIG_TEXT_ABSENT, None)
+    return classify_config_text(text)
+
+
+def declares_nothing(text: str) -> bool:
+    """True iff ``text`` declares no config at all (Redmine #14258 R14).
+
+    The canonical loader is the authority: whatever it resolves to
+    ``RepoLocalConfig.default()`` — a missing file, an empty document, a whitespace-only one,
+    a comment-only one — declares nothing, so there is no schema for any launcher to parse and
+    the compatibility question does not arise.
+
+    Deciding this with ``text.strip()`` was wrong in the direction that costs compatibility:
+    measured, a ``# operator note only`` document read as PRESENT, so a repo that declares no
+    schema at all — and that an older launcher reads perfectly well — was made to require the
+    ``config check-parse`` contract and could be refused for nothing. The surrounding docstring
+    already claimed comment-only was absent; this makes the code say the same thing.
+
+    A document that fails to parse is emphatically NOT "nothing": it is a real declaration this
+    runtime cannot read, and the caller must classify it, not admit it.
+    """
+    from mozyo_bridge.application.repo_local_config_loader import (
+        RepoLocalConfigError,
+        parses_as_default_config,
+    )
+
+    try:
+        return parses_as_default_config(text)
+    except RepoLocalConfigError:
+        return False
+
+
+def classify_config_text(text: str) -> tuple:
+    """Map a config document's TEXT onto ``(state, text)`` (Redmine #14258 R14).
+
+    Shared by both call sites — the session-start path reading a worktree file and the
+    ``sublane create`` gate reading a committed blob — so "declares nothing" cannot mean one
+    thing on one path and another on the other, which is exactly how the whitespace test
+    diverged from the documented contract.
+    """
+    return (CONFIG_TEXT_ABSENT, None) if declares_nothing(text) else (CONFIG_TEXT_PRESENT, text)
 
 
 def _observe_shared_lifecycle_schema(store_home: Path) -> TargetSchemaObservation:
@@ -808,6 +864,11 @@ __all__ = (
     "_list_rows",
     "CONFIG_TEXT_ABSENT",
     "CONFIG_TEXT_PRESENT",
+    "CONFIG_TEXT_NOT_REGULAR",
+    "CONFIG_TEXT_TRANSFORM_UNKNOWN",
+    "CONFIG_TEXT_UNDECODABLE",
+    "CONFIG_TEXT_TRANSFORM_UNVERIFIABLE",
+    "UNVERIFIABLE_CAUSES",
     "CONFIG_TEXT_UNREADABLE",
     "measure_config_parse_compatibility",
     "read_target_config_text",

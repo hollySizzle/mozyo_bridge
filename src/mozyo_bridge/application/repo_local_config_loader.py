@@ -155,10 +155,30 @@ def load_repo_local_config_from_path(path: Union[str, Path]) -> RepoLocalConfig:
     return RepoLocalConfig.from_record(parsed)
 
 
+def parses_as_default_config(text: str) -> bool:
+    """True iff ``text`` is a document this loader resolves to the behavior-preserving default.
+
+    The single authority for "this document declares nothing" (Redmine #14258 R14). An empty,
+    whitespace-only or comment-only document all reach :meth:`RepoLocalConfig.default` here,
+    so a caller must not re-decide that with its own whitespace test — measured, doing so
+    classified a comment-only config as a real declaration and required a launcher capability
+    for a repo that declares no schema at all.
+
+    Raises :class:`RepoLocalConfigError` for a document that does not parse: that is a real
+    declaration this build cannot read, and conflating it with "nothing" would admit it.
+    """
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise RepoLocalConfigLoadError(f"could not parse config text as YAML: {exc}") from exc
+    return parsed is None
+
+
 __all__ = (
     "CONFIG_FILE_RELPATH",
     "RepoLocalConfigLoadError",
     "load_repo_local_config",
     "load_repo_local_config_from_path",
+    "parses_as_default_config",
     "repo_local_config_path",
 )
