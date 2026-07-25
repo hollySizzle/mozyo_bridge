@@ -24,9 +24,11 @@ use case as a collaborator (its ``_blocked`` builder) and returns a terminal
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
+    REASON_LAUNCH_BLOCKED,
     REASON_LAUNCHER_INCOMPATIBLE,
     REASON_PAIR_SPLIT,
     REASON_PARTIAL_PAIR_RECOVERY,
@@ -120,7 +122,9 @@ def launcher_compatibility_gate(
     if not callable(gate):
         return None
     gate_ok, gate_reason, gate_detail = gate(
-        base_ref=getattr(request, "base_ref", "") or "",
+        # `pin_base_commit` already replaced this with an immutable full commit SHA for a
+        # create, so the config read below addresses the same object `git worktree add` will.
+        base_commit=getattr(request, "base_ref", "") or "",
         lane_runtime_root=resolve_lane_runtime_root(
             use_case.ops,
             getattr(request, "worktree_path", "") or "",
@@ -144,6 +148,56 @@ def launcher_compatibility_gate(
     )
 
 
+def pin_base_commit(
+    use_case,
+    request,
+    *,
+    launch_action,
+    dispatch: bool,
+    fill_decision,
+    fill_override_reason,
+):
+    """Resolve the lane's base to an immutable commit ONCE — ``(request, outcome)`` (#14258 R1).
+
+    A string ref is not a pin. The launcher preflight reads the config at the lane's base and
+    ``git worktree add`` then materializes it, and a branch / remote-tracking ref can advance
+    between the two: measured, the preflight admitted a v2 config while the worktree
+    materialized a v99 one, defeating the gate whose only purpose is keeping an unverified
+    config out of a new worktree (review j#87746 R1).
+
+    So the base is resolved to a full commit SHA here, once, and the returned request carries
+    that SHA as its ``base_ref``. Everything downstream — the config read AND the worktree
+    creation — then addresses the same immutable object, and a ref that advances afterwards
+    changes nothing about what this run materializes.
+
+    Only a worktree this run will CREATE needs it (a reuse / non-git lane reads a directory
+    that already exists and passes no ref to git). An unresolvable / ambiguous / non-commit
+    base is a zero-mutation refusal, not a fallback to the unpinned ref. Adapters without the
+    optional ``resolve_base_commit`` capability (the tmux port, test fakes) are unchanged.
+    """
+    if launch_action != LAUNCH_CREATE_WORKTREE:
+        return request, None
+    resolve = getattr(use_case.ops, "resolve_base_commit", None)
+    if not callable(resolve):
+        return request, None
+    requested = (getattr(request, "base_ref", "") or "").strip() or "HEAD"
+    pinned = (resolve(requested) or "").strip()
+    if not pinned:
+        return request, use_case._blocked(
+            request,
+            launch_action=launch_action,
+            reason=f"the lane's base {requested!r} could not be resolved to a single "
+            "immutable commit (unknown ref, ambiguous name, or not a commit); refusing "
+            "before any worktree so the config that was verified is the config that "
+            "materializes",
+            reasons=(REASON_LAUNCH_BLOCKED, "base_ref_unpinnable"),
+            dispatch=dispatch,
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
+        )
+    return replace(request, base_ref=pinned), None
+
+
 def pre_mutation_admission(
     use_case,
     request,
@@ -152,14 +206,29 @@ def pre_mutation_admission(
     dispatch: bool,
     fill_decision,
     fill_override_reason,
-) -> Optional[SublaneActuationOutcome]:
-    """Every admission check that must pass before the FIRST mutation, in order.
+):
+    """Every admission check that must pass before the FIRST mutation — ``(request, outcome)``.
 
     One entry point so the "nothing has happened yet" boundary has a single definition and a
-    later conjunct cannot be added to one caller only: the runtime placement fingerprint
-    (#13705) and the managed-launch launcher compatibility conjunction (#14258). Returns the
-    first blocked outcome, or ``None`` when every check passes.
+    later conjunct cannot be added to one caller only: the base-commit pin (#14258 R1), the
+    runtime placement fingerprint (#13705), and the managed-launch launcher compatibility
+    conjunction (#14258). Returns the (possibly base-pinned) request and the first blocked
+    outcome, or ``None`` when every check passes.
+
+    The pin runs FIRST and its result is what every later check and every mutation sees —
+    that ordering is the fix: a gate that verified an unpinned ref would be verifying a
+    different object than the one git materializes.
     """
+    request, outcome = pin_base_commit(
+        use_case,
+        request,
+        launch_action=launch_action,
+        dispatch=dispatch,
+        fill_decision=fill_decision,
+        fill_override_reason=fill_override_reason,
+    )
+    if outcome is not None:
+        return request, outcome
     for gate in (runtime_placement_gate, launcher_compatibility_gate):
         outcome = gate(
             use_case,
@@ -170,8 +239,8 @@ def pre_mutation_admission(
             fill_override_reason=fill_override_reason,
         )
         if outcome is not None:
-            return outcome
-    return None
+            return request, outcome
+    return request, None
 
 
 def pair_split_admission(

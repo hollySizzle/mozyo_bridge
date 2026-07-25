@@ -54,14 +54,6 @@ _SRC = _TESTS_ROOT.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from mozyo_bridge.application.repo_local_config_loader import (
-    CONFIG_SCHEMA_ABSENT,
-    CONFIG_SCHEMA_DECLARED,
-    CONFIG_SCHEMA_UNREADABLE,
-    CONFIG_SCHEMA_UNSUPPORTED,
-    probe_repo_local_config_schema,
-    probe_repo_local_config_schema_text,
-)
 from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
 from mozyo_bridge.core.state.lane_lifecycle_readonly import (
     LIFECYCLE_SCHEMA_ABSENT,
@@ -75,28 +67,25 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (
     readable_lane_lifecycle_versions,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
-    CONFIG_JOIN_OK,
-    CONFIG_UNREADABLE,
-    CONFIG_UNSUPPORTED,
-    LAUNCHER_CANNOT_READ_CONFIG_KEYS,
-    LAUNCHER_CANNOT_READ_CONFIG_VERSION,
+    CONFIG_PARSE_CONTRACT_VERSION,
+    LAUNCHER_CANNOT_PARSE_TARGET_CONFIG,
     LAUNCHER_CANNOT_READ_LIFECYCLE,
-    LAUNCHER_CONFIG_CONTRACT_ABSENT,
+    LAUNCHER_CONFIG_VALIDATOR_ABSENT,
     LAUNCHER_LIFECYCLE_CONTRACT_ABSENT,
     LIFECYCLE_JOIN_OK,
     TARGET_SCHEMA_ABSENT,
     TARGET_SCHEMA_DECLARED,
-    TARGET_SCHEMA_UNREADABLE,
-    TARGET_SCHEMA_UNSUPPORTED,
     TargetSchemaObservation,
     build_attest_capability_epilog,
-    decide_config_schema_compatibility,
     decide_lifecycle_reader_compatibility,
     parse_launcher_capability_output,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
     HerdrLauncherIncompatibleError,
     preflight_launcher_compatibility,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (  # noqa: E501
+    LiveSublaneGitOperations,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
     HerdrSessionStartError,
@@ -123,62 +112,6 @@ def _capable_help() -> str:
 
 def _observation(help_text: str):
     return parse_launcher_capability_output(help_text)
-
-
-class ConfigSchemaProbeTest(unittest.TestCase):
-    """The read-only probe answers the parse question without validating the whole config."""
-
-    def test_absent_and_empty_config_declare_nothing_to_parse(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            missing = Path(tmp) / "config.yaml"
-            self.assertEqual(
-                probe_repo_local_config_schema(missing).state, CONFIG_SCHEMA_ABSENT
-            )
-            missing.write_text("# only a comment\n", encoding="utf-8")
-            self.assertEqual(
-                probe_repo_local_config_schema(missing).state, CONFIG_SCHEMA_ABSENT
-            )
-
-    def test_v2_config_declares_its_version_and_top_level_keys(self) -> None:
-        probe = probe_repo_local_config_schema_text(_V2_CONFIG)
-        self.assertEqual(probe.state, CONFIG_SCHEMA_DECLARED)
-        self.assertEqual(probe.version, 2)
-        self.assertIn("agents", probe.keys)
-
-    def test_a_nested_block_this_runtime_would_reject_is_still_readable(self) -> None:
-        # The probe answers "could a launcher PARSE this file", which is the version + key
-        # boundary. A nested block that would fail full validation must not read as a
-        # launcher incompatibility — otherwise an unrelated config error would be reported
-        # as "upgrade your launcher".
-        probe = probe_repo_local_config_schema_text(
-            "version: 2\nagents:\n  profiles: not-a-mapping\n"
-        )
-        self.assertEqual(probe.state, CONFIG_SCHEMA_DECLARED)
-        self.assertEqual(probe.version, 2)
-
-    def test_malformed_and_non_integer_version_fail_closed(self) -> None:
-        for text in ("version: [1, 2\n", "version: true\n", "version: two\n", "- a\n"):
-            with self.subTest(text=text):
-                self.assertEqual(
-                    probe_repo_local_config_schema_text(text).state,
-                    CONFIG_SCHEMA_UNREADABLE,
-                    "an unreadable config is not an absent one",
-                )
-
-    def test_future_version_is_unsupported_and_names_the_upgrade(self) -> None:
-        probe = probe_repo_local_config_schema_text("version: 99\n")
-        self.assertEqual(probe.state, CONFIG_SCHEMA_UNSUPPORTED)
-        self.assertTrue(probe.upgrade_required)
-
-    def test_a_present_but_unreadable_file_is_not_absent(self) -> None:
-        # A directory where the config file should be: present, unreadable. Folding this
-        # into "absent" would admit every launcher against a config nobody can read.
-        with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / "config.yaml").mkdir()
-            self.assertEqual(
-                probe_repo_local_config_schema(Path(tmp) / "config.yaml").state,
-                CONFIG_SCHEMA_UNREADABLE,
-            )
 
 
 class LifecycleSchemaProbeTest(unittest.TestCase):
@@ -218,119 +151,6 @@ class LifecycleSchemaProbeTest(unittest.TestCase):
                 probe_lane_lifecycle_schema(home=home).state,
                 LIFECYCLE_SCHEMA_UNREADABLE,
             )
-
-
-class ConfigJoinTest(unittest.TestCase):
-    """The pure config join: the launcher must be provably able to parse the target."""
-
-    def test_this_builds_launcher_reads_this_builds_config(self) -> None:
-        verdict = decide_config_schema_compatibility(
-            _observation(_capable_help()),
-            TargetSchemaObservation(
-                TARGET_SCHEMA_DECLARED, 2, frozenset({"version", "agents"})
-            ),
-        )
-        self.assertTrue(verdict.ok, verdict.detail)
-        self.assertEqual(verdict.reason, CONFIG_JOIN_OK)
-
-    def test_a_config_less_target_admits_a_launcher_that_advertises_nothing(self) -> None:
-        # The pre-#14258 world for a config-less repo, preserved: with nothing to parse there
-        # is no defect to refuse, and refusing would break a working case for no reason.
-        verdict = decide_config_schema_compatibility(
-            _observation(f"usage: x [{_MARKER} NAME]\n"),
-            TargetSchemaObservation(TARGET_SCHEMA_ABSENT),
-        )
-        self.assertTrue(verdict.ok, verdict.detail)
-
-    def test_the_measured_failure_a_pre_14258_launcher_vs_a_v2_config(self) -> None:
-        # THE regression: the installed launcher carried `agent-attest` and the attestation
-        # schema (so #13748/#13847 passed) but advertises no config-parse capability at all.
-        pre_14258 = (
-            f"usage: x [{_MARKER} NAME]\n"
-            "mozyo_attest_capability_schema=2\n"
-            "mozyo_attest_capability_stores=1_2\n"
-        )
-        probe = probe_repo_local_config_schema_text(_V2_CONFIG)
-        verdict = decide_config_schema_compatibility(
-            _observation(pre_14258),
-            TargetSchemaObservation(TARGET_SCHEMA_DECLARED, probe.version, probe.keys),
-        )
-        self.assertFalse(verdict.ok)
-        self.assertEqual(verdict.reason, LAUNCHER_CONFIG_CONTRACT_ABSENT)
-
-    def test_a_v1_only_launcher_cannot_read_a_v2_config(self) -> None:
-        v1_only = (
-            f"usage: x [{_MARKER} NAME]\n"
-            "mozyo_attest_capability_config=1\n"
-            "mozyo_attest_capability_config_keys=cli.version\n"
-        )
-        verdict = decide_config_schema_compatibility(
-            _observation(v1_only),
-            TargetSchemaObservation(TARGET_SCHEMA_DECLARED, 2, frozenset({"version"})),
-        )
-        self.assertFalse(verdict.ok)
-        self.assertEqual(verdict.reason, LAUNCHER_CANNOT_READ_CONFIG_VERSION)
-
-    def test_an_unknown_top_level_key_is_refused_even_at_a_shared_version(self) -> None:
-        # The version join alone is not enough: recognized keys have been added WITHIN a
-        # version, and `unknown key 'agents'` is literally what the measured failure said.
-        same_version_fewer_keys = (
-            f"usage: x [{_MARKER} NAME]\n"
-            "mozyo_attest_capability_config=1_2\n"
-            "mozyo_attest_capability_config_keys=cli.version\n"
-        )
-        verdict = decide_config_schema_compatibility(
-            _observation(same_version_fewer_keys),
-            TargetSchemaObservation(
-                TARGET_SCHEMA_DECLARED, 2, frozenset({"version", "agents"})
-            ),
-        )
-        self.assertFalse(verdict.ok)
-        self.assertEqual(verdict.reason, LAUNCHER_CANNOT_READ_CONFIG_KEYS)
-        self.assertIn("agents", verdict.detail)
-
-    def test_an_unreadable_or_unsupported_target_config_fails_closed(self) -> None:
-        capable = _observation(_capable_help())
-        for state, expected in (
-            (TARGET_SCHEMA_UNREADABLE, CONFIG_UNREADABLE),
-            (TARGET_SCHEMA_UNSUPPORTED, CONFIG_UNSUPPORTED),
-        ):
-            with self.subTest(state=state):
-                verdict = decide_config_schema_compatibility(
-                    capable, TargetSchemaObservation(state, 99)
-                )
-                self.assertFalse(verdict.ok)
-                self.assertEqual(verdict.reason, expected)
-
-    def test_conflicting_advertisements_are_not_arbitrated(self) -> None:
-        # Two different claims about the same fact prove neither (the j#80000 finding-3 rule,
-        # now shared by every advertised set rather than re-implemented per token).
-        conflicting = (
-            f"usage: x [{_MARKER} NAME]\n"
-            "mozyo_attest_capability_config=1_2\n"
-            "mozyo_attest_capability_config=2\n"
-            "mozyo_attest_capability_config_keys=agents.version\n"
-        )
-        self.assertIsNone(_observation(conflicting).advertised_config_versions)
-        verdict = decide_config_schema_compatibility(
-            _observation(conflicting),
-            TargetSchemaObservation(TARGET_SCHEMA_DECLARED, 2, frozenset({"version"})),
-        )
-        self.assertFalse(verdict.ok)
-        self.assertEqual(verdict.reason, LAUNCHER_CONFIG_CONTRACT_ABSENT)
-
-    def test_a_malformed_advertisement_is_not_salvaged(self) -> None:
-        for token in (
-            "mozyo_attest_capability_config=1__2",
-            "mozyo_attest_capability_config=_1_2_",
-            "mozyo_attest_capability_config=1_2junk",
-        ):
-            with self.subTest(token=token):
-                self.assertIsNone(
-                    _observation(
-                        f"usage: x [{_MARKER} NAME]\n{token}\n"
-                    ).advertised_config_versions
-                )
 
 
 class LifecycleJoinTest(unittest.TestCase):
@@ -444,7 +264,7 @@ class ConjunctionZeroActuationTest(unittest.TestCase):
                     repo_root=root / "repo",
                     store_home=root / "home",
                 )
-            self.assertEqual(caught.exception.reason, LAUNCHER_CONFIG_CONTRACT_ABSENT)
+            self.assertEqual(caught.exception.reason, LAUNCHER_CONFIG_VALIDATOR_ABSENT)
             # The refusal must be actionable and must not persist a private absolute path.
             message = str(caught.exception)
             self.assertIn("MOZYO_BRIDGE_LAUNCHER", message)
@@ -549,11 +369,11 @@ class PreWorktreeGateTest(unittest.TestCase):
 
     def test_an_incompatible_launcher_creates_no_worktree_and_owes_no_rollback(self) -> None:
         ops, outcome = self._run(
-            (False, LAUNCHER_CANNOT_READ_CONFIG_VERSION, "launcher parses config v1 only")
+            (False, LAUNCHER_CANNOT_PARSE_TARGET_CONFIG, "launcher rejects the lane config")
         )
         self.assertTrue(outcome.is_blocked)
         self.assertIn("launcher_runtime_incompatible", outcome.blocked_reasons)
-        self.assertIn(LAUNCHER_CANNOT_READ_CONFIG_VERSION, outcome.blocked_reasons)
+        self.assertIn(LAUNCHER_CANNOT_PARSE_TARGET_CONFIG, outcome.blocked_reasons)
         self.assertIsNone(outcome.startup, "a zero-mutation refusal observed no startup")
         self.assertIsNone(outcome.gateway_pane)
         self.assertIsNone(outcome.worker_pane)
@@ -563,9 +383,10 @@ class PreWorktreeGateTest(unittest.TestCase):
         # A worktree this run would CREATE has no directory to read, so the gate must ask for
         # the committed blob at the lane's base ref rather than substituting this checkout's
         # working file — the proxy that would silently pass on a differing base.
-        ops, _ = self._run((False, LAUNCHER_CANNOT_READ_CONFIG_VERSION, "nope"))
+        ops, _ = self._run((False, LAUNCHER_CANNOT_PARSE_TARGET_CONFIG, "nope"))
         self.assertEqual(
-            ops.calls, ["preflight:['base_ref', 'from_base_ref', 'lane_runtime_root']"]
+            ops.calls,
+            ["preflight:['base_commit', 'from_base_ref', 'lane_runtime_root']"],
         )
 
     def test_a_port_without_the_capability_is_a_no_op(self) -> None:
@@ -666,14 +487,14 @@ class CanonicalContractProducerTest(unittest.TestCase):
                 )
         self.assertIsInstance(parser, argparse.ArgumentParser)
 
-    def test_the_source_launcher_reads_as_compatible_with_the_source_target(self) -> None:
+    def test_this_build_advertises_the_contract_it_requires(self) -> None:
         # The self-consistency the join depends on: THIS build's advertisement satisfies
         # THIS build's requirements. Without it the runtime would refuse its own launcher.
-        observation = _observation(f"usage: x [{_MARKER} NAME]\n{build_attest_capability_epilog()}")
-        probe = probe_repo_local_config_schema_text(_V2_CONFIG)
-        config = decide_config_schema_compatibility(
-            observation,
-            TargetSchemaObservation(TARGET_SCHEMA_DECLARED, probe.version, probe.keys),
+        observation = _observation(
+            f"usage: x [{_MARKER} NAME]\n{build_attest_capability_epilog()}"
+        )
+        self.assertEqual(
+            observation.advertised_config_parse_contract, CONFIG_PARSE_CONTRACT_VERSION
         )
         lifecycle = decide_lifecycle_reader_compatibility(
             observation,
@@ -681,8 +502,338 @@ class CanonicalContractProducerTest(unittest.TestCase):
                 TARGET_SCHEMA_DECLARED, LANE_LIFECYCLE_SCHEMA_VERSION
             ),
         )
-        self.assertTrue(config.ok, config.detail)
         self.assertTrue(lifecycle.ok, lifecycle.detail)
+
+
+# ---------------------------------------------------------------------------
+# Review j#87746 / j#87752 blocking findings — R1 / R2 / R3 / R4.
+# ---------------------------------------------------------------------------
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True)
+
+
+def _seed_repo(root: Path, config_text: str) -> Path:
+    repo = root / "primary"
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.invalid")
+    _git(repo, "config", "user.name", "t")
+    cfg = repo / ".mozyo-bridge"
+    cfg.mkdir()
+    (cfg / "config.yaml").write_text(config_text, encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "c1")
+    return repo
+
+
+class R1MovingBaseRefTest(unittest.TestCase):
+    """R1: a moving base ref must not let an unverified config into a new worktree."""
+
+    def test_a_string_ref_is_not_a_pin_but_the_resolved_commit_is(self) -> None:
+        # The defect, then the fix, on the same repo: `main` advances between the read and
+        # the materialization, so only a resolved commit addresses one document.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _seed_repo(root, _V2_CONFIG)
+            ops = LiveSublaneGitOperations(repo_root=repo)
+            pinned = ops.resolve_commit("main")
+            self.assertRegex(pinned, r"^[0-9a-f]{40}$")
+
+            (repo / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 99\n", encoding="utf-8"
+            )
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-qm", "c2")
+
+            # The moving ref now names the NEW commit; the pin still names the old one.
+            self.assertNotEqual(ops.resolve_commit("main"), pinned)
+            state, text = ops.committed_blob(
+                ref=pinned, relpath=".mozyo-bridge/config.yaml"
+            )
+            self.assertEqual(state, "blob_present")
+            self.assertIn("version: 2", text)
+            self.assertNotIn("version: 99", text)
+
+    def test_the_pinned_commit_is_what_the_worktree_materializes(self) -> None:
+        # GUARD BITE for the actual close condition: the config that was verified is the
+        # config that lands. Passing the ref instead of the pin makes this assertion fail.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _seed_repo(root, _V2_CONFIG)
+            ops = LiveSublaneGitOperations(repo_root=repo)
+            pinned = ops.resolve_commit("main")
+            (repo / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 99\n", encoding="utf-8"
+            )
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-qm", "c2")
+
+            worktree = root / "lane"
+            ops.create_worktree(
+                branch="lane_x", worktree_path=str(worktree), base_ref=pinned
+            )
+            materialized = (worktree / ".mozyo-bridge" / "config.yaml").read_text()
+            self.assertIn("version: 2", materialized)
+            self.assertNotIn("version: 99", materialized)
+
+    def test_an_unresolvable_or_non_commit_base_yields_no_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _seed_repo(Path(tmp), _V2_CONFIG)
+            ops = LiveSublaneGitOperations(repo_root=repo)
+            for ref in ("no-such-ref", "refs/heads/nope", ""):
+                with self.subTest(ref=ref):
+                    self.assertEqual(ops.resolve_commit(ref), "")
+
+    def test_the_gate_refuses_a_lane_whose_base_cannot_be_pinned(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_gates import (  # noqa: E501
+            pin_base_commit,
+        )
+
+        class _Ops:
+            def resolve_base_commit(self, ref):
+                return ""
+
+        blocked = {}
+
+        class _UseCase:
+            ops = _Ops()
+
+            def _blocked(self, request, **kwargs):
+                blocked.update(kwargs)
+                return "BLOCKED"
+
+        request, outcome = pin_base_commit(
+            _UseCase(),
+            type("_R", (), {"base_ref": "origin/main-next"})(),
+            launch_action="create_worktree",
+            dispatch=False,
+            fill_decision=None,
+            fill_override_reason=None,
+        )
+        self.assertEqual(outcome, "BLOCKED")
+        self.assertIn("base_ref_unpinnable", blocked["reasons"])
+
+
+class R2LifecycleProbeMatchesTheReaderTest(unittest.TestCase):
+    """R2: the probe must not credit a shape the real reader will refuse."""
+
+    def test_a_broken_column_signature_is_refused_by_probe_and_reader_alike(self) -> None:
+        import sqlite3
+
+        from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+            LIFECYCLE_SCHEMA_UNSUPPORTED,
+            LaneLifecycleReader,
+        )
+        from mozyo_bridge.core.state.lane_lifecycle_schema import TABLE, LaneLifecycleError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            LaneLifecycleStore(home=home).ensure_schema()
+            # Metadata / recorded version / table all stay intact; only the live column
+            # signature is broken. `readonly_component_status` still says "recognized",
+            # which is exactly why the probe must consult the reader's own authority.
+            conn = sqlite3.connect(lane_lifecycle_path(home))
+            conn.execute(f"ALTER TABLE {TABLE} DROP COLUMN lane_kind")
+            conn.commit()
+            conn.close()
+
+            probe = probe_lane_lifecycle_schema(home=home)
+            self.assertEqual(probe.state, LIFECYCLE_SCHEMA_UNSUPPORTED)
+            self.assertFalse(
+                probe.upgrade_required,
+                "a broken signature is a partial/corrupt shape, not a stale reader",
+            )
+            with self.assertRaises(LaneLifecycleError):
+                LaneLifecycleReader(home=home).records()
+
+    def test_the_join_refuses_that_store_for_every_launcher(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            LIFECYCLE_UNSUPPORTED,
+            TARGET_SCHEMA_UNSUPPORTED,
+        )
+
+        verdict = decide_lifecycle_reader_compatibility(
+            _observation(_capable_help()),
+            TargetSchemaObservation(TARGET_SCHEMA_UNSUPPORTED, 7, upgrade_required=False),
+        )
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.reason, LIFECYCLE_UNSUPPORTED)
+        self.assertIn("repair", verdict.detail)
+
+
+class R3RecoveryHintIsCompleteTest(unittest.TestCase):
+    """R3: the public recovery hint must be a complete, actionable instruction."""
+
+    _EXPECTED_HINT = (
+        "Recovery: either install / release a mozyo-bridge whose CLI advertises the "
+        "required capability, or set `MOZYO_BRIDGE_LAUNCHER` to the absolute path of a "
+        "launcher built from a source tree that advertises it."
+    )
+
+    def test_both_refusals_carry_the_full_hint_verbatim(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            CONFIG_PARSE_BOTH_OK,
+            CONFIG_PARSE_CONTRACT_VERSION as _CV,
+            ConfigParseObservation,
+            decide_config_parse_compatibility,
+        )
+
+        bare = _observation(f"usage: x [{_MARKER} NAME]\n")
+        config = decide_config_parse_compatibility(
+            bare, ConfigParseObservation(CONFIG_PARSE_BOTH_OK), required_contract_version=_CV
+        )
+        lifecycle = decide_lifecycle_reader_compatibility(
+            bare, TargetSchemaObservation(TARGET_SCHEMA_DECLARED, 7)
+        )
+        for verdict in (config, lifecycle):
+            with self.subTest(reason=verdict.reason):
+                self.assertFalse(verdict.ok)
+                # The WHOLE sentence, not a substring of it: the defect was a hint that
+                # trailed off after "that does", which `assertIn("MOZYO_BRIDGE_LAUNCHER")`
+                # happily accepted.
+                self.assertTrue(
+                    verdict.detail.endswith(self._EXPECTED_HINT),
+                    f"detail did not end with the complete hint: {verdict.detail!r}",
+                )
+
+
+class R4NestedGrammarTest(unittest.TestCase):
+    """R4: a launcher that cannot parse a NESTED key must be refused, not admitted."""
+
+    #: The exact axis of the counterexample: `lane_placement.by_lane_kind` was added by
+    #: commit `d28e59e2` with no change to the config version or the top-level key set.
+    _NESTED_CONFIG = (
+        "version: 2\n"
+        "lane_placement:\n"
+        "  version: 1\n"
+        "  by_lane_kind:\n"
+        "    implementation:\n"
+        "      split: right\n"
+    )
+
+    def _launcher(self, directory: Path, name: str, body: str) -> str:
+        path = directory / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        return str(path)
+
+    def _advertising(self, extra_reject: str = "") -> str:
+        """A launcher advertising THIS build's exact contract, whose validator may differ."""
+        epilog = "".join(
+            f"printf '%s\\n' {line!r}\n"
+            for line in (f"usage: x [{_MARKER} NAME]", *build_attest_capability_epilog().splitlines())
+        )
+        return (
+            "#!/bin/sh\n"
+            'if [ "$1" = "config" ] && [ "$2" = "check-parse" ]; then\n'
+            + extra_reject
+            + "  exit 0\n"
+            "fi\n" + epilog + "exit 0\n"
+        )
+
+    def test_this_builds_config_is_valid_here(self) -> None:
+        # The premise: the nested key is valid for the CURRENT runtime, so a refusal below
+        # can only be about the launcher — never about a broken config.
+        from mozyo_bridge.application.repo_local_config_loader import (
+            load_repo_local_config_from_path,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text(self._NESTED_CONFIG, encoding="utf-8")
+            self.assertIsNotNone(load_repo_local_config_from_path(path))
+
+    def test_a_launcher_that_rejects_the_nested_key_is_refused(self) -> None:
+        # THE R4 regression: identical version + top-level advertisement, different nested
+        # grammar. The summary-based join admitted this; the direct measurement refuses it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "repo" / ".mozyo-bridge").mkdir(parents=True)
+            (root / "repo" / ".mozyo-bridge" / "config.yaml").write_text(
+                self._NESTED_CONFIG, encoding="utf-8"
+            )
+            rejecting = self._launcher(
+                root,
+                "old-mozyo-bridge",
+                self._advertising(
+                    "  grep -q by_lane_kind \"$4\" && "
+                    "{ echo \"unknown key 'by_lane_kind'\" >&2; exit 2; }\n"
+                ),
+            )
+            with self.assertRaises(HerdrLauncherIncompatibleError) as caught:
+                preflight_launcher_compatibility(
+                    rejecting,
+                    subprocess.run,
+                    _TIMEOUT,
+                    dict(os.environ),
+                    repo_root=root / "repo",
+                    store_home=root / "home",
+                )
+            self.assertEqual(
+                caught.exception.reason, LAUNCHER_CANNOT_PARSE_TARGET_CONFIG
+            )
+            self.assertIn("by_lane_kind", str(caught.exception))
+
+    def test_a_launcher_that_accepts_it_is_admitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "repo" / ".mozyo-bridge").mkdir(parents=True)
+            (root / "repo" / ".mozyo-bridge" / "config.yaml").write_text(
+                self._NESTED_CONFIG, encoding="utf-8"
+            )
+            accepting = self._launcher(root, "new-mozyo-bridge", self._advertising())
+            preflight_launcher_compatibility(
+                accepting,
+                subprocess.run,
+                _TIMEOUT,
+                dict(os.environ),
+                repo_root=root / "repo",
+                store_home=root / "home",
+            )
+
+    def test_a_config_broken_for_this_runtime_is_not_blamed_on_the_launcher(self) -> None:
+        # The distinction review j#87752 required be preserved.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            TARGET_CONFIG_INVALID,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "repo" / ".mozyo-bridge").mkdir(parents=True)
+            (root / "repo" / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 2\nbogus_top_level: 1\n", encoding="utf-8"
+            )
+            accepting = self._launcher(root, "new-mozyo-bridge", self._advertising())
+            with self.assertRaises(HerdrLauncherIncompatibleError) as caught:
+                preflight_launcher_compatibility(
+                    accepting,
+                    subprocess.run,
+                    _TIMEOUT,
+                    dict(os.environ),
+                    repo_root=root / "repo",
+                    store_home=root / "home",
+                )
+            self.assertEqual(caught.exception.reason, TARGET_CONFIG_INVALID)
+            self.assertIn("Fix the config", str(caught.exception))
+
+    def test_the_real_cli_answers_the_probe_contract(self) -> None:
+        # The two halves must agree: the argv the preflight builds is the command the CLI
+        # registers, and its rejection exit code is the one the preflight expects.
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application.cli_config import (  # noqa: E501
+            CONFIG_CHECK_PARSE_REJECTED,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (  # noqa: E501
+            CONFIG_PARSE_REJECTED_EXIT,
+            build_config_parse_probe_argv,
+        )
+
+        self.assertEqual(CONFIG_PARSE_REJECTED_EXIT, CONFIG_CHECK_PARSE_REJECTED)
+        self.assertEqual(
+            build_config_parse_probe_argv("/x/launcher", "/tmp/c.yaml"),
+            ["/x/launcher", "config", "check-parse", "--file", "/tmp/c.yaml"],
+        )
 
 
 def _agent_attest_help(parser) -> str:

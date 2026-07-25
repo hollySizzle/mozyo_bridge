@@ -437,6 +437,18 @@ def probe_lane_lifecycle_schema(
     creates, migrates, or re-stamps anything. An absent store stays absent (a fresh home is
     legitimate); an unopenable file is :data:`LIFECYCLE_SCHEMA_UNREADABLE` rather than being
     folded into "absent" — an unreadable authority is not an empty one.
+
+    "Readable" is decided by the **same authority the real reader uses**, not a weaker proxy
+    (review j#87746 R2). :func:`readonly_component_status` only checks the container version,
+    the metadata row, the recorded version, and the table's existence; :class:`LaneLifecycleReader`
+    then additionally requires :func:`readonly_compatible_select` — the exact column signature
+    (names plus type / notnull / default / pk) for that recorded version. Measured: dropping the
+    additive ``lane_kind`` column from a healthy v7 store left this probe reporting
+    ``recognized / 7`` while ``records()`` refused it as a partial / corrupt authority shape. A
+    preflight that credits a shape the reader will reject proves nothing about the launcher, so
+    the signature check is part of the probe: a store whose metadata agrees but whose columns do
+    not is :data:`LIFECYCLE_SCHEMA_UNSUPPORTED` with ``upgrade_required`` **False** — the honest
+    classification is "recorded version and on-disk shape disagree", not "this reader is stale".
     """
     path = path if path is not None else lane_lifecycle_path(home)
     if not path.exists():
@@ -454,6 +466,14 @@ def probe_lane_lifecycle_schema(
         conn.execute("SELECT count(*) FROM sqlite_master")
         status = readonly_component_status(conn)
         upgrade = reader_upgrade_required(conn)
+        # The reader's OWN readability test, not a weaker proxy (j#87746 R2): `None` means
+        # the live column signature is not a known shape for the recorded version, so
+        # `records()` would refuse this store no matter which launcher opened it.
+        reader_can_read = (
+            readonly_compatible_select(conn) is not None
+            if status == READONLY_COMPONENT_RECOGNIZED
+            else False
+        )
     except sqlite3.DatabaseError:
         return LifecycleSchemaObservation(LIFECYCLE_SCHEMA_UNREADABLE)
     finally:
@@ -461,8 +481,13 @@ def probe_lane_lifecycle_schema(
     if status == READONLY_COMPONENT_ABSENT:
         return LifecycleSchemaObservation(LIFECYCLE_SCHEMA_ABSENT)
     version = _current_recorded_version(path=path)
-    if status == READONLY_COMPONENT_RECOGNIZED:
+    if status == READONLY_COMPONENT_RECOGNIZED and reader_can_read:
         return LifecycleSchemaObservation(LIFECYCLE_SCHEMA_RECOGNIZED, version)
+    if status == READONLY_COMPONENT_RECOGNIZED:
+        # Metadata / version / table all agree, but the columns do not: a partial or corrupt
+        # shape, NOT a stale reader. `upgrade_required` stays False so the refusal points at
+        # repair rather than dishonestly suggesting a newer runtime would fix it.
+        return LifecycleSchemaObservation(LIFECYCLE_SCHEMA_UNSUPPORTED, version, False)
     return LifecycleSchemaObservation(LIFECYCLE_SCHEMA_UNSUPPORTED, version, upgrade)
 
 

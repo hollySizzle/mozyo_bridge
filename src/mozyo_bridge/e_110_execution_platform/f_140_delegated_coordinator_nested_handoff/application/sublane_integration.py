@@ -32,6 +32,7 @@ Three parts:
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +71,10 @@ def policy_from_config(config: SublaneIntegrationConfig) -> SublaneIntegrationPo
 # and the path is not tracked there" and "the ref itself is unreadable": the first is a
 # legitimate absence, the second is unknowable and must fail closed.
 # ---------------------------------------------------------------------------
+
+#: A full commit SHA: exactly 40 lowercase hex digits. A pin that is not this shape is not a
+#: pin, so it is refused rather than passed on to `git worktree add`.
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 BLOB_PRESENT = "blob_present"
 BLOB_ABSENT = "blob_absent"
@@ -318,6 +323,33 @@ class LiveSublaneGitOperations:
                 + (f" from base {base!r}" if base else "")
                 + f": {result.stderr.strip()}"
             )
+
+    def resolve_commit(self, ref: str) -> str:
+        """Resolve ``ref`` to a single immutable full commit SHA, or ``""`` (Redmine #14258 R1).
+
+        A **string** ref is not a pin. The launcher preflight reads the config at the lane's
+        base and ``git worktree add`` then materializes it, and between those two operations a
+        branch / remote-tracking ref can advance — measured: the preflight admitted a v2 config
+        and the worktree materialized a v99 one, defeating the gate that exists precisely to
+        keep an unverified config out of a new worktree (review j#87746 R1). Callers resolve
+        once, here, and use the returned commit for BOTH.
+
+        Fail-closed on everything that is not exactly one commit: an unresolvable ref, a
+        non-commit object, output that is not a single 40-hex line, or a name git itself
+        reports as **ambiguous** (its own warning is the signal — refusing on it is what keeps
+        "which of the two did we pin?" from being answered by luck). ``""`` means "no pin", and
+        every caller treats that as a zero-mutation refusal rather than falling back to the ref.
+        """
+        result = self._run("rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}")
+        if result.returncode != 0:
+            return ""
+        if "ambiguous" in (result.stderr or "").lower():
+            return ""
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if len(lines) != 1:
+            return ""
+        commit = lines[0]
+        return commit if _FULL_SHA_RE.fullmatch(commit) else ""
 
     def committed_blob(self, *, ref: str, relpath: str) -> tuple[str, str]:
         """Read a committed file's text at ``ref`` without checking anything out (#14258).

@@ -303,17 +303,34 @@ flow:
    (b) **home-scoped shared lane lifecycle authority** — 最も新しい lane の source CLI が additive に
    migrate するため、reader が古い launcher は named lane を `LaneLifecycleReaderUpgradeRequired` で
    zero-start する (実測 j#85890: v7 store vs v6 reader)。
-   どちらも **宣言 (advertised capability)** として検証する: `agent-attest --help` epilog が
-   `mozyo_attest_capability_config=<versions>` / `mozyo_attest_capability_config_keys=<keys>` /
-   `mozyo_attest_capability_lifecycle=<versions>` を wrap-proof token で advertise し、preflight が
-   **実 target** (repo config の宣言 version + top-level key 集合 / shared store の recorded component
-   version) と join する。version 集合だけでは不足で、recognized key は同一 version 内で追加されてきた
-   (`terminal_transport` / `lane_placement`) 上、実測 error が literal に `unknown key 'agents'` である
-   ため、**key 集合も join する**。
+   検証手段は 2 つの authority で異なる。**lane lifecycle は宣言 join**:
+   `agent-attest --help` epilog が `mozyo_attest_capability_lifecycle=<versions>` を wrap-proof
+   token で advertise し、shared store の recorded component version と join する。probe は実 reader と
+   **同一の known-signature authority** (`readonly_compatible_select`) を使う — metadata/version/table
+   が整合していても column signature が壊れていれば実 reader は拒否するため、弱い認識で credit すると
+   「reader が読める」を証明したことにならない (review j#87746 R2、実測: 健全な v7 store から
+   `lane_kind` を落とすと旧 probe は `recognized/7`、実 reader は partial/corrupt で拒否)。
+
+   **config は宣言でなく直接測定する**。grammar の *要約* は原理的に不足する: commit `d28e59e2` は
+   supported version 集合も top-level key 集合も変えずに nested key `lane_placement.by_lane_kind` を
+   追加したため、それ以前の launcher は同一 contract を advertise しながら当該 config を
+   `unknown key 'by_lane_kind'` で拒否する (review j#87752 R4、実 pre-`d28e59e2` source で実測)。
+   したがって epilog は `mozyo_attest_capability_config_parse=<contract version>` として
+   「**訊いてよい**」ことだけを advertise し、答えは launcher 自身の parser から取る: preflight は
+   join 対象の **exact bytes** を private temp file へ置き `<launcher> config check-parse --file <path>`
+   (read-only、parse 成功 0 / 拒否 2) を実行する。これは version / top-level / nested / **将来追加される軸**
+   を一度に覆う。判定は 2 つの測定の直積で、自 runtime も拒否 → `target_config_invalid`
+   (config 自体の欠陥。launcher を責めない) / 自 runtime OK・launcher 拒否 →
+   `launcher_cannot_parse_target_config` (launcher の実 error を引用) / 両者 OK → admit。
    #14231 の cwd-sensitive probe は「launcher が偶然その cwd で非 0 終了する」ことに依存する
-   incidental discriminant であり、lane worktree が存在しないと問いを立てられない。宣言 join は
+   incidental discriminant であり、lane worktree が存在しないと問いを立てられない。宣言 join も直接測定も
    **worktree 生成前**に評価できるため、`sublane create` は worktree を残さずに拒否できる
-   (close condition 1)。実際の conjunction (`preflight_launcher_compatibility`) は 2 箇所から呼ばれる:
+   (close condition 1)。ただし worktree 生成前に config を読むには base を **immutable full commit へ
+   一度だけ pin** しなければならない: 文字列 ref は pin ではなく、branch / remote-tracking ref は preflight と
+   `git worktree add` の間に前進し得る (review j#87746 R1、実測: v2 config を admit した後 worktree には
+   v99 が materialize)。`pin_base_commit` が最初の mutation より前に `rev-parse --verify <ref>^{commit}`
+   で解決し、以降の config read と worktree 生成は**同一 object** を指す。解決不能 / ambiguous / 非 commit は
+   zero-mutation refusal (ref へ fallback しない)。実際の conjunction (`preflight_launcher_compatibility`) は 2 箇所から呼ばれる:
    `sublane create --execute` の pre-mutation gate (worktree より前) と `prepare_session` (first herdr
    write より前、create を経由しない heal / 明示 `herdr session-start` で唯一到達する境界)。両者が
    **同一関数**を呼ぶのは、conjunct が片方にしか存在しない状態が live failure として再出現するため。

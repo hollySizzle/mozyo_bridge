@@ -131,56 +131,53 @@ def evaluate_runtime_placement(
     return evaluate_mutation_placement_gate(fingerprint)
 
 
-def observe_lane_target_config(
+def read_lane_target_config_text(
     committed_blob: Callable[..., tuple[str, str]],
     *,
-    base_ref: str,
+    base_commit: str,
     lane_runtime_root: str,
     from_base_ref: bool,
-):
-    """The config schema the LANE will present to the launcher (Redmine #14258).
+) -> tuple[str, Optional[str]]:
+    """The exact config document the LANE will present: ``(state, text)`` (Redmine #14258).
 
-    Not this checkout's config — the lane's, which is a different file in the only case that
-    matters. Two sources, decided by the caller from the launch decision rather than guessed
-    here:
+    Not this checkout's config — the lane's. Two sources, decided by the caller from the
+    launch decision rather than guessed here:
 
-    - ``from_base_ref`` (a worktree this run will CREATE): the committed blob at ``base_ref``,
-      or ``HEAD`` when the create branches from the ambient checkout — the exact bytes
-      ``git worktree add`` will materialize. Reading the primary checkout's working file
-      instead would be a *proxy* for the target. It is usually identical, which is precisely
-      why the substitution would go unnoticed until a lane was cut from a ref whose config
-      differed;
+    - ``from_base_ref`` (a worktree this run will CREATE): the blob at ``base_commit``, which
+      the caller has already pinned to an immutable full commit SHA (review j#87746 R1). A
+      *ref* would not do: a branch that advances between this read and ``git worktree add``
+      makes the verified bytes and the materialized bytes different documents — measured, a
+      v2 config verified and a v99 config materialized;
     - otherwise (a reused worktree, or a non-git lane that runs in the workspace root):
       ``lane_runtime_root``'s own file, because that directory already exists and IS what the
       wrapper will be given as ``--cwd``.
 
-    A ref whose blob cannot be read at all yields an unreadable observation, which fails the
-    join closed. That is the honest answer — nothing about the lane's config is knowable — and
-    a create against an unresolvable ref would fail on its own anyway.
+    A base whose blob cannot be read yields :data:`CONFIG_TEXT_UNREADABLE`, which fails the
+    join closed — nothing about the lane's config is knowable, and it must never collapse into
+    the "absent" case that admits every launcher.
     """
-    from mozyo_bridge.application.repo_local_config_loader import (
-        CONFIG_FILE_RELPATH,
-        CONFIG_SCHEMA_ABSENT,
-        CONFIG_SCHEMA_UNREADABLE,
-        ConfigSchemaObservation,
-        probe_repo_local_config_schema,
-        probe_repo_local_config_schema_text,
+    from mozyo_bridge.application.repo_local_config_loader import CONFIG_FILE_RELPATH
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+        CONFIG_TEXT_ABSENT,
+        CONFIG_TEXT_PRESENT,
+        CONFIG_TEXT_UNREADABLE,
+        read_target_config_text,
     )
 
     if not from_base_ref:
         root = (lane_runtime_root or "").strip()
         if not root:
-            # No directory and no ref to read: nothing is knowable about the lane's config.
-            return ConfigSchemaObservation(CONFIG_SCHEMA_UNREADABLE)
-        return probe_repo_local_config_schema(Path(root) / CONFIG_FILE_RELPATH)
-    state, text = committed_blob(
-        ref=(base_ref or "").strip() or "HEAD", relpath=str(CONFIG_FILE_RELPATH)
-    )
-    if state == BLOB_PRESENT:
-        return probe_repo_local_config_schema_text(text)
-    return ConfigSchemaObservation(
-        CONFIG_SCHEMA_ABSENT if state == BLOB_ABSENT else CONFIG_SCHEMA_UNREADABLE
-    )
+            return CONFIG_TEXT_UNREADABLE, None
+        return read_target_config_text(Path(root))
+    pinned = (base_commit or "").strip()
+    if not pinned:
+        return CONFIG_TEXT_UNREADABLE, None
+    state, text = committed_blob(ref=pinned, relpath=str(CONFIG_FILE_RELPATH))
+    if state == BLOB_ABSENT:
+        return CONFIG_TEXT_ABSENT, None
+    if state != BLOB_PRESENT:
+        return CONFIG_TEXT_UNREADABLE, None
+    return (CONFIG_TEXT_PRESENT, text) if text.strip() else (CONFIG_TEXT_ABSENT, None)
 
 
 def evaluate_launcher_compatibility(
@@ -192,7 +189,7 @@ def evaluate_launcher_compatibility(
     store_home: Path,
     replacement_action_id: str,
     committed_blob: Callable[..., tuple[str, str]],
-    base_ref: str,
+    base_commit: str,
     lane_runtime_root: str,
     from_base_ref: bool,
 ) -> tuple[bool, str, str]:
@@ -219,18 +216,21 @@ def evaluate_launcher_compatibility(
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
         HerdrLauncherIncompatibleError,
-        normalize_config_schema_observation,
+        measure_config_parse_compatibility,
         preflight_launcher_compatibility,
     )
 
     launcher = resolve_attest_launcher(env)
     if not launcher:
         return True, "", "unwrapped launch; no managed-launch launcher to verify"
-    config = observe_lane_target_config(
+    config_state, config_text = read_lane_target_config_text(
         committed_blob,
-        base_ref=base_ref,
+        base_commit=base_commit,
         lane_runtime_root=lane_runtime_root,
         from_base_ref=from_base_ref,
+    )
+    config_parse = measure_config_parse_compatibility(
+        launcher, runner, timeout, env, config_state, config_text
     )
     # Probe in the wrapper's OWN cwd whenever that directory already exists (#14231: a
     # launcher's exit code is cwd-sensitive, so probing elsewhere hides a skew). For a
@@ -249,7 +249,7 @@ def evaluate_launcher_compatibility(
             repo_root=probe_cwd,
             store_home=Path(store_home),
             replacement_launch=bool((replacement_action_id or "").strip()),
-            config_schema=normalize_config_schema_observation(config),
+            config_parse=config_parse,
         )
     except HerdrLauncherIncompatibleError as exc:
         return False, exc.reason, str(exc)
@@ -265,5 +265,5 @@ __all__ = (
     "evaluate_dispatch_sender",
     "evaluate_launcher_compatibility",
     "evaluate_runtime_placement",
-    "observe_lane_target_config",
+    "read_lane_target_config_text",
 )

@@ -72,6 +72,38 @@ def register(sub) -> None:
     )
     status.set_defaults(func=cmd_config_status)
 
+    # Redmine #14258 (review j#87752 R4): the managed-launch preflight must prove the
+    # SELECTED launcher can parse the target repo's config, and no advertised summary of the
+    # grammar can prove it. A version set plus the top-level key set is only a *necessary*
+    # condition: commit `d28e59e2` added the nested `lane_placement.by_lane_kind` key without
+    # touching either, and a launcher predating it rejects that config as an unknown nested
+    # key while advertising an identical version + top-level contract (measured against real
+    # pre-`d28e59e2` source). So the preflight stops summarizing the grammar and instead runs
+    # THIS command on the candidate launcher against the exact target bytes: the launcher's
+    # own parser is the only authority that can answer the question, and it covers every
+    # axis — version, top-level, nested, and any axis added later — at once.
+    check_parse = config_sub.add_parser(
+        "check-parse",
+        help=(
+            "Read-only: can THIS build parse the given repo-local config file? Exit 0 when "
+            "it parses under this build's full schema, 2 when it does not (the error goes "
+            "to stderr). Writes nothing. Used by the managed-launch launcher preflight to "
+            "prove a candidate launcher can read a target repo's config."
+        ),
+    )
+    check_parse.add_argument(
+        "--file",
+        dest="config_file",
+        required=True,
+        help="Absolute path of the `.mozyo-bridge/config.yaml`-shaped document to parse.",
+    )
+    check_parse.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a machine-readable JSON result instead of human text.",
+    )
+    check_parse.set_defaults(func=cmd_config_check_parse)
+
     migrate = config_sub.add_parser(
         "migrate",
         help=(
@@ -151,6 +183,59 @@ def _atomic_write(path: Path, text: str) -> Path:
             pass
         raise
     return backup
+
+
+#: Exit code of ``config check-parse`` when the document does NOT parse under this build's
+#: schema. Distinct from ``1`` (which every other config command uses for "could not read
+#: the repo's own config"), so the launcher preflight can tell "this build rejects that
+#: document" from a mechanical failure to run the command at all.
+CONFIG_CHECK_PARSE_REJECTED = 2
+
+
+def cmd_config_check_parse(args) -> int:
+    """Handle ``config check-parse`` — can THIS build parse the given document? (#14258).
+
+    The whole command is one question with a binary answer, and the answer is the **exit
+    code** so a caller in another process can consume it without parsing prose: ``0`` when
+    the document parses under this build's full schema (every nested block included), and
+    :data:`CONFIG_CHECK_PARSE_REJECTED` when it does not, with the real error on stderr.
+
+    Read-only by construction: it parses the bytes and returns. It never migrates, never
+    writes, and never touches the repo's own config — the path is supplied explicitly,
+    because the managed-launch preflight asks about a document that may not be the caller's
+    (for a lane this run will create, it is the committed blob at the lane's base commit,
+    materialized to a temporary file).
+
+    A missing / unreadable / malformed file is a *rejection*, not a crash: the caller's
+    question is "can you parse this", and the honest answer for a file that cannot be read
+    is no. Nothing here prints credential-shaped data — the schema rejects such fields at
+    load time, so this surface inherits that guarantee without a new check.
+    """
+    from mozyo_bridge.application.repo_local_config_loader import (
+        load_repo_local_config_from_path,
+    )
+
+    as_json = bool(getattr(args, "json", False))
+    path = Path(getattr(args, "config_file", "") or "")
+    try:
+        if not path.is_file():
+            # The loader treats a MISSING file as the behavior-preserving default, which is
+            # right for "load this repo's config" and wrong here: the caller asked whether a
+            # specific document parses, and answering "yes" for a document that is not there
+            # would let the preflight credit a launcher it never actually exercised.
+            raise RepoLocalConfigError(f"no such config file: {path}")
+        config = load_repo_local_config_from_path(path)
+    except RepoLocalConfigError as exc:
+        if as_json:
+            print(json.dumps({"ok": False, "parsed": False, "error": str(exc)}))
+        else:
+            print(f"config check-parse: rejected: {exc}", file=sys.stderr)
+        return CONFIG_CHECK_PARSE_REJECTED
+    if as_json:
+        print(json.dumps({"ok": True, "parsed": True, "version": config.schema_version}))
+    else:
+        print(f"config check-parse: parsed (schema version {config.schema_version})")
+    return 0
 
 
 def cmd_config_status(args) -> int:

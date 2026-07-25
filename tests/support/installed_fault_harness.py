@@ -54,6 +54,9 @@ from mozyo_bridge.core.state.workspace_registry import read_anchor, register_wor
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (  # noqa: E501
+    CONFIG_PARSE_SUBCOMMAND,
+)
 
 from tests.support.agent_provider_binaries import FakeAgentBinaries
 from tests.support.herdr_fake import (
@@ -170,6 +173,33 @@ def _attest_launcher_capability_help() -> str:
     )
 
 
+def _config_check_parse_result(argv: list) -> "subprocess.CompletedProcess[str]":
+    """Answer ``<launcher> config check-parse --file <path>`` with THIS build's real verdict.
+
+    The installed layer execs the wheel's binary, which runs exactly this parser; in-process
+    the harness runs it directly rather than canning a ``0``, so the harness can never report
+    a launcher as config-compatible when this build's own grammar would reject the document.
+    """
+    from mozyo_bridge.application.repo_local_config_loader import (
+        RepoLocalConfigError,
+        load_repo_local_config_from_path,
+    )
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application.cli_config import (  # noqa: E501
+        CONFIG_CHECK_PARSE_REJECTED,
+    )
+
+    path = Path(argv[argv.index("--file") + 1]) if "--file" in argv else None
+    try:
+        if path is None or not path.is_file():
+            raise RepoLocalConfigError(f"no such config file: {path}")
+        load_repo_local_config_from_path(path)
+    except RepoLocalConfigError as exc:
+        return subprocess.CompletedProcess(
+            argv, CONFIG_CHECK_PARSE_REJECTED, stdout="", stderr=str(exc)
+        )
+    return subprocess.CompletedProcess(argv, 0, stdout="parsed", stderr="")
+
+
 class _HerdrRunner:
     """Route the driven subprocess calls of a public command hermetically (#14097).
 
@@ -209,6 +239,14 @@ class _HerdrRunner:
             return subprocess.CompletedProcess(
                 list(argv), 0, stdout=_attest_launcher_capability_help(), stderr=""
             )
+        if list(argv[1:3]) == list(CONFIG_PARSE_SUBCOMMAND):
+            # Redmine #14258 R4: the launcher preflight makes the candidate launcher parse the
+            # target config with its OWN grammar. In-process there is no wheel binary to exec,
+            # so run THIS build's parser — which is exactly what the installed binary would do,
+            # since the harness's launcher IS this build. Answering with the real verdict (not a
+            # canned 0) keeps the harness honest: a config this build rejects is reported
+            # rejected here too.
+            return _config_check_parse_result(list(argv))
         if head in ("sh", "/bin/sh", "bash", "/bin/bash"):
             # ``require_tmux`` runs ``sh -c 'command -v tmux'``; report tmux absent so a
             # misrouted send fails closed exactly as a pure-herdr session would.

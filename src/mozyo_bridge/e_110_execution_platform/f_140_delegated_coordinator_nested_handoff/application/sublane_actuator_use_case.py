@@ -243,7 +243,7 @@ class SublaneActuateUseCase:
         # 4b. Pre-mutation admission: runtime fingerprint (#13705) + managed-launch launcher
         # compatibility (#14258), before the worktree. Includes ``--no-dispatch``.
         if execute:
-            gate_outcome = pre_mutation_admission(
+            request, gate_outcome = pre_mutation_admission(
                 self, request, launch_action=launch.action, dispatch=dispatch,
                 fill_decision=fill_decision_token, fill_override_reason=fill_override_reason,
             )

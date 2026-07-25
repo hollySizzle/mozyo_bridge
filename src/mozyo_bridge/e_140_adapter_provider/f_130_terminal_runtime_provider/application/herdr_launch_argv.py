@@ -171,6 +171,37 @@ def build_attest_capability_probe_argv(launcher: str) -> list[str]:
     return [launcher, *ATTEST_WRAPPER_SUBCOMMAND, "--help"]
 
 
+#: The read-only subcommand the launcher preflight runs to make a candidate launcher parse
+#: a target repo's config with its OWN grammar (Redmine #14258 review j#87752 R4). Named
+#: here, beside the wrapper subcommand, for the same lockstep reason: the argv the preflight
+#: builds and the token the source advertises must never drift from the command the CLI
+#: actually registers.
+CONFIG_PARSE_SUBCOMMAND: tuple[str, ...] = ("config", "check-parse")
+
+#: Exit code that subcommand returns when it REJECTS the document (as opposed to ``0`` for
+#: "parses" or anything else for a mechanical failure). Mirrors
+#: ``cli_config.CONFIG_CHECK_PARSE_REJECTED``; a drift guard pins the two together.
+CONFIG_PARSE_REJECTED_EXIT = 2
+
+
+def build_config_parse_probe_argv(launcher: str, config_path: str) -> list[str]:
+    """The argv that makes ``launcher`` parse ``config_path`` with its own grammar (pure).
+
+    Redmine #14258 R4. Every *summary* of the config grammar is a proxy, and a proxy was
+    measured insufficient: commit ``d28e59e2`` added the nested ``lane_placement.by_lane_kind``
+    key while leaving the supported version set and the top-level key set untouched, so a
+    launcher predating it advertises an identical contract and still rejects the config as an
+    unknown nested key. The only authority that can answer "can THIS launcher read THAT
+    config" is the launcher's own parser, so the preflight hands it the exact target bytes
+    and reads the exit code (:data:`CONFIG_PARSE_REJECTED_EXIT` = rejected).
+
+    Read-only on both sides: the subcommand parses and returns without writing, and the path
+    is one the caller owns (for a lane this run will create, the committed blob at the pinned
+    base commit materialized to a temporary file) — never the launcher's own repo.
+    """
+    return [launcher, *CONFIG_PARSE_SUBCOMMAND, "--file", config_path]
+
+
 def _provider_command(
     *,
     workspace_id: str,
@@ -392,6 +423,9 @@ __all__ = (
     "MOZYO_BRIDGE_LAUNCHER_ENV",
     "MOZYO_PROVIDER_ARGV0_ENV",
     "build_agent_start_argv",
+    "CONFIG_PARSE_REJECTED_EXIT",
+    "CONFIG_PARSE_SUBCOMMAND",
     "build_attest_capability_probe_argv",
+    "build_config_parse_probe_argv",
     "resolve_attest_launcher",
 )

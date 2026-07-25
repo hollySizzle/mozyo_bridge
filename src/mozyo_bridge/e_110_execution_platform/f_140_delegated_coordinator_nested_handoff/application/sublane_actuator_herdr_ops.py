@@ -253,7 +253,7 @@ class HerdrSublaneActuatorOps:
         )
 
     def preflight_launcher_compatibility(
-        self, *, base_ref: str, lane_runtime_root: str, from_base_ref: bool
+        self, *, base_commit: str, lane_runtime_root: str, from_base_ref: bool
     ) -> tuple[bool, str, str]:
         """Verify the managed-launch launcher BEFORE the first worktree / process (#14258)."""
         return evaluate_launcher_compatibility(
@@ -264,10 +264,14 @@ class HerdrSublaneActuatorOps:
             store_home=mozyo_bridge_home(),
             replacement_action_id=self.replacement_action_id,
             committed_blob=self._git().committed_blob,
-            base_ref=base_ref,
+            base_commit=base_commit,
             lane_runtime_root=lane_runtime_root,
             from_base_ref=from_base_ref,
         )
+
+    def resolve_base_commit(self, ref: str) -> str:
+        """The lane base as a single immutable commit SHA, or ``""`` (Redmine #14258 R1)."""
+        return self._git().resolve_commit(ref)
 
     def create_worktree(
         self, *, branch: str, worktree_path: str, base_ref: Optional[str] = None
