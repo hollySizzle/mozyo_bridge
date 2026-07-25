@@ -33,12 +33,13 @@ from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
 from mozyo_bridge.core.state.startup_execution_events import (
+    JOIN_EXEC_STOPPED_LOCATOR_LIVE,
     JOIN_INVENTORY_UNREADABLE,
     JOIN_NOT_APPLICABLE,
     JOIN_POST_EXEC_LOCATOR_ABSENT,
     JOIN_PROVIDER_LIVE_CONFIRMED,
+    JOIN_PROVIDER_LIVE_EXEC_UNRECORDED,
     REASON_STARTUP_EVIDENCE_UNATTRIBUTED,
-    REASON_STARTUP_EVIDENCE_UNAVAILABLE,
     STAGE_NO_EVIDENCE,
     StartupEvidenceVerdict,
     classify_startup_evidence,
@@ -59,6 +60,60 @@ STATUS_AUTHORITY_UNAVAILABLE = "authority_unavailable"
 #: The action was read and its evidence (present or absent) is reported.
 STATUS_OK = "ok"
 
+#: Action-level provider-liveness roll-up (Redmine #14456). Folded from the SAME
+#: per-participant verdicts printed below, so the summary can never disagree with the
+#: rows. It exists so a pair launch's three interesting outcomes are readable without the
+#: operator re-deriving them from two participant lines: every participant confirmed live,
+#: only some (the partial pair), or none.
+LIVENESS_ALL_LIVE = "all_live"
+#: At least one participant is a confirmed live success and at least one is not — the
+#: partial pair. Never reported as a whole-action success or a whole-action failure.
+LIVENESS_PARTIAL = "partial"
+#: No participant is a confirmed live success, and at least one of them is determinately
+#: not live (a readable inventory without its locator, or an exec the evidence says
+#: stopped) — the vanished / exited case.
+LIVENESS_NONE_LIVE = "none_live"
+#: Liveness could not be determined for any participant (the inventory was unreadable, or
+#: every verdict is an evidence gap). Fail-closed: never collapsed into
+#: :data:`LIVENESS_NONE_LIVE`, which would read as "they all died".
+LIVENESS_INDETERMINATE = "indeterminate"
+#: The action recorded no participants at all — nothing was launched to be live.
+LIVENESS_NO_PARTICIPANTS = "no_participants"
+
+#: The joins that mean "this participant's provider is confirmed live". Both rest on the
+#: same live-inventory observation; they differ only in whether the exec row corroborates
+#: it (see :data:`JOIN_PROVIDER_LIVE_EXEC_UNRECORDED`). Membership — not the stage token —
+#: is what makes a participant a terminal success, so a dropped stage row cannot demote a
+#: running provider and, equally, :data:`JOIN_EXEC_STOPPED_LOCATOR_LIVE` cannot promote a
+#: reused locator into one.
+_LIVE_SUCCESS_JOINS: frozenset[str] = frozenset(
+    {JOIN_PROVIDER_LIVE_CONFIRMED, JOIN_PROVIDER_LIVE_EXEC_UNRECORDED}
+)
+
+
+def _roll_up_liveness(
+    participants: Sequence["ParticipantStartupStatus"], *, inventory_readable: bool
+) -> str:
+    """Fold the per-participant verdicts into one action-level liveness token.
+
+    Liveness comes from the live inventory and nowhere else, so an unreadable inventory
+    makes EVERY participant indeterminate — reported as such rather than as
+    :data:`LIVENESS_NONE_LIVE`. With a readable inventory each participant is determinate
+    (its locator is either observed or not), so the remaining fold is a plain count over
+    :data:`_LIVE_SUCCESS_JOINS`. Evidence completeness deliberately does not enter here:
+    that is what ``inventory_join`` / ``evidence_gap`` carry per row.
+    """
+    if not participants:
+        return LIVENESS_NO_PARTICIPANTS
+    if not inventory_readable:
+        return LIVENESS_INDETERMINATE
+    live = sum(1 for p in participants if p.live_success)
+    if live == len(participants):
+        return LIVENESS_ALL_LIVE
+    if live == 0:
+        return LIVENESS_NONE_LIVE
+    return LIVENESS_PARTIAL
+
 #: Per-participant next actions, keyed by the joined evidence verdict. Fixed operator
 #: instructions — no value is ever interpolated in.
 _NEXT_ACTION_BY_JOIN: dict[str, str] = {
@@ -71,14 +126,32 @@ _NEXT_ACTION_BY_JOIN: dict[str, str] = {
         "converge this action with `mozyo-bridge herdr session-rollback --action-id "
         "<id>` (read-only by default) before relaunching the slot"
     ),
+    JOIN_PROVIDER_LIVE_EXEC_UNRECORDED: (
+        "the provider is live at the locator this action launched, so the launch "
+        "succeeded; its exec-call event was not recorded (a dropped best-effort append, "
+        "NOT a stop before exec), so the stage below is the last row that landed rather "
+        "than the last step that ran. No recovery is needed for this participant"
+    ),
+    JOIN_EXEC_STOPPED_LOCATOR_LIVE: (
+        "this participant's own evidence records the exec call stopping (read "
+        "`last_stage` / `bounded_reason`) while the locator is live, so the live pane is "
+        "NOT this launch's provider — treat the locator as reused, not as a successful "
+        "launch, and converge this action with `mozyo-bridge herdr session-rollback "
+        "--action-id <id>` (read-only by default)"
+    ),
     JOIN_INVENTORY_UNREADABLE: (
         "the live inventory could not be read, so liveness is unknown (NOT absent); "
         "re-run `mozyo-bridge doctor` once the herdr transport answers, then re-read "
         "this status"
     ),
     JOIN_NOT_APPLICABLE: (
-        "the wrapper stopped before the provider exec call; read `last_stage` for the "
-        "step it reached and `bounded_reason` for why — no liveness conclusion applies"
+        "no exec-call event is recorded for this participant and nothing is live at its "
+        "locator, so no liveness conclusion applies; read `last_stage` for the furthest "
+        "step that was recorded and `bounded_reason` for why. A missing exec row is not "
+        "by itself proof the wrapper stopped before the exec call — the appends are "
+        "best-effort and one can be lost — so classify from the action's own "
+        "participants (`herdr session-rollback --action-id <id>`, read-only by default) "
+        "rather than from the absence alone"
     ),
 }
 
@@ -104,6 +177,16 @@ class ParticipantStartupStatus:
     bounded_reason: str
     next_action: str
 
+    @property
+    def live_success(self) -> bool:
+        """Whether this participant's provider is a CONFIRMED live launch (#14456).
+
+        Derived from :data:`_LIVE_SUCCESS_JOINS`, never from ``last_stage``: the stage is
+        only as complete as the best-effort appends that survived, so reading success off
+        it is what under-reported a running provider in the first place.
+        """
+        return self.inventory_join in _LIVE_SUCCESS_JOINS
+
     def as_payload(self) -> dict[str, Any]:
         return {
             "role": self.role,
@@ -114,6 +197,7 @@ class ParticipantStartupStatus:
             "inventory_join": self.inventory_join,
             "evidence_gap": self.evidence_gap,
             "bounded_reason": self.bounded_reason,
+            "live_success": self.live_success,
             "next_action": self.next_action,
         }
 
@@ -129,6 +213,10 @@ class StartupStatusReport:
     workspace_id: str = ""
     lane_id: str = ""
     participants: tuple[ParticipantStartupStatus, ...] = ()
+    #: Action-level fold of the participants' liveness (Redmine #14456). Empty on a
+    #: report that never got as far as reading participants (unknown action /
+    #: unreadable authority), where no liveness claim of any kind is appropriate.
+    provider_liveness: str = ""
 
     @property
     def ok(self) -> bool:
@@ -142,6 +230,7 @@ class StartupStatusReport:
             "phase": self.phase,
             "workspace_id": self.workspace_id,
             "lane_id": self.lane_id,
+            "provider_liveness": self.provider_liveness,
             "participants": [p.as_payload() for p in self.participants],
         }
 
@@ -191,20 +280,36 @@ def build_startup_status(
             participant=participant.assigned_name,
             sole_participant=sole_participant,
         )
+        live_locator_observed = participant.locator in live
         if unattributed_only:
+            # The rows cannot be placed on THIS participant, so the timeline stays a gap.
+            # The live-inventory observation is independent of that attribution (it joins
+            # on this participant's own locator, recorded in the action authority), so it
+            # still decides the liveness verdict — otherwise a legacy-row action would
+            # keep reporting a running provider as pre-exec, the very #14456 defect.
             verdict = StartupEvidenceVerdict(
                 last_stage=STAGE_NO_EVIDENCE,
-                inventory_join=JOIN_NOT_APPLICABLE,
+                inventory_join=(
+                    JOIN_PROVIDER_LIVE_EXEC_UNRECORDED
+                    if (inventory_readable and live_locator_observed)
+                    else JOIN_NOT_APPLICABLE
+                ),
                 evidence_gap=True,
                 bounded_reason=REASON_STARTUP_EVIDENCE_UNATTRIBUTED,
             )
         else:
             verdict = classify_startup_evidence(
                 scoped,
-                live_locator_observed=participant.locator in live,
+                live_locator_observed=live_locator_observed,
                 inventory_readable=inventory_readable,
             )
-        if verdict.last_stage == STAGE_NO_EVIDENCE:
+        # The no-evidence guidance applies only when the absence is ALL that was
+        # concluded. When a live locator carried the verdict anyway, the join's own
+        # instruction is the accurate one and must win.
+        if (
+            verdict.last_stage == STAGE_NO_EVIDENCE
+            and verdict.inventory_join == JOIN_NOT_APPLICABLE
+        ):
             next_action = _NEXT_ACTION_NO_EVIDENCE
         else:
             next_action = _NEXT_ACTION_BY_JOIN.get(verdict.inventory_join, "")
@@ -228,6 +333,9 @@ def build_startup_status(
         workspace_id=action.unit.workspace_id,
         lane_id=action.unit.lane_id,
         participants=tuple(participants),
+        provider_liveness=_roll_up_liveness(
+            participants, inventory_readable=inventory_readable
+        ),
     )
 
 
@@ -240,6 +348,7 @@ def _render_text(report: StartupStatusReport) -> str:
     lines.append(
         f"  phase: {report.phase} workspace={report.workspace_id} lane={report.lane_id}"
     )
+    lines.append(f"  provider liveness: {report.provider_liveness}")
     if not report.participants:
         lines.append("  (this action recorded no participants — nothing was launched)")
         return "\n".join(lines)
@@ -252,12 +361,17 @@ def _render_text(report: StartupStatusReport) -> str:
             line += f" locator={participant.locator}"
         if participant.closed:
             line += " closed=yes"
+        if participant.live_success:
+            line += " live=yes"
         lines.append(line)
         if participant.bounded_reason:
             lines.append(f"      reason: {participant.bounded_reason}")
         if participant.evidence_gap:
+            # The specific token is already on the `reason:` line above; naming one fixed
+            # token here would misreport the other gap kinds (unattributed rows, a
+            # dropped exec row) as an unreadable projection.
             lines.append(
-                f"      evidence gap: {REASON_STARTUP_EVIDENCE_UNAVAILABLE} "
+                "      evidence gap: this participant's stage timeline is incomplete "
                 "(missing evidence is not proof of what happened)"
             )
         if participant.next_action:
@@ -341,6 +455,11 @@ def register_herdr_startup_status_parser(sub) -> None:
 
 
 __all__ = (
+    "LIVENESS_ALL_LIVE",
+    "LIVENESS_INDETERMINATE",
+    "LIVENESS_NONE_LIVE",
+    "LIVENESS_NO_PARTICIPANTS",
+    "LIVENESS_PARTIAL",
     "STATUS_ACTION_UNKNOWN",
     "STATUS_AUTHORITY_UNAVAILABLE",
     "STATUS_OK",

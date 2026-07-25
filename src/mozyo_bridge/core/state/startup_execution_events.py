@@ -59,6 +59,7 @@ against a live inventory observation (:func:`classify_startup_evidence`).
 from __future__ import annotations
 
 import sqlite3
+import time
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -156,6 +157,24 @@ JOIN_PROVIDER_LIVE_CONFIRMED = "provider_live_confirmed"
 #: failing between ``exec`` and process registration is not resolvable from this
 #: evidence alone.
 JOIN_POST_EXEC_LOCATOR_ABSENT = "post_exec_locator_absent"
+#: The locator IS confirmed live in a readable inventory, but this participant's
+#: ``provider_exec_call_reached`` row was never recorded (Redmine #14456). A live locator
+#: cannot exist without the exec having happened, so the honest reading is "the launch
+#: succeeded and the projection has a hole" — NOT ``not_applicable`` / "the wrapper
+#: stopped before the provider exec call", which is what the pre-#14456 fold reported and
+#: which is positively false about a running provider. This is a terminal-success join,
+#: peer of :data:`JOIN_PROVIDER_LIVE_CONFIRMED`, kept as its own token so the strength of
+#: the evidence behind the verdict stays visible: live-confirmed carries the exec row,
+#: this one carries only the inventory observation. It rests on exactly the same
+#: locator-identity join as :data:`JOIN_PROVIDER_LIVE_CONFIRMED` and inherits its one
+#: assumption — that the live row at this locator is this action's generation.
+JOIN_PROVIDER_LIVE_EXEC_UNRECORDED = "provider_live_exec_unrecorded"
+#: This participant's own evidence records the exec call being REJECTED or FAILING, yet
+#: the locator is live (Redmine #14456). The two cannot both describe this participant's
+#: provider, so the live row belongs to something else — a reused locator. Reported as
+#: its own contradiction rather than collapsed into ``not_applicable`` (which would hide
+#: that a live pane is being mistaken for this launch) and never as a success.
+JOIN_EXEC_STOPPED_LOCATOR_LIVE = "exec_stopped_locator_live"
 #: The live inventory itself could not be read — never conflated with "absent".
 JOIN_INVENTORY_UNREADABLE = "inventory_unreadable"
 #: The exec call was never reached (or no events exist at all) — the join has nothing
@@ -174,11 +193,33 @@ STAGE_NO_EVIDENCE = "no_evidence"
 #: and the gap itself — not a false "wrapper never ran" — is what is reported.
 REASON_STARTUP_EVIDENCE_UNAVAILABLE = "startup_evidence_unavailable"
 
+#: Total wall-clock budget one :func:`append_execution_event` call may spend waiting out
+#: LOCK CONTENTION on the shared store lock (Redmine #14456). The fence's lock is
+#: ``LOCK_EX | LOCK_NB``, so a sibling wrapper holding it for its own single-row write
+#: made the loser's append fail instantly and — because the append is best-effort — that
+#: stage was lost FOREVER. A pair launch runs two wrappers appending 5 stages each into
+#: one store within a few milliseconds of each other, so the collision is not exotic: it
+#: was measured on 15 of 21 real pair actions, and the row it most often destroyed was
+#: ``provider_exec_call_reached``, which is exactly what made a live provider project as
+#: a pre-exec stop. The budget is small and bounded on purpose — the wrapper's
+#: never-block-the-boot contract is unchanged, an exhausted budget still returns
+#: ``False`` rather than raising, and the holder can only ever be another single-row
+#: write (or a dead process, whose flock the kernel releases).
+APPEND_BUSY_RETRY_BUDGET_SECONDS = 0.25
+#: Pause between contended attempts. Sized well under the budget so the whole window is
+#: retried many times; a contended holder finishes in about a millisecond.
+APPEND_BUSY_RETRY_SLEEP_SECONDS = 0.002
+
 #: Legacy (v1, pre-participant) rows exist for this action but cannot be attributed to
 #: THIS participant of a multi-participant action (Redmine #14222 j#85125 F1). Reported
 #: as its own honest gap — never guessed onto a participant, never silently read as
 #: "no evidence at all".
 REASON_STARTUP_EVIDENCE_UNATTRIBUTED = "startup_evidence_unattributed"
+
+#: The exec-call row is missing from an otherwise-present timeline while the locator is
+#: live (Redmine #14456) — names the hole that :data:`JOIN_PROVIDER_LIVE_EXEC_UNRECORDED`
+#: was derived over, so the verdict is never mistaken for fully-evidenced.
+REASON_STARTUP_EVIDENCE_EXEC_UNRECORDED = "startup_evidence_exec_unrecorded"
 
 
 @dataclass(frozen=True)
@@ -246,15 +287,28 @@ def append_execution_event(
     *,
     bounded_reason: str = "",
     participant: str = "",
+    busy_retry_budget_seconds: float = APPEND_BUSY_RETRY_BUDGET_SECONDS,
+    sleep=None,
+    monotonic=None,
 ) -> bool:
     """Best-effort append of one execution-stage event. Never raises.
 
     Returns ``True`` on a landed append, ``False`` on ANY failure — an unrecognized
-    ``stage``, lock contention, a damaged/absent store, or a write error. An append
-    failure must never stop the provider boot (the wrapper's existing never-block
+    ``stage``, unresolved lock contention, a damaged/absent store, or a write error. An
+    append failure must never stop the provider boot (the wrapper's existing never-block
     contract, mirrored from :func:`.herdr_identity_attestation.
     record_identity_attestation`); the read side treats missing/incomplete evidence as
     its own typed gap, never as proof of what did or did not happen.
+
+    **Contention is retried, everything else is not (Redmine #14456).** The store lock is
+    non-blocking (``LOCK_EX | LOCK_NB``), so before this fix the loser of a two-wrapper
+    race dropped its stage permanently and silently — the measured cause of a live
+    provider projecting as a pre-exec stop. Only :class:`StartupTransactionBusy` is
+    retried, inside :data:`APPEND_BUSY_RETRY_BUDGET_SECONDS`; a damaged store, an
+    unreserved action, or a write error is returned as ``False`` immediately, because no
+    amount of waiting changes those. ``sleep`` / ``monotonic`` / ``busy_retry_budget_seconds``
+    are injectable so the retry is testable without real time. Retrying does NOT make the
+    append reliable — it narrows a race — so every read-side gap contract still holds.
 
     ``participant`` is the appending wrapper's own assigned name (Redmine #14222
     j#85125 F1) — the identity a multi-participant action's read side scopes by. An
@@ -271,27 +325,42 @@ def append_execution_event(
     normalized_id = _norm(action_id)
     if not normalized_id:
         return False
-    try:
-        with fence._hold():
-            with fence._connection("rw") as conn:
-                conn.execute(EXECUTION_EVENTS_TABLE_SQL)
-                _ensure_participant_column(conn)
-                conn.execute(
-                    "INSERT INTO startup_execution_events "
-                    "(action_id, stage, bounded_reason, recorded_at, format_version, "
-                    "participant) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        normalized_id,
-                        token,
-                        _norm(bounded_reason),
-                        _utc_now(),
-                        STARTUP_EXECUTION_EVENTS_FORMAT_VERSION,
-                        _norm(participant),
-                    ),
-                )
-        return True
-    except (StartupTransactionError, StartupTransactionBusy, sqlite3.DatabaseError, OSError):
-        return False
+    clock = monotonic if monotonic is not None else time.monotonic
+    pause = sleep if sleep is not None else time.sleep
+    deadline = clock() + max(float(busy_retry_budget_seconds), 0.0)
+    while True:
+        try:
+            with fence._hold():
+                with fence._connection("rw") as conn:
+                    conn.execute(EXECUTION_EVENTS_TABLE_SQL)
+                    _ensure_participant_column(conn)
+                    conn.execute(
+                        "INSERT INTO startup_execution_events "
+                        "(action_id, stage, bounded_reason, recorded_at, format_version, "
+                        "participant) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            normalized_id,
+                            token,
+                            _norm(bounded_reason),
+                            _utc_now(),
+                            STARTUP_EXECUTION_EVENTS_FORMAT_VERSION,
+                            _norm(participant),
+                        ),
+                    )
+            return True
+        except StartupTransactionBusy:
+            # Contention only: a sibling wrapper holds the non-blocking lock for its own
+            # single-row write. Wait it out inside the bounded budget rather than losing
+            # the stage forever. `StartupTransactionBusy` subclasses
+            # `StartupTransactionError`, so this clause MUST stay above the terminal one.
+            remaining = deadline - clock()
+            if remaining <= 0:
+                return False
+            pause(min(APPEND_BUSY_RETRY_SLEEP_SECONDS, remaining))
+        except (StartupTransactionError, sqlite3.DatabaseError, OSError):
+            # Not contention (damaged/absent store, unreserved action, write error) —
+            # waiting cannot change the outcome, so fail fast and stay best-effort.
+            return False
 
 
 def read_execution_events(
@@ -351,10 +420,13 @@ class StartupEvidenceVerdict:
 
     ``last_stage`` is the most-advanced recorded stage, or :data:`STAGE_NO_EVIDENCE`
     when the events read is ``None`` or empty. ``inventory_join`` is one of
-    :data:`JOIN_PROVIDER_LIVE_CONFIRMED` / :data:`JOIN_POST_EXEC_LOCATOR_ABSENT` /
-    :data:`JOIN_INVENTORY_UNREADABLE` / :data:`JOIN_NOT_APPLICABLE`. ``evidence_gap``
-    is ``True`` whenever the projection itself is missing (table absent / unreadable
-    store) — distinct from a genuinely empty, readable projection.
+    :data:`JOIN_PROVIDER_LIVE_CONFIRMED` / :data:`JOIN_PROVIDER_LIVE_EXEC_UNRECORDED` /
+    :data:`JOIN_POST_EXEC_LOCATOR_ABSENT` / :data:`JOIN_EXEC_STOPPED_LOCATOR_LIVE` /
+    :data:`JOIN_INVENTORY_UNREADABLE` / :data:`JOIN_NOT_APPLICABLE`. ``evidence_gap`` is
+    ``True`` whenever the projection is missing or INCOMPLETE for the verdict drawn —
+    the table is absent / the store unreadable, or (Redmine #14456) liveness had to be
+    concluded from the inventory because the exec row is not there. It is the signal that
+    the verdict rests on less than a full timeline; it is never set for a complete one.
     """
 
     last_stage: str
@@ -414,25 +486,53 @@ def classify_startup_evidence(
     """Pure policy: derive a typed evidence verdict from events + a live-inventory join.
 
     No I/O. ``events`` is the result of :func:`read_execution_events` (``None`` /
-    empty tuple / ordered non-empty tuple, all handled distinctly). The inventory join
-    is only ever computed relative to :data:`STAGE_PROVIDER_EXEC_CALL_REACHED` — an
-    exec call that was rejected or failed, or that was never reached, has nothing to
-    join against a live locator (the wrapper never got far enough to hand off to the
-    provider), so ``inventory_join`` is :data:`JOIN_NOT_APPLICABLE` in every one of
-    those cases regardless of the ``live_locator_observed`` value passed in.
+    empty tuple / ordered non-empty tuple, all handled distinctly).
+
+    Two independent facts are folded: the recorded stages, and whether the locator is
+    observed live in a READABLE inventory. Neither is allowed to silently override the
+    other (Redmine #14456 — the pre-#14456 fold consulted the live observation only when
+    :data:`STAGE_PROVIDER_EXEC_CALL_REACHED` had been recorded, so a launch whose exec row
+    was dropped by a lock race reported ``not_applicable`` / "stopped before exec" about a
+    demonstrably running provider):
+
+    - exec recorded + live -> :data:`JOIN_PROVIDER_LIVE_CONFIRMED` (unchanged, #14231);
+    - exec recorded + absent / unreadable -> :data:`JOIN_POST_EXEC_LOCATOR_ABSENT` /
+      :data:`JOIN_INVENTORY_UNREADABLE` (unchanged, and an unreadable inventory still
+      takes precedence over any ``live_locator_observed`` value);
+    - exec NOT recorded, no explicit stop, locator live ->
+      :data:`JOIN_PROVIDER_LIVE_EXEC_UNRECORDED` with ``evidence_gap`` set: a terminal
+      success carrying an explicit hole, rather than a false pre-exec verdict;
+    - exec explicitly rejected / failed + locator live ->
+      :data:`JOIN_EXEC_STOPPED_LOCATOR_LIVE`: a typed contradiction, never a success;
+    - anything else with no live observation -> :data:`JOIN_NOT_APPLICABLE`, exactly as
+      before.
+
+    ``last_stage`` always reports what was actually recorded. An unrecorded stage is
+    never invented to make a timeline look complete — the gap is reported instead.
     """
+    # A live locator in a READABLE inventory is a direct observation, independent of how
+    # complete the append-only timeline happens to be. It is what lets the folds below
+    # tell "the wrapper stopped before exec" apart from "the exec row was dropped".
+    live_confirmed = inventory_readable and live_locator_observed
     if events is None:
         return StartupEvidenceVerdict(
             last_stage=STAGE_NO_EVIDENCE,
-            inventory_join=JOIN_NOT_APPLICABLE,
+            inventory_join=(
+                JOIN_PROVIDER_LIVE_EXEC_UNRECORDED if live_confirmed else JOIN_NOT_APPLICABLE
+            ),
             evidence_gap=True,
             bounded_reason=REASON_STARTUP_EVIDENCE_UNAVAILABLE,
         )
     if not events:
         return StartupEvidenceVerdict(
             last_stage=STAGE_NO_EVIDENCE,
-            inventory_join=JOIN_NOT_APPLICABLE,
-            evidence_gap=False,
+            inventory_join=(
+                JOIN_PROVIDER_LIVE_EXEC_UNRECORDED if live_confirmed else JOIN_NOT_APPLICABLE
+            ),
+            evidence_gap=live_confirmed,
+            bounded_reason=(
+                REASON_STARTUP_EVIDENCE_EXEC_UNRECORDED if live_confirmed else ""
+            ),
         )
     last = events[-1]
     reached_exec = any(e.stage == STAGE_PROVIDER_EXEC_CALL_REACHED for e in events)
@@ -440,7 +540,31 @@ def classify_startup_evidence(
         e.stage in (STAGE_PROVIDER_EXEC_REJECTED, STAGE_PROVIDER_EXEC_FAILED)
         for e in events
     )
-    if not reached_exec or exec_explicitly_stopped:
+    if exec_explicitly_stopped:
+        # This participant's OWN rows say the exec did not hand off. That is positive
+        # evidence and it outranks a live locator, which in this combination cannot be
+        # this participant's provider (#14456) — surfaced as the contradiction it is,
+        # never promoted to a success. The recorded reason (e.g. `argv0_alias_unbound`)
+        # is preserved: it is more specific than anything this fold could add.
+        return StartupEvidenceVerdict(
+            last_stage=last.stage,
+            inventory_join=(
+                JOIN_EXEC_STOPPED_LOCATOR_LIVE if live_confirmed else JOIN_NOT_APPLICABLE
+            ),
+            evidence_gap=False,
+            bounded_reason=last.bounded_reason,
+        )
+    if not reached_exec:
+        # No exec row and no explicit stop. If the locator is live the exec demonstrably
+        # happened and the row was lost (the #14456 defect); otherwise there is genuinely
+        # nothing to say about liveness and the pre-#14456 verdict stands unchanged.
+        if live_confirmed:
+            return StartupEvidenceVerdict(
+                last_stage=last.stage,
+                inventory_join=JOIN_PROVIDER_LIVE_EXEC_UNRECORDED,
+                evidence_gap=True,
+                bounded_reason=REASON_STARTUP_EVIDENCE_EXEC_UNRECORDED,
+            )
         return StartupEvidenceVerdict(
             last_stage=last.stage,
             inventory_join=JOIN_NOT_APPLICABLE,
@@ -462,12 +586,17 @@ def classify_startup_evidence(
 
 
 __all__ = (
+    "APPEND_BUSY_RETRY_BUDGET_SECONDS",
+    "APPEND_BUSY_RETRY_SLEEP_SECONDS",
     "EXECUTION_EVENTS_TABLE_SQL",
     "EXECUTION_EVENT_STAGES",
+    "JOIN_EXEC_STOPPED_LOCATOR_LIVE",
     "JOIN_INVENTORY_UNREADABLE",
     "JOIN_NOT_APPLICABLE",
     "JOIN_POST_EXEC_LOCATOR_ABSENT",
     "JOIN_PROVIDER_LIVE_CONFIRMED",
+    "JOIN_PROVIDER_LIVE_EXEC_UNRECORDED",
+    "REASON_STARTUP_EVIDENCE_EXEC_UNRECORDED",
     "REASON_STARTUP_EVIDENCE_UNATTRIBUTED",
     "REASON_STARTUP_EVIDENCE_UNAVAILABLE",
     "STAGE_ATTESTATION_WRITE_FAILED",

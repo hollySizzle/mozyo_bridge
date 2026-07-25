@@ -28,10 +28,13 @@ from pathlib import Path
 
 from mozyo_bridge.core.state.startup_execution_events import (
     EXECUTION_EVENT_STAGES,
+    JOIN_EXEC_STOPPED_LOCATOR_LIVE,
     JOIN_INVENTORY_UNREADABLE,
     JOIN_NOT_APPLICABLE,
     JOIN_POST_EXEC_LOCATOR_ABSENT,
     JOIN_PROVIDER_LIVE_CONFIRMED,
+    JOIN_PROVIDER_LIVE_EXEC_UNRECORDED,
+    REASON_STARTUP_EVIDENCE_EXEC_UNRECORDED,
     REASON_STARTUP_EVIDENCE_UNAVAILABLE,
     STAGE_ATTESTATION_WRITE_FAILED,
     STAGE_ATTESTATION_WRITE_SUCCEEDED,
@@ -65,6 +68,14 @@ class ExecutionEventProjectionTest(unittest.TestCase):
 
     def _reserve(self, nonce: str = "n1"):
         return self.fence.reserve(self.unit, nonce)
+
+    def _sibling_fence(self) -> StartupTransactionFence:
+        """A second fence over the SAME store — the sibling wrapper's view of the lock.
+
+        `_hold()` nests on the instance that already holds it, so contention can only be
+        modelled by a distinct instance (as two wrapper processes are).
+        """
+        return StartupTransactionFence(home=self.home)
 
     # -- optionality / additivity ----------------------------------------------
 
@@ -185,6 +196,86 @@ class ExecutionEventProjectionTest(unittest.TestCase):
             [e.stage for e in events_b], [STAGE_PROVIDER_EXEC_CALL_REACHED]
         )
 
+    # -- append_execution_event: contention is retried, nothing else is (#14456) ----
+
+    def test_append_lands_while_the_lock_is_briefly_held_by_a_sibling(self):
+        """Redmine #14456 root cause: the loser of a two-wrapper race lost its stage.
+
+        The fence lock is `LOCK_EX | LOCK_NB`, so a sibling holding it for its own
+        single-row write made this append fail instantly and forever. Driven through the
+        REAL lock, not a stubbed error: the holder is a SEPARATE fence instance over the
+        same store, because `_hold()` is reentrant per instance and a same-instance
+        holder would never contend (which is exactly how the first version of this probe
+        passed vacuously). Two wrapper processes are two instances.
+        """
+        action = self._reserve()
+        holder = self._sibling_fence()._hold()
+        holder.__enter__()
+        released = []
+
+        def _release_after_first_wait(_seconds):
+            if not released:
+                holder.__exit__(None, None, None)
+                released.append(True)
+
+        ok = append_execution_event(
+            self.fence,
+            action.action_id,
+            STAGE_PROVIDER_EXEC_CALL_REACHED,
+            sleep=_release_after_first_wait,
+        )
+        self.assertTrue(released, "the probe never contended -- it proves nothing")
+        self.assertTrue(ok)
+        events = read_execution_events(self.fence, action.action_id)
+        self.assertEqual(
+            [e.stage for e in events], [STAGE_PROVIDER_EXEC_CALL_REACHED]
+        )
+
+    def test_append_gives_up_when_the_lock_is_never_released(self):
+        """Bounded: a permanently held lock still returns False and never raises."""
+        action = self._reserve()
+        with self._sibling_fence()._hold():
+            ticks = iter([0.0, 0.01, 0.02, 99.0])
+            ok = append_execution_event(
+                self.fence,
+                action.action_id,
+                STAGE_WRAPPER_ENTERED,
+                sleep=lambda _s: None,
+                monotonic=lambda: next(ticks),
+            )
+        self.assertFalse(ok)
+
+    def test_append_does_not_retry_a_non_contention_failure(self):
+        """A damaged store cannot be waited out -- it must fail fast, not spin."""
+        action = self._reserve()
+        self.fence.seal_path.unlink()
+        slept = []
+        ok = append_execution_event(
+            self.fence,
+            action.action_id,
+            STAGE_WRAPPER_ENTERED,
+            sleep=lambda s: slept.append(s),
+        )
+        self.assertFalse(ok)
+        self.assertEqual(slept, [], "a damaged store must not be retried")
+
+    def test_append_retry_never_sleeps_past_its_budget(self):
+        action = self._reserve()
+        with self._sibling_fence()._hold():
+            slept = []
+            ticks = iter([0.0, 0.0, 0.0, 100.0])
+            append_execution_event(
+                self.fence,
+                action.action_id,
+                STAGE_WRAPPER_ENTERED,
+                busy_retry_budget_seconds=0.001,
+                sleep=lambda s: slept.append(s),
+                monotonic=lambda: next(ticks),
+            )
+        self.assertTrue(slept)
+        for pause in slept:
+            self.assertLessEqual(pause, 0.001)
+
     def test_every_vocabulary_stage_is_appendable(self):
         action = self._reserve()
         for stage in EXECUTION_EVENT_STAGES:
@@ -221,14 +312,26 @@ class ClassifyStartupEvidenceTest(unittest.TestCase):
         self.assertEqual(verdict.last_stage, STAGE_NO_EVIDENCE)
         self.assertFalse(verdict.evidence_gap)
 
-    def test_stopped_before_exec_is_not_applicable_join(self):
+    def test_stopped_before_exec_with_no_live_locator_is_not_applicable_join(self):
+        # A pre-exec stage AND nothing live: there is genuinely no liveness conclusion
+        # to draw. (Before #14456 this verdict was also returned when the locator WAS
+        # live -- see StoppedBeforeExecWithLiveLocatorTest for that case.)
         events = (self._event(STAGE_WRAPPER_ENTERED),)
         verdict = classify_startup_evidence(
-            events, live_locator_observed=True, inventory_readable=True
+            events, live_locator_observed=False, inventory_readable=True
         )
         self.assertEqual(verdict.last_stage, STAGE_WRAPPER_ENTERED)
         self.assertEqual(verdict.inventory_join, JOIN_NOT_APPLICABLE)
         self.assertFalse(verdict.evidence_gap)
+
+    def test_stopped_before_exec_with_unreadable_inventory_is_not_applicable(self):
+        # An unreadable inventory is not a live observation, so it can never promote a
+        # pre-exec timeline -- not even when a (nonsensical) True is passed alongside it.
+        events = (self._event(STAGE_WRAPPER_ENTERED),)
+        verdict = classify_startup_evidence(
+            events, live_locator_observed=True, inventory_readable=False
+        )
+        self.assertEqual(verdict.inventory_join, JOIN_NOT_APPLICABLE)
 
     def test_explicit_exec_rejection_overrides_reached_flag(self):
         events = (
@@ -236,10 +339,27 @@ class ClassifyStartupEvidenceTest(unittest.TestCase):
             self._event(STAGE_PROVIDER_EXEC_REJECTED, seq=2, reason="argv0_alias_unbound"),
         )
         verdict = classify_startup_evidence(
-            events, live_locator_observed=True, inventory_readable=True
+            events, live_locator_observed=False, inventory_readable=True
         )
         self.assertEqual(verdict.last_stage, STAGE_PROVIDER_EXEC_REJECTED)
         self.assertEqual(verdict.inventory_join, JOIN_NOT_APPLICABLE)
+        self.assertEqual(verdict.bounded_reason, "argv0_alias_unbound")
+
+    def test_explicit_exec_rejection_is_never_promoted_by_a_live_locator(self):
+        # #14456: a live locator must NOT turn an evidenced exec rejection into a
+        # success. It is reported as the contradiction it is (the live pane belongs to
+        # something else), keeping the recorded reason.
+        events = (
+            self._event(STAGE_PROVIDER_EXEC_CALL_REACHED, seq=1),
+            self._event(STAGE_PROVIDER_EXEC_REJECTED, seq=2, reason="argv0_alias_unbound"),
+        )
+        verdict = classify_startup_evidence(
+            events, live_locator_observed=True, inventory_readable=True
+        )
+        self.assertEqual(verdict.inventory_join, JOIN_EXEC_STOPPED_LOCATOR_LIVE)
+        self.assertNotEqual(verdict.inventory_join, JOIN_PROVIDER_LIVE_CONFIRMED)
+        self.assertNotEqual(verdict.inventory_join, JOIN_PROVIDER_LIVE_EXEC_UNRECORDED)
+        self.assertEqual(verdict.last_stage, STAGE_PROVIDER_EXEC_REJECTED)
         self.assertEqual(verdict.bounded_reason, "argv0_alias_unbound")
 
     def test_exec_reached_and_live_locator_is_confirmed(self):
@@ -268,6 +388,69 @@ class ClassifyStartupEvidenceTest(unittest.TestCase):
             events, live_locator_observed=True, inventory_readable=False
         )
         self.assertEqual(verdict2.inventory_join, JOIN_INVENTORY_UNREADABLE)
+
+    def test_live_locator_without_an_exec_row_is_a_terminal_success_not_pre_exec(self):
+        """Redmine #14456: the exact shape observed on the live pair launch.
+
+        The wrapper's `attestation_write_succeeded` / `provider_exec_call_reached`
+        appends were dropped by lock contention, leaving `self_lookup_succeeded` last,
+        while the provider was demonstrably running at the locator. The pre-#14456 fold
+        answered `not_applicable` ("the wrapper stopped before the provider exec call")
+        about a live provider.
+        """
+        events = (
+            self._event(STAGE_WRAPPER_ENTERED, seq=1),
+            self._event(STAGE_SELF_LOOKUP_SUCCEEDED, seq=2),
+        )
+        verdict = classify_startup_evidence(
+            events, live_locator_observed=True, inventory_readable=True
+        )
+        self.assertEqual(verdict.inventory_join, JOIN_PROVIDER_LIVE_EXEC_UNRECORDED)
+        self.assertNotEqual(verdict.inventory_join, JOIN_NOT_APPLICABLE)
+        # The hole is declared rather than papered over...
+        self.assertTrue(verdict.evidence_gap)
+        self.assertEqual(
+            verdict.bounded_reason, REASON_STARTUP_EVIDENCE_EXEC_UNRECORDED
+        )
+        # ...and no stage that was never recorded is invented to hide it.
+        self.assertEqual(verdict.last_stage, STAGE_SELF_LOOKUP_SUCCEEDED)
+
+    def test_live_locator_with_no_evidence_at_all_is_still_a_terminal_success(self):
+        """A store predating the projection still must not under-report a live pane."""
+        for events in (None, ()):
+            with self.subTest(events=events):
+                verdict = classify_startup_evidence(
+                    events, live_locator_observed=True, inventory_readable=True
+                )
+                self.assertEqual(
+                    verdict.inventory_join, JOIN_PROVIDER_LIVE_EXEC_UNRECORDED
+                )
+                self.assertEqual(verdict.last_stage, STAGE_NO_EVIDENCE)
+                self.assertTrue(verdict.evidence_gap)
+
+    def test_no_evidence_without_a_live_locator_keeps_its_14231_verdict(self):
+        """Non-regression: the #14231 contract is untouched where nothing is live."""
+        gap = classify_startup_evidence(
+            None, live_locator_observed=False, inventory_readable=True
+        )
+        self.assertEqual(gap.inventory_join, JOIN_NOT_APPLICABLE)
+        self.assertTrue(gap.evidence_gap)
+        self.assertEqual(gap.bounded_reason, REASON_STARTUP_EVIDENCE_UNAVAILABLE)
+        empty = classify_startup_evidence(
+            (), live_locator_observed=False, inventory_readable=True
+        )
+        self.assertEqual(empty.inventory_join, JOIN_NOT_APPLICABLE)
+        self.assertFalse(empty.evidence_gap)
+        self.assertEqual(empty.bounded_reason, "")
+
+    def test_fully_evidenced_live_launch_reports_no_gap(self):
+        """The two live joins are distinguishable: only the derived one flags a gap."""
+        events = (self._event(STAGE_PROVIDER_EXEC_CALL_REACHED),)
+        verdict = classify_startup_evidence(
+            events, live_locator_observed=True, inventory_readable=True
+        )
+        self.assertEqual(verdict.inventory_join, JOIN_PROVIDER_LIVE_CONFIRMED)
+        self.assertFalse(verdict.evidence_gap)
 
     def test_last_stage_is_the_most_advanced_recorded(self):
         events = (
