@@ -121,10 +121,17 @@ _STORES_RE = re.compile(
 #    (measured on the v7 store vs a v6 reader, #14258 j#85890).
 #
 # Both were previously invisible to the preflight, so the pair was created and only then
-# failed. They are advertised the same way as the store set — declared, wrap-proof tokens —
-# so the join is a *declaration* check rather than the incidental exit-code discriminant
-# #14231 relies on. That matters beyond honesty: a declaration can be verified BEFORE the
-# lane worktree exists, which is what lets `sublane create` refuse without creating one.
+# failed. They are verified by DIFFERENT means, and the difference is load-bearing:
+#
+# - the lane lifecycle is a *declaration* join — the launcher advertises the reader schemas it
+#   understands, and that set is joined against the store's recorded shape;
+# - the config is a *direct measurement* — the launcher's own parser is run against the exact
+#   target bytes. Every summary of the grammar was measured insufficient (#14258 j#87752 R4),
+#   so what a launcher advertises about config is only that it can be ASKED.
+#
+# What they share is the property that made them worth adopting: both can be evaluated BEFORE
+# the lane worktree exists, which is what lets `sublane create` refuse without creating one —
+# unlike the incidental exit-code discriminant #14231 relies on.
 
 #: The version of the read-only config-parse contract this launcher provides — i.e. that it
 #: registers ``config check-parse --file <path>`` and answers with the documented exit codes
@@ -538,6 +545,13 @@ TARGET_CONFIG_INVALID = "target_config_invalid"
 #: The launcher advertises no read-only config-parse contract (any pre-#14258 build), so it
 #: cannot be asked whether it can read the target. Unprovable fails closed.
 LAUNCHER_CONFIG_VALIDATOR_ABSENT = "launcher_config_validator_absent"
+#: The bytes the lane will actually receive could not be established, so no parser — this
+#: runtime's or the launcher's — could be asked the real question. Distinct from
+#: :data:`TARGET_CONFIG_INVALID` because the config may be perfectly valid: what is unknown is
+#: whether a checkout transforms it (consultation j#87807 — collapsing the two told the
+#: operator their config was broken and that changing the launcher would not help, when
+#: neither was true and the real action was neither).
+TARGET_CONFIG_UNVERIFIABLE = "target_config_unverifiable"
 #: The launcher's own parser REJECTED the exact target bytes — the direct measurement.
 LAUNCHER_CANNOT_PARSE_TARGET_CONFIG = "launcher_cannot_parse_target_config"
 #: The launcher advertises the contract but its validator could not be run / answered with
@@ -576,6 +590,9 @@ CONFIG_PARSE_SELF_REJECTED = "config_parse_self_rejected"
 CONFIG_PARSE_LAUNCHER_REJECTED = "config_parse_launcher_rejected"
 #: The launcher's validator could not be run, or answered outside the contract.
 CONFIG_PARSE_LAUNCHER_UNUSABLE = "config_parse_launcher_unusable"
+#: The document the lane will receive could not be established at all — not because it is
+#: broken, but because a checkout may transform it (Redmine #14258, consultation j#87807).
+CONFIG_PARSE_TARGET_UNVERIFIABLE = "config_parse_target_unverifiable"
 
 
 @dataclass(frozen=True)
@@ -632,6 +649,14 @@ def decide_config_parse_compatibility(
             CONFIG_JOIN_OK,
             "the target repo declares no repo-local config, so the launcher parses none",
         )
+    if config.state == CONFIG_PARSE_TARGET_UNVERIFIABLE:
+        return LauncherCapabilityVerdict(
+            False,
+            TARGET_CONFIG_UNVERIFIABLE,
+            f"the repo-local config the lane would receive could not be established, so "
+            f"nothing was created rather than verifying a document the lane may never see: "
+            f"{config.launcher_detail or 'the materialized bytes are not knowable here'}",
+        )
     if config.state == CONFIG_PARSE_SELF_REJECTED:
         return LauncherCapabilityVerdict(
             False,
@@ -684,21 +709,19 @@ def decide_config_parse_compatibility(
 class TargetSchemaObservation:
     """The schema shape of an authority the LAUNCHER must read (Redmine #14258).
 
-    One value type for both target-scoped authorities — the repo's config record and the
-    home-scoped shared lane lifecycle store — because the join is the same shape in both
-    cases: what is actually there, versus what the launcher declared it can read.
+    Used by the lane lifecycle join only. It once served the config axis too, back when that
+    axis compared advertised summaries; the config axis now measures the exact bytes directly
+    (#14258 j#87752 R4), so this type describes a *declared* authority shape and nothing else.
 
     ``state`` is one of :data:`TARGET_SCHEMA_ABSENT` / :data:`TARGET_SCHEMA_DECLARED` /
     :data:`TARGET_SCHEMA_UNREADABLE` / :data:`TARGET_SCHEMA_UNSUPPORTED`. ``version`` is the
-    declared / recorded schema version when one could be read; ``keys`` carries the config
-    record's present top-level keys (config only); ``upgrade_required`` distinguishes "the
+    recorded schema version when one could be read; ``upgrade_required`` distinguishes "the
     authority is newer than THIS runtime" from "the authority is corrupt", so a refusal names
     the operator's real next action instead of dishonestly suggesting an upgrade.
     """
 
     state: str
     version: Optional[int] = None
-    keys: Optional[frozenset] = None
     upgrade_required: bool = False
 
 
@@ -787,6 +810,7 @@ __all__ = (
     "CONFIG_PARSE_LAUNCHER_REJECTED",
     "CONFIG_PARSE_LAUNCHER_UNUSABLE",
     "CONFIG_PARSE_SELF_REJECTED",
+    "CONFIG_PARSE_TARGET_UNVERIFIABLE",
     "CONFIG_PARSE_TARGET_ABSENT",
     "ConfigParseObservation",
     "LAUNCHER_CANNOT_PARSE_TARGET_CONFIG",
@@ -798,6 +822,7 @@ __all__ = (
     "LIFECYCLE_UNREADABLE",
     "LIFECYCLE_UNSUPPORTED",
     "TARGET_CONFIG_INVALID",
+    "TARGET_CONFIG_UNVERIFIABLE",
     "TARGET_SCHEMA_ABSENT",
     "TARGET_SCHEMA_DECLARED",
     "TARGET_SCHEMA_UNREADABLE",

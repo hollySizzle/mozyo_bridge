@@ -86,6 +86,51 @@ _FORCE_AMBIGUITY_WARNING: tuple[str, ...] = ("-c", "core.warnAmbiguousRefs=true"
 BLOB_PRESENT = "blob_present"
 BLOB_ABSENT = "blob_absent"
 BLOB_REF_UNRESOLVABLE = "blob_ref_unresolvable"
+#: The path exists at the ref but is NOT a regular file, so its blob content is not what a
+#: checkout materializes (Redmine #14258 R13). A symlink's blob holds its *target string*; a
+#: submodule's holds a commit id. Measuring either would verify bytes the lane never presents.
+BLOB_NOT_REGULAR = "blob_not_regular"
+
+#: The path is tracked as a regular file, but the pinned commit's attributes can TRANSFORM it
+#: on checkout, so the blob is not provably the materialized bytes (Redmine #14258, design
+#: consultation j#87804). Measured: a `filter=inject` smudge filter turned an admissible
+#: `version: 2` blob into an invalid `version: [` in the new worktree while the tree entry
+#: stayed an ordinary `100644 blob`.
+BLOB_MAY_BE_TRANSFORMED = "blob_may_be_transformed"
+
+#: Whether a checkout would transform the path could not be ESTABLISHED — the read-only
+#: attribute query was unavailable, failed, or answered incompletely. Fail-closed like
+#: :data:`BLOB_MAY_BE_TRANSFORMED`, but a distinct fact: saying "a conversion applies" here
+#: would assert something unobserved (consultation j#87811), and the operator's real action is
+#: different (make the query answerable, not neutralize an attribute that may not exist).
+BLOB_TRANSFORM_UNKNOWN = "blob_transform_unknown"
+
+#: Tri-state answers from :meth:`LiveSublaneGitOperations._checkout_transform_state`.
+TRANSFORM_NONE = "transform_none"
+TRANSFORM_APPLIES = "transform_applies"
+TRANSFORM_UNKNOWN = "transform_unknown"
+
+#: The attributes that can make a checkout differ from the blob. Their MATCHING is delegated
+#: to `git check-attr --source=<pinned commit>` rather than modelled here — the gitattributes
+#: pattern rules are exactly the kind of external-tool rule this issue has repeatedly been
+#: wrong about (#14258 R8 / R9).
+_CONTENT_TRANSFORM_ATTRS: tuple[str, ...] = (
+    "filter",
+    "text",
+    "eol",
+    "ident",
+    "working-tree-encoding",
+)
+
+#: `check-attr` values that mean "no transformation": unset explicitly, or never mentioned.
+_INERT_ATTR_VALUES: frozenset = frozenset({"unspecified", "unset"})
+
+#: The tree-entry modes whose blob content IS the bytes a checkout writes. Anything else is
+#: reported as :data:`BLOB_NOT_REGULAR` rather than read: this is the whole premise of the
+#: pre-worktree config measurement, and it was measured false for a symlink — the gate read
+#: the link payload, called it compatible, and `git worktree add` then materialized a
+#: different, unverified document (review j#87796 R13).
+_REGULAR_BLOB_MODES: frozenset = frozenset({"100644", "100755"})
 
 
 # ---------------------------------------------------------------------------
@@ -387,15 +432,72 @@ class LiveSublaneGitOperations:
         commit = lines[0]
         return commit if _FULL_SHA_RE.fullmatch(commit) else ""
 
+    def _checkout_transform_state(self, ref: str, relpath: str) -> str:
+        """True iff ``ref``'s attributes could make a checkout of ``relpath`` differ (#14258).
+
+        The blob equals the materialized bytes only when nothing transforms it, so this is
+        the second half of "is this text what the lane will present" — the first being the
+        entry's mode. Attribute *matching* is asked of git, at the pinned tree
+        (``check-attr --source``), because that is the committed ``.gitattributes`` a new
+        worktree will check out and apply.
+
+        Reading the bytes through ``cat-file --filters`` instead was measured WRONG and is
+        deliberately not used: it resolves attributes from the working tree / index, so a
+        repo whose committed ``.gitattributes`` assigns a filter that the current checkout
+        lacks got the raw blob from ``--filters`` and a transformed file from
+        ``git worktree add``. Comparing the two attribute sources does not rescue it either —
+        ``check-attr`` falls back to the index, so it reports agreement in exactly that case.
+
+        Three answers, not two (consultation j#87811). Both non-``TRANSFORM_NONE`` outcomes
+        fail closed, but they are different facts and the operator's action differs: a
+        conversion that was *observed* is neutralized for that path, whereas a query that
+        could not be *answered* — an unsupported Git, an unreadable repo, a short reply — is
+        repaired by making the query answerable. Reporting the second as the first would
+        assert something never observed.
+        """
+        result = self._run(
+            "check-attr",
+            f"--source={ref}",
+            *_CONTENT_TRANSFORM_ATTRS,
+            "--",
+            relpath,
+        )
+        if result.returncode != 0:
+            return TRANSFORM_UNKNOWN
+        reported = 0
+        applies = False
+        for line in (result.stdout or "").splitlines():
+            # `<path>: <attr>: <value>` — the value is what decides, and the path may itself
+            # contain ": ", so the split is anchored from the RIGHT.
+            if ": " not in line:
+                continue
+            reported += 1
+            if line.rsplit(": ", 1)[-1].strip() not in _INERT_ATTR_VALUES:
+                applies = True
+        # Every attribute must have been answered; a short answer is an unanswered question.
+        if reported < len(_CONTENT_TRANSFORM_ATTRS):
+            return TRANSFORM_UNKNOWN
+        return TRANSFORM_APPLIES if applies else TRANSFORM_NONE
+
     def committed_blob(self, *, ref: str, relpath: str) -> tuple[str, str]:
         """Read a committed file's text at ``ref`` without checking anything out (#14258).
 
         Returns ``(state, text)`` where ``state`` is :data:`BLOB_PRESENT` (text is the blob),
-        :data:`BLOB_ABSENT` (the ref resolves and the path is simply not tracked there), or
+        :data:`BLOB_ABSENT` (the ref resolves and the path is simply not tracked there),
+        :data:`BLOB_NOT_REGULAR` (it is tracked but not a regular file), or
         :data:`BLOB_REF_UNRESOLVABLE` (the ref itself could not be read — nothing about the
         path is knowable). The presence question is answered by ``ls-tree`` rather than by
         interpreting ``git show``'s failure text, so "no such path at this ref" and "no such
         ref" are never conflated into one fail-open "absent".
+
+        **The entry's MODE is part of the answer, not just its existence** (review j#87796
+        R13). The caller's premise is that this text is what a checkout will materialize, and
+        that premise holds only for a regular blob. For a symlink the blob holds the *link
+        target string*; measured, a base whose ``.mozyo-bridge/config.yaml`` was a symlink had
+        the gate read the link payload, judge it compatible, and then ``git worktree add``
+        materialized a different, unverified document — the unverified-config-in-a-new-worktree
+        outcome this whole gate exists to prevent. A non-regular entry is therefore reported as
+        such and never read as content; the caller fails closed on it before any mutation.
 
         The ``sublane create`` launcher gate needs this: the lane worktree does not exist when
         the gate must refuse, and the config the lane will get is the blob at its base ref —
@@ -405,12 +507,23 @@ class LiveSublaneGitOperations:
         listed = self._run("ls-tree", ref, "--", relpath)
         if listed.returncode != 0:
             return BLOB_REF_UNRESOLVABLE, ""
-        if not listed.stdout.strip():
+        entry = listed.stdout.strip()
+        if not entry:
             return BLOB_ABSENT, ""
+        # `ls-tree` renders `<mode> SP <type> SP <object> TAB <path>`; the mode is the first
+        # field and is what decides whether the blob equals the materialized bytes.
+        mode = entry.split(None, 1)[0] if entry.split(None, 1) else ""
+        if mode not in _REGULAR_BLOB_MODES:
+            return BLOB_NOT_REGULAR, ""
+        transform = self._checkout_transform_state(ref, relpath)
+        if transform == TRANSFORM_APPLIES:
+            return BLOB_MAY_BE_TRANSFORMED, ""
+        if transform != TRANSFORM_NONE:
+            return BLOB_TRANSFORM_UNKNOWN, ""
         shown = self._run("show", f"{ref}:{relpath}")
         if shown.returncode != 0:
-            # Listed but unreadable (a submodule / non-blob entry, or a git failure): the
-            # content is unknowable, which is not the same as absent.
+            # Listed but unreadable (a git failure): the content is unknowable, which is not
+            # the same as absent.
             return BLOB_REF_UNRESOLVABLE, ""
         return BLOB_PRESENT, shown.stdout
 
@@ -439,7 +552,13 @@ class LiveSublaneGitOperations:
 
 __all__ = (
     "BLOB_ABSENT",
+    "BLOB_MAY_BE_TRANSFORMED",
+    "BLOB_NOT_REGULAR",
+    "BLOB_TRANSFORM_UNKNOWN",
     "BLOB_PRESENT",
+    "TRANSFORM_APPLIES",
+    "TRANSFORM_NONE",
+    "TRANSFORM_UNKNOWN",
     "BLOB_REF_UNRESOLVABLE",
     "policy_from_config",
     "SublaneGitOperations",

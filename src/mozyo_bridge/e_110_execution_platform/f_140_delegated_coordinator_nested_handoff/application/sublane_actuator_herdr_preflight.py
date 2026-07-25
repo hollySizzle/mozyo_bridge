@@ -34,7 +34,10 @@ from typing import Callable, Mapping, Optional
 from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (  # noqa: E501
     BLOB_ABSENT,
+    BLOB_MAY_BE_TRANSFORMED,
+    BLOB_NOT_REGULAR,
     BLOB_PRESENT,
+    BLOB_TRANSFORM_UNKNOWN,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     REASON_LAUNCHER_INCOMPATIBLE,
@@ -159,8 +162,11 @@ def read_lane_target_config_text(
     from mozyo_bridge.application.repo_local_config_loader import CONFIG_FILE_RELPATH
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
         CONFIG_TEXT_ABSENT,
-        CONFIG_TEXT_PRESENT,
+        CONFIG_TEXT_NOT_REGULAR,
+        CONFIG_TEXT_TRANSFORM_UNKNOWN,
+        CONFIG_TEXT_TRANSFORM_UNVERIFIABLE,
         CONFIG_TEXT_UNREADABLE,
+        classify_config_text,
         read_target_config_text,
     )
 
@@ -175,9 +181,24 @@ def read_lane_target_config_text(
     state, text = committed_blob(ref=pinned, relpath=str(CONFIG_FILE_RELPATH))
     if state == BLOB_ABSENT:
         return CONFIG_TEXT_ABSENT, None
+    if state == BLOB_MAY_BE_TRANSFORMED:
+        # A checkout conversion applies to the path: the document may be entirely valid, so
+        # this must NOT be reported as a broken config (consultation j#87807). It travels as
+        # its own state all the way to the public refusal.
+        return CONFIG_TEXT_TRANSFORM_UNVERIFIABLE, None
+    if state == BLOB_TRANSFORM_UNKNOWN:
+        # Unknown, not observed (j#87811): the public cause must not claim a conversion.
+        return CONFIG_TEXT_TRANSFORM_UNKNOWN, None
+    if state == BLOB_NOT_REGULAR:
+        # A symlink's object is its target string and a submodule's is a commit id, so neither
+        # is the document a checkout writes. Same class as the transform case, and reported
+        # with its own cause rather than as a broken config (j#87809).
+        return CONFIG_TEXT_NOT_REGULAR, None
     if state != BLOB_PRESENT:
         return CONFIG_TEXT_UNREADABLE, None
-    return (CONFIG_TEXT_PRESENT, text) if text.strip() else (CONFIG_TEXT_ABSENT, None)
+    # The SAME "declares nothing" authority the session-start path uses (#14258 R14), so a
+    # comment-only config cannot be absent on one path and present on the other.
+    return classify_config_text(text)
 
 
 def evaluate_launcher_compatibility(

@@ -19,10 +19,11 @@ schema, and can write the store shape on disk. None of them asks whether the lau
 
 What #14258 adds, and what these pins characterize:
 
-1. both capabilities are **advertised** (``mozyo_attest_capability_config`` /
-   ``_config_keys`` / ``_lifecycle``) and joined against the real target, so the answer is a
-   declaration rather than #14231's incidental "the launcher happens to exit non-zero in that
-   cwd" — which is what makes it answerable *before* the lane worktree exists;
+1. the two axes are verified by different means, both answerable *before* the lane worktree
+   exists (unlike #14231's incidental "the launcher happens to exit non-zero in that cwd"):
+   the lane lifecycle is a **declaration join** (``mozyo_attest_capability_lifecycle``), while
+   the config is a **direct measurement** — the launcher's own parser is run over the exact
+   target bytes, because every summary of the grammar was measured insufficient (j#87752 R4);
 2. the join fails closed on every unprovable axis (no advertisement, an unreadable /
    unsupported target) and admits the compatible case;
 3. the whole conjunction runs at the ``sublane create`` pre-worktree gate, so an incompatible
@@ -39,6 +40,7 @@ Characterization only; the fix lives in ``herdr_launcher_capability.py`` (the pu
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import stat
@@ -1262,24 +1264,767 @@ class R11WindowsPathRedactionTest(unittest.TestCase):
                 self.assertNotIn(REDACTED_PROBE_PATH, out)
 
 
-class R12ContractTextConsistencyTest(unittest.TestCase):
-    """R12: the config axis is a direct measurement, and the prose must not say otherwise."""
+class R13SymlinkMaterializationTest(unittest.TestCase):
+    """R13: the measured bytes must be the bytes a checkout materializes."""
 
-    def test_no_surviving_declaration_join_claim_for_the_config_axis(self) -> None:
-        import inspect
+    def _hazard_repo(self, root: Path) -> tuple[Path, str]:
+        """A base whose config is a SYMLINK, with the link payload a valid config document.
 
+        The shape that reaches an admit: `git show` returns the link *target string*, which
+        parses as a fine v2 config, while the checkout writes the linked file's contents — a
+        different, unverified document.
+        """
+        repo = root / "primary"
+        (repo / ".mozyo-bridge").mkdir(parents=True)
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "config", "user.email", "t@example.invalid")
+        _git(repo, "config", "user.name", "t")
+        (repo / ".mozyo-bridge" / "version: 2").write_text(
+            "version: 2\nbogus_top_level: 1\n", encoding="utf-8"
+        )
+        (repo / ".mozyo-bridge" / "config.yaml").symlink_to("version: 2")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "c1")
+        return repo, _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def test_a_non_regular_entry_is_reported_as_such_not_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, sha = self._hazard_repo(Path(tmp))
+            state, text = LiveSublaneGitOperations(repo_root=repo).committed_blob(
+                ref=sha, relpath=".mozyo-bridge/config.yaml"
+            )
+            self.assertEqual(state, "blob_not_regular")
+            self.assertEqual(text, "")
+
+    def test_the_hazard_reaches_a_typed_refusal_with_zero_actuation(self) -> None:
+        """The conjunction the close condition needs, driven through the real use case.
+
+        An earlier version of this test called the read-only helper and then compared refs
+        before/after — which a read-only call cannot change, so it proved nothing about the
+        gate (design consultation j#87802 point 1). This drives ``SublaneActuateUseCase``
+        against a spy port that RAISES on every mutation, so "no worktree, no branch, no pane"
+        is established by the actuation boundary itself rather than by a snapshot.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_use_case import (  # noqa: E501
+            SublaneActuateUseCase,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+            SublaneCreateRequest,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, sha = self._hazard_repo(root)
+            git_ops = LiveSublaneGitOperations(repo_root=repo)
+            calls: list = []
+
+            class _SpyOps:
+                """Every mutating port method raises; the reads are the real git ones."""
+
+                def is_git_workspace(self) -> bool:
+                    return True
+
+                def worktree_exists(self, branch: str) -> bool:
+                    return False
+
+                def resolve_base_commit(self, ref: str) -> str:
+                    return git_ops.resolve_commit(ref)
+
+                def preflight_launcher_compatibility(self, **kwargs):
+                    calls.append("preflight")
+                    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
+                        read_lane_target_config_text,
+                    )
+
+                    state, _ = read_lane_target_config_text(
+                        git_ops.committed_blob,
+                        base_commit=kwargs["base_commit"],
+                        lane_runtime_root=kwargs["lane_runtime_root"],
+                        from_base_ref=kwargs["from_base_ref"],
+                    )
+                    if state != "config_text_present":
+                        return False, "target_config_invalid", "hazard base is not measurable"
+                    return True, "", "ok"
+
+                def create_worktree(self, **kwargs):
+                    raise AssertionError("git worktree add reached on a hazard base")
+
+                def append_lane_column(self, worktree_path: str):
+                    raise AssertionError("pane creation reached on a hazard base")
+
+                def append_lane_argv(self, worktree_path: str) -> list:
+                    return []
+
+                def read_lane(self, worktree_path: str):
+                    raise AssertionError("lane read-back reached on a hazard base")
+
+                def declare_adopted_lane_lifecycle(self, worktree_path: str, *, adopted: bool):
+                    raise AssertionError("lifecycle write reached on a hazard base")
+
+                def probe_gateway_ready(self, gateway_pane: str) -> bool:
+                    return False
+
+                def dispatch_implementation_request(self, **kwargs) -> int:
+                    raise AssertionError("dispatch reached on a hazard base")
+
+            refs_before = _git(repo, "for-each-ref", "--format=%(refname)").stdout
+            worktrees_before = _git(repo, "worktree", "list", "--porcelain").stdout
+
+            outcome = SublaneActuateUseCase(_SpyOps(), gateway_ready_probes=0).run(
+                SublaneCreateRequest(
+                    issue="14258",
+                    lane_label="issue_14258_hazard",
+                    branch="issue_14258_hazard",
+                    worktree_path=str(root / "lane-that-must-not-exist"),
+                    journal="87796",
+                    base_ref=sha,
+                ),
+                execute=True,
+                dispatch=False,
+                target_repo=str(root / "lane-that-must-not-exist"),
+            )
+
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn("launcher_runtime_incompatible", outcome.blocked_reasons)
+            self.assertIn(TARGET_CONFIG_INVALID, outcome.blocked_reasons)
+            self.assertEqual(calls, ["preflight"])
+            # Nothing was created: no worktree directory, and git's own view is unchanged.
+            self.assertFalse((root / "lane-that-must-not-exist").exists())
+            self.assertEqual(
+                _git(repo, "for-each-ref", "--format=%(refname)").stdout, refs_before
+            )
+            self.assertEqual(
+                _git(repo, "worktree", "list", "--porcelain").stdout, worktrees_before
+            )
+
+    def test_the_measured_bytes_would_have_differed_from_the_checkout(self) -> None:
+        # Proves the premise the fix rests on, so the pin is not merely asserting the new
+        # return value: what `git show` yields is NOT what `git worktree add` writes.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, sha = self._hazard_repo(root)
+            shown = _git(repo, "show", f"{sha}:.mozyo-bridge/config.yaml").stdout
+            lane = root / "lane"
+            _git(repo, "worktree", "add", "-q", str(lane), "-b", "lane_x", sha)
+            materialized = (lane / ".mozyo-bridge" / "config.yaml").read_text()
+            self.assertNotEqual(shown.strip(), materialized.strip())
+            self.assertIn("bogus_top_level", materialized)
+
+    def test_a_regular_blob_is_still_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _seed_repo(Path(tmp), _V2_CONFIG)
+            sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+            state, text = LiveSublaneGitOperations(repo_root=repo).committed_blob(
+                ref=sha, relpath=".mozyo-bridge/config.yaml"
+            )
+            self.assertEqual(state, "blob_present")
+            self.assertIn("agents", text)
+
+
+class R13CheckoutTransformTest(unittest.TestCase):
+    """R13 (consultation j#87804): a REGULAR blob can still be transformed at checkout."""
+
+    def _filtered_repo(self, root: Path, attributes: str) -> tuple[Path, str]:
+        repo = root / "primary"
+        (repo / ".mozyo-bridge").mkdir(parents=True)
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "config", "user.email", "t@example.invalid")
+        _git(repo, "config", "user.name", "t")
+        (repo / ".mozyo-bridge" / "config.yaml").write_text(_V2_CONFIG, encoding="utf-8")
+        (repo / ".gitattributes").write_text(attributes + "\n", encoding="utf-8")
+        # A smudge filter that makes the checkout differ from the blob, so the two can be
+        # told apart by measurement rather than by argument.
+        _git(repo, "config", "filter.inject.smudge", 'sed "s/version: 2/version: [/"')
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "c1")
+        return repo, _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def test_the_blob_is_not_the_materialized_bytes_under_a_smudge_filter(self) -> None:
+        # The premise, measured: mode is an ordinary regular blob, yet the checkout differs.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, sha = self._filtered_repo(root, ".mozyo-bridge/config.yaml filter=inject")
+            entry = _git(repo, "ls-tree", sha, "--", ".mozyo-bridge/config.yaml").stdout
+            self.assertTrue(entry.startswith("100644 blob"), entry)
+            raw = _git(repo, "show", f"{sha}:.mozyo-bridge/config.yaml").stdout
+            lane = root / "lane"
+            _git(repo, "worktree", "add", "-q", str(lane), "-b", "lane_x", sha)
+            materialized = (lane / ".mozyo-bridge" / "config.yaml").read_text()
+            self.assertNotEqual(raw, materialized)
+
+    def test_a_transformable_path_is_refused_before_any_mutation(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
+            read_lane_target_config_text,
+        )
+
+        for attributes in (
+            ".mozyo-bridge/config.yaml filter=inject",
+            "* text=auto",  # the common shape; conservative refusal is deliberate
+        ):
+            with self.subTest(attributes=attributes):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    repo, sha = self._filtered_repo(root, attributes)
+                    ops = LiveSublaneGitOperations(repo_root=repo)
+                    self.assertEqual(
+                        ops.committed_blob(
+                            ref=sha, relpath=".mozyo-bridge/config.yaml"
+                        )[0],
+                        "blob_may_be_transformed",
+                    )
+                    state, text = read_lane_target_config_text(
+                        ops.committed_blob,
+                        base_commit=sha,
+                        lane_runtime_root="",
+                        from_base_ref=True,
+                    )
+                    # Distinct from "unreadable" on purpose (consultation j#87807): the
+                    # config may be valid, so the refusal must not claim it is broken.
+                    self.assertEqual(state, "config_text_transform_unverifiable")
+                    self.assertIsNone(text)
+
+    def test_the_attribute_source_is_the_pinned_commit_not_the_working_tree(self) -> None:
+        """The distinction that ruled out ``cat-file --filters`` (consultation j#87804).
+
+        With the attributes committed but deleted from the working tree, ``--filters`` returns
+        the RAW blob while ``git worktree add`` still transforms — so the bytes it reports are
+        not the lane's. This pins that the refusal survives that exact configuration.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, sha = self._filtered_repo(root, ".mozyo-bridge/config.yaml filter=inject")
+            (repo / ".gitattributes").unlink()
+
+            filtered = _git(
+                repo, "cat-file", "--filters",
+                "--path=.mozyo-bridge/config.yaml", f"{sha}:.mozyo-bridge/config.yaml",
+            ).stdout
+            lane = root / "lane"
+            _git(repo, "worktree", "add", "-q", str(lane), "-b", "lane_x", sha)
+            materialized = (lane / ".mozyo-bridge" / "config.yaml").read_text()
+            self.assertNotEqual(
+                filtered, materialized, "this is why --filters is not the authority"
+            )
+            self.assertEqual(
+                LiveSublaneGitOperations(repo_root=repo).committed_blob(
+                    ref=sha, relpath=".mozyo-bridge/config.yaml"
+                )[0],
+                "blob_may_be_transformed",
+            )
+
+    def test_an_untransformed_repo_is_still_read(self) -> None:
+        # The admission side: with no attributes the blob IS the materialized bytes.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = _seed_repo(root, _V2_CONFIG)
+            sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+            state, text = LiveSublaneGitOperations(repo_root=repo).committed_blob(
+                ref=sha, relpath=".mozyo-bridge/config.yaml"
+            )
+            self.assertEqual(state, "blob_present")
+            lane = root / "lane"
+            _git(repo, "worktree", "add", "-q", str(lane), "-b", "lane_x", sha)
+            self.assertEqual(
+                text, (lane / ".mozyo-bridge" / "config.yaml").read_text()
+            )
+
+
+class R13PublicReasonTest(unittest.TestCase):
+    """j#87807 / j#87809: an unverifiable materialization must not read as a broken config.
+
+    Both causes — a checkout conversion (j#87807) and a non-regular entry (j#87809) — are the
+    same class: the bytes the lane will receive cannot be established. Neither may be reported
+    as "your config does not parse", and each must name its own real recovery.
+
+    The reason is produced by the REAL evaluator here, not supplied by a spy (j#87809), so the
+    coverage is of the code that actually runs.
+    """
+
+    def _repo(self, root: Path, *, cause: str) -> tuple[Path, str]:
+        repo = root / "primary"
+        (repo / ".mozyo-bridge").mkdir(parents=True)
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "config", "user.email", "t@example.invalid")
+        _git(repo, "config", "user.name", "t")
+        if cause == "transform":
+            # A PERFECTLY VALID committed config: validity is not what is in question.
+            (repo / ".mozyo-bridge" / "config.yaml").write_text(_V2_CONFIG, encoding="utf-8")
+            (repo / ".gitattributes").write_text(
+                ".mozyo-bridge/config.yaml filter=inject\n", encoding="utf-8"
+            )
+            _git(repo, "config", "filter.inject.smudge", 'sed "s/version: 2/version: [/"')
+        else:
+            (repo / ".mozyo-bridge" / "real.yaml").write_text(_V2_CONFIG, encoding="utf-8")
+            (repo / ".mozyo-bridge" / "config.yaml").symlink_to("real.yaml")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "c1")
+        return repo, _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def _evaluate(self, root: Path, repo: Path, sha: str):
+        """Drive the REAL evaluator — the function the herdr ops adapter delegates to."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
+            evaluate_launcher_compatibility,
+        )
+
+        LaneLifecycleStore(home=root / "home").ensure_schema()
+        return evaluate_launcher_compatibility(
+            env=dict(os.environ),
+            runner=subprocess.run,
+            timeout=60.0,
+            repo_root=repo,
+            store_home=root / "home",
+            replacement_action_id="",
+            committed_blob=LiveSublaneGitOperations(repo_root=repo).committed_blob,
+            base_commit=sha,
+            lane_runtime_root="",
+            from_base_ref=True,
+        )
+
+    def test_both_causes_produce_the_typed_unverifiable_refusal(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            TARGET_CONFIG_UNVERIFIABLE,
+        )
+
+        expectations = {
+            "transform": "checkout conversion",
+            "not_regular": "not a regular file",
+        }
+        for cause, phrase in expectations.items():
+            with self.subTest(cause=cause):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    repo, sha = self._repo(root, cause=cause)
+                    ok, reason, detail = self._evaluate(root, repo, sha)
+
+                    self.assertFalse(ok)
+                    self.assertEqual(reason, TARGET_CONFIG_UNVERIFIABLE)
+                    # It says something TRUE about this repo, and names THIS cause.
+                    self.assertIn(phrase, detail)
+                    self.assertIn("Recovery:", detail)
+                    # The two false claims the collapsed reason used to make.
+                    self.assertNotIn("does not parse under THIS runtime", detail)
+                    self.assertNotIn("changing the launcher will not help", detail)
+                    # No private internals.
+                    for forbidden in (
+                        "filter=inject", "check-attr", "gitattributes", "real.yaml", str(repo)
+                    ):
+                        self.assertNotIn(forbidden, detail)
+
+    def test_the_refusal_reaches_the_actuator_outcome_with_zero_mutation(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_use_case import (  # noqa: E501
+            SublaneActuateUseCase,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+            SublaneCreateRequest,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            TARGET_CONFIG_UNVERIFIABLE,
+        )
+
+        for cause in ("transform", "not_regular"):
+            with self.subTest(cause=cause):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    repo, sha = self._repo(root, cause=cause)
+                    case = self
+                    git_ops = LiveSublaneGitOperations(repo_root=repo)
+
+                    class _Ops:
+                        """Reads are real; the REASON comes from the real evaluator; every
+                        mutation raises."""
+
+                        def is_git_workspace(self) -> bool:
+                            return True
+
+                        def worktree_exists(self, branch: str) -> bool:
+                            return False
+
+                        def resolve_base_commit(self, ref: str) -> str:
+                            return git_ops.resolve_commit(ref)
+
+                        def preflight_launcher_compatibility(self, **kwargs):
+                            return case._evaluate(root, repo, kwargs["base_commit"])
+
+                        def create_worktree(self, **kwargs):
+                            raise AssertionError("worktree created on an unverifiable base")
+
+                        def append_lane_column(self, worktree_path: str):
+                            raise AssertionError("pane created on an unverifiable base")
+
+                        def append_lane_argv(self, worktree_path: str) -> list:
+                            return []
+
+                        def read_lane(self, worktree_path: str):
+                            raise AssertionError("read-back on an unverifiable base")
+
+                        def declare_adopted_lane_lifecycle(self, worktree_path, *, adopted):
+                            raise AssertionError("lifecycle write on an unverifiable base")
+
+                        def probe_gateway_ready(self, gateway_pane: str) -> bool:
+                            return False
+
+                        def dispatch_implementation_request(self, **kwargs) -> int:
+                            raise AssertionError("dispatch on an unverifiable base")
+
+                    lane = root / "must-not-exist"
+                    refs_before = _git(repo, "for-each-ref", "--format=%(refname)").stdout
+                    outcome = SublaneActuateUseCase(_Ops(), gateway_ready_probes=0).run(
+                        SublaneCreateRequest(
+                            issue="14258", lane_label="issue_14258_x",
+                            branch="issue_14258_x", worktree_path=str(lane),
+                            journal="87809", base_ref=sha,
+                        ),
+                        execute=True, dispatch=False, target_repo=str(lane),
+                    )
+                    self.assertTrue(outcome.is_blocked)
+                    self.assertIn(TARGET_CONFIG_UNVERIFIABLE, outcome.blocked_reasons)
+                    self.assertFalse(lane.exists())
+                    self.assertEqual(
+                        _git(repo, "for-each-ref", "--format=%(refname)").stdout, refs_before
+                    )
+
+    def test_an_unanswerable_attribute_query_also_fails_closed(self) -> None:
+        """The fail-closed branch a mutation probe showed nothing pinned.
+
+        `check-attr` failing is not "no attributes" — the question simply went unanswered,
+        and the whole point of this gate is that an unanswered question is a refusal.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _seed_repo(Path(tmp), _V2_CONFIG)
+            sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+            class _QueryFails(LiveSublaneGitOperations):
+                def _run(self, *args):
+                    if args and args[0] == "check-attr":
+                        return subprocess.CompletedProcess(list(args), 128, "", "boom")
+                    return super()._run(*args)
+
+            failing = _QueryFails(repo_root=repo)
+            self.assertEqual(
+                failing._checkout_transform_state(sha, ".mozyo-bridge/config.yaml"),
+                "transform_unknown",
+            )
+            # Refused — but as its OWN fact: an unanswered query is not an observed
+            # conversion (consultation j#87811).
+            self.assertEqual(
+                failing.committed_blob(ref=sha, relpath=".mozyo-bridge/config.yaml")[0],
+                "blob_transform_unknown",
+                "an unanswered attribute query must refuse, not read as 'no attributes'",
+            )
+
+    def test_query_unanswerable_and_observed_conversion_say_different_things(self) -> None:
+        """Both refuse, but the public evidence must not claim an unobserved conversion."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
+            read_lane_target_config_text,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+            CONFIG_PARSE_CONTRACT_VERSION,
+            TARGET_CONFIG_UNVERIFIABLE,
+            decide_config_parse_compatibility,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            measure_config_parse_compatibility,
+        )
+
+        def _detail_for(blob_reader) -> str:
+            state, text = read_lane_target_config_text(
+                blob_reader, base_commit=sha, lane_runtime_root="", from_base_ref=True
+            )
+            observation = measure_config_parse_compatibility(
+                "/bin/true", lambda *a, **k: None, 5.0, {}, state, text
+            )
+            verdict = decide_config_parse_compatibility(
+                _observation(_capable_help()),
+                observation,
+                required_contract_version=CONFIG_PARSE_CONTRACT_VERSION,
+            )
+            self.assertFalse(verdict.ok)
+            self.assertEqual(verdict.reason, TARGET_CONFIG_UNVERIFIABLE)
+            return verdict.detail
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "primary"
+            (repo / ".mozyo-bridge").mkdir(parents=True)
+            _git(repo, "init", "-q", "-b", "main")
+            _git(repo, "config", "user.email", "t@example.invalid")
+            _git(repo, "config", "user.name", "t")
+            (repo / ".mozyo-bridge" / "config.yaml").write_text(_V2_CONFIG, encoding="utf-8")
+            (repo / ".gitattributes").write_text(
+                ".mozyo-bridge/config.yaml filter=inject\n", encoding="utf-8"
+            )
+            _git(repo, "config", "filter.inject.smudge", 'sed "s/version: 2/version: [/"')
+            _git(repo, "add", "-A")
+            _git(repo, "commit", "-qm", "c1")
+            sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+            class _QueryFails(LiveSublaneGitOperations):
+                def _run(self, *args):
+                    if args and args[0] == "check-attr":
+                        return subprocess.CompletedProcess(list(args), 128, "", "boom")
+                    return super()._run(*args)
+
+            observed = _detail_for(LiveSublaneGitOperations(repo_root=repo).committed_blob)
+            unknown = _detail_for(_QueryFails(repo_root=repo).committed_blob)
+
+            self.assertIn("checkout conversion applies", observed)
+            # The unobserved case must NOT claim one was seen.
+            self.assertNotIn("checkout conversion applies", unknown)
+            self.assertIn("could not establish", unknown)
+            self.assertIn("Recovery:", unknown)
+            self.assertNotEqual(observed, unknown)
+
+    def test_the_blob_state_vocabulary_is_fully_exported(self) -> None:
+        # j#87809: `BLOB_NOT_REGULAR` trailed the other states outside `__all__`.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
-            sublane_actuator_herdr_preflight,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
-            herdr_pane_lifecycle,
+            sublane_integration,
         )
 
-        for module in (herdr_pane_lifecycle, sublane_actuator_herdr_preflight):
-            with self.subTest(module=module.__name__):
-                source = inspect.getsource(module)
-                self.assertNotIn("Both are *declaration* joins", source)
-                self.assertNotIn("DECLARED join", source)
+        for name in dir(sublane_integration):
+            if name.startswith("BLOB_"):
+                with self.subTest(state=name):
+                    self.assertIn(name, sublane_integration.__all__)
+
+
+class R14DeclaresNothingTest(unittest.TestCase):
+    """R14: 'declares nothing' is the canonical loader's answer, not a whitespace test."""
+
+    #: The full input class the contract claims, not just the easy member of it. Membership is
+    #: the LOADER's answer, not an intuition about whitespace: a document containing a literal
+    #: tab looked like "whitespace only" to me and is in fact a YAML scanner error, so it
+    #: belongs below with the malformed ones. Delegating settled that instead of my guessing.
+    _NOTHING = (
+        "",
+        "\n",
+        "   \n   \n",
+        "# operator note only\n",
+        "#a\n#b\n",
+        # Canonical YAML empty documents (design consultation j#87802 point 2). Each was
+        # measured against the loader rather than assumed: these are the forms it resolves to
+        # `RepoLocalConfig.default()`.
+        "---\n",
+        "--- \n",
+        "---\n# c\n",
+        "null\n",
+        "~\n",
+    )
+    _SOMETHING = ("version: 2\n", "cli:\n  quiet: true\n")
+    #: Documents that do not parse. Emphatically NOT "nothing" — they are real declarations
+    #: this runtime cannot read, and admitting them would be the opposite of the contract.
+    _MALFORMED = ("version: [1, 2\n", "   \n\t\n", "---\n---\n")
+
+    def test_the_loader_agrees_these_declare_nothing(self) -> None:
+        from mozyo_bridge.application.repo_local_config_loader import (
+            RepoLocalConfigError,
+            parses_as_default_config,
+        )
+
+        for text in self._NOTHING:
+            with self.subTest(text=text[:20]):
+                self.assertTrue(parses_as_default_config(text))
+        for text in self._SOMETHING:
+            with self.subTest(text=text[:20]):
+                self.assertFalse(parses_as_default_config(text))
+        for text in self._MALFORMED:
+            with self.subTest(malformed=text[:20]):
+                with self.assertRaises(RepoLocalConfigError):
+                    parses_as_default_config(text)
+
+    def test_both_call_sites_classify_them_identically(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
+            read_lane_target_config_text,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            read_target_config_text,
+        )
+
+        for text in self._NOTHING:
+            with self.subTest(text=text[:20]):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    (root / ".mozyo-bridge").mkdir()
+                    (root / ".mozyo-bridge" / "config.yaml").write_text(text, encoding="utf-8")
+                    # session-start path (reads the directory)
+                    self.assertEqual(read_target_config_text(root)[0], "config_text_absent")
+                    # committed-blob path (same document, different source)
+                    state, _ = read_lane_target_config_text(
+                        lambda **kw: ("blob_present", text),
+                        base_commit="0" * 40,
+                        lane_runtime_root="",
+                        from_base_ref=True,
+                    )
+                    self.assertEqual(state, "config_text_absent")
+
+    def test_a_comment_only_repo_admits_a_launcher_advertising_nothing(self) -> None:
+        # The compatibility this restores: a repo that declares no schema must not require the
+        # config-parse contract, because an older launcher reads it perfectly well.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "repo" / ".mozyo-bridge").mkdir(parents=True)
+            (root / "repo" / ".mozyo-bridge" / "config.yaml").write_text(
+                "# operator note only\n", encoding="utf-8"
+            )
+            LaneLifecycleStore(home=root / "home").ensure_schema()
+            bare = root / "bare-mozyo-bridge"
+            lines = "".join(
+                f"printf '%s\\n' {line!r}\n"
+                for line in (
+                    f"usage: x [{_MARKER} NAME]",
+                    "mozyo_attest_capability_schema=2",
+                    "mozyo_attest_capability_stores=1_2",
+                    "mozyo_attest_capability_lifecycle=1_2_3_4_5_6_7",
+                )
+            )
+            bare.write_text("#!/bin/sh\n" + lines + "exit 0\n", encoding="utf-8")
+            bare.chmod(bare.stat().st_mode | stat.S_IEXEC)
+            preflight_launcher_compatibility(
+                str(bare), subprocess.run, _TIMEOUT, dict(os.environ),
+                repo_root=root / "repo", store_home=root / "home",
+            )
+
+    def test_a_malformed_document_is_not_nothing(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            classify_config_text,
+        )
+
+        for text in self._MALFORMED:
+            with self.subTest(text=text[:20]):
+                state, kept = classify_config_text(text)
+                self.assertEqual(state, "config_text_present")
+                self.assertIsNotNone(kept)
+
+
+class R15RedactionInputClassTest(unittest.TestCase):
+    """R15: redact every absolute shape (quoted, spaced) and no relative token / URL."""
+
+    def _redact(self, text: str) -> str:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            _redact_probe_paths,
+        )
+
+        return _redact_probe_paths(text, Path("/nonexistent"))
+
+    def test_quoted_absolute_paths_with_spaces_are_redacted_whole(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            REDACTED_PROBE_PATH,
+        )
+
+        backslash = chr(92)
+        drive = "C:" + backslash + backslash.join(("Users", "Ada Smith", "c.yaml"))
+        unc = backslash * 2 + backslash.join(("server", "Ada Share", "c.yaml"))
+        cases = (
+            ("quoted POSIX", "error in '" + macos_home_path("Ada Team", "p", "c.yaml") + "': x"),
+            ("quoted drive", f'error in "{drive}": x'),
+            # UNC with a space (design consultation j#87802 point 3): the third root shape,
+            # not just the two that were easy to write.
+            ("quoted UNC", f'error in "{unc}": x'),
+        )
+        for label, text in cases:
+            with self.subTest(shape=label):
+                out = self._redact(text)
+                self.assertIn(REDACTED_PROBE_PATH, out)
+                # The tail after the space is exactly what the previous rule left behind.
+                for leaked in ("Team", "Smith", "Share", "c.yaml"):
+                    self.assertNotIn(leaked, out)
+
+    def test_a_real_public_exception_carries_no_private_tail(self) -> None:
+        """The end-to-end obligation, not just the pure helper (j#87802 point 3).
+
+        The close condition constrains what an operator actually sees, so the assertion is
+        made on the raised, public exception produced by the real conjunction over a real
+        launcher — with the probe path forced to contain a space, which is the shape that
+        previously survived redaction.
+        """
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            REDACTED_PROBE_PATH,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Ada Team scratch"
+            (root / "repo" / ".mozyo-bridge").mkdir(parents=True)
+            # MALFORMED yaml, not an unknown key: a schema error names no file, so it could
+            # not exercise redaction at all. A parser error names the document, which is the
+            # path that reached the public error before this fix.
+            (root / "repo" / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: [1, 2\n", encoding="utf-8"
+            )
+            LaneLifecycleStore(home=root / "home").ensure_schema()
+            launcher = _current_head_launcher(root)
+            with self.assertRaises(HerdrLauncherIncompatibleError) as caught:
+                preflight_launcher_compatibility(
+                    launcher, subprocess.run, 60.0, dict(os.environ),
+                    repo_root=root / "repo", store_home=root / "home",
+                )
+            message = str(caught.exception)
+            self.assertEqual(caught.exception.reason, TARGET_CONFIG_INVALID)
+            for leaked in (str(root), "Ada Team scratch", "mozyo-config-parse-", str(Path.home())):
+                self.assertNotIn(leaked, message)
+            # The path was there to redact, and the parse reason survived it.
+            self.assertIn(REDACTED_PROBE_PATH, message)
+            self.assertIn("YAML", message)
+
+    def test_relative_tokens_and_urls_are_left_intact(self) -> None:
+        for text in (
+            "unknown key in relative/path.yaml",
+            "expected one of ['down/right'] for split",
+            "see https://example.invalid/docs/schema for the key list",
+            "lane_placement.by_lane_kind must be a mapping",
+        ):
+            with self.subTest(text=text[:36]):
+                self.assertEqual(self._redact(text), text)
+
+
+class R12R16ContractTextConsistencyTest(unittest.TestCase):
+    """R12 / R16: the retired declaration design must not survive anywhere in the subsystem.
+
+    R12's pin looked for two literal strings in two modules, and R16 then found the retired
+    design still stated in a third module, in a value type's docstring, and in this file's own
+    header. A pin narrower than the claim it protects is how that happens, so the surface and
+    the retired vocabulary are both enumerated here and swept together.
+    """
+
+    #: Every file that carries the target-authority contract. Adding a module to the
+    #: subsystem without adding it here is the gap R16 reported, so the list is explicit.
+    _SUBSYSTEM_FILES = (
+        ("src", "mozyo_bridge", "e_140_adapter_provider", "f_130_terminal_runtime_provider",
+         "application", "herdr_launcher_capability.py"),
+        ("src", "mozyo_bridge", "e_140_adapter_provider", "f_130_terminal_runtime_provider",
+         "application", "herdr_pane_lifecycle.py"),
+        ("src", "mozyo_bridge", "e_110_execution_platform",
+         "f_140_delegated_coordinator_nested_handoff", "application",
+         "sublane_actuator_herdr_preflight.py"),
+        ("vibes", "docs", "specs", "herdr-native-identity.md"),
+        ("tests", "regressions", "test_issue_14258_launcher_target_compat.py"),
+    )
+
+    #: Tokens and phrasings of the DESIGN THAT WAS RETIRED by R4. Each was actually present at
+    #: some point, so none is hypothetical — and each is COMPOSED rather than written, because
+    #: this file is itself in the swept set and a literal here would make the sweep fail on its
+    #: own definitions (the self-referential trap that makes a pointer test vacuous).
+    @staticmethod
+    def _retired_vocabulary() -> tuple:
+        cap = "mozyo_attest_capability_config"
+        return (
+            cap + "=",
+            cap + "_keys",
+            "Both are " + "*declaration*" + " joins",
+            "DECLARED" + " join",
+            "declaration" + " rather than",
+        )
+
+    def test_no_retired_declaration_vocabulary_survives_in_the_subsystem(self) -> None:
+        root = _SRC.parent
+        for parts in self._SUBSYSTEM_FILES:
+            path = root.joinpath(*parts)
+            with self.subTest(path=parts[-1]):
+                self.assertTrue(path.is_file(), f"{path} is not in the tree")
+                text = path.read_text(encoding="utf-8")
+                for retired in self._retired_vocabulary():
+                    self.assertNotIn(
+                        retired,
+                        text,
+                        f"{parts[-1]} still states the design R4 retired: {retired!r}",
+                    )
 
     def test_the_spec_describes_the_config_axis_as_a_measurement(self) -> None:
         spec = (_SRC.parent / "vibes" / "docs" / "specs" / "herdr-native-identity.md").read_text(
@@ -1290,6 +2035,14 @@ class R12ContractTextConsistencyTest(unittest.TestCase):
             "config 側の probe は宣言 version と top-level key のみを読み",
             spec,
             "the retired summary-join description must not survive the R4 redesign",
+        )
+
+    def test_the_lifecycle_value_type_no_longer_carries_config_key_state(self) -> None:
+        # The retired design's residue in the type itself (R16): a field the config axis used
+        # to fill and nothing sets any more.
+        self.assertNotIn(
+            "keys",
+            {f.name for f in dataclasses.fields(TargetSchemaObservation)},
         )
 
 
