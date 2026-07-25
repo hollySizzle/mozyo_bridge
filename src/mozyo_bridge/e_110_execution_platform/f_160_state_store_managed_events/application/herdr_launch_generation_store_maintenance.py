@@ -42,6 +42,7 @@ from mozyo_bridge.core.state.herdr_launch_generation import (
     HERDR_LAUNCH_GENERATION_SCHEMA_VERSION,
     HerdrLaunchGenerationStore,
     LaunchGenerationStoreLockBusy,
+    LaunchGenerationStoreLockReleaseError,
     LaunchGenerationStoreLockUnavailable,
     herdr_launch_generation_path,
     launch_generation_store_lock,
@@ -66,6 +67,12 @@ BLOCKED_INVENTORY_UNREADABLE = "blocked_inventory_unreadable"
 BLOCKED_CONSUMERS_UNMEASURABLE = "blocked_consumers_unmeasurable"
 #: Refused: the backup/removal itself failed (the store is left untouched).
 BLOCKED_FAILED = "blocked_failed"
+#: NOT a success: the rebuild body completed (its side effects stand as reported) but the
+#: store lock could not be released, so it may still be held — a subsequent managed write
+#: could stall. Distinct from ``BLOCKED_FAILED`` (which is "nothing removed") because the
+#: rotation truth is preserved, and distinct from ``APPLIED`` because the operation is not
+#: cleanly complete (review j#87512 F1).
+BLOCKED_RELEASE_UNVERIFIED = "blocked_release_unverified"
 
 _OK_STATES = frozenset({STATUS_REPORTED, PLANNED, APPLIED, ALREADY_CURRENT})
 
@@ -344,6 +351,40 @@ def _run_rebuild_locked(
     )
 
 
+def _release_failed_result(
+    body_result: Optional[LaunchGenerationStoreMaintenanceResult], exc: Exception
+) -> LaunchGenerationStoreMaintenanceResult:
+    """Render a rebuild whose BODY completed but whose lock could not be released.
+
+    Phase-aware (review j#87512 F1): the body's side-effect truth is preserved — a completed
+    rotation keeps its ``backup_dir`` / ``executed`` / ``store_state`` — while the release
+    failure is surfaced as a NON-success with a process-exit / retry action. It is neither
+    ``applied`` (the operation is not cleanly complete) nor ``blocked_failed``'s
+    "nothing removed" (that would erase a real rotation).
+    """
+    executed = bool(getattr(body_result, "executed", False))
+    backup_dir = getattr(body_result, "backup_dir", None)
+    store_state = getattr(body_result, "store_state", "")
+    prior = getattr(body_result, "detail", "") or ""
+    side = (
+        f"the rebuild's side effects stand as reported ({prior})"
+        if executed
+        else f"no store artifact was removed ({prior or 'nothing was rotated'})"
+    )
+    return LaunchGenerationStoreMaintenanceResult(
+        intent="rebuild",
+        state=BLOCKED_RELEASE_UNVERIFIED,
+        store_state=store_state,
+        detail=(
+            f"the rebuild completed but the store lock could NOT be released ({exc}); {side}, "
+            f"yet the lock may still be held, so a subsequent managed write could stall. "
+            f"Restart this process (or investigate the home's filesystem), then re-run"
+        ),
+        backup_dir=backup_dir,
+        executed=executed,
+    )
+
+
 def run_launch_generation_store_rebuild(
     *, home: Path, view, write: bool = False
 ) -> LaunchGenerationStoreMaintenanceResult:
@@ -352,15 +393,22 @@ def run_launch_generation_store_rebuild(
     A read-only plan mutates nothing and takes no lock. The ``--write`` path holds the store
     lock EXCLUSIVE (non-blocking) across the whole run — acquired BEFORE the probe — so the
     generation cannot be replaced underneath it and a live managed-launch write can never be
-    clobbered (review j#87488 P1). Contention reports blocked with nothing removed.
+    clobbered (review j#87488 P1). Contention reports blocked with nothing removed; a lock
+    that cannot be RELEASED after the body is a non-success that preserves the body's
+    side-effect truth (review j#87512 F1).
     """
     if not write:
         return _run_rebuild_locked(home=home, view=view, write=False)
+    body_result: Optional[LaunchGenerationStoreMaintenanceResult] = None
     try:
         with launch_generation_store_lock(home, exclusive=True, blocking=False):
-            return _run_rebuild_locked(home=home, view=view, write=True)
+            body_result = _run_rebuild_locked(home=home, view=view, write=True)
+    except LaunchGenerationStoreLockReleaseError as exc:
+        # The body completed (``body_result`` is set) but the lock could not be released.
+        return _release_failed_result(body_result, exc)
     except (LaunchGenerationStoreLockBusy, LaunchGenerationStoreLockUnavailable) as exc:
         return _blocked_by_lock(exc)
+    return body_result
 
 
 def format_maintenance_text(result: LaunchGenerationStoreMaintenanceResult) -> str:
@@ -386,6 +434,7 @@ __all__ = (
     "BLOCKED_CONSUMERS_UNMEASURABLE",
     "BLOCKED_FAILED",
     "BLOCKED_INVENTORY_UNREADABLE",
+    "BLOCKED_RELEASE_UNVERIFIED",
     "BLOCKED_STORE_HEALTHY",
     "PLANNED",
     "STATUS_REPORTED",

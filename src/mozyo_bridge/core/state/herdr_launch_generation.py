@@ -189,6 +189,16 @@ class LaunchGenerationStoreLockUnavailable(RuntimeError):
     """Advisory locking is not available, so the protocol cannot be honored."""
 
 
+class LaunchGenerationStoreLockReleaseError(RuntimeError):
+    """The lock was acquired and the body completed, but the lock could NOT be released.
+
+    Distinct from an acquisition failure (review j#87512 F1): a release failure after a
+    successful body means the OS lock may still be held, so a subsequent managed write
+    (blocking SHARED) could stall. It is surfaced fail-closed — never swallowed as success —
+    because hiding it would report a completed operation while leaking a live lock.
+    """
+
+
 #: Home-scoped advisory lock coordinating the two boundaries that touch this store (Redmine
 #: #14203 review j#87488 P1). Its own file: it is neither store content nor a backup
 #: artifact, carries no credential, and is private (0600). A managed launch's reserve /
@@ -212,16 +222,20 @@ def launch_generation_store_lock(home: Path, *, exclusive: bool, blocking: bool)
     holder's crash releases it at the OS level.
 
     Three explicit phases, so a lock failure is a TYPED outcome a public rail can render as a
-    structured refusal — never a raw traceback across the recovery boundary (review j#87496
-    F1):
+    structured refusal — never a raw traceback across the recovery boundary (review j#87496 F1)
+    — while NEVER hiding a lock leak behind a reported success (review j#87512 F1):
 
     * **acquire** (``mkdir`` / ``os.open`` / ``flock``): any :class:`OSError` here is a
       fail-closed :class:`LaunchGenerationStoreLockUnavailable` (contention →
       :class:`LaunchGenerationStoreLockBusy`). Nothing has been yielded, so nothing was done.
     * **body** (``yield``): the caller's operation runs; ITS errors propagate unchanged.
-    * **cleanup** (``flock`` unlock / ``os.close``): best-effort and swallowed. A failure here
-      happens AFTER the body completed, so raising it would relabel a finished operation (e.g.
-      an already-committed rotation) as failed — the exact mislabel the finding forbids.
+    * **release** (``flock`` unlock + ``os.close``, ALWAYS both attempted): a failure here is
+      handled by the body's outcome (mirroring ``startup_transaction_fence`` /
+      ``coordinator_placement_fence``). If the body RAISED, its exception is the real fault and
+      a secondary release error is suppressed so the body exception propagates unchanged. If
+      the body SUCCEEDED, a release error is raised as :class:`LaunchGenerationStoreLockReleaseError`
+      — never swallowed — because the OS lock may still be held and a caller reporting success
+      would hide a live lock leak.
     """
     try:
         import fcntl
@@ -259,18 +273,33 @@ def launch_generation_store_lock(home: Path, *, exclusive: bool, blocking: bool)
             f"may not support advisory locks"
         ) from exc
     # --- body phase: the caller's error, if any, is theirs and propagates as-is. ------------
+    body_failed = False
     try:
         yield
+    except BaseException:
+        body_failed = True
+        raise
     finally:
-        # --- cleanup phase: best-effort; a post-body failure must NOT relabel the result. ---
+        # --- release phase: ALWAYS attempt BOTH unlock and close; the fd is always closed. ---
+        release_error: Optional[OSError] = None
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
+        except OSError as unlock_exc:  # pragma: no cover - unlock rarely errors
+            release_error = unlock_exc
         try:
             os.close(fd)
-        except OSError:
-            pass
+        except OSError as close_exc:  # pragma: no cover - close rarely errors
+            release_error = release_error or close_exc
+        # A release error is surfaced ONLY when the body succeeded: a body exception is the
+        # real fault and must not be overwritten by a secondary release error (whose swallow
+        # is the ONE place hiding it is correct). On body success, a leaked lock is never
+        # hidden behind a reported success — the caller renders it phase-aware.
+        if release_error is not None and not body_failed:
+            raise LaunchGenerationStoreLockReleaseError(
+                f"the launch-generation store lock at {path.name} could not be released "
+                f"({release_error.__class__.__name__}: {release_error}); the lock may still "
+                f"be held, so a subsequent managed write could stall until this process exits"
+            ) from release_error
 
 
 def probe_launch_generation_store(path: Path) -> tuple[str, str]:
@@ -499,6 +528,16 @@ class HerdrLaunchGenerationStore:
             # already HerdrLaunchGenerationError and never reach here.
             raise HerdrLaunchGenerationError(
                 f"the launch-generation store lock could not be taken for a write ({exc})"
+            ) from exc
+        except LaunchGenerationStoreLockReleaseError as exc:
+            # The write's DB transaction COMMITTED inside the body (the reservation / finalize
+            # may have landed), but the store lock could not be released (review j#87512 F1).
+            # Fail closed with a typed error that does NOT hide the commit — this process must
+            # be restarted before it writes again, since the lock may still be held.
+            raise HerdrLaunchGenerationError(
+                f"the launch-generation write completed (its row may have committed) but the "
+                f"store lock could not be released ({exc}); restart this process before it "
+                f"writes again — the lock may still be held"
             ) from exc
 
     def read(self, assigned_name: str) -> Optional[LaunchGeneration]:
@@ -828,6 +867,7 @@ __all__ = (
     "HerdrLaunchGenerationStore",
     "LaunchGeneration",
     "LaunchGenerationStoreLockBusy",
+    "LaunchGenerationStoreLockReleaseError",
     "LaunchGenerationStoreLockUnavailable",
     "herdr_launch_generation_path",
     "launch_generation_store_lock",

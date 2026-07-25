@@ -984,29 +984,130 @@ class R11RealMultiProcessAndSidecar(unittest.TestCase):
         self.assertIn("could not be acquired", r.detail)
         self.assertTrue(herdr_launch_generation_path(home).exists())  # untouched
 
-    def test_a_post_body_cleanup_failure_never_relabels_a_completed_operation(self):
-        # F1: a failure in the lock's CLEANUP phase (unlock / close), which happens AFTER the
-        # body completed, is swallowed — a finished operation is never reported as failed.
+    def _both_release_fail_patches(self):
+        # unlock ALWAYS fails; close ALWAYS fails AND leaves the fd open (the reviewer's probe:
+        # the OS lock genuinely lingers). Returns (patchers, captured_fds) so the test can
+        # release the real fds afterward — a leaked lock must never survive the test.
         import fcntl
+        import os as _os
         from unittest.mock import patch
 
+        import mozyo_bridge.core.state.herdr_launch_generation as glm
+
+        real_flock, captured = fcntl.flock, []
+
+        def _flock(fd, flags):
+            if flags == fcntl.LOCK_UN:
+                raise OSError("injected unlock failure")
+            return real_flock(fd, flags)
+
+        def _close(fd):
+            captured.append(fd)  # record the real fd; do NOT close it (it lingers)
+            raise OSError("injected close failure")
+
+        return (
+            patch("fcntl.flock", _flock),
+            patch.object(glm.os, "close", _close),
+            captured,
+            _os.close,
+        )
+
+    def test_maintenance_release_failure_holds_side_effect_truth_and_is_not_success(self):
+        # F1 (j#87512): unlock + close BOTH fail after the rebuild body rotates the store. The
+        # payload is NOT applied/ok — it preserves the rotation truth (executed / backup_dir /
+        # store removed) AND surfaces the release-unverified + restart action. The lock really
+        # lingers (a peer is blocked) until the leaked fd is closed.
         from mozyo_bridge.core.state.herdr_launch_generation import (
+            launch_generation_store_lock,
+            LaunchGenerationStoreLockBusy,
+        )
+
+        m = self._maint()
+        home = _tmp()
+        self._corrupt(home)
+        p_flock, p_close, captured, real_close = self._both_release_fail_patches()
+        try:
+            with p_flock, p_close:
+                r = m.run_launch_generation_store_rebuild(
+                    home=home, view=self._view(), write=True
+                )
+            self.assertEqual(r.state, m.BLOCKED_RELEASE_UNVERIFIED)
+            self.assertFalse(r.ok)  # NOT reported as success
+            self.assertTrue(r.executed)  # the rotation truth is preserved
+            self.assertIsNotNone(r.backup_dir)
+            self.assertIn("could NOT be released", r.detail)
+            self.assertIn("Restart", r.detail)
+            self.assertFalse(
+                herdr_launch_generation_path(home).exists()
+            )  # the store WAS rotated
+            # The lock really lingers: a peer cannot take it until the leaked fd is closed.
+            with self.assertRaises(LaunchGenerationStoreLockBusy):
+                with launch_generation_store_lock(home, exclusive=False, blocking=False):
+                    pass
+        finally:
+            for fd in captured:  # release the real leaked fd(s) — test hygiene
+                try:
+                    real_close(fd)
+                except OSError:
+                    pass
+        # After the leak is cleared the lock is free again.
+        with launch_generation_store_lock(home, exclusive=False, blocking=False):
+            pass
+
+    def test_a_body_exception_is_never_overwritten_by_a_secondary_release_error(self):
+        # F1 (j#87512): when the body RAISES, its exception is the real fault; a concurrent
+        # release (unlock/close) failure is suppressed so the body exception propagates
+        # unchanged — never masked by a LaunchGenerationStoreLockReleaseError.
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            LaunchGenerationStoreLockReleaseError,
             launch_generation_store_lock,
         )
 
         home = _tmp()
-        body_ran = {}
-        real_flock = fcntl.flock
+        p_flock, p_close, captured, real_close = self._both_release_fail_patches()
+        try:
+            with p_flock, p_close:
+                with self.assertRaises(ValueError) as ctx:
+                    with launch_generation_store_lock(home, exclusive=True, blocking=False):
+                        raise ValueError("the body's own fault")
+            self.assertEqual(str(ctx.exception), "the body's own fault")
+            self.assertNotIsInstance(
+                ctx.exception, LaunchGenerationStoreLockReleaseError
+            )
+        finally:
+            for fd in captured:
+                try:
+                    real_close(fd)
+                except OSError:
+                    pass
 
-        def _flock(fd, flags):
-            if flags == fcntl.LOCK_UN:
-                raise OSError("injected unlock failure after the body")
-            return real_flock(fd, flags)
-
-        with patch("fcntl.flock", _flock):
-            with launch_generation_store_lock(home, exclusive=True, blocking=False):
-                body_ran["v"] = True  # the operation completed inside the lock
-        self.assertTrue(body_ran.get("v"))  # no exception escaped the cleanup phase
+    def test_a_writer_release_failure_is_a_fail_closed_typed_error_naming_the_commit(self):
+        # F1 (j#87512) point 4: a reserve/finalize whose row committed but whose lock could
+        # not be released fails closed with a typed error that does NOT hide the commit.
+        home = _tmp()
+        store = HerdrLaunchGenerationStore(home=home)
+        # Pre-create the store (unpatched) so the measured reserve skips _publish_fresh and the
+        # ONLY os.close the injected failure touches is the lock's release close.
+        store.reserve_pending(
+            assigned_name="gw", startup_action_id="startup-A", workspace_id="wsA",
+            role="codex", lane_id="lane",
+        )
+        p_flock, p_close, captured, real_close = self._both_release_fail_patches()
+        try:
+            with p_flock, p_close:
+                with self.assertRaises(HerdrLaunchGenerationError) as ctx:
+                    store.reserve_pending(
+                        assigned_name="gw", startup_action_id="startup-B",
+                        workspace_id="wsA", role="codex", lane_id="lane",
+                    )
+            self.assertIn("may have committed", str(ctx.exception))
+            self.assertIn("lock could not be released", str(ctx.exception))
+        finally:
+            for fd in captured:
+                try:
+                    real_close(fd)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":
