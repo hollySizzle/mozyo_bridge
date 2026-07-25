@@ -49,43 +49,72 @@ _QUOTED_RUNS = (
     re.compile(r'"((?:[^"\\]|\\.)*)"'),
 )
 
-#: Positive proof #1: the candidate is the ``//`` of a ``scheme://`` URL. A URL is a
-#: documentation pointer, not a private location, so it is preserved — but only when the
-#: scheme syntax is actually there, never merely because of what precedes it.
-_URL_PREFIX_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*:$")
+#: What an external URL is rendered as. A ``scheme://`` token is NOT preserved byte for byte
+#: (design consultation j#87837). A URL's path, query and fragment can carry a private path —
+#: ``https://host/docs/Users/<name>/private.yaml``, ``?file=/Users/…`` — and nothing structural
+#: separates those from an ordinary documentation path, so preserving the token means either
+#: modelling its content or accepting a hole. The close condition allows neither, and a URL is
+#: not a recovery authority, so the whole token is collapsed into this fixed string.
+EXTERNAL_URL_PLACEHOLDER = "<external URL>"
 
-#: Positive proof #2: the ``/`` sits INSIDE a token (``relative/path.yaml``, ``down/right``),
+#: Where a URL BEGINS. Deliberately not a rule for where one ends: nothing after a
+#: ``scheme://`` on that line is kept, so the token's extent is never a privacy authority
+#: (design consultation j#87841). Every candidate end rule failed on some real shape — a
+#: whitespace terminator cut ``?file=C:\\Users\\Ada Smith\\private.yaml`` in half and left the
+#: tail behind with its root gone (measured), and a "does it contain a slash" test missed that
+#: same drive/UNC case entirely. Not needing an end rule removes the whole class.
+_URL_OCCURRENCE_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://")
+
+#: The only positive proof left: the ``/`` sits INSIDE a token (``relative/path.yaml``, ``down/right``),
 #: i.e. the preceding character continues a word. ``:`` deliberately does not qualify —
 #: ``config:/Users/…`` is a labelled absolute path, and treating the label as proof of
 #: relativity is exactly the fail-open the allowlist had.
 _RELATIVE_CONTINUATION_RE = re.compile(r"[A-Za-z0-9_.\-]$")
 
 
-def _keeps_absolute_root(line: str, start: int, root: str) -> bool:
-    """True iff this root occurrence is provably NOT a private absolute path (#14258 R20).
+def _collapse_url_tokens(line: str) -> str:
+    """Replace the first ``scheme://`` onward with the placeholder — unconditionally.
 
-    The predicate is deliberately inverted from the earlier design. That one asked "does a
+    Not "the URL token": everything from there to the end of the line, whatever it is. Two
+    weaker rules were measured and rejected (j#87837 then j#87841). Ending the replacement at
+    whitespace splits ``?file=C:\\Users\\Ada Smith\\private.yaml`` at the space and leaves
+    ``Smith\\private.yaml`` behind, now unrecognizable to the scanner because its root went
+    into the placeholder. Truncating only for path-bearing URLs misses that same case, since a
+    drive or UNC path carries no forward slash at all.
+
+    The cost is stated plainly: prose after a URL, and any second URL, are dropped too. A URL is
+    not a recovery authority, and the close condition — no private absolute path in public
+    evidence — is not negotiable against detail.
+    """
+    match = _URL_OCCURRENCE_RE.search(line)
+    if match is None:
+        return line
+    return line[: match.start()] + EXTERNAL_URL_PLACEHOLDER
+
+
+def _keeps_absolute_root(line: str, start: int, root: str) -> bool:
+    """True iff this root occurrence is provably NOT a private absolute path (#14258 R20/R21).
+
+    The predicate is deliberately inverted from the original design. That one asked "does a
     known-safe character precede the root?" and, for anything it had not enumerated, concluded
     "not a path" — so a colon label, a backtick, a brace or a pipe let a full private path
     through untouched (measured). The candidate launcher's stderr format is not ours to
     control, so an allowlist of shapes can never be the safe side.
 
-    Only two things are preserved, each by positive proof: a ``scheme://`` URL, and a ``/``
-    that continues a word and is therefore inside a relative token. A drive or UNC root is
-    never exempt — neither can occur inside a relative path.
+    Exactly one thing is proven safe: a ``/`` that continues a word, and is therefore inside a
+    relative token (``relative/path.yaml``, ``down/right``). ``:`` deliberately does not
+    qualify — ``config:/Users/…`` is a labelled absolute path. A drive or UNC root is never
+    exempt; neither can occur inside a relative path.
+
+    The proof is judged per OCCURRENCE and covers nothing beyond itself (review j#87831 R21).
+    An earlier version let a proof exempt the rest of the surrounding token, which silently
+    exempted every later root in it — a tab, a non-breaking space or a ``?file=`` inside the
+    same token carried a full private path through. URLs are handled before this runs, by
+    replacement rather than by proof, so no case here needs to look forward at all.
     """
     if root != "/":
         return False
-    before = line[:start]
-    if line.startswith("//", start) and _URL_PREFIX_RE.search(before):
-        return True
-    return bool(_RELATIVE_CONTINUATION_RE.search(before))
-
-
-def _token_end(line: str, start: int) -> int:
-    """The index just past the whitespace-delimited token containing ``start``."""
-    end = line.find(" ", start)
-    return len(line) if end == -1 else end
+    return bool(_RELATIVE_CONTINUATION_RE.search(line[:start]))
 
 
 def _redact_probe_paths(detail: str, *scratch: Path) -> str:
@@ -111,7 +140,7 @@ def _redact_probe_paths(detail: str, *scratch: Path) -> str:
             spellings.add(str(candidate))
     for spelling in sorted(spellings, key=len, reverse=True):
         text = text.replace(spelling, REDACTED_PROBE_PATH)
-    # Quoted runs first: an escape-aware closing quote is a PROVEN terminator, so a path
+    # Quoted runs next: an escape-aware closing quote is a PROVEN terminator, so a path
     # containing spaces (or escaped quotes) is replaced precisely and the text after the run
     # survives. Only runs that actually start at an absolute root are touched.
     for pattern in _QUOTED_RUNS:
@@ -123,21 +152,18 @@ def _redact_probe_paths(detail: str, *scratch: Path) -> str:
             ),
             text,
         )
-    # Then every remaining absolute-root candidate. Nothing after it is kept: an unquoted path
-    # has no proven terminator, and the close condition forbids a private absolute path in
-    # public evidence outright. Text BEFORE the root survives — that is where the error class
-    # and the parse reason sit.
+    # Then every remaining absolute-root candidate, each judged on its own. Nothing after an
+    # unproven root is kept: an unquoted path has no proven terminator, and the close condition
+    # forbids a private absolute path in public evidence outright. Text BEFORE the root
+    # survives — that is where the error class and the parse reason sit.
     lines = []
     for line in text.splitlines() or [""]:
-        # `guard` skips the remainder of a token already proven safe. A URL contains further
-        # slashes (`https://host/path`), and judging each one in isolation would condemn the
-        # second — proving the token safe has to protect the whole token, not one character.
-        guard = 0
+        # URLs go first and go WHOLE. Replacing them here (rather than proving them safe in the
+        # scan below) is what makes the scan guard-free: no surviving token needs protecting
+        # from its own later characters, so nothing can exempt a root that follows one.
+        line = _collapse_url_tokens(line)
         for match in _ABS_ROOT_RE.finditer(line):
-            if match.start() < guard:
-                continue
             if _keeps_absolute_root(line, match.start(), match.group(0)):
-                guard = _token_end(line, match.start())
                 continue
             line = line[: match.start()] + REDACTED_PROBE_PATH
             break
@@ -146,6 +172,7 @@ def _redact_probe_paths(detail: str, *scratch: Path) -> str:
 
 
 __all__ = [
+    "EXTERNAL_URL_PLACEHOLDER",
     "REDACTED_PROBE_PATH",
     "redact_probe_paths",
 ]

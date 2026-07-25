@@ -1990,6 +1990,226 @@ class R19UndecodableConfigTest(unittest.TestCase):
         self.assertNotIn("does not parse under THIS runtime", verdict.detail)
 
 
+class R21ExternalUrlCollapseTest(unittest.TestCase):
+    """A ``scheme://`` token is collapsed to a fixed placeholder, not preserved (j#87837).
+
+    A URL's path, query and fragment can carry a filesystem path, and nothing structural
+    separates ``https://host/docs/schema`` from ``https://host/docs/Users/<name>/private.yaml``.
+    Preserving the token therefore means either modelling its content or accepting a hole, and
+    the close condition allows neither — so public evidence keeps the fact that a URL was
+    printed and drops what it said.
+    """
+
+    def _redact(self, text: str) -> str:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_probe_redaction import (  # noqa: E501
+            _redact_probe_paths,
+        )
+
+        return _redact_probe_paths(text, Path("/nonexistent"))
+
+    def _placeholder(self) -> str:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_probe_redaction import (  # noqa: E501
+            EXTERNAL_URL_PLACEHOLDER,
+        )
+
+        return EXTERNAL_URL_PLACEHOLDER
+
+    def test_no_url_body_reaches_public_evidence(self) -> None:
+        private = macos_home_path("Ada Smith", "private.yaml")
+        for label, text in (
+            ("path embeds a private path", "see https://example.invalid/docs" + private),
+            ("query names it", "see https://example.invalid/d?file=" + private),
+            ("fragment names it", "see https://example.invalid/d#" + private),
+            ("file:// URL", "see file://" + private),
+            ("host only", "see https://example.invalid/docs/schema for keys"),
+            ("port", "see http://example.invalid:8080/docs for keys"),
+            ("two on a line", "see https://a.invalid/x and http://b.invalid/y ok"),
+        ):
+            with self.subTest(shape=label):
+                out = self._redact(text)
+                self.assertIn(self._placeholder(), out)
+                for leaked in ("Ada", "Smith", "private.yaml", "Users", "invalid", "docs"):
+                    self.assertNotIn(leaked, out, f"{label}: {out!r}")
+
+    def test_a_url_takes_the_rest_of_the_line_with_it(self) -> None:
+        # A URL cannot contain a raw space, but a private path can — so a token that broke at a
+        # space may have been a path all along, and its tail would read as a relative token.
+        # Measured before this rule: `see <external URL> Smith/private.yaml`. A URL cannot
+        # contain a raw space; a private path can, and the tail loses its root to the
+        # placeholder, so the scanner behind it cannot recognize what is left.
+        out = self._redact("see https://example.invalid/docs/Users/Ada Smith/private.yaml")
+        self.assertEqual(out, "see " + self._placeholder())
+
+    def test_a_bare_authority_url_also_takes_the_rest_of_the_line(self) -> None:
+        # j#87841 removed the "only if it bears a path" carve-out. A bare authority followed by
+        # a query is exactly where the carve-out failed: `?file=C:\\Users\\Ada Smith\\…` has no
+        # forward slash, so the line was not truncated and the tail after the space survived.
+        backslash = chr(92)
+        for label, tail in (
+            ("drive in query",
+             "?file=C:" + backslash + backslash.join(("Users", "Ada Smith", "private.yaml"))),
+            ("UNC in query",
+             "?file=" + backslash * 2 + backslash.join(("srv", "Ada Share", "private.yaml"))),
+            ("POSIX in query", "?file=" + macos_home_path("Ada Smith", "private.yaml")),
+            ("prose after", " for the key list"),
+        ):
+            with self.subTest(shape=label):
+                out = self._redact("see https://host" + tail)
+                self.assertEqual(out, "see " + self._placeholder())
+
+    def test_no_end_of_url_rule_is_relied_on_for_privacy(self) -> None:
+        """The URL's extent must not decide anything (j#87841).
+
+        Both rejected rules were end-of-token rules, and each leaked on a shape the other did
+        not. Pinning the absence: whatever separator or content follows ``scheme://``, the line
+        ends at the placeholder.
+        """
+        private = macos_home_path("Ada Smith", "private.yaml")
+        for label, sep in (
+            ("tab", chr(9)),
+            ("non-breaking space", chr(160)),
+            ("ideographic space", chr(12288)),
+            ("narrow no-break space", chr(8239)),
+            ("zero-width space", chr(8203)),
+            ("literal space", " "),
+            ("no separator", ""),
+        ):
+            with self.subTest(separator=label):
+                out = self._redact("see https://example.invalid" + sep + private)
+                self.assertEqual(out, "see " + self._placeholder())
+
+    def test_the_token_ends_at_unicode_whitespace_not_at_a_literal_space(self) -> None:
+        # The R21 defect in one line: a rule that only knows `" "`. Each of these separators
+        # starts new text the URL rule must not absorb silently — and whatever it does absorb
+        # must be replaced, never emitted.
+        private = macos_home_path("Ada Smith", "private.yaml")
+        for label, sep in (
+            ("tab", chr(9)),
+            ("non-breaking space", chr(160)),
+            ("form feed", chr(12)),
+            ("vertical tab", chr(11)),
+            ("ideographic space", chr(12288)),
+            ("next line", chr(133)),
+            ("zero-width space", chr(8203)),
+        ):
+            with self.subTest(separator=label):
+                out = self._redact("see https://example.invalid/d" + sep + private)
+                for leaked in ("Ada", "Smith", "private.yaml", "Users"):
+                    self.assertNotIn(leaked, out, f"{label}: {out!r}")
+
+
+class R21ProofIsLocalToOneRootTest(unittest.TestCase):
+    """R21: a positive proof covers ONE root occurrence, never the token around it.
+
+    The R20 guard skipped to the end of the whitespace-delimited token once any proof held —
+    and its idea of "whitespace" was a literal space. So a tab, a non-breaking space or a
+    ``?file=`` inside the same token carried a full private path straight through a rule whose
+    whole premise is that unproven roots are private (review j#87831, all measured).
+    """
+
+    def _redact(self, text: str) -> str:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_probe_redaction import (  # noqa: E501
+            _redact_probe_paths,
+        )
+
+        return _redact_probe_paths(text, Path("/nonexistent"))
+
+    _PRIVATE = ("Ada", "Smith", "Team", "Share", "srv", "private.yaml", "p.yaml", "Users")
+
+    def _roots(self) -> tuple:
+        backslash = chr(92)
+        return (
+            ("POSIX", macos_home_path("Ada Smith", "private.yaml")),
+            ("drive", "C:" + backslash + backslash.join(("Users", "Ada Smith", "private.yaml"))),
+            ("UNC", backslash * 2 + backslash.join(("srv", "Ada Share", "p.yaml"))),
+        )
+
+    def _separators(self) -> tuple:
+        # Everything that put a second root inside one "token". The literal space is included
+        # as the case the old rule DID handle, so the sweep covers the whole class.
+        return (
+            ("tab", chr(9)),
+            ("non-breaking space", chr(160)),
+            ("form feed", chr(12)),
+            ("vertical tab", chr(11)),
+            ("URL query", "?file="),
+            ("colon label", " config:"),
+            ("space", " "),
+        )
+
+    def test_no_separator_after_a_proven_token_exempts_a_later_root(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_probe_redaction import (  # noqa: E501
+            EXTERNAL_URL_PLACEHOLDER,
+            REDACTED_PROBE_PATH,
+        )
+
+        # Both proof kinds have to be swept: a URL proof and a relative-token proof.
+        for proven in ("see https://example.invalid/docs", "reason relative/path.yaml"):
+            for sep_label, sep in self._separators():
+                for root_label, root in self._roots():
+                    text = proven + sep + root
+                    with self.subTest(proven=proven[:12], sep=sep_label, root=root_label):
+                        out = self._redact(text)
+                        self.assertTrue(
+                            REDACTED_PROBE_PATH in out or EXTERNAL_URL_PLACEHOLDER in out,
+                            f"nothing was redacted at all: {text!r} -> {out!r}",
+                        )
+                        for leaked in self._PRIVATE:
+                            self.assertNotIn(leaked, out, f"{text!r} -> {out!r}")
+
+    def test_the_prose_before_a_collapsed_url_survives(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_probe_redaction import (  # noqa: E501
+            EXTERNAL_URL_PLACEHOLDER,
+        )
+
+        out = self._redact(
+            "see https://example.invalid/docs" + chr(9) + macos_home_path("Ada Smith", "p.yaml")
+        )
+        self.assertEqual(out, "see " + EXTERNAL_URL_PLACEHOLDER)
+
+    def test_a_file_url_naming_a_private_path_is_redacted(self) -> None:
+        out = self._redact("see file://" + macos_home_path("Ada Smith", "private.yaml"))
+        for leaked in self._PRIVATE:
+            self.assertNotIn(leaked, out)
+
+    def test_relative_preservation_is_unchanged(self) -> None:
+        for text in (
+            "unknown key in relative/path.yaml",
+            "expected one of ['down/right'] for split",
+            "lane_placement.by_lane_kind must be a mapping",
+        ):
+            with self.subTest(text=text[:38]):
+                self.assertEqual(self._redact(text), text)
+
+    def test_the_public_refusal_carries_no_private_tail_and_mutates_nothing(self) -> None:
+        # Required fix 4: re-confirm through the REAL preflight, not the helper alone.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_probe_redaction import (  # noqa: E501
+            REDACTED_PROBE_PATH,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Ada Team scratch"
+            repo = root / "repo"
+            (repo / ".mozyo-bridge").mkdir(parents=True)
+            (repo / ".mozyo-bridge" / "config.yaml").write_text("version: [1, 2\n", encoding="utf-8")
+            LaneLifecycleStore(home=root / "home").ensure_schema()
+            launcher = _current_head_launcher(root)
+            # Snapshot AFTER the launcher script is written: the fixture's own setup is not the
+            # mutation under test, the preflight's behaviour is.
+            before = sorted(p.name for p in root.rglob("*"))
+            with self.assertRaises(HerdrLauncherIncompatibleError) as caught:
+                preflight_launcher_compatibility(
+                    launcher, subprocess.run, 60.0, dict(os.environ),
+                    repo_root=repo, store_home=root / "home",
+                )
+            message = str(caught.exception)
+            self.assertEqual(caught.exception.reason, TARGET_CONFIG_INVALID)
+            self.assertIn(REDACTED_PROBE_PATH, message)
+            for leaked in (str(root), "Ada Team scratch", "mozyo-config-parse-", str(Path.home())):
+                self.assertNotIn(leaked, message)
+            self.assertEqual(sorted(p.name for p in root.rglob("*")), before)
+
+
 class R20UntrustedShapeRedactionTest(unittest.TestCase):
     """R20: an absolute root is private unless something POSITIVELY proves otherwise.
 
@@ -2045,11 +2265,10 @@ class R20UntrustedShapeRedactionTest(unittest.TestCase):
                 for leaked in self._PRIVATE:
                     self.assertNotIn(leaked, out, f"{label} leaked {leaked!r}: {out!r}")
 
-    def test_urls_and_relative_tokens_survive_by_positive_proof(self) -> None:
+    def test_relative_tokens_survive_by_positive_proof(self) -> None:
+        # A relative token carries a parse reason and no location, so it stays byte for byte.
+        # URLs no longer do (j#87837) — see R21ExternalUrlCollapseTest.
         for text in (
-            "see https://example.invalid/docs/schema for the key list",
-            "see http://example.invalid:8080/docs for keys",
-            "see https://a.invalid/x and http://b.invalid/y ok",
             "unknown key in relative/path.yaml",
             "expected one of ['down/right'] for split",
             "lane_placement.by_lane_kind must be a mapping",
@@ -2139,11 +2358,12 @@ class R18PrivacyFirstRedactionTest(unittest.TestCase):
                     f"text after the closing quote should survive: {out!r}",
                 )
 
-    def test_relative_tokens_and_urls_are_still_intact(self) -> None:
+    def test_relative_tokens_are_still_intact(self) -> None:
+        # URLs used to be listed here too. They are collapsed to a placeholder now
+        # (j#87837) — see R21ExternalUrlCollapseTest.
         for text in (
             "unknown key in relative/path.yaml",
             "expected one of ['down/right'] for split",
-            "see https://example.invalid/docs/schema for the key list",
         ):
             with self.subTest(text=text[:34]):
                 self.assertEqual(self._redact(text), text)
@@ -2326,11 +2546,10 @@ class R15RedactionInputClassTest(unittest.TestCase):
             self.assertIn(REDACTED_PROBE_PATH, message)
             self.assertIn("YAML", message)
 
-    def test_relative_tokens_and_urls_are_left_intact(self) -> None:
+    def test_relative_tokens_are_left_intact(self) -> None:
         for text in (
             "unknown key in relative/path.yaml",
             "expected one of ['down/right'] for split",
-            "see https://example.invalid/docs/schema for the key list",
             "lane_placement.by_lane_kind must be a mapping",
         ):
             with self.subTest(text=text[:36]):
