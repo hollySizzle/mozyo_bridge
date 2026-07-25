@@ -239,8 +239,9 @@ class StoreRoundTripTest(unittest.TestCase):
     def test_no_env_value_column_exists(self) -> None:
         # Privacy invariant (refinement 3): the schema stores tokens / identity /
         # locator / a variable-name detail only — never an env value column.
-        # ``replacement_action_id`` (Redmine #13806 tranche D R2-F2) is a token id, not an
-        # env value, so it belongs to the token-only set.
+        # ``replacement_action_id`` (Redmine #13806 tranche D R2-F2) and ``startup_action_id``
+        # (Redmine #14203 review j#87445) are token ids, not env values, so they belong to the
+        # token-only set.
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             record_identity_attestation(_rec(), home=home)
@@ -267,6 +268,7 @@ class StoreRoundTripTest(unittest.TestCase):
                     "detail",
                     "observed_at",
                     "replacement_action_id",
+                    "startup_action_id",
                 },
             )
 

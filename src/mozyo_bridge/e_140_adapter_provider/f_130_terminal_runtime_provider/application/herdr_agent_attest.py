@@ -272,6 +272,7 @@ def perform_self_attestation(
     lane: str,
     env: Mapping[str, str],
     replacement_action_id: str = "",
+    startup_action_id: str = "",
     home=None,
     now: Optional[str] = None,
     append_event=None,
@@ -336,6 +337,7 @@ def perform_self_attestation(
         detail=detail,
         observed_at=now,
         replacement_action_id=_norm(replacement_action_id),
+        startup_action_id=_norm(startup_action_id),
     )
     persisted = record_identity_attestation(record, home=home)
     if persisted is None:
@@ -449,6 +451,9 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
         lane=_norm(getattr(args, "lane", "")),
         env=env,
         replacement_action_id=_norm(getattr(args, "replacement_action_id", "")),
+        # #14203 review j#87445: persist the collision-free per-launch startup action id as
+        # the generation token, so a recovery can distinguish two same-second launches.
+        startup_action_id=_norm(env.get(MOZYO_STARTUP_ACTION_ID_ENV, "")),
         append_event=append_event,
     )
     # Redmine #14017: the exec target is always provider_argv[0] (the verified realpath);

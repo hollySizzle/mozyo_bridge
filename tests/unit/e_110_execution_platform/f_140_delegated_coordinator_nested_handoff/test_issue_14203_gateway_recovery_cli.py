@@ -22,6 +22,9 @@ from unittest.mock import patch
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
     sublane_gateway_recovery_live as live_mod,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+    gateway_generation_authority as gen_mod,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.fresh_coordinator_drain import (  # noqa: E501
     DRAIN_SEND_ERROR,
     DRAIN_SEND_OK,
@@ -592,6 +595,7 @@ class TurnStartAuthorityTests(unittest.TestCase):
     #: The default legitimate live attestation observed_at (equals the default binding's, so a
     #: matching binding is generation-coherent). A recycle test re-seeds it differently.
     live_attestation_observed_at = "2026-07-24T17:00:00+00:00"
+    live_generation_token = "startup-GEN-A"
     WS = "ws"
 
     def setUp(self):
@@ -617,6 +621,7 @@ class TurnStartAuthorityTests(unittest.TestCase):
             assigned_name="gw", workspace_id=self.WS, role="codex",
             lane_id="issue_x_lane", locator="w:3", verdict=VERDICT_PRESENT,
             observed_at=self.live_attestation_observed_at,
+            startup_action_id=self.live_generation_token,
         )
         base.update(overrides)
         HerdrIdentityAttestationStore(home=self.attn_home).upsert(
@@ -651,7 +656,7 @@ class TurnStartAuthorityTests(unittest.TestCase):
 
         self.ops.ledger = _Ledger()
         with patch.object(self.ops, "_providers", return_value=("claude", "codex")), \
-                patch.object(live_mod, "repo_scope_workspace_id", return_value=self.WS):
+                patch.object(gen_mod, "repo_scope_workspace_id", return_value=self.WS):
             obs_record = self.ops._anchor_delivery_record("codex")
             started = (
                 obs_record is not None
@@ -672,6 +677,7 @@ class TurnStartAuthorityTests(unittest.TestCase):
         base = dict(
             provider="codex", assigned_name="gw", locator="w:3", row_revision="4",
             attestation_observed_at="2026-07-24T17:00:00+00:00",
+            startup_action_id="startup-GEN-A",
         )
         base.update(overrides)
         return base
@@ -719,24 +725,23 @@ class TurnStartAuthorityTests(unittest.TestCase):
             "gateway_binding": self._binding(provider="claude"),
         })])
         self.assertFalse(started)
-        # F2: a stale hand-written attestation_observed_at that does NOT equal the live
-        # current-generation attestation never binds (non-empty is not authority).
+        # j#87445: a DIFFERENT generation token (a distinct launch) never binds — this is
+        # the collision-free authority (a shared observed_at is no longer enough).
         _, started = self._facts_with([self._rec(queue_enter_observation={
             "event_wait_kind": "changed",
-            "gateway_binding": self._binding(
-                attestation_observed_at="2000-01-01T00:00:00+00:00"
-            ),
+            "gateway_binding": self._binding(startup_action_id="startup-GEN-B"),
         })])
         self.assertFalse(started)
-        # F2: a blank attestation observed_at never binds.
+        # j#87445: a blank generation token never binds (tokenless / legacy record).
         _, started = self._facts_with([self._rec(queue_enter_observation={
             "event_wait_kind": "changed",
-            "gateway_binding": self._binding(attestation_observed_at=""),
+            "gateway_binding": self._binding(startup_action_id=""),
         })])
         self.assertFalse(started)
-        # F1 (recovery side): a recycle BETWEEN delivery and recovery changes the LIVE
-        # attestation observed_at (re-seeded) — the same binding no longer equates, fail-closed.
-        self._seed_attestation(observed_at="2026-07-24T18:00:00+00:00")
+        # F1 / j#87445 (recovery side): a recycle BETWEEN delivery and recovery re-seeds the
+        # LIVE attestation with a NEW generation token (even at the same observed_at) — the
+        # same binding no longer equates, fail-closed (the ABA / same-second recycle case).
+        self._seed_attestation(startup_action_id="startup-GEN-B")
         _, started = self._facts_with([self._rec(queue_enter_observation={
             "event_wait_kind": "changed", "gateway_binding": self._binding(),
         })])
@@ -791,6 +796,32 @@ class TurnStartAuthorityTests(unittest.TestCase):
                 )
                 self.assertFalse(started)
                 self._seed_attestation()  # restore the legitimate record
+
+    def test_j87445_same_second_launches_never_join_by_the_timestamp(self):
+        # Review j#87445: two launches with the SAME name/workspace/lane/role/locator/
+        # row_revision AND the SAME observed_at second, differing ONLY in the collision-free
+        # startup generation token, must never be treated as one generation. Real store.
+        same_second = "2026-07-24T17:00:00+00:00"
+        # Generation A delivered (binding token A) and is still the live attestation -> binds.
+        self._seed_attestation(observed_at=same_second, startup_action_id="startup-A")
+        observed_A = {
+            "event_wait_kind": "changed",
+            "gateway_binding": self._binding(
+                attestation_observed_at=same_second, startup_action_id="startup-A"
+            ),
+        }
+        _, started = self._facts_with([self._rec(queue_enter_observation=observed_A)])
+        self.assertTrue(started)
+        # A same-second RECYCLE to generation B (identical timestamp, new token) is now live.
+        # The delivery-time generation-A binding must NOT join the current generation B.
+        self._seed_attestation(observed_at=same_second, startup_action_id="startup-B")
+        _, started = self._facts_with([self._rec(queue_enter_observation=observed_A)])
+        self.assertFalse(started)
+        # ABA: a THIRD launch (A') at the same second reuses generation A's shape but a fresh
+        # token — an old generation-A binding still never joins A' (each launch's nonce differs).
+        self._seed_attestation(observed_at=same_second, startup_action_id="startup-A-prime")
+        _, started = self._facts_with([self._rec(queue_enter_observation=observed_A)])
+        self.assertFalse(started)
 
     def test_j87424_no_attestation_or_absent_verdict_never_binds(self):
         observed = {

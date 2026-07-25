@@ -614,6 +614,7 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         binding = {
             "provider": "codex", "assigned_name": "gw", "locator": "w:3",
             "row_revision": "4", "attestation_observed_at": "2026-07-24T17:00:00+00:00",
+            "startup_action_id": "startup-GEN-A",
         }
         ops = _V2FakeOps(
             marker_observed=True, queue_enter_snapshot=self._snapshot("turn_ended"),
@@ -631,6 +632,7 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         binding = {
             "provider": "codex", "assigned_name": "gw", "locator": "w:3",
             "row_revision": "4", "attestation_observed_at": "2026-07-24T17:00:00+00:00",
+            "startup_action_id": "startup-GEN-A",
         }
         ops = _V2FakeOps(
             marker_observed=True, queue_enter_snapshot=self._snapshot(),
@@ -659,6 +661,7 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
                     "provider": "codex", "assigned_name": "gw", "locator": "w:3",
                     "row_revision": str(self._bind_calls),  # DIFFERENT each read
                     "attestation_observed_at": f"2026-07-24T17:0{self._bind_calls}:00+00:00",
+                    "startup_action_id": f"startup-GEN-{self._bind_calls}",  # DIFFERENT token
                 }
 
         ops = _RecycleOps(

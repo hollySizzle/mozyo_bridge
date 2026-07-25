@@ -38,6 +38,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DRAIN_SEND_ERROR,
     DRAIN_SEND_OK,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+    gateway_generation_authority as _gen_authority,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_ghost_composer_observation import (  # noqa: E501
     read_render_ghost_facts,
 )
@@ -65,7 +68,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_AWAITING_INPUT,
-    RUNTIME_BUSY,
     RUNTIME_TURN_ENDED,
     map_agent_status,
 )
@@ -352,117 +354,23 @@ class LiveGatewayRecoveryOps:
         return None
 
     def _record_observed_turn_start(self, rec) -> bool:
-        """Did the ANCHOR delivery's own QUEUE-ENTER rail OBSERVE the turn start, GENERATION-BOUND?
-
-        (j#87397 / design j#87409 / j#87418.) SCOPE: the herdr queue-enter rail only — the
-        design decision's observation-only pre-Enter wait lives there and is the standard
-        sublane dispatch default. A ``--mode standard`` delivery has its own turn-start death
-        contract and carries NO generation binding, so it is never classifiable here (F3:
-        the unreachable ``turn_start_outcome`` branch is removed rather than left as a
-        false capability). Two requirements, BOTH on the exact anchor delivery record:
-
-        1. an observed start on the v2 queue-enter observation — the pre-Enter armed wait
-           collected the ``working`` transition (``event_wait_kind == "changed"``) OR the
-           #13292 snapshot mechanically read the receiver WORKING (``read_ok`` +
-           ``runtime_state == busy``);
-        2. the record's persisted GATEWAY PROCESS BINDING is generation-coherent with THIS
-           request's live gateway (:meth:`_record_generation_bound`).
-        """
-        qe = getattr(rec, "queue_enter_observation", None)
-        if not isinstance(qe, dict):
-            return False
-        observed = _norm(str(qe.get("event_wait_kind") or "")) == "changed" or (
-            qe.get("read_ok") is True
-            and _norm(str(qe.get("runtime_state") or "")) == RUNTIME_BUSY
+        """Delegate to the shared generation-authority leaf (#14203 module-health split)."""
+        return _gen_authority.record_observed_turn_start(
+            rec, request=self.request, repo_root=self.repo_root,
+            attestation_home=self.attestation_home,
         )
-        if not observed:
-            return False
-        return self._record_generation_bound(rec)
 
     def _record_generation_bound(self, rec) -> bool:
-        """The record's persisted binding is the SAME generation as THIS request's LIVE gateway.
-
-        Fail-closed generation authority (design j#87409 item 3, tightened by review j#87418
-        F2): the binding must be present and its ``assigned_name`` / ``locator`` /
-        ``row_revision`` / ``provider`` must all exactly equal the request pins (all
-        non-empty), AND its ``attestation_observed_at`` must exactly equal the CURRENT live
-        startup attestation's ``observed_at`` for the pinned gateway (read now, at recovery
-        time, at the pinned locator). A non-empty timestamp is NOT authority — only equality
-        to the live current-generation attestation proves the delivery's observed start and
-        the process about to be closed are ONE generation. A recycle between delivery and
-        recovery changes the live ``observed_at`` and fails closed; a foreign provider or a
-        stale hand-written timestamp never binds.
-        """
-        qe = getattr(rec, "queue_enter_observation", None)
-        if not isinstance(qe, dict):
-            return False
-        binding = qe.get("gateway_binding")
-        if not isinstance(binding, dict):
-            return False
-        pin_rev = _norm(self.request.gateway_revision)
-        if not (
-            _norm(str(binding.get("assigned_name") or ""))
-            == _norm(self.request.assigned_name)
-            and _norm(str(binding.get("locator") or "")) == _norm(self.request.locator)
-            and pin_rev
-            and _norm(str(binding.get("row_revision") or "")) == pin_rev
-            and _norm(str(binding.get("provider") or "")) == _norm(self.request.provider)
-        ):
-            return False
-        binding_observed_at = _norm(str(binding.get("attestation_observed_at") or ""))
-        if not binding_observed_at:
-            return False
-        return binding_observed_at == self._current_request_attestation_observed_at()
-
-    def _current_request_attestation_observed_at(self) -> str:
-        """The LIVE startup attestation ``observed_at`` for THIS request's pinned gateway,
-        gated by a SINGLE VERIFIED IDENTITY JOIN (review j#87424 F1). (read-only, fail-closed)
-
-        Read at recovery time (the failed gateway is still live, pre-close). The returned
-        timestamp is the generation authority the record binding must equal, so EVERY identity
-        axis of the attestation must be verified — not just verdict + locator, which a foreign
-        workspace / lane / role record sharing the same assigned-name key + locator + timestamp
-        would otherwise satisfy. Required, all exact:
-
-        - ``verdict == present`` and a non-empty ``observed_at``;
-        - ``assigned_name`` / ``role`` (== the request provider) / ``lane_id`` / ``locator``
-          equal the request pins;
-        - ``workspace_id`` equals the repo workspace (:func:`repo_scope_workspace_id`).
-
-        ``""`` on an unreadable store, an absent record, or ANY mismatched axis — so a record
-        whose binding cannot be joined to THIS exact live generation never binds.
-        """
-        from mozyo_bridge.core.state.herdr_identity_attestation import (
-            HerdrIdentityAttestationStore,
-            VERDICT_PRESENT,
+        return _gen_authority.record_generation_bound(
+            rec, request=self.request, repo_root=self.repo_root,
+            attestation_home=self.attestation_home,
         )
 
-        try:
-            repo_workspace = repo_scope_workspace_id(self.repo_root)
-        except Exception:  # noqa: BLE001 - unresolvable workspace => no verified join
-            return ""
-        if not _norm(repo_workspace):
-            return ""
-        try:
-            record = HerdrIdentityAttestationStore(home=self.attestation_home).read(
-                _norm(self.request.assigned_name)
-            )
-        except Exception:  # noqa: BLE001 - unreadable attestation => no live generation
-            return ""
-        if record is None:
-            return ""
-        observed_at = _norm(str(getattr(record, "observed_at", "") or ""))
-        if not (
-            _norm(getattr(record, "verdict", "")) == VERDICT_PRESENT
-            and observed_at
-            and _norm(getattr(record, "assigned_name", "")) == _norm(self.request.assigned_name)
-            and _norm(getattr(record, "role", "")) == _norm(self.request.provider)
-            and _norm_lane(getattr(record, "lane_id", "")) == _norm_lane(self.request.lane)
-            and _norm(getattr(record, "locator", "")) == _norm(self.request.locator)
-            and _norm(getattr(record, "workspace_id", "")) == _norm(repo_workspace)
-        ):
-            return ""
-        return observed_at
+    def _current_request_generation_token(self) -> str:
+        return _gen_authority.current_request_generation_token(
+            request=self.request, repo_root=self.repo_root,
+            attestation_home=self.attestation_home,
+        )
 
     def observe_turn(self, request: GatewayRefreshRequest) -> GatewayTurnObservation:
         _worker_provider, gateway_provider = self._providers()

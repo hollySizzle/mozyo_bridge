@@ -798,7 +798,12 @@ class LiveTmuxTransportRailOps:
         ):
             return None
         observed_at = _norm(str(getattr(record, "observed_at", "") or ""))
-        if not observed_at:
+        # #14203 review j#87445: the COLLISION-FREE per-launch generation token is the
+        # authority (observed_at is demoted to ordering/diagnostic). A record with no token
+        # (a legacy launch / a store older than v3 that dropped it) yields NO binding — the
+        # recovery then fails closed rather than trusting a non-unique timestamp.
+        startup_action_id = _norm(str(getattr(record, "startup_action_id", "") or ""))
+        if not observed_at or not startup_action_id:
             return None
         return {
             "provider": identity.role,
@@ -806,6 +811,7 @@ class LiveTmuxTransportRailOps:
             "locator": _norm(target),
             "row_revision": row_revision,
             "attestation_observed_at": observed_at,
+            "startup_action_id": startup_action_id,
         }
 
     def emit(
