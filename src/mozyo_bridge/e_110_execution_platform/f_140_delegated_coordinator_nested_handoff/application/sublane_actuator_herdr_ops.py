@@ -55,7 +55,6 @@ from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
 if TYPE_CHECKING:
     from mozyo_bridge.core.state.startup_transaction_fence import StartupTransactionFence
 
-from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
     selected_attestation_store_is_v1,
 )
@@ -112,16 +111,17 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     resolve_lane_slots,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
+    evaluate_dispatch_sender,
+    evaluate_launcher_compatibility,
+    evaluate_runtime_placement,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
-    DEFAULT_LANE,
     _agent_locator,
     _norm,
     derive_directory_lane_token,
     derive_lane_workspace_token,
-)
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
-    resolve_sender_identity,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
     COMMAND_TIMEOUT_SECONDS,
@@ -235,85 +235,39 @@ class HerdrSublaneActuatorOps:
     def worktree_exists(self, branch: str) -> bool:
         return self._git().worktree_exists(branch)
 
+    # -- action-time pre-mutation preflights (bodies: `sublane_actuator_herdr_preflight`) --
+    #
+    # Each is a thin delegate to the cohesive sibling module that owns the answer. They are
+    # one kind of thing — "what must be true before the first mutation" — and keeping the
+    # bodies there is the reduction this adapter's module-health entry deferred (Redmine
+    # #14258): with them extracted, this adapter is back under the threshold.
+
     def preflight_dispatch_sender(self) -> tuple[bool, str]:
         """Verify the command-shell sender before any lane mutation (#13613)."""
-
-        try:
-            anchor = read_anchor(self.repo_root)
-        except Exception as exc:  # fail closed at the external read boundary
-            return False, f"workspace anchor unreadable ({exc})"
-        anchor_workspace_id = _norm(
-            anchor.get("workspace_id") if isinstance(anchor, Mapping) else ""
-        )
-        result = resolve_sender_identity(
-            self.env,
-            anchor_workspace_id=anchor_workspace_id or None,
-        )
-        if not result.ok or result.identity is None:
-            return False, f"{result.reason}: {result.detail}"
-        try:
-            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (  # noqa: E501
-                resolve_coordinator_provider,
-            )
-
-            coordinator_provider = resolve_coordinator_provider(str(self.repo_root))
-        except Exception as exc:  # config/binding IO is fail-closed here
-            return False, f"coordinator provider binding is unreadable ({exc})"
-        if result.identity.role != coordinator_provider:
-            return False, (
-                f"sender provider {result.identity.role!r} is not the configured "
-                f"coordinator provider {coordinator_provider!r}"
-            )
-        if result.identity.lane_id != DEFAULT_LANE:
-            return False, (
-                f"sender lane {result.identity.lane_id!r} is not the coordinator "
-                f"default lane {DEFAULT_LANE!r}"
-            )
-        return True, "sender identity matches the coordinator binding and default lane"
+        return evaluate_dispatch_sender(self.env, self.repo_root)
 
     def preflight_runtime_placement_gate(self) -> tuple[bool, str]:
-        """Action-time runtime fingerprint gate — the mutation front door (#13705 R1-F1).
-
-        Verifies BEFORE any worktree / lane side effect that the action-time runtime is
-        not a source/installed skew that would place the gateway/worker pair incorrectly.
-        Reads a :func:`run_runtime_fingerprint` result (active loaded package vs
-        repo-local source) and blocks ONLY when the active runtime is missing the
-        same-tab placement behavior the source ships — the exact skew that split the
-        #13441 lane (the pure :func:`evaluate_mutation_placement_gate` policy).
-
-        This is the achievable authority the R1 review asked for: the OFFICIAL mutating
-        front door goes zero-write on an installed/source fingerprint mismatch, detected
-        by a REAL active-vs-source probe (not a hard-coded capability). It cannot stop a
-        runtime that predates all fence code (no code we ship runs there); that residual
-        is closed by the #13524 reinstall fingerprint gate. A run with no repo-local
-        source to compare is unverifiable and allowed (again the reinstall gate covers it).
-        Any read failure fails closed (a fingerprint that cannot be established must not
-        greenlight a mutation).
-        """
-        from mozyo_bridge.application.doctor_runtime import (
-            evaluate_mutation_placement_gate,
+        """Action-time runtime fingerprint gate — the mutation front door (#13705 R1-F1)."""
+        return evaluate_runtime_placement(
+            self.repo_root, self.runtime_fingerprint_reader
         )
 
-        reader = self.runtime_fingerprint_reader
-        if reader is None:
-            import argparse
-
-            from mozyo_bridge.application.doctor_runtime import run_runtime_fingerprint
-
-            def reader() -> dict:
-                return run_runtime_fingerprint(
-                    argparse.Namespace(repo=str(self.repo_root))
-                )
-
-        try:
-            fingerprint = reader()
-        except Exception as exc:  # noqa: BLE001 — an unresolvable fingerprint fails closed.
-            return False, (
-                f"the action-time runtime fingerprint could not be established ({exc}); "
-                "refuse to actuate a lane from a runtime of unverifiable provenance "
-                "(Redmine #13705)"
-            )
-        return evaluate_mutation_placement_gate(fingerprint)
+    def preflight_launcher_compatibility(
+        self, *, base_ref: str, lane_runtime_root: str, from_base_ref: bool
+    ) -> tuple[bool, str, str]:
+        """Verify the managed-launch launcher BEFORE the first worktree / process (#14258)."""
+        return evaluate_launcher_compatibility(
+            env=self.env,
+            runner=self.runner,
+            timeout=self.timeout,
+            repo_root=self.repo_root,
+            store_home=mozyo_bridge_home(),
+            replacement_action_id=self.replacement_action_id,
+            committed_blob=self._git().committed_blob,
+            base_ref=base_ref,
+            lane_runtime_root=lane_runtime_root,
+            from_base_ref=from_base_ref,
+        )
 
     def create_worktree(
         self, *, branch: str, worktree_path: str, base_ref: Optional[str] = None

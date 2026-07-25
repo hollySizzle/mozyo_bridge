@@ -216,8 +216,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _invoke,
     _list_rows,
     _list_workspace_labels,
-    preflight_attest_launcher_capability,
-    preflight_attest_store_schema,
+    preflight_launcher_compatibility,
     HerdrLauncherIncompatibleError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
@@ -644,31 +643,26 @@ def _prepare_session_locked(
                 f"unresolved or mismatched provider"
             )
 
-    # Launcher command-capability preflight (Redmine #13748) — the same fail-closed
-    # boundary as the provider preflight above. The #13637 wrapper execs every launched
-    # provider THROUGH `<attest_launcher> herdr agent-attest ...`; `resolve_attest_launcher`
-    # proves the launcher is executable but NOT that its CLI still carries that subcommand.
-    # An installed launcher lagging unreleased source answers the wrapper with argparse
-    # exit 2, so every wrapped pane dies ~0.4s after start — the `sublane create` "live
-    # locator then vanishes" failure. Verify it here, before any workspace/tab/agent write,
-    # so a capability skew fails closed with recovery guidance and zero herdr actuation.
+    # Managed-launch compatibility boundary — the same fail-closed point as the provider
+    # preflight above, and the LAST one before any herdr write, so a skewed launcher aborts
+    # the run with zero actuation. The whole conjunction (wrapper subcommand + attestation
+    # schema #13748/#13847, the real store it writes #13882, the target config + shared lane
+    # lifecycle it must read #14258) is `preflight_launcher_compatibility`, shared with the
+    # `sublane create` pre-worktree gate so a conjunct can never be present at only one of
+    # the two boundaries.
     # Gated on a resolved wrapper AND an actual launch plan: an unwrapped (`attest_launcher
     # == ""`) or adopt-only / dry-run run runs no wrapper, so it is never probed and stays
     # byte-invariant (Redmine #13637 fallback preserved).
-    # The store-schema join (Redmine #13882) rides the same boundary: the probe above is
-    # code-vs-code, so it cannot see that the SELECTED home holds an older shape on disk —
-    # the live-but-unattested pair. Read-only; never migrates the shared home. See
-    # `preflight_attest_store_schema`.
     if attest_launcher and launch_plans:
         # Redmine #14231 j#84910: probe in the SAME cwd the wrapper will get
         # (`build_agent_start_argv` passes `--cwd repo_root`), so a launcher that only
-        # fails inside the lane's own config directory is caught here — before the first
-        # workspace / tab / agent write — instead of vanishing the pair after launch.
-        observation = preflight_attest_launcher_capability(
-            attest_launcher, runner, timeout, env, repo_root=repo_root
-        )
-        preflight_attest_store_schema(
-            observation,
+        # fails inside the lane's own config directory is caught here too.
+        preflight_launcher_compatibility(
+            attest_launcher,
+            runner,
+            timeout,
+            env,
+            repo_root=repo_root,
             store_home=Path(store_home),
             replacement_launch=bool((replacement_action_id or "").strip()),
         )

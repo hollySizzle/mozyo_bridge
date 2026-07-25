@@ -293,6 +293,36 @@ flow:
    (release/install または明示 `MOZYO_BRIDGE_LAUNCHER` override) を示す (credential / 個人 path は
    durable log へ残さない)。unwrapped fallback (`attest_launcher == ""`) と adopt-only / dry-run は
    wrapper を走らせないため probe せず byte-invariant のままとする。
+   **launcher target-authority compatibility preflight (Redmine #14258)**: #13748 / #13847 / #13882 の
+   3 conjunct はいずれも launcher を **attestation store** に対して検証する。しかし launcher は自分が
+   書かない authority を 2 つ **読む**必要があり、どちらの skew も lane を作った**後**に殺す。
+   (a) **target repo の `.mozyo-bridge/config.yaml`** — wrapper は `--cwd <lane worktree>` で起動し
+   mozyo-bridge CLI は startup でその config を parse するため、config schema bump に遅れた launcher は
+   provider を exec する前に exit する (実測 j#85834: `unknown key 'agents'` / exit 2。`sublane create
+   --execute` は worktree を作った後で両 slot が `provider_exited / rollback_owed`)。
+   (b) **home-scoped shared lane lifecycle authority** — 最も新しい lane の source CLI が additive に
+   migrate するため、reader が古い launcher は named lane を `LaneLifecycleReaderUpgradeRequired` で
+   zero-start する (実測 j#85890: v7 store vs v6 reader)。
+   どちらも **宣言 (advertised capability)** として検証する: `agent-attest --help` epilog が
+   `mozyo_attest_capability_config=<versions>` / `mozyo_attest_capability_config_keys=<keys>` /
+   `mozyo_attest_capability_lifecycle=<versions>` を wrap-proof token で advertise し、preflight が
+   **実 target** (repo config の宣言 version + top-level key 集合 / shared store の recorded component
+   version) と join する。version 集合だけでは不足で、recognized key は同一 version 内で追加されてきた
+   (`terminal_transport` / `lane_placement`) 上、実測 error が literal に `unknown key 'agents'` である
+   ため、**key 集合も join する**。
+   #14231 の cwd-sensitive probe は「launcher が偶然その cwd で非 0 終了する」ことに依存する
+   incidental discriminant であり、lane worktree が存在しないと問いを立てられない。宣言 join は
+   **worktree 生成前**に評価できるため、`sublane create` は worktree を残さずに拒否できる
+   (close condition 1)。実際の conjunction (`preflight_launcher_compatibility`) は 2 箇所から呼ばれる:
+   `sublane create --execute` の pre-mutation gate (worktree より前) と `prepare_session` (first herdr
+   write より前、create を経由しない heal / 明示 `herdr session-start` で唯一到達する境界)。両者が
+   **同一関数**を呼ぶのは、conjunct が片方にしか存在しない状態が live failure として再出現するため。
+   両 authority は read-only で probe し、launch は shared authority を **migrate しない** (migrate すると
+   同じ形で古い installed launcher を壊す)。config 側の probe は宣言 version と top-level key のみを読み、
+   nested block の validation はしない — 無関係な nested error を「launcher を upgrade せよ」と誤報しない
+   ため。target が unreadable / unsupported、launcher が capability を advertise しない場合はすべて
+   fail-closed (unprovable は compatible でない)。config が存在しない repo は parse する対象が無いので
+   admit する (この check 以前に動いていた case を defect 無しに壊さない)。
 5. idempotency: 対象 slot の mzb1 名を既に持つ live agent があれば **adopt** (再 launch しない)。
    ただし adopt は live name-match だけでは足りず、その live locator に **generation-bind した
    `present` startup self-attestation record** (§2 / #13637) が必要である。record 不在 (legacy /

@@ -1781,14 +1781,27 @@ class ZeroSideEffectTest(unittest.TestCase):
         )
 
         # The body moved under `_prepare_session_locked` when the launch-admission lock
-        # was added (j#80190 boundary 1 / j#80207 module split); the ordering it pins is
-        # unchanged, so the guard follows the body rather than being deleted.
+        # was added (j#80190 boundary 1 / j#80207 module split), and the call itself moved
+        # into the `preflight_launcher_compatibility` conjunction when Redmine #14258 added
+        # the target-authority conjuncts. The ordering it pins is unchanged, so the guard
+        # follows the body rather than being deleted — and it now pins BOTH links of the
+        # chain, so the store join cannot be dropped from the conjunction either.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_pane_lifecycle,
+        )
+
         src = inspect.getsource(herdr_session_start._prepare_session_locked)
-        self.assertIn("preflight_attest_store_schema", src)
+        self.assertIn("preflight_launcher_compatibility", src)
         self.assertLess(
-            src.index("preflight_attest_store_schema"),
+            src.index("preflight_launcher_compatibility"),
             src.index("_create_workspace"),
-            "the store preflight must precede the first herdr workspace write",
+            "the launcher compatibility conjunction must precede the first herdr "
+            "workspace write",
+        )
+        self.assertIn(
+            "preflight_attest_store_schema",
+            inspect.getsource(herdr_pane_lifecycle.preflight_launcher_compatibility),
+            "the store join must be one of the conjuncts that conjunction runs",
         )
 
     def test_launch_admission_takes_the_shared_lock_around_the_whole_run(self) -> None:

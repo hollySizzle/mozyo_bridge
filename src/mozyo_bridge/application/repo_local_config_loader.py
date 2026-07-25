@@ -41,12 +41,15 @@ Redmine #12191. It only turns "a repo root" into "a validated
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Mapping, Optional, Union
 
 import yaml
 
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
+    REPO_LOCAL_CONFIG_VERSION,
+    SUPPORTED_REPO_LOCAL_CONFIG_VERSIONS,
     RepoLocalConfig,
     RepoLocalConfigError,
 )
@@ -155,10 +158,120 @@ def load_repo_local_config_from_path(path: Union[str, Path]) -> RepoLocalConfig:
     return RepoLocalConfig.from_record(parsed)
 
 
+#: No repo-local config file exists — the behavior-preserving default (nothing to parse).
+CONFIG_SCHEMA_ABSENT = "config_schema_absent"
+#: A present file whose top-level ``version`` and key set were read, and whose version is
+#: one THIS build supports.
+CONFIG_SCHEMA_DECLARED = "config_schema_declared"
+#: A present file whose schema could not be read at all (unreadable, malformed YAML, a
+#: non-mapping document, a non-string key, or a non-integer ``version``).
+CONFIG_SCHEMA_UNREADABLE = "config_schema_unreadable"
+#: A present, readable file declaring a record version THIS build does not support.
+CONFIG_SCHEMA_UNSUPPORTED = "config_schema_unsupported"
+
+
+@dataclass(frozen=True)
+class ConfigSchemaObservation:
+    """The *schema shape* of a repo-local config file, read without validating it (#14258).
+
+    Deliberately narrower than :func:`load_repo_local_config_from_path`: it reads only the
+    two facts a launcher's config-parse capability is joined against — the declared top-level
+    ``version`` and the set of present top-level keys — and does **not** validate any block.
+    That separation is the point. The managed-launch preflight asks "could the selected
+    launcher parse this file at all", which is decided by the version boundary and the
+    closed top-level key set; whether some nested block is well-formed is a different
+    question, and one this runtime's own load already answers on its own path. Folding the
+    two would make an unrelated nested error look like a launcher incompatibility.
+
+    ``upgrade_required`` is ``True`` when the declared version is *newer* than anything this
+    build supports (as opposed to an unrecognized / foreign value), so a refusal can name the
+    operator's real next action.
+    """
+
+    state: str
+    version: Optional[int] = None
+    keys: frozenset = frozenset()
+    upgrade_required: bool = False
+
+
+def probe_repo_local_config_schema(
+    path: Union[str, Path],
+) -> ConfigSchemaObservation:
+    """Read-only probe of a repo-local config's schema shape (Redmine #14258).
+
+    The input the managed-launch launcher preflight was missing. The #13748 / #13847 / #13882
+    launcher checks all verify the launcher against the *attestation store*; none of them
+    looks at the config the wrapper is about to be pointed at with ``--cwd <lane worktree>``.
+    A launcher predating a config schema bump parses that file at startup, rejects it, and
+    exits before ``exec``ing the provider — measured as ``unknown key 'agents'`` / exit 2
+    against the v2 config (#14258 j#85834).
+
+    Read-only and fail-closed: a missing file is :data:`CONFIG_SCHEMA_ABSENT` (there is
+    nothing for any launcher to parse, so a config-less repo keeps working exactly as
+    before), while a *present* file whose schema cannot be read is
+    :data:`CONFIG_SCHEMA_UNREADABLE` rather than being folded into "absent" — an unreadable
+    config is not a missing one. ``yaml.safe_load`` only, like the loader above, so a config
+    file can never execute code or instantiate a class.
+    """
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ConfigSchemaObservation(CONFIG_SCHEMA_ABSENT)
+    except (OSError, UnicodeDecodeError):
+        return ConfigSchemaObservation(CONFIG_SCHEMA_UNREADABLE)
+    return probe_repo_local_config_schema_text(text)
+
+
+def probe_repo_local_config_schema_text(text: str) -> ConfigSchemaObservation:
+    """Probe a config's schema shape from its TEXT rather than a path (Redmine #14258).
+
+    The same decision as :func:`probe_repo_local_config_schema`, split out because the
+    ``sublane create`` launcher gate must ask the question about a config that is not on
+    disk yet: the lane worktree does not exist at the moment the gate has to refuse, so the
+    text comes from the committed blob at the lane's base ref (``git show <ref>:<path>``) —
+    exactly the bytes ``git worktree add`` will materialize. Reading the *primary* checkout's
+    file instead would be a proxy for the target, not the target.
+    """
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return ConfigSchemaObservation(CONFIG_SCHEMA_UNREADABLE)
+    if parsed is None:
+        # An empty / comment-only file declares nothing, which is the same as no file at
+        # all for the parse question: `RepoLocalConfig.default()` needs no schema support.
+        return ConfigSchemaObservation(CONFIG_SCHEMA_ABSENT)
+    if not isinstance(parsed, Mapping) or any(
+        not isinstance(key, str) for key in parsed
+    ):
+        return ConfigSchemaObservation(CONFIG_SCHEMA_UNREADABLE)
+    keys = frozenset(parsed)
+    version = parsed.get("version", REPO_LOCAL_CONFIG_VERSION)
+    # `bool` is an `int` subclass, so it is rejected explicitly for the same reason
+    # `_checked_top_level_version` rejects it: `version: true` must never read as 1.
+    if isinstance(version, bool) or not isinstance(version, int):
+        return ConfigSchemaObservation(CONFIG_SCHEMA_UNREADABLE, keys=keys)
+    if version not in SUPPORTED_REPO_LOCAL_CONFIG_VERSIONS:
+        return ConfigSchemaObservation(
+            CONFIG_SCHEMA_UNSUPPORTED,
+            version,
+            keys,
+            upgrade_required=version > max(SUPPORTED_REPO_LOCAL_CONFIG_VERSIONS),
+        )
+    return ConfigSchemaObservation(CONFIG_SCHEMA_DECLARED, version, keys)
+
+
 __all__ = (
     "CONFIG_FILE_RELPATH",
+    "CONFIG_SCHEMA_ABSENT",
+    "CONFIG_SCHEMA_DECLARED",
+    "CONFIG_SCHEMA_UNREADABLE",
+    "CONFIG_SCHEMA_UNSUPPORTED",
+    "ConfigSchemaObservation",
     "RepoLocalConfigLoadError",
     "load_repo_local_config",
     "load_repo_local_config_from_path",
+    "probe_repo_local_config_schema",
+    "probe_repo_local_config_schema_text",
     "repo_local_config_path",
 )

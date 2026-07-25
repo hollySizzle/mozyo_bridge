@@ -148,31 +148,24 @@ class CliResult(NamedTuple):
 def _attest_launcher_capability_help() -> str:
     """The exact ``<launcher> herdr agent-attest --help`` capability epilog, built canonically.
 
-    A managed fresh-worker launch (Redmine #13806 heal) runs a #13847 launcher-capability
+    A managed fresh-worker launch (Redmine #13806 heal) runs the launcher-capability
     preflight — ``<attest-launcher> herdr agent-attest --help`` — before ``agent start``, so a
     hermetic launch must answer that probe. The installed layer runs the REAL wheel's binary
     (which carries the capability); in-process there is no such subprocess, so this reproduces the
-    SAME epilog the source ``cli_core`` renders, from the SAME source builders + schema constants
-    (never a copied literal — a schema bump re-renders here automatically). Carries the
-    ``--assigned-name`` subcommand marker, the advertised schema token, and the writable-store set,
-    so :func:`parse_launcher_capability_output` reads a compatible launcher.
+    SAME epilog the source ``cli_core`` renders — by calling the SAME canonical composer, never a
+    copied literal. That is deliberate (Redmine #14258): when a new capability token was added,
+    every hand-rolled copy of the epilog silently advertised an incomplete contract and failed
+    closed somewhere else, looking like a launcher defect. One producer means a token added
+    upstream appears here automatically.
     """
-    from mozyo_bridge.core.state.herdr_identity_attestation import (
-        HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
-        RECOGNIZED_SCHEMA_VERSIONS,
-    )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
         ATTEST_CAPABILITY_MARKER,
-        build_attest_capability_contract_line,
-        build_attest_capability_stores_line,
+        build_attest_capability_epilog,
     )
 
     return (
         f"usage: mozyo-bridge herdr agent-attest [{ATTEST_CAPABILITY_MARKER} ASSIGNED_NAME]\n\n"
-        "capability contract (Redmine #13847):\n"
-        + build_attest_capability_contract_line(HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION)
-        + "\nwritable attestation store shapes (Redmine #13882):\n"
-        + build_attest_capability_stores_line(RECOGNIZED_SCHEMA_VERSIONS)
+        + build_attest_capability_epilog()
         + "\n"
     )
 

@@ -75,6 +75,9 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
     PHASE_COMPLETED,
 )
 from mozyo_bridge.core.state.workspace_registry import read_anchor
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+    build_attest_capability_epilog as _capability_epilog,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_convergence import (
     BoundPairObservation,
     ConvergeBoundPairRequest,
@@ -953,8 +956,9 @@ class _V1AttestingHerdr(_AttestingHerdr):
                 0,
                 stdout=(
                     "usage: mozyo-bridge herdr agent-attest --assigned-name NAME\n"
-                    "mozyo_attest_capability_schema=2\n"
-                    "mozyo_attest_capability_stores=1_2\n"
+                    # Redmine #14258: rendered by the canonical composer rather than
+                    # copied literals, which fell behind when a token was added.
+                    + _capability_epilog()
                 ),
                 stderr="",
             )

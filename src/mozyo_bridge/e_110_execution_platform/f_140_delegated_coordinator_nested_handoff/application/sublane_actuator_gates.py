@@ -1,15 +1,22 @@
 """Mutating-actuation admission gates for the sublane use case (Redmine #13705).
 
-Two fail-closed checks the :class:`~.sublane_actuator_use_case.SublaneActuateUseCase`
-runs around a live actuation, carved out of the use-case module so it stays under the
+Fail-closed checks the :class:`~.sublane_actuator_use_case.SublaneActuateUseCase` runs
+around a live actuation, carved out of the use-case module so it stays under the
 module-health ceiling (same pattern as :mod:`.sublane_actuator_heal`). Each drives the
 use case as a collaborator (its ``_blocked`` builder) and returns a terminal
 :class:`SublaneActuationOutcome` when it fails closed, or ``None`` to proceed:
 
-* :func:`runtime_placement_gate` — the action-time runtime fingerprint front door
-  (R1-F1): the official mutating entry goes zero-write when the active runtime is a
-  source/installed skew missing the same-tab placement behavior the repo-local source
-  ships (the exact class that split the #13441 lane). Optional / herdr-only.
+* :func:`pre_mutation_admission` — everything that must hold before the FIRST mutation, so
+  that boundary has one definition rather than one per caller. It runs:
+  * :func:`runtime_placement_gate` — the action-time runtime fingerprint front door
+    (R1-F1): the official mutating entry goes zero-write when the active runtime is a
+    source/installed skew missing the same-tab placement behavior the repo-local source
+    ships (the exact class that split the #13441 lane). Optional / herdr-only.
+  * :func:`launcher_compatibility_gate` — the managed-launch launcher must be able to write
+    the attestation store and READ the lane's config + the shared lane lifecycle authority
+    (Redmine #14258). ``prepare_session`` checks the same conjunction, but only at step 2 —
+    after ``git worktree add`` — which is how the measured failure left a worktree and a
+    ``rollback_owed`` pair behind. Optional / herdr-only.
 * :func:`pair_split_admission` — the operable-pair check (R1-F2): a resolved lane whose
   gateway/worker pair is ``pair_split`` (both panes live but not co-located) is a
   degraded state, not a healthy pair, so it is never adopted / dispatched.
@@ -20,6 +27,7 @@ from __future__ import annotations
 from typing import Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
+    REASON_LAUNCHER_INCOMPATIBLE,
     REASON_PAIR_SPLIT,
     REASON_PARTIAL_PAIR_RECOVERY,
     REASON_RUNTIME_FINGERPRINT,
@@ -29,6 +37,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ActuationStep,
     SublaneActuationOutcome,
     SublaneStartupObservation,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (  # noqa: E501
+    resolve_lane_runtime_root,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+    LAUNCH_CREATE_WORKTREE,
+    LAUNCH_SKIP_NO_GIT,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.pair_launch_attestation import (  # noqa: E501
     decide_pair_launch_attestation,
@@ -71,6 +86,92 @@ def runtime_placement_gate(
         fill_decision=fill_decision,
         fill_override_reason=fill_override_reason,
     )
+
+
+def launcher_compatibility_gate(
+    use_case,
+    request,
+    *,
+    launch_action,
+    dispatch: bool,
+    fill_decision,
+    fill_override_reason,
+) -> Optional[SublaneActuationOutcome]:
+    """Managed-launch launcher compatibility gate — BEFORE the worktree (Redmine #14258).
+
+    Optional / herdr-only (the tmux and test ports omit ``preflight_launcher_compatibility``,
+    so this is a no-op there). The same conjunction already runs inside ``prepare_session``,
+    but that is step 2 of the actuation — *after* ``git worktree add``. The measured failure
+    is exactly that shape: the worktree was created, then both slots exited because the
+    selected launcher could not read the lane's config, leaving a worktree and a
+    ``rollback_owed`` pair (#14258 j#85834). Running it here is what makes the refusal a
+    zero-mutation one, the issue's first close condition.
+
+    The gate must know which config the launcher will face, and it derives that from the launch
+    decision rather than guessing: only a worktree this run will CREATE has no directory to
+    read, so that case reads the committed blob at the lane's base ref (the bytes
+    ``git worktree add`` will materialize). A reused worktree — and a non-git lane, which runs
+    in the workspace root itself (#13392) and has no ref to read at all — already has the
+    directory the wrapper will get as ``--cwd``, so its own file is the target. Returns a
+    blocked outcome carrying the typed verdict reason when the launcher is incompatible, else
+    ``None``.
+    """
+    gate = getattr(use_case.ops, "preflight_launcher_compatibility", None)
+    if not callable(gate):
+        return None
+    gate_ok, gate_reason, gate_detail = gate(
+        base_ref=getattr(request, "base_ref", "") or "",
+        lane_runtime_root=resolve_lane_runtime_root(
+            use_case.ops,
+            getattr(request, "worktree_path", "") or "",
+            skip_no_git=launch_action == LAUNCH_SKIP_NO_GIT,
+        ),
+        from_base_ref=launch_action == LAUNCH_CREATE_WORKTREE,
+    )
+    if gate_ok:
+        return None
+    return use_case._blocked(
+        request,
+        launch_action=launch_action,
+        reason="managed-launch launcher is incompatible with this lane's target "
+        "authorities; refusing before any worktree / process is created — align the "
+        f"installed launcher or supply a scoped one, then re-run. {gate_detail}",
+        reasons=(REASON_LAUNCHER_INCOMPATIBLE,)
+        + ((gate_reason,) if gate_reason else ()),
+        dispatch=dispatch,
+        fill_decision=fill_decision,
+        fill_override_reason=fill_override_reason,
+    )
+
+
+def pre_mutation_admission(
+    use_case,
+    request,
+    *,
+    launch_action,
+    dispatch: bool,
+    fill_decision,
+    fill_override_reason,
+) -> Optional[SublaneActuationOutcome]:
+    """Every admission check that must pass before the FIRST mutation, in order.
+
+    One entry point so the "nothing has happened yet" boundary has a single definition and a
+    later conjunct cannot be added to one caller only: the runtime placement fingerprint
+    (#13705) and the managed-launch launcher compatibility conjunction (#14258). Returns the
+    first blocked outcome, or ``None`` when every check passes.
+    """
+    for gate in (runtime_placement_gate, launcher_compatibility_gate):
+        outcome = gate(
+            use_case,
+            request,
+            launch_action=launch_action,
+            dispatch=dispatch,
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
+        )
+        if outcome is not None:
+            return outcome
+    return None
 
 
 def pair_split_admission(

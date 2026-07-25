@@ -46,8 +46,15 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     build_attest_capability_probe_argv,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (
+    TARGET_SCHEMA_ABSENT,
+    TARGET_SCHEMA_DECLARED,
+    TARGET_SCHEMA_UNREADABLE,
+    TARGET_SCHEMA_UNSUPPORTED,
     LauncherCapabilityObservation,
+    TargetSchemaObservation,
+    decide_config_schema_compatibility,
     decide_launcher_capability,
+    decide_lifecycle_reader_compatibility,
     decide_store_compatibility,
     parse_launcher_capability_output,
 )
@@ -272,6 +279,179 @@ def preflight_attest_store_schema(
         )
 
 
+def normalize_config_schema_observation(probe) -> TargetSchemaObservation:
+    """Map a :mod:`repo_local_config_loader` config probe onto the join's value type.
+
+    Shared by both callers that must resolve "the config this launcher will face" — the
+    session-start path (which reads the lane worktree's file) and the ``sublane create``
+    pre-worktree gate (which reads the committed blob at the lane's base ref) — so the
+    state mapping exists once. An unrecognized probe state maps to
+    :data:`TARGET_SCHEMA_UNREADABLE`, i.e. a new loader state fails closed by default
+    rather than silently reading as compatible.
+    """
+    from mozyo_bridge.application.repo_local_config_loader import (
+        CONFIG_SCHEMA_ABSENT,
+        CONFIG_SCHEMA_DECLARED,
+        CONFIG_SCHEMA_UNSUPPORTED,
+    )
+
+    state = {
+        CONFIG_SCHEMA_ABSENT: TARGET_SCHEMA_ABSENT,
+        CONFIG_SCHEMA_DECLARED: TARGET_SCHEMA_DECLARED,
+        CONFIG_SCHEMA_UNSUPPORTED: TARGET_SCHEMA_UNSUPPORTED,
+    }.get(probe.state, TARGET_SCHEMA_UNREADABLE)
+    return TargetSchemaObservation(
+        state, probe.version, probe.keys, probe.upgrade_required
+    )
+
+
+def observe_target_config_schema(repo_root) -> TargetSchemaObservation:
+    """Probe the config of the directory the wrapper will run in (Redmine #14258).
+
+    ``repo_root`` is the wrapper's ``--cwd``; ``None`` means the caller has no repo to point
+    at, which is indistinguishable from a config-less repo for the parse question. Imports
+    are local so this provider module does not pull the config loader (and its YAML
+    dependency) in at import time.
+    """
+    from mozyo_bridge.application.repo_local_config_loader import (
+        CONFIG_FILE_RELPATH,
+        probe_repo_local_config_schema,
+    )
+
+    if repo_root is None:
+        return TargetSchemaObservation(TARGET_SCHEMA_ABSENT)
+    return normalize_config_schema_observation(
+        probe_repo_local_config_schema(Path(repo_root) / CONFIG_FILE_RELPATH)
+    )
+
+
+def _observe_shared_lifecycle_schema(store_home: Path) -> TargetSchemaObservation:
+    """Probe the SHARED lane lifecycle authority's schema, normalized for the join (#14258)."""
+    from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+        LIFECYCLE_SCHEMA_ABSENT,
+        LIFECYCLE_SCHEMA_RECOGNIZED,
+        LIFECYCLE_SCHEMA_UNSUPPORTED,
+        probe_lane_lifecycle_schema,
+    )
+
+    probe = probe_lane_lifecycle_schema(home=Path(store_home))
+    state = {
+        LIFECYCLE_SCHEMA_ABSENT: TARGET_SCHEMA_ABSENT,
+        LIFECYCLE_SCHEMA_RECOGNIZED: TARGET_SCHEMA_DECLARED,
+        LIFECYCLE_SCHEMA_UNSUPPORTED: TARGET_SCHEMA_UNSUPPORTED,
+    }.get(probe.state, TARGET_SCHEMA_UNREADABLE)
+    return TargetSchemaObservation(
+        state, probe.version, upgrade_required=probe.upgrade_required
+    )
+
+
+def preflight_launcher_target_authorities(
+    observation: LauncherCapabilityObservation,
+    *,
+    config_schema: TargetSchemaObservation,
+    store_home: Path,
+) -> None:
+    """Fail closed unless the launcher can READ the authorities it will be pointed at.
+
+    Redmine #14258 — the third and last conjunct of the managed-launch compatibility
+    boundary, and the one the earlier two structurally could not make. #13748 / #13847 prove
+    the launcher *carries* the wrapper subcommand and *advertises* the attestation schema;
+    #13882 joins that against the real store it will *write*. All three are about one
+    authority. But the launcher must also **read** two authorities it never writes, and a
+    skew in either kills the lane after it has been created:
+
+    - the TARGET repo's ``.mozyo-bridge/config.yaml``: the wrapper starts with
+      ``--cwd <lane worktree>`` and a mozyo-bridge CLI parses that config at startup, so a
+      launcher predating a schema bump exits before ``exec``ing the provider (measured:
+      ``unknown key 'agents'`` / exit 2 against the v2 config, #14258 j#85834 — the pair
+      booted, both slots reported ``provider_exited / rollback_owed``, and the worktree was
+      already there);
+    - the HOME-SCOPED SHARED lane lifecycle authority: it is additively migrated by whichever
+      lane's source CLI is newest, and a launcher whose reader is older zero-starts the named
+      lane with ``LaneLifecycleReaderUpgradeRequired`` (measured: a v7 store against a v6
+      reader, #14258 j#85890).
+
+    Both are *declaration* joins rather than exit-code observations. That is deliberate and is
+    what #14231 could not give: probing in the lane's own cwd catches a config skew only
+    because the launcher happens to read config at startup and happens to exit non-zero, and
+    only once the lane worktree exists to be probed in. A declared capability can be checked
+    **before the worktree is created**, which is what lets ``sublane create`` refuse without
+    leaving one behind.
+
+    Read-only on both authorities and never migrating either — a launch that migrated the
+    shared home would break every older installed launcher the same way. Called on the same
+    boundary as its two siblings, i.e. before the caller's first ``workspace`` / ``tab`` /
+    ``agent`` write, so an incompatible launcher aborts with zero herdr side effect. The error
+    is raised, never persisted, and names no absolute path.
+
+    ``config_schema`` is supplied by the caller rather than probed here, because the two
+    callers resolve *the same question* from different places: session-start reads the lane
+    worktree's own file, while the ``sublane create`` gate must answer before that worktree
+    exists and reads the committed blob at the lane's base ref instead. Both describe the
+    config the launcher will actually face; neither is a proxy for the other.
+    """
+    for verdict in (
+        decide_config_schema_compatibility(observation, config_schema),
+        decide_lifecycle_reader_compatibility(
+            observation, _observe_shared_lifecycle_schema(store_home)
+        ),
+    ):
+        if not verdict.ok:
+            raise HerdrLauncherIncompatibleError(
+                f"managed-launch preflight refused the selected launcher: {verdict.detail}. "
+                f"No workspace / tab / agent was created.",
+                reason=verdict.reason,
+            )
+
+
+def preflight_launcher_compatibility(
+    launcher: str,
+    runner: Runner,
+    timeout: float,
+    env: Mapping[str, str],
+    *,
+    repo_root=None,
+    store_home: Path,
+    replacement_launch: bool = False,
+    config_schema: Optional[TargetSchemaObservation] = None,
+) -> LauncherCapabilityObservation:
+    """The WHOLE managed-launch compatibility conjunction, in one place (Redmine #14258).
+
+    Every conjunct a selected launcher must satisfy before anything is created, in
+    fail-closed order: the wrapper subcommand + advertised attestation schema (#13748 /
+    #13847), the real attestation store it will write (#13882), and the target authorities it
+    must read — the repo's config record and the shared lane lifecycle store (#14258).
+
+    It exists because the conjunction has **two** call sites with different reach, and a
+    conjunct present at only one of them is a gap that reappears as a live failure. The
+    ``sublane create`` gate runs it before ``git worktree add``, so a skewed launcher leaves
+    no worktree behind; ``prepare_session`` runs it again before the first herdr write, which
+    is the only boundary reachable when a session starts without going through create (a heal,
+    an explicit ``herdr session-start``). Both read-only and idempotent, so running the
+    conjunction twice costs one extra probe and changes nothing.
+
+    ``config_schema`` defaults to the config of ``repo_root`` — the wrapper's own ``--cwd``.
+    A caller that must answer before that directory exists passes the observation it resolved
+    for the target instead (see :func:`preflight_launcher_target_authorities`).
+    """
+    observation = preflight_attest_launcher_capability(
+        launcher, runner, timeout, env, repo_root=repo_root
+    )
+    preflight_attest_store_schema(
+        observation, store_home=Path(store_home), replacement_launch=replacement_launch
+    )
+    preflight_launcher_target_authorities(
+        observation,
+        config_schema=(
+            config_schema
+            if config_schema is not None
+            else observe_target_config_schema(repo_root)
+        ),
+        store_home=Path(store_home),
+    )
+    return observation
+
+
 def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[str, object]]:
     """Run herdr ``agent list`` and return raw rows (fail-closed)."""
     completed = _invoke(binary, ["agent", "list"], runner, timeout, env=None)
@@ -405,5 +585,10 @@ __all__ = (
     "_create_workspace",
     "_invoke",
     "_list_rows",
+    "normalize_config_schema_observation",
+    "observe_target_config_schema",
     "preflight_attest_launcher_capability",
+    "preflight_attest_store_schema",
+    "preflight_launcher_compatibility",
+    "preflight_launcher_target_authorities",
 )

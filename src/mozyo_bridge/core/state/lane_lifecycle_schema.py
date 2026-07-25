@@ -82,6 +82,18 @@ _RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7})
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
 
+
+def readable_lane_lifecycle_versions() -> frozenset:
+    """The component shapes THIS build's reader understands (Redmine #14258).
+
+    The public read of :data:`_RECOGNIZED_SCHEMA_VERSIONS` for the managed-launch capability
+    contract, which must advertise a launcher's lane lifecycle *read* capability so a
+    preflight can refuse a stale reader before any lane is created. Exposed as a function of
+    the private constant — rather than copying the set into the advertisement — so a schema
+    bump can never leave the advertised capability behind.
+    """
+    return frozenset(_RECOGNIZED_SCHEMA_VERSIONS)
+
 _TABLE = "lane_lifecycle_records"
 _OWNER_INDEX = "idx_lane_lifecycle_active_owner"
 _PROJECT_OWNER_INDEX = "idx_lane_lifecycle_active_project_owner"
@@ -931,6 +943,7 @@ COLUMNS = _COLUMNS
 __all__ = (
     "LANE_LIFECYCLE_COMPONENT",
     "LANE_LIFECYCLE_RECOVERY_POLICY",
+    "readable_lane_lifecycle_versions",
     "LANE_LIFECYCLE_SCHEMA_VERSION",
     "READONLY_COMPONENT_ABSENT",
     "READONLY_COMPONENT_RECOGNIZED",

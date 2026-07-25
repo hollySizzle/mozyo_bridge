@@ -1427,27 +1427,18 @@ allowlist:
     resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
     expires: "2027-10-08"
 
-  - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_actuator_herdr_ops.py
-    lines: 1029
-    reason: >-
-      herdr-backend creation-side actuation IO port for `sublane start --execute`
-      (the sibling of the tmux LiveSublaneActuatorOps). A cohesive IO adapter — launch
-      the pair via prepare_session, resolve the live lane from the herdr inventory,
-      probe gateway readiness, dispatch. Was at 998 lines; Redmine #13847 added the two
-      required additions its port must carry: (1) translate the managed-launch
-      capability-preflight failure (HerdrLauncherIncompatibleError) into the typed
-      `SublaneLauncherIncompatibleError` the use case maps to `launcher_runtime_incompatible`;
-      and (2) `observe_pair_attestation`, the read-only port method the post-launch
-      attestation gate polls (a thin delegation to the cohesive
-      `sublane_pair_attestation_ops.observe_lane_pair_attestation` helper — the real
-      store/inventory IO lives there, not here). Splitting this adapter mid-review-cycle
-      for two small required additions is disproportionate risk; the extraction of the
-      slot-resolution / read-back helpers is deferred to a follow-up under this issue's
-      Version.
-    owner_issue: "#13847"
-    resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
-    expires: "2027-10-08"
 
+# sublane_actuator_herdr_ops.py was allowlisted at a 1029-line baseline (owner_issue
+# #13847). Redmine #14258 removed the entry by carrying out a reduction rather than
+# raising the baseline for its own addition: the adapter's three action-time
+# pre-mutation preflight BODIES (sender attestation #13613, runtime placement
+# fingerprint #13705, and the new managed-launch launcher compatibility conjunction
+# #14258) moved to the cohesive sibling
+# `e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_actuator_herdr_preflight.py`,
+# leaving three thin delegates behind. They are one kind of thing — "what must be true
+# before the first mutation" — and each is pure orchestration over injected
+# collaborators, so the extraction also makes them testable without the adapter. Net:
+# the adapter is ~983 lines, under the threshold, and no longer an exception.
 
 # herdr_session_start.py was allowlisted at 1027 lines (owner_issue #13425, split
 # deferred pending #13392). Redmine #13411 (lane=tab subdivision) resolved the

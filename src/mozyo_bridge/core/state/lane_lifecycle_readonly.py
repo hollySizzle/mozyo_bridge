@@ -393,6 +393,79 @@ def lifecycle_migration_preflight(
     )
 
 
+#: The shared home holds no lane lifecycle component at all (a fresh home).
+LIFECYCLE_SCHEMA_ABSENT = "lifecycle_schema_absent"
+#: A component whose recorded schema this build recognizes and can read.
+LIFECYCLE_SCHEMA_RECOGNIZED = "lifecycle_schema_recognized"
+#: The store file exists but could not be opened / queried at all.
+LIFECYCLE_SCHEMA_UNREADABLE = "lifecycle_schema_unreadable"
+#: A recorded version / on-disk shape this build does not recognize (newer, or partial).
+LIFECYCLE_SCHEMA_UNSUPPORTED = "lifecycle_schema_unsupported"
+
+
+@dataclass(frozen=True)
+class LifecycleSchemaObservation:
+    """The value-free facts a read-only lifecycle schema probe carries (Redmine #14258).
+
+    ``state`` is one of the ``LIFECYCLE_SCHEMA_*`` tokens above; ``version`` is the recorded
+    component ``schema_version`` when one could be read at all; ``upgrade_required`` names the
+    specific "the store is newer than THIS reader" sub-case so a refusal can distinguish a
+    stale reader from a corrupt store (the same honesty rule as
+    :func:`...lane_lifecycle_schema.reader_upgrade_required`).
+    """
+
+    state: str
+    version: Optional[int] = None
+    upgrade_required: bool = False
+
+
+def probe_lane_lifecycle_schema(
+    *, home: Path | None = None, path: Path | None = None
+) -> LifecycleSchemaObservation:
+    """Read-only probe of the SHARED lane lifecycle authority's schema (never migrates).
+
+    The lifecycle counterpart of
+    :func:`...herdr_identity_attestation_schema.probe_store_schema`, added for the
+    managed-launch compatibility preflight (Redmine #14258). A launch must be able to answer
+    "what shape is the shared authority in *right now*" before it creates anything, because
+    the launcher it is about to wrap may have an older reader than whichever lane last
+    migrated the shared store — measured as a v7 store zero-starting a v6 reader with
+    :class:`LaneLifecycleReaderUpgradeRequired` (#14258 j#85890).
+
+    Read-only and fail-closed on every axis, exactly like the reader it front-runs: it opens
+    the container ``mode=ro``, runs only ``PRAGMA`` / ``sqlite_master`` reads, and never
+    creates, migrates, or re-stamps anything. An absent store stays absent (a fresh home is
+    legitimate); an unopenable file is :data:`LIFECYCLE_SCHEMA_UNREADABLE` rather than being
+    folded into "absent" — an unreadable authority is not an empty one.
+    """
+    path = path if path is not None else lane_lifecycle_path(home)
+    if not path.exists():
+        return LifecycleSchemaObservation(LIFECYCLE_SCHEMA_ABSENT)
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.DatabaseError:
+        return LifecycleSchemaObservation(LIFECYCLE_SCHEMA_UNREADABLE)
+    try:
+        # `sqlite3.connect` is lazy, so a non-database file only fails on first use. Force
+        # that read HERE and report it as unreadable: `readonly_component_status` folds a
+        # `DatabaseError` into "unsupported", which would tell an operator to upgrade a
+        # runtime when the real problem is a corrupt / foreign file (the honesty rule
+        # `probe_store_schema` follows for the attestation store).
+        conn.execute("SELECT count(*) FROM sqlite_master")
+        status = readonly_component_status(conn)
+        upgrade = reader_upgrade_required(conn)
+    except sqlite3.DatabaseError:
+        return LifecycleSchemaObservation(LIFECYCLE_SCHEMA_UNREADABLE)
+    finally:
+        conn.close()
+    if status == READONLY_COMPONENT_ABSENT:
+        return LifecycleSchemaObservation(LIFECYCLE_SCHEMA_ABSENT)
+    version = _current_recorded_version(path=path)
+    if status == READONLY_COMPONENT_RECOGNIZED:
+        return LifecycleSchemaObservation(LIFECYCLE_SCHEMA_RECOGNIZED, version)
+    return LifecycleSchemaObservation(LIFECYCLE_SCHEMA_UNSUPPORTED, version, upgrade)
+
+
 def _current_recorded_version(
     *, home: Path | None = None, path: Path | None = None
 ) -> Optional[int]:
@@ -519,13 +592,19 @@ def emit_lifecycle_migration_advisory(
 
 
 __all__ = (
+    "LIFECYCLE_SCHEMA_ABSENT",
+    "LIFECYCLE_SCHEMA_RECOGNIZED",
+    "LIFECYCLE_SCHEMA_UNREADABLE",
+    "LIFECYCLE_SCHEMA_UNSUPPORTED",
     "LaneLifecycleReader",
     "LaneLifecycleReaderUpgradeRequired",
     "LifecycleMigrationPreflight",
+    "LifecycleSchemaObservation",
     "LifecycleWritePreparation",
     "emit_lifecycle_migration_advisory",
     "format_lifecycle_migration_advisory",
     "lifecycle_migration_payload",
     "lifecycle_migration_preflight",
     "load_lane_lifecycle_readonly",
+    "probe_lane_lifecycle_schema",
 )

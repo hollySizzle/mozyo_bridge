@@ -66,6 +66,17 @@ def policy_from_config(config: SublaneIntegrationConfig) -> SublaneIntegrationPo
 
 
 # ---------------------------------------------------------------------------
+# Committed-blob read states (Redmine #14258). Separate tokens for "the ref resolves
+# and the path is not tracked there" and "the ref itself is unreadable": the first is a
+# legitimate absence, the second is unknowable and must fail closed.
+# ---------------------------------------------------------------------------
+
+BLOB_PRESENT = "blob_present"
+BLOB_ABSENT = "blob_absent"
+BLOB_REF_UNRESOLVABLE = "blob_ref_unresolvable"
+
+
+# ---------------------------------------------------------------------------
 # Injected Git operations port.
 # ---------------------------------------------------------------------------
 
@@ -308,6 +319,33 @@ class LiveSublaneGitOperations:
                 + f": {result.stderr.strip()}"
             )
 
+    def committed_blob(self, *, ref: str, relpath: str) -> tuple[str, str]:
+        """Read a committed file's text at ``ref`` without checking anything out (#14258).
+
+        Returns ``(state, text)`` where ``state`` is :data:`BLOB_PRESENT` (text is the blob),
+        :data:`BLOB_ABSENT` (the ref resolves and the path is simply not tracked there), or
+        :data:`BLOB_REF_UNRESOLVABLE` (the ref itself could not be read — nothing about the
+        path is knowable). The presence question is answered by ``ls-tree`` rather than by
+        interpreting ``git show``'s failure text, so "no such path at this ref" and "no such
+        ref" are never conflated into one fail-open "absent".
+
+        The ``sublane create`` launcher gate needs this: the lane worktree does not exist when
+        the gate must refuse, and the config the lane will get is the blob at its base ref —
+        reading the primary checkout's working file instead would be a proxy for the target.
+        Read-only: ``ls-tree`` / ``show`` touch no ref, index, or working tree.
+        """
+        listed = self._run("ls-tree", ref, "--", relpath)
+        if listed.returncode != 0:
+            return BLOB_REF_UNRESOLVABLE, ""
+        if not listed.stdout.strip():
+            return BLOB_ABSENT, ""
+        shown = self._run("show", f"{ref}:{relpath}")
+        if shown.returncode != 0:
+            # Listed but unreadable (a submodule / non-blob entry, or a git failure): the
+            # content is unknowable, which is not the same as absent.
+            return BLOB_REF_UNRESOLVABLE, ""
+        return BLOB_PRESENT, shown.stdout
+
     def worktree_dirty(self) -> bool:
         result = self._run("status", "--porcelain")
         if result.returncode != 0:
@@ -332,6 +370,9 @@ class LiveSublaneGitOperations:
 
 
 __all__ = (
+    "BLOB_ABSENT",
+    "BLOB_PRESENT",
+    "BLOB_REF_UNRESOLVABLE",
     "policy_from_config",
     "SublaneGitOperations",
     "RetireInvariants",
