@@ -193,6 +193,24 @@ class HerdrSublaneActuatorOps:
     def _git(self) -> LiveSublaneGitOperations:
         return LiveSublaneGitOperations(repo_root=self.repo_root)
 
+    def _resolve_runner(self) -> Runner:
+        """The subprocess runner this adapter drives — the approved default when uninjected.
+
+        ``runner`` is the tests' injection seam, so in production it is simply absent. Every
+        consumer below is typed ``Runner`` (non-Optional) and *calls* what it is handed, so
+        the ``None`` must be resolved to the approved ``subprocess.run`` here, at the one
+        boundary that owns the seam. Resolving it per call site instead is what produced
+        Redmine #14457 j#87901: the launcher-compatibility preflight was the one site that
+        passed ``self.runner`` straight through, and the installed CLI's first
+        ``sublane create --execute`` died with ``'NoneType' object is not callable`` inside
+        the pre-mutation gate — a crash where a typed refusal or an admit belongs.
+        """
+        if self.runner is None:
+            import subprocess
+
+            return subprocess.run
+        return self.runner
+
     def gateway_provider(self) -> str:
         """The coordinator (gateway) role's runtime provider from the binding (Redmine #13569).
 
@@ -258,7 +276,7 @@ class HerdrSublaneActuatorOps:
         """Verify the managed-launch launcher BEFORE the first worktree / process (#14258)."""
         return evaluate_launcher_compatibility(
             env=self.env,
-            runner=self.runner,
+            runner=self._resolve_runner(),
             timeout=self.timeout,
             repo_root=self.repo_root,
             store_home=mozyo_bridge_home(),
@@ -714,12 +732,7 @@ class HerdrSublaneActuatorOps:
 
     def _live_rows(self) -> Sequence[Mapping[str, object]]:
         binary = _resolve_binary_or_die(self.env)
-        runner = self.runner
-        if runner is None:
-            import subprocess
-
-            runner = subprocess.run
-        return _list_rows(binary, runner, self.timeout)
+        return _list_rows(binary, self._resolve_runner(), self.timeout)
 
     def observe_pair_attestation(self, worktree_path: str):
         """Redmine #13847: observe both slots' post-launch self-attestation (read-only).
@@ -872,12 +885,9 @@ class HerdrSublaneActuatorOps:
             return False
         try:
             binary = _resolve_binary_or_die(self.env)
-            runner = self.runner
-            if runner is None:
-                import subprocess
-
-                runner = subprocess.run
-            transport = HerdrCliTransport(binary, runner=runner, timeout=self.timeout)
+            transport = HerdrCliTransport(
+                binary, runner=self._resolve_runner(), timeout=self.timeout
+            )
             read = transport.read_pane(want, lines=GATEWAY_READY_CAPTURE_LINES)
         except Exception:  # noqa: BLE001 — a probe never fails the actuation.
             return False
