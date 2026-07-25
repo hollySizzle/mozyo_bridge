@@ -1990,6 +1990,107 @@ class R19UndecodableConfigTest(unittest.TestCase):
         self.assertNotIn("does not parse under THIS runtime", verdict.detail)
 
 
+class R20UntrustedShapeRedactionTest(unittest.TestCase):
+    """R20: an absolute root is private unless something POSITIVELY proves otherwise.
+
+    The earlier rule asked whether a known-safe character preceded the root and treated every
+    unenumerated shape as "not a path" — fail-open, and the candidate launcher's stderr format
+    is not ours to control. These are the shapes that walked straight through it.
+    """
+
+    def _redact(self, text: str) -> str:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            _redact_probe_paths,
+        )
+
+        return _redact_probe_paths(text, Path("/nonexistent"))
+
+    #: Everything that must never survive, in any shape below.
+    _PRIVATE = ("Ada", "Smith", "Team", "Share", "srv", "private.yaml", "p.yaml", "Users")
+
+    def _shapes(self) -> tuple:
+        backslash, dquote, quote, backtick = chr(92), chr(34), chr(39), chr(96)
+        posix = macos_home_path("Ada Smith", "private.yaml")
+        drive = "C:" + backslash + backslash.join(("Users", "Ada Smith", "private.yaml"))
+        unc = backslash * 2 + backslash.join(("srv", "Ada Share", "p.yaml"))
+        return (
+            # Delimiters the allowlist never enumerated.
+            ("colon label, POSIX", f"config:{posix}: bad"),
+            ("colon label, drive", f"config:{drive}: bad"),
+            ("colon label, UNC", f"config:{unc}: bad"),
+            ("backtick", f"error in {backtick}{posix}{backtick}: bad"),
+            ("brace", "error in {" + posix + "}: bad"),
+            ("pipe", f"error in |{posix}|: bad"),
+            # Escaped same-quote: the naive rule closed at the escaped quote.
+            ("escaped double quote",
+             f'error in {dquote}/srv/Ada{backslash}{dquote}s Team/p.yaml{dquote}: bad'),
+            ("escaped single quote",
+             f"error in {quote}/srv/Ada{backslash}{quote}s Team/p.yaml{quote}: bad"),
+            # And the shapes that already worked, kept as non-regressions.
+            ("plain unquoted", f"error in {posix}: bad"),
+            ("quoted with spaces", f"error in {quote}{posix}{quote}: bad"),
+            ("drive unquoted", f"error in {drive}: bad"),
+            ("UNC unquoted", f"error in {unc}: bad"),
+        )
+
+    def test_no_shape_leaks_a_private_tail(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            REDACTED_PROBE_PATH,
+        )
+
+        for label, text in self._shapes():
+            with self.subTest(shape=label):
+                out = self._redact(text)
+                self.assertIn(REDACTED_PROBE_PATH, out)
+                for leaked in self._PRIVATE:
+                    self.assertNotIn(leaked, out, f"{label} leaked {leaked!r}: {out!r}")
+
+    def test_urls_and_relative_tokens_survive_by_positive_proof(self) -> None:
+        for text in (
+            "see https://example.invalid/docs/schema for the key list",
+            "see http://example.invalid:8080/docs for keys",
+            "see https://a.invalid/x and http://b.invalid/y ok",
+            "unknown key in relative/path.yaml",
+            "expected one of ['down/right'] for split",
+            "lane_placement.by_lane_kind must be a mapping",
+        ):
+            with self.subTest(text=text[:38]):
+                self.assertEqual(self._redact(text), text)
+
+    def test_a_url_after_a_private_path_does_not_rescue_the_path(self) -> None:
+        # The guard skips a PROVEN-safe token; it must not skip anything before one.
+        out = self._redact(
+            "error in " + macos_home_path("Ada Smith", "p.yaml") + " see https://x.invalid/d"
+        )
+        for leaked in self._PRIVATE:
+            self.assertNotIn(leaked, out)
+
+    def test_the_real_public_exception_carries_no_private_tail(self) -> None:
+        # End to end, with the scratch directory forced to contain a space.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            REDACTED_PROBE_PATH,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Ada Team scratch"
+            (root / "repo" / ".mozyo-bridge").mkdir(parents=True)
+            (root / "repo" / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: [1, 2\n", encoding="utf-8"
+            )
+            LaneLifecycleStore(home=root / "home").ensure_schema()
+            launcher = _current_head_launcher(root)
+            with self.assertRaises(HerdrLauncherIncompatibleError) as caught:
+                preflight_launcher_compatibility(
+                    launcher, subprocess.run, 60.0, dict(os.environ),
+                    repo_root=root / "repo", store_home=root / "home",
+                )
+            message = str(caught.exception)
+            self.assertEqual(caught.exception.reason, TARGET_CONFIG_INVALID)
+            for leaked in (str(root), "Ada Team scratch", "mozyo-config-parse-", str(Path.home())):
+                self.assertNotIn(leaked, message)
+            self.assertIn(REDACTED_PROBE_PATH, message)
+
+
 class R18PrivacyFirstRedactionTest(unittest.TestCase):
     """R18: no private tail survives, in any of the shapes the contract covers."""
 

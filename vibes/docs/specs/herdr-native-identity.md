@@ -349,6 +349,13 @@ flow:
    probe の repo 選択は **cwd 一軸に固定**する: `resolve_repo_root` は `--repo` > `MOZYO_REPO` > cwd の順で
    解決するため、probe env から repo 選択 env を除去しないと ambient `MOZYO_REPO` が neutral cwd を
    上書きし、直接測定へ到達する前に advertisement probe が target config で死ぬ (review j#87786 R10 実測)。
+   public 証拠の **path redaction は allowlist ではなく positive proof** で判定する: 引用する text は
+   candidate launcher の stderr であり形式は当方の管理下にないため、「既知の安全な delimiter が前置される
+   場合のみ path と見なす」旧規則は列挙外の形 (`config:<path>`、backtick、brace、pipe) を素通りさせ、
+   escaped same-quote では quoted run が途中で閉じて残りの private tail が公開された (review j#87824 R20、
+   5 形すべて実測)。現規則は絶対 root の出現を既定で private と扱い、`scheme://` URL と語中の `/`
+   (相対 token) のみを positive proof で保持する。proof が成立した token は末尾まで skip する —
+   URL 内の 2 つ目の `/` を単独で判定すると同じ URL を redact してしまうため。
    target が unreadable / unsupported、launcher が capability を advertise しない場合はすべて
    fail-closed (unprovable は compatible でない)。config が存在しない repo は parse する対象が無いので
    admit する (この check 以前に動いていた case を defect 無しに壊さない)。

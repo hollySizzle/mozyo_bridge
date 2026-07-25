@@ -135,7 +135,12 @@ _CONTENT_TRANSFORM_ATTRS: tuple[str, ...] = (
 # materialized an invalid config in the new worktree). `--all` instead lists only the
 # attributes that are actually SET, so PRESENCE — never the value — is what decides.
 
-#: The tree-entry modes whose blob content IS the bytes a checkout writes. Anything else is
+#: The tree-entry modes whose blob content is the checkout's content, once no attribute-driven
+#: conversion applies. Deliberately NOT "byte-identical" (review j#87824): `core.autocrlf` can
+#: still rewrite line endings with no attribute involved, and this check only establishes the
+#: attribute axis. What it does establish is parser-equivalence for the config question —
+#: YAML parses identically across that line-ending difference — which is the property the
+#: launcher compatibility measurement actually depends on. Anything else is
 #: reported as :data:`BLOB_NOT_REGULAR` rather than read: this is the whole premise of the
 #: pre-worktree config measurement, and it was measured false for a symlink — the gate read
 #: the link payload, called it compatible, and `git worktree add` then materialized a

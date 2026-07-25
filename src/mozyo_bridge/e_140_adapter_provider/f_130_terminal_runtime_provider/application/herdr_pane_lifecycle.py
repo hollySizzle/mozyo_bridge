@@ -71,6 +71,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     decide_store_compatibility,
     parse_launcher_capability_output,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_probe_redaction import (  # noqa: E501
+    REDACTED_PROBE_PATH,
+    _redact_probe_paths,
+)
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
     herdr_identity_attestation_path,
@@ -300,8 +304,6 @@ def preflight_attest_store_schema(
 #: it is given, but keeping the canonical basename makes any error it prints recognizable.
 _CONFIG_PROBE_BASENAME = "config.yaml"
 
-#: What a redacted filesystem path is rendered as in a public verdict detail.
-REDACTED_PROBE_PATH = "<target config>"
 
 #: The environment variables that select which repo a mozyo-bridge CLI resolves. Derived
 #: from :func:`...shared.paths.resolve_repo_root`, whose precedence is explicit ``--repo`` >
@@ -323,79 +325,6 @@ def repo_neutral_env(env: Mapping[str, str]) -> dict:
     launch env is untouched, so nothing about how the provider is started changes.
     """
     return {k: v for k, v in dict(env).items() if k not in REPO_SELECTION_ENV_VARS}
-
-#: Matches an absolute filesystem path anywhere in a message. Applied AFTER the exact scratch
-#: paths are substituted, so it is the backstop rather than the primary rule: a parser can
-#: print a path this code never chose (a realpath, an ``include`` target), and the issue's
-#: close condition forbids a private absolute path in public evidence regardless of who wrote
-#: it.
-#:
-#: Three root shapes, each pinned by a regression rather than asserted in prose (review
-#: j#87786 R11: the previous alternative required a *doubled* backslash, so an ordinary
-#: drive path with single separators passed straight through while the comment claimed Windows
-#: was covered — the same "docstring stronger than the implementation" defect as R1 and R7, in
-#: the same subject area): a UNC root, a drive root with either separator, and a POSIX root.
-#:
-#: A *relative* token is deliberately not matched. It carries no private location, and
-#: redacting it would eat the parse reason the detail exists to convey.
-#: The three absolute roots, as a shared fragment so every rule below agrees on what
-#: "absolute" means.
-_ABS_ROOT = r"(?:\\\\|[A-Za-z]:[\\/]|/)"
-
-#: A quoted absolute path, matched to the SAME closing quote. Two rules, not one character
-#: class: an earlier single rule excluded BOTH quote characters from the path body, so a
-#: double-quoted path containing an apostrophe fell out of the quoted case and leaked its tail
-#: (review j#87817 R18). The opposite quote is an ordinary path character.
-_QUOTED_ABS_PATH_RES = (
-    re.compile(r"'(" + _ABS_ROOT + r"[^']*)'"),
-    re.compile(r'"(' + _ABS_ROOT + r'[^"]*)"'),
-)
-
-#: An unquoted absolute path, anchored at a token boundary. The lookbehind stops the POSIX
-#: alternative from matching the slash INSIDE ``relative/path.yaml``, ``down/right`` or
-#: ``https://…`` — redacting those would destroy the parse reason the detail exists to carry.
-#: ``:`` is excluded from the delimiter set for the URL case specifically.
-_ABS_PATH_RE = re.compile(r"(?<![^\s'\"(\[<>=,;])" + _ABS_ROOT + r"[^\s'\"]*")
-
-
-def _redact_probe_paths(detail: str, *scratch: Path) -> str:
-    """Strip filesystem paths out of a parser's message, keeping WHY it failed (#14258 R7).
-
-    The config-parse measurement materializes the target document in a private temporary
-    directory, so both parsers name that path in their errors — and the detail is then
-    concatenated into a public, operator-facing refusal. Measured (review j#87766): the
-    self-parser's message carried the full ``/var/folders/.../mozyo-config-parse-*/config.yaml``
-    into the ``target_config_invalid`` error, which the issue's close condition forbids and
-    which the surrounding docstring wrongly claimed could not happen.
-
-    Each scratch path is substituted along with its ``realpath`` (on macOS ``/var`` resolves
-    to ``/private/var``, so the launcher prints a spelling this process never constructed),
-    and any remaining absolute path is replaced by the same placeholder. What survives is the
-    part that helps: the error class and the parse reason — ``unknown key 'by_lane_kind'``,
-    ``while parsing a flow sequence``.
-    """
-    text = detail or ""
-    spellings = set()
-    for path in scratch:
-        for candidate in (path, Path(os.path.realpath(path))):
-            spellings.add(str(candidate))
-    for spelling in sorted(spellings, key=len, reverse=True):
-        text = text.replace(spelling, REDACTED_PROBE_PATH)
-    # Quoted first: the closing quote is a proven terminator, so the whole path goes even when
-    # it contains spaces.
-    for pattern in _QUOTED_ABS_PATH_RES:
-        text = pattern.sub(REDACTED_PROBE_PATH, text)
-    # Then unquoted. An unquoted absolute path has NO proven terminator once it may contain
-    # spaces, so nothing after the root is kept: everything from the root to the end of that
-    # line is dropped (review j#87817 R18). Privacy wins over detail here — the close condition
-    # forbids a private absolute path in public evidence outright, and an earlier version that
-    # redacted only the first segment left the rest of the path visible. Text BEFORE the root
-    # is preserved, which is where the error class and parse reason sit.
-    lines = []
-    for line in text.splitlines() or [""]:
-        match = _ABS_PATH_RE.search(line)
-        lines.append(line[: match.start()] + REDACTED_PROBE_PATH if match else line)
-    return "\n".join(lines)
 
 #: The target declares no config document at all — nothing for any launcher to parse.
 CONFIG_TEXT_ABSENT = "config_text_absent"
