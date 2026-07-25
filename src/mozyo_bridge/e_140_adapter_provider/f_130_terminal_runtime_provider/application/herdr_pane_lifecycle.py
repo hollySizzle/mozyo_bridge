@@ -24,7 +24,10 @@ is recorded non-fatally (the agents are already live, an empty root pane is only
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -292,6 +295,42 @@ def preflight_attest_store_schema(
 #: it is given, but keeping the canonical basename makes any error it prints recognizable.
 _CONFIG_PROBE_BASENAME = "config.yaml"
 
+#: What a redacted filesystem path is rendered as in a public verdict detail.
+REDACTED_PROBE_PATH = "<target config>"
+
+#: Matches an absolute filesystem path (POSIX or Windows) anywhere in a message. Applied
+#: AFTER the exact scratch paths are substituted, so it is the backstop rather than the
+#: primary rule: a parser can print a path this code never chose (a realpath, an ``include``
+#: target), and the issue's close condition forbids a private absolute path in public
+#: evidence regardless of who wrote it.
+_ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:)?(?:/|\\\\)[^\s'\"]+")
+
+
+def _redact_probe_paths(detail: str, *scratch: Path) -> str:
+    """Strip filesystem paths out of a parser's message, keeping WHY it failed (#14258 R7).
+
+    The config-parse measurement materializes the target document in a private temporary
+    directory, so both parsers name that path in their errors — and the detail is then
+    concatenated into a public, operator-facing refusal. Measured (review j#87766): the
+    self-parser's message carried the full ``/var/folders/.../mozyo-config-parse-*/config.yaml``
+    into the ``target_config_invalid`` error, which the issue's close condition forbids and
+    which the surrounding docstring wrongly claimed could not happen.
+
+    Each scratch path is substituted along with its ``realpath`` (on macOS ``/var`` resolves
+    to ``/private/var``, so the launcher prints a spelling this process never constructed),
+    and any remaining absolute path is replaced by the same placeholder. What survives is the
+    part that helps: the error class and the parse reason — ``unknown key 'by_lane_kind'``,
+    ``while parsing a flow sequence``.
+    """
+    text = detail or ""
+    spellings = set()
+    for path in scratch:
+        for candidate in (path, Path(os.path.realpath(path))):
+            spellings.add(str(candidate))
+    for spelling in sorted(spellings, key=len, reverse=True):
+        text = text.replace(spelling, REDACTED_PROBE_PATH)
+    return _ABS_PATH_RE.sub(REDACTED_PROBE_PATH, text)
+
 #: The target declares no config document at all — nothing for any launcher to parse.
 CONFIG_TEXT_ABSENT = "config_text_absent"
 #: The exact document the lane will present was obtained.
@@ -331,8 +370,6 @@ def measure_config_parse_compatibility(
     cannot be run, or that answers with an exit code outside the contract, yields
     :data:`CONFIG_PARSE_LAUNCHER_UNUSABLE` — an unanswerable probe proves nothing.
     """
-    import tempfile
-
     from mozyo_bridge.application.repo_local_config_loader import (
         RepoLocalConfigError,
         load_repo_local_config_from_path,
@@ -358,7 +395,8 @@ def measure_config_parse_compatibility(
             # This runtime rejects it too: a config defect, not a launcher skew. Reported as
             # such so an operator is never told to upgrade a launcher over their own config.
             return ConfigParseObservation(
-                CONFIG_PARSE_SELF_REJECTED, _bounded_detail(str(exc))
+                CONFIG_PARSE_SELF_REJECTED,
+                _bounded_detail(_redact_probe_paths(str(exc), probe_path, Path(scratch))),
             )
         argv = build_config_parse_probe_argv(launcher, str(probe_path))
         try:
@@ -372,7 +410,11 @@ def measure_config_parse_compatibility(
             )
         if completed.returncode == 0:
             return ConfigParseObservation(CONFIG_PARSE_BOTH_OK)
-        detail = _bounded_detail(completed.stderr) or _bounded_detail(completed.stdout)
+        detail = _redact_probe_paths(
+            _bounded_detail(completed.stderr) or _bounded_detail(completed.stdout),
+            probe_path,
+            Path(scratch),
+        )
         if completed.returncode == CONFIG_PARSE_REJECTED_EXIT:
             return ConfigParseObservation(CONFIG_PARSE_LAUNCHER_REJECTED, detail)
         # Any other code is outside the contract (an old CLI's `invalid choice`, a crash, a
@@ -524,10 +566,33 @@ def preflight_launcher_compatibility(
     ``config_parse`` defaults to the document ``repo_root`` presents — the wrapper's own
     ``--cwd``. A caller that must answer before that directory exists passes the measurement
     it made for the target instead (see :func:`preflight_launcher_target_authorities`).
+
+    **Order matters, and it is the fix for review j#87762 R6.** The capability probe is
+    cwd-sensitive by design (#14231: it runs where the wrapper will run, so a launcher that
+    only fails inside the lane's own config directory is caught). But a CLI parses that config
+    at startup, so running the probe in the target cwd FIRST means an incompatible config kills
+    the probe and the run ends as "cannot run the `herdr agent-attest` subcommand" — blaming
+    the launcher's wrapper for what is really a config-parse skew, and, when the config is
+    broken on its own terms, blaming the launcher for the operator's config. Measured: a
+    self-invalid target yielded that generic error instead of ``target_config_invalid``.
+
+    So the conjunction reads the advertisement where the config cannot interfere, classifies
+    the config explicitly, and only then runs the cwd-sensitive probe:
+
+    1. **advertisement** — ``--help`` in a NEUTRAL cwd. What the launcher *claims* is a
+       property of the build, not of any directory, and this is the only cwd where an
+       older launcher survives long enough to say it;
+    2. **attestation store** (#13882);
+    3. **target authorities** (#14258) — the config measured directly (self + candidate) and
+       the shared lane lifecycle join. Every config outcome is typed HERE;
+    4. **the lane cwd probe** (#14231) — re-run in ``repo_root`` once the config is proven
+       parseable by this launcher, so a failure there is now unambiguously about something
+       other than the config.
     """
-    observation = preflight_attest_launcher_capability(
-        launcher, runner, timeout, env, repo_root=repo_root
-    )
+    with tempfile.TemporaryDirectory(prefix="mozyo-capability-probe-") as neutral:
+        observation = preflight_attest_launcher_capability(
+            launcher, runner, timeout, env, repo_root=Path(neutral)
+        )
     preflight_attest_store_schema(
         observation, store_home=Path(store_home), replacement_launch=replacement_launch
     )
@@ -539,6 +604,13 @@ def preflight_launcher_compatibility(
     preflight_launcher_target_authorities(
         observation, config_parse=config_parse, store_home=Path(store_home)
     )
+    if repo_root is not None and Path(repo_root).is_dir():
+        # #14231's boundary, kept: the launcher must also start cleanly in the directory the
+        # wrapper will actually run in. Reached only after the config is proven parseable, so
+        # this can no longer be a mis-attributed config failure.
+        preflight_attest_launcher_capability(
+            launcher, runner, timeout, env, repo_root=repo_root
+        )
     return observation
 
 

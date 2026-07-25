@@ -76,6 +76,13 @@ def policy_from_config(config: SublaneIntegrationConfig) -> SublaneIntegrationPo
 #: pin, so it is refused rather than passed on to `git worktree add`.
 _FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
+#: Forces git's own ambiguity warning ON for one command, whatever the repo config says.
+#: This is the whole of the pseudo-ref rule this code carries (#14258 R9): git decides what
+#: is ambiguous, and the only things controlled here are that the ambient config cannot
+#: silence it and that the verdict is read WITHOUT parsing the message (so it is
+#: locale-independent too).
+_FORCE_AMBIGUITY_WARNING: tuple[str, ...] = ("-c", "core.warnAmbiguousRefs=true")
+
 BLOB_PRESENT = "blob_present"
 BLOB_ABSENT = "blob_absent"
 BLOB_REF_UNRESOLVABLE = "blob_ref_unresolvable"
@@ -335,15 +342,44 @@ class LiveSublaneGitOperations:
         once, here, and use the returned commit for BOTH.
 
         Fail-closed on everything that is not exactly one commit: an unresolvable ref, a
-        non-commit object, output that is not a single 40-hex line, or a name git itself
-        reports as **ambiguous** (its own warning is the signal — refusing on it is what keeps
-        "which of the two did we pin?" from being answered by luck). ``""`` means "no pin", and
-        every caller treats that as a zero-mutation refusal rather than falling back to the ref.
+        non-commit object, output that is not a single 40-hex line, or an **ambiguous** name.
+        ``""`` means "no pin", and every caller treats that as a zero-mutation refusal rather
+        than falling back to the ref.
+
+        Ambiguity is decided by **git**, not by a model of git kept here (reviews j#87762 R5,
+        j#87772 R8, j#87777 R9). Modelling it was wrong twice in ways only a reviewer found:
+        the resolution order's first entry (``$GIT_DIR/<name>``) was missed, and then the
+        pseudo-ref boundary was inferred to be upper-case names when the real criterion is
+        whether the file's *content* is a valid ref (``.git/config`` is unambiguous because it
+        is INI, not because it is lower-case). So the judgment is delegated to the authority
+        and this code controls only how the question is asked:
+
+        - :data:`_FORCE_AMBIGUITY_WARNING` turns git's own warning on for this one command, so
+          a repo's ``core.warnAmbiguousRefs=false`` cannot silence it;
+        - the verdict is "did git say anything at all while succeeding" — the message is never
+          parsed, so a translated warning reads the same as an English one.
+
+        An earlier revision also counted the ``refs/…`` candidates directly as a second
+        signal. A mutation probe showed no test could tell whether that code was present, and
+        it carried a partial model of the very rule this delegation exists to stop maintaining
+        — so it was removed rather than shipped unpinned.
+
+        Deliberate over-refusal: any warning git emits while succeeding fails this closed, not
+        just an ambiguity one. That is the intended trade — the refusal is zero-mutation, a pin
+        git cannot produce silently is not one to trust, and an explicit full SHA always
+        resolves without a warning (measured), so a caller who needs to proceed has an exact,
+        unambiguous way to say so.
         """
-        result = self._run("rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}")
+        result = self._run(
+            *_FORCE_AMBIGUITY_WARNING,
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{ref}^{{commit}}",
+        )
         if result.returncode != 0:
             return ""
-        if "ambiguous" in (result.stderr or "").lower():
+        if (result.stderr or "").strip():
             return ""
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if len(lines) != 1:

@@ -71,6 +71,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     LAUNCHER_CANNOT_PARSE_TARGET_CONFIG,
     LAUNCHER_CANNOT_READ_LIFECYCLE,
     LAUNCHER_CONFIG_VALIDATOR_ABSENT,
+    TARGET_CONFIG_INVALID,
     LAUNCHER_LIFECYCLE_CONTRACT_ABSENT,
     LIFECYCLE_JOIN_OK,
     TARGET_SCHEMA_ABSENT,
@@ -834,6 +835,305 @@ class R4NestedGrammarTest(unittest.TestCase):
             build_config_parse_probe_argv("/x/launcher", "/tmp/c.yaml"),
             ["/x/launcher", "config", "check-parse", "--file", "/tmp/c.yaml"],
         )
+
+
+# ---------------------------------------------------------------------------
+# Review j#87762 / j#87766 blocking findings — R5 / R6 / R7.
+# ---------------------------------------------------------------------------
+
+
+def _current_head_launcher(directory: Path, name: str = "cur-mozyo-bridge") -> str:
+    """A REAL launcher: a shell entrypoint that runs THIS source tree's CLI.
+
+    Not a canned script. R6 is about what happens when a launcher's own startup parses the
+    target config, which only a real CLI does — a fake that answers ``--help`` from a string
+    cannot exhibit it, which is exactly why the previous round's tests missed the defect.
+    """
+    path = directory / name
+    path.write_text(
+        "#!/bin/sh\nexec " + sys.executable + " -c '"
+        'import sys; sys.path.insert(0,"' + str(_SRC) + '"); '
+        'sys.argv=["mozyo-bridge"]+sys.argv[1:]; '
+        "from mozyo_bridge.application.cli import main; sys.exit(main())' \"$@\"\n",
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return str(path)
+
+
+class R5AmbiguousRefTest(unittest.TestCase):
+    """R5: ambiguity must be proven, not inferred from git's (optional, localizable) warning."""
+
+    def _repo_with_collision(self, root: Path, *, warn: bool) -> Path:
+        repo = _seed_repo(root, _V2_CONFIG)
+        _git(repo, "branch", "collision")
+        _git(repo, "tag", "collision")
+        # The ambient setting the previous implementation depended on. With it off git
+        # resolves silently, so a warning-text check sees nothing to object to.
+        _git(repo, "config", "core.warnAmbiguousRefs", "true" if warn else "false")
+        return repo
+
+    def test_an_ambiguous_name_yields_no_pin_regardless_of_ambient_config(self) -> None:
+        for warn in (True, False):
+            with self.subTest(warnAmbiguousRefs=warn):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = self._repo_with_collision(Path(tmp), warn=warn)
+                    ops = LiveSublaneGitOperations(repo_root=repo)
+                    self.assertEqual(
+                        ops.resolve_commit("collision"),
+                        "",
+                        "an ambiguous base must never resolve to a pin",
+                    )
+
+    def test_the_ambiguity_refusal_mutates_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo_with_collision(Path(tmp), warn=False)
+            before = _git(repo, "rev-parse", "HEAD").stdout
+            refs_before = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)").stdout
+            LiveSublaneGitOperations(repo_root=repo).resolve_commit("collision")
+            self.assertEqual(_git(repo, "rev-parse", "HEAD").stdout, before)
+            self.assertEqual(
+                _git(repo, "for-each-ref", "--format=%(refname) %(objectname)").stdout,
+                refs_before,
+            )
+            self.assertEqual(_git(repo, "status", "--porcelain").stdout, "")
+
+    def test_unambiguous_shapes_still_pin(self) -> None:
+        # The refusal must not be so broad that ordinary bases stop resolving.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo_with_collision(Path(tmp), warn=False)
+            ops = LiveSublaneGitOperations(repo_root=repo)
+            for ref in ("main", "refs/heads/main", "HEAD"):
+                with self.subTest(ref=ref):
+                    self.assertRegex(ops.resolve_commit(ref), r"^[0-9a-f]{40}$")
+
+
+class R8R9PseudoRefAmbiguityTest(unittest.TestCase):
+    """R8 / R9: every name git calls ambiguous must be refused — including pseudo-refs.
+
+    Two rounds of modelling git's pseudo-ref rule were wrong: R8 missed the
+    ``$GIT_DIR/<name>`` candidate entirely, and R9 showed the follow-up rule (upper-case
+    names) was the wrong criterion — ``.git/config`` is not a candidate because its *content*
+    is not a ref, not because of its casing. These pin the outcome for all three shapes and,
+    just as importantly, that ordinary bases are still pinned.
+    """
+
+    def _repo(self, root: Path) -> tuple[Path, str]:
+        repo = _seed_repo(root, _V2_CONFIG)
+        sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        # R8: the pseudo-ref slot, which sits BEFORE every `refs/…` path in git's order.
+        (repo / ".git" / "FETCH_HEAD").write_text(sha + "\n", encoding="utf-8")
+        _git(repo, "branch", "FETCH_HEAD")
+        # R9: a LOWER-case pseudo-ref whose content is a valid ref. The casing rule admitted
+        # this one, which is why the rule is now git's own verdict rather than a model of it.
+        (repo / ".git" / "whatever").write_text(sha + "\n", encoding="utf-8")
+        _git(repo, "branch", "whatever")
+        # R5: the plain branch/tag collision.
+        _git(repo, "branch", "collision")
+        _git(repo, "tag", "collision")
+        # A lower-case `.git` file that is NOT a ref (INI), with a same-named branch. Git does
+        # not call this ambiguous, so neither may we — over-refusing a legitimate base is its
+        # own bug, and it is what a casing-shaped rule would have to get wrong in the other
+        # direction to catch R9.
+        _git(repo, "branch", "config")
+        # The ambient setting every one of these bypasses depended on.
+        _git(repo, "config", "core.warnAmbiguousRefs", "false")
+        return repo, sha
+
+    def test_every_ambiguous_shape_yields_no_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = self._repo(Path(tmp))
+            ops = LiveSublaneGitOperations(repo_root=repo)
+            for ref in ("FETCH_HEAD", "whatever", "collision"):
+                with self.subTest(ref=ref):
+                    self.assertEqual(
+                        ops.resolve_commit(ref),
+                        "",
+                        f"git calls {ref!r} ambiguous; a pin must never be taken from it",
+                    )
+
+    def test_those_refusals_mutate_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = self._repo(Path(tmp))
+            refs_before = _git(repo, "for-each-ref", "--format=%(refname) %(objectname)").stdout
+            head_before = _git(repo, "rev-parse", "HEAD").stdout
+            ops = LiveSublaneGitOperations(repo_root=repo)
+            for ref in ("FETCH_HEAD", "whatever", "collision"):
+                ops.resolve_commit(ref)
+            self.assertEqual(
+                _git(repo, "for-each-ref", "--format=%(refname) %(objectname)").stdout,
+                refs_before,
+            )
+            self.assertEqual(_git(repo, "rev-parse", "HEAD").stdout, head_before)
+            self.assertEqual(_git(repo, "status", "--porcelain").stdout, "")
+
+    def test_unambiguous_bases_are_still_pinned(self) -> None:
+        # False-positive non-regression, pinned against git's OWN boundary. `config` is the
+        # discriminating case: a `.git` file with a same-named branch that git does not treat
+        # as a candidate, because its content is not a ref.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, sha = self._repo(Path(tmp))
+            ops = LiveSublaneGitOperations(repo_root=repo)
+            for ref in ("config", "main", "HEAD", "refs/heads/main", sha):
+                with self.subTest(ref=ref):
+                    self.assertRegex(
+                        ops.resolve_commit(ref),
+                        r"^[0-9a-f]{40}$",
+                        f"{ref!r} is unambiguous to git and must still pin",
+                    )
+
+
+class R6ConfigClassificationOrderTest(unittest.TestCase):
+    """R6: the config classification must be reachable at the ``prepare_session`` callsite."""
+
+    def _target(self, root: Path, config_text: str) -> Path:
+        target = root / "target"
+        (target / ".mozyo-bridge").mkdir(parents=True)
+        (target / ".mozyo-bridge" / "config.yaml").write_text(config_text, encoding="utf-8")
+        LaneLifecycleStore(home=root / "home").ensure_schema()
+        return target
+
+    def test_a_self_invalid_target_is_classified_not_blamed_on_the_launcher(self) -> None:
+        # THE R6 regression. The capability probe is cwd-sensitive (#14231) and a CLI parses
+        # the config at startup, so probing the target cwd FIRST turned this into "cannot run
+        # the agent-attest subcommand" — blaming the launcher for the operator's config.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = self._target(root, "version: 2\nbogus_top_level: 1\n")
+            launcher = _current_head_launcher(root)
+            with self.assertRaises(HerdrLauncherIncompatibleError) as caught:
+                preflight_launcher_compatibility(
+                    launcher, subprocess.run, 60.0, dict(os.environ),
+                    repo_root=target, store_home=root / "home",
+                )
+            self.assertEqual(caught.exception.reason, TARGET_CONFIG_INVALID)
+
+    def test_a_current_valid_target_a_real_old_parser_rejects_is_attributed_to_it(self) -> None:
+        # The other half: valid HERE, rejected by the candidate. Must reach
+        # `launcher_cannot_parse_target_config`, not a generic wrapper failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = self._target(root, R4NestedGrammarTest._NESTED_CONFIG)
+            real = _current_head_launcher(root)
+            # A launcher whose ADVERTISEMENT is this build's, but whose parser predates the
+            # nested key — delegating everything else to the real CLI so the wrapper probe,
+            # in every cwd, behaves exactly like a current launcher.
+            old = root / "old-mozyo-bridge"
+            old.write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" = "config" ] && [ "$2" = "check-parse" ]; then\n'
+                '  grep -q by_lane_kind "$4" && '
+                "{ echo \"unknown key 'by_lane_kind'\" >&2; exit 2; }\n"
+                "fi\n"
+                f'exec "{real}" "$@"\n',
+                encoding="utf-8",
+            )
+            old.chmod(old.stat().st_mode | stat.S_IEXEC)
+            with self.assertRaises(HerdrLauncherIncompatibleError) as caught:
+                preflight_launcher_compatibility(
+                    str(old), subprocess.run, 60.0, dict(os.environ),
+                    repo_root=target, store_home=root / "home",
+                )
+            self.assertEqual(
+                caught.exception.reason, LAUNCHER_CANNOT_PARSE_TARGET_CONFIG
+            )
+            self.assertIn("by_lane_kind", str(caught.exception))
+
+    def test_the_lane_cwd_probe_survives_the_reorder(self) -> None:
+        # GUARD BITE for #14231: moving the advertisement read to a neutral cwd must not drop
+        # the lane-cwd boundary. A launcher that is fine in a neutral cwd and broken in the
+        # lane cwd for a NON-config reason must still be refused.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = self._target(root, _V2_CONFIG)
+            real = _current_head_launcher(root)
+            sentinel = target / "cwd-poison"
+            sentinel.write_text("x", encoding="utf-8")
+            cwd_broken = root / "cwd-broken-mozyo-bridge"
+            cwd_broken.write_text(
+                # cwd-sensitive by construction: the sentinel is only visible on a RELATIVE
+                # path when the process actually runs in the lane directory. (`$PWD` would
+                # not work — a subprocess `cwd=` changes the working directory but leaves
+                # that inherited shell variable pointing at the parent's.)
+                "#!/bin/sh\n"
+                'if [ -f ./cwd-poison ] && [ "$1" = "herdr" ]; then\n'
+                '  echo "boom in the lane cwd" >&2; exit 2\nfi\n'
+                f'exec "{real}" "$@"\n',
+                encoding="utf-8",
+            )
+            cwd_broken.chmod(cwd_broken.stat().st_mode | stat.S_IEXEC)
+            with self.assertRaises(HerdrSessionStartError):
+                preflight_launcher_compatibility(
+                    str(cwd_broken), subprocess.run, 60.0, dict(os.environ),
+                    repo_root=target, store_home=root / "home",
+                )
+
+
+class R7ProbePathRedactionTest(unittest.TestCase):
+    """R7: the private probe path must never reach a public verdict."""
+
+    _LEAKY = ("/var/", "/private/", "/tmp/", "mozyo-config-parse-", "\\")
+
+    def _assert_no_path(self, text: str) -> None:
+        for token in self._LEAKY:
+            self.assertNotIn(token, text, f"public detail leaked {token!r}: {text!r}")
+
+    def test_a_self_rejection_detail_carries_no_filesystem_path(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            CONFIG_TEXT_PRESENT,
+            measure_config_parse_compatibility,
+        )
+
+        def _ok(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        observation = measure_config_parse_compatibility(
+            "/bin/true", _ok, 5.0, {}, CONFIG_TEXT_PRESENT, "version: [1, 2\n"
+        )
+        self._assert_no_path(observation.launcher_detail)
+        # The useful part survives: the reader still learns WHY it failed.
+        self.assertIn("YAML", observation.launcher_detail)
+
+    def test_a_candidate_rejection_detail_carries_no_filesystem_path(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            CONFIG_TEXT_PRESENT,
+            measure_config_parse_compatibility,
+        )
+
+        def _reject(argv, **kwargs):
+            # A candidate that echoes the probe path back, as a real CLI's error does.
+            path = argv[argv.index("--file") + 1]
+            return subprocess.CompletedProcess(
+                argv, 2, stdout="", stderr=f"unknown key 'by_lane_kind' in {path}"
+            )
+
+        observation = measure_config_parse_compatibility(
+            "/bin/true", _reject, 5.0, {}, CONFIG_TEXT_PRESENT, _V2_CONFIG
+        )
+        self._assert_no_path(observation.launcher_detail)
+        self.assertIn("by_lane_kind", observation.launcher_detail)
+
+    def test_the_public_exception_from_a_real_run_carries_no_path(self) -> None:
+        # End to end through the real conjunction and a real launcher: the raised, public
+        # error is what an operator sees, and it is what the close condition constrains.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            (target / ".mozyo-bridge").mkdir(parents=True)
+            (target / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 2\nbogus_top_level: 1\n", encoding="utf-8"
+            )
+            LaneLifecycleStore(home=root / "home").ensure_schema()
+            launcher = _current_head_launcher(root)
+            with self.assertRaises(HerdrLauncherIncompatibleError) as caught:
+                preflight_launcher_compatibility(
+                    launcher, subprocess.run, 60.0, dict(os.environ),
+                    repo_root=target, store_home=root / "home",
+                )
+            message = str(caught.exception)
+            self.assertNotIn(str(Path.home()), message)
+            for token in ("mozyo-config-parse-", "/var/folders", "/private/var"):
+                self.assertNotIn(token, message)
 
 
 def _agent_attest_help(parser) -> str:

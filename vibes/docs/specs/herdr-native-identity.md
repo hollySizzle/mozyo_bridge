@@ -330,7 +330,12 @@ flow:
    `git worktree add` の間に前進し得る (review j#87746 R1、実測: v2 config を admit した後 worktree には
    v99 が materialize)。`pin_base_commit` が最初の mutation より前に `rev-parse --verify <ref>^{commit}`
    で解決し、以降の config read と worktree 生成は**同一 object** を指す。解決不能 / ambiguous / 非 commit は
-   zero-mutation refusal (ref へ fallback しない)。実際の conjunction (`preflight_launcher_compatibility`) は 2 箇所から呼ばれる:
+   zero-mutation refusal (ref へ fallback しない)。ambiguity の判定は **git 自身に委ねる**: この 1 command に限り
+   `-c core.warnAmbiguousRefs=true` を強制し、「成功したのに stderr が非空か」だけを見る (文字列一致をしないので
+   locale 非依存、ambient config でも無効化されない)。pseudo-ref (`$GIT_DIR/<name>`) の候補規則を自前で模写しない —
+   模写は 2 度外した (解決順序の先頭欠落 j#87772 / casing による誤った一般化 j#87777。実際の境界は
+   `.git/<name>` の**内容が ref として有効か**であって大文字小文字ではない)。この規則は ambiguity 以外の警告でも
+   拒否する意図的な over-refusal であり、逃げ道は full SHA の明示 (常に無警告で pin される)。実際の conjunction (`preflight_launcher_compatibility`) は 2 箇所から呼ばれる:
    `sublane create --execute` の pre-mutation gate (worktree より前) と `prepare_session` (first herdr
    write より前、create を経由しない heal / 明示 `herdr session-start` で唯一到達する境界)。両者が
    **同一関数**を呼ぶのは、conjunct が片方にしか存在しない状態が live failure として再出現するため。
