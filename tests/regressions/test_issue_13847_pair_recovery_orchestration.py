@@ -22,6 +22,9 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from mozyo_bridge.core.state.lane_lifecycle import DISPOSITION_HIBERNATED
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_recover_pair_delivery import (  # noqa: E501
+    SublaneRecoverPairDeliveryUseCase,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
     BLOCK_CLOSE_FAILED,
     BLOCK_LANE_NOT_HIBERNATED,
@@ -32,7 +35,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REDISPATCH_DELIVERED,
     RecoverPairDeliveryRetryRequest,
     RecoverPairRequest,
-    SublaneRecoverPairDeliveryUseCase,
     SublaneRecoverPairUseCase,
 )
 from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E501

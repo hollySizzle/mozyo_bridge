@@ -69,6 +69,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     probe_worktree_resolved,
     repo_scope_workspace_id,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_recover_pair_delivery import (  # noqa: E501
+    SublaneRecoverPairDeliveryUseCase,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
     REDISPATCH_ALREADY,
     REDISPATCH_DELIVERED,
@@ -77,7 +80,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REDISPATCH_UNCERTAIN,
     HibernatedPairRecoveryOps,
     SlotPlan,
-    SublaneRecoverPairDeliveryUseCase,
     SublaneRecoverPairUseCase,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501

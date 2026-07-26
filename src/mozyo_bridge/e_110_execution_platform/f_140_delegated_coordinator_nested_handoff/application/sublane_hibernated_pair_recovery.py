@@ -64,6 +64,16 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     SublaneStartupObservation,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+    EFFECT_CLOSED,
+    EFFECT_REDISPATCHED,
+    EFFECT_RELAUNCHED,
+    EFFECT_RESUME_COMMITTED,
+    FATE_REDISPATCH_UNRESOLVED,
+    RECOVERY_EFFECTS,
+    RECOVERY_UNRESOLVED_FATES,
+    validate_effect_contract,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.lane_worktree_binding_probe import (  # noqa: E501
     resolve_worktree_binding_reason,
 )
@@ -106,26 +116,6 @@ BLOCK_MISSING_PINS = "hibernated_record_missing_pins"
 #: resume / send. The blocker carries the closed ``LAUNCH_AUTHORITY_*`` axis token.
 BLOCK_WORKTREE_BINDING = "lane_worktree_binding_unverified"
 
-# Applied-effect vocabulary (Redmine #14475, review j#88554). ``executed`` says whether THIS
-# run changed anything; these name WHAT it changed, so an idempotent replay can be reported as
-# such instead of being flattened into a fixed ``executed=True``.
-EFFECT_CLOSED = "closed_bad_generation"
-EFFECT_RELAUNCHED = "relaunched_pair"
-EFFECT_RESUME_COMMITTED = "resume_disposition_committed"
-EFFECT_REDISPATCHED = "implementation_request_redelivered"
-#: The send neither delivered nor proved a no-op (``failed`` / ``uncertain``): a single status
-#: string cannot say whether a reserve / cancel / uncertain row was written, so it is reported
-#: as its own token rather than guessed either way.
-EFFECT_REDISPATCH_UNRESOLVED = "redispatch_effect_unresolved"
-RECOVERY_EFFECTS = frozenset(
-    {
-        EFFECT_CLOSED,
-        EFFECT_RELAUNCHED,
-        EFFECT_RESUME_COMMITTED,
-        EFFECT_REDISPATCHED,
-        EFFECT_REDISPATCH_UNRESOLVED,
-    }
-)
 BLOCK_SLOT_PRESERVED = "slot_preserved_not_recoverable"  # a slot is preserve-disposition
 BLOCK_CLOSE_FAILED = "bad_generation_close_failed"
 BLOCK_RELAUNCH_FAILED = "pair_relaunch_failed"
@@ -321,10 +311,31 @@ class RecoverPairOutcome:
     resume: Optional[ResumeOutcome] = None
     redispatch: str = REDISPATCH_SKIPPED
     detail: str = ""
-    #: The effects this run actually applied, from the closed :data:`RECOVERY_EFFECTS`
-    #: vocabulary (Redmine #14475, review j#88554). ``executed`` is its non-emptiness, so a
-    #: fully idempotent replay reports no effects rather than a fixed ``executed=True``.
+    #: The effects this run is KNOWN to have applied, from the closed :data:`RECOVERY_EFFECTS`
+    #: vocabulary (Redmine #14475, reviews j#88554 / j#88563). ``executed`` is its
+    #: non-emptiness, so a fully idempotent replay reports no effects rather than a fixed
+    #: ``executed=True``.
     effects: Tuple[str, ...] = ()
+    #: Whether the guarded actuation was ENTERED at all (past the ``--execute`` admission).
+    #: Distinct from :attr:`executed`, which says whether anything was applied: a run can be
+    #: attempted and apply nothing (a fence stopped it), and a preflight-only run is neither.
+    #: ``is_blocked`` keys off THIS, because "did we act" and "did anything change" are
+    #: different questions — conflating them made a first-close failure read as unblocked
+    #: (review j#88563 F1/F2).
+    attempted: bool = False
+    #: Actions whose durable fate could NOT be established, from
+    #: :data:`RECOVERY_UNRESOLVED_FATES`. Separate from :attr:`effects` because "attempted,
+    #: fate unknown" is not "applied" — reporting it as an effect claims a write that may
+    #: never have happened (review j#88563 F1).
+    unresolved: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Structural guarantee (review j#88563 F1): an outcome that contradicts itself cannot
+        # be constructed, so a future branch cannot reintroduce a fixed ``executed`` or an
+        # off-vocabulary token without failing here.
+        validate_effect_contract(
+            executed=self.executed, effects=self.effects, unresolved=self.unresolved
+        )
     #: Stable reason and locator-free nested startup evidence from a failed relaunch.
     #: These are additive so the historical top-level ``detail=pair_relaunch_failed``
     #: contract remains intact while the exact rollback debt is not discarded.
@@ -350,20 +361,30 @@ class RecoverPairOutcome:
         # ``executed`` truthful — a run stopped at the commit edge with zero applied effects —
         # silently flipped the outcome to NOT blocked. Effect-count and blocked-ness are
         # independent facts; the order here is what keeps them so.
-        if self.resume is not None and self.resume.is_blocked:
-            return True
-        if not self.executed:
+        if not self.attempted:
+            # A preflight-only run neither acted nor failed.
             return False
-        if self.resume is None:
+        if self.resume is None or self.resume.is_blocked:
+            # Stopped before the resume (a fence, a close / relaunch failure), or the resume
+            # itself refused. Either way the recovery did not complete.
             return True
-        # A redispatch that failed / is uncertain is a blocked outcome (the operator must
-        # reconcile); an already-redispatched or freshly-delivered redispatch is not.
-        return self.redispatch in (REDISPATCH_FAILED, REDISPATCH_UNCERTAIN)
+        # Review j#88563 F2: the terminal classification must be TOTAL. ``target_retiring`` is
+        # a reserve-cancelled zero-send — the send did not happen and will not — so it is a
+        # blocked outcome, not a silent success. Only a fresh delivery and a proven
+        # already-delivered no-op are unblocked; ``skipped`` means an earlier fence stopped the
+        # run, which the branches above have already classified.
+        return self.redispatch not in (
+            REDISPATCH_DELIVERED,
+            REDISPATCH_ALREADY,
+            REDISPATCH_SKIPPED,
+        )
 
     def as_payload(self) -> dict[str, Any]:
         payload = {
             "executed": self.executed,
+            "attempted": self.attempted,
             "effects": list(self.effects),
+            "unresolved": list(self.unresolved),
             "issue": self.issue,
             "lane": self.lane,
             "is_blocked": self.is_blocked,
@@ -393,18 +414,33 @@ class RecoverPairDeliveryRetryOutcome:
     may_deliver: bool = False
     redispatch: str = REDISPATCH_SKIPPED
     detail: str = ""
+    #: Same typed contract as the main recovery (review j#88563 F2): known-applied effects,
+    #: unresolved fates, and whether the actuation was entered at all.
+    effects: Tuple[str, ...] = ()
+    unresolved: Tuple[str, ...] = ()
+    attempted: bool = False
+
+    def __post_init__(self) -> None:
+        validate_effect_contract(
+            executed=self.executed, effects=self.effects, unresolved=self.unresolved
+        )
 
     @property
     def is_blocked(self) -> bool:
         if not self.may_deliver:
             return True
-        if not self.executed:
+        if not self.attempted:
             return False
+        # Total classification (review j#88563 F2): only a fresh delivery and a proven
+        # already-delivered no-op are unblocked; retiring / failed / uncertain are not.
         return self.redispatch not in (REDISPATCH_DELIVERED, REDISPATCH_ALREADY)
 
     def as_payload(self) -> dict[str, Any]:
         return {
             "executed": self.executed,
+            "attempted": self.attempted,
+            "effects": list(self.effects),
+            "unresolved": list(self.unresolved),
             "issue": self.issue,
             "lane": self.lane,
             "action_id": self.action_id,
@@ -673,11 +709,13 @@ class SublaneRecoverPairUseCase:
         applied: dict[str, bool] = {"relaunched": False, "resumed": False}
 
         def _effects(redispatch: str = "") -> Tuple[str, ...]:
-            """The effects THIS run applied, in the order they happen. (pure over the state)
+            """The effects THIS run is KNOWN to have applied, in the order they happen. (pure)
 
-            One composer for every return path (review j#88554): a branch that hard-codes
-            ``executed=True`` reports a change on a run that made none — an all-idempotent
-            replay, or a stop at the commit edge on an already-healthy pair.
+            One composer for every return path (reviews j#88554 / j#88563) — including the
+            close-failure and relaunch-failure branches, which used to hard-code
+            ``executed=True`` with no effects and therefore both over-reported (a first-close
+            failure applied nothing) and under-reported (a second-close failure lost the close
+            that HAD happened).
             """
             found: list[str] = []
             if closed:
@@ -688,11 +726,18 @@ class SublaneRecoverPairUseCase:
                 found.append(EFFECT_RESUME_COMMITTED)
             if redispatch == REDISPATCH_DELIVERED:
                 found.append(EFFECT_REDISPATCHED)
-            elif redispatch in (REDISPATCH_FAILED, REDISPATCH_UNCERTAIN):
-                # Neither delivered nor proven a no-op: the status alone cannot say whether a
-                # reserve / cancel / uncertain row was written, so say exactly that.
-                found.append(EFFECT_REDISPATCH_UNRESOLVED)
             return tuple(found)
+
+        def _unresolved(redispatch: str = "") -> Tuple[str, ...]:
+            """Actions whose durable fate this run could not establish. (pure)
+
+            ``failed`` / ``uncertain`` say the send did not demonstrably deliver AND did not
+            demonstrably no-op; ``uncertain`` in particular spans a pre-reserve zero-write and
+            a post-send unknown. That is a fate, not an effect (review j#88563 F1).
+            """
+            if redispatch in (REDISPATCH_FAILED, REDISPATCH_UNCERTAIN):
+                return (FATE_REDISPATCH_UNRESOLVED,)
+            return ()
 
         def _binding_drifted() -> Optional[RecoverPairOutcome]:
             """Re-join the 3 axes; a drift stops every REMAINING effect (review j#88526 F1).
@@ -714,6 +759,8 @@ class SublaneRecoverPairUseCase:
             return RecoverPairOutcome(
                 executed=bool(_effects()),
                 effects=_effects(),
+                unresolved=_unresolved(),
+                attempted=True,
                 preflight=replace(preflight, worktree_binding_reason=reason),
                 issue=issue,
                 lane=lane,
@@ -738,8 +785,12 @@ class SublaneRecoverPairUseCase:
             if not ok:
                 # A live close failed: fail-closed. The partial state stays replayable — a
                 # re-run finds the already-closed slot(s) `slot_absent` and relaunches them.
+                # Review j#88563 F1: through the composer. A FIRST-close failure applied
+                # nothing; a SECOND-close failure applied the first close and must say so.
                 return RecoverPairOutcome(
-                    executed=True, preflight=preflight, issue=issue, lane=lane,
+                    executed=bool(_effects()), effects=_effects(),
+                    unresolved=_unresolved(), attempted=True,
+                    preflight=preflight, issue=issue, lane=lane,
                     closed_roles=tuple(closed),
                     detail=f"{BLOCK_CLOSE_FAILED}:{slot.role}",
                 )
@@ -755,7 +806,9 @@ class SublaneRecoverPairUseCase:
             action_id=action_id, slots=tuple(recover_slots)
         ):
             return RecoverPairOutcome(
-                executed=True, preflight=preflight, issue=issue, lane=lane,
+                executed=bool(_effects()), effects=_effects(), unresolved=_unresolved(),
+                attempted=True,
+                preflight=preflight, issue=issue, lane=lane,
                 closed_roles=tuple(closed), detail=BLOCK_RELAUNCH_FAILED,
                 relaunch_reason=_norm(
                     getattr(self.ops, "relaunch_failure_reason", "")
@@ -790,7 +843,8 @@ class SublaneRecoverPairUseCase:
             # ``executed`` — a healthy pair stopped at the commit edge applied nothing AND is
             # blocked, and both must be reported.
             return RecoverPairOutcome(
-                executed=bool(_effects()), effects=_effects(),
+                executed=bool(_effects()), effects=_effects(), unresolved=_unresolved(),
+                attempted=True,
                 preflight=preflight, issue=issue, lane=lane,
                 closed_roles=tuple(closed), relaunched=relaunched, resume=resume_outcome,
                 detail=BLOCK_RESUME_REFUSED,
@@ -811,6 +865,34 @@ class SublaneRecoverPairUseCase:
                 redispatch=REDISPATCH_SKIPPED,
             )
 
+        def _final_detail(
+            effects: Tuple[str, ...], unresolved: Tuple[str, ...], redispatch: str
+        ) -> str:
+            """Say what actually happened (review j#88563 F2). (pure)"""
+            if redispatch == REDISPATCH_TARGET_RETIRING:
+                return (
+                    "zero-send: the gateway is inside a retirement transaction, so the "
+                    "outbox reserve was cancelled and nothing was delivered"
+                    + (f" (applied: {', '.join(effects)})" if effects else "")
+                )
+            if unresolved:
+                return (
+                    "the redelivery's durable fate could not be established "
+                    f"({redispatch}); operator reconcile required"
+                    + (f" (applied: {', '.join(effects)})" if effects else "")
+                )
+            if effects:
+                return (
+                    "pair recovered; lane resumed to active (applied: "
+                    + ", ".join(effects)
+                    + ")"
+                )
+            return (
+                "idempotent replay: the pair was already recovered and the "
+                f"implementation_request already delivered ({redispatch}); "
+                "nothing was applied"
+            )
+
         gateway_name = preflight.gateway.assigned_name if preflight.gateway else ""
         redispatch = self.ops.redispatch_to_gateway(
             action_id=action_id,
@@ -825,9 +907,12 @@ class SublaneRecoverPairUseCase:
         # an already-redispatched send, i.e. zero applied effects — reported the same thing as
         # a run that actually recovered the pair. Both are now derived from what happened.
         effects = _effects(redispatch)
+        unresolved = _unresolved(redispatch)
         return RecoverPairOutcome(
             executed=bool(effects),
             effects=effects,
+            unresolved=unresolved,
+            attempted=True,
             preflight=preflight,
             issue=issue,
             lane=lane,
@@ -835,108 +920,8 @@ class SublaneRecoverPairUseCase:
             relaunched=relaunched,
             resume=resume_outcome,
             redispatch=redispatch,
-            detail=(
-                "pair recovered; lane resumed to active (applied: "
-                + ", ".join(effects)
-                + ")"
-                if effects
-                else (
-                    "idempotent replay: the pair was already recovered and the "
-                    f"implementation_request already delivered ({redispatch}); "
-                    "nothing was applied"
-                )
-            ),
+            detail=_final_detail(effects, unresolved, redispatch),
         )
-
-
-@dataclass
-class SublaneRecoverPairDeliveryUseCase:
-    """Resume the original anchor on an already-active recovered pair under a new action."""
-
-    ops: HibernatedPairRecoveryOps
-
-    def run(
-        self, request: RecoverPairDeliveryRetryRequest, *, execute: bool
-    ) -> RecoverPairDeliveryRetryOutcome:
-        issue = _norm(request.issue)
-        lane = _norm(request.lane)
-        workspace_id = _norm(self.ops.workspace_id())
-        fields = (
-            issue,
-            lane,
-            workspace_id,
-            _norm(request.journal),
-            _norm(request.implementation_request_journal),
-            _norm(request.retry_of_action_id),
-            _norm(request.prior_zero_send_journal),
-        )
-        try:
-            action_id = request.action_id()
-        except ValueError:
-            action_id = ""
-        if not all(fields) or not action_id:
-            return RecoverPairDeliveryRetryOutcome(
-                executed=False,
-                issue=issue,
-                lane=lane,
-                action_id=action_id,
-                detail=BLOCK_IDENTITY_INCOMPLETE,
-            )
-        may_deliver, detail = self.ops.preflight_retry_redispatch_to_gateway(
-            retry_of_action_id=_norm(request.retry_of_action_id),
-            issue=issue,
-            lane=lane,
-            journal=_norm(request.implementation_request_journal),
-            approval_journal=_norm(request.journal),
-            prior_zero_send_journal=_norm(request.prior_zero_send_journal),
-            workspace_id=workspace_id,
-        )
-        if not may_deliver:
-            return RecoverPairDeliveryRetryOutcome(
-                executed=False,
-                issue=issue,
-                lane=lane,
-                action_id=action_id,
-                may_deliver=False,
-                detail=detail or "fail-closed: recovery delivery preflight blocked",
-            )
-        if not execute:
-            return RecoverPairDeliveryRetryOutcome(
-                executed=False,
-                issue=issue,
-                lane=lane,
-                action_id=action_id,
-                may_deliver=True,
-                detail="preflight only (no --execute)",
-            )
-        redispatch = self.ops.retry_redispatch_to_gateway(
-            action_id=action_id,
-            retry_of_action_id=_norm(request.retry_of_action_id),
-            issue=issue,
-            lane=lane,
-            journal=_norm(request.implementation_request_journal),
-            approval_journal=_norm(request.journal),
-            prior_zero_send_journal=_norm(request.prior_zero_send_journal),
-            workspace_id=workspace_id,
-        )
-        return RecoverPairDeliveryRetryOutcome(
-            executed=True,
-            issue=issue,
-            lane=lane,
-            action_id=action_id,
-            may_deliver=True,
-            redispatch=redispatch,
-            detail=(
-                "original implementation_request delivered under a new recovery action"
-                if redispatch in (REDISPATCH_DELIVERED, REDISPATCH_ALREADY)
-                else "fail-closed: recovery delivery blocked"
-            ),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Text rendering + thin CLI handler.
-# ---------------------------------------------------------------------------
 
 
 __all__ = (
@@ -962,5 +947,4 @@ __all__ = (
     "RecoverPairRequest",
     "SlotPlan",
     "SublaneRecoverPairUseCase",
-    "SublaneRecoverPairDeliveryUseCase",
 )

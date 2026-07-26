@@ -1832,11 +1832,15 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
         self.assertFalse(out.is_blocked)
         self.assertIn(EFFECT_REDISPATCHED, out.detail)
 
-    def test_an_unresolved_redispatch_is_reported_as_its_own_effect_token(self):
-        # ``failed`` / ``uncertain`` cannot say whether a reserve / cancel / uncertain row was
-        # written, so the effect set says exactly that rather than guessing either way.
+    def test_an_unresolved_redispatch_is_a_FATE_not_an_effect(self):
+        """Review j#88563 F1: ``uncertain`` is not a known-applied effect.
+
+        It spans a pre-reserve zero-write AND a post-send unknown fate, so listing it among
+        the applied effects (as R8 did) asserts a write the status cannot support — and raises
+        ``executed`` on a run that may have changed nothing.
+        """
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
-            EFFECT_REDISPATCH_UNRESOLVED,
+            FATE_REDISPATCH_UNRESOLVED,
             REDISPATCH_UNCERTAIN,
         )
 
@@ -1846,8 +1850,101 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
             redispatch=REDISPATCH_UNCERTAIN,
         )
         out = _use_case(ops, resume_transition="already_active").run(_REQ, execute=True)
-        self.assertEqual(out.effects, (EFFECT_REDISPATCH_UNRESOLVED,))
+        self.assertEqual(out.effects, (), "nothing is KNOWN to have been applied")
+        self.assertFalse(out.executed)
+        self.assertEqual(out.unresolved, (FATE_REDISPATCH_UNRESOLVED,))
         self.assertTrue(out.is_blocked, "an unresolved send needs operator reconcile")
+        self.assertIn("could not be established", out.detail)
+
+    def test_a_retiring_target_is_a_blocked_zero_send(self):
+        """Review j#88563 F2: ``target_retiring`` was classified as neither effect nor block.
+
+        It is a reserve-cancelled zero-send, so R8 reported it as an unblocked idempotent
+        replay whose detail claimed the request was already delivered.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_TARGET_RETIRING,
+        )
+
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        ops = _FakeOps(
+            per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy},
+            redispatch=REDISPATCH_TARGET_RETIRING,
+        )
+        out = _use_case(ops, resume_transition="already_active").run(_REQ, execute=True)
+        self.assertEqual(out.effects, ())
+        self.assertFalse(out.executed)
+        self.assertEqual(out.unresolved, (), "a cancelled reserve is a KNOWN zero-send")
+        self.assertTrue(out.is_blocked)
+        self.assertIn("retirement transaction", out.detail)
+        self.assertNotIn("already delivered", out.detail)
+
+    def test_a_first_close_failure_applies_nothing_and_blocks(self):
+        """Review j#88563 F1: the close-failure branch bypassed the composer."""
+        ops = _FakeOps(
+            per_slot_obs={GATEWAY_ROLE: _obs(), WORKER_ROLE: _obs()}, close_ok=False
+        )
+        out = _use_case(ops).run(_REQ, execute=True)
+        self.assertEqual(ops.closed, [], "the first close failed")
+        self.assertEqual(out.effects, (), "so nothing was applied")
+        self.assertFalse(out.executed)
+        self.assertTrue(out.attempted, "but the actuation WAS entered")
+        self.assertTrue(out.is_blocked)
+
+    def test_a_second_close_failure_still_reports_the_first_close(self):
+        # The complement: the branch must not lose an effect that DID happen.
+        ops = _FakeOps(per_slot_obs={GATEWAY_ROLE: _obs(), WORKER_ROLE: _obs()})
+        ops.close_result = {}
+
+        real_close = ops.close_bad_slot
+
+        def failing_second(**kw):
+            if ops.closed:
+                return False
+            return real_close(**kw)
+
+        ops.close_bad_slot = failing_second  # type: ignore[assignment]
+        out = _use_case(ops).run(_REQ, execute=True)
+        self.assertEqual(len(ops.closed), 1, "exactly one close landed")
+        self.assertEqual(out.effects, (EFFECT_CLOSED,), "and it must be reported")
+        self.assertTrue(out.executed)
+        self.assertTrue(out.is_blocked)
+
+    def test_a_vanished_slot_relaunch_failure_applies_nothing_and_blocks(self):
+        # No closable slot, and the relaunch fails: zero effects, still blocked.
+        ops = _FakeOps(
+            per_slot_obs={GATEWAY_ROLE: _absent(), WORKER_ROLE: _absent()},
+            relaunch_ok=False,
+        )
+        out = _use_case(ops).run(_REQ, execute=True)
+        self.assertEqual(ops.closed, [])
+        self.assertEqual(out.effects, ())
+        self.assertFalse(out.executed)
+        self.assertTrue(out.attempted)
+        self.assertTrue(out.is_blocked)
+
+    def test_the_outcome_cannot_contradict_itself(self):
+        """Structural guarantee (review j#88563 F1): no branch can hand-write a fixed value."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            RecoverPairOutcome,
+            RecoverPairPreflight,
+        )
+
+        pf = RecoverPairPreflight(
+            lane_hibernated=True, record_has_pins=True, gateway=None, worker=None,
+            action_id="a",
+        )
+        with self.assertRaises(ValueError):  # executed true with no effects
+            RecoverPairOutcome(executed=True, preflight=pf, issue="1", lane="l")
+        with self.assertRaises(ValueError):  # effects present but executed false
+            RecoverPairOutcome(
+                executed=False, preflight=pf, issue="1", lane="l",
+                effects=(EFFECT_CLOSED,),
+            )
+        with self.assertRaises(ValueError):  # off-vocabulary token
+            RecoverPairOutcome(
+                executed=True, preflight=pf, issue="1", lane="l", effects=("invented",),
+            )
 
     def test_the_preflight_matches_the_store_on_raw_persisted_bytes(self):
         """Review j#88526 F2: the 4 padded shapes, preflight and execute must agree.

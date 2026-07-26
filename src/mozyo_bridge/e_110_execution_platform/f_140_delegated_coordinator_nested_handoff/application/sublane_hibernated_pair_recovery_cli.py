@@ -40,6 +40,13 @@ def format_recover_pair_text(outcome: RecoverPairOutcome) -> str:
     ]
     for slot in outcome.preflight.slots:
         lines.append(f"  {slot.role}: {slot.disposition} (recovers={slot.recovers})")
+    # Review j#88563 F3: the applied-effect / unresolved-fate contract is operator-facing, so
+    # it is printed on EVERY path — a blocked or partial run is exactly when knowing what was
+    # already applied matters, and the blocked branch below returns early.
+    if outcome.attempted:
+        lines.append(f"  applied: {', '.join(outcome.effects) or 'nothing'}")
+        if outcome.unresolved:
+            lines.append(f"  unresolved: {', '.join(outcome.unresolved)}")
     if outcome.is_blocked:
         lines.append(
             "  -> fail-closed blocked: " + ", ".join(outcome.preflight.blocked_reasons or (outcome.detail,))
@@ -57,9 +64,12 @@ def format_recover_pair_text(outcome: RecoverPairOutcome) -> str:
         if outcome.rollback_pointer:
             lines.append(f"  rollback_pointer: {outcome.rollback_pointer}")
         return "\n".join(lines)
-    if outcome.executed:
+    if outcome.attempted:
         lines.append(f"  closed: {', '.join(outcome.closed_roles) or 'none'} relaunched: {outcome.relaunched}")
         lines.append(f"  redispatch: {outcome.redispatch}")
+        if not outcome.executed:
+            # An attempted run that applied nothing is an idempotent replay, not a recovery.
+            lines.append(f"  detail: {outcome.detail}")
     elif outcome.preflight.may_recover:
         lines.append("  (preflight only; re-run with --execute to recover the pair)")
     return "\n".join(lines)
@@ -123,11 +133,21 @@ def cmd_sublane_recover_pair_delivery(args: argparse.Namespace) -> int:
     if bool(getattr(args, "json", False)):
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
     else:
+        # Review j#88563 F3: the retry surface reports the SAME typed contract as the main
+        # recovery, so an operator reading either sees applied effects and unresolved fates,
+        # not just a status token.
+        applied = ", ".join(outcome.effects) or "nothing"
+        fate = (
+            f"\n  unresolved: {', '.join(outcome.unresolved)}"
+            if outcome.unresolved
+            else ""
+        )
         print(
             f"sublane recover-pair-delivery: {outcome.lane} (issue {outcome.issue})\n"
             f"  action_id: {outcome.action_id or '<invalid>'}\n"
             f"  may_deliver: {outcome.may_deliver} executed: {outcome.executed} "
             f"redispatch: {outcome.redispatch}\n"
+            f"  applied: {applied}{fate}\n"
             f"  {outcome.detail}",
             file=sys.stdout,
         )
