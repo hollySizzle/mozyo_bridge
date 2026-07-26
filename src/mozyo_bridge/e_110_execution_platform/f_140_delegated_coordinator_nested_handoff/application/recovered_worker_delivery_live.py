@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Mapping, Tuple
 
+from mozyo_bridge.core.state.lane_declared_slots import ProcessGenerationPin
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     LaneLifecycleError,
@@ -22,6 +23,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LiveHibernatedPairRecoveryOps,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovered_worker_delivery import (  # noqa: E501
+    is_exact_implementation_request_anchor,
     recovered_worker_forward_attempt_id,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
@@ -29,6 +31,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RecoveryAnchorDeliveryRequest,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    AGENT_KEY_NAME,
+    _agent_locator,
     _norm,
     _norm_lane,
     decode_assigned_name,
@@ -83,6 +87,83 @@ class LiveRecoveredWorkerDeliveryOps(LiveHibernatedPairRecoveryOps):
             return False
         return bool(result.may_deliver)
 
+    def _declared_pin_is_current(
+        self,
+        declared: ProcessGenerationPin,
+        rows: Tuple[Mapping[str, object], ...],
+    ) -> bool:
+        matches = tuple(
+            row
+            for row in rows
+            if _norm(row.get(AGENT_KEY_NAME)) == _norm(declared.assigned_name)
+        )
+        if len(matches) != 1:
+            return False
+        row = matches[0]
+        expected_provider = _norm(declared.provider)
+        row_provider = _norm(row.get("provider"))
+        row_agent = _norm(row.get("agent"))
+        if (
+            (row_provider and row_provider != expected_provider)
+            or (row_agent and row_agent != expected_provider)
+        ):
+            return False
+        try:
+            live = ProcessGenerationPin(
+                role=declared.role,
+                provider=row_provider or row_agent or expected_provider,
+                assigned_name=declared.assigned_name,
+                locator=_norm(_agent_locator(row)),
+                runtime_revision=_norm(row.get("runtime_revision")),
+            )
+        except (TypeError, ValueError):
+            return False
+        return declared.binds_same_generation(live)
+
+    def _declared_pair_is_current(self, pair: object) -> bool:
+        gateway = getattr(pair, "gateway", None)
+        worker = getattr(pair, "worker", None)
+        if not isinstance(gateway, ProcessGenerationPin) or not isinstance(
+            worker, ProcessGenerationPin
+        ):
+            return False
+        try:
+            rows = tuple(
+                row
+                for row in self._rows()
+                if isinstance(row, Mapping)
+            )
+        except (Exception, SystemExit):
+            return False
+        return self._declared_pin_is_current(
+            gateway, rows
+        ) and self._declared_pin_is_current(worker, rows)
+
+    def _work_anchor_is_exact(
+        self,
+        *,
+        issue: str,
+        journal: str,
+        lane: str,
+        lane_generation: int,
+    ) -> bool:
+        try:
+            entries = tuple(self._journal_entries(issue))
+        except (Exception, SystemExit):
+            return False
+        exact = tuple(
+            entry
+            for entry in entries
+            if _norm(getattr(entry, "journal_id", "")) == _norm(journal)
+        )
+        return len(exact) == 1 and is_exact_implementation_request_anchor(
+            exact[0],
+            issue=issue,
+            journal=journal,
+            lane=lane,
+            lane_generation=lane_generation,
+        )
+
     def _worker_delivery_context(
         self,
         *,
@@ -131,9 +212,20 @@ class LiveRecoveredWorkerDeliveryOps(LiveHibernatedPairRecoveryOps):
             and int(getattr(rec, "lane_generation", 0) or 0) > 0
         ):
             return "", "lifecycle_decision_moved"
+        if _norm(journal) == _norm(lifecycle_decision_journal):
+            return "", "work_anchor_is_lifecycle_decision"
         pair = read_declared_pin_pair(rec)
         if not pair.ok or pair.gateway is None or pair.worker is None:
             return "", "declared_pair_unresolved"
+        if not self._declared_pair_is_current(pair):
+            return "", "declared_pair_generation_moved"
+        if not self._work_anchor_is_exact(
+            issue=issue,
+            journal=journal,
+            lane=lane,
+            lane_generation=rec.lane_generation,
+        ):
+            return "", "work_anchor_unverified"
         gateway_name = encode_assigned_name(
             _norm(workspace_id),
             _norm(pair.gateway.provider),

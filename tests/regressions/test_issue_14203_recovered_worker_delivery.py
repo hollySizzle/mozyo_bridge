@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from mozyo_bridge.core.state.lane_declared_slots import ProcessGenerationPin
 from mozyo_bridge.core.state.lane_lifecycle import DISPOSITION_ACTIVE
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
     recovered_worker_delivery_live as worker_delivery_live,
@@ -194,6 +196,15 @@ class RecoveredWorkerDeliveryLiveAuthorityTest(unittest.TestCase):
         entries = (
             RedmineJournalEntry(
                 issue_id=ISSUE,
+                journal_id=WORK_ANCHOR,
+                notes=(
+                    "## Implementation Request\n\n"
+                    "[mozyo:workflow-event:gate=implementation_request:"
+                    "head=89ca7e44]"
+                ),
+            ),
+            RedmineJournalEntry(
+                issue_id=ISSUE,
                 journal_id=approval,
                 notes=build_recovery_delivery_authorization_marker(
                     issue=ISSUE,
@@ -226,14 +237,34 @@ class RecoveredWorkerDeliveryLiveAuthorityTest(unittest.TestCase):
         )
         pair = SimpleNamespace(
             ok=True,
-            gateway=SimpleNamespace(
+            gateway=ProcessGenerationPin(
+                role="gateway",
                 provider="codex",
                 assigned_name=gateway_name,
+                locator="wR18:p1",
+                runtime_revision="runtime-r18",
             ),
-            worker=SimpleNamespace(
+            worker=ProcessGenerationPin(
+                role="worker",
                 provider="claude",
                 assigned_name=worker_name,
+                locator="wR18:p2",
+                runtime_revision="runtime-r18",
             ),
+        )
+        rows = (
+            {
+                "name": gateway_name,
+                "pane_id": "wR18:p1",
+                "provider": "codex",
+                "runtime_revision": "runtime-r18",
+            },
+            {
+                "name": worker_name,
+                "pane_id": "wR18:p2",
+                "provider": "claude",
+                "runtime_revision": "runtime-r18",
+            },
         )
         return SimpleNamespace(
             approval=approval,
@@ -244,6 +275,7 @@ class RecoveredWorkerDeliveryLiveAuthorityTest(unittest.TestCase):
             entries=entries,
             record=record,
             pair=pair,
+            rows=rows,
         )
 
     def _ops(self, tmp: str, approval: str):
@@ -290,6 +322,10 @@ class RecoveredWorkerDeliveryLiveAuthorityTest(unittest.TestCase):
                 return_value=facts.entries,
             ), patch.object(
                 type(ops),
+                "_rows",
+                return_value=facts.rows,
+            ), patch.object(
+                type(ops),
                 "_target_delivery_ready",
                 return_value=True,
             ) as target_preflight:
@@ -327,12 +363,171 @@ class RecoveredWorkerDeliveryLiveAuthorityTest(unittest.TestCase):
                     return_value=facts.entries,
                 ), patch.object(
                     type(ops),
+                    "_rows",
+                    return_value=facts.rows,
+                ), patch.object(
+                    type(ops),
                     "_target_delivery_ready",
                     return_value=True,
                 ):
                     ready, detail = self._call(ops, facts, **changes)
                 self.assertFalse(ready)
                 self.assertEqual(expected, detail)
+
+    def test_declared_pair_generation_drift_is_zero_send(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            facts = self._facts()
+            ops = self._ops(tmp, facts.approval)
+            cases = (
+                (
+                    SimpleNamespace(
+                        ok=True,
+                        gateway=replace(
+                            facts.pair.gateway,
+                            locator="wOLD:p1",
+                        ),
+                        worker=facts.pair.worker,
+                    ),
+                    "gateway locator",
+                ),
+                (
+                    SimpleNamespace(
+                        ok=True,
+                        gateway=facts.pair.gateway,
+                        worker=replace(
+                            facts.pair.worker,
+                            locator="wOLD:p2",
+                        ),
+                    ),
+                    "worker locator",
+                ),
+                (
+                    SimpleNamespace(
+                        ok=True,
+                        gateway=replace(
+                            facts.pair.gateway,
+                            locator="wOLD:p1",
+                        ),
+                        worker=replace(
+                            facts.pair.worker,
+                            locator="wOLD:p2",
+                        ),
+                    ),
+                    "both locators",
+                ),
+                (
+                    SimpleNamespace(
+                        ok=True,
+                        gateway=replace(
+                            facts.pair.gateway,
+                            runtime_revision="runtime-old",
+                        ),
+                        worker=replace(
+                            facts.pair.worker,
+                            runtime_revision="runtime-old",
+                        ),
+                    ),
+                    "both revisions",
+                ),
+            )
+            for pair, label in cases:
+                with self.subTest(label=label), patch.object(
+                    worker_delivery_live,
+                    "LaneLifecycleStore",
+                    return_value=SimpleNamespace(get=lambda key: facts.record),
+                ), patch.object(
+                    worker_delivery_live,
+                    "read_declared_pin_pair",
+                    return_value=pair,
+                ), patch.object(
+                    type(ops),
+                    "_journal_entries",
+                    return_value=facts.entries,
+                ), patch.object(
+                    type(ops),
+                    "_rows",
+                    return_value=facts.rows,
+                ), patch.object(
+                    type(ops),
+                    "_target_delivery_ready",
+                    return_value=True,
+                ):
+                    ready, detail = self._call(ops, facts)
+                self.assertFalse(ready)
+                self.assertEqual("declared_pair_generation_moved", detail)
+
+    def test_work_anchor_must_be_fresh_unique_implementation_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            facts = self._facts()
+            ops = self._ops(tmp, facts.approval)
+            anchor = facts.entries[0]
+            wrong_kind = RedmineJournalEntry(
+                issue_id=ISSUE,
+                journal_id=WORK_ANCHOR,
+                notes="[mozyo:workflow-event:gate=reply]",
+            )
+            duplicate_marker = RedmineJournalEntry(
+                issue_id=ISSUE,
+                journal_id=WORK_ANCHOR,
+                notes=(
+                    anchor.notes
+                    + "\n"
+                    + "[mozyo:workflow-event:kind=implementation_request]"
+                ),
+            )
+            cases = (
+                (facts.entries[1:], {}, "missing"),
+                (
+                    (wrong_kind,) + facts.entries[1:],
+                    {},
+                    "wrong kind",
+                ),
+                (
+                    (anchor, anchor) + facts.entries[1:],
+                    {},
+                    "duplicate entry",
+                ),
+                (
+                    (duplicate_marker,) + facts.entries[1:],
+                    {},
+                    "duplicate marker",
+                ),
+                (
+                    facts.entries,
+                    {"journal": LIFECYCLE_DECISION},
+                    "lifecycle confusion",
+                ),
+            )
+            for entries, changes, label in cases:
+                with self.subTest(label=label), patch.object(
+                    worker_delivery_live,
+                    "LaneLifecycleStore",
+                    return_value=SimpleNamespace(get=lambda key: facts.record),
+                ), patch.object(
+                    worker_delivery_live,
+                    "read_declared_pin_pair",
+                    return_value=facts.pair,
+                ), patch.object(
+                    type(ops),
+                    "_journal_entries",
+                    return_value=entries,
+                ), patch.object(
+                    type(ops),
+                    "_rows",
+                    return_value=facts.rows,
+                ), patch.object(
+                    type(ops),
+                    "_target_delivery_ready",
+                    return_value=True,
+                ):
+                    ready, detail = self._call(ops, facts, **changes)
+                self.assertFalse(ready)
+                self.assertEqual(
+                    "work_anchor_is_lifecycle_decision"
+                    if label == "lifecycle confusion"
+                    else "work_anchor_unverified",
+                    detail,
+                )
 
     def test_execute_rejoins_full_context_after_fence_reserve(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -359,6 +554,10 @@ class RecoveredWorkerDeliveryLiveAuthorityTest(unittest.TestCase):
                 type(ops),
                 "_journal_entries",
                 return_value=facts.entries,
+            ), patch.object(
+                type(ops),
+                "_rows",
+                return_value=facts.rows,
             ), patch.object(
                 type(ops),
                 "_target_delivery_ready",
