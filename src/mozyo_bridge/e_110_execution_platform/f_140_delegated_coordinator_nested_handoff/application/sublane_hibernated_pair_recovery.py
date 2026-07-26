@@ -127,11 +127,15 @@ BLOCK_RESUME_REFUSED = "resume_verify_or_cas_refused"
 REDISPATCH_DELIVERED = "redispatched"  # the fence reserved this call and the send fired
 REDISPATCH_ALREADY = "already_redispatched"  # the fence already holds a delivered/reserved row
 REDISPATCH_UNCERTAIN = "redispatch_uncertain"  # send fate unknown -> operator reconcile
-REDISPATCH_SKIPPED = "redispatch_not_reached"  # resume did not apply -> nothing to redeliver
+#: The send was never reached. Review j#88592 F3: this is NOT "the resume did not apply" — the
+#: run's own drift re-join (``_binding_drifted`` after the resume) also produces it, so the
+#: status co-occurs with an APPLIED resume and the redelivery is then still owed. Whether
+#: anything is owed is read off the run's ``effects``, never off this token alone.
+REDISPATCH_SKIPPED = "redispatch_not_reached"
 REDISPATCH_FAILED = "redispatch_send_failed"
 #: The target is inside a retirement transaction, so the reserve is cancelled and no send
-#: fires (Redmine #13892 R6-F3). Distinct from `REDISPATCH_SKIPPED` ("resume did not apply"):
-#: here the resume DID apply and the fence WAS reserved — the send is what stops.
+#: fires (Redmine #13892 R6-F3). Distinct from `REDISPATCH_SKIPPED` ("the send was never
+#: reached"): here the fence WAS reserved and then cancelled — the reserve is what is undone.
 REDISPATCH_TARGET_RETIRING = "redispatch_target_retiring"
 
 
@@ -891,18 +895,24 @@ class SublaneRecoverPairUseCase:
                     "the redelivery's durable fate could not be established "
                     f"({redispatch}); operator reconcile required" + applied
                 )
-            # 2. Settled, and NOT a delivery. Naming the reason is useful; claiming a
-            #    delivery is not available on any of these statuses.
+            # 2. Settled, and NOT a delivery. Review j#88592 F3: whether a redelivery is
+            #    still OWED is a fact about what this run applied, not about the status. A
+            #    run that committed the resume and then never sent owes the redelivery,
+            #    whatever token names the reason; announcing "nothing is owed" there told the
+            #    operator the opposite of the blocked machine state.
             if not redispatch_is_success(redispatch):
-                if redispatch == REDISPATCH_TARGET_RETIRING:
-                    return (
-                        "zero-send: the gateway is inside a retirement transaction, so the "
-                        "outbox reserve was cancelled and nothing was delivered" + applied
-                    )
-                return (
-                    "zero-send: the implementation_request was not redelivered "
-                    f"({redispatch}); nothing is owed to the outbox" + applied
+                reason = (
+                    "the gateway is inside a retirement transaction, so the outbox reserve "
+                    "was cancelled and nothing was delivered"
+                    if redispatch == REDISPATCH_TARGET_RETIRING
+                    else f"the implementation_request was not redelivered ({redispatch})"
                 )
+                owed = (
+                    "; this run changed the pair, so the redelivery is still owed"
+                    if effects
+                    else "; nothing was applied and no outbox reservation is outstanding"
+                )
+                return "zero-send: " + reason + owed + applied
             # 3. Settled AND delivered (by this run or an earlier one).
             if effects:
                 return (

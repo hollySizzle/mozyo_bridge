@@ -96,7 +96,10 @@ REDISPATCH_EDGE_FACT_SHAPES = {
     "redispatched": {(True, False, False)},
     # The fence already held a DELIVERED row: this run sent nothing, state settled.
     "already_redispatched": {(False, True, False)},
-    # An earlier fence stopped the run before the send; nothing owed.
+    # The send was never reached (the resume did not apply, or the run's drift re-join
+    # stopped it after the resume). Nothing was sent and no reserve is outstanding — but the
+    # redelivery may still be OWED, which the run's effects say and this status does not
+    # (review j#88592 F3).
     "redispatch_not_reached": {(False, True, False)},
     # Reserve cancelled because the target is retiring: settled zero-send, or the cancel
     # itself did not land (then the fence row is still owed).

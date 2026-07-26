@@ -3303,12 +3303,17 @@ class RedispatchDetailFactOrderTests(unittest.TestCase):
     implementation_request already delivered" (found while verifying this finding).
     """
 
-    def _main_detail(self, edge):
+    def _main_detail(self, edge, *, resume="already_active"):
+        """Run the main use case. ``resume="applied"`` makes the run APPLY something.
+
+        The effects dimension is what review j#88592 F3 turned on: the same status means
+        different things to the operator depending on whether this run changed the pair.
+        """
         healthy = _obs(already_healthy=True, is_bad_generation=False)
         ops = _FakeOps(
             per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy}, redispatch=edge
         )
-        return _use_case(ops, resume_transition="already_active").run(_REQ, execute=True)
+        return _use_case(ops, resume_transition=resume).run(_REQ, execute=True)
 
     def _retry_outcome(self, edge):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_recover_pair_delivery import (  # noqa: E501
@@ -3406,10 +3411,15 @@ class RedispatchDetailFactOrderTests(unittest.TestCase):
                 # A delivery may be claimed ONLY when the fence positively holds one and the
                 # fate is settled.
                 may_claim = redispatch_is_success(status) and not unknown_fate
-                for label, out in (
+                # Review j#88592 F3: the same sweep, run once with this recovery applying
+                # nothing and once with it committing the resume. The first pass alone let
+                # "nothing is owed" stand on a run that had changed the pair.
+                cases = [
                     ("main", self._main_detail(edge)),
+                    ("main+applied", self._main_detail(edge, resume="applied")),
                     ("retry", self._retry_outcome(edge)),
-                ):
+                ]
+                for label, out in cases:
                     with self.subTest(surface=label, status=status,
                                       shape=(delivered, zero_send, unknown_fate)):
                         checked += 1
@@ -3424,4 +3434,76 @@ class RedispatchDetailFactOrderTests(unittest.TestCase):
                         if unknown_fate:
                             self.assertIn("reconcile", out.detail)
                         self.assertEqual(bool(out.unresolved), unknown_fate)
-        self.assertEqual(checked, 18, "the sweep must cover the whole table on both surfaces")
+                        # A run that APPLIED something and did not deliver owes the
+                        # redelivery; it may never announce that nothing is outstanding.
+                        if out.effects and not may_claim:
+                            self.assertNotIn(
+                                "nothing was applied", out.detail,
+                                f"{label} denied its own effects: {out.detail}",
+                            )
+                            self.assertNotIn(
+                                "no outbox reservation is outstanding", out.detail,
+                                f"{label} called an owed send settled: {out.detail}",
+                            )
+        self.assertEqual(checked, 27, "the sweep must cover the whole table on every surface")
+
+    def test_a_committed_resume_that_never_sent_reports_the_send_as_owed(self):
+        """The named case: applied resume + ``skipped`` (review j#88592 F3).
+
+        The machine state blocks precisely because the redelivery is owed; the detail said
+        "nothing is owed to the outbox", telling the operator the opposite. This case is a
+        real production shape — the run's own drift re-join returns ``skipped`` AFTER the
+        resume commits.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_SKIPPED,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            EFFECT_RESUME_COMMITTED,
+        )
+
+        out = self._main_detail(REDISPATCH_SKIPPED, resume="applied")
+        self.assertIn(EFFECT_RESUME_COMMITTED, out.effects)
+        self.assertTrue(out.is_blocked)
+        self.assertIn("still owed", out.detail)
+        self.assertNotIn("nothing is owed", out.detail)
+        self.assertNotIn("no outbox reservation is outstanding", out.detail)
+
+    def test_the_same_status_with_nothing_applied_reports_nothing_outstanding(self):
+        # Premise control: the fix must not make every ``skipped`` claim an owed send. With
+        # the resume already satisfied, this run applied nothing and owes nothing.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_SKIPPED,
+        )
+
+        out = self._main_detail(REDISPATCH_SKIPPED, resume="already_active")
+        self.assertEqual(out.effects, ())
+        self.assertIn("no outbox reservation is outstanding", out.detail)
+        self.assertNotIn("still owed", out.detail)
+
+    def test_the_skipped_token_documents_what_it_actually_means(self):
+        """The cross-layer half of the finding: the comment contradicted production.
+
+        ``REDISPATCH_SKIPPED`` was documented as "resume did not apply -> nothing to
+        redeliver" while ``run`` itself returns it after a COMMITTED resume when the binding
+        drifted. A reader who trusted the comment would reproduce exactly this defect.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_hibernated_pair_recovery as main,
+        )
+
+        source = Path(main.__file__).read_text(encoding="utf-8")
+        self.assertNotIn(
+            'REDISPATCH_SKIPPED = "redispatch_not_reached"  # resume did not apply', source
+        )
+        self.assertNotIn('"resume did not apply"', source)
+        # And production really does produce the combination the old comment denied.
+        out = self._main_detail(
+            __import__(
+                "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested"
+                "_handoff.application.sublane_hibernated_pair_recovery",
+                fromlist=["REDISPATCH_SKIPPED"],
+            ).REDISPATCH_SKIPPED,
+            resume="applied",
+        )
+        self.assertTrue(out.effects, "resume committed alongside a not-reached send")
