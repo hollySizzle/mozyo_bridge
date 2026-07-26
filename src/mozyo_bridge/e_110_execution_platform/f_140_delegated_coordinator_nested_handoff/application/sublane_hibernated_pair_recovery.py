@@ -73,7 +73,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RECOVERY_EFFECTS,
     RECOVERY_UNRESOLVED_FATES,
     validate_effect_contract,
-    as_edge_result,
+    RedispatchEdgeResult,
     redispatch_is_success,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.lane_worktree_binding_probe import (  # noqa: E501
@@ -379,10 +379,10 @@ class RecoverPairOutcome:
         # Review j#88571 F2: ONE closed success policy, shared with the retry surface, so the
         # two cannot drift and a future token is blocked by default. ``skipped`` means an
         # earlier fence stopped the run, which the branches above already classified.
-        return not (
-            redispatch_is_success(self.redispatch)
-            or self.redispatch == REDISPATCH_SKIPPED
-        )
+        # Review j#88579 F3 / probe j#88577: the shared policy is the ONLY policy. Keeping a
+        # local ``skipped`` whitelist made "the resume applied but the send never ran" a
+        # silent success on the main surface while the retry surface blocked it.
+        return not redispatch_is_success(self.redispatch)
 
     def as_payload(self) -> dict[str, Any]:
         payload = {
@@ -506,7 +506,7 @@ class HibernatedPairRecoveryOps(Protocol):
         lane: str,
         journal: str,
         workspace_id: str,
-    ) -> str: ...
+    ) -> RedispatchEdgeResult: ...
 
     def retry_redispatch_to_gateway(
         self,
@@ -519,7 +519,7 @@ class HibernatedPairRecoveryOps(Protocol):
         approval_journal: str,
         prior_zero_send_journal: str,
         workspace_id: str,
-    ) -> str: ...
+    ) -> RedispatchEdgeResult: ...
 
     def preflight_retry_redispatch_to_gateway(
         self,
@@ -900,14 +900,16 @@ class SublaneRecoverPairUseCase:
             )
 
         gateway_name = preflight.gateway.assigned_name if preflight.gateway else ""
-        edge = as_edge_result(self.ops.redispatch_to_gateway(
+        # Review j#88579 F5: the protocol is typed, so the production path consumes the edge's
+        # observation directly. No adapter stands between the observation and the report.
+        edge = self.ops.redispatch_to_gateway(
             action_id=action_id,
             gateway_assigned_name=gateway_name,
             issue=issue,
             lane=lane,
             journal=_norm(request.implementation_request_journal),
             workspace_id=workspace_id,
-        ))
+        )
         redispatch = edge.status
         # Review j#88554 F2: the final branch used to hard-code ``executed=True`` and a fixed
         # "pair recovered" detail, so an ALL-idempotent replay — an already-active resume plus

@@ -60,6 +60,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneStartupObservation,
     SublaneStartupRoleHealth,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+    RedispatchEdgeResult,
+    edge_result_from_status,
+)
 
 
 @dataclass
@@ -157,16 +161,27 @@ class _FakeOps:
         self.relaunch_slots = slots
         return self._relaunch_ok
 
-    def redispatch_to_gateway(self, **kw):
+    def redispatch_to_gateway(self, **kw) -> RedispatchEdgeResult:
         self.redispatched = kw
-        return self._redispatch
+        return _as_edge(self._redispatch)
 
-    def retry_redispatch_to_gateway(self, **kw):
+    def retry_redispatch_to_gateway(self, **kw) -> RedispatchEdgeResult:
         self.redispatched = kw
-        return self._redispatch
+        return _as_edge(self._redispatch)
 
     def preflight_retry_redispatch_to_gateway(self, **kw):
         return True, "ready"
+
+
+def _as_edge(value):
+    """Let a scenario spell its intent as a bare status (review j#88579 F5).
+
+    The PRODUCTION protocol is typed; only fakes may start from a status, and they do so
+    through the one test-support constructor rather than each inventing its own facts.
+    """
+    if isinstance(value, RedispatchEdgeResult):
+        return value
+    return edge_result_from_status(value)
 
 
 class _FakeResume:

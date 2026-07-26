@@ -32,6 +32,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 from mozyo_bridge.core.state.dispatch_outbox_fence import (
     DispatchOutboxFence,
     DispatchOutboxFenceError,
+    FENCE_CANCELLED,
     FENCE_DELIVERED,
     FENCE_RESERVED,
     FENCE_UNCERTAIN,
@@ -576,165 +577,14 @@ class LiveHibernatedPairRecoveryOps:
     def _edge_result(status: str, **facts) -> RedispatchEdgeResult:
         return RedispatchEdgeResult(status=status, **facts)
 
-    def _redispatch_with_action(
-        self,
-        *,
-        action_id: str,
-        target_action_id: str,
-        gateway_assigned_name: str,
-        issue: str,
-        lane: str,
-        journal: str,
-        workspace_id: str,
-        pre_send_authority: Optional[Callable[[], bool]] = None,
-    ) -> RedispatchEdgeResult:
-        # Review j#88571 F1: this edge reports what it OBSERVED (sent? settled? unknown?), not
-        # a status the application would have to re-infer those facts from.
-        _edge = self._edge_result
-        key = FenceKey(
-            workspace_id=_norm(workspace_id), lane_id=_norm_lane(lane), issue=_norm(issue),
-            journal=_norm(journal), action_id=_norm(action_id),
-            target_assigned_name=_norm(gateway_assigned_name),
-        )
-        fence = self._fence()
-        # Fail closed on a missing / lost / inconsistent fence (Redmine #13847 R1-F2): only an
-        # already-bootstrapped, identity-matched fence can prove exactly-once. An un-bootstrapped
-        # or lost store is a reconcile condition, never a fresh reserve that could re-send.
-        try:
-            bootstrapped = fence.is_bootstrapped()
-        except Exception:  # noqa: BLE001 - unreadable fence state => uncertain (never send)
-            return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
-        if not bootstrapped:
-            return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
-        try:
-            reserve = fence.reserve(key)
-        except DispatchOutboxFenceError:
-            return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
-        if not reserve.won:
-            # The fence already holds a row for this exact redispatch — idempotent. A
-            # delivered/reserved-by-another row is "already"; an uncertain one needs reconcile.
-            if reserve.needs_reconcile or reserve.current_state == "uncertain":
-                return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
-            # The fence already holds this delivery: THIS run sent nothing and the durable
-            # state is settled.
-            return _edge(REDISPATCH_ALREADY, zero_send=True)
-        # We won the reserve. Before resolving a locator or sending, the shared retirement
-        # guard (Redmine #13892 R6-F3): this is a reserve -> send edge like every other, and
-        # `target_is_retiring`'s own docstring already named this call site. A send into panes
-        # a retirement transaction is closing either lands in a doomed pane or races the
-        # close, so the reserve is cancelled — never left reserved, which would read as an
-        # unresolved send fate and block the retirement it just deferred to.
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_execution import (  # noqa: E501
-            target_is_retiring,
+    def _redispatch_with_action(self, **kwargs) -> RedispatchEdgeResult:
+        """Delegate to the extracted edge (module-health leaf; behaviour unchanged)."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_recover_pair_redispatch_edge import (  # noqa: E501
+            perform_redispatch,
         )
 
-        retiring, why = target_is_retiring(_norm(gateway_assigned_name))
-        if retiring:
-            try:
-                fence.mark_cancelled(key, detail=f"target retiring: {why}")
-            except DispatchOutboxFenceError:
-                return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
-            # Cancelled reserve, nothing sent, durable state settled.
-            return _edge(REDISPATCH_TARGET_RETIRING, zero_send=True)
-        if pre_send_authority is not None:
-            try:
-                still_authorized = bool(pre_send_authority())
-            except (Exception, SystemExit):
-                still_authorized = False
-            if not still_authorized:
-                try:
-                    fence.mark_cancelled(
-                        key,
-                        detail="recovery delivery action-time authority moved; zero-send",
-                    )
-                except DispatchOutboxFenceError:
-                    return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
-                # The cancel wrote: a KNOWN zero-send, not an unknown fate.
-                return _edge(REDISPATCH_FAILED, zero_send=True)
-        gateway_locator, target_revision = self._gateway_live_target(
-            gateway_assigned_name
-        )
-        decoded = decode_assigned_name(gateway_assigned_name)
-        if (
-            not gateway_locator
-            or not target_revision
-            or not decoded.ok
-            or decoded.identity is None
-        ):
-            try:
-                fence.mark_cancelled(
-                    key, detail="exact live gateway target unresolved; zero-send"
-                )
-            except DispatchOutboxFenceError:
-                return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
-            return _edge(REDISPATCH_FAILED, zero_send=True)
-        try:
-            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_anchor_delivery_live import (  # noqa: E501
-                LiveRecoveryAnchorDeliveryService,
-            )
+        return perform_redispatch(self, **kwargs)
 
-            outcome = LiveRecoveryAnchorDeliveryService(
-                repo_root=self.repo_root,
-                env=self.env,
-                runner=self.runner,
-                timeout=self.timeout,
-                attestation_home=self.attestation_home,
-                # Redmine #14475 (review j#88538 F1): the re-join the service performs AFTER
-                # its own target-resolution preflight and immediately before transport. The
-                # ``pre_send_authority`` the reserve edge uses fires earlier, so it cannot
-                # cover a drift that happens during that preflight.
-                pre_transport_authority=lambda: self._checkout_authority_current(
-                    self.request_lane
-                ),
-            ).deliver(
-                RecoveryAnchorDeliveryRequest(
-                    issue=_norm(issue),
-                    journal=_norm(journal),
-                    kind=KIND_IMPLEMENTATION_REQUEST,
-                    workspace_id=_norm(workspace_id),
-                    lane_id=_norm_lane(lane),
-                    provider=_norm(decoded.identity.role),
-                    target_assigned_name=_norm(gateway_assigned_name),
-                    target_locator=gateway_locator,
-                    target_revision=target_revision,
-                    target_action_id=_norm(target_action_id),
-                )
-            )
-        except (Exception, SystemExit):  # noqa: BLE001 - never leave a won reserve pending
-            try:
-                fence.mark_uncertain(key, detail="recovery delivery service raised")
-            except DispatchOutboxFenceError:
-                pass
-            return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
-        if outcome.started:
-            try:
-                fence.mark_delivered(
-                    key,
-                    detail="implementation_request recovery turn-start confirmed",
-                )
-            except DispatchOutboxFenceError:
-                # Review j#88571 F1 / probe j#88570: the transport POSITIVELY started, so the
-                # redelivery is a known-applied effect even though the ledger write failed.
-                # Reporting a bare ``uncertain`` here lost that fact downstream.
-                return _edge(REDISPATCH_UNCERTAIN, delivered=True, unknown_fate=True)
-            return _edge(REDISPATCH_DELIVERED, delivered=True)
-        if outcome.zero_send:
-            try:
-                fence.mark_cancelled(
-                    key,
-                    detail=f"recovery delivery zero-send: {outcome.detail}",
-                )
-            except DispatchOutboxFenceError:
-                return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
-            return _edge(REDISPATCH_FAILED, zero_send=True)
-        try:
-            fence.mark_uncertain(
-                key,
-                detail=f"recovery delivery uncertain: {outcome.detail}",
-            )
-        except DispatchOutboxFenceError:
-            pass
-        return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
 
     def redispatch_to_gateway(
         self, *, action_id: str, gateway_assigned_name: str, issue: str, lane: str, journal: str, workspace_id: str

@@ -87,6 +87,28 @@ def validate_effect_contract(
 
 # -- the redispatch edge's own observation --------------------------------------
 
+# The closed status vocabulary, and for each the fact shapes it can actually produce as
+# ``(delivered, zero_send, unknown_fate)`` (review j#88579 F4). Anything outside this table is
+# a contradiction the edge could not have observed, so it is refused at construction rather
+# than carried downstream.
+REDISPATCH_EDGE_FACT_SHAPES = {
+    # A confirmed delivery: the transport started AND the ledger recorded it.
+    "redispatched": {(True, False, False)},
+    # The fence already held a DELIVERED row: this run sent nothing, state settled.
+    "already_redispatched": {(False, True, False)},
+    # An earlier fence stopped the run before the send; nothing owed.
+    "redispatch_not_reached": {(False, True, False)},
+    # Reserve cancelled because the target is retiring: settled zero-send, or the cancel
+    # itself did not land (then the fence row is still owed).
+    "redispatch_target_retiring": {(False, True, False), (False, False, True)},
+    # Refused before the transport: settled when the cancel wrote, unresolved when it did not.
+    "redispatch_send_failed": {(False, True, False), (False, False, True)},
+    # Fate unknown: either nothing was sent (pre-reserve), or the transport started and the
+    # durable record could not be established.
+    "redispatch_uncertain": {(False, False, True), (True, False, True)},
+}
+REDISPATCH_EDGE_STATUSES = frozenset(REDISPATCH_EDGE_FACT_SHAPES)
+
 @dataclass(frozen=True)
 class RedispatchEdgeResult:
     """What the reserve -> send -> record edge OBSERVED, before any status collapse.
@@ -111,10 +133,20 @@ class RedispatchEdgeResult:
     unknown_fate: bool = False
 
     def __post_init__(self) -> None:
-        if self.zero_send and self.delivered:
-            raise ValueError("a zero-send cannot also be a delivery")
-        if self.zero_send and self.unknown_fate:
-            raise ValueError("a settled zero-send has no unknown fate")
+        # Review j#88579 F4 / probe j#88578: rejecting two impossible pairs left plenty of
+        # contradictions constructible — a ``redispatched`` with ``delivered=False`` is a
+        # terminal SUCCESS carrying no effect, which defeats the whole point of a typed
+        # result. Every status is checked against the fact shapes it can actually produce.
+        if self.status not in REDISPATCH_EDGE_FACT_SHAPES:
+            raise ValueError(f"unknown redispatch edge status: {self.status!r}")
+        shape = (self.delivered, self.zero_send, self.unknown_fate)
+        allowed = REDISPATCH_EDGE_FACT_SHAPES[self.status]
+        if shape not in allowed:
+            raise ValueError(
+                f"status {self.status!r} cannot carry "
+                f"(delivered={self.delivered}, zero_send={self.zero_send}, "
+                f"unknown_fate={self.unknown_fate}); allowed: {sorted(allowed)}"
+            )
 
     @property
     def effects(self) -> Tuple[str, ...]:
@@ -127,21 +159,18 @@ class RedispatchEdgeResult:
         return (FATE_REDISPATCH_UNRESOLVED,) if self.unknown_fate else ()
 
 
-def as_edge_result(value: object) -> RedispatchEdgeResult:
-    """Adapt an ops return to the typed edge result. (pure, conservative)
+def edge_result_from_status(status: str) -> RedispatchEdgeResult:
+    """Build the LEAST-committal edge result a bare status supports. (pure)
 
-    A :class:`RedispatchEdgeResult` passes through. A bare status string — what a fake that
-    does not model the edge returns — is adapted with the only inference a string supports:
-    ``redispatched`` is a delivery, ``already`` / ``skipped`` / ``target_retiring`` are settled
-    zero-sends, and ``failed`` / ``uncertain`` are unknown. Production adapters return the
-    typed result, so this inference never stands in for a real observation.
+    **Test-support only** (review j#88579 F5). Production adapters observe the edge and
+    construct the result directly; nothing on the production path may reach for this, because
+    a status alone cannot distinguish a settled zero-send from an unknown fate — that is the
+    very loss the typed result exists to prevent. It lives here so a fake that does not model
+    the edge has one obvious, conservative way to spell its intent.
     """
-    if isinstance(value, RedispatchEdgeResult):
-        return value
-    status = str(value or "")
     if status == "redispatched":
         return RedispatchEdgeResult(status=status, delivered=True)
-    if status in ("already_redispatched", "redispatch_not_reached", "redispatch_target_retiring"):
+    if status in ("already_redispatched", "redispatch_not_reached"):
         return RedispatchEdgeResult(status=status, zero_send=True)
     return RedispatchEdgeResult(status=status, unknown_fate=True)
 
@@ -169,7 +198,9 @@ __all__ = (
     "RECOVERY_UNRESOLVED_FATES",
     "validate_effect_contract",
     "RedispatchEdgeResult",
-    "as_edge_result",
+    "REDISPATCH_EDGE_FACT_SHAPES",
+    "REDISPATCH_EDGE_STATUSES",
+    "edge_result_from_status",
     "REDISPATCH_TERMINAL_SUCCESS",
     "redispatch_is_success",
 )

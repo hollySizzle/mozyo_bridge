@@ -156,6 +156,10 @@ def _healthy_obs() -> SlotRecoveryObservation:
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E402,E501
     LAUNCH_AUTHORITY_OK,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+    RedispatchEdgeResult,
+    edge_result_from_status,
+)
 
 class _FakeOps:
     """Records every destructive effect so a fail-closed run can be proven zero-write."""
@@ -191,9 +195,9 @@ class _FakeOps:
         self.relaunched = True
         return True
 
-    def redispatch_to_gateway(self, **kw) -> str:
+    def redispatch_to_gateway(self, **kw) -> RedispatchEdgeResult:
         self.redispatched = kw
-        return "redispatched"
+        return edge_result_from_status("redispatched")
 
 
 class _FakeResume:

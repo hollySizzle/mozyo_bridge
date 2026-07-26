@@ -26,9 +26,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REDISPATCH_UNCERTAIN,
     _norm,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
-    as_edge_result,
-)
+
 
 @dataclass
 class SublaneRecoverPairDeliveryUseCase:
@@ -90,7 +88,7 @@ class SublaneRecoverPairDeliveryUseCase:
                 may_deliver=True,
                 detail="preflight only (no --execute)",
             )
-        edge = as_edge_result(self.ops.retry_redispatch_to_gateway(
+        edge = self.ops.retry_redispatch_to_gateway(
             action_id=action_id,
             retry_of_action_id=_norm(request.retry_of_action_id),
             issue=issue,
@@ -99,7 +97,7 @@ class SublaneRecoverPairDeliveryUseCase:
             approval_journal=_norm(request.journal),
             prior_zero_send_journal=_norm(request.prior_zero_send_journal),
             workspace_id=workspace_id,
-        ))
+        )
         redispatch = edge.status
         # Review j#88571 F1: from the edge's own observation, never re-inferred from status.
         effects = edge.effects

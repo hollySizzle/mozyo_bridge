@@ -1865,16 +1865,23 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
             REDISPATCH_TARGET_RETIRING,
         )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            RedispatchEdgeResult,
+        )
 
         healthy = _obs(already_healthy=True, is_bad_generation=False)
+        # Review j#88579 F4/F5: the status ALONE cannot say whether the cancel landed, so the
+        # settled shape is stated explicitly. This scenario is the WRITTEN cancel.
         ops = _FakeOps(
             per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy},
-            redispatch=REDISPATCH_TARGET_RETIRING,
+            redispatch=RedispatchEdgeResult(
+                status=REDISPATCH_TARGET_RETIRING, zero_send=True
+            ),
         )
         out = _use_case(ops, resume_transition="already_active").run(_REQ, execute=True)
         self.assertEqual(out.effects, ())
         self.assertFalse(out.executed)
-        self.assertEqual(out.unresolved, (), "a cancelled reserve is a KNOWN zero-send")
+        self.assertEqual(out.unresolved, (), "a WRITTEN cancel is a KNOWN zero-send")
         self.assertTrue(out.is_blocked)
         self.assertIn("retirement transaction", out.detail)
         self.assertNotIn("already delivered", out.detail)
@@ -2582,3 +2589,571 @@ class LaunchAuthorityTypedOutcomeTests(_RefreshCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class RedispatchWriteObservationTests(HibernatedWorktreeRepairChainTests):
+    """Review j#88579 F1/F2: the fence's WRITE and the loser's STATE are observations.
+
+    ``mark_delivered`` / ``mark_cancelled`` return a bool — the UPDATE's rowcount. Discarding
+    it reported a settled durable state that was never written. And the reserve loser's
+    ``current_state`` was classified by a single negative test (``!= "uncertain"``), so a
+    ``cancelled`` row — a durable zero-send whose request was never delivered — was promoted to
+    ``already_redispatched``, a terminal success.
+
+    These cases drive the REAL live edge against a REAL fence.
+    """
+
+    def _fence(self):
+        from mozyo_bridge.core.state.dispatch_outbox_fence import (
+            DispatchOutboxFence,
+            dispatch_outbox_fence_path,
+        )
+
+        fence = DispatchOutboxFence(path=dispatch_outbox_fence_path(self.home))
+        fence.bootstrap()
+        return fence
+
+    def _key(self, action_id, gw, journal="88579"):
+        from mozyo_bridge.core.state.dispatch_outbox_fence import FenceKey
+
+        return FenceKey(
+            workspace_id=self.workspace_id, lane_id=self.lane, issue=self.issue,
+            journal=journal, action_id=action_id, target_assigned_name=gw,
+        )
+
+    def _gw(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            encode_assigned_name,
+        )
+
+        return encode_assigned_name(self.workspace_id, "codex", self.lane)
+
+    def _gw_row(self, gw):
+        return {
+            "name": gw, "pane_id": "wZ:p9K", "agent_status": "idle",
+            "cwd": str(self.repo), "revision": "7",
+        }
+
+    def _drop_row(self, fence, key):
+        """DELETE the reserved row: the store-level single-row loss the bool reports.
+
+        Deliberately NOT a state transition — ``_set_state`` matches on the key alone, so an
+        ``UPDATE`` still hits a cancelled/delivered row. Only a vanished row produces the
+        rowcount-0 this finding is about, and the fence exposes no delete, so the fixture
+        removes it directly from its own temporary store.
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(str(fence.path))
+        try:
+            conn.execute(
+                "DELETE FROM dispatch_outbox WHERE workspace_id=? AND lane_id=? AND issue=? "
+                "AND journal=? AND action_id=? AND target_assigned_name=?",
+                key.as_row(),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _ops(self, fence, journal="88579"):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_hibernated_pair_recovery_live as live,
+        )
+
+        self._mint_hibernated_unbound_row()
+        self._repair(execute=True)
+        return live.LiveHibernatedPairRecoveryOps(
+            repo_root=self.repo, request_issue=self.issue, request_lane=self.lane,
+            request_journal=journal, lifecycle_home=self.home, fence=fence,
+        )
+
+    # -- F1: the write's own return value ---------------------------------------
+
+    def test_a_started_transport_whose_row_vanished_is_delivered_and_unresolved(self):
+        """The decisive F1 case: the send happened, the ledger write matched no row.
+
+        Reporting the plain ``redispatched`` here claims a durable record that does not exist;
+        reporting a bare ``uncertain`` loses a redelivery that positively happened.
+        """
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            recovery_anchor_delivery_live as delivery_live,
+            sublane_hibernated_pair_recovery_live as live,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_DELIVERED,
+            REDISPATCH_UNCERTAIN,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            EFFECT_REDISPATCHED,
+            FATE_REDISPATCH_UNRESOLVED,
+        )
+
+        fence = self._fence()
+        ops = self._ops(fence)
+        gw = self._gw()
+        action = "recover-pair:14475:vanish:1:1"
+        key = self._key(action, gw)
+
+        class _Started:
+            started, zero_send, detail = True, False, "turn-start confirmed"
+
+        def _deliver(_self, _request):
+            # The transport POSITIVELY ran; the row disappears underneath it.
+            self._drop_row(fence, key)
+            return _Started()
+
+        with patch.object(live, "list_herdr_agent_rows", return_value=[self._gw_row(gw)]), \
+                patch.object(
+                    delivery_live.LiveRecoveryAnchorDeliveryService, "deliver", _deliver
+                ):
+            result = ops.redispatch_to_gateway(
+                action_id=action, gateway_assigned_name=gw, issue=self.issue,
+                lane=self.lane, journal="88579", workspace_id=self.workspace_id,
+            )
+
+        self.assertEqual(result.status, REDISPATCH_UNCERTAIN)
+        self.assertNotEqual(
+            result.status, REDISPATCH_DELIVERED, "no durable record backs a delivered claim"
+        )
+        self.assertTrue(result.delivered, "the transport positively started")
+        self.assertTrue(result.unknown_fate, "and its durable fate was never written")
+        self.assertEqual(result.effects, (EFFECT_REDISPATCHED,))
+        self.assertEqual(result.unresolved, (FATE_REDISPATCH_UNRESOLVED,))
+        # The exactly-once hold must SURVIVE the loss: re-asserted as the fail-closed terminal
+        # so a later reserve for the same key can never send again.
+        self.assertEqual(fence.state_of(key), "uncertain")
+
+    def test_a_written_delivery_is_a_plain_delivered(self):
+        """Premise control for the case above: the SAME setup with the row intact.
+
+        Without it, a ``uncertain`` verdict could come from any unrelated failure in the setup
+        and the row-vanish assertion would measure nothing.
+        """
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            recovery_anchor_delivery_live as delivery_live,
+            sublane_hibernated_pair_recovery_live as live,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_DELIVERED,
+        )
+
+        fence = self._fence()
+        ops = self._ops(fence)
+        gw = self._gw()
+        action = "recover-pair:14475:vanish:1:2"
+
+        class _Started:
+            started, zero_send, detail = True, False, "turn-start confirmed"
+
+        with patch.object(live, "list_herdr_agent_rows", return_value=[self._gw_row(gw)]), \
+                patch.object(
+                    delivery_live.LiveRecoveryAnchorDeliveryService,
+                    "deliver", lambda _s, _r: _Started(),
+                ):
+            result = ops.redispatch_to_gateway(
+                action_id=action, gateway_assigned_name=gw, issue=self.issue,
+                lane=self.lane, journal="88579", workspace_id=self.workspace_id,
+            )
+
+        self.assertEqual(result.status, REDISPATCH_DELIVERED)
+        self.assertTrue(result.delivered)
+        self.assertFalse(result.unknown_fate, "the ledger write landed")
+        self.assertEqual(fence.state_of(self._key(action, gw)), "delivered")
+
+    def test_a_pre_send_cancel_whose_row_vanished_is_not_a_settled_zero_send(self):
+        """The pre-send half of F1: nothing was sent, but the cancel wrote nothing either.
+
+        Calling that a settled zero-send asserts a durable ``cancelled`` record the store does
+        not hold, so a reconcile pass would see nothing owed.
+        """
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            recovery_anchor_delivery_live as delivery_live,
+            sublane_hibernated_pair_recovery_live as live,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_FAILED,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            FATE_REDISPATCH_UNRESOLVED,
+        )
+
+        fence = self._fence()
+        ops = self._ops(fence)
+        gw = self._gw()
+        action = "recover-pair:14475:vanish:2:1"
+        key = self._key(action, gw)
+        sent = []
+
+        def _moved(_ops_self, _lane):
+            # The authority check fires after the reserve and before transport; the row is lost
+            # in that same window. (Bound as an unbound function, so it takes the adapter and
+            # the lane exactly as the production call site passes them — a signature mismatch
+            # here would be swallowed by the caller's ``except`` and silently pass this case
+            # with the fence intact: measured.)
+            self._drop_row(fence, key)
+            return False
+
+        with patch.object(
+            live.LiveHibernatedPairRecoveryOps, "_checkout_authority_current", _moved
+        ), patch.object(live, "list_herdr_agent_rows", return_value=[self._gw_row(gw)]), \
+                patch.object(
+                    delivery_live.LiveRecoveryAnchorDeliveryService,
+                    "deliver", lambda _s, r: sent.append(r),
+                ):
+            result = ops.redispatch_to_gateway(
+                action_id=action, gateway_assigned_name=gw, issue=self.issue,
+                lane=self.lane, journal="88579", workspace_id=self.workspace_id,
+            )
+
+        self.assertEqual(sent, [], "zero transport")
+        self.assertEqual(result.status, REDISPATCH_FAILED)
+        self.assertFalse(result.delivered)
+        self.assertFalse(result.zero_send, "no durable cancel backs a settled claim")
+        self.assertTrue(result.unknown_fate)
+        self.assertEqual(result.unresolved, (FATE_REDISPATCH_UNRESOLVED,))
+        self.assertEqual(fence.state_of(key), "uncertain", "the hold is re-asserted")
+
+    def test_a_written_pre_send_cancel_is_a_settled_zero_send(self):
+        # Premise control: the same moved-authority path with the row intact IS settled.
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            recovery_anchor_delivery_live as delivery_live,
+            sublane_hibernated_pair_recovery_live as live,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_FAILED,
+        )
+
+        fence = self._fence()
+        ops = self._ops(fence)
+        gw = self._gw()
+        action = "recover-pair:14475:vanish:2:2"
+
+        with patch.object(
+            live.LiveHibernatedPairRecoveryOps,
+            "_checkout_authority_current", return_value=False,
+        ), patch.object(live, "list_herdr_agent_rows", return_value=[self._gw_row(gw)]), \
+                patch.object(
+                    delivery_live.LiveRecoveryAnchorDeliveryService,
+                    "deliver", lambda _s, _r: None,
+                ):
+            result = ops.redispatch_to_gateway(
+                action_id=action, gateway_assigned_name=gw, issue=self.issue,
+                lane=self.lane, journal="88579", workspace_id=self.workspace_id,
+            )
+
+        self.assertEqual(result.status, REDISPATCH_FAILED)
+        self.assertTrue(result.zero_send)
+        self.assertFalse(result.unknown_fate)
+        self.assertEqual(fence.state_of(self._key(action, gw)), "cancelled")
+
+    # -- F2: the reserve loser's state, classified TOTALLY -----------------------
+
+    def _loser(self, fence, ops, gw, action, pre_state):
+        """Put the key in ``pre_state``, then run the edge so its reserve LOSES."""
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            recovery_anchor_delivery_live as delivery_live,
+            sublane_hibernated_pair_recovery_live as live,
+        )
+
+        key = self._key(action, gw)
+        fence.reserve(key)
+        if pre_state == "delivered":
+            fence.mark_delivered(key)
+        elif pre_state == "cancelled":
+            fence.mark_cancelled(key)
+        elif pre_state == "uncertain":
+            fence.mark_uncertain(key)
+        elif pre_state != "reserved":  # pragma: no cover - fixture guard
+            raise AssertionError(f"unhandled pre-state {pre_state!r}")
+        self.assertEqual(fence.state_of(key), pre_state, "the fixture's premise")
+
+        def _deliver(_self, _request):
+            raise AssertionError("a losing reserve must never reach the transport")
+
+        with patch.object(live, "list_herdr_agent_rows", return_value=[self._gw_row(gw)]), \
+                patch.object(
+                    delivery_live.LiveRecoveryAnchorDeliveryService, "deliver", _deliver
+                ):
+            return ops.redispatch_to_gateway(
+                action_id=action, gateway_assigned_name=gw, issue=self.issue,
+                lane=self.lane, journal="88579", workspace_id=self.workspace_id,
+            )
+
+    def test_the_reserve_loser_state_matrix_is_total(self):
+        """Every state the loser can report, classified — the whole matrix in one place.
+
+        ``cancelled`` is the finding: a durable ZERO-SEND. Reading it as
+        ``already_redispatched`` told the caller the implementation_request had been delivered
+        by an earlier run when the store says the opposite.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_ALREADY,
+            REDISPATCH_FAILED,
+            REDISPATCH_UNCERTAIN,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            redispatch_is_success,
+        )
+
+        fence = self._fence()
+        ops = self._ops(fence)
+        gw = self._gw()
+        # (pre-state, expected status, delivered, zero_send, unknown_fate, success?)
+        matrix = (
+            ("delivered", REDISPATCH_ALREADY, False, True, False, True),
+            ("cancelled", REDISPATCH_FAILED, False, True, False, False),
+            ("uncertain", REDISPATCH_UNCERTAIN, False, False, True, False),
+            ("reserved", REDISPATCH_UNCERTAIN, False, False, True, False),
+        )
+        for i, (pre, status, delivered, zero, unknown, ok) in enumerate(matrix):
+            with self.subTest(prior_state=pre):
+                result = self._loser(
+                    fence, ops, gw, f"recover-pair:14475:loser:{i}", pre
+                )
+                self.assertEqual(result.status, status)
+                self.assertEqual(result.delivered, delivered)
+                self.assertEqual(result.zero_send, zero)
+                self.assertEqual(result.unknown_fate, unknown)
+                self.assertEqual(redispatch_is_success(result.status), ok)
+
+    def test_an_unrecognised_loser_state_is_never_a_success(self):
+        """The residual arm: a state outside the fence's vocabulary fails closed.
+
+        A future fence state must not fall through to ``already_redispatched`` by default —
+        that is the shape of the defect this finding names.
+        """
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state.dispatch_outbox_fence import ReserveResult
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_hibernated_pair_recovery_live as live,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_UNCERTAIN,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            redispatch_is_success,
+        )
+
+        fence = self._fence()
+        ops = self._ops(fence)
+        gw = self._gw()
+        lost = ReserveResult(
+            won=False, prior_state="quarantined", current_state="quarantined",
+            needs_reconcile=False,
+        )
+        with patch.object(live, "list_herdr_agent_rows", return_value=[self._gw_row(gw)]), \
+                patch.object(type(fence), "reserve", return_value=lost):
+            result = ops.redispatch_to_gateway(
+                action_id="recover-pair:14475:loser:unknown", gateway_assigned_name=gw,
+                issue=self.issue, lane=self.lane, journal="88579",
+                workspace_id=self.workspace_id,
+            )
+        self.assertEqual(result.status, REDISPATCH_UNCERTAIN)
+        self.assertTrue(result.unknown_fate)
+        self.assertFalse(redispatch_is_success(result.status))
+
+
+class RedispatchSuccessPolicyTests(unittest.TestCase):
+    """Review j#88579 F3/F4/F5: one success policy, a total fact table, a typed boundary."""
+
+    # -- F3: the shared policy is the ONLY policy --------------------------------
+
+    def test_a_skipped_send_after_a_successful_resume_blocks(self):
+        """Review j#88579 F3 / probe j#88577: the main surface's local whitelist.
+
+        ``redispatch_is_success`` exists so both surfaces agree, and the main use case then
+        OR-ed a local ``or self.redispatch == REDISPATCH_SKIPPED`` on top of it. The retry
+        surface blocked the same outcome. ``skipped`` after an APPLIED resume means the run
+        entered actuation, changed the pair, and never redelivered the implementation_request:
+        an owed send, reported as an unblocked success.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_SKIPPED,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            EFFECT_RESUME_COMMITTED,
+            redispatch_is_success,
+        )
+
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        ops = _FakeOps(
+            per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy},
+            redispatch=REDISPATCH_SKIPPED,
+        )
+        out = _use_case(ops, resume_transition="applied").run(_REQ, execute=True)
+
+        self.assertIn(EFFECT_RESUME_COMMITTED, out.effects, "the run DID change the pair")
+        self.assertTrue(out.executed)
+        self.assertTrue(
+            out.is_blocked, "an attempted run that never redelivered is not a success"
+        )
+        self.assertFalse(redispatch_is_success(REDISPATCH_SKIPPED))
+
+    def test_the_success_policy_admits_exactly_two_statuses(self):
+        # The closed set, stated positively: a future token blocks by default.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_hibernated_pair_recovery as main,
+            sublane_recover_pair_delivery as retry,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            REDISPATCH_TERMINAL_SUCCESS,
+            redispatch_is_success,
+        )
+
+        self.assertEqual(
+            REDISPATCH_TERMINAL_SUCCESS,
+            frozenset({"redispatched", "already_redispatched"}),
+        )
+        self.assertFalse(redispatch_is_success("a_future_token"))
+        for module in (main, retry):
+            with self.subTest(module=module.__name__):
+                source = Path(module.__file__).read_text(encoding="utf-8")
+                self.assertNotIn(
+                    "self.redispatch ==", source,
+                    "a per-surface equality test is how the two policies drifted",
+                )
+
+    # -- F4: the status x fact table, in full ------------------------------------
+
+    def test_every_status_fact_combination_is_decided(self):
+        """The whole product of statuses and fact shapes: each admitted or refused.
+
+        Enumerating the full table (not just the shapes the code happens to build) is what
+        makes this a contract rather than a description of today's call sites.
+        """
+        import itertools
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            REDISPATCH_EDGE_FACT_SHAPES,
+            REDISPATCH_EDGE_STATUSES,
+            RedispatchEdgeResult,
+        )
+
+        shapes = tuple(itertools.product((False, True), repeat=3))
+        self.assertEqual(len(shapes), 8)
+        admitted = 0
+        for status in sorted(REDISPATCH_EDGE_STATUSES):
+            for delivered, zero_send, unknown_fate in shapes:
+                allowed = (delivered, zero_send, unknown_fate) in (
+                    REDISPATCH_EDGE_FACT_SHAPES[status]
+                )
+                with self.subTest(status=status, shape=(delivered, zero_send, unknown_fate)):
+                    if allowed:
+                        admitted += 1
+                        result = RedispatchEdgeResult(
+                            status=status, delivered=delivered,
+                            zero_send=zero_send, unknown_fate=unknown_fate,
+                        )
+                        # The derived facts follow from the flags, never from the status.
+                        self.assertEqual(bool(result.effects), delivered)
+                        self.assertEqual(bool(result.unresolved), unknown_fate)
+                    else:
+                        with self.assertRaises(ValueError):
+                            RedispatchEdgeResult(
+                                status=status, delivered=delivered,
+                                zero_send=zero_send, unknown_fate=unknown_fate,
+                            )
+        self.assertEqual(
+            admitted, sum(len(v) for v in REDISPATCH_EDGE_FACT_SHAPES.values())
+        )
+        # Guard the table itself: it must stay total over the statuses and never admit
+        # everything (an all-permitting entry would make the validation vacuous).
+        for status, allowed in REDISPATCH_EDGE_FACT_SHAPES.items():
+            with self.subTest(status=status):
+                self.assertTrue(allowed, f"{status} admits no shape at all")
+                self.assertLess(len(allowed), len(shapes), f"{status} admits everything")
+
+    def test_a_terminal_success_must_carry_the_fact_that_makes_it_one(self):
+        # The concrete asymmetry the table encodes: a success with nothing behind it.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            RedispatchEdgeResult,
+        )
+
+        with self.assertRaises(ValueError):
+            RedispatchEdgeResult(status="redispatched")  # no delivery behind the success
+        with self.assertRaises(ValueError):
+            RedispatchEdgeResult(status="already_redispatched", delivered=True)
+        with self.assertRaises(ValueError):
+            RedispatchEdgeResult(status="invented_status", zero_send=True)
+
+    # -- F5: the production boundary is typed ------------------------------------
+
+    def test_the_ops_protocol_and_its_production_implementations_are_typed(self):
+        """The Protocol, the live adapter and both consumers agree on the typed result.
+
+        Annotating only the concrete class leaves the CONTRACT saying ``str``, so a second
+        implementation written against the Protocol satisfies the declared type and breaks the
+        consumer. Both the annotation and the runtime value are pinned.
+        """
+        import typing
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            HibernatedPairRecoveryOps,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery_live import (  # noqa: E501
+            LiveHibernatedPairRecoveryOps,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            RedispatchEdgeResult,
+        )
+
+        for owner in (HibernatedPairRecoveryOps, LiveHibernatedPairRecoveryOps):
+            for name in ("redispatch_to_gateway", "retry_redispatch_to_gateway"):
+                with self.subTest(owner=owner.__name__, method=name):
+                    method = getattr(owner, name)
+                    hints = typing.get_type_hints(method)
+                    self.assertIs(
+                        hints.get("return"), RedispatchEdgeResult,
+                        f"{owner.__name__}.{name} must DECLARE the typed result",
+                    )
+
+    def test_no_production_consumer_adapts_a_bare_status(self):
+        """The legacy-string constructor is test-support, and must stay out of ``src``.
+
+        A production path that reaches for it re-introduces exactly the loss the typed result
+        exists to prevent: a status alone cannot distinguish a settled zero-send from an
+        unknown fate.
+        """
+        import subprocess
+
+        root = Path(__file__).resolve().parents[2] / "src"
+        found = subprocess.run(
+            ["grep", "-rn", "--include=*.py", "edge_result_from_status", str(root)],
+            text=True, capture_output=True,
+        ).stdout.splitlines()
+        # Positive control: the sweep must be able to FIND the symbol, otherwise an empty
+        # ``offenders`` proves only that the grep was misaimed.
+        self.assertTrue(
+            [ln for ln in found if "recovery_effect_contract.py" in ln.split(":")[0]],
+            "the sweep found nothing at all; it is not measuring src",
+        )
+        offenders = [
+            line for line in found
+            if "recovery_effect_contract.py" not in line.split(":")[0]
+        ]
+        self.assertEqual(offenders, [], "production code must observe the edge, not a status")
+
+    def test_the_consumers_use_the_result_without_re_deriving_its_facts(self):
+        # Both consumers read ``.effects`` / ``.unresolved`` off the edge rather than mapping
+        # the status back to facts — the re-derivation that lost them in the first place.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_hibernated_pair_recovery as main,
+            sublane_recover_pair_delivery as retry,
+        )
+
+        for module in (main, retry):
+            with self.subTest(module=module.__name__):
+                source = Path(module.__file__).read_text(encoding="utf-8")
+                self.assertIn("edge.effects", source)
+                self.assertIn("edge.unresolved", source)
