@@ -110,7 +110,14 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    derive_lane_workspace_token,
     encode_assigned_name,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E501
+    LAUNCH_AUTHORITY_OK,
+    LAUNCH_AUTHORITY_WORKTREE_MISMATCH,
+    LAUNCH_AUTHORITY_WORKTREE_UNBOUND,
+    LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
     COMMAND_TIMEOUT_SECONDS,
@@ -156,6 +163,39 @@ class LiveHibernatedPairRecoveryOps:
             return repo_scope_workspace_id(self.repo_root)
         except Exception:  # noqa: BLE001 - unresolved workspace => empty (fail closed upstream)
             return ""
+
+    def lane_worktree_binding_reason(self, *, lane: str, record) -> str:
+        """The lane's canonical worktree-binding axis (Redmine #14475, review j#88477 F1).
+
+        The recovery relaunches the pair into ``self.repo_root``, so the axis is exactly:
+        does the lifecycle row carry a non-empty ``worktree_identity`` that EQUALS the token
+        freshly derived from that same root? Uses ``derive_lane_workspace_token`` — the same
+        derivation the guarded refresh's pre-close launch-authority fence uses — so the two
+        surfaces agree by construction rather than by convention.
+
+        Fail-closed: an underivable token is ``worktree_token_underivable``, never ``ok``.
+        Distinguishes UNBOUND (nothing to compare) from MISMATCH (a wrong compare) because
+        they are different operator problems with different runbooks.
+        """
+        pinned = _norm(getattr(record, "worktree_identity", ""))
+        if not pinned:
+            return LAUNCH_AUTHORITY_WORKTREE_UNBOUND
+        try:
+            # Review j#88494: derive from the CANONICAL (symlink-resolved) root — the
+            # contract ``derive_lane_workspace_token`` states ("the caller must pass a
+            # symlink-resolved path so mint-time and resolve-time agree"). Deriving from an
+            # unresolved caller path makes a correctly-bound lane read as a MISMATCH whenever
+            # the recovery is invoked through a symlink alias.
+            live = _norm(
+                derive_lane_workspace_token(str(Path(self.repo_root).resolve()))
+            )
+        except Exception:  # noqa: BLE001 - an underivable token fails closed
+            return LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE
+        if not live:
+            return LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE
+        return (
+            LAUNCH_AUTHORITY_OK if live == pinned else LAUNCH_AUTHORITY_WORKTREE_MISMATCH
+        )
 
     def _rows(self) -> Sequence[Mapping[str, object]]:
         return list_herdr_agent_rows(self.env)

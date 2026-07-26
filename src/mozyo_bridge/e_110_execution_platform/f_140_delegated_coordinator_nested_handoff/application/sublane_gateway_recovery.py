@@ -197,6 +197,14 @@ class GatewayRefreshOutcome:
     #: Whether this --execute was admitted as a POST-CLOSE resume (the #13806 correction:
     #: close committed, launch owed — the pinned old gateway is expectedly absent).
     post_close_resume: bool = False
+    #: The lane LAUNCH-authority axis as a closed
+    #: :data:`...lane_launch_authority.LAUNCH_AUTHORITY_REASONS` token, and its secret-safe
+    #: operator runbook (review j#88477 F2). Emitted as TYPED fields on EVERY outcome —
+    #: preflight, refused, stopped, completed — so an operator / automation can select a
+    #: recovery action without parsing :attr:`detail` prose. Both are axis-level facts: never
+    #: a path, token value, branch, or identity.
+    launch_authority_reason: str = LAUNCH_AUTHORITY_UNKNOWN
+    launch_authority_runbook: str = ""
 
     @property
     def is_blocked(self) -> bool:
@@ -226,6 +234,8 @@ class GatewayRefreshOutcome:
             "observation": self.observation,
             "preservation_reasons": list(self.preservation_reasons),
             "post_close_resume": self.post_close_resume,
+            "launch_authority_reason": self.launch_authority_reason,
+            "launch_authority_runbook": self.launch_authority_runbook or None,
         }
 
 
@@ -330,12 +340,20 @@ class GatewayRefreshUseCase:
         self._ttl = lease_ttl_seconds
 
     def _lane_authority_reason(self, request: GatewayRefreshRequest) -> str:
-        """The lane launch-authority axis, read ONCE per run (fail-closed, normalized).
+        """The lane launch-authority axis (fail-closed, normalized).
 
         Read through the same evaluator the launch leg's authority fence uses, so the
         preflight verdict and the action-time effect cannot be backed by different logic. An
         ops adapter that raises (or predates the #14475 protocol) is ``unknown``, which
         refuses — never a fabricated green axis.
+
+        MAY be called more than once per run (review j#88485 / j#88498): always once before
+        the verdict, to make the axis a pre-close preflight fence, and AGAIN only at an
+        actuator or continuation refusal, so the reported reason names the ACTION-TIME state
+        rather than the preflight-time observation the run no longer reflects. A run that
+        completes re-reads nothing — it acted under the axis it reported. Each call is a fresh
+        read; the result is never cached across the close boundary, which is exactly what
+        would report ``ok`` for a lane whose authority moved mid-action (#14462 j#88463).
         """
         try:
             raw = self._ops.lane_authority_reason(request)
@@ -373,6 +391,7 @@ class GatewayRefreshUseCase:
                     "preflight only; --execute requires a positive owner approval"
                     + authority_detail
                 ),
+                authority_reason=authority_reason,
             )
         if verdict == REFRESH_BLOCK_LAUNCH_AUTHORITY:
             # The one blocker that must never fall through to the post-close resume admission:
@@ -385,10 +404,12 @@ class GatewayRefreshUseCase:
                 detail=(
                     f"target not actionable ({verdict}); zero close" + authority_detail
                 ),
+                authority_reason=authority_reason,
             )
         if verdict != REFRESH_ACTIONABLE:
             resumed = self._post_close_resume(
-                request, turn_class, turn_reason, verdict, turn_obs, observation
+                request, turn_class, turn_reason, verdict, turn_obs, observation,
+                authority_reason,
             )
             if resumed is not None:
                 return resumed
@@ -397,9 +418,11 @@ class GatewayRefreshUseCase:
                 status=REFRESH_STATUS_REFUSED, executed=True,
                 turn_observation=turn_obs, observation=observation,
                 detail=f"target not actionable ({verdict}); zero close",
+                authority_reason=authority_reason,
             )
         return self._execute(
-            request, turn_class, turn_reason, verdict, turn_obs, observation
+            request, turn_class, turn_reason, verdict, turn_obs, observation,
+            authority_reason,
         )
 
     # -- post-close resume admission (the #13806 correction, mirrored) --------
@@ -412,6 +435,7 @@ class GatewayRefreshUseCase:
         verdict: str,
         turn_obs: GatewayTurnObservation,
         observation: GatewayRefreshObservation,
+        authority_reason: str,
     ) -> Optional[GatewayRefreshOutcome]:
         """Admit + drive a post-close replay, or ``None`` when it is not a resume.
 
@@ -454,7 +478,8 @@ class GatewayRefreshUseCase:
         if stored is None or not worker_close_committed(stored.phase):
             return None
         outcome = self._execute(
-            request, turn_class, turn_reason, verdict, turn_obs, observation
+            request, turn_class, turn_reason, verdict, turn_obs, observation,
+            authority_reason,
         )
         return replace(outcome, post_close_resume=True)
 
@@ -468,12 +493,14 @@ class GatewayRefreshUseCase:
         verdict: str,
         turn_obs: GatewayTurnObservation,
         observation: GatewayRefreshObservation,
+        authority_reason: str,
     ) -> GatewayRefreshOutcome:
         def refused(detail: str) -> GatewayRefreshOutcome:
             return self._outcome(
                 request, turn_class, turn_reason, verdict,
                 status=REFRESH_STATUS_REFUSED, executed=True,
                 turn_observation=turn_obs, observation=observation, detail=detail,
+                authority_reason=authority_reason,
             )
 
         # 1. Positive durable owner approval + exact action id + generation + evidence,
@@ -558,6 +585,7 @@ class GatewayRefreshUseCase:
                 status=REFRESH_STATUS_STOPPED, executed=True,
                 turn_observation=turn_obs, observation=observation,
                 detail=f"transaction plan refused ({plan.reason})",
+                authority_reason=authority_reason,
             )
         current = self._store.get(key)
         if current is None:
@@ -566,6 +594,7 @@ class GatewayRefreshUseCase:
                 status=REFRESH_STATUS_STOPPED, executed=True,
                 turn_observation=turn_obs, observation=observation,
                 detail="transaction row vanished after plan",
+                authority_reason=authority_reason,
             )
         # A pre-existing row at this key must be THIS exact approved generation + decision +
         # continuation AND the same single pinned gateway — otherwise a different authority is
@@ -591,6 +620,7 @@ class GatewayRefreshUseCase:
                     "a different refresh authority is already in flight for this gateway; "
                     "zero actuation"
                 ),
+                authority_reason=authority_reason,
             )
 
         # 3. Drive the guarded close → launch → attest (the tranche B actuator). The launch
@@ -624,6 +654,13 @@ class GatewayRefreshUseCase:
                     + (f": {recov.detail}" if norm(recov.detail) else "")
                     + "); re-run resumes"
                 ),
+                # Review j#88485: the actuator re-joins the lane authority AFTER the close, so
+                # a stop here may be the authority MOVING mid-action (the exact #14462 j#88463
+                # transition). Reporting the preflight-time reason would name a state that is
+                # no longer true. Re-read the canonical evaluator and report the action-time
+                # axis — which stays ``ok`` when the stop had some other cause (e.g. the
+                # gateway's assigned name occupied by a foreign live process).
+                authority_reason=self._lane_authority_reason(request),
             )
 
         # 4. Fresh gateway attested — drive the resume continuation exactly once through the
@@ -653,6 +690,14 @@ class GatewayRefreshUseCase:
                 if resume == CONTINUATION_CONFIRMED
                 else f"gateway refreshed; resume {resume} (no blind resend; re-run resumes)"
             ),
+            # The resume leg re-joins the same authority immediately before the send, so a
+            # stopped continuation gets the action-time axis too (review j#88485). A confirmed
+            # resume re-reads to the same ``ok`` it acted under.
+            authority_reason=(
+                authority_reason
+                if resume == CONTINUATION_CONFIRMED
+                else self._lane_authority_reason(request)
+            ),
         )
 
     @staticmethod
@@ -681,7 +726,11 @@ class GatewayRefreshUseCase:
         revision: int = 0,
         detail: str = "",
         preservation_reasons: tuple[str, ...] = (),
+        authority_reason: str = LAUNCH_AUTHORITY_UNKNOWN,
     ) -> GatewayRefreshOutcome:
+        # Review j#88477 F2: the closed axis token + its runbook are TYPED fields on every
+        # outcome the surface can return, not prose inside ``detail``.
+        reason = normalize_launch_authority_reason(authority_reason)
         return GatewayRefreshOutcome(
             issue=norm(request.issue),
             lane=norm(request.lane),
@@ -703,6 +752,8 @@ class GatewayRefreshUseCase:
             ),
             observation=observation.as_payload() if observation is not None else None,
             preservation_reasons=preservation_reasons,
+            launch_authority_reason=reason,
+            launch_authority_runbook=launch_authority_runbook(reason),
         )
 
 

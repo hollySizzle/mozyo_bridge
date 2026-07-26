@@ -151,10 +151,19 @@ def _backfill_missing_worktree_binding(
     reused verbatim rather than re-implemented: it is guarded on ``declare_active``'s observed
     revision and refuses zero-write on a non-empty *different* worktree, a non-empty *different*
     declared-slot snapshot, a different issue, a non-active disposition, or a concurrent write.
-    ``declared_slots=()`` is deliberate — the create boundary has no pins yet, and passing the
-    empty set means the store fills the worktree gap on a slot-less row and refuses (zero-write)
-    on a row whose pins already landed, rather than clobbering them. That residual stays covered
-    by the guarded recovery surfaces' pre-close launch-authority fence.
+
+    ``declared_slots`` carries the row's OWN CURRENT pins, re-read here (review j#88477 F1).
+    Passing the empty set instead would hit that store's "non-empty different slot snapshot"
+    fence on every row whose pins had already landed — i.e. exactly the #14462 shape (pins
+    present, worktree empty) — making the backfill a guaranteed zero-write there and leaving
+    the documented recovery runbook ("re-run the lane's own declaration surface") pointing at
+    an action that could never succeed. Handing the pins back UNCHANGED keeps the snapshot
+    byte-identical (the store sees them as already-exactly-present and writes only the empty
+    worktree field), so this closes the worktree gap on a pin-bearing row without ever
+    rewriting a pin. The read→CAS window is covered by ``expected_revision``: any concurrent
+    write that moved the pins also moved the revision, so the CAS refuses ``stale_revision``
+    rather than writing back a stale snapshot. A row whose pins are unreadable / undecodable
+    is left alone (fail-closed) rather than backfilled with a guess.
 
     Best-effort like every other write here: a store error is reported and never breaks the
     actuation.
@@ -163,6 +172,7 @@ def _backfill_missing_worktree_binding(
     from mozyo_bridge.core.state.lane_lifecycle import (
         DecisionPointerError,
         LaneLifecycleError,
+        LaneLifecycleStore,
     )
 
     token = _norm(worktree_identity)
@@ -172,12 +182,30 @@ def _backfill_missing_worktree_binding(
         # No token to bind — a create that could not resolve one never guesses a binding.
         return
     try:
+        current = LaneLifecycleStore().get(key)
+    except (LaneLifecycleError, ValueError, OSError):
+        current = None
+    if current is None:
+        # The row vanished between the refusal and this read — the CAS would refuse anyway.
+        return
+    try:
+        # The row's OWN pins, decoded through the canonical model accessor. An undecodable
+        # snapshot raises here and is left untouched (never re-encoded from a guess).
+        pins = tuple(current.declared_pins)
+    except Exception:  # noqa: BLE001 - an undecodable snapshot is never rewritten
+        print(
+            "warning: lane worktree binding backfill skipped (undecodable declared pins); "
+            "lane reads as worktree-unbound",
+            file=sys.stderr,
+        )
+        return
+    try:
         LaneDeclarationStore().backfill_active_binding(
             key,
             expected_revision=result.revision,
             issue_id=issue_id,
             worktree_identity=token,
-            declared_slots=(),
+            declared_slots=pins,
         )
     except (LaneLifecycleError, DecisionPointerError, ValueError, OSError) as exc:
         print(

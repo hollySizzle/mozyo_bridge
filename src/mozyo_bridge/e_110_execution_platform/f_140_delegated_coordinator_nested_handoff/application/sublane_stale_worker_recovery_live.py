@@ -615,7 +615,13 @@ class LiveStaleWorkerRecoveryOps:
             # a worktree. Distinct from a MISMATCH: nothing to compare, not a wrong compare.
             return LAUNCH_AUTHORITY_WORKTREE_UNBOUND
         try:
-            live_token = _norm(derive_lane_workspace_token(str(self.repo_root)))
+            # Canonical (symlink-resolved) root, per ``derive_lane_workspace_token``'s stated
+            # contract (review j#88494). Unresolved, a lane invoked through a symlink alias
+            # reads as ``worktree_identity_mismatch`` and its guarded recovery is refused for
+            # a binding that is in fact exact.
+            live_token = _norm(
+                derive_lane_workspace_token(str(Path(self.repo_root).resolve()))
+            )
         except Exception:  # noqa: BLE001 - an underivable token fails closed
             return LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE
         if not live_token:

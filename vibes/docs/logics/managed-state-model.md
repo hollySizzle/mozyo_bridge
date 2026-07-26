@@ -444,9 +444,14 @@ Table naming:
       `declare_created_lane_lifecycle` はその outcome を **捨てていた** ため、create が算出済みの canonical token が
       row へ届かず lane は worktree-unbound のまま稼働した (guarded recovery の launch fence で初めて露見し、
       その時点では既に destructive close 済)。create path は `already_declared` 拒否時に **同じ**
-      `backfill_active_binding` CAS へ route する。`declared_slots=()` を渡すので、pin 未宣言 row では worktree gap
-      だけを埋め、**pin 既着地 row は zero-write** (clobber しない) — 後者の残余は recover 系 surface の
-      **close 前 launch-authority fence** が受け持つ。token 無しの create は binding を推測しない。
+      `backfill_active_binding` CAS へ route する。`declared_slots` には **row 自身の現在の pins を再読して
+      exact に渡す** (review j#88477 F1)。空集合を渡すと store の「non-empty different slot snapshot」fence に当たり、
+      **pin 既着地 row (=まさに #14462 の形) では必ず zero-write** となって、「lane 自身の declaration surface を
+      再実行する」という回復 runbook が成立しない action を指してしまう。pins を **不変のまま**渡せば store は
+      「既に exact に存在する」と見なし、空の worktree field だけを書く (pin は決して書き換えない)。read→CAS の
+      窓は `expected_revision` が覆う: pins を動かした並行 write は revision も動かすので CAS は `stale_revision` で
+      拒否し、stale snapshot を書き戻さない。pins が decode 不能な row は触らない (fail-closed、推測で再 encode しない)。
+      token 無しの create は binding を推測しない。
       ★adopt が gate failure / CAS refusal で終わったとき「既に確立済みゆえ dispatch 安全」と判定する
       条件は、**issue 所有だけでは不十分**で state DB owner row が **complete かつ exact な binding**
       — `worktree_identity` 非空 かつ token 一致、**かつ** `declared_slots` が decode-valid で

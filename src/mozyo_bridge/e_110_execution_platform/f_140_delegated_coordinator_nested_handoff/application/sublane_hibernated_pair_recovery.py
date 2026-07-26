@@ -64,6 +64,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     SublaneStartupObservation,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.lane_worktree_binding_probe import (  # noqa: E501
+    resolve_worktree_binding_reason,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E501
+    LAUNCH_AUTHORITY_UNKNOWN,
+    launch_authority_current,
+    launch_authority_runbook,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_pair_recovery import (  # noqa: E501
     SLOT_HEALTHY,
     SLOT_RECOVER,
@@ -90,6 +98,13 @@ BLOCK_LANE_NOT_HIBERNATED = "lane_not_hibernated"
 BLOCK_IDENTITY_INCOMPLETE = "identity_or_decision_incomplete"
 BLOCK_STORE_UNREADABLE = "lifecycle_store_unreadable"
 BLOCK_MISSING_PINS = "hibernated_record_missing_pins"
+#: The lane's lifecycle row carries no canonical ``worktree_identity`` binding, or the one it
+#: carries is not this worktree's (Redmine #14475, review j#88477 F1). A recovery that
+#: relaunches a pair into a worktree the lane is not bound to — or that is bound to nothing —
+#: hands an unbound row on to every later guarded surface, which is exactly how #14462 j#88463
+#: reached a closed-and-unrelaunchable gateway. Fail-closed BEFORE any close / relaunch /
+#: resume / send. The blocker carries the closed ``LAUNCH_AUTHORITY_*`` axis token.
+BLOCK_WORKTREE_BINDING = "lane_worktree_binding_unverified"
 BLOCK_SLOT_PRESERVED = "slot_preserved_not_recoverable"  # a slot is preserve-disposition
 BLOCK_CLOSE_FAILED = "bad_generation_close_failed"
 BLOCK_RELAUNCH_FAILED = "pair_relaunch_failed"
@@ -191,6 +206,21 @@ class RecoverPairPreflight:
     #: duplicate / half a pair. Empty once the pair resolved. Reported so an operator reads
     #: "the pins are there but ambiguous" apart from "there are no pins".
     pins_reason: str = PIN_PAIR_ABSENT
+    #: WHICH canonical worktree-binding axis holds / fails, from the closed #14475
+    #: ``LAUNCH_AUTHORITY_*`` vocabulary shared with the guarded recovery surfaces (one
+    #: vocabulary, not a per-surface dialect). Defaults to the fail-closed ``unknown``, so an
+    #: ops adapter that never observed the axis blocks rather than riding a green default.
+    worktree_binding_reason: str = LAUNCH_AUTHORITY_UNKNOWN
+
+    @property
+    def worktree_binding_current(self) -> bool:
+        """Is the lane bound to THIS worktree by a canonical, matching token? (fail-closed)"""
+        return launch_authority_current(self.worktree_binding_reason)
+
+    @property
+    def worktree_binding_runbook(self) -> str:
+        """The secret-safe operator recovery hint for the failing binding axis."""
+        return launch_authority_runbook(self.worktree_binding_reason)
 
     @property
     def slots(self) -> Tuple[SlotPlan, ...]:
@@ -213,6 +243,9 @@ class RecoverPairPreflight:
             and self.record_has_pins
             and len(self.slots) == 2
             and not self.preserved_slots
+            # Redmine #14475 (review j#88477 F1): a recovery may not relaunch a pair into a
+            # lane whose canonical worktree binding is absent or is some other worktree's.
+            and self.worktree_binding_current
         )
 
     @property
@@ -228,6 +261,11 @@ class RecoverPairPreflight:
                 if self.pins_reason
                 else BLOCK_MISSING_PINS
             )
+        if not self.worktree_binding_current:
+            # Carry WHICH axis (the closed #14475 vocabulary): "bound to nothing" and "bound
+            # to a different worktree" are both fail-closed, and are different operator
+            # problems with different runbooks.
+            reasons.append(f"{BLOCK_WORKTREE_BINDING}:{self.worktree_binding_reason}")
         for slot in self.preserved_slots:
             reasons.append(f"{BLOCK_SLOT_PRESERVED}:{slot.role}={slot.disposition}")
         return tuple(reasons)
@@ -238,6 +276,9 @@ class RecoverPairPreflight:
             "lane_hibernated": self.lane_hibernated,
             "record_has_pins": self.record_has_pins,
             "pins_reason": self.pins_reason,
+            "worktree_binding_current": self.worktree_binding_current,
+            "worktree_binding_reason": self.worktree_binding_reason,
+            "worktree_binding_runbook": self.worktree_binding_runbook,
             "action_id": self.action_id,
             "gateway": self.gateway.as_payload() if self.gateway else None,
             "worker": self.worker.as_payload() if self.worker else None,
@@ -357,6 +398,21 @@ class HibernatedPairRecoveryOps(Protocol):
         declared-pin locator), reads its startup self-attestation, and returns
         ``(observation, live_locator, assigned_name)``. The live locator is what a close
         pin-matches (byte-preserving the exact live bad generation), never a stale pin.
+        """
+        ...
+
+    def lane_worktree_binding_reason(self, *, lane: str, record: Any) -> str:
+        """WHICH canonical worktree-binding axis holds for this lane? (read-only, #14475)
+
+        Returns a closed :data:`...lane_launch_authority.LAUNCH_AUTHORITY_REASONS` token:
+        :data:`...LAUNCH_AUTHORITY_OK` only when the record's ``worktree_identity`` is
+        non-empty AND equals the token freshly derived from the recovery worktree; otherwise
+        the exact failing axis (unbound / mismatch / underivable / unreadable). Fail-closed —
+        an unreadable observation is never ``ok``.
+
+        This is the SAME token vocabulary (and, in the live adapter, the same derivation) the
+        guarded refresh's pre-close launch-authority fence uses, so the two surfaces cannot
+        disagree about what "bound to this worktree" means.
         """
         ...
 
@@ -534,6 +590,9 @@ class SublaneRecoverPairUseCase:
             worker=worker_plan,
             action_id=action_id,
             pins_reason=pins_reason,
+            worktree_binding_reason=resolve_worktree_binding_reason(
+                self.ops, lane=lane, record=rec
+            ),
         )
         if not preflight.may_recover or not execute:
             return RecoverPairOutcome(

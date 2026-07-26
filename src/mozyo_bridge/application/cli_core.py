@@ -85,6 +85,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     register_sublane_recover_pair_parser,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pin_repair import register_sublane_repair_pins_parser  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worktree_binding_repair import register_sublane_repair_worktree_binding_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_convergence import register_sublane_converge_bound_pair_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard import register_sublane_prepare_bound_pair_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
@@ -847,6 +848,7 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     register_sublane_recover_gateway_parser(sublane_sub)
     register_sublane_recover_pair_parser(sublane_sub)
     register_sublane_repair_pins_parser(sublane_sub)
+    register_sublane_repair_worktree_binding_parser(sublane_sub)
     register_sublane_converge_bound_pair_parser(sublane_sub)
     register_sublane_prepare_bound_pair_parser(sublane_sub)
     # `herdr` groups the pure-herdr session helpers (Redmine #13261). `session-start`

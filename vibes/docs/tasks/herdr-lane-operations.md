@@ -101,7 +101,27 @@ same-lane implementation_gateway が **callback delivery 確認済みの provide
   - reason (`rate_limit`/`auth`/`session_stale`) は構造化 evidence token の注入のみ。不明は `unknown` (herdr は turn 終了理由を公開しない)。
 - **execute (destructive, owner approval 必須)**: 上記に加え `--journal <owner approval j>` `--action-id refresh-gateway:<lane>:<role>:<provider>:<name>:<locator>` `--action-generation <n>` `--lane-revision <r>` `--lane-generation <g>` `--execute`。`turn_failed_no_durable_gate` + 全 fence green のときだけ、**exact gateway generation のみ** close → same-slot fresh launch → action-bound attestation → **既存 anchor を governed handoff rail で exactly-once resume** (IR/RR は再生成しない)。worker / default coordinator / foreign slot は ordered fence が保護する。
 - **partial failure**: replacement transaction が replay fence を保持し、re-run が resume する。close 後 crash の replay は `identity_unknown` + committed-close transaction のみ admit。
+- **typed outcome** (#14475 review j#88477 F2): blocker の判定材料は `detail` の散文でなく **typed field** で出す。`--json` payload と text 出力の双方が、全 outcome (preflight / refused / stopped / completed) で `launch_authority_reason` (closed token) を、blocking 時は `launch_authority_runbook` (secret-safe な回復手順) を伴って出す。`ok` のときも reason は出る (automation が「field 不在＝正常」を推測しなくてよい)。
+  - ★**reason は action-time の事実である** (review j#88485)。close は launch より前に commit されるため、preflight で `ok` だった lane が launch 直前の re-join で moved することがある (#14462 j#88463 はまさにこの遷移)。actuator 停止時および resume leg の authority refusal 時には canonical evaluator を **再読**し、その時点の axis を報告する。preflight 時の観測を持ち回さない。lane authority が維持されたまま別要因 (gateway assigned name occupied 等) で停止した場合は、再読結果どおり `ok` のままとする — この field は「何かが失敗した」ではなく **観測**を報告する。
 - 実装正本: `domain/gateway_turn_recovery.py` / `domain/lane_launch_authority.py` (#14475) / `application/sublane_gateway_recovery*.py` (#14203)。
+
+### `recover-pair` の worktree binding fence (#14475 review j#88477 F1)
+
+`sublane recover-pair` の preflight も **同じ closed `LAUNCH_AUTHORITY_*` 語彙**で lane の canonical worktree binding を判定する (surface ごとの方言を作らない)。`worktree_identity` が空、または recovery worktree から導出した token と不一致なら `may_recover=false` で、**close / relaunch / resume / redispatch いずれも 0**。blocker は `lane_worktree_binding_unverified:<axis token>` の形で `blocked_reasons` に載り、preflight payload は `worktree_binding_current` / `worktree_binding_reason` / `worktree_binding_runbook` を出す。probe を持たない古い ops adapter や例外を投げる probe は `unknown` = fail-closed（green default に乗らない）。
+
+- 回復手順は **row の disposition で分岐する** (review j#88490)。使える bounded write surface が違うため。
+  - **active** row: **lane 自身の declaration surface を再実行**する (`sublane create` の self-heal 再実行)。create path の bounded backfill は row の現在の pins を exact に保持したまま空の worktree field だけを CAS で埋めるため、**pins を持つ row でも成立する** (#14462 の形)。
+  - **hibernated** row: `sublane repair-worktree-binding`（#14475、下記）。#13809 backfill は active 専用なので hibernated row には構造的に届かない。
+  - いずれも非空で異なる binding は上書きしない。
+
+### `sublane repair-worktree-binding` (#14475 review j#88490)
+
+hibernated / released で `declared_slots` は在るが `worktree_identity` が空、という **どの既存 surface も収束させられない**形の public な metadata-only 回復。#13879 `repair-pins`（worktree 非空・pins 空）の**鏡像**であり、両者の signature は構成上排他。既定は read-only preflight、`--execute` で **lifecycle payload field は `worktree_identity` の 1 つだけ**を exact revision+generation CAS で書く（同 UPDATE は本 component の全 CAS と同様に decision anchor / revision / `updated_at` の audit metadata も更新する。review j#88496）。**process launch / close / resume / send は 0**、worktree / branch も触らない。lane は hibernated のまま残り、以後は `recover-pair` が担当する。
+
+- row 側に比較対象の token が無い（それが欠陥そのもの）ため、`--worktree` の自己申告は信用せず **positive evidence** を要求する: (1) 実在 git checkout の **root 自身**であること（subdir は同じ branch を答えるが別 token を導出するため不可）、(2) canonical resolver で **lane record と同一 workspace** に解決すること（別 repository の同名 branch を排除。branch 名は identity ではない — review j#88493）、(3) 現在 branch が lane id と一致すること。
+- token は **canonical (symlink 解決済み) root** から導出する。`derive_lane_workspace_token` の契約が resolve 済み path を要求しており、未解決だと symlink alias 経由の repair が「後続 live probe が再導出できない token」を記録してしまう (review j#88494)。同じ理由で live 側の binding probe も resolve 済み root から導出する。
+- 既に**同一 token** で bound なら idempotent no-op、**別 worktree** に bound なら zero-write 拒否（この surface は隙間を埋めるだけで lane を移動させない）。
+- repair の `--journal` は row の **decision anchor を更新する**（sibling と同じ。lifecycle row は常に「現在の状態にした durable record」を指す、`transition_disposition` R1-F5 規則）。**issue binding** / pins / disposition / generation は不変 (review j#88493 / j#88495)。worktree binding は空→canonical token へ更新される — それが本 command の目的そのものであり、ここで「不変」なのは issue binding の方である。
 
 ## Host reboot recovery (#13518)
 

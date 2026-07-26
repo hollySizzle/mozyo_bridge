@@ -62,6 +62,11 @@ def format_recover_gateway_text(outcome: GatewayRefreshOutcome) -> str:
         )
     if outcome.post_close_resume:
         lines.append("  post_close_resume: true")
+    # Review j#88477 F2: the closed axis token is always shown; its runbook only when the axis
+    # is actually blocking (an ``ok`` axis has nothing to recover).
+    lines.append(f"  launch_authority: {outcome.launch_authority_reason}")
+    if outcome.launch_authority_runbook:
+        lines.append(f"  launch_authority_recovery: {outcome.launch_authority_runbook}")
     if outcome.detail:
         lines.append(f"  detail: {outcome.detail}")
     return "\n".join(lines)

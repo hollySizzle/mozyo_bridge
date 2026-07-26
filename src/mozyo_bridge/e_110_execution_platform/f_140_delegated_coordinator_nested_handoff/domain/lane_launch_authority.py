@@ -138,10 +138,17 @@ _RUNBOOKS = {
         "the lane moved under this approval; re-read the live lifecycle revision + "
         "generation and obtain a fresh owner approval pinned to them"
     ),
+    # Review j#88490: the recovery BRANCHES on the row's disposition, because the bounded
+    # write surfaces do. An ACTIVE row binds through the #13809 backfill the create path
+    # drives; that store is active-only, so a HIBERNATED row needs the #14475 repair command
+    # instead. Naming only the active path made this runbook false for exactly the lane a
+    # recover-pair blocker stops on.
     LAUNCH_AUTHORITY_WORKTREE_UNBOUND: (
-        "the lane's lifecycle row carries no canonical worktree binding; re-run the lane's "
-        "own declaration surface (sublane create / sublane adopt) from the lane worktree so "
-        "the bounded binding backfill records the token, then re-run the preflight"
+        "the lane's lifecycle row carries no canonical worktree binding. If the row is "
+        "active, re-run the lane's own declaration surface (sublane create / sublane adopt) "
+        "from the lane worktree so the bounded binding backfill records the token. If the row "
+        "is hibernated, run `sublane repair-worktree-binding` (metadata only, no process) "
+        "against the lane worktree. Then re-run the preflight"
     ),
     LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE: (
         "the recovery worktree's canonical token could not be derived; run from the lane's "

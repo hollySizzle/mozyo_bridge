@@ -153,6 +153,10 @@ def _healthy_obs() -> SlotRecoveryObservation:
     )
 
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E402,E501
+    LAUNCH_AUTHORITY_OK,
+)
+
 class _FakeOps:
     """Records every destructive effect so a fail-closed run can be proven zero-write."""
 
@@ -164,6 +168,15 @@ class _FakeOps:
 
     def workspace_id(self) -> str:
         return WS
+
+    def lane_worktree_binding_reason(self, *, lane, record) -> str:
+        """#14475 (review j#88477 F1): the lane's canonical worktree-binding axis.
+
+        Scripted, defaulting to the bound-and-matching axis so the pre-existing scenarios
+        keep exercising what they were written for; a test that wants the #14462 shape sets
+        ``_worktree_binding_reason`` to the failing token explicitly.
+        """
+        return getattr(self, "_worktree_binding_reason", LAUNCH_AUTHORITY_OK)
 
     def observe_slot(self, *, role, provider, workspace_id, lane, record):
         self.observed.append((role, provider))
