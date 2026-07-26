@@ -79,6 +79,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     KIND_IMPLEMENTATION_REQUEST,
     RecoveryAnchorDeliveryRequest,
     parse_recovery_delivery_authorizations,
+    parse_recovery_delivery_zero_send_evidence,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
     LiveSublaneQuarantineOps,
@@ -485,6 +486,7 @@ class LiveHibernatedPairRecoveryOps:
         approval_journal: str,
         prior_zero_send_journal: str,
         workspace_id: str,
+        target_assigned_name: str,
     ) -> bool:
         """Verify action authority from a fresh Redmine read, never CLI self-equality."""
 
@@ -506,16 +508,28 @@ class LiveHibernatedPairRecoveryOps:
         if len(exact_approval) != 1 or len(exact_prior) != 1:
             return False
         authorizations = parse_recovery_delivery_authorizations(exact_approval)
-        if len(authorizations) != 1:
+        evidence = parse_recovery_delivery_zero_send_evidence(exact_prior)
+        if len(authorizations) != 1 or len(evidence) != 1:
             return False
-        return authorizations[0].valid_for(
-            issue=issue,
-            lane=lane,
-            workspace_id=workspace_id,
-            approval_journal=approval_journal,
-            anchor_journal=journal,
-            retry_of_action_id=retry_of_action_id,
-            prior_zero_send_journal=prior_zero_send_journal,
+        return bool(
+            authorizations[0].valid_for(
+                issue=issue,
+                lane=lane,
+                workspace_id=workspace_id,
+                approval_journal=approval_journal,
+                anchor_journal=journal,
+                retry_of_action_id=retry_of_action_id,
+                prior_zero_send_journal=prior_zero_send_journal,
+            )
+            and evidence[0].valid_for(
+                issue=issue,
+                lane=lane,
+                workspace_id=workspace_id,
+                evidence_journal=prior_zero_send_journal,
+                anchor_journal=journal,
+                retry_of_action_id=retry_of_action_id,
+                target_assigned_name=target_assigned_name,
+            )
         )
 
     def _redispatch_with_action(
@@ -685,16 +699,6 @@ class LiveHibernatedPairRecoveryOps:
             return "", "retry_authority_incomplete"
         if _norm(approval_journal) != _norm(self.request_journal):
             return "", "retry_authority_context_mismatch"
-        if not self._retry_authority_is_exact(
-            retry_of_action_id=retry_of_action_id,
-            issue=issue,
-            lane=lane,
-            journal=journal,
-            approval_journal=approval_journal,
-            prior_zero_send_journal=prior_zero_send_journal,
-            workspace_id=workspace_id,
-        ):
-            return "", "retry_authority_unverified"
         try:
             rec = LaneLifecycleStore(home=self.lifecycle_home).get(
                 LaneLifecycleKey(_norm(workspace_id), _norm_lane(lane))
@@ -717,6 +721,17 @@ class LiveHibernatedPairRecoveryOps:
         declared_name = _norm(getattr(pair.gateway, "assigned_name", ""))
         if declared_name and declared_name != gateway_assigned_name:
             return "", "declared_gateway_identity_mismatch"
+        if not self._retry_authority_is_exact(
+            retry_of_action_id=retry_of_action_id,
+            issue=issue,
+            lane=lane,
+            journal=journal,
+            approval_journal=approval_journal,
+            prior_zero_send_journal=prior_zero_send_journal,
+            workspace_id=workspace_id,
+            target_assigned_name=gateway_assigned_name,
+        ):
+            return "", "retry_authority_unverified"
         prior_key = FenceKey(
             workspace_id=_norm(workspace_id),
             lane_id=_norm_lane(lane),

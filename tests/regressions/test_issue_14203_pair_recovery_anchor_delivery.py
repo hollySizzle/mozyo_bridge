@@ -31,7 +31,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPOSITION_ZERO_SEND,
     RecoveryAnchorDeliveryRequest,
     build_recovery_delivery_authorization_marker,
+    build_recovery_delivery_zero_send_marker,
     parse_recovery_delivery_authorizations,
+    parse_recovery_delivery_zero_send_evidence,
     recovery_delivery_action_id,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
@@ -228,9 +230,12 @@ class RecoveryAnchorDeliveryDomainTest(unittest.TestCase):
         )
 
         duplicate = marker.replace(
-            ":typed_count=0", ":typed_count=1:typed_count=0"
+            ":authorized_by_role=owner",
+            ":authorized_by_role=coordinator:authorized_by_role=owner",
         )
-        malformed = marker.replace(":send_count=0", ":send_count")
+        malformed = marker.replace(
+            ":prior_zero_send_journal=88148", ":prior_zero_send_journal"
+        )
         for notes in (duplicate, malformed, marker + marker):
             with self.subTest(notes=notes):
                 self.assertEqual(
@@ -245,6 +250,52 @@ class RecoveryAnchorDeliveryDomainTest(unittest.TestCase):
                         )
                     ),
                 )
+
+    def test_zero_send_evidence_is_strict_and_binds_exact_target(self) -> None:
+        retry_of = "recover-pair:14203:lane:5:1"
+        marker = build_recovery_delivery_zero_send_marker(
+            issue="14203",
+            lane=LANE,
+            workspace_id=WORKSPACE,
+            anchor_journal="88143",
+            retry_of_action_id=retry_of,
+            target_assigned_name=ASSIGNED_NAME,
+        )
+        entry = RedmineJournalEntry(
+            issue_id="14203", journal_id="88198", notes=marker
+        )
+        parsed = parse_recovery_delivery_zero_send_evidence((entry,))
+        self.assertEqual(1, len(parsed))
+        self.assertTrue(
+            parsed[0].valid_for(
+                issue="14203",
+                lane=LANE,
+                workspace_id=WORKSPACE,
+                evidence_journal="88198",
+                anchor_journal="88143",
+                retry_of_action_id=retry_of,
+                target_assigned_name=ASSIGNED_NAME,
+            )
+        )
+        self.assertFalse(
+            parsed[0].valid_for(
+                issue="14203",
+                lane=LANE,
+                workspace_id=WORKSPACE,
+                evidence_journal="88198",
+                anchor_journal="88143",
+                retry_of_action_id=retry_of,
+                target_assigned_name=ASSIGNED_NAME + "-foreign",
+            )
+        )
+        unrelated = RedmineJournalEntry(
+            issue_id="14203",
+            journal_id="88198",
+            notes="[mozyo:workflow-event:gate=production_verification:verdict=blocked]",
+        )
+        self.assertEqual(
+            (), parse_recovery_delivery_zero_send_evidence((unrelated,))
+        )
 
 
 class RecoveryAnchorDeliveryLiveTest(unittest.TestCase):

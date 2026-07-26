@@ -60,6 +60,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RecoveryAnchorDeliveryPreflight,
     RecoveryAnchorDeliveryOutcome,
     build_recovery_delivery_authorization_marker,
+    build_recovery_delivery_zero_send_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     RedmineJournalEntry,
@@ -328,7 +329,14 @@ class RedispatchExactlyOnce(unittest.TestCase):
                 RedmineJournalEntry(
                     issue_id="13847",
                     journal_id="88148",
-                    notes="[mozyo:workflow-event:gate=production_verification:verdict=blocked]",
+                    notes=build_recovery_delivery_zero_send_marker(
+                        issue="13847",
+                        lane=_LANE,
+                        workspace_id=_WS,
+                        anchor_journal="79612",
+                        retry_of_action_id=prior_action,
+                        target_assigned_name=gw_name,
+                    ),
                 ),
             )
             with patch.object(live, "LaneLifecycleStore",
@@ -396,6 +404,14 @@ class RedispatchExactlyOnce(unittest.TestCase):
                 ok=True,
                 gateway=SimpleNamespace(provider="codex", assigned_name=gw_name),
             )
+            authorization = build_recovery_delivery_authorization_marker(
+                issue="13847",
+                lane=_LANE,
+                workspace_id=_WS,
+                anchor_journal="79612",
+                retry_of_action_id=prior_action,
+                prior_zero_send_journal="99999",
+            )
             with patch.object(
                 type(ops),
                 "_journal_entries",
@@ -403,7 +419,7 @@ class RedispatchExactlyOnce(unittest.TestCase):
                     RedmineJournalEntry(
                         issue_id="13847",
                         journal_id=approval,
-                        notes="[mozyo:workflow-event:gate=owner_approval]",
+                        notes=authorization,
                     ),
                     RedmineJournalEntry(
                         issue_id="13847",
