@@ -98,11 +98,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_NOT_HIBERNATED,
     BLOCK_BINDING_KIND,
     BLOCK_INVALID_PINS,
+    BLOCK_PINS_NOT_CANONICAL,
     BLOCK_PROJECT_SCOPE,
     BLOCK_RELEASE_NOT_SETTLED,
     BLOCK_REPLACEMENT_IN_FLIGHT,
     BLOCK_WORKTREE_NOT_ROOT,
     BLOCK_WORKTREE_UNREADABLE,
+    BLOCK_WRONG_ISSUE,
     REPAIR_APPLIED,
     REPAIR_PREFLIGHT,
     _current_branch,
@@ -1065,15 +1067,37 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
 
     # -- the REAL use case, not just the probe (review j#88505 F1) --------------
 
-    def _readable_empty_inventory_env(self) -> dict:
-        """Env pointing at the stateful fake herdr CLI with an EMPTY agent inventory."""
+    def _readable_empty_inventory_env(self, *, live_pair: bool = False) -> dict:
+        """Env pointing at the stateful fake herdr CLI.
+
+        ``live_pair`` seeds the two declared slots as live-but-unattested, so the recovery
+        has something to close; the default empty inventory makes them vanished.
+        """
         import json
         import stat
 
         from tests.support.herdr_fake import FakeHerdr
 
-        fake = FakeHerdr()
-        fake.seed_workspace(cwd=str(self.repo))
+        # ``"> "`` renders a readable, NON-pending composer; the default render text reads as
+        # real unsent input and would preserve (never close) every slot.
+        fake = FakeHerdr(read_text="> ")
+        ws = fake.seed_workspace(cwd=str(self.repo))
+        if live_pair:
+            # Live-but-UNATTESTED slots at the declared assigned names: they classify as the
+            # pair's own bad generation with a real locator, so the recovery actually CLOSES
+            # them. Without this every slot is ``slot_absent`` (nothing to close) and the
+            # per-close fence would never be exercised.
+            # Seeded under the DERIVED assigned name the observer computes (not the pin's
+            # stored one) — that derivation is what resolves a live slot.
+            from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+                encode_assigned_name,
+            )
+
+            for pin in self._pins():
+                fake.seed_agent(
+                    encode_assigned_name(self.workspace_id, pin.provider, self.lane),
+                    workspace_id=ws, provider=pin.provider, cwd=str(self.repo),
+                )
         state_path = self.home / "herdr-state.json"
         state_path.write_text(json.dumps(fake.to_state()), encoding="utf-8")
         adapter = Path(__file__).resolve().parents[2] / "smoke" / "support" / "fake_herdr_cli.py"
@@ -1089,7 +1113,7 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
         binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
         return {"MOZYO_HERDR_BINARY": str(binary)}
 
-    def _real_use_case(self):
+    def _real_use_case(self, *, live_pair: bool = False):
         """The production ``SublaneRecoverPairUseCase`` over the LIVE ops and this store.
 
         The R2 chain test asserted against the live probe directly, so it never exercised
@@ -1118,7 +1142,7 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
         # ``slot_absent`` -> SLOT_RECOVER, so ``may_recover`` turns on the binding axis alone.
         # ``list_herdr_agent_rows`` resolves the binary from the ENV (a runner injection does
         # not reach it), so this uses the repo's stateful fake-herdr CLI fixture.
-        env = self._readable_empty_inventory_env()
+        env = self._readable_empty_inventory_env(live_pair=live_pair)
         ops = LiveHibernatedPairRecoveryOps(
             repo_root=self.repo, request_issue=self.issue, request_lane=self.lane,
             request_journal="88505", lifecycle_home=self.home, env=env,
@@ -1292,6 +1316,141 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
         self.assertEqual(self._repair(execute=False).state, REPAIR_PREFLIGHT)
         self.assertEqual(self._repair(execute=True).state, REPAIR_APPLIED)
         self.assertTrue(self._record().worktree_identity)
+
+    def _pair_ops_with_scripted_binding(self, script):
+        """The #13847 canonical fakes (live, closable slots) with a scripted binding axis.
+
+        The REAL ``SublaneRecoverPairUseCase`` is what is under test here — j#88526 F1 is about
+        WHERE that use case re-joins the axis. The live adapter's slot observation is covered
+        separately; driving it here would need an attested live pair and would measure the
+        observer, not the fence placement.
+        """
+        ops = _FakeOps(per_slot_obs={GATEWAY_ROLE: _obs(), WORKER_ROLE: _obs()})
+        ops.lane_worktree_binding_reason = script  # type: ignore[assignment]
+        return ops
+
+    def test_a_drift_after_the_first_close_stops_every_remaining_effect(self):
+        """Review j#88526 F1: the fence must guard EVERY destructive effect, not the first.
+
+        R3 re-joined the axis once before the close loop, so a checkout switched between the
+        first close and the relaunch let the pair be relaunched onto the wrong branch — the
+        reviewer's injection produced closed_roles=(gateway, worker) / relaunched / redispatched
+        with the reported axis still ``ok``.
+        """
+        calls = {"n": 0}
+
+        def drifting(*, lane, record):
+            calls["n"] += 1
+            # Joins, in order: preflight build, pre-loop action-time, before close#1,
+            # before close#2, before relaunch. Drift from the 4th, i.e. after ONE close.
+            return LAUNCH_AUTHORITY_OK if calls["n"] <= 3 else LAUNCH_AUTHORITY_BRANCH_DRIFTED
+
+        ops = self._pair_ops_with_scripted_binding(drifting)
+        out = _use_case(ops).run(_REQ, execute=True)
+
+        self.assertGreaterEqual(calls["n"], 3, "each destructive effect must re-join the axis")
+        self.assertEqual(len(ops.closed), 1, "exactly the first close ran")
+        self.assertEqual(len(out.closed_roles), 1)
+        self.assertFalse(ops.relaunched)
+        self.assertIsNone(out.resume)
+        self.assertEqual(out.redispatch, REDISPATCH_SKIPPED)
+        self.assertIsNone(ops.redispatched)
+        self.assertEqual(
+            out.preflight.worktree_binding_reason, LAUNCH_AUTHORITY_BRANCH_DRIFTED
+        )
+        self.assertIn("moved during actuation", out.detail)
+        # The partial close stays reported, so a re-run can converge it.
+        self.assertTrue(out.executed)
+
+    def test_a_drift_before_the_relaunch_stops_the_relaunch(self):
+        # Both closes ran under a current axis; the relaunch is the next irreversible effect.
+        calls = {"n": 0}
+
+        def drifting(*, lane, record):
+            calls["n"] += 1
+            # Both close joins hold; the 5th join — the relaunch's — is the one that moves.
+            return LAUNCH_AUTHORITY_OK if calls["n"] <= 4 else LAUNCH_AUTHORITY_BRANCH_DRIFTED
+
+        ops = self._pair_ops_with_scripted_binding(drifting)
+        out = _use_case(ops).run(_REQ, execute=True)
+        self.assertEqual(len(ops.closed), 2, "both closes ran under a current axis")
+        self.assertFalse(ops.relaunched, "the relaunch must not ride a moved binding")
+        self.assertIsNone(out.resume)
+        self.assertEqual(out.redispatch, REDISPATCH_SKIPPED)
+        self.assertEqual(
+            out.preflight.worktree_binding_reason, LAUNCH_AUTHORITY_BRANCH_DRIFTED
+        )
+
+    def test_a_stable_binding_still_completes_the_whole_recovery(self):
+        # The positive control: the per-effect fence must not stop a healthy recovery.
+        ops = self._pair_ops_with_scripted_binding(
+            lambda *, lane, record: LAUNCH_AUTHORITY_OK
+        )
+        out = _use_case(ops).run(_REQ, execute=True)
+        self.assertFalse(out.is_blocked, out.detail)
+        self.assertEqual(len(ops.closed), 2)
+        self.assertTrue(ops.relaunched)
+
+    def test_the_preflight_matches_the_store_on_raw_persisted_bytes(self):
+        """Review j#88526 F2: the 4 padded shapes, preflight and execute must agree.
+
+        Each row below is byte-malformed in exactly one field. The store's CAS compares the
+        RAW persisted value, so a preflight that normalized first reported "--execute would
+        record" and the execute then refused ``repair_cas_refused`` — a dry-run green an owner
+        could approve from.
+        """
+        from mozyo_bridge.core.state.lane_lifecycle_model import encode_declared_slots
+
+        canonical_pins = encode_declared_slots(self._pins())
+        shapes = (
+            ("issue_id", f" {self.issue} ", BLOCK_WRONG_ISSUE),
+            ("project_scope", "   ", BLOCK_PROJECT_SCOPE),
+            ("process_release", " released ", BLOCK_RELEASE_NOT_SETTLED),
+            ("declared_slots", f" {canonical_pins} ", BLOCK_PINS_NOT_CANONICAL),
+        )
+        for column, raw, expected in shapes:
+            with self.subTest(column=column):
+                self.setUp()
+                _seed_hibernated_released_bound(
+                    path=LaneLifecycleStore(home=self.home).path, key=self.key,
+                    issue=self.issue, worktree_identity="", declared_slots=self._pins(),
+                )
+                before = self._record()
+                self._raw_update(column, raw)
+                pre = self._repair(execute=False)
+                self.assertTrue(pre.is_blocked, "the preflight must not report a false green")
+                self.assertEqual(pre.reason, expected)
+                # ...and the execute reaches the SAME typed verdict, having written nothing.
+                out = self._repair(execute=True)
+                self.assertEqual(out.reason, expected)
+                after = self._record()
+                self.assertEqual(after.worktree_identity, "")
+                self.assertEqual(after.revision, before.revision)
+
+    def test_the_store_and_the_preflight_share_one_classifier(self):
+        """The structural claim: neither surface re-derives the signature (j#88526 F2).
+
+        Three rounds were lost to hand-written parity, so the anti-regression is that both
+        modules reference the same pure classifier and the command maps EVERY axis it defines.
+        """
+        import inspect
+
+        from mozyo_bridge.core.state import lane_worktree_binding_repair as store_mod
+        from mozyo_bridge.core.state.lane_worktree_binding_signature import (
+            SIGNATURE_BLOCKERS,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_worktree_binding_repair as app_mod,
+        )
+
+        for module in (store_mod, app_mod):
+            with self.subTest(module=module.__name__):
+                self.assertIn(
+                    "classify_repair_signature", inspect.getsource(module),
+                    "this surface must classify through the shared classifier",
+                )
+        unmapped = sorted(a for a in SIGNATURE_BLOCKERS if a not in app_mod._SIGNATURE_BLOCKERS)
+        self.assertEqual(unmapped, [], "every signature axis needs a command-facing blocker")
 
     def test_the_preflight_projects_the_whole_store_signature(self):
         """Review j#88512 / j#88513: the required predicate matrix, one shape per axis.

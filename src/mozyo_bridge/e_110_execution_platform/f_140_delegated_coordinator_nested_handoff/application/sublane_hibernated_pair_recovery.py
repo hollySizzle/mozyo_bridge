@@ -636,9 +636,37 @@ class SublaneRecoverPairUseCase:
         # partially-closed pair sees the closed slot as `slot_absent` -> SLOT_RECOVER -> relaunch.
         recover_slots = [slot for slot in preflight.slots if slot.recovers]
         closed: list[str] = []
+
+        def _binding_drifted() -> Optional[RecoverPairOutcome]:
+            """Re-join the 3 axes; a drift stops every REMAINING effect (review j#88526 F1).
+
+            Called before EACH destructive effect, not once before the first: a checkout can be
+            switched between two closes, or between the last close and the relaunch, and the
+            single pre-loop read left every effect after the first unguarded. Whatever was
+            already closed stays reported so the partial state remains replayable — a re-run
+            sees those slots ``slot_absent`` and relaunches them.
+            """
+            reason = self._worktree_binding_reason(lane=lane, record=rec)
+            if launch_authority_current(reason):
+                return None
+            return RecoverPairOutcome(
+                executed=bool(closed),
+                preflight=replace(preflight, worktree_binding_reason=reason),
+                issue=issue,
+                lane=lane,
+                closed_roles=tuple(closed),
+                detail=(
+                    "fail-closed: the lane's worktree binding moved during actuation "
+                    f"({reason}); zero further close / relaunch / resume / send"
+                ),
+            )
+
         for slot in recover_slots:
             if not slot.locator:
                 continue  # vanished (absent) — nothing to close; the relaunch recreates it
+            drifted = _binding_drifted()
+            if drifted is not None:
+                return drifted
             ok = self.ops.close_bad_slot(
                 role=slot.role, provider=slot.provider,
                 assigned_name=slot.assigned_name, locator=slot.locator,
@@ -654,6 +682,12 @@ class SublaneRecoverPairUseCase:
                 )
             closed.append(slot.role)
 
+        if recover_slots:
+            # The relaunch is the effect that stands processes up in the checkout, so it gets
+            # its own re-join even when every close was skipped (all slots vanished).
+            drifted = _binding_drifted()
+            if drifted is not None:
+                return drifted
         if recover_slots and not self.ops.relaunch_pair(
             action_id=action_id, slots=tuple(recover_slots)
         ):

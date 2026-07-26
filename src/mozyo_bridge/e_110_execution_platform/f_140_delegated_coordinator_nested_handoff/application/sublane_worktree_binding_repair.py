@@ -52,6 +52,19 @@ from pathlib import Path
 from typing import Any, Optional
 
 from mozyo_bridge.application.cli_common import add_repo_option
+from mozyo_bridge.core.state.lane_worktree_binding_signature import (
+    SIGNATURE_BINDING_KIND,
+    SIGNATURE_INVALID_PINS,
+    SIGNATURE_MISSING_PINS,
+    SIGNATURE_NOT_HIBERNATED,
+    SIGNATURE_OK,
+    SIGNATURE_PINS_NOT_CANONICAL,
+    SIGNATURE_PROJECT_SCOPE,
+    SIGNATURE_RELEASE_NOT_SETTLED,
+    SIGNATURE_REPLACEMENT_IN_FLIGHT,
+    SIGNATURE_WRONG_ISSUE,
+    classify_repair_signature,
+)
 
 #: The repair ran and the row now carries the canonical token (or already did — byte-equal
 #: replay is an idempotent success).
@@ -81,6 +94,9 @@ BLOCK_BINDING_KIND = "lane_binding_kind_is_not_issue"
 #: (duplicate stable identities, malformed pins). The preflight applies the SAME pure
 #: validator the CAS applies, rather than only checking non-emptiness (review j#88513 F2).
 BLOCK_INVALID_PINS = "declared_pins_fail_validation"
+#: The pins validate but are stored non-canonically, so the guarded CAS can never match them
+#: (review j#88526 F2 — a raw-bytes axis a normalizing preflight cannot see).
+BLOCK_PINS_NOT_CANONICAL = "declared_pins_are_not_canonically_encoded"
 #: The lane's process release is not durably ``released`` (never requested, or requested /
 #: partial and still in flight) — an actuator may be mutating its slots (review j#88505 F2).
 BLOCK_RELEASE_NOT_SETTLED = "lane_process_release_not_settled"
@@ -96,6 +112,55 @@ BLOCK_FOREIGN_WORKSPACE = "worktree_belongs_to_a_foreign_workspace"
 BLOCK_BRANCH_DRIFTED = "worktree_branch_is_not_the_lane_branch"
 BLOCK_TOKEN_UNDERIVABLE = "worktree_token_underivable"
 BLOCK_CAS_REFUSED = "repair_cas_refused"
+
+
+#: The command-facing blocker for each shared signature axis. One entry per axis, so a new
+#: axis in the classifier is a mapping error here rather than a silently missing fence.
+_SIGNATURE_BLOCKERS = {
+    SIGNATURE_NOT_HIBERNATED: BLOCK_NOT_HIBERNATED,
+    SIGNATURE_BINDING_KIND: BLOCK_BINDING_KIND,
+    SIGNATURE_WRONG_ISSUE: BLOCK_WRONG_ISSUE,
+    SIGNATURE_PROJECT_SCOPE: BLOCK_PROJECT_SCOPE,
+    SIGNATURE_MISSING_PINS: BLOCK_MISSING_PINS,
+    SIGNATURE_INVALID_PINS: BLOCK_INVALID_PINS,
+    SIGNATURE_PINS_NOT_CANONICAL: BLOCK_PINS_NOT_CANONICAL,
+    SIGNATURE_RELEASE_NOT_SETTLED: BLOCK_RELEASE_NOT_SETTLED,
+    SIGNATURE_REPLACEMENT_IN_FLIGHT: BLOCK_REPLACEMENT_IN_FLIGHT,
+}
+
+_SIGNATURE_DETAILS = {
+    SIGNATURE_NOT_HIBERNATED: (
+        "this surface repairs a HIBERNATED row; an active lane binds through its own "
+        "declaration surface (sublane create self-heal)"
+    ),
+    SIGNATURE_BINDING_KIND: (
+        "this surface repairs an ISSUE-bound lane; the row's binding kind is not 'issue'"
+    ),
+    SIGNATURE_WRONG_ISSUE: (
+        "the row's stored issue is not exactly this issue (a different or padded value)"
+    ),
+    SIGNATURE_PROJECT_SCOPE: (
+        "this surface repairs an ISSUE-bound lane; the row carries a project scope"
+    ),
+    SIGNATURE_MISSING_PINS: (
+        "the row carries no declared pins; repair its pins first (sublane repair-pins)"
+    ),
+    SIGNATURE_INVALID_PINS: (
+        "the row's declared pins do not pass validation (duplicate or malformed slots); "
+        "repair its pins first (sublane repair-pins)"
+    ),
+    SIGNATURE_PINS_NOT_CANONICAL: (
+        "the row's declared pins are stored in a non-canonical encoding, so the guarded CAS "
+        "could never match them; repair its pins first (sublane repair-pins)"
+    ),
+    SIGNATURE_RELEASE_NOT_SETTLED: (
+        "the lane's process release is not durably 'released' (never requested, still in "
+        "flight, or stored non-canonically) — an actuator may be closing its slots right now"
+    ),
+    SIGNATURE_REPLACEMENT_IN_FLIGHT: (
+        "a receiver replacement is in flight for this lane"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -224,63 +289,25 @@ def run_worktree_binding_repair(
         return blocked(BLOCK_STORE_UNREADABLE, "the lifecycle store is unreadable; zero write")
     if record is None:
         return blocked(BLOCK_ROW_ABSENT, "no lifecycle row owns this lane; zero write")
-    if record.lane_disposition != DISPOSITION_HIBERNATED:
+    # Review j#88526 F2: classify the row's signature through the SHARED pure classifier the
+    # store's CAS uses. Re-deriving these axes here is exactly what let a normalizing preflight
+    # report a green the raw CAS then refused — three rounds running. The preflight now cannot
+    # reach a verdict the CAS would not.
+    signature = classify_repair_signature(record, issue_id=issue_id)
+    if signature != SIGNATURE_OK:
         return blocked(
-            BLOCK_NOT_HIBERNATED,
-            "this surface repairs a HIBERNATED row; an active lane binds through its own "
-            "declaration surface (sublane create self-heal); zero write",
-        )
-    if _norm(record.issue_id) != issue_id:
-        return blocked(BLOCK_WRONG_ISSUE, "the lane owns a different issue; zero write")
-    if _norm(record.binding_kind) != BINDING_KIND_ISSUE:
-        # An INDEPENDENT axis from the scope check below — the store checks both, and a
-        # malformed row can carry a project-gateway kind with an empty scope (j#88512).
-        return blocked(
-            BLOCK_BINDING_KIND,
-            "this surface repairs an ISSUE-bound lane; the row's binding kind is not "
-            "'issue'; zero write",
-        )
-    if _norm(record.project_scope):
-        return blocked(
-            BLOCK_PROJECT_SCOPE,
-            "this surface repairs an ISSUE-bound lane; a project-gateway lane owns a scope, "
-            "not an issue; zero write",
+            _SIGNATURE_BLOCKERS[signature],
+            _SIGNATURE_DETAILS[signature] + "; zero write",
         )
     try:
         pins = tuple(record.declared_pins)
-    except Exception:  # noqa: BLE001 - an undecodable snapshot is never matched against
+    except Exception:  # noqa: BLE001 - the classifier already proved these decode + validate
         pins = ()
     if not pins:
         return blocked(
             BLOCK_MISSING_PINS,
             "the row carries no decodable declared pins; repair its pins first "
             "(sublane repair-pins); zero write",
-        )
-    try:
-        # The SAME pure validator the CAS runs (review j#88513 F2). Checking only
-        # non-emptiness here lets a row with duplicate / malformed pins read green and then be
-        # refused at execute — the false-green class this ticket exists to remove.
-        validate_declared_slots(pins)
-    except Exception:  # noqa: BLE001 - an unusable snapshot is a typed preflight blocker
-        return blocked(
-            BLOCK_INVALID_PINS,
-            "the row's declared pins do not pass validation (duplicate or malformed slots); "
-            "repair its pins first (sublane repair-pins); zero write",
-        )
-    # Review j#88505 F2: the preflight must project the STORE's whole readable signature, not
-    # a subset of it. Projecting only part of it is how a dry-run reports "--execute would
-    # record" for a row the CAS then refuses — a false green an owner can approve from, which
-    # is precisely the preflight-does-not-predict-the-effect defect this ticket exists to fix.
-    if _norm(record.process_release) != RELEASE_RELEASED:
-        return blocked(
-            BLOCK_RELEASE_NOT_SETTLED,
-            "the lane's process release is not durably 'released' (never requested, or still "
-            "in flight) — an actuator may be closing its slots right now; zero write",
-        )
-    if not replacement_settled(record.replacement_state):
-        return blocked(
-            BLOCK_REPLACEMENT_IN_FLIGHT,
-            "a receiver replacement is in flight for this lane; zero write",
         )
 
     # Positive evidence that the named worktree IS this lane's — the row has no token to
@@ -496,6 +523,7 @@ __all__ = (
     "BLOCK_PROJECT_SCOPE",
     "BLOCK_BINDING_KIND",
     "BLOCK_INVALID_PINS",
+    "BLOCK_PINS_NOT_CANONICAL",
     "BLOCK_RELEASE_NOT_SETTLED",
     "BLOCK_REPLACEMENT_IN_FLIGHT",
     "BLOCK_WORKTREE_UNREADABLE",

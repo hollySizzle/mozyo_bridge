@@ -59,6 +59,18 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     replacement_settled,
     validate_declared_slots,
 )
+from mozyo_bridge.core.state.lane_worktree_binding_signature import (
+    SIGNATURE_BINDING_KIND,
+    SIGNATURE_INVALID_PINS,
+    SIGNATURE_MISSING_PINS,
+    SIGNATURE_NOT_HIBERNATED,
+    SIGNATURE_PINS_NOT_CANONICAL,
+    SIGNATURE_PROJECT_SCOPE,
+    SIGNATURE_RELEASE_NOT_SETTLED,
+    SIGNATURE_REPLACEMENT_IN_FLIGHT,
+    SIGNATURE_WRONG_ISSUE,
+    classify_repair_signature,
+)
 from mozyo_bridge.core.state.lane_lifecycle_rows import (
     _locked_row,
     _rollback,
@@ -67,6 +79,24 @@ from mozyo_bridge.core.state.lane_lifecycle_rows import (
 from mozyo_bridge.core.state.lane_lifecycle_schema import (
     TABLE as _TABLE,
     LaneLifecycleError,
+)
+
+
+#: Signature axes the CAS reports as ``unexpected_state`` (a row that is a different shape).
+_UNEXPECTED_STATE_SIGNATURES = frozenset(
+    {
+        SIGNATURE_NOT_HIBERNATED,
+        SIGNATURE_BINDING_KIND,
+        SIGNATURE_WRONG_ISSUE,
+        SIGNATURE_PROJECT_SCOPE,
+        SIGNATURE_MISSING_PINS,
+        SIGNATURE_INVALID_PINS,
+        SIGNATURE_PINS_NOT_CANONICAL,
+    }
+)
+#: Signature axes the CAS reports as ``forbidden_transition`` (right shape, wrong moment).
+_FORBIDDEN_TRANSITION_SIGNATURES = frozenset(
+    {SIGNATURE_RELEASE_NOT_SETTLED, SIGNATURE_REPLACEMENT_IN_FLIGHT}
 )
 
 
@@ -194,37 +224,37 @@ class LaneWorktreeBindingRepairStore:
                     reason=CAS_GENERATION_MISMATCH,
                     revision=current.revision,
                 )
-            if (
-                current.lane_disposition != DISPOSITION_HIBERNATED
-                or norm(current.binding_kind) != BINDING_KIND_ISSUE
-                or current.issue_id != issue
-                or current.project_scope
-                or not current.declared_slots
-                or current.declared_slots != encoded_slots
-            ):
+            # The row-signature axes are classified by the SHARED pure classifier (review
+            # j#88526 F2), so the command's read-only preflight reaches the same verdict for
+            # the same row. Writing them out separately here is what let a normalizing
+            # preflight report a green the CAS then refused.
+            signature = classify_repair_signature(current, issue_id=issue)
+            if signature in _UNEXPECTED_STATE_SIGNATURES:
                 # Not the exact pinned signature: an active row (the #13809 backfill's target),
                 # a superseded / retired row, a project-gateway binding, a different issue, an
                 # EMPTY pin snapshot (the #13879 / #13842 shape — their target, never this
-                # one's), or a snapshot naming a DIFFERENT (recycled / foreign) generation.
-                # Refused zero-write, never coerced.
+                # one's), or a snapshot that is not the caller's canonical set.
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=False,
                     reason=CAS_UNEXPECTED_STATE,
                     revision=current.revision,
                 )
-            if current.process_release != RELEASE_RELEASED:
+            if signature in _FORBIDDEN_TRANSITION_SIGNATURES:
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=False,
                     reason=CAS_FORBIDDEN_TRANSITION,
                     revision=current.revision,
                 )
-            if not replacement_settled(current.replacement_state):
+            # The caller's validated set must additionally be THIS row's snapshot — the
+            # classifier proves the stored bytes are canonical, this proves they are the same
+            # pins the caller observed.
+            if current.declared_slots != encoded_slots:
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=False,
-                    reason=CAS_FORBIDDEN_TRANSITION,
+                    reason=CAS_UNEXPECTED_STATE,
                     revision=current.revision,
                 )
             if norm(current.worktree_identity) == want_worktree:
