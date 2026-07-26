@@ -263,7 +263,14 @@ class RedispatchExactlyOnce(unittest.TestCase):
             fence.bootstrap()
             ops = _ops(tmp, fence=fence)
             gw_name = encode_assigned_name(_WS, "codex", _LANE)
-            with patch.object(live, "list_herdr_agent_rows", return_value=[]):
+            # Redmine #14475 (review j#88547, j#88545 focus 6): the checkout axis is stubbed
+            # CURRENT so this case can only fail for the reason it names — an unresolvable
+            # target. Without the stub the outer authority (no lifecycle row here) fails first
+            # and produces the same ``REDISPATCH_FAILED`` for a different reason.
+            with patch.object(live, "list_herdr_agent_rows", return_value=[]), patch.object(
+                live.LiveHibernatedPairRecoveryOps,
+                "_checkout_authority_current", return_value=True,
+            ):
                 result = ops.redispatch_to_gateway(
                     action_id="a", gateway_assigned_name=gw_name, issue="13847",
                     lane=_LANE, journal="79612", workspace_id=_WS,

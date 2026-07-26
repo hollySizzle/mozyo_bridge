@@ -35,6 +35,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SublaneRecoverPairDeliveryUseCase,
     SublaneRecoverPairUseCase,
 )
+from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E501
+    CAS_APPLIED,
+    CasOutcome,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (  # noqa: E501
     ResumeOutcome,
     ResumePreflight,
@@ -164,9 +168,14 @@ class _FakeOps:
 
 
 class _FakeResume:
-    def __init__(self, *, applied=True):
+    def __init__(self, *, applied=True, transition="applied"):
         self._applied = applied
         self.ran = False
+        #: What the disposition CAS did (Redmine #14475 review j#88547 F2). ``"applied"`` is a
+        #: real commit, ``"already_active"`` an idempotent no-op that applies NOTHING, and
+        #: ``None`` no transition at all. Callers that care whether this run APPLIED the
+        #: resume — as opposed to merely not being blocked — need the difference.
+        self._transition = transition
 
     def run(self, request, *, execute):
         self.ran = True
@@ -174,17 +183,24 @@ class _FakeResume:
             lane_hibernated=self._applied, release_settled=True, issue_not_reowned=True,
             pair_both_slots_live=self._applied, pair_attested=self._applied,
         )
+        transition = None
+        already_active = False
+        if self._transition == "applied":
+            transition = CasOutcome(applied=True, reason=CAS_APPLIED, revision=9)
+        elif self._transition == "already_active":
+            already_active = True
         return ResumeOutcome(
             executed=True, preflight=pf, issue=request.issue, lane=request.lane,
+            transition=transition, already_active=already_active,
             detail="fake resume",
         )
 
 
-def _use_case(ops, record=None, resume_applied=True):
+def _use_case(ops, record=None, resume_applied=True, resume_transition="applied"):
     return SublaneRecoverPairUseCase(
         ops=ops,
         store=_FakeStore(record or _Record()),
-        resume=_FakeResume(applied=resume_applied),
+        resume=_FakeResume(applied=resume_applied, transition=resume_transition),
     )
 
 

@@ -38,6 +38,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (
 )
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (  # noqa: E501
+    format_resume_text,
     BLOCK_ISSUE_REOWNED,
     BLOCK_NOT_HIBERNATED,
     BLOCK_PAIR_ATTESTATION,
@@ -259,6 +260,13 @@ class SublaneResumeTest(unittest.TestCase):
                 ops=_fresh_pair_ops(), store=store, commit_authority=lambda: False,
             ).run(_request(), execute=True)
             self.assertEqual(outcome.detail, BLOCK_COMMIT_AUTHORITY_MOVED)
+            # Review j#88547 F1: the outcome must READ as blocked, not merely apply nothing.
+            # A caller gating on ``is_blocked`` would otherwise proceed to its own next effect.
+            self.assertTrue(outcome.is_blocked, "a commit-edge authority loss is a block")
+            self.assertIn(
+                BLOCK_COMMIT_AUTHORITY_MOVED, format_resume_text(outcome),
+                "and the operator-facing line must name the reason, not print an empty one",
+            )
             after = store.get(LaneLifecycleKey(WS, LANE))
             self.assertEqual(after.lane_disposition, _HIB, "zero active flip")
             self.assertEqual(after.revision, before.revision, "and the row untouched")

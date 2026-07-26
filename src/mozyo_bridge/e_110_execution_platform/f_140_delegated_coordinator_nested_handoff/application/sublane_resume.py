@@ -174,6 +174,12 @@ class ResumeOutcome:
         # is a block.
         if self.executed and self.transition is not None and not self.transition.applied:
             return True
+        # Redmine #14475 (review j#88547 F1): an execute that reached the commit edge and was
+        # stopped there by the action-time authority has NO transition to inspect, so the
+        # branch above cannot see it. Without this the caller's ``if resume.is_blocked`` reads
+        # green and proceeds to the send — the exact effect the seam exists to stop.
+        if self.executed and self.detail == BLOCK_COMMIT_AUTHORITY_MOVED:
+            return True
         return False
 
     def as_payload(self) -> dict[str, Any]:
@@ -521,9 +527,11 @@ def format_resume_text(outcome: ResumeOutcome) -> str:
     if outcome.already_active:
         lines.append("  lane already active (idempotent no-op)")
     if outcome.is_blocked:
-        lines.append(
-            "  -> fail-closed blocked: " + ", ".join(outcome.preflight.blocked_reasons)
-        )
+        # Redmine #14475 (review j#88547 F1): a commit-edge authority loss passes the preflight,
+        # so ``preflight.blocked_reasons`` is empty for it. Falling back to the typed ``detail``
+        # keeps the operator-facing line from reading "fail-closed blocked:" with no reason.
+        reasons = ", ".join(outcome.preflight.blocked_reasons) or outcome.detail
+        lines.append(f"  -> fail-closed blocked: {reasons}")
         if outcome.preflight.pair_attestation_detail:
             lines.append(f"  pair: {outcome.preflight.pair_attestation_detail}")
         if outcome.transition is not None and not outcome.transition.applied:

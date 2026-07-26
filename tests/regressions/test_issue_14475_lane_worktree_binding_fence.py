@@ -1670,25 +1670,98 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
             out.executed, "a run that relaunched the pair has executed something"
         )
 
-    def test_a_post_resume_drift_reports_executed_truthfully(self):
-        # A healthy pair: nothing to close, nothing to relaunch — the resume commit is the only
-        # applied effect, so a close-derived ``executed`` misreports it too.
+    def test_an_applied_resume_commit_reports_executed_true(self):
+        """Review j#88547 F2 (a): a run whose disposition CAS APPLIED has executed something."""
         calls = {"n": 0}
 
         def drifting(*, lane, record):
             calls["n"] += 1
-            # Joins here: preflight build, pre-loop, resume, send.
+            # Joins with a healthy pair: preflight build, pre-loop, resume, send.
             return LAUNCH_AUTHORITY_OK if calls["n"] <= 3 else LAUNCH_AUTHORITY_BRANCH_DRIFTED
 
         healthy = _obs(already_healthy=True, is_bad_generation=False)
         ops = _FakeOps(per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy})
         ops.lane_worktree_binding_reason = drifting  # type: ignore[assignment]
-        out = _use_case(ops).run(_REQ, execute=True)
+        out = _use_case(ops, resume_transition="applied").run(_REQ, execute=True)
         self.assertEqual(ops.closed, [])
         self.assertFalse(ops.relaunched)
-        self.assertIsNotNone(out.resume, "the resume committed")
-        self.assertIsNone(ops.redispatched, "and the send was fenced")
-        self.assertTrue(out.executed, "a run that committed the resume has executed something")
+        self.assertIsNotNone(out.resume.transition, "the CAS ran")
+        self.assertTrue(out.resume.transition.applied, "and applied")
+        self.assertIsNone(ops.redispatched, "the send was fenced")
+        self.assertTrue(out.executed, "an applied resume commit is an executed effect")
+
+    def test_an_already_active_resume_reports_executed_false(self):
+        """Review j#88547 F2 (b): an idempotent no-op applies NOTHING.
+
+        R6 set the resume effect unconditionally, so this path reported ``executed=True`` for a
+        run that closed nothing, relaunched nothing and committed nothing.
+        """
+        calls = {"n": 0}
+
+        def drifting(*, lane, record):
+            calls["n"] += 1
+            return LAUNCH_AUTHORITY_OK if calls["n"] <= 3 else LAUNCH_AUTHORITY_BRANCH_DRIFTED
+
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        ops = _FakeOps(per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy})
+        ops.lane_worktree_binding_reason = drifting  # type: ignore[assignment]
+        out = _use_case(ops, resume_transition="already_active").run(_REQ, execute=True)
+        self.assertEqual(ops.closed, [])
+        self.assertFalse(ops.relaunched)
+        self.assertTrue(out.resume.already_active)
+        self.assertIsNone(out.resume.transition, "no CAS ran")
+        self.assertIsNone(ops.redispatched)
+        self.assertFalse(
+            out.executed, "a run that applied no effect must not report executed"
+        )
+
+    def test_a_commit_authority_loss_blocks_the_recovery_and_the_send(self):
+        """Review j#88547 F1: the typed authority loss must READ as blocked.
+
+        ``ResumeOutcome.is_blocked`` ignored the commit-edge stop (there is no transition to
+        inspect), so the caller's ``if resume.is_blocked`` read green and went on to redispatch
+        — the send the seam exists to prevent.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            BLOCK_RESUME_REFUSED,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (  # noqa: E501
+            BLOCK_COMMIT_AUTHORITY_MOVED,
+            ResumeOutcome,
+            ResumePreflight,
+        )
+
+        class _AuthorityLostResume:
+            """A resume stopped AT the commit edge: no transition, typed detail."""
+
+            def run(self, request, *, execute):
+                pf = ResumePreflight(
+                    lane_hibernated=True, release_settled=True, issue_not_reowned=True,
+                    pair_both_slots_live=True, pair_attested=True,
+                )
+                return ResumeOutcome(
+                    executed=True, preflight=pf, issue=request.issue, lane=request.lane,
+                    detail=BLOCK_COMMIT_AUTHORITY_MOVED,
+                )
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            SublaneRecoverPairUseCase,
+        )
+        from tests.regressions.test_issue_13847_pair_recovery_orchestration import (
+            _FakeStore,
+            _Record,
+        )
+
+        ops = _FakeOps(per_slot_obs={GATEWAY_ROLE: _obs(), WORKER_ROLE: _obs()})
+        use_case = SublaneRecoverPairUseCase(
+            ops=ops, store=_FakeStore(_Record()), resume=_AuthorityLostResume(),
+        )
+        out = use_case.run(_REQ, execute=True)
+        self.assertTrue(out.resume.is_blocked, "the typed authority loss IS a block")
+        self.assertTrue(out.is_blocked)
+        self.assertEqual(out.detail, BLOCK_RESUME_REFUSED)
+        self.assertIsNone(ops.redispatched, "and the send never happens")
+        self.assertEqual(out.redispatch, REDISPATCH_SKIPPED)
 
     def test_the_preflight_matches_the_store_on_raw_persisted_bytes(self):
         """Review j#88526 F2: the 4 padded shapes, preflight and execute must agree.

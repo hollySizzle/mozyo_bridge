@@ -737,7 +737,13 @@ class SublaneRecoverPairUseCase:
         # The fence key + delivery anchor use the ORIGINAL implementation_request journal (never
         # the owner-approval journal), so a re-approval never changes the fence key and can never
         # re-send the same original request (Redmine #13847 R1-F3).
-        applied["resumed"] = True
+        # Redmine #14475 (review j#88547 F2): the resume EFFECT is the disposition CAS actually
+        # applying — not merely the resume returning non-blocked. An ``already_active``
+        # idempotent no-op carries no transition and applies nothing, so counting it would
+        # over-report what this run did.
+        applied["resumed"] = bool(
+            resume_outcome.transition is not None and resume_outcome.transition.applied
+        )
 
         # The send is the last owed effect and the one that reaches a live pane, so it gets its
         # own re-join here as well as the transport-direct one the live ops passes as
