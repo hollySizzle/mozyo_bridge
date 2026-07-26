@@ -31,12 +31,18 @@ from mozyo_bridge.core.state.scratch_retirement_fence import (
     slot_digest,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+    recovery_anchor_delivery_live as delivery_live,
     sublane_hibernated_pair_recovery_live as live,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
     REDISPATCH_DELIVERED,
     REDISPATCH_TARGET_RETIRING,
     REDISPATCH_UNCERTAIN,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
+    DETAIL_OK,
+    DISPOSITION_STARTED,
+    RecoveryAnchorDeliveryOutcome,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
@@ -64,14 +70,17 @@ class RedispatchRetirementGuardTest(unittest.TestCase):
         self.sends = []
 
     def _redispatch(self, *, action_id="recover-pair:13847:x:3:2"):
-        def _dispatch(_self, **kw):
-            self.sends.append(kw)
-            return 0
+        def _deliver(_self, request):
+            self.sends.append(request)
+            return RecoveryAnchorDeliveryOutcome(
+                disposition=DISPOSITION_STARTED,
+                detail=DETAIL_OK,
+            )
 
         with patch.object(
             live, "list_herdr_agent_rows", return_value=[_row(self.gw, "wZ:p3G")]
         ), patch.object(
-            live.HerdrSublaneActuatorOps, "dispatch_implementation_request", _dispatch
+            delivery_live.LiveRecoveryAnchorDeliveryService, "deliver", _deliver
         ):
             return self.ops.redispatch_to_gateway(
                 action_id=action_id, gateway_assigned_name=self.gw, issue="13847",

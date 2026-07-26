@@ -30,7 +30,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_SLOT_PRESERVED,
     REDISPATCH_ALREADY,
     REDISPATCH_DELIVERED,
+    RecoverPairDeliveryRetryRequest,
     RecoverPairRequest,
+    SublaneRecoverPairDeliveryUseCase,
     SublaneRecoverPairUseCase,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (  # noqa: E501
@@ -140,6 +142,13 @@ class _FakeOps:
     def redispatch_to_gateway(self, **kw):
         self.redispatched = kw
         return self._redispatch
+
+    def retry_redispatch_to_gateway(self, **kw):
+        self.redispatched = kw
+        return self._redispatch
+
+    def preflight_retry_redispatch_to_gateway(self, **kw):
+        return True, "ready"
 
 
 class _FakeResume:
@@ -410,6 +419,57 @@ class JournalSeparation(unittest.TestCase):
             ops.redispatched["journal"], _APPROVAL_JOURNAL,
             "a re-approval (different --journal) must never change the redispatch fence key",
         )
+
+
+class ActivePairRecoveryDelivery(unittest.TestCase):
+    def _request(self, **changes):
+        values = {
+            "issue": "13847",
+            "lane": "issue_13847_x",
+            "journal": "88159",
+            "implementation_request_journal": _ORIGINAL_IR_JOURNAL,
+            "retry_of_action_id": "recover-pair:13847:issue_13847_x:3:2",
+            "prior_zero_send_journal": "88148",
+        }
+        values.update(changes)
+        return RecoverPairDeliveryRetryRequest(**values)
+
+    def test_preflight_builds_new_action_without_dispatch(self):
+        ops = _FakeOps(per_slot_obs={})
+        out = SublaneRecoverPairDeliveryUseCase(ops=ops).run(
+            self._request(), execute=False
+        )
+        self.assertFalse(out.is_blocked)
+        self.assertFalse(out.executed)
+        self.assertTrue(out.action_id.startswith("recovery-delivery-"))
+        self.assertIsNone(ops.redispatched)
+
+    def test_execute_keeps_original_anchor_and_binds_retry_evidence(self):
+        ops = _FakeOps(per_slot_obs={})
+        request = self._request()
+        out = SublaneRecoverPairDeliveryUseCase(ops=ops).run(request, execute=True)
+        self.assertFalse(out.is_blocked)
+        self.assertEqual(out.redispatch, REDISPATCH_DELIVERED)
+        self.assertEqual(
+            ops.redispatched["journal"], request.implementation_request_journal
+        )
+        self.assertEqual(
+            ops.redispatched["retry_of_action_id"], request.retry_of_action_id
+        )
+        self.assertEqual(
+            ops.redispatched["prior_zero_send_journal"],
+            request.prior_zero_send_journal,
+        )
+        self.assertEqual(ops.redispatched["action_id"], out.action_id)
+
+    def test_missing_prior_evidence_is_zero_dispatch(self):
+        ops = _FakeOps(per_slot_obs={})
+        out = SublaneRecoverPairDeliveryUseCase(ops=ops).run(
+            self._request(prior_zero_send_journal=""), execute=True
+        )
+        self.assertTrue(out.is_blocked)
+        self.assertFalse(out.executed)
+        self.assertIsNone(ops.redispatched)
 
 
 if __name__ == "__main__":

@@ -319,9 +319,17 @@ class ReviewR2AdversarialTests(unittest.TestCase):
         with patch.object(live_mod, "repo_scope_workspace_id", return_value="real_ws"):
             self.assertFalse(foreign._governed_sender_resolves())
             # …and rail readiness then depends ONLY on the operator-capable one-shot rail.
-            with patch.object(foreign, "_build_oneshot_rail", return_value=None):
+            with patch.object(
+                foreign,
+                "_recovery_delivery_service",
+                return_value=type("S", (), {"ready": lambda self: False})(),
+            ):
                 self.assertFalse(foreign.resume_rail_ready(foreign.request))
-            with patch.object(foreign, "_build_oneshot_rail", return_value=object()):
+            with patch.object(
+                foreign,
+                "_recovery_delivery_service",
+                return_value=type("S", (), {"ready": lambda self: True})(),
+            ):
                 self.assertTrue(foreign.resume_rail_ready(foreign.request))
         # A matching-workspace attested context resolves through the same resolver.
         attested = LiveGatewayRecoveryOps(
@@ -339,6 +347,9 @@ class ReviewR2AdversarialTests(unittest.TestCase):
         # receive its ``.path`` — pinned with the production type, not a fake shape.
         import os
         import stat
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_anchor_delivery_live import (  # noqa: E501
+            LiveRecoveryAnchorDeliveryService,
+        )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
             HerdrCliTransport,
         )
@@ -350,9 +361,10 @@ class ReviewR2AdversarialTests(unittest.TestCase):
             repo_root=self.repo, request=_request(),
             env={"MOZYO_HERDR_BINARY": str(fake_bin)},
         )
-        transport = ops._oneshot_transport()
-        self.assertIsInstance(transport, HerdrCliTransport)
-        self.assertEqual(transport.binary, str(fake_bin))  # the .path, not the resolution
+        service = LiveRecoveryAnchorDeliveryService(self.repo, ops.env)
+        rail = service._build_rail()
+        self.assertIsInstance(rail._transport, HerdrCliTransport)
+        self.assertEqual(rail._transport.binary, str(fake_bin))
 
     def test_f1_the_oneshot_rail_builds_from_the_exact_resolved_transport(self):
         # j#87384 F1: with a resolvable herdr binary the rail constructs (non-None) from the
@@ -371,7 +383,7 @@ class ReviewR2AdversarialTests(unittest.TestCase):
             repo_root=self.repo, request=_request(),
             env={"MOZYO_HERDR_BINARY": str(fake_bin)},
         )
-        rail = ops._build_oneshot_rail()
+        rail = ops._recovery_delivery_service()._build_rail()
         self.assertIsInstance(rail, HerdrTurnStartRail)
         with patch.object(ops, "_governed_sender_resolves", return_value=False):
             self.assertTrue(ops.resume_rail_ready(ops.request))
@@ -384,114 +396,83 @@ class ReviewR2AdversarialTests(unittest.TestCase):
             repo_root=self.repo, request=_request(),
             env={"PATH": str(self.repo / "empty-path")},
         )
-        self.assertIsNone(ops._oneshot_transport())
-        self.assertIsNone(ops._build_oneshot_rail())
-        self.assertIsNone(ops._drive_oneshot_turn_start("w:9", "body"))
+        service = ops._recovery_delivery_service()
+        self.assertIsNone(service._build_rail())
+        self.assertFalse(service.ready())
         with patch.object(ops, "_governed_sender_resolves", return_value=False):
             self.assertFalse(ops.resume_rail_ready(ops.request))
 
     def test_f2_oneshot_requires_action_bound_attestation_and_generation(self):
-        # j#87378 F2(a): a fresh row without a readable revision, or an attestation that is
-        # absent / at a different locator / bound to a DIFFERENT action, is a zero-send.
-        from types import SimpleNamespace
-
+        # The wrapper carries the exact revision + refresh action into the shared service;
+        # the service regressions own the identity/attestation adversarial matrix.
         ops = LiveGatewayRecoveryOps(
-            repo_root=self.repo, request=_request(action_id="refresh-gateway:a:r4"),
+            repo_root=self.repo,
+            request=_request(
+                assigned_name="gw", action_id="refresh-gateway:a:r4"
+            ),
         )
-        no_rev_row = {"name": "gw", "pane_id": "w:9", "status": "done"}
-        self.assertFalse(ops._fresh_gateway_bound_to_action(no_rev_row, "w:9"))
         row = {"name": "gw", "pane_id": "w:9", "status": "done", "revision": "2"}
-
-        def _with_record(record):
-            class _Store:
-                def __init__(self, home=None):
-                    pass
-
-                def read(self, name):
-                    return record
-
-            return patch(
-                "mozyo_bridge.core.state.herdr_identity_attestation."
-                "HerdrIdentityAttestationStore", _Store,
+        seen = []
+        service = type(
+            "S",
+            (),
+            {
+                "deliver": lambda self, request: (
+                    seen.append(request)
+                    or type("O", (), {"started": True})()
+                )
+            },
+        )()
+        continuation = ContinuationPointer(
+            source="redmine",
+            issue_id="14203",
+            journal_id="87251",
+            expected_gate="implementation_request",
+            next_semantic_action="callback_recovery_once",
+        )
+        with patch.object(live_mod, "repo_scope_workspace_id", return_value="ws"), \
+                patch.object(ops, "_rows", return_value=[row]), \
+                patch.object(ops, "_recovery_delivery_service", return_value=service):
+            self.assertEqual(
+                ops._oneshot_resume(continuation, "w:9", "codex"),
+                DRAIN_SEND_OK,
             )
-
-        with _with_record(None):
-            self.assertFalse(ops._fresh_gateway_bound_to_action(row, "w:9"))
-        foreign = SimpleNamespace(
-            locator="w:OLD", observed_at="2026-07-24T00:00:00+00:00",
-            replacement_action_id="refresh-gateway:a:r4",
-        )
-        with _with_record(foreign):
-            self.assertFalse(ops._fresh_gateway_bound_to_action(row, "w:9"))
-        unbound = SimpleNamespace(
-            locator="w:9", observed_at="2026-07-24T00:00:00+00:00",
-            replacement_action_id="other-action",
-        )
-        with _with_record(unbound):
-            self.assertFalse(ops._fresh_gateway_bound_to_action(row, "w:9"))
-        bound = SimpleNamespace(
-            locator="w:9", observed_at="2026-07-24T00:00:00+00:00",
-            replacement_action_id="refresh-gateway:a:r4",
-        )
-        with _with_record(bound):
-            self.assertTrue(ops._fresh_gateway_bound_to_action(row, "w:9"))
+        self.assertEqual(seen[0].target_revision, "2")
+        self.assertEqual(seen[0].target_action_id, "refresh-gateway:a:r4")
 
     def test_f2_oneshot_records_ok_only_on_an_observed_turn_start(self):
-        # j#87378 F2(b): the send rides the high-level turn-start rail; ``sent/ok`` is
-        # recorded ONLY on an OBSERVED ``started``; delivered_not_started records uncertain
-        # and NEVER completes; an unresolvable rail is a plain failed send.
-        from types import SimpleNamespace
-
+        # The wrapper promotes only the shared service's typed ``started`` result.
         continuation = ContinuationPointer(
             source="redmine", issue_id="14203", journal_id="87251",
             expected_gate="implementation_request",
             next_semantic_action="callback_recovery_once",
         )
-        ops = LiveGatewayRecoveryOps(repo_root=self.repo, request=_request())
-        row = {"name": "gw", "pane_id": "w:9", "status": "done", "revision": "2"}
-        ident = type("I", (), {
-            "workspace_id": "ws", "lane_id": "issue_x_lane", "role": "codex",
-        })()
-        recorded = []
-
-        def _run(rail_outcome):
-            recorded.clear()
-            with patch.object(live_mod, "repo_scope_workspace_id", return_value="ws"):
-                with patch.object(live_mod, "list_herdr_agent_rows", return_value=[row]):
-                    with patch.object(
-                        live_mod, "decode_assigned_name",
-                        return_value=type("D", (), {"ok": True, "identity": ident})(),
-                    ):
-                        with patch.object(live_mod, "classify_named_slot",
-                                          return_value=live_mod.SLOT_LIVE):
-                            with patch.object(
-                                ops, "_fresh_gateway_bound_to_action", return_value=True
-                            ):
-                                with patch.object(
-                                    ops, "_oneshot_transport", return_value=object()
-                                ), patch.object(
-                                    ops, "_drive_oneshot_turn_start",
-                                    return_value=(
-                                        None if rail_outcome is None
-                                        else SimpleNamespace(outcome=rail_outcome)
-                                    ),
-                                ):
-                                    with patch.object(
-                                        ops, "_record_oneshot",
-                                        side_effect=lambda *a, **k: recorded.append(k),
-                                    ):
-                                        return ops._oneshot_resume(
-                                            continuation, "w:9", "codex"
-                                        )
-
-        self.assertEqual(_run("started"), DRAIN_SEND_OK)
-        self.assertEqual(recorded[-1], {"status": "sent", "reason": "ok"})
-        self.assertEqual(_run("delivered_not_started"), DRAIN_SEND_ERROR)
-        self.assertEqual(
-            recorded[-1], {"status": "uncertain", "reason": "delivered_not_started"}
+        ops = LiveGatewayRecoveryOps(
+            repo_root=self.repo,
+            request=_request(assigned_name="gw", action_id="refresh-gateway:a:r4"),
         )
-        self.assertEqual(_run(None), DRAIN_SEND_ERROR)
-        self.assertEqual(recorded, [])  # no rail => no record, plain failed send
+        row = {"name": "gw", "pane_id": "w:9", "status": "done", "revision": "2"}
+        def _run(started):
+            with patch.object(live_mod, "repo_scope_workspace_id", return_value="ws"):
+                with patch.object(ops, "_rows", return_value=[row]):
+                    service = type(
+                        "S",
+                        (),
+                        {
+                            "deliver": lambda self, request: type(
+                                "O", (), {"started": started}
+                            )()
+                        },
+                    )()
+                    with patch.object(
+                        ops, "_recovery_delivery_service", return_value=service
+                    ):
+                        return ops._oneshot_resume(
+                            continuation, "w:9", "codex"
+                        )
+
+        self.assertEqual(_run(True), DRAIN_SEND_OK)
+        self.assertEqual(_run(False), DRAIN_SEND_ERROR)
 
     def test_f3_an_implementation_request_anchor_lands_on_the_worker_forward_record(self):
         # j#87370 F3: the IR's causal result is the exact-anchor gateway→worker forward in

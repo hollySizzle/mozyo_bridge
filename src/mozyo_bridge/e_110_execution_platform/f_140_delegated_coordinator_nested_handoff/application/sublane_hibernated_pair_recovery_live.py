@@ -33,6 +33,8 @@ from mozyo_bridge.core.state.dispatch_outbox_fence import (
     DispatchOutboxFence,
     DispatchOutboxFenceError,
     FENCE_DELIVERED,
+    FENCE_RESERVED,
+    FENCE_UNCERTAIN,
     FenceKey,
 )
 from mozyo_bridge.core.state.herdr_identity_attestation import (
@@ -46,6 +48,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding impo
     selected_attestation_store_is_v1,
 )
 from mozyo_bridge.core.state.lane_lifecycle import (
+    DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
     LaneLifecycleError,
     LaneLifecycleKey,
@@ -69,7 +72,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REDISPATCH_UNCERTAIN,
     HibernatedPairRecoveryOps,
     SlotPlan,
+    SublaneRecoverPairDeliveryUseCase,
     SublaneRecoverPairUseCase,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
+    KIND_IMPLEMENTATION_REQUEST,
+    RecoveryAnchorDeliveryRequest,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
     LiveSublaneQuarantineOps,
@@ -106,6 +114,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     COMMAND_TIMEOUT_SECONDS,
     Runner,
 )
+from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 _STATUS_KEYS = ("agent_status", "status", "state")
@@ -438,19 +447,32 @@ class LiveHibernatedPairRecoveryOps:
         # contract: missing/corrupt -> zero-send + operator `recover()` + a new action_id).
         return self.fence if self.fence is not None else DispatchOutboxFence()
 
-    def _gateway_live_locator(self, gateway_assigned_name: str) -> str:
+    def _gateway_live_target(self, gateway_assigned_name: str) -> Tuple[str, str]:
         try:
             rows = self._rows()
         except Exception:  # noqa: BLE001
-            return ""
+            return "", ""
         matches = [
             row for row in rows
             if isinstance(row, Mapping) and _norm(row.get(AGENT_KEY_NAME)) == _norm(gateway_assigned_name)
         ]
-        return _agent_locator(matches[0]) if len(matches) == 1 else ""
+        if len(matches) != 1:
+            return "", ""
+        revision = matches[0].get("revision")
+        if isinstance(revision, bool):
+            return "", ""
+        return _norm(_agent_locator(matches[0])), _norm(revision)
 
-    def redispatch_to_gateway(
-        self, *, action_id: str, gateway_assigned_name: str, issue: str, lane: str, journal: str, workspace_id: str
+    def _redispatch_with_action(
+        self,
+        *,
+        action_id: str,
+        target_action_id: str,
+        gateway_assigned_name: str,
+        issue: str,
+        lane: str,
+        journal: str,
+        workspace_id: str,
     ) -> str:
         key = FenceKey(
             workspace_id=_norm(workspace_id), lane_id=_norm_lane(lane), issue=_norm(issue),
@@ -494,39 +516,229 @@ class LiveHibernatedPairRecoveryOps:
             except DispatchOutboxFenceError:
                 return REDISPATCH_UNCERTAIN
             return REDISPATCH_TARGET_RETIRING
-        gateway_locator = self._gateway_live_locator(gateway_assigned_name)
-        if not gateway_locator:
-            # No live gateway to deliver to: record uncertain (never mark delivered on no send).
+        gateway_locator, target_revision = self._gateway_live_target(
+            gateway_assigned_name
+        )
+        decoded = decode_assigned_name(gateway_assigned_name)
+        if (
+            not gateway_locator
+            or not target_revision
+            or not decoded.ok
+            or decoded.identity is None
+        ):
             try:
-                fence.mark_uncertain(key, detail="no live gateway locator resolved")
+                fence.mark_cancelled(
+                    key, detail="exact live gateway target unresolved; zero-send"
+                )
             except DispatchOutboxFenceError:
-                pass
-            return REDISPATCH_UNCERTAIN
+                return REDISPATCH_UNCERTAIN
+            return REDISPATCH_FAILED
         try:
-            rc = HerdrSublaneActuatorOps(
-                repo_root=self.repo_root, lane_label=_norm(lane), issue=_norm(issue),
-                journal=_norm(journal), env=self.env, runner=self.runner, timeout=self.timeout,
-            ).dispatch_implementation_request(
-                issue=_norm(issue), journal=_norm(journal), gateway_pane=gateway_locator,
-                lane_label=_norm(lane), upstream_coordinator=None, target_repo=str(self.repo_root),
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_anchor_delivery_live import (  # noqa: E501
+                LiveRecoveryAnchorDeliveryService,
             )
-        except Exception:  # noqa: BLE001 - a send failure: fate unknown -> uncertain (never delivered)
+
+            outcome = LiveRecoveryAnchorDeliveryService(
+                repo_root=self.repo_root,
+                env=self.env,
+                runner=self.runner,
+                timeout=self.timeout,
+                attestation_home=self.attestation_home,
+            ).deliver(
+                RecoveryAnchorDeliveryRequest(
+                    issue=_norm(issue),
+                    journal=_norm(journal),
+                    kind=KIND_IMPLEMENTATION_REQUEST,
+                    workspace_id=_norm(workspace_id),
+                    lane_id=_norm_lane(lane),
+                    provider=_norm(decoded.identity.role),
+                    target_assigned_name=_norm(gateway_assigned_name),
+                    target_locator=gateway_locator,
+                    target_revision=target_revision,
+                    target_action_id=_norm(target_action_id),
+                )
+            )
+        except (Exception, SystemExit):  # noqa: BLE001 - never leave a won reserve pending
             try:
-                fence.mark_uncertain(key, detail="gateway dispatch raised")
+                fence.mark_uncertain(key, detail="recovery delivery service raised")
             except DispatchOutboxFenceError:
                 pass
             return REDISPATCH_UNCERTAIN
-        if rc == 0:
+        if outcome.started:
             try:
-                fence.mark_delivered(key, detail="implementation_request redispatched to gateway")
+                fence.mark_delivered(
+                    key,
+                    detail="implementation_request recovery turn-start confirmed",
+                )
             except DispatchOutboxFenceError:
                 return REDISPATCH_UNCERTAIN
             return REDISPATCH_DELIVERED
+        if outcome.zero_send:
+            try:
+                fence.mark_cancelled(
+                    key,
+                    detail=f"recovery delivery zero-send: {outcome.detail}",
+                )
+            except DispatchOutboxFenceError:
+                return REDISPATCH_UNCERTAIN
+            return REDISPATCH_FAILED
         try:
-            fence.mark_uncertain(key, detail=f"gateway dispatch rc={rc}")
+            fence.mark_uncertain(
+                key,
+                detail=f"recovery delivery uncertain: {outcome.detail}",
+            )
         except DispatchOutboxFenceError:
             pass
-        return REDISPATCH_FAILED
+        return REDISPATCH_UNCERTAIN
+
+    def redispatch_to_gateway(
+        self, *, action_id: str, gateway_assigned_name: str, issue: str, lane: str, journal: str, workspace_id: str
+    ) -> str:
+        return self._redispatch_with_action(
+            action_id=action_id,
+            target_action_id=action_id,
+            gateway_assigned_name=gateway_assigned_name,
+            issue=issue,
+            lane=lane,
+            journal=journal,
+            workspace_id=workspace_id,
+        )
+
+    def _retry_delivery_context(
+        self,
+        *,
+        retry_of_action_id: str,
+        issue: str,
+        lane: str,
+        journal: str,
+        approval_journal: str,
+        prior_zero_send_journal: str,
+        workspace_id: str,
+    ) -> Tuple[str, str]:
+        if not (
+            _norm(retry_of_action_id)
+            and _norm(approval_journal) == _norm(self.request_journal)
+            and _norm(prior_zero_send_journal)
+        ):
+            return "", "retry_authority_incomplete"
+        try:
+            rec = LaneLifecycleStore(home=self.lifecycle_home).get(
+                LaneLifecycleKey(_norm(workspace_id), _norm_lane(lane))
+            )
+        except (LaneLifecycleError, OSError, ValueError):
+            return "", "lifecycle_unreadable"
+        if not (
+            rec is not None
+            and rec.lane_disposition == DISPOSITION_ACTIVE
+            and _norm(rec.issue_id) == _norm(issue)
+        ):
+            return "", "lane_not_active_or_reowned"
+        pair = read_declared_pin_pair(rec)
+        if not pair.ok or pair.gateway is None:
+            return "", "declared_gateway_unresolved"
+        provider = _norm(pair.gateway.provider)
+        gateway_assigned_name = encode_assigned_name(
+            _norm(workspace_id), provider, _norm_lane(lane)
+        )
+        declared_name = _norm(getattr(pair.gateway, "assigned_name", ""))
+        if declared_name and declared_name != gateway_assigned_name:
+            return "", "declared_gateway_identity_mismatch"
+        prior_key = FenceKey(
+            workspace_id=_norm(workspace_id),
+            lane_id=_norm_lane(lane),
+            issue=_norm(issue),
+            journal=_norm(journal),
+            action_id=_norm(retry_of_action_id),
+            target_assigned_name=gateway_assigned_name,
+        )
+        try:
+            prior_state = self._fence().state_of(prior_key)
+        except DispatchOutboxFenceError:
+            return "", "prior_fence_unreadable"
+        if prior_state == FENCE_DELIVERED:
+            return gateway_assigned_name, "prior_delivered"
+        if prior_state not in (FENCE_RESERVED, FENCE_UNCERTAIN):
+            return "", f"prior_fence_not_reconcilable:{prior_state}"
+        locator, revision = self._gateway_live_target(gateway_assigned_name)
+        if not locator or not revision:
+            return "", "fresh_gateway_unresolved"
+        try:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_anchor_delivery_live import (  # noqa: E501
+                LiveRecoveryAnchorDeliveryService,
+            )
+
+            ready = LiveRecoveryAnchorDeliveryService(
+                repo_root=self.repo_root,
+                env=self.env,
+                runner=self.runner,
+                timeout=self.timeout,
+                attestation_home=self.attestation_home,
+            ).ready()
+        except Exception:  # noqa: BLE001 - unavailable capability is zero-send
+            ready = False
+        if not ready:
+            return "", "recovery_delivery_rail_unavailable"
+        return gateway_assigned_name, "ready"
+
+    def preflight_retry_redispatch_to_gateway(
+        self,
+        *,
+        retry_of_action_id: str,
+        issue: str,
+        lane: str,
+        journal: str,
+        approval_journal: str,
+        prior_zero_send_journal: str,
+        workspace_id: str,
+    ) -> Tuple[bool, str]:
+        gateway, detail = self._retry_delivery_context(
+            retry_of_action_id=retry_of_action_id,
+            issue=issue,
+            lane=lane,
+            journal=journal,
+            approval_journal=approval_journal,
+            prior_zero_send_journal=prior_zero_send_journal,
+            workspace_id=workspace_id,
+        )
+        return bool(gateway), detail
+
+    def retry_redispatch_to_gateway(
+        self,
+        *,
+        action_id: str,
+        retry_of_action_id: str,
+        issue: str,
+        lane: str,
+        journal: str,
+        approval_journal: str,
+        prior_zero_send_journal: str,
+        workspace_id: str,
+    ) -> str:
+        """Use a new key while preserving and proving the exact prior blocked attempt."""
+        if not _norm(action_id):
+            return REDISPATCH_FAILED
+        gateway_assigned_name, detail = self._retry_delivery_context(
+            retry_of_action_id=retry_of_action_id,
+            issue=issue,
+            lane=lane,
+            journal=journal,
+            approval_journal=approval_journal,
+            prior_zero_send_journal=prior_zero_send_journal,
+            workspace_id=workspace_id,
+        )
+        if not gateway_assigned_name:
+            return REDISPATCH_FAILED
+        if detail == "prior_delivered":
+            return REDISPATCH_ALREADY
+        return self._redispatch_with_action(
+            action_id=action_id,
+            target_action_id=retry_of_action_id,
+            gateway_assigned_name=gateway_assigned_name,
+            issue=issue,
+            lane=lane,
+            journal=journal,
+            workspace_id=workspace_id,
+        )
 
 
 def build_live_recover_pair_use_case(
@@ -552,7 +764,23 @@ def build_live_recover_pair_use_case(
     return SublaneRecoverPairUseCase(ops=ops, store=store, resume=resume)
 
 
+def build_live_recover_pair_delivery_use_case(
+    *, repo_root: Path, env: Mapping[str, str], issue: str, lane: str, journal: str
+) -> SublaneRecoverPairDeliveryUseCase:
+    """Composition root for the active-pair, new-action recovery delivery."""
+    return SublaneRecoverPairDeliveryUseCase(
+        ops=LiveHibernatedPairRecoveryOps(
+            repo_root=repo_root,
+            request_issue=issue,
+            request_lane=lane,
+            request_journal=journal,
+            env=dict(env),
+        )
+    )
+
+
 __all__ = (
     "LiveHibernatedPairRecoveryOps",
+    "build_live_recover_pair_delivery_use_case",
     "build_live_recover_pair_use_case",
 )

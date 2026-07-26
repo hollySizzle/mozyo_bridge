@@ -72,6 +72,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     hibernated_pair_recovery_action_id,
     slot_recovers,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
+    recovery_delivery_action_id,
+)
 from mozyo_bridge.core.state.lane_pin_role import (
     PIN_PAIR_ABSENT,
     PIN_ROLE_GATEWAY,
@@ -143,6 +146,34 @@ class RecoverPairRequest:
     #: the exactly-once fence key + delivery anchor, so a re-approval (a different approval
     #: journal) never changes the fence key and can never re-send the same original request.
     implementation_request_journal: str
+
+
+@dataclass(frozen=True)
+class RecoverPairDeliveryRetryRequest:
+    """One explicit recovery-delivery action for an already-relaunched active pair.
+
+    This does not regenerate the implementation request and does not release the prior
+    outbox row.  It binds the same durable work anchor to a new owner-approved action whose
+    identity includes the prior pair action and the journal that proved the prior attempt
+    was zero-send.
+    """
+
+    issue: str
+    lane: str
+    journal: str
+    implementation_request_journal: str
+    retry_of_action_id: str
+    prior_zero_send_journal: str
+
+    def action_id(self) -> str:
+        return recovery_delivery_action_id(
+            issue=self.issue,
+            lane=self.lane,
+            approval_journal=self.journal,
+            anchor_journal=self.implementation_request_journal,
+            retry_of_action_id=self.retry_of_action_id,
+            prior_zero_send_journal=self.prior_zero_send_journal,
+        )
 
 
 @dataclass(frozen=True)
@@ -277,6 +308,39 @@ class RecoverPairOutcome:
         return payload
 
 
+@dataclass(frozen=True)
+class RecoverPairDeliveryRetryOutcome:
+    """Result of the active-pair, new-action delivery recovery surface."""
+
+    executed: bool
+    issue: str
+    lane: str
+    action_id: str = ""
+    may_deliver: bool = False
+    redispatch: str = REDISPATCH_SKIPPED
+    detail: str = ""
+
+    @property
+    def is_blocked(self) -> bool:
+        if not self.may_deliver:
+            return True
+        if not self.executed:
+            return False
+        return self.redispatch not in (REDISPATCH_DELIVERED, REDISPATCH_ALREADY)
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "executed": self.executed,
+            "issue": self.issue,
+            "lane": self.lane,
+            "action_id": self.action_id,
+            "may_deliver": self.may_deliver,
+            "redispatch": self.redispatch,
+            "is_blocked": self.is_blocked,
+            "detail": self.detail,
+        }
+
+
 @runtime_checkable
 class HibernatedPairRecoveryOps(Protocol):
     """The destructive / observing effects the recovery use case needs (injected)."""
@@ -312,6 +376,31 @@ class HibernatedPairRecoveryOps(Protocol):
         journal: str,
         workspace_id: str,
     ) -> str: ...
+
+    def retry_redispatch_to_gateway(
+        self,
+        *,
+        action_id: str,
+        retry_of_action_id: str,
+        issue: str,
+        lane: str,
+        journal: str,
+        approval_journal: str,
+        prior_zero_send_journal: str,
+        workspace_id: str,
+    ) -> str: ...
+
+    def preflight_retry_redispatch_to_gateway(
+        self,
+        *,
+        retry_of_action_id: str,
+        issue: str,
+        lane: str,
+        journal: str,
+        approval_journal: str,
+        prior_zero_send_journal: str,
+        workspace_id: str,
+    ) -> Tuple[bool, str]: ...
 
 
 @dataclass
@@ -540,6 +629,91 @@ class SublaneRecoverPairUseCase:
         )
 
 
+@dataclass
+class SublaneRecoverPairDeliveryUseCase:
+    """Resume the original anchor on an already-active recovered pair under a new action."""
+
+    ops: HibernatedPairRecoveryOps
+
+    def run(
+        self, request: RecoverPairDeliveryRetryRequest, *, execute: bool
+    ) -> RecoverPairDeliveryRetryOutcome:
+        issue = _norm(request.issue)
+        lane = _norm(request.lane)
+        workspace_id = _norm(self.ops.workspace_id())
+        fields = (
+            issue,
+            lane,
+            workspace_id,
+            _norm(request.journal),
+            _norm(request.implementation_request_journal),
+            _norm(request.retry_of_action_id),
+            _norm(request.prior_zero_send_journal),
+        )
+        try:
+            action_id = request.action_id()
+        except ValueError:
+            action_id = ""
+        if not all(fields) or not action_id:
+            return RecoverPairDeliveryRetryOutcome(
+                executed=False,
+                issue=issue,
+                lane=lane,
+                action_id=action_id,
+                detail=BLOCK_IDENTITY_INCOMPLETE,
+            )
+        may_deliver, detail = self.ops.preflight_retry_redispatch_to_gateway(
+            retry_of_action_id=_norm(request.retry_of_action_id),
+            issue=issue,
+            lane=lane,
+            journal=_norm(request.implementation_request_journal),
+            approval_journal=_norm(request.journal),
+            prior_zero_send_journal=_norm(request.prior_zero_send_journal),
+            workspace_id=workspace_id,
+        )
+        if not may_deliver:
+            return RecoverPairDeliveryRetryOutcome(
+                executed=False,
+                issue=issue,
+                lane=lane,
+                action_id=action_id,
+                may_deliver=False,
+                detail=detail or "fail-closed: recovery delivery preflight blocked",
+            )
+        if not execute:
+            return RecoverPairDeliveryRetryOutcome(
+                executed=False,
+                issue=issue,
+                lane=lane,
+                action_id=action_id,
+                may_deliver=True,
+                detail="preflight only (no --execute)",
+            )
+        redispatch = self.ops.retry_redispatch_to_gateway(
+            action_id=action_id,
+            retry_of_action_id=_norm(request.retry_of_action_id),
+            issue=issue,
+            lane=lane,
+            journal=_norm(request.implementation_request_journal),
+            approval_journal=_norm(request.journal),
+            prior_zero_send_journal=_norm(request.prior_zero_send_journal),
+            workspace_id=workspace_id,
+        )
+        return RecoverPairDeliveryRetryOutcome(
+            executed=True,
+            issue=issue,
+            lane=lane,
+            action_id=action_id,
+            may_deliver=True,
+            redispatch=redispatch,
+            detail=(
+                "original implementation_request delivered under a new recovery action"
+                if redispatch in (REDISPATCH_DELIVERED, REDISPATCH_ALREADY)
+                else "fail-closed: recovery delivery blocked"
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Text rendering + thin CLI handler.
 # ---------------------------------------------------------------------------
@@ -606,6 +780,46 @@ def cmd_sublane_recover_pair(args: argparse.Namespace) -> int:
     return 1 if outcome.is_blocked else 0
 
 
+def cmd_sublane_recover_pair_delivery(args: argparse.Namespace) -> int:
+    """Drive one owner-approved new-action delivery to an already-active recovered pair."""
+    repo = getattr(args, "repo", None)
+    repo_root = Path(repo).expanduser() if repo else Path.cwd()
+    request = RecoverPairDeliveryRetryRequest(
+        issue=getattr(args, "issue", "") or "",
+        lane=getattr(args, "lane", "") or "",
+        journal=getattr(args, "journal", "") or "",
+        implementation_request_journal=(
+            getattr(args, "implementation_request_journal", "") or ""
+        ),
+        retry_of_action_id=getattr(args, "retry_of_action_id", "") or "",
+        prior_zero_send_journal=getattr(args, "prior_zero_send_journal", "") or "",
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery_live import (  # noqa: E501
+        build_live_recover_pair_delivery_use_case,
+    )
+
+    use_case = build_live_recover_pair_delivery_use_case(
+        repo_root=repo_root,
+        env=dict(os.environ),
+        issue=request.issue,
+        lane=request.lane,
+        journal=request.journal,
+    )
+    outcome = use_case.run(request, execute=bool(getattr(args, "execute", False)))
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(
+            f"sublane recover-pair-delivery: {outcome.lane} (issue {outcome.issue})\n"
+            f"  action_id: {outcome.action_id or '<invalid>'}\n"
+            f"  may_deliver: {outcome.may_deliver} executed: {outcome.executed} "
+            f"redispatch: {outcome.redispatch}\n"
+            f"  {outcome.detail}",
+            file=sys.stdout,
+        )
+    return 1 if outcome.is_blocked else 0
+
+
 def register_sublane_recover_pair_parser(sublane_sub: Any) -> None:
     """Register ``sublane recover-pair`` outside the at-ceiling core CLI module."""
     parser = sublane_sub.add_parser(
@@ -641,6 +855,48 @@ def register_sublane_recover_pair_parser(sublane_sub: Any) -> None:
     parser.add_argument("--json", action="store_true", help="Emit structured JSON output")
     parser.set_defaults(func=cmd_sublane_recover_pair)
 
+    delivery = sublane_sub.add_parser(
+        "recover-pair-delivery",
+        help=(
+            "Redmine #14203 R17: deliver the original implementation_request to an "
+            "already-active recovered pair under one explicit new recovery action. The "
+            "prior fence row is retained and never released."
+        ),
+    )
+    delivery.add_argument("--issue", required=True)
+    delivery.add_argument("--lane", required=True)
+    delivery.add_argument(
+        "--journal",
+        required=True,
+        help="New owner-approval journal authorizing this exact recovery-delivery action",
+    )
+    delivery.add_argument(
+        "--implementation-request-journal",
+        dest="implementation_request_journal",
+        required=True,
+        help="The unchanged original implementation_request anchor to deliver",
+    )
+    delivery.add_argument(
+        "--retry-of-action-id",
+        dest="retry_of_action_id",
+        required=True,
+        help="Exact prior pair-recovery action whose fenced delivery was proven zero-send",
+    )
+    delivery.add_argument(
+        "--prior-zero-send-journal",
+        dest="prior_zero_send_journal",
+        required=True,
+        help="Durable outcome journal recording typed/send 0 for the prior action",
+    )
+    delivery.add_argument(
+        "--execute",
+        action="store_true",
+        help="Perform one guarded, fenced delivery attempt (default: preflight only)",
+    )
+    add_repo_option(delivery)
+    delivery.add_argument("--json", action="store_true")
+    delivery.set_defaults(func=cmd_sublane_recover_pair_delivery)
+
 
 __all__ = (
     "BLOCK_CLOSE_FAILED",
@@ -659,11 +915,15 @@ __all__ = (
     "REDISPATCH_UNCERTAIN",
     "HibernatedPairRecoveryOps",
     "RecoverPairOutcome",
+    "RecoverPairDeliveryRetryOutcome",
+    "RecoverPairDeliveryRetryRequest",
     "RecoverPairPreflight",
     "RecoverPairRequest",
     "SlotPlan",
     "SublaneRecoverPairUseCase",
+    "SublaneRecoverPairDeliveryUseCase",
     "cmd_sublane_recover_pair",
+    "cmd_sublane_recover_pair_delivery",
     "format_recover_pair_text",
     "register_sublane_recover_pair_parser",
 )

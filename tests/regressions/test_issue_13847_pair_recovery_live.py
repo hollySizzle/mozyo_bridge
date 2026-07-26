@@ -25,6 +25,10 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 
 from mozyo_bridge.core.state.dispatch_outbox_fence import (
     DispatchOutboxFence,
+    FENCE_DELIVERED,
+    FENCE_RESERVED,
+    FENCE_UNCERTAIN,
+    FenceKey,
     dispatch_outbox_fence_path,
 )
 from mozyo_bridge.core.state.herdr_identity_attestation import (
@@ -35,15 +39,25 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
 from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
     BINDING_RESERVED,
 )
-from mozyo_bridge.core.state.lane_lifecycle import DISPOSITION_HIBERNATED
+from mozyo_bridge.core.state.lane_lifecycle import (
+    DISPOSITION_ACTIVE,
+    DISPOSITION_HIBERNATED,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+    recovery_anchor_delivery_live as delivery_live,
     sublane_hibernated_pair_recovery_live as live,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
     REDISPATCH_ALREADY,
     REDISPATCH_DELIVERED,
+    REDISPATCH_FAILED,
     REDISPATCH_UNCERTAIN,
     SlotPlan,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
+    DETAIL_OK,
+    DISPOSITION_STARTED,
+    RecoveryAnchorDeliveryOutcome,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
@@ -60,8 +74,14 @@ _WS = "wsA"
 _LANE = "issue_13847_x"
 
 
-def _row(name, locator, *, status="idle", cwd="/wt"):
-    return {"name": name, "pane_id": locator, "agent_status": status, "cwd": cwd}
+def _row(name, locator, *, status="idle", cwd="/wt", revision="7"):
+    return {
+        "name": name,
+        "pane_id": locator,
+        "agent_status": status,
+        "cwd": cwd,
+        "revision": revision,
+    }
 
 
 def _ops(tmp, **kw):
@@ -200,12 +220,15 @@ class RedispatchExactlyOnce(unittest.TestCase):
             gw_name = encode_assigned_name(_WS, "codex", _LANE)
             sends = []
 
-            def _dispatch(self, **kw):
-                sends.append(kw)
-                return 0
+            def _deliver(self, request):
+                sends.append(request)
+                return RecoveryAnchorDeliveryOutcome(
+                    disposition=DISPOSITION_STARTED,
+                    detail=DETAIL_OK,
+                )
 
             with patch.object(live, "list_herdr_agent_rows", return_value=[_row(gw_name, "wZ:p3G")]), \
-                 patch.object(live.HerdrSublaneActuatorOps, "dispatch_implementation_request", _dispatch):
+                 patch.object(delivery_live.LiveRecoveryAnchorDeliveryService, "deliver", _deliver):
                 first = ops.redispatch_to_gateway(
                     action_id="recover-pair:13847:issue_13847_x:3:2", gateway_assigned_name=gw_name,
                     issue="13847", lane=_LANE, journal="79612", workspace_id=_WS,
@@ -218,7 +241,7 @@ class RedispatchExactlyOnce(unittest.TestCase):
             self.assertEqual(second, REDISPATCH_ALREADY)
             self.assertEqual(len(sends), 1, "the fence must permit exactly one gateway send")
             # The send targeted the live gateway locator.
-            self.assertEqual(sends[0]["gateway_pane"], "wZ:p3G")
+            self.assertEqual(sends[0].target_locator, "wZ:p3G")
 
     def test_no_live_gateway_is_uncertain_never_delivered(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -231,7 +254,7 @@ class RedispatchExactlyOnce(unittest.TestCase):
                     action_id="a", gateway_assigned_name=gw_name, issue="13847",
                     lane=_LANE, journal="79612", workspace_id=_WS,
                 )
-            self.assertEqual(result, REDISPATCH_UNCERTAIN)
+            self.assertEqual(result, REDISPATCH_FAILED)
 
     def test_unbootstrapped_fence_is_uncertain_never_sends(self):
         # R1-F2: the recovery must NOT bootstrap a missing fence. An absent / never-bootstrapped
@@ -243,8 +266,8 @@ class RedispatchExactlyOnce(unittest.TestCase):
             gw_name = encode_assigned_name(_WS, "codex", _LANE)
             sends = []
             with patch.object(live, "list_herdr_agent_rows", return_value=[_row(gw_name, "wZ:p3G")]), \
-                 patch.object(live.HerdrSublaneActuatorOps, "dispatch_implementation_request",
-                              lambda self, **kw: sends.append(kw) or 0):
+                 patch.object(delivery_live.LiveRecoveryAnchorDeliveryService, "deliver",
+                              lambda self, request: sends.append(request)):
                 result = ops.redispatch_to_gateway(
                     action_id="a", gateway_assigned_name=gw_name, issue="13847",
                     lane=_LANE, journal="79612", workspace_id=_WS,
@@ -253,6 +276,105 @@ class RedispatchExactlyOnce(unittest.TestCase):
             self.assertEqual(sends, [], "an un-bootstrapped fence must never send")
             # The recovery must NOT have created the fence store (no auto-bootstrap).
             self.assertFalse(fence.is_bootstrapped(), "recovery must not bootstrap the fence")
+
+    def test_explicit_retry_preserves_prior_row_and_delivers_under_new_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fence = DispatchOutboxFence(path=dispatch_outbox_fence_path(Path(tmp)))
+            fence.bootstrap()
+            approval = "88159"
+            ops = _ops(tmp, fence=fence, request_journal=approval)
+            gw_name = encode_assigned_name(_WS, "codex", _LANE)
+            prior_action = "recover-pair:13847:issue_13847_x:3:2"
+            new_action = "recovery-delivery-new"
+            prior_key = FenceKey(
+                workspace_id=_WS,
+                lane_id=_LANE,
+                issue="13847",
+                journal="79612",
+                action_id=prior_action,
+                target_assigned_name=gw_name,
+            )
+            self.assertTrue(fence.reserve(prior_key).won)
+            record = SimpleNamespace(
+                lane_disposition=DISPOSITION_ACTIVE,
+                issue_id="13847",
+            )
+            pair = SimpleNamespace(
+                ok=True,
+                gateway=SimpleNamespace(provider="codex", assigned_name=gw_name),
+            )
+            started = RecoveryAnchorDeliveryOutcome(
+                disposition=DISPOSITION_STARTED,
+                detail=DETAIL_OK,
+            )
+            with patch.object(live, "LaneLifecycleStore",
+                              return_value=SimpleNamespace(get=lambda key: record)), \
+                    patch.object(live, "read_declared_pin_pair", return_value=pair), \
+                    patch.object(live, "list_herdr_agent_rows",
+                                 return_value=[_row(gw_name, "wZ:p3G")]), \
+                    patch.object(
+                        delivery_live.LiveRecoveryAnchorDeliveryService,
+                        "deliver",
+                        return_value=started,
+                    ), patch.object(
+                        delivery_live.LiveRecoveryAnchorDeliveryService,
+                        "ready",
+                        return_value=True,
+                    ):
+                result = ops.retry_redispatch_to_gateway(
+                    action_id=new_action,
+                    retry_of_action_id=prior_action,
+                    issue="13847",
+                    lane=_LANE,
+                    journal="79612",
+                    approval_journal=approval,
+                    prior_zero_send_journal="88148",
+                    workspace_id=_WS,
+                )
+            new_key = FenceKey(
+                workspace_id=_WS,
+                lane_id=_LANE,
+                issue="13847",
+                journal="79612",
+                action_id=new_action,
+                target_assigned_name=gw_name,
+            )
+            self.assertEqual(result, REDISPATCH_DELIVERED)
+            self.assertEqual(fence.state_of(prior_key), FENCE_RESERVED)
+            self.assertEqual(fence.state_of(new_key), FENCE_DELIVERED)
+
+    def test_system_exit_after_reserve_becomes_uncertain_not_reserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fence = DispatchOutboxFence(path=dispatch_outbox_fence_path(Path(tmp)))
+            fence.bootstrap()
+            ops = _ops(tmp, fence=fence)
+            gw_name = encode_assigned_name(_WS, "codex", _LANE)
+            action = "a"
+            with patch.object(live, "list_herdr_agent_rows",
+                              return_value=[_row(gw_name, "wZ:p3G")]), \
+                    patch.object(
+                        delivery_live.LiveRecoveryAnchorDeliveryService,
+                        "deliver",
+                        side_effect=SystemExit(2),
+                    ):
+                result = ops.redispatch_to_gateway(
+                    action_id=action,
+                    gateway_assigned_name=gw_name,
+                    issue="13847",
+                    lane=_LANE,
+                    journal="79612",
+                    workspace_id=_WS,
+                )
+            key = FenceKey(
+                workspace_id=_WS,
+                lane_id=_LANE,
+                issue="13847",
+                journal="79612",
+                action_id=action,
+                target_assigned_name=gw_name,
+            )
+            self.assertEqual(result, REDISPATCH_UNCERTAIN)
+            self.assertEqual(fence.state_of(key), FENCE_UNCERTAIN)
 
 
 class AttestationReadFailClosed(unittest.TestCase):
