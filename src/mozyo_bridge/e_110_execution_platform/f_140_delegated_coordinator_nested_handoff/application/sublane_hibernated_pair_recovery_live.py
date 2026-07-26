@@ -39,6 +39,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     evaluate_attestation,
 )
+from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
+    selected_attestation_store_is_v1,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_HIBERNATED,
     LaneLifecycleError,
@@ -62,6 +65,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REDISPATCH_TARGET_RETIRING,
     REDISPATCH_UNCERTAIN,
     HibernatedPairRecoveryOps,
+    SlotPlan,
     SublaneRecoverPairUseCase,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
@@ -91,6 +95,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     COMMAND_TIMEOUT_SECONDS,
     Runner,
 )
+from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 _STATUS_KEYS = ("agent_status", "status", "state")
 
@@ -313,14 +318,33 @@ class LiveHibernatedPairRecoveryOps:
 
     # -- relaunch (heal: adopt healthy, relaunch closed) -------------------------------
 
-    def relaunch_pair(self, *, action_id: str) -> bool:
+    def relaunch_pair(self, *, action_id: str, slots: Tuple[SlotPlan, ...]) -> bool:
         try:
-            HerdrSublaneActuatorOps(
-                repo_root=self.repo_root, lane_label=_norm(self.request_lane),
-                issue=_norm(self.request_issue), journal=_norm(self.request_journal),
-                env=self.env, runner=self.runner, timeout=self.timeout,
-                replacement_action_id=_norm(action_id),
-            ).heal_lane_column(str(self.repo_root))
+            if selected_attestation_store_is_v1(mozyo_bridge_home()):
+                for slot in slots:
+                    if not (
+                        _norm(slot.provider)
+                        and _norm(slot.assigned_name)
+                        and _norm(slot.declared_locator)
+                    ):
+                        return False
+                    HerdrSublaneActuatorOps(
+                        repo_root=self.repo_root, lane_label=_norm(self.request_lane),
+                        issue=_norm(self.request_issue), journal=_norm(self.request_journal),
+                        env=self.env, runner=self.runner, timeout=self.timeout,
+                        replacement_action_id=_norm(action_id),
+                        replacement_assigned_name=_norm(slot.assigned_name),
+                        replacement_old_locator=_norm(slot.declared_locator),
+                    ).heal_lane_column(
+                        str(self.repo_root), target_provider=_norm(slot.provider)
+                    )
+            else:
+                HerdrSublaneActuatorOps(
+                    repo_root=self.repo_root, lane_label=_norm(self.request_lane),
+                    issue=_norm(self.request_issue), journal=_norm(self.request_journal),
+                    env=self.env, runner=self.runner, timeout=self.timeout,
+                    replacement_action_id=_norm(action_id),
+                ).heal_lane_column(str(self.repo_root))
         except Exception:  # noqa: BLE001 - a fixed relaunch failure
             return False
         return True

@@ -64,8 +64,8 @@ class _Record:
     updated_at: str = "2026-07-16T00:00:00+00:00"
     declared_pins: tuple = field(
         default_factory=lambda: (
-            _Pin(GATEWAY_ROLE, "codex"),
-            _Pin(WORKER_ROLE, "claude"),
+            _Pin(GATEWAY_ROLE, "codex", locator="wZ:pOldG"),
+            _Pin(WORKER_ROLE, "claude", locator="wZ:pOldH"),
         )
     )
 
@@ -104,6 +104,7 @@ class _FakeOps:
         self._redispatch = redispatch
         self.closed = []
         self.relaunched = False
+        self.relaunch_slots = ()
         self.redispatched = None
 
     def workspace_id(self):
@@ -121,8 +122,9 @@ class _FakeOps:
         self.closed.append((role, locator, action_id))
         return True
 
-    def relaunch_pair(self, *, action_id):
+    def relaunch_pair(self, *, action_id, slots):
         self.relaunched = True
+        self.relaunch_slots = slots
         return self._relaunch_ok
 
     def redispatch_to_gateway(self, **kw):
@@ -217,6 +219,9 @@ class Actuation(unittest.TestCase):
         self.assertEqual(out.closed_roles, (WORKER_ROLE,))
         self.assertEqual([c[0] for c in ops.closed], [WORKER_ROLE], "gateway must NOT be closed")
         self.assertTrue(ops.relaunched)
+        self.assertEqual(len(ops.relaunch_slots), 1)
+        self.assertEqual(ops.relaunch_slots[0].provider, "claude")
+        self.assertEqual(ops.relaunch_slots[0].declared_locator, "wZ:pOldH")
         self.assertEqual(out.redispatch, REDISPATCH_DELIVERED)
         # Redispatch targets the gateway assigned name.
         self.assertIn("gateway_assigned_name", ops.redispatched)
@@ -314,6 +319,10 @@ class PartialCloseReplay(unittest.TestCase):
         # Only the still-live worker is closed; the absent gateway is NOT closed (no locator).
         self.assertEqual([c[0] for c in ops.closed], [WORKER_ROLE])
         self.assertTrue(ops.relaunched, "the vanished slot must be relaunched")
+        self.assertEqual(
+            [(slot.provider, slot.declared_locator) for slot in ops.relaunch_slots],
+            [("codex", "wZ:pOldG"), ("claude", "wZ:pOldH")],
+        )
 
     def test_replay_after_full_relaunch_failure_both_absent_relaunches(self):
         # A prior run closed both then relaunch failed: on replay both are absent. The recovery

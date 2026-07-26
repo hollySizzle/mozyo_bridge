@@ -108,6 +108,7 @@ class SlotPlan:
     role: str
     provider: str
     assigned_name: str
+    declared_locator: str
     locator: str
     disposition: str
 
@@ -120,6 +121,7 @@ class SlotPlan:
             "role": self.role,
             "provider": self.provider,
             "assigned_name": self.assigned_name,
+            "declared_locator": self.declared_locator,
             "locator": self.locator,
             "disposition": self.disposition,
             "recovers": self.recovers,
@@ -274,7 +276,7 @@ class HibernatedPairRecoveryOps(Protocol):
         self, *, role: str, provider: str, assigned_name: str, locator: str, action_id: str
     ) -> bool: ...
 
-    def relaunch_pair(self, *, action_id: str) -> bool: ...
+    def relaunch_pair(self, *, action_id: str, slots: Tuple[SlotPlan, ...]) -> bool: ...
 
     def redispatch_to_gateway(
         self,
@@ -331,6 +333,7 @@ class SublaneRecoverPairUseCase:
             role=role,
             provider=provider,
             assigned_name=_norm(assigned_name),
+            declared_locator=_norm(getattr(pin, "locator", "")),
             locator=_norm(live_locator),
             disposition=decide_slot_recovery(observation),
         )
@@ -458,7 +461,9 @@ class SublaneRecoverPairUseCase:
                 )
             closed.append(slot.role)
 
-        if recover_slots and not self.ops.relaunch_pair(action_id=action_id):
+        if recover_slots and not self.ops.relaunch_pair(
+            action_id=action_id, slots=tuple(recover_slots)
+        ):
             return RecoverPairOutcome(
                 executed=True, preflight=preflight, issue=issue, lane=lane,
                 closed_roles=tuple(closed), detail=BLOCK_RELAUNCH_FAILED,

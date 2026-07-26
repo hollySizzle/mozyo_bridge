@@ -40,6 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REDISPATCH_ALREADY,
     REDISPATCH_DELIVERED,
     REDISPATCH_UNCERTAIN,
+    SlotPlan,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
@@ -296,6 +297,95 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
                     locator="wZ:p3H", action_id="a",
                 )
             self.assertTrue(ok, "a positively-absent exact slot is byte-preserving, not a failure")
+
+    def test_v1_relaunch_carries_exact_role_binding_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ops = _ops(tmp)
+            calls = []
+
+            class _FakeActuator:
+                def __init__(self, **kw):
+                    self.kw = kw
+
+                def heal_lane_column(self, worktree_path, target_provider=None):
+                    calls.append((self.kw, worktree_path, target_provider))
+
+            slots = (
+                SlotPlan(
+                    role="gateway", provider="codex",
+                    assigned_name=encode_assigned_name(_WS, "codex", _LANE),
+                    declared_locator="wZ:pOldG", locator="", disposition="recover_absent",
+                ),
+                SlotPlan(
+                    role="worker", provider="claude",
+                    assigned_name=encode_assigned_name(_WS, "claude", _LANE),
+                    declared_locator="wZ:pOldH", locator="wZ:p3H",
+                    disposition="recover_bad_generation",
+                ),
+            )
+            with patch.object(live, "selected_attestation_store_is_v1", return_value=True), \
+                 patch.object(live, "HerdrSublaneActuatorOps", _FakeActuator):
+                ok = ops.relaunch_pair(action_id="recover-a", slots=slots)
+
+            self.assertTrue(ok)
+            self.assertEqual([call[2] for call in calls], ["codex", "claude"])
+            self.assertEqual(
+                [
+                    (
+                        call[0]["replacement_action_id"],
+                        call[0]["replacement_assigned_name"],
+                        call[0]["replacement_old_locator"],
+                    )
+                    for call in calls
+                ],
+                [
+                    ("recover-a", slots[0].assigned_name, "wZ:pOldG"),
+                    ("recover-a", slots[1].assigned_name, "wZ:pOldH"),
+                ],
+            )
+
+    def test_v2_relaunch_preserves_single_unscoped_heal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ops = _ops(tmp)
+            calls = []
+
+            class _FakeActuator:
+                def __init__(self, **kw):
+                    self.kw = kw
+
+                def heal_lane_column(self, worktree_path, target_provider=None):
+                    calls.append((self.kw, worktree_path, target_provider))
+
+            slot = SlotPlan(
+                role="worker", provider="claude",
+                assigned_name=encode_assigned_name(_WS, "claude", _LANE),
+                declared_locator="wZ:pOldH", locator="", disposition="recover_absent",
+            )
+            with patch.object(live, "selected_attestation_store_is_v1", return_value=False), \
+                 patch.object(live, "HerdrSublaneActuatorOps", _FakeActuator):
+                ok = ops.relaunch_pair(action_id="recover-a", slots=(slot,))
+
+            self.assertTrue(ok)
+            self.assertEqual(len(calls), 1)
+            self.assertIsNone(calls[0][2])
+            self.assertEqual(calls[0][0]["replacement_action_id"], "recover-a")
+            self.assertNotIn("replacement_assigned_name", calls[0][0])
+            self.assertNotIn("replacement_old_locator", calls[0][0])
+
+    def test_v1_missing_binding_context_fails_before_heal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ops = _ops(tmp)
+            slot = SlotPlan(
+                role="worker", provider="claude",
+                assigned_name=encode_assigned_name(_WS, "claude", _LANE),
+                declared_locator="", locator="", disposition="recover_absent",
+            )
+            with patch.object(live, "selected_attestation_store_is_v1", return_value=True), \
+                 patch.object(live, "HerdrSublaneActuatorOps") as actuator:
+                ok = ops.relaunch_pair(action_id="recover-a", slots=(slot,))
+
+            self.assertFalse(ok)
+            actuator.assert_not_called()
 
 
 if __name__ == "__main__":
