@@ -815,10 +815,23 @@ Table naming:
           防ぐべき欠陥)。identity derive と authority が entangle しているため、git-kind derive への切替は destructive 挙動を
           変える per-surface 設計判断であり、別 review を要する。**共有 probe は generic authority guard へ統合しない** (design
           answer j#81046 Decision 4): 各 surface が identity family と fail-closed 条件を自分で決める。#14478 でも本 carve-out は
-          維持した。副次的に、この collapse は **#14478 以前に `dl_` で mis-bind された既存 live row の public な収束経路**でもある:
-          `--repo` と `--worktree` の双方を lane worktree に向けた `sublane retire` は同じ `dl_` を derive するため attestation が成立し、
-          retire 後の再 create が canonical `wt_` を宣言し直す (raw DB 修復も guard 緩和も不要。実測: `attest_retire_target` が
-          lane-worktree anchor で `attested=True`、primary-checkout anchor で `worktree_binding_mismatch`)。
+          維持した。
+        - ★**#14478 以前に `dl_` で mis-bind された既存 live row に、in-place で rebind する public rail は無い** (review j#88645 F1)。
+          measured なのは **identity axis 1 本だけ**である: `--repo` と `--worktree` の双方を lane worktree に向けると
+          destructive retire は row と同じ `dl_` を derive するため `attest_retire_target` が `attested=True` を返し、
+          primary-checkout anchor では `worktree_binding_mismatch` になる。**これを収束経路と読んではならない。**
+          `sublane retire` は `decide_retire_integration` の **hard invariant `issue_closed` を含む** 全 invariant
+          (`target_identity_known` / `issue_closed` / `callbacks_drained` / `durable_record_recorded` / `verification_passed` /
+          `latest_generation_admissible`) を無条件に要求し、これらは policy field で無効化できない (config schema に key が無い)。
+          つまり retire は **issue close 後の terminal cleanup** であって rebind 機構ではなく、**再 create を伴わない**。
+          open issue の lane は `issue_not_closed` で block されるため、mis-bound な open row は **fail-closed のまま残る**のが
+          現契約の帰結である。修正版の live 検証は、この row を handover するのではなく **canonical `wt_` を持つ fresh lane**
+          (例: #14478 実装 lane) で行う。同一 issue 内で open row を handover する public rail を主張するなら、
+          identity axis だけでなく **当該 surface の全 preflight を実測してから**別途記載すること (regression:
+          `test_issue_14478_linked_worktree_declaration_identity.py::RetireIsNotARebindRailTests` が
+          「identity が合っても open issue は `issue_not_closed` で block」「`merge_on_retire` opt-out でも invariant は緩まない」を
+          pin し、全 invariant を満たした control が `retire_ok` に届くことで非空虚性を担保する) — 1 axis の green を
+          rail 全体の green として書かない。
       - ★**bound-signature block は typed sub-reason で報告する** (#13933 R7、design answer j#81046 Decision 2)。
         `not_hibernated_released_bound_pins_empty` は独立 axis の連言 (hibernated / issue-bound / issue 一致 / non-project /
         worktree identity 非空 / identity 一致 / released / replacement settled / pins) であり、collapse した単一 token は

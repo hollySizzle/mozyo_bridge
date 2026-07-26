@@ -436,6 +436,96 @@ class DivergentBindingIsStillNeverOverwrittenTests(_RealWorktreeFixture):
         self.assertEqual(self._row().worktree_identity, bound)  # untouched
 
 
+class RetireIsNotARebindRailTests(unittest.TestCase):
+    """A green identity axis is not a green retire rail (review j#88645 F1).
+
+    The first version of this issue's design-doc note read the retire family's deliberate
+    #13754 token collapse as a *convergence path* for rows already mis-bound to a ``dl_``
+    token: run the retire from the lane worktree, then re-create. Only the identity axis had
+    been measured. `decide_retire_integration` additionally enforces invariants that no
+    policy field can disable — among them ``issue_closed`` — so retire is terminal cleanup
+    AFTER close, never a rebind, and an open issue's lane is refused outright.
+
+    These pin the gap between the two so the retracted claim cannot be re-derived from the
+    identity measurement alone.
+    """
+
+    def _preflight(self, **overrides):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+            RetirePreflight,
+        )
+
+        # Every invariant satisfied, so a block below is attributable to the one axis the
+        # test flips. `latest_generation_admissible` defaults to False (fail-closed), so it
+        # must be set explicitly or the control below can never reach RETIRE_OK and the
+        # blocking assertions would pass vacuously.
+        facts = dict(
+            target_identity_known=True,
+            verification_passed=True,
+            issue_closed=True,
+            callbacks_drained=True,
+            durable_record_recorded=True,
+            latest_generation_admissible=True,
+            is_git_workspace=True,
+            worktree_dirty=False,
+            integration_branch_resolved=True,
+            merge_conflict=False,
+        )
+        facts.update(overrides)
+        return RetirePreflight(**facts)
+
+    def _decide(self, **overrides):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+            SublaneIntegrationPolicy,
+            decide_retire_integration,
+        )
+
+        return decide_retire_integration(
+            SublaneIntegrationPolicy(merge_on_retire=False),
+            self._preflight(**overrides),
+        )
+
+    def test_an_open_issue_blocks_the_retire_regardless_of_worktree_identity(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+            BLOCKED_ISSUE_NOT_CLOSED,
+            INTEGRATION_BLOCKED,
+        )
+
+        decision = self._decide(issue_closed=False)
+        self.assertEqual(decision.state, INTEGRATION_BLOCKED)
+        self.assertIn(BLOCKED_ISSUE_NOT_CLOSED, decision.blocked_reasons)
+
+    def test_the_issue_closed_invariant_is_not_disableable_by_the_merge_opt_out(self) -> None:
+        # `merge_on_retire=False` is the ONLY opt-out the policy carries, and it governs the
+        # merge gate alone. If it could also relax the invariants, "retire it from the lane
+        # worktree" would become a real rebind rail and the retracted note would be true.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+            BLOCKED_ISSUE_NOT_CLOSED,
+            SublaneIntegrationPolicy,
+            decide_retire_integration,
+        )
+
+        for merge_on_retire in (True, False):
+            decision = decide_retire_integration(
+                SublaneIntegrationPolicy(
+                    merge_on_retire=merge_on_retire, integration_branch="main"
+                ),
+                self._preflight(issue_closed=False),
+            )
+            self.assertIn(
+                BLOCKED_ISSUE_NOT_CLOSED, decision.blocked_reasons, merge_on_retire
+            )
+
+    def test_a_fully_closed_lane_still_retires(self) -> None:
+        # The control: the block above is the `issue_closed` axis specifically, not a fixture
+        # that can never reach RETIRE_OK.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+            RETIRE_OK,
+        )
+
+        self.assertEqual(self._decide().state, RETIRE_OK)
+
+
 class DeclarationWriterSurfaceContractTests(unittest.TestCase):
     """The anchor is gone from the writers structurally, not just by convention.
 
