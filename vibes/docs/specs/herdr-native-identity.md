@@ -368,6 +368,20 @@ flow:
    target が unreadable / unsupported、launcher が capability を advertise しない場合はすべて
    fail-closed (unprovable は compatible でない)。config が存在しない repo は parse する対象が無いので
    admit する (この check 以前に動いていた case を defect 無しに壊さない)。
+   **launch-generation protocol conjunct (Redmine #14203)**: 上の 4 conjunct はいずれも launcher が
+   attestation を「書ける」ことを検証するが、parent の launch-generation finalize が join する
+   `attestation_write_succeeded` startup execution event を wrapper が **emit するか**については何も
+   述べない。`agent-attest` と一致する attestation schema を持ちながらこの event を持たない launcher は
+   4 conjunct すべてを通過し、parent が generation を `pending` 予約 → pair 起動 → **actuation 後に初めて**
+   finalize 不能が判明して generation が固定化し、#14203 の gateway recovery 自体を塞ぐ。したがって
+   generation protocol は attestation schema から推定せず **独立の conjunct** として advertise / 判定する:
+   epilog は `mozyo_generation_protocol_capability=<wire version>` を wrap-proof token で出し、preflight は
+   step 1 で読んだ同一 advertisement から (追加 probe 無しで) exact version 一致を要求する。判定は
+   conjunction の **最後**に置く — attestation 系 conjunct も落とす launcher は、より基底であるそちらの理由で
+   拒否されるべきだからである。この conjunct を reserve boundary (`prepare_session`) だけに置くと、
+   `sublane create` の pre-worktree gate を通過して worktree を作った後で拒否することになり、
+   close condition 1 (worktree を残さず拒否) が破れる。conjunct を 2 boundary の片方にしか置かないと
+   live failure として再出現する、という本 conjunction の存在理由がそのまま当てはまる。
 5. idempotency: 対象 slot の mzb1 名を既に持つ live agent があれば **adopt** (再 launch しない)。
    ただし adopt は live name-match だけでは足りず、その live locator に **generation-bind した
    `present` startup self-attestation record** (§2 / #13637) が必要である。record 不在 (legacy /

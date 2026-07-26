@@ -883,6 +883,48 @@ def _err(argv, message: str) -> "subprocess.CompletedProcess[str]":
     return subprocess.CompletedProcess(list(argv), 1, stdout="", stderr=message)
 
 
+def attest_capability_epilog(*, include_generation: bool = True) -> str:
+    """The launcher-capability epilog a fake ``agent-attest --help`` answers with.
+
+    The one producer every fake launcher shares, for the reason Redmine #14258 gave the
+    production side one: a hand-rolled epilog advertises whatever token set existed when it
+    was written, so the moment a conjunct is added upstream the fake silently degrades into
+    an *incapable* launcher and its test fails for a reason nobody changed.
+
+    ``include_generation=False`` is the Redmine #14203 F1 negative control — a launcher whose
+    attestation schema / store contract landed but that predates the generation-protocol
+    event. It is produced by **subtracting** that one section from the canonical epilog, never
+    by re-composing a shorter one: a hand-rolled negative control also drops every token added
+    since it was written, so the launch fails closed on the first missing conjunct and the
+    capable/incapable contrast stops isolating the generation protocol.
+    """
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
+        GENERATION_PROTOCOL_CAPABILITY_PREFIX,
+        build_attest_capability_epilog,
+    )
+
+    epilog = build_attest_capability_epilog()
+    if include_generation:
+        return epilog
+    kept: list = []
+    dropped = 0
+    for line in epilog.splitlines():
+        if line.startswith(GENERATION_PROTOCOL_CAPABILITY_PREFIX):
+            dropped += 1
+            kept.pop()  # the section header sitting immediately above the token
+            continue
+        kept.append(line)
+    # The subtraction must have found its target: if the canonical epilog ever stops
+    # carrying the token, an unchanged fixture would advertise a fully CAPABLE launcher
+    # while still claiming to be the negative control — a vacuously passing contrast.
+    if dropped != 1:
+        raise AssertionError(
+            "expected exactly one generation-protocol capability token in the canonical "
+            f"epilog to subtract, found {dropped}"
+        )
+    return "\n".join(kept)
+
+
 __all__ = (
     "DEFAULT_START_STATUS",
     "FakeHerdr",
@@ -895,4 +937,5 @@ __all__ = (
     "UnknownHerdrCommandError",
     "WAIT_ABSENT_MESSAGE",
     "WAIT_TIMEOUT_MESSAGE",
+    "attest_capability_epilog",
 )

@@ -957,7 +957,8 @@ class _V1AttestingHerdr(_AttestingHerdr):
                 stdout=(
                     "usage: mozyo-bridge herdr agent-attest --assigned-name NAME\n"
                     # Redmine #14258: rendered by the canonical composer rather than
-                    # copied literals, which fell behind when a token was added.
+                    # copied literals, which fell behind when a token was added — which is
+                    # how this fake picks up #14203's generation-protocol token unedited.
                     + _capability_epilog()
                 ),
                 stderr="",

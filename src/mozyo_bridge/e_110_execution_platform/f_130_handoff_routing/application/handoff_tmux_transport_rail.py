@@ -400,6 +400,34 @@ class TmuxTransportRailUseCase:
             ops.capture(request.target, landing_lines) if standard_rail else None
         )
 
+        # Redmine #14203 (design j#87409, B-constrained): on the herdr queue-enter rail, arm an
+        # OBSERVATION-ONLY ``working``-transition wait BEFORE the first Enter, so an immediate
+        # start -> turn_ended is captured durably even when the post-choreography snapshot only
+        # ever sees the settled state. The wait never gates ``status`` / ``reason`` /
+        # ``next_action_owner``, and the injection / Enter / Enter-only-retry choreography
+        # below stays untouched (no double input). Ops without the seam (legacy fakes) are
+        # silently unarmed — the observation is additive telemetry only.
+        # Redmine #14203 review j#87418 F1: the `working` observation is only generation-COHERENT
+        # if the gateway process did NOT change across the arm/Enter/collect window. Capture the
+        # generation-bound gateway binding BEFORE arming (the pre-generation), so a post-collect
+        # re-read can confirm it is the SAME process — a same-name/-locator recycle mid-window
+        # would otherwise let an old process's `working` event pair with a new process's binding.
+        queue_enter_armed_wait = None
+        queue_enter_pre_binding = None
+        if request.herdr_send and request.mode == MODE_QUEUE_ENTER:
+            _bind = getattr(ops, "observe_queue_enter_gateway_binding", None)
+            if _bind is not None:
+                try:
+                    queue_enter_pre_binding = _bind(request.target)
+                except Exception:  # noqa: BLE001 - observation-only; never breaks the send
+                    queue_enter_pre_binding = None
+            _arm = getattr(ops, "arm_queue_enter_turn_wait", None)
+            if _arm is not None:
+                try:
+                    queue_enter_armed_wait = _arm(request.target)
+                except Exception:  # noqa: BLE001 - observation-only; never breaks the send
+                    queue_enter_armed_wait = None
+
         ops.press_enter(request.target)
         enter_attempts = 1
 
@@ -482,9 +510,46 @@ class TmuxTransportRailUseCase:
         # `None`).
         queue_enter_observation: Optional[dict] = None
         if request.herdr_send and request.mode == MODE_QUEUE_ENTER:
+            # #14203 j#87409: collect the observation-only armed wait FIRST (also reaps the
+            # non-blocking wait subprocess), then capture the action-time gateway process
+            # binding. Both are additive versioned telemetry on the persisted observation —
+            # never consulted for status / reason; only the gateway recovery reads them.
+            queue_enter_wait_kind = None
+            if queue_enter_armed_wait is not None:
+                _collect = getattr(ops, "collect_queue_enter_turn_wait", None)
+                if _collect is not None:
+                    try:
+                        queue_enter_wait_kind = _collect(queue_enter_armed_wait)
+                    except Exception:  # noqa: BLE001 - observation-only
+                        queue_enter_wait_kind = None
+            # j#87418 F1: the POST-collect generation. The observed start + binding are only
+            # persisted as one generation-coherent authority when the pre-arm and post-collect
+            # generations are BOTH present and EXACTLY equal — the process did not change across
+            # the observation window. A None / mismatched pair drops BOTH the event_wait_kind and
+            # the binding (an old-process start can never pair with a new-process binding).
+            queue_enter_post_binding = None
+            _bind = getattr(ops, "observe_queue_enter_gateway_binding", None)
+            if _bind is not None:
+                try:
+                    queue_enter_post_binding = _bind(request.target)
+                except Exception:  # noqa: BLE001 - observation-only
+                    queue_enter_post_binding = None
+            generation_coherent = (
+                queue_enter_pre_binding is not None
+                and queue_enter_post_binding is not None
+                and queue_enter_pre_binding == queue_enter_post_binding
+            )
             snapshot = ops.observe_queue_enter_turn_start(request.target)
             if snapshot is not None:  # always installed under herdr; skip defensively if not
                 queue_enter_observation = snapshot.to_telemetry_dict()
+                extra = {}
+                if generation_coherent:
+                    if queue_enter_wait_kind:
+                        extra["event_wait_kind"] = queue_enter_wait_kind
+                    extra["gateway_binding"] = queue_enter_post_binding
+                if extra:
+                    extra["observation_version"] = 2
+                    queue_enter_observation = {**queue_enter_observation, **extra}
                 # Reuse the additive `turn_start_lines` record channel (appended, never overrides
                 # `next_action`); the queue-enter renderer labels itself telemetry-only.
                 turn_start_lines = queue_enter_turn_start_record_lines(snapshot)
@@ -629,6 +694,142 @@ class LiveTmuxTransportRailOps:
             read=rail.reader.read_agent_state,
             sleep=time.sleep,
         )
+
+    # -- #14203 j#87409: observation-only armed wait + gateway process binding ----------
+
+    def arm_queue_enter_turn_wait(self, target: str):
+        """Arm the OBSERVATION-ONLY herdr ``working``-transition wait (pre-Enter).
+
+        Non-blocking; the same trusted-env binary resolution the transport uses. Any
+        failure yields ``None`` (unarmed) — the send choreography is never affected.
+        """
+        import os
+
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
+            resolve_herdr_binary,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_turn_start import (  # noqa: E501
+            DEFAULT_WAIT_TIMEOUT_MS,
+            HerdrCliWaitPrimitive,
+        )
+
+        try:
+            resolution = resolve_herdr_binary(os.environ)
+            return HerdrCliWaitPrimitive(resolution.path).arm(
+                target, timeout_ms=DEFAULT_WAIT_TIMEOUT_MS
+            )
+        except Exception:  # noqa: BLE001 - observation-only; unarmed on any failure
+            return None
+
+    def collect_queue_enter_turn_wait(self, armed) -> Optional[str]:
+        """Collect the armed wait's closed result kind (``changed`` = working observed)."""
+        if armed is None:
+            return None
+        try:
+            kind = str(getattr(armed.collect(), "kind", "") or "").strip()
+            return kind or None
+        except Exception:  # noqa: BLE001 - observation-only
+            return None
+
+    def observe_queue_enter_gateway_binding(self, target: str) -> Optional[dict]:
+        """The action-time gateway process GENERATION binding for ``target`` (j#87418 F2).
+
+        A generation authority, not a loose annotation: it is emitted ONLY when a
+        ``verdict=present`` startup self-attestation exists whose workspace / lane / role /
+        assigned-name / locator ALL match the live inventory row's decoded identity + this
+        target. Any missing / non-present / mismatched axis yields ``None`` (fail-closed) —
+        so the recovery can trust ``attestation_observed_at`` as the exact generation pin.
+        Redaction-safe tokens / timestamps only.
+        """
+        import os
+
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+            VERDICT_PRESENT,
+        )
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            verified_generation_token,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            AGENT_KEY_NAME,
+            _agent_locator,
+            _norm,
+            _norm_lane,
+            decode_assigned_name,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (  # noqa: E501
+            HerdrCliAgentLister,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
+            resolve_herdr_binary,
+        )
+
+        try:
+            resolution = resolve_herdr_binary(os.environ)
+            rows = HerdrCliAgentLister(resolution.path).list_agent_rows()
+        except Exception:  # noqa: BLE001 - unreadable inventory => no binding
+            return None
+        matches = [
+            row for row in rows
+            if isinstance(row, dict) and _agent_locator(row) == _norm(target)
+        ]
+        if len(matches) != 1:
+            return None
+        row = matches[0]
+        name = _norm(row.get(AGENT_KEY_NAME))
+        decoded = decode_assigned_name(name)
+        if not decoded.ok or decoded.identity is None:
+            return None
+        identity = decoded.identity
+        revision_raw = row.get("revision")
+        row_revision = _norm(str(revision_raw)) if not isinstance(revision_raw, bool) else ""
+        # A generation-bound, verdict=present attestation whose EVERY identity axis matches the
+        # decoded live-inventory identity AND this target locator — otherwise no binding.
+        try:
+            record = HerdrIdentityAttestationStore().read(name)
+        except Exception:  # noqa: BLE001 - unreadable attestation => no binding
+            return None
+        if record is None:
+            return None
+        if not (
+            _norm(getattr(record, "verdict", "")) == VERDICT_PRESENT
+            and _norm(getattr(record, "workspace_id", "")) == _norm(identity.workspace_id)
+            and _norm_lane(getattr(record, "lane_id", "")) == _norm_lane(identity.lane_id)
+            and _norm(getattr(record, "role", "")) == _norm(identity.role)
+            and _norm(getattr(record, "assigned_name", "")) == name
+            and _norm(getattr(record, "locator", "")) == _norm(target)
+        ):
+            return None
+        observed_at = _norm(str(getattr(record, "observed_at", "") or ""))
+        # #14203 design j#87472: the COLLISION-FREE per-launch generation token is sourced
+        # from the home-scoped launch-generation store, NOT the main attestation (whose
+        # seconds-precision observed_at cannot separate two same-second launches, and which
+        # must not carry a required token onto shared v1/v2 homes). The attestation above is
+        # an INDEPENDENT health prerequisite; the token is the launch-generation authority's,
+        # verified as an attested row for this exact identity whose startup transaction is a
+        # terminally-successful participant of this gateway. A pending / superseded / tokenless
+        # generation yields NO binding — recovery then fails closed rather than trusting a
+        # non-unique timestamp.
+        startup_action_id = verified_generation_token(
+            None,
+            assigned_name=name,
+            workspace_id=identity.workspace_id,
+            role=identity.role,
+            lane_id=identity.lane_id,
+            locator=target,
+            norm=_norm,
+            norm_lane=_norm_lane,
+        )
+        if not observed_at or not startup_action_id:
+            return None
+        return {
+            "provider": identity.role,
+            "assigned_name": name,
+            "locator": _norm(target),
+            "row_revision": row_revision,
+            "attestation_observed_at": observed_at,
+            "startup_action_id": startup_action_id,
+        }
 
     def emit(
         self,

@@ -63,6 +63,7 @@ from tests.support.herdr_fake import (
     DEFAULT_START_STATUS,
     STATUS_WORKING,
     FakeHerdr,
+    attest_capability_epilog,
 )
 
 #: A herdr ``agent_status`` that :func:`classify_named_slot` reads as a #13518 shell residue
@@ -148,7 +149,7 @@ class CliResult(NamedTuple):
         return json.loads(self.stdout)
 
 
-def _attest_launcher_capability_help() -> str:
+def _attest_launcher_capability_help(*, include_generation: bool = True) -> str:
     """The exact ``<launcher> herdr agent-attest --help`` capability epilog, built canonically.
 
     A managed fresh-worker launch (Redmine #13806 heal) runs the launcher-capability
@@ -160,15 +161,23 @@ def _attest_launcher_capability_help() -> str:
     every hand-rolled copy of the epilog silently advertised an incomplete contract and failed
     closed somewhere else, looking like a launcher defect. One producer means a token added
     upstream appears here automatically.
+
+    ``include_generation=False`` reproduces the installed-launcher fault of Redmine #14203 F1:
+    a launcher whose attestation schema / store contract landed but that predates the
+    generation-protocol event — attestation-capable, generation-incapable. It is produced by
+    **subtracting** the generation section from the canonical epilog rather than re-composing a
+    shorter one, so the fixture keeps every OTHER advertised token. Hand-rolling the negative
+    control would silently drop the #14258 config-parse / lifecycle tokens too, and the launch
+    would then fail closed on the FIRST missing conjunct — refusing for a reason that is not the
+    one under test and making the capable/incapable contrast vacuous.
     """
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
         ATTEST_CAPABILITY_MARKER,
-        build_attest_capability_epilog,
     )
 
     return (
         f"usage: mozyo-bridge herdr agent-attest [{ATTEST_CAPABILITY_MARKER} ASSIGNED_NAME]\n\n"
-        + build_attest_capability_epilog()
+        + attest_capability_epilog(include_generation=include_generation)
         + "\n"
     )
 
@@ -215,6 +224,10 @@ class _HerdrRunner:
     def __init__(self, fake: FakeHerdr, herdr_bin: str, real_run, real_popen) -> None:
         self.fake = fake
         self.herdr_bin = herdr_bin
+        #: The capability epilog the attest-launcher probe answers with. Overridable to model
+        #: an installed-launcher capability fault (Redmine #14203 F1: a generation-incapable
+        #: launcher). Defaults to the canonical, fully-capable epilog.
+        self.capability_help = _attest_launcher_capability_help()
         #: The unpatched ``subprocess.run`` / ``subprocess.Popen`` captured before the
         #: driving-context patch, so a git probe against a real git-backed lane root (shape 5)
         #: runs real git instead of the non-git degrade. ``subprocess.run`` internally calls the
@@ -237,7 +250,7 @@ class _HerdrRunner:
             # installed layer runs the real binary). A compatible answer lets the launch proceed to
             # ``agent start`` exactly as the built artifact does.
             return subprocess.CompletedProcess(
-                list(argv), 0, stdout=_attest_launcher_capability_help(), stderr=""
+                list(argv), 0, stdout=self.capability_help, stderr=""
             )
         if list(argv[1:3]) == list(CONFIG_PARSE_SUBCOMMAND):
             # Redmine #14258 R4: the launcher preflight makes the candidate launcher parse the
@@ -316,6 +329,14 @@ class InstalledFaultHarness:
         #: (``--repo`` == the lane worktree), so its nested ``handoff send`` must attest as that
         #: lane's identity or the sender env fails the anchor-workspace fence (target_unavailable).
         self._identity_override: "tuple[str, str] | None" = None
+
+    def make_launcher_generation_incapable(self) -> None:
+        """Model the Redmine #14203 F1 installed-launcher fault: the resolved attest-launcher
+        advertises its attestation schema/store contract but NOT the generation protocol. A
+        managed launch's preflight must refuse it before any actuation."""
+        self._runner.capability_help = _attest_launcher_capability_help(
+            include_generation=False
+        )
 
     # -- environment ----------------------------------------------------------
 

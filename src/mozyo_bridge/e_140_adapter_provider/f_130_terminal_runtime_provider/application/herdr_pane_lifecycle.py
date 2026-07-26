@@ -66,6 +66,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     LauncherCapabilityObservation,
     TargetSchemaObservation,
     decide_config_parse_compatibility,
+    decide_generation_protocol_capability,
     decide_launcher_capability,
     decide_lifecycle_reader_compatibility,
     decide_store_compatibility,
@@ -74,6 +75,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_probe_redaction import (  # noqa: E501
     REDACTED_PROBE_PATH,
     _redact_probe_paths,
+)
+from mozyo_bridge.core.state.herdr_launch_generation import (
+    HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION,
 )
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
@@ -667,8 +671,9 @@ def preflight_launcher_compatibility(
 
     Every conjunct a selected launcher must satisfy before anything is created, in
     fail-closed order: the wrapper subcommand + advertised attestation schema (#13748 /
-    #13847), the real attestation store it will write (#13882), and the target authorities it
-    must read — the repo's config record and the shared lane lifecycle store (#14258).
+    #13847), the real attestation store it will write (#13882), the target authorities it
+    must read — the repo's config record and the shared lane lifecycle store (#14258) — and
+    the launch-generation wire protocol it must speak (#14203).
 
     It exists because the conjunction has **two** call sites with different reach, and a
     conjunct present at only one of them is a gap that reappears as a live failure. The
@@ -726,7 +731,49 @@ def preflight_launcher_compatibility(
         preflight_attest_launcher_capability(
             launcher, runner, timeout, env, repo_root=repo_root
         )
+    # 5. **generation protocol** (#14203) — decided on the advertisement read in step 1, so it
+    #    costs no extra probe. Last, which keeps the refusal precedence the #14203 review
+    #    approved: a launcher failing an attestation conjunct as well is still refused for
+    #    that, the more fundamental, reason. It belongs in the conjunction rather than at the
+    #    reserve boundary alone for the reason this function exists at all — a conjunct
+    #    present at only one call site is a gap that reappears as a live failure. Here that
+    #    gap is concrete: without it a generation-incapable launcher passes the `sublane
+    #    create` pre-worktree gate, the worktree is created, and only the later
+    #    `prepare_session` boundary refuses — leaving exactly the worktree residue #14258's
+    #    close condition 1 exists to prevent.
+    preflight_generation_protocol_capability(observation)
     return observation
+
+
+def preflight_generation_protocol_capability(
+    observation: LauncherCapabilityObservation,
+) -> None:
+    """Fail closed unless the probed launcher speaks this runtime's generation protocol.
+
+    Redmine #14203 review j#87479 F1 — the check the #13847 / #13882 attestation preflights
+    structurally cannot make. Those prove the launcher writes an attestation of a compatible
+    schema into the selected store; they say NOTHING about whether the wrapper emits the
+    ``attestation_write_succeeded`` startup execution event the parent's launch-generation
+    finalize requires. A launcher carrying ``agent-attest`` + a matching attestation schema
+    but predating that event passes both, lets the parent reserve a ``pending`` generation,
+    the pair actuates, and only then is the finalize discovered impossible — stranding the
+    generation and blocking the very gateway recovery #14203 adds.
+
+    Decided on the SAME probe observation as the attestation checks (no second subprocess),
+    and called next to them — before the caller reserves the generation and issues its first
+    ``workspace`` / ``tab`` / ``agent`` write — so an incompatible generation protocol aborts
+    with zero herdr side effect. The error is raised, never persisted, so no personal path is
+    written to a durable store.
+    """
+    verdict = decide_generation_protocol_capability(
+        observation, required_version=HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION
+    )
+    if not verdict.ok:
+        raise HerdrLauncherIncompatibleError(
+            f"managed-launch preflight refused the selected launcher's generation protocol: "
+            f"{verdict.detail}. No workspace / tab / agent was created.",
+            reason=verdict.reason,
+        )
 
 
 def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[str, object]]:
@@ -874,6 +921,7 @@ __all__ = (
     "read_target_config_text",
     "preflight_attest_launcher_capability",
     "preflight_attest_store_schema",
+    "preflight_generation_protocol_capability",
     "preflight_launcher_compatibility",
     "preflight_launcher_target_authorities",
 )

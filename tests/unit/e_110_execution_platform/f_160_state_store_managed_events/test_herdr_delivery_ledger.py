@@ -129,6 +129,47 @@ class LedgerRoundTripTest(unittest.TestCase):
         self.assertIsNone(got.queue_enter_observation)
         self.assertEqual(got.recorded_at, "2026-07-06T03:00:00+00:00")
 
+    def test_auto_recorded_at_is_microsecond_precision_and_strict_after_a_same_second_boundary(
+        self,
+    ) -> None:
+        # Redmine #14203 review j#87418 F4: the default (auto) recorded_at is stamped at
+        # MICROSECOND precision, and a record stamped within the same wall-clock second as a
+        # seconds-precision attestation boundary compares STRICTLY AFTER it. A seconds-
+        # truncated stamp flipped a confirmed #13806 redispatch to `uncertain` (the #14097
+        # harness race). Clock-fixed: the module-level `_utc_now` is patched to a deterministic
+        # microsecond instant.
+        from datetime import datetime, timezone
+
+        from mozyo_bridge.core.state import herdr_delivery_ledger as _led
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery_live import (  # noqa: E501
+            _recorded_after,
+        )
+
+        fixed = datetime(2026, 7, 6, 3, 0, 0, 123456, tzinfo=timezone.utc)
+        boundary_seconds = "2026-07-06T03:00:00+00:00"  # the attestation, same second, no micros
+        ledger = HerdrDeliveryLedger(path=self.path)
+        with patch.object(_led, "_utc_now", lambda: fixed.isoformat(timespec="microseconds")):
+            appended = ledger.append(
+                build_herdr_delivery_ledger_record(
+                    _outcome(turn_start_outcome=dict(_EVENT_TELEMETRY)), provider="claude",
+                )  # NO explicit recorded_at -> auto-stamped
+            )
+        # The stored value carries microseconds (6 fractional digits), not a seconds truncation.
+        self.assertEqual(appended.recorded_at, "2026-07-06T03:00:00.123456+00:00")
+        self.assertIn(".123456", appended.recorded_at)
+        got = ledger.records_for_marker("mkr-13296-abc")[0]
+        self.assertEqual(got.recorded_at, "2026-07-06T03:00:00.123456+00:00")
+        # The strict-after ordering the #13806 resume confirmation depends on: the microsecond
+        # record IS strictly after the same-second seconds-precision boundary (the bug: a
+        # seconds-truncated stamp would compare EQUAL, i.e. NOT strictly-after).
+        self.assertTrue(_recorded_after(got.recorded_at, boundary_seconds))
+        # A record at the exact boundary (no micros) is NOT strictly after it.
+        self.assertFalse(_recorded_after(boundary_seconds, boundary_seconds))
+        # A microsecond boundary earlier in the same second is still before the record.
+        self.assertTrue(
+            _recorded_after(got.recorded_at, "2026-07-06T03:00:00.000001+00:00")
+        )
+
     def test_status_and_reason_stored_verbatim(self) -> None:
         # A blocked/delivered_not_started outcome: the ledger stores the wire
         # (status, reason) exactly, adding no judgement of its own.

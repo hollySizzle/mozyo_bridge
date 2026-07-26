@@ -107,6 +107,24 @@ _STORES_RE = re.compile(
     r"(?:^|\s)" + re.escape(ATTEST_CAPABILITY_STORES_PREFIX) + r"(\d+(?:_\d+)*)(?=\s|$)"
 )
 
+#: The stable prefix advertising the launcher's **generation-protocol** wire version
+#: (Redmine #14203 review j#87479 F1). The #13847 tokens above prove the wrapper writes an
+#: attestation of a given schema; they say NOTHING about whether it emits the
+#: ``attestation_write_succeeded`` startup execution event the parent's launch-generation
+#: finalize requires. A launcher carrying ``agent-attest`` + a matching attestation schema
+#: but predating that event would pass the attestation preflight, let the parent reserve a
+#: pending generation, actuate, and only then be discovered un-finalizable — so the
+#: generation is advertised and decided as its OWN capability, independent of the store
+#: schema. Whitespace-/hyphen-free for the same wrap-proof reason as its siblings.
+GENERATION_PROTOCOL_CAPABILITY_PREFIX = "mozyo_generation_protocol_capability="
+
+#: Matches the advertised generation-protocol version, bounded on both sides so only a
+#: whole canonical token is credited (review j#80000 finding 3 discipline: a malformed
+#: advertisement is unprovable and must not be salvaged into a capability).
+_GENERATION_RE = re.compile(
+    r"(?:^|\s)" + re.escape(GENERATION_PROTOCOL_CAPABILITY_PREFIX) + r"(\d+)(?=\s|$)"
+)
+
 # --- Target-scoped read capability (Redmine #14258). -----------------------------------
 # The three tokens above are all about ONE authority: the attestation store the wrapper
 # writes. The launcher must also *read* two authorities it did not write, and neither is
@@ -201,6 +219,10 @@ class LauncherCapabilityObservation:
     than summarize its grammar), and ``advertised_lifecycle_versions`` — the shared lane
     lifecycle component schemas its READER understands (both Redmine #14258); each is
     ``None`` on a build predating that token, which is unprovable and therefore fails closed.
+    ``advertised_generation_protocol_version`` — the launch-generation wire protocol the
+    launcher declares (Redmine #14203), decided independently of every token above because
+    writing an attestation of a given schema does not imply emitting the
+    ``attestation_write_succeeded`` startup event the parent's finalize joins on.
     """
 
     subcommand_marker_present: bool
@@ -208,6 +230,10 @@ class LauncherCapabilityObservation:
     advertised_store_versions: Optional[frozenset] = None
     advertised_config_parse_contract: Optional[int] = None
     advertised_lifecycle_versions: Optional[frozenset] = None
+    #: The generation-protocol wire version the launcher declares (Redmine #14203 F1), or
+    #: ``None`` when it advertises none (a build predating the launch-generation event
+    #: protocol). Independent of the attestation schema above.
+    advertised_generation_protocol_version: Optional[int] = None
 
     @property
     def writable_store_versions(self) -> frozenset:
@@ -283,6 +309,9 @@ def build_attest_capability_epilog() -> str:
         HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
         RECOGNIZED_SCHEMA_VERSIONS,
     )
+    from mozyo_bridge.core.state.herdr_launch_generation import (
+        HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION,
+    )
     from mozyo_bridge.core.state.lane_lifecycle_schema import (
         readable_lane_lifecycle_versions,
     )
@@ -298,6 +327,10 @@ def build_attest_capability_epilog() -> str:
         + build_attest_capability_config_parse_line(CONFIG_PARSE_CONTRACT_VERSION)
         + "\nreadable shared lane lifecycle schema (Redmine #14258):\n"
         + build_attest_capability_lifecycle_line(readable_lane_lifecycle_versions())
+        + "\ngeneration protocol (Redmine #14203):\n"
+        + build_generation_protocol_capability_line(
+            HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION
+        )
     )
 
 
@@ -322,6 +355,17 @@ def _parse_version_set(haystack: str, pattern) -> Optional[frozenset]:
     return found.pop() if len(found) == 1 else None
 
 
+def build_generation_protocol_capability_line(protocol_version: int) -> str:
+    """The generation-protocol capability token the source ``agent-attest --help``
+    advertises (pure, Redmine #14203 F1).
+
+    Built from the generation-protocol version constant at the call site so the advertised
+    number can never drift from the protocol the wrapper actually implements. Whitespace-free
+    so ``--help`` wrapping cannot split it.
+    """
+    return f"{GENERATION_PROTOCOL_CAPABILITY_PREFIX}{int(protocol_version)}"
+
+
 def parse_launcher_capability_output(text: str) -> LauncherCapabilityObservation:
     """Parse a launcher's capability probe output into observed facts (pure).
 
@@ -344,6 +388,7 @@ def parse_launcher_capability_output(text: str) -> LauncherCapabilityObservation
     if len(schema_values) == 1:
         advertised = schema_values.pop()
     parse_contracts = {int(m) for m in _CONFIG_PARSE_RE.findall(haystack)}
+    generation_values = {int(m) for m in _GENERATION_RE.findall(haystack)}
     return LauncherCapabilityObservation(
         subcommand_marker_present=ATTEST_CAPABILITY_MARKER in haystack,
         advertised_schema_version=advertised,
@@ -352,6 +397,9 @@ def parse_launcher_capability_output(text: str) -> LauncherCapabilityObservation
             parse_contracts.pop() if len(parse_contracts) == 1 else None
         ),
         advertised_lifecycle_versions=_parse_version_set(haystack, _LIFECYCLE_RE),
+        advertised_generation_protocol_version=(
+            generation_values.pop() if len(generation_values) == 1 else None
+        ),
     )
 
 
@@ -407,6 +455,73 @@ def decide_launcher_capability(
         LAUNCHER_CAPABILITY_OK,
         f"launcher carries the agent-attest wrapper and advertises the required "
         f"attestation schema v{required}",
+    )
+
+
+# --- Generation-protocol verdict vocabulary (Redmine #14203 F1; fail-closed). ---------
+#: The launcher advertises exactly the required generation-protocol version.
+GENERATION_PROTOCOL_OK = "generation_protocol_ok"
+#: The launcher advertises NO generation-protocol contract — it predates the launch-
+#: generation event protocol (it emits no ``attestation_write_succeeded`` event). Unprovable
+#: compatibility fails closed BEFORE the generation is reserved.
+GENERATION_PROTOCOL_CONTRACT_ABSENT = "generation_protocol_contract_absent"
+#: The launcher advertises a generation-protocol version that is not the exact one this
+#: runtime finalizes against — an incompatible wire protocol, refused fail-closed.
+GENERATION_PROTOCOL_VERSION_MISMATCH = "generation_protocol_version_mismatch"
+
+
+def decide_generation_protocol_capability(
+    observation: LauncherCapabilityObservation,
+    *,
+    required_version: int,
+) -> LauncherCapabilityVerdict:
+    """Decide whether a probed launcher speaks this runtime's generation protocol (pure).
+
+    Independent of the attestation schema decision (Redmine #14203 review j#87479 F1): a
+    launcher can carry ``agent-attest`` and a matching attestation schema yet predate the
+    ``attestation_write_succeeded`` startup execution event the parent's launch-generation
+    finalize requires. Without this check that skew is invisible until AFTER the first Herdr
+    side effect — the generation is reserved, the pair actuates, and the finalize then never
+    lands, stranding the row ``pending``. Deciding it here lets the caller refuse before any
+    actuation.
+
+    Fail-closed precedence:
+
+    1. no advertised generation-protocol contract -> :data:`GENERATION_PROTOCOL_CONTRACT_ABSENT`
+       (a build predating the event protocol; unprovable fails closed);
+    2. advertised version != the required version -> :data:`GENERATION_PROTOCOL_VERSION_MISMATCH`
+       (an incompatible wire protocol; only the current marker admits);
+    3. otherwise :data:`GENERATION_PROTOCOL_OK`.
+
+    The subcommand-marker absence is left to :func:`decide_launcher_capability` (reported
+    first there); a caller runs both decisions on the same observation.
+    """
+    required = int(required_version)
+    advertised = observation.advertised_generation_protocol_version
+    if advertised is None:
+        return LauncherCapabilityVerdict(
+            False,
+            GENERATION_PROTOCOL_CONTRACT_ABSENT,
+            "the launcher carries the `herdr agent-attest` subcommand but advertises no "
+            "generation-protocol capability contract; this runtime requires generation "
+            f"protocol v{required} (the wrapper must emit the launch-generation "
+            "`attestation_write_succeeded` event), and a launcher that cannot prove it "
+            "would let a generation be reserved and the pair actuate before the finalize "
+            "is discovered impossible — stranding the generation and blocking recovery",
+        )
+    if advertised != required:
+        return LauncherCapabilityVerdict(
+            False,
+            GENERATION_PROTOCOL_VERSION_MISMATCH,
+            f"the launcher advertises generation protocol v{advertised} but this runtime "
+            f"finalizes against exactly v{required}; an incompatible generation protocol "
+            "would strand every reserved generation, so the launch is refused before any "
+            "side effect",
+        )
+    return LauncherCapabilityVerdict(
+        True,
+        GENERATION_PROTOCOL_OK,
+        f"launcher advertises the required generation protocol v{required}",
     )
 
 
@@ -833,10 +948,16 @@ __all__ = (
     "build_attest_capability_lifecycle_line",
     "decide_config_parse_compatibility",
     "decide_lifecycle_reader_compatibility",
+    "GENERATION_PROTOCOL_CAPABILITY_PREFIX",
+    "GENERATION_PROTOCOL_OK",
+    "GENERATION_PROTOCOL_CONTRACT_ABSENT",
+    "GENERATION_PROTOCOL_VERSION_MISMATCH",
     "LAUNCHER_CAPABILITY_OK",
     "LAUNCHER_SUBCOMMAND_ABSENT",
     "LAUNCHER_SCHEMA_CONTRACT_ABSENT",
     "LAUNCHER_SCHEMA_VERSION_MISMATCH",
+    "build_generation_protocol_capability_line",
+    "decide_generation_protocol_capability",
     "STORE_JOIN_OK",
     "STORE_LAUNCHER_CANNOT_WRITE",
     "STORE_MAINTENANCE_IN_PROGRESS",

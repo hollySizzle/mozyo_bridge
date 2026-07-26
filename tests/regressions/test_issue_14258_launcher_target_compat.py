@@ -305,6 +305,10 @@ class ConjunctionZeroActuationTest(unittest.TestCase):
             "preflight_attest_launcher_capability",
             "preflight_attest_store_schema",
             "preflight_launcher_target_authorities",
+            # Redmine #14203: the launch-generation protocol joined the conjunction for the
+            # same reason as the rest — at the reserve boundary alone it let a skewed
+            # launcher through this pre-worktree gate and left a worktree behind.
+            "preflight_generation_protocol_capability",
         ):
             self.assertIn(conjunct, source, f"{conjunct} must be part of the conjunction")
 
@@ -2441,6 +2445,12 @@ class R14DeclaresNothingTest(unittest.TestCase):
     def test_a_comment_only_repo_admits_a_launcher_advertising_nothing(self) -> None:
         # The compatibility this restores: a repo that declares no schema must not require the
         # config-parse contract, because an older launcher reads it perfectly well.
+        #
+        # "advertising nothing" is scoped to the CONFIG-PARSE token — that is the carve-out
+        # under test. The launcher therefore satisfies every other conjunct, including the
+        # #14203 generation protocol: a launcher missing that one is refused whatever the
+        # repo's config declares (it cannot emit the event the parent's finalize joins on),
+        # so omitting it here would make this test pass or fail for the wrong axis.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "repo" / ".mozyo-bridge").mkdir(parents=True)
@@ -2456,6 +2466,7 @@ class R14DeclaresNothingTest(unittest.TestCase):
                     "mozyo_attest_capability_schema=2",
                     "mozyo_attest_capability_stores=1_2",
                     "mozyo_attest_capability_lifecycle=1_2_3_4_5_6_7",
+                    "mozyo_generation_protocol_capability=1",
                 )
             )
             bare.write_text("#!/bin/sh\n" + lines + "exit 0\n", encoding="utf-8")

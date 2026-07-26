@@ -565,5 +565,131 @@ class TmuxTransportRailContextThreadingTest(unittest.TestCase):
         self.assertEqual(ops.persisted[0].activation, restored)
 
 
+class _V2FakeOps(_FakeOps):
+    """A fake carrying the #14203 j#87409 observation-only seams (arm / collect / binding)."""
+
+    def __init__(self, *args, wait_kind="changed", binding=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.wait_kind = wait_kind
+        self.binding = binding
+        self.armed_targets: List[str] = []
+        self.collected: List[object] = []
+
+    def arm_queue_enter_turn_wait(self, target: str):
+        self.events.append("arm_qe_wait")
+        self.armed_targets.append(target)
+        return object()
+
+    def collect_queue_enter_turn_wait(self, armed) -> Optional[str]:
+        self.events.append("collect_qe_wait")
+        self.collected.append(armed)
+        return self.wait_kind
+
+    def observe_queue_enter_gateway_binding(self, target: str) -> Optional[dict]:
+        self.events.append("bind_qe")
+        return self.binding
+
+
+class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
+    """#14203 j#87409 (B-constrained): the pre-Enter observation-only wait + process binding."""
+
+    def _snapshot(self, runtime_state="turn_ended"):
+        return QueueEnterTurnStartObservation(
+            runtime_state=runtime_state, read_ok=True, read_reason=None, poll_attempts=1
+        )
+
+    def test_the_wait_is_armed_before_the_first_enter(self) -> None:
+        ops = _V2FakeOps(marker_observed=True, queue_enter_snapshot=self._snapshot())
+        code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
+        self.assertIsNone(died)
+        self.assertEqual(code, 0)
+        self.assertIn("arm_qe_wait", ops.events)
+        self.assertLess(ops.events.index("arm_qe_wait"), ops.events.index("enter"))
+        self.assertEqual(ops.enter_presses, 1)  # the choreography is untouched (no double input)
+
+    def test_a_fast_turn_persists_the_observed_start_despite_a_settled_snapshot(self) -> None:
+        # The immediate start->turn_ended shape: the armed wait collected ``changed`` while
+        # the post-choreography snapshot only ever saw the settled state. The persisted
+        # observation carries BOTH + the action-time process binding, versioned additively.
+        binding = {
+            "provider": "codex", "assigned_name": "gw", "locator": "w:3",
+            "row_revision": "4", "attestation_observed_at": "2026-07-24T17:00:00+00:00",
+            "startup_action_id": "startup-GEN-A",
+        }
+        ops = _V2FakeOps(
+            marker_observed=True, queue_enter_snapshot=self._snapshot("turn_ended"),
+            wait_kind="changed", binding=binding,
+        )
+        code, _died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
+        self.assertEqual(code, 0)
+        obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
+        self.assertEqual(obs.get("runtime_state"), "turn_ended")
+        self.assertEqual(obs.get("event_wait_kind"), "changed")
+        self.assertEqual(obs.get("gateway_binding"), binding)
+        self.assertEqual(obs.get("observation_version"), 2)
+
+    def test_a_wait_timeout_is_persisted_without_changing_the_delivery(self) -> None:
+        binding = {
+            "provider": "codex", "assigned_name": "gw", "locator": "w:3",
+            "row_revision": "4", "attestation_observed_at": "2026-07-24T17:00:00+00:00",
+            "startup_action_id": "startup-GEN-A",
+        }
+        ops = _V2FakeOps(
+            marker_observed=True, queue_enter_snapshot=self._snapshot(),
+            wait_kind="timeout", binding=binding,
+        )
+        code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
+        self.assertIsNone(died)
+        self.assertEqual(code, 0)  # the observation NEVER fails a normal delivery
+        obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
+        self.assertEqual(obs.get("event_wait_kind"), "timeout")  # non-``changed`` diagnostic
+        self.assertEqual(obs.get("gateway_binding"), binding)
+
+    def test_a_generation_change_across_the_window_drops_the_v2_authority(self) -> None:
+        # j#87418 F1: the pre-arm and post-collect generations differ (a same-name/-locator
+        # recycle mid-window) -> the observed start + binding are NOT persisted as one
+        # authority; the record keeps only the settled snapshot.
+        class _RecycleOps(_V2FakeOps):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self._bind_calls = 0
+
+            def observe_queue_enter_gateway_binding(self, target):
+                self.events.append("bind_qe")
+                self._bind_calls += 1
+                return {
+                    "provider": "codex", "assigned_name": "gw", "locator": "w:3",
+                    "row_revision": str(self._bind_calls),  # DIFFERENT each read
+                    "attestation_observed_at": f"2026-07-24T17:0{self._bind_calls}:00+00:00",
+                    "startup_action_id": f"startup-GEN-{self._bind_calls}",  # DIFFERENT token
+                }
+
+        ops = _RecycleOps(
+            marker_observed=True, queue_enter_snapshot=self._snapshot(), wait_kind="changed",
+        )
+        code, _died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
+        self.assertEqual(code, 0)
+        obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
+        self.assertNotIn("event_wait_kind", obs)
+        self.assertNotIn("gateway_binding", obs)
+
+    def test_a_legacy_ops_without_the_seam_stays_green_and_unversioned(self) -> None:
+        ops = _FakeOps(marker_observed=True, queue_enter_snapshot=self._snapshot())
+        code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
+        self.assertIsNone(died)
+        self.assertEqual(code, 0)
+        obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
+        self.assertNotIn("event_wait_kind", obs)
+        self.assertNotIn("observation_version", obs)
+
+    def test_the_tmux_and_standard_paths_never_arm(self) -> None:
+        ops = _V2FakeOps(marker_observed=True)
+        _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=False))
+        self.assertNotIn("arm_qe_wait", ops.events)
+        ops2 = _V2FakeOps(marker_observed=True, standard_confirmed=True)
+        _run(ops2, _request(mode="standard", herdr_send=True))
+        self.assertNotIn("arm_qe_wait", ops2.events)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

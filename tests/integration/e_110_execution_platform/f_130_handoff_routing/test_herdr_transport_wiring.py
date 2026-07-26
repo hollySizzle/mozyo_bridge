@@ -615,25 +615,35 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertEqual(len(enters), 2, msg=f"expected one Enter re-send: {herdr.sends}")
         self.assertIn("1 Enter re-send(s)", out)
 
-    def test_queue_enter_rail_choreography_unchanged_under_herdr(self) -> None:
-        # Redmine #13255 decision 5 / #13292: the queue-enter rail is NOT promoted to
-        # the event-driven rail — it NEVER arms a `wait` and its inject -> Enter ->
-        # Enter-only retry choreography is byte-unchanged, resolving to `sent`. Redmine
-        # #13292 adds ONLY an additive, telemetry-only post-choreography `agent get`
-        # snapshot: `get` may now appear, but `wait` must NOT, and the wire is unchanged.
-        herdr = _FakeHerdr([], get_states=["working"])
+    def test_queue_enter_rail_choreography_adds_observation_only_wait_under_herdr(self) -> None:
+        # Redmine #14203 design j#87409 (B, constrained): the queue-enter rail now arms an
+        # OBSERVATION-ONLY `working` wait BEFORE the first Enter (so an immediate
+        # start->turn_ended is captured even when the post-hoc snapshot only sees the settled
+        # state). The wait is telemetry only: the injection (once, no double input), the Enter
+        # choreography, and the `sent`/`ok` wire are UNCHANGED, and the STANDARD event rail's
+        # `turn_start_outcome` field stays absent — the observation lives in the additive v2
+        # `queue_enter_turn_start_observation` fields, never on the wire.
+        herdr = _FakeHerdr([], get_states=["working"], wait_results=[(0, "")])
         result, herdr, ws, out, err = self._run(
             agent_rows_fn=_same_lane_rows(), herdr=herdr, mode="queue-enter"
         )
         self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
         outcome = _outcome_from(out)
         self.assertEqual(outcome.get("status"), "sent", msg=out)
-        # The queue-enter rail never arms an event wait (only the standard rail does).
-        self.assertFalse([op for op in herdr.sends if op[0] == "wait"], msg=herdr.sends)
-        # The body is injected exactly once (the additive snapshot never re-injects).
+        # The observation-only wait IS now armed (design j#87409) — and BEFORE the first Enter.
+        wait_ops = [op for op in herdr.sends if op[0] == "wait"]
+        self.assertTrue(wait_ops, msg=herdr.sends)
+        wait_idx = herdr.sends.index(wait_ops[0])
+        enter_ops = [
+            i for i, op in enumerate(herdr.sends)
+            if op[0] == "send_keys" and str(op[2]).lower() == "enter"
+        ]
+        self.assertTrue(enter_ops, msg=herdr.sends)
+        self.assertLess(wait_idx, enter_ops[0], msg=herdr.sends)  # armed before Enter
+        # The body is injected exactly once (no double input; the observation never re-injects).
         send_texts = [op for op in herdr.sends if op[0] == "send_text"]
         self.assertEqual(len(send_texts), 1, msg=herdr.sends)
-        # The event rail's `turn_start_outcome` telemetry stays absent on queue-enter.
+        # The STANDARD event rail's `turn_start_outcome` wire field stays absent on queue-enter.
         self.assertIsNone(outcome.get("turn_start_outcome"), msg=out)
 
     def test_queue_enter_snapshot_records_telemetry_only(self) -> None:

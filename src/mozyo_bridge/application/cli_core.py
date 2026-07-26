@@ -80,6 +80,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery_cli import (  # noqa: E501
     register_sublane_recover_stale_parser,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_gateway_recovery_cli import register_sublane_recover_gateway_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
     register_sublane_recover_pair_parser,
 )
@@ -843,6 +844,7 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     register_sublane_quarantine_parser(sublane_sub)
     register_sublane_quarantine_inspect_parser(sublane_sub)
     register_sublane_recover_stale_parser(sublane_sub)
+    register_sublane_recover_gateway_parser(sublane_sub)
     register_sublane_recover_pair_parser(sublane_sub)
     register_sublane_repair_pins_parser(sublane_sub)
     register_sublane_converge_bound_pair_parser(sublane_sub)
@@ -867,8 +869,14 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.cli_herdr_attestation_store import (  # noqa: E501
         register_herdr_attestation_store_parser,
     )
+    from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.cli_herdr_launch_generation_store import (  # noqa: E501
+        register_herdr_launch_generation_store_parser,
+    )
 
     register_herdr_attestation_store_parser(herdr_sub, add_repo_option=add_repo_option)
+    register_herdr_launch_generation_store_parser(
+        herdr_sub, add_repo_option=add_repo_option
+    )
     # Redmine #13892 / #13948: every herdr session recovery surface, in one call.
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_recovery import (  # noqa: E501
         register_herdr_recovery_surfaces,
@@ -934,12 +942,13 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     # This subcommand's `--help` is also the managed-launch **capability contract**: the
     # preflight probes a candidate launcher with it and joins what the launcher advertises
     # against what it will actually be pointed at — the attestation store schema it must
-    # write (#13847) and the store shapes it can write (#13882), plus the repo-local config
-    # it must parse and the shared lane lifecycle schema it must read (#14258). Every token
-    # is composed by the single canonical producer below, built from the constants of the
-    # authorities it describes, so a schema bump anywhere re-renders here with no edit and no
-    # producer can fall behind. A launcher predating a token advertises none, cannot be
-    # proven compatible, and fails the preflight closed before any process launch.
+    # write (#13847) and the store shapes it can write (#13882), the repo-local config it
+    # must parse and the shared lane lifecycle schema it must read (#14258), and the
+    # launch-generation wire protocol it must speak (#14203). Every token is composed by the
+    # single canonical producer below, built from the constants of the authorities it
+    # describes, so a schema bump anywhere re-renders here with no edit and no producer can
+    # fall behind. A launcher predating a token advertises none, cannot be proven
+    # compatible, and fails the preflight closed before any process launch.
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (
         build_attest_capability_epilog,
     )
