@@ -174,7 +174,7 @@ class _FakeOps:
         self.closed.append((role, provider, locator))
         return True
 
-    def relaunch_pair(self, *, action_id) -> bool:
+    def relaunch_pair(self, *, action_id, slots) -> bool:
         self.relaunched = True
         return True
 
