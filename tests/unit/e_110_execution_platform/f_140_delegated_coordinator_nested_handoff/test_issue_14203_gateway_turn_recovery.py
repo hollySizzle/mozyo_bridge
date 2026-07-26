@@ -74,6 +74,7 @@ def _refresh(**overrides) -> GatewayRefreshObservation:
         resume_anchor_present=True,
         worker_distinct_preserved=True,
         no_authority_conflict=True,
+        launch_authority_current=True,
     )
     facts.update(overrides)
     return GatewayRefreshObservation(**facts)
@@ -220,7 +221,8 @@ class RefreshDecisionTests(unittest.TestCase):
         )
 
     def test_the_verdict_vocabulary_is_closed(self):
-        self.assertEqual(len(REFRESH_VERDICTS), 11)
+        # 11 pre-#14475 + the pre-close launch-authority blocker.
+        self.assertEqual(len(REFRESH_VERDICTS), 12)
         self.assertEqual(REFRESH_BLOCKERS, REFRESH_VERDICTS - {REFRESH_ACTIONABLE})
 
 

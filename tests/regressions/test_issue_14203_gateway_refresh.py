@@ -46,6 +46,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GatewayRefreshObservation,
     GatewayTurnObservation,
     REFRESH_ACTIONABLE,
+    REFRESH_BLOCK_LAUNCH_AUTHORITY,
     REFRESH_BLOCK_NON_GATEWAY,
     REFRESH_BLOCK_TURN_NOT_FAILED,
     REFRESH_BLOCK_UNKNOWN,
@@ -53,6 +54,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     TURN_CLASS_UNCONFIRMED,
     TURN_REASON_RATE_LIMIT,
     TURN_REASON_UNKNOWN,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E402,E501
+    LAUNCH_AUTHORITY_OK,
+    LAUNCH_AUTHORITY_WORKTREE_MISMATCH,
+    LAUNCH_AUTHORITY_WORKTREE_UNBOUND,
+    launch_authority_current,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E402,E501
     ATTEST_BOUND,
@@ -86,6 +93,10 @@ def _target(**overrides) -> GatewayRefreshObservation:
         issue_lane_matches=True, generation_matches=True, settled_idle=True,
         composer_clear=True, resume_anchor_present=True,
         worker_distinct_preserved=True, no_authority_conflict=True,
+        # #14475: the use case JOINS this axis from ``ops.lane_authority_reason`` and
+        # overwrites whatever the target observer carried, so this value is inert here —
+        # kept green so the canonical builder stays an all-facts-hold observation.
+        launch_authority_current=True,
     )
     facts.update(overrides)
     return GatewayRefreshObservation(**facts)
@@ -152,12 +163,24 @@ class FakeGatewayOps:
     def observe_target(self, request) -> GatewayRefreshObservation:
         return self._target
 
-    def resume_lane_authority(self, request) -> bool:
+    def lane_authority_reason(self, request) -> str:
+        """The #14475 typed axis, driven by the SAME ``_lane_authority`` script.
+
+        The fake mirrors the live adapter's structure: one evaluator, and
+        ``resume_lane_authority`` is its boolean projection. A test that scripts the authority
+        moving mid-run therefore moves it for the preflight axis and the action-time fence
+        alike, exactly as the real join would.
+        """
         self.authority_checks.append(request)
         v = self._lane_authority
         if isinstance(v, list):
-            return v.pop(0) if v else True
-        return v
+            current = v.pop(0) if v else True
+        else:
+            current = v
+        return LAUNCH_AUTHORITY_OK if current else LAUNCH_AUTHORITY_WORKTREE_UNBOUND
+
+    def resume_lane_authority(self, request) -> bool:
+        return launch_authority_current(self.lane_authority_reason(request))
 
     def gateway_name_free_of_live_process(self, request) -> bool:
         self.name_free_checks.append(request)
@@ -397,13 +420,15 @@ class StoppedLegTests(_RefreshCase):
         self.assertEqual(len(ops.resumes), 1)  # exactly one attempt — never repeated blind
 
     def test_an_authority_move_before_the_resume_is_a_typed_zero_send(self):
-        # Authority holds for the launch probe (twice: lane + name checks share the fn) and
+        # Authority holds for the #14475 pre-close preflight axis AND the launch probe, then
         # MOVES immediately before the resume transport: the attempt is un-recorded and the
-        # resume reports authority_moved with ZERO send.
-        ops = FakeGatewayOps(lane_authority=[True, False])
+        # resume reports authority_moved with ZERO send. The gateway IS closed and relaunched
+        # here — this pins the LATE move, which the pre-close fence cannot and must not catch.
+        ops = FakeGatewayOps(lane_authority=[True, True, False])
         outcome = self._use_case(ops).run(self._request(), execute=True)
         self.assertEqual(outcome.status, REFRESH_STATUS_STOPPED)
         self.assertEqual(outcome.resume_status, CONTINUATION_AUTHORITY_MOVED)
+        self.assertTrue(outcome.fresh_slot_attested)
         self.assertEqual(ops.resumes, [])
 
 

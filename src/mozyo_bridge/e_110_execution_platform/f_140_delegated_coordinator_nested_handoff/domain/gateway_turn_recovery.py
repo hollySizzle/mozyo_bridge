@@ -225,6 +225,13 @@ REFRESH_BLOCK_STALE_GENERATION = "stale_generation"
 #: unconfirmed, unsettled, or unobservable. A refresh without a classified failure is blind
 #: process churn; zero actuation.
 REFRESH_BLOCK_TURN_NOT_FAILED = "turn_not_classified_failed"
+#: The lane's ambient LAUNCH authority is not exact + current: the lifecycle
+#: ``(revision, generation)`` moved, the canonical ``worktree_identity`` token is unbound or
+#: mismatched, the worktree is unreadable, or the branch drifted. The refresh's own launch leg
+#: re-joins exactly this authority AFTER the destructive close, so a refresh admitted without
+#: it closes a gateway it can never relaunch (Redmine #14475; live evidence #14462 j#88463).
+#: Checked BEFORE any close — zero actuation.
+REFRESH_BLOCK_LAUNCH_AUTHORITY = "launch_authority_unavailable"
 #: The gateway is not settled (``working`` / busy / unknown) at the fresh action-time read —
 #: never close a possibly-working turn. Zero actuation.
 REFRESH_BLOCK_NOT_SETTLED = "gateway_not_settled"
@@ -249,6 +256,7 @@ REFRESH_VERDICTS = frozenset(
         REFRESH_BLOCK_WRONG_ISSUE_LANE,
         REFRESH_BLOCK_STALE_GENERATION,
         REFRESH_BLOCK_TURN_NOT_FAILED,
+        REFRESH_BLOCK_LAUNCH_AUTHORITY,
         REFRESH_BLOCK_NOT_SETTLED,
         REFRESH_BLOCK_PENDING_COMPOSER,
         REFRESH_BLOCK_NO_RESUME_ANCHOR,
@@ -283,6 +291,12 @@ class GatewayRefreshObservation:
       DIFFERENT slot than the close target (so the close cannot touch it).
     - ``no_authority_conflict`` — no other approved generation / in-flight replacement
       transaction is already acting on this slot.
+    - ``launch_authority_current`` — the lane's ambient LAUNCH authority is exact + current
+      RIGHT NOW: the lifecycle ``(revision, generation)`` matches the pinned evidence, the
+      canonical ``worktree_identity`` token is bound and matches the recovery worktree, and
+      the worktree resolves on the lane's expected branch. It is the same join the refresh's
+      own launch leg re-performs after the close, so an unbound / mismatched lane must block
+      BEFORE the destructive leg (Redmine #14475).
     """
 
     __slots__ = (
@@ -295,6 +309,7 @@ class GatewayRefreshObservation:
         "resume_anchor_present",
         "worker_distinct_preserved",
         "no_authority_conflict",
+        "launch_authority_current",
     )
 
     def __init__(
@@ -309,6 +324,7 @@ class GatewayRefreshObservation:
         resume_anchor_present: bool = False,
         worker_distinct_preserved: bool = False,
         no_authority_conflict: bool = False,
+        launch_authority_current: bool = False,
     ) -> None:
         self.identity_resolved = bool(identity_resolved)
         self.is_lane_implementation_gateway = bool(is_lane_implementation_gateway)
@@ -319,6 +335,28 @@ class GatewayRefreshObservation:
         self.resume_anchor_present = bool(resume_anchor_present)
         self.worker_distinct_preserved = bool(worker_distinct_preserved)
         self.no_authority_conflict = bool(no_authority_conflict)
+        self.launch_authority_current = bool(launch_authority_current)
+
+    def with_launch_authority(self, current: bool) -> "GatewayRefreshObservation":
+        """This observation with its launch-authority axis replaced. (pure)
+
+        The axis is joined by the use case from the ONE authority evaluator (so the preflight
+        verdict and the action-time launch fence read the same source exactly once), rather
+        than by the target observer — which observes the SLOT, while this axis is about the
+        LANE. Every other axis is carried through unchanged.
+        """
+        return GatewayRefreshObservation(
+            identity_resolved=self.identity_resolved,
+            is_lane_implementation_gateway=self.is_lane_implementation_gateway,
+            issue_lane_matches=self.issue_lane_matches,
+            generation_matches=self.generation_matches,
+            settled_idle=self.settled_idle,
+            composer_clear=self.composer_clear,
+            resume_anchor_present=self.resume_anchor_present,
+            worker_distinct_preserved=self.worker_distinct_preserved,
+            no_authority_conflict=self.no_authority_conflict,
+            launch_authority_current=bool(current),
+        )
 
     def as_payload(self) -> dict[str, bool]:
         return {
@@ -331,6 +369,7 @@ class GatewayRefreshObservation:
             "resume_anchor_present": self.resume_anchor_present,
             "worker_distinct_preserved": self.worker_distinct_preserved,
             "no_authority_conflict": self.no_authority_conflict,
+            "launch_authority_current": self.launch_authority_current,
         }
 
 
@@ -353,11 +392,19 @@ def decide_gateway_refresh(
     5. the provider turn must be CLASSIFIED failed (a productive / unconfirmed / unsettled /
        unobservable turn never justifies a close — checked before the runtime gates so a
        blind refresh is named for what it is, not for an incidental runtime state);
-    6. the gateway must be settled at the fresh action-time read;
-    7. the composer must hold no real unsent input;
-    8. a durable resume anchor must exist (a refresh exists to resume work, not to churn);
-    9. the worker must be positively distinguished from the close target;
-    10. no competing authority may already be acting on the slot.
+    6. the lane's LAUNCH authority must be exact + current — the first of the
+       actuation-feasibility gates, because it is the one whose absence makes the refresh
+       *irrecoverable* rather than merely refused: the launch leg re-joins this authority
+       AFTER the destructive close, so admitting a refresh without it closes a gateway that
+       can never be relaunched (Redmine #14475; live evidence #14462 j#88463). It is
+       deliberately ordered AFTER the turn classification so a *productive* turn on an unbound
+       lane still reports ``turn_not_classified_failed`` — no refresh is needed there, and
+       naming a launch-authority gap would imply one is;
+    7. the gateway must be settled at the fresh action-time read;
+    8. the composer must hold no real unsent input;
+    9. a durable resume anchor must exist (a refresh exists to resume work, not to churn);
+    10. the worker must be positively distinguished from the close target;
+    11. no competing authority may already be acting on the slot.
     """
     if not observation.identity_resolved:
         return REFRESH_BLOCK_UNKNOWN
@@ -369,6 +416,8 @@ def decide_gateway_refresh(
         return REFRESH_BLOCK_STALE_GENERATION
     if norm(turn_class) != TURN_CLASS_FAILED:
         return REFRESH_BLOCK_TURN_NOT_FAILED
+    if not observation.launch_authority_current:
+        return REFRESH_BLOCK_LAUNCH_AUTHORITY
     if not observation.settled_idle:
         return REFRESH_BLOCK_NOT_SETTLED
     if not observation.composer_clear:
@@ -466,6 +515,7 @@ __all__ = (
     "REFRESH_BLOCK_WRONG_ISSUE_LANE",
     "REFRESH_BLOCK_STALE_GENERATION",
     "REFRESH_BLOCK_TURN_NOT_FAILED",
+    "REFRESH_BLOCK_LAUNCH_AUTHORITY",
     "REFRESH_BLOCK_NOT_SETTLED",
     "REFRESH_BLOCK_PENDING_COMPOSER",
     "REFRESH_BLOCK_NO_RESUME_ANCHOR",

@@ -64,6 +64,21 @@ def declare_created_lane_lifecycle(
     (``already_declared``); a create for an issue another lane still actively owns is refused
     (``owner_conflict``) and the recovery lane stays unbound until an explicit
     ``sublane supersede`` hands ownership over (W2) — both are correct, not errors.
+
+    Redmine #14475: ``already_declared`` being "correct, not an error" is true of the
+    DECLARATION and was silently untrue of the BINDING. A ``sublane supersede`` handover mints
+    the recovery lane's ``active`` row itself (``lane_lifecycle.py`` supersede INSERT) with an
+    intentionally EMPTY ``worktree_identity`` — "written when that lane is actually created",
+    i.e. here. But the create's ``declare_active`` then sees an existing row, returns
+    ``already_declared`` zero-write, and this function discarded the outcome — so the canonical
+    token this create had already computed never reached the row, and the lane ran with an
+    unbound worktree until a guarded recovery's launch fence refused it (live evidence #14462
+    j#88463: an exact gateway closed, then ``launch_authority_moved``, unrelaunchable). The
+    refusal now routes to the bounded ``backfill_active_binding`` CAS — the SAME residual
+    surface the #13809 live-adopt path uses — which fills an EMPTY binding field only. A
+    non-empty different worktree, a different issue, a non-active disposition, or a revision
+    race is zero-write there, so ``declare_active``'s divergent-re-declare refusal is preserved
+    rather than generally relaxed, and no token is ever guessed.
     """
     anchor = _norm(journal)
     issue_id = _norm(issue)
@@ -73,6 +88,7 @@ def declare_created_lane_lifecycle(
         return
     from mozyo_bridge.core.state.lane_kind import LaneKindError
     from mozyo_bridge.core.state.lane_lifecycle import (
+        CAS_ALREADY_DECLARED,
         DecisionPointer,
         DecisionPointerError,
         LaneLifecycleError,
@@ -90,7 +106,7 @@ def declare_created_lane_lifecycle(
         # rather than write an owner row no recovery could ever resolve.
         return
     try:
-        LaneLifecycleStore().declare_active(
+        result = LaneLifecycleStore().declare_active(
             key,
             decision=decision,
             issue_id=issue_id,
@@ -103,6 +119,70 @@ def declare_created_lane_lifecycle(
         print(
             f"warning: lane lifecycle declare skipped ({type(exc).__name__}); "
             "lane reads as owner-unbound",
+            file=sys.stderr,
+        )
+        return
+    _backfill_missing_worktree_binding(
+        key,
+        result=result,
+        issue_id=issue_id,
+        worktree_identity=worktree_identity,
+        already_declared=CAS_ALREADY_DECLARED,
+    )
+
+
+def _backfill_missing_worktree_binding(
+    key,
+    *,
+    result,
+    issue_id: str,
+    worktree_identity: str,
+    already_declared: str,
+) -> None:
+    """Fill an ``already_declared`` row's EMPTY worktree binding, or do nothing (#14475).
+
+    Runs ONLY on the exact residual this create can legitimately close: ``declare_active``
+    refused ``already_declared`` (a row this lane already owns exists — the supersede-minted
+    one) AND this create resolved a non-empty canonical token. Everything else — an applied
+    declare, an ``owner_conflict``, a create with no token — returns without touching the
+    store.
+
+    The write itself is the #13809 :meth:`...LaneDeclarationStore.backfill_active_binding` CAS,
+    reused verbatim rather than re-implemented: it is guarded on ``declare_active``'s observed
+    revision and refuses zero-write on a non-empty *different* worktree, a non-empty *different*
+    declared-slot snapshot, a different issue, a non-active disposition, or a concurrent write.
+    ``declared_slots=()`` is deliberate — the create boundary has no pins yet, and passing the
+    empty set means the store fills the worktree gap on a slot-less row and refuses (zero-write)
+    on a row whose pins already landed, rather than clobbering them. That residual stays covered
+    by the guarded recovery surfaces' pre-close launch-authority fence.
+
+    Best-effort like every other write here: a store error is reported and never breaks the
+    actuation.
+    """
+    from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
+    from mozyo_bridge.core.state.lane_lifecycle import (
+        DecisionPointerError,
+        LaneLifecycleError,
+    )
+
+    token = _norm(worktree_identity)
+    if result is None or result.applied or _norm(result.reason) != already_declared:
+        return
+    if not token:
+        # No token to bind — a create that could not resolve one never guesses a binding.
+        return
+    try:
+        LaneDeclarationStore().backfill_active_binding(
+            key,
+            expected_revision=result.revision,
+            issue_id=issue_id,
+            worktree_identity=token,
+            declared_slots=(),
+        )
+    except (LaneLifecycleError, DecisionPointerError, ValueError, OSError) as exc:
+        print(
+            f"warning: lane worktree binding backfill skipped ({type(exc).__name__}); "
+            "lane reads as worktree-unbound",
             file=sys.stderr,
         )
 

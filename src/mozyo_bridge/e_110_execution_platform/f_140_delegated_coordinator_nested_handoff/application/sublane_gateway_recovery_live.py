@@ -66,6 +66,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GatewayRefreshObservation,
     GatewayTurnObservation,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E501
+    launch_authority_current,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_AWAITING_INPUT,
     RUNTIME_TURN_ENDED,
@@ -171,8 +174,16 @@ class LiveGatewayRecoveryOps:
             attestation_home=self.attestation_home, lifecycle_home=self.lifecycle_home,
         )
 
+    def lane_authority_reason(self, request: GatewayRefreshRequest) -> str:
+        """The closed launch-authority axis token, from the #13806 evaluator (#14475).
+
+        Delegated — never re-implemented — so the pre-close preflight axis and the
+        action-time launch fence are backed by the identical join.
+        """
+        return self._delegate().lane_authority_reason(port_pin_request(request))
+
     def resume_lane_authority(self, request: GatewayRefreshRequest) -> bool:
-        return self._delegate().resume_lane_authority(port_pin_request(request))
+        return launch_authority_current(self.lane_authority_reason(request))
 
     def gateway_name_free_of_live_process(self, request: GatewayRefreshRequest) -> bool:
         return self._delegate().lane_free_of_live_process(port_pin_request(request))

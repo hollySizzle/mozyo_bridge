@@ -437,6 +437,16 @@ Table naming:
       re-declare は上書き禁止」を一般的に緩める surface ではなく、欠落 field 専用。live-adopt path は
       `declare_lane` 拒否時にのみこの CAS を試み、成功を `backfilled` として rowless declaration (`declared`) と
       区別して伝播する。disposition / generation / release / replacement / decision anchor は不変。
+      ★**create path も同じ residual を持つ** (#14475、live blocker #14462 j#88463)。`sublane supersede` の handover は
+      recovery lane の `active` 行を **自ら** generation 1 で INSERT し、`worktree_identity` / `declared_slots` を
+      意図的に空のまま残す (「その lane が実際に create されたときに書く」)。ところが後続 create の
+      `LaneLifecycleStore.declare_active` は既存 row を見て `already_declared` で zero-write 拒否し、
+      `declare_created_lane_lifecycle` はその outcome を **捨てていた** ため、create が算出済みの canonical token が
+      row へ届かず lane は worktree-unbound のまま稼働した (guarded recovery の launch fence で初めて露見し、
+      その時点では既に destructive close 済)。create path は `already_declared` 拒否時に **同じ**
+      `backfill_active_binding` CAS へ route する。`declared_slots=()` を渡すので、pin 未宣言 row では worktree gap
+      だけを埋め、**pin 既着地 row は zero-write** (clobber しない) — 後者の残余は recover 系 surface の
+      **close 前 launch-authority fence** が受け持つ。token 無しの create は binding を推測しない。
       ★adopt が gate failure / CAS refusal で終わったとき「既に確立済みゆえ dispatch 安全」と判定する
       条件は、**issue 所有だけでは不十分**で state DB owner row が **complete かつ exact な binding**
       — `worktree_identity` 非空 かつ token 一致、**かつ** `declared_slots` が decode-valid で
@@ -1015,6 +1025,13 @@ observation に join し、次の typed decision を返す。
   token・drifted branch・unreadable worktree・foreign live（busy/idle）は zero launch/send で durable transaction を温存
   （lease は actuator が effect 直前に別途再認証、launch 後の自 fresh worker は action-bound attestation が正当性を証明）。
   worktree readability は exact worktree-token authority の一部（単なる git-checkout 解決だけでは sibling/wrong worktree を通す）。
+  ★**action-time 再 join は「close 前 preflight を持たない理由」にならない** (#14475、live blocker #14462 j#88463)。launch authority が
+  action-time にしか無いと、**launch より前に destructive close がある** guarded refresh では「preflight 全 green → close commit →
+  `launch_authority_moved`」で relaunch 不能な状態に落ちる。したがって同 authority は **close 前の read-only preflight 軸**
+  でもあり、両者は `lane_authority_reason`（closed typed vocabulary）という **単一 evaluator** を共有する — preflight を別実装で
+  近似すると、preflight が予測しているはずの effect から drift する。action-time 再 join は撤去せず維持する（pre-close read は
+  close と launch の間に起きる **遅い** authority move を予測できないため）。preflight 軸が加わっても post-close replay の
+  admission（`identity_unknown` + committed-close transaction のみ）と exactly-once resume 契約は不変。
   **dirty（but readable）worktree は byte 保存対象ゆえ authority 軸でない=block しない**（Design Consultation Answer j#82708
   Option A / tranche D contract, IR j#79485 §4 / `assess_worker_recovery_preservation`; 初回 close_owed と retry launch_owed で
   同一 policy、launch failure timing で挙動を変えない）。durable transaction 不在 / `close_owed` 止まり / generation 相違は

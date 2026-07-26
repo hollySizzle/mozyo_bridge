@@ -727,6 +727,65 @@ class ResumeLaneAuthorityTests(_LiveCase):
         )
         self.assertFalse(ops.resume_lane_authority(self._req(lane=branch)))
 
+    def test_the_live_adapter_names_each_failing_axis(self):
+        """Redmine #14475: the LIVE evaluator must emit the typed axis, not just ``False``.
+
+        The boolean cases above all pass even if every branch collapsed to one token, so this
+        pins the mapping at the real adapter — the seam the preflight blocker's detail and its
+        operator runbook are read from.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E501
+            LAUNCH_AUTHORITY_BRANCH_DRIFTED,
+            LAUNCH_AUTHORITY_GENERATION_MOVED,
+            LAUNCH_AUTHORITY_LIFECYCLE_ABSENT,
+            LAUNCH_AUTHORITY_OK,
+            LAUNCH_AUTHORITY_PINS_UNPINNED,
+            LAUNCH_AUTHORITY_WORKTREE_MISMATCH,
+            LAUNCH_AUTHORITY_WORKTREE_UNBOUND,
+        )
+
+        branch = _actual_branch()
+        bound = self._declared(lane=branch, worktree_identity=_root_token())
+        self.assertEqual(
+            self._ops(bound, lane=branch).lane_authority_reason(self._req(lane=branch)),
+            LAUNCH_AUTHORITY_OK,
+        )
+        self.assertEqual(
+            self._ops(bound, lane=branch).lane_authority_reason(
+                self._req(lane=branch, gen="2")
+            ),
+            LAUNCH_AUTHORITY_GENERATION_MOVED,
+        )
+        self.assertEqual(
+            self._ops(bound, lane=branch).lane_authority_reason(
+                _request(lane=branch, lane_revision="", lane_generation="")
+            ),
+            LAUNCH_AUTHORITY_PINS_UNPINNED,
+        )
+        # THE #14462 j#88463 axis: an unbound row is distinguished from a wrong-token one.
+        unbound = self._declared(lane=branch, worktree_identity="")
+        self.assertEqual(
+            self._ops(unbound, lane=branch).lane_authority_reason(self._req(lane=branch)),
+            LAUNCH_AUTHORITY_WORKTREE_UNBOUND,
+        )
+        sibling = self._declared(lane=branch, worktree_identity="wt_deadbeefdeadbeef")
+        self.assertEqual(
+            self._ops(sibling, lane=branch).lane_authority_reason(self._req(lane=branch)),
+            LAUNCH_AUTHORITY_WORKTREE_MISMATCH,
+        )
+        other = "issue_13806_some_other_branch"
+        drifted = self._declared(lane=other, worktree_identity=_root_token())
+        self.assertEqual(
+            self._ops(drifted, lane=other).lane_authority_reason(self._req(lane=other)),
+            LAUNCH_AUTHORITY_BRANCH_DRIFTED,
+        )
+        self.assertEqual(
+            self._ops(Path(tempfile.mkdtemp()), lane=branch).lane_authority_reason(
+                self._req(lane=branch)
+            ),
+            LAUNCH_AUTHORITY_LIFECYCLE_ABSENT,
+        )
+
 
 class LaneFreeOfLiveProcessTests(_LiveCase):
     """R3-F1 (Review j#82731 F2): a pre-launch fence blocking ANY live (busy OR idle) foreign row."""

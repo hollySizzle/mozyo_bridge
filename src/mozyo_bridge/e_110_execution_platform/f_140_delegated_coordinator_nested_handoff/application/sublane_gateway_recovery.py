@@ -70,10 +70,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CONTINUATION_CONFIRMED,
     drive_continuation_once,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E501
+    LAUNCH_AUTHORITY_UNKNOWN,
+    launch_authority_current,
+    launch_authority_runbook,
+    normalize_launch_authority_reason,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_turn_recovery import (  # noqa: E501
     GatewayRefreshObservation,
     GatewayTurnObservation,
     REFRESH_ACTIONABLE,
+    REFRESH_BLOCK_LAUNCH_AUTHORITY,
     REFRESH_BLOCK_UNKNOWN,
     RESUMABLE_GATES,
     RESUME_VIA_CALLBACK_RECOVERY,
@@ -240,6 +247,17 @@ class GatewayRecoveryOps(Protocol):
         """Observe the live pinned gateway slot (read-only, all-positive-fact)."""
         ...
 
+    def lane_authority_reason(self, request: GatewayRefreshRequest) -> str:
+        """WHICH lane launch-authority axis fails right now? (read-only)
+
+        A closed :data:`...lane_launch_authority.LAUNCH_AUTHORITY_REASONS` token naming the
+        first failing axis (``ok`` when every axis holds). This is the SINGLE evaluator behind
+        both the pre-close preflight axis and :meth:`resume_lane_authority` — a preflight
+        backed by a second implementation drifts away from the effect it predicts, which is
+        how #14462 j#88463 closed a gateway it could never relaunch (Redmine #14475).
+        """
+        ...
+
     def resume_lane_authority(self, request: GatewayRefreshRequest) -> bool:
         """Is the lane's ambient authority EXACT and current, right now? (read-only)
 
@@ -247,6 +265,8 @@ class GatewayRecoveryOps(Protocol):
         the LIVE lane lifecycle ``(revision, generation)`` must equal the approval's pinned
         evidence, the worktree token / branch must be exact, and the lane's WORKER slot must
         still hold its pinned identity (the refresh preserves it byte-for-byte). Fail-closed.
+
+        The boolean projection of :meth:`lane_authority_reason`.
         """
         ...
 
@@ -309,20 +329,62 @@ class GatewayRefreshUseCase:
         self._clock = clock
         self._ttl = lease_ttl_seconds
 
+    def _lane_authority_reason(self, request: GatewayRefreshRequest) -> str:
+        """The lane launch-authority axis, read ONCE per run (fail-closed, normalized).
+
+        Read through the same evaluator the launch leg's authority fence uses, so the
+        preflight verdict and the action-time effect cannot be backed by different logic. An
+        ops adapter that raises (or predates the #14475 protocol) is ``unknown``, which
+        refuses — never a fabricated green axis.
+        """
+        try:
+            raw = self._ops.lane_authority_reason(request)
+        except Exception:  # noqa: BLE001 - an unreadable authority is never "current"
+            return LAUNCH_AUTHORITY_UNKNOWN
+        return normalize_launch_authority_reason(raw)
+
     def run(self, request: GatewayRefreshRequest, *, execute: bool) -> GatewayRefreshOutcome:
         turn_obs = self._ops.observe_turn(request)
         turn_class = classify_gateway_turn(turn_obs)
         turn_reason = normalize_turn_failure_reason(
             turn_obs.reason_token or request.reason_token
         )
-        observation = self._ops.observe_target(request)
+        # Redmine #14475: the lane LAUNCH authority is a preflight axis, joined from the ONE
+        # evaluator before any verdict — so the read-only preflight reports the same fence the
+        # post-close launch leg would hit, instead of reporting ``actionable`` for a lane that
+        # can never be relaunched (#14462 j#88463).
+        authority_reason = self._lane_authority_reason(request)
+        observation = self._ops.observe_target(request).with_launch_authority(
+            launch_authority_current(authority_reason)
+        )
         verdict = decide_gateway_refresh(observation, turn_class)
+        authority_detail = (
+            f" (lane launch authority: {authority_reason}; "
+            f"{launch_authority_runbook(authority_reason)})"
+            if verdict == REFRESH_BLOCK_LAUNCH_AUTHORITY
+            else ""
+        )
         if not execute:
             return self._outcome(
                 request, turn_class, turn_reason, verdict,
                 status=REFRESH_STATUS_PREFLIGHT,
                 turn_observation=turn_obs, observation=observation,
-                detail="preflight only; --execute requires a positive owner approval",
+                detail=(
+                    "preflight only; --execute requires a positive owner approval"
+                    + authority_detail
+                ),
+            )
+        if verdict == REFRESH_BLOCK_LAUNCH_AUTHORITY:
+            # The one blocker that must never fall through to the post-close resume admission:
+            # it is a CURRENT-state fence on the lane, not the expected post-close
+            # ``identity_unknown`` signal, so it stands and closes nothing.
+            return self._outcome(
+                request, turn_class, turn_reason, verdict,
+                status=REFRESH_STATUS_REFUSED, executed=True,
+                turn_observation=turn_obs, observation=observation,
+                detail=(
+                    f"target not actionable ({verdict}); zero close" + authority_detail
+                ),
             )
         if verdict != REFRESH_ACTIONABLE:
             resumed = self._post_close_resume(

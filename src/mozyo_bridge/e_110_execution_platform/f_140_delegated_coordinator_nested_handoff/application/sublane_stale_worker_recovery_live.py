@@ -59,6 +59,19 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     resolve_gateway_provider,
     resolve_worker_provider,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E501
+    LAUNCH_AUTHORITY_BRANCH_DRIFTED,
+    LAUNCH_AUTHORITY_GENERATION_MOVED,
+    LAUNCH_AUTHORITY_LIFECYCLE_ABSENT,
+    LAUNCH_AUTHORITY_LIFECYCLE_UNREADABLE,
+    LAUNCH_AUTHORITY_OK,
+    LAUNCH_AUTHORITY_PINS_UNPINNED,
+    LAUNCH_AUTHORITY_WORKTREE_MISMATCH,
+    LAUNCH_AUTHORITY_WORKTREE_UNBOUND,
+    LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE,
+    LAUNCH_AUTHORITY_WORKTREE_UNREADABLE,
+    launch_authority_current,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E501
     ATTEST_BOUND,
     ATTEST_MISMATCH,
@@ -543,11 +556,12 @@ class LiveStaleWorkerRecoveryOps:
             return ""
         return result.stdout.strip() if result.returncode == 0 else ""
 
-    def resume_lane_authority(self, request: RecoveryRequest) -> bool:
-        """Is the lane's ambient authority EXACT and current, right now? (read-only, #13806 R3-F1)
+    def lane_authority_reason(self, request: RecoveryRequest) -> str:
+        """WHICH lane-authority axis fails right now? (read-only, #13806 R3-F1 / #14475)
 
         Re-joins EVERY exact lane-authority axis (Review j#82731 F2 / Answer j#82708), old-slot-
-        independent, for the action-time launch / send fence:
+        independent, and names the FIRST failing one as a closed
+        :data:`...lane_launch_authority.LAUNCH_AUTHORITY_REASONS` token:
 
         - the LIVE lane lifecycle exists and its ``(revision, generation)`` equals the pinned
           ``lane_revision`` / ``lane_generation``;
@@ -559,12 +573,19 @@ class LiveStaleWorkerRecoveryOps:
           drifted branch fails here.
 
         Dirtiness is deliberately NOT an axis (Answer j#82708 Option A). Fail-closed: any absent /
-        mismatched axis returns ``False``.
+        mismatched axis returns its blocking token, and only a fully-joined authority returns
+        :data:`...lane_launch_authority.LAUNCH_AUTHORITY_OK`.
+
+        This is the SINGLE evaluator behind both the action-time launch fence
+        (:meth:`resume_lane_authority`) and the read-only preflight axis a guarded refresh
+        reports (Redmine #14475): a preflight backed by a second implementation is how a
+        preflight drifts away from the effect it claims to predict — which is exactly how
+        #14462 j#88463 closed a gateway it could never relaunch.
         """
         pinned_rev = _norm(request.lane_revision)
         pinned_gen = _norm(request.lane_generation)
         if not pinned_rev or not pinned_gen:
-            return False
+            return LAUNCH_AUTHORITY_PINS_UNPINNED
         from mozyo_bridge.core.state.lane_lifecycle import (
             LaneLifecycleError,
             LaneLifecycleKey,
@@ -579,29 +600,47 @@ class LiveStaleWorkerRecoveryOps:
                 LaneLifecycleKey(repo_scope_workspace_id(self.repo_root), _norm_lane(request.lane))
             )
         except (LaneLifecycleError, ValueError, OSError):
-            return False
+            # An unreadable authority is never degraded to a proven-absent one.
+            return LAUNCH_AUTHORITY_LIFECYCLE_UNREADABLE
         if record is None:
-            return False
+            return LAUNCH_AUTHORITY_LIFECYCLE_ABSENT
         if str(record.revision) != pinned_rev or str(record.lane_generation) != pinned_gen:
-            return False
+            return LAUNCH_AUTHORITY_GENERATION_MOVED
         # Exact worktree-token authority: the lane's canonical token must be present AND equal the
         # token freshly derived from the recovery worktree (a wrong / sibling worktree differs).
         pinned_token = _norm(record.worktree_identity)
         if not pinned_token:
-            return False
+            # Redmine #14475: an unbound row (a supersede-minted recovery lane whose later
+            # create declaration was refused ``already_declared`` zero-write) can never attest
+            # a worktree. Distinct from a MISMATCH: nothing to compare, not a wrong compare.
+            return LAUNCH_AUTHORITY_WORKTREE_UNBOUND
         try:
             live_token = _norm(derive_lane_workspace_token(str(self.repo_root)))
         except Exception:  # noqa: BLE001 - an underivable token fails closed
-            return False
-        if not live_token or live_token != pinned_token:
-            return False
+            return LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE
+        if not live_token:
+            return LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE
+        if live_token != pinned_token:
+            return LAUNCH_AUTHORITY_WORKTREE_MISMATCH
         # Readable worktree on the lane's expected branch (the issue lane id is the branch).
         try:
             if probe_worktree_resolved(str(self.repo_root)) is not True:
-                return False
+                return LAUNCH_AUTHORITY_WORKTREE_UNREADABLE
         except Exception:  # noqa: BLE001 - unreadable worktree fails closed
-            return False
-        return _norm_lane(self._current_branch(str(self.repo_root))) == _norm_lane(request.lane)
+            return LAUNCH_AUTHORITY_WORKTREE_UNREADABLE
+        if _norm_lane(self._current_branch(str(self.repo_root))) != _norm_lane(request.lane):
+            return LAUNCH_AUTHORITY_BRANCH_DRIFTED
+        return LAUNCH_AUTHORITY_OK
+
+    def resume_lane_authority(self, request: RecoveryRequest) -> bool:
+        """Is the lane's ambient authority EXACT and current, right now? (read-only)
+
+        The boolean projection of :meth:`lane_authority_reason` — byte-for-byte the pre-#14475
+        contract (ONLY a fully-joined authority is ``True``), now expressed as the single
+        closed-vocabulary projection so the action-time fence and the preflight axis can never
+        disagree about what "current" means.
+        """
+        return launch_authority_current(self.lane_authority_reason(request))
 
     def lane_free_of_live_process(self, request: RecoveryRequest) -> bool:
         """Is the lane free of ANY foreign live process (busy OR idle)? (read-only, #13806 R3-F1)
