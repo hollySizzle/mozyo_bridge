@@ -40,13 +40,11 @@ def format_recover_pair_text(outcome: RecoverPairOutcome) -> str:
     ]
     for slot in outcome.preflight.slots:
         lines.append(f"  {slot.role}: {slot.disposition} (recovers={slot.recovers})")
-    # Review j#88563 F3: the applied-effect / unresolved-fate contract is operator-facing, so
-    # it is printed on EVERY path — a blocked or partial run is exactly when knowing what was
-    # already applied matters, and the blocked branch below returns early.
-    if outcome.attempted:
-        lines.append(f"  applied: {', '.join(outcome.effects) or 'nothing'}")
-        if outcome.unresolved:
-            lines.append(f"  unresolved: {', '.join(outcome.unresolved)}")
+    # Review j#88563 F3 / j#88571 F3: printed on EVERY path with a STABLE shape — including a
+    # preflight-blocked run, which previously showed neither line. An operator scanning the
+    # output must not have to infer "the field is missing, so presumably nothing".
+    lines.append(f"  applied: {', '.join(outcome.effects) or 'nothing'}")
+    lines.append(f"  unresolved: {', '.join(outcome.unresolved) or 'none'}")
     if outcome.is_blocked:
         lines.append(
             "  -> fail-closed blocked: " + ", ".join(outcome.preflight.blocked_reasons or (outcome.detail,))
@@ -137,11 +135,7 @@ def cmd_sublane_recover_pair_delivery(args: argparse.Namespace) -> int:
         # recovery, so an operator reading either sees applied effects and unresolved fates,
         # not just a status token.
         applied = ", ".join(outcome.effects) or "nothing"
-        fate = (
-            f"\n  unresolved: {', '.join(outcome.unresolved)}"
-            if outcome.unresolved
-            else ""
-        )
+        fate = f"\n  unresolved: {', '.join(outcome.unresolved) or 'none'}"
         print(
             f"sublane recover-pair-delivery: {outcome.lane} (issue {outcome.issue})\n"
             f"  action_id: {outcome.action_id or '<invalid>'}\n"

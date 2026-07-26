@@ -27,8 +27,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     _norm,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
-    EFFECT_REDISPATCHED,
-    FATE_REDISPATCH_UNRESOLVED,
+    as_edge_result,
 )
 
 @dataclass
@@ -91,7 +90,7 @@ class SublaneRecoverPairDeliveryUseCase:
                 may_deliver=True,
                 detail="preflight only (no --execute)",
             )
-        redispatch = self.ops.retry_redispatch_to_gateway(
+        edge = as_edge_result(self.ops.retry_redispatch_to_gateway(
             action_id=action_id,
             retry_of_action_id=_norm(request.retry_of_action_id),
             issue=issue,
@@ -100,15 +99,11 @@ class SublaneRecoverPairDeliveryUseCase:
             approval_journal=_norm(request.journal),
             prior_zero_send_journal=_norm(request.prior_zero_send_journal),
             workspace_id=workspace_id,
-        )
-        effects = (
-            (EFFECT_REDISPATCHED,) if redispatch == REDISPATCH_DELIVERED else ()
-        )
-        unresolved = (
-            (FATE_REDISPATCH_UNRESOLVED,)
-            if redispatch in (REDISPATCH_FAILED, REDISPATCH_UNCERTAIN)
-            else ()
-        )
+        ))
+        redispatch = edge.status
+        # Review j#88571 F1: from the edge's own observation, never re-inferred from status.
+        effects = edge.effects
+        unresolved = edge.unresolved
         if redispatch == REDISPATCH_DELIVERED:
             detail = "original implementation_request delivered under a new recovery action"
         elif redispatch == REDISPATCH_ALREADY:

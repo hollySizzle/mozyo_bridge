@@ -56,6 +56,9 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     ReleasePin,
     ReleasePinError,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+    RedispatchEdgeResult,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.lane_checkout_authority import (  # noqa: E501
     checkout_authority_current,
     current_branch,
@@ -569,6 +572,10 @@ class LiveHibernatedPairRecoveryOps:
             )
         )
 
+    @staticmethod
+    def _edge_result(status: str, **facts) -> RedispatchEdgeResult:
+        return RedispatchEdgeResult(status=status, **facts)
+
     def _redispatch_with_action(
         self,
         *,
@@ -580,7 +587,10 @@ class LiveHibernatedPairRecoveryOps:
         journal: str,
         workspace_id: str,
         pre_send_authority: Optional[Callable[[], bool]] = None,
-    ) -> str:
+    ) -> RedispatchEdgeResult:
+        # Review j#88571 F1: this edge reports what it OBSERVED (sent? settled? unknown?), not
+        # a status the application would have to re-infer those facts from.
+        _edge = self._edge_result
         key = FenceKey(
             workspace_id=_norm(workspace_id), lane_id=_norm_lane(lane), issue=_norm(issue),
             journal=_norm(journal), action_id=_norm(action_id),
@@ -593,19 +603,21 @@ class LiveHibernatedPairRecoveryOps:
         try:
             bootstrapped = fence.is_bootstrapped()
         except Exception:  # noqa: BLE001 - unreadable fence state => uncertain (never send)
-            return REDISPATCH_UNCERTAIN
+            return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
         if not bootstrapped:
-            return REDISPATCH_UNCERTAIN
+            return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
         try:
             reserve = fence.reserve(key)
         except DispatchOutboxFenceError:
-            return REDISPATCH_UNCERTAIN
+            return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
         if not reserve.won:
             # The fence already holds a row for this exact redispatch — idempotent. A
             # delivered/reserved-by-another row is "already"; an uncertain one needs reconcile.
             if reserve.needs_reconcile or reserve.current_state == "uncertain":
-                return REDISPATCH_UNCERTAIN
-            return REDISPATCH_ALREADY
+                return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
+            # The fence already holds this delivery: THIS run sent nothing and the durable
+            # state is settled.
+            return _edge(REDISPATCH_ALREADY, zero_send=True)
         # We won the reserve. Before resolving a locator or sending, the shared retirement
         # guard (Redmine #13892 R6-F3): this is a reserve -> send edge like every other, and
         # `target_is_retiring`'s own docstring already named this call site. A send into panes
@@ -621,8 +633,9 @@ class LiveHibernatedPairRecoveryOps:
             try:
                 fence.mark_cancelled(key, detail=f"target retiring: {why}")
             except DispatchOutboxFenceError:
-                return REDISPATCH_UNCERTAIN
-            return REDISPATCH_TARGET_RETIRING
+                return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
+            # Cancelled reserve, nothing sent, durable state settled.
+            return _edge(REDISPATCH_TARGET_RETIRING, zero_send=True)
         if pre_send_authority is not None:
             try:
                 still_authorized = bool(pre_send_authority())
@@ -635,8 +648,9 @@ class LiveHibernatedPairRecoveryOps:
                         detail="recovery delivery action-time authority moved; zero-send",
                     )
                 except DispatchOutboxFenceError:
-                    return REDISPATCH_UNCERTAIN
-                return REDISPATCH_FAILED
+                    return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
+                # The cancel wrote: a KNOWN zero-send, not an unknown fate.
+                return _edge(REDISPATCH_FAILED, zero_send=True)
         gateway_locator, target_revision = self._gateway_live_target(
             gateway_assigned_name
         )
@@ -652,8 +666,8 @@ class LiveHibernatedPairRecoveryOps:
                     key, detail="exact live gateway target unresolved; zero-send"
                 )
             except DispatchOutboxFenceError:
-                return REDISPATCH_UNCERTAIN
-            return REDISPATCH_FAILED
+                return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
+            return _edge(REDISPATCH_FAILED, zero_send=True)
         try:
             from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_anchor_delivery_live import (  # noqa: E501
                 LiveRecoveryAnchorDeliveryService,
@@ -691,7 +705,7 @@ class LiveHibernatedPairRecoveryOps:
                 fence.mark_uncertain(key, detail="recovery delivery service raised")
             except DispatchOutboxFenceError:
                 pass
-            return REDISPATCH_UNCERTAIN
+            return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
         if outcome.started:
             try:
                 fence.mark_delivered(
@@ -699,8 +713,11 @@ class LiveHibernatedPairRecoveryOps:
                     detail="implementation_request recovery turn-start confirmed",
                 )
             except DispatchOutboxFenceError:
-                return REDISPATCH_UNCERTAIN
-            return REDISPATCH_DELIVERED
+                # Review j#88571 F1 / probe j#88570: the transport POSITIVELY started, so the
+                # redelivery is a known-applied effect even though the ledger write failed.
+                # Reporting a bare ``uncertain`` here lost that fact downstream.
+                return _edge(REDISPATCH_UNCERTAIN, delivered=True, unknown_fate=True)
+            return _edge(REDISPATCH_DELIVERED, delivered=True)
         if outcome.zero_send:
             try:
                 fence.mark_cancelled(
@@ -708,8 +725,8 @@ class LiveHibernatedPairRecoveryOps:
                     detail=f"recovery delivery zero-send: {outcome.detail}",
                 )
             except DispatchOutboxFenceError:
-                return REDISPATCH_UNCERTAIN
-            return REDISPATCH_FAILED
+                return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
+            return _edge(REDISPATCH_FAILED, zero_send=True)
         try:
             fence.mark_uncertain(
                 key,
@@ -717,11 +734,11 @@ class LiveHibernatedPairRecoveryOps:
             )
         except DispatchOutboxFenceError:
             pass
-        return REDISPATCH_UNCERTAIN
+        return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
 
     def redispatch_to_gateway(
         self, *, action_id: str, gateway_assigned_name: str, issue: str, lane: str, journal: str, workspace_id: str
-    ) -> str:
+    ) -> RedispatchEdgeResult:
         return self._redispatch_with_action(
             action_id=action_id,
             target_action_id=action_id,
@@ -883,10 +900,11 @@ class LiveHibernatedPairRecoveryOps:
         approval_journal: str,
         prior_zero_send_journal: str,
         workspace_id: str,
-    ) -> str:
+    ) -> RedispatchEdgeResult:
         """Use a new key while preserving and proving the exact prior blocked attempt."""
         if not _norm(action_id):
-            return REDISPATCH_FAILED
+            # Nothing was reserved or sent, and there is nothing owed to reconcile.
+            return RedispatchEdgeResult(status=REDISPATCH_FAILED, zero_send=True)
         gateway_assigned_name, detail = self._retry_delivery_context(
             retry_of_action_id=retry_of_action_id,
             issue=issue,
@@ -897,9 +915,9 @@ class LiveHibernatedPairRecoveryOps:
             workspace_id=workspace_id,
         )
         if not gateway_assigned_name:
-            return REDISPATCH_FAILED
+            return RedispatchEdgeResult(status=REDISPATCH_FAILED, zero_send=True)
         if detail == "prior_delivered":
-            return REDISPATCH_ALREADY
+            return RedispatchEdgeResult(status=REDISPATCH_ALREADY, zero_send=True)
         return self._redispatch_with_action(
             action_id=action_id,
             target_action_id=retry_of_action_id,

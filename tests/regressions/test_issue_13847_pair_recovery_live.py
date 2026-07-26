@@ -251,8 +251,8 @@ class RedispatchExactlyOnce(unittest.TestCase):
                     action_id="recover-pair:13847:issue_13847_x:3:2", gateway_assigned_name=gw_name,
                     issue="13847", lane=_LANE, journal="79612", workspace_id=_WS,
                 )
-            self.assertEqual(first, REDISPATCH_DELIVERED)
-            self.assertEqual(second, REDISPATCH_ALREADY)
+            self.assertEqual(first.status, REDISPATCH_DELIVERED)
+            self.assertEqual(second.status, REDISPATCH_ALREADY)
             self.assertEqual(len(sends), 1, "the fence must permit exactly one gateway send")
             # The send targeted the live gateway locator.
             self.assertEqual(sends[0].target_locator, "wZ:p3G")
@@ -275,7 +275,7 @@ class RedispatchExactlyOnce(unittest.TestCase):
                     action_id="a", gateway_assigned_name=gw_name, issue="13847",
                     lane=_LANE, journal="79612", workspace_id=_WS,
                 )
-            self.assertEqual(result, REDISPATCH_FAILED)
+            self.assertEqual(result.status, REDISPATCH_FAILED)
 
     def test_unbootstrapped_fence_is_uncertain_never_sends(self):
         # R1-F2: the recovery must NOT bootstrap a missing fence. An absent / never-bootstrapped
@@ -301,7 +301,7 @@ class RedispatchExactlyOnce(unittest.TestCase):
                     action_id="a", gateway_assigned_name=gw_name, issue="13847",
                     lane=_LANE, journal="79612", workspace_id=_WS,
                 )
-            self.assertEqual(result, REDISPATCH_UNCERTAIN)
+            self.assertEqual(result.status, REDISPATCH_UNCERTAIN)
             self.assertEqual(sends, [], "an un-bootstrapped fence must never send")
             # The recovery must NOT have created the fence store (no auto-bootstrap).
             self.assertFalse(fence.is_bootstrapped(), "recovery must not bootstrap the fence")
@@ -405,7 +405,7 @@ class RedispatchExactlyOnce(unittest.TestCase):
                 action_id=new_action,
                 target_assigned_name=gw_name,
             )
-            self.assertEqual(result, REDISPATCH_DELIVERED)
+            self.assertEqual(result.status, REDISPATCH_DELIVERED)
             self.assertEqual(fence.state_of(prior_key), FENCE_RESERVED)
             self.assertEqual(fence.state_of(new_key), FENCE_DELIVERED)
 
@@ -476,7 +476,7 @@ class RedispatchExactlyOnce(unittest.TestCase):
                     prior_zero_send_journal="99999",
                     workspace_id=_WS,
                 )
-            self.assertEqual(REDISPATCH_FAILED, result)
+            self.assertEqual(REDISPATCH_FAILED, result.status)
             self.assertEqual(FENCE_RESERVED, fence.state_of(prior_key))
             deliver.assert_not_called()
 
@@ -517,7 +517,7 @@ class RedispatchExactlyOnce(unittest.TestCase):
                 action_id=action,
                 target_assigned_name=gw_name,
             )
-            self.assertEqual(result, REDISPATCH_UNCERTAIN)
+            self.assertEqual(result.status, REDISPATCH_UNCERTAIN)
             self.assertEqual(fence.state_of(key), FENCE_UNCERTAIN)
 
 

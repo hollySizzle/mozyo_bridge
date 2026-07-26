@@ -99,7 +99,7 @@ class RedispatchRetirementGuardTest(unittest.TestCase):
             txn.reserve(pinned=(("codex", "wZ:p3G"), ("claude", "wZ:p3C")))
             result = self._redispatch()
         self.assertEqual(self.sends, [], "sent=0: never redispatch into a retiring pair")
-        self.assertEqual(result, REDISPATCH_TARGET_RETIRING)
+        self.assertEqual(result.status, REDISPATCH_TARGET_RETIRING)
 
     def test_a_stopped_send_leaves_no_reserved_row_blocking_the_retirement(self):
         """The reserve must be cancelled, not abandoned reserved.
@@ -124,7 +124,7 @@ class RedispatchRetirementGuardTest(unittest.TestCase):
         """Control: the ordinary case for every non-scratch lane must still send."""
         result = self._redispatch()
         self.assertEqual(len(self.sends), 1, "an absent authority must not block a send")
-        self.assertEqual(result, REDISPATCH_DELIVERED)
+        self.assertEqual(result.status, REDISPATCH_DELIVERED)
 
     def test_an_unreadable_authority_stops_the_send(self):
         with self.retirement.transaction(self.unit, live_pair_present=True) as txn:
@@ -134,7 +134,7 @@ class RedispatchRetirementGuardTest(unittest.TestCase):
         self.assertEqual(
             self.sends, [], "a send we cannot prove is safe is not sent"
         )
-        self.assertEqual(result, REDISPATCH_TARGET_RETIRING)
+        self.assertEqual(result.status, REDISPATCH_TARGET_RETIRING)
 
     def test_the_guard_runs_before_the_locator_is_resolved(self):
         """No live gateway AND retiring: the retirement answer wins, and nothing sends.
@@ -149,7 +149,7 @@ class RedispatchRetirementGuardTest(unittest.TestCase):
                     action_id="a", gateway_assigned_name=self.gw, issue="13847",
                     lane=_LANE, journal="79612", workspace_id=_WS,
                 )
-        self.assertEqual(result, REDISPATCH_TARGET_RETIRING)
+        self.assertEqual(result.status, REDISPATCH_TARGET_RETIRING)
         self.assertNotEqual(result, REDISPATCH_UNCERTAIN)
 
 

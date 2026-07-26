@@ -21,6 +21,7 @@ Pure: no store, no process, no I/O.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Sequence, Tuple
 
 # -- what a run is KNOWN to have applied ---------------------------------------
@@ -50,13 +51,20 @@ RECOVERY_UNRESOLVED_FATES = frozenset({FATE_REDISPATCH_UNRESOLVED})
 
 
 def validate_effect_contract(
-    *, executed: bool, effects: Sequence[str], unresolved: Sequence[str]
+    *,
+    executed: bool,
+    effects: Sequence[str],
+    unresolved: Sequence[str],
+    attempted: bool,
 ) -> None:
-    """Raise unless the outcome's three facts are mutually consistent. (pure)
+    """Raise unless the outcome's facts are mutually consistent. (pure)
 
-    ``executed`` must be exactly the non-emptiness of ``effects`` — an outcome claiming a
-    change with nothing applied (or the reverse) is a report contradicting itself — and every
-    token must come from its own closed vocabulary.
+    - every token comes from its own closed vocabulary;
+    - ``executed`` is exactly the non-emptiness of ``effects`` — an outcome claiming a change
+      with nothing applied (or the reverse) contradicts itself;
+    - anything applied OR attempted-with-unknown-fate implies the actuation was entered
+      (review j#88571 F2). Without this the validator was weaker than its own docstring: an
+      outcome with effects and ``attempted=False`` constructed fine and then read as unblocked.
     """
     unknown = tuple(e for e in effects if e not in RECOVERY_EFFECTS)
     if unknown:
@@ -69,18 +77,86 @@ def validate_effect_contract(
             "executed must be exactly the non-emptiness of the applied effects "
             f"(executed={executed!r}, effects={tuple(effects)!r})"
         )
+    if (effects or unresolved) and not attempted:
+        raise ValueError(
+            "effects / unresolved fates imply the actuation was attempted "
+            f"(attempted={attempted!r}, effects={tuple(effects)!r}, "
+            f"unresolved={tuple(unresolved)!r})"
+        )
 
 
-def redispatch_effects(redispatch: str) -> Tuple[str, ...]:
-    """The KNOWN-applied effects a redispatch status proves. (pure)"""
-    return (EFFECT_REDISPATCHED,) if redispatch == "redispatched" else ()
+# -- the redispatch edge's own observation --------------------------------------
+
+@dataclass(frozen=True)
+class RedispatchEdgeResult:
+    """What the reserve -> send -> record edge OBSERVED, before any status collapse.
+
+    Review j#88571 F1: collapsing that edge into a single ``REDISPATCH_*`` string throws away
+    facts the application then cannot recover. A ``uncertain`` status covers both "the fence
+    was never bootstrapped, nothing was sent" and "the transport started and the delivered
+    record failed to write" — the same token for a zero-send and for a KNOWN redelivery. The
+    edge reports what it knows; nothing downstream re-infers it.
+
+    - :attr:`status` — the public ``REDISPATCH_*`` token (unchanged contract for callers).
+    - :attr:`delivered` — the transport positively started for this action: a known-applied
+      redelivery, whatever happened to the ledger write afterwards.
+    - :attr:`zero_send` — positively nothing was sent AND the durable state is settled (e.g. a
+      cancelled reserve): no unknown fate remains.
+    - :attr:`unknown_fate` — the durable fate could not be established.
+    """
+
+    status: str
+    delivered: bool = False
+    zero_send: bool = False
+    unknown_fate: bool = False
+
+    def __post_init__(self) -> None:
+        if self.zero_send and self.delivered:
+            raise ValueError("a zero-send cannot also be a delivery")
+        if self.zero_send and self.unknown_fate:
+            raise ValueError("a settled zero-send has no unknown fate")
+
+    @property
+    def effects(self) -> Tuple[str, ...]:
+        """The KNOWN-applied effects this edge observed. (pure)"""
+        return (EFFECT_REDISPATCHED,) if self.delivered else ()
+
+    @property
+    def unresolved(self) -> Tuple[str, ...]:
+        """The unresolved fates this edge observed. (pure)"""
+        return (FATE_REDISPATCH_UNRESOLVED,) if self.unknown_fate else ()
 
 
-def redispatch_unresolved(redispatch: str) -> Tuple[str, ...]:
-    """The unresolved fates a redispatch status carries. (pure)"""
-    if redispatch in ("redispatch_send_failed", "redispatch_uncertain"):
-        return (FATE_REDISPATCH_UNRESOLVED,)
-    return ()
+def as_edge_result(value: object) -> RedispatchEdgeResult:
+    """Adapt an ops return to the typed edge result. (pure, conservative)
+
+    A :class:`RedispatchEdgeResult` passes through. A bare status string — what a fake that
+    does not model the edge returns — is adapted with the only inference a string supports:
+    ``redispatched`` is a delivery, ``already`` / ``skipped`` / ``target_retiring`` are settled
+    zero-sends, and ``failed`` / ``uncertain`` are unknown. Production adapters return the
+    typed result, so this inference never stands in for a real observation.
+    """
+    if isinstance(value, RedispatchEdgeResult):
+        return value
+    status = str(value or "")
+    if status == "redispatched":
+        return RedispatchEdgeResult(status=status, delivered=True)
+    if status in ("already_redispatched", "redispatch_not_reached", "redispatch_target_retiring"):
+        return RedispatchEdgeResult(status=status, zero_send=True)
+    return RedispatchEdgeResult(status=status, unknown_fate=True)
+
+
+# -- terminal success policy, shared by both surfaces ---------------------------
+
+#: The ONLY redispatch statuses that leave an attempted run unblocked (review j#88571 F2).
+#: One closed set for the main recovery and the retry surface, so they cannot drift, and a
+#: future token is blocked by default rather than silently succeeding.
+REDISPATCH_TERMINAL_SUCCESS = frozenset({"redispatched", "already_redispatched"})
+
+
+def redispatch_is_success(status: str) -> bool:
+    """Does this terminal status leave an attempted run unblocked? (pure, fail-closed)"""
+    return status in REDISPATCH_TERMINAL_SUCCESS
 
 
 __all__ = (
@@ -92,6 +168,8 @@ __all__ = (
     "FATE_REDISPATCH_UNRESOLVED",
     "RECOVERY_UNRESOLVED_FATES",
     "validate_effect_contract",
-    "redispatch_effects",
-    "redispatch_unresolved",
+    "RedispatchEdgeResult",
+    "as_edge_result",
+    "REDISPATCH_TERMINAL_SUCCESS",
+    "redispatch_is_success",
 )

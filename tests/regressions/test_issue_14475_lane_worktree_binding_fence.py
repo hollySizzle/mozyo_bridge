@@ -1507,7 +1507,7 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
                     issue=self.issue, lane=self.lane, journal="88465",
                     workspace_id=self.workspace_id,
                 )
-            self.assertEqual(result, REDISPATCH_FAILED)
+            self.assertEqual(result.status, REDISPATCH_FAILED)
             self.assertEqual(sent, [], "zero transport")
             key = FenceKey(
                 workspace_id=self.workspace_id, lane_id=self.lane, issue=self.issue,
@@ -1945,6 +1945,219 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
             RecoverPairOutcome(
                 executed=True, preflight=pf, issue="1", lane="l", effects=("invented",),
             )
+
+    # -- j#88571 F1: the edge reports what it observed --------------------------
+
+    def test_a_started_transport_keeps_its_effect_when_the_ledger_write_fails(self):
+        """Review j#88571 F1 / probe j#88570: the decisive case.
+
+        The transport POSITIVELY started and then ``mark_delivered`` failed. The status is the
+        same ``uncertain`` a never-bootstrapped fence produces, so an application that infers
+        effects FROM the status loses a redelivery it is known to have made.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            EFFECT_REDISPATCHED,
+            FATE_REDISPATCH_UNRESOLVED,
+            RedispatchEdgeResult,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_UNCERTAIN,
+        )
+
+        started_then_lost = RedispatchEdgeResult(
+            status=REDISPATCH_UNCERTAIN, delivered=True, unknown_fate=True
+        )
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        ops = _FakeOps(
+            per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy},
+            redispatch=started_then_lost,
+        )
+        out = _use_case(ops, resume_transition="already_active").run(_REQ, execute=True)
+        self.assertEqual(
+            out.effects, (EFFECT_REDISPATCHED,), "the redelivery IS known to have happened"
+        )
+        self.assertTrue(out.executed)
+        self.assertEqual(out.unresolved, (FATE_REDISPATCH_UNRESOLVED,), "and its fate is not")
+        self.assertTrue(out.is_blocked, "an unresolved ledger write needs reconcile")
+
+    def test_an_uncertain_before_the_reserve_applies_nothing(self):
+        # The SAME status, the opposite facts: nothing was sent, so no effect may be claimed.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            FATE_REDISPATCH_UNRESOLVED,
+            RedispatchEdgeResult,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_UNCERTAIN,
+        )
+
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        ops = _FakeOps(
+            per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy},
+            redispatch=RedispatchEdgeResult(
+                status=REDISPATCH_UNCERTAIN, unknown_fate=True
+            ),
+        )
+        out = _use_case(ops, resume_transition="already_active").run(_REQ, execute=True)
+        self.assertEqual(out.effects, (), "nothing was sent")
+        self.assertFalse(out.executed)
+        self.assertEqual(out.unresolved, (FATE_REDISPATCH_UNRESOLVED,))
+        self.assertTrue(out.is_blocked)
+
+    def test_a_settled_zero_send_carries_no_unresolved_fate(self):
+        # A cancelled reserve is a KNOWN zero-send: nothing applied AND nothing unknown.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            RedispatchEdgeResult,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_FAILED,
+        )
+
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        ops = _FakeOps(
+            per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy},
+            redispatch=RedispatchEdgeResult(status=REDISPATCH_FAILED, zero_send=True),
+        )
+        out = _use_case(ops, resume_transition="already_active").run(_REQ, execute=True)
+        self.assertEqual(out.effects, ())
+        self.assertEqual(out.unresolved, (), "a settled zero-send is not an unknown fate")
+        self.assertTrue(out.is_blocked)
+
+    def test_the_edge_result_refuses_contradictory_observations(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            RedispatchEdgeResult,
+        )
+
+        with self.assertRaises(ValueError):
+            RedispatchEdgeResult(status="x", delivered=True, zero_send=True)
+        with self.assertRaises(ValueError):
+            RedispatchEdgeResult(status="x", zero_send=True, unknown_fate=True)
+
+    # -- j#88571 F2: the contract validates attempted, one success policy --------
+
+    def test_the_validator_requires_attempted_for_any_effect_or_fate(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            EFFECT_CLOSED as _CLOSED,
+            FATE_REDISPATCH_UNRESOLVED as _FATE,
+            validate_effect_contract,
+        )
+
+        with self.assertRaises(ValueError):  # effects without attempted
+            validate_effect_contract(
+                executed=True, effects=(_CLOSED,), unresolved=(), attempted=False
+            )
+        with self.assertRaises(ValueError):  # unresolved without attempted
+            validate_effect_contract(
+                executed=False, effects=(), unresolved=(_FATE,), attempted=False
+            )
+        # ...and the consistent shapes still pass.
+        validate_effect_contract(
+            executed=True, effects=(_CLOSED,), unresolved=(), attempted=True
+        )
+        validate_effect_contract(
+            executed=False, effects=(), unresolved=(), attempted=False
+        )
+
+    def test_both_surfaces_share_one_terminal_success_policy(self):
+        """Review j#88571 F2: main and retry must not classify the same status differently."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            REDISPATCH_TERMINAL_SUCCESS,
+            redispatch_is_success,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_ALREADY,
+            REDISPATCH_DELIVERED,
+            REDISPATCH_FAILED,
+            REDISPATCH_TARGET_RETIRING,
+            REDISPATCH_UNCERTAIN,
+        )
+
+        table = {
+            REDISPATCH_DELIVERED: True,
+            REDISPATCH_ALREADY: True,
+            REDISPATCH_TARGET_RETIRING: False,
+            REDISPATCH_FAILED: False,
+            REDISPATCH_UNCERTAIN: False,
+            "a_token_invented_later": False,  # unknown is blocked by default
+        }
+        for status, ok in table.items():
+            with self.subTest(status=status):
+                self.assertEqual(redispatch_is_success(status), ok)
+        self.assertEqual(
+            REDISPATCH_TERMINAL_SUCCESS, {REDISPATCH_DELIVERED, REDISPATCH_ALREADY}
+        )
+
+    # -- j#88571 F3: the text surface, on every path ----------------------------
+
+    def test_the_text_renderer_shows_applied_and_unresolved_on_every_path(self):
+        """Review j#88571 F3: including a PREFLIGHT-BLOCKED run, which showed neither.
+
+        There were no renderer assertions at all, so the "all paths" claim in the commit and
+        the runbook was never measured.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery_cli import (  # noqa: E501
+            format_recover_pair_text,
+        )
+
+        # 1. preflight-blocked (not hibernated): never entered the actuation.
+        from tests.regressions.test_issue_13847_pair_recovery_orchestration import _Record
+
+        blocked = _use_case(
+            _FakeOps(per_slot_obs={GATEWAY_ROLE: _obs(), WORKER_ROLE: _obs()}),
+            record=_Record(lane_disposition="active"),
+        ).run(_REQ, execute=True)
+        text = format_recover_pair_text(blocked)
+        self.assertIn("applied: nothing", text)
+        self.assertIn("unresolved: none", text)
+
+        # 2. a completed recovery.
+        done = _use_case(
+            _FakeOps(per_slot_obs={GATEWAY_ROLE: _obs(), WORKER_ROLE: _obs()})
+        ).run(_REQ, execute=True)
+        text = format_recover_pair_text(done)
+        self.assertIn(EFFECT_CLOSED, text)
+        self.assertIn("unresolved: none", text)
+
+        # 3. an all-idempotent replay.
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        replay = _use_case(
+            _FakeOps(
+                per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy},
+                redispatch=REDISPATCH_ALREADY,
+            ),
+            resume_transition="already_active",
+        ).run(_REQ, execute=True)
+        text = format_recover_pair_text(replay)
+        self.assertIn("applied: nothing", text)
+        self.assertIn("unresolved: none", text)
+
+        # 4. an unresolved fate.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            FATE_REDISPATCH_UNRESOLVED,
+            RedispatchEdgeResult,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_UNCERTAIN,
+        )
+
+        unknown = _use_case(
+            _FakeOps(
+                per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy},
+                redispatch=RedispatchEdgeResult(
+                    status=REDISPATCH_UNCERTAIN, unknown_fate=True
+                ),
+            ),
+            resume_transition="already_active",
+        ).run(_REQ, execute=True)
+        text = format_recover_pair_text(unknown)
+        self.assertIn(FATE_REDISPATCH_UNRESOLVED, text)
+
+    def test_the_json_payload_carries_the_same_three_facts(self):
+        payload = _use_case(
+            _FakeOps(per_slot_obs={GATEWAY_ROLE: _obs(), WORKER_ROLE: _obs()})
+        ).run(_REQ, execute=True).as_payload()
+        for key in ("executed", "attempted", "effects", "unresolved"):
+            with self.subTest(key=key):
+                self.assertIn(key, payload)
 
     def test_the_preflight_matches_the_store_on_raw_persisted_bytes(self):
         """Review j#88526 F2: the 4 padded shapes, preflight and execute must agree.

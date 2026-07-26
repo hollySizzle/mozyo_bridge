@@ -73,6 +73,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RECOVERY_EFFECTS,
     RECOVERY_UNRESOLVED_FATES,
     validate_effect_contract,
+    as_edge_result,
+    redispatch_is_success,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.lane_worktree_binding_probe import (  # noqa: E501
     resolve_worktree_binding_reason,
@@ -334,7 +336,8 @@ class RecoverPairOutcome:
         # be constructed, so a future branch cannot reintroduce a fixed ``executed`` or an
         # off-vocabulary token without failing here.
         validate_effect_contract(
-            executed=self.executed, effects=self.effects, unresolved=self.unresolved
+            executed=self.executed, effects=self.effects, unresolved=self.unresolved,
+            attempted=self.attempted,
         )
     #: Stable reason and locator-free nested startup evidence from a failed relaunch.
     #: These are additive so the historical top-level ``detail=pair_relaunch_failed``
@@ -373,10 +376,12 @@ class RecoverPairOutcome:
         # blocked outcome, not a silent success. Only a fresh delivery and a proven
         # already-delivered no-op are unblocked; ``skipped`` means an earlier fence stopped the
         # run, which the branches above have already classified.
-        return self.redispatch not in (
-            REDISPATCH_DELIVERED,
-            REDISPATCH_ALREADY,
-            REDISPATCH_SKIPPED,
+        # Review j#88571 F2: ONE closed success policy, shared with the retry surface, so the
+        # two cannot drift and a future token is blocked by default. ``skipped`` means an
+        # earlier fence stopped the run, which the branches above already classified.
+        return not (
+            redispatch_is_success(self.redispatch)
+            or self.redispatch == REDISPATCH_SKIPPED
         )
 
     def as_payload(self) -> dict[str, Any]:
@@ -422,7 +427,8 @@ class RecoverPairDeliveryRetryOutcome:
 
     def __post_init__(self) -> None:
         validate_effect_contract(
-            executed=self.executed, effects=self.effects, unresolved=self.unresolved
+            executed=self.executed, effects=self.effects, unresolved=self.unresolved,
+            attempted=self.attempted,
         )
 
     @property
@@ -431,9 +437,9 @@ class RecoverPairDeliveryRetryOutcome:
             return True
         if not self.attempted:
             return False
-        # Total classification (review j#88563 F2): only a fresh delivery and a proven
-        # already-delivered no-op are unblocked; retiring / failed / uncertain are not.
-        return self.redispatch not in (REDISPATCH_DELIVERED, REDISPATCH_ALREADY)
+        # Review j#88571 F2: the SAME closed policy the main recovery uses, so the two
+        # surfaces cannot drift and an unknown future token is blocked by default.
+        return not redispatch_is_success(self.redispatch)
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -708,7 +714,7 @@ class SublaneRecoverPairUseCase:
 
         applied: dict[str, bool] = {"relaunched": False, "resumed": False}
 
-        def _effects(redispatch: str = "") -> Tuple[str, ...]:
+        def _effects(edge=None) -> Tuple[str, ...]:
             """The effects THIS run is KNOWN to have applied, in the order they happen. (pure)
 
             One composer for every return path (reviews j#88554 / j#88563) — including the
@@ -724,20 +730,20 @@ class SublaneRecoverPairUseCase:
                 found.append(EFFECT_RELAUNCHED)
             if applied["resumed"]:
                 found.append(EFFECT_RESUME_COMMITTED)
-            if redispatch == REDISPATCH_DELIVERED:
-                found.append(EFFECT_REDISPATCHED)
+            if edge is not None:
+                # Review j#88571 F1: taken from what the EDGE observed, never re-inferred from
+                # its status — the same status covers a zero-send and a started transport.
+                found.extend(edge.effects)
             return tuple(found)
 
-        def _unresolved(redispatch: str = "") -> Tuple[str, ...]:
+        def _unresolved(edge=None) -> Tuple[str, ...]:
             """Actions whose durable fate this run could not establish. (pure)
 
             ``failed`` / ``uncertain`` say the send did not demonstrably deliver AND did not
             demonstrably no-op; ``uncertain`` in particular spans a pre-reserve zero-write and
             a post-send unknown. That is a fate, not an effect (review j#88563 F1).
             """
-            if redispatch in (REDISPATCH_FAILED, REDISPATCH_UNCERTAIN):
-                return (FATE_REDISPATCH_UNRESOLVED,)
-            return ()
+            return edge.unresolved if edge is not None else ()
 
         def _binding_drifted() -> Optional[RecoverPairOutcome]:
             """Re-join the 3 axes; a drift stops every REMAINING effect (review j#88526 F1).
@@ -894,20 +900,21 @@ class SublaneRecoverPairUseCase:
             )
 
         gateway_name = preflight.gateway.assigned_name if preflight.gateway else ""
-        redispatch = self.ops.redispatch_to_gateway(
+        edge = as_edge_result(self.ops.redispatch_to_gateway(
             action_id=action_id,
             gateway_assigned_name=gateway_name,
             issue=issue,
             lane=lane,
             journal=_norm(request.implementation_request_journal),
             workspace_id=workspace_id,
-        )
+        ))
+        redispatch = edge.status
         # Review j#88554 F2: the final branch used to hard-code ``executed=True`` and a fixed
         # "pair recovered" detail, so an ALL-idempotent replay — an already-active resume plus
         # an already-redispatched send, i.e. zero applied effects — reported the same thing as
         # a run that actually recovered the pair. Both are now derived from what happened.
-        effects = _effects(redispatch)
-        unresolved = _unresolved(redispatch)
+        effects = _effects(edge)
+        unresolved = _unresolved(edge)
         return RecoverPairOutcome(
             executed=bool(effects),
             effects=effects,
