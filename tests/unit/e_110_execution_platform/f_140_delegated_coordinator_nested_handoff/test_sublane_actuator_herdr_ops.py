@@ -242,6 +242,32 @@ class _StatefulHerdr:
         raise AssertionError(f"unexpected herdr call: {argv!r}")
 
 
+def _real_linked_worktree(coord: Path, worktree: Path, branch: str) -> Path:
+    """Turn ``coord`` into a real checkout and link a REAL worktree at ``worktree`` (#14478).
+
+    The lane runtime root's identity token family is chosen by probing whether that root IS a
+    git worktree, so a fixture that only ``mkdir``s a directory cannot stand in for the git
+    lane the create path actually produces (``create_worktree`` runs before
+    ``append_lane_column``). The worktree is linked from the ops adapter's own ``repo_root``,
+    which is also what the #13152 / #13377 workspace inheritance requires. Returns the
+    resolved worktree path.
+    """
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(coord), *args],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.invalid")
+    git("config", "user.name", "t")
+    (coord / "README.md").write_text("x\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    git("worktree", "add", "-q", "-b", branch, str(worktree), "main")
+    return worktree.resolve()
+
+
 def _fake_binary(tmp: str) -> Path:
     binpath = Path(tmp) / "fake-herdr"
     binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -524,6 +550,13 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         # Redmine #13356 j#73386 Q2 / #13377: the create command boundary records the
         # display join keyed on the worktree's stable path token, carrying the lane
         # unit fields (`repo_workspace_id`, `lane_id`) the shared-model reads join on.
+        #
+        # Redmine #14478: the lane runtime root here is a REAL linked git worktree, because
+        # that is what the `wt_` assertion below claims and what the use case guarantees —
+        # `create_worktree` (step 1) runs before `append_lane_column` (step 2). The fixture
+        # used to be a bare `mkdir`, and it passed only because the pre-fix writer read the
+        # token family off `resolved == repo_root` (a plain directory that merely differs
+        # from `--repo` is NOT a worktree, and now correctly keys `dl_`).
         from mozyo_bridge.core.state.lane_metadata import load_lane_records
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
             derive_lane_workspace_token,
@@ -533,9 +566,14 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ops, home = self._ops(tmp, herdr)
             ops.branch = "issue_13331_x"
-            worktree = Path(tmp) / "lane-wt"
-            worktree.mkdir()
+            worktree = _real_linked_worktree(
+                ops.repo_root, Path(tmp) / "lane-wt", "issue_13331_x"
+            )
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                # A linked worktree inherits its main checkout's registered workspace
+                # identity (#13152 / #13377), so the coordinator checkout is registered
+                # exactly as the create path requires.
+                register_workspace(ops.repo_root, home=home)
                 ops.append_lane_column(str(worktree))
                 records = load_lane_records(home=home)
             token = derive_lane_workspace_token(str(worktree.resolve()))

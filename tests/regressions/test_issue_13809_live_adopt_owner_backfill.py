@@ -61,7 +61,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ADOPT_DECL_UNATTESTED,
     ADOPT_DECL_UNREADABLE,
     ADOPT_DECL_UNRESOLVED_UNIT,
-    _worktree_token,
+    declared_worktree_identity,
     declare_adopted_owner_row,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E402
@@ -133,7 +133,6 @@ class DeclareAdoptedOwnerRowTest(unittest.TestCase):
             journal=JOURNAL,
             issue=ISSUE,
             lane_label=LANE,
-            repo_root=self.coord,
             worktree_path=self.worktree,
             workspace_id=WS,
             lane_id=LANE,
@@ -342,7 +341,7 @@ class DeclareAdoptedOwnerRowTest(unittest.TestCase):
     def _seed_worktree_only_row(self) -> str:
         """A v4->v5 migrated row: worktree bound (== the adopt's resolved token) but the typed
         pin snapshot empty (pre-v5). ``declare_lane`` sets the worktree, leaves slots empty."""
-        token = _worktree_token(self.coord, self.worktree, LANE)
+        token = declared_worktree_identity(self.worktree, LANE)
         out = LaneDeclarationStore(home=self.home).declare_lane(
             LaneLifecycleKey(WS, LANE),
             decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
@@ -391,7 +390,7 @@ class DeclareAdoptedOwnerRowTest(unittest.TestCase):
 
     def _seed_complete_row(self, pins: list) -> str:
         """A worktree-complete row carrying an explicit typed-pin snapshot (any provider pair)."""
-        token = _worktree_token(self.coord, self.worktree, LANE)
+        token = declared_worktree_identity(self.worktree, LANE)
         out = LaneDeclarationStore(home=self.home).declare_lane(
             LaneLifecycleKey(WS, LANE),
             decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
@@ -528,7 +527,7 @@ class DeclareAdoptedOwnerRowTest(unittest.TestCase):
         # attestation closed; after the adopt backfill the SAME token attests (synthetic,
         # isolated home — no live pane/process/route mutation and no real #13754 lane).
         self._seed_legacy_owner_row()
-        token = _worktree_token(self.coord, self.worktree, LANE)
+        token = declared_worktree_identity(self.worktree, LANE)
         self.assertTrue(token)
         with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False):
             attested, reason, _ = attest_retire_target(
@@ -843,7 +842,7 @@ class HerdrAdoptOwnerRowWiringTest(unittest.TestCase):
         self.assertEqual(row.worktree_identity, "")
 
     def _seed_worktree_only_row(self) -> str:
-        token = _worktree_token(self.coord, self.worktree, LANE)
+        token = declared_worktree_identity(self.worktree, LANE)
         LaneDeclarationStore(home=self.home).declare_lane(
             LaneLifecycleKey(WS, LANE),
             decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
@@ -878,7 +877,7 @@ class HerdrAdoptOwnerRowWiringTest(unittest.TestCase):
         # review j#79074 F3 at the official ops surface: a worktree-complete row whose typed
         # pins bind a SWAPPED/foreign provider pair + an unattested live pair returns an
         # owner-unbound BLOCK token (dispatch=false), NOT already_owned.
-        token = _worktree_token(self.coord, self.worktree, LANE)
+        token = declared_worktree_identity(self.worktree, LANE)
         LaneDeclarationStore(home=self.home).declare_lane(
             LaneLifecycleKey(WS, LANE),
             decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),
@@ -901,7 +900,7 @@ class HerdrAdoptOwnerRowWiringTest(unittest.TestCase):
         # F4 (review j#79097): the official-ops half of the foreign-provider + AMBIGUOUS matrix
         # cell — a worktree-complete row bound to a swapped provider pair + a duplicate current
         # provider slot blocks dispatch (owner-unbound), never already_owned.
-        token = _worktree_token(self.coord, self.worktree, LANE)
+        token = declared_worktree_identity(self.worktree, LANE)
         LaneDeclarationStore(home=self.home).declare_lane(
             LaneLifecycleKey(WS, LANE),
             decision=DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL),

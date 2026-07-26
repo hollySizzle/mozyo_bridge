@@ -111,8 +111,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_KEY_NAME,
     _agent_locator,
     _norm,
-    derive_directory_lane_token,
-    derive_lane_workspace_token,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (
     COMMAND_TIMEOUT_SECONDS,
@@ -412,28 +410,25 @@ class HerdrSublaneActuatorOps:
     def _record_lane_metadata(self, worktree_path: str) -> None:
         """Upsert the lane's display-metadata record (best-effort, never raises)."""
         from mozyo_bridge.core.state.lane_metadata import record_lane_created
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+            declared_worktree_identity,
+        )
 
-        try:
-            resolved = Path(worktree_path).expanduser().resolve()
-        except OSError:
-            return
         # The stable per-worktree metadata key (also the legacy pre-#13377 workspace
         # segment) — NOT the mzb1 workspace segment, which is the project identity now.
-        # #13392: a non-git (directory scaffold) lane has no worktree — the use case
-        # collapses its runtime root to the shared workspace root (``== self.repo_root``),
-        # so the path-only ``wt_`` token would collide across every lane on that root and
-        # one lane's record would overwrite the next. Detect that collapse (runtime root IS
-        # the workspace root) and scope the key by ``(workspace root, lane_id)`` instead so
-        # two lanes on one non-git root keep distinct records (live unit stays
-        # ``(project ws, lane_id)``). A Git lane's distinct worktree keeps the ``wt_`` token.
-        try:
-            is_workspace_root = resolved == self.repo_root.expanduser().resolve()
-        except OSError:
-            is_workspace_root = False
-        if is_workspace_root:
-            token = derive_directory_lane_token(str(resolved), self.lane_label or "")
-        else:
-            token = derive_lane_workspace_token(str(resolved))
+        # #13392: a non-git (directory scaffold) lane has no worktree — the use case runs it
+        # in the shared workspace root itself, so the path-only ``wt_`` token would collide
+        # across every lane on that root and one lane's record would overwrite the next; such
+        # a lane is keyed by ``(root, lane_id)`` instead. The discriminant is the KIND of the
+        # runtime root, probed on that root, and it is resolved ONCE for both declaration
+        # writers by ``declared_worktree_identity`` — never re-derived here from
+        # ``resolved == self.repo_root`` (Redmine #13933 j#81046 Decision 1 / #14478). That
+        # proxy is a fact about the caller's ``--repo``: a create/adopt anchored at the lane's
+        # own worktree collapsed it and minted a ``dl_`` token for a linked git worktree,
+        # which the recovery reader (deriving ``wt_`` from the same root) can never match.
+        token = declared_worktree_identity(worktree_path, self.lane_label or "")
+        if token is None:
+            return
         try:
             repo_workspace_id = herdr_workspace_segment(self.repo_root)
         except (OSError, ValueError):
@@ -532,7 +527,6 @@ class HerdrSublaneActuatorOps:
             journal=self.journal or "",
             issue=self.issue or "",
             lane_label=self.lane_label or "",
-            repo_root=self.repo_root,
             worktree_path=worktree_path,
             workspace_id=workspace_id,
             lane_id=lane_id,

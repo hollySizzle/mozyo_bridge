@@ -298,7 +298,7 @@ class AdoptToRecoverPairSeamTest(_HomeBackedCase):
         self._attest(WK_PROVIDER, WK_LOC)
         return declare_adopted_owner_row(
             journal=JOURNAL, issue=ISSUE, lane_label=LANE,
-            repo_root=self.coord, worktree_path=self.worktree,
+            worktree_path=self.worktree,
             workspace_id=WS, lane_id=LANE, providers=PROVIDERS, rows=_pair_rows(),
             store_factory=lambda: LaneDeclarationStore(home=self.home),
             attestation_store_factory=lambda: HerdrIdentityAttestationStore(home=self.home),

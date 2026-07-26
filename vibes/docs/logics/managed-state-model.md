@@ -796,12 +796,29 @@ Table naming:
           `test_issue_13933_lane_identity_execution_root.py` が `is_git_worktree_root` / `lane_runtime_identity` / convergence・prepare
           両 ops の `_worktree` を real git worktree に対し駆動)、`repair-pins` は inline derive を real git worktree + real probe で
           `--repo` 非依存に固定する (`test_issue_13879_...::PinRepairExecutionRootInvarianceTests`、旧 proxy で fail することを実測)。
+        - ★**create/adopt declaration writer も同じ derive を採る** (#14478、live evidence #14462 j#88632)。#13933 は read/repair 側
+          だけを直したため、**identity を書く側**に `resolved == repo_root` が残っていた。active declaration self-heal の runbook は
+          「lane worktree を execution root にする」と案内するので、その通りに `--repo` を lane worktree へ向けると proxy が collapse し、
+          **linked git worktree の lifecycle `worktree_identity` が `dl_` で backfill** される。recovery reader は同じ root から常に `wt_` を
+          derive するため、直後の `sublane recover-gateway` preflight が `worktree_identity_mismatch` で close/launch/send 0 になった。
+          create writer (`_record_lane_metadata` -> `_declare_lane_lifecycle`) と adopt writer (`declare_adopted_owner_row`) は
+          共有 `declared_worktree_identity(worktree_path, lane_label)` を通し、**caller anchor を引数に取らない** (branch を消すのではなく、
+          anchor を signature から外して分岐を表現不能にする)。regression:
+          `test_issue_14478_linked_worktree_declaration_identity.py` が real git worktree / real probe / real isolated-home store に対し、
+          両 anchor からの declared token、両 recovery evaluator (`LiveStaleWorkerRecoveryOps.lane_authority_reason` =
+          recover-gateway / recover-stale、`lane_checkout_authority.worktree_binding_reason` = recover-pair) との join、
+          non-git `dl_` 契約、divergent binding 非上書きを駆動する。recovery reader 側は**変更しない** — 既に anchor 非依存に `wt_` を
+          derive しており、緩めれば #14475 の fence を弱める。
         - **destructive retire 系** (`sublane retire` guarded close / hibernated-bound / hibernated-legacy / live-reconcile) は
           この derive を採らない。#13754 は「lane worktree を `--repo` と `--worktree` の両方に渡すと token が collapse し、
           worktree-binding attestation が **意図的に fail-closed** する」ことを安全弁として持つ (false block は安全、false close が
           防ぐべき欠陥)。identity derive と authority が entangle しているため、git-kind derive への切替は destructive 挙動を
           変える per-surface 設計判断であり、別 review を要する。**共有 probe は generic authority guard へ統合しない** (design
-          answer j#81046 Decision 4): 各 surface が identity family と fail-closed 条件を自分で決める。
+          answer j#81046 Decision 4): 各 surface が identity family と fail-closed 条件を自分で決める。#14478 でも本 carve-out は
+          維持した。副次的に、この collapse は **#14478 以前に `dl_` で mis-bind された既存 live row の public な収束経路**でもある:
+          `--repo` と `--worktree` の双方を lane worktree に向けた `sublane retire` は同じ `dl_` を derive するため attestation が成立し、
+          retire 後の再 create が canonical `wt_` を宣言し直す (raw DB 修復も guard 緩和も不要。実測: `attest_retire_target` が
+          lane-worktree anchor で `attested=True`、primary-checkout anchor で `worktree_binding_mismatch`)。
       - ★**bound-signature block は typed sub-reason で報告する** (#13933 R7、design answer j#81046 Decision 2)。
         `not_hibernated_released_bound_pins_empty` は独立 axis の連言 (hibernated / issue-bound / issue 一致 / non-project /
         worktree identity 非空 / identity 一致 / released / replacement settled / pins) であり、collapse した単一 token は

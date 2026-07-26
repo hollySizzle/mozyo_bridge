@@ -71,14 +71,16 @@ from mozyo_bridge.core.state.lane_pin_role import (
     PIN_ROLE_WORKER,
     read_declared_pin_pair,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+    is_git_worktree_root,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     _agent_locator,
     _norm,
     _norm_lane,
     decode_assigned_name,
-    derive_directory_lane_token,
-    derive_lane_workspace_token,
+    lane_runtime_identity,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
     SLOT_LIVE,
@@ -176,22 +178,34 @@ ADOPT_DECL_ZERO_WRITE = frozenset(
 )
 
 
-def _worktree_token(repo_root: Path, worktree_path: str, lane_label: str) -> Optional[str]:
+def declared_worktree_identity(worktree_path: str, lane_label: str) -> Optional[str]:
     """The lane's canonical worktree identity token, or ``None`` if unresolvable.
 
     The SAME token the create-path metadata / lifecycle declaration is keyed on
-    (``_record_lane_metadata``): a non-git directory lane whose runtime root collapses onto
-    the workspace root is scoped by ``(workspace root, lane_label)``; a git lane's distinct
-    worktree keeps its ``wt_`` token. Writer and reader compute it identically.
+    (``_record_lane_metadata``, which calls this function), so writer and reader compute one
+    identity. The family is decided by the **KIND of the root being named** — probed on that
+    root with :func:`...sublane_herdr_projection.is_git_worktree_root` — and by nothing else
+    (Redmine #13933 j#81046 Decision 1). A linked git worktree (or a main checkout) is named
+    by its path alone (``wt_``); a non-git directory-scaffold lane, whose runtime root IS the
+    shared workspace root, is scoped by ``(root, lane_label)`` (``dl_``) so two lanes on one
+    root cannot overwrite each other.
+
+    This function deliberately takes **no caller anchor**. Its predecessor chose the family
+    with ``resolved == repo_root``, which is a fact about where the operator ran the command,
+    not about the lane. Anchoring ``--repo`` at the lane's own worktree — the execution root
+    the active-declaration self-heal prescribes — collapsed that proxy and backfilled a
+    **linked git worktree's** binding with a ``dl_`` token, while the recovery reader derives
+    ``wt_`` from that same root and refused the launch with ``worktree_identity_mismatch``
+    (Redmine #14478; live evidence #14462 j#88632). Removing the anchor from the signature
+    makes that split structurally unrepresentable here, rather than merely corrected.
     """
     try:
         resolved = Path(worktree_path).expanduser().resolve()
-        is_workspace_root = resolved == repo_root.expanduser().resolve()
     except OSError:
         return None
-    if is_workspace_root:
-        return derive_directory_lane_token(str(resolved), lane_label)
-    return derive_lane_workspace_token(str(resolved))
+    return lane_runtime_identity(
+        str(resolved), lane_label, git_worktree=is_git_worktree_root(resolved)
+    )
 
 
 def _resolve_attested_slot(
@@ -336,7 +350,6 @@ def declare_adopted_owner_row(
     journal: str,
     issue: str,
     lane_label: str,
-    repo_root: Path,
     worktree_path: str,
     workspace_id: str,
     lane_id: str,
@@ -372,7 +385,7 @@ def declare_adopted_owner_row(
     # owner-completeness resolution below agree on the exact token this adopt resolved. It is
     # the completeness anchor: a lane is "already established" (safe to dispatch on a gate /
     # CAS refusal) only when the state DB owner row is bound to THIS exact token.
-    worktree_token = _worktree_token(repo_root, worktree_path, lane_label)
+    worktree_token = declared_worktree_identity(worktree_path, lane_label)
     # Redmine #13844 F1: the declaration store this adopt writes through — created ONCE so the
     # command can read the explicit write gate's typed result (``last_write_preparation``) after
     # the declare, and surface a schema migration + its peer-reader risk to the operator instead
@@ -632,6 +645,7 @@ def _binding_has_required_pins(record, providers: tuple[str, str]) -> bool:
 
 
 __all__ = (
+    "declared_worktree_identity",
     "declare_adopted_owner_row",
     "owner_bound_or",
     "complete_owner_bound_or",
