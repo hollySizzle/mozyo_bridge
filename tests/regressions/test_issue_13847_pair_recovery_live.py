@@ -57,7 +57,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
     DETAIL_OK,
     DISPOSITION_STARTED,
+    RecoveryAnchorDeliveryPreflight,
     RecoveryAnchorDeliveryOutcome,
+    build_recovery_delivery_authorization_marker,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+    RedmineJournalEntry,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
@@ -307,9 +312,29 @@ class RedispatchExactlyOnce(unittest.TestCase):
                 disposition=DISPOSITION_STARTED,
                 detail=DETAIL_OK,
             )
+            entries = (
+                RedmineJournalEntry(
+                    issue_id="13847",
+                    journal_id=approval,
+                    notes=build_recovery_delivery_authorization_marker(
+                        issue="13847",
+                        lane=_LANE,
+                        workspace_id=_WS,
+                        anchor_journal="79612",
+                        retry_of_action_id=prior_action,
+                        prior_zero_send_journal="88148",
+                    ),
+                ),
+                RedmineJournalEntry(
+                    issue_id="13847",
+                    journal_id="88148",
+                    notes="[mozyo:workflow-event:gate=production_verification:verdict=blocked]",
+                ),
+            )
             with patch.object(live, "LaneLifecycleStore",
                               return_value=SimpleNamespace(get=lambda key: record)), \
                     patch.object(live, "read_declared_pin_pair", return_value=pair), \
+                    patch.object(type(ops), "_journal_entries", return_value=entries), \
                     patch.object(live, "list_herdr_agent_rows",
                                  return_value=[_row(gw_name, "wZ:p3G")]), \
                     patch.object(
@@ -318,8 +343,11 @@ class RedispatchExactlyOnce(unittest.TestCase):
                         return_value=started,
                     ), patch.object(
                         delivery_live.LiveRecoveryAnchorDeliveryService,
-                        "ready",
-                        return_value=True,
+                        "preflight",
+                        return_value=RecoveryAnchorDeliveryPreflight(
+                            may_deliver=True,
+                            detail=DETAIL_OK,
+                        ),
                     ):
                 result = ops.retry_redispatch_to_gateway(
                     action_id=new_action,
@@ -342,6 +370,69 @@ class RedispatchExactlyOnce(unittest.TestCase):
             self.assertEqual(result, REDISPATCH_DELIVERED)
             self.assertEqual(fence.state_of(prior_key), FENCE_RESERVED)
             self.assertEqual(fence.state_of(new_key), FENCE_DELIVERED)
+
+    def test_forged_journal_ids_cannot_mint_retry_authority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fence = DispatchOutboxFence(path=dispatch_outbox_fence_path(Path(tmp)))
+            fence.bootstrap()
+            approval = "99998"
+            ops = _ops(tmp, fence=fence, request_journal=approval)
+            gw_name = encode_assigned_name(_WS, "codex", _LANE)
+            prior_action = "recover-pair:13847:issue_13847_x:3:2"
+            prior_key = FenceKey(
+                workspace_id=_WS,
+                lane_id=_LANE,
+                issue="13847",
+                journal="79612",
+                action_id=prior_action,
+                target_assigned_name=gw_name,
+            )
+            self.assertTrue(fence.reserve(prior_key).won)
+            record = SimpleNamespace(
+                lane_disposition=DISPOSITION_ACTIVE,
+                issue_id="13847",
+            )
+            pair = SimpleNamespace(
+                ok=True,
+                gateway=SimpleNamespace(provider="codex", assigned_name=gw_name),
+            )
+            with patch.object(
+                type(ops),
+                "_journal_entries",
+                return_value=(
+                    RedmineJournalEntry(
+                        issue_id="13847",
+                        journal_id=approval,
+                        notes="[mozyo:workflow-event:gate=owner_approval]",
+                    ),
+                    RedmineJournalEntry(
+                        issue_id="13847",
+                        journal_id="99999",
+                        notes="typed/send 0",
+                    ),
+                ),
+            ), patch.object(
+                live,
+                "LaneLifecycleStore",
+                return_value=SimpleNamespace(get=lambda key: record),
+            ), patch.object(
+                live, "read_declared_pin_pair", return_value=pair
+            ), patch.object(
+                delivery_live.LiveRecoveryAnchorDeliveryService, "deliver"
+            ) as deliver:
+                result = ops.retry_redispatch_to_gateway(
+                    action_id="forged-new-action",
+                    retry_of_action_id=prior_action,
+                    issue="13847",
+                    lane=_LANE,
+                    journal="79612",
+                    approval_journal=approval,
+                    prior_zero_send_journal="99999",
+                    workspace_id=_WS,
+                )
+            self.assertEqual(REDISPATCH_FAILED, result)
+            self.assertEqual(FENCE_RESERVED, fence.state_of(prior_key))
+            deliver.assert_not_called()
 
     def test_system_exit_after_reserve_becomes_uncertain_not_reserved(self):
         with tempfile.TemporaryDirectory() as tmp:

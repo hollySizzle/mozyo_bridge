@@ -16,6 +16,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
     DETAIL_ATTESTATION_MISMATCH,
+    DETAIL_OK,
     DETAIL_PRECONDITION_NOT_IDLE,
     DETAIL_TARGET_IDENTITY_MISMATCH,
     DETAIL_TARGET_NOT_LIVE,
@@ -29,7 +30,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPOSITION_UNCERTAIN,
     DISPOSITION_ZERO_SEND,
     RecoveryAnchorDeliveryRequest,
+    build_recovery_delivery_authorization_marker,
+    parse_recovery_delivery_authorizations,
     recovery_delivery_action_id,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+    RedmineJournalEntry,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
@@ -180,6 +186,65 @@ class RecoveryAnchorDeliveryDomainTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             recovery_delivery_action_id(**{**values, "prior_zero_send_journal": ""})
+
+    def test_authorization_marker_is_strict_and_binds_colon_action_by_digest(self) -> None:
+        retry_of = "recover-pair:14203:lane:5:1"
+        marker = build_recovery_delivery_authorization_marker(
+            issue="14203",
+            lane=LANE,
+            workspace_id=WORKSPACE,
+            anchor_journal="88143",
+            retry_of_action_id=retry_of,
+            prior_zero_send_journal="88148",
+        )
+        entries = (
+            RedmineJournalEntry(
+                issue_id="14203", journal_id="88197", notes=marker
+            ),
+        )
+        parsed = parse_recovery_delivery_authorizations(entries)
+        self.assertEqual(1, len(parsed))
+        self.assertTrue(
+            parsed[0].valid_for(
+                issue="14203",
+                lane=LANE,
+                workspace_id=WORKSPACE,
+                approval_journal="88197",
+                anchor_journal="88143",
+                retry_of_action_id=retry_of,
+                prior_zero_send_journal="88148",
+            )
+        )
+        self.assertFalse(
+            parsed[0].valid_for(
+                issue="14203",
+                lane=LANE,
+                workspace_id=WORKSPACE,
+                approval_journal="88197",
+                anchor_journal="88143",
+                retry_of_action_id=retry_of + "-forged",
+                prior_zero_send_journal="88148",
+            )
+        )
+
+        duplicate = marker.replace(
+            ":typed_count=0", ":typed_count=1:typed_count=0"
+        )
+        malformed = marker.replace(":send_count=0", ":send_count")
+        for notes in (duplicate, malformed, marker + marker):
+            with self.subTest(notes=notes):
+                self.assertEqual(
+                    (),
+                    parse_recovery_delivery_authorizations(
+                        (
+                            RedmineJournalEntry(
+                                issue_id="14203",
+                                journal_id="88197",
+                                notes=notes,
+                            ),
+                        )
+                    ),
+                )
 
 
 class RecoveryAnchorDeliveryLiveTest(unittest.TestCase):
@@ -339,6 +404,33 @@ class RecoveryAnchorDeliveryLiveTest(unittest.TestCase):
             self.assertEqual(DETAIL_TARGET_RETIRING, result.detail)
             self.assertEqual([], rail.calls)
 
+    def test_public_preflight_runs_all_identity_binding_and_retirement_gates(self) -> None:
+        cases = (
+            (DETAIL_TARGET_NOT_SETTLED, {"rows": [live_row(status="working")]}),
+            (
+                DETAIL_ATTESTATION_MISMATCH,
+                {"attested": attestation(replacement_action_id="foreign-action")},
+            ),
+            (DETAIL_TARGET_RETIRING, {"retiring": True}),
+        )
+        for expected, service_changes in cases:
+            with self.subTest(expected=expected), self._home() as raw_home:
+                rail = FakeRail(TurnStartResult(outcome=OUTCOME_STARTED))
+                service = FakeLiveService(
+                    Path(raw_home), rail=rail, **service_changes
+                )
+                result = service.preflight(request())
+                self.assertFalse(result.may_deliver)
+                self.assertEqual(expected, result.detail)
+                self.assertEqual([], rail.calls)
+
+        with self._home() as raw_home:
+            rail = FakeRail(TurnStartResult(outcome=OUTCOME_STARTED))
+            result = FakeLiveService(Path(raw_home), rail=rail).preflight(request())
+            self.assertTrue(result.may_deliver)
+            self.assertEqual(DETAIL_OK, result.detail)
+            self.assertEqual([], rail.calls, "preflight must never inject")
+
     def test_preinjection_rail_refusal_is_typed_zero_send_and_recorded(self) -> None:
         with self._home() as raw_home:
             home = Path(raw_home)
@@ -380,6 +472,18 @@ class RecoveryAnchorDeliveryLiveTest(unittest.TestCase):
             ).deliver(request())
             self.assertEqual(DISPOSITION_UNCERTAIN, result.disposition)
             records = HerdrDeliveryLedger(home=home).records_for_marker(result.marker)
+            self.assertEqual("uncertain", records[0].status)
+
+    def test_drive_system_exit_is_uncertain_and_records_ledger(self) -> None:
+        with self._home() as raw_home:
+            home = Path(raw_home)
+            result = FakeLiveService(
+                home, rail=FakeRail(SystemExit(2))
+            ).deliver(request())
+            self.assertEqual(DISPOSITION_UNCERTAIN, result.disposition)
+            self.assertEqual(DETAIL_TURN_START_UNCONFIRMED, result.detail)
+            records = HerdrDeliveryLedger(home=home).records_for_marker(result.marker)
+            self.assertEqual(1, len(records))
             self.assertEqual("uncertain", records[0].status)
 
     def test_unavailable_rail_is_zero_send(self) -> None:

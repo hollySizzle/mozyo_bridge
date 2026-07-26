@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Mapping, Optional
@@ -43,6 +44,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPOSITION_STARTED,
     DISPOSITION_UNCERTAIN,
     DISPOSITION_ZERO_SEND,
+    RecoveryAnchorDeliveryPreflight,
     RecoveryAnchorDeliveryOutcome,
     RecoveryAnchorDeliveryRequest,
 )
@@ -89,6 +91,17 @@ def _row_runtime_state(row: Mapping[str, object]) -> str:
     return map_agent_status(None)
 
 
+@dataclass(frozen=True)
+class _DeliveryPreflight:
+    marker: str
+    rail: object | None
+    blocker: RecoveryAnchorDeliveryOutcome | None
+
+    @property
+    def ready(self) -> bool:
+        return self.rail is not None and self.blocker is None
+
+
 class LiveRecoveryAnchorDeliveryService:
     """Deliver one closed-kind durable anchor to one exact fresh receiver.
 
@@ -115,105 +128,44 @@ class LiveRecoveryAnchorDeliveryService:
         """Whether the operator-capable high-level turn-start rail resolves."""
         return self._build_rail() is not None
 
+    def preflight(
+        self, request: RecoveryAnchorDeliveryRequest
+    ) -> RecoveryAnchorDeliveryPreflight:
+        """Run every read-only action gate without injecting or writing a ledger."""
+
+        resolved = self._preflight(request)
+        if resolved.blocker is not None:
+            return RecoveryAnchorDeliveryPreflight(
+                may_deliver=False,
+                detail=resolved.blocker.detail,
+                marker=resolved.marker,
+            )
+        return RecoveryAnchorDeliveryPreflight(
+            may_deliver=True,
+            detail=DETAIL_OK,
+            marker=resolved.marker,
+        )
+
     def deliver(
         self, request: RecoveryAnchorDeliveryRequest
     ) -> RecoveryAnchorDeliveryOutcome:
+        # Re-run the complete read-only preflight at the irreversible edge.  A
+        # prior public preflight is advisory and never reused as authority.
+        resolved = self._preflight(request)
+        if resolved.blocker is not None:
+            return resolved.blocker
+        rail = resolved.rail
+        marker = resolved.marker
+        assert rail is not None  # established by _DeliveryPreflight.ready
         anchor = normalize_anchor(
             "redmine", issue=_norm(request.issue), journal=_norm(request.journal)
         )
-        marker = build_marker(anchor, request.kind, request.provider)
         body = build_notification_body(anchor, request.kind, None, request.provider)
-
-        # Resolve transport capability before the final action-time identity
-        # read.  The inventory + attestation + retirement join below is
-        # therefore the last observation before drive_turn_start may inject.
-        rail = self._build_rail()
-        if rail is None:
-            return self._zero(DETAIL_RAIL_UNAVAILABLE, marker)
-
-        try:
-            workspace_id = _norm(self._workspace_id())
-        except Exception:  # noqa: BLE001 - unreadable authority is a zero-send
-            return self._zero(DETAIL_WORKSPACE_MISMATCH, marker)
-        if workspace_id != _norm(request.workspace_id):
-            return self._zero(DETAIL_WORKSPACE_MISMATCH, marker)
-
-        try:
-            rows = self._rows()
-        except Exception:  # noqa: BLE001 - unreadable live inventory is a zero-send
-            return self._zero(DETAIL_TARGET_UNRESOLVED, marker)
-        named = [
-            row
-            for row in rows
-            if isinstance(row, Mapping)
-            and _norm(row.get(AGENT_KEY_NAME)) == _norm(request.target_assigned_name)
-        ]
-        if len(named) != 1:
-            return self._zero(DETAIL_TARGET_UNRESOLVED, marker)
-        row = named[0]
-        if _norm(_agent_locator(row)) != _norm(request.target_locator):
-            return self._zero(DETAIL_TARGET_IDENTITY_MISMATCH, marker)
-
-        decoded = decode_assigned_name(row.get(AGENT_KEY_NAME))
-        if not decoded.ok or decoded.identity is None:
-            return self._zero(DETAIL_TARGET_IDENTITY_MISMATCH, marker)
-        identity = decoded.identity
-        if not (
-            _norm(identity.workspace_id) == _norm(request.workspace_id)
-            and _norm(identity.lane_id) == _norm(request.lane_id)
-            and _norm(identity.role) == _norm(request.provider)
-        ):
-            return self._zero(DETAIL_TARGET_IDENTITY_MISMATCH, marker)
-        detected_provider = _norm(row.get("agent"))
-        if detected_provider and detected_provider != _norm(request.provider):
-            return self._zero(DETAIL_TARGET_IDENTITY_MISMATCH, marker)
-        if classify_named_slot(row) != SLOT_LIVE:
-            return self._zero(DETAIL_TARGET_NOT_LIVE, marker)
-        if _row_runtime_state(row) not in (
-            RUNTIME_TURN_ENDED,
-            RUNTIME_AWAITING_INPUT,
-        ):
-            return self._zero(DETAIL_TARGET_NOT_SETTLED, marker)
-        if _norm(row.get("revision")) != _norm(request.target_revision):
-            return self._zero(DETAIL_TARGET_REVISION_MISMATCH, marker)
-
-        try:
-            attestation = self._read_attestation(request.target_assigned_name)
-        except Exception:  # noqa: BLE001 - unreadable attestation is a zero-send
-            return self._zero(DETAIL_ATTESTATION_UNREADABLE, marker)
-        if attestation is None:
-            return self._zero(DETAIL_ATTESTATION_MISMATCH, marker)
-        if not (
-            _norm(getattr(attestation, "assigned_name", ""))
-            == _norm(request.target_assigned_name)
-            and _norm(getattr(attestation, "workspace_id", ""))
-            == _norm(request.workspace_id)
-            and _norm(getattr(attestation, "lane_id", ""))
-            == _norm(request.lane_id)
-            and _norm(getattr(attestation, "role", "")) == _norm(request.provider)
-            and _norm(getattr(attestation, "locator", ""))
-            == _norm(request.target_locator)
-            and _norm(getattr(attestation, "verdict", "")) == VERDICT_PRESENT
-            and bool(_norm(getattr(attestation, "observed_at", "")))
-        ):
-            return self._zero(DETAIL_ATTESTATION_MISMATCH, marker)
-        if not self._attestation_bound_to_action(attestation, request):
-            return self._zero(DETAIL_ATTESTATION_MISMATCH, marker)
-
-        try:
-            retiring, _reason = self._target_is_retiring(
-                request.target_assigned_name
-            )
-        except Exception:  # noqa: BLE001 - unreadable retirement authority fails closed
-            return self._zero(DETAIL_TARGET_RETIRING, marker)
-        if retiring:
-            return self._zero(DETAIL_TARGET_RETIRING, marker)
-
         try:
             result = rail.drive_turn_start(
                 request.target_locator, f"{marker} {body}"
             )
-        except Exception:  # noqa: BLE001 - injection may have happened
+        except (Exception, SystemExit):  # injection may have happened
             outcome = self._uncertain(marker)
             self._record(outcome, request, turn_start_telemetry=None)
             return outcome
@@ -238,6 +190,131 @@ class LiveRecoveryAnchorDeliveryService:
             outcome = self._uncertain(marker, turn_start_outcome)
         self._record(outcome, request, turn_start_telemetry=telemetry)
         return outcome
+
+    def _preflight(self, request: RecoveryAnchorDeliveryRequest) -> _DeliveryPreflight:
+        anchor = normalize_anchor(
+            "redmine", issue=_norm(request.issue), journal=_norm(request.journal)
+        )
+        marker = build_marker(anchor, request.kind, request.provider)
+
+        rail = self._build_rail()
+        if rail is None:
+            return _DeliveryPreflight(
+                marker, None, self._zero(DETAIL_RAIL_UNAVAILABLE, marker)
+            )
+
+        try:
+            workspace_id = _norm(self._workspace_id())
+        except Exception:  # noqa: BLE001 - unreadable authority is a zero-send
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_WORKSPACE_MISMATCH, marker)
+            )
+        if workspace_id != _norm(request.workspace_id):
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_WORKSPACE_MISMATCH, marker)
+            )
+
+        try:
+            rows = self._rows()
+        except Exception:  # noqa: BLE001 - unreadable live inventory is a zero-send
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_TARGET_UNRESOLVED, marker)
+            )
+        named = [
+            row
+            for row in rows
+            if isinstance(row, Mapping)
+            and _norm(row.get(AGENT_KEY_NAME)) == _norm(request.target_assigned_name)
+        ]
+        if len(named) != 1:
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_TARGET_UNRESOLVED, marker)
+            )
+        row = named[0]
+        if _norm(_agent_locator(row)) != _norm(request.target_locator):
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_TARGET_IDENTITY_MISMATCH, marker)
+            )
+
+        decoded = decode_assigned_name(row.get(AGENT_KEY_NAME))
+        if not decoded.ok or decoded.identity is None:
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_TARGET_IDENTITY_MISMATCH, marker)
+            )
+        identity = decoded.identity
+        if not (
+            _norm(identity.workspace_id) == _norm(request.workspace_id)
+            and _norm(identity.lane_id) == _norm(request.lane_id)
+            and _norm(identity.role) == _norm(request.provider)
+        ):
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_TARGET_IDENTITY_MISMATCH, marker)
+            )
+        detected_provider = _norm(row.get("agent"))
+        if detected_provider and detected_provider != _norm(request.provider):
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_TARGET_IDENTITY_MISMATCH, marker)
+            )
+        if classify_named_slot(row) != SLOT_LIVE:
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_TARGET_NOT_LIVE, marker)
+            )
+        if _row_runtime_state(row) not in (
+            RUNTIME_TURN_ENDED,
+            RUNTIME_AWAITING_INPUT,
+        ):
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_TARGET_NOT_SETTLED, marker)
+            )
+        if _norm(row.get("revision")) != _norm(request.target_revision):
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_TARGET_REVISION_MISMATCH, marker)
+            )
+
+        try:
+            attestation = self._read_attestation(request.target_assigned_name)
+        except Exception:  # noqa: BLE001 - unreadable attestation is a zero-send
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_ATTESTATION_UNREADABLE, marker)
+            )
+        if attestation is None:
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_ATTESTATION_MISMATCH, marker)
+            )
+        if not (
+            _norm(getattr(attestation, "assigned_name", ""))
+            == _norm(request.target_assigned_name)
+            and _norm(getattr(attestation, "workspace_id", ""))
+            == _norm(request.workspace_id)
+            and _norm(getattr(attestation, "lane_id", ""))
+            == _norm(request.lane_id)
+            and _norm(getattr(attestation, "role", "")) == _norm(request.provider)
+            and _norm(getattr(attestation, "locator", ""))
+            == _norm(request.target_locator)
+            and _norm(getattr(attestation, "verdict", "")) == VERDICT_PRESENT
+            and bool(_norm(getattr(attestation, "observed_at", "")))
+        ):
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_ATTESTATION_MISMATCH, marker)
+            )
+        if not self._attestation_bound_to_action(attestation, request):
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_ATTESTATION_MISMATCH, marker)
+            )
+
+        try:
+            retiring, _reason = self._target_is_retiring(
+                request.target_assigned_name
+            )
+        except Exception:  # noqa: BLE001 - unreadable retirement authority fails closed
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_TARGET_RETIRING, marker)
+            )
+        if retiring:
+            return _DeliveryPreflight(
+                marker, rail, self._zero(DETAIL_TARGET_RETIRING, marker)
+            )
+        return _DeliveryPreflight(marker, rail, None)
 
     def _workspace_id(self) -> str:
         return repo_scope_workspace_id(self.repo_root)

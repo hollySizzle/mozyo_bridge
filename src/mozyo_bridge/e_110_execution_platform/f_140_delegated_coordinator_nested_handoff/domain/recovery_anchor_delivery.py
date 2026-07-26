@@ -9,13 +9,41 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
+from typing import Iterable
 
 
 KIND_REPLY = "reply"
 KIND_IMPLEMENTATION_REQUEST = "implementation_request"
 RECOVERY_ANCHOR_DELIVERY_KINDS: frozenset[str] = frozenset(
     {KIND_REPLY, KIND_IMPLEMENTATION_REQUEST}
+)
+
+RECOVERY_DELIVERY_AUTHORIZATION_CHANNEL = "recovery-delivery-authorization"
+RECOVERY_DELIVERY_AUTHORIZED = "authorized"
+RECOVERY_DELIVERY_AUTHORIZER_OWNER = "owner"
+RECOVERY_DELIVERY_PRIOR_ZERO_SEND = "known_zero_send"
+
+_AUTHORIZATION_RE = re.compile(
+    r"\[mozyo:recovery-delivery-authorization:(?P<body>[^\]]*)\]"
+)
+_AUTHORIZATION_FIELDS = frozenset(
+    {
+        "conclusion",
+        "authorized_by_role",
+        "issue",
+        "lane",
+        "workspace_id",
+        "anchor_journal",
+        "retry_of_action_sha256",
+        "prior_zero_send_journal",
+        "prior_outcome",
+        "typed_count",
+        "send_count",
+        "turn_start_count",
+        "target_count",
+    }
 )
 
 DISPOSITION_STARTED = "started"
@@ -104,6 +132,156 @@ def recovery_delivery_action_id(
 
 
 @dataclass(frozen=True)
+class RecoveryDeliveryAuthorization:
+    """One strict owner authorization read from its own durable journal entry."""
+
+    journal: str
+    conclusion: str
+    authorized_by_role: str
+    issue: str
+    lane: str
+    workspace_id: str
+    anchor_journal: str
+    retry_of_action_sha256: str
+    prior_zero_send_journal: str
+    prior_outcome: str
+    typed_count: str
+    send_count: str
+    turn_start_count: str
+    target_count: str
+
+    def valid_for(
+        self,
+        *,
+        issue: object,
+        lane: object,
+        workspace_id: object,
+        approval_journal: object,
+        anchor_journal: object,
+        retry_of_action_id: object,
+        prior_zero_send_journal: object,
+    ) -> bool:
+        """Whether every action and known-zero-send axis is exact."""
+
+        return bool(
+            self.journal == _norm(approval_journal)
+            and self.conclusion == RECOVERY_DELIVERY_AUTHORIZED
+            and self.authorized_by_role == RECOVERY_DELIVERY_AUTHORIZER_OWNER
+            and self.issue == _norm(issue)
+            and self.lane == _norm(lane)
+            and self.workspace_id == _norm(workspace_id)
+            and self.anchor_journal == _norm(anchor_journal)
+            and self.retry_of_action_sha256
+            == hashlib.sha256(_norm(retry_of_action_id).encode("utf-8")).hexdigest()
+            and self.prior_zero_send_journal == _norm(prior_zero_send_journal)
+            and self.prior_outcome == RECOVERY_DELIVERY_PRIOR_ZERO_SEND
+            and self.typed_count == "0"
+            and self.send_count == "0"
+            and self.turn_start_count == "0"
+            and self.target_count == "0"
+        )
+
+
+def parse_recovery_delivery_authorizations(
+    entries: Iterable[object],
+) -> tuple[RecoveryDeliveryAuthorization, ...]:
+    """Parse strict action-specific authorization markers, never surrounding prose.
+
+    Duplicate fields, missing/extra fields, empty values, malformed tokens, or
+    more than one marker in a journal entry all fail closed for that entry.
+    """
+
+    found: list[RecoveryDeliveryAuthorization] = []
+    for entry in entries:
+        journal = _norm(getattr(entry, "journal_id", ""))
+        notes = getattr(entry, "notes", "")
+        if not journal or not isinstance(notes, str):
+            continue
+        matches = tuple(_AUTHORIZATION_RE.finditer(notes))
+        if len(matches) != 1:
+            continue
+        fields: dict[str, str] = {}
+        valid = True
+        for raw_token in matches[0].group("body").split(":"):
+            token = raw_token.strip()
+            key, separator, value = token.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if (
+                not separator
+                or not key
+                or not value
+                or key in fields
+                or key not in _AUTHORIZATION_FIELDS
+                or any(character.isspace() for character in key)
+            ):
+                valid = False
+                break
+            fields[key] = value
+        if not valid or frozenset(fields) != _AUTHORIZATION_FIELDS:
+            continue
+        found.append(
+            RecoveryDeliveryAuthorization(
+                journal=journal,
+                conclusion=fields["conclusion"],
+                authorized_by_role=fields["authorized_by_role"],
+                issue=fields["issue"],
+                lane=fields["lane"],
+                workspace_id=fields["workspace_id"],
+                anchor_journal=fields["anchor_journal"],
+                retry_of_action_sha256=fields["retry_of_action_sha256"],
+                prior_zero_send_journal=fields["prior_zero_send_journal"],
+                prior_outcome=fields["prior_outcome"],
+                typed_count=fields["typed_count"],
+                send_count=fields["send_count"],
+                turn_start_count=fields["turn_start_count"],
+                target_count=fields["target_count"],
+            )
+        )
+    return tuple(found)
+
+
+def build_recovery_delivery_authorization_marker(
+    *,
+    issue: object,
+    lane: object,
+    workspace_id: object,
+    anchor_journal: object,
+    retry_of_action_id: object,
+    prior_zero_send_journal: object,
+) -> str:
+    """Build the only machine-readable marker accepted by the live retry rail."""
+
+    fields = (
+        ("conclusion", RECOVERY_DELIVERY_AUTHORIZED),
+        ("authorized_by_role", RECOVERY_DELIVERY_AUTHORIZER_OWNER),
+        ("issue", _norm(issue)),
+        ("lane", _norm(lane)),
+        ("workspace_id", _norm(workspace_id)),
+        ("anchor_journal", _norm(anchor_journal)),
+        (
+            "retry_of_action_sha256",
+            hashlib.sha256(_norm(retry_of_action_id).encode("utf-8")).hexdigest()
+            if _norm(retry_of_action_id)
+            else "",
+        ),
+        ("prior_zero_send_journal", _norm(prior_zero_send_journal)),
+        ("prior_outcome", RECOVERY_DELIVERY_PRIOR_ZERO_SEND),
+        ("typed_count", "0"),
+        ("send_count", "0"),
+        ("turn_start_count", "0"),
+        ("target_count", "0"),
+    )
+    if any(not value for _key, value in fields):
+        raise ValueError("recovery delivery authorization requires every exact authority field")
+    return (
+        f"[mozyo:{RECOVERY_DELIVERY_AUTHORIZATION_CHANNEL}:"
+        + ":".join(f"{key}={value}" for key, value in fields)
+        + "]"
+    )
+
+
+@dataclass(frozen=True)
 class RecoveryAnchorDeliveryRequest:
     issue: str
     journal: str
@@ -145,6 +323,19 @@ class RecoveryAnchorDeliveryRequest:
 
 
 @dataclass(frozen=True)
+class RecoveryAnchorDeliveryPreflight:
+    """Read-only delivery admission; never claims that a turn started."""
+
+    may_deliver: bool
+    detail: str
+    marker: str = ""
+
+    def __post_init__(self) -> None:
+        if self.detail not in RECOVERY_ANCHOR_DELIVERY_DETAILS:
+            raise ValueError(f"unsupported recovery delivery detail {self.detail!r}")
+
+
+@dataclass(frozen=True)
 class RecoveryAnchorDeliveryOutcome:
     disposition: str
     detail: str
@@ -179,6 +370,14 @@ class RecoveryAnchorDeliveryOutcome:
 
 
 __all__ = [
+    "RECOVERY_DELIVERY_AUTHORIZATION_CHANNEL",
+    "RECOVERY_DELIVERY_AUTHORIZED",
+    "RECOVERY_DELIVERY_AUTHORIZER_OWNER",
+    "RECOVERY_DELIVERY_PRIOR_ZERO_SEND",
+    "RecoveryDeliveryAuthorization",
+    "RecoveryAnchorDeliveryPreflight",
+    "build_recovery_delivery_authorization_marker",
+    "parse_recovery_delivery_authorizations",
     "DETAIL_ATTESTATION_MISMATCH",
     "DETAIL_ATTESTATION_UNREADABLE",
     "DETAIL_INVALID_REQUEST",

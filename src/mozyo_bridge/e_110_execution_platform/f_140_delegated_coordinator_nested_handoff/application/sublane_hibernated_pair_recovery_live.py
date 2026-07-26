@@ -78,6 +78,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
     KIND_IMPLEMENTATION_REQUEST,
     RecoveryAnchorDeliveryRequest,
+    parse_recovery_delivery_authorizations,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
     LiveSublaneQuarantineOps,
@@ -463,6 +464,60 @@ class LiveHibernatedPairRecoveryOps:
             return "", ""
         return _norm(_agent_locator(matches[0])), _norm(revision)
 
+    def _journal_entries(self, issue: str):
+        """Fresh durable authority read; tests may replace this narrow boundary."""
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+            LiveRedmineJournalSource,
+        )
+
+        return LiveRedmineJournalSource.from_environment(
+            environ=self.env
+        ).read_entries(_norm(issue))
+
+    def _retry_authority_is_exact(
+        self,
+        *,
+        retry_of_action_id: str,
+        issue: str,
+        lane: str,
+        journal: str,
+        approval_journal: str,
+        prior_zero_send_journal: str,
+        workspace_id: str,
+    ) -> bool:
+        """Verify action authority from a fresh Redmine read, never CLI self-equality."""
+
+        try:
+            entries = tuple(self._journal_entries(issue))
+        except (Exception, SystemExit):  # unreadable durable truth fails closed
+            return False
+        exact_approval = tuple(
+            entry
+            for entry in entries
+            if _norm(getattr(entry, "journal_id", "")) == _norm(approval_journal)
+        )
+        exact_prior = tuple(
+            entry
+            for entry in entries
+            if _norm(getattr(entry, "journal_id", ""))
+            == _norm(prior_zero_send_journal)
+        )
+        if len(exact_approval) != 1 or len(exact_prior) != 1:
+            return False
+        authorizations = parse_recovery_delivery_authorizations(exact_approval)
+        if len(authorizations) != 1:
+            return False
+        return authorizations[0].valid_for(
+            issue=issue,
+            lane=lane,
+            workspace_id=workspace_id,
+            approval_journal=approval_journal,
+            anchor_journal=journal,
+            retry_of_action_id=retry_of_action_id,
+            prior_zero_send_journal=prior_zero_send_journal,
+        )
+
     def _redispatch_with_action(
         self,
         *,
@@ -615,12 +670,31 @@ class LiveHibernatedPairRecoveryOps:
         prior_zero_send_journal: str,
         workspace_id: str,
     ) -> Tuple[str, str]:
-        if not (
-            _norm(retry_of_action_id)
-            and _norm(approval_journal) == _norm(self.request_journal)
-            and _norm(prior_zero_send_journal)
+        if not all(
+            _norm(value)
+            for value in (
+                retry_of_action_id,
+                issue,
+                lane,
+                journal,
+                approval_journal,
+                prior_zero_send_journal,
+                workspace_id,
+            )
         ):
             return "", "retry_authority_incomplete"
+        if _norm(approval_journal) != _norm(self.request_journal):
+            return "", "retry_authority_context_mismatch"
+        if not self._retry_authority_is_exact(
+            retry_of_action_id=retry_of_action_id,
+            issue=issue,
+            lane=lane,
+            journal=journal,
+            approval_journal=approval_journal,
+            prior_zero_send_journal=prior_zero_send_journal,
+            workspace_id=workspace_id,
+        ):
+            return "", "retry_authority_unverified"
         try:
             rec = LaneLifecycleStore(home=self.lifecycle_home).get(
                 LaneLifecycleKey(_norm(workspace_id), _norm_lane(lane))
@@ -662,22 +736,38 @@ class LiveHibernatedPairRecoveryOps:
         locator, revision = self._gateway_live_target(gateway_assigned_name)
         if not locator or not revision:
             return "", "fresh_gateway_unresolved"
+        decoded = decode_assigned_name(gateway_assigned_name)
+        if not decoded.ok or decoded.identity is None:
+            return "", "fresh_gateway_identity_mismatch"
         try:
             from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_anchor_delivery_live import (  # noqa: E501
                 LiveRecoveryAnchorDeliveryService,
             )
 
-            ready = LiveRecoveryAnchorDeliveryService(
+            delivery_preflight = LiveRecoveryAnchorDeliveryService(
                 repo_root=self.repo_root,
                 env=self.env,
                 runner=self.runner,
                 timeout=self.timeout,
                 attestation_home=self.attestation_home,
-            ).ready()
-        except Exception:  # noqa: BLE001 - unavailable capability is zero-send
-            ready = False
-        if not ready:
-            return "", "recovery_delivery_rail_unavailable"
+            ).preflight(
+                RecoveryAnchorDeliveryRequest(
+                    issue=_norm(issue),
+                    journal=_norm(journal),
+                    kind=KIND_IMPLEMENTATION_REQUEST,
+                    workspace_id=_norm(workspace_id),
+                    lane_id=_norm_lane(lane),
+                    provider=_norm(decoded.identity.role),
+                    target_assigned_name=_norm(gateway_assigned_name),
+                    target_locator=locator,
+                    target_revision=revision,
+                    target_action_id=_norm(retry_of_action_id),
+                )
+            )
+        except (Exception, SystemExit):  # unavailable capability is zero-send
+            return "", "recovery_delivery_preflight_unreadable"
+        if not delivery_preflight.may_deliver:
+            return "", f"recovery_delivery_preflight_blocked:{delivery_preflight.detail}"
         return gateway_assigned_name, "ready"
 
     def preflight_retry_redispatch_to_gateway(
