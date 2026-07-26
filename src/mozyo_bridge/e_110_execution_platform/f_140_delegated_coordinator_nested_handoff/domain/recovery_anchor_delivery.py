@@ -81,6 +81,10 @@ DETAIL_TARGET_REVISION_MISMATCH = "target_revision_mismatch"
 DETAIL_ATTESTATION_UNREADABLE = "attestation_unreadable"
 DETAIL_ATTESTATION_MISMATCH = "attestation_mismatch"
 DETAIL_TARGET_RETIRING = "target_retiring"
+#: The caller's action-time authority (e.g. the lane's checkout binding) was no longer current
+#: at the LAST point before transport — after target resolution and the delivery preflight
+#: (Redmine #14475, review j#88538 F1). A zero-send: no injection was attempted.
+DETAIL_AUTHORITY_MOVED = "authority_moved"
 DETAIL_PRECONDITION_NOT_IDLE = "precondition_not_idle"
 DETAIL_TURN_START_UNCONFIRMED = "turn_start_unconfirmed"
 RECOVERY_ANCHOR_DELIVERY_DETAILS: frozenset[str] = frozenset(
@@ -97,6 +101,7 @@ RECOVERY_ANCHOR_DELIVERY_DETAILS: frozenset[str] = frozenset(
         DETAIL_ATTESTATION_UNREADABLE,
         DETAIL_ATTESTATION_MISMATCH,
         DETAIL_TARGET_RETIRING,
+        DETAIL_AUTHORITY_MOVED,
         DETAIL_PRECONDITION_NOT_IDLE,
         DETAIL_TURN_START_UNCONFIRMED,
     }
@@ -529,6 +534,7 @@ __all__ = [
     "DETAIL_TARGET_NOT_LIVE",
     "DETAIL_TARGET_NOT_SETTLED",
     "DETAIL_TARGET_RETIRING",
+    "DETAIL_AUTHORITY_MOVED",
     "DETAIL_TARGET_REVISION_MISMATCH",
     "DETAIL_TARGET_UNRESOLVED",
     "DETAIL_TURN_START_UNCONFIRMED",

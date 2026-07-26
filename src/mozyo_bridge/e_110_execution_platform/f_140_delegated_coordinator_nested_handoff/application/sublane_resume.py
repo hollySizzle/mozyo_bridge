@@ -40,7 +40,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.core.state.herdr_identity_attestation import (
@@ -79,6 +79,11 @@ BLOCK_ISSUE_REOWNED = "issue_reowned_by_another_lane"
 BLOCK_PAIR_SLOTS = "pair_not_both_slots_live"
 BLOCK_PAIR_ATTESTATION = "pair_not_attested"
 BLOCK_PAIR_PINS = "fresh_pair_pins_unresolved"
+#: The caller's action-time authority (e.g. the lane's checkout binding) was no longer current
+#: at the disposition CAS itself (Redmine #14475, review j#88538 F1). The preflight above makes
+#: external observations, so a check before ``run()`` is not a check before the COMMIT — this
+#: token names a drift observed at the irreversible edge, with the CAS never executed.
+BLOCK_COMMIT_AUTHORITY_MOVED = "commit_authority_moved"
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +279,11 @@ class SublaneResumeUseCase:
 
     ops: SublaneResumeOps
     store: LaneLifecycleStore
+    #: Optional action-time authority, re-joined IMMEDIATELY before the disposition CAS
+    #: (Redmine #14475, review j#88538 F1). ``None`` keeps every pre-#14475 caller
+    #: byte-invariant. A callable that returns ``False`` — or raises — stops the commit with
+    #: :data:`BLOCK_COMMIT_AUTHORITY_MOVED` and zero active flip.
+    commit_authority: Optional[Callable[[], bool]] = None
 
     def _decision(self, request: ResumeRequest) -> Optional[DecisionPointer]:
         try:
@@ -452,6 +462,23 @@ class SublaneResumeUseCase:
         # Commit point: CAS hibernated -> active, clearing the settled release generation on
         # rehydrate. Guarded on the lane's exact state + revision and the durable anchor.
         assert rec is not None  # guaranteed by lane_hibernated
+        # Redmine #14475 (review j#88538 F1): the LAST re-join before the irreversible edge.
+        # Everything above this line is observation — the live pair read, the attestation join,
+        # the pin resolution — so an authority checked before ``run()`` is not an authority
+        # checked before the COMMIT. A drift observed here means the active flip never happens.
+        if self.commit_authority is not None:
+            try:
+                still_authorized = bool(self.commit_authority())
+            except (Exception, SystemExit):  # noqa: BLE001 - an unreadable authority is not current
+                still_authorized = False
+            if not still_authorized:
+                return ResumeOutcome(
+                    executed=True,
+                    preflight=preflight,
+                    issue=issue,
+                    lane=lane,
+                    detail=BLOCK_COMMIT_AUTHORITY_MOVED,
+                )
         # Redmine #13844 R3: resume opens through the universal `_connect_write` gate, which emits
         # the PRE-migration peer-reader advisory before the shared store is migrated.
         transition = self.store.transition_disposition(

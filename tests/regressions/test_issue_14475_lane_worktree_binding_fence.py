@@ -120,6 +120,7 @@ from tests.regressions.test_issue_13847_pair_recovery_orchestration import (  # 
     WORKER_ROLE,
     _FakeOps,
     _REQ,
+    _absent,
     _obs,
     _use_case,
 )
@@ -1578,6 +1579,116 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
             sorted(partitioned - SIGNATURE_BLOCKERS), [],
             "the store must not partition tokens the classifier does not define",
         )
+
+    # The resume-commit seam is measured in the canonical resume suite
+    # (``test_sublane_resume.test_a_moved_commit_authority_leaves_the_active_flip_zero``),
+    # over that surface's own harness rather than a private fake of its ops protocol.
+
+    def test_a_drift_during_the_delivery_preflight_is_a_zero_send(self):
+        """Review j#88538 F1: the LAST external observation before transport is the delivery
+        preflight, so the re-join has to sit after it — not at the reserve edge."""
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            recovery_anchor_delivery_live as delivery_live,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
+            DETAIL_AUTHORITY_MOVED,
+            DISPOSITION_ZERO_SEND,
+            KIND_REPLY,
+            RecoveryAnchorDeliveryRequest,
+        )
+
+        drives = []
+
+        class _Rail:
+            def drive_turn_start(self, *a, **kw):
+                drives.append(a)
+                raise AssertionError("transport must not be reached on a moved authority")
+
+        service = delivery_live.LiveRecoveryAnchorDeliveryService(
+            repo_root=self.repo, env={}, attestation_home=self.home,
+            pre_transport_authority=lambda: False,
+        )
+        request = RecoveryAnchorDeliveryRequest(
+            issue=self.issue, journal="88465", kind=KIND_REPLY,
+            workspace_id=self.workspace_id, lane_id=self.lane, provider="codex",
+            target_assigned_name="mzb1_x_codex_" + self.lane, target_locator="wZ:p3G",
+            target_revision="7", target_action_id="a",
+        )
+        ready = delivery_live._DeliveryPreflight(
+            rail=_Rail(), marker="[marker]", blocker=None,
+        )
+        with patch.object(
+            delivery_live.LiveRecoveryAnchorDeliveryService, "_preflight", return_value=ready
+        ), patch.object(
+            delivery_live.LiveRecoveryAnchorDeliveryService, "_record", return_value=None
+        ):
+            outcome = service.deliver(request)
+        self.assertEqual(outcome.disposition, DISPOSITION_ZERO_SEND)
+        self.assertEqual(outcome.detail, DETAIL_AUTHORITY_MOVED)
+        self.assertEqual(drives, [], "zero transport")
+
+        # Premise control: with the authority CURRENT the same setup reaches transport, so the
+        # assertions above measure the seam and not an unusable rail.
+        service_ok = delivery_live.LiveRecoveryAnchorDeliveryService(
+            repo_root=self.repo, env={}, attestation_home=self.home,
+            pre_transport_authority=lambda: True,
+        )
+        with patch.object(
+            delivery_live.LiveRecoveryAnchorDeliveryService, "_preflight", return_value=ready
+        ), patch.object(
+            delivery_live.LiveRecoveryAnchorDeliveryService, "_record", return_value=None
+        ):
+            # ``drive_turn_start`` failures are absorbed into an ``uncertain`` outcome, so the
+            # reach is measured by the recorded call, not by the exception escaping.
+            service_ok.deliver(request)
+        self.assertEqual(len(drives), 1, "the authority is the only thing that stopped it")
+
+    def test_a_post_relaunch_drift_reports_executed_truthfully(self):
+        """Review j#88538 F2: ``executed`` must describe what this run actually applied.
+
+        VANISHED slots, so there are ZERO closes — deriving ``executed`` from the closes then
+        reports ``False`` on a run that has already relaunched the pair. (Measured: with the
+        close-only derivation this case is exactly what stays green in the earlier tests,
+        because those close two slots first.)
+        """
+        calls = {"n": 0}
+
+        def drifting(*, lane, record):
+            calls["n"] += 1
+            # Joins with no closable slot: preflight build, pre-loop, relaunch, resume, send.
+            return LAUNCH_AUTHORITY_OK if calls["n"] <= 3 else LAUNCH_AUTHORITY_BRANCH_DRIFTED
+
+        ops = _FakeOps(per_slot_obs={GATEWAY_ROLE: _absent(), WORKER_ROLE: _absent()})
+        ops.lane_worktree_binding_reason = drifting  # type: ignore[assignment]
+        out = _use_case(ops).run(_REQ, execute=True)
+        self.assertEqual(ops.closed, [], "vanished slots are never closed")
+        self.assertTrue(ops.relaunched, "but the pair WAS relaunched")
+        self.assertIsNone(out.resume, "and the resume was fenced")
+        self.assertTrue(
+            out.executed, "a run that relaunched the pair has executed something"
+        )
+
+    def test_a_post_resume_drift_reports_executed_truthfully(self):
+        # A healthy pair: nothing to close, nothing to relaunch — the resume commit is the only
+        # applied effect, so a close-derived ``executed`` misreports it too.
+        calls = {"n": 0}
+
+        def drifting(*, lane, record):
+            calls["n"] += 1
+            # Joins here: preflight build, pre-loop, resume, send.
+            return LAUNCH_AUTHORITY_OK if calls["n"] <= 3 else LAUNCH_AUTHORITY_BRANCH_DRIFTED
+
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        ops = _FakeOps(per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy})
+        ops.lane_worktree_binding_reason = drifting  # type: ignore[assignment]
+        out = _use_case(ops).run(_REQ, execute=True)
+        self.assertEqual(ops.closed, [])
+        self.assertFalse(ops.relaunched)
+        self.assertIsNotNone(out.resume, "the resume committed")
+        self.assertIsNone(ops.redispatched, "and the send was fenced")
+        self.assertTrue(out.executed, "a run that committed the resume has executed something")
 
     def test_the_preflight_matches_the_store_on_raw_persisted_bytes(self):
         """Review j#88526 F2: the 4 padded shapes, preflight and execute must agree.

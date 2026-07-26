@@ -663,6 +663,13 @@ class LiveHibernatedPairRecoveryOps:
                 runner=self.runner,
                 timeout=self.timeout,
                 attestation_home=self.attestation_home,
+                # Redmine #14475 (review j#88538 F1): the re-join the service performs AFTER
+                # its own target-resolution preflight and immediately before transport. The
+                # ``pre_send_authority`` the reserve edge uses fires earlier, so it cannot
+                # cover a drift that happens during that preflight.
+                pre_transport_authority=lambda: self._checkout_authority_current(
+                    self.request_lane
+                ),
             ).deliver(
                 RecoveryAnchorDeliveryRequest(
                     issue=_norm(issue),
@@ -913,15 +920,20 @@ def build_live_recover_pair_use_case(
     anchor — the CLI resolves the request first and passes it in.
     """
     store = LaneLifecycleStore()
-    resume = SublaneResumeUseCase(
-        ops=LiveSublaneResumeOps(repo_root=repo_root, env=dict(env)), store=store
-    )
+    # ``ops`` first: the resume's commit authority closes over it.
     ops = LiveHibernatedPairRecoveryOps(
         repo_root=repo_root,
         request_issue=issue,
         request_lane=lane,
         request_journal=journal,
         env=dict(env),
+    )
+    resume = SublaneResumeUseCase(
+        ops=LiveSublaneResumeOps(repo_root=repo_root, env=dict(env)), store=store,
+        # Redmine #14475 (review j#88538 F1): re-joined INSIDE the resume, immediately before
+        # the disposition CAS — the resume's own preflight makes external observations, so a
+        # check before ``run()`` is not a check before the active flip.
+        commit_authority=lambda: ops._checkout_authority_current(lane),
     )
     return SublaneRecoverPairUseCase(ops=ops, store=store, resume=resume)
 

@@ -637,20 +637,27 @@ class SublaneRecoverPairUseCase:
         recover_slots = [slot for slot in preflight.slots if slot.recovers]
         closed: list[str] = []
 
+        applied: dict[str, bool] = {"relaunched": False, "resumed": False}
+
         def _binding_drifted() -> Optional[RecoverPairOutcome]:
             """Re-join the 3 axes; a drift stops every REMAINING effect (review j#88526 F1).
 
             Called before EACH destructive effect, not once before the first: a checkout can be
             switched between two closes, or between the last close and the relaunch, and the
             single pre-loop read left every effect after the first unguarded. Whatever was
-            already closed stays reported so the partial state remains replayable — a re-run
-            sees those slots ``slot_absent`` and relaunches them.
+            already applied stays reported so the partial state remains replayable — a re-run
+            sees closed slots ``slot_absent`` and relaunches them.
+
+            ``executed`` is composed from EVERY effect this run applied (review j#88538 F2).
+            Deriving it from the closes alone reported ``executed=False`` on a run that had
+            already relaunched the pair or committed the resume — a report contradicting what
+            the run actually did.
             """
             reason = self._worktree_binding_reason(lane=lane, record=rec)
             if launch_authority_current(reason):
                 return None
             return RecoverPairOutcome(
-                executed=bool(closed),
+                executed=bool(closed) or applied["relaunched"] or applied["resumed"],
                 preflight=replace(preflight, worktree_binding_reason=reason),
                 issue=issue,
                 lane=lane,
@@ -702,6 +709,7 @@ class SublaneRecoverPairUseCase:
                 ),
             )
         relaunched = bool(recover_slots)
+        applied["relaunched"] = relaunched
 
         # -- resume: both-slots post-hibernate attestation verify + hibernated->active CAS --
         # Review j#88532 F1: the resume is NOT checkout-independent — it flips the lane to
@@ -729,6 +737,8 @@ class SublaneRecoverPairUseCase:
         # The fence key + delivery anchor use the ORIGINAL implementation_request journal (never
         # the owner-approval journal), so a re-approval never changes the fence key and can never
         # re-send the same original request (Redmine #13847 R1-F3).
+        applied["resumed"] = True
+
         # The send is the last owed effect and the one that reaches a live pane, so it gets its
         # own re-join here as well as the transport-direct one the live ops passes as
         # ``pre_send_authority`` (review j#88532 F1). Stopping here leaves the resume applied

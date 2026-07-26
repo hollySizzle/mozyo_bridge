@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional
 
 from mozyo_bridge.core.state.herdr_delivery_ledger import record_herdr_delivery
 from mozyo_bridge.core.state.herdr_identity_attestation import (
@@ -41,6 +41,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DETAIL_TARGET_UNRESOLVED,
     DETAIL_TURN_START_UNCONFIRMED,
     DETAIL_WORKSPACE_MISMATCH,
+    DETAIL_AUTHORITY_MOVED,
     DISPOSITION_STARTED,
     DISPOSITION_UNCERTAIN,
     DISPOSITION_ZERO_SEND,
@@ -117,12 +118,17 @@ class LiveRecoveryAnchorDeliveryService:
         runner: Optional[Runner] = None,
         timeout: float = COMMAND_TIMEOUT_SECONDS,
         attestation_home: Optional[Path] = None,
+        pre_transport_authority: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.repo_root = Path(repo_root)
         self.env = env
         self.runner = runner
         self.timeout = timeout
         self.attestation_home = attestation_home
+        #: Optional action-time authority re-joined AFTER the delivery preflight and
+        #: IMMEDIATELY before ``drive_turn_start`` (Redmine #14475, review j#88538 F1).
+        #: ``None`` keeps every pre-#14475 caller byte-invariant.
+        self.pre_transport_authority = pre_transport_authority
 
     def ready(self) -> bool:
         """Whether the operator-capable high-level turn-start rail resolves."""
@@ -161,6 +167,22 @@ class LiveRecoveryAnchorDeliveryService:
             "redmine", issue=_norm(request.issue), journal=_norm(request.journal)
         )
         body = build_notification_body(anchor, request.kind, None, request.provider)
+        # Redmine #14475 (review j#88538 F1): the LAST external observation before transport is
+        # ``_preflight`` above (target resolution + rail readiness), so an authority checked by
+        # the caller BEFORE ``deliver`` is not an authority checked before the send. This seam
+        # is the final re-join; a drift here is a typed zero-send with no injection attempted.
+        if self.pre_transport_authority is not None:
+            try:
+                still_authorized = bool(self.pre_transport_authority())
+            except (Exception, SystemExit):  # noqa: BLE001 - unreadable authority is not current
+                still_authorized = False
+            if not still_authorized:
+                outcome = RecoveryAnchorDeliveryOutcome(
+                    disposition=DISPOSITION_ZERO_SEND,
+                    detail=DETAIL_AUTHORITY_MOVED,
+                )
+                self._record(outcome, request, turn_start_telemetry=None)
+                return outcome
         try:
             result = rail.drive_turn_start(
                 request.target_locator, f"{marker} {body}"

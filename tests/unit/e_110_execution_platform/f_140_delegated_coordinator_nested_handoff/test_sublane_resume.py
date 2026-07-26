@@ -238,6 +238,44 @@ class SublaneResumeTest(unittest.TestCase):
             self.assertEqual(pair.gateway.locator, f"{WS}:p20")
             self.assertEqual(pair.worker.locator, f"{WS}:p21")
 
+    def test_a_moved_commit_authority_leaves_the_active_flip_zero(self) -> None:
+        """Redmine #14475 (review j#88538 F1): the seam sits AT the CAS, not before ``run()``.
+
+        Everything the resume does before the commit is observation — the live pair read, the
+        attestation join, the pin resolution — so a caller checking its authority before
+        calling ``run()`` has not checked it before the active flip. This drives the exact
+        happy path and moves only the commit authority.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (  # noqa: E501
+            BLOCK_COMMIT_AUTHORITY_MOVED,
+            DISPOSITION_HIBERNATED as _HIB,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._hibernated(store, released=False)
+            before = store.get(LaneLifecycleKey(WS, LANE))
+            outcome = SublaneResumeUseCase(
+                ops=_fresh_pair_ops(), store=store, commit_authority=lambda: False,
+            ).run(_request(), execute=True)
+            self.assertEqual(outcome.detail, BLOCK_COMMIT_AUTHORITY_MOVED)
+            after = store.get(LaneLifecycleKey(WS, LANE))
+            self.assertEqual(after.lane_disposition, _HIB, "zero active flip")
+            self.assertEqual(after.revision, before.revision, "and the row untouched")
+
+    def test_a_current_commit_authority_still_resumes(self) -> None:
+        # The positive control: the seam must not block a healthy resume.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._hibernated(store, released=False)
+            outcome = SublaneResumeUseCase(
+                ops=_fresh_pair_ops(), store=store, commit_authority=lambda: True,
+            ).run(_request(), execute=True)
+            self.assertFalse(outcome.is_blocked)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition, DISPOSITION_ACTIVE
+            )
+
     def test_resumes_when_hibernate_left_no_release(self) -> None:
         # A lane hibernated with dead processes (process_release stays not_requested) still
         # resumes once a fresh pair is relaunched.
