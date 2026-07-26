@@ -1030,6 +1030,24 @@ queue-enter / transport ACK と worker uptake は別の causal fact である。
 transport=`sent/ok`、かつ exact delivery に結び付く event-driven turn-start=`started` の連言だけで記録する。ACK 後に
 turn-start が観測不能なら `turn_start_unconfirmed` とし、inject 済みの可能性があるため自動再送しない。
 
+#### Recovered pair の lifecycle decision と work anchor (#14203 R18)
+
+通常の `dispatch-worker` は current lane decision と dispatch anchor が一致する same-lane gateway
+flow のまま維持する。一方、hibernated lane を recovery approval で `active` へ戻した generation では、
+`lane_lifecycle.decision_journal` は **resume を決めた durable record** を指し、worker に渡す
+`implementation_request` journal とは異なる。ここで lifecycle pointer を work anchor へ上書きしては
+ならない。上の `lane_lifecycle_records` 契約どおり、pointer は「現在の state をどの durable record が
+決めたか」の authority だからである。
+
+この限定形は `sublane recover-worker-delivery` が別責務として扱う。public preflight / execute は
+active lifecycle issue・generation・decision journal、declared gateway+worker pair、両slotの
+live/settled/startup-attestation/replacement-action binding、retirement、unchanged work anchorを別axisで
+joinする。さらに、standard forward が typed/send/turn-start/target 0だった strict evidence journal と、
+その exact lifecycle decision / work anchor / worker generationをdigestした action-specific owner
+authorizationが必要である。new outbox actionは `started` のみ delivered とし、zero-sendはcancelled、
+post-injection/unknownはuncertainとして自動retryしない。ordinary sender admission / standard
+`dispatch-worker` / lifecycle schemaは緩めない。
+
 ### schema version / migration
 
 Use a two-level version model:

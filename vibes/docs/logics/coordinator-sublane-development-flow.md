@@ -383,6 +383,14 @@ implementation_request_preflight:
 「既存 lane が使いづらい」ではなく、main lane で処理する方が安全または速いことを
 durable record から説明できる場合だけである。
 
+Recovered pair では、gateway への recovery anchor delivery ACK と worker forward completion を
+同一視しない。resume approval が `lane_lifecycle.decision_journal`、元の
+`implementation_request` が work anchor である場合、standard `dispatch-worker` の current-decision
+gate を緩めたり lifecycle pointer を書き換えたりしない。gateway deliveryが `started` でもworker
+deliveryは別の causal edgeであり、typed/send/turn-start/target 0がdurableに証明されたときだけ、
+action-specific owner authorization下の `sublane recover-worker-delivery` でexact worker generationへ
+一度送る。これは通常dispatchの代替入口ではなく、recovered pairの未完edgeを閉じる限定recoveryである。
+
 ### Pipeline Dispatch Check
 
 待つかどうかを決める前に、次の quick classification を使う。

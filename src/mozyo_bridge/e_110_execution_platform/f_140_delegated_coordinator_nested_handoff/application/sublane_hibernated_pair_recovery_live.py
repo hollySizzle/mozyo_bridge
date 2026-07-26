@@ -27,7 +27,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from mozyo_bridge.core.state.dispatch_outbox_fence import (
     DispatchOutboxFence,
@@ -542,6 +542,7 @@ class LiveHibernatedPairRecoveryOps:
         lane: str,
         journal: str,
         workspace_id: str,
+        pre_send_authority: Optional[Callable[[], bool]] = None,
     ) -> str:
         key = FenceKey(
             workspace_id=_norm(workspace_id), lane_id=_norm_lane(lane), issue=_norm(issue),
@@ -585,6 +586,20 @@ class LiveHibernatedPairRecoveryOps:
             except DispatchOutboxFenceError:
                 return REDISPATCH_UNCERTAIN
             return REDISPATCH_TARGET_RETIRING
+        if pre_send_authority is not None:
+            try:
+                still_authorized = bool(pre_send_authority())
+            except (Exception, SystemExit):
+                still_authorized = False
+            if not still_authorized:
+                try:
+                    fence.mark_cancelled(
+                        key,
+                        detail="recovery delivery action-time authority moved; zero-send",
+                    )
+                except DispatchOutboxFenceError:
+                    return REDISPATCH_UNCERTAIN
+                return REDISPATCH_FAILED
         gateway_locator, target_revision = self._gateway_live_target(
             gateway_assigned_name
         )

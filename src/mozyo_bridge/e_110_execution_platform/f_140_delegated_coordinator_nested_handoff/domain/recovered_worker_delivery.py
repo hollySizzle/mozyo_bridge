@@ -1,0 +1,126 @@
+"""Typed authority for the worker leg of a recovered managed pair (#14203 R18)."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from typing import Any
+
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
+    recovery_delivery_action_id,
+)
+
+
+def _norm(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def recovered_worker_forward_attempt_id(
+    *,
+    issue: object,
+    lane: object,
+    workspace_id: object,
+    lane_generation: object,
+    lifecycle_decision_journal: object,
+    anchor_journal: object,
+    target_action_id: object,
+    target_assigned_name: object,
+) -> str:
+    """Identify the proven-zero standard forward that recovery may replace.
+
+    The lifecycle decision (why this generation is active) and the work anchor
+    (what the worker receives) remain distinct fields.  The digest binds both,
+    the exact worker generation, and the startup action without exposing those
+    values in the identifier.
+    """
+
+    fields = {
+        "issue": _norm(issue),
+        "lane": _norm(lane),
+        "workspace_id": _norm(workspace_id),
+        "lane_generation": _norm(lane_generation),
+        "lifecycle_decision_journal": _norm(lifecycle_decision_journal),
+        "anchor_journal": _norm(anchor_journal),
+        "target_action_id": _norm(target_action_id),
+        "target_assigned_name": _norm(target_assigned_name),
+    }
+    missing = [name for name, value in fields.items() if not value]
+    if missing:
+        raise ValueError(
+            "a recovered worker-forward attempt id requires every authority field "
+            f"(missing: {', '.join(missing)})"
+        )
+    encoded = json.dumps(
+        fields,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "worker-forward-zero-send-" + hashlib.sha256(
+        encoded.encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True)
+class RecoveredWorkerDeliveryRequest:
+    """One owner-approved direct recovery leg to an exact recovered worker."""
+
+    issue: str
+    lane: str
+    journal: str
+    implementation_request_journal: str
+    lifecycle_decision_journal: str
+    target_action_id: str
+    retry_of_action_id: str
+    prior_zero_send_journal: str
+
+    def action_id(self) -> str:
+        return recovery_delivery_action_id(
+            issue=self.issue,
+            lane=self.lane,
+            approval_journal=self.journal,
+            anchor_journal=self.implementation_request_journal,
+            retry_of_action_id=self.retry_of_action_id,
+            prior_zero_send_journal=self.prior_zero_send_journal,
+        )
+
+
+@dataclass(frozen=True)
+class RecoveredWorkerDeliveryOutcome:
+    executed: bool
+    issue: str
+    lane: str
+    action_id: str = ""
+    may_deliver: bool = False
+    redispatch: str = "redispatch_not_reached"
+    detail: str = ""
+
+    @property
+    def is_blocked(self) -> bool:
+        if not self.may_deliver:
+            return True
+        if not self.executed:
+            return False
+        return self.redispatch not in ("redispatched", "already_redispatched")
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "executed": self.executed,
+            "issue": self.issue,
+            "lane": self.lane,
+            "action_id": self.action_id,
+            "may_deliver": self.may_deliver,
+            "redispatch": self.redispatch,
+            "is_blocked": self.is_blocked,
+            "detail": self.detail,
+        }
+
+
+__all__ = (
+    "RecoveredWorkerDeliveryOutcome",
+    "RecoveredWorkerDeliveryRequest",
+    "recovered_worker_forward_attempt_id",
+)
