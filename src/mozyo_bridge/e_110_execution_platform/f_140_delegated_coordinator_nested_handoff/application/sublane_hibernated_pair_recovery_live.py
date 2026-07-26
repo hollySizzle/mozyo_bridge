@@ -56,6 +56,11 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     ReleasePin,
     ReleasePinError,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.lane_checkout_authority import (  # noqa: E501
+    checkout_authority_current,
+    current_branch,
+    worktree_binding_reason,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
     HerdrSublaneActuatorOps,
 )
@@ -166,74 +171,26 @@ class LiveHibernatedPairRecoveryOps:
         except Exception:  # noqa: BLE001 - unresolved workspace => empty (fail closed upstream)
             return ""
 
-    def lane_worktree_binding_reason(self, *, lane: str, record) -> str:
-        """The lane's canonical worktree-binding axis (Redmine #14475, review j#88477 F1).
+    def _checkout_authority_current(self, lane: str) -> bool:
+        """Are the lane's checkout axes current RIGHT NOW? (read-only, fail-closed)
 
-        The recovery relaunches the pair into ``self.repo_root``, so the axis is exactly:
-        does the lifecycle row carry a non-empty ``worktree_identity`` that EQUALS the token
-        freshly derived from that same root? Uses ``derive_lane_workspace_token`` — the same
-        derivation the guarded refresh's pre-close launch-authority fence uses — so the two
-        surfaces agree by construction rather than by convention.
-
-        Fail-closed: an underivable token is ``worktree_token_underivable``, never ``ok``.
-        Distinguishes UNBOUND (nothing to compare) from MISMATCH (a wrong compare) because
-        they are different operator problems with different runbooks.
+        The transport-direct fence (review j#88532 F1), delegated to the shared leaf so the
+        preflight axis and the pre-send axis are literally the same code.
         """
-        pinned = _norm(getattr(record, "worktree_identity", ""))
-        if not pinned:
-            return LAUNCH_AUTHORITY_WORKTREE_UNBOUND
-        try:
-            # Review j#88494: derive from the CANONICAL (symlink-resolved) root — the
-            # contract ``derive_lane_workspace_token`` states ("the caller must pass a
-            # symlink-resolved path so mint-time and resolve-time agree"). Deriving from an
-            # unresolved caller path makes a correctly-bound lane read as a MISMATCH whenever
-            # the recovery is invoked through a symlink alias.
-            live = _norm(
-                derive_lane_workspace_token(str(Path(self.repo_root).resolve()))
-            )
-        except Exception:  # noqa: BLE001 - an underivable token fails closed
-            return LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE
-        if not live:
-            return LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE
-        if live != pinned:
-            return LAUNCH_AUTHORITY_WORKTREE_MISMATCH
-        # Review j#88505 F1: a matching token is NOT the whole positive-evidence contract this
-        # ticket wrote down. The token is derived from the worktree's PATH, so it still equals
-        # the pinned one after the checkout has been switched to another branch or has stopped
-        # resolving — and the recovery would then relaunch the pair onto whatever is checked
-        # out there. The remaining two axes (readable checkout, current branch == lane id) are
-        # the same ones ``lane_authority_reason`` re-joins before any owed launch.
-        try:
-            if probe_worktree_resolved(str(self.repo_root)) is not True:
-                return LAUNCH_AUTHORITY_WORKTREE_UNREADABLE
-        except Exception:  # noqa: BLE001 - an unreadable worktree fails closed
-            return LAUNCH_AUTHORITY_WORKTREE_UNREADABLE
-        # The RAW branch, checked for emptiness BEFORE normalization (review j#88513 F1):
-        # ``_norm_lane("")`` yields the "default" lane, so normalizing first would read a
-        # failed git read as "on the default lane" — and on a lane literally named ``default``
-        # that turns a TOCTOU-unreadable checkout into a green axis.
-        raw_branch = self._current_branch(str(self.repo_root))
-        if not raw_branch:
-            return LAUNCH_AUTHORITY_WORKTREE_UNREADABLE
-        if _norm_lane(raw_branch) != _norm_lane(lane):
-            return LAUNCH_AUTHORITY_BRANCH_DRIFTED
-        return LAUNCH_AUTHORITY_OK
+        return checkout_authority_current(
+            self.repo_root, workspace_id=self.workspace_id(), lane=lane,
+            lifecycle_home=self.lifecycle_home,
+        )
+
+    def lane_worktree_binding_reason(self, *, lane: str, record) -> str:
+        """The lane's canonical worktree-binding axis (Redmine #14475, reviews j#88477 F1 /
+        j#88505 F1 / j#88513 F1 / j#88532 F1), delegated to the shared leaf."""
+        return worktree_binding_reason(self.repo_root, lane=lane, record=record)
 
     @staticmethod
     def _current_branch(path: str) -> str:
         """The worktree's current branch, or ``""`` (fail-closed). Read-only."""
-        import subprocess
-
-        if not path or not Path(path).is_dir():
-            return ""
-        try:
-            result = subprocess.run(
-                ["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
-                text=True, capture_output=True,
-            )
-        except OSError:
-            return ""
-        return result.stdout.strip() if result.returncode == 0 else ""
+        return current_branch(path)
 
     def _rows(self) -> Sequence[Mapping[str, object]]:
         return list_herdr_agent_rows(self.env)
@@ -764,6 +721,12 @@ class LiveHibernatedPairRecoveryOps:
             lane=lane,
             journal=journal,
             workspace_id=workspace_id,
+            # Review j#88532 F1: the seam existed and neither caller passed it. The send is an
+            # owed effect on THIS lane's checkout, so its authority is re-joined at the last
+            # external observation before transport — a branch that moved after the relaunch
+            # makes this a typed zero-send with the reserve cancelled, never a delivery into a
+            # pair standing on the wrong checkout.
+            pre_send_authority=lambda: self._checkout_authority_current(lane),
         )
 
     def _retry_delivery_context(
@@ -936,6 +899,7 @@ class LiveHibernatedPairRecoveryOps:
             lane=lane,
             journal=journal,
             workspace_id=workspace_id,
+            pre_send_authority=lambda: self._checkout_authority_current(lane),
         )
 
 

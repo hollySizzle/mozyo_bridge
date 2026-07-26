@@ -80,6 +80,13 @@ class RedispatchRetirementGuardTest(unittest.TestCase):
         with patch.object(
             live, "list_herdr_agent_rows", return_value=[_row(self.gw, "wZ:p3G")]
         ), patch.object(
+            live.LiveHibernatedPairRecoveryOps,
+            # Redmine #14475 (review j#88532 F1): the transport-direct checkout fence. This
+            # suite's subject is the RETIREMENT guard on the reserve -> send edge; it has no
+            # lifecycle row or checkout, so the checkout axis is stubbed current here and
+            # measured on its own in the #14475 suite.
+            "_checkout_authority_current", return_value=True,
+        ), patch.object(
             delivery_live.LiveRecoveryAnchorDeliveryService, "deliver", _deliver
         ):
             return self.ops.redispatch_to_gateway(

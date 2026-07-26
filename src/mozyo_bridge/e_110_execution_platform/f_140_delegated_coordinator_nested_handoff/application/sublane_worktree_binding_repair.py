@@ -383,6 +383,13 @@ def run_worktree_binding_repair(
     # The already-bound fence is evaluated AFTER the token is derived so a re-run of the exact
     # same repair is the idempotent success the store already implements, and only a binding
     # naming a DIFFERENT worktree is refused.
+    #
+    # Review j#88532 F2: this is a residual predicate the shared classifier does not cover, and
+    # it must mirror the CAS's own two-step semantics EXACTLY — normalized equality for the
+    # replay case, then a RAW non-emptiness test for the conflict case. Using the normalized
+    # value for both (as this did) collapses a whitespace-only binding to "unbound", so a row
+    # persisted as ``'   '`` read green here and was refused ``repair_cas_refused`` at execute:
+    # the same raw-vs-normalized false green the classifier closed, reappearing just outside it.
     bound = _norm(record.worktree_identity)
     if bound == token:
         return WorktreeBindingRepairOutcome(
@@ -393,11 +400,12 @@ def run_worktree_binding_repair(
                 "idempotent no-op (zero write)"
             ),
         )
-    if bound:
+    if record.worktree_identity:  # RAW, exactly as the CAS tests it
         return blocked(
             BLOCK_ALREADY_BOUND,
-            "the lane is already bound to a DIFFERENT worktree; this surface fills a gap and "
-            "never re-binds a lane; zero write",
+            "the lane is already bound to a DIFFERENT worktree (or to a non-canonical value "
+            "the guarded CAS refuses); this surface fills a gap and never re-binds a lane; "
+            "zero write",
         )
 
     if not execute:

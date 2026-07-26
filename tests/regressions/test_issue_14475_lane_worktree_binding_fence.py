@@ -1391,6 +1391,194 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
         self.assertEqual(len(ops.closed), 2)
         self.assertTrue(ops.relaunched)
 
+    def test_a_drift_after_the_relaunch_stops_the_resume_and_the_send(self):
+        """Review j#88532 F1: the resume and the send are NOT checkout-independent.
+
+        The resume flips the lane to ``active`` on the premise that the fresh pair stands in
+        THIS worktree (its own preflight never re-reads the branch), and the send delivers the
+        work anchor to that pair. R4 re-joined only through the relaunch, so a branch moved
+        afterwards still reached the active flip and the delivery.
+        """
+        calls = {"n": 0}
+
+        def drifting(*, lane, record):
+            calls["n"] += 1
+            # Joins: preflight build, pre-loop, close#1, close#2, relaunch, resume, send.
+            # Everything through the relaunch holds; the resume's join is the one that moves.
+            return LAUNCH_AUTHORITY_OK if calls["n"] <= 5 else LAUNCH_AUTHORITY_BRANCH_DRIFTED
+
+        ops = self._pair_ops_with_scripted_binding(drifting)
+        out = _use_case(ops).run(_REQ, execute=True)
+        self.assertEqual(len(ops.closed), 2)
+        self.assertTrue(ops.relaunched, "the relaunch ran under a current axis")
+        self.assertIsNone(out.resume, "the active flip must not ride a moved binding")
+        self.assertIsNone(ops.redispatched, "and nothing may be sent")
+        self.assertEqual(out.redispatch, REDISPATCH_SKIPPED)
+        self.assertEqual(
+            out.preflight.worktree_binding_reason, LAUNCH_AUTHORITY_BRANCH_DRIFTED
+        )
+        # The relaunch stays reported, so a re-run resumes from there.
+        self.assertTrue(out.relaunched)
+
+    def test_a_drift_after_the_resume_stops_the_send(self):
+        # The resume applied; the send is the last owed effect and gets its own join.
+        calls = {"n": 0}
+
+        def drifting(*, lane, record):
+            calls["n"] += 1
+            return LAUNCH_AUTHORITY_OK if calls["n"] <= 6 else LAUNCH_AUTHORITY_BRANCH_DRIFTED
+
+        ops = self._pair_ops_with_scripted_binding(drifting)
+        out = _use_case(ops).run(_REQ, execute=True)
+        self.assertTrue(ops.relaunched)
+        self.assertIsNotNone(out.resume, "the resume ran under a current axis")
+        self.assertIsNone(ops.redispatched, "the send must be zero")
+        self.assertEqual(out.redispatch, REDISPATCH_SKIPPED)
+        self.assertEqual(
+            out.preflight.worktree_binding_reason, LAUNCH_AUTHORITY_BRANCH_DRIFTED
+        )
+
+    def test_the_transport_direct_fence_cancels_the_reserve_on_a_moved_binding(self):
+        """The live ops' own ``pre_send_authority`` seam (review j#88532 F1).
+
+        The seam existed and neither redispatch caller passed it. It fires AFTER the outbox
+        reserve is won and BEFORE transport, so a moved binding is a typed zero-send with the
+        reserve cancelled — never a reservation left dangling as an unresolved send fate.
+        """
+        import tempfile as _tempfile
+        from unittest.mock import patch
+
+        from mozyo_bridge.core.state.dispatch_outbox_fence import (
+            DispatchOutboxFence,
+            FenceKey,
+            dispatch_outbox_fence_path,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            recovery_anchor_delivery_live as delivery_live,
+            sublane_hibernated_pair_recovery_live as live,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_FAILED,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            encode_assigned_name,
+        )
+
+        with _tempfile.TemporaryDirectory() as tmp:
+            fence = DispatchOutboxFence(path=dispatch_outbox_fence_path(Path(tmp)))
+            fence.bootstrap()
+            ops = live.LiveHibernatedPairRecoveryOps(
+                repo_root=self.repo, request_issue=self.issue, request_lane=self.lane,
+                request_journal="88532", lifecycle_home=self.home, fence=fence,
+            )
+            gw = encode_assigned_name(self.workspace_id, "codex", self.lane)
+            sent = []
+
+            def _deliver(_self, request):
+                sent.append(request)
+                raise AssertionError("transport must not be reached on a moved binding")
+
+            # The gateway MUST resolve, otherwise the send would fail for want of a target and
+            # this case would pass with the fence removed (measured: it did).
+            gw_row = {
+                "name": gw, "pane_id": "wZ:p3G", "agent_status": "idle",
+                "cwd": str(self.repo), "revision": "7",
+            }
+            # ``deliver`` is patched to FAIL if it is ever reached: without that, an unwired
+            # seam lets the real transport run and fail for its own reasons, and this case
+            # passes with the fence removed (measured: it did).
+            with patch.object(
+                live.LiveHibernatedPairRecoveryOps,
+                "_checkout_authority_current", return_value=False,
+            ), patch.object(
+                live, "list_herdr_agent_rows", return_value=[gw_row],
+            ), patch.object(
+                delivery_live.LiveRecoveryAnchorDeliveryService, "deliver", _deliver,
+            ):
+                result = ops.redispatch_to_gateway(
+                    action_id="recover-pair:14475:x:1:1", gateway_assigned_name=gw,
+                    issue=self.issue, lane=self.lane, journal="88465",
+                    workspace_id=self.workspace_id,
+                )
+            self.assertEqual(result, REDISPATCH_FAILED)
+            self.assertEqual(sent, [], "zero transport")
+            key = FenceKey(
+                workspace_id=self.workspace_id, lane_id=self.lane, issue=self.issue,
+                journal="88465", action_id="recover-pair:14475:x:1:1",
+                target_assigned_name=gw,
+            )
+            self.assertEqual(
+                fence.state_of(key), "cancelled",
+                "the reserve must be cancelled, not left as an unresolved send fate",
+            )
+
+            # Premise control: with the axis CURRENT the same setup reaches the transport, so
+            # the assertions above measure the fence and not an unresolvable target.
+            reached = []
+
+            def _deliver_ok(_self, request):
+                reached.append(request)
+                raise RuntimeError("transport reached")
+
+            with patch.object(
+                live.LiveHibernatedPairRecoveryOps,
+                "_checkout_authority_current", return_value=True,
+            ), patch.object(
+                live, "list_herdr_agent_rows", return_value=[gw_row],
+            ), patch.object(
+                delivery_live.LiveRecoveryAnchorDeliveryService, "deliver", _deliver_ok,
+            ):
+                ops.redispatch_to_gateway(
+                    action_id="recover-pair:14475:x:1:2", gateway_assigned_name=gw,
+                    issue=self.issue, lane=self.lane, journal="88465",
+                    workspace_id=self.workspace_id,
+                )
+            self.assertEqual(len(reached), 1, "the axis is the only thing that stopped it")
+
+    def test_a_whitespace_only_binding_blocks_in_preflight_and_execute_alike(self):
+        """Review j#88532 F2: the already-bound predicate lives OUTSIDE the classifier.
+
+        The classifier closed the four in-signature shapes, but this residual predicate kept
+        the old normalized comparison, so a row persisted as ``'   '`` read as unbound in the
+        preflight and was refused ``repair_cas_refused`` at execute — the same false green,
+        just outside the classifier.
+        """
+        self._mint_hibernated_unbound_row()
+        before = self._record()
+        self._raw_update("worktree_identity", "   ")
+        pre = self._repair(execute=False)
+        self.assertTrue(pre.is_blocked, "the preflight must not report a false green")
+        self.assertEqual(pre.reason, BLOCK_ALREADY_BOUND)
+        out = self._repair(execute=True)
+        self.assertEqual(out.reason, BLOCK_ALREADY_BOUND)
+        after = self._record()
+        self.assertEqual(after.worktree_identity, "   ", "zero write")
+        self.assertEqual(after.revision, before.revision)
+
+    def test_the_store_partitions_every_classifier_axis(self):
+        """Totality: a new classifier token must not fall through the store's mapping.
+
+        Recommended by j#88532. The store maps signature axes onto two CAS reasons; an axis in
+        neither set would be silently accepted by the CAS while the command still blocked it.
+        """
+        from mozyo_bridge.core.state import lane_worktree_binding_repair as store_mod
+        from mozyo_bridge.core.state.lane_worktree_binding_signature import (
+            SIGNATURE_BLOCKERS,
+        )
+
+        partitioned = (
+            store_mod._UNEXPECTED_STATE_SIGNATURES
+            | store_mod._FORBIDDEN_TRANSITION_SIGNATURES
+        )
+        self.assertEqual(
+            sorted(SIGNATURE_BLOCKERS - partitioned), [],
+            "every signature blocker must map to a CAS refusal reason",
+        )
+        self.assertEqual(
+            sorted(partitioned - SIGNATURE_BLOCKERS), [],
+            "the store must not partition tokens the classifier does not define",
+        )
+
     def test_the_preflight_matches_the_store_on_raw_persisted_bytes(self):
         """Review j#88526 F2: the 4 padded shapes, preflight and execute must agree.
 
@@ -1658,15 +1846,22 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
         self._mint_hibernated_unbound_row()
         self._repair(execute=True)
         record = self._record()
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            lane_checkout_authority,
+        )
+
         ops = LiveHibernatedPairRecoveryOps(
             repo_root=self.repo, request_issue=self.issue, request_lane="default",
             request_journal="88513", lifecycle_home=self.home,
         )
-        ops._current_branch = staticmethod(lambda _p: "")  # type: ignore[assignment]
-        self.assertEqual(
-            ops.lane_worktree_binding_reason(lane="default", record=record),
-            LAUNCH_AUTHORITY_WORKTREE_UNREADABLE,
-        )
+        # Patched at the leaf that actually reads the branch — the seam the axis uses.
+        with patch.object(lane_checkout_authority, "current_branch", return_value=""):
+            self.assertEqual(
+                ops.lane_worktree_binding_reason(lane="default", record=record),
+                LAUNCH_AUTHORITY_WORKTREE_UNREADABLE,
+            )
 
     def test_the_unbound_runbook_names_both_dispositions(self):
         # The runbook is the operator's only pointer out of the blocker; it must name the

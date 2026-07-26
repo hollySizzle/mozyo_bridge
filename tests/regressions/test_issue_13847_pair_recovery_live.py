@@ -234,6 +234,14 @@ class RedispatchExactlyOnce(unittest.TestCase):
                 )
 
             with patch.object(live, "list_herdr_agent_rows", return_value=[_row(gw_name, "wZ:p3G")]), \
+                 patch.object(
+                     live.LiveHibernatedPairRecoveryOps,
+                     # Redmine #14475 (review j#88532 F1): the transport-direct checkout
+                     # fence. These cases have no lifecycle row or checkout — their subject
+                     # is the outbox's exactly-once behaviour — so the axis is stubbed
+                     # current here and measured on its own in the #14475 suite.
+                     "_checkout_authority_current", return_value=True,
+                 ), \
                  patch.object(delivery_live.LiveRecoveryAnchorDeliveryService, "deliver", _deliver):
                 first = ops.redispatch_to_gateway(
                     action_id="recover-pair:13847:issue_13847_x:3:2", gateway_assigned_name=gw_name,
@@ -272,6 +280,14 @@ class RedispatchExactlyOnce(unittest.TestCase):
             gw_name = encode_assigned_name(_WS, "codex", _LANE)
             sends = []
             with patch.object(live, "list_herdr_agent_rows", return_value=[_row(gw_name, "wZ:p3G")]), \
+                 patch.object(
+                     live.LiveHibernatedPairRecoveryOps,
+                     # Redmine #14475 (review j#88532 F1): the transport-direct checkout
+                     # fence. These cases have no lifecycle row or checkout — their subject
+                     # is the outbox's exactly-once behaviour — so the axis is stubbed
+                     # current here and measured on its own in the #14475 suite.
+                     "_checkout_authority_current", return_value=True,
+                 ), \
                  patch.object(delivery_live.LiveRecoveryAnchorDeliveryService, "deliver",
                               lambda self, request: sends.append(request)):
                 result = ops.redispatch_to_gateway(
@@ -341,6 +357,13 @@ class RedispatchExactlyOnce(unittest.TestCase):
             )
             with patch.object(live, "LaneLifecycleStore",
                               return_value=SimpleNamespace(get=lambda key: record)), \
+                    patch.object(
+                        live.LiveHibernatedPairRecoveryOps,
+                        # Redmine #14475 (review j#88532 F1): transport-direct checkout fence;
+                        # not this case's subject (the stubbed record has no real checkout).
+                        "_checkout_authority_current",
+                        return_value=True,
+                    ), \
                     patch.object(live, "read_declared_pin_pair", return_value=pair), \
                     patch.object(type(ops), "_journal_entries", return_value=entries), \
                     patch.object(live, "list_herdr_agent_rows",
@@ -459,6 +482,13 @@ class RedispatchExactlyOnce(unittest.TestCase):
             action = "a"
             with patch.object(live, "list_herdr_agent_rows",
                               return_value=[_row(gw_name, "wZ:p3G")]), \
+                    patch.object(
+                        live.LiveHibernatedPairRecoveryOps,
+                        # Redmine #14475 (review j#88532 F1): transport-direct checkout fence;
+                        # not this case's subject (no lifecycle row / checkout here).
+                        "_checkout_authority_current",
+                        return_value=True,
+                    ), \
                     patch.object(
                         delivery_live.LiveRecoveryAnchorDeliveryService,
                         "deliver",

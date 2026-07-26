@@ -704,6 +704,14 @@ class SublaneRecoverPairUseCase:
         relaunched = bool(recover_slots)
 
         # -- resume: both-slots post-hibernate attestation verify + hibernated->active CAS --
+        # Review j#88532 F1: the resume is NOT checkout-independent — it flips the lane to
+        # ``active`` on the premise that the fresh pair stands in THIS lane's worktree, and its
+        # own preflight does not re-read the branch. R4 stopped re-joining after the relaunch,
+        # so a branch moved between relaunch and resume still reached the active flip.
+        drifted = _binding_drifted()
+        if drifted is not None:
+            return replace(drifted, relaunched=relaunched)
+
         # Authorized by the owner-APPROVAL journal (request.journal), distinct from the original
         # implementation_request journal that the redispatch re-sends (Redmine #13847 R1-F3).
         resume_outcome = self.resume.run(
@@ -721,6 +729,17 @@ class SublaneRecoverPairUseCase:
         # The fence key + delivery anchor use the ORIGINAL implementation_request journal (never
         # the owner-approval journal), so a re-approval never changes the fence key and can never
         # re-send the same original request (Redmine #13847 R1-F3).
+        # The send is the last owed effect and the one that reaches a live pane, so it gets its
+        # own re-join here as well as the transport-direct one the live ops passes as
+        # ``pre_send_authority`` (review j#88532 F1). Stopping here leaves the resume applied
+        # and the outbox untouched, so a re-run redelivers exactly once.
+        drifted = _binding_drifted()
+        if drifted is not None:
+            return replace(
+                drifted, relaunched=relaunched, resume=resume_outcome,
+                redispatch=REDISPATCH_SKIPPED,
+            )
+
         gateway_name = preflight.gateway.assigned_name if preflight.gateway else ""
         redispatch = self.ops.redispatch_to_gateway(
             action_id=action_id,
