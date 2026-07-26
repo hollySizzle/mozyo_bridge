@@ -102,7 +102,15 @@ class SublaneRecoverPairDeliveryUseCase:
         # Review j#88571 F1: from the edge's own observation, never re-inferred from status.
         effects = edge.effects
         unresolved = edge.unresolved
-        if redispatch == REDISPATCH_DELIVERED:
+        # Review j#88587 F2: the OBSERVED facts decide, in the same order as the main
+        # surface. Ranking the statuses first let a ``target_retiring`` carrying an
+        # unresolved fate announce a settled cancel.
+        if unresolved:
+            detail = (
+                f"the redelivery's durable fate could not be established ({redispatch}); "
+                "operator reconcile required"
+            )
+        elif redispatch == REDISPATCH_DELIVERED:
             detail = "original implementation_request delivered under a new recovery action"
         elif redispatch == REDISPATCH_ALREADY:
             # Review j#88563 F2: an already-delivered fence hit applies NOTHING; reporting it
@@ -116,13 +124,11 @@ class SublaneRecoverPairDeliveryUseCase:
                 "zero-send: the gateway is inside a retirement transaction, so the outbox "
                 "reserve was cancelled"
             )
-        elif unresolved:
-            detail = (
-                f"the redelivery's durable fate could not be established ({redispatch}); "
-                "operator reconcile required"
-            )
         else:
-            detail = "fail-closed: recovery delivery blocked"
+            detail = (
+                "fail-closed: recovery delivery blocked; the implementation_request was not "
+                f"redelivered ({redispatch})"
+            )
         return RecoverPairDeliveryRetryOutcome(
             executed=bool(effects),
             effects=effects,

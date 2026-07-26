@@ -208,10 +208,11 @@ def perform_redispatch(
             )
         )
     except (Exception, SystemExit):  # noqa: BLE001 - never leave a won reserve pending
-        try:
-            fence.mark_uncertain(key, detail="recovery delivery service raised")
-        except DispatchOutboxFenceError:
-            pass
+        # Review j#88587 F1: ``mark_uncertain`` returns the SAME rowcount bool as the other
+        # outcome writes, so these two branches bypassed the observer and lost the hold on a
+        # vanished row exactly as the delivered/cancelled sites did. Every fence write in this
+        # edge goes through ``_record``; a structural regression pins that there are no others.
+        _record(fence.mark_uncertain, "recovery delivery service raised")
         return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
     if outcome.started:
         wrote = _record(
@@ -239,13 +240,7 @@ def perform_redispatch(
         if not wrote:
             return _edge(REDISPATCH_FAILED, unknown_fate=True)
         return _edge(REDISPATCH_FAILED, zero_send=True)
-    try:
-        fence.mark_uncertain(
-            key,
-            detail=f"recovery delivery uncertain: {outcome.detail}",
-        )
-    except DispatchOutboxFenceError:
-        pass
+    _record(fence.mark_uncertain, f"recovery delivery uncertain: {outcome.detail}")
     return _edge(REDISPATCH_UNCERTAIN, unknown_fate=True)
 
 

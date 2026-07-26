@@ -3157,3 +3157,271 @@ class RedispatchSuccessPolicyTests(unittest.TestCase):
                 source = Path(module.__file__).read_text(encoding="utf-8")
                 self.assertIn("edge.effects", source)
                 self.assertIn("edge.unresolved", source)
+
+
+class UncertainWriteObservationTests(RedispatchWriteObservationTests):
+    """Review j#88587 F1: ``mark_uncertain`` is an outcome write like the other two.
+
+    R11 routed ``mark_delivered`` / ``mark_cancelled`` through the observer and left the two
+    ``mark_uncertain`` sites calling the fence directly, so a vanished row on those branches
+    dropped the exactly-once hold entirely and a later reserve for the same key WON.
+    """
+
+    def _run_with_outcome(self, action, *, raise_it, drop_before_write):
+        """Drive the edge to a ``mark_uncertain`` branch, optionally losing the row first."""
+        from unittest.mock import patch
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            recovery_anchor_delivery_live as delivery_live,
+            sublane_hibernated_pair_recovery_live as live,
+        )
+
+        # Seed once per test: ``_ops`` mints the lifecycle row, and a second mint is refused
+        # ``already_declared``. The fence is shared with it so both branches of a subTest run
+        # against the same store.
+        if getattr(self, "_cached", None) is None:
+            fence = self._fence()
+            self._cached = (fence, self._ops(fence))
+        fence, ops = self._cached
+        gw = self._gw()
+        key = self._key(action, gw)
+
+        class _Unresolved:
+            started, zero_send, detail = False, False, "no turn-start observed"
+
+        def _deliver(_self, _request):
+            if drop_before_write:
+                self._drop_row(fence, key)
+            if raise_it:
+                raise RuntimeError("delivery service exploded")
+            return _Unresolved()
+
+        with patch.object(live, "list_herdr_agent_rows", return_value=[self._gw_row(gw)]), \
+                patch.object(
+                    delivery_live.LiveRecoveryAnchorDeliveryService, "deliver", _deliver
+                ):
+            result = ops.redispatch_to_gateway(
+                action_id=action, gateway_assigned_name=gw, issue=self.issue,
+                lane=self.lane, journal="88579", workspace_id=self.workspace_id,
+            )
+        return fence, key, result
+
+    def test_a_raising_delivery_service_keeps_the_hold_when_the_row_vanished(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_UNCERTAIN,
+        )
+
+        fence, key, result = self._run_with_outcome(
+            "recover-pair:14475:uncertain:raise:vanished",
+            raise_it=True, drop_before_write=True,
+        )
+        self.assertEqual(result.status, REDISPATCH_UNCERTAIN)
+        self.assertTrue(result.unknown_fate)
+        self.assertEqual(
+            fence.state_of(key), "uncertain",
+            "the hold must be re-asserted, not left absent",
+        )
+        # The decisive consequence: a later run must NOT be cleared to send again.
+        self.assertFalse(
+            fence.reserve(key).won, "a re-run won the reserve; exactly-once was lost"
+        )
+
+    def test_an_unresolved_delivery_outcome_keeps_the_hold_when_the_row_vanished(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_UNCERTAIN,
+        )
+
+        fence, key, result = self._run_with_outcome(
+            "recover-pair:14475:uncertain:outcome:vanished",
+            raise_it=False, drop_before_write=True,
+        )
+        self.assertEqual(result.status, REDISPATCH_UNCERTAIN)
+        self.assertTrue(result.unknown_fate)
+        self.assertEqual(fence.state_of(key), "uncertain")
+        self.assertFalse(fence.reserve(key).won)
+
+    def test_the_same_branches_with_the_row_intact_settle_uncertain(self):
+        # Premise controls: without the row loss both branches already reach ``uncertain``,
+        # so the assertions above measure the vanished-row repair and not the branch itself.
+        for label, raise_it in (("raise", True), ("outcome", False)):
+            with self.subTest(branch=label):
+                fence, key, result = self._run_with_outcome(
+                    f"recover-pair:14475:uncertain:{label}:intact",
+                    raise_it=raise_it, drop_before_write=False,
+                )
+                self.assertTrue(result.unknown_fate)
+                self.assertEqual(fence.state_of(key), "uncertain")
+                self.assertFalse(fence.reserve(key).won)
+
+    def test_the_edge_routes_every_fence_write_through_the_observer(self):
+        """The structural pin: no fence write may bypass ``_record``.
+
+        The recurrence this prevents is exactly R11's — the observer was introduced and two
+        write sites were left calling the fence directly, while the journal claimed all of
+        them had been routed. Counting the call sites is what makes that claim checkable.
+        """
+        import ast
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_recover_pair_redispatch_edge as edge_mod,
+        )
+
+        source = Path(edge_mod.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        # Parsed, not grepped: four of the seven observer call sites wrap across lines, so a
+        # source-substring count silently under-reports and the pin passes while writes are
+        # missing.
+        direct, observed = [], []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr.startswith("mark_"):
+                # CALLING fence.mark_* directly is the bypass this pin forbids.
+                direct.append((func.attr, node.lineno))
+            if isinstance(func, ast.Name) and func.id == "_record" and node.args:
+                first = node.args[0]
+                if isinstance(first, ast.Attribute):
+                    # PASSING it to the observer is the sanctioned form.
+                    observed.append((first.attr, node.lineno))
+        self.assertEqual(direct, [], f"these fence writes bypass _record: {direct}")
+        # Positive control: the observer IS used, for every write the edge performs, and the
+        # set of write kinds is the whole fence outcome vocabulary.
+        self.assertEqual(len(observed), 7, f"observer call sites changed: {observed}")
+        self.assertEqual(
+            {name for name, _ in observed},
+            {"mark_cancelled", "mark_delivered", "mark_uncertain"},
+        )
+
+
+class RedispatchDetailFactOrderTests(unittest.TestCase):
+    """Review j#88587 F2: the detail states OBSERVED facts, not a status ranking.
+
+    Both surfaces ranked statuses before consulting ``unresolved``, so a ``target_retiring``
+    whose cancel never wrote announced a settled "the outbox reserve was cancelled". The same
+    ordering also let a settled refusal with nothing applied fall through to "the
+    implementation_request already delivered" (found while verifying this finding).
+    """
+
+    def _main_detail(self, edge):
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        ops = _FakeOps(
+            per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy}, redispatch=edge
+        )
+        return _use_case(ops, resume_transition="already_active").run(_REQ, execute=True)
+
+    def _retry_outcome(self, edge):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_recover_pair_delivery import (  # noqa: E501
+            SublaneRecoverPairDeliveryUseCase,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            RecoverPairDeliveryRetryRequest,
+        )
+
+        class _Ops:
+            def workspace_id(self):
+                return "ws-14475"
+
+            def preflight_retry_redispatch_to_gateway(self, **kw):
+                return True, "ready"
+
+            def retry_redispatch_to_gateway(self, **kw):
+                return edge
+
+        request = RecoverPairDeliveryRetryRequest(
+            issue="14475", lane="issue_14475_detail", journal="88587",
+            implementation_request_journal="88465",
+            retry_of_action_id="recover-pair:14475:issue_14475_detail:3:2",
+            prior_zero_send_journal="88579",
+        )
+        out = SublaneRecoverPairDeliveryUseCase(ops=_Ops()).run(request, execute=True)
+        self.assertTrue(
+            out.attempted, "the fixture must actually reach the redispatch edge"
+        )
+        return out
+
+    def test_an_unresolved_fate_is_never_reported_as_a_settled_cancel(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_TARGET_RETIRING,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            RedispatchEdgeResult,
+        )
+
+        edge = RedispatchEdgeResult(
+            status=REDISPATCH_TARGET_RETIRING, unknown_fate=True
+        )
+        for label, detail in (
+            ("main", self._main_detail(edge).detail),
+            ("retry", self._retry_outcome(edge).detail),
+        ):
+            with self.subTest(surface=label):
+                self.assertIn("could not be established", detail)
+                self.assertIn("reconcile", detail)
+                self.assertNotIn(
+                    "reserve was cancelled", detail,
+                    "the cancel is exactly what did NOT durably happen",
+                )
+
+    def test_a_settled_retirement_cancel_still_names_the_retirement(self):
+        # Premise control: with the cancel WRITTEN, the retirement-specific phrasing is the
+        # right answer — the fix must not flatten every status into one message.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            REDISPATCH_TARGET_RETIRING,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            RedispatchEdgeResult,
+        )
+
+        edge = RedispatchEdgeResult(status=REDISPATCH_TARGET_RETIRING, zero_send=True)
+        for label, detail in (
+            ("main", self._main_detail(edge).detail),
+            ("retry", self._retry_outcome(edge).detail),
+        ):
+            with self.subTest(surface=label):
+                self.assertIn("retirement transaction", detail)
+                self.assertNotIn("could not be established", detail)
+
+    def test_no_settled_refusal_claims_a_delivery_on_either_surface(self):
+        """The whole fact table, both surfaces: only a real delivery may say so.
+
+        Checking the two statuses the finding names would leave the sibling branch — a
+        settled ``send_failed`` reporting "the implementation_request already delivered" —
+        exactly as it was.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_effect_contract import (  # noqa: E501
+            REDISPATCH_EDGE_FACT_SHAPES,
+            RedispatchEdgeResult,
+            redispatch_is_success,
+        )
+
+        claims = ("already delivered", "delivered under a new recovery action")
+        checked = 0
+        for status, shapes in sorted(REDISPATCH_EDGE_FACT_SHAPES.items()):
+            for delivered, zero_send, unknown_fate in sorted(shapes):
+                edge = RedispatchEdgeResult(
+                    status=status, delivered=delivered,
+                    zero_send=zero_send, unknown_fate=unknown_fate,
+                )
+                # A delivery may be claimed ONLY when the fence positively holds one and the
+                # fate is settled.
+                may_claim = redispatch_is_success(status) and not unknown_fate
+                for label, out in (
+                    ("main", self._main_detail(edge)),
+                    ("retry", self._retry_outcome(edge)),
+                ):
+                    with self.subTest(surface=label, status=status,
+                                      shape=(delivered, zero_send, unknown_fate)):
+                        checked += 1
+                        claimed = any(c in out.detail for c in claims)
+                        if not may_claim:
+                            self.assertFalse(
+                                claimed,
+                                f"{label} claimed a delivery for {status} "
+                                f"{(delivered, zero_send, unknown_fate)}: {out.detail}",
+                            )
+                        # An unresolved fate always routes to reconcile, whatever the status.
+                        if unknown_fate:
+                            self.assertIn("reconcile", out.detail)
+                        self.assertEqual(bool(out.unresolved), unknown_fate)
+        self.assertEqual(checked, 18, "the sweep must cover the whole table on both surfaces")

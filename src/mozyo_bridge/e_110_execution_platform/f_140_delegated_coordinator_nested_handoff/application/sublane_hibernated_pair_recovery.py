@@ -874,19 +874,36 @@ class SublaneRecoverPairUseCase:
         def _final_detail(
             effects: Tuple[str, ...], unresolved: Tuple[str, ...], redispatch: str
         ) -> str:
-            """Say what actually happened (review j#88563 F2). (pure)"""
-            if redispatch == REDISPATCH_TARGET_RETIRING:
-                return (
-                    "zero-send: the gateway is inside a retirement transaction, so the "
-                    "outbox reserve was cancelled and nothing was delivered"
-                    + (f" (applied: {', '.join(effects)})" if effects else "")
-                )
+            """Say what actually happened (review j#88563 F2, j#88587 F2). (pure)
+
+            Driven by the OBSERVED facts, not by the status's position in a chain of
+            equality tests. The status was checked first, so a ``target_retiring`` whose
+            cancel never wrote announced a settled "the reserve was cancelled" while
+            carrying an unresolved fate, and a settled refusal with nothing applied fell
+            through to "the implementation_request already delivered" — both statements
+            the observation contradicts.
+            """
+            applied = f" (applied: {', '.join(effects)})" if effects else ""
+            # 1. An unresolved fate outranks every status-specific phrasing: nothing about
+            #    the durable state may be asserted.
             if unresolved:
                 return (
                     "the redelivery's durable fate could not be established "
-                    f"({redispatch}); operator reconcile required"
-                    + (f" (applied: {', '.join(effects)})" if effects else "")
+                    f"({redispatch}); operator reconcile required" + applied
                 )
+            # 2. Settled, and NOT a delivery. Naming the reason is useful; claiming a
+            #    delivery is not available on any of these statuses.
+            if not redispatch_is_success(redispatch):
+                if redispatch == REDISPATCH_TARGET_RETIRING:
+                    return (
+                        "zero-send: the gateway is inside a retirement transaction, so the "
+                        "outbox reserve was cancelled and nothing was delivered" + applied
+                    )
+                return (
+                    "zero-send: the implementation_request was not redelivered "
+                    f"({redispatch}); nothing is owed to the outbox" + applied
+                )
+            # 3. Settled AND delivered (by this run or an earlier one).
             if effects:
                 return (
                     "pair recovered; lane resumed to active (applied: "
