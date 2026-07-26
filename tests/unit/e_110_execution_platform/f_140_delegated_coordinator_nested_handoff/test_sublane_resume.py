@@ -34,10 +34,12 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     LaneLifecycleStore,
     ReleasePin,
 )
+from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (  # noqa: E501
     BLOCK_ISSUE_REOWNED,
     BLOCK_NOT_HIBERNATED,
     BLOCK_PAIR_ATTESTATION,
+    BLOCK_PAIR_PINS,
     BLOCK_PAIR_SLOTS,
     BLOCK_RELEASE_IN_FLIGHT,
     ResumeRequest,
@@ -99,6 +101,9 @@ class _FakeOps:
 
     def read_attestation(self, assigned_name):
         return self._attest.get(assigned_name)
+
+    def provider_pair(self):
+        return ("codex", "claude")
 
 
 def _decision(journal: str = JOURNAL) -> DecisionPointer:
@@ -193,6 +198,10 @@ class SublaneResumeTest(unittest.TestCase):
             self.assertEqual(owner.lane_id, LANE)
             # The resume decision anchor replaced the hibernate one (never inherited).
             self.assertEqual(rec.decision_journal, RESUME_JOURNAL)
+            pair = read_declared_pin_pair(rec)
+            self.assertTrue(pair.ok)
+            self.assertEqual(pair.gateway.locator, f"{WS}:p20")
+            self.assertEqual(pair.worker.locator, f"{WS}:p21")
 
     def test_resumes_when_hibernate_left_no_release(self) -> None:
         # A lane hibernated with dead processes (process_release stays not_requested) still
@@ -254,6 +263,26 @@ class SublaneResumeTest(unittest.TestCase):
             self.assertTrue(outcome.is_blocked)
             self.assertIn(BLOCK_PAIR_ATTESTATION, outcome.preflight.blocked_reasons)
             self.assertIsNone(outcome.transition)
+
+    def test_blocks_before_transition_when_fresh_pair_pins_do_not_resolve(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._hibernated(store, released=True)
+            ops = _fresh_pair_ops()
+            ops.provider_pair = lambda: ("unknown-gateway", "unknown-worker")
+            outcome = SublaneResumeUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(
+                BLOCK_PAIR_PINS,
+                outcome.preflight.blocked_reasons,
+            )
+            self.assertIsNone(outcome.transition)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
+                DISPOSITION_HIBERNATED,
+            )
 
     def test_stale_pre_hibernate_pane_is_not_fresh(self) -> None:
         # Freshness guard: a pane lingering from before hibernate is live at its OLD

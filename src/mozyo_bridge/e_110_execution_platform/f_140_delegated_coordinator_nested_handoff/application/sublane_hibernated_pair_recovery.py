@@ -903,6 +903,12 @@ def register_sublane_recover_pair_parser(sublane_sub: Any) -> None:
 
     register_sublane_recovered_worker_delivery_parser(sublane_sub)
 
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_recovered_pair_pin_reconciliation_cli import (  # noqa: E501
+        register_sublane_recovered_pair_pin_reconciliation_parser,
+    )
+
+    register_sublane_recovered_pair_pin_reconciliation_parser(sublane_sub)
+
 
 __all__ = (
     "BLOCK_CLOSE_FAILED",

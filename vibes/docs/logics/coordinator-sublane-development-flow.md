@@ -391,6 +391,15 @@ deliveryは別の causal edgeであり、typed/send/turn-start/target 0がdurabl
 action-specific owner authorization下の `sublane recover-worker-delivery` でexact worker generationへ
 一度送る。これは通常dispatchの代替入口ではなく、recovered pairの未完edgeを閉じる限定recoveryである。
 
+`recover-worker-delivery` が `declared_pair_generation_moved` を返した場合、current pair に合わせて
+generation checkを緩めたり lifecycle decisionをwork anchorへ書き換えたりしない。まず
+`sublane reconcile-recovered-pair-pins` の read-only preflightで、old declared pairがexact
+`recover-pair` actionのsource generationであり、current pairがそのactionにboundした
+live/settled/attested generationであることを確認する。exact structured owner authorizationと
+revision/generation CASが成立した場合だけmetadata snapshotを補正し、同じ
+`recover-worker-delivery` preflightを再実行する。補正command自体はprocess launch/close/resume/sendを
+行わず、通常のactive lane pin rewrite入口として使わない。
+
 ### Pipeline Dispatch Check
 
 待つかどうかを決める前に、次の quick classification を使う。

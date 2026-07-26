@@ -72,7 +72,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     BINDING_KIND_ISSUE,
@@ -414,6 +414,7 @@ class LaneLifecycleStore:
         expected_revision: int,
         target: str,
         decision: DecisionPointer,
+        rehydrated_declared_slots: Optional[Sequence[ProcessGenerationPin]] = None,
         now: Optional[str] = None,
     ) -> CasOutcome:
         """CAS the lane's disposition, guarded on its exact state + revision.
@@ -426,9 +427,24 @@ class LaneLifecycleStore:
         a *finished* one — :func:`rehydrate_allowed` refuses while a generation is in
         flight (R1-F3), so a lane whose panes an actuator is still closing cannot slip
         back into the active roster.
+
+        ``rehydrated_declared_slots`` atomically replaces the declaration snapshot on
+        ``hibernated -> active`` only; production resume supplies the fresh pair (#14203 R19).
         """
         if target not in DISPOSITIONS:
             raise ValueError(f"unknown lane disposition {target!r}")
+        encoded_rehydrated_slots: Optional[str] = None
+        if rehydrated_declared_slots is not None:
+            if expected_disposition != DISPOSITION_HIBERNATED or target != DISPOSITION_ACTIVE:
+                raise ValueError(
+                    "rehydrated declared slots require hibernated -> active"
+                )
+            rehydrated = validate_declared_slots(tuple(rehydrated_declared_slots))
+            if not rehydrated:
+                raise ValueError(
+                    "rehydrating declared slots must contain the freshly observed pair"
+                )
+            encoded_rehydrated_slots = encode_declared_slots(rehydrated)
         stamp = now or _utc_now()
         conn = self._connect_write(key)
         try:
@@ -494,12 +510,18 @@ class LaneLifecycleStore:
             )
             replacement_action = "" if rehydrating else current.replacement_action_id
             replacement_pins = "" if rehydrating else current.replacement_pins
+            declared_slots = (
+                encoded_rehydrated_slots
+                if rehydrating and encoded_rehydrated_slots is not None
+                else current.declared_slots
+            )
             revision = current.revision + 1
             try:
                 conn.execute(
                     f"UPDATE {_TABLE} SET lane_disposition = ?, process_release = ?, "
                     "release_action_id = ?, release_pins = ?, replacement_state = ?, "
-                    "replacement_action_id = ?, replacement_pins = ?, revision = ?, "
+                    "replacement_action_id = ?, replacement_pins = ?, declared_slots = ?, "
+                    "revision = ?, "
                     "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                     "updated_at = ? "
                     "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
@@ -511,6 +533,7 @@ class LaneLifecycleStore:
                         replacement,
                         replacement_action,
                         replacement_pins,
+                        declared_slots,
                         revision,
                         decision.source,
                         decision.issue_id,

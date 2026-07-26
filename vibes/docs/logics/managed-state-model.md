@@ -1048,6 +1048,27 @@ authorizationが必要である。new outbox actionは `started` のみ delivere
 post-injection/unknownはuncertainとして自動retryしない。ordinary sender admission / standard
 `dispatch-worker` / lifecycle schemaは緩めない。
 
+#### Rehydrate 時の declared pair snapshot と既存 active residue (#14203 R19)
+
+`hibernated -> active` は fresh pair の live/settled/startup self-attestation を確認するだけでは不十分で
+ある。`declared_slots` は「宣言時点の process generation snapshot」なので、resume が採用した fresh
+gateway/worker の canonical `ProcessGenerationPin` を **disposition flip と同一 lifecycle CAS** で保存する。
+別 transaction にすると `active + old locator snapshot` が観測可能になり、strict generation admission が
+健全な fresh pair を stale として拒否する。provider binding、raw assigned-name multiplicity、live surfaced
+provider、locator、startup attestation のいずれかが解決不能なら、resume は disposition も pins も
+zero-write とする。
+
+この原子的更新より前に作られた `active + old declared pair + action-bound fresh pair` residue は、
+generic backfill / `repair-pins` / standard dispatch の緩和では直さない。public
+`sublane reconcile-recovered-pair-pins` は、exact issue/lane/worktree、active revision、lane generation、
+lifecycle decision、old pair、`recover-pair` source revisionから再構成した action id、fresh pair の
+live/settled/attested/action-bound generation、および exact structured owner authorizationを連言した場合
+だけ、`declared_slots + revision + updated_at` を bounded CAS で更新する。side-binding v1 では各 old
+locator も exact 照合する。disposition、lane generation、decision pointer、issue/worktree binding、
+release/replacement axes、process、worktree、branch、message delivery は変更しない。byte-equal new snapshot
+の replay だけを idempotent success とし、expected-old / expected-new のどちらでもない snapshot、
+revision/generation/decision/action drift は zero-write である。
+
 ### schema version / migration
 
 Use a two-level version model:

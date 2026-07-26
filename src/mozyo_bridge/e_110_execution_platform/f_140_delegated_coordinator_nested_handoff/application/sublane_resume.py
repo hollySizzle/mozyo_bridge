@@ -39,6 +39,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from mozyo_bridge.application.cli_common import add_repo_option
@@ -58,6 +59,11 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     LaneLifecycleError,
     LaneLifecycleKey,
     LaneLifecycleStore,
+    ProcessGenerationPin,
+)
+from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
+    resolve_declared_pins,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
     evaluate_pair_attestation,
@@ -72,6 +78,7 @@ BLOCK_RELEASE_IN_FLIGHT = "release_generation_in_flight"
 BLOCK_ISSUE_REOWNED = "issue_reowned_by_another_lane"
 BLOCK_PAIR_SLOTS = "pair_not_both_slots_live"
 BLOCK_PAIR_ATTESTATION = "pair_not_attested"
+BLOCK_PAIR_PINS = "fresh_pair_pins_unresolved"
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +95,8 @@ class ResumePreflight:
     issue_not_reowned: bool
     pair_both_slots_live: bool
     pair_attested: bool
+    fresh_pair_pins: tuple[ProcessGenerationPin, ...] = ()
+    fresh_pair_pins_required: bool = False
     pair_attestation_detail: str = ""
 
     @property
@@ -98,6 +107,10 @@ class ResumePreflight:
             and self.issue_not_reowned
             and self.pair_both_slots_live
             and self.pair_attested
+            and (
+                not self.fresh_pair_pins_required
+                or len(self.fresh_pair_pins) == 2
+            )
         )
 
     @property
@@ -113,6 +126,8 @@ class ResumePreflight:
             reasons.append(BLOCK_PAIR_SLOTS)
         elif not self.pair_attested:
             reasons.append(BLOCK_PAIR_ATTESTATION)
+        elif self.fresh_pair_pins_required and len(self.fresh_pair_pins) != 2:
+            reasons.append(BLOCK_PAIR_PINS)
         return tuple(reasons)
 
     def as_payload(self) -> dict[str, Any]:
@@ -123,6 +138,10 @@ class ResumePreflight:
             "issue_not_reowned": self.issue_not_reowned,
             "pair_both_slots_live": self.pair_both_slots_live,
             "pair_attested": self.pair_attested,
+            "fresh_pair_pins": [
+                pin.as_payload() for pin in self.fresh_pair_pins
+            ],
+            "fresh_pair_pins_required": self.fresh_pair_pins_required,
             "pair_attestation_detail": self.pair_attestation_detail,
             "blocked_reasons": list(self.blocked_reasons),
         }
@@ -190,6 +209,8 @@ class SublaneResumeOps(Protocol):
         self, assigned_name: str
     ) -> Optional[IdentityAttestationRecord]: ...
 
+    def provider_pair(self) -> tuple[str, str]: ...
+
 
 @dataclass
 class LiveSublaneResumeOps:
@@ -222,6 +243,17 @@ class LiveSublaneResumeOps:
         self, assigned_name: str
     ) -> Optional[IdentityAttestationRecord]:
         return HerdrIdentityAttestationStore().read(assigned_name)
+
+    def provider_pair(self) -> tuple[str, str]:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+            resolve_gateway_provider,
+            resolve_worker_provider,
+        )
+
+        return (
+            resolve_gateway_provider(str(self.repo_root)),
+            resolve_worker_provider(str(self.repo_root)),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +299,7 @@ class SublaneResumeUseCase:
                 issue_not_reowned=False,
                 pair_both_slots_live=False,
                 pair_attested=False,
+                fresh_pair_pins=(),
                 pair_attestation_detail="identity / decision anchor incomplete",
             )
             return ResumeOutcome(
@@ -289,6 +322,7 @@ class SublaneResumeUseCase:
                 issue_not_reowned=False,
                 pair_both_slots_live=False,
                 pair_attested=False,
+                fresh_pair_pins=(),
                 pair_attestation_detail="lifecycle store unreadable",
             )
             return ResumeOutcome(
@@ -315,6 +349,7 @@ class SublaneResumeUseCase:
                 issue_not_reowned=True,
                 pair_both_slots_live=True,
                 pair_attested=True,
+                fresh_pair_pins=(),
                 pair_attestation_detail="lane already active",
             )
             return ResumeOutcome(
@@ -354,12 +389,42 @@ class SublaneResumeUseCase:
             self.ops.read_attestation,
             fresh_after=hibernation_anchor,
         )
+        fresh_pair_pins: tuple[ProcessGenerationPin, ...] = ()
+        if both_live and attested:
+            try:
+                declared_pair = read_declared_pin_pair(rec)
+                providers = (
+                    (
+                        declared_pair.gateway.provider,
+                        declared_pair.worker.provider,
+                    )
+                    if declared_pair.ok
+                    else self.ops.provider_pair()
+                )
+                resolved, pin_reason = resolve_declared_pins(
+                    rows,
+                    workspace_id=workspace_id,
+                    lane_id=lane,
+                    providers=providers,
+                    attestation_store=SimpleNamespace(
+                        read=self.ops.read_attestation
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - unresolved authority fails closed
+                resolved = None
+                pin_reason = type(exc).__name__
+            if resolved is not None:
+                fresh_pair_pins = tuple(resolved)
+            elif pin_reason:
+                attest_detail = f"{attest_detail}; pins: {pin_reason}"
         preflight = ResumePreflight(
             lane_hibernated=lane_hibernated,
             release_settled=release_settled,
             issue_not_reowned=issue_not_reowned,
             pair_both_slots_live=both_live,
             pair_attested=attested,
+            fresh_pair_pins=fresh_pair_pins,
+            fresh_pair_pins_required=True,
             pair_attestation_detail=attest_detail,
         )
         if not preflight.may_resume or not execute:
@@ -386,6 +451,7 @@ class SublaneResumeUseCase:
             expected_revision=rec.revision,
             target=DISPOSITION_ACTIVE,
             decision=decision,
+            rehydrated_declared_slots=preflight.fresh_pair_pins,
         )
         if not transition.applied:
             return ResumeOutcome(
