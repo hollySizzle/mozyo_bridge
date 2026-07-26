@@ -24,6 +24,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     VERDICT_MISSING,
     VERDICT_PRESENT,
 )
+from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
@@ -32,6 +33,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     DecisionPointer,
     LaneLifecycleKey,
     LaneLifecycleStore,
+    ProcessGenerationPin,
     ReleasePin,
 )
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
@@ -131,20 +133,51 @@ def _fresh_pair_ops(*, gw="p20", wk="p21", lane=LANE):
     return _FakeOps(rows=rows, attestations=attest)
 
 
+def _declared_pair() -> tuple[ProcessGenerationPin, ...]:
+    return (
+        ProcessGenerationPin(
+            role="gateway",
+            provider="codex",
+            assigned_name=encode_assigned_name(WS, "codex", LANE),
+            locator=f"{WS}:p10",
+            attested_at=DECLARE_AT,
+        ),
+        ProcessGenerationPin(
+            role="worker",
+            provider="claude",
+            assigned_name=encode_assigned_name(WS, "claude", LANE),
+            locator=f"{WS}:p11",
+            attested_at=DECLARE_AT,
+        ),
+    )
+
+
 class SublaneResumeTest(unittest.TestCase):
     def _store(self, tmp) -> LaneLifecycleStore:
         return LaneLifecycleStore(home=Path(tmp))
 
-    def _hibernated(self, store, *, released=False) -> None:
+    def _hibernated(self, store, *, released=False, declared_slots=()) -> None:
         """Declare active, then hibernate; optionally drive the release to `released`.
 
         All hibernate-side writes are stamped ``HIBERNATE_AT`` so the row's ``updated_at``
         is a deterministic freshness anchor (a fresh relaunch attests at ``FRESH_AT``).
         """
         key = LaneLifecycleKey(WS, LANE)
-        store.declare_active(
-            key, decision=_decision(JOURNAL), issue_id=ISSUE, now=DECLARE_AT
-        )
+        if declared_slots:
+            LaneDeclarationStore(path=store.path).declare_lane(
+                key,
+                decision=_decision(JOURNAL),
+                issue_id=ISSUE,
+                declared_slots=declared_slots,
+                now=DECLARE_AT,
+            )
+        else:
+            store.declare_active(
+                key,
+                decision=_decision(JOURNAL),
+                issue_id=ISSUE,
+                now=DECLARE_AT,
+            )
         store.transition_disposition(
             key,
             expected_disposition=DISPOSITION_ACTIVE,
@@ -180,7 +213,9 @@ class SublaneResumeTest(unittest.TestCase):
     def test_happy_path_resumes_to_active(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(tmp)
-            self._hibernated(store, released=True)
+            self._hibernated(
+                store, released=True, declared_slots=_declared_pair()
+            )
             ops = _fresh_pair_ops()
             outcome = SublaneResumeUseCase(ops=ops, store=store).run(
                 _request(), execute=True
@@ -283,6 +318,30 @@ class SublaneResumeTest(unittest.TestCase):
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
                 DISPOSITION_HIBERNATED,
             )
+
+    def test_blocks_provider_binding_drift_without_mutating_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._hibernated(
+                store, released=True, declared_slots=_declared_pair()
+            )
+            before = store.get(LaneLifecycleKey(WS, LANE))
+            ops = _fresh_pair_ops()
+            ops.provider_pair = lambda: ("claude", "codex")
+            outcome = SublaneResumeUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(BLOCK_PAIR_PINS, outcome.preflight.blocked_reasons)
+            self.assertIn(
+                "provider_binding_drift",
+                outcome.preflight.pair_attestation_detail,
+            )
+            self.assertIsNone(outcome.transition)
+            after = store.get(LaneLifecycleKey(WS, LANE))
+            self.assertEqual(after.lane_disposition, before.lane_disposition)
+            self.assertEqual(after.revision, before.revision)
+            self.assertEqual(after.declared_slots, before.declared_slots)
 
     def test_stale_pre_hibernate_pane_is_not_fresh(self) -> None:
         # Freshness guard: a pane lingering from before hibernate is live at its OLD

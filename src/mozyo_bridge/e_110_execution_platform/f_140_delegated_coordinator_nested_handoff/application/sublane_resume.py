@@ -392,24 +392,33 @@ class SublaneResumeUseCase:
         fresh_pair_pins: tuple[ProcessGenerationPin, ...] = ()
         if both_live and attested:
             try:
+                providers = self.ops.provider_pair()
                 declared_pair = read_declared_pin_pair(rec)
-                providers = (
+                stored_providers = (
                     (
                         declared_pair.gateway.provider,
                         declared_pair.worker.provider,
                     )
-                    if declared_pair.ok
-                    else self.ops.provider_pair()
+                    if (
+                        declared_pair.ok
+                        and declared_pair.gateway is not None
+                        and declared_pair.worker is not None
+                    )
+                    else None
                 )
-                resolved, pin_reason = resolve_declared_pins(
-                    rows,
-                    workspace_id=workspace_id,
-                    lane_id=lane,
-                    providers=providers,
-                    attestation_store=SimpleNamespace(
-                        read=self.ops.read_attestation
-                    ),
-                )
+                if stored_providers is not None and stored_providers != providers:
+                    resolved = None
+                    pin_reason = "provider_binding_drift"
+                else:
+                    resolved, pin_reason = resolve_declared_pins(
+                        rows,
+                        workspace_id=workspace_id,
+                        lane_id=lane,
+                        providers=providers,
+                        attestation_store=SimpleNamespace(
+                            read=self.ops.read_attestation
+                        ),
+                    )
             except Exception as exc:  # noqa: BLE001 - unresolved authority fails closed
                 resolved = None
                 pin_reason = type(exc).__name__

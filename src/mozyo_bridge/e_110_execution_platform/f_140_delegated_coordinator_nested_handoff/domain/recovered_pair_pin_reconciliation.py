@@ -3,12 +3,30 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     MARKER_CHANNEL_WORKFLOW_EVENT,
-    marker_fields_in_note,
+)
+
+
+_AUTHORITY_FIELDS = frozenset(
+    {
+        "gate",
+        "kind",
+        "issue",
+        "lane",
+        "lane_generation",
+        "source_revision",
+        "expected_revision",
+        "lifecycle_decision_journal",
+        "target_action_digest",
+    }
+)
+_AUTHORITY_RE = re.compile(
+    rf"\[mozyo:{re.escape(MARKER_CHANNEL_WORKFLOW_EVENT)}:(?P<body>[^\]]*)\]"
 )
 
 
@@ -19,6 +37,33 @@ def _norm(value: object) -> str:
 def recovery_action_digest(value: object) -> str:
     action = _norm(value)
     return hashlib.sha256(action.encode("utf-8")).hexdigest() if action else ""
+
+
+def _strict_authority_fields(notes: object) -> dict[str, str] | None:
+    """Parse exactly one closed R19 owner marker without lossy field folding."""
+
+    if not isinstance(notes, str):
+        return None
+    matches = tuple(_AUTHORITY_RE.finditer(notes))
+    if len(matches) != 1:
+        return None
+    fields: dict[str, str] = {}
+    for raw_token in matches[0].group("body").split(":"):
+        token = raw_token.strip()
+        key, separator, value = token.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if (
+            not separator
+            or not key
+            or not value
+            or key in fields
+            or key not in _AUTHORITY_FIELDS
+            or any(character.isspace() for character in key)
+        ):
+            return None
+        fields[key] = value
+    return fields if frozenset(fields) == _AUTHORITY_FIELDS else None
 
 
 @dataclass(frozen=True)
@@ -80,15 +125,8 @@ def is_exact_reconciliation_authority(
             request.target_action_id
         ),
     }
-    matches = 0
-    for channel, fields in marker_fields_in_note(
-        _norm(getattr(entry, "notes", ""))
-    ):
-        if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
-            continue
-        if all(_norm(fields.get(key)) == value for key, value in expected.items()):
-            matches += 1
-    return matches == 1
+    fields = _strict_authority_fields(getattr(entry, "notes", ""))
+    return fields is not None and fields == expected
 
 
 @dataclass(frozen=True)

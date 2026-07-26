@@ -257,6 +257,32 @@ class ReconciliationAuthorityTest(unittest.TestCase):
         )
         self.assertFalse(is_exact_reconciliation_authority(duplicate, request))
 
+    def test_rejects_noncanonical_authority_field_grammar(self) -> None:
+        request = _request()
+        exact = _approval_note(request)
+        variants = (
+            exact.replace(
+                "expected_revision=1",
+                "expected_revision=999:expected_revision=1",
+            ),
+            exact.replace("]", ":unexpected=accepted]"),
+            exact.replace("]", ":badtoken]"),
+            exact.replace(f":lane={LANE}", ""),
+            exact.replace(f"lane={LANE}", "lane="),
+        )
+        for notes in variants:
+            with self.subTest(notes=notes):
+                self.assertFalse(
+                    is_exact_reconciliation_authority(
+                        RedmineJournalEntry(
+                            issue_id=ISSUE,
+                            journal_id=APPROVAL,
+                            notes=notes,
+                        ),
+                        request,
+                    )
+                )
+
 
 class _FakeLiveOps(LiveRecoveredPairPinReconciliationOps):
     def __init__(self, home: Path):
