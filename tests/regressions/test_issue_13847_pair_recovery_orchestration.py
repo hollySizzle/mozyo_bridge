@@ -45,6 +45,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GATEWAY_ROLE,
     WORKER_ROLE,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+    SublaneStartupObservation,
+    SublaneStartupRoleHealth,
+)
 
 
 @dataclass
@@ -96,11 +100,17 @@ def _absent(**kw):
 
 
 class _FakeOps:
-    def __init__(self, *, per_slot_obs, close_ok=True, relaunch_ok=True, redispatch=REDISPATCH_DELIVERED):
+    def __init__(
+        self, *, per_slot_obs, close_ok=True, relaunch_ok=True,
+        relaunch_reason="", relaunch_startup=None,
+        redispatch=REDISPATCH_DELIVERED,
+    ):
         # per_slot_obs: {role: SlotRecoveryObservation}
         self._per_slot_obs = per_slot_obs
         self._close_ok = close_ok
         self._relaunch_ok = relaunch_ok
+        self.relaunch_failure_reason = relaunch_reason
+        self.relaunch_failure_startup = relaunch_startup
         self._redispatch = redispatch
         self.closed = []
         self.relaunched = False
@@ -245,6 +255,43 @@ class Actuation(unittest.TestCase):
         self.assertTrue(out.is_blocked)
         self.assertEqual(out.detail, BLOCK_RELAUNCH_FAILED)
         self.assertIsNone(out.resume)
+
+    def test_relaunch_failure_preserves_reason_and_rollback_pointer(self):
+        startup = SublaneStartupObservation(
+            ok=False,
+            action_id="startup-safe-id",
+            roles=(
+                SublaneStartupRoleHealth(
+                    provider="claude", disposition="launched",
+                    health="unhealthy", compensation="rollback_owed",
+                ),
+            ),
+            rollback_owed=True,
+        )
+        ops = _FakeOps(
+            per_slot_obs={
+                GATEWAY_ROLE: _obs(is_bad_generation=True),
+                WORKER_ROLE: _obs(is_bad_generation=True),
+            },
+            relaunch_ok=False,
+            relaunch_reason="replacement_binding_launch_unhealthy",
+            relaunch_startup=startup,
+        )
+        out = _use_case(ops).run(_REQ, execute=True)
+        self.assertEqual(out.detail, BLOCK_RELAUNCH_FAILED)
+        self.assertEqual(
+            out.relaunch_reason, "replacement_binding_launch_unhealthy"
+        )
+        self.assertIs(out.relaunch_startup, startup)
+        self.assertEqual(
+            out.rollback_pointer,
+            "mozyo-bridge herdr session-rollback --action-id startup-safe-id",
+        )
+        payload = out.as_payload()
+        self.assertEqual(
+            payload["relaunch_startup"]["action_id"], "startup-safe-id"
+        )
+        self.assertEqual(payload["rollback_pointer"], out.rollback_pointer)
 
     def test_resume_refusal_blocks_and_skips_redispatch(self):
         ops = _FakeOps(per_slot_obs={GATEWAY_ROLE: _obs(is_bad_generation=True), WORKER_ROLE: _obs(is_bad_generation=True)})

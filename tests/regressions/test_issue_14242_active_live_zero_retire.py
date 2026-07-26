@@ -455,16 +455,22 @@ class LaunchExclusionTest(unittest.TestCase):
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             sublane_actuator_herdr_ops,
+            sublane_actuator_v1_replacement,
         )
 
         funnel = inspect.getsource(herdr_session_start.prepare_session)
         self.assertIn("attestation_store_lock(", funnel)
         self.assertIn("exclusive=False", funnel)
-        # The v1 replacement binding reaches `_prepare_session_locked` DIRECTLY with
-        # admission_lock_held=True, so its caller must hold the same shared lock.
+        # The heal delegates the v1 compatibility transaction to its typed application
+        # service. That driver reaches `_prepare_session_locked` with
+        # admission_lock_held=True, so the DRIVER must hold the same shared lock.
         v1_caller = inspect.getsource(sublane_actuator_herdr_ops.HerdrSublaneActuatorOps.heal_lane_column)
-        self.assertIn("attestation_store_lock(", v1_caller)
-        self.assertIn("exclusive=False", v1_caller)
+        self.assertIn("V1ReplacementDriver", v1_caller)
+        v1_driver = inspect.getsource(
+            sublane_actuator_v1_replacement.V1ReplacementDriver.run
+        )
+        self.assertIn("attestation_store_lock(", v1_driver)
+        self.assertIn("exclusive=False", v1_driver)
 
     def test_terminalizer_reports_launch_in_flight_and_writes_nothing(self):
         # Required test: lock busy -> typed blocked, lifecycle row zero-write.

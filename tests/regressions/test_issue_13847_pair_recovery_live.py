@@ -32,6 +32,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
     VERDICT_PRESENT,
 )
+from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
+    BINDING_RESERVED,
+)
 from mozyo_bridge.core.state.lane_lifecycle import DISPOSITION_HIBERNATED
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
     sublane_hibernated_pair_recovery_live as live,
@@ -44,6 +47,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+    SublaneStartupObservation,
+    SublaneStartupRoleHealth,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
+    SublaneHealError,
 )
 
 _WS = "wsA"
@@ -111,6 +121,31 @@ class ObserveJoin(unittest.TestCase):
             )
             self.assertTrue(obs.already_healthy, "an attested locator-matched slot is healthy")
             self.assertFalse(obs.is_bad_generation)
+
+    def test_v1_reserved_replacement_is_preserved_not_promoted_healthy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ops = _ops(tmp)
+            name = encode_assigned_name(_WS, "claude", _LANE)
+            fake_store = SimpleNamespace(
+                read=lambda action, assigned: SimpleNamespace(
+                    phase=BINDING_RESERVED
+                )
+            )
+            with patch.object(
+                live, "selected_attestation_store_is_v1", return_value=True
+            ), patch.object(
+                live, "HerdrIdentityReplacementBindingStore",
+                return_value=fake_store,
+            ):
+                obs, locator, an = self._observe(
+                    tmp, ops, "claude", rows=[_row(name, "wZ:p3H")],
+                    attested_locator="wZ:p3H",
+                )
+            self.assertFalse(obs.already_healthy)
+            self.assertFalse(
+                obs.is_bad_generation,
+                "a reserved v1 launch may owe rollback and must never be closed/replayed",
+            )
 
     def test_absent_slot_is_unresolved(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -335,12 +370,13 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
                         call[0]["replacement_action_id"],
                         call[0]["replacement_assigned_name"],
                         call[0]["replacement_old_locator"],
+                        call[0]["replacement_target_only"],
                     )
                     for call in calls
                 ],
                 [
-                    ("recover-a", slots[0].assigned_name, "wZ:pOldG"),
-                    ("recover-a", slots[1].assigned_name, "wZ:pOldH"),
+                    ("recover-a", slots[0].assigned_name, "wZ:pOldG", True),
+                    ("recover-a", slots[1].assigned_name, "wZ:pOldH", True),
                 ],
             )
 
@@ -371,6 +407,7 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
             self.assertEqual(calls[0][0]["replacement_action_id"], "recover-a")
             self.assertNotIn("replacement_assigned_name", calls[0][0])
             self.assertNotIn("replacement_old_locator", calls[0][0])
+            self.assertNotIn("replacement_target_only", calls[0][0])
 
     def test_v1_missing_binding_context_fails_before_heal(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -385,7 +422,55 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
                 ok = ops.relaunch_pair(action_id="recover-a", slots=(slot,))
 
             self.assertFalse(ok)
+            self.assertEqual(
+                ops.relaunch_failure_reason,
+                "replacement_binding_context_missing",
+            )
             actuator.assert_not_called()
+
+    def test_v1_heal_failure_preserves_reason_startup_and_rollback_debt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ops = _ops(tmp)
+            startup = SublaneStartupObservation(
+                ok=False,
+                action_id="startup-safe-id",
+                roles=(
+                    SublaneStartupRoleHealth(
+                        provider="claude", disposition="launched",
+                        health="unhealthy", compensation="rollback_owed",
+                    ),
+                ),
+                rollback_owed=True,
+            )
+
+            class _FakeActuator:
+                def __init__(self, **kw):
+                    pass
+
+                def heal_lane_column(self, worktree_path, target_provider=None):
+                    raise SublaneHealError(
+                        "safe fixed failure",
+                        reason="replacement_binding_launch_unhealthy",
+                        startup=startup,
+                    )
+
+            slot = SlotPlan(
+                role="worker", provider="claude",
+                assigned_name=encode_assigned_name(_WS, "claude", _LANE),
+                declared_locator="wZ:pOldH", locator="",
+                disposition="recover_absent",
+            )
+            with patch.object(
+                live, "selected_attestation_store_is_v1", return_value=True
+            ), patch.object(live, "HerdrSublaneActuatorOps", _FakeActuator):
+                ok = ops.relaunch_pair(action_id="recover-a", slots=(slot,))
+
+            self.assertFalse(ok)
+            self.assertEqual(
+                ops.relaunch_failure_reason,
+                "replacement_binding_launch_unhealthy",
+            )
+            self.assertIs(ops.relaunch_failure_startup, startup)
 
 
 if __name__ == "__main__":

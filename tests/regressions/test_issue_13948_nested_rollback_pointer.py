@@ -43,6 +43,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops as herdr_ops  # noqa: E501
+import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_v1_replacement as v1_drive  # noqa: E501
 import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard_live as compdisclive  # noqa: E501
 import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_convergence_live as convlive  # noqa: E501
 from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
@@ -368,10 +369,10 @@ class RealDriveWiringTest(unittest.TestCase):
                 (convlive, "list_herdr_agent_rows", lambda env: []),
                 (herdr_ops, "evaluate_heal_runtime_fence",
                  lambda *a, **k: SimpleNamespace(ok=True, reason="", detail="")),
-                (herdr_ops, "selected_attestation_store_is_v1", lambda home: True),
-                (herdr_ops, "attestation_store_lock", _nolock),
+                (v1_drive, "selected_attestation_store_is_v1", lambda home: True),
+                (v1_drive, "attestation_store_lock", _nolock),
                 (herdr_ops, "mozyo_bridge_home", lambda: self.home),
-                (herdr_ops, "launch_or_resume_v1_replacement", _fenced_nested_launch),
+                (v1_drive, "launch_or_resume_v1_replacement", _fenced_nested_launch),
             ]:
                 stack.enter_context(mock.patch.object(target, name, value))
             for cls, name, value in [

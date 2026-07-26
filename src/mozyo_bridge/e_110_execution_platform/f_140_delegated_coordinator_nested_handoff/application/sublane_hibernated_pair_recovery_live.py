@@ -40,6 +40,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     evaluate_attestation,
 )
 from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
+    BINDING_BOUND,
+    HerdrIdentityReplacementBindingStore,
+    replacement_action_is_bound,
     selected_attestation_store_is_v1,
 )
 from mozyo_bridge.core.state.lane_lifecycle import (
@@ -78,6 +81,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_pair_recovery import (  # noqa: E501
     SlotRecoveryObservation,
+    hibernated_pair_recovery_action_id,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+    SublaneLauncherIncompatibleError,
+    SublaneStartupObservation,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
+    SublaneHealError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_BUSY,
@@ -122,6 +133,10 @@ class LiveHibernatedPairRecoveryOps:
     lifecycle_home: Optional[Path] = None
     attestation_home: Optional[Path] = None
     fence: Optional[DispatchOutboxFence] = None
+    relaunch_failure_reason: str = field(default="", init=False)
+    relaunch_failure_startup: Optional[SublaneStartupObservation] = field(
+        default=None, init=False
+    )
 
     # -- workspace ---------------------------------------------------------------------
 
@@ -218,6 +233,48 @@ class LiveHibernatedPairRecoveryOps:
             expected_role=provider,
             expected_lane=lane,
         )
+        # A normal-v1 self-attestation is insufficient after this recovery action has
+        # reserved a replacement.  The side binding and its startup transaction are the
+        # authority that prevents a fresh-but-unbound / rollback-owed participant from
+        # being promoted to healthy on replay.  A reserved, malformed, or unreadable binding
+        # is therefore PRESERVE (neither bad-generation nor healthy): the operator must
+        # discharge the exact startup rollback debt before the same action can relaunch.
+        binding_allows_classification = True
+        home = self.attestation_home or mozyo_bridge_home()
+        try:
+            is_v1 = selected_attestation_store_is_v1(home)
+        except Exception:  # noqa: BLE001 - unknown generation is not positive health
+            is_v1 = True
+            binding_allows_classification = False
+        if is_v1 and binding_allows_classification:
+            try:
+                recovery_action_id = hibernated_pair_recovery_action_id(
+                    issue=_norm(self.request_issue),
+                    lane_id=_norm_lane(lane),
+                    revision=str(getattr(record, "revision", "")),
+                    generation=str(getattr(record, "lane_generation", "")),
+                )
+                binding = HerdrIdentityReplacementBindingStore(home=home).read(
+                    recovery_action_id, assigned_name
+                )
+            except Exception:  # noqa: BLE001 - unreadable authority preserves the live slot
+                binding_allows_classification = False
+            else:
+                if binding is not None:
+                    binding_allows_classification = bool(
+                        binding.phase == BINDING_BOUND
+                        and replacement_action_is_bound(
+                            record_att,
+                            action_id=recovery_action_id,
+                            live_locator=live_locator,
+                            expected_workspace_id=workspace_id,
+                            expected_role=provider,
+                            expected_lane=lane,
+                            expected_assigned_name=assigned_name,
+                            expected_old_locator=binding.old_locator,
+                            home=home,
+                        )
+                    )
         observation = SlotRecoveryObservation(
             identity_resolved=True,
             belongs_to_pair=belongs,
@@ -227,8 +284,15 @@ class LiveHibernatedPairRecoveryOps:
                 role=role, assigned_name=assigned_name, locator=live_locator
             ),
             worktree_readable=self._worktree_readable(row),
-            is_bad_generation=belongs and att_readable and not join.ok,
-            already_healthy=att_readable and join.ok,
+            is_bad_generation=(
+                belongs
+                and att_readable
+                and binding_allows_classification
+                and not join.ok
+            ),
+            already_healthy=(
+                att_readable and binding_allows_classification and join.ok
+            ),
         )
         return observation, live_locator, assigned_name
 
@@ -319,6 +383,8 @@ class LiveHibernatedPairRecoveryOps:
     # -- relaunch (heal: adopt healthy, relaunch closed) -------------------------------
 
     def relaunch_pair(self, *, action_id: str, slots: Tuple[SlotPlan, ...]) -> bool:
+        self.relaunch_failure_reason = ""
+        self.relaunch_failure_startup = None
         try:
             if selected_attestation_store_is_v1(mozyo_bridge_home()):
                 for slot in slots:
@@ -327,6 +393,9 @@ class LiveHibernatedPairRecoveryOps:
                         and _norm(slot.assigned_name)
                         and _norm(slot.declared_locator)
                     ):
+                        self.relaunch_failure_reason = (
+                            "replacement_binding_context_missing"
+                        )
                         return False
                     HerdrSublaneActuatorOps(
                         repo_root=self.repo_root, lane_label=_norm(self.request_lane),
@@ -335,6 +404,7 @@ class LiveHibernatedPairRecoveryOps:
                         replacement_action_id=_norm(action_id),
                         replacement_assigned_name=_norm(slot.assigned_name),
                         replacement_old_locator=_norm(slot.declared_locator),
+                        replacement_target_only=True,
                     ).heal_lane_column(
                         str(self.repo_root), target_provider=_norm(slot.provider)
                     )
@@ -345,7 +415,15 @@ class LiveHibernatedPairRecoveryOps:
                     env=self.env, runner=self.runner, timeout=self.timeout,
                     replacement_action_id=_norm(action_id),
                 ).heal_lane_column(str(self.repo_root))
+        except SublaneHealError as exc:
+            self.relaunch_failure_reason = _norm(exc.reason) or "launch_error"
+            self.relaunch_failure_startup = exc.startup
+            return False
+        except SublaneLauncherIncompatibleError as exc:
+            self.relaunch_failure_reason = _norm(exc.reason) or "launch_error"
+            return False
         except Exception:  # noqa: BLE001 - a fixed relaunch failure
+            self.relaunch_failure_reason = "launch_error"
             return False
         return True
 

@@ -61,6 +61,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ResumeRequest,
     SublaneResumeUseCase,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+    SublaneStartupObservation,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_pair_recovery import (  # noqa: E501
     SLOT_HEALTHY,
     SLOT_RECOVER,
@@ -225,6 +228,21 @@ class RecoverPairOutcome:
     resume: Optional[ResumeOutcome] = None
     redispatch: str = REDISPATCH_SKIPPED
     detail: str = ""
+    #: Stable reason and locator-free nested startup evidence from a failed relaunch.
+    #: These are additive so the historical top-level ``detail=pair_relaunch_failed``
+    #: contract remains intact while the exact rollback debt is not discarded.
+    relaunch_reason: str = ""
+    relaunch_startup: Optional[SublaneStartupObservation] = None
+
+    @property
+    def rollback_pointer(self) -> Optional[str]:
+        startup = self.relaunch_startup
+        if startup is not None and startup.rollback_owed and startup.action_id:
+            return (
+                "mozyo-bridge herdr session-rollback "
+                f"--action-id {startup.action_id}"
+            )
+        return None
 
     @property
     def is_blocked(self) -> bool:
@@ -239,7 +257,7 @@ class RecoverPairOutcome:
         return self.redispatch in (REDISPATCH_FAILED, REDISPATCH_UNCERTAIN)
 
     def as_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "executed": self.executed,
             "issue": self.issue,
             "lane": self.lane,
@@ -251,6 +269,12 @@ class RecoverPairOutcome:
             "resume": self.resume.as_payload() if self.resume is not None else None,
             "detail": self.detail,
         }
+        if self.relaunch_reason:
+            payload["relaunch_reason"] = self.relaunch_reason
+        if self.relaunch_startup is not None:
+            payload["relaunch_startup"] = self.relaunch_startup.as_payload()
+            payload["rollback_pointer"] = self.rollback_pointer
+        return payload
 
 
 @runtime_checkable
@@ -467,6 +491,12 @@ class SublaneRecoverPairUseCase:
             return RecoverPairOutcome(
                 executed=True, preflight=preflight, issue=issue, lane=lane,
                 closed_roles=tuple(closed), detail=BLOCK_RELAUNCH_FAILED,
+                relaunch_reason=_norm(
+                    getattr(self.ops, "relaunch_failure_reason", "")
+                ),
+                relaunch_startup=getattr(
+                    self.ops, "relaunch_failure_startup", None
+                ),
             )
         relaunched = bool(recover_slots)
 
@@ -528,6 +558,16 @@ def format_recover_pair_text(outcome: RecoverPairOutcome) -> str:
         )
         if outcome.resume is not None and outcome.resume.is_blocked:
             lines.append("  resume: " + ", ".join(outcome.resume.preflight.blocked_reasons))
+        if outcome.relaunch_reason:
+            lines.append(f"  relaunch_reason: {outcome.relaunch_reason}")
+        if outcome.relaunch_startup is not None:
+            lines.append(
+                "  startup: "
+                f"{outcome.relaunch_startup.health_summary()} "
+                f"rollback_owed={outcome.relaunch_startup.rollback_owed}"
+            )
+        if outcome.rollback_pointer:
+            lines.append(f"  rollback_pointer: {outcome.rollback_pointer}")
         return "\n".join(lines)
     if outcome.executed:
         lines.append(f"  closed: {', '.join(outcome.closed_roles) or 'none'} relaunched: {outcome.relaunched}")

@@ -1512,16 +1512,25 @@ class PartialStartupBindingHealthTests(unittest.TestCase):
     def _append_v1_pair(self, tmp: str):
         return _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
 
-    def _heal_gateway(self, home, coord, worktree, env, fake, gw_name, gw_old):
+    def _heal_target(
+        self, home, coord, worktree, env, fake, provider, assigned_name, old_locator,
+        *, target_only=False,
+    ):
         ops = HerdrSublaneActuatorOps(
             repo_root=coord, lane_label=self.LANE, issue=self.ISSUE, journal="80925",
             env=env, runner=fake.run,
             replacement_action_id=self.ACTION,
-            replacement_assigned_name=gw_name,
-            replacement_old_locator=gw_old,
+            replacement_assigned_name=assigned_name,
+            replacement_old_locator=old_locator,
+            replacement_target_only=target_only,
         )
         with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
-            return ops.heal_lane_column(str(worktree), target_provider="codex")
+            return ops.heal_lane_column(str(worktree), target_provider=provider)
+
+    def _heal_gateway(self, home, coord, worktree, env, fake, gw_name, gw_old):
+        return self._heal_target(
+            home, coord, worktree, env, fake, "codex", gw_name, gw_old
+        )
 
     def _startup_phase(self, home, ws) -> str:
         intent = HerdrIdentityReplacementBindingStore(home=home).read(
@@ -1572,6 +1581,64 @@ class PartialStartupBindingHealthTests(unittest.TestCase):
             # The startup transaction settled SUCCESS: the only fresh launch was healthy, so
             # the run owed no rollback even though the surfaced sibling made the pair unusable.
             self.assertEqual(self._startup_phase(home, ws), PHASE_COMPLETED_SUCCESS)
+
+    def test_target_only_v1_recovery_launches_and_binds_both_absent_slots_one_at_a_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
+                self._append_v1_pair(tmp)
+            )
+            with mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                for pane, agent in list(fake._agents.items()):
+                    if agent.name in {gw_name, wk_name}:
+                        del fake._agents[pane]
+
+                self._heal_target(
+                    home, coord, worktree, env, fake,
+                    "codex", gw_name, gw_old, target_only=True,
+                )
+                self.assertIsNotNone(fake.agent_named(gw_name))
+                self.assertIsNone(
+                    fake.agent_named(wk_name),
+                    "the first target-only recovery must not launch an unreserved sibling",
+                )
+
+                self._heal_target(
+                    home, coord, worktree, env, fake,
+                    "claude", wk_name, wk_old, target_only=True,
+                )
+
+            gateway = fake.agent_named(gw_name)
+            worker = fake.agent_named(wk_name)
+            self.assertIsNotNone(gateway)
+            self.assertIsNotNone(worker)
+            self.assertEqual(gateway.get("tab_id"), worker.get("tab_id"))
+
+            bindings = HerdrIdentityReplacementBindingStore(home=home)
+            fence = StartupTransactionFence(home=home)
+            for provider, assigned_name, old_locator in (
+                ("codex", gw_name, gw_old),
+                ("claude", wk_name, wk_old),
+            ):
+                intent = bindings.read(self.ACTION, assigned_name)
+                self.assertIsNotNone(intent)
+                startup = fence.read(intent.startup_action_id)
+                self.assertIsNotNone(startup)
+                self.assertEqual(startup.unit.providers, (provider,))
+                live_row = fake.agent_named(assigned_name)
+                record = HerdrIdentityAttestationStore(home=home).read(assigned_name)
+                self.assertTrue(
+                    replacement_action_is_bound(
+                        record,
+                        action_id=self.ACTION,
+                        live_locator=live_row["pane_id"],
+                        expected_workspace_id=ws,
+                        expected_role=provider,
+                        expected_lane=self.LANE,
+                        expected_assigned_name=assigned_name,
+                        expected_old_locator=old_locator,
+                        home=home,
+                    )
+                )
 
     def test_a_non_green_target_fails_closed_and_owes_a_rollback(self):
         # Scenario B: gateway absent -> fresh target that lands a live locator but never

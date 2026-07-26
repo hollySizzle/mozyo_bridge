@@ -160,7 +160,7 @@ def _binding_identity_matches(
     provider: str,
     lane_id: str,
     old_locator: str,
-    managed_pair: tuple[str, ...],
+    startup_providers: tuple[str, ...],
 ) -> bool:
     if (
         intent.action_id != action_id
@@ -173,7 +173,7 @@ def _binding_identity_matches(
         return False
     try:
         expected_startup = startup_action_id(
-            StartupUnit(workspace_id, lane_id, managed_pair), intent.startup_nonce
+            StartupUnit(workspace_id, lane_id, startup_providers), intent.startup_nonce
         )
     except ValueError:
         return False
@@ -212,7 +212,7 @@ def _bind_startup_receipt(
     startup_fence: StartupTransactionFence,
     intent: ReplacementActionBinding,
     live_locator: str,
-    managed_pair: tuple[str, ...],
+    startup_providers: tuple[str, ...],
 ) -> None:
     """Finish or replay one exact reserve -> startup receipt -> v1-row binding."""
     if intent.phase == "bound":
@@ -254,7 +254,7 @@ def _bind_startup_receipt(
         and startup.action_id == intent.startup_action_id
         and startup.unit.workspace_id == intent.workspace_id
         and startup.unit.lane_id == intent.lane_id
-        and tuple(startup.unit.providers) == tuple(sorted(set(managed_pair)))
+        and tuple(startup.unit.providers) == tuple(sorted(set(startup_providers)))
     )
     # The a14 partial (Redmine #13933 R13 item 3): an exact fresh launch THIS action owns
     # that the durable startup record marks rollback-owed. Even if the slot now reads live +
@@ -346,6 +346,7 @@ def launch_or_resume_v1_replacement(
     rows: Sequence[Mapping[str, object]],
     existing: Mapping[str, tuple[str, str]],
     launch: Callable[[str, StartupTransactionFence], SessionStartResult],
+    target_only: bool = False,
 ) -> None:
     """Launch or resume one exact v1-bound replacement under a caller-held lock."""
     action_id = (action_id or "").strip()
@@ -366,6 +367,13 @@ def launch_or_resume_v1_replacement(
             V1_BINDING_CONTEXT_MISSING,
             "an exact action/provider/assigned-name/workspace/lane binding is required",
         )
+
+    # Normal bounded replacement keeps the pair-level startup transaction. Recover-pair's
+    # both-absent replay is different: a pair-level launch would start the unreserved sibling
+    # beside the exact target, making its later bind fail reserve-before-launch. Its explicit
+    # opt-in therefore gives each slot an independent target-only startup transaction. The
+    # default stays pair-level, byte-preserving every existing #13933 caller.
+    startup_providers = (provider,) if target_only else managed_pair
 
     named_rows = [
         row
@@ -402,7 +410,7 @@ def launch_or_resume_v1_replacement(
         provider=provider,
         lane_id=lane_id,
         old_locator=old_locator,
-        managed_pair=managed_pair,
+        startup_providers=startup_providers,
     ):
         _stop(
             V1_BINDING_AUTHORITY_CONFLICT,
@@ -421,13 +429,13 @@ def launch_or_resume_v1_replacement(
             startup_fence=startup_fence,
             intent=intent,
             live_locator=live_locator,
-            managed_pair=managed_pair,
+            startup_providers=startup_providers,
         )
         return
 
     nonce = binding_store.new_startup_nonce()
     startup_id = startup_action_id(
-        StartupUnit(workspace_id, lane_id, managed_pair), nonce
+        StartupUnit(workspace_id, lane_id, startup_providers), nonce
     )
     if intent is None:
         try:
@@ -504,5 +512,5 @@ def launch_or_resume_v1_replacement(
         startup_fence=startup_fence,
         intent=intent,
         live_locator=launched[0].locator,
-        managed_pair=managed_pair,
+        startup_providers=startup_providers,
     )

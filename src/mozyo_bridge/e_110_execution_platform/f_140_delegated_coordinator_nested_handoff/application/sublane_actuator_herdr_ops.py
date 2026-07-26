@@ -55,19 +55,15 @@ from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
 if TYPE_CHECKING:
     from mozyo_bridge.core.state.startup_transaction_fence import StartupTransactionFence
 
-from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
-    selected_attestation_store_is_v1,
-)
-from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
-    AttestationStoreLockBusy,
-    AttestationStoreLockUnavailable,
-    attestation_store_lock,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (
     GATEWAY_READY_CAPTURE_LINES,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_startup_projection import (
     project_sublane_startup,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_v1_replacement import (  # noqa: E501
+    V1ReplacementDriver,
+    V1ReplacementRequest,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (
     LiveSublaneGitOperations,
@@ -80,7 +76,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
     RuntimePlacementFingerprint,
-    SublaneHealError,
     enforce_heal_postcondition,
     evaluate_heal_runtime_fence,
     production_placement_fingerprint,
@@ -99,10 +94,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     herdr_workspace_segment,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_v1_replacement_binding import (  # noqa: E501
-    V1_BINDING_MAINTENANCE_BUSY,
-    V1_BINDING_STORE_UNUSABLE,
-    V1ReplacementBindingFailure,
-    launch_or_resume_v1_replacement,
     prepare_actuator_lane_session,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_lane_resolution import (  # noqa: E501
@@ -187,6 +178,9 @@ class HerdrSublaneActuatorOps:
     #: (Redmine #13933 R12). Empty on every normal create/heal.
     replacement_assigned_name: str = ""
     replacement_old_locator: str = ""
+    #: Recover-pair's explicit both-absent v1 mode: launch and receipt-bind only the exact
+    #: target provider. Default False preserves the pair-managed #13933 replacement path.
+    replacement_target_only: bool = False
 
     # -- git probes / additive worktree add (backend-agnostic, reused verbatim) -----
 
@@ -344,6 +338,7 @@ class HerdrSublaneActuatorOps:
         action_nonce: str = "",
         startup_fence: "StartupTransactionFence | None" = None,
         admission_lock_held: bool = False,
+        providers: "Sequence[str] | None" = None,
     ):
         """Run the production session composition and return its durable launch result.
 
@@ -355,7 +350,11 @@ class HerdrSublaneActuatorOps:
             result = prepare_actuator_lane_session(
                 worktree_path=worktree_path,
                 config_repo_root=self.repo_root,
-                providers=self._launch_providers(),
+                providers=(
+                    self._launch_providers()
+                    if providers is None
+                    else tuple(providers)
+                ),
                 lane_id=self.lane_label,
                 env=self.env,
                 runner=self.runner,
@@ -646,67 +645,32 @@ class HerdrSublaneActuatorOps:
         if not verdict.ok:
             raise RuntimeError(f"lane heal fenced ({verdict.reason}): {verdict.detail}")
 
-        used_v1_binding = False
-        if (self.replacement_action_id or "").strip():
-            home = mozyo_bridge_home()
-            try:
-                # Pin the selected main-store generation from the v1 decision through
-                # reserve, launch/self-attestation, startup receipt, and side bind.  The
-                # child self-attestation writer takes a compatible shared lock; explicit
-                # maintenance (exclusive) cannot overtake this action.
-                with attestation_store_lock(
-                    home, exclusive=False, blocking=False
-                ):
-                    if selected_attestation_store_is_v1(home):
-                        launch_or_resume_v1_replacement(
-                            home=home,
-                            action_id=self.replacement_action_id,
-                            assigned_name=self.replacement_assigned_name,
-                            old_locator=self.replacement_old_locator,
-                            target_provider=target_provider,
-                            workspace_id=_ws,
-                            lane_id=self.lane_label,
-                            managed_pair=managed_pair,
-                            rows=rows,
-                            existing=existing,
-                            launch=lambda nonce, startup_fence: self._prepare_lane_session(
-                                worktree_path,
-                                replacement_action_id="",
-                                action_nonce=nonce,
-                                startup_fence=startup_fence,
-                                admission_lock_held=True,
-                            ),
-                        )
-                        used_v1_binding = True
-            except V1ReplacementBindingFailure as exc:
-                # Project the nested unhealthy launch into the locator-free startup observation
-                # HERE (raw result never leaves this catch site); surfaces the pointer (#13948 R3).
-                startup = (
-                    project_sublane_startup(exc.startup_result)
-                    if exc.startup_result is not None else None
-                )
-                raise SublaneHealError(
-                    f"lane heal fenced ({exc.reason}): {exc.detail}",
-                    reason=exc.reason, startup=startup,
-                ) from exc
-            except AttestationStoreLockBusy as exc:
-                raise SublaneHealError(
-                    "lane heal fenced (replacement_binding_maintenance_busy): "
-                    "the attestation store is under maintenance",
-                    reason=V1_BINDING_MAINTENANCE_BUSY,
-                ) from exc
-            except AttestationStoreLockUnavailable as exc:
-                raise SublaneHealError(
-                    "lane heal fenced (replacement_binding_store_unusable): "
-                    "the attestation-store generation lock is unavailable",
-                    reason=V1_BINDING_STORE_UNUSABLE,
-                ) from exc
-            except OSError as exc:
-                raise SublaneHealError(
-                    "lane heal fenced (replacement_binding_store_unusable): "
-                    "the attestation-store generation lock could not be opened",
-                    reason=V1_BINDING_STORE_UNUSABLE,
-                ) from exc
+        used_v1_binding = V1ReplacementDriver(home=mozyo_bridge_home()).run(
+            V1ReplacementRequest(
+                action_id=self.replacement_action_id,
+                assigned_name=self.replacement_assigned_name,
+                old_locator=self.replacement_old_locator,
+                target_provider=target_provider,
+                workspace_id=_ws,
+                lane_id=self.lane_label,
+                managed_pair=managed_pair,
+                rows=rows,
+                existing=existing,
+                launch=lambda nonce, startup_fence: self._prepare_lane_session(
+                    worktree_path,
+                    replacement_action_id="",
+                    action_nonce=nonce,
+                    startup_fence=startup_fence,
+                    admission_lock_held=True,
+                    providers=(
+                        (target_provider,)
+                        if self.replacement_target_only and target_provider
+                        else None
+                    ),
+                ),
+                target_only=self.replacement_target_only,
+            )
+        )
         if not used_v1_binding:
             self.append_lane_column(worktree_path)
 
