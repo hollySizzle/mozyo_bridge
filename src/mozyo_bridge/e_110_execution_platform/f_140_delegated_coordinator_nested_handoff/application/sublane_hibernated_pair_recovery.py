@@ -43,7 +43,7 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
@@ -507,6 +507,10 @@ class SublaneRecoverPairUseCase:
             disposition=decide_slot_recovery(observation),
         )
 
+    def _worktree_binding_reason(self, *, lane: str, record: Any) -> str:
+        """The lane's worktree-binding axis through the fail-closed leaf seam (#14475)."""
+        return resolve_worktree_binding_reason(self.ops, lane=lane, record=record)
+
     def _blocked_preflight(self, *, action_id: str, detail: str) -> RecoverPairPreflight:
         return RecoverPairPreflight(
             lane_hibernated=False,
@@ -590,9 +594,7 @@ class SublaneRecoverPairUseCase:
             worker=worker_plan,
             action_id=action_id,
             pins_reason=pins_reason,
-            worktree_binding_reason=resolve_worktree_binding_reason(
-                self.ops, lane=lane, record=rec
-            ),
+            worktree_binding_reason=self._worktree_binding_reason(lane=lane, record=rec),
         )
         if not preflight.may_recover or not execute:
             return RecoverPairOutcome(
@@ -604,6 +606,25 @@ class SublaneRecoverPairUseCase:
                     "preflight only (no --execute)"
                     if preflight.may_recover
                     else "fail-closed: recovery blocked"
+                ),
+            )
+
+        # Redmine #14475 (review j#88505 F1): re-join the worktree binding IMMEDIATELY before
+        # the first destructive effect. The preflight axis above was read before the operator
+        # decision; a checkout can be switched to another branch — or stop resolving — between
+        # that read and this actuation, and the relaunch would then stand the pair up on
+        # whatever is checked out there. This is the same discipline the guarded refresh
+        # follows: a pre-close fence does not retire the action-time re-join, it precedes it.
+        action_time_binding = self._worktree_binding_reason(lane=lane, record=rec)
+        if not launch_authority_current(action_time_binding):
+            return RecoverPairOutcome(
+                executed=False,
+                preflight=replace(preflight, worktree_binding_reason=action_time_binding),
+                issue=issue,
+                lane=lane,
+                detail=(
+                    "fail-closed: the lane's worktree binding moved between preflight and "
+                    f"actuation ({action_time_binding}); zero close / relaunch / resume / send"
                 ),
             )
 
@@ -778,197 +799,6 @@ class SublaneRecoverPairDeliveryUseCase:
 # ---------------------------------------------------------------------------
 
 
-def format_recover_pair_text(outcome: RecoverPairOutcome) -> str:
-    lines = [
-        f"sublane recover-pair: {outcome.lane} (issue {outcome.issue})",
-        f"  may_recover: {outcome.preflight.may_recover} executed: {outcome.executed}",
-    ]
-    for slot in outcome.preflight.slots:
-        lines.append(f"  {slot.role}: {slot.disposition} (recovers={slot.recovers})")
-    if outcome.is_blocked:
-        lines.append(
-            "  -> fail-closed blocked: " + ", ".join(outcome.preflight.blocked_reasons or (outcome.detail,))
-        )
-        if outcome.resume is not None and outcome.resume.is_blocked:
-            lines.append("  resume: " + ", ".join(outcome.resume.preflight.blocked_reasons))
-        if outcome.relaunch_reason:
-            lines.append(f"  relaunch_reason: {outcome.relaunch_reason}")
-        if outcome.relaunch_startup is not None:
-            lines.append(
-                "  startup: "
-                f"{outcome.relaunch_startup.health_summary()} "
-                f"rollback_owed={outcome.relaunch_startup.rollback_owed}"
-            )
-        if outcome.rollback_pointer:
-            lines.append(f"  rollback_pointer: {outcome.rollback_pointer}")
-        return "\n".join(lines)
-    if outcome.executed:
-        lines.append(f"  closed: {', '.join(outcome.closed_roles) or 'none'} relaunched: {outcome.relaunched}")
-        lines.append(f"  redispatch: {outcome.redispatch}")
-    elif outcome.preflight.may_recover:
-        lines.append("  (preflight only; re-run with --execute to recover the pair)")
-    return "\n".join(lines)
-
-
-def cmd_sublane_recover_pair(args: argparse.Namespace) -> int:
-    repo = getattr(args, "repo", None)
-    repo_root = Path(repo).expanduser() if repo else Path.cwd()
-    request = RecoverPairRequest(
-        issue=getattr(args, "issue", "") or "",
-        lane=getattr(args, "lane", "") or "",
-        journal=getattr(args, "journal", "") or "",
-        implementation_request_journal=getattr(args, "implementation_request_journal", "") or "",
-    )
-    json_mode = bool(getattr(args, "json", False))
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery_live import (  # noqa: E501
-        build_live_recover_pair_use_case,
-    )
-
-    # The builder binds the owner-APPROVAL journal into the live ops (close/relaunch/actuator
-    # requests); the ORIGINAL implementation_request journal flows per-run through the request
-    # to the redispatch call, so it is not a builder argument.
-    use_case = build_live_recover_pair_use_case(
-        repo_root=repo_root, env=dict(os.environ),
-        issue=request.issue, lane=request.lane, journal=request.journal,
-    )
-    outcome = use_case.run(request, execute=bool(getattr(args, "execute", False)))
-    if json_mode:
-        print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(format_recover_pair_text(outcome), file=sys.stdout)
-    return 1 if outcome.is_blocked else 0
-
-
-def cmd_sublane_recover_pair_delivery(args: argparse.Namespace) -> int:
-    """Drive one owner-approved new-action delivery to an already-active recovered pair."""
-    repo = getattr(args, "repo", None)
-    repo_root = Path(repo).expanduser() if repo else Path.cwd()
-    request = RecoverPairDeliveryRetryRequest(
-        issue=getattr(args, "issue", "") or "",
-        lane=getattr(args, "lane", "") or "",
-        journal=getattr(args, "journal", "") or "",
-        implementation_request_journal=(
-            getattr(args, "implementation_request_journal", "") or ""
-        ),
-        retry_of_action_id=getattr(args, "retry_of_action_id", "") or "",
-        prior_zero_send_journal=getattr(args, "prior_zero_send_journal", "") or "",
-    )
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery_live import (  # noqa: E501
-        build_live_recover_pair_delivery_use_case,
-    )
-
-    use_case = build_live_recover_pair_delivery_use_case(
-        repo_root=repo_root,
-        env=dict(os.environ),
-        issue=request.issue,
-        lane=request.lane,
-        journal=request.journal,
-    )
-    outcome = use_case.run(request, execute=bool(getattr(args, "execute", False)))
-    if bool(getattr(args, "json", False)):
-        print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
-    else:
-        print(
-            f"sublane recover-pair-delivery: {outcome.lane} (issue {outcome.issue})\n"
-            f"  action_id: {outcome.action_id or '<invalid>'}\n"
-            f"  may_deliver: {outcome.may_deliver} executed: {outcome.executed} "
-            f"redispatch: {outcome.redispatch}\n"
-            f"  {outcome.detail}",
-            file=sys.stdout,
-        )
-    return 1 if outcome.is_blocked else 0
-
-
-def register_sublane_recover_pair_parser(sublane_sub: Any) -> None:
-    """Register ``sublane recover-pair`` outside the at-ceiling core CLI module."""
-    parser = sublane_sub.add_parser(
-        "recover-pair",
-        help=(
-            "Redmine #13847: recover the exact gateway+worker pair of a hibernated lane "
-            "whose fresh launch booted partially (unattested/stale). Default is preflight "
-            "only; --execute closes only the bad generation, relaunches, resumes, and "
-            "redispatches the original implementation_request exactly-once."
-        ),
-    )
-    parser.add_argument("--issue", required=True, help="Redmine issue the hibernated lane owns")
-    parser.add_argument("--lane", required=True, help="Hibernated lane label to recover")
-    parser.add_argument(
-        "--journal",
-        required=True,
-        help="Redmine journal of the owner APPROVAL authorizing this destructive recovery "
-        "(the resume authorization anchor)",
-    )
-    parser.add_argument(
-        "--implementation-request-journal",
-        dest="implementation_request_journal",
-        required=True,
-        help="Redmine journal of the ORIGINAL implementation_request to re-deliver to the "
-        "gateway exactly-once (the fence key + delivery anchor; distinct from --journal)",
-    )
-    parser.add_argument(
-        "--execute",
-        action="store_true",
-        help="Perform the guarded close (bad generation only) + relaunch + resume + redispatch",
-    )
-    add_repo_option(parser)
-    parser.add_argument("--json", action="store_true", help="Emit structured JSON output")
-    parser.set_defaults(func=cmd_sublane_recover_pair)
-
-    delivery = sublane_sub.add_parser(
-        "recover-pair-delivery",
-        help=(
-            "Redmine #14203 R17: deliver the original implementation_request to an "
-            "already-active recovered pair under one explicit new recovery action. The "
-            "prior fence row is retained and never released."
-        ),
-    )
-    delivery.add_argument("--issue", required=True)
-    delivery.add_argument("--lane", required=True)
-    delivery.add_argument(
-        "--journal",
-        required=True,
-        help="New owner-approval journal authorizing this exact recovery-delivery action",
-    )
-    delivery.add_argument(
-        "--implementation-request-journal",
-        dest="implementation_request_journal",
-        required=True,
-        help="The unchanged original implementation_request anchor to deliver",
-    )
-    delivery.add_argument(
-        "--retry-of-action-id",
-        dest="retry_of_action_id",
-        required=True,
-        help="Exact prior pair-recovery action whose fenced delivery was proven zero-send",
-    )
-    delivery.add_argument(
-        "--prior-zero-send-journal",
-        dest="prior_zero_send_journal",
-        required=True,
-        help="Durable outcome journal recording typed/send 0 for the prior action",
-    )
-    delivery.add_argument(
-        "--execute",
-        action="store_true",
-        help="Perform one guarded, fenced delivery attempt (default: preflight only)",
-    )
-    add_repo_option(delivery)
-    delivery.add_argument("--json", action="store_true")
-    delivery.set_defaults(func=cmd_sublane_recover_pair_delivery)
-
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_recovered_worker_delivery_cli import (  # noqa: E501
-        register_sublane_recovered_worker_delivery_parser,
-    )
-
-    register_sublane_recovered_worker_delivery_parser(sublane_sub)
-
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_recovered_pair_pin_reconciliation_cli import (  # noqa: E501
-        register_sublane_recovered_pair_pin_reconciliation_parser,
-    )
-
-    register_sublane_recovered_pair_pin_reconciliation_parser(sublane_sub)
-
-
 __all__ = (
     "BLOCK_CLOSE_FAILED",
     "BLOCK_IDENTITY_INCOMPLETE",
@@ -993,8 +823,4 @@ __all__ = (
     "SlotPlan",
     "SublaneRecoverPairUseCase",
     "SublaneRecoverPairDeliveryUseCase",
-    "cmd_sublane_recover_pair",
-    "cmd_sublane_recover_pair_delivery",
-    "format_recover_pair_text",
-    "register_sublane_recover_pair_parser",
 )

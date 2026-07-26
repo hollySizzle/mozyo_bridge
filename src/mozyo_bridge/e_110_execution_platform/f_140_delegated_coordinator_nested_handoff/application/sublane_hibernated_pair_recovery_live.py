@@ -114,10 +114,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     encode_assigned_name,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E501
+    LAUNCH_AUTHORITY_BRANCH_DRIFTED,
     LAUNCH_AUTHORITY_OK,
     LAUNCH_AUTHORITY_WORKTREE_MISMATCH,
     LAUNCH_AUTHORITY_WORKTREE_UNBOUND,
     LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE,
+    LAUNCH_AUTHORITY_WORKTREE_UNREADABLE,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
     COMMAND_TIMEOUT_SECONDS,
@@ -193,9 +195,45 @@ class LiveHibernatedPairRecoveryOps:
             return LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE
         if not live:
             return LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE
-        return (
-            LAUNCH_AUTHORITY_OK if live == pinned else LAUNCH_AUTHORITY_WORKTREE_MISMATCH
-        )
+        if live != pinned:
+            return LAUNCH_AUTHORITY_WORKTREE_MISMATCH
+        # Review j#88505 F1: a matching token is NOT the whole positive-evidence contract this
+        # ticket wrote down. The token is derived from the worktree's PATH, so it still equals
+        # the pinned one after the checkout has been switched to another branch or has stopped
+        # resolving — and the recovery would then relaunch the pair onto whatever is checked
+        # out there. The remaining two axes (readable checkout, current branch == lane id) are
+        # the same ones ``lane_authority_reason`` re-joins before any owed launch.
+        try:
+            if probe_worktree_resolved(str(self.repo_root)) is not True:
+                return LAUNCH_AUTHORITY_WORKTREE_UNREADABLE
+        except Exception:  # noqa: BLE001 - an unreadable worktree fails closed
+            return LAUNCH_AUTHORITY_WORKTREE_UNREADABLE
+        # The RAW branch, checked for emptiness BEFORE normalization (review j#88513 F1):
+        # ``_norm_lane("")`` yields the "default" lane, so normalizing first would read a
+        # failed git read as "on the default lane" — and on a lane literally named ``default``
+        # that turns a TOCTOU-unreadable checkout into a green axis.
+        raw_branch = self._current_branch(str(self.repo_root))
+        if not raw_branch:
+            return LAUNCH_AUTHORITY_WORKTREE_UNREADABLE
+        if _norm_lane(raw_branch) != _norm_lane(lane):
+            return LAUNCH_AUTHORITY_BRANCH_DRIFTED
+        return LAUNCH_AUTHORITY_OK
+
+    @staticmethod
+    def _current_branch(path: str) -> str:
+        """The worktree's current branch, or ``""`` (fail-closed). Read-only."""
+        import subprocess
+
+        if not path or not Path(path).is_dir():
+            return ""
+        try:
+            result = subprocess.run(
+                ["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
+                text=True, capture_output=True,
+            )
+        except OSError:
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
 
     def _rows(self) -> Sequence[Mapping[str, object]]:
         return list_herdr_agent_rows(self.env)

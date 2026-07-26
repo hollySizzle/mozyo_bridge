@@ -70,6 +70,22 @@ BLOCK_NOT_HIBERNATED = "lane_not_hibernated"
 BLOCK_WRONG_ISSUE = "lane_owns_a_different_issue"
 BLOCK_ALREADY_BOUND = "worktree_binding_already_present"
 BLOCK_MISSING_PINS = "hibernated_record_missing_pins"
+#: The row is a project-gateway binding; this surface repairs an issue-bound lane
+#: (review j#88505 F2 — a store predicate the preflight must project, not discover at execute).
+BLOCK_PROJECT_SCOPE = "lane_owns_a_project_scope"
+#: The row's ``binding_kind`` is not ``issue``. The store checks this as an INDEPENDENT axis
+#: from ``project_scope``, so a malformed / legacy row (project-gateway kind with an empty
+#: scope) would otherwise read green here and be refused at execute (review j#88512).
+BLOCK_BINDING_KIND = "lane_binding_kind_is_not_issue"
+#: The row's declared pins do not survive the store's own ``validate_declared_slots``
+#: (duplicate stable identities, malformed pins). The preflight applies the SAME pure
+#: validator the CAS applies, rather than only checking non-emptiness (review j#88513 F2).
+BLOCK_INVALID_PINS = "declared_pins_fail_validation"
+#: The lane's process release is not durably ``released`` (never requested, or requested /
+#: partial and still in flight) — an actuator may be mutating its slots (review j#88505 F2).
+BLOCK_RELEASE_NOT_SETTLED = "lane_process_release_not_settled"
+#: A receiver replacement is in flight for this lane (review j#88505 F2).
+BLOCK_REPLACEMENT_IN_FLIGHT = "lane_replacement_in_flight"
 BLOCK_WORKTREE_UNREADABLE = "worktree_not_a_live_checkout"
 #: ``--worktree`` names a SUBDIRECTORY of a checkout, not the worktree root. A subdir answers
 #: the same branch query but derives a different canonical token (review j#88493).
@@ -163,6 +179,12 @@ def run_worktree_binding_repair(
         LaneLifecycleKey,
         LaneLifecycleStore,
     )
+    from mozyo_bridge.core.state.lane_lifecycle_model import (
+        BINDING_KIND_ISSUE,
+        RELEASE_RELEASED,
+        replacement_settled,
+        validate_declared_slots,
+    )
     from mozyo_bridge.core.state.lane_worktree_binding_repair import (
         LaneWorktreeBindingRepairStore,
     )
@@ -210,6 +232,20 @@ def run_worktree_binding_repair(
         )
     if _norm(record.issue_id) != issue_id:
         return blocked(BLOCK_WRONG_ISSUE, "the lane owns a different issue; zero write")
+    if _norm(record.binding_kind) != BINDING_KIND_ISSUE:
+        # An INDEPENDENT axis from the scope check below — the store checks both, and a
+        # malformed row can carry a project-gateway kind with an empty scope (j#88512).
+        return blocked(
+            BLOCK_BINDING_KIND,
+            "this surface repairs an ISSUE-bound lane; the row's binding kind is not "
+            "'issue'; zero write",
+        )
+    if _norm(record.project_scope):
+        return blocked(
+            BLOCK_PROJECT_SCOPE,
+            "this surface repairs an ISSUE-bound lane; a project-gateway lane owns a scope, "
+            "not an issue; zero write",
+        )
     try:
         pins = tuple(record.declared_pins)
     except Exception:  # noqa: BLE001 - an undecodable snapshot is never matched against
@@ -219,6 +255,32 @@ def run_worktree_binding_repair(
             BLOCK_MISSING_PINS,
             "the row carries no decodable declared pins; repair its pins first "
             "(sublane repair-pins); zero write",
+        )
+    try:
+        # The SAME pure validator the CAS runs (review j#88513 F2). Checking only
+        # non-emptiness here lets a row with duplicate / malformed pins read green and then be
+        # refused at execute — the false-green class this ticket exists to remove.
+        validate_declared_slots(pins)
+    except Exception:  # noqa: BLE001 - an unusable snapshot is a typed preflight blocker
+        return blocked(
+            BLOCK_INVALID_PINS,
+            "the row's declared pins do not pass validation (duplicate or malformed slots); "
+            "repair its pins first (sublane repair-pins); zero write",
+        )
+    # Review j#88505 F2: the preflight must project the STORE's whole readable signature, not
+    # a subset of it. Projecting only part of it is how a dry-run reports "--execute would
+    # record" for a row the CAS then refuses — a false green an owner can approve from, which
+    # is precisely the preflight-does-not-predict-the-effect defect this ticket exists to fix.
+    if _norm(record.process_release) != RELEASE_RELEASED:
+        return blocked(
+            BLOCK_RELEASE_NOT_SETTLED,
+            "the lane's process release is not durably 'released' (never requested, or still "
+            "in flight) — an actuator may be closing its slots right now; zero write",
+        )
+    if not replacement_settled(record.replacement_state):
+        return blocked(
+            BLOCK_REPLACEMENT_IN_FLIGHT,
+            "a receiver replacement is in flight for this lane; zero write",
         )
 
     # Positive evidence that the named worktree IS this lane's — the row has no token to
@@ -431,6 +493,11 @@ __all__ = (
     "BLOCK_WRONG_ISSUE",
     "BLOCK_ALREADY_BOUND",
     "BLOCK_MISSING_PINS",
+    "BLOCK_PROJECT_SCOPE",
+    "BLOCK_BINDING_KIND",
+    "BLOCK_INVALID_PINS",
+    "BLOCK_RELEASE_NOT_SETTLED",
+    "BLOCK_REPLACEMENT_IN_FLIGHT",
     "BLOCK_WORKTREE_UNREADABLE",
     "BLOCK_WORKTREE_NOT_ROOT",
     "BLOCK_FOREIGN_WORKSPACE",

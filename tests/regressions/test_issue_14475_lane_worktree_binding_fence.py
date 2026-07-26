@@ -58,8 +58,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_AUTHORITY_OK,
     LAUNCH_AUTHORITY_REASONS,
     LAUNCH_AUTHORITY_UNKNOWN,
+    LAUNCH_AUTHORITY_BRANCH_DRIFTED,
     LAUNCH_AUTHORITY_WORKTREE_MISMATCH,
     LAUNCH_AUTHORITY_WORKTREE_UNBOUND,
+    LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE,
+    LAUNCH_AUTHORITY_WORKTREE_UNREADABLE,
     launch_authority_current,
     launch_authority_runbook,
     normalize_launch_authority_reason,
@@ -93,6 +96,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_BRANCH_DRIFTED,
     BLOCK_FOREIGN_WORKSPACE,
     BLOCK_NOT_HIBERNATED,
+    BLOCK_BINDING_KIND,
+    BLOCK_INVALID_PINS,
+    BLOCK_PROJECT_SCOPE,
+    BLOCK_RELEASE_NOT_SETTLED,
+    BLOCK_REPLACEMENT_IN_FLIGHT,
     BLOCK_WORKTREE_NOT_ROOT,
     BLOCK_WORKTREE_UNREADABLE,
     REPAIR_APPLIED,
@@ -103,6 +111,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E402,E501
     BLOCK_WORKTREE_BINDING,
+    REDISPATCH_SKIPPED,
 )
 from tests.regressions.test_issue_13847_pair_recovery_orchestration import (  # noqa: E402
     GATEWAY_ROLE,
@@ -114,6 +123,10 @@ from tests.regressions.test_issue_13847_pair_recovery_orchestration import (  # 
 )
 from tests.regressions.test_issue_13879_hibernated_bound_pin_repair import (  # noqa: E402
     _seed_hibernated_released_bound,
+)
+from mozyo_bridge.core.state.lane_pin_role import (  # noqa: E402
+    PIN_ROLE_GATEWAY,
+    PIN_ROLE_WORKER,
 )
 
 # The canonical all-facts-hold target observation. Negative controls SUBTRACT from this one
@@ -751,13 +764,17 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
         from mozyo_bridge.core.state.lane_lifecycle_model import ProcessGenerationPin
 
         return (
+            # CANONICAL pin roles (``lane_pin_role.PIN_ROLE_GATEWAY`` / ``PIN_ROLE_WORKER``).
+            # Review j#88505 F1: the previous fixture used the role-profile spelling, which the
+            # real use case's pin-role boundary rejects as ``foreign_pin_role`` — so a chain
+            # test built on it could never have reached the axis it claimed to prove.
             ProcessGenerationPin(
-                role="implementation_gateway", provider="codex",
+                role=PIN_ROLE_GATEWAY, provider="codex",
                 assigned_name="mzb1_wsrepair_codex_" + self.lane, locator="w3N:p1K",
                 runtime_revision="1",
             ),
             ProcessGenerationPin(
-                role="implementation_worker", provider="claude",
+                role=PIN_ROLE_WORKER, provider="claude",
                 assigned_name="mzb1_wsrepair_claude_" + self.lane, locator="w3N:p1M",
                 runtime_revision="1",
             ),
@@ -1045,6 +1062,452 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
                     ops.lane_worktree_binding_reason(lane=self.lane, record=record),
                     LAUNCH_AUTHORITY_OK,
                 )
+
+    # -- the REAL use case, not just the probe (review j#88505 F1) --------------
+
+    def _readable_empty_inventory_env(self) -> dict:
+        """Env pointing at the stateful fake herdr CLI with an EMPTY agent inventory."""
+        import json
+        import stat
+
+        from tests.support.herdr_fake import FakeHerdr
+
+        fake = FakeHerdr()
+        fake.seed_workspace(cwd=str(self.repo))
+        state_path = self.home / "herdr-state.json"
+        state_path.write_text(json.dumps(fake.to_state()), encoding="utf-8")
+        adapter = Path(__file__).resolve().parents[2] / "smoke" / "support" / "fake_herdr_cli.py"
+        binary = self.home / "fake-herdr"
+        # The state path is baked into the wrapper rather than passed through the ops env:
+        # the inventory read spawns the binary and the fake CLI reads the variable from ITS
+        # own environment, so relying on propagation would leave it unset.
+        binary.write_text(
+            f'#!/bin/sh\nMOZYO_FAKE_HERDR_STATE="{state_path}" '
+            f'exec python3 "{adapter}" "$@"\n',
+            encoding="utf-8",
+        )
+        binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+        return {"MOZYO_HERDR_BINARY": str(binary)}
+
+    def _real_use_case(self):
+        """The production ``SublaneRecoverPairUseCase`` over the LIVE ops and this store.
+
+        The R2 chain test asserted against the live probe directly, so it never exercised
+        ``may_recover`` / the actuation at all. Driving the real use case is the only way the
+        "close / relaunch / resume / send are all 0" claim can actually be measured.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            SublaneRecoverPairUseCase,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery_live import (  # noqa: E501
+            LiveHibernatedPairRecoveryOps,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (  # noqa: E501
+            LiveSublaneResumeOps,
+            SublaneResumeUseCase,
+        )
+
+        # Assembled exactly like ``build_live_recover_pair_use_case``, with the stores pointed
+        # at this test's isolated home. A test-only assembly could diverge from the shape the
+        # product actually runs.
+        store = LaneLifecycleStore(home=self.home)
+        # A READABLE but empty inventory. Without it every slot classifies
+        # ``preserve_ambiguous`` (an unreadable inventory fails closed), ``may_recover`` is
+        # False for that reason alone, and a "zero close / relaunch" assertion would pass even
+        # with the binding axis deleted — vacuous. Empty + readable makes both declared slots
+        # ``slot_absent`` -> SLOT_RECOVER, so ``may_recover`` turns on the binding axis alone.
+        # ``list_herdr_agent_rows`` resolves the binary from the ENV (a runner injection does
+        # not reach it), so this uses the repo's stateful fake-herdr CLI fixture.
+        env = self._readable_empty_inventory_env()
+        ops = LiveHibernatedPairRecoveryOps(
+            repo_root=self.repo, request_issue=self.issue, request_lane=self.lane,
+            request_journal="88505", lifecycle_home=self.home, env=env,
+        )
+        resume = SublaneResumeUseCase(
+            ops=LiveSublaneResumeOps(repo_root=self.repo, env=env), store=store
+        )
+        return SublaneRecoverPairUseCase(ops=ops, store=store, resume=resume), ops
+
+    def _recover_request(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            RecoverPairRequest,
+        )
+
+        return RecoverPairRequest(
+            issue=self.issue, lane=self.lane, journal="88505",
+            implementation_request_journal="88465",
+        )
+
+    def _switch_branch(self, name: str):
+        import subprocess
+
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "-b", name],
+            check=True, capture_output=True,
+        )
+
+    def test_the_real_use_case_blocks_a_wrong_branch_checkout_with_zero_effect(self):
+        """THE j#88505 F1 reproduction, through the production use case.
+
+        Canonical token, canonical pins, hibernated+released — and the checkout switched to
+        another branch. The token still matches (it is derived from the PATH), so a probe that
+        checks only the token reports ``ok`` and the recovery would relaunch the pair onto
+        whatever is checked out there.
+        """
+        self._mint_hibernated_unbound_row()
+        self._repair(execute=True)  # bind it, so the token axis is genuinely satisfied
+        self._switch_branch("wrong_branch")
+        use_case, ops = self._real_use_case()
+        out = use_case.run(self._recover_request(), execute=True)
+        self.assertTrue(out.is_blocked)
+        self.assertFalse(out.preflight.may_recover)
+        self.assertEqual(
+            out.preflight.worktree_binding_reason, LAUNCH_AUTHORITY_BRANCH_DRIFTED
+        )
+        self.assertIn(
+            f"{BLOCK_WORKTREE_BINDING}:{LAUNCH_AUTHORITY_BRANCH_DRIFTED}",
+            out.preflight.blocked_reasons,
+        )
+        self.assertFalse(out.executed)
+        self.assertEqual(out.closed_roles, ())
+        self.assertFalse(out.relaunched)
+        self.assertIsNone(out.resume)
+        self.assertEqual(out.redispatch, REDISPATCH_SKIPPED)
+
+    def test_the_real_use_case_blocks_an_unreadable_root_with_zero_effect(self):
+        import shutil
+
+        self._mint_hibernated_unbound_row()
+        self._repair(execute=True)
+        shutil.rmtree(self.repo / ".git")  # still a directory, no longer a checkout
+        use_case, ops = self._real_use_case()
+        out = use_case.run(self._recover_request(), execute=True)
+        self.assertTrue(out.is_blocked)
+        self.assertFalse(out.preflight.may_recover)
+        self.assertIn(
+            out.preflight.worktree_binding_reason,
+            (LAUNCH_AUTHORITY_WORKTREE_UNREADABLE, LAUNCH_AUTHORITY_WORKTREE_UNDERIVABLE),
+        )
+        self.assertFalse(out.executed)
+        self.assertEqual(out.closed_roles, ())
+        self.assertFalse(out.relaunched)
+
+    def test_the_real_use_case_blocks_an_unbound_row_with_zero_effect(self):
+        # The same measurement for the axis R2 already had, now through the real use case.
+        self._mint_hibernated_unbound_row()
+        use_case, ops = self._real_use_case()
+        out = use_case.run(self._recover_request(), execute=True)
+        self.assertTrue(out.is_blocked)
+        self.assertEqual(
+            out.preflight.worktree_binding_reason, LAUNCH_AUTHORITY_WORKTREE_UNBOUND
+        )
+        self.assertEqual(out.closed_roles, ())
+        self.assertFalse(out.relaunched)
+
+    def test_the_real_use_case_reaches_the_binding_axis_at_all(self):
+        """The premise check: canonical pins must actually resolve, or every assertion above
+        would be passing on ``hibernated_record_missing_pins`` instead of the axis it names."""
+        self._mint_hibernated_unbound_row()
+        self._repair(execute=True)
+        use_case, ops = self._real_use_case()
+        out = use_case.run(self._recover_request(), execute=False)
+        self.assertTrue(
+            out.preflight.record_has_pins,
+            "the fixture's pins must resolve through the canonical pin-role boundary",
+        )
+        self.assertEqual(out.preflight.worktree_binding_reason, LAUNCH_AUTHORITY_OK)
+
+    def test_a_binding_that_drifts_after_the_preflight_stops_before_any_close(self):
+        """The action-time re-join (j#88505 F1): a drift between preflight and actuation.
+
+        The preflight axis was read before the operator decided; the destructive close is what
+        must be fenced. The use case re-reads immediately before it.
+        """
+        self._mint_hibernated_unbound_row()
+        self._repair(execute=True)
+        use_case, ops = self._real_use_case()
+        seen = {"n": 0}
+        real = ops.lane_worktree_binding_reason
+
+        def drifting(*, lane, record):
+            seen["n"] += 1
+            if seen["n"] == 1:
+                return LAUNCH_AUTHORITY_OK  # preflight: current
+            return LAUNCH_AUTHORITY_BRANCH_DRIFTED  # action-time: moved
+
+        ops.lane_worktree_binding_reason = drifting  # type: ignore[assignment]
+        try:
+            out = use_case.run(self._recover_request(), execute=True)
+        finally:
+            ops.lane_worktree_binding_reason = real  # type: ignore[assignment]
+        self.assertGreaterEqual(seen["n"], 2, "the actuation must re-join the axis")
+        # The reported preflight carries the ACTION-TIME axis, not the admitting read — the
+        # same discipline as the refresh's typed reason: report what stopped it, not the
+        # observation the run no longer reflects.
+        self.assertFalse(out.preflight.may_recover)
+        self.assertIn("moved between preflight and actuation", out.detail)
+        self.assertFalse(out.executed)
+        self.assertEqual(out.closed_roles, ())
+        self.assertFalse(out.relaunched)
+        self.assertIsNone(out.resume)
+        self.assertEqual(out.redispatch, REDISPATCH_SKIPPED)
+        self.assertEqual(
+            out.preflight.worktree_binding_reason, LAUNCH_AUTHORITY_BRANCH_DRIFTED
+        )
+
+    # -- F2: the preflight must project the STORE's whole readable signature ----
+
+    def test_an_unsettled_release_is_a_preflight_blocker_not_an_execute_surprise(self):
+        """Review j#88505 F2: a dry-run green an owner could approve from.
+
+        With ``process_release='requested'`` the store's CAS refuses, but the preflight used to
+        report "--execute would record". A false green is the same class of defect this whole
+        ticket is about: a preflight that does not predict its own effect.
+        """
+        from mozyo_bridge.core.state.lane_lifecycle_model import (
+            RELEASE_PARTIAL,
+            RELEASE_REQUESTED,
+        )
+
+        for target in (RELEASE_REQUESTED, RELEASE_PARTIAL):
+            with self.subTest(release=target):
+                self.setUp()  # a fresh anchored lane per release shape
+                _seed_hibernated_released_bound(
+                    path=LaneLifecycleStore(home=self.home).path, key=self.key,
+                    issue=self.issue, worktree_identity="",
+                    declared_slots=self._pins(), release_target=target,
+                )
+                pre = self._repair(execute=False)
+                self.assertTrue(pre.is_blocked, "the preflight must not report a false green")
+                self.assertEqual(pre.reason, BLOCK_RELEASE_NOT_SETTLED)
+                # ...and the execute agrees with it, having written nothing.
+                out = self._repair(execute=True)
+                self.assertTrue(out.is_blocked)
+                self.assertEqual(out.reason, BLOCK_RELEASE_NOT_SETTLED)
+                self.assertEqual(self._record().worktree_identity, "")
+
+    def test_the_preflight_and_the_execute_agree_on_the_exact_signature(self):
+        # The positive control for F2: on the exact signature the preflight's green is real.
+        self._mint_hibernated_unbound_row()
+        self.assertEqual(self._repair(execute=False).state, REPAIR_PREFLIGHT)
+        self.assertEqual(self._repair(execute=True).state, REPAIR_APPLIED)
+        self.assertTrue(self._record().worktree_identity)
+
+    def test_the_preflight_projects_the_whole_store_signature(self):
+        """Review j#88512 / j#88513: the required predicate matrix, one shape per axis.
+
+        Each row below satisfies every OTHER axis, so a green here would be a dry-run the
+        ``--execute`` then refuses — the false-green class this ticket exists to remove. The
+        exact-signature positive control is asserted last so the matrix cannot pass by
+        blocking everything.
+        """
+        from mozyo_bridge.core.state.lane_lifecycle_model import (
+            BINDING_KIND_PROJECT_GATEWAY,
+            RELEASE_NOT_REQUESTED,
+            RELEASE_PARTIAL,
+            RELEASE_REQUESTED,
+        )
+
+        def _seed(**kw):
+            self.setUp()
+            defaults = dict(
+                path=LaneLifecycleStore(home=self.home).path, key=self.key,
+                issue=self.issue, worktree_identity="", declared_slots=self._pins(),
+            )
+            defaults.update(kw)
+            _seed_hibernated_released_bound(**defaults)
+
+        # 1-3. release not settled, in every unsettled shape.
+        for target in (RELEASE_REQUESTED, RELEASE_PARTIAL):
+            with self.subTest(axis="release", release=target):
+                _seed(release_target=target)
+                out = self._repair(execute=False)
+                self.assertTrue(out.is_blocked)
+                self.assertEqual(out.reason, BLOCK_RELEASE_NOT_SETTLED)
+                self.assertEqual(self._repair(execute=True).reason, BLOCK_RELEASE_NOT_SETTLED)
+                self.assertEqual(self._record().worktree_identity, "")
+
+        with self.subTest(axis="release", release=RELEASE_NOT_REQUESTED):
+            # A hibernated row whose release was NEVER requested: unproven, so unsafe.
+            self.setUp()
+            from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
+            from mozyo_bridge.core.state.lane_lifecycle import (
+                DISPOSITION_ACTIVE,
+                DISPOSITION_HIBERNATED,
+            )
+
+            decision = DecisionPointer(
+                source="redmine", issue_id=self.issue, journal_id="88513"
+            )
+            declared = LaneDeclarationStore(home=self.home).declare_lane(
+                self.key, decision=decision, issue_id=self.issue,
+                declared_slots=self._pins(), worktree_identity="",
+            )
+            LaneLifecycleStore(home=self.home).transition_disposition(
+                self.key, expected_disposition=DISPOSITION_ACTIVE,
+                expected_revision=declared.revision, target=DISPOSITION_HIBERNATED,
+                decision=decision,
+            )
+            out = self._repair(execute=False)
+            self.assertTrue(out.is_blocked)
+            self.assertEqual(out.reason, BLOCK_RELEASE_NOT_SETTLED)
+            self.assertEqual(self._record().worktree_identity, "")
+
+        # 4. a project-gateway binding KIND with an EMPTY scope — the store checks the kind as
+        #    an independent axis, so a scope-only projection would read this green (j#88512).
+        with self.subTest(axis="binding_kind"):
+            self.setUp()
+            _seed_hibernated_released_bound(
+                path=LaneLifecycleStore(home=self.home).path, key=self.key,
+                issue=self.issue, worktree_identity="", declared_slots=self._pins(),
+            )
+            self._force_binding_kind(BINDING_KIND_PROJECT_GATEWAY)
+            out = self._repair(execute=False)
+            self.assertTrue(out.is_blocked)
+            self.assertEqual(out.reason, BLOCK_BINDING_KIND)
+            self.assertEqual(self._repair(execute=True).reason, BLOCK_BINDING_KIND)
+            self.assertEqual(self._record().worktree_identity, "")
+
+        # 5. pins that decode but do NOT survive the store's own validator (j#88513 F2).
+        with self.subTest(axis="invalid_pins"):
+            self.setUp()
+            _seed_hibernated_released_bound(
+                path=LaneLifecycleStore(home=self.home).path, key=self.key,
+                issue=self.issue, worktree_identity="", declared_slots=self._pins(),
+            )
+            self._force_duplicate_pins()
+            out = self._repair(execute=False)
+            self.assertTrue(out.is_blocked)
+            self.assertEqual(out.reason, BLOCK_INVALID_PINS)
+            self.assertEqual(self._repair(execute=True).reason, BLOCK_INVALID_PINS)
+            self.assertEqual(self._record().worktree_identity, "")
+
+        # 4b. a non-empty project scope (review j#88517): the row owns a scope, not an issue.
+        with self.subTest(axis="project_scope"):
+            self.setUp()
+            _seed_hibernated_released_bound(
+                path=LaneLifecycleStore(home=self.home).path, key=self.key,
+                issue=self.issue, worktree_identity="", declared_slots=self._pins(),
+            )
+            before = self._record()
+            self._raw_update("project_scope", "some/project/scope")
+            out = self._repair(execute=False)
+            self.assertTrue(out.is_blocked)
+            self.assertEqual(out.reason, BLOCK_PROJECT_SCOPE)
+            self.assertEqual(self._repair(execute=True).reason, BLOCK_PROJECT_SCOPE)
+            after = self._record()
+            self.assertEqual(after.worktree_identity, "")
+            self.assertEqual(after.revision, before.revision)
+
+        # 5b. a receiver replacement in flight (review j#88517): an actuator may be mutating
+        #     this lane's slots right now, so the metadata write must not ride along.
+        with self.subTest(axis="replacement_in_flight"):
+            from mozyo_bridge.core.state.lane_lifecycle_model import (
+                REPLACEMENT_REQUESTED,
+                replacement_settled,
+            )
+
+            self.setUp()
+            _seed_hibernated_released_bound(
+                path=LaneLifecycleStore(home=self.home).path, key=self.key,
+                issue=self.issue, worktree_identity="", declared_slots=self._pins(),
+            )
+            before = self._record()
+            self._raw_update("replacement_state", REPLACEMENT_REQUESTED)
+            self.assertFalse(
+                replacement_settled(self._record().replacement_state),
+                "the fixture must actually be in-flight for this axis to mean anything",
+            )
+            out = self._repair(execute=False)
+            self.assertTrue(out.is_blocked)
+            self.assertEqual(out.reason, BLOCK_REPLACEMENT_IN_FLIGHT)
+            self.assertEqual(
+                self._repair(execute=True).reason, BLOCK_REPLACEMENT_IN_FLIGHT
+            )
+            after = self._record()
+            self.assertEqual(after.worktree_identity, "")
+            self.assertEqual(after.revision, before.revision)
+
+        # 6. the exact signature still goes green and writes — the positive control.
+        with self.subTest(axis="exact_signature"):
+            self.setUp()
+            self._mint_hibernated_unbound_row()
+            self.assertEqual(self._repair(execute=False).state, REPAIR_PREFLIGHT)
+            self.assertEqual(self._repair(execute=True).state, REPAIR_APPLIED)
+            self.assertTrue(self._record().worktree_identity)
+
+    def _raw_update(self, column: str, value: str):
+        """Write one column directly — ONLY to synthesize a malformed / legacy row shape that
+        no public surface can produce, so the preflight's fence for it can be measured."""
+        import sqlite3
+
+        from mozyo_bridge.core.state.lane_lifecycle_schema import TABLE
+
+        path = LaneLifecycleStore(home=self.home).path
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                f"UPDATE {TABLE} SET {column} = ? WHERE repo_workspace_id = ? AND lane_id = ?",
+                (value, self.key.repo_workspace_id, self.key.lane_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _force_binding_kind(self, kind: str):
+        self._raw_update("binding_kind", kind)
+
+    def _force_duplicate_pins(self):
+        """A snapshot that DECODES but fails ``validate_declared_slots`` (duplicate slots)."""
+        from mozyo_bridge.core.state.lane_lifecycle_model import encode_declared_slots
+
+        gateway = self._pins()[0]
+        self._raw_update("declared_slots", encode_declared_slots((gateway, gateway)))
+
+    def test_the_use_case_module_exports_only_what_it_defines(self):
+        """Review j#88516: ``__all__`` parity after the CLI leaf split.
+
+        The CLI symbols moved to ``*_cli.py`` but stayed listed in the use-case module's
+        ``__all__``, so ``import *`` would raise on the missing attributes.
+        """
+        import importlib
+
+        for name in (
+            "sublane_hibernated_pair_recovery",
+            "sublane_hibernated_pair_recovery_cli",
+            "sublane_worktree_binding_repair",
+        ):
+            module = importlib.import_module(
+                "mozyo_bridge.e_110_execution_platform"
+                ".f_140_delegated_coordinator_nested_handoff.application." + name
+            )
+            with self.subTest(module=name):
+                missing = [n for n in getattr(module, "__all__", ()) if not hasattr(module, n)]
+                self.assertEqual(missing, [], f"{name}.__all__ names undefined symbols")
+
+    def test_an_unreadable_branch_read_never_normalizes_to_the_default_lane(self):
+        """Review j#88513 F1, on the live PAIR probe (the repair surface already had this).
+
+        ``_norm_lane("")`` is ``"default"``. If the branch read fails at action time — a
+        TOCTOU the readability probe cannot exclude — normalizing before the emptiness check
+        makes a lane named ``default`` read as ``ok``.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery_live import (  # noqa: E501
+            LiveHibernatedPairRecoveryOps,
+        )
+
+        self._mint_hibernated_unbound_row()
+        self._repair(execute=True)
+        record = self._record()
+        ops = LiveHibernatedPairRecoveryOps(
+            repo_root=self.repo, request_issue=self.issue, request_lane="default",
+            request_journal="88513", lifecycle_home=self.home,
+        )
+        ops._current_branch = staticmethod(lambda _p: "")  # type: ignore[assignment]
+        self.assertEqual(
+            ops.lane_worktree_binding_reason(lane="default", record=record),
+            LAUNCH_AUTHORITY_WORKTREE_UNREADABLE,
+        )
 
     def test_the_unbound_runbook_names_both_dispositions(self):
         # The runbook is the operator's only pointer out of the blocker; it must name the
