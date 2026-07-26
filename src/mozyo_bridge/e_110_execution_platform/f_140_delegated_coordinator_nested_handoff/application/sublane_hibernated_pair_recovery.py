@@ -105,6 +105,27 @@ BLOCK_MISSING_PINS = "hibernated_record_missing_pins"
 #: reached a closed-and-unrelaunchable gateway. Fail-closed BEFORE any close / relaunch /
 #: resume / send. The blocker carries the closed ``LAUNCH_AUTHORITY_*`` axis token.
 BLOCK_WORKTREE_BINDING = "lane_worktree_binding_unverified"
+
+# Applied-effect vocabulary (Redmine #14475, review j#88554). ``executed`` says whether THIS
+# run changed anything; these name WHAT it changed, so an idempotent replay can be reported as
+# such instead of being flattened into a fixed ``executed=True``.
+EFFECT_CLOSED = "closed_bad_generation"
+EFFECT_RELAUNCHED = "relaunched_pair"
+EFFECT_RESUME_COMMITTED = "resume_disposition_committed"
+EFFECT_REDISPATCHED = "implementation_request_redelivered"
+#: The send neither delivered nor proved a no-op (``failed`` / ``uncertain``): a single status
+#: string cannot say whether a reserve / cancel / uncertain row was written, so it is reported
+#: as its own token rather than guessed either way.
+EFFECT_REDISPATCH_UNRESOLVED = "redispatch_effect_unresolved"
+RECOVERY_EFFECTS = frozenset(
+    {
+        EFFECT_CLOSED,
+        EFFECT_RELAUNCHED,
+        EFFECT_RESUME_COMMITTED,
+        EFFECT_REDISPATCHED,
+        EFFECT_REDISPATCH_UNRESOLVED,
+    }
+)
 BLOCK_SLOT_PRESERVED = "slot_preserved_not_recoverable"  # a slot is preserve-disposition
 BLOCK_CLOSE_FAILED = "bad_generation_close_failed"
 BLOCK_RELAUNCH_FAILED = "pair_relaunch_failed"
@@ -300,6 +321,10 @@ class RecoverPairOutcome:
     resume: Optional[ResumeOutcome] = None
     redispatch: str = REDISPATCH_SKIPPED
     detail: str = ""
+    #: The effects this run actually applied, from the closed :data:`RECOVERY_EFFECTS`
+    #: vocabulary (Redmine #14475, review j#88554). ``executed`` is its non-emptiness, so a
+    #: fully idempotent replay reports no effects rather than a fixed ``executed=True``.
+    effects: Tuple[str, ...] = ()
     #: Stable reason and locator-free nested startup evidence from a failed relaunch.
     #: These are additive so the historical top-level ``detail=pair_relaunch_failed``
     #: contract remains intact while the exact rollback debt is not discarded.
@@ -320,9 +345,16 @@ class RecoverPairOutcome:
     def is_blocked(self) -> bool:
         if not self.preflight.may_recover:
             return True
+        # Redmine #14475 (review j#88554 F1): a nested resume blocker dominates REGARDLESS of
+        # ``executed``. Evaluating "did this run change anything" first meant that making
+        # ``executed`` truthful — a run stopped at the commit edge with zero applied effects —
+        # silently flipped the outcome to NOT blocked. Effect-count and blocked-ness are
+        # independent facts; the order here is what keeps them so.
+        if self.resume is not None and self.resume.is_blocked:
+            return True
         if not self.executed:
             return False
-        if self.resume is None or self.resume.is_blocked:
+        if self.resume is None:
             return True
         # A redispatch that failed / is uncertain is a blocked outcome (the operator must
         # reconcile); an already-redispatched or freshly-delivered redispatch is not.
@@ -331,6 +363,7 @@ class RecoverPairOutcome:
     def as_payload(self) -> dict[str, Any]:
         payload = {
             "executed": self.executed,
+            "effects": list(self.effects),
             "issue": self.issue,
             "lane": self.lane,
             "is_blocked": self.is_blocked,
@@ -639,6 +672,28 @@ class SublaneRecoverPairUseCase:
 
         applied: dict[str, bool] = {"relaunched": False, "resumed": False}
 
+        def _effects(redispatch: str = "") -> Tuple[str, ...]:
+            """The effects THIS run applied, in the order they happen. (pure over the state)
+
+            One composer for every return path (review j#88554): a branch that hard-codes
+            ``executed=True`` reports a change on a run that made none — an all-idempotent
+            replay, or a stop at the commit edge on an already-healthy pair.
+            """
+            found: list[str] = []
+            if closed:
+                found.append(EFFECT_CLOSED)
+            if applied["relaunched"]:
+                found.append(EFFECT_RELAUNCHED)
+            if applied["resumed"]:
+                found.append(EFFECT_RESUME_COMMITTED)
+            if redispatch == REDISPATCH_DELIVERED:
+                found.append(EFFECT_REDISPATCHED)
+            elif redispatch in (REDISPATCH_FAILED, REDISPATCH_UNCERTAIN):
+                # Neither delivered nor proven a no-op: the status alone cannot say whether a
+                # reserve / cancel / uncertain row was written, so say exactly that.
+                found.append(EFFECT_REDISPATCH_UNRESOLVED)
+            return tuple(found)
+
         def _binding_drifted() -> Optional[RecoverPairOutcome]:
             """Re-join the 3 axes; a drift stops every REMAINING effect (review j#88526 F1).
 
@@ -657,7 +712,8 @@ class SublaneRecoverPairUseCase:
             if launch_authority_current(reason):
                 return None
             return RecoverPairOutcome(
-                executed=bool(closed) or applied["relaunched"] or applied["resumed"],
+                executed=bool(_effects()),
+                effects=_effects(),
                 preflight=replace(preflight, worktree_binding_reason=reason),
                 issue=issue,
                 lane=lane,
@@ -726,9 +782,16 @@ class SublaneRecoverPairUseCase:
             ResumeRequest(issue=issue, lane=lane, journal=_norm(request.journal)),
             execute=True,
         )
+        applied["resumed"] = bool(
+            resume_outcome.transition is not None and resume_outcome.transition.applied
+        )
         if resume_outcome.is_blocked:
+            # Review j#88554 F1: truthful effects here, and ``is_blocked`` no longer depends on
+            # ``executed`` — a healthy pair stopped at the commit edge applied nothing AND is
+            # blocked, and both must be reported.
             return RecoverPairOutcome(
-                executed=True, preflight=preflight, issue=issue, lane=lane,
+                executed=bool(_effects()), effects=_effects(),
+                preflight=preflight, issue=issue, lane=lane,
                 closed_roles=tuple(closed), relaunched=relaunched, resume=resume_outcome,
                 detail=BLOCK_RESUME_REFUSED,
             )
@@ -737,14 +800,6 @@ class SublaneRecoverPairUseCase:
         # The fence key + delivery anchor use the ORIGINAL implementation_request journal (never
         # the owner-approval journal), so a re-approval never changes the fence key and can never
         # re-send the same original request (Redmine #13847 R1-F3).
-        # Redmine #14475 (review j#88547 F2): the resume EFFECT is the disposition CAS actually
-        # applying — not merely the resume returning non-blocked. An ``already_active``
-        # idempotent no-op carries no transition and applies nothing, so counting it would
-        # over-report what this run did.
-        applied["resumed"] = bool(
-            resume_outcome.transition is not None and resume_outcome.transition.applied
-        )
-
         # The send is the last owed effect and the one that reaches a live pane, so it gets its
         # own re-join here as well as the transport-direct one the live ops passes as
         # ``pre_send_authority`` (review j#88532 F1). Stopping here leaves the resume applied
@@ -765,8 +820,14 @@ class SublaneRecoverPairUseCase:
             journal=_norm(request.implementation_request_journal),
             workspace_id=workspace_id,
         )
+        # Review j#88554 F2: the final branch used to hard-code ``executed=True`` and a fixed
+        # "pair recovered" detail, so an ALL-idempotent replay — an already-active resume plus
+        # an already-redispatched send, i.e. zero applied effects — reported the same thing as
+        # a run that actually recovered the pair. Both are now derived from what happened.
+        effects = _effects(redispatch)
         return RecoverPairOutcome(
-            executed=True,
+            executed=bool(effects),
+            effects=effects,
             preflight=preflight,
             issue=issue,
             lane=lane,
@@ -774,7 +835,17 @@ class SublaneRecoverPairUseCase:
             relaunched=relaunched,
             resume=resume_outcome,
             redispatch=redispatch,
-            detail="pair recovered; lane resumed to active",
+            detail=(
+                "pair recovered; lane resumed to active (applied: "
+                + ", ".join(effects)
+                + ")"
+                if effects
+                else (
+                    "idempotent replay: the pair was already recovered and the "
+                    f"implementation_request already delivered ({redispatch}); "
+                    "nothing was applied"
+                )
+            ),
         )
 
 

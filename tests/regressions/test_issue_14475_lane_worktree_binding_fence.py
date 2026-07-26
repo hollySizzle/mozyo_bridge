@@ -113,6 +113,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E402,E501
     BLOCK_WORKTREE_BINDING,
+    EFFECT_CLOSED,
+    EFFECT_REDISPATCHED,
+    EFFECT_RELAUNCHED,
+    EFFECT_RESUME_COMMITTED,
+    REDISPATCH_ALREADY,
+    REDISPATCH_DELIVERED,
     REDISPATCH_SKIPPED,
 )
 from tests.regressions.test_issue_13847_pair_recovery_orchestration import (  # noqa: E402
@@ -1715,16 +1721,8 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
             out.executed, "a run that applied no effect must not report executed"
         )
 
-    def test_a_commit_authority_loss_blocks_the_recovery_and_the_send(self):
-        """Review j#88547 F1: the typed authority loss must READ as blocked.
-
-        ``ResumeOutcome.is_blocked`` ignored the commit-edge stop (there is no transition to
-        inspect), so the caller's ``if resume.is_blocked`` read green and went on to redispatch
-        — the send the seam exists to prevent.
-        """
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
-            BLOCK_RESUME_REFUSED,
-        )
+    def _authority_lost_resume(self):
+        """A resume stopped AT the commit edge: no transition, typed detail."""
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (  # noqa: E501
             BLOCK_COMMIT_AUTHORITY_MOVED,
             ResumeOutcome,
@@ -1732,8 +1730,6 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
         )
 
         class _AuthorityLostResume:
-            """A resume stopped AT the commit edge: no transition, typed detail."""
-
             def run(self, request, *, execute):
                 pf = ResumePreflight(
                     lane_hibernated=True, release_settled=True, issue_not_reowned=True,
@@ -1744,6 +1740,9 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
                     detail=BLOCK_COMMIT_AUTHORITY_MOVED,
                 )
 
+        return _AuthorityLostResume()
+
+    def _use_case_with_resume(self, ops, resume):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
             SublaneRecoverPairUseCase,
         )
@@ -1752,16 +1751,103 @@ class HibernatedWorktreeRepairChainTests(unittest.TestCase):
             _Record,
         )
 
-        ops = _FakeOps(per_slot_obs={GATEWAY_ROLE: _obs(), WORKER_ROLE: _obs()})
-        use_case = SublaneRecoverPairUseCase(
-            ops=ops, store=_FakeStore(_Record()), resume=_AuthorityLostResume(),
+        return SublaneRecoverPairUseCase(
+            ops=ops, store=_FakeStore(_Record()), resume=resume
         )
-        out = use_case.run(_REQ, execute=True)
-        self.assertTrue(out.resume.is_blocked, "the typed authority loss IS a block")
-        self.assertTrue(out.is_blocked)
+
+    def test_a_commit_authority_loss_on_a_healthy_pair_is_blocked_with_zero_effects(self):
+        """Review j#88554 F1: blocked AND zero-effect, on the exact zero-effect premise.
+
+        A HEALTHY pair — nothing to close, nothing to relaunch — stopped at the resume commit
+        edge. R7 reported ``executed=True`` here, and the naive fix (truthful ``executed``)
+        would have flipped ``is_blocked`` to False because the predicate short-circuited on
+        ``executed`` first. Both facts are asserted together so neither can regress alone.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            BLOCK_RESUME_REFUSED,
+        )
+
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        ops = _FakeOps(per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy})
+        out = self._use_case_with_resume(ops, self._authority_lost_resume()).run(
+            _REQ, execute=True
+        )
+        self.assertEqual(ops.closed, [], "nothing to close")
+        self.assertFalse(ops.relaunched, "nothing to relaunch")
+        self.assertIsNone(out.resume.transition, "the CAS never ran")
+        self.assertIsNone(ops.redispatched, "and the send never happened")
+        self.assertEqual(out.effects, (), "this run applied nothing")
+        self.assertFalse(out.executed, "so it must not claim to have executed")
+        self.assertTrue(out.is_blocked, "and it IS blocked")
         self.assertEqual(out.detail, BLOCK_RESUME_REFUSED)
-        self.assertIsNone(ops.redispatched, "and the send never happens")
         self.assertEqual(out.redispatch, REDISPATCH_SKIPPED)
+
+    def test_a_commit_authority_loss_after_real_effects_still_reports_them(self):
+        # The complement: the same block, but on a pair that WAS closed and relaunched first.
+        ops = _FakeOps(per_slot_obs={GATEWAY_ROLE: _obs(), WORKER_ROLE: _obs()})
+        out = self._use_case_with_resume(ops, self._authority_lost_resume()).run(
+            _REQ, execute=True
+        )
+        self.assertEqual(len(ops.closed), 2)
+        self.assertTrue(ops.relaunched)
+        self.assertTrue(out.executed, "closes and a relaunch ARE effects")
+        self.assertTrue(out.is_blocked)
+        self.assertIn(EFFECT_CLOSED, out.effects)
+        self.assertIn(EFFECT_RELAUNCHED, out.effects)
+        self.assertNotIn(EFFECT_RESUME_COMMITTED, out.effects)
+        self.assertNotIn(EFFECT_REDISPATCHED, out.effects)
+
+    def test_an_all_idempotent_replay_reports_no_effects(self):
+        """Review j#88554 F2: a replay that changed nothing must not read as a recovery.
+
+        Healthy pair + already-active resume + already-redispatched send: zero closes, zero
+        relaunch, no CAS, no delivery. R7 reported ``executed=True`` and "pair recovered".
+        """
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        ops = _FakeOps(
+            per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy},
+            redispatch=REDISPATCH_ALREADY,
+        )
+        out = _use_case(ops, resume_transition="already_active").run(_REQ, execute=True)
+        self.assertEqual(ops.closed, [])
+        self.assertFalse(ops.relaunched)
+        self.assertTrue(out.resume.already_active)
+        self.assertEqual(out.redispatch, REDISPATCH_ALREADY)
+        self.assertEqual(out.effects, (), "an idempotent replay applies nothing")
+        self.assertFalse(out.executed)
+        self.assertFalse(out.is_blocked, "and it is not an error either")
+        self.assertIn("idempotent replay", out.detail)
+
+    def test_a_fresh_delivery_is_an_applied_effect(self):
+        # The separation j#88554 asks for: the same healthy/already-active lane, but a send
+        # that actually delivered, is an executed run.
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        ops = _FakeOps(
+            per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy},
+            redispatch=REDISPATCH_DELIVERED,
+        )
+        out = _use_case(ops, resume_transition="already_active").run(_REQ, execute=True)
+        self.assertEqual(out.effects, (EFFECT_REDISPATCHED,))
+        self.assertTrue(out.executed)
+        self.assertFalse(out.is_blocked)
+        self.assertIn(EFFECT_REDISPATCHED, out.detail)
+
+    def test_an_unresolved_redispatch_is_reported_as_its_own_effect_token(self):
+        # ``failed`` / ``uncertain`` cannot say whether a reserve / cancel / uncertain row was
+        # written, so the effect set says exactly that rather than guessing either way.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery import (  # noqa: E501
+            EFFECT_REDISPATCH_UNRESOLVED,
+            REDISPATCH_UNCERTAIN,
+        )
+
+        healthy = _obs(already_healthy=True, is_bad_generation=False)
+        ops = _FakeOps(
+            per_slot_obs={GATEWAY_ROLE: healthy, WORKER_ROLE: healthy},
+            redispatch=REDISPATCH_UNCERTAIN,
+        )
+        out = _use_case(ops, resume_transition="already_active").run(_REQ, execute=True)
+        self.assertEqual(out.effects, (EFFECT_REDISPATCH_UNRESOLVED,))
+        self.assertTrue(out.is_blocked, "an unresolved send needs operator reconcile")
 
     def test_the_preflight_matches_the_store_on_raw_persisted_bytes(self):
         """Review j#88526 F2: the 4 padded shapes, preflight and execute must agree.
