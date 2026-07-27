@@ -1934,6 +1934,7 @@ file_conventions:
       - scripts/install_claude_skill.sh
       - scripts/install_codex_skill.sh
       - scripts/sync_plugin_skill.sh
+      - scripts/sync_legacy_project_skill.sh
       - .claude-plugin/**
       - plugins/mozyo-bridge-agent/.claude-plugin/**
       - plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/agents/**

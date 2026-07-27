@@ -59,7 +59,7 @@ class ReleaseHelperParserTest(unittest.TestCase):
 
     def test_release_check_drift(self) -> None:
         args = self.parse("release", "check", "drift")
-        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import cmd_release_check_drift
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release_drift import cmd_release_check_drift
 
         self.assertIs(args.func, cmd_release_check_drift)
 
@@ -1732,29 +1732,41 @@ class ReleasePublishTest(unittest.TestCase):
 
 
 class ReleaseCheckDriftTest(unittest.TestCase):
-    """Pin Redmine #10688: `mozyo-bridge release check drift` runs both
-    pre-existing drift gates and strict-fails on either side.
+    """Pin Redmine #10688: `mozyo-bridge release check drift` runs every
+    pre-existing drift gate and strict-fails on any side.
 
     The unittest suite already gates each drift surface independently:
     - `CanonicalRendererTest::test_committed_templates_match_canonical_render`
       and `GovernedWorkflowCanonicalTest::test_both_governed_outputs_match_canonical_render`
       for `scaffold canonical --check`;
     - `PluginMarketplaceTest::test_plugin_skill_mirror_matches_canonical`
-      and `test_sync_script_check_mode_*` for the plugin mirror.
+      and `test_sync_script_check_mode_*` for the plugin mirror;
+    - `LegacyProjectSkillMirrorTest` for the legacy project Claude skill
+      partial mirror (Redmine #14580).
 
     This class pins the *release helper* surface: the operator-facing
-    command that bundles both checks into one call (mirroring the
+    command that bundles the checks into one call (mirroring the
     `release check tree` / `release check scaffold` / `release check
     artifact` pattern). A future helper edit that, for example, swallows
     a sub-check's non-zero exit and reports `result: clean` would slip
     past the per-surface tests but fails here.
+
+    Redmine #14580 also pins a staging invariant: every sub-check's inputs
+    must be staged into the temp repo. When `.claude/skills/` and the legacy
+    sync script were absent from `SOURCE_TREE_PATHS`, the drift tests below
+    still saw exit 1 — but partly because an unstaged gate blocked, not only
+    because the mutation they injected did. Each drift test therefore asserts
+    that the *other* gates report up to date, so a masked failure cannot pass
+    for the wrong reason.
     """
 
     SOURCE_TREE_PATHS = (
         Path("src/mozyo_bridge"),
         Path("scripts/sync_plugin_skill.sh"),
+        Path("scripts/sync_legacy_project_skill.sh"),
         Path("skills/mozyo-bridge-agent"),
         Path("plugins/mozyo-bridge-agent"),
+        Path(".claude/skills"),
         Path("vibes/docs/logics"),
         Path(".mozyo-bridge/docs/catalog.yaml"),
         Path(".mozyo-bridge/docs/file_conventions.generated.yaml"),
@@ -1800,17 +1812,34 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             result = args.func(args)
         return result, stdout.getvalue(), stderr.getvalue()
 
-    def test_clean_tree_exits_zero_and_reports_both_checks(self) -> None:
+    def test_clean_tree_exits_zero_and_reports_all_checks(self) -> None:
         result, stdout, stderr = self._run_helper(ROOT)
         self.assertEqual(0, result, msg=stdout + stderr)
-        # Both sub-check section headers must appear so operators can
+        # Every sub-check section header must appear so operators can
         # see what ran without re-reading the source.
         self.assertIn("scaffold canonical --check", stdout)
         self.assertIn("sync_plugin_skill.sh --check", stdout)
-        # Both sub-checks must report up-to-date on a clean tree.
+        self.assertIn("sync_legacy_project_skill.sh --check", stdout)
+        # Every sub-check must report up-to-date on a clean tree.
         self.assertIn("AGENTS.md is up to date", stdout)
         self.assertIn("plugin skill mirror is up to date", stdout)
+        self.assertIn("legacy project skill mirror is up to date", stdout)
         self.assertIn("result: clean", stdout)
+
+    def test_staged_repo_is_clean_before_any_mutation(self) -> None:
+        """The staging fixture itself must produce a clean drift result.
+
+        Without this, a drift test's `assertEqual(1, result)` can pass
+        because an unstaged gate blocked rather than because the injected
+        mutation was detected — the exact vacuity Redmine #14580 hit when
+        the new legacy-mirror gate landed against an incomplete
+        `SOURCE_TREE_PATHS`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            result, stdout, stderr = self._run_helper(repo)
+            self.assertEqual(0, result, msg=stdout + stderr)
+            self.assertIn("result: clean", stdout)
 
     def test_canonical_drift_causes_strict_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1827,9 +1856,10 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             # Recovery hint must name the real CLI verbatim so the
             # operator can copy-paste from the release-flow doc.
             self.assertIn("mozyo-bridge scaffold canonical", stdout)
-            # The mirror check must still have run; its section header
-            # is the proof.
-            self.assertIn("sync_plugin_skill.sh --check", stdout)
+            # The mirror checks must still have run AND still be clean, so
+            # the exit 1 is attributable to the canonical mutation alone.
+            self.assertIn("plugin skill mirror is up to date", stdout)
+            self.assertIn("legacy project skill mirror is up to date", stdout)
 
     def test_mirror_drift_causes_strict_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1852,8 +1882,101 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             self.assertIn("from the repo root", stdout)
             # The canonical check must still have run on the same
             # invocation; failing fast on one side without reporting
-            # the other defeats the bundled-helper purpose.
+            # the other defeats the bundled-helper purpose. The legacy
+            # mirror stays clean, isolating the injected mutation.
             self.assertIn("scaffold canonical --check", stdout)
+            self.assertIn("legacy project skill mirror is up to date", stdout)
+
+    def test_legacy_project_mirror_drift_causes_strict_fail(self) -> None:
+        """Redmine #14580: a canonical-only edit must block the release gate.
+
+        This reproduces the confirmed defect's shape exactly — canonical
+        moves, the legacy `.claude/skills/` partial mirror does not — and
+        pins that `release check drift` now catches it instead of leaving
+        detection to a full-suite run nobody ran before commit.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            canonical = repo / "skills/mozyo-bridge-agent/references/workflow.md"
+            canonical.write_text(
+                canonical.read_text(encoding="utf-8") + "\nCANONICAL-ONLY EDIT\n",
+                encoding="utf-8",
+            )
+            # Keep the plugin mirror in lockstep, so the ONLY drift left is
+            # the legacy partial mirror. Otherwise this test would also pass
+            # on the plugin gate's blocker and prove nothing new.
+            plugin_mirror = (
+                repo
+                / "plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/references/workflow.md"
+            )
+            plugin_mirror.write_text(
+                canonical.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("legacy project skill mirror drift detected", stdout)
+            self.assertIn("references/workflow.md", stdout)
+            self.assertIn("result: blocker", stdout)
+            # Recovery hint must be repo-root runnable, matching the plugin
+            # gate's contract.
+            self.assertIn("scripts/sync_legacy_project_skill.sh", stdout)
+            self.assertIn("from the repo root", stdout)
+            # The other gates ran and stayed clean.
+            self.assertIn("plugin skill mirror is up to date", stdout)
+            self.assertNotIn("scaffold canonical drift detected", stdout)
+
+    def test_legacy_mirror_gate_recovers_after_running_the_sync(self) -> None:
+        """Running the sync script turns the blocker back into `clean`.
+
+        Pins the round trip the Acceptance names: canonical-only mutation
+        goes red, the documented recovery command makes it green again.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            canonical = repo / "skills/mozyo-bridge-agent/references/workflow.md"
+            canonical.write_text(
+                canonical.read_text(encoding="utf-8") + "\nCANONICAL-ONLY EDIT\n",
+                encoding="utf-8",
+            )
+            plugin_mirror = (
+                repo
+                / "plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/references/workflow.md"
+            )
+            plugin_mirror.write_text(
+                canonical.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+
+            before, stdout_before, _ = self._run_helper(repo)
+            self.assertEqual(1, before, msg=stdout_before)
+
+            recovery = subprocess.run(
+                ["sh", str(repo / "scripts/sync_legacy_project_skill.sh")],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, recovery.returncode, msg=recovery.stderr)
+
+            after, stdout_after, stderr_after = self._run_helper(repo)
+            self.assertEqual(0, after, msg=stdout_after + stderr_after)
+            self.assertIn("legacy project skill mirror is up to date", stdout_after)
+
+    def test_missing_legacy_sync_script_is_release_blocker(self) -> None:
+        """A deleted legacy sync script must block, not silently pass.
+
+        The plugin gate already pins this; the legacy gate needs its own
+        assertion because a `not script.is_file()` branch that `return`s
+        without appending a blocker reads as success.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            (repo / "scripts/sync_legacy_project_skill.sh").unlink()
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("missing sync script", stdout)
+            self.assertIn("legacy project skill mirror sync script missing", stdout)
+            self.assertIn("result: blocker", stdout)
 
     def test_helper_reports_both_drifts_in_one_run(self) -> None:
         """When both sides drift, the operator sees both findings in
