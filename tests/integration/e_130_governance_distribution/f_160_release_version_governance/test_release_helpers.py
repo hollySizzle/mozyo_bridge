@@ -1920,7 +1920,8 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             result, stdout, _stderr = self._run_helper(repo)
             self.assertEqual(1, result)
             self.assertIn("legacy project skill mirror drift detected", stdout)
-            self.assertIn("references/workflow.md", stdout)
+            self.assertIn("[F/content_drift]", stdout)
+            self.assertIn("workflow.md", stdout)
             self.assertIn("result: blocker", stdout)
             # Recovery hint must be repo-root runnable, matching the plugin
             # gate's contract.
@@ -1980,11 +1981,12 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             ).write_text("smuggled in\n", encoding="utf-8")
             result, stdout, _stderr = self._run_helper(repo)
             self.assertEqual(1, result)
-            self.assertIn(f"unpinned entry: {LEGACY_MIRROR_REL}/unpinned.md", stdout)
+            self.assertIn("[D/unpinned_entry]", stdout)
+            self.assertIn("unpinned.md", stdout)
             self.assertIn("result: blocker", stdout)
             # The bullet must say the sync will NOT clear this class.
             self.assertIn("refuses while one is present", stdout)
-            self.assertIn("reviewed delete", stdout)
+            self.assertIn("never deletes it for you", stdout)
             # The plugin gate keeps its own, still-correct recovery.
             self.assertIn("plugin skill mirror is up to date", stdout)
 
@@ -2002,9 +2004,10 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             ).symlink_to("missing-target")
             result, stdout, _stderr = self._run_helper(repo)
             self.assertEqual(1, result)
-            self.assertIn(f"unpinned entry: {LEGACY_MIRROR_REL}/unpinned.md", stdout)
+            self.assertIn("[D/unpinned_entry]", stdout)
+            self.assertIn("unpinned.md", stdout)
             self.assertIn("result: blocker", stdout)
-            self.assertIn("reviewed delete", stdout)
+            self.assertIn("never deletes it for you", stdout)
             self.assertIn("plugin skill mirror is up to date", stdout)
 
     def test_legacy_mirror_invalid_entry_type_is_a_release_blocker(self) -> None:
@@ -2023,7 +2026,8 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             pinned.mkdir()
             result, stdout, _stderr = self._run_helper(repo)
             self.assertEqual(1, result)
-            self.assertIn(f"not a regular file: {LEGACY_MIRROR_REL}/safety.md", stdout)
+            self.assertIn("[E/entry_not_regular]", stdout)
+            self.assertIn("safety.md", stdout)
             self.assertIn("result: blocker", stdout)
             self.assertIn("plugin skill mirror is up to date", stdout)
 
@@ -2043,7 +2047,8 @@ class ReleaseCheckDriftTest(unittest.TestCase):
                     ).write_text("smuggled\n", encoding="utf-8")
                     result, stdout, _stderr = self._run_helper(repo)
                     self.assertEqual(1, result)
-                    self.assertIn(f"unpinned entry: {LEGACY_MIRROR_REL}/{name}", stdout)
+                    self.assertIn("[D/unpinned_entry]", stdout)
+                    self.assertIn(name, stdout)
                     self.assertIn("result: blocker", stdout)
                     self.assertIn("plugin skill mirror is up to date", stdout)
 
@@ -2064,7 +2069,7 @@ class ReleaseCheckDriftTest(unittest.TestCase):
 
             result, stdout, _stderr = self._run_helper(repo)
             self.assertEqual(1, result)
-            self.assertIn("canonical reference is a symlink", stdout)
+            self.assertIn("[B/source_symlink]", stdout)
             self.assertIn("result: blocker", stdout)
 
     def test_missing_legacy_sync_script_is_release_blocker(self) -> None:

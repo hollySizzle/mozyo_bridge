@@ -36,39 +36,48 @@ Grace period 中の運用:
 - `scripts/install_claude_skill.sh` の default scope は `global` に移し、`MOZYO_BRIDGE_CLAUDE_SCOPE=project` は **明示 opt-in** とする (#12360)。bare invocation (env 未設定) は project scope を選ばなくなり、project mirror を書くのは明示的に `MOZYO_BRIDGE_CLAUDE_SCOPE=project` を渡した場合だけになる。project scope 動作自体は **当面残置** し、script header の DEPRECATED block + project 分岐の非致命的 stderr note で legacy/offline/internal opt-in であることを案内する。即時の warn-and-exit / 失敗化は行わない。
 - `references/safety.md` 等の project-scope mirror が canonical (`skills/mozyo-bridge-agent/references/safety.md`) からドリフトしないよう、canonical を先に編集し、その content を mirror へ写す (`PluginMarketplaceTest` が plugin mirror のドリフトを検出するのと同じ思想)。この partial mirror の drift は `LegacyProjectSkillMirrorTest` (`tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py`, Redmine #13483) が自動検出する: mirror する `references/{project-map,release,safety,workflow}.md` が canonical と byte 一致であること、partial set が pin されていること (canonical の `redmine-issue-authoring.md` / `subagent-delegation.md` は意図的に非 mirror)、`SKILL.md` は Claude adapter stub として意図的に canonical と非一致であることを固定する。
 - **写す作業は `scripts/sync_legacy_project_skill.sh` で行う (Redmine #14580)。** 本節は当初「plugin mirror と異なり専用 sync script は無く、canonical を先に編集して mirror へ写す運用を維持する」と決めていたが、この決定は実測で否定された: commit `7ca3380f`「Pin coordinator work-unit resolution」は canonical と plugin mirror を更新し、legacy mirror だけを落とした。plugin 側には script と `release check drift` gate があり、legacy 側には散文の運用規約しか無かったことが差を生んだ。#13483 の detection は正しく動いたが、検出したのは full suite 実行時であり、focused pre-commit lane は `skills/**` の変更に対して full 推奨を出しつつ実行しない設計 (`vibes/docs/logics/pre-commit-focused-verification.md`) のため、commit 前には効かなかった。
-- `scripts/sync_legacy_project_skill.sh` は plugin 用 script の `rsync -a --delete` を**再利用しない**。この mirror は partial かつ adapter が意図的に非一致であり、full mirror sync は (a) `SKILL.md` adapter stub を canonical `SKILL.md` で上書きし、(b) 意図的な非 mirror file を持ち込むため、契約を 2 か所で壊す。script は pin した reference 集合だけを `cp` し、`SKILL.md` には触れない。
-- `--check` mode は書き込まずに exit 1 を返す fail-closed gate で、`mozyo-bridge release check drift` の 3 番目の sub-check として実行される。content 差分、mirror file 欠落、pin 外 reference の混入、canonical source 欠落のいずれも drift として落とす。
-- **pin 外 reference は sync mode も拒否する (exit 1・書き込みなし)。** この class だけは sync が解消しない (tracked file の削除は sync の副作用ではなく reviewed decision) ため、sync が成功表示を返すと「rerun して復旧」という運用契約が収束しなくなる。解消できない drift class の存在下で成功を報告しない、が本 script の契約である (Redmine #14580 review j#90322 F1)。audit は書き込み前に走るので、拒否時の worktree は無変更のまま。
-- 復旧案内は drift class ごとに出し分ける。content 差分 / mirror file 欠落 = sync の再実行で解消。pin 外 reference = 削除するか script と test の pinned set を同一 commit で更新する (`release check drift` の blocker 行も同じ出し分けを持つ)。「どの drift でも sync を再実行」という単一案内は書かない。
-### Mirror Contract (script の正本規則)
+- `scripts/sync_legacy_project_skill.sh` は plugin 用の `rsync -a --delete` を**再利用しない**。この mirror は partial かつ adapter が意図的に非一致であり、full mirror sync は (a) `SKILL.md` adapter stub を canonical `SKILL.md` で上書きし、(b) 意図的な非 mirror file を持ち込むため、契約を 2 か所で壊す。pin した reference 集合だけを置換し、`SKILL.md` には触れない。
+- `--check` mode は書き込まずに exit 1 を返す fail-closed gate で、`mozyo-bridge release check drift` の 3 番目の sub-check として実行される。判定規則と recovery の正本は下記 `### Mirror Contract` を読む。
 
-`scripts/sync_legacy_project_skill.sh` は次の 6 規則を **1 つの契約**として両 mode で適用する。規則を増やすときは script 冒頭の同一 list に足す。個別 audit を別所に足す形にしない——それが軸を 1 つずつ取りこぼした原因である (Redmine #14580 review j#90322 F1 / j#90342 R2-F1・R3-F1 / j#90378 R4-F1〜F3 が、それぞれ mode 軸・entry 種別軸・topology 軸・filename domain 軸・**source 側**軸で同じ fail-open を見つけた)。
+### Mirror Contract (Python authority が正本)
+
+legacy partial mirror の規則は **Python authority** が正本である (Redmine #14580 design consultation j#90400 → answer j#90402)。
+
+- 契約語彙・pinned set・violation 分類・recovery 導出: `src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/domain/legacy_mirror_contract.py` (pure、filesystem を触らない)
+- observation と write: 同 Feature の `application/legacy_mirror_sync.py`
+- CLI adapter: 同 `application/cli_legacy_mirror_sync.py`
+- `scripts/sync_legacy_project_skill.sh` は **薄い互換 wrapper**。repo root と `src` を解決して Python module へ `exec` するだけで、pinned set・audit・copy・cleanup logic を**持たない**。operator command / docs / `release check drift` の subprocess 契約を維持するために残している。
+- `f_160_release_version_governance/release_drift.py` は gate を束ねる **caller** に留まり、mirror 規則を複製しない。
+
+6 規則を 1 つの契約として両 mode に適用する。規則を増やすときは domain module の同一 taxonomy に足す。
 
 | 規則 | 内容 |
 |---|---|
 | A. source topology | canonical references path の全 component が実在する非 symlink directory |
 | B. source entries | pin 済み name が **非 symlink の regular file** |
-| C. dest topology | mirror path の**実在する** component が非 symlink directory。不在は sync が作る |
+| C. dest topology | mirror path の**実在する** component が非 symlink directory。不在は sync が作る (別 class) |
 | D. dest entry set | mirror references の**全 direct entry** (hidden / 拡張子不問 / 種別不問) が pinned set に属する |
 | E. dest entry types | 実在する pin 済み entry が非 symlink の regular file |
 | F. content parity | pin 済み entry が canonical と byte 一致 |
 
-`--check` は A-F を報告し何も書かない。sync は A-E を**書き込み前**に強制し、自分の stale temp を除去してから rename で置換する。
+`--check` は A-F を typed result へ集約して報告し、何も書かない。sync は **A-E** を書き込み前に評価し、1 件でも違反があれば **write zero**。**F と「mirror 不在」は書き込みを阻まない**——content drift の修復と directory 作成こそが sync の仕事であり、これを blocker にすると command が自分の仕事を拒否する。A/B 不成立時は F を評価せず、source invalid と content drift を合成しない。recovery は**完全な audit result から導出**し、実行して収束する action だけを表示する。
 
-実測した実害 (すべて修正前は exit 0 + 成功表示):
+実測した実害 (すべて修正前は exit 0 + 成功表示。fail-open は round ごとに別の軸から入った):
 
-- **dangling symlink**: `[ -e ]` は symlink を辿るので false。素朴な glob no-match guard では「glob 未展開」と同じ枝で skip される。guard は `[ -e ] || [ -L ]` の対で書く。
-- **pin 済み symlink**: content parity は link を辿って通過し、`cp` が link 先へ書き込む。無関係 file が canonical 本文で上書きされる。
-- **pin 済み directory / FIFO**: 前者は `safety.md/safety.md` を作って成功表示、後者は `cp` が open で**無限停止**。type 判定は `-f` (stat) で行い FIFO を open しない。
-- **dest path component の symlink**: `-d "$dest"` が辿るため mirror は健全に見え、外部 directory を書き換える。**component ごとに `-L`** で検査する。
-- **filename domain**: audit を `*.md` に限ると `unpinned.txt` / hidden entry / stale temp を素通りさせる (shell glob は hidden も除外する)。**全 direct entry**を domain にする。
-- **canonical source の alias**: `[ -d "$src" ]` / `[ -f "$src/$name" ]` も symlink を辿る。aliased source は repo が tracking しない byte を mirror へ publish するので、**内容として取り込まず正本 path の復旧を案内する**。
-- **非 directory ancestor**: `.claude/skills` を regular file にすると ENOTDIR で `-e "$dest"` が false になり「mirror missing → sync を rerun」と案内するが、その sync は `mkdir -p` で失敗する。「実在するが directory でない」と「不在」を**別 class**として扱い、rerun 案内は収束する class にだけ出す。
+- **dangling symlink**: `-e` は symlink を辿るので false になり、glob no-match と同じ枝で skip された。
+- **pin 済み symlink / hardlink**: content parity は link を辿って通過し、`cp` が link 先の inode へ書き込んで無関係 file を canonical 本文で上書きした。**hardlink は regular file なので type 判定では原理的に捕まらない**。
+- **pin 済み directory / FIFO**: 前者は `safety.md/safety.md` を作り、後者は `cp` が open で無限停止した。type 判定は `lstat` の mode 分類で行い、拒否対象を open しない。
+- **dest path component の symlink**: `-d` が辿るため mirror は健全に見え、外部 directory を書き換えた。component ごとに follow しない判定を行う。
+- **filename domain**: audit を `*.md` に限ると `unpinned.txt` / hidden entry / residue を素通りさせた (shell glob は hidden も除外する)。
+- **filename serialization**: shell の `$(...)` 経由で entry 名を列に直すと word splitting と pathname expansion を受け、`project-map.md release.md` という 1 entry が 2 語に割れて両方 pinned に一致した。literal `*` の entry は再 glob 展開され無関係 path を誤報した。**`os.scandir` の entry name を exact 比較し、直列化しない**。診断は `repr` で control character を escape し、1 filename が複数 log 行へ偽装しないようにする。
+- **canonical source の alias**: `-d "$src"` / `-f "$src/$name"` も symlink を辿る。aliased source は repo が tracking しない byte を publish するので、**内容として取り込まず正本 path の復旧を案内する**。
+- **非 directory ancestor**: `.claude/skills` を regular file にすると ENOTDIR で `-e` が false になり「mirror missing → rerun」と案内するが、その sync は `mkdir -p` で失敗した。「実在するが directory でない」と「不在」を**別 class**にし、rerun 案内は収束する class にだけ出す。
 
-**sync は既存 entry へ書き込まず rename で置換する。** hardlink は regular file なので type 判定では原理的に捕まらず、`cp src dest` は pin 済み name が指す inode を open/truncate して無関係 file を書き換える。destination directory 内の temp file へ copy し `mv` で directory entry を差し替えれば、旧 inode とその別名は無傷、中断時も半端な reference が残らない。**temp は audit の domain 内**に置き (規則 D)、crash residue を専用 class として報告する。sync は自分の prefix の residue だけを除去する——自分が作った file の削除は、unpinned reference の削除のような reviewed decision ではない。glob から隠して見えなくする設計は採らない。
+**write は既存 entry へ書き込まず replace する。** destination directory 内に `tempfile.mkstemp` 相当の **exclusive fd** で temp を作り、mode `0644` を固定して `os.replace` で directory entry を差し替える。旧 inode とその別名は無傷で、中断時も半端な reference が残らない。source は open 時に no-follow + regular file を fd で再確認し、preflight 後の alias / type swap を fail-closed にする。成功表示の前に A-F を再監査し、途中の race や partial state を success として報告しない。
 
-test 側も同じ契約を assert する: `LegacyProjectSkillMirrorTest` は exact-set / regular-file 判定を `is_file()` filter と `*.md` glob の**どちらも使わずに** 全 direct entry で計算し、symlink 不在と regular file を**別々に** assert し、mirror path component に symlink が無いことを assert する。assertion 名が主張する性質と実際に検査している性質を一致させる (R3-F1 は「regular file」を名乗って symlink 不在しか見ていない test を指摘した)。pinned set と temp prefix は script と test の両方が持つため、それぞれ cross-check test で一致を固定する。
-- pinned reference 集合は script と `LegacyProjectSkillMirrorTest` の両方が持つ (shell から Python tuple は import できない)。`LegacySkillSyncScriptTest::test_script_pinned_set_matches_this_modules_pinned_set` が両者の一致を assert するので、片側だけ更新すると落ちる。mirror する reference を増減するときは script・test・本節を同一 commit で更新する。
+**temp の ownership は prefix ではなく fd で持つ。** 現在 run が保持する exact path だけを `finally` で cleanup し、他 run の temp には触れない。prefix 一致を ownership の証明に使うと、(a) prefix を共有するだけの無関係 file を自動削除し、(b) **並行 run の active temp を削除**する (両方とも実測)。kill 等で残った residue は次回の規則 D で**通常の unpinned entry として block** し reviewed disposition を要求する——自分の crash residue と「誰かが残したい file」を実行時に区別できないため、「stale だから sync が消す」とは案内しない。
+
+test 側も同じ契約に従う。規則・violation 組合せ・recovery precedence は `test_legacy_mirror_contract.py` が **rule 単位の pure unit test** で押さえ、adversarial case は `LegacyMirrorSyncServiceTest` が Python authority に対して、CLI 契約 (default sync / `--check` / `--help` / unknown argument = exit 64 / repo-root 実行) は `LegacyMirrorWrapperCliTest` が wrapper に対して押さえる。tracked tree の exact-set / regular-file 判定は `is_file()` filter と `*.md` glob の**どちらも使わず**全 direct entry で計算する (どちらも symlink を辿る / hidden を落とすため)。**pinned set の定義は domain module の 1 箇所だけ**であり、shell 側の複製と cross-check test は撤去した。
 
 Removal criteria (本 grace period を解除する条件):
 

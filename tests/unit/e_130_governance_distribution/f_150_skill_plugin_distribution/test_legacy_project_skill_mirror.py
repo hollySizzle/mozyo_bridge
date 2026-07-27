@@ -1,4 +1,4 @@
-"""Legacy project Claude skill partial-mirror parity tests (Redmine #13483).
+"""Legacy project Claude skill partial-mirror tests (Redmine #13483 / #14580).
 
 The repo ships a grace-period-deprecated legacy project skill at
 `.claude/skills/mozyo-bridge-agent/` so that `MOZYO_BRIDGE_CLAUDE_SCOPE=project`
@@ -8,72 +8,70 @@ partial mirror of the shared skill body directly (see
 `## Legacy Project Claude Skill ... Grace-Period Deprecation`).
 
 Unlike the plugin marketplace mirror (a *full* byte-for-byte copy guarded by
-`PluginMarketplaceTest`), the project mirror is intentionally *partial*:
+`PluginMarketplaceTest`), the project mirror is intentionally *partial*: only
+:data:`MIRRORED_REFERENCES` is shipped, and `SKILL.md` is an intentional Claude
+Code adapter stub that is never parity-checked.
 
-- Only the `references/{project-map,release,safety,workflow}.md` subset is
-  mirrored; `redmine-issue-authoring.md`, `subagent-delegation.md`, and the
-  `agents/` metadata are intentionally *not* shipped.
-- `SKILL.md` is an intentional Claude Code adapter stub, not a copy of the
-  canonical `SKILL.md`, so its content is *not* parity-checked here.
+#13483 added the detection. #14580 added the recovery and the gate: commit
+`7ca3380f` updated canonical and the plugin mirror and skipped this one,
+because the plugin mirror had a sync script plus a `release check drift` gate
+while this mirror had only a "copy it by hand" convention.
 
-The distribution doc previously flagged that "the project-scope mirror has no
-automatic drift test yet; add a doc-regression test or remove it before the
-grace period ends." This test closes that gap: the mirrored reference files
-must stay byte-identical to canonical, and the partial file set is pinned so a
-silent add/drop is caught.
+Six review rounds then found the same fail-open — reporting success in the
+presence of a state the sync cannot resolve — through a different axis each
+time. The design consultation answer (j#90402) moved the authority into Python:
+`os.scandir` cannot re-split a filename, an exclusive `mkstemp` fd is real
+ownership rather than a name prefix, and the rules are unit-testable
+individually (see `test_legacy_mirror_contract.py`).
 
-Redmine #14580 adds the missing *recovery and gating* half. Detection alone was
-not enough: commit `7ca3380f` ("Pin coordinator work-unit resolution") updated
-canonical and the plugin mirror and skipped this one, because the plugin mirror
-had `scripts/sync_plugin_skill.sh` plus a `release check drift` gate while this
-mirror had neither — only a manual "copy it by hand" convention. The drift then
-sat undetected until a full-suite run, which the focused pre-commit lane
-deliberately does not perform. `scripts/sync_legacy_project_skill.sh` is now the
-recovery command and `mozyo-bridge release check drift` its fail-closed gate;
-`LegacySkillSyncScriptTest` below pins the script's behavior, including a
-cross-check that the script's pinned reference set and this module's
-:data:`MIRRORED_REFERENCES` cannot drift apart.
+Layout of this module:
 
-Resolve any parity failure by editing the canonical
-`skills/mozyo-bridge-agent/references/<f>.md` first and then running
-`scripts/sync_legacy_project_skill.sh` from the repo root, never by hand-editing
-the mirror to diverge.
+- :class:`LegacyProjectSkillMirrorTest` — the tracked tree itself.
+- :class:`LegacyMirrorSyncServiceTest` — every adversarial case, in-process
+  against the Python authority.
+- :class:`LegacyMirrorWrapperCliTest` — the thin `scripts/` wrapper, black-box,
+  pinning the operator-facing CLI contract the wrapper exists to preserve.
+
+The pinned set is imported, not re-declared: there is exactly one definition
+now, so there is nothing to cross-check and nothing to drift.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
-import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "src"))
 
-#: Recovery / gating script introduced by Redmine #14580.
-SYNC_SCRIPT_PATH = ROOT / "scripts" / "sync_legacy_project_skill.sh"
-
-#: Repo-relative mirror reference directory, as the script prints it.
-MIRROR_REL = ".claude/skills/mozyo-bridge-agent/references"
-
-#: Prefix of the script's rename-staging file. Duplicated from the script for
-#: the same reason as MIRRORED_REFERENCES — shell cannot import a Python
-#: constant — and cross-checked below so the copies cannot drift.
-TEMP_PREFIX = ".sync-legacy-project-skill.tmp."
-
-# The tracked partial-mirror reference set. Pinned so that adding or dropping a
-# mirrored reference file is a deliberate, reviewed change rather than silent
-# drift. Keep in lockstep with `git ls-files .claude/skills/` and the
-# distribution doc's enumeration.
-MIRRORED_REFERENCES = (
-    "project-map.md",
-    "release.md",
-    "safety.md",
-    "workflow.md",
+from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.application.legacy_mirror_sync import (  # noqa: E402
+    HOOK_TEMP_CREATED,
+    LegacyProjectSkillMirrorSync,
 )
+from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.domain.legacy_mirror_contract import (  # noqa: E402
+    CONTENT_DRIFT,
+    ENTRY_NOT_REGULAR,
+    ENTRY_SYMLINK,
+    MIRROR_RELATIVE,
+    MIRRORED_REFERENCES,
+    PATH_COMPONENT_NOT_DIRECTORY,
+    PATH_COMPONENT_SYMLINK,
+    RECOVERY_RESYNC,
+    RULE_CONTENT_PARITY,
+    SOURCE_MISSING,
+    SOURCE_RELATIVE,
+    SOURCE_SYMLINK,
+    UNPINNED_ENTRY,
+)
+
+#: The thin wrapper `release check drift` and operators invoke.
+SYNC_SCRIPT_PATH = ROOT / "scripts" / "sync_legacy_project_skill.sh"
 
 
 def _sha256(path: Path) -> str:
@@ -81,24 +79,16 @@ def _sha256(path: Path) -> str:
 
 
 class LegacyProjectSkillMirrorTest(unittest.TestCase):
-    """Guardrails for the legacy `.claude/skills/mozyo-bridge-agent/` mirror."""
+    """Guardrails on the tracked `.claude/skills/mozyo-bridge-agent/` mirror."""
 
     def setUp(self) -> None:
-        self.canonical_ref_dir = (
-            ROOT / "skills" / "mozyo-bridge-agent" / "references"
-        )
+        self.canonical_ref_dir = ROOT / "skills" / "mozyo-bridge-agent" / "references"
         self.mirror_skill_dir = ROOT / ".claude" / "skills" / "mozyo-bridge-agent"
         self.mirror_ref_dir = self.mirror_skill_dir / "references"
 
     def test_mirror_reference_dirs_present(self) -> None:
-        self.assertTrue(
-            self.canonical_ref_dir.is_dir(),
-            f"canonical references dir missing: {self.canonical_ref_dir}",
-        )
-        self.assertTrue(
-            self.mirror_ref_dir.is_dir(),
-            f"legacy project mirror references dir missing: {self.mirror_ref_dir}",
-        )
+        self.assertTrue(self.canonical_ref_dir.is_dir())
+        self.assertTrue(self.mirror_ref_dir.is_dir())
 
     def test_mirror_reference_files_match_canonical(self) -> None:
         """Each mirrored reference file is byte-identical to canonical.
@@ -112,14 +102,10 @@ class LegacyProjectSkillMirrorTest(unittest.TestCase):
         for name in MIRRORED_REFERENCES:
             canonical = self.canonical_ref_dir / name
             mirror = self.mirror_ref_dir / name
-            self.assertTrue(
-                canonical.is_file(),
-                f"canonical reference missing: {canonical}",
-            )
+            self.assertTrue(canonical.is_file(), f"canonical missing: {canonical}")
             if not mirror.is_file():
                 missing.append(name)
-                continue
-            if _sha256(canonical) != _sha256(mirror):
+            elif _sha256(canonical) != _sha256(mirror):
                 differing.append(name)
 
         hint = (
@@ -127,832 +113,590 @@ class LegacyProjectSkillMirrorTest(unittest.TestCase):
             "first, then run scripts/sync_legacy_project_skill.sh from the repo "
             "root (never hand-edit the mirror to diverge)"
         )
-        self.assertFalse(missing, f"legacy project mirror missing files: {missing}; {hint}")
-        self.assertFalse(
-            differing,
-            f"legacy project mirror content differs from canonical: {differing}; {hint}",
-        )
+        self.assertFalse(missing, f"mirror missing files: {missing}; {hint}")
+        self.assertFalse(differing, f"mirror differs from canonical: {differing}; {hint}")
 
     def test_mirror_reference_set_is_exactly_the_partial_set(self) -> None:
-        """The mirror ships exactly the pinned partial reference set.
+        """The mirror ships exactly the pinned partial set — every entry.
 
-        This is intentionally *partial*: canonical carries additional
-        references (`redmine-issue-authoring.md`, `subagent-delegation.md`)
-        that are deliberately not mirrored. Pinning the set catches a silent
-        add (a new canonical reference copied in without review) or drop.
-
-        The set is computed over EVERY direct entry, with no `is_file()` filter
-        and no `*.md` glob. Both narrowings were measured letting an unpinned
-        entry sit in the mirror while this equality held: `is_file()` follows
-        symlinks so a dangling one drops out (j#90342 R2-F1), and `*.md` misses
-        `unpinned.txt`, hidden entries and stale temps (j#90378 R4-F1). The
-        script's rule D uses the same full domain.
+        Computed over `iterdir()` with no `is_file()` filter and no `*.md`
+        glob. Both narrowings were measured letting an unpinned entry sit here
+        while this equality held: `is_file()` follows symlinks so a dangling one
+        drops out (j#90342 R2-F1), and `*.md` misses `unpinned.txt`, hidden
+        entries and stale temps (j#90378 R4-F1).
         """
         present = {p.name for p in self.mirror_ref_dir.iterdir()}
         self.assertEqual(
             set(MIRRORED_REFERENCES),
             present,
-            "legacy project mirror reference set drifted from the pinned partial "
-            f"set; expected {sorted(MIRRORED_REFERENCES)}, found {sorted(present)}",
+            "mirror reference set drifted from the pinned partial set; expected "
+            f"{sorted(MIRRORED_REFERENCES)}, found {sorted(present)}",
         )
 
     def test_mirror_references_are_regular_files(self) -> None:
-        """Every mirrored reference is a regular file (j#90342 R2-F1 / R3-F1).
+        """No symlinks, and nothing non-regular (j#90342 R2-F1 / R3-F1).
 
-        The mirror is a byte copy, so a symlink is never a correct entry, and
-        neither is a directory / FIFO / socket / device. Both were measured
-        breaking the sync: a symlinked pinned name passed content parity and
-        made `cp` write through into the link target, and a directory under a
-        pinned name made the sync create `safety.md/safety.md` and report
-        success.
-
-        R3-F1 also caught this assertion's name over-claiming what it checked —
-        it said "regular files" while only asserting non-symlink. It now
-        asserts both halves separately so each failure names its own cause.
+        Asserted as two separate claims so a failure names its own cause — the
+        earlier single assertion was called `..._are_regular_files_not_symlinks`
+        while only checking the symlink half.
         """
         entries = sorted(self.mirror_ref_dir.iterdir())
-
         symlinked = sorted(p.name for p in entries if p.is_symlink())
-        self.assertEqual(
-            [],
-            symlinked,
-            "legacy project mirror references must not be symlinks; found "
-            f"{symlinked}. Replace with a regular file, then run "
-            "scripts/sync_legacy_project_skill.sh from the repo root.",
-        )
-
+        self.assertEqual([], symlinked, f"mirror references must not be symlinks: {symlinked}")
         non_regular = sorted(
             p.name for p in entries if not p.is_symlink() and not p.is_file()
         )
-        self.assertEqual(
-            [],
-            non_regular,
-            "legacy project mirror references must be regular files (not "
-            f"directories / FIFOs / sockets / devices); found {non_regular}.",
-        )
+        self.assertEqual([], non_regular, f"mirror references must be regular files: {non_regular}")
 
-    def test_mirror_destination_is_not_reached_through_a_symlink(self) -> None:
-        """No component of the mirror path may be a symlink (j#90342 R3-F1).
-
-        Pointing `references/` itself at an external directory made the sync
-        write the canonical bodies into that directory and exit 0 — the entry
-        checks all followed the link and saw a healthy mirror.
-        """
-        symlinked_components = []
+    def test_mirror_path_has_no_symlinked_component(self) -> None:
+        """Pointing `references/` at an external directory made the sync write
+        the canonical bodies there and exit 0 (j#90342 R3-F1)."""
+        symlinked = []
         probe = ROOT
-        for part in (".claude", "skills", "mozyo-bridge-agent", "references"):
+        for part in MIRROR_RELATIVE.split("/"):
             probe = probe / part
             if probe.is_symlink():
-                symlinked_components.append(str(probe.relative_to(ROOT)))
-        self.assertEqual(
-            [],
-            symlinked_components,
-            "the legacy project mirror must live at a real path inside the "
-            f"repo; these components are symlinks: {symlinked_components}",
-        )
+                symlinked.append(str(probe.relative_to(ROOT)))
+        self.assertEqual([], symlinked)
+
+    def test_tracked_tree_satisfies_the_contract(self) -> None:
+        """The authority's own verdict on the repo, not a restatement of it."""
+        audit = LegacyProjectSkillMirrorSync(ROOT).audit()
+        self.assertTrue(audit.ok, msg="\n".join(audit.report_lines()))
 
     def test_adapter_skill_md_present_and_not_a_canonical_copy(self) -> None:
-        """`SKILL.md` is an intentional Claude Code adapter stub.
-
-        It must exist so Claude Code can discover the skill from the project
-        root, but it is deliberately *not* a byte-copy of the canonical
-        `SKILL.md`; asserting divergence documents that intentional diff so a
-        future well-meaning "sync" that clobbers the adapter is caught.
-        """
+        """`SKILL.md` is an intentional Claude Code adapter stub."""
         mirror_skill_md = self.mirror_skill_dir / "SKILL.md"
         canonical_skill_md = ROOT / "skills" / "mozyo-bridge-agent" / "SKILL.md"
-        self.assertTrue(
-            mirror_skill_md.is_file(),
-            "legacy project mirror must ship SKILL.md so Claude Code can "
-            "discover the skill when launched from the project root",
-        )
+        self.assertTrue(mirror_skill_md.is_file())
         self.assertTrue(canonical_skill_md.is_file())
-        self.assertNotEqual(
-            _sha256(canonical_skill_md),
-            _sha256(mirror_skill_md),
-            "legacy project SKILL.md is expected to be an intentional adapter "
-            "stub, not a copy of the canonical SKILL.md",
-        )
+        self.assertNotEqual(_sha256(canonical_skill_md), _sha256(mirror_skill_md))
 
 
-class LegacySkillSyncScriptTest(unittest.TestCase):
-    """Pin `scripts/sync_legacy_project_skill.sh` (Redmine #14580).
+class _MirrorTreeFixture(unittest.TestCase):
+    """Builds a self-contained mirror tree in a temp dir."""
 
-    The parity assertions above tell an implementer that the mirror drifted.
-    This class pins the mechanism that (a) fixes it and (b) fails closed
-    before a commit lands, which is what was actually missing: the drift
-    #14580 fixed was introduced *because* the only recovery path was a manual
-    convention documented in prose.
-
-    Every case runs against a staged temp tree, never the real worktree, so a
-    failing assertion cannot leave the repo mutated.
-    """
-
-    def _stage(self, tmp: Path) -> Path:
-        """Build a minimal in-sync repo: script + canonical + mirror."""
-        (tmp / "scripts").mkdir(parents=True)
-        staged_script = tmp / "scripts" / SYNC_SCRIPT_PATH.name
-        shutil.copy(SYNC_SCRIPT_PATH, staged_script)
-        staged_script.chmod(0o755)
-
-        canonical = tmp / "skills" / "mozyo-bridge-agent" / "references"
-        canonical.mkdir(parents=True)
-        mirror = tmp / ".claude" / "skills" / "mozyo-bridge-agent" / "references"
+    def _stage(self) -> Path:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        source = tmp / SOURCE_RELATIVE
+        source.mkdir(parents=True)
+        mirror = tmp / MIRROR_RELATIVE
         mirror.mkdir(parents=True)
-
-        real_canonical = ROOT / "skills" / "mozyo-bridge-agent" / "references"
-        for source in real_canonical.glob("*.md"):
-            shutil.copy(source, canonical / source.name)
-            # Only the pinned partial set gets mirrored — that asymmetry is
-            # the contract, not an oversight.
-            if source.name in MIRRORED_REFERENCES:
-                shutil.copy(source, mirror / source.name)
-
-        # The adapter stub: present, and deliberately not a canonical copy.
-        (mirror.parent / "SKILL.md").write_text(
-            "---\nname: mozyo-bridge-agent\n---\nadapter stub\n", encoding="utf-8"
-        )
+        real = ROOT / SOURCE_RELATIVE
+        for path in real.glob("*.md"):
+            shutil.copy(path, source / path.name)
+            if path.name in MIRRORED_REFERENCES:
+                shutil.copy(path, mirror / path.name)
+        (mirror.parent / "SKILL.md").write_text("adapter stub\n", encoding="utf-8")
         return tmp
 
-    def _check(self, repo: Path) -> subprocess.CompletedProcess[str]:
+    @staticmethod
+    def _source(repo: Path) -> Path:
+        return repo / SOURCE_RELATIVE
+
+    @staticmethod
+    def _mirror(repo: Path) -> Path:
+        return repo / MIRROR_RELATIVE
+
+    @staticmethod
+    def _service(repo: Path, **kwargs: object) -> LegacyProjectSkillMirrorSync:
+        return LegacyProjectSkillMirrorSync(repo, **kwargs)  # type: ignore[arg-type]
+
+    def assertBlocksWrite(self, repo: Path, expected_kind: str) -> None:
+        """Both modes refuse, nothing is written, and the class is named."""
+        service = self._service(repo)
+        check_code, check_out, _ = service.check()
+        self.assertEqual(1, check_code)
+        self.assertEqual((), check_out, "a violated contract must not print success")
+
+        before = self._snapshot(self._mirror(repo))
+        sync_code, sync_out, sync_err = service.sync()
+        self.assertEqual(1, sync_code)
+        self.assertEqual((), sync_out)
+        self.assertIn("nothing was written", sync_err[0])
+        self.assertEqual(before, self._snapshot(self._mirror(repo)))
+        self.assertIn(expected_kind, service.audit().kinds())
+
+    @staticmethod
+    def _snapshot(directory: Path) -> dict[str, bytes | None]:
+        if not directory.is_dir() or directory.is_symlink():
+            return {}
+        out: dict[str, bytes | None] = {}
+        for entry in directory.iterdir():
+            try:
+                out[entry.name] = entry.read_bytes() if entry.is_file() else None
+            except OSError:
+                out[entry.name] = None
+        return out
+
+
+class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
+    """Every adversarial case from R1-R5, against the Python authority."""
+
+    # --- the happy paths the sync exists for -------------------------------
+
+    def test_clean_tree_passes_and_syncs_idempotently(self) -> None:
+        repo = self._stage()
+        service = self._service(repo)
+        self.assertEqual(0, service.check()[0])
+        self.assertEqual(0, service.sync()[0])
+        self.assertEqual(0, service.check()[0])
+
+    def test_canonical_only_edit_is_caught_and_repaired(self) -> None:
+        """The confirmed defect's exact shape: canonical moves, mirror does not."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nEDIT\n", encoding="utf-8")
+
+        service = self._service(repo)
+        code, _, err = service.check()
+        self.assertEqual(1, code)
+        self.assertIn(CONTENT_DRIFT, service.audit().kinds())
+        self.assertIn(RECOVERY_RESYNC, service.audit().recovery_actions())
+        self.assertIn("Rerun 'scripts/sync_legacy_project_skill.sh'", "\n".join(err))
+
+        self.assertEqual(0, service.sync()[0])
+        self.assertEqual(0, service.check()[0])
+
+    def test_content_drift_does_not_block_the_write(self) -> None:
+        """Rule F is what the sync repairs — treating it as a blocker would
+        make the command refuse its own job."""
+        repo = self._stage()
+        canonical = self._source(repo) / "safety.md"
+        canonical.write_text("REPLACED\n", encoding="utf-8")
+        self.assertFalse(self._service(repo).audit().blocks_write)
+        self.assertEqual(0, self._service(repo).sync()[0])
+        self.assertEqual("REPLACED\n", (self._mirror(repo) / "safety.md").read_text())
+
+    def test_missing_mirror_directory_is_created_by_the_sync(self) -> None:
+        repo = self._stage()
+        shutil.rmtree(self._mirror(repo))
+        service = self._service(repo)
+        code, _, err = service.check()
+        self.assertEqual(1, code)
+        self.assertIn("Rerun 'scripts/sync_legacy_project_skill.sh'", "\n".join(err))
+        self.assertEqual(0, service.sync()[0])
+        self.assertEqual(0, service.check()[0])
+
+    def test_sync_never_writes_the_adapter_stub_or_extra_references(self) -> None:
+        repo = self._stage()
+        adapter = self._mirror(repo).parent / "SKILL.md"
+        before = adapter.read_bytes()
+        self.assertEqual(0, self._service(repo).sync()[0])
+        self.assertEqual(before, adapter.read_bytes())
+        self.assertEqual(
+            set(MIRRORED_REFERENCES), {p.name for p in self._mirror(repo).iterdir()}
+        )
+
+    # --- R5-F1: filename serialization -------------------------------------
+
+    def test_entry_names_are_compared_losslessly(self) -> None:
+        """j#90397 R5-F1. A shell word list lost the filename boundary: an
+        entry named `project-map.md release.md` split into two words that both
+        matched the pinned set, so both modes exited 0."""
+        for name in (
+            "project-map.md release.md",
+            "project-map.md\trelease.md",
+            "a\nb.md",
+            "*",
+            ".*",
+            "unpinned.txt",
+            ".unpinned.md",
+        ):
+            with self.subTest(entry=name):
+                repo = self._stage()
+                (self._mirror(repo) / name).write_text("smuggled\n", encoding="utf-8")
+                self.assertBlocksWrite(repo, UNPINNED_ENTRY)
+
+    def test_a_glob_named_entry_does_not_report_unrelated_paths(self) -> None:
+        """The shell version re-expanded its own output, so an entry named `*`
+        listed the repo's `AGENTS.md` / `CLAUDE.md` as mirror entries."""
+        repo = self._stage()
+        (self._mirror(repo) / "*").write_text("smuggled\n", encoding="utf-8")
+        report = "\n".join(self._service(repo).check()[2])
+        self.assertIn("'*'", report)
+        for unrelated in ("AGENTS.md", "CLAUDE.md", "LICENSE"):
+            self.assertNotIn(unrelated, report)
+
+    def test_a_newline_named_entry_cannot_forge_a_success_line(self) -> None:
+        repo = self._stage()
+        (self._mirror(repo) / "x\nlegacy project skill mirror is up to date").write_text(
+            "smuggled\n", encoding="utf-8"
+        )
+        code, out, err = self._service(repo).check()
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        for line in err:
+            self.assertNotIn("\n", line)
+
+    def test_unpinned_subdirectory_is_an_entry_too(self) -> None:
+        repo = self._stage()
+        (self._mirror(repo) / "nested").mkdir()
+        self.assertBlocksWrite(repo, UNPINNED_ENTRY)
+
+    # --- R5-F2: temp ownership and concurrency -----------------------------
+
+    def test_a_file_sharing_the_temp_prefix_is_never_deleted(self) -> None:
+        """j#90397 R5-F2. A name prefix is not ownership: the sync deleted an
+        arbitrary file that merely shared it, and reported success."""
+        repo = self._stage()
+        decoy = self._mirror(repo) / ".mozyo-legacy-mirror.keep-me.tmp"
+        decoy.write_text("PRECIOUS\n", encoding="utf-8")
+        self.assertBlocksWrite(repo, UNPINNED_ENTRY)
+        self.assertEqual("PRECIOUS\n", decoy.read_text(encoding="utf-8"))
+
+    def test_a_directory_sharing_the_temp_prefix_blocks_rather_than_hangs(self) -> None:
+        repo = self._stage()
+        (self._mirror(repo) / ".mozyo-legacy-mirror.adir.tmp").mkdir()
+        self.assertBlocksWrite(repo, UNPINNED_ENTRY)
+
+    def test_crash_residue_asks_for_a_reviewed_disposition(self) -> None:
+        """Residue is indistinguishable from a file someone meant to keep, so
+        the advice must not promise that a rerun clears it."""
+        repo = self._stage()
+        (self._mirror(repo) / ".mozyo-legacy-mirror.abc123.tmp").write_text(
+            "half written\n", encoding="utf-8"
+        )
+        report = "\n".join(self._service(repo).check()[2])
+        self.assertIn("reviewed disposition", report)
+        self.assertNotIn("Rerun 'scripts/sync_legacy_project_skill.sh'", report)
+
+    def test_a_concurrent_run_neither_deletes_nor_is_deleted(self) -> None:
+        """j#90397 R5-F2, controlled. The later run must block on the earlier
+        run's in-flight temp rather than delete it, and the earlier run must
+        still finish green."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nEDIT\n", encoding="utf-8")
+
+        observed: dict[str, object] = {}
+
+        def hook(event: str) -> None:
+            if event == HOOK_TEMP_CREATED and "second" not in observed:
+                observed["temps"] = [
+                    p.name
+                    for p in self._mirror(repo).iterdir()
+                    if p.name.startswith(".mozyo-legacy-mirror.")
+                ]
+                observed["second"] = self._service(repo).sync()
+
+        first_code, _, _ = self._service(repo, progress_hook=hook).sync()
+        second_code, second_out, second_err = observed["second"]  # type: ignore[misc]
+
+        self.assertTrue(observed["temps"], "the fixture never observed an in-flight temp")
+        self.assertEqual(1, second_code, "the later run must not write over an in-flight sync")
+        self.assertEqual((), second_out)
+        self.assertIn("nothing was written", second_err[0])
+        self.assertEqual(0, first_code, "the earlier run must still converge")
+        self.assertEqual(0, self._service(repo).check()[0])
+
+    def test_successful_sync_leaves_no_temp_behind(self) -> None:
+        repo = self._stage()
+        self.assertEqual(0, self._service(repo).sync()[0])
+        leftovers = [p.name for p in self._mirror(repo).iterdir() if "tmp" in p.name]
+        self.assertEqual([], leftovers)
+
+    def test_failed_sync_cleans_only_its_own_temp(self) -> None:
+        """The error path is where a prefix-wide cleanup would do its damage.
+
+        The happy path never reaches the cleanup branch, so a widened `finally`
+        — deleting everything sharing the staging prefix, which is exactly what
+        j#90397 R5-F2 reported — survives a green suite untouched unless this
+        case exists. A foreign temp standing in for a concurrent run must be
+        intact afterwards, and ours must be gone.
+        """
+        repo = self._stage()
+        foreign = self._mirror(repo) / ".mozyo-legacy-mirror.someone-else.tmp"
+
+        def hook(event: str) -> None:
+            if event == HOOK_TEMP_CREATED:
+                foreign.write_text("ANOTHER RUN\n", encoding="utf-8")
+                raise RuntimeError("copy failed mid-flight")
+
+        with self.assertRaises(RuntimeError):
+            self._service(repo, progress_hook=hook).sync()
+
+        self.assertEqual(
+            "ANOTHER RUN\n",
+            foreign.read_text(encoding="utf-8"),
+            "cleanup reached beyond this run's own temp",
+        )
+        ours = [
+            p.name
+            for p in self._mirror(repo).iterdir()
+            if p.name.startswith(".mozyo-legacy-mirror.") and p != foreign
+        ]
+        self.assertEqual([], ours, "this run's own temp survived a failure")
+
+    def test_success_is_not_reported_on_an_unverified_tree(self) -> None:
+        """Contract 6: re-audit before announcing success.
+
+        Without the post-write re-audit, a tree that stopped conforming while
+        the copies ran is reported as synced. The window is small but the
+        report is the thing every gate above this trusts.
+        """
+        repo = self._stage()
+        planted = {"done": False}
+
+        def hook(event: str) -> None:
+            if event == HOOK_TEMP_CREATED and not planted["done"]:
+                planted["done"] = True
+                (self._mirror(repo) / "unpinned.txt").write_text(
+                    "arrived mid-sync\n", encoding="utf-8"
+                )
+
+        code, out, err = self._service(repo, progress_hook=hook).sync()
+        self.assertEqual(1, code, msg="\n".join(out))
+        self.assertEqual((), out)
+        self.assertIn("did not converge", err[0])
+        self.assertIn(UNPINNED_ENTRY, self._service(repo).audit().kinds())
+
+    def test_written_references_are_mode_644(self) -> None:
+        """`mkstemp` creates 0600; canonical and mirror are tracked 0644."""
+        repo = self._stage()
+        self.assertEqual(0, self._service(repo).sync()[0])
+        for name in MIRRORED_REFERENCES:
+            self.assertEqual(0o644, (self._mirror(repo) / name).stat().st_mode & 0o777)
+
+    # --- R5-F3: recovery composition ---------------------------------------
+
+    def test_invalid_source_never_offers_the_resync(self) -> None:
+        """j#90397 R5-F3: the sync refuses at its own source preflight, so
+        advertising a rerun sends the operator in a circle."""
+        repo = self._stage()
+        (self._source(repo) / "safety.md").unlink()
+        report = "\n".join(self._service(repo).check()[2])
+        self.assertIn("Restore the tracked canonical path", report)
+        self.assertNotIn("Rerun 'scripts/sync_legacy_project_skill.sh'", report)
+        self.assertBlocksWrite(repo, SOURCE_MISSING)
+
+    def test_content_parity_is_skipped_when_the_source_is_invalid(self) -> None:
+        repo = self._stage()
+        (self._source(repo) / "safety.md").unlink()
+        audit = self._service(repo).audit()
+        self.assertIn(RULE_CONTENT_PARITY, audit.skipped_rules)
+        self.assertNotIn(CONTENT_DRIFT, audit.kinds())
+
+    # --- R4-F2: canonical source aliasing ----------------------------------
+
+    def test_symlinked_canonical_reference_is_rejected(self) -> None:
+        """j#90378 R4-F2: `-f` follows symlinks, so an aliased source was
+        accepted and its external bytes copied into the mirror."""
+        repo = self._stage()
+        external = repo / "external-body.md"
+        external.write_text("EXTERNAL BODY\n", encoding="utf-8")
+        source = self._source(repo) / "safety.md"
+        source.unlink()
+        source.symlink_to(external)
+
+        self.assertBlocksWrite(repo, SOURCE_SYMLINK)
+        self.assertNotIn(
+            "EXTERNAL BODY", (self._mirror(repo) / "safety.md").read_text(encoding="utf-8")
+        )
+
+    def test_symlinked_canonical_directory_is_rejected(self) -> None:
+        repo = self._stage()
+        external = repo / "external-refs"
+        shutil.copytree(self._source(repo), external)
+        shutil.rmtree(self._source(repo))
+        self._source(repo).symlink_to(external, target_is_directory=True)
+        self.assertBlocksWrite(repo, PATH_COMPONENT_SYMLINK)
+
+    # --- R4-F3 / R3-F1: destination topology and entry types ---------------
+
+    def test_non_directory_ancestor_is_topology_not_missing_mirror(self) -> None:
+        """j#90378 R4-F3: reported as "mirror missing, rerun the sync", whose
+        `mkdir -p` then failed."""
+        repo = self._stage()
+        ancestor = repo / ".claude" / "skills"
+        shutil.rmtree(ancestor)
+        ancestor.write_text("not a directory\n", encoding="utf-8")
+
+        audit = self._service(repo).audit()
+        self.assertIn(PATH_COMPONENT_NOT_DIRECTORY, audit.kinds())
+        self.assertFalse(audit.dest_missing)
+        report = "\n".join(self._service(repo).check()[2])
+        self.assertNotIn("Rerun 'scripts/sync_legacy_project_skill.sh'", report)
+        self.assertEqual(1, self._service(repo).sync()[0])
+
+    def test_symlinked_mirror_destination_is_rejected(self) -> None:
+        repo = self._stage()
+        outside = repo / "outside"
+        outside.mkdir()
+        sentinel = outside / "safety.md"
+        sentinel.write_text("OUTSIDE\n", encoding="utf-8")
+        shutil.rmtree(self._mirror(repo))
+        self._mirror(repo).symlink_to(outside, target_is_directory=True)
+
+        self.assertEqual(1, self._service(repo).check()[0])
+        self.assertEqual(1, self._service(repo).sync()[0])
+        self.assertEqual("OUTSIDE\n", sentinel.read_text(encoding="utf-8"))
+
+    def test_symlinked_pinned_entry_is_rejected_without_writing_through(self) -> None:
+        repo = self._stage()
+        victim = repo / "victim.txt"
+        victim.write_text("UNRELATED\n", encoding="utf-8")
+        pinned = self._mirror(repo) / "safety.md"
+        pinned.unlink()
+        pinned.symlink_to(victim)
+
+        self.assertBlocksWrite(repo, ENTRY_SYMLINK)
+        self.assertEqual("UNRELATED\n", victim.read_text(encoding="utf-8"))
+
+    def test_dangling_symlink_entry_is_rejected(self) -> None:
+        repo = self._stage()
+        (self._mirror(repo) / "unpinned.md").symlink_to("missing-target")
+        self.assertBlocksWrite(repo, UNPINNED_ENTRY)
+
+    def test_non_regular_pinned_entries_are_rejected_without_blocking(self) -> None:
+        """A directory made the shell sync create `safety.md/safety.md`; a FIFO
+        made its `cp` block on open. `lstat` never opens either."""
+        for kind in ("directory", "fifo"):
+            with self.subTest(kind=kind):
+                repo = self._stage()
+                target = self._mirror(repo) / "safety.md"
+                target.unlink()
+                if kind == "directory":
+                    target.mkdir()
+                else:
+                    os.mkfifo(target)
+                self.assertBlocksWrite(repo, ENTRY_NOT_REGULAR)
+                if kind == "directory":
+                    self.assertFalse((target / "safety.md").exists())
+
+    def test_hardlinked_entry_is_replaced_not_written_through(self) -> None:
+        """A hardlink is a regular file, so no type check can see it. Replacing
+        the directory entry leaves the shared inode alone (j#90342 R3-F1)."""
+        repo = self._stage()
+        victim = repo / "victim.txt"
+        victim.write_text("UNRELATED\n", encoding="utf-8")
+        pinned = self._mirror(repo) / "safety.md"
+        pinned.unlink()
+        os.link(victim, pinned)
+
+        self.assertEqual(0, self._service(repo).sync()[0])
+        self.assertEqual("UNRELATED\n", victim.read_text(encoding="utf-8"))
+        self.assertEqual(1, pinned.stat().st_nlink)
+        self.assertEqual(0, self._service(repo).check()[0])
+
+    # --- action-time recheck ------------------------------------------------
+
+    def test_source_swapped_after_preflight_is_fail_closed(self) -> None:
+        """Contract 6: a source that becomes an alias between preflight and
+        write must abort rather than mirror whatever it now points at."""
+        repo = self._stage()
+        external = repo / "external-body.md"
+        external.write_text("EXTERNAL BODY\n", encoding="utf-8")
+
+        swapped = {"done": False}
+
+        def hook(event: str) -> None:
+            if event == HOOK_TEMP_CREATED and not swapped["done"]:
+                swapped["done"] = True
+                target = self._source(repo) / "workflow.md"
+                target.unlink()
+                target.symlink_to(external)
+
+        code, out, err = self._service(repo, progress_hook=hook).sync()
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        self.assertIn("aborted", err[0])
+        mirrored = self._mirror(repo) / "workflow.md"
+        self.assertNotIn("EXTERNAL BODY", mirrored.read_text(encoding="utf-8"))
+
+
+class LegacyMirrorWrapperCliTest(_MirrorTreeFixture):
+    """The `scripts/` wrapper: operator-facing contract, black-box.
+
+    The wrapper carries no mirror logic, so these pin only what it exists to
+    preserve — the invocation contract `release check drift`, the docs and
+    operators depend on.
+    """
+
+    def _stage_with_wrapper(self) -> Path:
+        repo = self._stage()
+        (repo / "scripts").mkdir()
+        shutil.copy(SYNC_SCRIPT_PATH, repo / "scripts" / SYNC_SCRIPT_PATH.name)
+        (repo / "scripts" / SYNC_SCRIPT_PATH.name).chmod(0o755)
+        (repo / "src").mkdir()
+        shutil.copytree(
+            ROOT / "src" / "mozyo_bridge",
+            repo / "src" / "mozyo_bridge",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        return repo
+
+    def _run(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
+            ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name), *args],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def test_wrapper_exists_and_is_executable(self) -> None:
+        self.assertTrue(SYNC_SCRIPT_PATH.is_file())
+        self.assertTrue(SYNC_SCRIPT_PATH.stat().st_mode & 0o111)
+
+    def test_wrapper_carries_no_mirror_logic(self) -> None:
+        """Contract 1: one authority. A pinned name or an audit in the wrapper
+        would be a second definition to drift from."""
+        body = SYNC_SCRIPT_PATH.read_text(encoding="utf-8")
+        code = "\n".join(
+            line for line in body.splitlines() if not line.lstrip().startswith("#")
+        )
+        for name in MIRRORED_REFERENCES:
+            self.assertNotIn(name, code, "the wrapper must not name pinned references")
+        for token in ("cmp ", "rsync", "mkstemp", "MIRRORED_REFERENCES"):
+            self.assertNotIn(token, code)
+
+    def test_check_and_sync_round_trip(self) -> None:
+        repo = self._stage_with_wrapper()
+        self.assertEqual(0, self._run(repo, "--check").returncode)
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nEDIT\n", encoding="utf-8")
+        self.assertEqual(1, self._run(repo, "--check").returncode)
+        synced = self._run(repo)
+        self.assertEqual(0, synced.returncode, msg=synced.stderr)
+        self.assertIn("synced legacy project skill mirror", synced.stdout)
+        self.assertEqual(0, self._run(repo, "--check").returncode)
+
+    def test_check_reports_a_violation_and_writes_nothing(self) -> None:
+        repo = self._stage_with_wrapper()
+        (self._mirror(repo) / "unpinned.txt").write_text("smuggled\n", encoding="utf-8")
+        result = self._run(repo, "--check")
+        self.assertEqual(1, result.returncode)
+        self.assertNotIn("is up to date", result.stdout)
+        self.assertIn("unpinned_entry", result.stderr)
+        self.assertTrue((self._mirror(repo) / "unpinned.txt").exists())
+
+    def test_help_exits_zero(self) -> None:
+        repo = self._stage_with_wrapper()
+        result = self._run(repo, "--help")
+        self.assertEqual(0, result.returncode)
+        self.assertIn("--check", result.stdout)
+
+    def test_unknown_argument_exits_64(self) -> None:
+        repo = self._stage_with_wrapper()
+        result = self._run(repo, "--force")
+        self.assertEqual(64, result.returncode)
+        self.assertIn("unknown argument", result.stderr)
+
+    def test_wrapper_targets_its_own_repo_not_the_cwd(self) -> None:
+        """`release check drift` runs the staged tree's wrapper; it must check
+        that tree, not whichever repo the process happens to sit in."""
+        repo = self._stage_with_wrapper()
+        (self._mirror(repo) / "unpinned.txt").write_text("smuggled\n", encoding="utf-8")
+        result = subprocess.run(
             ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name), "--check"],
             capture_output=True,
             text=True,
+            cwd=str(ROOT),
+            timeout=120,
         )
-
-    def _sync(self, repo: Path) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name)],
-            capture_output=True,
-            text=True,
-        )
-
-    def test_script_exists_and_is_executable(self) -> None:
-        self.assertTrue(
-            SYNC_SCRIPT_PATH.is_file(), f"missing sync script: {SYNC_SCRIPT_PATH}"
-        )
-        self.assertTrue(
-            SYNC_SCRIPT_PATH.stat().st_mode & 0o111,
-            "sync script must be executable so the documented "
-            "`scripts/sync_legacy_project_skill.sh` invocation works",
-        )
-
-    def test_script_pinned_set_matches_this_modules_pinned_set(self) -> None:
-        """The script's list and this module's list are one fact, not two.
-
-        Both need the partial set, and a shell script cannot import a Python
-        tuple. Duplicating it is only safe while something asserts the copies
-        are equal — otherwise adding a mirrored reference to one side leaves
-        the other silently un-enforcing, which is the same class of gap that
-        produced this issue.
-        """
-        body = SYNC_SCRIPT_PATH.read_text(encoding="utf-8")
-        match = re.search(r'^MIRRORED_REFERENCES="([^"]*)"$', body, re.MULTILINE)
-        self.assertIsNotNone(
-            match,
-            "sync script must declare MIRRORED_REFERENCES=\"...\" on one line "
-            "so this cross-check can read it",
-        )
-        assert match is not None  # narrow for type checkers
-        script_set = set(match.group(1).split())
-        self.assertEqual(
-            set(MIRRORED_REFERENCES),
-            script_set,
-            "the sync script's mirrored reference set and this module's "
-            "MIRRORED_REFERENCES drifted; update both in the same commit",
-        )
-
-    def test_script_temp_prefix_matches_this_modules_prefix(self) -> None:
-        """Same cross-check as the pinned set, for the staging-file prefix.
-
-        The prefix decides which residue the sync may clear on its own; a copy
-        that drifted would make the tests exercise a name the script does not
-        recognise, and a real stale temp would be reported as an unpinned entry
-        with a disposition saying a rerun cannot clear it.
-        """
-        body = SYNC_SCRIPT_PATH.read_text(encoding="utf-8")
-        match = re.search(r'^TEMP_PREFIX="([^"]*)"$', body, re.MULTILINE)
-        self.assertIsNotNone(
-            match,
-            'sync script must declare TEMP_PREFIX="..." on one line so this '
-            "cross-check can read it",
-        )
-        assert match is not None  # narrow for type checkers
-        self.assertEqual(TEMP_PREFIX, match.group(1))
-
-    def test_check_passes_on_an_in_sync_tree(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            result = self._check(repo)
-            self.assertEqual(
-                0, result.returncode, msg=result.stdout + result.stderr
-            )
-            self.assertIn("legacy project skill mirror is up to date", result.stdout)
-
-    def test_check_fails_on_canonical_only_edit(self) -> None:
-        """The confirmed defect's exact shape: canonical moves, mirror does not."""
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            canonical = (
-                repo / "skills" / "mozyo-bridge-agent" / "references" / "workflow.md"
-            )
-            canonical.write_text(
-                canonical.read_text(encoding="utf-8") + "\nCANONICAL-ONLY EDIT\n",
-                encoding="utf-8",
-            )
-            result = self._check(repo)
-            self.assertEqual(1, result.returncode, msg=result.stdout)
-            self.assertIn("drift detected", result.stderr)
-            self.assertIn("references/workflow.md", result.stderr)
-            # Recovery hint must be repo-root runnable, matching the plugin
-            # mirror script's contract (Codex review #50344 precedent).
-            self.assertIn("scripts/sync_legacy_project_skill.sh", result.stderr)
-            self.assertIn("from the repo root", result.stderr)
-
-    def test_sync_repairs_a_canonical_only_edit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            canonical = (
-                repo / "skills" / "mozyo-bridge-agent" / "references" / "workflow.md"
-            )
-            canonical.write_text(
-                canonical.read_text(encoding="utf-8") + "\nCANONICAL-ONLY EDIT\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(1, self._check(repo).returncode)
-
-            synced = self._sync(repo)
-            self.assertEqual(0, synced.returncode, msg=synced.stderr)
-
-            after = self._check(repo)
-            self.assertEqual(0, after.returncode, msg=after.stdout + after.stderr)
-
-    def test_sync_never_writes_the_adapter_stub(self) -> None:
-        """A sync must not clobber the intentional `SKILL.md` divergence.
-
-        This is why the legacy mirror cannot reuse the plugin mirror's
-        `rsync -a --delete`: that would overwrite the adapter with canonical
-        `SKILL.md` and delete the mirror's deliberate omissions.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            adapter = (
-                repo / ".claude" / "skills" / "mozyo-bridge-agent" / "SKILL.md"
-            )
-            before = adapter.read_bytes()
-
-            synced = self._sync(repo)
-            self.assertEqual(0, synced.returncode, msg=synced.stderr)
-
-            self.assertEqual(
-                before,
-                adapter.read_bytes(),
-                "sync overwrote the Claude Code adapter stub",
-            )
-            # The deliberately non-mirrored canonical references must also
-            # stay out of the mirror after a sync.
-            mirror_refs = {
-                p.name
-                for p in (
-                    repo / ".claude" / "skills" / "mozyo-bridge-agent" / "references"
-                ).glob("*.md")
-            }
-            self.assertEqual(set(MIRRORED_REFERENCES), mirror_refs)
-
-    def test_check_fails_when_a_mirrored_file_is_deleted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            (
-                repo
-                / ".claude/skills/mozyo-bridge-agent/references/safety.md"
-            ).unlink()
-            result = self._check(repo)
-            self.assertEqual(1, result.returncode, msg=result.stdout)
-            self.assertIn(f"missing file: {MIRROR_REL}/safety.md", result.stderr)
-
-    def test_check_fails_on_an_unpinned_extra_reference(self) -> None:
-        """An extra mirrored file means the partial set was widened unreviewed."""
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            (
-                repo
-                / ".claude/skills/mozyo-bridge-agent/references/subagent-delegation.md"
-            ).write_text("smuggled in\n", encoding="utf-8")
-            result = self._check(repo)
-            self.assertEqual(1, result.returncode, msg=result.stdout)
-            self.assertIn(
-                f"unpinned entry: {MIRROR_REL}/subagent-delegation.md", result.stderr
-            )
-
-    def test_check_does_not_offer_a_rerun_that_cannot_clear_the_drift(self) -> None:
-        """Review j#90322 F1: the recovery line must match the drift class.
-
-        An unpinned reference is the one class the sync refuses to resolve, so
-        printing the blanket "rerun the sync" recovery for it points the
-        operator at a command that exits 1 on the same state.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            (
-                repo / ".claude/skills/mozyo-bridge-agent/references/unpinned.md"
-            ).write_text("smuggled in\n", encoding="utf-8")
-            result = self._check(repo)
-            self.assertEqual(1, result.returncode, msg=result.stdout)
-            self.assertIn("reviewed disposition", result.stderr)
-            self.assertIn("does NOT clear them", result.stderr)
-            self.assertNotIn("to resync the mirror", result.stderr)
-
-    def test_sync_refuses_while_an_unpinned_reference_is_present(self) -> None:
-        """Sync must not report success in the presence of a class it cannot fix.
-
-        Review j#90322 F1: the sync previously copied the pinned set, exited 0
-        and printed `synced legacy project skill mirror` while an unpinned file
-        sat in the mirror — so the very next `--check` exited 1, and the
-        documented "rerun the sync" recovery could never converge.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            canonical = (
-                repo / "skills" / "mozyo-bridge-agent" / "references" / "workflow.md"
-            )
-            canonical.write_text(
-                canonical.read_text(encoding="utf-8") + "\nCANONICAL-ONLY EDIT\n",
-                encoding="utf-8",
-            )
-            mirror_workflow = (
-                repo
-                / ".claude/skills/mozyo-bridge-agent/references/workflow.md"
-            )
-            before = mirror_workflow.read_bytes()
-            (
-                repo / ".claude/skills/mozyo-bridge-agent/references/unpinned.md"
-            ).write_text("smuggled in\n", encoding="utf-8")
-
-            synced = self._sync(repo)
-            self.assertEqual(1, synced.returncode, msg=synced.stdout)
-            self.assertNotIn("synced legacy project skill mirror", synced.stdout)
-            self.assertIn("refusing to sync", synced.stderr)
-            self.assertIn("references/unpinned.md", synced.stderr)
-            # Audit runs before any write: the pending content drift must be
-            # untouched, so the exit code describes the whole tree state.
-            self.assertEqual(
-                before,
-                mirror_workflow.read_bytes(),
-                "sync wrote a partial result before refusing",
-            )
-
-    def test_sync_converges_once_the_unpinned_reference_is_dispositioned(self) -> None:
-        """After the reviewed delete, the documented recovery reaches green."""
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            canonical = (
-                repo / "skills" / "mozyo-bridge-agent" / "references" / "workflow.md"
-            )
-            canonical.write_text(
-                canonical.read_text(encoding="utf-8") + "\nCANONICAL-ONLY EDIT\n",
-                encoding="utf-8",
-            )
-            extra = repo / ".claude/skills/mozyo-bridge-agent/references/unpinned.md"
-            extra.write_text("smuggled in\n", encoding="utf-8")
-
-            self.assertEqual(1, self._sync(repo).returncode)
-            self.assertEqual(1, self._check(repo).returncode)
-
-            extra.unlink()  # the reviewed disposition
-
-            synced = self._sync(repo)
-            self.assertEqual(0, synced.returncode, msg=synced.stderr)
-            after = self._check(repo)
-            self.assertEqual(0, after.returncode, msg=after.stdout + after.stderr)
-
-    def test_both_modes_reject_a_dangling_unpinned_symlink(self) -> None:
-        """Review j#90342 R2-F1: `-e` is false for a dangling symlink.
-
-        The glob no-match guard was `[ -e "$path" ] || continue`, so a dangling
-        `unpinned.md` symlink was skipped as though the glob had not matched —
-        both modes exited 0 and reported the mirror up to date while an
-        unpinned entry sat in it. Same fail-open shape as R1 F1, reached
-        through the entry TYPE rather than the mode.
-        """
-        for mode in (["--check"], []):
-            with self.subTest(mode=mode or ["sync"]):
-                with tempfile.TemporaryDirectory() as tmp:
-                    repo = self._stage(Path(tmp))
-                    (
-                        repo
-                        / ".claude/skills/mozyo-bridge-agent/references/unpinned.md"
-                    ).symlink_to("missing-target")
-                    result = subprocess.run(
-                        ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name), *mode],
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(1, result.returncode, msg=result.stdout)
-                    self.assertNotIn("is up to date", result.stdout)
-                    self.assertNotIn(
-                        "synced legacy project skill mirror", result.stdout
-                    )
-                    self.assertIn(
-                        f"unpinned entry: {MIRROR_REL}/unpinned.md", result.stderr
-                    )
-
-    def test_sync_refuses_a_symlinked_pinned_reference_without_writing_through(
-        self,
-    ) -> None:
-        """A symlinked PINNED name is the dangerous case the type ban closes.
-
-        Content parity follows the link and passes, so the unpinned audit
-        cannot see it by construction. Left unchecked, the sync's `cp` writes
-        THROUGH the link into its target — measured overwriting an unrelated
-        file while exiting 0 and printing success.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            victim = repo / "victim.txt"
-            victim.write_text("UNRELATED CONTENT\n", encoding="utf-8")
-            pinned = repo / ".claude/skills/mozyo-bridge-agent/references/safety.md"
-            pinned.unlink()
-            pinned.symlink_to(victim)
-
-            for mode in (["--check"], []):
-                with self.subTest(mode=mode or ["sync"]):
-                    result = subprocess.run(
-                        ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name), *mode],
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(1, result.returncode, msg=result.stdout)
-                    self.assertIn(
-                        f"reference is a symlink: {MIRROR_REL}/safety.md", result.stderr
-                    )
-
-            self.assertEqual(
-                "UNRELATED CONTENT\n",
-                victim.read_text(encoding="utf-8"),
-                "sync wrote through the symlink into its target",
-            )
-
-    def test_both_modes_reject_a_non_regular_pinned_entry(self) -> None:
-        """Review j#90342 R3-F1: type-check pinned names, not just symlinks.
-
-        A directory under a pinned name made the sync exit 0 with a success
-        banner after creating `safety.md/safety.md`. A FIFO made `cp` block on
-        open indefinitely. The preflight uses `-f`, a stat rather than an open,
-        so it rejects the FIFO without blocking on it.
-        """
-        pinned = ".claude/skills/mozyo-bridge-agent/references/safety.md"
-        for kind in ("directory", "fifo"):
-            for mode in (["--check"], []):
-                with self.subTest(kind=kind, mode=mode or ["sync"]):
-                    with tempfile.TemporaryDirectory() as tmp:
-                        repo = self._stage(Path(tmp))
-                        target = repo / pinned
-                        target.unlink()
-                        if kind == "directory":
-                            target.mkdir()
-                        else:
-                            os.mkfifo(target)
-
-                        result = subprocess.run(
-                            [
-                                "sh",
-                                str(repo / "scripts" / SYNC_SCRIPT_PATH.name),
-                                *mode,
-                            ],
-                            capture_output=True,
-                            text=True,
-                            # A blocking `cp` on the FIFO would hang the suite;
-                            # the timeout turns that regression into a failure.
-                            timeout=30,
-                        )
-                        self.assertEqual(1, result.returncode, msg=result.stdout)
-                        self.assertNotIn(
-                            "synced legacy project skill mirror", result.stdout
-                        )
-                        self.assertNotIn("is up to date", result.stdout)
-                        self.assertIn(
-                            f"not a regular file: {MIRROR_REL}/safety.md",
-                            result.stderr,
-                        )
-                        if kind == "directory":
-                            self.assertFalse(
-                                (target / "safety.md").exists(),
-                                "sync wrote into the directory it should reject",
-                            )
-
-    def test_both_modes_reject_a_symlinked_mirror_destination(self) -> None:
-        """Review j#90342 R3-F1: `-d "$dest"` follows symlinks.
-
-        Pointing `references/` at an external directory made the sync write the
-        canonical bodies there and exit 0 with a success banner: every entry
-        check followed the link and saw a healthy mirror.
-        """
-        for mode in (["--check"], []):
-            with self.subTest(mode=mode or ["sync"]):
-                with tempfile.TemporaryDirectory() as tmp:
-                    repo = self._stage(Path(tmp))
-                    outside = repo / "outside"
-                    outside.mkdir()
-                    sentinel = outside / "safety.md"
-                    sentinel.write_text("OUTSIDE\n", encoding="utf-8")
-
-                    mirror_refs = (
-                        repo / ".claude/skills/mozyo-bridge-agent/references"
-                    )
-                    shutil.rmtree(mirror_refs)
-                    mirror_refs.symlink_to(outside, target_is_directory=True)
-
-                    result = subprocess.run(
-                        ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name), *mode],
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(1, result.returncode, msg=result.stdout)
-                    self.assertNotIn(
-                        "synced legacy project skill mirror", result.stdout
-                    )
-                    self.assertIn("path component is a symlink", result.stderr)
-                    self.assertEqual(
-                        "OUTSIDE\n",
-                        sentinel.read_text(encoding="utf-8"),
-                        "sync wrote outside the mirror",
-                    )
-
-    def test_sync_replaces_by_rename_and_never_writes_through_a_hardlink(
-        self,
-    ) -> None:
-        """Review j#90342 R3-F1 condition 2: replace the entry, not the inode.
-
-        A hardlink IS a regular file, so no entry-type check can see it — the
-        earlier `cp src dest` opened and truncated whatever the pinned name
-        resolved to, rewriting an unrelated file's contents. Copying to a temp
-        file and renaming it into place swaps the directory entry, leaving the
-        old inode and its other names untouched.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            victim = repo / "victim.txt"
-            victim.write_text("UNRELATED CONTENT\n", encoding="utf-8")
-            pinned = repo / ".claude/skills/mozyo-bridge-agent/references/safety.md"
-            pinned.unlink()
-            os.link(victim, pinned)
-
-            synced = self._sync(repo)
-            self.assertEqual(0, synced.returncode, msg=synced.stderr)
-
-            self.assertEqual(
-                "UNRELATED CONTENT\n",
-                victim.read_text(encoding="utf-8"),
-                "sync wrote through the hardlink into the shared inode",
-            )
-            # The mirror still converged: the entry now points at a fresh inode
-            # carrying the canonical bytes.
-            self.assertEqual(0, self._check(repo).returncode)
-            self.assertEqual(1, pinned.stat().st_nlink)
-
-    def test_sync_leaves_no_temp_file_behind(self) -> None:
-        """A successful sync leaves the staging file nowhere in the mirror."""
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            self.assertEqual(0, self._sync(repo).returncode)
-            mirror_refs = repo / ".claude/skills/mozyo-bridge-agent/references"
-            leftovers = sorted(
-                p.name for p in mirror_refs.iterdir() if "tmp" in p.name
-            )
-            self.assertEqual([], leftovers)
-            self.assertEqual(0, self._check(repo).returncode)
-
-    def test_entry_set_audit_covers_every_filename_domain(self) -> None:
-        """Review j#90378 R4-F1: `*.md` is not the entry domain.
-
-        The audit globbed `*.md`, and a shell glob also excludes hidden entries,
-        so a non-`.md` name, a dotfile and a stale temp all sat in the mirror
-        with both modes exiting 0 and `release check drift` reporting clean. The
-        rule is now "every direct entry is pinned or a violation".
-        """
-        for name in ("unpinned.txt", ".unpinned.md", "unpinned"):
-            for mode in (["--check"], []):
-                with self.subTest(entry=name, mode=mode or ["sync"]):
-                    with tempfile.TemporaryDirectory() as tmp:
-                        repo = self._stage(Path(tmp))
-                        (
-                            repo
-                            / ".claude/skills/mozyo-bridge-agent/references"
-                            / name
-                        ).write_text("smuggled\n", encoding="utf-8")
-                        result = subprocess.run(
-                            [
-                                "sh",
-                                str(repo / "scripts" / SYNC_SCRIPT_PATH.name),
-                                *mode,
-                            ],
-                            capture_output=True,
-                            text=True,
-                        )
-                        self.assertEqual(1, result.returncode, msg=result.stdout)
-                        self.assertNotIn("is up to date", result.stdout)
-                        self.assertNotIn(
-                            "synced legacy project skill mirror", result.stdout
-                        )
-                        self.assertIn(f"unpinned entry: {MIRROR_REL}/{name}", result.stderr)
-
-    def test_entry_set_audit_covers_an_unpinned_subdirectory(self) -> None:
-        """A directory entry is an entry too — type must not exempt it."""
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            (
-                repo / ".claude/skills/mozyo-bridge-agent/references/nested"
-            ).mkdir()
-            result = self._check(repo)
-            self.assertEqual(1, result.returncode, msg=result.stdout)
-            self.assertIn(f"unpinned entry: {MIRROR_REL}/nested", result.stderr)
-
-    def test_stale_temp_is_reported_by_check_and_cleared_by_sync(self) -> None:
-        """Review j#90378 R4-F1 condition 2 and 4: residue is not invisible.
-
-        The staging file used to be excluded from the audit by its name, so a
-        crashed run left the mirror looking clean. It is now inside the audited
-        domain: `--check` reports it (with a disposition saying a rerun clears
-        it), and the sync clears its own residue before writing. Deleting a file
-        this script created is not the reviewed decision that deleting an
-        unpinned reference is — so the two get different dispositions.
-        """
-        stale = f"{TEMP_PREFIX}999"
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            residue = (
-                repo / ".claude/skills/mozyo-bridge-agent/references" / stale
-            )
-            residue.write_text("half written\n", encoding="utf-8")
-
-            checked = self._check(repo)
-            self.assertEqual(1, checked.returncode, msg=checked.stdout)
-            self.assertNotIn("is up to date", checked.stdout)
-            self.assertIn("stale sync temp file", checked.stderr)
-            # It must NOT be reported as an unpinned reference: that class's
-            # disposition tells the operator a rerun will not clear it, which
-            # is the opposite of what is true here.
-            self.assertNotIn("unpinned entry", checked.stderr)
-
-            synced = self._sync(repo)
-            self.assertEqual(0, synced.returncode, msg=synced.stderr)
-            self.assertFalse(residue.exists(), "sync left its own residue behind")
-            self.assertEqual(0, self._check(repo).returncode)
-
-    def test_both_modes_reject_a_symlinked_canonical_source(self) -> None:
-        """Review j#90378 R4-F2: `-f "$src/$name"` follows symlinks.
-
-        A pinned canonical name pointed at an external regular file was
-        accepted, and the sync copied those external bytes into the mirror —
-        publishing content the repo does not track while exiting 0. The R4
-        request asserted this was "already rejected by `! -f`"; measuring it
-        showed that claim was wrong.
-        """
-        for mode in (["--check"], []):
-            with self.subTest(mode=mode or ["sync"]):
-                with tempfile.TemporaryDirectory() as tmp:
-                    repo = self._stage(Path(tmp))
-                    external = repo / "external-body.md"
-                    external.write_text("EXTERNAL BODY\n", encoding="utf-8")
-                    source = (
-                        repo / "skills/mozyo-bridge-agent/references/safety.md"
-                    )
-                    source.unlink()
-                    source.symlink_to(external)
-
-                    result = subprocess.run(
-                        ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name), *mode],
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(1, result.returncode, msg=result.stdout)
-                    self.assertNotIn(
-                        "synced legacy project skill mirror", result.stdout
-                    )
-                    self.assertIn("canonical reference is a symlink", result.stderr)
-                    mirrored = (
-                        repo
-                        / ".claude/skills/mozyo-bridge-agent/references/safety.md"
-                    )
-                    self.assertNotIn(
-                        "EXTERNAL BODY",
-                        mirrored.read_text(encoding="utf-8"),
-                        "external bytes reached the mirror through a source alias",
-                    )
-
-    def test_both_modes_reject_a_symlinked_canonical_source_directory(self) -> None:
-        """The source directory itself is part of the same contract.
-
-        `[ -d "$src" ]` follows too, so an aliased `references/` directory made
-        both modes exit 0 while sourcing every byte from outside the repo.
-        """
-        for mode in (["--check"], []):
-            with self.subTest(mode=mode or ["sync"]):
-                with tempfile.TemporaryDirectory() as tmp:
-                    repo = self._stage(Path(tmp))
-                    source_dir = repo / "skills/mozyo-bridge-agent/references"
-                    external = repo / "external-refs"
-                    shutil.copytree(source_dir, external)
-                    shutil.rmtree(source_dir)
-                    source_dir.symlink_to(external, target_is_directory=True)
-
-                    result = subprocess.run(
-                        ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name), *mode],
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(1, result.returncode, msg=result.stdout)
-                    self.assertIn(
-                        "canonical source path component is a symlink", result.stderr
-                    )
-
-    def test_non_directory_ancestor_is_topology_not_missing_mirror(self) -> None:
-        """Review j#90378 R4-F3: the recovery has to converge.
-
-        Replacing `.claude/skills` with a regular file made `-e "$dest"` false
-        through ENOTDIR, so check reported "mirror missing" and told the
-        operator to rerun the sync — whose `mkdir -p` then failed. The component
-        walk now distinguishes "not a directory" from "missing", and only the
-        genuinely-missing case gets the rerun line.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            ancestor = repo / ".claude/skills"
-            shutil.rmtree(ancestor)
-            ancestor.write_text("not a directory\n", encoding="utf-8")
-
-            checked = self._check(repo)
-            self.assertEqual(1, checked.returncode, msg=checked.stdout)
-            self.assertIn("path component is not a directory", checked.stderr)
-            self.assertNotIn("mirror missing", checked.stderr)
-            self.assertNotIn(
-                "Rerun 'scripts/sync_legacy_project_skill.sh'", checked.stderr
-            )
-
-            synced = self._sync(repo)
-            self.assertEqual(1, synced.returncode)
-            self.assertNotIn(
-                "synced legacy project skill mirror", synced.stdout
-            )
-
-    def test_genuinely_missing_mirror_still_gets_the_rerun_recovery(self) -> None:
-        """The converse of the test above: don't over-correct into silence.
-
-        A mirror directory that simply does not exist yet IS cleared by
-        rerunning the sync, so that class must keep the rerun line.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            shutil.rmtree(repo / ".claude/skills/mozyo-bridge-agent/references")
-            checked = self._check(repo)
-            self.assertEqual(1, checked.returncode)
-            self.assertIn(
-                "Rerun 'scripts/sync_legacy_project_skill.sh'", checked.stderr
-            )
-            self.assertEqual(0, self._sync(repo).returncode)
-            self.assertEqual(0, self._check(repo).returncode)
-
-    def test_check_fails_when_the_mirror_directory_is_absent(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            shutil.rmtree(repo / ".claude/skills/mozyo-bridge-agent/references")
-            result = self._check(repo)
-            self.assertEqual(1, result.returncode, msg=result.stdout)
-            self.assertIn("mirror missing", result.stderr)
-
-    def test_missing_canonical_source_is_an_error_in_both_modes(self) -> None:
-        """A pinned name canonical no longer has must never read as 'in sync'.
-
-        Skipping the missing name would let `--check` exit 0 with a stale
-        mirror file still on disk — a fail-open the gate exists to prevent.
-        """
-        for mode in ([], ["--check"]):
-            with self.subTest(mode=mode or ["sync"]):
-                with tempfile.TemporaryDirectory() as tmp:
-                    repo = self._stage(Path(tmp))
-                    (
-                        repo
-                        / "skills/mozyo-bridge-agent/references/safety.md"
-                    ).unlink()
-                    result = subprocess.run(
-                        ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name), *mode],
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(1, result.returncode, msg=result.stdout)
-                    self.assertIn("canonical reference missing", result.stderr)
-
-    def test_unknown_argument_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = self._stage(Path(tmp))
-            result = subprocess.run(
-                ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name), "--force"],
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(64, result.returncode)
-            self.assertIn("unknown argument", result.stderr)
+        self.assertEqual(1, result.returncode)
+        self.assertIn("unpinned.txt", result.stderr)
 
 
 if __name__ == "__main__":

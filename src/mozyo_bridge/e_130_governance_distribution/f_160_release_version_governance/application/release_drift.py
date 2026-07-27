@@ -47,9 +47,8 @@ _PLUGIN_MIRROR_RECOVERY = (
 _LEGACY_PROJECT_MIRROR_RECOVERY = (
     "follow the disposition the sub-check printed above: content drift and a missing "
     "mirrored file are cleared by rerunning `scripts/sync_legacy_project_skill.sh` "
-    "(no --check, from the repo root); an unpinned reference is not — that sync "
-    "refuses while one is present, and it needs a reviewed delete or a pinned-set "
-    "update in the script and its test. Then recommit."
+    "(no --check, from the repo root); an unpinned entry is not — that sync refuses "
+    "while one is present and never deletes it for you. Then recommit."
 )
 
 
