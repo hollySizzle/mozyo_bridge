@@ -82,7 +82,16 @@ GATE_MALFORMED = "\n".join(
 
 HEAD = "4f2b9c1a3d5e6f708192a3b4c5d6e7f809a1b2c3"
 
-REVIEW_REQUEST = f"## Gate: Review Request\n- commit: {HEAD}\n"
+# A COMPLIANT governed review_request: the template mandates `changed_paths`, and a real one
+# carries it (this issue's own RR j#89842 does). A change-bearing journal that declares a commit
+# WITHOUT them declares an unproven scope and shadows — see ReviewJ90289Tests.
+REVIEW_REQUEST = (
+    f"## Gate: Review Request\n"
+    f"- commit: {HEAD}\n"
+    "- changed_paths:\n"
+    "  - `vibes/docs/rules/agent-workflow.md`\n"
+    "  - `vibes/docs/logics/coordinator-sublane-development-flow.md`\n"
+)
 # The durable change scope every exemption's path coverage is checked against (review j#90137 F1).
 # Both paths are inside GATE_EXEMPT's ``allowed_paths``.
 IMPLEMENTATION_DONE = (
@@ -538,9 +547,116 @@ class ReviewJ90244Tests(unittest.TestCase):
             self.assertTrue(self._resolve(self._obs(t, self._history(proven))))
 
     def test_a_newer_journal_that_declares_nothing_leaves_the_scope_standing(self):
-        """Absence is not a declaration: only a journal CARRYING the field supersedes."""
-        facts, _ = state_of(self._history(f"## Gate: Review Request\n- commit: {HEAD}\n"))
-        # The review round supersedes the exemption here, but the SCOPE is still j#100's.
+        """Absence is not a declaration.
+
+        A ``close`` gate carries a commit too, but it reports on work already scoped rather than
+        announcing a new implementation, so it must not erase the scope of the work it closes.
+        """
+        facts, _ = state_of(self._history(f"## Gate: Close\n- commit: {HEAD}\n"))
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
+        self.assertEqual(facts.review_exemption.covered_commit, self.OLD_COMMIT)
+
+
+class ReviewJ90289Tests(unittest.TestCase):
+    """R3-F1: a change-bearing journal announcing a NEW target commit declares a change scope.
+
+    R3 keyed "is this a scope declaration?" on the ``changed_paths`` FIELD being present, so a new
+    ``## Gate: Implementation Done`` naming a different commit but omitting the field altogether
+    declared nothing — the previous commit's scope stayed authoritative and the gate went on being
+    checked against it. Announcing a new target commit as an implementation result IS a
+    declaration; without paths it is an UNPROVEN one.
+    """
+
+    OLD_COMMIT = "1111111111111111111111111111111111111111"
+    NEW_COMMIT = "2222222222222222222222222222222222222222"
+    OLD_SCOPE = (
+        f"## Gate: Implementation Done\n"
+        f"- commit: {OLD_COMMIT}\n"
+        "- changed_paths:\n"
+        "  - `vibes/docs/rules/agent-workflow.md`\n"
+    )
+
+    def _resolve(self, obs_path, *, issue="14539"):
+        return _resolve_latest_generation_admissible(
+            argparse.Namespace(
+                review_generation_json=None,
+                review_exemption_json=obs_path,
+                latest_generation_admissible=False,
+                issue=issue,
+            )
+        )
+
+    def _obs(self, tmp, journals):
+        path = Path(tmp) / "o.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "issue": "14539",
+                    "journals": [{"journal_id": j, "notes": n} for j, n in journals],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def _open_history(self, newest):
+        return [("100", self.OLD_SCOPE), ("101", GATE_EXEMPT), ("200", newest)]
+
+    def _retire_history(self, newest):
+        return self._open_history(newest) + [("203", INTEGRATION_MERGED), ("204", CLOSE)]
+
+    #: The defect's shape: a new implementation result, a new commit, no changed_paths at all.
+    NEW_COMMIT_NO_PATHS = f"## Gate: Implementation Done\n- commit: {NEW_COMMIT}\n"
+
+    def test_a_new_commit_without_changed_paths_withholds_the_exemption(self):
+        facts, state = state_of(self._open_history(self.NEW_COMMIT_NO_PATHS))
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_PATH_COVERAGE_UNPROVEN)
+        self.assertFalse(facts.review_exempt)
+        self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
+
+    def test_a_new_commit_without_changed_paths_blocks_the_terminal_retire(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertFalse(
+                self._resolve(self._obs(t, self._retire_history(self.NEW_COMMIT_NO_PATHS)))
+            )
+
+    def test_a_review_request_announcing_a_new_commit_without_paths_also_declares(self):
+        """``review_request`` is change-bearing too — it pins the commit it wants reviewed."""
+        newest = f"## Gate: Review Request\n- commit: {self.NEW_COMMIT}\n"
+        facts, _ = state_of(self._open_history(newest))
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_PATH_COVERAGE_UNPROVEN)
+
+    def test_the_same_history_with_the_new_commit_scoped_admits(self):
+        """Negative control: only the presence of the new commit's paths differs."""
+        newest = (
+            f"## Gate: Implementation Done\n"
+            f"- commit: {self.NEW_COMMIT}\n"
+            "- changed_paths:\n"
+            "  - `vibes/docs/logics/coordinator-sublane-development-flow.md`\n"
+        )
+        facts, state = state_of(self._open_history(newest))
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
+        self.assertEqual(facts.review_exemption.covered_commit, self.NEW_COMMIT)
+        self.assertEqual(state, LANE_STATE_OWNER_WAITING)
+        with tempfile.TemporaryDirectory() as t:
+            self.assertTrue(self._resolve(self._obs(t, self._retire_history(newest))))
+
+    def test_a_commit_bearing_close_gate_does_not_erase_the_scope(self):
+        """The boundary the fix must not cross: ``close`` reports on work already scoped."""
+        facts, _ = state_of(self._open_history(f"## Gate: Close\n- commit: {self.NEW_COMMIT}\n"))
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
+        self.assertEqual(facts.review_exemption.covered_commit, self.OLD_COMMIT)
+
+    def test_an_integration_disposition_does_not_erase_the_scope(self):
+        facts, _ = state_of(self._open_history(INTEGRATION_MERGED))
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
+        self.assertEqual(facts.review_exemption.covered_commit, self.OLD_COMMIT)
+
+    def test_a_change_bearing_journal_with_no_commit_announces_no_new_target(self):
+        """Without a commit there is no NEW target commit, so the standing scope is unaffected."""
+        facts, _ = state_of(
+            self._open_history("## Gate: Implementation Done\n- 残リスク: none\n")
+        )
         self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
         self.assertEqual(facts.review_exemption.covered_commit, self.OLD_COMMIT)
 

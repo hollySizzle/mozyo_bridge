@@ -460,44 +460,73 @@ def _int_journal(journal_id: object) -> Optional[int]:
 
 def fold_declared_change_scope(
     journals: Sequence[Tuple[object, str]],
+    *,
+    change_bearing_journals: Sequence[object] = (),
 ) -> DeclaredChangeScope:
     """The LATEST durable ``(commit, changed_paths)`` declaration across one issue (pure).
 
     The governed ``implementation_done`` / ``review_request`` journals declare the target commit
-    and the paths it changed; this reads the newest journal that carries a ``changed_paths``
-    field and takes the commit from that SAME journal, so the two are correlated rather than
-    stitched across unrelated records (Redmine #14539 review j#90137 F1).
+    and the paths it changed; this reads the newest journal that DECLARES a change scope and takes
+    the commit from that SAME journal, so the two are correlated rather than stitched across
+    unrelated records (Redmine #14539 review j#90137 F1).
 
     A journal that declares changed paths but no commit — or a commit but no paths — yields an
     unproven scope, and an unproven scope can never satisfy a coverage check.
 
-    **A declaration supersedes by EXISTING, not by being valid** (Redmine #14539 review j#90244
-    R2-F1; the same invariant this module already applies to the gate itself, and that
+    **A declaration supersedes by EXISTING, not by being valid** (review j#90244 R2-F1; the same
+    invariant this module applies to the gate itself, and that
     :func:`...glance_integration_disposition.fold_work_unit` carries from #13490 j#85365 F1). The
-    latest journal that CARRIES a ``changed_paths`` field wins, and only THEN is its content
-    judged. Skipping a newer empty / commit-less declaration instead — the R2 behaviour — left a
-    STALE older scope as "latest", so a gate kept being checked against the previous commit's
-    path set: j200 declaring a new commit with an empty ``changed_paths`` still read as
-    ``exempt`` against j100's paths.
+    latest DECLARING journal wins, and only THEN is its content judged — a newer empty or
+    commit-less declaration shadows an older proven scope instead of being skipped so the stale
+    one stays "latest".
+
+    **What counts as declaring a change scope** (review j#90289 R3-F1). Either:
+
+    1. the journal carries a ``changed_paths`` field — whatever it contains; or
+    2. the journal is a CHANGE-BEARING gate (its id is in ``change_bearing_journals``, i.e. its
+       recognized gate is ``implementation_done`` / ``review_request``) AND it declares a commit.
+
+    Rule 2 is what R3 was missing. Keying only on the field's presence meant a NEW
+    ``## Gate: Implementation Done`` naming a new target commit but omitting ``changed_paths``
+    altogether declared nothing, so the previous commit's scope stayed authoritative and the gate
+    kept being checked against it. Announcing a new target commit as an implementation result IS
+    a change-scope declaration; if it does not say which paths changed, that scope is unproven.
+
+    ``change_bearing_journals`` is supplied by the caller that owns gate recognition
+    (:func:`...glance_journal_grammar.fold_issue_gate_facts`) rather than re-derived here, so the
+    gate vocabulary stays in ONE place — the drift this codebase keeps paying for otherwise
+    (#13952). Its default is empty, which leaves only rule 1 — the total, fail-open-to-strictness
+    behaviour for a direct caller that cannot classify gates.
+
+    Non-change-bearing journals (``close`` / an integration disposition / an ordinary note) still
+    declare nothing and leave the scope standing: **absence is not a declaration**. Otherwise a
+    Close gate — which also carries a commit — would erase the scope of the work it closes.
 
     Boundary: this reads what the durable record DECLARES. It cannot re-derive the true changed
     set (that needs git, which this pure domain has no access to). The preset already requires
     the record to be replayable; what this adds is that a gate must be checked against the
     declared scope instead of being trusted on the strength of a non-empty field.
     """
+    change_bearing = {
+        str(j).strip() for j in (change_bearing_journals or ()) if str(j).strip()
+    }
     latest: Optional[Tuple[int, DeclaredChangeScope]] = None
     for journal_id, notes in journals or ():
         jint = _int_journal(journal_id)
         if jint is None:
             continue
-        if _CHANGED_PATHS_FIELD_RE.search(notes or "") is None:
-            continue  # no declaration here — this journal says nothing about the change scope
-        # A declaration IS present, so it supersedes regardless of what it says. An empty item
-        # list or a missing commit resolves to an UNPROVEN scope, which shadows an older proven
-        # one instead of leaving it standing.
-        paths = _path_field(_CHANGED_PATHS_FIELD_RE, notes or "")
-        commit_match = _COMMIT_FIELD_RE.search(notes or "")
+        text = notes or ""
+        commit_match = _COMMIT_FIELD_RE.search(text)
         commit = commit_match.group("value").strip().lower() if commit_match else ""
+        declares = _CHANGED_PATHS_FIELD_RE.search(text) is not None or (
+            str(jint) in change_bearing and bool(commit)
+        )
+        if not declares:
+            continue  # this journal says nothing about the change scope
+        # A declaration IS present, so it supersedes regardless of what it says. A missing /
+        # empty path list or a missing commit resolves to an UNPROVEN scope, which shadows an
+        # older proven one instead of leaving it standing.
+        paths = _path_field(_CHANGED_PATHS_FIELD_RE, text)
         if latest is None or jint > latest[0]:
             latest = (jint, DeclaredChangeScope(commit=commit, paths=paths, journal=str(jint)))
     if latest is None:
@@ -507,6 +536,8 @@ def fold_declared_change_scope(
 
 def fold_review_exemption(
     journals: Sequence[Tuple[object, str]],
+    *,
+    change_bearing_journals: Sequence[object] = (),
 ) -> ReviewExemptionFacts:
     """The LATEST durable ``codex_direct_edit`` exemption across one issue's journals (pure).
 
@@ -521,6 +552,9 @@ def fold_review_exemption(
     preset's ``close.review_exemption`` requires "対象 commit の全 changed path を覆う有効な gate",
     so a gate whose coverage cannot be shown — nothing declared to check against, or a changed
     path no glob matches — folds to :data:`EXEMPTION_PATH_COVERAGE_UNPROVEN`, not to an exemption.
+
+    ``change_bearing_journals`` is forwarded to :func:`fold_declared_change_scope`; see its
+    docstring for what makes a journal declare a change scope (review j#90289 R3-F1).
     """
     latest: Optional[Tuple[int, ReviewExemptionFacts]] = None
     for journal_id, notes in journals or ():
@@ -546,7 +580,9 @@ def fold_review_exemption(
     if resolved.state != EXEMPTION_EXEMPT:
         return resolved
 
-    scope = fold_declared_change_scope(journals)
+    scope = fold_declared_change_scope(
+        journals, change_bearing_journals=change_bearing_journals
+    )
     if not scope.proven:
         # Nothing to check the gate against. "We could not verify coverage" must never read as
         # "covered": the exemption is withheld until the record declares its change scope.

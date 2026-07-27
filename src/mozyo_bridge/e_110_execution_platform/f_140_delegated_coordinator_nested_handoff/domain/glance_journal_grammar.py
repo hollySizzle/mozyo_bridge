@@ -653,6 +653,16 @@ class _RecognizedJournal:
 #: policy decides, so its ordering against the exemption journal is irrelevant.
 _REVIEW_ROUND_GATES: frozenset[str] = frozenset({GATE_REVIEW_REQUEST, GATE_REVIEW})
 
+#: The recognized gates whose journal, when it declares a commit, ANNOUNCES A NEW TARGET COMMIT as
+#: an implementation result — so it declares a change scope even when it omits ``changed_paths``
+#: (Redmine #14539 review j#90289 R3-F1). ``close`` / ``owner_close_approval`` are deliberately
+#: absent: they also carry a commit, but they report on work already scoped, so treating them as
+#: declarations would erase the scope of the very work they close. Passed to
+#: :func:`...review_exemption.fold_declared_change_scope` so the gate vocabulary stays here.
+_CHANGE_BEARING_GATES: frozenset[str] = frozenset(
+    {GATE_IMPLEMENTATION_DONE, GATE_REVIEW_REQUEST}
+)
+
 
 def _review_exempt_now(
     exemption: ReviewExemptionFacts, recognized: Sequence["_RecognizedJournal"]
@@ -704,10 +714,6 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
     # they are folded across the whole history rather than accumulated per recognized gate.
     integration = fold_integration_disposition(journals or ())
     work_unit = fold_work_unit(journals or ())
-    # Redmine #14539: the ``codex_direct_edit`` review exemption is a third issue-wide,
-    # latest-wins authority fact standing in its OWN journal (its heading is deliberately NOT in
-    # ``_HEADING_GATE`` — it is an authority declaration, never a lifecycle gate).
-    review_exemption = fold_review_exemption(journals or ())
 
     for journal_id, notes in journals or ():
         jint = _int_journal(journal_id)
@@ -766,6 +772,19 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
 
     if not recognized:
         return None
+
+    # Redmine #14539: the ``codex_direct_edit`` review exemption is a third issue-wide,
+    # latest-wins authority fact standing in its OWN journal (its heading is deliberately NOT in
+    # ``_HEADING_GATE`` — it is an authority declaration, never a lifecycle gate). Its path-coverage
+    # check needs to know which journals are CHANGE-BEARING gates, and gate recognition lives here,
+    # so the ids are computed from the recognized set and passed down rather than re-derived in the
+    # exemption module — one gate vocabulary, not two (review j#90289 R3-F1).
+    change_bearing_journals = [
+        str(r.journal_id) for r in recognized if r.gate in _CHANGE_BEARING_GATES
+    ]
+    review_exemption = fold_review_exemption(
+        journals or (), change_bearing_journals=change_bearing_journals
+    )
 
     latest = max(recognized, key=lambda r: r.journal_id)
     return GateFacts(
