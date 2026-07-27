@@ -45,35 +45,124 @@ def _close_quietly(fd: int) -> bool:
 
 
 
-def _describe_teardown_result(outcome: object) -> str | None:
-    """Turn a teardown action's *returned* failure into a note, if it is one.
+LEDGER_ATTRIBUTE = "mozyo_teardown_failures"
+
+
+def teardown_failures(primary: BaseException) -> tuple[object, ...]:
+    """Every failure seen while tearing down ``primary``, as objects.
+
+    This is the machine-readable half of the record. Notes are for humans and
+    are best effort; this is what a caller — or a test — reads to find out that
+    a cleanup returned ``CLEANUP_FAILED`` and residue is on disk.
+    """
+    return tuple(_ledger(primary))
+
+
+def _ledger(primary: BaseException) -> list[object]:
+    """The list every teardown failure is appended to, created on first use.
+
+    Appending to a list cannot fail, and that is the entire point: the failure
+    has to be *retained* before anything fallible runs on it. Making
+    ``add_note`` the ledger meant that an interrupt during recording lost the
+    failure being recorded, not just the interrupt — a cleanup that reported
+    ``CLEANUP_FAILED`` left residue on disk and nothing reachable said so
+    (j#90503 R15-F1) — and a secondary whose ``__str__`` raised vanished
+    outright (R15-F2).
+
+    It lives in the primary's instance dictionary, reached through
+    ``object.__getattribute__`` and written by key. Both ``setattr`` and
+    ``__context__`` assignment route through a type's ``__setattr__``, so an
+    exception class that refuses attribute assignment defeats both — a second
+    carrier chained into ``__context__`` was tried and measured to fail for
+    exactly the class it was meant for. Going to the instance dictionary
+    directly is one carrier that works instead of two that do not.
+
+    ``BaseException`` instances always have an instance dictionary, so for the
+    declared parameter type retention is total. The guard below is for a
+    caller that passes something else; it degrades to a throwaway list rather
+    than raising during an unwind.
+    """
+    try:
+        state = object.__getattribute__(primary, "__dict__")
+        if not isinstance(state, dict):
+            return []
+        existing = state.get(LEDGER_ATTRIBUTE)
+        if isinstance(existing, list):
+            return existing
+        entries: list[object] = []
+        state[LEDGER_ATTRIBUTE] = entries
+        return entries
+    except Exception:  # noqa: BLE001 - never fail while already unwinding
+        return []
+
+
+def _remember(primary: BaseException, failure: object) -> None:
+    """Retain a teardown failure. Cannot fail, and must not be able to.
+
+    Idempotent by identity, so a call site may retain defensively without
+    having to know whether an earlier step already did. Equality is not
+    consulted — a failure object may define a hostile ``__eq__`` just as
+    readily as a hostile ``__str__``.
+    """
+    entries = _ledger(primary)
+    for entry in entries:
+        if entry is failure:
+            return
+    entries.append(failure)
+
+
+def _is_reported_failure(outcome: object) -> bool:
+    """Whether a teardown action *returned* a failure rather than raising one.
 
     Teardown actions report failure two ways, and only one of them is an
     exception: :meth:`_OwnedDescriptor.close` returns ``False`` for a close
     ``OSError``, and the staging release returns a non-empty violation tuple
     for a cleanup ``OSError``. Discarding those return values meant a typed
     cleanup failure vanished — the primary surfaced with no notes while
-    residue stayed on disk (j#90487 R13-F2).
+    residue stayed on disk (j#90487 R13-F2). This is a pure type test, so
+    classifying an outcome cannot itself lose it.
     """
-    if outcome is False:
+    return outcome is False or (isinstance(outcome, tuple) and bool(outcome))
+
+
+def _describe_failure(failure: object) -> str:
+    """Name a failure for a human, without trusting its ``__str__``.
+
+    A secondary whose ``__str__`` raised used to disappear entirely (j#90503
+    R15-F2). Retention no longer depends on this function at all, but a note
+    that degrades to a type name is still better than no note.
+    """
+    if failure is False:
         return "close reported a failure"
-    if isinstance(outcome, tuple) and outcome:
-        return "; ".join(
-            violation.message() if isinstance(violation, Violation) else str(violation)
-            for violation in outcome
-        )
-    return None
+    if isinstance(failure, tuple):
+        parts = []
+        for violation in failure:
+            try:
+                parts.append(
+                    violation.message() if isinstance(violation, Violation) else str(violation)
+                )
+            except Exception:  # noqa: BLE001 - degrade to identity
+                parts.append(f"<unprintable {type(violation).__name__}>")
+        return "; ".join(parts) or "a teardown result could not be described"
+    name = type(failure).__name__
+    try:
+        return f"{name}: {failure}"
+    except Exception:  # noqa: BLE001 - degrade to identity
+        return f"{name}: <unprintable>"
 
 
-def _record_secondary(primary: BaseException, secondary: BaseException) -> BaseException | None:
-    """Attach ``secondary`` to ``primary``; return control-flow raised doing so.
+def _record_secondary(primary: BaseException, secondary: object) -> BaseException | None:
+    """Retain ``secondary``, then present it; return control-flow raised doing so.
 
-    :func:`_attach_secondary` deliberately lets a control-flow exception out —
-    an interrupt outranks a note (R13-F3) — but it must not leave the loop that
-    called it, because the actions after this one would never run (j#90492
-    R14-F1). Returning it puts it on the same channel as an interrupt from the
-    action itself, so exactly one rule decides what happens next.
+    The order is the fix: retention first and unconditionally, presentation
+    second and best effort. :func:`_attach_secondary` deliberately lets a
+    control-flow exception out — an interrupt outranks a note (R13-F3) — but it
+    must not leave the loop that called it, because the actions after this one
+    would never run (j#90492 R14-F1). Returning it puts it on the same channel
+    as an interrupt from the action itself, so exactly one rule decides what
+    happens next, and the failure is on the ledger either way.
     """
+    _remember(primary, secondary)
     try:
         _attach_secondary(primary, secondary)
     except Exception:  # noqa: BLE001 - `_attach_secondary` already absorbs these
@@ -81,19 +170,6 @@ def _record_secondary(primary: BaseException, secondary: BaseException) -> BaseE
     except BaseException as interrupt:  # noqa: BLE001 - routed, not raised here
         return interrupt
     return None
-
-
-def _record_returned_failure(primary: BaseException, outcome: object) -> BaseException | None:
-    """Record a teardown action's *returned* failure, if it reported one."""
-    try:
-        note = _describe_teardown_result(outcome)
-    except Exception:  # noqa: BLE001 - describing a failure cannot itself fail loudly
-        note = "a teardown result could not be described"
-    except BaseException as interrupt:  # noqa: BLE001 - routed, not raised here
-        return interrupt
-    if note is None:
-        return None
-    return _record_secondary(primary, RuntimeError(note))
 
 
 def _run_teardown_action(primary: BaseException, action) -> BaseException | None:
@@ -109,9 +185,14 @@ def _run_teardown_action(primary: BaseException, action) -> BaseException | None
     except Exception as failure:  # noqa: BLE001 - recorded, not raised
         return _record_secondary(primary, failure)
     except BaseException as interrupt:  # noqa: BLE001 - routed, not raised here
+        # Retained here rather than by the caller: whether it goes on to be
+        # raised or merely noted, it is already on the ledger.
+        _remember(primary, interrupt)
         return interrupt
     else:
-        return _record_returned_failure(primary, outcome)
+        if _is_reported_failure(outcome):
+            return _record_secondary(primary, outcome)
+        return None
 
 
 def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
@@ -138,15 +219,17 @@ def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
       to escape the loop, so a staging release never ran and residue stayed on
       disk (j#90492 R14-F1). Recording is now on the same channel as the
       action, via :func:`_run_teardown_action`.
-    - **No teardown failure is dropped.** Later control-flow exceptions used to
-      vanish once one was held (j#90492 R14-F2); they are recorded on
-      ``primary``, which is the single ledger of everything that went wrong
-      during teardown and stays reachable as the ``__context__`` of whatever
-      the caller raises.
+    - **No teardown failure is dropped.** Every one of them — raised, returned,
+      or arriving while another was being recorded — is appended to
+      :func:`_ledger` as an *object*, before anything fallible touches it.
+      Notes are a rendering of that ledger, not the ledger itself. Making
+      ``add_note`` the record meant an interrupt mid-recording lost the failure
+      being recorded (j#90503 R15-F1), and a secondary whose ``__str__`` raised
+      was swallowed as a best-effort no-op (R15-F2).
 
-    The one bounded exception: if recording a *later* control-flow exception is
-    itself interrupted, that innermost interrupt is dropped rather than chased,
-    since the regress has no natural end. The remaining actions still run.
+    Precedence and retention are separate questions, which is what R14-F2 got
+    wrong in the other direction: the **first** control-flow exception is the
+    one the caller raises, and every later one is still on the ledger.
     """
     control_flow: BaseException | None = None
     for action in actions:
@@ -155,8 +238,14 @@ def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
             continue
         if control_flow is None:
             control_flow = arrived
+            _remember(primary, arrived)
         else:
-            _record_secondary(primary, arrived)
+            # Already retained; this adds the human-readable note. An interrupt
+            # raised by the note itself is retained too — only its *priority*
+            # is bounded, because the regress has no natural end.
+            interrupt = _record_secondary(primary, arrived)
+            if interrupt is not None:
+                _remember(primary, interrupt)
     return control_flow
 
 
@@ -204,15 +293,19 @@ class _OwnedDescriptor:
         return _close_quietly(fd)
 
 
-def _attach_secondary(primary: BaseException, secondary: BaseException) -> None:
-    """Keep a teardown failure visible without replacing the primary one.
+def _attach_secondary(primary: BaseException, secondary: object) -> None:
+    """Render a teardown failure into a note, without replacing the primary one.
 
     The exception the caller sees must stay the one that actually unwound the
     write; a close or cleanup failure is additional information, not a
     replacement (j#90477 R11-F1 condition 3).
+
+    This is presentation only. The record itself is :func:`_ledger`, which was
+    already written before this runs — so everything below may fail without
+    losing anything (j#90503 R15-F1/F2).
     """
     try:
-        note = f"{type(secondary).__name__}: {secondary}"
+        note = _describe_failure(secondary)
         add_note = getattr(primary, "add_note", None)
         if add_note is not None:
             add_note(f"secondary failure during teardown: {note}")

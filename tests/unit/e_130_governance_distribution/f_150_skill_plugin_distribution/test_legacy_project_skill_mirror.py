@@ -2005,6 +2005,185 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         notes = "\n".join(getattr(primary, "__notes__", []))
         self.assertIn("SystemExit", notes, "the second control-flow failure was dropped")
 
+    def test_a_broken_note_still_leaves_the_cleanup_failure_reachable(self) -> None:
+        """j#90503 R15-F1. Making `add_note` the ledger meant that an interrupt
+        during recording lost the failure *being recorded*, not just the
+        interrupt: the release ran, reported `CLEANUP_FAILED`, left residue —
+        and nothing reachable from the exception said so.
+
+        The composite is the point. Interrupt priority, one release, residue on
+        disk, and the typed cleanup failure reachable are one property, not
+        four; fixing any of them alone is what the last three rounds did.
+        """
+
+        class PrimaryWrite(Exception):
+            def add_note(self, note: str) -> None:  # type: ignore[override]
+                raise KeyboardInterrupt("interrupt while recording")
+
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        service = self._service(repo)
+        real_release = service._release_staging
+        calls: list[int] = []
+
+        def counting_release(mirror_fd: int, temp_name: str, identity):  # type: ignore[no-untyped-def]
+            calls.append(1)
+            return real_release(mirror_fd, temp_name, identity)
+
+        service._release_staging = counting_release  # type: ignore[method-assign]
+        tracking_open, failing_close, state = self._fail_staging_close_with(
+            RuntimeError("injected ordinary close failure")
+        )
+
+        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise PrimaryWrite("injected write unwind")
+
+        def failing_unlink(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise PermissionError(errno.EACCES, "injected")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "close", failing_close
+            ):
+                with unittest.mock.patch.object(
+                    legacy_mirror_sync.os, "write", primary_write
+                ):
+                    with unittest.mock.patch.object(
+                        legacy_mirror_sync.os, "unlink", failing_unlink
+                    ):
+                        with self.assertRaises(KeyboardInterrupt) as caught:
+                            service.sync()
+
+        self.assertTrue(state["fired"], "the close injection never fired")
+        primary = caught.exception.__context__
+        self.assertIsInstance(primary, PrimaryWrite)
+        self.assertEqual(1, len(calls), "the release did not run exactly once")
+        self.assertNotEqual(
+            [], self._staging_names(repo), "the fixture did not actually leave residue"
+        )
+        self.assertEqual([], getattr(primary, "__notes__", []), "the fixture must break notes")
+
+        ledger = owned_descriptors.teardown_failures(primary)
+        self.assertTrue(
+            any(
+                isinstance(entry, tuple)
+                and any(getattr(violation, "kind", None) == CLEANUP_FAILED for violation in entry)
+                for entry in ledger
+            ),
+            "the typed cleanup failure was unreachable while its residue stayed on disk",
+        )
+        self.assertTrue(
+            any(isinstance(entry, RuntimeError) for entry in ledger),
+            "the close failure was lost",
+        )
+
+    def test_a_secondary_that_cannot_be_stringified_is_still_retained(self) -> None:
+        """j#90503 R15-F2. `_attach_secondary` swallows an ordinary exception as
+        best effort, so a secondary whose `__str__` raised was reported as
+        recorded and then dropped — no special interrupt needed."""
+
+        class UnprintableFailure(Exception):
+            def __str__(self) -> str:
+                raise RuntimeError("this failure cannot be stringified")
+
+        class UnprintableExit(SystemExit):
+            def __str__(self) -> str:
+                raise RuntimeError("nor can this one")
+
+        ran: list[str] = []
+
+        def first() -> None:
+            ran.append("first")
+            raise KeyboardInterrupt("first")
+
+        def second() -> None:
+            ran.append("second")
+            raise UnprintableFailure()
+
+        def third() -> None:
+            ran.append("third")
+            raise UnprintableExit()
+
+        def fourth() -> None:
+            ran.append("fourth")
+
+        primary = Exception("write failed")
+        control = owned_descriptors._teardown_during(primary, first, second, third, fourth)
+
+        self.assertIsInstance(control, KeyboardInterrupt)
+        self.assertEqual(["first", "second", "third", "fourth"], ran)
+
+        kinds = {type(entry) for entry in owned_descriptors.teardown_failures(primary)}
+        self.assertIn(UnprintableFailure, kinds, "the unprintable ordinary failure was dropped")
+        self.assertIn(UnprintableExit, kinds, "the unprintable control-flow failure was dropped")
+
+        # The note is presentation, and it degrades to the type name rather
+        # than disappearing — a reader still learns what arrived.
+        notes = "\n".join(getattr(primary, "__notes__", []))
+        self.assertIn("UnprintableFailure", notes)
+        self.assertIn("UnprintableExit", notes)
+
+    def test_an_interrupt_while_recording_a_later_failure_is_retained(self) -> None:
+        """The innermost case: a later control-flow failure arrives, and the
+        recording of *that* is interrupted too. Only its priority is bounded —
+        both it and what it was recording stay on the ledger (j#90503)."""
+
+        class Primary(Exception):
+            def add_note(self, note: str) -> None:  # type: ignore[override]
+                raise GeneratorExit("interrupt while recording the later failure")
+
+        ran: list[str] = []
+
+        def first() -> None:
+            ran.append("first")
+            raise KeyboardInterrupt("first")
+
+        def second() -> None:
+            ran.append("second")
+            raise SystemExit("second")
+
+        def third() -> None:
+            ran.append("third")
+
+        primary = Primary("write failed")
+        control = owned_descriptors._teardown_during(primary, first, second, third)
+
+        self.assertIsInstance(control, KeyboardInterrupt)
+        self.assertEqual(["first", "second", "third"], ran)
+        kinds = {type(entry) for entry in owned_descriptors.teardown_failures(primary)}
+        self.assertIn(SystemExit, kinds, "the later control-flow failure was dropped")
+        self.assertIn(GeneratorExit, kinds, "the interrupt that broke the recording was dropped")
+
+    def test_the_ledger_survives_a_primary_that_refuses_attributes(self) -> None:
+        """The carrier has to be the instance dictionary, not `setattr`.
+
+        A `__context__`-chained second carrier was written for exactly this
+        case and measured to fail: `__context__` assignment routes through the
+        same `__setattr__` that refuses the attribute, so both carriers died
+        together. One carrier that works beats two that do not.
+        """
+
+        class Frozen(Exception):
+            def __setattr__(self, name: str, value: object) -> None:
+                raise AttributeError("this exception refuses attributes")
+
+            def __getattr__(self, name: str) -> object:
+                raise AttributeError("and refuses unknown reads")
+
+        def failing() -> None:
+            raise RuntimeError("teardown failure")
+
+        primary = Frozen("write failed")
+        owned_descriptors._teardown_during(primary, failing)
+
+        ledger = owned_descriptors.teardown_failures(primary)
+        self.assertTrue(
+            any(isinstance(entry, RuntimeError) for entry in ledger),
+            "the ledger did not survive an exception that refuses attributes",
+        )
+
     def test_cleanup_helper_runs_exactly_once_when_it_raises(self) -> None:
         """j#90472 R10-F4. I claimed the single-shot guard was structurally
         unreachable; the review showed the path. `_release_staging` raising a
