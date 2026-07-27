@@ -805,5 +805,123 @@ class CanonicalDecisionGrammarTest(unittest.TestCase):
         self.assertIn("mozyo", canonical_note_text(BOOTSTRAP_MARKER))
 
 
+class QuotedDecisionShapeTest(ProxySendTestBase):
+    """A quotation is not a decision — in EVERY shape Markdown renders as quoted (#14577 j#90392).
+
+    The first quote-aware draft stripped fenced blocks and inline backticks, which reads as "handled"
+    until you notice those are two of the four ways Markdown quotes. Live acceptance wrote the
+    grammar into a journal as a plain `>` blockquote and the rail read it as the coordinator's own
+    instruction: `decisions=[{journal: 90389}]`, `links.anchor=verified`. The delegation was
+    zero-send only because a LATER link (`proxy_coordinator_authority_missing`) happened to break —
+    an accident of the invocation context, not the quotation being refused.
+
+    So these are written as a class, not as one more special case. Each negative is a way of saying
+    "this text is an example"; each positive is the coordinator actually speaking. The positives
+    matter as much as the negatives: a rule that refuses quotations by refusing everything would
+    make the rail unusable, and the failure would look identical to a correct refusal.
+    """
+
+    #: The live probe note, verbatim (#14577 j#90389) — the shape that reached acceptance.
+    LIVE_QUOTED_NOTE = (
+        "## R8 negative probe — quoted bootstrap marker\n"
+        "\n"
+        "これは仕様例の引用であり、decisionではない。\n"
+        "\n"
+        "> [mozyo:workflow-event:gate=implementation_request:proxy_action=bootstrap_lane]\n"
+        "\n"
+        "- expected: named-journal parser がquotationとして拒否する\n"
+        "- action: `bootstrap_lane`\n"
+        "\n"
+        "issue_14577\n"
+    )
+
+    def _read(self, notes, action="bootstrap_lane"):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            marker_fields_in_note,
+        )
+
+        return canonical_decision_in_journal(notes, action=action, parse=marker_fields_in_note)
+
+    def test_the_live_acceptance_note_is_not_a_decision(self):
+        _d, refusal = self._read(self.LIVE_QUOTED_NOTE)
+        self.assertEqual(refusal, "no_canonical_decision")
+
+    def test_every_blockquote_shape_is_refused(self):
+        shapes = {
+            "plain": f"> {BOOTSTRAP_MARKER}",
+            "no space after the marker char": f">{BOOTSTRAP_MARKER}",
+            "nested": f"> > {BOOTSTRAP_MARKER}",
+            "nested without spaces": f">>{BOOTSTRAP_MARKER}",
+            "leading whitespace": f"   > {BOOTSTRAP_MARKER}",
+            "fenced inside a quote": f"> ```\n> {BOOTSTRAP_MARKER}\n> ```",
+        }
+        for label, note in shapes.items():
+            with self.subTest(shape=label):
+                _d, refusal = self._read(note)
+                self.assertEqual(refusal, "no_canonical_decision")
+
+    def test_every_verbatim_block_shape_is_refused(self):
+        shapes = {
+            "backtick fence": f"```\n{BOOTSTRAP_MARKER}\n```",
+            "backtick fence with an info string": f"```text\n{BOOTSTRAP_MARKER}\n```",
+            "tilde fence": f"~~~\n{BOOTSTRAP_MARKER}\n~~~",
+            "unclosed fence": f"```\n{BOOTSTRAP_MARKER}",
+            "indented code": f"    {BOOTSTRAP_MARKER}",
+            "tab-indented code": f"\t{BOOTSTRAP_MARKER}",
+            "inline span": f"the grammar is `{BOOTSTRAP_MARKER}`",
+        }
+        for label, note in shapes.items():
+            with self.subTest(shape=label):
+                _d, refusal = self._read(note)
+                self.assertEqual(refusal, "no_canonical_decision")
+
+    def test_the_coordinators_own_voice_still_carries_a_decision(self):
+        # The other side of the boundary. Refusing quotations must not refuse instructions.
+        shapes = {
+            "bare line": BOOTSTRAP_MARKER,
+            "three spaces of indent": f"   {BOOTSTRAP_MARKER}",
+            "on a list bullet": f"- decision: {BOOTSTRAP_MARKER}",
+            "after prose": f"この lane を bootstrap する。\n\n{BOOTSTRAP_MARKER}\n",
+            "with a `>` inside the prose": f"generation 1 > 0 なので進める。\n{BOOTSTRAP_MARKER}",
+        }
+        for label, note in shapes.items():
+            with self.subTest(shape=label):
+                decision, refusal = self._read(note)
+                self.assertEqual(refusal, "", label)
+                self.assertEqual(decision.token, "implementation_request")
+
+    def test_a_quoted_example_beside_a_real_decision_does_not_poison_it(self):
+        # The whole point of contract 5: documenting the grammar next to a real instruction must
+        # neither transfer authority to the example nor make the journal ambiguous.
+        note = f"例:\n\n> {BOOTSTRAP_MARKER}\n\n実際の decision:\n\n{BOOTSTRAP_MARKER}\n"
+        decision, refusal = self._read(note)
+        self.assertEqual(refusal, "")
+        self.assertEqual(decision.token, "implementation_request")
+
+    def test_a_marker_cannot_be_spliced_together_across_a_quoted_region(self):
+        # The marker body is `[^\]]*`, which spans newlines. Blanking a quoted line without also
+        # scanning line by line leaves an unclosed `[mozyo:` free to close on a `]` further down —
+        # and every field it needs is already on the first line, so the splice parses cleanly as a
+        # decision that no single line of the note contains.
+        note = (
+            f"{BOOTSTRAP_MARKER[:-1]}\n"  # the marker, minus its closing bracket
+            "> quoted noise\n"
+            "]\n"
+        )
+        _d, refusal = self._read(note)
+        self.assertEqual(refusal, "no_canonical_decision")
+
+    def test_the_delegation_refuses_a_blockquoted_decision_end_to_end(self):
+        # Not just the parser: the resolution must report an UNVERIFIED anchor, because the live
+        # failure was that `links.anchor` said `verified` and only a later link happened to break.
+        context = self._context(decisions={CURRENT_JOURNAL: self.LIVE_QUOTED_NOTE})
+        self.assertEqual(context.links.anchor, ANCHOR_UNVERIFIED)
+        result, port = self._execute(context)
+        self.assertFalse(result.sent)
+        self.assertEqual(result.decision, ZERO_SEND)
+        self.assertEqual(result.reason, REASON_ANCHOR_UNVERIFIED)
+        self.assertEqual(port.calls, [])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

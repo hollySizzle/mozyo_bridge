@@ -78,10 +78,26 @@ authorize したかを照合しなければ scope は未検証のままである
   candidate になり、その対策として入れた「2 件以上は ambiguity」が今度は issue を**恒久的に使用不能**
   にした。名指し journal だけを見れば、どちらも起こらない。
 - **canonical grammar** (producer: `render_bootstrap_decision_marker()`):
-  - note から fenced block と inline code span を除去してから scan する。**引用・code block 内の
-    marker は candidate にならない。**
-  - top-level workflow-event marker が**ちょうど 1 件**であること。0 件 / 2 件以上は fixed reason で
-    拒否する。
+  - **canonical な行だけを scan する。** canonical decision とは coordinator が**自分の声で**書いた
+    指示であり、Markdown が「引用」「逐語」として描画するものは定義上それではない。規則は
+    `canonical_note_text()` に 1 箇所だけ列挙し、全行に同順で適用する:
+    - **A. fenced code** — ` ``` ` / `~~~` の opener から closer まで (fence 行を含む)。閉じていない
+      fence は以降を全部飲む (半開の引用も引用である = fail-closed)。
+    - **B. blockquote** — 先頭の非空白文字が `>`。nest (`> >`) と leading whitespace を含む。
+    - **C. indented code** — 4 space 以上 (または tab) の indent。
+    - **D. inline code** — canonical 行内の backtick span。
+    ★**A と D だけを覆った初版は live acceptance で破れた** (#14577 j#90392)。journal に `>` で
+    grammar を引用しただけの note が `links.anchor=verified` を返し、zero-send になったのは後段の
+    別 link がたまたま壊れていたからにすぎない。**引用の形は 1 つではないので、報告された形だけを
+    塞ぐと次の形が残る。** B と C は同じ class として同時に塞ぐ。
+  - 代償として **decision は top-level に書く**必要がある (list bullet の下に 4 space indent した
+    marker は拒否される)。この向きの失敗は coordinator が column 0 に書き直せば済む。逆向きの失敗
+    (引用に authority を渡す) は復旧できない。
+  - **scan は行単位で行う。** marker body の grammar は `[^\]]*` で改行を跨ぐため、blank 化した note
+    を 1 文字列として scan すると、canonical 行の閉じていない `[mozyo:` が引用行を越えて後続の `]`
+    で閉じ、**どの 1 行にも存在しない marker** が成立しうる。
+  - canonical 行上の workflow-event marker が**ちょうど 1 件**であること。0 件 / 2 件以上は fixed
+    reason で拒否する。
   - marker は `proxy_action` field で**どの action を authorize するか**を明示する。欠落は
     `action_not_declared` で拒否。lane-scoped の場合は `lane` / `lane_generation` も持つ。
   - journal id は marker を持つ **entry 自身の id** を使う (marker の自己申告は使わない)。
