@@ -49,9 +49,15 @@ def _envelope(context, *, action: str, executed: bool, result=None) -> dict:
         "lane_id": "default",
         "issue": context.issue,
         "journal": context.journal,
-        "decision_journals": {
-            token: list(journals) for token, journals in context.decision_journals.items()
-        },
+        "decisions": [
+            {
+                "journal": d.journal,
+                "token": d.token,
+                "lane": d.lane,
+                "lane_generation": d.lane_generation,
+            }
+            for d in context.decisions
+        ],
         "links": {
             "action": links.action,
             "workspace": links.workspace,
@@ -179,6 +185,72 @@ def _emit(payload: dict, *, as_json: bool, rc: int) -> int:
     return rc
 
 
+def cmd_workflow_proxy_ack(args: argparse.Namespace) -> int:
+    """Acknowledge a delivered delegation so the route may take its next decision.
+
+    The completion half of the exactly-once lifecycle (review j#89918 finding 1). Without it the
+    rail delivers once and then wedges: a ``delivered`` generation holds the route, and only a
+    completion lets a strictly newer durable decision mint the next one. The acknowledgement is a
+    **production surface** rather than an implicit side effect because the thing being asserted —
+    "the coordinator acted on the delegated decision" — is not something the delivery path can
+    observe. A delegation whose outcome is unknown must keep holding the route.
+
+    The coordinator (or an operator on its behalf) passes the opaque ``proxy_action_id`` the
+    delegation carried. It advances only a positively **delivered** generation in this workspace;
+    an unknown / stale id, a reserved or uncertain generation, and a foreign workspace all no-op.
+    """
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.core.state.coordinator_proxy_fence import CoordinatorProxyFence
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
+        live_workspace_id,
+    )
+
+    repo_root = repo_root_from_args(args)
+    workspace_id = live_workspace_id(repo_root)
+    action_id = (getattr(args, "proxy_action_id", "") or "").strip()
+    as_json = bool(getattr(args, "as_json", False))
+
+    fence = CoordinatorProxyFence()
+    completed = False
+    if not workspace_id:
+        reason = "proxy_workspace_unresolved"
+        detail = "the workspace anchor could not be derived from the repo checkout"
+    elif not action_id:
+        reason = "proxy_action_id_required"
+        detail = "--proxy-action-id is required; it is the opaque id the delegation carried"
+    elif not fence.is_bootstrapped():
+        reason = "proxy_fence_unavailable"
+        detail = "the delegation store is not bootstrapped; nothing to acknowledge"
+    else:
+        completed = fence.complete_by_action_id(action_id, workspace_id=workspace_id)
+        reason = "" if completed else "proxy_ack_no_match"
+        detail = (
+            "the delivered generation was completed; the route may now take a strictly newer "
+            "durable decision"
+            if completed
+            else "no positively delivered generation in this workspace carries that action id "
+            "(unknown / stale id, a still-reserved or uncertain generation, or another workspace)"
+        )
+
+    payload = {
+        "action": "proxy-ack",
+        "proxy_action_id": action_id,
+        "workspace_id": workspace_id,
+        "completed": completed,
+        "reason": reason,
+        "detail": detail,
+    }
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"workflow proxy-ack: completed={completed}")
+        print(f"  proxy_action_id: {action_id or '-'}")
+        if reason:
+            print(f"  reason         : {reason}")
+        print(f"  detail         : {detail}")
+    return 0 if completed else 1
+
+
 def cmd_workflow_proxy_fence(args: argparse.Namespace) -> int:
     """Operator surface for the coordinator-proxy delegation store (Redmine #14546).
 
@@ -261,6 +333,31 @@ def register_proxy_parsers(workflow_sub) -> None:
     )
     proxy.set_defaults(func=cmd_workflow_proxy)
 
+    ack = workflow_sub.add_parser(
+        "proxy-ack",
+        description=(
+            "Acknowledge a delivered coordinator-proxy delegation (Redmine #14546). The completion "
+            "half of the exactly-once lifecycle: a delivered generation holds its route until it is "
+            "acknowledged, so without this the rail delivers once and then refuses every later "
+            "decision as a duplicate. Pass the opaque proxy_action_id the delegation carried. It "
+            "advances only a positively delivered generation in this workspace; an unknown / stale "
+            "id, a reserved or uncertain generation, and a foreign workspace all no-op with a "
+            "nonzero exit."
+        ),
+        help="Acknowledge a delivered delegation so the route may take its next decision.",
+    )
+    ack.add_argument(
+        "--proxy-action-id",
+        dest="proxy_action_id",
+        default="",
+        help="The opaque id the delegation carried (required).",
+    )
+    ack.add_argument(
+        "--json", dest="as_json", action="store_true",
+        help="Emit exactly one structured envelope as JSON.",
+    )
+    ack.set_defaults(func=cmd_workflow_proxy_ack)
+
     fence_p = workflow_sub.add_parser(
         "proxy-fence",
         description=(
@@ -284,6 +381,7 @@ def register_proxy_parsers(workflow_sub) -> None:
 
 __all__ = (
     "cmd_workflow_proxy",
+    "cmd_workflow_proxy_ack",
     "cmd_workflow_proxy_fence",
     "register_proxy_parsers",
 )

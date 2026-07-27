@@ -56,12 +56,16 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
     ACTION_DISPATCH_NEXT,
     ANCHOR_ACTION_MISMATCH,
+    ANCHOR_DECISION_INCOMPLETE,
+    ANCHOR_GENERATION_STALE,
     ANCHOR_SUPERSEDED,
     ANCHOR_UNVERIFIED,
     ANCHOR_VERIFIED,
     AUTHORITY_MISSING,
     AUTHORITY_RESOLVED,
     REASON_ANCHOR_ACTION_MISMATCH,
+    REASON_ANCHOR_DECISION_INCOMPLETE,
+    REASON_ANCHOR_GENERATION_STALE,
     REASON_ANCHOR_SUPERSEDED,
     REASON_ANCHOR_UNVERIFIED,
     REASON_AUTHORITY_MISSING,
@@ -79,6 +83,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     TARGET_UNATTESTED,
     WORKSPACE_UNRESOLVED,
     ZERO_SEND,
+    DecisionRecord,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (  # noqa: E501
     SCHEMA_NAME,
@@ -103,10 +108,14 @@ CURRENT_JOURNAL = "89736"
 #: A real journal on the same issue carrying a DIFFERENT decision token.
 OTHER_KIND_JOURNAL = "89873"
 
-DECISIONS = {
-    "implementation_request": (OLDER_JOURNAL, CURRENT_JOURNAL),
-    "implementation_done": (OTHER_KIND_JOURNAL,),
-}
+LANE = "issue_14546_default_coordinator_authority"
+
+#: Canonical dispatch decisions carry lane + generation; the other-kind gate does not.
+DECISIONS = (
+    DecisionRecord(OLDER_JOURNAL, "implementation_request", LANE, "1"),
+    DecisionRecord(CURRENT_JOURNAL, "implementation_request", LANE, "2"),
+    DecisionRecord(OTHER_KIND_JOURNAL, "implementation_done"),
+)
 
 
 def _attested(_name, *, locator, workspace_id, provider):
@@ -177,7 +186,7 @@ class ProxySendTestBase(unittest.TestCase):
         attestation=None,
     ):
         rows = [_row(WS, "codex")] if rows is None else rows
-        decisions = DECISIONS if decisions is None else decisions
+        decisions = DECISIONS if decisions is None else tuple(decisions)
         return resolve_proxy_context(
             argparse.Namespace(repo=str(self.repo)),
             action=action,
@@ -223,12 +232,18 @@ class ResolutionTest(ProxySendTestBase):
         self.assertEqual(context.links.authority, AUTHORITY_MISSING)
         self.assertEqual(context.provider, "")
 
-    def test_a_superseded_journal_is_not_verified(self):
+    def test_an_older_lane_generation_is_not_verified(self):
         context = self._context(journal=OLDER_JOURNAL)
-        self.assertEqual(context.links.anchor, ANCHOR_SUPERSEDED)
+        self.assertEqual(context.links.anchor, ANCHOR_GENERATION_STALE)
+
+    def test_a_decision_without_lane_or_generation_is_not_verified(self):
+        context = self._context(
+            decisions=(DecisionRecord(CURRENT_JOURNAL, "implementation_request"),)
+        )
+        self.assertEqual(context.links.anchor, ANCHOR_DECISION_INCOMPLETE)
 
     def test_an_unreachable_redmine_is_not_verified(self):
-        context = self._context(decisions={})
+        context = self._context(decisions=())
         self.assertEqual(context.links.anchor, ANCHOR_UNVERIFIED)
 
     def test_a_journal_carrying_another_decision_does_not_authorize_this_action(self):
@@ -371,10 +386,14 @@ class SendCountTest(ProxySendTestBase):
              lambda: self._context(rows=[_row(WS, "codex", locator="a"),
                                          _row(WS, "codex", locator="b")]),
              REASON_TARGET_AMBIGUOUS),
-            ("superseded anchor", lambda: self._context(journal=OLDER_JOURNAL),
-             REASON_ANCHOR_SUPERSEDED),
-            ("unverified anchor", lambda: self._context(decisions={}),
+            ("unverified anchor", lambda: self._context(decisions=()),
              REASON_ANCHOR_UNVERIFIED),
+            ("decision without a lane/generation",
+             lambda: self._context(
+                 decisions=(DecisionRecord(CURRENT_JOURNAL, "implementation_request"),)),
+             REASON_ANCHOR_DECISION_INCOMPLETE),
+            ("stale lane generation", lambda: self._context(journal=OLDER_JOURNAL),
+             REASON_ANCHOR_GENERATION_STALE),
             ("action mismatch", lambda: self._context(journal=OTHER_KIND_JOURNAL),
              REASON_ANCHOR_ACTION_MISMATCH),
             ("unattested target", lambda: self._context(attestation=_unattested("absent")),
@@ -431,6 +450,82 @@ class SendCountTest(ProxySendTestBase):
         self.assertEqual(port2.calls, [])
 
 
+class AcknowledgementLifecycleTest(ProxySendTestBase):
+    """The completion half of exactly-once (review j#89918 finding 1).
+
+    The first draft delivered, marked `delivered`, and stopped. Nothing in the product ever
+    completed the generation, so the route stayed held forever and every later decision — including
+    a genuinely newer one — was refused as a duplicate. A rail that works exactly once and then
+    wedges is not a repeatable single-step entrypoint, and the tests hid it by driving `complete()`
+    directly. These exercise the acknowledgement the way the product does.
+    """
+
+    NEWER_JOURNAL = "90100"
+    NEWER_DECISIONS = DECISIONS + (
+        DecisionRecord("90100", "implementation_request", LANE, "3"),
+    )
+
+    def _ack(self, action_id):
+        from mozyo_bridge.core.state.coordinator_proxy_fence import CoordinatorProxyFence
+
+        # The production surface resolves the store from the home; drive the same method the
+        # `workflow proxy-ack` command calls, on this test's store.
+        return self.fence.complete_by_action_id(action_id, workspace_id=WS)
+
+    def test_without_an_ack_a_newer_decision_is_refused(self):
+        first, port = self._execute(self._context())
+        self.assertTrue(first.sent)
+
+        newer, port2 = self._execute(
+            self._context(journal=self.NEWER_JOURNAL, decisions=self.NEWER_DECISIONS)
+        )
+        self.assertFalse(newer.sent)
+        self.assertEqual(newer.reason, REASON_DUPLICATE)
+        self.assertEqual(port2.calls, [])
+
+    def test_ack_then_a_strictly_newer_decision_delivers_once(self):
+        first, _ = self._execute(self._context())
+        self.assertTrue(first.sent)
+        self.assertTrue(self._ack(first.action_id))
+
+        newer, port = self._execute(
+            self._context(journal=self.NEWER_JOURNAL, decisions=self.NEWER_DECISIONS)
+        )
+        self.assertTrue(newer.sent)
+        self.assertEqual(len(port.calls), 1)
+        self.assertEqual(port.calls[0][1], self.NEWER_JOURNAL)
+        self.assertNotEqual(newer.action_id, first.action_id)
+
+    def test_ack_does_not_reopen_the_same_decision(self):
+        first, _ = self._execute(self._context())
+        self.assertTrue(self._ack(first.action_id))
+
+        repeat, port = self._execute(self._context())
+        self.assertFalse(repeat.sent)
+        self.assertEqual(repeat.reason, REASON_DUPLICATE)
+        self.assertEqual(port.calls, [])
+
+    def test_an_unknown_or_stale_action_id_acks_nothing(self):
+        first, _ = self._execute(self._context())
+        self.assertFalse(self._ack("pxy_deadbeef"))
+        self.assertFalse(self._ack(""))
+        self.assertTrue(self._ack(first.action_id))
+        self.assertFalse(self._ack(first.action_id))  # already completed
+
+    def test_a_foreign_workspace_cannot_ack(self):
+        first, _ = self._execute(self._context())
+        self.assertFalse(
+            self.fence.complete_by_action_id(first.action_id, workspace_id=FOREIGN_WS)
+        )
+        self.assertTrue(self._ack(first.action_id))
+
+    def test_an_undelivered_generation_cannot_be_acked(self):
+        # A send whose outcome was unknown stays uncertain: an ack must not paper over it.
+        result, _ = self._execute(self._context(), port=CountingSendPort(result=SEND_FAILED))
+        self.assertFalse(result.sent)
+        self.assertFalse(self._ack(result.action_id))
+
+
 class DecisionJournalFoldTest(unittest.TestCase):
     """The anchor evidence is read from the GENERIC workflow-event token (review j#89878 F1)."""
 
@@ -461,20 +556,22 @@ class DecisionJournalFoldTest(unittest.TestCase):
     def test_the_dispatch_decision_is_visible(self):
         # The exact regression: `implementation_request` is NOT in the callback-gate vocabulary,
         # so reading through that reader made the one decision `dispatch_next` needs invisible.
-        self.assertEqual(self._fold()["implementation_request"], ("89688",))
+        journals = [d.journal for d in self._fold() if d.token == "implementation_request"]
+        self.assertEqual(journals, ["89688"])
 
     def test_each_journal_is_keyed_by_its_own_entry_id(self):
-        folded = self._fold()
-        self.assertEqual(folded["start"], ("89754",))
-        self.assertEqual(folded["implementation_done"], ("89873",))
+        folded = {d.token: d.journal for d in self._fold()}
+        self.assertEqual(folded["start"], "89754")
+        self.assertEqual(folded["implementation_done"], "89873")
 
     def test_prose_is_never_a_decision(self):
-        self.assertNotIn("89900", [j for js in self._fold().values() for j in js])
+        self.assertNotIn("89900", [d.journal for d in self._fold()])
 
     def test_another_issue_s_entry_never_contributes(self):
-        self.assertNotIn("89901", [j for js in self._fold().values() for j in js])
+        self.assertNotIn("89901", [d.journal for d in self._fold()])
 
-    def test_the_dispatch_grammar_kind_field_is_also_a_decision(self):
+    def test_the_canonical_dispatch_marker_s_lane_and_generation_are_preserved(self):
+        # Review j#89918 F2: dropping these is what left the decision unmatchable.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
             RedmineJournalEntry,
         )
@@ -482,10 +579,19 @@ class DecisionJournalFoldTest(unittest.TestCase):
         entries = [
             RedmineJournalEntry(
                 ISSUE, "90000",
-                "[mozyo:workflow-event:kind=implementation_request:lane=l:lane_generation=1]",
+                "[mozyo:workflow-event:kind=implementation_request:lane=lane_a:lane_generation=3]",
             )
         ]
-        self.assertEqual(self._fold(entries)["implementation_request"], ("90000",))
+        (record,) = self._fold(entries)
+        self.assertEqual(record.journal, "90000")
+        self.assertEqual(record.token, "implementation_request")
+        self.assertEqual(record.lane, "lane_a")
+        self.assertEqual(record.lane_generation, "3")
+
+    def test_a_gate_style_marker_carries_no_lane_or_generation(self):
+        (record,) = [d for d in self._fold() if d.token == "implementation_request"]
+        self.assertEqual(record.lane, "")
+        self.assertEqual(record.lane_generation, "")
 
 
 if __name__ == "__main__":  # pragma: no cover

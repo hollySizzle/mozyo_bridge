@@ -54,6 +54,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ZERO_SEND,
     ProxyDecision,
     ProxyLinks,
+    DecisionRecord,
     anchor_status_for,
     decide_proxy_delegation,
     normalize_action,
@@ -103,8 +104,8 @@ class ProxyContext:
     target: ProxyTarget = field(default_factory=lambda: ProxyTarget(status="missing"))
     issue: str = ""
     journal: str = ""
-    #: decision token -> the issue's journal ids carrying it, in note order (the anchor evidence).
-    decision_journals: "dict[str, tuple[str, ...]]" = field(default_factory=dict)
+    #: the issue's durable decisions in note order (the anchor evidence).
+    decisions: "tuple[DecisionRecord, ...]" = ()
     authority_reason: str = ""
     detail: str = ""
 
@@ -145,7 +146,7 @@ _WORKFLOW_EVENT_CHANNEL = "workflow-event"
 
 def live_decision_journals(
     args: argparse.Namespace, issue: str
-) -> "dict[str, tuple[str, ...]]":
+) -> "tuple[DecisionRecord, ...]":
     """The issue's decision token -> journal ids, in note order, from source-of-truth Redmine.
 
     Reads the **generic** workflow-event marker rather than the callback-gate reader, because the
@@ -164,7 +165,7 @@ def live_decision_journals(
     """
     issue = (issue or "").strip()
     if not issue:
-        return {}
+        return ()
     try:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
             LiveRedmineJournalSource,
@@ -175,11 +176,11 @@ def live_decision_journals(
 
         entries = LiveRedmineJournalSource.from_environment().read_entries(issue)
     except Exception:  # noqa: BLE001 - any live-read failure fails the anchor gate closed
-        return {}
+        return ()
     return decision_journals_from_entries(entries, issue=issue, parse=marker_fields_in_note)
 
 
-def decision_journals_from_entries(entries, *, issue: str, parse) -> "dict[str, tuple[str, ...]]":
+def decision_journals_from_entries(entries, *, issue: str, parse) -> "tuple[DecisionRecord, ...]":
     """The decision token -> journal ids fold over already-read entries (pure over its inputs).
 
     Split out of :func:`live_decision_journals` so the fold — which is where the anchor evidence is
@@ -187,7 +188,7 @@ def decision_journals_from_entries(entries, *, issue: str, parse) -> "dict[str, 
     scanner (``marker_fields_in_note``), injected rather than imported so this stays a pure fold.
     """
     issue = (issue or "").strip()
-    decisions: "dict[str, list[str]]" = {}
+    decisions: list = []
     for entry in entries or ():
         if str(getattr(entry, "issue_id", "")).strip() != issue:
             continue  # an entry from another issue never authorizes this anchor
@@ -200,10 +201,20 @@ def decision_journals_from_entries(entries, *, issue: str, parse) -> "dict[str, 
             token = (fields.get("gate") or fields.get("kind") or "").strip()
             if not token:
                 continue
-            bucket = decisions.setdefault(token, [])
-            if journal not in bucket:
-                bucket.append(journal)
-    return {token: tuple(journals) for token, journals in decisions.items()}
+            # The canonical dispatch producer writes `lane` / `lane_generation` alongside the
+            # token. They are carried through here rather than discarded, because they are what
+            # makes the decision exact-matchable (review j#89918 finding 2); a decision without
+            # them is kept but classified `decision_incomplete` downstream, never silently
+            # accepted.
+            decisions.append(
+                DecisionRecord(
+                    journal=journal,
+                    token=token,
+                    lane=(fields.get("lane") or "").strip(),
+                    lane_generation=(fields.get("lane_generation") or "").strip(),
+                )
+            )
+    return tuple(decisions)
 
 
 def live_attestation_join(assigned_name: str, *, locator: str, workspace_id: str, provider: str):
@@ -376,7 +387,7 @@ def resolve_proxy_context(
     repo_root,
     env: Mapping[str, str],
     rows_provider: Optional[Callable[[Mapping[str, str]], Sequence[Mapping]]] = None,
-    decision_journals_provider: Optional[Callable[..., "dict[str, tuple[str, ...]]"]] = None,
+    decision_journals_provider: Optional[Callable[..., "tuple[DecisionRecord, ...]"]] = None,
     workspace_provider: Optional[Callable[..., str]] = None,
     attestation_join: Optional[Callable[..., "tuple[bool, str, str]"]] = None,
 ) -> ProxyContext:
@@ -416,12 +427,10 @@ def resolve_proxy_context(
         else ProxyTarget(status=target_status_from_cardinality(0, 0))
     )
 
-    decision_journals: "dict[str, tuple[str, ...]]" = {}
+    decisions: "tuple[DecisionRecord, ...]" = ()
     if issue and journal:
-        decision_journals = resolve_decisions(issue) or {}
-    anchor_status = anchor_status_for(
-        journal, action=action, decision_journals=decision_journals
-    )
+        decisions = tuple(resolve_decisions(issue) or ())
+    anchor_status = anchor_status_for(journal, action=action, decisions=decisions)
 
     links = ProxyLinks(
         action=action,
@@ -441,7 +450,7 @@ def resolve_proxy_context(
         target=target,
         issue=issue,
         journal=journal,
-        decision_journals=decision_journals,
+        decisions=decisions,
         authority_reason=authority_reason,
     )
 

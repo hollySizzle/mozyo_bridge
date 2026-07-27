@@ -38,7 +38,7 @@ authority* ではない — 実行するのは coordinator 自身の attested ru
 | 3 | role | repo-local durable role authority の default-lane binding | `proxy_coordinator_authority_missing` / `proxy_coordinator_authority_blocked` |
 | 4 | provider | 当該 role の `provider_binding` | `proxy_provider_unresolved` |
 | 5 | target | live inventory の **mzb1 assigned name** decode **＋ generation-bound startup self-attestation の join** | `proxy_target_missing` / `proxy_target_ambiguous` / `proxy_target_locator_missing` / `proxy_target_unattested` |
-| 6 | anchor | source-of-truth Redmine 上の **(action, journal) pair**（§3） | `proxy_anchor_unverified` / `proxy_anchor_action_mismatch` / `proxy_anchor_superseded` |
+| 6 | anchor | source-of-truth Redmine 上の **(action, journal, lane generation) triple**（§3） | `proxy_anchor_unverified` / `proxy_anchor_action_mismatch` / `proxy_anchor_decision_incomplete` / `proxy_anchor_generation_stale` / `proxy_anchor_superseded` |
 | 7 | fence | dedicated exactly-once store | `proxy_duplicate` / `proxy_stale` / `proxy_fence_reconcile_required` / `proxy_fence_unavailable` |
 
 不変条件:
@@ -62,12 +62,14 @@ authority* ではない — 実行するのは coordinator 自身の attested ru
 - **順序は美観ではない。** 最初に壊れた link を報告することと、拒否が何を消費するかは同じ順序
   で決まる。
 
-## 3. Anchor 検証 — authority の単位は **(action, journal) の対**
+## 3. Anchor 検証 — authority の単位は **(action, journal, lane generation)**
 
 action を closed vocabulary で検証し、journal を marker 集合で検証しても、**両者を突き合わせない
 限り「決定」を検証したことにはならない**。初版はこの join を欠いており、任意の in-vocabulary
 action が任意の gate journal に乗れた（`implementation_done` が `dispatch_next` を authorize でき
-た）。対は authority の単位であり、片側ずつではない。
+た）。さらに token と journal が一致しても、その決定が **どの lane のどの generation** を
+authorize したかを照合しなければ scope は未検証のままである（review j#89918 F2）。authority の
+単位はこの三つ組であり、どれか一つずつではない。
 
 - **action → 決定 token の closed map**（`ACTION_DECISION_TOKENS`）を持つ。
   `dispatch_next` → `implementation_request`。
@@ -81,14 +83,40 @@ action が任意の gate journal に乗れた（`implementation_done` が `dispa
   決定が見えない一方、無関係な gate は anchor として使えてしまう。
 - journal id は marker を持つ **entry 自身の `journal_id`** を使う。marker の自己申告 `journal=`
   は使わない（note が自分の anchor を名乗ってはならない）。散文は source にしない。
+- canonical dispatch marker が持つ `lane` / `lane_generation` を**捨てずに保持**し、照合に使う
+  （review j#89918 F2）。これらを落とすと、token と journal が一致しただけで authorization が
+  成立してしまう。
 - 分類:
   - 当該 issue の workflow-event marker をどれも持たない journal → `unverified`。**live read 失敗も
     marker 集合が空**になるため、到達不能な Redmine が verified anchor に見えることはない。
   - marker は持つが当該 action の token ではない → `action_mismatch`。anchor は実在し、**対**が
     成立していない。どちらが誤りかを operator に区別可能な形で返すため `unverified` と分ける。
-  - 当該 action の token を持つが、同じ token を持つより新しい journal がある → `superseded`。
-    supersession は **その action 自身の決定系列の中**で判定する。無関係な後続 gate が正しい
-    authorization を stale に見せてはならず、無関係な後続 gate が代役になってもならない。
+  - 当該 action の token を持つが `lane` / 数値 `lane_generation` を欠く → `decision_incomplete`。
+    canonical producer は常に両方を書く。**scope を名指さない決定は何も authorize しない** —
+    live fact と exact-match できないからである。散文中の marker-shaped **引用**もここへ落ちる
+    (引用された gate token は lane も generation も持たない)。
+  - 同一 lane についてより新しい generation が宣言されている → `generation_stale`。lane が
+    advance した後の authorization は死んだ generation に属する。
+  - 同一 lane・同一 generation でより新しい journal が同じ token を持つ → `superseded`。
+    supersession は **その action 自身の決定系列・当該 lane の中**で判定する。無関係な後続 gate が
+    正しい authorization を stale に見せてはならず、代役になってもならない。
+
+## 3b. Acknowledgement — exactly-once の「完了」半分
+
+`delivered` generation は route を保持し、`completed` になるまで次の decision を mint できない。
+初版はこの completion を **product のどこからも呼んでいなかった**（呼んでいたのは test だけ）。
+結果、最初の positive delivery の後は、より新しい durable decision すら永久に `duplicate` 拒否
+される — 一度だけ動いて wedge する rail は反復可能な single-step 入口ではない（review j#89918 F1）。
+
+- **`mozyo-bridge workflow proxy-ack --proxy-action-id <id>`** が completion の production surface。
+  coordinator（または代理の operator）が、delegation が運んだ opaque id を渡す。
+- ack を **暗黙の副作用にしない**。主張している内容が「coordinator が委譲された decision を実行
+  した」であり、delivery path から観測できる事実ではないため。outcome 不明の delegation は route
+  を保持し続けるのが正しい。
+- CAS は **positive delivery のみ**から進む。unknown / stale id、`reserved` / `uncertain`
+  generation、別 workspace はいずれも no-op + 非ゼロ終了。ack は「着かなかったもの」を塗り潰さない。
+- ack しても **同一 decision は再開しない**（§4）。supersede する decision だけが次の generation を
+  mint する。
 
 ## 4. Exactly-once fence（`core/state/coordinator_proxy_fence.py`）
 
@@ -127,7 +155,8 @@ send が **発火した**ことは、着地した証拠ではない。positive d
 ## 6. Surface
 
 - CLI: `mozyo-bridge workflow proxy --action <token> --source redmine --issue <id> --journal <id>`
-  （既定 dry-run、`--execute` で 1 回配送）/ `mozyo-bridge workflow proxy-fence`。
+  （既定 dry-run、`--execute` で 1 回配送）/ `mozyo-bridge workflow proxy-ack --proxy-action-id <id>`
+  / `mozyo-bridge workflow proxy-fence`。
 - 実装: pure matrix `...f_140_delegated_coordinator_nested_handoff/domain/coordinator_proxy.py`、
   adapter `...application/coordinator_proxy_send.py`、CLI `...application/cli_workflow_proxy.py`、
   fence `core/state/coordinator_proxy_fence.py`。

@@ -24,6 +24,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTION_DECISION_TOKENS,
     ACTION_DISPATCH_NEXT,
     ANCHOR_ACTION_MISMATCH,
+    ANCHOR_DECISION_INCOMPLETE,
+    ANCHOR_GENERATION_STALE,
     ANCHOR_SUPERSEDED,
     ANCHOR_UNVERIFIED,
     ANCHOR_VERIFIED,
@@ -41,6 +43,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PROXY_ACTIONS,
     REASON_ACTION_UNKNOWN,
     REASON_ANCHOR_ACTION_MISMATCH,
+    REASON_ANCHOR_DECISION_INCOMPLETE,
+    REASON_ANCHOR_GENERATION_STALE,
     REASON_ANCHOR_SUPERSEDED,
     REASON_ANCHOR_UNVERIFIED,
     REASON_AUTHORITY_BLOCKED,
@@ -63,6 +67,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WORKSPACE_RESOLVED,
     WORKSPACE_UNRESOLVED,
     ZERO_SEND,
+    DecisionRecord,
     ProxyLinks,
     anchor_status_for,
     decide_proxy_delegation,
@@ -134,6 +139,8 @@ class TheOnlyDeliverPathTest(unittest.TestCase):
             (dict(anchor=ANCHOR_UNVERIFIED), REASON_ANCHOR_UNVERIFIED),
             (dict(anchor=ANCHOR_SUPERSEDED), REASON_ANCHOR_SUPERSEDED),
             (dict(anchor=ANCHOR_ACTION_MISMATCH), REASON_ANCHOR_ACTION_MISMATCH),
+            (dict(anchor=ANCHOR_DECISION_INCOMPLETE), REASON_ANCHOR_DECISION_INCOMPLETE),
+            (dict(anchor=ANCHOR_GENERATION_STALE), REASON_ANCHOR_GENERATION_STALE),
             (dict(fence=FENCE_DUPLICATE), REASON_DUPLICATE),
             (dict(fence=FENCE_STALE), REASON_STALE),
             (dict(fence=FENCE_RECONCILE), REASON_FENCE_RECONCILE),
@@ -213,26 +220,26 @@ class TargetCardinalityTest(unittest.TestCase):
 
 
 class AnchorStatusTest(unittest.TestCase):
-    """The (action, journal) PAIR is the unit of authority (review j#89878 finding 1)."""
+    """The (action, journal, lane generation) triple is the unit of authority (j#89878 / j#89918)."""
 
-    DECISIONS = {
-        "implementation_request": ("89688",),
-        "implementation_done": ("89873",),
-        "start": ("89754",),
-    }
+    #: A canonical dispatch decision names its lane AND generation; the gate-style ones do not.
+    DECISIONS = (
+        DecisionRecord("89688", "implementation_request", "lane_a", "1"),
+        DecisionRecord("89754", "start"),
+        DecisionRecord("89873", "implementation_done"),
+    )
 
     def _status(self, journal, decisions=None, action=ACTION_DISPATCH_NEXT):
         return anchor_status_for(
             journal,
             action=action,
-            decision_journals=self.DECISIONS if decisions is None else decisions,
+            decisions=self.DECISIONS if decisions is None else decisions,
         )
 
     def test_the_action_s_own_current_decision_verifies(self):
         self.assertEqual(self._status("89688"), ANCHOR_VERIFIED)
 
     def test_a_real_journal_carrying_another_decision_does_not_authorize_this_action(self):
-        # The exact defect: an implementation_done must never authorize a dispatch_next.
         self.assertEqual(self._status("89873"), ANCHOR_ACTION_MISMATCH)
         self.assertEqual(self._status("89754"), ANCHOR_ACTION_MISMATCH)
 
@@ -240,25 +247,49 @@ class AnchorStatusTest(unittest.TestCase):
         self.assertEqual(self._status("99999"), ANCHOR_UNVERIFIED)
 
     def test_an_unreachable_redmine_never_verifies(self):
-        # The live read failing yields no decisions at all; that must not read as verified.
-        self.assertEqual(self._status("89688", decisions={}), ANCHOR_UNVERIFIED)
+        self.assertEqual(self._status("89688", decisions=()), ANCHOR_UNVERIFIED)
 
     def test_an_empty_journal_never_verifies(self):
         self.assertEqual(self._status(""), ANCHOR_UNVERIFIED)
 
-    def test_a_newer_decision_of_the_same_kind_supersedes(self):
-        decisions = {"implementation_request": ("89688", "89900")}
+    def test_a_decision_without_a_lane_authorizes_nothing(self):
+        # Review j#89918 F2: a decision that names no scope cannot be exact-matched. This is also
+        # where a marker-shaped QUOTATION in prose lands — a quoted gate token has no lane.
+        decisions = (DecisionRecord("89688", "implementation_request"),)
+        self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_DECISION_INCOMPLETE)
+
+    def test_a_decision_without_a_numeric_generation_authorizes_nothing(self):
+        for generation in ("", "one", "1.0", "-1"):
+            decisions = (DecisionRecord("89688", "implementation_request", "lane_a", generation),)
+            self.assertEqual(
+                self._status("89688", decisions=decisions), ANCHOR_DECISION_INCOMPLETE, generation
+            )
+
+    def test_an_older_generation_of_the_same_lane_is_stale(self):
+        decisions = (
+            DecisionRecord("89688", "implementation_request", "lane_a", "1"),
+            DecisionRecord("89900", "implementation_request", "lane_a", "2"),
+        )
+        self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_GENERATION_STALE)
+        self.assertEqual(self._status("89900", decisions=decisions), ANCHOR_VERIFIED)
+
+    def test_another_lane_s_newer_generation_does_not_stale_this_one(self):
+        decisions = (
+            DecisionRecord("89688", "implementation_request", "lane_a", "1"),
+            DecisionRecord("89900", "implementation_request", "lane_b", "7"),
+        )
+        self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_VERIFIED)
+
+    def test_a_newer_decision_for_the_same_lane_and_generation_supersedes(self):
+        decisions = (
+            DecisionRecord("89688", "implementation_request", "lane_a", "1"),
+            DecisionRecord("89900", "implementation_request", "lane_a", "1"),
+        )
         self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_SUPERSEDED)
         self.assertEqual(self._status("89900", decisions=decisions), ANCHOR_VERIFIED)
 
     def test_a_later_unrelated_gate_does_not_supersede_the_authorization(self):
-        # Supersession is judged WITHIN the action's own decision series. An implementation_done
-        # recorded after the dispatch decision does not make that decision stale.
-        decisions = {
-            "implementation_request": ("89688",),
-            "implementation_done": ("89873",),  # a later journal, a different kind
-        }
-        self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_VERIFIED)
+        self.assertEqual(self._status("89688"), ANCHOR_VERIFIED)  # 89873 is later, other token
 
     def test_an_unknown_action_can_authorize_nothing(self):
         self.assertEqual(self._status("89688", action="not_an_action"), ANCHOR_ACTION_MISMATCH)

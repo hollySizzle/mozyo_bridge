@@ -99,6 +99,15 @@ ANCHOR_SUPERSEDED = "superseded"  # a NEWER decision of the SAME kind supersedes
 #: (review j#89878 F1). Distinct from ``unverified`` on purpose: the anchor is real, the *pairing*
 #: is not, and an operator needs to be told which of the two is wrong.
 ANCHOR_ACTION_MISMATCH = "action_mismatch"
+#: The decision marker names this action's token but omits the lane / lane_generation the
+#: canonical producer writes (review j#89918 finding 2). A decision that does not name the lane and
+#: generation it authorizes cannot be exact-matched against anything, so it authorizes nothing.
+#: This is also what a marker-shaped *quotation* in prose degrades to — a quoted gate token carries
+#: no lane or generation, so it can never pass as a decision.
+ANCHOR_DECISION_INCOMPLETE = "decision_incomplete"
+#: The decision names a lane generation that is no longer the current one for that lane: the lane
+#: was re-created / advanced, so this authorization belongs to a dead generation.
+ANCHOR_GENERATION_STALE = "generation_stale"
 
 FENCE_OPEN = "open"  # the fence reserved this delegation (the single caller cleared to deliver)
 FENCE_DUPLICATE = "duplicate"  # in flight, or this exact decision was already delegated
@@ -122,6 +131,8 @@ REASON_TARGET_UNATTESTED = "proxy_target_unattested"
 REASON_ANCHOR_UNVERIFIED = "proxy_anchor_unverified"
 REASON_ANCHOR_SUPERSEDED = "proxy_anchor_superseded"
 REASON_ANCHOR_ACTION_MISMATCH = "proxy_anchor_action_mismatch"
+REASON_ANCHOR_DECISION_INCOMPLETE = "proxy_anchor_decision_incomplete"
+REASON_ANCHOR_GENERATION_STALE = "proxy_anchor_generation_stale"
 #: The single send fired but did not positively land; the fence holds an ``uncertain`` generation
 #: awaiting an operator reconcile (review j#89878 finding 3). NOT a success.
 REASON_DELIVERY_UNCERTAIN = "proxy_delivery_uncertain"
@@ -144,6 +155,8 @@ _ANCHOR_REASON = {
     ANCHOR_UNVERIFIED: REASON_ANCHOR_UNVERIFIED,
     ANCHOR_SUPERSEDED: REASON_ANCHOR_SUPERSEDED,
     ANCHOR_ACTION_MISMATCH: REASON_ANCHOR_ACTION_MISMATCH,
+    ANCHOR_DECISION_INCOMPLETE: REASON_ANCHOR_DECISION_INCOMPLETE,
+    ANCHOR_GENERATION_STALE: REASON_ANCHOR_GENERATION_STALE,
 }
 
 _FENCE_REASON = {
@@ -302,41 +315,80 @@ def target_status_from_cardinality(
     return TARGET_OK if attested else TARGET_UNATTESTED
 
 
-def anchor_status_for(
-    journal: str,
-    *,
-    action: str,
-    decision_journals: "dict[str, tuple[str, ...]]",
-) -> str:
+@dataclass(frozen=True)
+class DecisionRecord:
+    """One durable decision the issue's journals carry (value object).
+
+    ``journal`` is the **owning entry's own** id, ``token`` the workflow-event marker's
+    ``gate`` / ``kind``, and ``lane`` / ``lane_generation`` the fields the canonical dispatch
+    producer writes. The last two are what make a decision *exact-matchable*; a decision that omits
+    them names no scope and therefore authorizes nothing (review j#89918 finding 2).
+    """
+
+    journal: str
+    token: str
+    lane: str = ""
+    lane_generation: str = ""
+
+
+def _generation_ordinal(value: object) -> Optional[int]:
+    """The numeric lane generation, or ``None`` when absent / non-numeric (pure, fail-closed)."""
+    token = str(value or "").strip()
+    return int(token) if token.isdigit() else None
+
+
+def anchor_status_for(journal: str, *, action: str, decisions: "tuple[DecisionRecord, ...]") -> str:
     """Classify a requested journal as this action's current durable decision (pure, fail-closed).
 
-    ``decision_journals`` maps a decision token (the workflow-event marker's ``gate`` / ``kind``)
-    to the issue's journal ids carrying it, in note order, as read from source-of-truth Redmine
-    (prose is never a source). The classification is the **pair** (action, journal), because
-    verifying them separately verifies neither:
+    ``decisions`` are the issue's workflow-event decisions in note order, as read from
+    source-of-truth Redmine (prose is never a source). The classification is the **pair**
+    (action, journal) *scoped to a lane generation*, because each of those three alone is
+    insufficient:
 
     - the journal carries none of this issue's workflow-event markers -> :data:`ANCHOR_UNVERIFIED`.
-      This is also what an unreachable Redmine produces (no markers at all), so a failed live read
-      can never look like a verified anchor;
+      An unreachable Redmine produces no decisions at all, so a failed live read can never look
+      like a verified anchor;
     - the journal carries a marker, but not one in this action's
       :data:`ACTION_DECISION_TOKENS` -> :data:`ANCHOR_ACTION_MISMATCH`. The anchor is real; it just
       does not authorize *this* action;
-    - the journal carries an accepted token but a LATER journal carries the same token ->
-      :data:`ANCHOR_SUPERSEDED`. Supersession is judged **within the action's own decision series**:
-      an unrelated later gate must not make the correct authorization look stale, and an unrelated
-      later gate must not stand in for it either;
+    - the accepted decision omits its ``lane`` / numeric ``lane_generation`` ->
+      :data:`ANCHOR_DECISION_INCOMPLETE`. The canonical producer always writes both; a decision
+      without them cannot be matched against any live fact, and a marker-shaped *quotation* in
+      prose lands here rather than passing as an authorization;
+    - the decision's generation is older than the newest generation declared for that same lane ->
+      :data:`ANCHOR_GENERATION_STALE`. The lane advanced; this authorization is for a dead
+      generation;
+    - a LATER journal carries the same token for the same lane and generation ->
+      :data:`ANCHOR_SUPERSEDED`. Supersession is judged **within the action's own decision series
+      for that lane**, so an unrelated later gate neither stales the real authorization nor stands
+      in for it;
     - otherwise -> :data:`ANCHOR_VERIFIED`.
     """
     want = (journal or "").strip()
-    token_map = {str(k): tuple(v or ()) for k, v in (decision_journals or {}).items()}
-    if not want or not any(want in journals for journals in token_map.values()):
+    rows = tuple(decisions or ())
+    if not want or not any(r.journal == want for r in rows):
         return ANCHOR_UNVERIFIED
 
-    accepted = ACTION_DECISION_TOKENS.get(normalize_action(action), ())
-    accepted_journals = [j for token in accepted for j in token_map.get(token, ())]
-    if want not in accepted_journals:
+    accepted_tokens = ACTION_DECISION_TOKENS.get(normalize_action(action), ())
+    accepted = [r for r in rows if r.token in accepted_tokens]
+    mine = [r for r in accepted if r.journal == want]
+    if not mine:
         return ANCHOR_ACTION_MISMATCH
-    if accepted_journals[-1] != want:
+
+    record = mine[-1]
+    generation = _generation_ordinal(record.lane_generation)
+    if not record.lane.strip() or generation is None:
+        return ANCHOR_DECISION_INCOMPLETE
+
+    same_lane = [r for r in accepted if r.lane.strip() == record.lane.strip()]
+    generations = [
+        g for g in (_generation_ordinal(r.lane_generation) for r in same_lane) if g is not None
+    ]
+    if generations and generation < max(generations):
+        return ANCHOR_GENERATION_STALE
+
+    current = [r for r in same_lane if _generation_ordinal(r.lane_generation) == generation]
+    if current and current[-1].journal != want:
         return ANCHOR_SUPERSEDED
     return ANCHOR_VERIFIED
 
@@ -361,6 +413,8 @@ __all__ = (
     "ANCHOR_UNVERIFIED",
     "ANCHOR_SUPERSEDED",
     "ANCHOR_ACTION_MISMATCH",
+    "ANCHOR_DECISION_INCOMPLETE",
+    "ANCHOR_GENERATION_STALE",
     "FENCE_OPEN",
     "FENCE_DUPLICATE",
     "FENCE_STALE",
@@ -378,6 +432,8 @@ __all__ = (
     "REASON_ANCHOR_UNVERIFIED",
     "REASON_ANCHOR_SUPERSEDED",
     "REASON_ANCHOR_ACTION_MISMATCH",
+    "REASON_ANCHOR_DECISION_INCOMPLETE",
+    "REASON_ANCHOR_GENERATION_STALE",
     "REASON_DELIVERY_UNCERTAIN",
     "REASON_DUPLICATE",
     "REASON_STALE",
@@ -386,6 +442,7 @@ __all__ = (
     "DELIVER",
     "ZERO_SEND",
     "normalize_action",
+    "DecisionRecord",
     "ProxyLinks",
     "ProxyDecision",
     "decide_proxy_delegation",

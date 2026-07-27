@@ -490,6 +490,56 @@ class CoordinatorProxyFence:
             detail or "coordinator acknowledged the delegated action", now=now,
         )
 
+    def complete_by_action_id(
+        self, action_id: str, *, workspace_id: str, detail: str = "", now: Optional[str] = None
+    ) -> bool:
+        """Complete the EXACT delivered generation carrying ``action_id`` in ``workspace_id``.
+
+        The acknowledgement hook the coordinator's ack surface drives (review j#89918 finding 1).
+        The opaque, globally-unique ``proxy_action_id`` already pins one generation, so the route's
+        lane / role / action are not required in the match; the ``workspace_id`` is the cross-check
+        that rejects an id replayed against a different workspace.
+
+        Advances **only** from :data:`PROXY_DELIVERED`. A stale / unknown id, a generation that is
+        still ``reserved``, one already ``completed``, or an ``uncertain`` one (which needs an
+        explicit reconcile) all no-op and return ``False`` — an acknowledgement can never close a
+        generation that was not positively delivered, and never a newer one than it names. Returns
+        ``False`` (never raises) on a fail-closed store: a missing completion is safe, because the
+        generation simply stays delivered until a real acknowledgement arrives.
+        """
+        aid = (action_id or "").strip()
+        if not aid:
+            return False
+        try:
+            conn = self._connect()
+        except CoordinatorProxyFenceError:
+            return False
+        stamp = now or _utc_now()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE proxy_generation SET state=?, detail=?, updated_at=? WHERE workspace_id=? "
+                "AND proxy_action_id=? AND state=?",
+                (
+                    PROXY_COMPLETED,
+                    detail or "coordinator acknowledged the delegated action",
+                    stamp,
+                    (workspace_id or "").strip(),
+                    aid,
+                    PROXY_DELIVERED,
+                ),
+            )
+            conn.execute("COMMIT")
+            return cur.rowcount > 0
+        except sqlite3.DatabaseError:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            return False
+        finally:
+            conn.close()
+
     # -- reads -------------------------------------------------------------
 
     def active(self, route: ProxyRouteKey) -> ProxyGeneration:
