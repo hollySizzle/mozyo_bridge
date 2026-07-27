@@ -15,6 +15,16 @@ The two properties that carry the security argument are asserted directly:
 - **cross-workspace is structurally impossible, not merely discouraged.** The target is selected by
   decoding the agent's own mzb1 assigned name, so a foreign-workspace row cannot be chosen even when
   it is the only live coordinator in the inventory.
+
+Review j#89878 added three more, each pinned here because each was a way the rail could *look*
+verified while verifying nothing:
+
+- the **(action, journal) pair** is the unit of authority. A real journal on the right issue that
+  carries a different decision token does not authorize this action;
+- a decoded assigned name is **not** an attestation. The single live candidate must also join its
+  generation-bound startup self-attestation record;
+- a send that **fired** is not a send that **landed**. A non-delivering send is reported as a
+  non-delivery, because the caller branches on the exit code.
 """
 
 from __future__ import annotations
@@ -38,29 +48,35 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SEND_DELIVERED,
     SEND_FAILED,
     ProxySendOutcome,
+    decision_journals_from_entries,
     execute_proxy_delegation,
     resolve_proxy_context,
     resolve_proxy_target,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
     ACTION_DISPATCH_NEXT,
+    ANCHOR_ACTION_MISMATCH,
     ANCHOR_SUPERSEDED,
     ANCHOR_UNVERIFIED,
     ANCHOR_VERIFIED,
     AUTHORITY_MISSING,
     AUTHORITY_RESOLVED,
+    REASON_ANCHOR_ACTION_MISMATCH,
     REASON_ANCHOR_SUPERSEDED,
     REASON_ANCHOR_UNVERIFIED,
     REASON_AUTHORITY_MISSING,
+    REASON_DELIVERY_UNCERTAIN,
     REASON_DUPLICATE,
     REASON_FENCE_UNAVAILABLE,
     REASON_TARGET_AMBIGUOUS,
     REASON_TARGET_MISSING,
+    REASON_TARGET_UNATTESTED,
     REASON_WORKSPACE_UNRESOLVED,
     TARGET_AMBIGUOUS,
     TARGET_LOCATOR_MISSING,
     TARGET_MISSING,
     TARGET_OK,
+    TARGET_UNATTESTED,
     WORKSPACE_UNRESOLVED,
     ZERO_SEND,
 )
@@ -81,8 +97,28 @@ WS = "e1487dcb1f2d4412b28e825fdeccf9e8"
 FOREIGN_WS = "ffffffffffffffffffffffffffffffff"
 SCOPE = "bare_mozyo_workspace"
 ISSUE = "14546"
-CURRENT_JOURNAL = "89736"
+#: The action's own decision series (`implementation_request`), oldest first.
 OLDER_JOURNAL = "89688"
+CURRENT_JOURNAL = "89736"
+#: A real journal on the same issue carrying a DIFFERENT decision token.
+OTHER_KIND_JOURNAL = "89873"
+
+DECISIONS = {
+    "implementation_request": (OLDER_JOURNAL, CURRENT_JOURNAL),
+    "implementation_done": (OTHER_KIND_JOURNAL,),
+}
+
+
+def _attested(_name, *, locator, workspace_id, provider):
+    """A passing attestation join (the store is exercised separately)."""
+    return True, "ok", "startup self-attestation present and generation-matched"
+
+
+def _unattested(state="stale"):
+    def _join(_name, *, locator, workspace_id, provider):
+        return False, state, f"attestation {state}"
+
+    return _join
 
 
 def _row(workspace_id: str, provider: str, lane: str = "", locator: str = "w3:p1") -> dict:
@@ -132,15 +168,16 @@ class ProxySendTestBase(unittest.TestCase):
         self,
         *,
         rows=None,
-        gate_journals=(OLDER_JOURNAL, CURRENT_JOURNAL),
-        latest=CURRENT_JOURNAL,
+        decisions=None,
         journal=CURRENT_JOURNAL,
         issue=ISSUE,
         workspace=WS,
         env=None,
         action=ACTION_DISPATCH_NEXT,
+        attestation=None,
     ):
         rows = [_row(WS, "codex")] if rows is None else rows
+        decisions = DECISIONS if decisions is None else decisions
         return resolve_proxy_context(
             argparse.Namespace(repo=str(self.repo)),
             action=action,
@@ -149,8 +186,9 @@ class ProxySendTestBase(unittest.TestCase):
             repo_root=self.repo,
             env=env if env is not None else {},
             rows_provider=lambda _env: rows,
-            gate_markers_provider=lambda _issue: (tuple(gate_journals), latest),
+            decision_journals_provider=lambda _issue: decisions,
             workspace_provider=lambda _root: workspace,
+            attestation_join=attestation or _attested,
         )
 
     def _execute(self, context, *, port=None, fence=None, bootstrap=True):
@@ -190,8 +228,17 @@ class ResolutionTest(ProxySendTestBase):
         self.assertEqual(context.links.anchor, ANCHOR_SUPERSEDED)
 
     def test_an_unreachable_redmine_is_not_verified(self):
-        context = self._context(gate_journals=(), latest="")
+        context = self._context(decisions={})
         self.assertEqual(context.links.anchor, ANCHOR_UNVERIFIED)
+
+    def test_a_journal_carrying_another_decision_does_not_authorize_this_action(self):
+        context = self._context(journal=OTHER_KIND_JOURNAL)
+        self.assertEqual(context.links.anchor, ANCHOR_ACTION_MISMATCH)
+
+    def test_an_unattested_live_slot_is_not_a_target(self):
+        context = self._context(attestation=_unattested("stale"))
+        self.assertEqual(context.links.target, TARGET_UNATTESTED)
+        self.assertEqual(context.target.attestation_state, "stale")
 
 
 class CallerEnvIsNeverAuthorityTest(ProxySendTestBase):
@@ -241,24 +288,28 @@ class CallerEnvIsNeverAuthorityTest(ProxySendTestBase):
 
 class TargetResolutionTest(unittest.TestCase):
     def test_exactly_one_same_workspace_default_lane_agent_resolves(self):
-        target = resolve_proxy_target([_row(WS, "codex")], workspace_id=WS, provider="codex")
+        target = resolve_proxy_target([_row(WS, "codex")], workspace_id=WS, provider="codex", attestation_join=_attested)
         self.assertEqual(target.status, TARGET_OK)
         self.assertEqual(target.locator, "w3:p1")
 
     def test_a_foreign_workspace_row_is_never_selected(self):
         target = resolve_proxy_target(
-            [_row(FOREIGN_WS, "codex")], workspace_id=WS, provider="codex"
+            [_row(FOREIGN_WS, "codex")], workspace_id=WS, provider="codex",
+            attestation_join=_attested,
         )
         self.assertEqual(target.status, TARGET_MISSING)
 
     def test_a_non_default_lane_row_is_never_selected(self):
         target = resolve_proxy_target(
-            [_row(WS, "codex", lane="issue_14546")], workspace_id=WS, provider="codex"
+            [_row(WS, "codex", lane="issue_14546")], workspace_id=WS, provider="codex",
+            attestation_join=_attested,
         )
         self.assertEqual(target.status, TARGET_MISSING)
 
     def test_a_different_provider_row_is_never_selected(self):
-        target = resolve_proxy_target([_row(WS, "claude")], workspace_id=WS, provider="codex")
+        target = resolve_proxy_target(
+            [_row(WS, "claude")], workspace_id=WS, provider="codex", attestation_join=_attested
+        )
         self.assertEqual(target.status, TARGET_MISSING)
 
     def test_duplicate_default_lane_agents_are_ambiguous(self):
@@ -266,13 +317,15 @@ class TargetResolutionTest(unittest.TestCase):
             [_row(WS, "codex", locator="w3:p1"), _row(WS, "codex", locator="w4:p1")],
             workspace_id=WS,
             provider="codex",
+            attestation_join=_attested,
         )
         self.assertEqual(target.status, TARGET_AMBIGUOUS)
         self.assertEqual(target.live, 2)
 
     def test_a_single_agent_without_a_locator_is_unaddressable(self):
         target = resolve_proxy_target(
-            [_row(WS, "codex", locator="")], workspace_id=WS, provider="codex"
+            [_row(WS, "codex", locator="")], workspace_id=WS, provider="codex",
+            attestation_join=_attested,
         )
         self.assertEqual(target.status, TARGET_LOCATOR_MISSING)
 
@@ -281,6 +334,7 @@ class TargetResolutionTest(unittest.TestCase):
             [{"name": "some-hand-named-pane", "pane_id": "w9:p9"}, _row(WS, "codex")],
             workspace_id=WS,
             provider="codex",
+            attestation_join=_attested,
         )
         self.assertEqual(target.status, TARGET_OK)
         self.assertEqual(target.locator, "w3:p1")
@@ -319,8 +373,12 @@ class SendCountTest(ProxySendTestBase):
              REASON_TARGET_AMBIGUOUS),
             ("superseded anchor", lambda: self._context(journal=OLDER_JOURNAL),
              REASON_ANCHOR_SUPERSEDED),
-            ("unverified anchor", lambda: self._context(gate_journals=(), latest=""),
+            ("unverified anchor", lambda: self._context(decisions={}),
              REASON_ANCHOR_UNVERIFIED),
+            ("action mismatch", lambda: self._context(journal=OTHER_KIND_JOURNAL),
+             REASON_ANCHOR_ACTION_MISMATCH),
+            ("unattested target", lambda: self._context(attestation=_unattested("absent")),
+             REASON_TARGET_UNATTESTED),
         ]
         for label, build, reason in cases:
             with self.subTest(label):
@@ -353,11 +411,15 @@ class SendCountTest(ProxySendTestBase):
         self.assertTrue(fixed.sent)
         self.assertEqual(len(port2.calls), 1)
 
-    def test_a_failed_send_is_recorded_uncertain_and_never_blind_retried(self):
+    def test_a_failed_send_is_not_reported_as_a_delivery(self):
+        # Review j#89878 finding 3: the caller has no runtime and branches on the exit code, so a
+        # send that fired but did not land must never surface as a delivered delegation.
         context = self._context()
         result, port = self._execute(context, port=CountingSendPort(result=SEND_FAILED))
-        self.assertTrue(result.sent)  # the send fired; its OUTCOME failed
-        self.assertEqual(len(port.calls), 1)
+        self.assertEqual(len(port.calls), 1)  # it DID fire exactly once
+        self.assertFalse(result.sent)
+        self.assertEqual(result.decision, ZERO_SEND)
+        self.assertEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
         route = ProxyRouteKey(
             workspace_id=WS, lane_id="default", role=ROLE_COORDINATOR, action=ACTION_DISPATCH_NEXT
         )
@@ -367,6 +429,63 @@ class SendCountTest(ProxySendTestBase):
         self.assertFalse(retry.sent)
         self.assertEqual(retry.reason, REASON_DUPLICATE)
         self.assertEqual(port2.calls, [])
+
+
+class DecisionJournalFoldTest(unittest.TestCase):
+    """The anchor evidence is read from the GENERIC workflow-event token (review j#89878 F1)."""
+
+    def _entries(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+        )
+
+        return [
+            RedmineJournalEntry(ISSUE, "89688", "[mozyo:workflow-event:gate=implementation_request]"),
+            RedmineJournalEntry(ISSUE, "89754", "[mozyo:workflow-event:gate=start]"),
+            RedmineJournalEntry(ISSUE, "89873", "[mozyo:workflow-event:gate=implementation_done]"),
+            RedmineJournalEntry(ISSUE, "89900", "no marker here, only prose about a gate"),
+            RedmineJournalEntry("99999", "89901", "[mozyo:workflow-event:gate=implementation_request]"),
+        ]
+
+    def _fold(self, entries=None, issue=ISSUE):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            marker_fields_in_note,
+        )
+
+        return decision_journals_from_entries(
+            self._entries() if entries is None else entries,
+            issue=issue,
+            parse=marker_fields_in_note,
+        )
+
+    def test_the_dispatch_decision_is_visible(self):
+        # The exact regression: `implementation_request` is NOT in the callback-gate vocabulary,
+        # so reading through that reader made the one decision `dispatch_next` needs invisible.
+        self.assertEqual(self._fold()["implementation_request"], ("89688",))
+
+    def test_each_journal_is_keyed_by_its_own_entry_id(self):
+        folded = self._fold()
+        self.assertEqual(folded["start"], ("89754",))
+        self.assertEqual(folded["implementation_done"], ("89873",))
+
+    def test_prose_is_never_a_decision(self):
+        self.assertNotIn("89900", [j for js in self._fold().values() for j in js])
+
+    def test_another_issue_s_entry_never_contributes(self):
+        self.assertNotIn("89901", [j for js in self._fold().values() for j in js])
+
+    def test_the_dispatch_grammar_kind_field_is_also_a_decision(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+        )
+
+        entries = [
+            RedmineJournalEntry(
+                ISSUE, "90000",
+                "[mozyo:workflow-event:kind=implementation_request:lane=l:lane_generation=1]",
+            )
+        ]
+        self.assertEqual(self._fold(entries)["implementation_request"], ("90000",))
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -21,8 +21,9 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
+    ACTION_DECISION_TOKENS,
     ACTION_DISPATCH_NEXT,
-    ACTION_WORKFLOW_STEP,
+    ANCHOR_ACTION_MISMATCH,
     ANCHOR_SUPERSEDED,
     ANCHOR_UNVERIFIED,
     ANCHOR_VERIFIED,
@@ -39,6 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PROVIDER_UNRESOLVED,
     PROXY_ACTIONS,
     REASON_ACTION_UNKNOWN,
+    REASON_ANCHOR_ACTION_MISMATCH,
     REASON_ANCHOR_SUPERSEDED,
     REASON_ANCHOR_UNVERIFIED,
     REASON_AUTHORITY_BLOCKED,
@@ -51,11 +53,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_TARGET_AMBIGUOUS,
     REASON_TARGET_LOCATOR_MISSING,
     REASON_TARGET_MISSING,
+    REASON_TARGET_UNATTESTED,
     REASON_WORKSPACE_UNRESOLVED,
     TARGET_AMBIGUOUS,
     TARGET_LOCATOR_MISSING,
     TARGET_MISSING,
     TARGET_OK,
+    TARGET_UNATTESTED,
     WORKSPACE_RESOLVED,
     WORKSPACE_UNRESOLVED,
     ZERO_SEND,
@@ -83,7 +87,19 @@ def _links(**overrides) -> ProxyLinks:
 
 class ActionVocabularyTest(unittest.TestCase):
     def test_the_vocabulary_is_closed(self):
-        self.assertEqual(PROXY_ACTIONS, (ACTION_DISPATCH_NEXT, ACTION_WORKFLOW_STEP))
+        self.assertEqual(PROXY_ACTIONS, (ACTION_DISPATCH_NEXT,))
+
+    def test_every_action_names_the_decision_that_authorizes_it(self):
+        # Review j#89878 finding 1: an action with no decision token is an action whose anchor
+        # cannot be verified. The map must cover the vocabulary exactly — no delegable action
+        # without a decision, and no decision entry for an action that cannot be requested.
+        self.assertEqual(sorted(ACTION_DECISION_TOKENS), sorted(PROXY_ACTIONS))
+        for action, tokens in ACTION_DECISION_TOKENS.items():
+            self.assertTrue(tokens, action)
+            self.assertTrue(all(t.strip() for t in tokens), action)
+
+    def test_dispatch_next_is_authorized_by_the_dispatch_decision(self):
+        self.assertEqual(ACTION_DECISION_TOKENS[ACTION_DISPATCH_NEXT], ("implementation_request",))
 
     def test_normalize_rejects_anything_outside_it(self):
         for value in ("", None, "sublane_retire", "close", "dispatch next", "DISPATCH_NEXT"):
@@ -100,7 +116,7 @@ class TheOnlyDeliverPathTest(unittest.TestCase):
         self.assertEqual(decision.decision, DELIVER)
         self.assertEqual(decision.reason, "")
 
-    def test_both_actions_deliver_when_every_other_link_is_ok(self):
+    def test_every_action_delivers_when_every_other_link_is_ok(self):
         for action in PROXY_ACTIONS:
             self.assertTrue(decide_proxy_delegation(_links(action=action)).delivers, action)
 
@@ -114,8 +130,10 @@ class TheOnlyDeliverPathTest(unittest.TestCase):
             (dict(target=TARGET_MISSING), REASON_TARGET_MISSING),
             (dict(target=TARGET_AMBIGUOUS), REASON_TARGET_AMBIGUOUS),
             (dict(target=TARGET_LOCATOR_MISSING), REASON_TARGET_LOCATOR_MISSING),
+            (dict(target=TARGET_UNATTESTED), REASON_TARGET_UNATTESTED),
             (dict(anchor=ANCHOR_UNVERIFIED), REASON_ANCHOR_UNVERIFIED),
             (dict(anchor=ANCHOR_SUPERSEDED), REASON_ANCHOR_SUPERSEDED),
+            (dict(anchor=ANCHOR_ACTION_MISMATCH), REASON_ANCHOR_ACTION_MISMATCH),
             (dict(fence=FENCE_DUPLICATE), REASON_DUPLICATE),
             (dict(fence=FENCE_STALE), REASON_STALE),
             (dict(fence=FENCE_RECONCILE), REASON_FENCE_RECONCILE),
@@ -170,48 +188,80 @@ class AuthorityOrderingTest(unittest.TestCase):
 
 
 class TargetCardinalityTest(unittest.TestCase):
-    def test_exactly_one_addressable_agent_is_a_target(self):
-        self.assertEqual(target_status_from_cardinality(1, 1), TARGET_OK)
+    def test_exactly_one_addressable_attested_agent_is_a_target(self):
+        self.assertEqual(target_status_from_cardinality(1, 1, attested=True), TARGET_OK)
 
     def test_zero_is_missing(self):
-        self.assertEqual(target_status_from_cardinality(0, 0), TARGET_MISSING)
+        self.assertEqual(target_status_from_cardinality(0, 0, attested=True), TARGET_MISSING)
 
     def test_duplicates_are_ambiguity_not_a_pick(self):
-        self.assertEqual(target_status_from_cardinality(2, 2), TARGET_AMBIGUOUS)
-        self.assertEqual(target_status_from_cardinality(2, 1), TARGET_AMBIGUOUS)
-        self.assertEqual(target_status_from_cardinality(5, 0), TARGET_AMBIGUOUS)
+        self.assertEqual(target_status_from_cardinality(2, 2, attested=True), TARGET_AMBIGUOUS)
+        self.assertEqual(target_status_from_cardinality(2, 1, attested=True), TARGET_AMBIGUOUS)
+        self.assertEqual(target_status_from_cardinality(5, 0, attested=True), TARGET_AMBIGUOUS)
 
     def test_one_agent_without_a_locator_is_unaddressable(self):
-        self.assertEqual(target_status_from_cardinality(1, 0), TARGET_LOCATOR_MISSING)
+        self.assertEqual(target_status_from_cardinality(1, 0, attested=True), TARGET_LOCATOR_MISSING)
+
+    def test_a_name_match_without_an_attestation_is_not_a_target(self):
+        # Review j#89878 finding 2: the decoded assigned name is what the slot was launched to BE.
+        self.assertEqual(target_status_from_cardinality(1, 1, attested=False), TARGET_UNATTESTED)
+
+    def test_an_unperformed_attestation_join_fails_closed(self):
+        # `None` = the caller could not join (unreadable store). That must not decay to a match.
+        self.assertEqual(target_status_from_cardinality(1, 1, attested=None), TARGET_UNATTESTED)
+        self.assertEqual(target_status_from_cardinality(1, 1), TARGET_UNATTESTED)
 
 
 class AnchorStatusTest(unittest.TestCase):
-    def test_the_current_gate_journal_verifies(self):
-        self.assertEqual(
-            anchor_status_for("89736", ("89688", "89712", "89736"), latest="89736"),
-            ANCHOR_VERIFIED,
+    """The (action, journal) PAIR is the unit of authority (review j#89878 finding 1)."""
+
+    DECISIONS = {
+        "implementation_request": ("89688",),
+        "implementation_done": ("89873",),
+        "start": ("89754",),
+    }
+
+    def _status(self, journal, decisions=None, action=ACTION_DISPATCH_NEXT):
+        return anchor_status_for(
+            journal,
+            action=action,
+            decision_journals=self.DECISIONS if decisions is None else decisions,
         )
 
-    def test_an_earlier_gate_journal_is_superseded(self):
-        self.assertEqual(
-            anchor_status_for("89688", ("89688", "89712", "89736"), latest="89736"),
-            ANCHOR_SUPERSEDED,
-        )
+    def test_the_action_s_own_current_decision_verifies(self):
+        self.assertEqual(self._status("89688"), ANCHOR_VERIFIED)
 
-    def test_a_journal_that_is_not_a_gate_marker_never_verifies(self):
-        self.assertEqual(
-            anchor_status_for("99999", ("89688", "89736"), latest="89736"), ANCHOR_UNVERIFIED
-        )
+    def test_a_real_journal_carrying_another_decision_does_not_authorize_this_action(self):
+        # The exact defect: an implementation_done must never authorize a dispatch_next.
+        self.assertEqual(self._status("89873"), ANCHOR_ACTION_MISMATCH)
+        self.assertEqual(self._status("89754"), ANCHOR_ACTION_MISMATCH)
+
+    def test_a_journal_with_no_marker_never_verifies(self):
+        self.assertEqual(self._status("99999"), ANCHOR_UNVERIFIED)
 
     def test_an_unreachable_redmine_never_verifies(self):
-        # The live read failing yields no markers; that must not read as a verified anchor.
-        self.assertEqual(anchor_status_for("89736", (), latest=""), ANCHOR_UNVERIFIED)
+        # The live read failing yields no decisions at all; that must not read as verified.
+        self.assertEqual(self._status("89688", decisions={}), ANCHOR_UNVERIFIED)
 
     def test_an_empty_journal_never_verifies(self):
-        self.assertEqual(anchor_status_for("", ("89736",), latest="89736"), ANCHOR_UNVERIFIED)
+        self.assertEqual(self._status(""), ANCHOR_UNVERIFIED)
 
-    def test_a_single_marker_that_is_also_the_latest_verifies(self):
-        self.assertEqual(anchor_status_for("89688", ("89688",), latest="89688"), ANCHOR_VERIFIED)
+    def test_a_newer_decision_of_the_same_kind_supersedes(self):
+        decisions = {"implementation_request": ("89688", "89900")}
+        self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_SUPERSEDED)
+        self.assertEqual(self._status("89900", decisions=decisions), ANCHOR_VERIFIED)
+
+    def test_a_later_unrelated_gate_does_not_supersede_the_authorization(self):
+        # Supersession is judged WITHIN the action's own decision series. An implementation_done
+        # recorded after the dispatch decision does not make that decision stale.
+        decisions = {
+            "implementation_request": ("89688",),
+            "implementation_done": ("89873",),  # a later journal, a different kind
+        }
+        self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_VERIFIED)
+
+    def test_an_unknown_action_can_authorize_nothing(self):
+        self.assertEqual(self._status("89688", action="not_an_action"), ANCHOR_ACTION_MISMATCH)
 
 
 if __name__ == "__main__":  # pragma: no cover

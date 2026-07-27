@@ -49,7 +49,9 @@ def _envelope(context, *, action: str, executed: bool, result=None) -> dict:
         "lane_id": "default",
         "issue": context.issue,
         "journal": context.journal,
-        "latest_gate_journal": context.latest_gate_journal,
+        "decision_journals": {
+            token: list(journals) for token, journals in context.decision_journals.items()
+        },
         "links": {
             "action": links.action,
             "workspace": links.workspace,
@@ -64,6 +66,8 @@ def _envelope(context, *, action: str, executed: bool, result=None) -> dict:
             "assigned_name": context.target.assigned_name,
             "live": context.target.live,
             "with_locator": context.target.with_locator,
+            "attestation_state": context.target.attestation_state,
+            "attestation_reason": context.target.attestation_reason,
         },
         "authority_reason": context.authority_reason,
     }
@@ -159,7 +163,8 @@ def _emit(payload: dict, *, as_json: bool, rc: int) -> int:
     print(f"  provider    : {payload['provider'] or '-'}")
     print(
         f"  target      : {payload['target']['status']} "
-        f"(live={payload['target']['live']}, with_locator={payload['target']['with_locator']})"
+        f"(live={payload['target']['live']}, with_locator={payload['target']['with_locator']}, "
+        f"attestation={payload['target']['attestation_state'] or '-'})"
     )
     links = payload["links"]
     print(

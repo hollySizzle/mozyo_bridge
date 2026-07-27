@@ -171,13 +171,15 @@ def _expected_provider(repo_root, role: str) -> dict:
 
 
 def _live_attestation_layer(workspace_id: str, provider: str) -> dict:
-    """The startup-attestation layer: live default-lane rows for this workspace + provider.
+    """The startup-attestation layer: the live default-lane slot and its attestation join.
 
     Reads the herdr inventory and counts the rows whose **mzb1 assigned name** decodes to
-    ``(workspace_id, provider, default lane)`` — the launch-time attestation a restart / adopt
-    re-establishes. Reports the cardinality (0 / 1 / 2+) and whether the single row carries a
-    usable locator, so a duplicate identity reads as ambiguity rather than as a target. An
-    unreadable inventory is :data:`LAYER_UNAVAILABLE`.
+    ``(workspace_id, provider, default lane)``. Reports the cardinality (0 / 1 / 2+) and whether
+    the single row carries a usable locator, so a duplicate identity reads as ambiguity rather
+    than as a slot. The single addressable candidate is then joined against its **generation-bound
+    startup self-attestation record**; only that join reports ``attested``. An unreadable inventory
+    is :data:`LAYER_UNAVAILABLE`; an unreadable attestation store is ``unattested``, never
+    ``attested``.
     """
     if not workspace_id or not provider:
         return {"status": LAYER_UNAVAILABLE, "live": 0, "with_locator": 0}
@@ -198,6 +200,8 @@ def _live_attestation_layer(workspace_id: str, provider: str) -> dict:
 
     live = 0
     with_locator = 0
+    assigned_name = ""
+    locator = ""
     for row in rows or ():
         if not isinstance(row, dict):
             continue
@@ -210,17 +214,39 @@ def _live_attestation_layer(workspace_id: str, provider: str) -> dict:
         if _norm_lane(identity.lane_id) != DEFAULT_LANE:
             continue
         live += 1
-        if _agent_locator(row):
+        row_locator = _agent_locator(row) or ""
+        if row_locator:
             with_locator += 1
-    if live == 1 and with_locator == 1:
-        status = "attested"
-    elif live == 0:
-        status = "absent"
-    elif live >= 2:
-        status = "ambiguous"
-    else:
-        status = "locator_missing"
-    return {"status": status, "live": live, "with_locator": with_locator}
+            if not locator:
+                locator = row_locator
+                assigned_name = str(row.get(AGENT_KEY_NAME) or "")
+
+    if live == 0:
+        return {"status": "absent", "live": live, "with_locator": with_locator}
+    if live >= 2:
+        return {"status": "ambiguous", "live": live, "with_locator": with_locator}
+    if with_locator != 1:
+        return {"status": "locator_missing", "live": live, "with_locator": with_locator}
+
+    # A decoded name is what the slot was launched to BE. Only the generation-bound startup
+    # self-attestation record attests that this process actually booted with that identity and
+    # still holds this live locator, so the readback must not report "attested" from a name match
+    # (review j#89878 finding 2). Reuses the shared read-side policy the adopt classifier and
+    # doctor use, so this layer can never drift from them.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
+        live_attestation_join,
+    )
+
+    ok, state, reason = live_attestation_join(
+        assigned_name, locator=locator, workspace_id=workspace_id, provider=provider
+    )
+    return {
+        "status": "attested" if ok else "unattested",
+        "live": live,
+        "with_locator": with_locator,
+        "attestation_state": state,
+        "attestation_reason": reason,
+    }
 
 
 def _default_lane_binding(parsed: ParsedRoleBindings):

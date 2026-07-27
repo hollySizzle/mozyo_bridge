@@ -11,18 +11,22 @@ What this module deliberately does *not* do is as important as what it does:
   point of the rail is that the caller has no attested identity, so accepting one from the caller's
   env would turn "I am not attested" into "I claim to be attested" — the exact forgery the observed
   dead end (#14500) must not be routed around. The workspace comes from the repo checkout's registry
-  anchor; the target's identity comes from its own mzb1 assigned name, which the caller cannot mint;
+  anchor; the target's identity comes from its own boot-time evidence, which the caller cannot mint;
 - it **never relaxes the receiver's own gates**. The delegation is an ordinary anchored handoff to
   an attested agent; the coordinator still runs its own preflight, and ``sublane create`` still
   requires *its* sender attestation — which the coordinator has and the caller does not. The proxy
   moves the *decision*, not the *authority to act on it*;
-- it **never resolves a target by pane, title, or "closest match"**. Exactly one live agent whose
-  assigned name decodes to (this workspace, the bound role's provider, the default lane) is a
-  target; zero and two-or-more are both zero-send.
+- it **never resolves a target by pane, title, or "closest match"**, and never by assigned name
+  alone. Exactly one live agent whose name decodes to (this workspace, the bound role's provider,
+  the default lane) **and** whose generation-bound startup self-attestation joins that live slot is
+  a target; zero, two-or-more, and unattested are all zero-send;
+- it **never treats a fired send as a delivery**. A send that did not positively land leaves an
+  ``uncertain`` generation and is reported as a non-delivery, because the caller has no runtime of
+  its own and will branch on the exit code.
 
-Resolution is injectable end to end (``rows`` / ``gate_markers`` / ``fence`` / ``send_port``) so the
-whole choreography — including every zero-send path and the send count — is testable without a live
-herdr or Redmine.
+Resolution is injectable end to end (``rows`` / ``decision_journals`` / ``attestation_join`` /
+``fence`` / ``send_port``) so the whole choreography — including every zero-send path and the send
+count — is testable without a live herdr or Redmine.
 """
 
 from __future__ import annotations
@@ -42,6 +46,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     FENCE_UNAVAILABLE,
     PROVIDER_RESOLVED,
     PROVIDER_UNRESOLVED,
+    DELIVER,
+    REASON_DELIVERY_UNCERTAIN,
     REASON_FENCE_UNAVAILABLE,
     WORKSPACE_RESOLVED,
     WORKSPACE_UNRESOLVED,
@@ -69,13 +75,20 @@ CALLER_ENV_KEYS_NEVER_AUTHORITY: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class ProxyTarget:
-    """The live-resolved delegation target, or a fail-closed cardinality (value object)."""
+    """The live-resolved delegation target, or a fail-closed cardinality (value object).
+
+    ``attestation_state`` / ``attestation_reason`` carry the generation-bound startup
+    self-attestation join for the single candidate, so a refusal names *which* attestation state
+    stopped it (absent / stale / conflict / missing / unavailable) rather than only "unattested".
+    """
 
     status: str
     assigned_name: str = ""
     locator: str = ""
     live: int = 0
     with_locator: int = 0
+    attestation_state: str = ""
+    attestation_reason: str = ""
 
 
 @dataclass
@@ -90,7 +103,8 @@ class ProxyContext:
     target: ProxyTarget = field(default_factory=lambda: ProxyTarget(status="missing"))
     issue: str = ""
     journal: str = ""
-    latest_gate_journal: str = ""
+    #: decision token -> the issue's journal ids carrying it, in note order (the anchor evidence).
+    decision_journals: "dict[str, tuple[str, ...]]" = field(default_factory=dict)
     authority_reason: str = ""
     detail: str = ""
 
@@ -125,49 +139,121 @@ def live_agent_rows(env: Mapping[str, str]) -> Sequence[Mapping]:
         return ()
 
 
-def live_gate_markers(args: argparse.Namespace, issue: str) -> "tuple[tuple[str, ...], str]":
-    """The issue's structured gate-marker journals + the latest one, from source-of-truth Redmine.
+#: The workflow-event marker channel whose ``gate`` / ``kind`` field names a durable decision.
+_WORKFLOW_EVENT_CHANNEL = "workflow-event"
 
-    Reuses the credential-gated :class:`LiveRedmineJournalSource` read boundary and the structured
-    ``[mozyo:…]`` marker extraction — prose is never a source. Any unconfigured-credential /
-    transport / decode failure yields ``((), "")`` so the anchor simply fails to verify (an
-    unreachable Redmine must never read as a verified anchor). Errors are already
-    credential/URL-redacted upstream and are not re-raised here.
+
+def live_decision_journals(
+    args: argparse.Namespace, issue: str
+) -> "dict[str, tuple[str, ...]]":
+    """The issue's decision token -> journal ids, in note order, from source-of-truth Redmine.
+
+    Reads the **generic** workflow-event marker rather than the callback-gate reader, because the
+    two vocabularies are deliberately disjoint (review j#89878 finding 1): ``GATE_BEARING_KINDS``
+    covers only the states that must wake a coordinator, and ``implementation_request`` — the
+    coordinator's dispatch decision, and precisely what a ``dispatch_next`` delegation is
+    authorized by — is excluded from it by design. Reading through the callback reader therefore
+    made the one decision that matters invisible while leaving unrelated gates usable as anchors.
+
+    A journal's decision token is its marker's ``gate`` field, or ``kind`` when the marker uses the
+    dispatch grammar. The journal id is the **owning entry's own** ``journal_id``, never the
+    marker's self-reported ``journal=`` field (a note must not name its own anchor). Prose is never
+    inspected. Any unconfigured-credential / transport / decode failure yields ``{}`` so the anchor
+    simply fails to verify — an unreachable Redmine must never read as a verified anchor. Errors
+    are already credential/URL-redacted upstream and are not re-raised here.
     """
     issue = (issue or "").strip()
     if not issue:
-        return (), ""
+        return {}
     try:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
             LiveRedmineJournalSource,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
-            markers_from_source,
+            marker_fields_in_note,
         )
 
-        markers = markers_from_source(LiveRedmineJournalSource.from_environment(), issue)
+        entries = LiveRedmineJournalSource.from_environment().read_entries(issue)
     except Exception:  # noqa: BLE001 - any live-read failure fails the anchor gate closed
-        return (), ""
-    journals: list = []
-    for marker in markers:
-        if str(getattr(marker, "issue", "")).strip() != issue:
-            continue  # a marker for another issue never verifies this anchor
-        journal = str(getattr(marker, "journal", "")).strip()
-        if journal:
-            journals.append(journal)
-    latest = journals[-1] if journals else ""  # markers are note-ordered
-    return tuple(journals), latest
+        return {}
+    return decision_journals_from_entries(entries, issue=issue, parse=marker_fields_in_note)
+
+
+def decision_journals_from_entries(entries, *, issue: str, parse) -> "dict[str, tuple[str, ...]]":
+    """The decision token -> journal ids fold over already-read entries (pure over its inputs).
+
+    Split out of :func:`live_decision_journals` so the fold — which is where the anchor evidence is
+    actually decided — is testable without a live Redmine. ``parse`` is the shared structured-token
+    scanner (``marker_fields_in_note``), injected rather than imported so this stays a pure fold.
+    """
+    issue = (issue or "").strip()
+    decisions: "dict[str, list[str]]" = {}
+    for entry in entries or ():
+        if str(getattr(entry, "issue_id", "")).strip() != issue:
+            continue  # an entry from another issue never authorizes this anchor
+        journal = str(getattr(entry, "journal_id", "")).strip()
+        if not journal:
+            continue
+        for channel, fields in parse(str(getattr(entry, "notes", "") or "")):
+            if channel != _WORKFLOW_EVENT_CHANNEL:
+                continue
+            token = (fields.get("gate") or fields.get("kind") or "").strip()
+            if not token:
+                continue
+            bucket = decisions.setdefault(token, [])
+            if journal not in bucket:
+                bucket.append(journal)
+    return {token: tuple(journals) for token, journals in decisions.items()}
+
+
+def live_attestation_join(assigned_name: str, *, locator: str, workspace_id: str, provider: str):
+    """Join the live slot with its generation-bound startup self-attestation record.
+
+    Reuses the **existing** read-side policy :func:`...herdr_identity_attestation.evaluate_attestation`
+    — the one the adopt classifier and doctor already share — rather than writing a second one that
+    could drift from it. Returns ``(ok, state, reason)``; an unreadable store yields
+    ``(False, "unavailable", …)`` so a missing store fails closed instead of decaying to a
+    name-only match (review j#89878 finding 2).
+    """
+    try:
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+            evaluate_attestation,
+        )
+
+        record = HerdrIdentityAttestationStore().read(assigned_name)
+        join = evaluate_attestation(
+            record,
+            live_locator=locator,
+            expected_workspace_id=workspace_id,
+            expected_role=provider,
+            expected_lane=DEFAULT_LANE,
+        )
+    except Exception:  # noqa: BLE001 - an unreadable attestation store is never an attestation
+        return False, "unavailable", "the startup self-attestation store could not be read"
+    return bool(join.ok), str(join.state), str(join.reason)
 
 
 def resolve_proxy_target(
-    rows: Sequence[Mapping], *, workspace_id: str, provider: str
+    rows: Sequence[Mapping],
+    *,
+    workspace_id: str,
+    provider: str,
+    attestation_join: Optional[Callable[..., "tuple[bool, str, str]"]] = None,
 ) -> ProxyTarget:
-    """Resolve the single live default-lane coordinator target (pure over ``rows``).
+    """Resolve the single live, **attested** default-lane coordinator target (pure over ``rows``).
 
     A row qualifies only when its **mzb1 assigned name** decodes to this workspace, this provider,
-    and the default lane — the agent's own launch-time attestation. Rows from another workspace are
-    excluded by that decode, which is what makes a cross-workspace delegation structurally
-    impossible rather than merely discouraged.
+    and the default lane. Rows from another workspace are excluded by that decode, which is what
+    makes a cross-workspace delegation structurally impossible rather than merely discouraged.
+
+    The decode is necessary but **not sufficient** (review j#89878 finding 2). An assigned name is
+    what a slot was launched to be; only the generation-bound startup self-attestation record
+    attests that *this* process actually booted with that identity and still occupies that live
+    locator. So a single decoded candidate with a usable locator is joined against that record, and
+    a record that is absent / stale (a different process generation) / conflicting / missing yields
+    :data:`TARGET_UNATTESTED` rather than a target. ``attestation_join`` is injectable; the live
+    default is :func:`live_attestation_join`.
     """
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
         AGENT_KEY_NAME,
@@ -205,13 +291,24 @@ def resolve_proxy_target(
                 assigned_name = str(row.get(AGENT_KEY_NAME) or "")
         elif not assigned_name:
             assigned_name = str(row.get(AGENT_KEY_NAME) or "")
-    status = target_status_from_cardinality(live, with_locator)
+
+    attested: Optional[bool] = None
+    attestation_state = ""
+    attestation_reason = ""
+    if live == 1 and with_locator == 1:
+        join = attestation_join or live_attestation_join
+        attested, attestation_state, attestation_reason = join(
+            assigned_name, locator=locator, workspace_id=ws, provider=want_provider
+        )
+    status = target_status_from_cardinality(live, with_locator, attested=attested)
     return ProxyTarget(
         status=status,
         assigned_name=assigned_name,
         locator=locator,
         live=live,
         with_locator=with_locator,
+        attestation_state=attestation_state,
+        attestation_reason=attestation_reason,
     )
 
 
@@ -279,8 +376,9 @@ def resolve_proxy_context(
     repo_root,
     env: Mapping[str, str],
     rows_provider: Optional[Callable[[Mapping[str, str]], Sequence[Mapping]]] = None,
-    gate_markers_provider: Optional[Callable[..., "tuple[tuple[str, ...], str]"]] = None,
+    decision_journals_provider: Optional[Callable[..., "dict[str, tuple[str, ...]]"]] = None,
     workspace_provider: Optional[Callable[..., str]] = None,
+    attestation_join: Optional[Callable[..., "tuple[bool, str, str]"]] = None,
 ) -> ProxyContext:
     """Re-derive every authority link at action time and assemble the matrix input (no fence).
 
@@ -291,7 +389,7 @@ def resolve_proxy_context(
     """
     resolve_ws = workspace_provider or live_workspace_id
     resolve_rows = rows_provider or live_agent_rows
-    resolve_markers = gate_markers_provider or (lambda i: live_gate_markers(args, i))
+    resolve_decisions = decision_journals_provider or (lambda i: live_decision_journals(args, i))
 
     issue = (issue or "").strip()
     journal = (journal or "").strip()
@@ -308,15 +406,22 @@ def resolve_proxy_context(
     provider_status = PROVIDER_RESOLVED if provider else PROVIDER_UNRESOLVED
 
     target = (
-        resolve_proxy_target(resolve_rows(env), workspace_id=workspace_id, provider=provider)
+        resolve_proxy_target(
+            resolve_rows(env),
+            workspace_id=workspace_id,
+            provider=provider,
+            attestation_join=attestation_join,
+        )
         if workspace_id and provider
         else ProxyTarget(status=target_status_from_cardinality(0, 0))
     )
 
-    gate_journals, latest = ((), "")
+    decision_journals: "dict[str, tuple[str, ...]]" = {}
     if issue and journal:
-        gate_journals, latest = resolve_markers(issue)
-    anchor_status = anchor_status_for(journal, gate_journals, latest=latest)
+        decision_journals = resolve_decisions(issue) or {}
+    anchor_status = anchor_status_for(
+        journal, action=action, decision_journals=decision_journals
+    )
 
     links = ProxyLinks(
         action=action,
@@ -336,7 +441,7 @@ def resolve_proxy_context(
         target=target,
         issue=issue,
         journal=journal,
-        latest_gate_journal=latest,
+        decision_journals=decision_journals,
         authority_reason=authority_reason,
     )
 
@@ -445,16 +550,29 @@ def execute_proxy_delegation(
 
     # (4) exactly one send with the minted action id.
     outcome = send_port.send(context, reserve.action_id, args=args)
+    context.links = replace(context.links, fence=FENCE_OPEN)
     if outcome.result == SEND_DELIVERED:
         fence.mark_delivered(route, reserve.action_id, detail=outcome.detail)
-    else:
-        fence.mark_uncertain(
-            route, reserve.action_id, detail=outcome.detail or f"send {outcome.result}"
+        return ProxyExecutionResult(
+            sent=True, decision=DELIVER, action_id=reserve.action_id, fence_state=FENCE_OPEN,
+            detail=f"delegated once to {context.target.assigned_name}", send=outcome,
         )
-    context.links = replace(context.links, fence=FENCE_OPEN)
+    # A send that fired but did not positively land is NOT a delivery (review j#89878 finding 3).
+    # The fence holds an `uncertain` generation for an operator reconcile, and the caller — which
+    # has no runtime of its own and will typically branch on the exit code — must be told the
+    # delegation did not land. Reporting `sent` here would make a lost delegation script as success.
+    fence.mark_uncertain(
+        route, reserve.action_id, detail=outcome.detail or f"send {outcome.result}"
+    )
     return ProxyExecutionResult(
-        sent=True, decision="deliver", action_id=reserve.action_id, fence_state=FENCE_OPEN,
-        detail=f"delegated once to {context.target.assigned_name}", send=outcome,
+        sent=False, decision=ZERO_SEND, reason=REASON_DELIVERY_UNCERTAIN,
+        action_id=reserve.action_id, fence_state=FENCE_OPEN,
+        detail=(
+            "the single send fired but did not positively land; the delegation generation is "
+            "recorded `uncertain` and is never blind-retried. Reconcile with the coordinator, "
+            f"then decide explicitly. {outcome.detail}"
+        ),
+        send=outcome,
     )
 
 
@@ -536,7 +654,9 @@ __all__ = (
     "ProxyContext",
     "live_workspace_id",
     "live_agent_rows",
-    "live_gate_markers",
+    "live_decision_journals",
+    "decision_journals_from_entries",
+    "live_attestation_join",
     "resolve_proxy_target",
     "resolve_default_lane_authority",
     "resolve_expected_provider",

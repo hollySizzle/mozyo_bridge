@@ -37,8 +37,8 @@ authority* ではない — 実行するのは coordinator 自身の attested ru
 | 2 | workspace | repo checkout の registry anchor（`herdr_workspace_segment`） | `proxy_workspace_unresolved` |
 | 3 | role | repo-local durable role authority の default-lane binding | `proxy_coordinator_authority_missing` / `proxy_coordinator_authority_blocked` |
 | 4 | provider | 当該 role の `provider_binding` | `proxy_provider_unresolved` |
-| 5 | target | live inventory の **mzb1 assigned name** が decode する (workspace, provider, default lane) | `proxy_target_missing` / `proxy_target_ambiguous` / `proxy_target_locator_missing` |
-| 6 | anchor | source-of-truth Redmine の structured gate marker | `proxy_anchor_unverified` / `proxy_anchor_superseded` |
+| 5 | target | live inventory の **mzb1 assigned name** decode **＋ generation-bound startup self-attestation の join** | `proxy_target_missing` / `proxy_target_ambiguous` / `proxy_target_locator_missing` / `proxy_target_unattested` |
+| 6 | anchor | source-of-truth Redmine 上の **(action, journal) pair**（§3） | `proxy_anchor_unverified` / `proxy_anchor_action_mismatch` / `proxy_anchor_superseded` |
 | 7 | fence | dedicated exactly-once store | `proxy_duplicate` / `proxy_stale` / `proxy_fence_reconcile_required` / `proxy_fence_unavailable` |
 
 不変条件:
@@ -48,6 +48,13 @@ authority* ではない — 実行するのは coordinator 自身の attested ru
   できない場合は `proxy_workspace_unresolved` で停止し、caller の主張へ退避しない。
 - **cross-workspace は構造的に不可能。** target は agent 自身の assigned name の decode で選ぶ
   ため、foreign workspace の row は「選ばれない」のではなく「候補にならない」。
+- **decode は necessary であって sufficient ではない。** assigned name はその slot が「何として
+  launch されたか」を表すにすぎない。実際にその identity で boot し、いまその live locator を
+  占有していることを attest するのは generation-bound な startup self-attestation record だけで
+  ある。よって単一候補は既存 read-side policy `evaluate_attestation`（adopt classifier / doctor と
+  共有。二重実装しない）で join し、record が absent / stale（別 process generation）/ conflict /
+  missing なら `proxy_target_unattested` で zero-send する。**attestation store が読めない場合も
+  `unattested`** であり、name 一致へ decay しない。
 - **duplicate identity は ambiguity であって選択肢ではない。** 同一 (workspace, provider,
   default lane) に 2+ live agent がある場合、どちらへ送っても推測になるため zero-send。
 - **fence は最後に評価する。** target 不正 / anchor superseded で拒否される委譲は generation を
@@ -55,14 +62,33 @@ authority* ではない — 実行するのは coordinator 自身の attested ru
 - **順序は美観ではない。** 最初に壊れた link を報告することと、拒否が何を消費するかは同じ順序
   で決まる。
 
-## 3. Anchor 検証（現在の決定だけを委譲する）
+## 3. Anchor 検証 — authority の単位は **(action, journal) の対**
 
-- 検証対象は `--issue` の journal から抽出した **structured gate marker**（machine `[mozyo:…]`
-  token）のみ。散文は source にしない。
-- 要求 journal が marker 集合に含まれない場合は `unverified`。**live read が失敗した場合も
-  marker 集合は空**になるため、到達不能な Redmine が verified anchor に見えることはない。
-- marker 集合に含まれるが最新でない場合は `superseded`。durable record が先へ進んだ決定を委譲
-  することは、duplicate を委譲することと同じ欠陥である。
+action を closed vocabulary で検証し、journal を marker 集合で検証しても、**両者を突き合わせない
+限り「決定」を検証したことにはならない**。初版はこの join を欠いており、任意の in-vocabulary
+action が任意の gate journal に乗れた（`implementation_done` が `dispatch_next` を authorize でき
+た）。対は authority の単位であり、片側ずつではない。
+
+- **action → 決定 token の closed map**（`ACTION_DECISION_TOKENS`）を持つ。
+  `dispatch_next` → `implementation_request`。
+- 決定 token を **tie できない action は語彙に置かない。** `workflow_step` はこの理由で撤回した:
+  「一段進める」を authorize するのは「その時点で next action を名指す gate」であって固定 token
+  ではなく、mapping を発明すれば同じ未検証 join を別の形で持ち込むだけになる。委譲可能面を狭める
+  のが fail-closed な答えであり、具体的な決定 token が特定できた時点で広げればよい。
+- marker の読み取りは **generic workflow-event token**（`gate` / `kind`）で行う。callback 用
+  `GATE_BEARING_KINDS` は「coordinator を起こすべき状態」だけを覆い、`implementation_request` は
+  意図的に**除外**されている。callback reader 経由で読むと、`dispatch_next` を authorize する唯一の
+  決定が見えない一方、無関係な gate は anchor として使えてしまう。
+- journal id は marker を持つ **entry 自身の `journal_id`** を使う。marker の自己申告 `journal=`
+  は使わない（note が自分の anchor を名乗ってはならない）。散文は source にしない。
+- 分類:
+  - 当該 issue の workflow-event marker をどれも持たない journal → `unverified`。**live read 失敗も
+    marker 集合が空**になるため、到達不能な Redmine が verified anchor に見えることはない。
+  - marker は持つが当該 action の token ではない → `action_mismatch`。anchor は実在し、**対**が
+    成立していない。どちらが誤りかを operator に区別可能な形で返すため `unverified` と分ける。
+  - 当該 action の token を持つが、同じ token を持つより新しい journal がある → `superseded`。
+    supersession は **その action 自身の決定系列の中**で判定する。無関係な後続 gate が正しい
+    authorization を stale に見せてはならず、無関係な後続 gate が代役になってもならない。
 
 ## 4. Exactly-once fence（`core/state/coordinator_proxy_fence.py`）
 
@@ -82,7 +108,7 @@ attestation であり key に含めない（target rename が generation を進�
   auto-bootstrap しない** — 損失後の silent re-create は、既に delivered な委譲の再送を許す。
   init / recovery は `workflow proxy-fence --bootstrap` / `--recover` のみ。
 
-## 5. Delivery
+## 5. Delivery — 「送った」と「着いた」を混同しない
 
 `custom` kind の通常の anchored `handoff send` を、解決済み locator + explicit target lane /
 target repo へ 1 回だけ行う。preflight・receiver binding・landing gate はすべて通常どおり通す
@@ -91,6 +117,13 @@ vocabulary は closed であり、委譲は implementation request でも review
 でもない）。summary に action / durable anchor / opaque `proxy_action_id` を載せ、coordinator 側
 の記録が何を渡されたかを相関できるようにする。
 
+send が **発火した**ことは、着地した証拠ではない。positive delivery でない場合:
+
+- generation は `uncertain` を保持し、blind retry しない（reconcile が先）。
+- 結果は **delivery ではない**。`sent=False` / `reason=proxy_delivery_uncertain` を返し、CLI は
+  **非ゼロ終了**する。caller は自前 runtime を持たず exit code で分岐するため、着かなかった委譲を
+  成功として script させてはならない。rc 0 は positive delivery のときだけである。
+
 ## 6. Surface
 
 - CLI: `mozyo-bridge workflow proxy --action <token> --source redmine --issue <id> --journal <id>`
@@ -98,8 +131,8 @@ vocabulary は closed であり、委譲は implementation request でも review
 - 実装: pure matrix `...f_140_delegated_coordinator_nested_handoff/domain/coordinator_proxy.py`、
   adapter `...application/coordinator_proxy_send.py`、CLI `...application/cli_workflow_proxy.py`、
   fence `core/state/coordinator_proxy_fence.py`。
-- action vocabulary は closed: `dispatch_next` / `workflow_step`。いずれも durable record が
-  既に解決し得る action であり、proxy が仕事を発明することはない。
+- action vocabulary は closed: `dispatch_next` のみ。決定 token を tie できる action だけを置く
+  （§3）。proxy が仕事を発明することはない。
 
 ## 7. 非 goal
 
