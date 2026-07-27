@@ -154,6 +154,60 @@ def _close_quietly(fd: int) -> bool:
     return True
 
 
+
+class _OwnedDescriptor:
+    """A descriptor this run owns, closed at most once.
+
+    Ownership is released **before** the close syscall runs.
+    :func:`_close_quietly` deliberately re-raises anything that is not an
+    ``OSError`` so an interrupt is never swallowed, which means the close can
+    unwind — and if the sentinel were set afterwards, a later ``finally`` would
+    close the same descriptor *number* again. Under number reuse that closed an
+    unrelated descriptor: a measured run closed a `/dev/null` handle that had
+    just been assigned the freed number (j#90477 R11-F1).
+
+    Both the staging descriptor and the verification descriptor go through this
+    one structure, so the ordering cannot be right in one place and wrong in
+    the other.
+    """
+
+    __slots__ = ("_fd",)
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    @property
+    def held(self) -> bool:
+        return self._fd != -1
+
+    @property
+    def fileno(self) -> int:
+        return self._fd
+
+    def close(self) -> bool:
+        """Close once. ``False`` when the close reported an ``OSError``."""
+        fd = self._fd
+        if fd == -1:
+            return True
+        self._fd = -1  # detach first: a raising close must not close it twice
+        return _close_quietly(fd)
+
+
+def _attach_secondary(primary: BaseException, secondary: BaseException) -> None:
+    """Keep a teardown failure visible without replacing the primary one.
+
+    The exception the caller sees must stay the one that actually unwound the
+    write; a close or cleanup failure is additional information, not a
+    replacement (j#90477 R11-F1 condition 3).
+    """
+    note = f"{type(secondary).__name__}: {secondary}"
+    add_note = getattr(primary, "add_note", None)
+    if add_note is not None:
+        add_note(f"secondary failure during teardown: {note}")
+    elif primary.__context__ is None:
+        primary.__context__ = secondary
+
+
 class LegacyProjectSkillMirrorSync:
     """Check or sync the legacy project skill partial mirror for one repo."""
 
@@ -565,11 +619,13 @@ class LegacyProjectSkillMirrorSync:
         subject = f"{MIRROR_RELATIVE}/{describe_name(name)}"
         temp_name = f"{_TEMP_PREFIX}{os.urandom(8).hex()}.tmp"
         try:
-            temp_fd = os.open(
-                temp_name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=mirror_fd,
+            temp = _OwnedDescriptor(
+                os.open(
+                    temp_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=mirror_fd,
+                )
             )
         except OSError:
             return (
@@ -599,14 +655,14 @@ class LegacyProjectSkillMirrorSync:
             return self._release_staging(mirror_fd, temp_name, identity)
 
         try:
-            identity = os.fstat(temp_fd)
+            identity = os.fstat(temp.fileno)
             view = memoryview(payload or b"")
             # A single `os.write` may write fewer bytes than asked
             # (j#90450 R7-F3). A run of zero-progress writes would spin
             # forever, so it is bounded and reported instead.
             stalled = 0
             while view:
-                written = os.write(temp_fd, view)
+                written = os.write(temp.fileno, view)
                 if written <= 0:
                     stalled += 1
                     if stalled > 16:
@@ -617,26 +673,35 @@ class LegacyProjectSkillMirrorSync:
             # `fchmod` on our own descriptor: a path-based `chmod` here changed
             # a victim's mode when the temp name was re-bound to a symlink
             # between create and chmod (j#90418 R6-F1 case 4).
-            os.fchmod(temp_fd, 0o644)
+            os.fchmod(temp.fileno, 0o644)
         except OSError:
             write_failure = "staging file could not be written"
-        except BaseException:
+        except BaseException as primary:
             # Not just `OSError`: a non-OSError unwinding the write reached
             # neither the hook nor the verify safety net, so the staging entry
-            # this run owned was left behind and the next audit stopped on its
-            # own residue (j#90472 R10-F1). Close first, then release once,
-            # then re-raise unchanged.
-            _close_quietly(temp_fd)
-            temp_fd = -1
+            # this run owned was left behind (j#90472 R10-F1). The close itself
+            # may also unwind — it must not stop the release, and it must not
+            # replace the exception the caller sees (j#90477 R11-F1).
+            try:
+                temp.close()
+            except BaseException as close_error:
+                _attach_secondary(primary, close_error)
             release()
             raise
         finally:
             # A close can report a deferred write error, so discarding its
             # result folded a real failure into a `synced` banner and exit 0
-            # (j#90467 R9-F1). `temp_fd` is -1 only on the re-raise path above,
+            # (j#90467 R9-F1). `held` is false on the re-raise path above,
             # which already closed and released.
-            if temp_fd != -1:
-                if not _close_quietly(temp_fd) and write_failure is None:
+            if temp.held:
+                try:
+                    closed_cleanly = temp.close()
+                except BaseException:
+                    # No prior exception is propagating here, so the close
+                    # failure is the one to surface — after releasing.
+                    release()
+                    raise
+                if not closed_cleanly and write_failure is None:
                     write_failure = (
                         "staging file could not be closed; the write may not have reached disk"
                     )
@@ -659,7 +724,7 @@ class LegacyProjectSkillMirrorSync:
         # nothing is unlinked: the entry is not ours.
         try:
             try:
-                verify_fd = os.open(temp_name, _FILE_FLAGS, dir_fd=mirror_fd)
+                verify = _OwnedDescriptor(os.open(temp_name, _FILE_FLAGS, dir_fd=mirror_fd))
             except OSError:
                 # Not observing the entry is not evidence that it is foreign.
                 # `_release_staging` re-proves identity and leaves anything
@@ -674,7 +739,7 @@ class LegacyProjectSkillMirrorSync:
                     ),
                 ) + release()
             try:
-                current = os.fstat(verify_fd)
+                current = os.fstat(verify.fileno)
             except OSError:
                 verify_failure = Violation(
                     RULE_WRITE,
@@ -682,12 +747,22 @@ class LegacyProjectSkillMirrorSync:
                     f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
                     "staging entry could not be re-validated",
                 )
-                _close_quietly(verify_fd)
-                verify_fd = -1
+                verify.close()
                 return (verify_failure,) + release()
+            except BaseException as primary:
+                try:
+                    verify.close()
+                except BaseException as close_error:
+                    _attach_secondary(primary, close_error)
+                release()
+                raise
             finally:
-                if verify_fd != -1:
-                    _close_quietly(verify_fd)
+                if verify.held:
+                    try:
+                        verify.close()
+                    except BaseException:
+                        release()
+                        raise
 
             if identity is None or (current.st_dev, current.st_ino) != (
                 identity.st_dev,
@@ -743,9 +818,12 @@ class LegacyProjectSkillMirrorSync:
         the second call had just removed (R9-F3). Ownership is re-proved
         against the creation identity, and this is the single cleanup path.
 
-        A window remains between the check and the unlink — the same shape as
-        the documented verify-to-replace residual, and closable only by
-        directory-level exclusion.
+        A window remains between the check and the unlink. It is NOT the same
+        shape as the verify-to-replace residual, and the docs say so: that one
+        can install a foreign inode, this one can delete a foreign entry. Both
+        sit inside the threat model where an actor able to modify the mirror
+        directory can modify entries directly, and closing either needs
+        directory-level exclusion (j#90472 R10-F3).
         """
         display = f"{MIRROR_RELATIVE}/{describe_name(temp_name)}"
         try:
