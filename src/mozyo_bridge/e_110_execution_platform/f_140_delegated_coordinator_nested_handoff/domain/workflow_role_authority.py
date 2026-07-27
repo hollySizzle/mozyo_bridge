@@ -14,8 +14,13 @@ This module is the **pure, fail-closed** durable role authority the Design Consu
 (j#75780) / Answer (j#75782) put in that gap. It owns:
 
 - the **closed** vocabulary of durable workflow roles a binding may declare
-  (``grandparent_coordinator`` / ``project_gateway``, canonical; ``root_coordinator`` accepted
-  only as a compat *input* alias for the grandparent, never re-emitted — j#75782 vocabulary);
+  (``grandparent_coordinator`` / ``project_gateway`` / ``coordinator``, canonical;
+  ``root_coordinator`` accepted only as a compat *input* alias for the grandparent, never
+  re-emitted — j#75782 vocabulary). ``coordinator`` (Redmine #14546) closes the gap the bare
+  ``mozyo`` single-workspace default pair fell into: it is neither a department root nor a
+  separate project-gateway lane, so before it existed a fresh default pair had no declarable
+  authority at all and ``workflow step`` fail-closed ``ambiguous_default_coordinator_role``
+  regardless of what the operator declared (Redmine #14500);
 - the **versioned, deterministic** ``project_scope -> lane_id`` resolver
   (:func:`project_gateway_lane_id`) so the project-gateway lane id is *derived*, never hand
   copied into several places (Design Answer Q2-A);
@@ -47,6 +52,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transiti
     ROLE_GRANDPARENT_COORDINATOR,
     ROLE_PROJECT_GATEWAY,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
+    ROLE_COORDINATOR,
+)
 
 # ---------------------------------------------------------------------------
 # Static binding-file schema (machine-readable; kept literal regardless of UI language).
@@ -73,9 +81,22 @@ _ALLOWED_ENTRY_KEYS = frozenset({"role", "project_scope", "source_pointer"})
 ROLE_ROOT_COORDINATOR_ALIAS = "root_coordinator"
 
 #: The CLOSED set of canonical roles a binding resolves to.
+#:
+#: ``coordinator`` (Redmine #14546) is the **single-workspace default coordinator**: the bare
+#: ``mozyo`` default pair that owns its workspace's fill decision and dispatches managed sublanes.
+#: It is NOT a new vocabulary invention — the token is the existing runtime workflow role
+#: :data:`...workflow_runtime.ROLE_COORDINATOR` (imported, never re-declared), the same role
+#: ``provider_binding`` already binds a provider to. It shares the :data:`DEFAULT_LANE` slot with
+#: the department-root ``grandparent_coordinator``: a declaration that binds both fails closed at
+#: parse time on the slot collision, so one default lane never holds two coordinator authorities.
 CANONICAL_ROLES: frozenset = frozenset(
-    {ROLE_GRANDPARENT_COORDINATOR, ROLE_PROJECT_GATEWAY}
+    {ROLE_GRANDPARENT_COORDINATOR, ROLE_PROJECT_GATEWAY, ROLE_COORDINATOR}
 )
+
+#: The canonical roles that sit in the :data:`DEFAULT_LANE` (one per declaration, enforced by the
+#: slot-collision check). A department root declares the grandparent; a single-workspace repo
+#: declares the ``coordinator``. They are mutually exclusive by construction, not by convention.
+DEFAULT_LANE_ROLES: frozenset = frozenset({ROLE_GRANDPARENT_COORDINATOR, ROLE_COORDINATOR})
 
 _ROLE_ALIASES: Mapping[str, str] = {
     ROLE_ROOT_COORDINATOR_ALIAS: ROLE_GRANDPARENT_COORDINATOR,
@@ -307,8 +328,11 @@ def parse_role_bindings(record: object) -> ParsedRoleBindings:
       missing / non-list ``bindings``;
     - an entry that is not an object, an unknown entry key, a non-string / unknown / out-of-vocabulary
       role, or a present-but-non-string (incl. explicit ``null``) project scope / source pointer;
-    - a grandparent with a non-empty project scope, or a project gateway with an empty scope;
-    - two grandparent entries, or two entries that derive the same lane id (slot collision).
+    - a grandparent with a non-empty project scope, or a project gateway / ``coordinator`` with an
+      empty scope;
+    - two grandparent entries, or two entries that derive the same lane id (slot collision — this
+      is what rejects a declaration binding BOTH the department-root grandparent and the
+      single-workspace ``coordinator`` to the default lane, Redmine #14546).
     """
     if record is None:
         return ParsedRoleBindings.empty()
@@ -380,6 +404,20 @@ def parse_role_bindings(record: object) -> ParsedRoleBindings:
                     "exactly one department-root coordinator"
                 )
             seen_grandparent = True
+            lane_id = DEFAULT_LANE
+        elif role == ROLE_COORDINATOR:
+            # The single-workspace default coordinator (Redmine #14546). It MUST declare its
+            # project scope: the scope is what the one-step work-intake forward carries and what
+            # the forward fence's route key is partitioned on, so an empty scope would collapse
+            # distinct workspaces' generations onto one degenerate key. It sits in the default
+            # lane, so a declaration that also binds the grandparent there fails closed below on
+            # the slot collision (one default lane, one coordinator authority).
+            if not scope:
+                return ParsedRoleBindings.invalid(
+                    f"binding #{index} ({ROLE_COORDINATOR}) must declare a non-empty project "
+                    "scope; the default coordinator's scope is carried on its one-step forward "
+                    "and partitions its forward fence"
+                )
             lane_id = DEFAULT_LANE
         else:  # ROLE_PROJECT_GATEWAY
             if not scope:
@@ -487,6 +525,7 @@ __all__ = (
     "SCHEMA_VERSION",
     "ROLE_ROOT_COORDINATOR_ALIAS",
     "CANONICAL_ROLES",
+    "DEFAULT_LANE_ROLES",
     "DEFAULT_LANE",
     "LANE_SCHEME",
     "WorkflowRoleAuthorityError",

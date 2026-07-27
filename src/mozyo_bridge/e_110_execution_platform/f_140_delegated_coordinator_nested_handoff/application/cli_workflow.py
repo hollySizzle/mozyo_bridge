@@ -861,6 +861,14 @@ def register(sub) -> None:
 
     register_fence_operator_parsers(workflow_sub)
 
+    # `workflow role-authority` (Redmine #14546): the mint / readback surface for the durable
+    # workflow-role authority a default lane needs before `workflow step` may resolve its role.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_role_authority import (  # noqa: E501
+        register_role_authority_parser,
+    )
+
+    register_role_authority_parser(workflow_sub)
+
     step = workflow_sub.add_parser(
         "step",
         description=(

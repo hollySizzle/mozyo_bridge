@@ -421,13 +421,6 @@ class OrchestrateHandoffForwardSendPort:
         import io
 
         from mozyo_bridge.application.commands import orchestrate_handoff
-        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.relative_route import (
-            ROLE_DELEGATED_COORDINATOR,
-        )
-        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
-            ROLE_GRANDPARENT_COORDINATOR,
-            ROLE_PROJECT_GATEWAY,
-        )
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_consultation import (
             CALLBACK_METHODS,
             CONSULTATION_PROJECT_DOMAIN,
@@ -452,17 +445,20 @@ class OrchestrateHandoffForwardSendPort:
         send_args.callback_methods = list(CALLBACK_METHODS)
         # R1-F1: inject the minted forward generation id so the returning callback echoes it.
         send_args.forward_action_id = action_id
+        # The callback returns to the leg's sender role and the receiver acts under the leg's
+        # target-role contract. Derived from the plan (Redmine #14546) rather than re-hard-coded
+        # per branch: for the two pre-existing legs ``plan.from_role`` / ``plan.to_role`` ARE the
+        # tokens that were written literally here, so this is byte-invariant for them, and the
+        # coordinator -> managed gateway leg needs no third branch.
+        send_args.callback_to_role = plan.from_role
+        send_args.read_contract = plan.to_role
         if plan.ticketless_kind == TICKETLESS_CONSULTATION:
-            send_args.transition_role = ROLE_GRANDPARENT_COORDINATOR
-            send_args.workflow_contract = ROLE_GRANDPARENT_COORDINATOR
+            send_args.transition_role = plan.from_role
+            send_args.workflow_contract = plan.from_role
             send_args.consultation_kind = CONSULTATION_PROJECT_DOMAIN
-            send_args.callback_to_role = ROLE_GRANDPARENT_COORDINATOR
-            send_args.read_contract = ROLE_PROJECT_GATEWAY
             ticketless_kwargs = {"ticketless_consultation": True}
         else:
             send_args.work_shape = WORK_SHAPE_DOMAIN_DESIGN
-            send_args.callback_to_role = ROLE_PROJECT_GATEWAY
-            send_args.read_contract = ROLE_DELEGATED_COORDINATOR
             ticketless_kwargs = {"ticketless_work_intake": True}
 
         buf = io.StringIO()

@@ -69,8 +69,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (
     PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE,
     PRIMITIVE_HERDR_FORWARD_CONSULT,
+    PRIMITIVE_HERDR_FORWARD_MANAGED_GATEWAY,
     REASON_HERDR_FORWARD_CHILD_INTAKE_READY,
     REASON_HERDR_FORWARD_CONSULT_READY,
+    REASON_HERDR_FORWARD_MANAGED_GATEWAY_READY,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
+    ROLE_COORDINATOR,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step import (
     EXECUTION_BLOCKED,
@@ -191,6 +196,8 @@ HERDR_STEP_REASONS = frozenset(
         # Increment 3 one-step forward-ready reasons (Redmine #13583).
         REASON_HERDR_FORWARD_CONSULT_READY,
         REASON_HERDR_FORWARD_CHILD_INTAKE_READY,
+        # The single-workspace default coordinator's forward-ready reason (Redmine #14546).
+        REASON_HERDR_FORWARD_MANAGED_GATEWAY_READY,
     }
 )
 
@@ -362,7 +369,26 @@ def _role_authority_resolved_outcome(
     NOT ``--dry-run`` — so a dry-run reports the route/result and mutates nothing (point 6). The
     forward primitive rides its own dedicated duplicate fence, never the generic ``executable`` set.
     """
-    if resolution.role == ROLE_GRANDPARENT_COORDINATOR:
+    if resolution.role == ROLE_COORDINATOR:
+        # The single-workspace default coordinator (Redmine #14546 / #14500). A bare `mozyo`
+        # default pair is neither a department root nor a separate project-gateway lane: its
+        # one-step-down transition is the MANAGED SUBLANE GATEWAY. This is what replaces the
+        # `ambiguous_default_coordinator_role` dead end for a workspace that declared its
+        # authority — the role is named from the durable binding, never from the fact that the
+        # pair happens to sit in the default lane on a codex provider.
+        state = STATE_PARENT_WORK_INTAKE
+        primitive = PRIMITIVE_HERDR_FORWARD_MANAGED_GATEWAY
+        reason = REASON_HERDR_FORWARD_MANAGED_GATEWAY_READY
+        next_owner = OWNER_CHILD
+        next_action = (
+            "durable workflow-role authority resolves this default lane to the single-workspace "
+            f"coordinator (project_scope={resolution.project_scope!r}). workflow step forwards a "
+            "single ticketless work-intake to the same-lane-self-fenced managed sublane gateway "
+            "(fail closed on same-lane / missing / duplicate). It answers no project-domain "
+            "question and mints no anchor; the managed gateway owns the Redmine anchor decision "
+            "and its own worker dispatch."
+        )
+    elif resolution.role == ROLE_GRANDPARENT_COORDINATOR:
         state = STATE_GRANDPARENT_CONSULTATION
         primitive = PRIMITIVE_HERDR_FORWARD_CONSULT
         reason = REASON_HERDR_FORWARD_CONSULT_READY

@@ -467,11 +467,15 @@ def _resolve_role_authority(args: argparse.Namespace, repo_root, sender):
         load_parsed_role_bindings,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+        ROLE_COORDINATOR as BINDING_COORDINATOR,
         ROLE_PROJECT_GATEWAY as BINDING_PROJECT_GATEWAY,
         ROLE_ROOT_COORDINATOR as BINDING_ROOT_COORDINATOR,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
         resolve_role_for_lane,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
+        ROLE_COORDINATOR,
     )
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.transition_role import (
         ROLE_GRANDPARENT_COORDINATOR,
@@ -487,14 +491,17 @@ def _resolve_role_authority(args: argparse.Namespace, repo_root, sender):
         # A broken provider config cannot confirm the coordinator surface: return None so the
         # pure resolver fails closed (provider_mismatch) when a binding matches this lane. The
         # authority's canonical grandparent_coordinator maps to provider_binding's compat
-        # ``root_coordinator`` role for the lookup (both default to codex).
+        # ``root_coordinator`` role for the lookup; the single-workspace ``coordinator``
+        # (Redmine #14546) maps to provider_binding's own ``coordinator`` role. All default to
+        # codex, and each is independently reboundable — the authority names the ROLE, the
+        # provider is resolved from config, so the default coordinator authority is
+        # provider-neutral by construction.
         if binding is None:
             return None
-        key = (
-            BINDING_ROOT_COORDINATOR
-            if role == ROLE_GRANDPARENT_COORDINATOR
-            else BINDING_PROJECT_GATEWAY
-        )
+        key = {
+            ROLE_GRANDPARENT_COORDINATOR: BINDING_ROOT_COORDINATOR,
+            ROLE_COORDINATOR: BINDING_COORDINATOR,
+        }.get(role, BINDING_PROJECT_GATEWAY)
         return binding.provider_for(key)
 
     return resolve_role_for_lane(
