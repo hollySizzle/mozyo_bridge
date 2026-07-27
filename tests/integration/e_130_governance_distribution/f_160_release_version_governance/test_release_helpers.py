@@ -1962,6 +1962,28 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             self.assertEqual(0, after, msg=stdout_after + stderr_after)
             self.assertIn("legacy project skill mirror is up to date", stdout_after)
 
+    def test_legacy_mirror_blocker_names_a_recovery_that_fits_the_drift(self) -> None:
+        """Review j#90322 F1: per-gate recovery, not one line for every class.
+
+        An unpinned mirrored reference is the one legacy drift class the sync
+        refuses to resolve. A blocker bullet that just says "rerun the sync"
+        sends the operator to a command that exits 1 on the same tree.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            (
+                repo / ".claude/skills/mozyo-bridge-agent/references/unpinned.md"
+            ).write_text("smuggled in\n", encoding="utf-8")
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("unpinned reference: references/unpinned.md", stdout)
+            self.assertIn("result: blocker", stdout)
+            # The bullet must say the sync will NOT clear this class.
+            self.assertIn("refuses while one is present", stdout)
+            self.assertIn("reviewed delete", stdout)
+            # The plugin gate keeps its own, still-correct recovery.
+            self.assertIn("plugin skill mirror is up to date", stdout)
+
     def test_missing_legacy_sync_script_is_release_blocker(self) -> None:
         """A deleted legacy sync script must block, not silently pass.
 

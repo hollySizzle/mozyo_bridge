@@ -34,11 +34,31 @@ _PLUGIN_SKILL_SYNC_RELATIVE = Path("scripts/sync_plugin_skill.sh")
 _LEGACY_PROJECT_SKILL_SYNC_RELATIVE = Path("scripts/sync_legacy_project_skill.sh")
 
 
+#: Recovery guidance per mirror gate. Kept per-gate rather than generated from
+#: the script name because the two mirrors do not have the same recovery
+#: contract, and review j#90322 F1 showed that stating one fix for every drift
+#: class sends the operator to a command that cannot resolve theirs. The plugin
+#: sync is a full `rsync -a --delete`, so rerunning it clears every class it
+#: reports. The legacy partial sync deliberately refuses to delete an unpinned
+#: reference, so that class needs a reviewed disposition first.
+_PLUGIN_MIRROR_RECOVERY = (
+    "rerun `scripts/sync_plugin_skill.sh` (no --check, from the repo root) and recommit."
+)
+_LEGACY_PROJECT_MIRROR_RECOVERY = (
+    "follow the disposition the sub-check printed above: content drift and a missing "
+    "mirrored file are cleared by rerunning `scripts/sync_legacy_project_skill.sh` "
+    "(no --check, from the repo root); an unpinned reference is not — that sync "
+    "refuses while one is present, and it needs a reviewed delete or a pinned-set "
+    "update in the script and its test. Then recommit."
+)
+
+
 def _run_skill_mirror_check(
     repo_root: Path,
     script_relative: Path,
     *,
     label: str,
+    recovery: str,
     blockers: list[str],
 ) -> None:
     """Run one skill-mirror ``--check`` script and record a blocker on failure.
@@ -46,7 +66,8 @@ def _run_skill_mirror_check(
     Shared by the plugin (full) and legacy project (partial) mirror gates so
     the two cannot diverge in how a non-zero exit or a missing script is
     handled. A missing script is itself a blocker: the gate would otherwise
-    pass silently because nothing ran.
+    pass silently because nothing ran. ``recovery`` stays per-gate because the
+    two mirrors have different recovery contracts (see the constants above).
     """
     script = repo_root / script_relative
     if not script.is_file():
@@ -63,10 +84,7 @@ def _run_skill_mirror_check(
     if result.stderr:
         print(result.stderr, end="" if result.stderr.endswith("\n") else "\n")
     if result.returncode != 0:
-        blockers.append(
-            f"{label} drift detected; rerun "
-            f"`{script_relative.as_posix()}` (no --check, from the repo root) and recommit."
-        )
+        blockers.append(f"{label} drift detected; {recovery}")
 
 
 def cmd_release_check_drift(args: argparse.Namespace) -> int:
@@ -131,6 +149,7 @@ def cmd_release_check_drift(args: argparse.Namespace) -> int:
         repo_root,
         _PLUGIN_SKILL_SYNC_RELATIVE,
         label="plugin skill mirror",
+        recovery=_PLUGIN_MIRROR_RECOVERY,
         blockers=blockers,
     )
 
@@ -139,6 +158,7 @@ def cmd_release_check_drift(args: argparse.Namespace) -> int:
         repo_root,
         _LEGACY_PROJECT_SKILL_SYNC_RELATIVE,
         label="legacy project skill mirror",
+        recovery=_LEGACY_PROJECT_MIRROR_RECOVERY,
         blockers=blockers,
     )
 

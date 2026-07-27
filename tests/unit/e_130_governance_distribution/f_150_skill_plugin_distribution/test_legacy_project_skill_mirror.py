@@ -95,8 +95,8 @@ class LegacyProjectSkillMirrorTest(unittest.TestCase):
         """Each mirrored reference file is byte-identical to canonical.
 
         Recovery: edit the canonical file under
-        `skills/mozyo-bridge-agent/references/` first, then copy its content
-        into the `.claude/skills/mozyo-bridge-agent/references/` mirror.
+        `skills/mozyo-bridge-agent/references/` first, then run
+        `scripts/sync_legacy_project_skill.sh` from the repo root.
         """
         differing: list[str] = []
         missing: list[str] = []
@@ -114,10 +114,9 @@ class LegacyProjectSkillMirrorTest(unittest.TestCase):
                 differing.append(name)
 
         hint = (
-            "sync by copying the canonical content from "
-            "skills/mozyo-bridge-agent/references/ into "
-            ".claude/skills/mozyo-bridge-agent/references/ "
-            "(edit canonical first, then mirror)"
+            "edit the canonical file under skills/mozyo-bridge-agent/references/ "
+            "first, then run scripts/sync_legacy_project_skill.sh from the repo "
+            "root (never hand-edit the mirror to diverge)"
         )
         self.assertFalse(missing, f"legacy project mirror missing files: {missing}; {hint}")
         self.assertFalse(
@@ -358,6 +357,87 @@ class LegacySkillSyncScriptTest(unittest.TestCase):
             self.assertIn(
                 "unpinned reference: references/subagent-delegation.md", result.stderr
             )
+
+    def test_check_does_not_offer_a_rerun_that_cannot_clear_the_drift(self) -> None:
+        """Review j#90322 F1: the recovery line must match the drift class.
+
+        An unpinned reference is the one class the sync refuses to resolve, so
+        printing the blanket "rerun the sync" recovery for it points the
+        operator at a command that exits 1 on the same state.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage(Path(tmp))
+            (
+                repo / ".claude/skills/mozyo-bridge-agent/references/unpinned.md"
+            ).write_text("smuggled in\n", encoding="utf-8")
+            result = self._check(repo)
+            self.assertEqual(1, result.returncode, msg=result.stdout)
+            self.assertIn("reviewed disposition", result.stderr)
+            self.assertIn("does NOT clear them", result.stderr)
+            self.assertNotIn("to resync the mirror", result.stderr)
+
+    def test_sync_refuses_while_an_unpinned_reference_is_present(self) -> None:
+        """Sync must not report success in the presence of a class it cannot fix.
+
+        Review j#90322 F1: the sync previously copied the pinned set, exited 0
+        and printed `synced legacy project skill mirror` while an unpinned file
+        sat in the mirror — so the very next `--check` exited 1, and the
+        documented "rerun the sync" recovery could never converge.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage(Path(tmp))
+            canonical = (
+                repo / "skills" / "mozyo-bridge-agent" / "references" / "workflow.md"
+            )
+            canonical.write_text(
+                canonical.read_text(encoding="utf-8") + "\nCANONICAL-ONLY EDIT\n",
+                encoding="utf-8",
+            )
+            mirror_workflow = (
+                repo
+                / ".claude/skills/mozyo-bridge-agent/references/workflow.md"
+            )
+            before = mirror_workflow.read_bytes()
+            (
+                repo / ".claude/skills/mozyo-bridge-agent/references/unpinned.md"
+            ).write_text("smuggled in\n", encoding="utf-8")
+
+            synced = self._sync(repo)
+            self.assertEqual(1, synced.returncode, msg=synced.stdout)
+            self.assertNotIn("synced legacy project skill mirror", synced.stdout)
+            self.assertIn("refusing to sync", synced.stderr)
+            self.assertIn("references/unpinned.md", synced.stderr)
+            # Audit runs before any write: the pending content drift must be
+            # untouched, so the exit code describes the whole tree state.
+            self.assertEqual(
+                before,
+                mirror_workflow.read_bytes(),
+                "sync wrote a partial result before refusing",
+            )
+
+    def test_sync_converges_once_the_unpinned_reference_is_dispositioned(self) -> None:
+        """After the reviewed delete, the documented recovery reaches green."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage(Path(tmp))
+            canonical = (
+                repo / "skills" / "mozyo-bridge-agent" / "references" / "workflow.md"
+            )
+            canonical.write_text(
+                canonical.read_text(encoding="utf-8") + "\nCANONICAL-ONLY EDIT\n",
+                encoding="utf-8",
+            )
+            extra = repo / ".claude/skills/mozyo-bridge-agent/references/unpinned.md"
+            extra.write_text("smuggled in\n", encoding="utf-8")
+
+            self.assertEqual(1, self._sync(repo).returncode)
+            self.assertEqual(1, self._check(repo).returncode)
+
+            extra.unlink()  # the reviewed disposition
+
+            synced = self._sync(repo)
+            self.assertEqual(0, synced.returncode, msg=synced.stderr)
+            after = self._check(repo)
+            self.assertEqual(0, after.returncode, msg=after.stdout + after.stderr)
 
     def test_check_fails_when_the_mirror_directory_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

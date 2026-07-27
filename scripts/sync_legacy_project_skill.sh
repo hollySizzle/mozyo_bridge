@@ -93,34 +93,20 @@ for name in $MIRRORED_REFERENCES; do
   fi
 done
 
-if [ "$check_only" -eq 1 ]; then
-  if [ ! -d "$dest" ]; then
-    echo "legacy project skill mirror missing: $dest" >&2
-    echo "$recovery" >&2
-    exit 1
-  fi
-
-  drift=0
-
-  # 1. content parity over the pinned set (the drift #14580 actually hit).
-  for name in $MIRRORED_REFERENCES; do
-    if [ ! -f "$dest/$name" ]; then
-      echo "legacy project skill mirror missing file: references/$name" >&2
-      drift=1
-      continue
-    fi
-    # `set -e` would abort on cmp's non-zero exit, so branch on it explicitly.
-    if cmp -s "$src/$name" "$dest/$name"; then
-      continue
-    fi
-    echo "legacy project skill mirror drift detected: references/$name differs from canonical" >&2
-    drift=1
-  done
-
-  # 2. file-set parity: an extra mirrored reference means a canonical file was
-  # copied in without extending the pinned set. Not auto-removed — deleting a
-  # tracked file is a reviewed decision, not a sync side effect.
+# File-set audit: an extra mirrored reference means a canonical file was copied
+# in without extending the pinned set. It is NOT auto-removed — deleting a
+# tracked file is a reviewed decision, not a sync side effect.
+#
+# Both modes run this, and both refuse. Review j#90322 F1 caught the earlier
+# split where only `--check` audited the set: the sync then exited 0 with a
+# success banner while the very next `--check` exited 1, and the documented
+# "rerun the sync" recovery could never converge. A mode that cannot resolve a
+# drift class must not report success in its presence.
+unpinned_found=0
+audit_unpinned_references() {
+  [ -d "$dest" ] || return 0
   for path in "$dest"/*.md; do
+    # Guard the no-match case: an unmatched glob stays literal in sh.
     [ -e "$path" ] || continue
     found=0
     base="$(basename "$path")"
@@ -132,15 +118,55 @@ if [ "$check_only" -eq 1 ]; then
     done
     if [ "$found" -eq 0 ]; then
       echo "legacy project skill mirror has an unpinned reference: references/$base" >&2
-      echo "Either delete it, or add it to MIRRORED_REFERENCES in this script AND in" >&2
-      echo "tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py." >&2
-      drift=1
+      unpinned_found=1
     fi
   done
+}
 
-  if [ "$drift" -ne 0 ]; then
-    echo "" >&2
+unpinned_disposition() {
+  echo "Unpinned reference(s) need a reviewed disposition: either delete them, or add" >&2
+  echo "them to MIRRORED_REFERENCES in this script AND in" >&2
+  echo "tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py." >&2
+  echo "Rerunning this script does NOT clear them — it refuses while they are present." >&2
+}
+
+if [ "$check_only" -eq 1 ]; then
+  if [ ! -d "$dest" ]; then
+    echo "legacy project skill mirror missing: $dest" >&2
     echo "$recovery" >&2
+    exit 1
+  fi
+
+  content_drift=0
+
+  # Content parity over the pinned set (the drift #14580 actually hit).
+  for name in $MIRRORED_REFERENCES; do
+    if [ ! -f "$dest/$name" ]; then
+      echo "legacy project skill mirror missing file: references/$name" >&2
+      content_drift=1
+      continue
+    fi
+    # `set -e` would abort on cmp's non-zero exit, so branch on it explicitly.
+    if cmp -s "$src/$name" "$dest/$name"; then
+      continue
+    fi
+    echo "legacy project skill mirror drift detected: references/$name differs from canonical" >&2
+    content_drift=1
+  done
+
+  audit_unpinned_references
+
+  # Report the recovery that actually resolves each class present. Printing the
+  # blanket "rerun the sync" line for an unpinned-reference drift would send the
+  # operator to a command that refuses.
+  if [ "$content_drift" -ne 0 ] || [ "$unpinned_found" -ne 0 ]; then
+    echo "" >&2
+    if [ "$content_drift" -ne 0 ]; then
+      echo "$recovery" >&2
+    fi
+    if [ "$unpinned_found" -ne 0 ]; then
+      unpinned_disposition
+    fi
     exit 1
   fi
 
@@ -148,6 +174,15 @@ if [ "$check_only" -eq 1 ]; then
   echo "  source: $src"
   echo "  destination: $dest"
   exit 0
+fi
+
+# Sync mode. Audit BEFORE writing anything: refusing after a partial copy would
+# leave the tree in a state neither the exit code nor the banner describes.
+audit_unpinned_references
+if [ "$unpinned_found" -ne 0 ]; then
+  echo "refusing to sync the legacy project skill mirror; nothing was written." >&2
+  unpinned_disposition
+  exit 1
 fi
 
 mkdir -p "$dest"
