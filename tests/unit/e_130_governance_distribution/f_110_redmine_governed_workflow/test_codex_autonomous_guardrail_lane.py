@@ -39,6 +39,15 @@ class CodexAutonomousGuardrailLaneTest(unittest.TestCase):
         "mozyo-bridge docs generate-file-conventions --check",
     )
 
+    DIRECT_EDIT_REVIEW_EXEMPTION_MARKERS = (
+        "review結果 (US では US-level audit) または有効な review exemption",
+        "follow_up_review: false",
+        "別 auditor の Review Request / Review Gate を要求しない",
+        "実装 actor 自身が Review Gate approval を記録したりしない",
+        "coordinator-owned standalone policy / operations docs",
+        "通常の Claude 実装 code",
+    )
+
     def _packaged_preset(self, preset: str) -> str:
         path = (
             ROOT
@@ -87,6 +96,32 @@ class CodexAutonomousGuardrailLaneTest(unittest.TestCase):
                     f"marker {marker!r}; see Redmine #10338."
                 ),
             )
+
+    def test_governed_presets_pin_direct_edit_review_exemption(self) -> None:
+        for preset in ("redmine-governed", "redmine-rails-governed"):
+            body = self._packaged_preset(preset)
+            for marker in self.DIRECT_EDIT_REVIEW_EXEMPTION_MARKERS:
+                self.assertIn(
+                    marker,
+                    body,
+                    msg=(
+                        f"{preset} is missing direct-edit review-exemption "
+                        f"marker {marker!r}."
+                    ),
+                )
+
+    def test_coordinator_flow_pins_standalone_docs_review_exemption(self) -> None:
+        body = (
+            ROOT / "vibes" / "docs" / "logics" / "coordinator-sublane-development-flow.md"
+        ).read_text(encoding="utf-8")
+        for marker in (
+            "Coordinator-owned docs と direct-edit review exemption",
+            "既定は `follow_up_review: false`",
+            "実装 actor が自己 Review Gate を書くことはしない",
+            "通常の Claude 実装 code",
+            "`coordinator_assistant` も review authority を持たない",
+        ):
+            self.assertIn(marker, body)
 
     def test_governed_preset_versions_were_bumped(self) -> None:
         # The autonomous-lane change is a workflow / guardrail change, so
