@@ -48,6 +48,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _TESTS_ROOT = Path(__file__).resolve().parents[1]
@@ -1015,3 +1016,528 @@ class LiveZeroMeasurementIsSharedNotDuplicated(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# 6. Review j#89191 findings 1-4: the adversarial pins the re-review requires.
+# ---------------------------------------------------------------------------
+
+
+def _git(*args, cwd):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+class Finding1LaneSelectionProof(unittest.TestCase):
+    """j#89191 finding 1: the CAS must prove WHICH lane, not only that it is fresh.
+
+    **What this fence actually is.** The review asked for a lane-selection proof because the
+    CAS's generation/revision predicates are freshness, not selection. That reasoning is
+    correct. The failure scenario it described — two ACTIVE rows owning one issue, both at
+    generation 1 / revision 1, one of them terminalized by mistake — is nonetheless
+    unreachable, and measurably so at **three** independent layers:
+
+    1. the application path refuses (``declare_lane`` and the hibernated→active rehydrate
+       both return ``owner_conflict``);
+    2. the storage engine makes it unrepresentable — a partial UNIQUE index
+       ``idx_lane_lifecycle_active_owner`` on ``(repo_workspace_id, issue_id) WHERE
+       lane_disposition = 'active' AND issue_id <> ''``, whose own comment says "original +
+       recovery both own the issue" is *unrepresentable rather than merely detected
+       afterwards*. A raw ``INSERT`` raises ``sqlite3.IntegrityError``;
+    3. and dropping that index to force the state does not help either: the store's schema
+       signature check then declares the whole authority corrupt, so **every read fails
+       closed** and the rail never reaches its CAS.
+
+    So the owner fence added for this finding is **defense in depth, not a fix for a
+    reachable bug**, and the re-review record says so. It is still worth having — this is the
+    only terminal rail with no second identity axis — and it does improve one reachable case:
+    a ``--lane-label`` naming a row that is not the issue's owner now refuses early with a
+    reason that names the owner, instead of falling through to a generic CAS refusal.
+
+    These tests pin all of that: the unreachability (so a future relaxation is caught here,
+    next to the reason it matters), and the fence's behaviour at its own boundary.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+        env = mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.path = self.home / "state.sqlite"
+
+    def _seed(self, lane: str, issue: str = _ISSUE) -> None:
+        out = LaneDeclarationStore(path=self.path).declare_lane(
+            LaneLifecycleKey(_WORKSPACE_ID, lane),
+            decision=_decision(issue),
+            issue_id=issue,
+            declared_slots=_pins(),
+            worktree_identity="",
+        )
+        self.assertTrue(out.applied, out.reason)
+
+    def _terminalize(self, lane_label: str, *, generation: int = 1, revision: int = 1):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_active_unbound_live_zero_retire import (  # noqa: E501
+            _terminalize_under_exclusion,
+        )
+
+        return _terminalize_under_exclusion(
+            argparse.Namespace(
+                lane_label=lane_label, issue=_ISSUE, journal=_JOURNAL, worktree=None,
+                branch="b", integration_branch="main",
+            ),
+            Path("."),
+            workspace_id=_WORKSPACE_ID,
+            lane_label=lane_label,
+            issue=_ISSUE,
+            journal=_JOURNAL,
+            expect_generation=generation,
+            expect_revision=revision,
+        )
+
+    def test_two_active_owners_are_unrepresentable_not_merely_refused(self):
+        """Layers 1 and 2 of the unreachability, measured rather than assumed."""
+        import sqlite3
+
+        from mozyo_bridge.core.state.lane_lifecycle_schema import TABLE
+
+        self._seed("lane_r1")
+        second = LaneDeclarationStore(path=self.path).declare_lane(
+            LaneLifecycleKey(_WORKSPACE_ID, "lane_r2"),
+            decision=_decision(),
+            issue_id=_ISSUE,
+            declared_slots=_pins(),
+            worktree_identity="",
+        )
+        self.assertFalse(second.applied)
+        self.assertEqual(second.reason, "owner_conflict")
+
+        conn = sqlite3.connect(str(self.path))
+        try:
+            row = conn.execute(
+                f"SELECT * FROM {TABLE} WHERE lane_id = ?", ("lane_r1",)
+            ).fetchone()
+            cols = [d[0] for d in conn.execute(f"SELECT * FROM {TABLE} LIMIT 0").description]
+            values = dict(zip(cols, row))
+            values["lane_id"] = "lane_r2"
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    f"INSERT INTO {TABLE} ({', '.join(cols)}) "
+                    f"VALUES ({', '.join('?' for _ in cols)})",
+                    [values[c] for c in cols],
+                )
+        finally:
+            conn.close()
+
+    def test_dropping_the_owner_index_makes_the_whole_authority_unreadable(self):
+        """Layer 3: forcing the state past the index does not open a path either."""
+        import sqlite3
+
+        from mozyo_bridge.core.state.lane_lifecycle_schema import LaneLifecycleError
+
+        self._seed("lane_r1")
+        conn = sqlite3.connect(str(self.path))
+        try:
+            conn.execute("DROP INDEX IF EXISTS idx_lane_lifecycle_active_owner")
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(LaneLifecycleError):
+            LaneLifecycleStore(path=self.path).records()
+        # And the rail reports that as unreadable rather than proceeding.
+        verdict = self._terminalize("lane_r1")
+        self.assertEqual(verdict.reason, "lifecycle_unreadable")
+
+    def test_ambiguous_owner_resolution_refuses_the_retire(self):
+        """The fence at its own boundary: a non-unique owner licenses no terminal write."""
+        from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore as _Store
+        from mozyo_bridge.core.state.lane_lifecycle_model import (
+            OWNER_AMBIGUOUS,
+            OwnerResolution,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_active_unbound_live_zero_retire import (  # noqa: E501
+            UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN,
+        )
+
+        self._seed("lane_r1")
+        with mock.patch.object(
+            _Store,
+            "resolve_owner",
+            return_value=OwnerResolution(
+                status=OWNER_AMBIGUOUS, detail="2 active owners; the owner index is not holding"
+            ),
+        ):
+            verdict = self._terminalize("lane_r1")
+        self.assertEqual(verdict.reason, UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN)
+        self.assertIn("ambiguous", verdict.detail)
+        self.assertEqual(
+            LaneLifecycleStore(path=self.path)
+            .get(LaneLifecycleKey(_WORKSPACE_ID, "lane_r1"))
+            .lane_disposition,
+            DISPOSITION_ACTIVE,
+            "zero-write: the lane must be untouched",
+        )
+
+    def test_owner_resolving_to_a_different_lane_refuses(self):
+        """If the resolved owner is some other lane, this one is not the caller's target."""
+        from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore as _Store
+        from mozyo_bridge.core.state.lane_lifecycle_model import (
+            OWNER_RESOLVED,
+            OwnerResolution,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_active_unbound_live_zero_retire import (  # noqa: E501
+            UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN,
+        )
+
+        self._seed("lane_r1")
+        with mock.patch.object(
+            _Store,
+            "resolve_owner",
+            return_value=OwnerResolution(status=OWNER_RESOLVED, lane_id="lane_somewhere_else"),
+        ):
+            verdict = self._terminalize("lane_r1")
+        self.assertEqual(verdict.reason, UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN)
+        self.assertIn("lane_somewhere_else", verdict.detail)
+
+    def test_a_lane_that_is_not_the_issues_owner_refuses_without_any_patching(self):
+        """The one reachable case the fence improves — real store, no mocks."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_active_unbound_live_zero_retire import (  # noqa: E501
+            UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN,
+        )
+
+        self._seed("lane_owner", issue=_ISSUE)
+        self._seed("lane_other", issue="99999")
+        verdict = self._terminalize("lane_other")
+        self.assertEqual(verdict.reason, UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN)
+        self.assertIn("lane_owner", verdict.detail)
+        self.assertEqual(
+            LaneLifecycleStore(path=self.path)
+            .get(LaneLifecycleKey(_WORKSPACE_ID, "lane_other"))
+            .lane_disposition,
+            DISPOSITION_ACTIVE,
+        )
+
+
+class Finding2BranchIsBoundToTheLane(unittest.TestCase):
+    """j#89191 finding 2: --branch must be THIS lane's branch, not any integrated one."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+        env = mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _record_lane_branch(self, branch: str) -> None:
+        from mozyo_bridge.core.state.lane_metadata import record_lane_created
+
+        record_lane_created(
+            lane_workspace_token="wt_probe",
+            repo_workspace_id=_WORKSPACE_ID,
+            issue_id=_ISSUE,
+            lane_label=_LANE,
+            branch=branch,
+            worktree_path="/private/tmp/gone",
+            lane_id=_LANE,
+        )
+
+    def _verify(self, branch, integration="main"):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_active_unbound_live_zero_retire import (  # noqa: E501
+            _verify_branch_binds_to_lane,
+        )
+
+        return _verify_branch_binds_to_lane(
+            argparse.Namespace(branch=branch, integration_branch=integration),
+            workspace_id=_WORKSPACE_ID,
+            lane_label=_LANE,
+        )
+
+    def test_the_ancestry_probe_really_does_pass_for_a_self_ancestor(self):
+        """Non-vacuity: the fail-open this fence closes is real, measured over real git."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
+            LiveSublaneLifecycleOps,
+        )
+
+        repo = Path(self.tmp.name) / "repo"
+        repo.mkdir()
+        _git("init", "-q", "-b", "main", cwd=repo)
+        _git("config", "user.email", "t@example.com", cwd=repo)
+        _git("config", "user.name", "t", cwd=repo)
+        (repo / "f.txt").write_text("x\n", encoding="utf-8")
+        _git("add", ".", cwd=repo)
+        _git("commit", "-qm", "base", cwd=repo)
+        _git("branch", "integration", cwd=repo)
+        _git("checkout", "-q", "-b", "lane_branch", cwd=repo)
+        (repo / "g.txt").write_text("y\n", encoding="utf-8")
+        _git("add", ".", cwd=repo)
+        _git("commit", "-qm", "unintegrated lane work", cwd=repo)
+        ops = LiveSublaneLifecycleOps(repo_root=repo)
+        self.assertFalse(
+            ops.branch_integrated("lane_branch", "integration"),
+            "the lane's real head is unintegrated",
+        )
+        self.assertTrue(
+            ops.branch_integrated("integration", "integration"),
+            "a branch is trivially its own ancestor — the fail-open this fence closes",
+        )
+
+    def test_an_unrelated_integrated_branch_is_refused(self):
+        self._record_lane_branch("lane_branch")
+        ok, detail = self._verify("some_other_integrated_branch")
+        self.assertFalse(ok)
+        self.assertIn("lane_branch", detail)
+
+    def test_the_integration_branch_itself_is_refused(self):
+        self._record_lane_branch("integration")
+        ok, detail = self._verify("integration", integration="integration")
+        self.assertFalse(ok)
+        self.assertIn("its own ancestor", detail)
+
+    def test_the_lanes_own_branch_passes(self):
+        self._record_lane_branch("lane_branch")
+        ok, detail = self._verify("lane_branch")
+        self.assertTrue(ok, detail)
+
+    def test_absent_metadata_refuses_rather_than_trusting_the_caller(self):
+        ok, detail = self._verify("anything")
+        self.assertFalse(ok)
+        self.assertIn("no lane metadata record", detail)
+
+    def test_a_record_without_a_branch_refuses(self):
+        self._record_lane_branch("")
+        ok, detail = self._verify("anything")
+        self.assertFalse(ok)
+        self.assertIn("carries no branch", detail)
+
+    def test_an_empty_branch_argument_refuses(self):
+        self._record_lane_branch("lane_branch")
+        ok, _ = self._verify("")
+        self.assertFalse(ok)
+
+
+class Finding3PreCloseIdentityRecheck(unittest.TestCase):
+    """j#89191 finding 3: re-verify name+locator immediately before each close."""
+
+    def _execute(self, plan, recheck_rows=None, *, recheck_raises=False):
+        """Drive ``_execute_closes`` with a controlled pre-close inventory re-read.
+
+        ``recheck_rows`` is what every re-read returns (the state the world moved to between
+        the plan and the close); ``recheck_raises`` makes the re-read fail instead.
+        ``attempted`` records every locator an actual close was issued for — the assertion
+        that matters for "zero foreign close" is that it stays empty.
+        """
+        from unittest import mock
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_herdr_projection as projection,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_pane_lifecycle,
+            herdr_session_start,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_residue_close import (  # noqa: E501
+            _execute_closes,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+            HerdrSessionStartError,
+        )
+
+        attempted: list[str] = []
+
+        def _reread(*_a, **_k):
+            if recheck_raises:
+                raise HerdrSessionStartError("inventory unreadable")
+            return list(recheck_rows or [])
+
+        def _close(_binary, locator, *_a, **_k):
+            attempted.append(locator)
+            return True, ""
+
+        with mock.patch.object(
+            projection, "list_herdr_agent_rows", side_effect=_reread
+        ), mock.patch.object(
+            herdr_session_start, "_resolve_binary_or_die", return_value="herdr"
+        ), mock.patch.object(
+            herdr_pane_lifecycle, "_close_base_pane", side_effect=_close
+        ):
+            closed, failed, skipped = _execute_closes(
+                plan,
+                workspace_id=_WORKSPACE_ID,
+                lane_id=_LANE,
+                legacy_workspace_id="",
+                managed_roles=_ROLES,
+            )
+        return closed, failed, skipped, attempted
+
+    def _plan(self, rows):
+        return plan_residue_close(
+            rows, workspace_id=_WORKSPACE_ID, lane_id=_LANE, managed_roles=_ROLES
+        )
+
+    def test_unchanged_inventory_closes_normally(self):
+        rows = [_residue_row("codex", "w3N:pF")]
+        plan = self._plan(rows)
+        closed, failed, skipped, attempted = self._execute(plan, rows)
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(skipped, ())
+        self.assertEqual(attempted, ["w3N:pF"])
+
+    def test_a_locator_reassigned_to_a_foreign_occupant_is_not_closed(self):
+        """The finding's scenario: same pane id, different (foreign) occupant."""
+        rows = [_residue_row("codex", "w3N:pF")]
+        plan = self._plan(rows)
+        # Between the plan and the close the residue shell exits and herdr hands w3N:pF to a
+        # completely different agent.
+        after = [{"name": "mzb1_otherws_claude_someone_elses_lane", "pane": "w3N:pF",
+                  "agent": "claude", "agent_status": "working"}]
+        closed, failed, skipped, attempted = self._execute(plan, after)
+        self.assertEqual(closed, (), "a reassigned locator must not be closed")
+        self.assertEqual(attempted, [], "zero foreign close: nothing was even attempted")
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("no longer a residue target", skipped[0][2])
+
+    def test_a_slot_that_came_back_to_life_is_not_closed(self):
+        rows = [_residue_row("codex", "w3N:pF")]
+        plan = self._plan(rows)
+        revived = [_live_row("codex", "w3N:pF")]
+        closed, _failed, skipped, attempted = self._execute(plan, revived)
+        self.assertEqual(closed, ())
+        self.assertEqual(attempted, [])
+        self.assertEqual(len(skipped), 1)
+
+    def test_a_live_half_appearing_late_collapses_the_whole_close(self):
+        """The pair fence is re-applied at close time, not only at plan time."""
+        rows = [_residue_row("codex", "w3N:pF"), _residue_row("claude", "w3N:pG")]
+        plan = self._plan(rows)
+        self.assertEqual(len(plan.close_targets), 2)
+        late = [_residue_row("codex", "w3N:pF"), _live_row("claude", "w3N:pG")]
+        closed, _failed, skipped, attempted = self._execute(plan, late)
+        self.assertEqual(closed, ())
+        self.assertEqual(attempted, [])
+        self.assertEqual(len(skipped), 2)
+        self.assertIn("live agent appeared", skipped[0][2])
+
+    def test_an_unreadable_recheck_skips_rather_than_closing_blind(self):
+        rows = [_residue_row("codex", "w3N:pF")]
+        plan = self._plan(rows)
+        closed, _failed, skipped, attempted = self._execute(plan, recheck_raises=True)
+        self.assertEqual(closed, ())
+        self.assertEqual(attempted, [])
+        self.assertIn("could not be re-read", skipped[0][2])
+
+    def test_all_targets_skipped_is_blocked_not_a_success(self):
+        """An all-skipped run must not read as the verified `no_residue` state.
+
+        Nothing was closed and nothing failed, but the lane still holds slots that looked
+        like residue moments ago — reporting success there is the unproven-no-op misread the
+        whole surface exists to avoid.
+        """
+        from unittest import mock
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_residue_close as module,
+        )
+
+        rows = [_residue_row("codex", "w3N:pF")]
+        plan = self._plan(rows)
+        moved = [{"name": "mzb1_otherws_claude_elsewhere", "pane": "w3N:pF",
+                  "agent": "claude", "agent_status": "working"}]
+        closed, failed, skipped, attempted = self._execute(plan, moved)
+        self.assertEqual((closed, failed, attempted), ((), (), []))
+        self.assertEqual(len(skipped), 1)
+        # And the verdict that shape produces is blocked, not a success.
+        verdict = module.ResidueCloseVerdict(
+            state=module.RESIDUE_BLOCKED,
+            reason=module.RESIDUE_IDENTITY_MOVED,
+            skipped=tuple(skipped),
+        )
+        self.assertFalse(verdict.ok)
+        self.assertEqual(len(verdict.as_payload()["skipped"]), 1)
+
+
+class Finding4UnreadableAuthorityIsNotEmpty(unittest.TestCase):
+    """j#89191 finding 4: an unreadable authority must not read as 'nothing to converge'."""
+
+    def test_an_unreadable_lifecycle_store_raises_rather_than_reporting_empty(self):
+        from unittest import mock
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_reboot_audit as audit,
+        )
+
+        with mock.patch.object(
+            audit, "gather_reboot_facts", wraps=audit.gather_reboot_facts
+        ):
+            with mock.patch(
+                "mozyo_bridge.core.state.lane_lifecycle_readonly.load_lane_lifecycle_readonly",
+                return_value=None,
+            ), mock.patch.object(
+                audit, "_DEFAULT_INTEGRATION_BRANCH", "main"
+            ):
+                with mock.patch(
+                    "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+                    "application.sublane_herdr_projection.repo_scope_workspace_id",
+                    return_value=_WORKSPACE_ID,
+                ):
+                    with self.assertRaises(audit.RebootAuditUnavailable) as caught:
+                        audit.gather_reboot_facts(Path("."))
+        self.assertIn("could not be read", str(caught.exception))
+        self.assertIn("NOT the same as the store having no rows", str(caught.exception))
+
+    def test_an_unresolvable_workspace_raises_rather_than_reporting_empty(self):
+        from unittest import mock
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_reboot_audit as audit,
+        )
+
+        with mock.patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff."
+            "application.sublane_herdr_projection.repo_scope_workspace_id",
+            return_value="",
+        ):
+            with self.assertRaises(audit.RebootAuditUnavailable) as caught:
+                audit.gather_reboot_facts(Path("."))
+        self.assertIn("workspace identity", str(caught.exception))
+
+    def test_the_command_exits_non_zero_when_the_snapshot_is_unavailable(self):
+        from unittest import mock
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_reboot_audit as audit,
+        )
+
+        with mock.patch.object(
+            audit,
+            "gather_reboot_facts",
+            side_effect=audit.RebootAuditUnavailable("store unreadable"),
+        ):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = audit.cmd_sublane_reboot_audit(
+                    argparse.Namespace(repo=".", integration_branch="", lane_label="", json=True)
+                )
+        self.assertEqual(rc, 1, "an unreadable authority must not exit 0")
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["state"], "unavailable")
+        self.assertEqual(payload["lane_count"], 0)
+
+    def test_a_genuinely_empty_workspace_still_reports_zero_lanes_at_exit_0(self):
+        """The distinction: empty is a normal result, unreadable is not."""
+        from unittest import mock
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_reboot_audit as audit,
+        )
+
+        with mock.patch.object(audit, "gather_reboot_facts", return_value=()):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = audit.cmd_sublane_reboot_audit(
+                    argparse.Namespace(repo=".", integration_branch="", lane_label="", json=True)
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(buf.getvalue())["lane_count"], 0)

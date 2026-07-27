@@ -98,6 +98,26 @@ UNBOUND_RETIRE_LAUNCH_IN_FLIGHT = "launch_in_flight"
 UNBOUND_RETIRE_EXCLUSION_UNAVAILABLE = "exclusion_unavailable"
 #: The lane unit's workspace identity could not be resolved from ``--repo``.
 UNBOUND_RETIRE_WORKSPACE_UNRESOLVED = "workspace_unresolved"
+#: The issue's ACTIVE owning lane does not resolve to exactly one row, or resolves to a
+#: DIFFERENT lane than ``--lane-label`` (Redmine #14499 review j#89191 finding 1). This is
+#: the *lane selection* proof, as opposed to the generation/revision *freshness* proof: the
+#: CAS below verifies the row at ``(workspace, lane_label)`` is fresh and owns the issue, but
+#: on its own it cannot tell a correctly-aimed retire from one aimed at a sibling lane of the
+#: same issue that happens to carry the same generation and revision (``1``/``1`` for every
+#: freshly declared lane). The durable store's write paths do refuse to create two ACTIVE
+#: owners for one issue — measured: ``declare_lane`` and the hibernated→active rehydrate both
+#: return ``owner_conflict`` — so that shape is not reachable today. This surface nonetheless
+#: checks it, because it is the ONLY terminal rail with no second identity axis (the four
+#: bound rails attest a worktree token), and the codebase's posture is to verify the
+#: invariant it depends on rather than inherit it: #14242's duplicate-inventory fence exists
+#: even though "a herdr assigned name is unique by construction".
+UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN = "lane_selection_unproven"
+#: ``--branch`` is not the branch this lane's durable metadata records, so the head-integration
+#: evidence describes some other branch (Redmine #14499 review j#89191 finding 2). Measured:
+#: ``branch_integrated("integration", "integration")`` is ``True``, so without this check a
+#: caller passing the integration branch as ``--branch`` clears the head gate for a lane whose
+#: real head was never integrated.
+UNBOUND_RETIRE_BRANCH_NOT_LANE_BOUND = "branch_not_lane_bound"
 
 
 @dataclass(frozen=True)
@@ -222,6 +242,31 @@ def run_active_unbound_live_zero_retire(
             lane_id=lane_label,
         )
 
+    # ---- branch <-> lane binding (Redmine #14499 review j#89191 finding 2) -------------
+    #
+    # `head_integrated` is computed from the caller's --branch alone. The bound rails tie
+    # that branch to the lane by requiring the ATTESTED worktree to be checked out on it;
+    # this rail has no worktree, and the first version simply dropped the tie instead of
+    # replacing it. Measured consequence: `branch_integrated("integration", "integration")`
+    # is True, so `--branch <integration-branch>` cleared the head gate for any lane,
+    # including one whose real head was never integrated.
+    #
+    # The lane's branch is not recorded in the lifecycle (authority) store at all — only in
+    # the lane METADATA store. That store is documented as a display join and reads fail-open
+    # to empty, which would normally disqualify it as an authority. It is sound here because
+    # it is used ONLY to REFUSE: an unreadable/absent/empty record blocks, and a mismatch
+    # blocks. A fail-open read used to narrow can never widen what is permitted.
+    branch_ok, branch_detail = _verify_branch_binds_to_lane(
+        args, workspace_id=workspace_id, lane_label=lane_label
+    )
+    if not branch_ok:
+        return _blocked(
+            UNBOUND_RETIRE_BRANCH_NOT_LANE_BOUND,
+            detail=branch_detail,
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+        )
+
     # Head integration is an action-time invariant the retire preflight (run with
     # merge_on_retire=False) does not check. Identical to the bound surfaces.
     if head_integrated is not True:
@@ -305,6 +350,69 @@ def run_active_unbound_live_zero_retire(
         )
 
 
+def _verify_branch_binds_to_lane(
+    args: argparse.Namespace, *, workspace_id: str, lane_label: str
+) -> tuple[bool, str]:
+    """Is ``--branch`` the branch this lane's durable metadata records? (#14499 finding 2)
+
+    Returns ``(ok, detail)``; ``detail`` is the refusal reason when ``ok`` is false. Every
+    failure mode — no ``--branch``, no metadata record for the lane unit, a record carrying
+    no branch, a mismatch, or a metadata read error — refuses. The check only ever narrows,
+    so the metadata store's fail-open read cannot turn into a fail-open *permit*.
+
+    ``--branch == --integration-branch`` is refused separately and first: that is a branch
+    which is trivially its own ancestor, so the head-integration probe returns ``True``
+    without measuring anything about the lane. Even when the lane's record happened to name
+    the integration branch, "the integration branch is integrated" is not evidence that this
+    lane's work reached it.
+    """
+    from mozyo_bridge.core.state.lane_metadata import (
+        lane_records_by_unit,
+        load_lane_records,
+    )
+
+    branch = (getattr(args, "branch", "") or "").strip()
+    integration = (getattr(args, "integration_branch", "") or "").strip()
+    if not branch:
+        return False, (
+            "--branch is required: head integration is measured against it, and without it "
+            "there is nothing to bind to this lane"
+        )
+    if integration and branch == integration:
+        return False, (
+            f"--branch and --integration-branch are both {branch!r}; a branch is trivially "
+            "its own ancestor, so the head-integration probe would pass without measuring "
+            "anything about this lane's work"
+        )
+    try:
+        recorded = lane_records_by_unit(load_lane_records()).get(
+            (workspace_id, lane_label)
+        )
+    except Exception:  # noqa: BLE001 - an unreadable display store refuses, never permits
+        return False, (
+            "the lane metadata store could not be read, so --branch cannot be bound to this "
+            "lane; the terminal retire fails closed rather than trusting the caller's branch"
+        )
+    if recorded is None:
+        return False, (
+            f"no lane metadata record exists for unit ({workspace_id}, {lane_label}), so "
+            "there is no durable record of which branch this lane owns; --branch cannot be "
+            "verified and the head-integration evidence cannot be attributed to this lane"
+        )
+    lane_branch = (recorded.branch or "").strip()
+    if not lane_branch:
+        return False, (
+            "this lane's metadata record carries no branch, so --branch cannot be bound to "
+            "it; the head-integration evidence cannot be attributed to this lane"
+        )
+    if lane_branch != branch:
+        return False, (
+            f"--branch {branch!r} is not this lane's recorded branch {lane_branch!r}; the "
+            "head-integration evidence would describe a different branch's history"
+        )
+    return True, ""
+
+
 def _terminalize_under_exclusion(
     args: argparse.Namespace,
     repo_root: Path,
@@ -329,6 +437,7 @@ def _terminalize_under_exclusion(
         LaneLifecycleKey,
         LaneLifecycleStore,
     )
+    from mozyo_bridge.core.state.lane_lifecycle_model import OWNER_RESOLVED
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
         REASON_INVENTORY_UNREADABLE,
         REASON_PROVIDER_UNRESOLVED,
@@ -377,6 +486,44 @@ def _terminalize_under_exclusion(
             detail=(
                 "the lane unit has no durable lifecycle owner row; there is no active state "
                 "to terminalize"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+        )
+
+    # ---- lane SELECTION proof (Redmine #14499 review j#89191 finding 1) ----------------
+    #
+    # The CAS below proves the row at this address is FRESH (generation + revision) and owns
+    # this issue. It does not prove the caller aimed at the right lane: a sibling lane of the
+    # same issue, freshly declared, carries the same generation and revision, so a mistyped
+    # --lane-label would satisfy every one of the CAS's predicates. The four bound rails do
+    # not have this hole because their worktree token is a second, independent identity axis;
+    # this rail has none, so the proof is taken from the durable owner index instead.
+    #
+    # Resolved under the same exclusive lock as the CAS, so the answer cannot move between the
+    # check and the write. Exactly-one is required: OWNER_AMBIGUOUS means the invariant the
+    # store's write paths maintain has been violated, and no terminal write may be licensed by
+    # an index that is not holding; OWNER_ABSENT means no ACTIVE row owns the issue at all.
+    owner = LaneLifecycleStore().resolve_owner(workspace_id, issue)
+    if owner.status != OWNER_RESOLVED:
+        return _blocked(
+            UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN,
+            detail=(
+                f"issue #{issue} does not resolve to exactly one ACTIVE owning lane "
+                f"({owner.status}: {owner.detail}); with no worktree binding to attest, a "
+                "unique owner is this surface's only proof that --lane-label names the lane "
+                "the audit selected"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+        )
+    if owner.lane_id != lane_label:
+        return _blocked(
+            UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN,
+            detail=(
+                f"issue #{issue} is owned by lane {owner.lane_id!r}, not the requested "
+                f"{lane_label!r}; the requested lane is not this issue's owner, so "
+                "terminalizing it would retire a lane the caller did not select"
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
@@ -552,6 +699,7 @@ def format_unbound_retire_text(verdict: ActiveUnboundLiveZeroRetireVerdict) -> s
 __all__ = (
     "UNBOUND_RETIRE_ALREADY_RETIRED",
     "UNBOUND_RETIRE_BLOCKED",
+    "UNBOUND_RETIRE_BRANCH_NOT_LANE_BOUND",
     "UNBOUND_RETIRE_DUPLICATE_INVENTORY",
     "UNBOUND_RETIRE_EXCLUSION_UNAVAILABLE",
     "UNBOUND_RETIRE_EXPECTED_IDENTITY_UNRESOLVED",
@@ -560,6 +708,7 @@ __all__ = (
     "UNBOUND_RETIRE_GENERATION_RACE",
     "UNBOUND_RETIRE_HEAD_NOT_INTEGRATED",
     "UNBOUND_RETIRE_LANE_NOT_DECLARED",
+    "UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN",
     "UNBOUND_RETIRE_LAUNCH_IN_FLIGHT",
     "UNBOUND_RETIRE_LIFECYCLE_UNREADABLE",
     "UNBOUND_RETIRE_LIVE_PAIR_PRESENT",

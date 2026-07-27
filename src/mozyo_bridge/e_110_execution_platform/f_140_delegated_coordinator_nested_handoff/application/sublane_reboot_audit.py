@@ -51,6 +51,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 _DEFAULT_INTEGRATION_BRANCH = "main"
 
 
+class RebootAuditUnavailable(RuntimeError):
+    """A snapshot could not be produced because an AUTHORITY could not be read (#14499).
+
+    Distinct from "this repo owns no lanes", which is a legitimate empty result. The
+    lifecycle store being unreadable, or the repo's workspace identity being unresolvable,
+    means the audit does not know what exists — and an audit that cannot see is not an audit
+    that found nothing. The command surfaces this as a non-zero exit, unlike a lane-level
+    ``unknown`` / ``blocked`` finding, which is a normal result of a successful snapshot.
+    """
+
+
 def read_issue_closed_states(
     issue_ids: Sequence[str],
     *,
@@ -245,8 +256,27 @@ def gather_reboot_facts(
 
     environ = environ if environ is not None else os.environ
     workspace_id = repo_scope_workspace_id(repo_root)
-    records = load_lane_lifecycle_readonly() or ()
-    mine = tuple(r for r in records if r.repo_workspace_id == workspace_id and workspace_id)
+    if not workspace_id:
+        # Redmine #14499 review j#89191 finding 4 (adjacent instance): an unresolvable
+        # workspace identity used to make the `mine` filter match nothing, which rendered as
+        # "no lane rows for this repo workspace" — indistinguishable from a repo that
+        # genuinely owns none. That is the fail-open this whole surface exists to avoid.
+        raise RebootAuditUnavailable(
+            "the repo's workspace identity could not be resolved, so the lanes this repo "
+            "owns cannot be determined. This is an unreadable authority, not an empty one"
+        )
+    records = load_lane_lifecycle_readonly()
+    if records is None:
+        # `load_lane_lifecycle_readonly` returns None for its fail-closed cases (an
+        # unreadable / newer / malformed / partial component schema) and () only for a
+        # genuinely absent store. Folding the two together with `or ()` reported an
+        # unreadable lifecycle authority as "nothing to converge" (review j#89191 finding 4).
+        raise RebootAuditUnavailable(
+            "the lane lifecycle store could not be read (unreadable, or a newer / malformed "
+            "component schema). A snapshot cannot be produced; this is NOT the same as the "
+            "store having no rows"
+        )
+    mine = tuple(r for r in records if r.repo_workspace_id == workspace_id)
     if not mine:
         return ()
 
@@ -402,10 +432,21 @@ def _tri(value: Optional[bool]) -> str:
 def cmd_sublane_reboot_audit(args: argparse.Namespace) -> int:
     repo = getattr(args, "repo", None)
     repo_root = Path(repo).expanduser() if repo else Path.cwd()
-    facts = gather_reboot_facts(
-        repo_root,
-        integration_branch=getattr(args, "integration_branch", "") or "",
-    )
+    try:
+        facts = gather_reboot_facts(
+            repo_root,
+            integration_branch=getattr(args, "integration_branch", "") or "",
+        )
+    except RebootAuditUnavailable as exc:
+        # An unreadable AUTHORITY, not an empty result (#14499 review j#89191 finding 4).
+        # Non-zero, because no snapshot was produced at all — a caller that treats exit 0 as
+        # "audited, nothing to do" must never see that for a store it could not read.
+        payload = {"state": "unavailable", "detail": str(exc), "lanes": [], "lane_count": 0}
+        if bool(getattr(args, "json", False)):
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            print(f"sublane reboot-audit: unavailable\n  detail: {exc}", file=sys.stderr)
+        return 1
     only = (getattr(args, "lane_label", "") or "").strip()
     if only:
         facts = tuple(f for f in facts if f.lane_id == only)
@@ -464,6 +505,7 @@ def register_sublane_reboot_audit_parser(sublane_sub: Any) -> None:
 
 
 __all__ = (
+    "RebootAuditUnavailable",
     "audit_payload",
     "cmd_sublane_reboot_audit",
     "format_audit_text",

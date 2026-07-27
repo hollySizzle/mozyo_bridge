@@ -68,6 +68,11 @@ RESIDUE_LIVE_PAIR_PRESENT = "live_pair_present"
 RESIDUE_CLOSE_FAILED = "close_failed"
 #: A managed launch / attestation write is in flight on this home right now.
 RESIDUE_LAUNCH_IN_FLIGHT = "launch_in_flight"
+#: Every planned target stopped qualifying between the plan and the close, so nothing was
+#: closed (Redmine #14499 review j#89191 finding 3). Not a success: the lane still holds
+#: slots that looked like residue moments ago, and reporting "no residue" would be the
+#: unproven-no-op misread this surface exists to avoid.
+RESIDUE_IDENTITY_MOVED = "residue_identity_moved"
 #: Advisory file locking is unavailable, so the launch/close exclusion cannot be honored.
 RESIDUE_EXCLUSION_UNAVAILABLE = "exclusion_unavailable"
 
@@ -84,6 +89,10 @@ class ResidueCloseVerdict:
     plan: Optional[ResidueClosePlan] = None
     closed: tuple[tuple[str, str], ...] = ()
     failed: tuple[tuple[str, str, str], ...] = ()
+    #: Targets the pre-close re-verification dropped (#14499 review j#89191 finding 3): the
+    #: pair no longer qualified in a freshly read inventory, or the inventory could not be
+    #: re-read. Distinct from ``failed`` — nothing was attempted on these.
+    skipped: tuple[tuple[str, str, str], ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -101,6 +110,10 @@ class ResidueCloseVerdict:
             "failed": [
                 {"assigned_name": n, "locator": loc, "detail": d}
                 for n, loc, d in self.failed
+            ],
+            "skipped": [
+                {"assigned_name": n, "locator": loc, "detail": d}
+                for n, loc, d in self.skipped
             ],
         }
 
@@ -349,7 +362,13 @@ def _close_under_exclusion(
             lane_id=lane_label,
             plan=plan,
         )
-    closed, failed = _execute_closes(plan)
+    closed, failed, skipped = _execute_closes(
+        plan,
+        workspace_id=workspace_id,
+        lane_id=lane_label,
+        legacy_workspace_id=legacy_token,
+        managed_roles=managed_roles,
+    )
     if failed:
         return ResidueCloseVerdict(
             state=RESIDUE_BLOCKED,
@@ -363,34 +382,90 @@ def _close_under_exclusion(
             plan=plan,
             closed=closed,
             failed=failed,
+            skipped=skipped,
+        )
+    if skipped and not closed:
+        # Every target was dropped by the pre-close re-verification. Nothing was closed and
+        # nothing failed, but this is not the verified "no residue" state either: the lane
+        # still holds slots that looked like residue moments ago. Reporting it as a success
+        # would be the #13748-class misread this whole surface exists to avoid.
+        return ResidueCloseVerdict(
+            state=RESIDUE_BLOCKED,
+            reason=RESIDUE_IDENTITY_MOVED,
+            detail=(
+                f"all {len(skipped)} planned target(s) stopped qualifying between the plan "
+                "and the close, so nothing was closed. Re-run to re-plan against the "
+                "current inventory"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            plan=plan,
+            skipped=skipped,
         )
     return ResidueCloseVerdict(
         state=RESIDUE_CLOSED,
         detail=(
-            f"closed {len(closed)} shell-residue slot(s) of this lane. No worktree, branch "
-            "or commit was touched and the lifecycle row is unchanged — terminalization "
-            "remains a separate, explicitly-fenced step"
+            f"closed {len(closed)} shell-residue slot(s) of this lane"
+            + (
+                f"; {len(skipped)} target(s) were skipped because their identity moved "
+                "between the plan and the close"
+                if skipped
+                else ""
+            )
+            + ". No worktree, branch or commit was touched and the lifecycle row is "
+            "unchanged — terminalization remains a separate, explicitly-fenced step"
         ),
         workspace_id=workspace_id,
         lane_id=lane_label,
         plan=plan,
         closed=closed,
+        skipped=skipped,
     )
 
 
-def _execute_closes(plan: ResidueClosePlan):
-    """Close each planned pane via ``herdr pane close`` (per-target, non-fatal).
+def _execute_closes(
+    plan: ResidueClosePlan,
+    *,
+    workspace_id: str,
+    lane_id: str,
+    legacy_workspace_id: str,
+    managed_roles,
+):
+    """Close each planned pane, re-verifying its identity immediately first (#14499).
 
-    Mirrors the #13330 base pane reclaim / #13331 guarded close contract: a failed close
-    leaves a live pane, which is recorded rather than raised, so one stuck pane does not
-    hide the outcome of the others.
+    ``herdr pane close`` takes a **locator** and nothing else — it does not check which
+    assigned name currently occupies that pane (``herdr_pane_lifecycle._close_base_pane`` →
+    ``herdr pane close <pane_id>``). So a plan built from one inventory read and executed
+    later is closing an address, not an identity: if a residue shell exits between the two
+    and herdr reassigns that pane id, the close lands on whatever is there now (Redmine
+    #14499 review j#89191 finding 3).
+
+    Before each close this therefore re-reads the live inventory and re-runs the **whole**
+    planner against it, requiring the exact ``(assigned_name, locator)`` pair to still be a
+    target. Re-running the planner rather than spot-checking the row means every original
+    condition is re-applied — byte-exact name, live locator, stale classification, no
+    recognised activity, and the pair fence — so a lane that acquired a live half in the
+    interval closes nothing at all. Anything that no longer qualifies is skipped and
+    recorded, never closed. An inventory that cannot be re-read skips too (fail-closed).
+
+    **Residual, not claimed solved.** This narrows the window to between the re-check and
+    the ``pane close`` call; it cannot eliminate it. Closing an address atomically with a
+    condition on its occupant would require a conditional-close primitive that herdr does
+    not expose, and no amount of re-reading here substitutes for one.
+
+    Per-target and non-fatal, mirroring the #13330 base pane reclaim / #13331 guarded close
+    contract: one stuck pane does not hide the outcome of the others.
     """
     import subprocess
 
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        list_herdr_agent_rows,
+    )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
         _close_base_pane,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+        HerdrSessionStartError,
         _resolve_binary_or_die,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
@@ -400,7 +475,43 @@ def _execute_closes(plan: ResidueClosePlan):
     binary = _resolve_binary_or_die(os.environ)
     closed: list[tuple[str, str]] = []
     failed: list[tuple[str, str, str]] = []
+    skipped: list[tuple[str, str, str]] = []
     for name, locator in plan.close_targets:
+        try:
+            fresh_rows = list_herdr_agent_rows(os.environ)
+        except HerdrSessionStartError as exc:
+            skipped.append(
+                (
+                    name,
+                    locator,
+                    f"the live inventory could not be re-read before closing ({exc}); the "
+                    "target's identity could not be re-verified, so it was left alone",
+                )
+            )
+            continue
+        recheck = plan_residue_close(
+            fresh_rows,
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            legacy_workspace_id=legacy_workspace_id,
+            managed_roles=managed_roles,
+        )
+        if (name, locator) not in recheck.close_targets:
+            skipped.append(
+                (
+                    name,
+                    locator,
+                    "this exact (assigned name, locator) pair is no longer a residue target "
+                    "in a freshly read inventory"
+                    + (
+                        " (a live agent appeared in one of the lane's slots)"
+                        if recheck.pair_fence_tripped
+                        else ""
+                    )
+                    + "; closing the locator now could land on a different occupant",
+                )
+            )
+            continue
         ok, detail = _close_base_pane(
             binary, locator, subprocess.run, COMMAND_TIMEOUT_SECONDS, os.environ
         )
@@ -408,7 +519,7 @@ def _execute_closes(plan: ResidueClosePlan):
             closed.append((name, locator))
         else:
             failed.append((name, locator, detail))
-    return tuple(closed), tuple(failed)
+    return tuple(closed), tuple(failed), tuple(skipped)
 
 
 def format_residue_close_text(verdict: ResidueCloseVerdict) -> str:
@@ -438,6 +549,8 @@ def format_residue_close_text(verdict: ResidueCloseVerdict) -> str:
             )
     for name, locator in verdict.closed:
         lines.append(f"  closed: {name} @ {locator}")
+    for name, locator, detail in verdict.skipped:
+        lines.append(f"  skipped (identity moved): {name} @ {locator}: {detail}")
     for name, locator, detail in verdict.failed:
         lines.append(f"  FAILED: {name} @ {locator}: {detail}")
     return "\n".join(lines)
@@ -506,6 +619,7 @@ __all__ = (
     "RESIDUE_CLOSED",
     "RESIDUE_CLOSE_FAILED",
     "RESIDUE_EXCLUSION_UNAVAILABLE",
+    "RESIDUE_IDENTITY_MOVED",
     "RESIDUE_INVENTORY_UNREADABLE",
     "RESIDUE_LANE_OWNER_UNVERIFIED",
     "RESIDUE_LAUNCH_IN_FLIGHT",
