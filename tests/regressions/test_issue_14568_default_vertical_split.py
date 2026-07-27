@@ -1,0 +1,398 @@
+"""Regression pins for Redmine #14568 — the undeclared pair splits vertically.
+
+Owner intent 2026-07-27 (+ scope amendment j#89848): a workspace that declares no
+``lane_placement`` had its coordinator pair AND its sublane gateway/worker pair rendered
+side by side. That was not an accident — #13646 deliberately froze the undeclared launch
+byte-for-byte (the ``default`` lane emitted no ``--split`` and delegated to herdr's own
+default, a ``sublane`` emitted the literal ``--split right``), and herdr's own default is
+``right`` (live-measured j#76622), so both pairs came out horizontal unless every adopter
+wrote the same block. #14568 moves that decision into the product.
+
+What these pins characterize, stated as the behaviour rather than the implementation:
+
+1. **the product default is ``down`` on BOTH lane classes** — the thing owner intent asked
+   for, and the thing #13646 pinned the other way;
+2. **the upper pane is deterministic** — the pair's OCCUPANT is whoever launches first, and
+   the coordinator pair gets a product-default order of ``(codex, claude)`` so it does not
+   inherit ``DEFAULT_EXPECTED_AGENTS``' claude-first launch order. The sublane deliberately
+   gets NO product-default order: it already launches ``(gateway, worker)`` from the role
+   binding, and imposing one would override a rebound binding instead of respecting it;
+3. **``split: right`` is the rollback**, per lane class and per lane kind, and
+   ``by_lane_kind > lane_class > product default`` still holds in that order;
+4. **the safety contracts are untouched** — a single-provider request never gains a peer, a
+   heal never focuses / moves / closes the live sibling, a partial launch still reports the
+   failure, and the root / tab-root pane is still reclaimed;
+5. **``config status`` reports what the launch will do**, sourced ``default`` when the
+   operator declared nothing.
+
+The fix lives in ``lane_placement.py`` (``product_default_placement`` +
+``LanePlacementConfig.resolve_effective``), ``herdr_lane_topology.py`` (the effective
+policy adapter and the focus policy, now keyed on the effective split direction rather than
+on "did the operator declare a block"), and ``repo_local_config_status.py`` (the leaf rows).
+
+The focus policy is load-bearing here and is easy to under-test: herdr splits a container's
+ACTIVE pane, so a pair that renders ``--split down`` but leaves the empty root pane active
+splits the ROOT, and reclaiming that root collapses the split away — leaving herdr's default
+``right`` with the argv still looking correct (R1-F1, j#76613 / j#76622). Every layout
+assertion below therefore runs against ``_LayoutHerdr``, the fake that models that geometry,
+and is taken AFTER the reclaim.
+"""
+
+from __future__ import annotations
+
+import os
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (  # noqa: E501
+    LanePlacementConfig,
+    product_default_placement,
+)
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (  # noqa: E501
+    RepoLocalConfig,
+)
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config_status import (  # noqa: E501
+    SOURCE_DECLARED,
+    SOURCE_DEFAULT,
+    classify_config_sources,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
+    resolve_placement_policy_for_role,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+    HerdrSessionStartError,
+    prepare_session,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    encode_assigned_name,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501
+    LaneLaunchContext,
+)
+
+# The two herdr fakes live with the unit suite that introduced them (#13646 / R1-F1).
+# `_LayoutHerdr` models the live-measured layout semantics — active-pane splitting,
+# implicit `right`, focus, and split collapse on close — which is the only way to assert
+# what the operator SEES rather than what the argv says. Importing them keeps this file a
+# pin on the behaviour instead of a second, subtly different simulation of herdr. The
+# harness below is local on purpose: subclassing the unit TestCases would re-run their
+# whole suite here and blur which module a failure belongs to.
+from tests.unit.e_140_adapter_provider.f_130_terminal_runtime_provider.test_herdr_session_start import (  # noqa: E501
+    _Herdr,
+    _LayoutHerdr,
+    _launch_env,
+)
+
+ISSUE = "14568"
+
+
+def _prepare(
+    tmp,
+    *,
+    herdr,
+    providers,
+    lane,
+    lane_placement=None,
+    launch_context=None,
+    rows=None,
+):
+    """Run the real ``prepare_session`` against a fake herdr in an isolated home.
+
+    Returns ``(result, workspace_id, {provider: pane_locator})`` — the pane map is what
+    the layout assertions key on, since a pane id is the only handle
+    ``_LayoutHerdr.direction_between`` understands.
+    """
+    repo = Path(tmp) / "repo"
+    repo.mkdir()
+    home = Path(tmp) / "home"
+    home.mkdir()
+    binpath = Path(tmp) / "fake-herdr"
+    binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+    with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+        register_workspace(repo, home=home)
+        workspace_id = read_anchor(repo)["workspace_id"]
+        if rows is not None:
+            herdr.existing_rows = rows(workspace_id)
+        result = prepare_session(
+            repo_root=repo,
+            providers=providers,
+            lane_id=lane,
+            env=_launch_env(binpath),
+            runner=herdr.run,
+            lane_placement=lane_placement,
+            launch_context=launch_context,
+        )
+    return result, workspace_id, {s.provider: s.locator for s in result.slots}
+
+
+def _second_split(herdr) -> str:
+    second = herdr.start_argvs[1]
+    return second[second.index("--split") + 1] if "--split" in second else ""
+
+
+def _launched_role(start_argv) -> str:
+    """The provider the durable assigned name in an ``agent start`` argv belongs to."""
+    return start_argv[2].split("_")[-2]
+
+
+class ProductDefaultPolicyTest(unittest.TestCase):
+    """The policy value itself, and the precedence it sits at the bottom of."""
+
+    def test_both_lane_classes_default_to_down(self) -> None:
+        for lane_class in ("default", "sublane"):
+            with self.subTest(lane_class=lane_class):
+                self.assertEqual(product_default_placement(lane_class).split, "down")
+
+    def test_only_the_default_lane_gets_a_product_default_order(self) -> None:
+        # The asymmetry is the deliberate part: the coordinator pair's launch order is a
+        # fixed topology this policy must correct, while a lane's order comes from the
+        # role binding and must be left alone.
+        self.assertEqual(
+            product_default_placement("default").order, ("codex", "claude")
+        )
+        self.assertIsNone(product_default_placement("sublane").order)
+
+    def test_an_undeclared_config_resolves_to_the_product_default(self) -> None:
+        config = LanePlacementConfig.default()
+        for lane_class in ("default", "sublane"):
+            with self.subTest(lane_class=lane_class):
+                self.assertEqual(
+                    resolve_placement_policy_for_role(config, lane_class, None),
+                    (
+                        product_default_placement(lane_class).split,
+                        product_default_placement(lane_class).order,
+                    ),
+                )
+
+    def test_a_declared_class_wins_over_the_product_default(self) -> None:
+        config = LanePlacementConfig.from_record({"sublane": {"split": "right"}})
+        self.assertEqual(
+            resolve_placement_policy_for_role(config, "sublane", None)[0], "right"
+        )
+        # ...and does not leak into the other class.
+        self.assertEqual(
+            resolve_placement_policy_for_role(config, "default", None)[0], "down"
+        )
+
+    def test_a_declared_kind_wins_over_a_declared_class(self) -> None:
+        # Three distinguishable layers in one config: kind says `right`, class says `down`
+        # (which happens to equal the product default, so the class layer is only visible
+        # when the kind does NOT apply — hence the second assertion's `None` kind).
+        config = LanePlacementConfig.from_record(
+            {
+                "by_lane_kind": {"implementation": {"split": "right"}},
+                "sublane": {"split": "down"},
+            }
+        )
+        self.assertEqual(
+            resolve_placement_policy_for_role(config, "sublane", "implementation")[0],
+            "right",
+        )
+        self.assertEqual(
+            resolve_placement_policy_for_role(config, "sublane", "coordinator")[0],
+            "down",
+        )
+
+    def test_no_config_object_at_all_still_resolves_the_product_default(self) -> None:
+        # A caller that hands the chokepoint no policy must not silently reach a DIFFERENT
+        # geometry than one that hands it an empty policy — that divergence is exactly how
+        # a "default" ends up applying on some launch paths and not others.
+        for lane_class in ("default", "sublane"):
+            with self.subTest(lane_class=lane_class):
+                self.assertEqual(
+                    resolve_placement_policy_for_role(None, lane_class, None),
+                    resolve_placement_policy_for_role(
+                        LanePlacementConfig.default(), lane_class, None
+                    ),
+                )
+
+
+class UndeclaredPairLandsVerticalTest(unittest.TestCase):
+    """The close conditions at the LAYOUT layer, after the root-pane reclaim."""
+
+    def test_undeclared_default_pair_is_down_with_codex_on_top(self) -> None:
+        herdr = _LayoutHerdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            # Deliberately the claude-first request the real bare-`mozyo` topology makes,
+            # so a missing product-default order would show up as claude on top.
+            _, _, panes = _prepare(
+                tmp, herdr=herdr, providers=["claude", "codex"], lane=""
+            )
+        self.assertTrue(herdr.pane_closes, "the root pane must still be reclaimed")
+        self.assertEqual(herdr.direction_between(panes["codex"], panes["claude"]), "down")
+        self.assertEqual(_launched_role(herdr.start_argvs[0]), "codex")
+
+    def test_undeclared_sublane_pair_is_down_with_the_gateway_on_top(self) -> None:
+        herdr = _LayoutHerdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, panes = _prepare(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
+            )
+        self.assertEqual(herdr.direction_between(panes["codex"], panes["claude"]), "down")
+        self.assertEqual(_launched_role(herdr.start_argvs[0]), "codex")
+
+    def test_the_pre_14568_focus_gate_would_have_lost_the_direction(self) -> None:
+        # The negative control for the focus change: replay the pre-#14568 sequence for an
+        # undeclared pair (every launch `--no-focus`, which is what a gate keyed on "the
+        # operator declared a block" would still produce) and confirm the `down` really is
+        # discarded by the reclaim. Without this, the two tests above could pass for the
+        # wrong reason and nobody would notice the focus flag being dropped.
+        herdr = _LayoutHerdr(created_workspace="wZ")
+
+        def call(*tail):
+            herdr.run(["/fake-herdr", *tail], capture_output=True, text=True, timeout=5, env={})
+
+        call("workspace", "create", "--cwd", "/x", "--no-focus")
+        call("agent", "start", "a1", "--workspace", "wZ", "--no-focus", "--", "codex")
+        call(
+            "agent", "start", "a2", "--workspace", "wZ",
+            "--split", "down", "--no-focus", "--", "claude",
+        )
+        root, a1, a2 = "wZ:p1", "wZ:p2", "wZ:p3"
+        call("pane", "close", root)
+        self.assertEqual(herdr.direction_between(a1, a2), "right")
+
+
+class RollbackAndSafetyContractsTest(unittest.TestCase):
+    """The rollback, and the contracts the new default must not disturb."""
+
+    def test_explicit_right_rolls_back_each_lane_class(self) -> None:
+        for lane, lane_class, tab in (("", "default", None), ("lane-1", "sublane", "wZ:t1")):
+            with self.subTest(lane_class=lane_class):
+                herdr = _Herdr(created_workspace="wZ", created_tab=tab)
+                with tempfile.TemporaryDirectory() as tmp:
+                    _prepare(
+                        tmp,
+                        herdr=herdr,
+                        providers=["codex", "claude"],
+                        lane=lane,
+                        lane_placement=LanePlacementConfig.from_record(
+                            {lane_class: {"split": "right"}}
+                        ),
+                    )
+                self.assertEqual(_second_split(herdr), "right")
+
+    def test_by_lane_kind_right_rolls_back_one_kind_only(self) -> None:
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            _prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=LanePlacementConfig.from_record(
+                    {"by_lane_kind": {"implementation": {"split": "right"}}}
+                ),
+                launch_context=LaneLaunchContext(lane_kind="implementation"),
+            )
+        self.assertEqual(_second_split(herdr), "right")
+
+    def test_an_unmatched_lane_kind_keeps_the_product_default(self) -> None:
+        # The other side of the same rollback: rolling back ONE kind leaves every other
+        # lane on `down`, so a kind-scoped rollback cannot silently become a global one.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            _prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=LanePlacementConfig.from_record(
+                    {"by_lane_kind": {"coordinator": {"split": "right"}}}
+                ),
+                launch_context=LaneLaunchContext(lane_kind="implementation"),
+            )
+        self.assertEqual(_second_split(herdr), "down")
+
+    def test_single_provider_request_stays_single_and_never_splits_first(self) -> None:
+        # The product-default `order` names both providers; a single-provider request must
+        # not grow a peer, and as the container's first occupant it emits no `--split` and
+        # never takes the pair-only focus.
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = _prepare(tmp, herdr=herdr, providers=["claude"], lane="")
+        self.assertEqual(len(herdr.start_argvs), 1)
+        self.assertEqual([s.provider for s in result.slots], ["claude"])
+        self.assertNotIn("--split", herdr.start_argvs[0])
+        self.assertNotIn("--focus", herdr.start_argvs[0])
+
+    def test_heal_splits_down_beside_the_live_sibling_and_moves_nothing(self) -> None:
+        # An undeclared default-lane heal: the relaunched slot joins the live sibling with
+        # the product-default direction, and the live pane is never focused, closed, or
+        # moved (Non-goal: no live relayout / no implicit re-placement of a live pair).
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            _prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="",
+                rows=lambda ws: [
+                    {"name": encode_assigned_name(ws, "codex", ""), "pane_id": "w5:pC"}
+                ],
+            )
+        argv = herdr.start_argvs[0]
+        self.assertEqual(argv[argv.index("--split") + 1], "down")
+        self.assertNotIn("--focus", argv)
+        self.assertEqual(herdr.pane_closes, [])
+
+    def test_an_undeclared_fresh_pair_still_reclaims_the_root_pane(self) -> None:
+        herdr = _Herdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = _prepare(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane=""
+            )
+        self.assertEqual(herdr.pane_closes, [["pane", "close", "wZ:p1"]])
+        self.assertTrue(result.base_pane_reclaimed)
+
+    def test_a_failing_launch_still_fails_closed_and_leaves_the_root_pane(self) -> None:
+        # The product default runs before the first launch and must not disturb the
+        # fail-closed contract: a provider failure still raises, and the created root pane
+        # is left as visible residue rather than blindly reclaimed (#13330).
+        herdr = _Herdr(created_workspace="wZ", start_fails=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                _prepare(tmp, herdr=herdr, providers=["codex", "claude"], lane="")
+        self.assertEqual(len(herdr.workspace_creates), 1)
+        self.assertEqual(herdr.pane_closes, [])
+
+
+class StatusProjectionTest(unittest.TestCase):
+    """`config status` must state the geometry a fresh launch will actually take."""
+
+    def test_undeclared_reports_down_sourced_default(self) -> None:
+        statuses = {
+            s.key: s
+            for s in classify_config_sources(
+                raw_record=None,
+                config=RepoLocalConfig.default(),
+                schema_version=2,
+                legacy_migratable=False,
+            )
+        }
+        for lane_class in ("default", "sublane"):
+            row = statuses[f"lane_placement.{lane_class}.split"]
+            self.assertEqual((row.effective_value, row.source), ("down", SOURCE_DEFAULT))
+
+    def test_a_rollback_reports_right_sourced_declared(self) -> None:
+        record = {"version": 2, "lane_placement": {"sublane": {"split": "right"}}}
+        statuses = {
+            s.key: s
+            for s in classify_config_sources(
+                raw_record=record,
+                config=RepoLocalConfig.from_record(record),
+                schema_version=2,
+                legacy_migratable=False,
+            )
+        }
+        row = statuses["lane_placement.sublane.split"]
+        self.assertEqual((row.effective_value, row.source), ("right", SOURCE_DECLARED))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

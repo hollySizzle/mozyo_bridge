@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Optional
 
 from mozyo_bridge.core.state.lane_kind import LANE_KINDS
@@ -108,19 +109,75 @@ class LanePlacementError(ValueError):
 
 @dataclass(frozen=True)
 class ResolvedPlacement:
-    """The effective placement policy for one lane class (pure value).
+    """The placement policy declared for one lane class / kind (pure value).
 
-    Both fields are ``None`` when the lane class inherits the legacy launch discipline —
-    :attr:`split` ``None`` means "emit the lane class's historical split flag" (server
-    default for ``default``, literal ``--split right`` for ``sublane``); :attr:`order`
-    ``None`` means "keep the requested launch order". A configured value overrides only its
-    own field, so a partial object (``split`` set, ``order`` absent) changes only the split
-    direction (Design Answer j#76564 Q3). ``order`` is a full permutation of
+    A ``None`` field is UNDECLARED, not a value: :meth:`LanePlacementConfig.resolve` and
+    :meth:`resolve_by_lane_kind` return what the operator wrote and nothing else, so a
+    partial object (``split`` set, ``order`` absent) declares only the split direction
+    (Design Answer j#76564 Q3). ``order`` is a full permutation of
     :data:`LANE_PLACEMENT_PROVIDERS` when set.
+
+    What an undeclared field falls back to is :func:`product_default_placement`, applied
+    once at the end of the precedence chain by :meth:`LanePlacementConfig.resolve_effective`
+    (Redmine #14568) — never here, so "the operator declared it" stays distinguishable from
+    "the product decided it" (the distinction ``config status`` reports as
+    ``declared`` / ``default``).
     """
 
     split: Optional[str] = None
     order: Optional[tuple[str, ...]] = None
+
+
+#: The PRODUCT-DEFAULT placement per lane class — the bottom of the
+#: ``by_lane_kind > lane_class > product default`` precedence (Redmine #14568, owner intent
+#: 2026-07-27 + scope amendment j#89848).
+#:
+#: This deliberately SUPERSEDES the #13646 unset byte-invariance. Before it, an undeclared
+#: lane class inherited the historical launch discipline — the ``default`` pair emitted no
+#: ``--split`` at all (herdr server default) and a ``sublane`` emitted the literal
+#: ``--split right`` — and both render HORIZONTALLY on real herdr (live-measured j#76622:
+#: herdr's own default direction is ``right``). Owner intent is that a workspace which
+#: declares nothing gets the VERTICAL pair on both, so the default moves here rather than
+#: every adopter having to write the same block. Explicit ``split: right`` is the rollback,
+#: per lane class and per lane kind.
+#:
+#: ``order`` differs by lane class because only one of the two has a role binding to
+#: respect:
+#:
+#: - ``default`` — the bare ``mozyo`` coordinator pair launches the FIXED
+#:   ``default_agent_topology.DEFAULT_EXPECTED_AGENTS`` topology, whose launch order is
+#:   ``claude`` first; with a vertical split that would put the implementer on TOP. The
+#:   product default pins ``(codex, claude)`` so the coordinator deterministically occupies
+#:   the upper pane under the default Codex/Claude binding. A workspace on a different
+#:   binding declares ``lane_placement.default.order`` explicitly.
+#: - ``sublane`` — a lane already launches ``(gateway, worker)`` resolved from the
+#:   repo-local role binding (``sublane_actuator_herdr_ops._launch_providers``), so a
+#:   product-default ``order`` here would OVERRIDE that binding rather than respect it. It
+#:   stays undeclared (keep the requested order), which puts the gateway in the upper pane
+#:   — ``codex`` under the default binding — while a rebound binding still launches ITS
+#:   providers in ITS order.
+PRODUCT_DEFAULT_PLACEMENTS: "Mapping[str, ResolvedPlacement]" = MappingProxyType(
+    {
+        "default": ResolvedPlacement(split="down", order=("codex", "claude")),
+        "sublane": ResolvedPlacement(split="down"),
+    }
+)
+
+
+def product_default_placement(lane_class: str) -> ResolvedPlacement:
+    """The product default for ``lane_class`` (Redmine #14568).
+
+    The single source of the undeclared-field fallback, read by BOTH the launch chokepoint
+    (:meth:`LanePlacementConfig.resolve_effective`, via the herdr placement decisions) and
+    the operator-facing ``config status`` projection, so the geometry a fresh launch takes
+    and the geometry status reports can never drift apart.
+
+    An unknown lane class yields a fully-undeclared :class:`ResolvedPlacement` rather than
+    guessing a geometry for a class this build has no product opinion about. The closed
+    class vocabulary (:data:`LANE_PLACEMENT_LANE_CLASSES`) is enforced at parse time, so
+    this is unreachable from a parsed config.
+    """
+    return PRODUCT_DEFAULT_PLACEMENTS.get(lane_class, ResolvedPlacement())
 
 
 def _normalize_order(order: object, *, lane_class: str, source: str) -> Optional[tuple[str, ...]]:
@@ -366,8 +423,12 @@ class LanePlacementConfig:
     - **Geometry only.** ``split`` names a herdr split direction and ``order`` names launch
       providers; the block can never address a live pane / target / route, name an
       executable, or grant approval / close / send authority.
-    - **Default-preserving.** No block ⇒ empty ⇒ no argv change, so a repo with no
-      ``lane_placement`` block launches exactly as before (Design Answer j#76564 Q3).
+    - **Declaration-preserving, not default-preserving** (Redmine #14568). An absent block
+      still parses to an empty policy — :attr:`placements` and :attr:`kind_placements` are
+      both ``()`` — but an undeclared FIELD no longer means "launch exactly as before": it
+      resolves through :meth:`resolve_effective` to :func:`product_default_placement`
+      (``split: down`` on both lane classes). The #13646 unset byte-invariance is
+      deliberately superseded; ``split: right`` is the per-class / per-kind rollback.
     """
 
     version: int = LANE_PLACEMENT_CONFIG_VERSION
@@ -411,17 +472,51 @@ class LanePlacementConfig:
         return any(entry_kind == lane_kind for entry_kind, _, _ in self.kind_placements)
 
     def resolve(self, lane_class: str) -> ResolvedPlacement:
-        """The effective :class:`ResolvedPlacement` for ``lane_class`` (the single source).
+        """The DECLARED :class:`ResolvedPlacement` for ``lane_class`` (the lane-CLASS layer).
 
-        Returns the configured ``(split, order)`` for a present lane class, else a legacy
-        :class:`ResolvedPlacement` (both ``None`` — inherit the historical launch
-        discipline). ``prepare_session`` reads this once per run to decide the launch order
-        and the per-slot split direction (Design Answer j#76564 Q4).
+        Returns the configured ``(split, order)`` for a present lane class, else a fully
+        undeclared :class:`ResolvedPlacement` (both ``None``). It reports the operator's
+        declaration only; :meth:`resolve_effective` is what a launch reads, because it also
+        applies the product default to whatever this layer leaves undeclared.
         """
         for entry_class, split, order in self.placements:
             if entry_class == lane_class:
                 return ResolvedPlacement(split=split, order=order)
         return ResolvedPlacement()
+
+    def resolve_effective(
+        self, lane_class: str, lane_kind: "Optional[str]" = None
+    ) -> ResolvedPlacement:
+        """The geometry a launch actually uses: declaration, else product default (#14568).
+
+        The single placement-policy authority ``prepare_session`` reads once per run. It
+        composes the whole ``by_lane_kind > lane_class > product default`` precedence, so no
+        caller re-implements a layer and the launch path holds no fallback of its own:
+
+        1. **lane-kind layer** — consulted ONLY when a durable ``lane_kind`` is supplied AND
+           the config explicitly declares that kind (:meth:`has_lane_kind`). A declared kind
+           SHADOWS the lane-class entry wholesale, exactly as it did pre-#14568 (Redmine
+           #13647, Design Answer j#85645): a kind that declares ``order`` alone does not
+           inherit its lane class's ``split``.
+        2. **lane-class layer** — otherwise :meth:`resolve` (``default`` / ``sublane``).
+        3. **product default** — every field still undeclared after 1–2 is filled from
+           :func:`product_default_placement`, per field. This is the layer #14568 adds; it
+           is what makes an undeclared workspace launch its pairs ``down``.
+
+        ``lane_kind is None`` (no durable kind fact — the launch path's fallback) and a
+        config with no matching ``by_lane_kind`` entry both fall straight through to step 2,
+        so the kind axis still never shadows the class axis with an empty override.
+        """
+        declared = (
+            self.resolve_by_lane_kind(lane_kind)
+            if lane_kind is not None and self.has_lane_kind(lane_kind)
+            else self.resolve(lane_class)
+        )
+        fallback = product_default_placement(lane_class)
+        return ResolvedPlacement(
+            split=declared.split if declared.split is not None else fallback.split,
+            order=declared.order if declared.order is not None else fallback.order,
+        )
 
     @classmethod
     def default(cls) -> "LanePlacementConfig":
@@ -495,9 +590,11 @@ __all__ = (
     "LANE_PLACEMENT_SPLIT_DIRECTIONS",
     "LANE_PLACEMENT_CLASS_KEYS",
     "LANE_PLACEMENT_KEYS",
+    "PRODUCT_DEFAULT_PLACEMENTS",
     "LanePlacementConfig",
     "LanePlacementError",
     "ResolvedPlacement",
+    "product_default_placement",
     "parse_lane_placement_record",
     "parse_lane_kind_placement_record",
     "validate_lane_placement",

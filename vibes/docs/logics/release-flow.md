@@ -324,6 +324,31 @@ PyPI production publisher:
 5. GitHub Actions `Test` の green を待つ。
    - Helper: `mozyo-bridge release workflow runs --workflow Test` で最新 run-id を確認し、`mozyo-bridge release workflow wait --run-id <id> --timeout <seconds>` で `completed` まで polling できる。
 
+## Release Note Entries (behaviour change ledger)
+
+helper は release notes を生成しない (`### Tag and Release`)。よって **既定挙動を変える変更は、その実装
+issue の時点でここに 1 entry を残す**。release 時に notes を書く operator はこの節を読み、当該 release に
+含まれる entry を転記する。転記済み entry は release journal に version を記録した上で削除する
+(ここは *未反映* の台帳であり、履歴の正本ではない — 履歴の正本は tag / release notes / release journal)。
+
+entry は「何が変わったか」「adopter は何もしないとどうなるか」「元へ戻す方法」の 3 点を必ず含める。
+
+### 未反映 entry
+
+- **`lane_placement` 未設定時の pair 配置が左右 → 上下になった (Redmine #14568)**
+  - 変更: `lane_placement` を宣言していない workspace でも、coordinator pair と sublane の
+    gateway/worker pair が `--split down` で縦に並ぶ。coordinator pair の launch 順は
+    `[codex, claude]` に固定され、codex が上段になる (sublane は role binding の
+    `(gateway, worker)` 順を尊重するため、既定 binding では gateway = codex が上段)。
+    #13646 が固定した「未設定は byte 一致」は意図的に置換された。
+  - 何もしない場合: **既存の live pair は動かない**。次の fresh launch / heal から縦になる。
+    live pane の move / swap / kill は一切行わない。
+  - 戻し方: `.mozyo-bridge/config.yaml` に `lane_placement.default.split: right` (coordinator pair) /
+    `lane_placement.sublane.split: right` (全 sublane) / `lane_placement.by_lane_kind.<kind>.split: right`
+    (特定 lane role のみ) を明示宣言する。`mozyo-bridge config status` の
+    `lane_placement.<class>.split` row で effective 値と `declared` / `default` の別を確認できる。
+  - 詳細: [[spec-herdr-native-identity]] §5.1 Product default。
+
 ## Tag and Release
 
 - tag は annotated tag を使い、`v` prefix を付ける。例: `v0.1.0`、`v0.1.0a1`。

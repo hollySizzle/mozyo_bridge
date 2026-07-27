@@ -2906,8 +2906,9 @@ class LaneTabSubdivisionTest(unittest.TestCase):
 
     def test_fresh_lane_creates_dedicated_tab_and_splits_pair(self) -> None:
         # A fresh non-default lane mints ONE tab (labelled with the lane key), lands
-        # the first slot in it (no --split), the second beside it (--split right),
-        # and reclaims the host base pane AND the tab root pane.
+        # the first slot in it (no --split), the second beside it (--split down — the
+        # #14568 product default for an undeclared sublane), and reclaims the host base
+        # pane AND the tab root pane.
         herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
         with tempfile.TemporaryDirectory() as tmp:
             result, _ = self._prepare(
@@ -2918,13 +2919,13 @@ class LaneTabSubdivisionTest(unittest.TestCase):
         self.assertEqual(tab_create[tab_create.index("--workspace") + 1], "wZ")
         self.assertEqual(tab_create[tab_create.index("--label") + 1], "lane-1")
         # First launch (codex) occupies the tab with no split; the second (claude)
-        # splits right beside it. Both carry `--tab wZ:t1`.
+        # splits beside it. Both carry `--tab wZ:t1`.
         codex_argv = herdr.start_argvs[0]
         claude_argv = herdr.start_argvs[1]
         self.assertEqual(codex_argv[codex_argv.index("--tab") + 1], "wZ:t1")
         self.assertNotIn("--split", codex_argv)
         self.assertEqual(claude_argv[claude_argv.index("--tab") + 1], "wZ:t1")
-        self.assertEqual(claude_argv[claude_argv.index("--split") + 1], "right")
+        self.assertEqual(claude_argv[claude_argv.index("--split") + 1], "down")
         # `--tab` sits right after `--workspace` (before the `-- provider` tail).
         self.assertEqual(
             codex_argv[codex_argv.index("--workspace") : codex_argv.index("--workspace") + 4],
@@ -2938,9 +2939,11 @@ class LaneTabSubdivisionTest(unittest.TestCase):
             [["pane", "close", "wZ:p1"], ["pane", "close", "wZ:t1-root"]],
         )
 
-    def test_default_lane_uses_no_tab_byte_invariant(self) -> None:
-        # The coordinator pair (default lane) never subdivides: no tab create, no
-        # `--tab` / `--split` in any launch argv, no tab fields set.
+    def test_default_lane_uses_no_tab(self) -> None:
+        # The coordinator pair (default lane) never subdivides into a TAB: no tab create,
+        # no `--tab` in any launch argv, no tab fields set. It does split inside the
+        # workspace — `--split down` on the 2nd slot since #14568 — which is the axis this
+        # test deliberately does NOT own; `--tab` and `--split` are independent flags.
         herdr = _Herdr(created_workspace="wZ")
         with tempfile.TemporaryDirectory() as tmp:
             result, _ = self._prepare(
@@ -2949,7 +2952,6 @@ class LaneTabSubdivisionTest(unittest.TestCase):
         self.assertEqual(herdr.tab_creates, [])
         for argv in herdr.start_argvs:
             self.assertNotIn("--tab", argv)
-            self.assertNotIn("--split", argv)
         self.assertEqual(result.herdr_tab_id, "")
         self.assertEqual(result.tab_pane_id, "")
         self.assertEqual(herdr.pane_closes, [["pane", "close", "wZ:p1"]])
@@ -2987,13 +2989,13 @@ class LaneTabSubdivisionTest(unittest.TestCase):
                     env=_launch_env(binpath),
                     runner=herdr.run,
                 )
-        # codex adopts; claude launches into the adopted tab with --split right.
+        # codex adopts; claude launches into the adopted tab with --split down.
         self.assertEqual(herdr.tab_creates, [])
         self.assertEqual(len(herdr.start_argvs), 1)
         claude_argv = herdr.start_argvs[0]
         self.assertEqual(claude_argv[claude_argv.index("--workspace") + 1], "w5")
         self.assertEqual(claude_argv[claude_argv.index("--tab") + 1], "w5:t3")
-        self.assertEqual(claude_argv[claude_argv.index("--split") + 1], "right")
+        self.assertEqual(claude_argv[claude_argv.index("--split") + 1], "down")
         self.assertEqual(result.herdr_tab_id, "w5:t3")
         self.assertEqual(result.tab_pane_id, "")
         self.assertEqual(herdr.pane_closes, [])
@@ -3092,7 +3094,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
         # Review j#74433 finding 1: a SINGLE-provider heal (only claude requested)
         # must see the lane's live codex sibling in the inventory — even though codex
         # is not in this run's requested plans — and split claude beside it in the
-        # SAME tab, never dropping `--split right`.
+        # SAME tab, never dropping the split.
         with tempfile.TemporaryDirectory() as tmp:
             result, herdr = self._heal_prepare(
                 tmp,
@@ -3109,7 +3111,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
         self.assertEqual(len(herdr.start_argvs), 1)
         claude_argv = herdr.start_argvs[0]
         self.assertEqual(claude_argv[claude_argv.index("--tab") + 1], "w5:t3")
-        self.assertEqual(claude_argv[claude_argv.index("--split") + 1], "right")
+        self.assertEqual(claude_argv[claude_argv.index("--split") + 1], "down")
         self.assertEqual(result.herdr_tab_id, "w5:t3")
         self.assertEqual(herdr.pane_closes, [])
 
@@ -3597,20 +3599,63 @@ class LanePlacementLayoutTest(unittest.TestCase):
             herdr.direction_between(panes["codex"], panes["claude"]), "right"
         )
 
-    def test_unset_sublane_layout_is_unchanged(self) -> None:
-        # Byte-invariance is also LAYOUT-invariance: an unset lane class keeps its
-        # historical (coincidentally `right`) result and gains no --focus.
+    def test_undeclared_default_pair_lands_down_with_codex_above_claude(self) -> None:
+        # Close conditions 1 + 3 at the LAYOUT layer — the level the operator actually
+        # sees, and the one the argv tests cannot reach. With NO `lane_placement` at all
+        # the coordinator pair must end up `down` AFTER the root-pane reclaim, and codex
+        # must be the pane the split hangs off (the upper one), even though the request
+        # named claude first.
+        herdr = _LayoutHerdr(created_workspace="wZ")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, panes = self._run(
+                tmp, herdr=herdr, providers=["claude", "codex"], lane=""
+            )
+        self.assertTrue(herdr.pane_closes, "the root pane must still be reclaimed")
+        self.assertEqual(
+            herdr.direction_between(panes["codex"], panes["claude"]), "down"
+        )
+        # `down` alone does not say WHICH pane is on top: the occupant is, and the
+        # occupant is whoever launched first. Codex, by the product-default order.
+        self.assertEqual(herdr.start_argvs[0][2].split("_")[-2], "codex")
+
+    def test_undeclared_sublane_pair_lands_down_after_tab_root_reclaim(self) -> None:
+        # Close condition 2 at the layout layer (scope amendment j#89848): the same holds
+        # inside a lane tab, where the tab root is the pane that used to eat the split.
+        # The gateway (codex, launched first by the role binding) is the upper pane.
         herdr = _LayoutHerdr(created_workspace="wZ", created_tab="wZ:t1")
         with tempfile.TemporaryDirectory() as tmp:
             _, _, panes = self._run(
                 tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
             )
-        for argv in herdr.start_argvs:
-            self.assertIn("--no-focus", argv)
-            self.assertNotIn("--focus", argv)
         self.assertEqual(
-            herdr.direction_between(panes["codex"], panes["claude"]), "right"
+            herdr.direction_between(panes["codex"], panes["claude"]), "down"
         )
+        self.assertEqual(herdr.start_argvs[0][2].split("_")[-2], "codex")
+
+    def test_explicit_right_still_lands_right_on_both_lane_classes(self) -> None:
+        # Close condition 4 at the layout layer: the rollback is a real rollback, not
+        # just a different argv token that collapses to the same picture.
+        for lane, lane_class, tab in (("", "default", None), ("lane-1", "sublane", "wZ:t1")):
+            with self.subTest(lane_class=lane_class):
+                herdr = _LayoutHerdr(created_workspace="wZ", created_tab=tab)
+                with tempfile.TemporaryDirectory() as tmp:
+                    _, _, panes = self._run(
+                        tmp,
+                        herdr=herdr,
+                        providers=["codex", "claude"],
+                        lane=lane,
+                        lane_placement=LanePlacementConfig.from_record(
+                            {lane_class: {"split": "right"}}
+                        ),
+                    )
+                # `right` is also the fake's (live-measured) implicit direction, so the
+                # layout assertion alone cannot tell "rolled back to right" from "emitted
+                # no direction at all". Pin the argv as well.
+                second = herdr.start_argvs[1]
+                self.assertEqual(second[second.index("--split") + 1], "right")
+                self.assertEqual(
+                    herdr.direction_between(panes["codex"], panes["claude"]), "right"
+                )
 
 
 class LanePlacementLaunchTest(unittest.TestCase):
@@ -3652,34 +3697,60 @@ class LanePlacementLaunchTest(unittest.TestCase):
             )
         return result, ws
 
-    # --- unset: byte-invariant (Design Answer Q3) --------------------------------
+    # --- unset: the #14568 product default ---------------------------------------
 
-    def test_unset_default_pair_emits_no_split_flag(self) -> None:
-        # An unset `lane_placement` leaves the coordinator pair delegating to the herdr
-        # server default: no `--tab`, no `--split`, requested provider order preserved.
+    def test_unset_default_pair_splits_down_and_launches_codex_first(self) -> None:
+        # Close condition 1 + 3 at the argv layer: an undeclared `lane_placement` no
+        # longer delegates to the herdr server default. The coordinator pair splits
+        # `down`, still with no `--tab` (the tab axis is untouched), and the product
+        # default order puts codex in the OCCUPYING launch — the upper pane — even
+        # though the request named claude first.
         herdr = _Herdr(created_workspace="wZ")
         with tempfile.TemporaryDirectory() as tmp:
             result, _ = self._prepare(
-                tmp, herdr=herdr, providers=["codex", "claude"], lane=""
+                tmp, herdr=herdr, providers=["claude", "codex"], lane=""
             )
-        for argv in herdr.start_argvs:
+        first, second = herdr.start_argvs
+        for argv in (first, second):
             self.assertNotIn("--tab", argv)
-            self.assertNotIn("--split", argv)
+        self.assertNotIn("--split", first)
+        self.assertEqual(second[second.index("--split") + 1], "down")
         self.assertEqual([s.provider for s in result.slots], ["codex", "claude"])
 
-    def test_unset_sublane_keeps_legacy_split_right(self) -> None:
-        # An unset `lane_placement` keeps the pre-#13646 literal: 1st slot occupies the
-        # tab, 2nd splits `right`.
+    def test_unset_sublane_splits_down_keeping_the_requested_gateway_first(self) -> None:
+        # Close condition 2: an undeclared sublane splits `down` too (scope amendment
+        # j#89848). Its provider order is NOT overridden — the lane launches
+        # `(gateway, worker)` resolved from the role binding, so the request order is
+        # what reaches herdr and the gateway occupies the upper pane.
         herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
         with tempfile.TemporaryDirectory() as tmp:
-            self._prepare(tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1")
+            result, _ = self._prepare(
+                tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
+            )
         first, second = herdr.start_argvs
         self.assertNotIn("--split", first)
-        self.assertEqual(second[second.index("--split") + 1], "right")
+        self.assertEqual(second[second.index("--split") + 1], "down")
+        self.assertEqual([s.provider for s in result.slots], ["codex", "claude"])
 
-    def test_empty_class_object_is_a_noop(self) -> None:
-        # A present-but-empty lane-class object configures neither field, so both
-        # inherit the legacy discipline (an empty `{}` never changes the launch).
+    def test_unset_sublane_respects_a_rebound_provider_order(self) -> None:
+        # The other half of "provider順は既存role bindingを尊重し": a lane whose binding
+        # resolves the OPPOSITE pair order launches in ITS order. A product-default
+        # `order` on the sublane class would silently invert a rebound binding, so there
+        # deliberately is none — only the split direction is a product decision.
+        herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+        with tempfile.TemporaryDirectory() as tmp:
+            result, ws = self._prepare(
+                tmp, herdr=herdr, providers=["claude", "codex"], lane="lane-1"
+            )
+        first, second = herdr.start_argvs
+        self.assertEqual(first[2], encode_assigned_name(ws, "claude", "lane-1"))
+        self.assertEqual(second[2], encode_assigned_name(ws, "codex", "lane-1"))
+        self.assertEqual(second[second.index("--split") + 1], "down")
+        self.assertEqual([s.provider for s in result.slots], ["claude", "codex"])
+
+    def test_empty_class_object_declares_nothing_and_takes_the_product_default(self) -> None:
+        # A present-but-empty lane-class object still declares neither field, so both
+        # resolve exactly as a wholly absent block does: `{}` is not a rollback.
         herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
         with tempfile.TemporaryDirectory() as tmp:
             self._prepare(
@@ -3691,7 +3762,24 @@ class LanePlacementLaunchTest(unittest.TestCase):
             )
         first, second = herdr.start_argvs
         self.assertNotIn("--split", first)
-        self.assertEqual(second[second.index("--split") + 1], "right")
+        self.assertEqual(second[second.index("--split") + 1], "down")
+
+    def test_explicit_right_rolls_each_lane_class_back(self) -> None:
+        # Close condition 4: `split: right` is the documented rollback, per lane class.
+        # Run BOTH classes so a fix that only re-plumbs one of them cannot pass.
+        for lane, lane_class, tab in (("", "default", None), ("lane-1", "sublane", "wZ:t1")):
+            with self.subTest(lane_class=lane_class):
+                herdr = _Herdr(created_workspace="wZ", created_tab=tab)
+                with tempfile.TemporaryDirectory() as tmp:
+                    self._prepare(
+                        tmp,
+                        herdr=herdr,
+                        providers=["codex", "claude"],
+                        lane=lane,
+                        lane_placement=self._placement(**{lane_class: {"split": "right"}}),
+                    )
+                second = herdr.start_argvs[1]
+                self.assertEqual(second[second.index("--split") + 1], "right")
 
     # --- configured fresh pairs ---------------------------------------------------
 
@@ -3753,8 +3841,10 @@ class LanePlacementLaunchTest(unittest.TestCase):
         self.assertEqual(second[second.index("--split") + 1], "right")
         self.assertEqual([s.provider for s in result.slots], ["claude", "codex"])
 
-    def test_order_alone_leaves_the_legacy_split_direction(self) -> None:
-        # A partial object (order only) reorders but keeps the legacy `right`.
+    def test_order_alone_leaves_the_product_default_split_direction(self) -> None:
+        # A partial object declares only `order`: it reorders, and the undeclared `split`
+        # field independently takes the product default (not the other declared field's
+        # lane class, and not the pre-#14568 `right`).
         herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
         with tempfile.TemporaryDirectory() as tmp:
             self._prepare(
@@ -3764,25 +3854,29 @@ class LanePlacementLaunchTest(unittest.TestCase):
                 lane="lane-1",
                 lane_placement=self._placement(sublane={"order": ["claude", "codex"]}),
             )
-        second = herdr.start_argvs[1]
-        self.assertEqual(second[second.index("--split") + 1], "right")
+        first, second = herdr.start_argvs
+        self.assertEqual(first[2].split("_")[-2], "claude")
+        self.assertEqual(second[second.index("--split") + 1], "down")
 
     def test_other_lane_class_is_untouched(self) -> None:
-        # Configuring `default` never changes the `sublane` launch (and vice versa).
+        # Configuring one lane class never leaks into the other: a `default` rolled back
+        # to `right` leaves the sublane on its own (product-default `down`) geometry, and
+        # the `default` order does not reorder the lane's launch.
         herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
         with tempfile.TemporaryDirectory() as tmp:
-            self._prepare(
+            result, _ = self._prepare(
                 tmp,
                 herdr=herdr,
                 providers=["codex", "claude"],
                 lane="lane-1",
                 lane_placement=self._placement(
-                    default={"split": "down", "order": ["claude", "codex"]}
+                    default={"split": "right", "order": ["claude", "codex"]}
                 ),
             )
         first, second = herdr.start_argvs
         self.assertNotIn("--split", first)
-        self.assertEqual(second[second.index("--split") + 1], "right")
+        self.assertEqual(second[second.index("--split") + 1], "down")
+        self.assertEqual([s.provider for s in result.slots], ["codex", "claude"])
 
     # --- single-provider / heal ----------------------------------------------------
 
@@ -3958,15 +4052,17 @@ class LanePlacementLaunchTest(unittest.TestCase):
             )
         self.assertEqual(self._focus_flags(herdr), [True, False])
 
-    def test_unset_lane_class_never_focuses(self) -> None:
-        # Byte-invariance: an unset lane class keeps `--no-focus` on every launch, even
-        # though its effective split direction is the legacy `right`.
+    def test_unset_lane_class_focuses_the_first_launch(self) -> None:
+        # Redmine #14568: the focus policy now keys on the EFFECTIVE split direction, so
+        # an undeclared lane class gets it too. Without this the pair would render the
+        # `--split down` argv and still collapse to herdr's own `right` on root reclaim
+        # (R1-F1) — i.e. the whole product default would be argv-only theatre.
         herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
         with tempfile.TemporaryDirectory() as tmp:
             self._prepare(
                 tmp, herdr=herdr, providers=["codex", "claude"], lane="lane-1"
             )
-        self.assertEqual(self._focus_flags(herdr), [False, False])
+        self.assertEqual(self._focus_flags(herdr), [True, False])
 
     def test_single_provider_request_never_focuses(self) -> None:
         # No second slot to place -> the focus policy does not fire.
@@ -4751,8 +4847,10 @@ class LaneRolePlacementLaunchTest(unittest.TestCase):
 
     def test_none_context_falls_back_to_lane_class_geometry(self) -> None:
         # No durable kind fact (`launch_context=None`) even with a `by_lane_kind`
-        # block present -> the sublane lane keeps its legacy `--split right`
-        # (byte-for-byte the pre-#13647 launch). The kind layer is never consulted.
+        # block present -> the kind layer is never consulted and the LANE-CLASS
+        # declaration decides. The lane class is pinned to `right` on purpose: since
+        # #14568 the product default is `down`, so asserting `down` here would pass
+        # whether the kind layer fired, the class layer fired, or neither did.
         with tempfile.TemporaryDirectory() as tmp:
             herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
             self._prepare(
@@ -4761,7 +4859,8 @@ class LaneRolePlacementLaunchTest(unittest.TestCase):
                 providers=["codex", "claude"],
                 lane="lane-1",
                 lane_placement=self._placement(
-                    by_lane_kind={"delegated_coordinator": {"split": "down"}}
+                    by_lane_kind={"delegated_coordinator": {"split": "down"}},
+                    sublane={"split": "right"},
                 ),
                 launch_context=None,
             )
@@ -4770,7 +4869,8 @@ class LaneRolePlacementLaunchTest(unittest.TestCase):
     def test_kind_absent_from_config_falls_back_to_lane_class(self) -> None:
         # A resolved kind whose token the config's `by_lane_kind` does NOT declare
         # falls through to the lane-class layer (the gate keys on the config
-        # DECLARING the kind, not merely on a kind being supplied).
+        # DECLARING the kind, not merely on a kind being supplied). Same discriminating
+        # `right` lane class as above, for the same reason.
         with tempfile.TemporaryDirectory() as tmp:
             herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
             self._prepare(
@@ -4779,11 +4879,53 @@ class LaneRolePlacementLaunchTest(unittest.TestCase):
                 providers=["codex", "claude"],
                 lane="lane-1",
                 lane_placement=self._placement(
-                    by_lane_kind={"coordinator": {"split": "down"}}
+                    by_lane_kind={"coordinator": {"split": "down"}},
+                    sublane={"split": "right"},
                 ),
                 launch_context=LaneLaunchContext(lane_kind="implementation"),
             )
         self.assertEqual(self._second_split(herdr), "right")
+
+    def test_unset_kind_and_class_reach_the_product_default(self) -> None:
+        # The third layer, isolated: nothing declared on either axis -> `down`. Paired
+        # with the two fall-through tests above (which pin `right` at the class layer),
+        # this is what makes `by_lane_kind > lane_class > product default` a real
+        # three-way ordering rather than two indistinguishable `down`s.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(),
+                launch_context=LaneLaunchContext(lane_kind="implementation"),
+            )
+        self.assertEqual(self._second_split(herdr), "down")
+
+    def test_a_declared_kind_shadows_the_class_and_undeclared_fields_take_the_product_default(
+        self,
+    ) -> None:
+        # #13647's wholesale-shadowing rule is PRESERVED, not quietly turned into a
+        # per-field merge: a declared kind that names only `order` does not inherit its
+        # lane class's `split`. The undeclared `split` falls to the product default
+        # (`down`), NOT to the class's `right`.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ", created_tab="wZ:t1")
+            self._prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-1",
+                lane_placement=self._placement(
+                    by_lane_kind={"implementation": {"order": ["claude", "codex"]}},
+                    sublane={"split": "right"},
+                ),
+                launch_context=LaneLaunchContext(lane_kind="implementation"),
+            )
+        self.assertEqual(self._second_split(herdr), "down")
+        # The kind's own declared field still applies: claude occupies, codex splits.
+        self.assertEqual(herdr.start_argvs[0][2].split("_")[-2], "claude")
 
     # --- close condition 3: precedence role > lane_class > default ---------------
 

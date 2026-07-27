@@ -18,7 +18,8 @@ live な herdr pane pair (coordinator + auditor / gateway + worker 等) の **�
 
 - **target identity は assigned name 権威**: pane の route authority は herdr assigned name (durable identity) + live inventory であり、pane 位置・tab 配置・pane id は権威ではない ([[spec-herdr-native-identity]])。再配置は表示位置を変えるだけで、assigned name / route / projection を変えない。操作前に必ず対象 pane の assigned name と live 状態を確認し、pane id を durable な target として扱わない。
 - **tab join の権威は `tab_id`**: どの pane が同一 tab に属するかは live inventory の `tab_id` のみが authority で、tab label は cosmetic (#13411)。bounce で「元の tab へ戻す」際は label ではなく元 tab の `tab_id` を指定する。
-- **live pair の即時再配置経路はこの recipe のみ**: herdr は same-tab re-split を拒否するため (下記)、`pane_placement` 設定を将来足しても既存 live pair の配置は変わらない。live で今すぐ入れ替える唯一の経路が本 recipe である (#13648)。
+- **live pair の即時再配置経路はこの recipe のみ**: herdr は same-tab re-split を拒否するため (下記)、`lane_placement` 設定 (#13646 / #13647) も、その未設定既定 (#14568 の product default `split: down`) も、**既存 live pair の配置を変えない**。設定は次の fresh launch / heal の argv を決めるだけである。live で今すぐ入れ替える唯一の経路が本 recipe である (#13648)。
+  - #14568 で未設定既定が縦 (`down`) になったため、**既定変更より前に立ち上げた live pair は左右のまま残る**。左右のまま使い続けても不整合ではない (設定と live 配置は別 authority)。今すぐ縦に揃えたい場合は下記 recipe B を使い、pair を再起動できる場面なら fresh launch に任せる方が安全である (live 操作を伴わない)。
 
 ## herdr 0.7.1 の制約 (2026-07-12 実測)
 
