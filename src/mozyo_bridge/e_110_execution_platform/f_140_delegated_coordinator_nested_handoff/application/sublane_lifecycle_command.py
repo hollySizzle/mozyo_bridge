@@ -388,6 +388,7 @@ class SublaneRetireUseCase:
         integration_branch: Optional[str],
         assertions: RetireAssertions,
         worktree_dirty_override: Optional[bool] = None,
+        worktree_missing: bool = False,
     ) -> SublaneRetireOutcome:
         is_git = self.ops.is_git_workspace()
         # Redmine #13331 review j#73338 (blocking): the retire TARGET is the lane worktree
@@ -410,6 +411,11 @@ class SublaneRetireUseCase:
         preflight = RetirePreflight(
             is_git_workspace=is_git,
             worktree_dirty=worktree_dirty,
+            # Redmine #14499: a positively-measured missing worktree. The dirty probe above
+            # already fails closed on it, so this only sharpens the reported diagnosis from
+            # "go commit your changes" to "the checkout is gone" — the blocked/permitted
+            # verdict is unchanged either way.
+            worktree_missing=worktree_missing,
             integration_branch_resolved=True,
             merge_conflict=False,
             target_identity_known=assertions.target_identity_known,
@@ -706,6 +712,11 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
             ("--retire-hibernated-bound", "retire_hibernated_bound"),
             # Redmine #14242: the active live-zero terminal retire is a fifth distinct intent.
             ("--retire-active-live-zero", "retire_active_live_zero"),
+            # Redmine #14499: the active UNBOUND live-zero terminal retire is a sixth.
+            (
+                "--retire-active-unbound-live-zero",
+                "retire_active_unbound_live_zero",
+            ),
         )
         if getattr(args, flag, False)
     ]
@@ -736,11 +747,27 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     # uninspectable / non-git path reads as dirty), so a missing / bad `--worktree` blocks.
     worktree = getattr(args, "worktree", None)
     worktree_dirty_override = None
+    worktree_missing = False
     if worktree:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (  # noqa: E501
             LiveSublaneGitOperations,
         )
 
+        # Redmine #14499: measure "is the recorded checkout still there?" BEFORE probing it.
+        # After a host reboot every lane worktree under `/private/tmp` is gone, and the dirty
+        # probe below used to raise `FileNotFoundError` straight out of this read-only
+        # preflight — `subprocess.run(cwd=<missing>)` raises rather than exiting non-zero
+        # (six production runs, effects 0: #14203 j#89077 / #14476 j#89076 / #14478 j#89078 /
+        # #14479 j#89079 / #14480 j#89080 / #14482 j#89081). The probe itself is now
+        # OSError-safe, so the traceback cannot escape from anywhere; this positive
+        # measurement additionally lets the preflight say `worktree_missing_after_reboot`
+        # instead of the fail-closed `dirty_worktree` the unreadable path would produce.
+        # A path that cannot be inspected at all (a permission error on an ancestor) stays
+        # `False` here — unknown is never reported as missing — and still blocks as dirty.
+        try:
+            worktree_missing = not Path(worktree).expanduser().is_dir()
+        except OSError:
+            worktree_missing = False
         worktree_dirty_override = LiveSublaneGitOperations(
             repo_root=Path(worktree)
         ).worktree_dirty()
@@ -753,157 +780,30 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         integration_branch=getattr(args, "integration_branch", None),
         assertions=assertions,
         worktree_dirty_override=worktree_dirty_override,
+        worktree_missing=worktree_missing,
     )
-    # Redmine #13331: opt-in herdr guarded close. Only under backend: herdr, only with
-    # --execute, and only when the preflight already permits retirement (may_retire), close
-    # the lane workspace's managed gateway/worker agents. Never removes a worktree / deletes
-    # a branch (still runbook per worktree-lifecycle-boundary.md); never touches a foreign
-    # agent. The default (no --execute) path is byte-for-byte the preflight-only behaviour.
-    #
-    # Redmine #13841: --migrate-hibernated-legacy is the metadata-only path for a hibernated /
-    # released LEGACY row (empty worktree binding) the guarded close can never retire (it blocks
-    # forever on worktree_binding_unverified) and #13809 backfill does not cover (active-row
-    # only). It launches / closes / resumes NO process. It and --execute are conflicting
-    # destructive intents, so passing both is rejected up front (review j#79150 finding 3, the
-    # guard at the top of this handler) — the branch below runs the migration in the exclusive
-    # case where only --migrate-hibernated-legacy is set, and never the guarded close.
-    close_result = None
-    migration_result = None
-    reconcile_result = None
-    bound_retire_result = None
-    active_retire_result = None
-    if getattr(args, "migrate_hibernated_legacy", False):
-        if outcome.preflight.may_retire:
-            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_legacy_retire import (  # noqa: E501
-                run_hibernated_legacy_retire_migration,
-            )
+    # The six mutually exclusive retire intents (guarded close / hibernated-legacy migration /
+    # hibernated-live reconcile / hibernated-bound terminal retire / active live-zero terminal
+    # retire / active UNBOUND live-zero terminal retire) live in `sublane_retire_intents`, which
+    # runs exactly one of them — and only when the fail-closed preflight already permits
+    # retirement. Relocated there in Redmine #14499 when the sixth intent pushed this module
+    # over the module-health threshold; the dispatch is byte-for-byte the chain that was here.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_intents import (  # noqa: E501
+        dispatch_retire_intent,
+    )
 
-            # Head integration is an action-time invariant the retire preflight (run with
-            # merge_on_retire=False) does not check: probe --branch's ancestry into
-            # --integration-branch read-only. Unknown / non-ancestor fails closed downstream.
-            ops = LiveSublaneLifecycleOps(repo_root=repo_root)
-            head_integrated = ops.branch_integrated(
-                getattr(args, "branch", None) or "",
-                getattr(args, "integration_branch", None) or "",
-            )
-            # The --worktree's ACTUAL checked-out branch (review j#79150 finding 1): the
-            # migration requires it to equal --branch, so the clean + integrated evidence
-            # describes the worktree's real head and not an unrelated branch name.
-            worktree_branch = (
-                ops.branch_for(worktree) if worktree else None
-            )
-            migration_result = run_hibernated_legacy_retire_migration(
-                args,
-                repo_root,
-                head_integrated=head_integrated,
-                worktree_branch=worktree_branch,
-            )
-    elif getattr(args, "reconcile_hibernated_live", False):
-        # Redmine #13842: the bounded live-pair reconcile for a hibernated / released legacy
-        # row whose exact managed pair is live (the #13756 contradiction). Like the migration
-        # it runs only when the preflight permits retirement (so the callback / review
-        # obligations block upstream); unlike it, it verifies the exact live pair and hands off
-        # to the #13754 guarded close. Never runs the plain guarded close below.
-        if outcome.preflight.may_retire:
-            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_live_reconcile import (  # noqa: E501
-                run_hibernated_live_reconcile,
-            )
-
-            ops = LiveSublaneLifecycleOps(repo_root=repo_root)
-            head_integrated = ops.branch_integrated(
-                getattr(args, "branch", None) or "",
-                getattr(args, "integration_branch", None) or "",
-            )
-            worktree_branch = ops.branch_for(worktree) if worktree else None
-            reconcile_result = run_hibernated_live_reconcile(
-                args,
-                repo_root,
-                head_integrated=head_integrated,
-                worktree_branch=worktree_branch,
-            )
-    elif getattr(args, "retire_hibernated_bound", False):
-        # Redmine #13845: the metadata-only TERMINAL retire for a hibernated / released BOUND
-        # row whose live pair is already gone (#13810 j#79416). The #13754 guarded close leaves
-        # it a permanent `zero_close_unproven` (there is nothing to close, yet the durable row
-        # is not `retired`), and the #13841 migration / #13842 reconcile both refuse it because
-        # they require an EMPTY worktree binding. Like them it runs only when the preflight
-        # permits retirement (so the callback / review obligations block upstream), and it
-        # launches / closes / resumes NO process. Never runs the plain guarded close below.
-        if outcome.preflight.may_retire:
-            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_retire import (  # noqa: E501
-                run_hibernated_bound_retire,
-            )
-
-            ops = LiveSublaneLifecycleOps(repo_root=repo_root)
-            head_integrated = ops.branch_integrated(
-                getattr(args, "branch", None) or "",
-                getattr(args, "integration_branch", None) or "",
-            )
-            worktree_branch = ops.branch_for(worktree) if worktree else None
-            # Redmine #14066 review j#82298 F2: the literal-ancestor path must stay byte-identical
-            # to #13845 — NO file IO / git probe / Redmine read / exception surface added. So the
-            # patch-equivalent resolver is only imported AND called when the literal ancestry
-            # probe did NOT pass. When --branch is a literal ancestor (head_integrated is True) the
-            # resolver is never constructed and the retire runs exactly as before. On the
-            # non-literal path the resolver fresh-reads the exact Redmine integration journal
-            # (credential-gated authority) and recomputes patch-ids / origin reachability; ``None``
-            # means no integration journal was supplied (the retire keeps its literal
-            # ``head_not_integrated``), and every read / probe / fence failure is fail-closed.
-            patch_equivalent = None
-            if head_integrated is not True:
-                from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_patch_equivalent_integration import (  # noqa: E501
-                    resolve_patch_equivalent_integration,
-                )
-
-                patch_equivalent = resolve_patch_equivalent_integration(args, repo_root)
-            bound_retire_result = run_hibernated_bound_retire(
-                args,
-                repo_root,
-                head_integrated=head_integrated,
-                worktree_branch=worktree_branch,
-                patch_equivalent=patch_equivalent,
-            )
-    elif getattr(args, "retire_active_live_zero", False):
-        # Redmine #14242: the metadata-only TERMINAL retire for an ACTIVE bound row whose live
-        # pair is already gone (#14222 j#85208). The #13754 guarded close leaves it a permanent
-        # `zero_close_unproven`, and #13845 refuses it (`not_hibernated_bound_state`) because its
-        # CAS requires hibernated + released — an active row has neither. Like the siblings it
-        # runs only when the preflight permits retirement (so the closed-issue / callback /
-        # review obligations block upstream), and it launches / closes / resumes NO process.
-        if outcome.preflight.may_retire:
-            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_active_live_zero_retire import (  # noqa: E501
-                run_active_live_zero_retire,
-            )
-
-            ops = LiveSublaneLifecycleOps(repo_root=repo_root)
-            head_integrated = ops.branch_integrated(
-                getattr(args, "branch", None) or "",
-                getattr(args, "integration_branch", None) or "",
-            )
-            worktree_branch = ops.branch_for(worktree) if worktree else None
-            # Same #14066 discipline as #13845: the patch-equivalent resolver is imported AND
-            # called ONLY when the literal ancestry probe did not pass, so a literal-ancestor
-            # lane performs no extra Redmine read / git probe.
-            patch_equivalent = None
-            if head_integrated is not True:
-                from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_patch_equivalent_integration import (  # noqa: E501
-                    resolve_patch_equivalent_integration,
-                )
-
-                patch_equivalent = resolve_patch_equivalent_integration(args, repo_root)
-            active_retire_result = run_active_live_zero_retire(
-                args,
-                repo_root,
-                head_integrated=head_integrated,
-                worktree_branch=worktree_branch,
-                patch_equivalent=patch_equivalent,
-            )
-    elif getattr(args, "execute", False) and outcome.preflight.may_retire:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E501
-            run_guarded_retire_close,
-        )
-
-        close_result = run_guarded_retire_close(args, repo_root)
+    intents = dispatch_retire_intent(
+        args,
+        repo_root,
+        may_retire=outcome.preflight.may_retire,
+        worktree=worktree,
+    )
+    close_result = intents.close_result
+    migration_result = intents.migration_result
+    reconcile_result = intents.reconcile_result
+    bound_retire_result = intents.bound_retire_result
+    active_retire_result = intents.active_retire_result
+    unbound_retire_result = intents.unbound_retire_result
     payload = outcome.as_payload()
     # Redmine #13754: the ACTUATION verdict — not the preflight — decides whether the lane
     # was actually retired. ``decision.state: retire_ok`` says the retire was *permitted*;
@@ -927,6 +827,9 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     if active_retire_result is not None:
         payload["active_live_zero_retire"] = active_retire_result.as_payload()
         actuated_ok = active_retire_result.ok
+    if unbound_retire_result is not None:
+        payload["active_unbound_live_zero_retire"] = unbound_retire_result.as_payload()
+        actuated_ok = unbound_retire_result.ok
     payload["retire_ok"] = bool(outcome.preflight.may_retire and actuated_ok)
     if getattr(args, "json", False):
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
@@ -962,6 +865,12 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
             )
 
             print(format_active_retire_text(active_retire_result))
+        if unbound_retire_result is not None:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_active_unbound_live_zero_retire import (  # noqa: E501
+                format_unbound_retire_text,
+            )
+
+            print(format_unbound_retire_text(unbound_retire_result))
     return 0 if (outcome.preflight.may_retire and actuated_ok) else 1
 
 

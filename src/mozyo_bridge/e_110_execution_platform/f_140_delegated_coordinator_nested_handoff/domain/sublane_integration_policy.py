@@ -114,6 +114,16 @@ BLOCKED_DURABLE_RECORD_MISSING = "durable_record_missing"
 #: approved AND clean, never merely "an approval exists somewhere". Defined here (above the
 #: precedence tuple) so it can rank among the fundamental invariants.
 INTEGRATION_STALE_REVIEW_GENERATION = "stale_review_generation"
+#: The lane's recorded worktree path is **gone** (Redmine #14499). Distinct from
+#: :data:`BLOCKED_DIRTY_WORKTREE`, which the fail-closed dirty probe would otherwise report
+#: for the same lane: a host reboot wipes every ``/private/tmp`` worktree, so the retire's
+#: dirty probe cannot even spawn ``git`` there (live evidence #13490 j#89060 — 15 residue
+#: panes, every recorded worktree missing). "Dirty" would tell the coordinator to inspect and
+#: commit uncommitted work that no longer exists on disk; this reason names the actual state
+#: so the convergence rail (restore the exact worktree, or terminalize the lifecycle metadata)
+#: is the visible next step. The lane's branch and commits are untouched and MUST NOT be
+#: deleted on the strength of this reason — it is a statement about the checkout only.
+BLOCKED_WORKTREE_MISSING_AFTER_REBOOT = "worktree_missing_after_reboot"
 
 #: Precedence order for the *primary* blocked reason (most fundamental first): an
 #: unidentified target, then the close / owner / callback / durable invariants, then the
@@ -124,6 +134,9 @@ _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_ISSUE_NOT_CLOSED,
     BLOCKED_UNRESOLVED_CALLBACK,
     BLOCKED_DURABLE_RECORD_MISSING,
+    # A missing worktree outranks a dirty one: it is the more fundamental fact and the two
+    # are mutually exclusive by construction (see `decide_retire_integration`).
+    BLOCKED_WORKTREE_MISSING_AFTER_REBOOT,
     BLOCKED_DIRTY_WORKTREE,
     BLOCKED_VERIFICATION_FAILURE,
     BLOCKED_TARGET_BRANCH_UNRESOLVED,
@@ -296,6 +309,12 @@ class RetirePreflight:
     is_git_workspace: bool
     # Git-specific.
     worktree_dirty: bool = False
+    #: The lane's recorded worktree path does not exist (Redmine #14499). Positively
+    #: measured by the caller — ``False`` means "present, or not measured", never "assumed
+    #: gone". Default ``False`` so every existing caller is byte-for-byte unchanged: an
+    #: unmeasured missing worktree still blocks, via the fail-closed ``worktree_dirty``
+    #: probe, exactly as before; supplying it only sharpens the *diagnosis*.
+    worktree_missing: bool = False
     integration_branch_resolved: bool = True
     merge_conflict: bool = False
     # Always-enforced invariants.
@@ -395,7 +414,14 @@ def decide_retire_integration(
     # Git-specific gates — only in a Git workspace.
     merge_attempted = False
     if preflight.is_git_workspace:
-        if preflight.worktree_dirty:
+        if preflight.worktree_missing:
+            # Redmine #14499: a *gone* worktree is reported as itself, never folded into
+            # "dirty". The dirty probe fails closed on an uninspectable path, so a missing
+            # worktree arrives here as BOTH facts; reporting both would tell the coordinator
+            # to go commit work that has no checkout to live in. The two are emitted
+            # mutually exclusively so the blocked-reason set names one true state.
+            blockers.add(BLOCKED_WORKTREE_MISSING_AFTER_REBOOT)
+        elif preflight.worktree_dirty:
             blockers.add(BLOCKED_DIRTY_WORKTREE)
         if policy.merge_on_retire:
             merge_attempted = True
@@ -487,6 +513,7 @@ __all__ = (
     "BLOCKED_ISSUE_NOT_CLOSED",
     "BLOCKED_UNRESOLVED_CALLBACK",
     "BLOCKED_DURABLE_RECORD_MISSING",
+    "BLOCKED_WORKTREE_MISSING_AFTER_REBOOT",
     "SublaneIntegrationPolicy",
     "LaunchPreflight",
     "WorktreeLaunchDecision",

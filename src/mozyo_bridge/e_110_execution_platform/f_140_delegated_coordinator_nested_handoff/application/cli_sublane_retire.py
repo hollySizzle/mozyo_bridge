@@ -230,6 +230,55 @@ def register_sublane_retire(
         ),
     )
     sublane_retire.add_argument(
+        "--retire-active-unbound-live-zero",
+        dest="retire_active_unbound_live_zero",
+        action="store_true",
+        help=(
+            "Redmine #14499: metadata-only TERMINAL retire for an ACTIVE row that records NO "
+            "canonical worktree binding (an empty worktree_identity) and whose managed pair is "
+            "already positively gone — the #14456 j#87973 shape no rail could converge: the "
+            "guarded close returns `worktree_binding_unverified` (nothing to attest), "
+            "--retire-active-live-zero refuses an EMPTY binding by construction, and "
+            "--migrate-hibernated-legacy / --reconcile-hibernated-live / "
+            "--retire-hibernated-bound all require a hibernated row. With no binding to attest "
+            "and no release witness, its identity fence is the caller-declared "
+            "--expect-lane-generation + --expect-lane-revision (both mandatory; read them from "
+            "`sublane reboot-audit`), so a lane re-incarnated between the read and the write "
+            "loses the CAS rather than being terminalized on a stale reading. Requires the "
+            "preflight to permit retirement AND the row to be active + issue-bound + owning "
+            "--issue + EMPTY-bound AND --branch integrated (literal ancestor, or a #14066 "
+            "patch_equivalent integration verified via --integration-journal), and takes the "
+            "same launch-exclusion lock and live-zero fences as #14242. --worktree is NOT "
+            "required and is never attested here (it is used only to widen the live-zero scan "
+            "to a pre-#13377 legacy twin unit). Launches / closes / resumes NO process; removes "
+            "no worktree, branch or commit. Duplicate replay is idempotent. Mutually exclusive "
+            "with every other retire intent (passing more than one is a zero-write error)."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--expect-lane-generation",
+        dest="expect_lane_generation",
+        type=int,
+        default=0,
+        help=(
+            "Redmine #14499: the exact positive lane_generation the caller measured the "
+            "live-zero read against. Mandatory with --retire-active-unbound-live-zero (it "
+            "replaces the worktree attestation that surface cannot perform); ignored by every "
+            "other intent."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--expect-lane-revision",
+        dest="expect_lane_revision",
+        type=int,
+        default=0,
+        help=(
+            "Redmine #14499: the exact positive lifecycle revision the caller measured the "
+            "live-zero read against. Mandatory with --retire-active-unbound-live-zero; ignored "
+            "by every other intent."
+        ),
+    )
+    sublane_retire.add_argument(
         "--integration-journal",
         dest="integration_journal",
         default=None,

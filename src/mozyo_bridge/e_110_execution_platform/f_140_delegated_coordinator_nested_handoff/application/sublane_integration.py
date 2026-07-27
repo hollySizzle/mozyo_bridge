@@ -352,12 +352,40 @@ class LiveSublaneGitOperations:
     repo_root: Path
 
     def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", *args],
-            cwd=self.repo_root,
-            text=True,
-            capture_output=True,
-        )
+        """Run ``git`` in :attr:`repo_root`, mapping a spawn failure to a failed result.
+
+        Redmine #14499: ``subprocess.run(cwd=...)`` raises ``FileNotFoundError`` — not a
+        non-zero exit — when ``cwd`` does not exist. After a host reboot every lane's
+        recorded worktree under ``/private/tmp`` is gone, so the retire preflight's dirty
+        probe (``LiveSublaneGitOperations(repo_root=Path(worktree)).worktree_dirty()``)
+        raised straight out of the read-only preflight as an uncaught traceback (live
+        evidence #14203 j#89077 / #14476 j#89076 / #14478 j#89078 / #14479 j#89079 /
+        #14480 j#89080 / #14482 j#89081 — six production runs, effects 0). Every probe
+        here already documents a *fail-closed* reading of a non-zero result, so mapping
+        the spawn failure onto that same shape keeps each probe's contract instead of
+        letting an OS-level error escape a read-only path: an uninspectable worktree
+        reads dirty, a missing one is not a git workspace, no branch resolves. The
+        precise *diagnosis* (missing rather than merely unreadable) is a separate typed
+        preflight fact — see ``worktree_missing_after_reboot`` — because collapsing it
+        into "dirty" would name the wrong problem.
+
+        ``git`` itself being absent from ``PATH`` raises the same ``OSError`` family and
+        is mapped identically: a probe that could not run has not proven anything.
+        """
+        try:
+            return subprocess.run(
+                ["git", *args],
+                cwd=self.repo_root,
+                text=True,
+                capture_output=True,
+            )
+        except OSError as exc:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=127,
+                stdout="",
+                stderr=f"git could not be run in {self.repo_root}: {type(exc).__name__}",
+            )
 
     def is_git_workspace(self) -> bool:
         result = self._run("rev-parse", "--is-inside-work-tree")
