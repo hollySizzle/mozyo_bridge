@@ -34,15 +34,27 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
     ``--review-exemption-json`` supplies the issue's durable journals
     (``{issue, journals: [{journal_id, notes}]}``). They are folded with the SAME grammar the
     glance projection uses — no second reader — and admitted only when all three durable facts
-    hold together: a valid ``codex_direct_edit`` gate with ``follow_up_review: false``, a recorded
-    Close gate, and a COMPLETE integration disposition
+    hold together: an in-force ``codex_direct_edit`` exemption, a recorded Close gate, and a
+    COMPLETE integration disposition
     (:func:`...review_exemption.evaluate_exemption_integration_admissible`).
 
     This is what removes the false assert the issue names: an exempt lane has no review generation,
     so ``--latest-generation-admissible`` ("the latest generation is approved with no unresolved
-    blocking finding") could only ever be asserted untruthfully for it. Every failure mode —
-    unreadable file, malformed journals, invalid gate, ``follow_up_review: true``, missing Close,
-    incomplete integration — is fail-closed to ``False``.
+    blocking finding") could only ever be asserted untruthfully for it.
+
+    Two fences make the evidence actually belong to THIS retire (Redmine #14539 review j#90137):
+
+    - **F2, issue correlation.** The observation MUST declare an ``issue`` and it must literal
+      exact-match the retire's ``--issue``. Without this, durable evidence from a *different*
+      issue — a closed, merged, exempt one — unlocked the ``stale_review_generation`` fence for
+      any target. An absent / blank / mismatched issue on either side is fail-closed.
+    - **F3, supersession.** Admissibility uses ``GateFacts.review_exempt`` — the supersession-aware
+      fact the glance classifier consumes — not the bare gate state. A review round opened AFTER
+      the exemption re-owes the review, and the retire must agree with the glance about that.
+
+    Every other failure mode — unreadable file, malformed journals, invalid gate, unproven path
+    coverage, ``follow_up_review: true``, missing Close, incomplete integration — is likewise
+    fail-closed to ``False``.
     """
     path = (getattr(args, "review_exemption_json", None) or "").strip()
     if not path:
@@ -58,24 +70,34 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_exemption import (  # noqa: E501
             evaluate_exemption_integration_admissible,
-            fold_review_exemption,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
             GATE_CLOSE,
         )
 
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
+
+        # F2: the observation must be ABOUT the issue being retired. Both sides must be present
+        # and equal as literals — a blank on either side correlates to nothing.
+        target_issue = str(getattr(args, "issue", "") or "").strip()
+        observed_issue = str(raw.get("issue", "") or "").strip()
+        if not target_issue or not observed_issue or target_issue != observed_issue:
+            return False
+
         journals = [
             (str(entry.get("journal_id", "")), str(entry.get("notes", "")))
             for entry in (raw.get("journals") or [])
         ]
         gate_facts = fold_issue_gate_facts(journals)
-        # No recognized gate at all -> no Close evidence. Never "assume closed".
-        close_recorded = gate_facts is not None and gate_facts.latest_gate == GATE_CLOSE
+        if gate_facts is None:
+            # No recognized gate at all -> no Close evidence, no exemption authority.
+            return False
         return bool(
             evaluate_exemption_integration_admissible(
-                fold_review_exemption(journals),
-                close_recorded=close_recorded,
+                gate_facts.review_exemption,
+                # F3: the SAME supersession-aware fact the glance classifier consumes.
+                currently_in_force=gate_facts.review_exempt,
+                close_recorded=gate_facts.latest_gate == GATE_CLOSE,
                 integration_complete=fold_integration_disposition(journals).complete,
             ).admissible
         )

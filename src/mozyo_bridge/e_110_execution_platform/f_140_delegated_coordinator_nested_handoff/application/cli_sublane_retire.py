@@ -134,11 +134,14 @@ def register_sublane_retire(
         help=(
             "#14539: path to the issue's durable journals "
             "{issue, journals:[{journal_id, notes}]}. When supplied, the retire RE-VERIFIES at "
-            "action-time that a valid `codex_direct_edit` gate with `follow_up_review: false` is in "
+            "action-time that a `codex_direct_edit` gate with `follow_up_review: false` is in "
             "force AND the issue records Close AND the integration disposition is complete — the "
             "three facts that let a review-exempt lane pass the latest-generation fence without a "
-            "false --latest-generation-admissible assert. Fail-closed on an unreadable / malformed "
-            "file or on any missing fact."
+            "false --latest-generation-admissible assert. The observation's `issue` MUST literal "
+            "exact-match --issue (evidence from another issue never unlocks this fence), the gate's "
+            "`allowed_paths` must cover the record's declared changed_paths, and a review round "
+            "opened AFTER the exemption re-owes the review. Fail-closed on an unreadable / "
+            "malformed file or on any missing fact."
         ),
     )
     sublane_retire.add_argument(

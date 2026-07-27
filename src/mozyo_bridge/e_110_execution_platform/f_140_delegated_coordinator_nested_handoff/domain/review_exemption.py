@@ -51,6 +51,7 @@ Boundary: pure. No IO, no Redmine, no git. A total function over ``(journal_id, 
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
@@ -85,9 +86,23 @@ EXEMPTION_REVIEW_REQUIRED = "review_required"
 #: A gate journal exists but does not satisfy the gate's required fields. Fail-closed: treated
 #: exactly like :data:`EXEMPTION_NONE` by every consumer, and it SUPERSEDES an older valid gate.
 EXEMPTION_INVALID = "invalid"
+#: The gate's own fields are well-formed, but its ``allowed_paths`` could NOT be shown to cover
+#: the durable record's declared changed paths for the target commit (Redmine #14539 review
+#: j#90137 F1). The central preset's ``close.review_exemption`` requires a gate covering *the
+#: whole changed-path set of the target commit*, so a gate whose coverage is unproven — no
+#: declared change scope to check against, or a changed path no glob matches — is NOT an
+#: exemption. Distinct from :data:`EXEMPTION_INVALID` only for diagnosis; every consumer treats
+#: it the same fail-closed way.
+EXEMPTION_PATH_COVERAGE_UNPROVEN = "path_coverage_unproven"
 
 REVIEW_EXEMPTION_STATES: frozenset[str] = frozenset(
-    {EXEMPTION_NONE, EXEMPTION_EXEMPT, EXEMPTION_REVIEW_REQUIRED, EXEMPTION_INVALID}
+    {
+        EXEMPTION_NONE,
+        EXEMPTION_EXEMPT,
+        EXEMPTION_REVIEW_REQUIRED,
+        EXEMPTION_INVALID,
+        EXEMPTION_PATH_COVERAGE_UNPROVEN,
+    }
 )
 
 #: The literal ``role`` value the gate schema requires (central preset `### Codex Direct Edit
@@ -133,11 +148,38 @@ def _field_re(*names: str) -> "re.Pattern[str]":
     )
 
 
+def _field_label_re(*names: str) -> "re.Pattern[str]":
+    """A line-anchored governed field LABEL matcher whose inline value may be empty (pure).
+
+    The governed templates write list-valued fields with an empty inline value and the items on
+    following indented list lines (``- allowed_paths:`` / ``- changed_paths:`` then ``  - src/**``),
+    so a matcher that requires a non-empty inline value cannot see them at all.
+    """
+    alternation = "|".join(re.escape(n) for n in names)
+    return re.compile(
+        r"^(?P<indent>[ \t]*)[-*]?[ \t]*\**[ \t]*(?:" + alternation + r")\**[ \t]*[:：][ \t]*"
+        r"(?P<value>.*?)[ \t]*$",
+        re.MULTILINE | re.IGNORECASE,
+    )
+
+
 _ROLE_FIELD_RE = _field_re("role")
 _DIRECT_EDIT_FIELD_RE = _field_re("direct_edit", "direct edit")
-_ALLOWED_PATHS_FIELD_RE = _field_re("allowed_paths", "allowed paths")
+_ALLOWED_PATHS_FIELD_RE = _field_label_re("allowed_paths", "allowed paths")
+_CHANGED_PATHS_FIELD_RE = _field_label_re("changed_paths", "changed paths")
 _REASON_FIELD_RE = _field_re("reason")
 _FOLLOW_UP_REVIEW_FIELD_RE = _field_re("follow_up_review", "follow up review")
+
+#: An explicit commit-hash field on a governed journal (the same shapes the glance grammar's
+#: ``_COMMIT_FIELD_RE`` accepts). Used to tie a declared change scope to the commit it describes.
+_COMMIT_FIELD_RE = re.compile(
+    r"(?im)^[ \t]*[-*]?[ \t]*\**[ \t]*"
+    r"(?:commit|commit_or_diff|commit_hash|target_commit(?:_or_diff)?)\**[ \t]*[:：][ \t]*"
+    r"\**`?[ \t]*(?P<value>[0-9a-f]{7,64})"
+)
+
+#: A following list item line (``  - `src/**` (新規)``) under a list-valued field label.
+_LIST_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)[-*][ \t]+(?P<value>.+?)[ \t]*$")
 
 #: Decorations a governed field value carries around the real token.
 _DECORATION_RE = re.compile(r"^[`*\s\"']+|[`*\s\"']+$")
@@ -168,25 +210,138 @@ def _field(pattern: "re.Pattern[str]", notes: str) -> str:
     return _clean(match.group("value")) if match else ""
 
 
-def _allowed_paths(notes: str) -> Tuple[str, ...]:
-    """The inline ``allowed_paths`` value as a tuple of path globs (pure).
+def _clean_path(value: object) -> str:
+    """Strip decoration and one trailing parenthetical off ONE path entry (pure).
 
-    Only the INLINE form (``- allowed_paths: src/**, tests/**``) is recognized. A gate whose
-    paths are written as a following bullet sub-list yields an empty tuple, which fails the gate
-    closed to :data:`EXEMPTION_INVALID` — review owed — rather than admitting an exemption whose
-    covered scope this reader could not actually determine. Widening the shape is a change to
-    make against a real durable record, not a guess.
-
-    Decoration is stripped with :data:`_PATH_DECORATION_RE`, NOT the generic :data:`_DECORATION_RE`:
-    a path's trailing ``**`` is a glob, and treating it as Markdown emphasis would silently
-    narrow ``vibes/docs/rules/**`` to ``vibes/docs/rules/``.
+    Uses :data:`_PATH_DECORATION_RE`, NOT the generic :data:`_DECORATION_RE`: a path glob's
+    trailing ``**`` is semantic, and treating it as Markdown emphasis silently narrowed
+    ``vibes/docs/rules/**`` to ``vibes/docs/rules/``. The trailing parenthetical strip is what
+    lets a governed author annotate an entry (`` `src/x.py` (新規)``).
     """
-    match = _ALLOWED_PATHS_FIELD_RE.search(notes or "")
+    text = _TRAILING_PAREN_RE.sub("", str(value or "").strip())
+    return _PATH_DECORATION_RE.sub("", text).strip()
+
+
+def _path_field(pattern: "re.Pattern[str]", notes: str) -> Tuple[str, ...]:
+    """A governed list-valued path field as a tuple of entries (pure).
+
+    Reads BOTH governed shapes, because the templates produce both:
+
+    - inline — ``- allowed_paths: src/**, tests/**`` (comma / whitespace separated);
+    - continuation list — the label with an empty inline value followed by MORE-indented list
+      items, which is exactly what the ``## Gate: codex_direct_edit`` /
+      ``## Gate: review_request`` templates invite (they ship ``- allowed_paths:`` /
+      ``- changed_paths:`` with nothing after the colon).
+
+    Redmine #14539 review j#90137: the first implementation read the inline form only. That was
+    fail-closed, but the continuation form is the shape real governed journals actually use
+    (this issue's own review_request j#89842 writes ``changed_paths`` that way), so reading only
+    the inline form would have made every real record unverifiable rather than merely strict.
+
+    Scanning stops at the first line that is not a more-indented list item, so a following
+    sibling field or a new section never leaks entries into the list.
+    """
+    match = pattern.search(notes or "")
     if match is None:
         return ()
-    raw = _TRAILING_PAREN_RE.sub("", str(match.group("value") or "").strip())
-    parts = [_PATH_DECORATION_RE.sub("", p).strip() for p in _PATH_SPLIT_RE.split(raw)]
-    return tuple(p for p in parts if p)
+    entries: list[str] = []
+    inline = _TRAILING_PAREN_RE.sub("", str(match.group("value") or "").strip())
+    if inline:
+        entries.extend(_PATH_SPLIT_RE.split(inline))
+    label_indent = len(str(match.group("indent") or "").expandtabs(4))
+    # ``match`` ends at the label line's end-of-line, so the slice begins with that line's
+    # newline; ``split("\n")[1:]`` drops it and yields the FOLLOWING lines. (``splitlines()``
+    # here would yield a leading "" and stop the scan before the first item.)
+    for line in (notes or "")[match.end() :].split("\n")[1:]:
+        if not line.strip():
+            break
+        item = _LIST_ITEM_RE.match(line)
+        if item is None:
+            break
+        if len(str(item.group("indent") or "").expandtabs(4)) <= label_indent:
+            break
+        entries.append(item.group("value"))
+    return tuple(p for p in (_clean_path(e) for e in entries) if p)
+
+
+# ---------------------------------------------------------------------------
+# Path coverage: does the gate's ``allowed_paths`` cover the declared changed paths?
+# ---------------------------------------------------------------------------
+
+
+def _segment_match(segment: str, pattern: str) -> bool:
+    """Match ONE path segment against one pattern segment (pure).
+
+    ``fnmatchcase`` is safe here precisely because it is applied per segment: its ``*`` would
+    otherwise cross ``/`` and turn ``src/*`` into a recursive glob.
+    """
+    return fnmatch.fnmatchcase(segment, pattern)
+
+
+def _glob_match(path: str, pattern: str) -> bool:
+    """Whether one POSIX-ish path matches one governed ``allowed_paths`` glob (pure).
+
+    ``**`` matches zero or more whole segments; ``*`` / ``?`` match within a single segment;
+    anything else is an exact segment. Deliberately a small explicit matcher rather than a
+    ``fnmatch`` of the whole string (whose ``*`` crosses ``/``, so ``src/*`` would match
+    ``src/a/b/c.py`` and over-grant coverage) and rather than ``PurePath.full_match`` (3.13+).
+    """
+    segs = [s for s in str(path or "").strip().split("/") if s]
+    pats = [s for s in str(pattern or "").strip().split("/") if s]
+    if not segs or not pats:
+        return False
+
+    def walk(i: int, j: int) -> bool:
+        if j == len(pats):
+            return i == len(segs)
+        if pats[j] == "**":
+            return any(walk(k, j + 1) for k in range(i, len(segs) + 1))
+        if i == len(segs) or not _segment_match(segs[i], pats[j]):
+            return False
+        return walk(i + 1, j + 1)
+
+    return walk(0, 0)
+
+
+def uncovered_paths(
+    changed_paths: Sequence[str], allowed_paths: Sequence[str]
+) -> Tuple[str, ...]:
+    """The declared changed paths NO ``allowed_paths`` glob covers (pure).
+
+    Empty iff every changed path is covered. Callers treat a non-empty result as "this gate does
+    not cover the commit", which is the central preset's actual exemption condition.
+    """
+    allowed = [p for p in (str(a).strip() for a in allowed_paths or ()) if p]
+    if not allowed:
+        return tuple(str(p).strip() for p in changed_paths or () if str(p).strip())
+    return tuple(
+        p
+        for p in (str(c).strip() for c in changed_paths or ())
+        if p and not any(_glob_match(p, a) for a in allowed)
+    )
+
+
+@dataclass(frozen=True)
+class DeclaredChangeScope:
+    """The change scope the durable record declares: a target commit and its changed paths.
+
+    Both come from ONE journal — the latest that carries a governed ``changed_paths`` field — so
+    the paths are tied to the commit that journal declares, rather than being stitched together
+    across unrelated records (Redmine #14539 review j#90137 F1: "対象 commit と changed paths を
+    durable evidence から相関し").
+
+    ``proven`` is the fail-closed predicate: without BOTH a commit and a non-empty path set there
+    is nothing to check an exemption's coverage against, and "we could not check" must never read
+    as "covered".
+    """
+
+    commit: str = ""
+    paths: Tuple[str, ...] = ()
+    journal: str = ""
+
+    @property
+    def proven(self) -> bool:
+        return bool(self.commit and self.paths)
 
 
 @dataclass(frozen=True)
@@ -196,12 +351,18 @@ class ReviewExemptionFacts:
     ``state`` is the closed :data:`REVIEW_EXEMPTION_STATES` token. ``journal`` is the journal the
     gate was recorded at. ``allowed_paths`` / ``reason`` are projected from governed structured
     field lines and are EMPTY when the record does not carry them — never guessed from prose.
+
+    ``covered_commit`` is the target commit the coverage check ran against (empty when no change
+    scope was declared), and ``uncovered`` names the declared changed paths no ``allowed_paths``
+    glob matched. Both are diagnosis for :data:`EXEMPTION_PATH_COVERAGE_UNPROVEN`.
     """
 
     state: str = EXEMPTION_NONE
     journal: str = ""
     allowed_paths: Tuple[str, ...] = ()
     reason: str = ""
+    covered_commit: str = ""
+    uncovered: Tuple[str, ...] = ()
 
     @property
     def recorded(self) -> bool:
@@ -226,6 +387,8 @@ class ReviewExemptionFacts:
             journal=str(self.journal or "").strip(),
             allowed_paths=tuple(str(p).strip() for p in self.allowed_paths if str(p).strip()),
             reason=str(self.reason or "").strip(),
+            covered_commit=str(self.covered_commit or "").strip(),
+            uncovered=tuple(str(p).strip() for p in self.uncovered if str(p).strip()),
         )
 
     def as_payload(self) -> dict[str, object]:
@@ -235,6 +398,8 @@ class ReviewExemptionFacts:
             "journal": v.journal,
             "allowed_paths": list(v.allowed_paths),
             "reason": v.reason,
+            "covered_commit": v.covered_commit,
+            "uncovered": list(v.uncovered),
         }
 
 
@@ -260,7 +425,7 @@ def _journal_exemption(notes: str) -> Optional[ReviewExemptionFacts]:
     if not qualifies:
         return None
 
-    allowed_paths = _allowed_paths(text)
+    allowed_paths = _path_field(_ALLOWED_PATHS_FIELD_RE, text)
     reason = _field(_REASON_FIELD_RE, text)
     invalid = ReviewExemptionFacts(
         state=EXEMPTION_INVALID, allowed_paths=allowed_paths, reason=reason
@@ -293,6 +458,41 @@ def _int_journal(journal_id: object) -> Optional[int]:
         return None
 
 
+def fold_declared_change_scope(
+    journals: Sequence[Tuple[object, str]],
+) -> DeclaredChangeScope:
+    """The LATEST durable ``(commit, changed_paths)`` declaration across one issue (pure).
+
+    The governed ``implementation_done`` / ``review_request`` journals declare the target commit
+    and the paths it changed; this reads the newest journal that carries a ``changed_paths``
+    field and takes the commit from that SAME journal, so the two are correlated rather than
+    stitched across unrelated records (Redmine #14539 review j#90137 F1).
+
+    A journal that declares changed paths but no commit — or a commit but no paths — yields an
+    unproven scope, and an unproven scope can never satisfy a coverage check.
+
+    Boundary: this reads what the durable record DECLARES. It cannot re-derive the true changed
+    set (that needs git, which this pure domain has no access to). The preset already requires
+    the record to be replayable; what this adds is that a gate must be checked against the
+    declared scope instead of being trusted on the strength of a non-empty field.
+    """
+    latest: Optional[Tuple[int, DeclaredChangeScope]] = None
+    for journal_id, notes in journals or ():
+        jint = _int_journal(journal_id)
+        if jint is None:
+            continue
+        paths = _path_field(_CHANGED_PATHS_FIELD_RE, notes or "")
+        if not paths:
+            continue
+        commit_match = _COMMIT_FIELD_RE.search(notes or "")
+        commit = commit_match.group("value").strip().lower() if commit_match else ""
+        if latest is None or jint > latest[0]:
+            latest = (jint, DeclaredChangeScope(commit=commit, paths=paths, journal=str(jint)))
+    if latest is None:
+        return DeclaredChangeScope()
+    return latest[1]
+
+
 def fold_review_exemption(
     journals: Sequence[Tuple[object, str]],
 ) -> ReviewExemptionFacts:
@@ -303,6 +503,12 @@ def fold_review_exemption(
     and a malformed newer gate therefore SHADOWS an older valid one instead of being skipped so
     the stale one stays "latest". Returns the :data:`EXEMPTION_NONE` facts when no journal
     declares a gate.
+
+    An otherwise-valid ``follow_up_review: false`` gate is then checked for PATH COVERAGE against
+    the durable record's declared change scope (Redmine #14539 review j#90137 F1). The central
+    preset's ``close.review_exemption`` requires "対象 commit の全 changed path を覆う有効な gate",
+    so a gate whose coverage cannot be shown — nothing declared to check against, or a changed
+    path no glob matches — folds to :data:`EXEMPTION_PATH_COVERAGE_UNPROVEN`, not to an exemption.
     """
     latest: Optional[Tuple[int, ReviewExemptionFacts]] = None
     for journal_id, notes in journals or ():
@@ -324,7 +530,37 @@ def fold_review_exemption(
             )
     if latest is None:
         return ReviewExemptionFacts()
-    return latest[1]
+    resolved = latest[1]
+    if resolved.state != EXEMPTION_EXEMPT:
+        return resolved
+
+    scope = fold_declared_change_scope(journals)
+    if not scope.proven:
+        # Nothing to check the gate against. "We could not verify coverage" must never read as
+        # "covered": the exemption is withheld until the record declares its change scope.
+        return ReviewExemptionFacts(
+            state=EXEMPTION_PATH_COVERAGE_UNPROVEN,
+            journal=resolved.journal,
+            allowed_paths=resolved.allowed_paths,
+            reason=resolved.reason,
+        )
+    missing = uncovered_paths(scope.paths, resolved.allowed_paths)
+    if missing:
+        return ReviewExemptionFacts(
+            state=EXEMPTION_PATH_COVERAGE_UNPROVEN,
+            journal=resolved.journal,
+            allowed_paths=resolved.allowed_paths,
+            reason=resolved.reason,
+            covered_commit=scope.commit,
+            uncovered=missing,
+        )
+    return ReviewExemptionFacts(
+        state=EXEMPTION_EXEMPT,
+        journal=resolved.journal,
+        allowed_paths=resolved.allowed_paths,
+        reason=resolved.reason,
+        covered_commit=scope.commit,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +574,10 @@ REASON_EXEMPTION_INVALID = "invalid_review_exemption_gate"
 #: The gate declares ``follow_up_review: true`` — the owner required an independent review, so
 #: the ordinary latest-generation fence (never this exemption route) decides admissibility.
 REASON_FOLLOW_UP_REVIEW_REQUIRED = "owner_required_follow_up_review"
+#: The gate's ``allowed_paths`` could not be shown to cover the declared changed paths.
+REASON_PATH_COVERAGE_UNPROVEN = "review_exemption_path_coverage_unproven"
+#: A valid exemption exists but a NEWER review round supersedes it, so a review is owed again.
+REASON_EXEMPTION_SUPERSEDED = "review_exemption_superseded_by_newer_review_round"
 #: The issue is not durably closed, so there is no Close evidence to re-verify.
 REASON_CLOSE_NOT_RECORDED = "close_not_recorded"
 #: No integration disposition means the work reached the integration branch.
@@ -347,6 +587,7 @@ REASON_INTEGRATION_NOT_COMPLETE = "integration_not_complete"
 def evaluate_exemption_integration_admissible(
     exemption: ReviewExemptionFacts,
     *,
+    currently_in_force: bool,
     close_recorded: bool,
     integration_complete: bool,
 ) -> AdmissionResult:
@@ -358,8 +599,9 @@ def evaluate_exemption_integration_admissible(
     review that never happened, the retire re-verifies the three durable facts that actually
     carry the same safety weight, at action time (#14539 acceptance 2/3):
 
-    1. a VALID ``codex_direct_edit`` gate declaring ``follow_up_review: false`` — review is not
-       owed *by policy*, not by an operator's say-so;
+    1. a VALID ``codex_direct_edit`` gate declaring ``follow_up_review: false``, whose
+       ``allowed_paths`` cover the declared changed paths, and which is CURRENTLY in force —
+       review is not owed *by policy*, not by an operator's say-so;
     2. the issue is durably CLOSED (its own close contract was satisfied upstream — the owner
        close approval a US / standalone issue needs is enforced at close time);
     3. the integration disposition says the work actually reached the integration branch.
@@ -367,14 +609,25 @@ def evaluate_exemption_integration_admissible(
     All three are read from the SAME durable record and the SAME folds the glance projection uses,
     so this is a re-verification, not a second grammar. Any missing fact is fail-closed, and an
     ``invalid`` gate or an owner-required follow-up review never reaches this route at all.
+
+    ``currently_in_force`` is the SUPERSESSION-aware fact
+    (:attr:`...glance_journal_grammar.GateFacts.review_exempt`) — the same one the glance
+    classifier consumes — NOT :attr:`ReviewExemptionFacts.in_force`. Redmine #14539 review j#90137
+    F3: reading the bare gate state here let the retire admit a lane whose exemption a NEWER review
+    round had already superseded, so the retire and the glance disagreed about the very same
+    durable record. One authority, two consumers.
     """
     facts = exemption.validated()
     if facts.state == EXEMPTION_NONE:
         return AdmissionResult(False, REASON_NO_EXEMPTION_RECORDED)
     if facts.state == EXEMPTION_INVALID:
         return AdmissionResult(False, REASON_EXEMPTION_INVALID)
+    if facts.state == EXEMPTION_PATH_COVERAGE_UNPROVEN:
+        return AdmissionResult(False, REASON_PATH_COVERAGE_UNPROVEN)
     if facts.state == EXEMPTION_REVIEW_REQUIRED:
         return AdmissionResult(False, REASON_FOLLOW_UP_REVIEW_REQUIRED)
+    if not currently_in_force:
+        return AdmissionResult(False, REASON_EXEMPTION_SUPERSEDED)
     if not close_recorded:
         return AdmissionResult(False, REASON_CLOSE_NOT_RECORDED)
     if not integration_complete:
@@ -387,15 +640,21 @@ __all__ = (
     "EXEMPTION_EXEMPT",
     "EXEMPTION_INVALID",
     "EXEMPTION_NONE",
+    "EXEMPTION_PATH_COVERAGE_UNPROVEN",
     "EXEMPTION_REVIEW_REQUIRED",
     "MARKER_GATE_CODEX_DIRECT_EDIT",
     "REASON_CLOSE_NOT_RECORDED",
     "REASON_EXEMPTION_INVALID",
+    "REASON_EXEMPTION_SUPERSEDED",
     "REASON_FOLLOW_UP_REVIEW_REQUIRED",
     "REASON_INTEGRATION_NOT_COMPLETE",
     "REASON_NO_EXEMPTION_RECORDED",
+    "REASON_PATH_COVERAGE_UNPROVEN",
     "REVIEW_EXEMPTION_STATES",
+    "DeclaredChangeScope",
     "ReviewExemptionFacts",
     "evaluate_exemption_integration_admissible",
+    "fold_declared_change_scope",
     "fold_review_exemption",
+    "uncovered_paths",
 )

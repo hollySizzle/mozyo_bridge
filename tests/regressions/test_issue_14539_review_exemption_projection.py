@@ -40,6 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_exemption import (
     EXEMPTION_EXEMPT,
     EXEMPTION_INVALID,
+    EXEMPTION_PATH_COVERAGE_UNPROVEN,
     EXEMPTION_REVIEW_REQUIRED,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
@@ -79,11 +80,19 @@ GATE_MALFORMED = "\n".join(
     line for line in GATE_EXEMPT.splitlines() if not line.startswith("- reason:")
 )
 
-REVIEW_REQUEST = "## Gate: Review Request\n- commit: 4f2b9c1a3d5e6f708192a3b4c5d6e7f809a1b2c3\n"
+HEAD = "4f2b9c1a3d5e6f708192a3b4c5d6e7f809a1b2c3"
+
+REVIEW_REQUEST = f"## Gate: Review Request\n- commit: {HEAD}\n"
+# The durable change scope every exemption's path coverage is checked against (review j#90137 F1).
+# Both paths are inside GATE_EXEMPT's ``allowed_paths``.
 IMPLEMENTATION_DONE = (
-    "## Gate: Implementation Done\n- commit: 4f2b9c1a3d5e6f708192a3b4c5d6e7f809a1b2c3\n"
+    f"## Gate: Implementation Done\n"
+    f"- commit: {HEAD}\n"
+    "- changed_paths:\n"
+    "  - `vibes/docs/rules/agent-workflow.md`\n"
+    "  - `vibes/docs/logics/coordinator-sublane-development-flow.md`\n"
 )
-CLOSE = "## Gate: Close\n- commit: 4f2b9c1a3d5e6f708192a3b4c5d6e7f809a1b2c3\n"
+CLOSE = f"## Gate: Close\n- commit: {HEAD}\n"
 INTEGRATION_MERGED = "## Integration disposition\n- disposition: merged\n"
 
 
@@ -101,7 +110,9 @@ class GlanceProjectionTests(unittest.TestCase):
 
     def test_exemption_supersedes_an_earlier_review_request(self):
         """The literal defect: a superseded past Review Request re-projected as review owed."""
-        facts, state = state_of([("100", REVIEW_REQUEST), ("101", GATE_EXEMPT)])
+        facts, state = state_of(
+            [("99", IMPLEMENTATION_DONE), ("100", REVIEW_REQUEST), ("101", GATE_EXEMPT)]
+        )
         self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
         self.assertTrue(facts.review_exempt)
         self.assertNotEqual(state, LANE_STATE_REVIEW_WAITING)
@@ -136,7 +147,9 @@ class GlanceProjectionTests(unittest.TestCase):
 
     def test_glance_row_reports_no_review_owed(self):
         """Through the actual ``workflow glance`` row fold, not just the classifier."""
-        facts, _ = state_of([("100", REVIEW_REQUEST), ("101", GATE_EXEMPT)])
+        facts, _ = state_of(
+            [("99", IMPLEMENTATION_DONE), ("100", REVIEW_REQUEST), ("101", GATE_EXEMPT)]
+        )
         row = fold_glance_row(
             IssueGlanceSnapshot(
                 issue_id="14539",
@@ -153,33 +166,41 @@ class ExemptionFenceIsNotErodedTests(unittest.TestCase):
     """Acceptance 4 + the fail-closed direction: what must STILL read as review_waiting."""
 
     def test_owner_required_follow_up_review_keeps_the_review_owed(self):
-        facts, state = state_of([("100", REVIEW_REQUEST), ("101", GATE_REVIEW_REQUIRED)])
+        facts, state = state_of(
+            [("99", IMPLEMENTATION_DONE), ("100", REVIEW_REQUEST), ("101", GATE_REVIEW_REQUIRED)]
+        )
         self.assertEqual(facts.review_exemption.state, EXEMPTION_REVIEW_REQUIRED)
         self.assertFalse(facts.review_exempt)
         self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
 
     def test_malformed_gate_keeps_the_review_owed(self):
-        facts, state = state_of([("100", REVIEW_REQUEST), ("101", GATE_MALFORMED)])
+        facts, state = state_of(
+            [("99", IMPLEMENTATION_DONE), ("100", REVIEW_REQUEST), ("101", GATE_MALFORMED)]
+        )
         self.assertEqual(facts.review_exemption.state, EXEMPTION_INVALID)
         self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
 
     def test_a_review_round_opened_after_the_exemption_re_owes_the_review(self):
         """Cross-generation: the exemption exempts what it precedes, not what supersedes it."""
-        facts, state = state_of([("101", GATE_EXEMPT), ("205", REVIEW_REQUEST)])
+        facts, state = state_of(
+            [("99", IMPLEMENTATION_DONE), ("101", GATE_EXEMPT), ("205", REVIEW_REQUEST)]
+        )
         self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
         self.assertFalse(facts.review_exempt)
         self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
 
     def test_a_newer_review_round_re_owes_even_when_impl_done_is_latest(self):
         facts, state = state_of(
-            [("101", GATE_EXEMPT), ("205", REVIEW_REQUEST), ("300", IMPLEMENTATION_DONE)]
+            [("99", IMPLEMENTATION_DONE), ("101", GATE_EXEMPT), ("205", REVIEW_REQUEST),
+             ("300", IMPLEMENTATION_DONE)]
         )
         self.assertFalse(facts.review_exempt)
         self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
 
     def test_a_newer_malformed_gate_shadows_an_older_valid_exemption(self):
         facts, state = state_of(
-            [("101", GATE_EXEMPT), ("205", GATE_MALFORMED), ("300", REVIEW_REQUEST)]
+            [("99", IMPLEMENTATION_DONE), ("101", GATE_EXEMPT), ("205", GATE_MALFORMED),
+             ("300", REVIEW_REQUEST)]
         )
         self.assertEqual(facts.review_exemption.state, EXEMPTION_INVALID)
         self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
@@ -197,6 +218,7 @@ class TerminalRetireAdmissionTests(unittest.TestCase):
             review_generation_json=None,
             review_exemption_json=None,
             latest_generation_admissible=False,
+            issue="14539",
         )
         base.update(over)
         return _resolve_latest_generation_admissible(argparse.Namespace(**base))
@@ -310,6 +332,116 @@ class TerminalRetireAdmissionTests(unittest.TestCase):
         """The glance half of the same scenario agrees with the retire half."""
         _, state = state_of(self.EXEMPT_CLOSED_MERGED, issue_open=False)
         self.assertEqual(state, LANE_STATE_RETIRE_READY)
+
+
+class ReviewJ90137Tests(unittest.TestCase):
+    """The three defects review j#90137 found in R1, each pinned by its own reproduction."""
+
+    def _resolve(self, obs_path, *, issue="14539", assertion=False):
+        return _resolve_latest_generation_admissible(
+            argparse.Namespace(
+                review_generation_json=None,
+                review_exemption_json=obs_path,
+                latest_generation_admissible=assertion,
+                issue=issue,
+            )
+        )
+
+    def _obs(self, tmp, journals, *, issue="14539", name="o.json"):
+        path = Path(tmp) / name
+        path.write_text(
+            json.dumps(
+                {
+                    "issue": issue,
+                    "journals": [{"journal_id": j, "notes": n} for j, n in journals],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    #: A gate naming ONE unrelated file, against a commit that changed the docs tree.
+    GATE_NARROW = GATE_EXEMPT.replace(
+        "- allowed_paths: vibes/docs/rules/**, vibes/docs/logics/**",
+        "- allowed_paths: README.md",
+    )
+
+    def test_f1_a_gate_not_covering_the_changed_paths_does_not_exempt(self):
+        """F1: R1 accepted any non-empty ``allowed_paths``, so a README-only gate exempted src/**."""
+        facts, state = state_of(
+            [("99", IMPLEMENTATION_DONE), ("100", REVIEW_REQUEST), ("101", self.GATE_NARROW)]
+        )
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_PATH_COVERAGE_UNPROVEN)
+        self.assertFalse(facts.review_exempt)
+        self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
+        self.assertEqual(
+            facts.review_exemption.uncovered,
+            (
+                "vibes/docs/rules/agent-workflow.md",
+                "vibes/docs/logics/coordinator-sublane-development-flow.md",
+            ),
+        )
+
+    def test_f1_the_retire_route_also_refuses_an_uncovering_gate(self):
+        journals = [
+            ("99", IMPLEMENTATION_DONE),
+            ("101", self.GATE_NARROW),
+            ("103", INTEGRATION_MERGED),
+            ("104", CLOSE),
+        ]
+        with tempfile.TemporaryDirectory() as t:
+            self.assertFalse(self._resolve(self._obs(t, journals)))
+
+    def test_f2_evidence_from_another_issue_never_unlocks_the_fence(self):
+        """F2: R1 read the observation's journals without ever correlating its ``issue``."""
+        journals = [
+            ("99", IMPLEMENTATION_DONE),
+            ("101", GATE_EXEMPT),
+            ("103", INTEGRATION_MERGED),
+            ("104", CLOSE),
+        ]
+        with tempfile.TemporaryDirectory() as t:
+            obs = self._obs(t, journals, issue="14539")
+            # The very same observation admits for its own issue …
+            self.assertTrue(self._resolve(obs, issue="14539"))
+            # … and never for another one.
+            self.assertFalse(self._resolve(obs, issue="99999"))
+
+    def test_f2_a_missing_issue_on_either_side_fails_closed(self):
+        journals = [
+            ("99", IMPLEMENTATION_DONE),
+            ("101", GATE_EXEMPT),
+            ("103", INTEGRATION_MERGED),
+            ("104", CLOSE),
+        ]
+        with tempfile.TemporaryDirectory() as t:
+            self.assertFalse(self._resolve(self._obs(t, journals, issue=""), issue="14539"))
+            self.assertFalse(self._resolve(self._obs(t, journals, name="b.json"), issue=""))
+
+    def test_f3_the_retire_agrees_with_the_glance_about_supersession(self):
+        """F3: R1's retire ignored a review round opened after the exemption; the glance did not."""
+        journals = [
+            ("99", IMPLEMENTATION_DONE),
+            ("101", GATE_EXEMPT),
+            ("102", REVIEW_REQUEST),
+            ("103", INTEGRATION_MERGED),
+            ("104", CLOSE),
+        ]
+        facts = fold_issue_gate_facts(journals)
+        self.assertFalse(facts.review_exempt)
+        with tempfile.TemporaryDirectory() as t:
+            self.assertFalse(self._resolve(self._obs(t, journals)))
+
+    def test_f3_without_the_newer_round_the_same_history_admits(self):
+        """The negative control: the ONLY difference is the superseding review round."""
+        journals = [
+            ("99", IMPLEMENTATION_DONE),
+            ("101", GATE_EXEMPT),
+            ("103", INTEGRATION_MERGED),
+            ("104", CLOSE),
+        ]
+        with tempfile.TemporaryDirectory() as t:
+            self.assertTrue(self._resolve(self._obs(t, journals)))
 
 
 if __name__ == "__main__":  # pragma: no cover
