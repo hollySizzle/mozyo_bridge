@@ -239,6 +239,11 @@ fail-closed dead-end (`herdr_self_lane_unresolved`、`sublane create/start --exe
   - **非 default** lane + provider `claude` → `implementation_worker` (孫 worker);
   - **非 default** lane + provider `codex` → `delegated_coordinator` (sublane gateway / 子);
   - **default** lane (provider 不問) → fail-closed (`ambiguous_default_coordinator_role`);
+    ただしこれは **分類器** の挙動であり、durable role authority が当該 lane を解決する場合は
+    分類の前に authority が優先する。single-workspace の bare `mozyo` default pair が
+    `coordinator` を宣言して managed gateway transition を解決する経路の正本は
+    `spec-herdr-default-lane-workflow-role-authority` (#14546)。binding が無い default lane は
+    従来どおりここで fail-closed する;
   - unknown provider → fail-closed (`herdr_lane_role_unresolved`)。
   - registry `project_name` を role/scope authority にしない (display metadata、dir 名 default)。
 - **anchor gate (j#74748 F3 / j#74784 / j#74787)。** worker/gateway は **source-of-truth Redmine**

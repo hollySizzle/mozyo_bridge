@@ -869,6 +869,14 @@ def register(sub) -> None:
 
     register_role_authority_parser(workflow_sub)
 
+    # `workflow proxy` / `workflow proxy-fence` (Redmine #14546): the external-client rail that
+    # delegates one durably resolved action to the live attested default coordinator, exactly once.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_proxy import (  # noqa: E501
+        register_proxy_parsers,
+    )
+
+    register_proxy_parsers(workflow_sub)
+
     step = workflow_sub.add_parser(
         "step",
         description=(

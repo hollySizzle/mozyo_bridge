@@ -158,6 +158,7 @@ rules:
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_workflow_step.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_forward_route.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_forward_send.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_role_authority.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/delivery_outcome_gate.py
   - src/mozyo_bridge/core/state/forward_outbox_fence.py
   - .mozyo-bridge/workflow-role-bindings.json
@@ -168,9 +169,28 @@ rules:
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_forward_route.py
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_forward_send.py
   - tests/unit/core/state/test_forward_outbox_fence.py
+  - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_cli_workflow_role_authority.py
+  - tests/regressions/test_issue_14500_default_coordinator_authority.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/specs/herdr-default-lane-workflow-role-authority.md と @vibes/docs/logics/workflow-step-command-design.md
     と @vibes/docs/logics/ticketless-project-gateway-runtime-ux.md と @vibes/docs/specs/herdr-native-identity.md と @vibes/docs/logics/managed-state-model.md
+    と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: external-client coordinator proxy delegation rail
+  patterns:
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/coordinator_proxy.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/coordinator_proxy_send.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_proxy.py
+  - src/mozyo_bridge/core/state/coordinator_proxy_fence.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_coordinator_proxy.py
+  - tests/unit/core/state/test_coordinator_proxy_fence.py
+  - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_coordinator_proxy_send.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/external-client-coordinator-proxy.md と @vibes/docs/specs/herdr-default-lane-workflow-role-authority.md
+    と @vibes/docs/specs/herdr-native-identity.md と @vibes/docs/logics/workflow-step-command-design.md と @vibes/docs/logics/managed-state-model.md
     と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
