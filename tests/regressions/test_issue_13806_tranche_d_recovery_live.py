@@ -339,7 +339,12 @@ class ActuatorDelegationTests(_LiveCase):
             def __init__(self, **kwargs):
                 # the recovery MUST carry the exact action id into the fresh launch
                 assert kwargs.get("replacement_action_id") == "a"
-            def heal_lane_column(self, worktree_path):
+
+            # Mirrors the real ``heal_lane_column`` signature (Redmine #14480). A double that
+            # omits ``target_provider`` would still make this test pass — by raising TypeError
+            # instead of the RuntimeError it means to exercise — so the failure path would be
+            # green for the wrong reason.
+            def heal_lane_column(self, worktree_path, *, target_provider=None):
                 raise RuntimeError("launch failed")
 
         orig = live.HerdrSublaneActuatorOps
@@ -351,13 +356,15 @@ class ActuatorDelegationTests(_LiveCase):
         finally:
             live.HerdrSublaneActuatorOps = orig
 
-    def test_launch_carries_action_id(self):
+    def test_launch_carries_action_id_and_the_exact_pin_context(self):
         seen = {}
 
         class CapturingActuator:
             def __init__(self, **kwargs):
-                seen["action_id"] = kwargs.get("replacement_action_id")
-            def heal_lane_column(self, worktree_path):
+                seen["init"] = kwargs
+
+            def heal_lane_column(self, worktree_path, *, target_provider=None):
+                seen["heal"] = (worktree_path, target_provider)
                 return None
 
         orig = live.HerdrSublaneActuatorOps
@@ -368,7 +375,14 @@ class ActuatorDelegationTests(_LiveCase):
             )
         finally:
             live.HerdrSublaneActuatorOps = orig
-        self.assertEqual(seen["action_id"], "act-9")
+        self.assertEqual(seen["init"]["replacement_action_id"], "act-9")
+        # Redmine #14480: recover-stale shares this port with recover-gateway, so its relaunch
+        # carries the SAME exact binding context. Under a selected v1 attestation store the
+        # action binding is keyed on the exact participant, so a launch without these could not
+        # bind at all — it failed with ``replacement_binding_context_missing``.
+        self.assertEqual(seen["init"]["replacement_assigned_name"], NAME)
+        self.assertEqual(seen["init"]["replacement_old_locator"], LOCATOR)
+        self.assertEqual(seen["heal"], (str(ROOT), ROLE))
 
     def _seed_attestation(self, home, *, action_id):
         HerdrIdentityAttestationStore(home=home).upsert(IdentityAttestationRecord(

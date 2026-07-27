@@ -111,8 +111,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MARKER_CHANNEL_WORKFLOW_EVENT,
     marker_fields_in_note,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_launch_failure import (  # noqa: E501
+    launch_failure_detail,
+    port_launch_failure_reason,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (
-    ACTUATION_EFFECT_FAILED,
     ACTUATION_RECOVERED,
     ATTEST_BOUND,
     ATTEST_MISMATCH,
@@ -172,12 +175,18 @@ def _launch_detail(result, port) -> str:
     the stable, path/credential-free reason token the heal fence raised, so the public outcome
     carries ``launch:<reason>`` (j#81429 #2) instead of a bare swallowed exception.  Every
     other status keeps its own detail unchanged.
+
+    Redmine #14480 made the projection shared rather than local: the gateway refresh needs the
+    identical judgement, and the same decision implemented twice is how two surfaces end up
+    disagreeing about what stopped a launch.  This function stays as the #13933 call site's
+    name; the rule itself lives in :mod:`...domain.replacement_launch_failure`.
     """
-    detail = result.detail or ",".join(result.preservation_reasons)
-    reason = norm(getattr(port, "launch_failure_reason", ""))
-    if result.status == ACTUATION_EFFECT_FAILED and norm(result.detail) == "launch" and reason:
-        return f"launch:{reason}"
-    return detail
+    return launch_failure_detail(
+        status=result.status,
+        detail=result.detail,
+        preservation_reasons=result.preservation_reasons,
+        reason=port_launch_failure_reason(port),
+    )
 
 
 def _git(worktree: Path, *args: str) -> tuple[bool, str]:

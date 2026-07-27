@@ -92,6 +92,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E501
     ACTUATION_RECOVERED,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_launch_failure import (  # noqa: E501
+    LAUNCH_FAILURE_NONE,
+    launch_failure_detail,
+    normalize_launch_failure_reason,
+    port_launch_failure_reason,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.stale_worker_recovery import (  # noqa: E501
     worker_close_committed,
 )
@@ -205,6 +211,15 @@ class GatewayRefreshOutcome:
     #: a path, token value, branch, or identity.
     launch_authority_reason: str = LAUNCH_AUTHORITY_UNKNOWN
     launch_authority_runbook: str = ""
+    #: WHY the action-bound launch leg fenced, as the closed token the fence itself raised
+    #: (Redmine #14480). ``""`` whenever no launch fence fired — the launch succeeded, or the
+    #: run stopped somewhere else entirely — so a consumer never has to read "field absent" as
+    #: "launch was fine". A launch that failed with no typed reason reports
+    #: :data:`...replacement_launch_failure.LAUNCH_FAILURE_UNTYPED`, which is a different
+    #: statement from ``""``. Value-free by construction: an axis / fence name, never a path,
+    #: locator, credential, or exception prose. :attr:`detail` keeps the compatibility
+    #: ``launch:<reason>`` rendering for readers that predate this field.
+    launch_failure_reason: str = LAUNCH_FAILURE_NONE
 
     @property
     def is_blocked(self) -> bool:
@@ -236,6 +251,11 @@ class GatewayRefreshOutcome:
             "post_close_resume": self.post_close_resume,
             "launch_authority_reason": self.launch_authority_reason,
             "launch_authority_runbook": self.launch_authority_runbook or None,
+            # Redmine #14480: emitted on EVERY outcome (like the authority axis above), so
+            # automation reads a value rather than inferring from a missing key. ``""`` is
+            # rendered as ``None`` — "no launch fence fired" — matching the runbook field's
+            # existing empty-to-null convention.
+            "launch_failure_reason": self.launch_failure_reason or None,
         }
 
 
@@ -641,6 +661,18 @@ class GatewayRefreshUseCase:
         after = self._store.get(key)
         gateway_pin = after.find_participant(gateway.identity) if after else None
         if recov.status != ACTUATION_RECOVERED:
+            # Redmine #14480: the actuator collapses every launch-leg failure into the
+            # hardcoded ``detail="launch"``, so the reason the port's fence actually raised is
+            # read from the port as a typed value and carried BOTH as its own closed field and
+            # (compatibly) inside the stop detail. Read once, here, so the typed field and the
+            # rendered detail can never disagree about what stopped the launch.
+            launch_reason = port_launch_failure_reason(self._actuation_port)
+            stop_detail = launch_failure_detail(
+                status=recov.status,
+                detail=recov.detail,
+                preservation_reasons=recov.preservation_reasons,
+                reason=launch_reason,
+            )
             return self._outcome(
                 request, turn_class, turn_reason, verdict,
                 status=REFRESH_STATUS_STOPPED, executed=True,
@@ -649,9 +681,10 @@ class GatewayRefreshUseCase:
                 closed_old_gateway=self._closed_old_gateway(gateway_pin),
                 phase=after.phase if after else "", revision=after.revision if after else 0,
                 preservation_reasons=tuple(recov.preservation_reasons),
+                launch_failure_reason=launch_reason,
                 detail=(
                     f"gateway refresh stopped ({recov.status}"
-                    + (f": {recov.detail}" if norm(recov.detail) else "")
+                    + (f": {stop_detail}" if norm(stop_detail) else "")
                     + "); re-run resumes"
                 ),
                 # Review j#88485: the actuator re-joins the lane authority AFTER the close, so
@@ -727,6 +760,7 @@ class GatewayRefreshUseCase:
         detail: str = "",
         preservation_reasons: tuple[str, ...] = (),
         authority_reason: str = LAUNCH_AUTHORITY_UNKNOWN,
+        launch_failure_reason: str = LAUNCH_FAILURE_NONE,
     ) -> GatewayRefreshOutcome:
         # Review j#88477 F2: the closed axis token + its runbook are TYPED fields on every
         # outcome the surface can return, not prose inside ``detail``.
@@ -754,6 +788,9 @@ class GatewayRefreshUseCase:
             preservation_reasons=preservation_reasons,
             launch_authority_reason=reason,
             launch_authority_runbook=launch_authority_runbook(reason),
+            # Normalized at the composer so EVERY return path yields a well-shaped token,
+            # including the ones that never touch the launch leg (they pass the default).
+            launch_failure_reason=normalize_launch_failure_reason(launch_failure_reason),
         )
 
 

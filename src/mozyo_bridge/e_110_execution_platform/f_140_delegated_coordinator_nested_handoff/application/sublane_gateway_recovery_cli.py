@@ -67,6 +67,12 @@ def format_recover_gateway_text(outcome: GatewayRefreshOutcome) -> str:
     lines.append(f"  launch_authority: {outcome.launch_authority_reason}")
     if outcome.launch_authority_runbook:
         lines.append(f"  launch_authority_recovery: {outcome.launch_authority_runbook}")
+    # Redmine #14480: shown only when a launch fence actually fired. Unlike the authority axis
+    # (which reports an observation on every run, so ``ok`` is meaningful), this field's empty
+    # value means "the launch leg never fenced" — printing ``launch_failure: -`` on a clean
+    # preflight would invite reading absence-of-failure as a diagnosis.
+    if outcome.launch_failure_reason:
+        lines.append(f"  launch_failure: {outcome.launch_failure_reason}")
     if outcome.detail:
         lines.append(f"  detail: {outcome.detail}")
     return "\n".join(lines)

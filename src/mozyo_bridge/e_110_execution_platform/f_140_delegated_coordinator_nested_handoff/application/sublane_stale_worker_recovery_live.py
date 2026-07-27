@@ -85,8 +85,19 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OLD_SLOT_PRESENT,
     OLD_SLOT_RECYCLED,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_launch_failure import (  # noqa: E501
+    LAUNCH_FAILURE_NONE,
+    LAUNCH_FAILURE_UNTYPED,
+    normalize_launch_failure_reason,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.stale_worker_recovery import (  # noqa: E501
     RecoveryObservation,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+    SublaneLauncherIncompatibleError,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
+    SublaneHealError,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
     HerdrSublaneActuatorOps,
@@ -187,6 +198,18 @@ class LiveRecoveryActuatorPort:
     #: The startup-attestation store home the action-binding verify reads (Redmine #13806 R2-F2).
     #: ``None`` = the real state home; tests inject an isolated one.
     attestation_home: Optional[Path] = None
+    #: The typed, value-free reason the LAST :meth:`launch_action_bound` fenced on, as the
+    #: optional port capability :func:`...domain.replacement_launch_failure.
+    #: port_launch_failure_reason` reads (Redmine #14480). Empty after a successful launch and
+    #: before the first one — the generic actuator's hardcoded ``detail="launch"`` carries no
+    #: information, so without this the operator cannot tell a binding-context fence from a
+    #: transient pane failure (#14479 j#88695). Never part of the constructor signature: it is
+    #: an observation this port makes, not authority a caller supplies.
+    launch_failure_reason: str = field(default=LAUNCH_FAILURE_NONE, init=False)
+    #: The nested locator-free startup observation of an UNHEALTHY fresh launch (Redmine
+    #: #13948 R3), so a caller can surface the explicit public rollback pointer for the same
+    #: startup action. ``None`` unless the last launch fenced on a launch-health reason.
+    launch_startup_health: object = field(default=None, init=False)
 
     def _q(self) -> LiveSublaneQuarantineOps:
         return LiveSublaneQuarantineOps(
@@ -344,13 +367,39 @@ class LiveRecoveryActuatorPort:
         return CLOSE_DONE if (result.closed or result.old_absent) else CLOSE_ERROR
 
     def launch_action_bound(self, action_id: str, pin: ParticipantPin) -> str:
-        """Relaunch the fresh worker carrying the exact ``action_id`` (Redmine #13806 R2-F2).
+        """Relaunch the fresh participant carrying the exact ``action_id`` (#13806 R2-F2).
 
         Constructs the herdr lane actuator with ``replacement_action_id=action_id`` so the
         fresh process's startup self-attestation records it — the durable action binding
         :meth:`verify_attestation` re-checks. Not the plain ``heal_receiver`` (which drops the
         action id): a fresh relaunch that does not carry the exact replacement action can never
         be verified as THIS recovery's worker.
+
+        **The exact pin IS the launch's binding context (Redmine #14480).** While the selected
+        identity-attestation store is v1, the action binding is a side record keyed on the exact
+        participant, so ``launch_or_resume_v1_replacement`` requires the target's ``provider`` /
+        ``assigned_name`` / ``old_locator`` and refuses a partial context with
+        ``replacement_binding_context_missing``. Passing only the action id therefore did not
+        launch "generically" — it could not launch AT ALL under v1, which is what #14479 j#88695
+        measured: two consecutive ``effect_failed: launch`` on a committed-close replay whose
+        lane authority was ``ok``. The pin is the single authority already carried through
+        close and verify; the launch now reads its context from that same pin instead of
+        re-deriving a narrower one (the sibling ``_BoundPairActuatorPort`` shape).
+
+        ``target_provider`` scopes the same-tab postcondition to THIS owed participant. The
+        actuator drives exactly ONE participant per launch, so the pair is partial *by
+        construction* at this edge (recover-gateway: gateway closed, worker live; recover-stale:
+        worker closed, gateway live). The pair-level launcher still adopts the surviving sibling
+        rather than relaunching it — ``prepare_session`` is adopt-or-launch idempotent per slot —
+        and a LIVE split is still fail-closed (:func:`...enforce_heal_postcondition` only relaxes
+        the *absent*-sibling case, never the split one). Scoping is not optional here: an empty /
+        unscoped provider is not in the managed pair and re-raises the same v1 context refusal.
+
+        A fenced launch stashes the fence's stable, value-free ``reason`` token (and, for an
+        unhealthy launch, its locator-free startup observation) so the public outcome can name
+        WHY instead of collapsing every cause into a bare ``effect_failed: launch``. The
+        broad final ``except`` stays — it is the fail-closed floor — but it no longer swallows
+        the typed reasons the fences above it raise.
         """
         try:
             HerdrSublaneActuatorOps(
@@ -358,9 +407,36 @@ class LiveRecoveryActuatorPort:
                 issue=_norm(self.request.issue), journal=_norm(self.request.journal),
                 env=self.env, runner=self.runner, timeout=self.timeout,
                 replacement_action_id=_norm(action_id),
-            ).heal_lane_column(str(self.repo_root))
-        except Exception:  # noqa: BLE001 - a fixed launch failure, no body persisted
+                replacement_assigned_name=_norm(pin.assigned_name),
+                replacement_old_locator=_norm(pin.old_locator),
+            ).heal_lane_column(
+                str(self.repo_root), target_provider=_norm(pin.provider) or None
+            )
+        except SublaneHealError as exc:
+            # The typed heal / v1-binding fence (context missing, authority conflict, startup
+            # debt, unhealthy launch, pair split, ...). Its reason is a closed token by
+            # contract, so it is projected verbatim; the shape guard in the projector is the
+            # backstop against anything that is not one.
+            self.launch_failure_reason = (
+                normalize_launch_failure_reason(exc.reason) or LAUNCH_FAILURE_UNTYPED
+            )
+            self.launch_startup_health = getattr(exc, "startup", None)
             return LAUNCH_ERROR
+        except SublaneLauncherIncompatibleError as exc:
+            self.launch_failure_reason = (
+                normalize_launch_failure_reason(exc.reason) or LAUNCH_FAILURE_UNTYPED
+            )
+            self.launch_startup_health = None
+            return LAUNCH_ERROR
+        except Exception:  # noqa: BLE001 - a fixed launch failure, no body persisted
+            # Untyped (a transport / adapter error, or the heal preflight's plain RuntimeError).
+            # Reported as a failure with an honest "we do not know why" — never as no failure,
+            # and never by parsing the exception's prose into a public field.
+            self.launch_failure_reason = LAUNCH_FAILURE_UNTYPED
+            self.launch_startup_health = None
+            return LAUNCH_ERROR
+        self.launch_failure_reason = LAUNCH_FAILURE_NONE
+        self.launch_startup_health = None
         return LAUNCH_DONE
 
     def verify_attestation(self, action_id: str, pin: ParticipantPin) -> str:
