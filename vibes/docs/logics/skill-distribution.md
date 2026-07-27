@@ -73,6 +73,19 @@ legacy partial mirror の規則は **Python authority** が正本である (Redm
 - **canonical source の alias**: `-d "$src"` / `-f "$src/$name"` も symlink を辿る。aliased source は repo が tracking しない byte を publish するので、**内容として取り込まず正本 path の復旧を案内する**。
 - **非 directory ancestor**: `.claude/skills` を regular file にすると ENOTDIR で `-e` が false になり「mirror missing → rerun」と案内するが、その sync は `mkdir -p` で失敗した。「実在するが directory でない」と「不在」を**別 class**にし、rerun 案内は収束する class にだけ出す。
 
+#### Action-time authority (R7 で load-bearing になった不変条件)
+
+規則 A-F の**判定**に加えて、**判定した対象へ実際に I/O が届く**ことを保証する層がある。preflight で観測した path は次の syscall で別物になり得る (TOCTOU) ため、以下は contract の一部である (Redmine #14580 review j#90418 R6-F1 / j#90450 R7-F1〜F4)。
+
+- **dir-fd bind**: path の全 component を `O_DIRECTORY|O_NOFOLLOW` で open して descriptor を保持し、**以後 multi-component path を再解決しない**。stat / read / create / rename / unlink はすべて bound descriptor 相対で行う。component を後から差し替えても I/O の着地点は変わらない。「post-audit で検出する」は防止ではない——親 component を alias にすると、検出前に外部へ書き込まれる (実測)。
+- **leaf の type validation は open 前に効かせる**: leaf は `O_NOFOLLOW|O_NONBLOCK` で open し、返った fd の `fstat` で regular file 以外を拒否する。`O_NONBLOCK` が無いと **FIFO を掴んだ open 自体が writer を待って停止**する (実測: `--check` が停止し kill が必要)。「拒否対象を open しない」ではなく「**拒否対象で停止しない**」が正しい表現。
+- **action-time に見つかった type failure は、rule E と同じ重み**で扱う。後から見つかったからといって rule F (非 write-blocking) に落とすと、recovery が「resync せよ」と言う一方で sync の preflight が同じ tree を拒否し、案内が収束しない。
+- **staging の identity**: temp は destination dir fd に対する `O_CREAT|O_EXCL|O_NOFOLLOW`、mode は `fchmod(fd)`、swap は `os.replace(..., src_dir_fd=, dst_dir_fd=)`。**`os.replace` は NAME が指すものを移す**ため、create 時 `fstat` の `(st_dev, st_ino)` を swap 直前に再検証する。不一致なら abort し、**自分のものでない entry は unlink しない**。
+- **残る窓 (residual)**: identity 検証と `os.replace` の間は原理的に閉じない。verify 直後に staging name を canonical と同内容の外部 hardlink へ差し替えると sync は exit 0 となり、mirror entry がその inode を指し得る。現行 A-F は hardlink を regular file + byte parity として許すため mirror 外 write も mode 変更も起きず、内容が異なる場合や symlink は post-audit が nonzero にする。**mirror directory を変更できる actor は entry を直接変更できる**ため、現行 contract ではこれを residual risk とし block しない。output inode ownership まで contract 化するなら directory-level exclusion / lock を含む設計変更が要る (再検査の追加では閉じない)。
+- **観測不能は独立 class**: observation / open / scandir / read / write / chmod / stat / replace / cleanup の `OSError` は typed violation へ変換し、専用 recovery を持たせる。traceback で抜けさせない (`release check drift` の「sub-check の disposition に従え」が空振りする)。診断の subject は repo-relative に保ち、errno / host 絶対 path を machine contract に載せない。
+- **platform fail-closed**: no-follow / dir-fd primitive が無い host では 0 へ弱化せず `rule P` で拒否する。**capability manifest は実際の call surface を漏れなく列挙する**——代表的に見える別 primitive を検査しても、実際に使う primitive が欠けた host は preflight を通り抜ける (実測: `os.stat` を見て `os.lstat` を見ていなかった)。
+- 単一 `os.write` は全 byte 書込を保証しないため write-all loop を使う。
+
 **write は既存 entry へ書き込まず replace する。** destination directory 内に `tempfile.mkstemp` 相当の **exclusive fd** で temp を作り、mode `0644` を固定して `os.replace` で directory entry を差し替える。旧 inode とその別名は無傷で、中断時も半端な reference が残らない。source は open 時に no-follow + regular file を fd で再確認し、preflight 後の alias / type swap を fail-closed にする。成功表示の前に A-F を再監査し、途中の race や partial state を success として報告しない。
 
 **temp の ownership は prefix ではなく fd で持つ。** 現在 run が保持する exact path だけを `finally` で cleanup し、他 run の temp には触れない。prefix 一致を ownership の証明に使うと、(a) prefix を共有するだけの無関係 file を自動削除し、(b) **並行 run の active temp を削除**する (両方とも実測)。kill 等で残った residue は次回の規則 D で**通常の unpinned entry として block** し reviewed disposition を要求する——自分の crash residue と「誰かが残したい file」を実行時に区別できないため、「stale だから sync が消す」とは案内しない。

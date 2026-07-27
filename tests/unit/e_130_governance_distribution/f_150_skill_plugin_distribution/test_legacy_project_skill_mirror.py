@@ -45,6 +45,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -793,6 +794,227 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             code, out, _ = service.sync()
             self.assertEqual(1, code)
             self.assertEqual((), out)
+
+    # --- R7-F1: descriptor lifetime -----------------------------------------
+
+    def _open_descriptor_count(self) -> int:
+        return len(os.listdir("/dev/fd"))
+
+    def test_abnormal_topology_does_not_leak_descriptors(self) -> None:
+        """j#90450 R7-F1. Every early return in the component walk left the
+        current directory fd open — `except BaseException` does not fire on a
+        `return` — so auditing a tree with neither side present leaked two
+        descriptors per call, 50 over 25 calls, on a path a release preflight
+        can repeat.
+        """
+        empty = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        service = self._service(empty)
+
+        service.audit()  # settle any first-call allocation
+        before = self._open_descriptor_count()
+        for _ in range(25):
+            service.audit()
+        self.assertEqual(before, self._open_descriptor_count(), "audit leaked descriptors")
+
+    def test_repeated_sync_on_an_invalid_tree_does_not_leak_descriptors(self) -> None:
+        repo = self._stage()
+        (self._mirror(repo) / "unpinned.txt").write_text("x\n", encoding="utf-8")
+        service = self._service(repo)
+
+        service.sync()
+        before = self._open_descriptor_count()
+        for _ in range(25):
+            service.sync()
+        self.assertEqual(before, self._open_descriptor_count())
+
+    def test_every_topology_failure_shape_is_descriptor_neutral(self) -> None:
+        """Each early-return branch of the walk, not just the missing one."""
+        shapes = ("missing", "not_directory", "symlink")
+        for shape in shapes:
+            with self.subTest(shape=shape):
+                repo = self._stage()
+                ancestor = repo / ".claude" / "skills"
+                shutil.rmtree(ancestor)
+                if shape == "not_directory":
+                    ancestor.write_text("x\n", encoding="utf-8")
+                elif shape == "symlink":
+                    outside = repo / "outside"
+                    outside.mkdir()
+                    ancestor.symlink_to(outside, target_is_directory=True)
+
+                service = self._service(repo)
+                service.audit()
+                before = self._open_descriptor_count()
+                for _ in range(20):
+                    service.audit()
+                self.assertEqual(before, self._open_descriptor_count())
+
+    # --- R7-F2: action-time type failures ------------------------------------
+
+    def test_entry_swapped_to_a_fifo_after_the_type_audit_does_not_block(self) -> None:
+        """j#90450 R7-F2. The leaf open validated *after* opening, and opening a
+        FIFO for reading blocks until a writer appears — so an entry swapped to
+        a FIFO right after rule E hung `check()` outright. `O_NONBLOCK` lets the
+        open return so the `fstat` can reject it.
+        """
+        repo = self._stage()
+        service = self._service(repo)
+        original = service._audit_dest_entries
+
+        def swap_to_fifo(mirror_fd: int):  # type: ignore[no-untyped-def]
+            result = original(mirror_fd)
+            entry = self._mirror(repo) / "safety.md"
+            entry.unlink()
+            os.mkfifo(entry)
+            return result
+
+        service._audit_dest_entries = swap_to_fifo  # type: ignore[method-assign]
+
+        finished: list[object] = []
+
+        def run() -> None:
+            finished.append(service.check())
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=20)
+        self.assertFalse(worker.is_alive(), "check() blocked on a FIFO open")
+        code, out, err = finished[0]  # type: ignore[misc]
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        self.assertIn(ENTRY_NOT_REGULAR, service.audit().kinds())
+
+    def test_action_time_type_failure_advises_a_recovery_that_converges(self) -> None:
+        """j#90450 R7-F2. Filing the late discovery under rule F left it out of
+        the write-blocking set, so the advice said "resync" while the sync's own
+        preflight refused the identical tree."""
+        repo = self._stage()
+        service = self._service(repo)
+        original = service._audit_dest_entries
+
+        def swap_to_directory(mirror_fd: int):  # type: ignore[no-untyped-def]
+            result = original(mirror_fd)
+            entry = self._mirror(repo) / "safety.md"
+            entry.unlink()
+            entry.mkdir()
+            return result
+
+        service._audit_dest_entries = swap_to_directory  # type: ignore[method-assign]
+        audit = service.audit()
+        self.assertTrue(audit.blocks_write)
+        self.assertNotIn(RECOVERY_RESYNC, audit.recovery_actions())
+        self.assertEqual(1, self._service(repo).sync()[0])
+
+    def test_source_swapped_to_a_fifo_is_bounded_in_both_modes(self) -> None:
+        """The same window on the canonical side."""
+        for mode in ("check", "sync"):
+            with self.subTest(mode=mode):
+                repo = self._stage()
+                entry = self._source(repo) / "safety.md"
+                entry.unlink()
+                os.mkfifo(entry)
+                self.addCleanup(entry.unlink)
+
+                service = self._service(repo)
+                finished: list[object] = []
+
+                def run() -> None:
+                    finished.append(getattr(service, mode)())
+
+                worker = threading.Thread(target=run, daemon=True)
+                worker.start()
+                worker.join(timeout=20)
+                self.assertFalse(worker.is_alive(), f"{mode}() blocked on a FIFO source")
+                self.assertEqual(1, finished[0][0])  # type: ignore[index]
+
+    # --- R7-F3: write-path errors are typed ----------------------------------
+
+    def test_replace_onto_a_directory_is_typed_not_raised(self) -> None:
+        """j#90450 R7-F3. Only the temp create converted `OSError`; the write,
+        chmod, verify and replace did not, so a destination that became a
+        directory after the preflight raised `IsADirectoryError` through the
+        CLI and the release gate.
+        """
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        def hook(event: str) -> None:
+            if event == HOOK_TEMP_CREATED:
+                entry = self._mirror(repo) / "project-map.md"
+                if entry.is_file():
+                    entry.unlink()
+                    entry.mkdir()
+
+        code, out, err = self._service(repo, progress_hook=hook).sync()
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        self.assertIn("aborted", err[0])
+        leftovers = [
+            p.name
+            for p in self._mirror(repo).iterdir()
+            if p.name.startswith(".mozyo-legacy-mirror.")
+        ]
+        self.assertEqual([], leftovers, "staging file survived a failed replace")
+
+    def test_payload_is_written_in_full(self) -> None:
+        """A single `os.write` may write fewer bytes than asked."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_bytes(b"A" * (1 << 20))
+        self.assertEqual(0, self._service(repo).sync()[0])
+        self.assertEqual(
+            b"A" * (1 << 20), (self._mirror(repo) / "workflow.md").read_bytes()
+        )
+        self.assertEqual(0, self._service(repo).check()[0])
+
+    # --- R7-F4: the capability manifest is the call surface -------------------
+
+    def test_each_required_capability_individually_fails_closed(self) -> None:
+        """j#90450 R7-F4. The manifest probed `os.stat`, which nothing calls,
+        and omitted `os.lstat(dir_fd=)`, which every type decision uses — so a
+        host missing it passed the preflight and then raised
+        `NotImplementedError` past the fail-closed path.
+        """
+        repo = self._stage()
+        required = [function for _label, function in legacy_mirror_sync._REQUIRED_DIR_FD_CALLS]
+        self.assertIn(os.lstat, required, "lstat(dir_fd=) is not in the manifest")
+
+        for function in required:
+            with self.subTest(capability=getattr(function, "__name__", function)):
+                reduced = frozenset(os.supports_dir_fd) - {function}
+                with unittest.mock.patch.object(os, "supports_dir_fd", reduced):
+                    self.assertIn(
+                        getattr(function, "__name__", ""),
+                        " ".join(legacy_mirror_sync.missing_platform_capabilities()),
+                    )
+                    service = self._service(repo)
+                    audit = service.audit()
+                    self.assertIn(PLATFORM_UNSUPPORTED, audit.kinds())
+                    self.assertTrue(audit.blocks_write)
+                    code, out, _ = service.sync()
+                    self.assertEqual(1, code)
+                    self.assertEqual((), out)
+
+    def test_capability_manifest_covers_the_primitives_the_module_calls(self) -> None:
+        """Guard the manifest against the module drifting away from it."""
+        source = Path(legacy_mirror_sync.__file__).read_text(encoding="utf-8")
+        body = source.split("class LegacyProjectSkillMirrorSync", 1)[1]
+        listed = {
+            getattr(function, "__name__", "")
+            for _label, function in legacy_mirror_sync._REQUIRED_DIR_FD_CALLS
+        }
+        for call, name in (
+            ("os.lstat(", "lstat"),
+            ("os.open(", "open"),
+            ("os.unlink(", "unlink"),
+            ("os.mkdir(", "mkdir"),
+        ):
+            if call in body:
+                self.assertIn(name, listed, f"{name} is called but not in the manifest")
+        if "os.replace(" in body:
+            self.assertIn("rename", listed, "replace is called; rename must be probed")
 
     # --- R6-F3: unreadable state is typed, not an exception ------------------
 

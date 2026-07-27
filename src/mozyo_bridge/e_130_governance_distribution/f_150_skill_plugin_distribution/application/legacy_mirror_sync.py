@@ -97,28 +97,38 @@ _TEMP_PREFIX = ".mozyo-legacy-mirror."
 HOOK_TEMP_CREATED = "temp_created"
 
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-_FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+#: Leaf reads: no-follow AND non-blocking. `O_NONBLOCK` is what keeps a FIFO
+#: swapped in after the type audit from blocking the open itself; the `fstat`
+#: on the returned fd then rejects it (j#90450 R7-F2).
+_FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+
+
+#: Every platform-dependent primitive this module actually calls, paired with
+#: the capability probe for it. Review j#90450 R7-F4: the manifest listed
+#: `os.stat`, which nothing here calls, and omitted `os.lstat(dir_fd=)`, which
+#: every type decision goes through — so a host without it passed the preflight
+#: and then raised `NotImplementedError` straight past the fail-closed path. The
+#: manifest is the call surface, not a plausible-looking sample of it.
+_REQUIRED_DIR_FD_CALLS: tuple[tuple[str, object], ...] = (
+    ("open(dir_fd=)", os.open),
+    ("lstat(dir_fd=)", os.lstat),
+    ("unlink(dir_fd=)", os.unlink),
+    ("mkdir(dir_fd=)", os.mkdir),
+    # `os.replace` shares `os.rename`'s implementation; the capability set is
+    # keyed on `os.rename` even though both accept the arguments (measured).
+    ("rename(src_dir_fd=, dst_dir_fd=)", os.rename),
+)
 
 
 def missing_platform_capabilities() -> tuple[str, ...]:
     """Primitives this service refuses to run without."""
     missing: list[str] = []
-    if not hasattr(os, "O_NOFOLLOW"):
-        missing.append("O_NOFOLLOW")
-    if not hasattr(os, "O_DIRECTORY"):
-        missing.append("O_DIRECTORY")
-    if os.open not in os.supports_dir_fd:
-        missing.append("open(dir_fd=)")
-    if os.stat not in os.supports_dir_fd:
-        missing.append("stat(dir_fd=)")
-    if os.unlink not in os.supports_dir_fd:
-        missing.append("unlink(dir_fd=)")
-    if os.mkdir not in os.supports_dir_fd:
-        missing.append("mkdir(dir_fd=)")
-    # `os.replace` shares `os.rename`'s implementation; the capability set is
-    # keyed on `os.rename` even though both accept the arguments.
-    if os.rename not in os.supports_dir_fd:
-        missing.append("rename(src_dir_fd=, dst_dir_fd=)")
+    for flag in ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK"):
+        if not hasattr(os, flag):
+            missing.append(flag)
+    for label, function in _REQUIRED_DIR_FD_CALLS:
+        if function not in os.supports_dir_fd:
+            missing.append(label)
     if os.scandir not in os.supports_fd:
         missing.append("scandir(fd)")
     return tuple(missing)
@@ -204,6 +214,12 @@ class LegacyProjectSkillMirrorSync:
                 False,
             )
 
+        # Ownership of `parent` belongs to this frame until it is handed to the
+        # caller. Every exit closes it exactly once: the early returns used to
+        # leak it, and `except BaseException` does not fire on `return` — an
+        # audit of a tree with no source and no mirror leaked two descriptors
+        # per call, 50 over 25 calls (j#90450 R7-F1).
+        handed_over = False
         walked = ""
         try:
             for part in relative.split("/"):
@@ -229,10 +245,11 @@ class LegacyProjectSkillMirrorSync:
                         return None, (violation,), False
                 os.close(parent)
                 parent = child
-        except BaseException:
-            os.close(parent)
-            raise
-        return parent, (), False
+            handed_over = True
+            return parent, (), False
+        finally:
+            if not handed_over:
+                os.close(parent)
 
     @contextmanager
     def _bound(self, relative: str, rule: str, *, create: bool = False) -> Iterator[
@@ -251,8 +268,15 @@ class LegacyProjectSkillMirrorSync:
 
         Returns ``(payload, failure_kind)``. The ``fstat`` is what makes this
         safe after the type audit: the descriptor cannot be re-pointed, so a
-        symlink or FIFO installed in the meantime is refused here rather than
-        followed or blocked on.
+        symlink or FIFO installed in the meantime is refused here.
+
+        ``O_NONBLOCK`` matters as much as ``O_NOFOLLOW``. Validating *after* the
+        open is too late for a FIFO: the open itself blocks waiting for a
+        writer, so an entry swapped to a FIFO right after the type audit hung
+        `check()` indefinitely (j#90450 R7-F2 — a probe was still alive after
+        four seconds and had to be killed). ``O_NONBLOCK`` makes the open return
+        so the ``fstat`` can reject it; on a regular file it does not change
+        read semantics.
         """
         try:
             fd = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
@@ -383,7 +407,18 @@ class LegacyProjectSkillMirrorSync:
                 continue
             mirror_payload, mirror_failure = self._read_bound(mirror_fd, name)
             if mirror_failure is not None:
-                found.append(Violation(RULE_CONTENT_PARITY, mirror_failure, subject, "could not be read as a regular file"))
+                # A type failure discovered HERE is the same defect rule E
+                # reports, just found a moment later — so it must carry rule
+                # E's weight. Filing it under rule F left it out of the
+                # write-blocking set, and the recovery then said "resync" while
+                # the sync's own preflight refused the identical tree
+                # (j#90450 R7-F2).
+                rule = (
+                    RULE_DEST_ENTRY_TYPES
+                    if mirror_failure == ENTRY_NOT_REGULAR
+                    else RULE_CONTENT_PARITY
+                )
+                found.append(Violation(rule, mirror_failure, subject, "could not be read as a regular file"))
                 continue
             if source_payload != mirror_payload:
                 found.append(Violation(RULE_CONTENT_PARITY, CONTENT_DRIFT, subject, "differs from canonical"))
@@ -468,12 +503,23 @@ class LegacyProjectSkillMirrorSync:
         owned = temp_name
         try:
             try:
-                os.write(temp_fd, payload or b"")
+                # A single `os.write` may write fewer bytes than asked; loop
+                # until the payload is out (j#90450 R7-F3).
+                view = memoryview(payload or b"")
+                while view:
+                    view = view[os.write(temp_fd, view) :]
                 # `fchmod` on our own descriptor: a path-based `chmod` here
                 # changed a victim's mode when the temp name was re-bound to a
                 # symlink between create and chmod (j#90418 R6-F1 case 4).
                 os.fchmod(temp_fd, 0o644)
                 created = os.fstat(temp_fd)
+            except OSError:
+                return Violation(
+                    RULE_DEST_ENTRY_SET,
+                    ENTRY_UNREADABLE,
+                    f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
+                    "staging file could not be written",
+                )
             finally:
                 os.close(temp_fd)
 
@@ -497,6 +543,14 @@ class LegacyProjectSkillMirrorSync:
                 )
             try:
                 current = os.fstat(verify_fd)
+            except OSError:
+                owned = ""
+                return Violation(
+                    RULE_DEST_ENTRY_SET,
+                    ENTRY_UNREADABLE,
+                    f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
+                    "staging entry could not be re-validated",
+                )
             finally:
                 os.close(verify_fd)
             if (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino):
@@ -508,7 +562,19 @@ class LegacyProjectSkillMirrorSync:
                     "staging entry was rebound while the sync held it",
                 )
 
-            os.replace(temp_name, name, src_dir_fd=mirror_fd, dst_dir_fd=mirror_fd)
+            try:
+                os.replace(temp_name, name, src_dir_fd=mirror_fd, dst_dir_fd=mirror_fd)
+            except OSError:
+                # e.g. the destination became a directory after the preflight —
+                # `IsADirectoryError` used to escape as a traceback through the
+                # CLI and the release gate (j#90450 R7-F3). The staging file is
+                # still ours, so the `finally` below removes it.
+                return Violation(
+                    RULE_DEST_ENTRY_TYPES,
+                    ENTRY_NOT_REGULAR,
+                    f"{MIRROR_RELATIVE}/{describe_name(name)}",
+                    "could not be replaced; it is no longer a regular file",
+                )
             owned = ""
         finally:
             if owned:
@@ -564,8 +630,9 @@ class LegacyProjectSkillMirrorSync:
                             "aborted the legacy project skill mirror sync.",
                             swapped.message(),
                             "",
-                            "The tree changed underneath the sync. Re-run once the tracked",
-                            f"{SOURCE_RELATIVE} path is stable.",
+                            "The tree changed underneath the sync, or the write could not",
+                            "complete. Nothing outside the mirror was modified. Re-run once the",
+                            "tracked paths are stable.",
                         )
 
         # Never announce success on an unverified tree: re-audit what we wrote.
