@@ -471,6 +471,15 @@ def fold_declared_change_scope(
     A journal that declares changed paths but no commit — or a commit but no paths — yields an
     unproven scope, and an unproven scope can never satisfy a coverage check.
 
+    **A declaration supersedes by EXISTING, not by being valid** (Redmine #14539 review j#90244
+    R2-F1; the same invariant this module already applies to the gate itself, and that
+    :func:`...glance_integration_disposition.fold_work_unit` carries from #13490 j#85365 F1). The
+    latest journal that CARRIES a ``changed_paths`` field wins, and only THEN is its content
+    judged. Skipping a newer empty / commit-less declaration instead — the R2 behaviour — left a
+    STALE older scope as "latest", so a gate kept being checked against the previous commit's
+    path set: j200 declaring a new commit with an empty ``changed_paths`` still read as
+    ``exempt`` against j100's paths.
+
     Boundary: this reads what the durable record DECLARES. It cannot re-derive the true changed
     set (that needs git, which this pure domain has no access to). The preset already requires
     the record to be replayable; what this adds is that a gate must be checked against the
@@ -481,9 +490,12 @@ def fold_declared_change_scope(
         jint = _int_journal(journal_id)
         if jint is None:
             continue
+        if _CHANGED_PATHS_FIELD_RE.search(notes or "") is None:
+            continue  # no declaration here — this journal says nothing about the change scope
+        # A declaration IS present, so it supersedes regardless of what it says. An empty item
+        # list or a missing commit resolves to an UNPROVEN scope, which shadows an older proven
+        # one instead of leaving it standing.
         paths = _path_field(_CHANGED_PATHS_FIELD_RE, notes or "")
-        if not paths:
-            continue
         commit_match = _COMMIT_FIELD_RE.search(notes or "")
         commit = commit_match.group("value").strip().lower() if commit_match else ""
         if latest is None or jint > latest[0]:

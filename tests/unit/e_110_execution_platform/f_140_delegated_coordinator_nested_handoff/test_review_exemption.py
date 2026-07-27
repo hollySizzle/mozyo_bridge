@@ -279,6 +279,55 @@ class PathCoverageTests(unittest.TestCase):
         self.assertEqual(resolved.journal, "300")
 
 
+class ChangeScopeSupersedesByExistingTests(unittest.TestCase):
+    """Review j#90244 R2-F1: a scope declaration supersedes by EXISTING, not by being valid.
+
+    Skipping a newer empty / commit-less declaration leaves a STALE older scope as "latest", so
+    the gate keeps being checked against the PREVIOUS commit's path set. This is the same
+    invariant the module already applies to the gate itself (#13490 j#85365 F1 / #13952 F3).
+    """
+
+    OLD_COMMIT = "1111111111111111111111111111111111111111"
+    OLD_SCOPE = scope("vibes/docs/rules/agent-workflow.md", commit=OLD_COMMIT)
+
+    def _fold(self, newest_notes):
+        journals = [("100", self.OLD_SCOPE), ("101", gate()), ("200", newest_notes)]
+        return fold_declared_change_scope(journals), fold_review_exemption(journals)
+
+    def test_a_newer_empty_declaration_shadows_an_older_proven_scope(self):
+        newer = f"## Gate: Implementation Done\n- commit: {HEAD}\n- changed_paths:\n"
+        resolved, exemption = self._fold(newer)
+        self.assertEqual(resolved.journal, "200")
+        self.assertEqual(resolved.paths, ())
+        self.assertFalse(resolved.proven)
+        self.assertEqual(exemption.state, EXEMPTION_PATH_COVERAGE_UNPROVEN)
+        self.assertFalse(exemption.in_force)
+
+    def test_a_newer_declaration_without_a_commit_shadows_too(self):
+        newer = "## Gate: Implementation Done\n- changed_paths:\n  - vibes/docs/rules/x.md\n"
+        resolved, exemption = self._fold(newer)
+        self.assertEqual(resolved.journal, "200")
+        self.assertEqual(resolved.commit, "")
+        self.assertFalse(resolved.proven)
+        self.assertEqual(exemption.state, EXEMPTION_PATH_COVERAGE_UNPROVEN)
+
+    def test_a_newer_valid_declaration_is_adopted(self):
+        """Negative control: the shadow rule does not make every newer journal unprovable."""
+        resolved, exemption = self._fold(scope("vibes/docs/rules/other.md"))
+        self.assertEqual(resolved.journal, "200")
+        self.assertEqual(resolved.commit, HEAD)
+        self.assertTrue(resolved.proven)
+        self.assertEqual(exemption.state, EXEMPTION_EXEMPT)
+
+    def test_a_journal_with_no_declaration_leaves_the_older_scope_standing(self):
+        """Absence is not a declaration — only a journal that CARRIES the field supersedes."""
+        resolved, exemption = self._fold(f"## Gate: Close\n- commit: {HEAD}\n")
+        self.assertEqual(resolved.journal, "100")
+        self.assertEqual(resolved.commit, self.OLD_COMMIT)
+        self.assertTrue(resolved.proven)
+        self.assertEqual(exemption.state, EXEMPTION_EXEMPT)
+
+
 class GovernedPathListShapeTests(unittest.TestCase):
     """Both governed shapes are read: inline, and the template's continuation list."""
 

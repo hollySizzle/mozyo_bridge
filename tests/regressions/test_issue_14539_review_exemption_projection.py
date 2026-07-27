@@ -444,5 +444,106 @@ class ReviewJ90137Tests(unittest.TestCase):
             self.assertTrue(self._resolve(self._obs(t, journals)))
 
 
+class ReviewJ90244Tests(unittest.TestCase):
+    """R2-F1: a NEWER empty change-scope declaration must shadow an older proven one.
+
+    R2 fixed the covered/uncovered paths but kept ``continue``-ing past a declaration that
+    yielded no entries, so a stale older scope stayed "latest" and the gate went on being checked
+    against the PREVIOUS commit's path set — an exemption granted for a commit whose changed set
+    the record no longer proves.
+    """
+
+    OLD_COMMIT = "1111111111111111111111111111111111111111"
+    #: A scope for an EARLIER commit, fully covered by GATE_EXEMPT's allowed_paths.
+    OLD_SCOPE = (
+        f"## Gate: Implementation Done\n"
+        f"- commit: {OLD_COMMIT}\n"
+        "- changed_paths:\n"
+        "  - `vibes/docs/rules/agent-workflow.md`\n"
+    )
+    #: A NEW commit whose changed set the record declares but leaves empty.
+    NEW_EMPTY_SCOPE = f"## Gate: Implementation Done\n- commit: {HEAD}\n- changed_paths:\n"
+
+    def _resolve(self, obs_path, *, issue="14539"):
+        return _resolve_latest_generation_admissible(
+            argparse.Namespace(
+                review_generation_json=None,
+                review_exemption_json=obs_path,
+                latest_generation_admissible=False,
+                issue=issue,
+            )
+        )
+
+    def _obs(self, tmp, journals, name="o.json"):
+        path = Path(tmp) / name
+        path.write_text(
+            json.dumps(
+                {
+                    "issue": "14539",
+                    "journals": [{"journal_id": j, "notes": n} for j, n in journals],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def _history(self, newest):
+        """The retire-shaped history: closed and merged, so only the SCOPE decides."""
+        return [
+            ("100", self.OLD_SCOPE),
+            ("101", GATE_EXEMPT),
+            ("200", newest),
+            ("203", INTEGRATION_MERGED),
+            ("204", CLOSE),
+        ]
+
+    def _open_history(self, newest):
+        """The glance-shaped history: the latest gate is ``implementation_done``, so the lane's
+        state turns on whether a review is owed (a Close gate would decide it regardless)."""
+        return [("100", self.OLD_SCOPE), ("101", GATE_EXEMPT), ("200", newest)]
+
+    def test_a_newer_empty_scope_withholds_the_exemption_in_the_glance(self):
+        facts, state = state_of(self._open_history(self.NEW_EMPTY_SCOPE))
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_PATH_COVERAGE_UNPROVEN)
+        self.assertFalse(facts.review_exempt)
+        self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
+
+    def test_the_same_open_history_with_a_proven_newer_scope_owes_no_review(self):
+        """Negative control for the glance half: only the newest declaration's CONTENT differs."""
+        proven = (
+            f"## Gate: Implementation Done\n"
+            f"- commit: {HEAD}\n"
+            "- changed_paths:\n"
+            "  - `vibes/docs/logics/coordinator-sublane-development-flow.md`\n"
+        )
+        facts, state = state_of(self._open_history(proven))
+        self.assertTrue(facts.review_exempt)
+        self.assertEqual(state, LANE_STATE_OWNER_WAITING)
+
+    def test_a_newer_empty_scope_blocks_the_terminal_retire(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertFalse(self._resolve(self._obs(t, self._history(self.NEW_EMPTY_SCOPE))))
+
+    def test_the_same_history_with_a_proven_newer_scope_admits(self):
+        """Negative control: only the newest declaration's CONTENT differs."""
+        proven = (
+            f"## Gate: Implementation Done\n"
+            f"- commit: {HEAD}\n"
+            "- changed_paths:\n"
+            "  - `vibes/docs/logics/coordinator-sublane-development-flow.md`\n"
+        )
+        facts, _ = state_of(self._history(proven))
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
+        with tempfile.TemporaryDirectory() as t:
+            self.assertTrue(self._resolve(self._obs(t, self._history(proven))))
+
+    def test_a_newer_journal_that_declares_nothing_leaves_the_scope_standing(self):
+        """Absence is not a declaration: only a journal CARRYING the field supersedes."""
+        facts, _ = state_of(self._history(f"## Gate: Review Request\n- commit: {HEAD}\n"))
+        # The review round supersedes the exemption here, but the SCOPE is still j#100's.
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
+        self.assertEqual(facts.review_exemption.covered_commit, self.OLD_COMMIT)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
