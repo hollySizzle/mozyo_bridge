@@ -57,6 +57,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.application import (  # noqa: E402
     legacy_mirror_sync,
+    owned_descriptors,
 )
 from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.application.legacy_mirror_sync import (  # noqa: E402
     HOOK_TEMP_CREATED,
@@ -1675,6 +1676,186 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             "the cleanup failure was dropped instead of being recorded",
         )
 
+    def _fail_staging_close_with(self, error: BaseException):  # type: ignore[no-untyped-def]
+        """Patch pair failing only the staging close, with a chosen exception."""
+        real_open, real_close = os.open, os.close
+        state: dict[str, object] = {"fd": None, "fired": False}
+
+        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_CREAT:
+                state["fd"] = fd
+            return fd
+
+        def failing_close(fd: int) -> None:
+            real_close(fd)
+            if fd == state["fd"] and not state["fired"]:
+                state["fired"] = True
+                raise error
+
+        return tracking_open, failing_close, state
+
+    def test_a_close_primary_survives_a_raising_release(self) -> None:
+        """j#90487 R13-F1. When the close is itself the primary, the release ran
+        bare — a raising release replaced it and left residue. Both must be
+        independent, with the first ordinary primary surviving."""
+
+        class PrimaryClose(Exception):
+            pass
+
+        class SecondaryCleanup(Exception):
+            pass
+
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        service = self._service(repo)
+
+        def exploding_release(mirror_fd: int, temp_name: str, identity):  # type: ignore[no-untyped-def]
+            raise SecondaryCleanup("injected cleanup failure")
+
+        service._release_staging = exploding_release  # type: ignore[method-assign]
+        tracking_open, failing_close, state = self._fail_staging_close_with(
+            PrimaryClose("injected close primary")
+        )
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "close", failing_close
+            ):
+                with self.assertRaises(PrimaryClose) as caught:
+                    service.sync()
+
+        self.assertTrue(state["fired"], "the staging close injection never fired")
+        notes = getattr(caught.exception, "__notes__", [])
+        self.assertTrue(
+            any("SecondaryCleanup" in note for note in notes),
+            "the cleanup failure was dropped",
+        )
+
+    def test_the_walk_keeps_the_first_close_failure(self) -> None:
+        """j#90487 R13-F1. In the walk, a previous-close primary was overwritten
+        by the `finally`'s current-close secondary."""
+
+        class PreviousClose(Exception):
+            pass
+
+        class CurrentClose(Exception):
+            pass
+
+        repo = self._stage()
+        real_close = os.close
+        order: list[int] = []
+
+        def failing_close(fd: int) -> None:
+            real_close(fd)
+            order.append(fd)
+            if len(order) == 1:
+                raise PreviousClose("first")
+            if len(order) == 2:
+                raise CurrentClose("second")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "close", failing_close):
+            with self.assertRaises(PreviousClose) as caught:
+                self._service(repo).audit()
+
+        notes = getattr(caught.exception, "__notes__", [])
+        self.assertTrue(
+            any("CurrentClose" in note for note in notes),
+            "the second close failure was dropped",
+        )
+
+    def test_a_typed_cleanup_failure_is_recorded_not_discarded(self) -> None:
+        """j#90487 R13-F2. Teardown actions report failure by *return value* as
+        well as by raising: the release returns a violation tuple for a cleanup
+        `OSError`. Discarding it left the primary with no notes while residue
+        stayed on disk."""
+
+        class PrimaryWrite(Exception):
+            pass
+
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise PrimaryWrite("injected write unwind")
+
+        def failing_unlink(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise PermissionError(errno.EACCES, "injected")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", primary_write):
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "unlink", failing_unlink
+            ):
+                with self.assertRaises(PrimaryWrite) as caught:
+                    self._service(repo).sync()
+
+        notes = "\n".join(getattr(caught.exception, "__notes__", []))
+        self.assertIn(CLEANUP_FAILED, notes, "the typed cleanup failure was discarded")
+        self.assertNotEqual(
+            [], self._staging_names(repo), "the fixture did not actually leave residue"
+        )
+
+    def test_a_typed_close_failure_is_recorded_not_discarded(self) -> None:
+        """The other returned-failure channel: `close()` returns False."""
+
+        class PrimaryWrite(Exception):
+            pass
+
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        tracking_open, failing_close, state = self._fail_staging_close_with(
+            OSError(errno.EIO, "injected typed close failure")
+        )
+
+        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise PrimaryWrite("injected write unwind")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "close", failing_close
+            ):
+                with unittest.mock.patch.object(
+                    legacy_mirror_sync.os, "write", primary_write
+                ):
+                    with self.assertRaises(PrimaryWrite) as caught:
+                        self._service(repo).sync()
+
+        self.assertTrue(state["fired"], "the typed close injection never fired")
+        notes = "\n".join(getattr(caught.exception, "__notes__", []))
+        self.assertIn("close reported a failure", notes)
+
+    def test_an_interrupt_during_teardown_outranks_the_primary(self) -> None:
+        """j#90487 R13-F3. `_teardown_during` caught `BaseException`, so a
+        `KeyboardInterrupt` arriving during cleanup was demoted to a note on an
+        ordinary exception — contradicting the descriptor helper's stated
+        promise never to swallow an interrupt."""
+
+        class PrimaryWrite(Exception):
+            pass
+
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        service = self._service(repo)
+
+        def interrupted_release(mirror_fd: int, temp_name: str, identity):  # type: ignore[no-untyped-def]
+            raise KeyboardInterrupt()
+
+        service._release_staging = interrupted_release  # type: ignore[method-assign]
+
+        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise PrimaryWrite("injected write unwind")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", primary_write):
+            with self.assertRaises(KeyboardInterrupt):
+                service.sync()
+
     def test_cleanup_helper_runs_exactly_once_when_it_raises(self) -> None:
         """j#90472 R10-F4. I claimed the single-shot guard was structurally
         unreachable; the review showed the path. `_release_staging` raising a
@@ -1777,7 +1958,13 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
 
     def test_capability_manifest_covers_the_primitives_the_module_calls(self) -> None:
         """Guard the manifest against the module drifting away from it."""
-        source = Path(legacy_mirror_sync.__file__).read_text(encoding="utf-8")
+        # Both modules: the primitives were split across two files when the
+        # service crossed the module-health threshold, and a fence that reads
+        # only one of them would go blind to the other.
+        source = "\n".join(
+            Path(module.__file__).read_text(encoding="utf-8")
+            for module in (legacy_mirror_sync, owned_descriptors)
+        )
         # Scan the WHOLE module: restricting it to the class body meant a call
         # moved to a module-level helper escaped the fence while still being a
         # platform-dependent primitive (j#90458 R8-F4).

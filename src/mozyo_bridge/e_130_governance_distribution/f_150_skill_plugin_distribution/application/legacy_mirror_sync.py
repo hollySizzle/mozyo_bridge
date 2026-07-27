@@ -57,6 +57,12 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from .owned_descriptors import (
+    _attach_secondary,
+    _close_quietly,
+    _OwnedDescriptor,
+    _teardown_during,
+)
 from ..domain.legacy_mirror_contract import (
     CLEANUP_FAILED,
     CONTENT_DRIFT,
@@ -137,105 +143,6 @@ def missing_platform_capabilities() -> tuple[str, ...]:
         missing.append("scandir(fd)")
     return tuple(missing)
 
-
-
-def _close_quietly(fd: int) -> bool:
-    """Close a descriptor, reporting failure rather than raising.
-
-    A failing `close` is not a fact about the mirror, but letting it escape
-    turned every caller — the CLI, `release check drift` — back into a
-    traceback (j#90458 R8-F2). Callers that care fold the ``False`` into their
-    typed result; the rest simply must not crash on teardown.
-    """
-    try:
-        os.close(fd)
-    except OSError:
-        return False
-    return True
-
-
-
-
-def _teardown_during(primary: BaseException, *actions) -> None:
-    """Run each teardown action, independently, without disturbing ``primary``.
-
-    Chaining them meant one failure skipped the rest: a raising close, or a
-    raising cleanup, stopped the release from running at all and left residue
-    behind (j#90482 R12-F2). Each action is attempted on its own and its
-    failure is recorded as secondary.
-    """
-    for action in actions:
-        try:
-            action()
-        except BaseException as failure:  # noqa: BLE001 - recorded, not raised
-            _attach_secondary(primary, failure)
-
-
-class _OwnedDescriptor:
-    """A descriptor this run owns, closed at most once.
-
-    Ownership is released **before** the close syscall runs.
-    :func:`_close_quietly` deliberately re-raises anything that is not an
-    ``OSError`` so an interrupt is never swallowed, which means the close can
-    unwind — and if the sentinel were set afterwards, a later ``finally`` would
-    close the same descriptor *number* again. Under number reuse that closed an
-    unrelated descriptor: a measured run closed a `/dev/null` handle that had
-    just been assigned the freed number (j#90477 R11-F1).
-
-    Both the staging descriptor and the verification descriptor go through this
-    one structure, so the ordering cannot be right in one place and wrong in
-    the other.
-    """
-
-    __slots__ = ("_fd",)
-
-    def __init__(self, fd: int) -> None:
-        self._fd = fd
-
-    @property
-    def held(self) -> bool:
-        return self._fd != -1
-
-    @property
-    def fileno(self) -> int:
-        return self._fd
-
-    def detach(self) -> int:
-        """Give the descriptor to someone else; this object stops owning it."""
-        fd = self._fd
-        self._fd = -1
-        return fd
-
-    def close(self) -> bool:
-        """Close once. ``False`` when the close reported an ``OSError``."""
-        fd = self._fd
-        if fd == -1:
-            return True
-        self._fd = -1  # detach first: a raising close must not close it twice
-        return _close_quietly(fd)
-
-
-def _attach_secondary(primary: BaseException, secondary: BaseException) -> None:
-    """Keep a teardown failure visible without replacing the primary one.
-
-    The exception the caller sees must stay the one that actually unwound the
-    write; a close or cleanup failure is additional information, not a
-    replacement (j#90477 R11-F1 condition 3).
-    """
-    try:
-        note = f"{type(secondary).__name__}: {secondary}"
-        add_note = getattr(primary, "add_note", None)
-        if add_note is not None:
-            add_note(f"secondary failure during teardown: {note}")
-        elif primary.__context__ is None:
-            primary.__context__ = secondary
-    except BaseException:
-        # Best effort, deliberately swallowing. Recording a secondary failure
-        # must never become the reason the caller sees a different exception —
-        # a raising `add_note` replaced the primary and skipped the release
-        # entirely (j#90482 R12-F2). The region is a format plus an attribute
-        # set, so nothing meaningful is hidden.
-        pass
 
 
 class LegacyProjectSkillMirrorSync:
@@ -327,6 +234,10 @@ class LegacyProjectSkillMirrorSync:
         # second close hit an unrelated handle (j#90482 R12-F1, the same defect
         # R11-F1 fixed for the staging descriptor).
         walked = ""
+        # Remember what is unwinding, so the cleanup close below can record its
+        # own failure without replacing it. A previous-close primary was being
+        # overwritten by the current-close secondary (j#90487 R13-F1).
+        in_flight: BaseException | None = None
         try:
             for part in relative.split("/"):
                 walked = f"{walked}/{part}" if walked else part
@@ -356,8 +267,22 @@ class LegacyProjectSkillMirrorSync:
                 previous.close()
             # Hand the leaf to the caller; the `finally` then has nothing to do.
             return current.detach(), (), False
+        except BaseException as unwinding:
+            in_flight = unwinding
+            raise
         finally:
-            current.close()
+            if current.held:
+                try:
+                    closed_cleanly = current.close()
+                except Exception as cleanup_error:  # noqa: BLE001
+                    if in_flight is None:
+                        raise
+                    _attach_secondary(in_flight, cleanup_error)
+                else:
+                    if not closed_cleanly and in_flight is not None:
+                        _attach_secondary(
+                            in_flight, RuntimeError("close reported a failure")
+                        )
 
     @contextmanager
     def _bound(self, relative: str, rule: str, *, create: bool = False) -> Iterator[
@@ -717,7 +642,9 @@ class LegacyProjectSkillMirrorSync:
             # release may each unwind too — they are attempted independently so
             # one failing cannot skip the other, and neither replaces the
             # exception the caller sees (j#90477 R11-F1 / j#90482 R12-F2).
-            _teardown_during(primary, temp.close, release)
+            interrupt = _teardown_during(primary, temp.close, release)
+            if interrupt is not None:
+                raise interrupt
             raise
         finally:
             # A close can report a deferred write error, so discarding its
@@ -727,10 +654,13 @@ class LegacyProjectSkillMirrorSync:
             if temp.held:
                 try:
                     closed_cleanly = temp.close()
-                except BaseException:
-                    # No prior exception is propagating here, so the close
-                    # failure is the one to surface — after releasing.
-                    release()
+                except BaseException as close_primary:
+                    # The close IS the primary here. The release must still run,
+                    # independently, and must not replace it — a raising release
+                    # took its place and left residue (j#90487 R13-F1).
+                    interrupt = _teardown_during(close_primary, release)
+                    if interrupt is not None:
+                        raise interrupt
                     raise
                 if not closed_cleanly and write_failure is None:
                     write_failure = (
@@ -743,7 +673,9 @@ class LegacyProjectSkillMirrorSync:
         try:
             self._notify(HOOK_TEMP_CREATED)
         except BaseException as primary:
-            _teardown_during(primary, release)
+            interrupt = _teardown_during(primary, release)
+            if interrupt is not None:
+                raise interrupt
             raise
 
         # From here to the rename, an exception must still release the staging
@@ -781,14 +713,18 @@ class LegacyProjectSkillMirrorSync:
                 verify.close()
                 return (verify_failure,) + release()
             except BaseException as primary:
-                _teardown_during(primary, verify.close, release)
+                interrupt = _teardown_during(primary, verify.close, release)
+                if interrupt is not None:
+                    raise interrupt
                 raise
             finally:
                 if verify.held:
                     try:
                         verify.close()
-                    except BaseException:
-                        release()
+                    except BaseException as close_primary:
+                        interrupt = _teardown_during(close_primary, release)
+                        if interrupt is not None:
+                            raise interrupt
                         raise
 
             if identity is None or (current.st_dev, current.st_ino) != (
@@ -828,7 +764,9 @@ class LegacyProjectSkillMirrorSync:
             staging_live = False  # the rename consumed it
             return ()
         except BaseException as primary:
-            _teardown_during(primary, release)
+            interrupt = _teardown_during(primary, release)
+            if interrupt is not None:
+                raise interrupt
             raise
 
 
