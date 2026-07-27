@@ -1115,6 +1115,57 @@ class ScaffoldRulesTest(unittest.TestCase):
                 tracked_output,
             )
 
+    def test_governed_scaffold_syncs_catalog_governance_manifest_only(
+        self,
+    ) -> None:
+        """Re-apply syncs the rule and changes only its manifest hash."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            apply_args = [
+                "scaffold",
+                "apply",
+                "redmine-governed",
+                "--target",
+                str(project),
+                "--home",
+                str(home),
+            ]
+            initial_code, initial_output = self.run_cli(apply_args)
+            self.assertEqual(0, initial_code, msg=initial_output)
+
+            relative_rule = ".mozyo-bridge/rules/docs_catalog_governance.yaml"
+            rule_path = project / relative_rule
+            stale_rule = rule_path.read_text(encoding="utf-8") + "\n# stale fixture\n"
+            rule_path.write_text(stale_rule, encoding="utf-8")
+
+            manifest_path = project / ".mozyo-bridge/scaffold.json"
+            before = json.loads(manifest_path.read_text(encoding="utf-8"))
+            before["files"][relative_rule]["sha256"] = hashlib.sha256(
+                stale_rule.encode("utf-8")
+            ).hexdigest()
+            manifest_path.write_text(
+                json.dumps(before, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            reapplied_code, reapplied_output = self.run_cli([*apply_args, "--force"])
+            self.assertEqual(0, reapplied_code, msg=reapplied_output)
+
+            distributed_source = (
+                ROOT
+                / "src/mozyo_bridge/scaffold/presets/redmine-governed/files"
+                / relative_rule
+            )
+            self.assertEqual(rule_path.read_bytes(), distributed_source.read_bytes())
+
+            after = json.loads(manifest_path.read_text(encoding="utf-8"))
+            expected = json.loads(json.dumps(before))
+            expected["files"][relative_rule] = after["files"][relative_rule]
+            self.assertEqual(expected, after)
+
     def test_docs_validate_file_coverage_fails_closed_when_git_is_unavailable(
         self,
     ) -> None:
