@@ -121,7 +121,24 @@ def register_sublane_retire(
             "#13518 R2-F7 / R3-F2: assert (from the durable review journals) that the LATEST review "
             "generation is approved AND carries no unresolved blocking finding. Fail-closed when "
             "unset: the actual retire/integration no longer default-admits a stale approval. Ignored "
-            "when --review-generation-json is supplied (that MEASURES it at action-time)."
+            "when --review-generation-json or --review-exemption-json is supplied (those MEASURE "
+            "admissibility at action-time). Do NOT pass it for a review-exempt lane: there is no "
+            "review generation to be approved, so the assert would be false — use "
+            "--review-exemption-json instead (#14539)."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--review-exemption-json",
+        dest="review_exemption_json",
+        default=None,
+        help=(
+            "#14539: path to the issue's durable journals "
+            "{issue, journals:[{journal_id, notes}]}. When supplied, the retire RE-VERIFIES at "
+            "action-time that a valid `codex_direct_edit` gate with `follow_up_review: false` is in "
+            "force AND the issue records Close AND the integration disposition is complete — the "
+            "three facts that let a review-exempt lane pass the latest-generation fence without a "
+            "false --latest-generation-admissible assert. Fail-closed on an unreadable / malformed "
+            "file or on any missing fact."
         ),
     )
     sublane_retire.add_argument(

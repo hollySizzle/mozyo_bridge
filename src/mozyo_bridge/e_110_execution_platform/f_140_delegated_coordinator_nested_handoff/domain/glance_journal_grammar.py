@@ -108,6 +108,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     fold_integration_disposition,
     fold_work_unit,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_exemption import (
+    ReviewExemptionFacts,
+    fold_review_exemption,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
     correlated_review_request_journal,
     is_explicit_review_conclusion,
@@ -613,6 +617,10 @@ class GateFacts:
     it False *and* records the pending disposition, which is what keeps an approved-but-
     unmerged lane out of owner-close guidance. ``work_unit`` is the governed granularity the
     durable record declares (``leaf_issue`` / ``user_story``), or ``""`` when undeclared.
+
+    ``review_exemption`` is the LATEST typed ``codex_direct_edit`` exemption (Redmine #14539);
+    ``review_exempt`` is the derived "no independent review is owed *right now*" fact — the
+    exemption is in force AND no newer review round supersedes it.
     """
 
     latest_gate: str
@@ -625,6 +633,8 @@ class GateFacts:
         default_factory=IntegrationDispositionFacts
     )
     work_unit: str = ""
+    review_exemption: ReviewExemptionFacts = field(default_factory=ReviewExemptionFacts)
+    review_exempt: bool = False
 
 
 @dataclass(frozen=True)
@@ -634,6 +644,43 @@ class _RecognizedJournal:
     review_conclusion: str
     commit_bearing: bool
     blocker: bool = False  # an audit review that concluded ``blocker``
+
+
+#: The recognized gates that constitute an OPEN review round. A round is an explicit request for
+#: an independent review, so an exemption recorded BEFORE it does not close it (Redmine #14539).
+#: ``implementation_done`` is deliberately absent: it states that implementation finished, not
+#: that a review was requested — whether a review is owed on it is exactly what the exemption
+#: policy decides, so its ordering against the exemption journal is irrelevant.
+_REVIEW_ROUND_GATES: frozenset[str] = frozenset({GATE_REVIEW_REQUEST, GATE_REVIEW})
+
+
+def _review_exempt_now(
+    exemption: ReviewExemptionFacts, recognized: Sequence["_RecognizedJournal"]
+) -> bool:
+    """Whether the durable exemption is in force AND not superseded by a review round (pure).
+
+    An exemption exempts what it precedes in the durable record, not what supersedes it:
+
+    - no review round at all (the common direct-edit lane, whose latest gate is
+      ``implementation_done`` / ``close``) -> the exemption stands;
+    - a review round recorded BEFORE the exemption journal (the "superseded past Review Request"
+      the #14539 acceptance names) -> the exemption supersedes it, so the round is not re-projected
+      as ``review_waiting``;
+    - a review round recorded AFTER the exemption journal -> a review was opened on top of the
+      exemption, so the review is owed again. Fail-closed, and the safe side.
+
+    An unparseable exemption journal id also fails closed (no exemption), because the ordering
+    that makes the exemption safe could not be established.
+    """
+    if not exemption.validated().in_force:
+        return False
+    exemption_journal = _int_journal(exemption.journal)
+    if exemption_journal is None:
+        return False
+    rounds = [r.journal_id for r in recognized if r.gate in _REVIEW_ROUND_GATES]
+    if not rounds:
+        return True
+    return exemption_journal > max(rounds)
 
 
 def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[GateFacts]:
@@ -657,6 +704,10 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
     # they are folded across the whole history rather than accumulated per recognized gate.
     integration = fold_integration_disposition(journals or ())
     work_unit = fold_work_unit(journals or ())
+    # Redmine #14539: the ``codex_direct_edit`` review exemption is a third issue-wide,
+    # latest-wins authority fact standing in its OWN journal (its heading is deliberately NOT in
+    # ``_HEADING_GATE`` — it is an authority declaration, never a lifecycle gate).
+    review_exemption = fold_review_exemption(journals or ())
 
     for journal_id, notes in journals or ():
         jint = _int_journal(journal_id)
@@ -726,6 +777,8 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         blocker_recorded=(latest.gate == GATE_BLOCKED or latest.blocker),
         integration=integration,
         work_unit=work_unit,
+        review_exemption=review_exemption,
+        review_exempt=_review_exempt_now(review_exemption, recognized),
     )
 
 
@@ -755,6 +808,10 @@ def lane_signal_from_gate_facts(
         # Redmine #14213: the TYPED disposition is what lets the classifier tell "integrated"
         # from "explicitly deferred / blocked" at the approved-review step.
         integration_disposition=facts.integration.validated().disposition,
+        # Redmine #14539: the derived exemption fact. The ordering authority (is a review round
+        # newer than the exemption?) is resolved in the fold, where the journal ids live, so the
+        # classifier stays a flat function over facts.
+        review_exempt=facts.review_exempt,
     )
 
 

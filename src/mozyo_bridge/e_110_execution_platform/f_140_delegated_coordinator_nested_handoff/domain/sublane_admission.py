@@ -186,7 +186,8 @@ class LaneSignal:
     "explicitly deferred / blocked", which the ``integration_recorded`` boolean cannot
     express (Redmine #14213). ``issue_open`` reflects the Redmine issue status (open vs
     closed). ``blocker_recorded`` marks a recorded blocker / failed handoff / unresolved
-    dependency.
+    dependency. ``review_exempt`` is the derived "no independent review is owed" fact from a
+    valid ``codex_direct_edit`` gate (Redmine #14539) — see :func:`classify_lane_state` step 4.
     """
 
     issue: str
@@ -198,6 +199,12 @@ class LaneSignal:
     issue_open: bool = True
     blocker_recorded: bool = False
     integration_disposition: str = INTEGRATION_NONE
+    #: A durable ``codex_direct_edit`` gate with ``follow_up_review: false`` is in force AND is
+    #: not superseded by a newer review round (Redmine #14539). Derived in
+    #: :func:`...glance_journal_grammar.lane_signal_from_gate_facts`, where both journal ids are
+    #: known. FAIL-CLOSED default: a caller that cannot establish the exemption (the advisory
+    #: store fallback, any hand-built signal) leaves the ordinary review path fully armed.
+    review_exempt: bool = False
 
 
 def _integration_owed(signal: LaneSignal) -> bool:
@@ -226,7 +233,10 @@ def classify_lane_state(signal: LaneSignal) -> str:
     3. a ``start`` / ``progress`` gate, or a ``review`` that requested changes (work is
        back with the implementer) -> :data:`LANE_STATE_IMPLEMENTING` (**not** blocking);
     4. ``implementation_done`` / ``review_request``, or a ``review`` still pending ->
-       :data:`LANE_STATE_REVIEW_WAITING` (Codex audit owed);
+       :data:`LANE_STATE_REVIEW_WAITING` (Codex audit owed) — UNLESS ``review_exempt`` is
+       set by a valid ``codex_direct_edit`` gate (Redmine #14539), in which case no review
+       is owed and the lane takes step 5's projection (``integration_waiting`` when a
+       pending integration disposition is recorded, else ``owner_waiting``);
     5. a ``review`` approved -> :data:`LANE_STATE_INTEGRATION_WAITING` when a PENDING
        integration disposition is recorded (``explicit_deferral`` / ``integration_blocked`` /
        unreadable — the approved work is durably NOT on the integration branch), else
@@ -268,11 +278,23 @@ def classify_lane_state(signal: LaneSignal) -> str:
     if gate == GATE_REVIEW and signal.review_conclusion == REVIEW_CHANGES_REQUESTED:
         return LANE_STATE_IMPLEMENTING
 
-    # 4. Codex audit owed.
-    if gate in (GATE_IMPLEMENTATION_DONE, GATE_REVIEW_REQUEST):
-        return LANE_STATE_REVIEW_WAITING
-    if gate == GATE_REVIEW and signal.review_conclusion == REVIEW_PENDING:
-        return LANE_STATE_REVIEW_WAITING
+    # 4. Codex audit owed — UNLESS a durable review exemption is in force (Redmine #14539).
+    # A valid ``codex_direct_edit`` gate with ``follow_up_review: false`` promotes Codex to the
+    # implementation subject for its scope and, by policy, owes no separate auditor review. An
+    # exempt lane therefore advances to the SAME post-review projection an approved review
+    # reaches (step 5) — reached by the exemption route, NEVER by fabricating a REVIEW_APPROVED
+    # conclusion, which the preset explicitly forbids ("exemption を Review Gate approval または
+    # 自己 review と表現しないこと"). ``review_exempt`` is fail-closed: it is False for an
+    # invalid gate, for ``follow_up_review: true``, and whenever a NEWER review round supersedes
+    # the exemption, so each of those keeps the ordinary review path.
+    if gate in (GATE_IMPLEMENTATION_DONE, GATE_REVIEW_REQUEST) or (
+        gate == GATE_REVIEW and signal.review_conclusion == REVIEW_PENDING
+    ):
+        if not signal.review_exempt:
+            return LANE_STATE_REVIEW_WAITING
+        if _integration_owed(signal):
+            return LANE_STATE_INTEGRATION_WAITING
+        return LANE_STATE_OWNER_WAITING
 
     # 5. review approved — owner aggregation is the next coordinator-only action, UNLESS the
     # durable record already carries a PENDING integration disposition. A recorded

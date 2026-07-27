@@ -43,6 +43,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
+# Redmine #14539: the retire admissibility resolvers live in their own module — adding the
+# second measured route (the review-exemption fence) pushed this one past the oversized-module
+# gate. Re-exported here so the CLI import site and the #13518 tests are unchanged.
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: F401
+    _resolve_latest_generation_admissible,
+    _resolve_review_exemption_admissible,
+    _resolve_review_generation_admissible,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (
     decide_create_launch,
     default_nongit_worktree_request,
@@ -236,6 +244,11 @@ class RetireAssertions:
     #: FAIL-CLOSED default: the actual `sublane retire` integration decision no longer default-admits
     #: a stale last-write-wins approval — the coordinator must positively assert (from the durable
     #: review journals) OR the CLI must measure it via `evaluate_integration_admissible`.
+    #:
+    #: Redmine #14539: a review-EXEMPT lane (a valid `codex_direct_edit` gate with
+    #: `follow_up_review: false`) has NO review generation, so the assert could only be made
+    #: untruthfully for it. `--review-exemption-json` measures the equivalent durable evidence
+    #: (exemption + Close + complete integration) at action time instead.
     latest_generation_admissible: bool = False
 
 
@@ -663,56 +676,6 @@ def cmd_sublane_create(args: argparse.Namespace) -> int:
     else:
         print(format_create_text(outcome, worktree_path=request.worktree_path))
     return 1 if outcome.plan.status == CREATE_BLOCKED else 0
-
-
-def _resolve_latest_generation_admissible(args: argparse.Namespace) -> bool:
-    """Resolve the latest-generation integration admissibility for a retire (#13518 R3-F2).
-
-    Priority: (1) a coordinator-supplied durable review observation (``--review-generation-json``)
-    is MEASURED at action-time through the pure review-generation fence
-    (:func:`...review_generation.evaluate_integration_admissible`) — an unreadable / malformed file
-    or an inadmissible latest generation fails closed. (2) Otherwise the operator's durable-record
-    assertion (``--latest-generation-admissible``). (3) Absent both, ``False`` (fail-closed) — the
-    actual integration decision never default-admits a stale last-write-wins approval.
-    """
-    path = (getattr(args, "review_generation_json", None) or "").strip()
-    if path:
-        try:
-            import json
-
-            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_generation import (  # noqa: E501
-                ReviewDecision,
-                ReviewGeneration,
-                evaluate_integration_admissible,
-            )
-
-            raw = json.loads(Path(path).read_text(encoding="utf-8"))
-            gen = ReviewGeneration(
-                issue=str(raw.get("issue", "")),
-                review_request_journal=str(raw.get("review_request_journal", "")),
-                target_head=str(raw.get("target_head", "")),
-            )
-            decisions = [
-                ReviewDecision(
-                    generation=ReviewGeneration(
-                        issue=str(d.get("issue", raw.get("issue", ""))),
-                        review_request_journal=str(
-                            d.get("review_request_journal", raw.get("review_request_journal", ""))
-                        ),
-                        target_head=str(d.get("target_head", raw.get("target_head", ""))),
-                    ),
-                    kind=str(d.get("kind", "")),
-                    seq=int(d.get("seq", 0)),
-                    blocking=bool(d.get("blocking", False)),
-                    disposition=str(d.get("disposition", "unresolved")),
-                    journal_id=str(d.get("journal_id", "")),
-                )
-                for d in (raw.get("decisions") or [])
-            ]
-            return bool(evaluate_integration_admissible(gen, decisions).admissible)
-        except Exception:  # noqa: BLE001 - unreadable / malformed durable observation -> fail closed
-            return False
-    return bool(getattr(args, "latest_generation_admissible", False))
 
 
 def cmd_sublane_retire(args: argparse.Namespace) -> int:

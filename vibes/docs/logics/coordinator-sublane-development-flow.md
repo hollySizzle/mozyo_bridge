@@ -225,6 +225,15 @@ coordinator が所有する standalone policy / operations docs の変更は、�
 
 この exemption は通常の Claude 実装 code や、その code に付随して同じ受け入れ条件を説明する docs へ波及しない。それらは従来どおり UserStory 単位の横断 audit 対象である。`coordinator_assistant` も review authority を持たないため、この exemption の判断者または Review Gate writer にはならない。
 
+#### exemption の runtime projection (#14539)
+
+上記 policy は runtime の read-model にも反映する。exemption は integration disposition / work unit と同じ **issue 全体・latest-wins の authority fact** であり、lifecycle gate ではない (`## Gate: codex_direct_edit` は gate heading allowlist に入れない)。正本実装は `review_exemption` domain module で、`workflow glance` の fold と terminal retire の admission が同じ fold を共有する。
+
+- **glance projection**: 有効な exemption が in force の lane は `review_waiting` へ戻さない。review が owed でないだけなので、approved review と同じ後続 projection (pending integration disposition があれば `integration_waiting`、なければ `owner_waiting`) に載せる。**`review_conclusion` を `approved` に捏造しない** — exemption を Review Gate approval と表現しない規則を実装側でも守る。
+- **supersession**: exemption はそれ自身より前の記録を exempt する。exemption journal より **新しい** review round (`review_request` / `review`) がある場合は review が再び owed になる。`implementation_done` は review round ではないため順序を問わない。
+- **terminal retire**: exempt lane には review generation が存在しないため、`--latest-generation-admissible` (「latest generation は approved で未解決 blocking finding なし」) を真として assert できない。代わりに `--review-exemption-json` が durable journals を受け取り、**exemption・Close・integration disposition complete** の 3 点を action-time に再照合して `stale_review_generation` を解く。measured input を渡した場合は operator assertion へ fall back しない。
+- **fail-closed 方向**: gate の必須 field 欠落 / 非 canonical `role` / marker 単独 / `follow_up_review: true` は全て exemption 不成立として扱い、review と既存 generation fence をそのまま維持する。新しい malformed gate は古い有効 gate を **shadow** する (declaration は valid だからではなく存在によって supersede する)。
+
 ### レーン作成単位
 
 一つの作業単位は `$work_unit()` の対応で扱う。対応は Redmine issue / journal に記録し、pane 配置から推測しない。
