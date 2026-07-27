@@ -24,7 +24,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# ``parents[2]`` is the repo root from ``tests/regressions/`` — ``parents[1]`` is ``tests/``,
+# whose ``src`` does not exist, so the insert would be a silent no-op and the module would only
+# import under an ambient ``PYTHONPATH``. Every test module self-inserts the repo-local ``src``
+# so full, subpackage-scoped, and single-file discovery are each self-sufficient (``tests``
+# is the discovery top-level dir and is never imported as a package, see ``tests/__init__.py``).
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state import (  # noqa: E402
