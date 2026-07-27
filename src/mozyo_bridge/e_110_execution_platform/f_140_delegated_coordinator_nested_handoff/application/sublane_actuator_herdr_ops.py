@@ -149,7 +149,8 @@ class HerdrSublaneActuatorOps:
     #: ``implementation``) the CREATING caller resolved from durable governance (Redmine
     #: #13647 T1b). Stored generation-bound on the lifecycle authority row at create, so a
     #: later heal resolves this lane's pane placement offline. Empty (every pre-#13647
-    #: caller) records no kind and keeps ``lane_class`` placement, byte-for-byte.
+    #: caller) records no kind, so the lane places by ``lane_class`` — which since Redmine
+    #: #14568 resolves an undeclared class to the product default (``split: down``).
     lane_kind: str = ""
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     runner: Optional[Runner] = None

@@ -50,6 +50,7 @@ from unittest.mock import patch
 from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (  # noqa: E501
     LanePlacementConfig,
+    ResolvedPlacement,
     product_default_placement,
 )
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (  # noqa: E501
@@ -197,6 +198,29 @@ class ProductDefaultPolicyTest(unittest.TestCase):
             resolve_placement_policy_for_role(config, "sublane", "coordinator")[0],
             "down",
         )
+
+    def test_the_empty_policy_is_a_declaration_state_not_a_preserved_behaviour(self) -> None:
+        # R1-F1 (review j#90277) was a documentation defect of exactly this shape: several
+        # schema / call-site docstrings still called the empty policy "behavior-preserving".
+        # Pin the claim itself as a runtime fact so the prose has something to be wrong
+        # against: `default()` declares nothing (both tables empty) AND resolves to a
+        # geometry that is NOT the pre-#14568 launch (`sublane` was `right`, `default` was
+        # no `--split` at all).
+        empty = LanePlacementConfig.default()
+        self.assertEqual((empty.placements, empty.kind_placements), ((), ()))
+        self.assertEqual(empty.resolve("sublane"), ResolvedPlacement())
+        self.assertEqual(empty.resolve_effective("sublane").split, "down")
+        self.assertEqual(empty.resolve_effective("default").split, "down")
+        # ...and the same geometry holds for a present-but-empty block. Note it is NOT the
+        # same parse: `{}` records a class entry with both FIELDS undeclared, so the
+        # distinction that matters is per-field, not per-block. `{}` is not a rollback.
+        parsed = LanePlacementConfig.from_record({"sublane": {}, "default": {}})
+        self.assertEqual(parsed.placements, (("default", None, None), ("sublane", None, None)))
+        self.assertEqual(parsed.resolve("sublane"), ResolvedPlacement())
+        for lane_class in ("default", "sublane"):
+            self.assertEqual(
+                parsed.resolve_effective(lane_class), empty.resolve_effective(lane_class)
+            )
 
     def test_no_config_object_at_all_still_resolves_the_product_default(self) -> None:
         # A caller that hands the chokepoint no policy must not silently reach a DIFFERENT

@@ -21,6 +21,15 @@ provider occupies first / left / top, which one splits beside it) per lane class
 uses; it is never a live layout / liveness / route authority, and never reconfigures an
 already-live pair (Non-goal: no live relayout).
 
+**Declaration vs effective geometry (Redmine #14568).** Everything in this module that
+*parses* or *reports* the block answers "what did the operator declare", and an absent
+declaration stays absent there. What a LAUNCH uses is a different question, answered only by
+:meth:`LanePlacementConfig.resolve_effective`: it composes ``by_lane_kind`` > lane class >
+:func:`product_default_placement`, and that bottom layer is ``split: down`` on both lane
+classes. So an undeclared workspace is NOT the pre-#14568 launch — #13646's undeclared
+byte-invariance was deliberately superseded by owner intent 2026-07-27. Read a "default" /
+"absent" / "no override" statement below as scoped to the declaration, never to the geometry.
+
 The config KEY is ``lane_placement`` — deliberately NOT ``pane_placement``: the repo-local
 schema boundary (:data:`...repo_local_config._FORBIDDEN_KEY_PARTS`) rejects any config key
 containing ``pane`` (a live-pane-addressing shape) before the allowed-key check, so a
@@ -60,8 +69,13 @@ LANE_PLACEMENT_PROVIDERS: frozenset[str] = frozenset({"claude", "codex"})
 LANE_PLACEMENT_SPLIT_DIRECTIONS: frozenset[str] = frozenset({"right", "down"})
 
 #: The closed set of recognized keys inside a lane-class placement object. Both are
-#: individually optional; a missing field inherits the legacy launch discipline for that
-#: lane class (Design Answer j#76564 Q1 / Q3), so an empty ``{}`` object is a no-op.
+#: individually optional (Design Answer j#76564 Q1 / Q3): a missing field is simply
+#: UNDECLARED. An empty ``{}`` object therefore records a lane-class entry that declares
+#: neither field — it is a no-op on the *declaration*, but NOT on the launch: since Redmine
+#: #14568 each undeclared field resolves through
+#: :meth:`LanePlacementConfig.resolve_effective` to :func:`product_default_placement`
+#: (``split: down``), so ``{}`` and an absent block land the pair identically — vertically.
+#: Rolling a lane class back takes an explicit ``split: right``, never an empty object.
 LANE_PLACEMENT_CLASS_KEYS: frozenset[str] = frozenset({"split", "order"})
 
 #: The closed lane-KIND vocabulary of the ``by_lane_kind`` block (Redmine #13647,
@@ -74,9 +88,11 @@ LANE_PLACEMENT_LANE_KINDS: frozenset[str] = LANE_KINDS
 
 #: The additive top-level ``lane_placement`` key that carries the lane-KIND placement
 #: table (Redmine #13647). Deliberately a *separate* nested block from the flat
-#: ``default`` / ``sublane`` lane-CLASS keys so the two axes never collide: the
-#: lane-class axis (#13646) stays byte-for-byte, and the lane-kind axis is a finer
-#: partition consulted at higher precedence (Design Answer j#85645).
+#: ``default`` / ``sublane`` lane-CLASS keys so the two axes never collide: adding this
+#: block left the lane-class axis's own PARSING and resolution untouched (#13646), and the
+#: lane-kind axis is a finer partition consulted at higher precedence (Design Answer
+#: j#85645). That disjointness is about the two axes, not about the launch geometry an
+#: undeclared repo gets — Redmine #14568 changed the latter for both axes at once.
 LANE_PLACEMENT_BY_LANE_KIND_KEY = "by_lane_kind"
 
 #: The supported ``lane_placement`` record version. Kept intentionally identical to
@@ -248,7 +264,10 @@ def parse_lane_placement_record(
     ``LanePlacementConfig.from_record`` before this is called, so every remaining key must
     be a lane class. A non-mapping block, an unknown lane class, an unknown class-object
     key, a non-mapping class object, or an invalid ``split`` / ``order`` value fails closed.
-    ``None`` yields ``()`` (no override, byte-for-byte historical).
+    ``None`` yields ``()`` — nothing DECLARED on this axis. What an undeclared lane class
+    then launches with is decided one layer up, by
+    :meth:`LanePlacementConfig.resolve_effective` (product default since #14568); this
+    parser reports the operator's record and nothing more.
     """
     if record is None:
         return ()
@@ -324,7 +343,8 @@ def parse_lane_kind_placement_record(
     axes. A non-mapping block, an unknown lane kind (e.g. a ``parent`` / ``child``
     alias — there is no such alias), an unknown class-object key, a non-mapping
     class object, or an invalid ``split`` / ``order`` value fails closed. ``None``
-    yields ``()`` (no override, byte-for-byte historical).
+    yields ``()`` — nothing DECLARED on the lane-kind axis, so every kind falls through
+    to the lane-class layer (and, undeclared there too, to the product default).
     """
     if record is None:
         return ()
@@ -436,7 +456,9 @@ class LanePlacementConfig:
     #: The lane-KIND placement table parsed from the ``by_lane_kind`` block (Redmine
     #: #13647). A frozen, sorted tuple of ``(lane_kind, split, order)`` triples,
     #: disjoint from :attr:`placements` (the lane-CLASS table). Empty when the block
-    #: is absent, so a repo with no ``by_lane_kind`` block is byte-for-byte pre-#13647.
+    #: is absent, so a repo with no ``by_lane_kind`` block declares nothing on this axis
+    #: and resolves exactly as it did pre-#13647 — i.e. through the lane-class layer, whose
+    #: own undeclared fallback is the #14568 product default.
     kind_placements: "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]]], ...]" = (
         field(default=())
     )
@@ -448,14 +470,13 @@ class LanePlacementConfig:
         validate_lane_kind_placement(self.kind_placements, source="lane placement config")
 
     def resolve_by_lane_kind(self, lane_kind: str) -> ResolvedPlacement:
-        """The effective :class:`ResolvedPlacement` for ``lane_kind``, or legacy (Redmine #13647).
+        """The DECLARED :class:`ResolvedPlacement` for ``lane_kind`` (the lane-KIND layer).
 
-        The lane-KIND lookup consulted at higher precedence than
-        :meth:`resolve` (the lane-CLASS lookup). Returns the configured
-        ``(split, order)`` for a present lane kind, else a legacy
-        :class:`ResolvedPlacement` (both ``None``) so the caller falls through to
-        the lane-class layer. A lane kind absent from ``by_lane_kind`` — or an empty
-        table — resolves to legacy, so the fall-through is byte-for-byte.
+        The lane-KIND lookup consulted at higher precedence than :meth:`resolve` (the
+        lane-CLASS lookup). Returns the configured ``(split, order)`` for a present lane
+        kind, else a fully undeclared :class:`ResolvedPlacement` (both ``None``) so the
+        caller falls through to the lane-class layer. Like :meth:`resolve` it reports the
+        declaration only — :meth:`resolve_effective` is what a launch reads.
         """
         for entry_kind, split, order in self.kind_placements:
             if entry_kind == lane_kind:
@@ -467,7 +488,7 @@ class LanePlacementConfig:
 
         The precedence gate: the lane-kind layer is consulted ONLY when the config
         explicitly declares that kind, so an undeclared kind falls through to the
-        lane-class layer (byte-invariant), never shadowing it with an empty override.
+        lane-class layer intact, never shadowing it with an empty override.
         """
         return any(entry_kind == lane_kind for entry_kind, _, _ in self.kind_placements)
 
@@ -520,7 +541,13 @@ class LanePlacementConfig:
 
     @classmethod
     def default(cls) -> "LanePlacementConfig":
-        """The behavior-preserving default: no placement override."""
+        """The empty policy: no declaration on either axis.
+
+        "Default" here names the DECLARATION state (nothing declared), not the launch
+        geometry. It is deliberately not behavior-preserving since Redmine #14568: a launch
+        reading this policy resolves every field through :meth:`resolve_effective` to
+        :func:`product_default_placement`, so an undeclared workspace splits ``down``.
+        """
         return cls()
 
     @classmethod
@@ -529,9 +556,11 @@ class LanePlacementConfig:
     ) -> "LanePlacementConfig":
         """Normalize a ``lane_placement`` sub-record into a typed policy (fail-closed).
 
-        ``None`` or an empty mapping yields the behavior-preserving default. A non-mapping
-        record, an unknown top-level key (an unknown lane class), an unsupported version, an
-        unknown class-object key, or an invalid ``split`` / ``order`` value raises
+        ``None`` or an empty mapping yields the empty policy (:meth:`default` — nothing
+        DECLARED; the launch geometry it resolves to is the product default, not the
+        pre-#14568 launch). A non-mapping record, an unknown top-level key (an unknown lane
+        class), an unsupported version, an unknown class-object key, or an invalid
+        ``split`` / ``order`` value raises
         :class:`LanePlacementError` (which ``RepoLocalConfig`` re-raises as
         ``RepoLocalConfigError``). The top-level *boundary-token* screen for the
         ``lane_placement`` key itself stays with the repo-local schema, which rejects a

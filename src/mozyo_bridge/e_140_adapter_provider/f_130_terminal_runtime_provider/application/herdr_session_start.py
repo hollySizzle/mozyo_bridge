@@ -401,10 +401,10 @@ def _prepare_session_locked(
 
     ``lane_placement`` (Redmine #13646, Design Answer j#76564) is the repo-local herdr
     pane-pair placement policy the launch site resolved from ``.mozyo-bridge/config.yaml``.
-    It reorders the requested ``providers`` (the configured provider launches first and
+    It reorders the requested ``providers`` (the resolved primary launches first and
     occupies; the rest split beside it) and supplies each splitting launch's ``--split
-    <dir>`` — including the tab-less ``default`` pair, previously left to the herdr server
-    default. ``order`` never adds an unrequested peer; a configured primary that can only
+    <dir>`` — including the tab-less ``default`` pair, which before #13646 was left to the
+    herdr server default. ``order`` never adds an unrequested peer; a configured primary that can only
     split beside a live sibling is reported ``order_deferred_until_full_relaunch`` rather
     than silently claimed (no swap / bounce — Non-goal: no live relayout). ``None`` — and
     an undeclared lane class — resolve to the PRODUCT default (Redmine #14568): both pairs

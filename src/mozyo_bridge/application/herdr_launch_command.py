@@ -264,9 +264,12 @@ class LiveHerdrLaunchOps:
 
         # Config-driven pane placement (Redmine #13646): the bare `mozyo` coordinator pair
         # is the `default` lane_class, so the config's `lane_placement.default` split /
-        # order decides the pair's geometry (e.g. `split: down` for the owner's vertical
-        # main window) and which provider occupies first. Unconfigured repos keep the herdr
-        # server default placement and the requested provider order, byte-for-byte.
+        # order decides the pair's geometry and which provider occupies first.
+        # Redmine #14568: an UNCONFIGURED repo no longer delegates to the herdr server
+        # default. `lane_placement.default` resolves to the product default — `split: down`
+        # with `order: (codex, claude)` — so this pair lands vertically with the coordinator
+        # on top even though `LAUNCH_PROVIDERS` below is claude-first. A repo rolls that
+        # back with an explicit `lane_placement.default.split: right`.
         repo_config = load_repo_local_config(repo_root)
         # Operator-scoped coordinator placement mode (Redmine #14139): read from the
         # mozyo-bridge HOME (never a repo-committed value), so the coordinator pair lands

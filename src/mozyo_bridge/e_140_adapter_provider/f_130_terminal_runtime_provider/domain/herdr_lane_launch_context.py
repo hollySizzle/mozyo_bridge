@@ -16,8 +16,10 @@ Authority model (kept enforced by what this type does and does NOT carry):
   proximity (disposition j#85650 P1).
 - **Absent is a legitimate state, not an error.** ``lane_kind is None`` means the
   caller has no durable kind fact (a legacy / bare launch); the launch path then
-  resolves placement geometry by ``lane_class`` — the byte-for-byte pre-#13647
-  fallback the issue's close condition fixes. A *present* value is always a
+  resolves placement geometry by ``lane_class`` — the fall-through the issue's close
+  condition fixes. That fall-through is unchanged, but what it lands on is not: an
+  undeclared lane class now resolves to the #14568 product default (``split: down``),
+  not to the pre-#13646 geometry. A *present* value is always a
   canonical :data:`~mozyo_bridge.core.state.lane_kind.LANE_KINDS` token or fails closed.
 - **Geometry / plan input only.** This context selects placement geometry (Tranche
   1) and — later — per-slot role→profile (Tranche 2). It is never promoted to an

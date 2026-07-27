@@ -37,10 +37,15 @@ Boundary, kept enforced in code (this is *schema only*):
   normalizes an already-parsed mapping — the in-memory shape ``yaml.safe_load``
   of the repo-local file would yield. Reading the file from disk is Redmine
   #12190; wiring the resolved records into CLI composition is Redmine #12191.
-- **Default / missing / empty config is behavior-preserving.** ``None`` and an
-  empty mapping both resolve to :meth:`RepoLocalConfig.default`, whose three
-  sub-records are each their own behavior-preserving default. A repo with no
-  ``config.yaml`` can never change the default ``mozyo-bridge`` behavior.
+- **Default / missing / empty config declares nothing.** ``None`` and an empty
+  mapping both resolve to :meth:`RepoLocalConfig.default`, whose sub-records are
+  each their own empty declaration. A repo with no ``config.yaml`` therefore never
+  *overrides* anything — but "declares nothing" is not the same as "behaves like an
+  older build". A sub-record is free to resolve an undeclared field to a product
+  default, and one does: ``lane_placement`` resolves an undeclared ``split`` to
+  ``down`` (Redmine #14568), so an unconfigured repo launches its herdr pairs
+  vertically. Read the behavior-preserving claim as scoped to each sub-record's own
+  documented contract, never as a blanket promise about launch behavior.
 - **Closed schema, fail-closed.** Any unknown top-level key, an unsupported
   version, a non-mapping record, or a key shaped like a module / callable /
   entry point / authority / credential is rejected through
@@ -452,8 +457,12 @@ class RepoLocalConfig:
     Composes the configurable surfaces — :attr:`cli`, :attr:`providers`,
     :attr:`presentation`, :attr:`delegation`, :attr:`sublane_integration`,
     :attr:`work_unit`, :attr:`agent_launch`, :attr:`lane_placement`,
-    :attr:`provider_binding` — each behavior-preserving by default. The default (no
-    fields set) reproduces the current ``mozyo-bridge`` behavior exactly.
+    :attr:`provider_binding` — each of which resolves to an empty DECLARATION when the
+    operator writes nothing. That is not the same as reproducing an older build: every
+    sub-record except :attr:`lane_placement` is additionally behavior-preserving when
+    undeclared, while :attr:`lane_placement` resolves its undeclared fields to a product
+    default (``split: down``, Redmine #14568). Each sub-record's own docstring is the
+    authority for which of the two it is.
 
     This layer does no file IO and no parsing: :meth:`from_record` normalizes an
     already-parsed mapping into typed records and fails closed on any unknown
@@ -519,7 +528,13 @@ class RepoLocalConfig:
 
     @classmethod
     def default(cls) -> "RepoLocalConfig":
-        """The behavior-preserving default for a missing / empty config."""
+        """The empty declaration a missing / empty config resolves to.
+
+        Every sub-record is its own empty declaration, so nothing here overrides anything.
+        Whether a given sub-record then *behaves* like an older build is that sub-record's
+        contract — ``lane_placement`` deliberately does not (Redmine #14568: an undeclared
+        split resolves to ``down``).
+        """
         return cls()
 
     @classmethod
@@ -530,8 +545,11 @@ class RepoLocalConfig:
 
         ``record`` is the in-memory mapping a ``yaml.safe_load`` of the
         repo-local config would produce; this layer does no file IO. ``None`` or
-        an empty mapping yields the behavior-preserving default, so a missing or
-        empty config can never change default behavior.
+        an empty mapping yields :meth:`default` — every sub-record empty — so a
+        missing or empty config never *overrides* anything. What each sub-record
+        resolves an undeclared field to is its own contract (see the module
+        docstring; ``lane_placement`` is the one that is deliberately not
+        behavior-preserving).
 
         Fail-closed, in order:
 
@@ -619,9 +637,11 @@ class RepoLocalConfig:
         # direction / provider order per lane class. It is parsed by its own
         # self-contained domain schema (the sibling that also owns the vocabulary); its
         # LanePlacementError is re-raised as a RepoLocalConfigError so the loader keeps a
-        # single fail-closed boundary. An absent ``lane_placement`` block resolves to the
-        # behavior-preserving default (no split / order override), so a repo with no block
-        # launches exactly as before. The ``pane``-shaped key screen already ran above.
+        # single fail-closed boundary. An absent ``lane_placement`` block parses to an empty
+        # declaration (no split / order override recorded) — but NOT to the pre-#13646
+        # launch: `LanePlacementConfig.resolve_effective` resolves every undeclared field to
+        # the #14568 product default, so a repo with no block launches its pairs `split:
+        # down`. The ``pane``-shaped key screen already ran above.
         try:
             lane_placement = LanePlacementConfig.from_record(
                 record.get("lane_placement")
