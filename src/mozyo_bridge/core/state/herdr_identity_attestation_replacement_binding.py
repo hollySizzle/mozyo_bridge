@@ -678,6 +678,65 @@ def replacement_action_is_bound(
     )
 
 
+def replacement_action_bound_after_identity_join(
+    record: Optional[IdentityAttestationRecord],
+    *,
+    action_id: str,
+    live_locator: str,
+    workspace_id: str,
+    role: str,
+    lane: str,
+    assigned_name: str,
+    old_locator: str,
+    home: Path | None = None,
+) -> bool:
+    """Is this joined identity bound to ``action_id``? (native v2, or the exact v1 side record)
+
+    The caller has already established that ``record`` is the FRESH attestation of the exact
+    live participant (the identity / locator / freshness join).  What is left is the ACTION
+    binding, and its shape depends on which main store is selected:
+
+    - **v2 (native).**  The row carries ``replacement_action_id`` itself, so an exact match on
+      that field IS the binding, and the caller's join already covered the identity.
+    - **v1.**  The row cannot carry that field — #13882 keeps the on-disk shape while older
+      installed launchers are live — so a replacement launch writes a normal v1 attestation
+      PLUS a separate bound side record.  A v1 row with an EMPTY direct field is therefore the
+      *designed* shape of a correctly bound launch, not evidence of an unbound one.
+
+    Reading only the direct field makes every correctly-bound v1 replacement permanently
+    unverifiable.  That is the exact defect Redmine #14485 fixes, measured on the #14484
+    installed dogfood: the fresh gateway attested ``present`` with ``replacement_action_id=""``
+    while the side record was ``phase=bound`` on the same exact action, name, locator, and old
+    locator — and the recovery still stopped at ``attestation_mismatch``.
+
+    Both post-launch verifications call THIS function — the bound-pair convergence rail and
+    the #13806 actuator port that ``recover-stale`` and ``recover-gateway`` share — so the two
+    rails cannot drift into disagreeing about what "bound" means.  #14480 fixed the same
+    authority model on the LAUNCH side; this is its post-launch half.
+
+    Fail-closed throughout: :func:`replacement_action_is_bound` never fabricates a binding, so
+    an absent / reserved / foreign / wrong-action / wrong-locator side record, a main store
+    that is no longer recognized v1, and an unreadable binding store all return ``False``.
+    """
+    if record is None:
+        return False
+    action = (action_id or "").strip()
+    direct = (getattr(record, "replacement_action_id", "") or "").strip()
+    if direct:
+        return direct == action
+    return replacement_action_is_bound(
+        record,
+        action_id=action,
+        live_locator=live_locator,
+        expected_workspace_id=workspace_id,
+        expected_role=role,
+        expected_lane=lane,
+        expected_assigned_name=assigned_name,
+        expected_old_locator=old_locator,
+        home=home,
+    )
+
+
 __all__ = (
     "BINDING_BOUND",
     "BINDING_RESERVED",
@@ -687,6 +746,7 @@ __all__ = (
     "ReplacementActionBinding",
     "ReplacementActionBindingError",
     "herdr_identity_replacement_binding_path",
+    "replacement_action_bound_after_identity_join",
     "replacement_action_is_bound",
     "selected_attestation_store_is_v1",
 )

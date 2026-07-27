@@ -25,6 +25,9 @@ from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
 from mozyo_bridge.core.state.herdr_delivery_ledger import HerdrDeliveryLedger
+from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
+    replacement_action_bound_after_identity_join,
+)
 from mozyo_bridge.core.state.lane_lifecycle import ReleasePin, ReleasePinError
 from mozyo_bridge.core.state.replacement_preservation import (
     PreservationObservation,
@@ -447,9 +450,35 @@ class LiveRecoveryActuatorPort:
         exact replacement ``action_id`` (option B, Design Answer j#79556):
 
         - no fresh attestation yet (still booting / not fresh) -> :data:`ATTEST_PENDING`;
-        - fresh, but the ``replacement_action_id`` is missing / a different action ->
-          :data:`ATTEST_MISMATCH` (a fresh slot NOT launched by this recovery is never adopted);
-        - fresh AND exact action match -> :data:`ATTEST_BOUND`.
+        - fresh, but not bound to this action -> :data:`ATTEST_MISMATCH` (a fresh slot NOT
+          launched by this recovery is never adopted);
+        - fresh AND exact action binding -> :data:`ATTEST_BOUND`.
+
+        **The action binding has two shapes, and reading only the direct field sees one of
+        them (Redmine #14485).** Under a selected v2 store the fresh row carries
+        ``replacement_action_id`` itself; under v1 it CANNOT (#13882 holds the on-disk shape
+        while older installed launchers are live), so the launch writes a normal v1 attestation
+        plus a separate bound side record. This method used to compare only
+        ``record.replacement_action_id``, so a v1 row — whose direct field is empty *by design*
+        — could never match, and a correctly bound v1 replacement was permanently
+        ``attestation_mismatch``. #14484 measured exactly that on installed 0.14.0a4: the old
+        gateway closed, the fresh one launched and attested ``present``, the side record was
+        ``phase=bound`` on the same exact action / name / locator / old locator, and the
+        execute still stopped partial. #14480 fixed this authority model on the LAUNCH side;
+        this is its post-launch half.
+
+        The judgement itself is NOT re-implemented here — it is
+        :func:`...replacement_action_bound_after_identity_join`, the same function the
+        bound-pair convergence rail calls. Two post-launch verifications reading one rule is
+        the point: a second local copy is how they would drift.
+
+        ``verify_fresh_receiver`` above is the identity join, and it is what supplies the
+        FRESH ``locator`` the v1 side record must agree with — the old pinned locator would
+        match the side record's ``old_locator`` instead, which is precisely what the evaluator
+        refuses. Fail-closed at every unresolved input: an unresolvable workspace identity is
+        passed through as an empty token, which can never equal the record's workspace, so the
+        v1 leg refuses rather than guessing (and the v2 leg, already covered by the join above,
+        is left exactly as it was).
         """
         from mozyo_bridge.core.state.herdr_identity_attestation import (
             HerdrIdentityAttestationStore,
@@ -470,11 +499,25 @@ class LiveRecoveryActuatorPort:
             return ATTEST_PENDING
         if record is None:
             return ATTEST_PENDING
-        if _norm(record.replacement_action_id) != _norm(action_id):
-            # A fresh, attested slot whose startup did NOT bind this exact action — a different
-            # (or no) replacement authority launched it. Never complete the participant on it.
-            return ATTEST_MISMATCH
-        return ATTEST_BOUND
+        try:
+            workspace_id = _norm(repo_scope_workspace_id(self.repo_root))
+        except Exception:  # noqa: BLE001 - see the docstring: empty never joins, so v1 refuses
+            workspace_id = ""
+        if replacement_action_bound_after_identity_join(
+            record,
+            action_id=_norm(action_id),
+            live_locator=_norm(verification.locator),
+            workspace_id=workspace_id,
+            role=_norm(self.request.role),
+            lane=_norm_lane(self.request.lane),
+            assigned_name=_norm(self.request.assigned_name),
+            old_locator=_norm(pin.old_locator),
+            home=self.attestation_home,
+        ):
+            return ATTEST_BOUND
+        # A fresh, attested slot whose startup did NOT bind this exact action — a different
+        # (or no) replacement authority launched it. Never complete the participant on it.
+        return ATTEST_MISMATCH
 
 
 @dataclass

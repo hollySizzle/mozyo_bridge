@@ -18,7 +18,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     evaluate_attestation,
 )
 from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
-    replacement_action_is_bound,
+    replacement_action_bound_after_identity_join,
 )
 from mozyo_bridge.core.state.lane_lifecycle import (
     BINDING_KIND_ISSUE,
@@ -151,19 +151,24 @@ def _action_bound_after_identity_join(
     assigned_name: str,
     old_locator: str,
 ) -> bool:
-    """Accept native-v2 directly, or the exact v1 side binding after identity join."""
-    direct_action = norm(getattr(record, "replacement_action_id", ""))
-    if direct_action:
-        return direct_action == norm(action_id)
-    return replacement_action_is_bound(
+    """Accept native-v2 directly, or the exact v1 side binding after identity join.
+
+    Redmine #14485 made the rule shared rather than local, the same way #14480 did for
+    ``_launch_detail``: the recovery port that ``recover-stale`` / ``recover-gateway`` share
+    needs the identical judgement, and the same decision implemented twice is how two
+    post-launch verifications end up disagreeing about whether a launch bound its action.
+    This function stays as the #13933 call site's name; the rule itself now lives in
+    :mod:`...core.state.herdr_identity_attestation_replacement_binding`.
+    """
+    return replacement_action_bound_after_identity_join(
         record,
         action_id=norm(action_id),
         live_locator=live_locator,
-        expected_workspace_id=workspace_id,
-        expected_role=role,
-        expected_lane=lane,
-        expected_assigned_name=assigned_name,
-        expected_old_locator=old_locator,
+        workspace_id=workspace_id,
+        role=role,
+        lane=lane,
+        assigned_name=assigned_name,
+        old_locator=old_locator,
     )
 
 
