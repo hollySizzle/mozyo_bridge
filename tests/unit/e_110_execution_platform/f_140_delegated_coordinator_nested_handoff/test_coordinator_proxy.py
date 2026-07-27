@@ -27,6 +27,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTION_SCOPES,
     ANCHOR_ACTION_MISMATCH,
     ANCHOR_DECISION_AMBIGUOUS,
+    DECISION_REFUSAL_STATUS,
     ANCHOR_DECISION_INCOMPLETE,
     ANCHOR_GENERATION_STALE,
     ANCHOR_LANE_UNRESOLVED,
@@ -241,126 +242,95 @@ class TargetCardinalityTest(unittest.TestCase):
 
 
 class AnchorStatusTest(unittest.TestCase):
-    """A decision is matched against LIVE lane facts, never against itself (j#89969 F2).
-
-    The previous shape compared the marker set with itself, so a lone marker declaring any
-    non-empty lane and any numeric generation verified — a decision could name a lane that does not
-    exist, and a real lane advancing without a new marker left the old decision looking current.
-    """
+    """The NAMED journal's canonical decision, matched against live facts (j#90329 contract 5)."""
 
     LANE = "lane_a"
-    DECISIONS = (
-        DecisionRecord("89688", "implementation_request", LANE, "1"),
-        DecisionRecord("89754", "start"),
-        DecisionRecord("89873", "implementation_done"),
-    )
     EXPECTED = LaneExpectation(lane=LANE, generation=1, decision_journal="89688")
 
-    def _status(self, journal, decisions=None, expected=..., action=ACTION_DISPATCH_NEXT):
+    def _status(self, decision=..., expected=..., action=ACTION_DISPATCH_NEXT, refusal=""):
+        if decision is ...:
+            decision = DecisionRecord("89688", "implementation_request", self.LANE, "1")
         return anchor_status_for(
-            journal,
             action=action,
-            decisions=self.DECISIONS if decisions is None else decisions,
+            decision=decision,
+            decision_refusal=refusal,
             expected=self.EXPECTED if expected is ... else expected,
         )
 
-    def test_the_lane_s_current_decision_verifies(self):
-        self.assertEqual(self._status("89688"), ANCHOR_VERIFIED)
+    def test_the_named_journal_s_canonical_decision_verifies(self):
+        self.assertEqual(self._status(), ANCHOR_VERIFIED)
 
-    def test_a_real_journal_carrying_another_decision_does_not_authorize_this_action(self):
-        self.assertEqual(self._status("89873"), ANCHOR_ACTION_MISMATCH)
-        self.assertEqual(self._status("89754"), ANCHOR_ACTION_MISMATCH)
+    def test_every_canonical_read_refusal_maps_to_a_status(self):
+        # The reader's fixed refusals are the ONLY way a decision is absent now — there is no
+        # history to scan, so nothing elsewhere on the issue can produce or poison one.
+        self.assertEqual(
+            DECISION_REFUSAL_STATUS,
+            {
+                "no_canonical_decision": ANCHOR_UNVERIFIED,
+                "duplicate_canonical_decision": ANCHOR_DECISION_AMBIGUOUS,
+                "action_not_declared": ANCHOR_ACTION_MISMATCH,
+            },
+        )
+        for refusal, status in DECISION_REFUSAL_STATUS.items():
+            self.assertEqual(self._status(decision=None, refusal=refusal), status, refusal)
 
-    def test_a_journal_with_no_marker_never_verifies(self):
-        self.assertEqual(self._status("99999"), ANCHOR_UNVERIFIED)
-
-    def test_an_unreachable_redmine_never_verifies(self):
-        self.assertEqual(self._status("89688", decisions=()), ANCHOR_UNVERIFIED)
-
-    def test_an_empty_journal_never_verifies(self):
-        self.assertEqual(self._status(""), ANCHOR_UNVERIFIED)
+    def test_an_unknown_refusal_fails_closed_as_unverified(self):
+        self.assertEqual(self._status(decision=None, refusal="something_new"), ANCHOR_UNVERIFIED)
 
     def test_a_decision_without_a_lane_authorizes_nothing(self):
-        decisions = (DecisionRecord("89688", "implementation_request"),)
-        self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_DECISION_INCOMPLETE)
+        decision = DecisionRecord("89688", "implementation_request")
+        self.assertEqual(self._status(decision=decision), ANCHOR_DECISION_INCOMPLETE)
 
     def test_a_decision_without_a_numeric_generation_authorizes_nothing(self):
         for generation in ("", "one", "1.0", "-1"):
-            decisions = (DecisionRecord("89688", "implementation_request", self.LANE, generation),)
+            decision = DecisionRecord("89688", "implementation_request", self.LANE, generation)
             self.assertEqual(
-                self._status("89688", decisions=decisions), ANCHOR_DECISION_INCOMPLETE, generation
+                self._status(decision=decision), ANCHOR_DECISION_INCOMPLETE, generation
             )
 
     def test_a_lane_with_no_live_facts_authorizes_nothing(self):
-        # A decision naming a lane the runtime does not know cannot be matched against anything.
-        self.assertEqual(self._status("89688", expected=None), ANCHOR_LANE_UNRESOLVED)
+        self.assertEqual(self._status(expected=None), ANCHOR_LANE_UNRESOLVED)
 
     def test_a_decision_naming_a_different_lane_is_a_scope_mismatch(self):
         expected = LaneExpectation(lane="lane_b", generation=1, decision_journal="89688")
-        self.assertEqual(self._status("89688", expected=expected), ANCHOR_SCOPE_MISMATCH)
+        self.assertEqual(self._status(expected=expected), ANCHOR_SCOPE_MISMATCH)
 
     def test_a_real_lane_advance_stales_the_old_decision(self):
-        # THE case the self-comparison missed: the lane moved on, and no new marker was written.
         expected = LaneExpectation(lane=self.LANE, generation=2, decision_journal="90000")
-        self.assertEqual(self._status("89688", expected=expected), ANCHOR_GENERATION_STALE)
-
-    def test_a_canonical_shaped_quotation_is_not_the_decision(self):
-        # Review j#89969 F2 probe, verbatim: a quotation reproduces the token, lane and generation
-        # exactly. It is refused because it is not the journal the lifecycle points at.
-        decisions = self.DECISIONS + (
-            DecisionRecord("99999", "implementation_request", self.LANE, "1"),
-        )
-        self.assertEqual(self._status("99999", decisions=decisions), ANCHOR_SUPERSEDED)
-        self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_VERIFIED)
-
-    def test_a_fictitious_lane_and_generation_never_verify(self):
-        decisions = (DecisionRecord("89688", "implementation_request", "no_such_lane", "42"),)
-        self.assertEqual(
-            self._status("89688", decisions=decisions, expected=None), ANCHOR_LANE_UNRESOLVED
-        )
+        self.assertEqual(self._status(expected=expected), ANCHOR_GENERATION_STALE)
 
     def test_an_unknown_action_can_authorize_nothing(self):
-        self.assertEqual(self._status("89688", action="not_an_action"), ANCHOR_ACTION_MISMATCH)
+        self.assertEqual(self._status(action="not_an_action"), ANCHOR_ACTION_MISMATCH)
 
 
 class BootstrapScopeTest(unittest.TestCase):
-    """The rail must act from the state that has NO lane (review j#90068 finding 1).
-
-    A lane-scoped-only contract could never solve the observed dead end: `sublane create --execute`
-    stopped pre-effect with zero lane / worktree / pair, and matching every decision against a live
-    lane makes that exact state unreachable. The bootstrap action is matched against the issue's
-    ownership instead, and its precondition is the absence a lane-scoped contract required.
-    """
+    """The rail must act from the state that has NO lane (review j#90068 finding 1)."""
 
     ISSUE = "14546"
-    #: A US-level implementation request names an issue, not a lane — the lane does not exist yet.
-    DECISIONS = (DecisionRecord("89688", "implementation_request"),)
 
-    def _status(self, journal="89688", decisions=None, expected=..., action=ACTION_BOOTSTRAP_LANE):
+    def _status(self, decision=..., expected=..., action=ACTION_BOOTSTRAP_LANE, refusal=""):
+        if decision is ...:
+            decision = DecisionRecord("89688", "implementation_request")
         if expected is ...:
             expected = IssueExpectation(
-                issue=self.ISSUE, owns_active_lane=False, latest_decision_journal="89688"
+                issue=self.ISSUE, owns_active_lane=False, latest_decision_journal=""
             )
         return anchor_status_for(
-            journal,
-            action=action,
-            decisions=self.DECISIONS if decisions is None else decisions,
-            expected=expected,
+            action=action, decision=decision, decision_refusal=refusal, expected=expected
         )
 
     def test_a_fresh_issue_with_no_lane_verifies(self):
-        # THE case: no lane row exists anywhere, and the bootstrap is exactly what creates one.
         self.assertEqual(self._status(), ANCHOR_VERIFIED)
 
     def test_an_issue_that_already_owns_a_lane_is_past_the_bootstrap(self):
         expected = IssueExpectation(
-            issue=self.ISSUE, owns_active_lane=True, latest_decision_journal="89688"
+            issue=self.ISSUE, owns_active_lane=True, latest_decision_journal=""
         )
         self.assertEqual(self._status(expected=expected), ANCHOR_SCOPE_MISMATCH)
 
     def test_a_lane_scoped_decision_is_not_a_bootstrap_decision(self):
-        decisions = (DecisionRecord("89688", "implementation_request", "lane_a", "1"),)
-        self.assertEqual(self._status(decisions=decisions), ANCHOR_SCOPE_MISMATCH)
+        decision = DecisionRecord("89688", "implementation_request", "lane_a", "1")
+        self.assertEqual(self._status(decision=decision), ANCHOR_SCOPE_MISMATCH)
 
     def test_an_unreadable_lifecycle_authority_fails_closed(self):
         self.assertEqual(self._status(expected=None), ANCHOR_LANE_UNRESOLVED)
@@ -369,44 +339,15 @@ class BootstrapScopeTest(unittest.TestCase):
         expected = LaneExpectation(lane="lane_a", generation=1, decision_journal="89688")
         self.assertEqual(self._status(expected=expected), ANCHOR_SCOPE_MISMATCH)
 
-    def test_a_quoted_canonical_marker_makes_the_bootstrap_ambiguous(self):
-        # Review j#90250 F2, the probe verbatim: a real decision at j100 and a note at j101 that
-        # merely QUOTES the canonical grammar. The scanner cannot tell them apart, so neither may
-        # authorize — "latest wins" would hand the quotation the authority.
-        real = DecisionRecord("100", "implementation_request")
-        quoted = DecisionRecord("101", "implementation_request")
-        expected = IssueExpectation(
-            issue=self.ISSUE, owns_active_lane=False, latest_decision_journal="101"
-        )
+    def test_a_quotation_is_neither_authority_nor_poison(self):
+        # j#90329 contract 5: a quotation on ANOTHER journal is simply not read. A quotation in the
+        # NAMED journal yields `no_canonical_decision` (the scanner strips code spans first), which
+        # refuses this invocation without touching any other decision on the issue.
         self.assertEqual(
-            self._status(journal="101", decisions=(real, quoted), expected=expected),
-            ANCHOR_DECISION_AMBIGUOUS,
-        )
-        self.assertEqual(
-            self._status(journal="100", decisions=(real, quoted), expected=expected),
-            ANCHOR_DECISION_AMBIGUOUS,
-        )
-
-    def test_a_single_canonical_decision_still_verifies(self):
-        self.assertEqual(self._status(), ANCHOR_VERIFIED)
-
-    def test_two_decisions_on_one_issue_are_never_resolved_by_recency(self):
-        # Whether the second is a re-issue or a quotation cannot be told apart from the note, so
-        # neither is picked. This replaces the previous "latest wins" behaviour (j#90250 F2).
-        decisions = self.DECISIONS + (DecisionRecord("90100", "implementation_request"),)
-        expected = IssueExpectation(
-            issue=self.ISSUE, owns_active_lane=False, latest_decision_journal="90100"
-        )
-        self.assertEqual(
-            self._status(decisions=decisions, expected=expected), ANCHOR_DECISION_AMBIGUOUS
-        )
-        self.assertEqual(
-            self._status(journal="90100", decisions=decisions, expected=expected),
-            ANCHOR_DECISION_AMBIGUOUS,
+            self._status(decision=None, refusal="no_canonical_decision"), ANCHOR_UNVERIFIED
         )
 
     def test_the_lane_scoped_action_still_requires_a_lane(self):
-        # The bootstrap's laxity must not leak into dispatch_next.
         self.assertEqual(
             self._status(action=ACTION_DISPATCH_NEXT, expected=None), ANCHOR_DECISION_INCOMPLETE
         )

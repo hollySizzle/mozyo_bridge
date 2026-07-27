@@ -47,11 +47,24 @@ PROXY_RESERVED = "reserved"  # minted + write-locked before the send; the send's
 PROXY_DELIVERED = "delivered"  # the delegation was positively delivered to the coordinator
 PROXY_UNCERTAIN = "uncertain"  # the send outcome is unknown (crash / timeout) -> operator reconcile
 PROXY_COMPLETED = "completed"  # the coordinator acknowledged; the route may take a NEWER decision
+PROXY_ABANDONED = "abandoned"  # an operator proved the send never left; the route may move on
 PROXY_ABSENT = "absent"  # sentinel: no row existed for the route (not persisted)
 
-PROXY_STATES = frozenset({PROXY_RESERVED, PROXY_DELIVERED, PROXY_UNCERTAIN, PROXY_COMPLETED})
-#: The states that hold an in-flight generation (a repeat is a duplicate zero-send).
-_ACTIVE_STATES = frozenset({PROXY_RESERVED, PROXY_DELIVERED, PROXY_UNCERTAIN})
+PROXY_STATES = frozenset(
+    {PROXY_RESERVED, PROXY_DELIVERED, PROXY_UNCERTAIN, PROXY_COMPLETED, PROXY_ABANDONED}
+)
+#: The states that hold an IN-FLIGHT generation (a repeat is a duplicate zero-send). ``delivered``
+#: left this set with Design Answer j#90329 contract 1: a positively recorded delivery is terminal,
+#: not in flight, because the proxy's job ends at delivery.
+_ACTIVE_STATES = frozenset({PROXY_RESERVED, PROXY_UNCERTAIN})
+
+#: The TERMINAL states a strictly newer canonical decision may mint past (Design Answer j#90329
+#: contract 1). ``delivered`` is now one of them: a positively recorded delivery IS the proxy's
+#: terminal success, because the proxy delivers a decision and does not — and cannot — prove the
+#: coordinator acted on it. ``completed`` remains readable as a LEGACY terminal written by the
+#: withdrawn acknowledgement path; nothing produces it any more. ``abandoned`` is the operator's
+#: proven-not-sent disposition, which deliberately re-opens retry.
+_TERMINAL_STATES = frozenset({PROXY_DELIVERED, PROXY_COMPLETED, PROXY_ABANDONED})
 
 # Reserve verdicts (why a reserve did or did not win). Machine-readable.
 RESERVE_WON = "won"
@@ -296,12 +309,14 @@ class CoordinatorProxyFence:
     ) -> ProxyReserveResult:
         """Reserve the single delegation of ``(issue, journal)`` on ``route``, or refuse.
 
-        Wins only when the route is fresh, or when its prior generation is
-        :data:`PROXY_COMPLETED` for a **strictly older** journal on the same issue. Refuses with:
+        Wins only when the route is fresh, or when its prior generation is terminal
+        (:data:`PROXY_DELIVERED` / :data:`PROXY_ABANDONED` / legacy :data:`PROXY_COMPLETED`) for a
+        **strictly older** journal on the same issue. Refuses with:
 
-        - :data:`RESERVE_DUPLICATE` — a generation is in flight (reserved / delivered / uncertain),
-          or a completed generation already delegated this exact ``(issue, journal)``;
-        - :data:`RESERVE_STALE` — the completed generation delegated a NEWER journal, so this
+        - :data:`RESERVE_DUPLICATE` — a generation is in flight (reserved / uncertain), or ANY
+          generation already delegated this exact ``(issue, journal)``. A decision is delegated
+          once, whatever state its generation reached;
+        - :data:`RESERVE_STALE` — the terminal generation delegated a NEWER journal, so this
           decision is superseded;
         - :data:`RESERVE_NEEDS_RECONCILE` — a prior reserve never resolved (crash window). The row
           is moved to :data:`PROXY_UNCERTAIN` and never auto-retried.
@@ -366,6 +381,21 @@ class CoordinatorProxyFence:
                     detail="prior reserve unresolved; marked uncertain for operator reconcile",
                 )
 
+            # The SAME durable decision is never delegated twice, whatever state its generation
+            # reached — delivered, completed (legacy), abandoned, uncertain or still reserved
+            # (Design Answer j#90329 contract 1). This is checked before the state split so a
+            # terminal state can never re-open the decision that produced it.
+            if prior_issue == want_issue and prior_journal == want_journal:
+                conn.execute("ROLLBACK")
+                return ProxyReserveResult(
+                    won=False, verdict=RESERVE_DUPLICATE, action_id=prior_action,
+                    prior_state=prior_state, prior_issue=prior_issue, prior_journal=prior_journal,
+                    detail=(
+                        "this exact durable decision was already delegated on this route "
+                        f"(generation {prior_state}); a decision is delegated once"
+                    ),
+                )
+
             if prior_state in _ACTIVE_STATES:
                 conn.execute("ROLLBACK")
                 return ProxyReserveResult(
@@ -377,16 +407,12 @@ class CoordinatorProxyFence:
                     ),
                 )
 
-            # prior_state == PROXY_COMPLETED: only a strictly NEWER decision may re-mint.
-            if prior_issue == want_issue and prior_journal == want_journal:
+            if prior_state not in _TERMINAL_STATES:
                 conn.execute("ROLLBACK")
                 return ProxyReserveResult(
                     won=False, verdict=RESERVE_DUPLICATE, action_id=prior_action,
                     prior_state=prior_state, prior_issue=prior_issue, prior_journal=prior_journal,
-                    detail=(
-                        "this exact durable decision was already delegated on this route; a "
-                        "decision is delegated once"
-                    ),
+                    detail=f"generation state {prior_state!r} is not terminal; never-send",
                 )
             prior_ordinal = journal_ordinal(prior_journal)
             if want_ordinal is None or prior_ordinal is None or want_ordinal < prior_ordinal:
@@ -411,9 +437,9 @@ class CoordinatorProxyFence:
             )
             conn.execute("COMMIT")
             return ProxyReserveResult(
-                won=True, verdict=RESERVE_WON, action_id=action_id, prior_state=PROXY_COMPLETED,
+                won=True, verdict=RESERVE_WON, action_id=action_id, prior_state=prior_state,
                 prior_issue=prior_issue, prior_journal=prior_journal,
-                detail="minted a new generation for a superseding decision",
+                detail=f"minted a new generation for a superseding decision (prior {prior_state})",
             )
         except CoordinatorProxyFenceError:
             raise
@@ -432,18 +458,30 @@ class CoordinatorProxyFence:
 
     def _guarded_set(
         self, route: ProxyRouteKey, action_id: str, from_states, to_state: str, detail: str,
-        *, now: Optional[str],
+        *, now: Optional[str], issue: str = "", journal: str = "",
     ) -> bool:
+        """CAS the route's generation, joined to the EXACT stored decision anchor.
+
+        ``issue`` / ``journal`` are matched against the row's stored values when supplied (Design
+        Answer j#90329 contract 3). Without that join a caller could name a different anchor and
+        still advance this route's generation — the transition would be about one decision while the
+        row records another.
+        """
         stamp = now or _utc_now()
         placeholders = ",".join("?" for _ in from_states)
+        anchor_sql = ""
+        anchor_params: tuple = ()
+        if issue or journal:
+            anchor_sql = " AND issue=? AND journal=?"
+            anchor_params = ((issue or "").strip(), (journal or "").strip())
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
                 "UPDATE proxy_generation SET state=?, detail=?, updated_at=? WHERE workspace_id=? "
                 "AND lane_id=? AND role=? AND action=? AND proxy_action_id=? AND state IN "
-                f"({placeholders})",
-                (to_state, detail, stamp, *route.as_row(), action_id, *from_states),
+                f"({placeholders}){anchor_sql}",
+                (to_state, detail, stamp, *route.as_row(), action_id, *from_states, *anchor_params),
             )
             conn.execute("COMMIT")
             return cur.rowcount > 0
@@ -459,27 +497,72 @@ class CoordinatorProxyFence:
             conn.close()
 
     def mark_delivered(
-        self, route: ProxyRouteKey, action_id: str, *, detail: str = "", now: Optional[str] = None
+        self, route: ProxyRouteKey, action_id: str, *, detail: str = "", now: Optional[str] = None,
+        issue: str = "", journal: str = "",
     ) -> bool:
-        """Record the reserved generation's delegation as delivered (guarded by the exact id)."""
+        """Record the reserved generation's delegation as delivered — the proxy's TERMINAL success.
+
+        The proxy delivers a decision; it does not, and cannot, prove the coordinator acted on it
+        (Design Answer j#90329 contract 1). So a positively recorded delivery ends this decision's
+        life on the route: the same ``(issue, journal)`` is duplicate forever, and only a strictly
+        newer canonical decision mints the next generation.
+        """
         return self._guarded_set(
             route, action_id, (PROXY_RESERVED,), PROXY_DELIVERED,
             detail or "delegation delivered to the live default coordinator", now=now,
+            issue=issue, journal=journal,
+        )
+
+    def mark_abandoned(
+        self, route: ProxyRouteKey, action_id: str, *, detail: str, now: Optional[str] = None,
+        issue: str = "", journal: str = "",
+    ) -> bool:
+        """Record that an operator PROVED the send never left — the unwedging terminal (contract 4).
+
+        It releases the route so the coordinator's NEXT canonical decision can be delegated; it does
+        not resurrect the decision it names, which stays delegated-once like every other terminal.
+        Admitted only against the exact generation and its stored anchor, and only from
+        :data:`PROXY_UNCERTAIN`: a delivery that landed, or one whose fate is still being
+        established, is not abandonable.
+        """
+        return self._guarded_set(
+            route, action_id, (PROXY_UNCERTAIN,), PROXY_ABANDONED, detail, now=now,
+            issue=issue, journal=journal,
         )
 
     def mark_uncertain(
-        self, route: ProxyRouteKey, action_id: str, *, detail: str = "", now: Optional[str] = None
+        self, route: ProxyRouteKey, action_id: str, *, detail: str = "", now: Optional[str] = None,
+        issue: str = "", journal: str = "",
     ) -> bool:
         """Record the reserved generation's outcome as unknown (crash / timeout) -> reconcile."""
         return self._guarded_set(
             route, action_id, (PROXY_RESERVED,), PROXY_UNCERTAIN,
-            detail or "delegation outcome uncertain", now=now,
+            detail or "delegation outcome uncertain", now=now, issue=issue, journal=journal,
+        )
+
+    def confirm_delivered(
+        self, route: ProxyRouteKey, action_id: str, *, detail: str, now: Optional[str] = None,
+        issue: str = "", journal: str = "",
+    ) -> bool:
+        """Resolve an ``uncertain`` generation to ``delivered`` on proven evidence (contract 4).
+
+        The reconcile's positive disposition: an operator established that the send DID land, so the
+        generation reaches the proxy's terminal success and a strictly newer decision may follow.
+        Advances only from :data:`PROXY_UNCERTAIN`, joined to the exact stored anchor.
+        """
+        return self._guarded_set(
+            route, action_id, (PROXY_UNCERTAIN,), PROXY_DELIVERED, detail, now=now,
+            issue=issue, journal=journal,
         )
 
     def complete(
         self, route: ProxyRouteKey, action_id: str, *, detail: str = "", now: Optional[str] = None
     ) -> bool:
-        """CAS the EXACT delivered generation to completed (the coordinator acknowledged).
+        """LEGACY: the withdrawn acknowledgement transition (Design Answer j#90329 contract 2).
+
+        Nothing in the product calls this any more. ``completed`` rows written by the withdrawn ack
+        path stay readable as a terminal state, but completion is no longer an authority the proxy
+        claims — delivery is. Kept only so an existing row's history is interpretable.
 
         Completing does NOT re-open the route for the same decision: :meth:`reserve` still refuses a
         repeat of the completed ``(issue, journal)`` as a duplicate. Only a strictly newer journal

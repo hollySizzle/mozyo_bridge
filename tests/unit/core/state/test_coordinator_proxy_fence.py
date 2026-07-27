@@ -27,6 +27,7 @@ from mozyo_bridge.core.state.coordinator_proxy_fence import (  # noqa: E501
     PROXY_COMPLETED,
     PROXY_DELIVERED,
     PROXY_RESERVED,
+    PROXY_ABANDONED,
     PROXY_UNCERTAIN,
     RESERVE_DUPLICATE,
     RESERVE_NEEDS_RECONCILE,
@@ -115,32 +116,106 @@ class ExactlyOnceTest(FenceTestBase):
         self.assertTrue(result.action_id.startswith("pxy_"))
         self.assertEqual(fence.active(ROUTE).state, PROXY_RESERVED)
 
+    def test_a_delivered_generation_is_terminal_and_admits_a_newer_decision(self):
+        # Design Answer j#90329 contract 1: the proxy delivers a decision and cannot prove the
+        # coordinator acted, so a positively recorded delivery IS its terminal success. It no
+        # longer holds the route — only an in-flight (reserved / uncertain) generation does.
+        fence = self._bootstrapped()
+        first = fence.reserve(ROUTE, issue="14546", journal="89688")
+        fence.mark_delivered(ROUTE, first.action_id, issue="14546", journal="89688")
+        second = fence.reserve(ROUTE, issue="14546", journal="89999")
+        self.assertTrue(second.won)
+        self.assertEqual(second.prior_state, PROXY_DELIVERED)
+
     def test_an_inflight_generation_refuses_a_second_reserve(self):
         fence = self._bootstrapped()
         first = fence.reserve(ROUTE, issue="14546", journal="89688")
-        fence.mark_delivered(ROUTE, first.action_id)
+        fence.mark_uncertain(ROUTE, first.action_id, issue="14546", journal="89688")
         second = fence.reserve(ROUTE, issue="14546", journal="89999")
         self.assertFalse(second.won)
         self.assertEqual(second.verdict, RESERVE_DUPLICATE)
-        self.assertEqual(second.prior_state, PROXY_DELIVERED)
+        self.assertEqual(second.prior_state, PROXY_UNCERTAIN)
 
-    def test_a_completed_generation_does_not_reopen_the_same_decision(self):
-        # THE property: completion must not make a re-run deliver the same decision again.
+    def test_the_same_decision_is_duplicate_after_delivery(self):
         fence = self._bootstrapped()
         first = fence.reserve(ROUTE, issue="14546", journal="89688")
-        fence.mark_delivered(ROUTE, first.action_id)
+        fence.mark_delivered(ROUTE, first.action_id, issue="14546", journal="89688")
+        repeat = fence.reserve(ROUTE, issue="14546", journal="89688")
+        self.assertFalse(repeat.won)
+        self.assertEqual(repeat.verdict, RESERVE_DUPLICATE)
+
+    def test_an_outcome_write_naming_a_foreign_anchor_changes_nothing(self):
+        # Contract 3: every outcome write joins the generation's exact stored issue+journal.
+        fence = self._bootstrapped()
+        first = fence.reserve(ROUTE, issue="14546", journal="89688")
+        self.assertFalse(
+            fence.mark_delivered(ROUTE, first.action_id, issue="99999", journal="89688")
+        )
+        self.assertFalse(
+            fence.mark_delivered(ROUTE, first.action_id, issue="14546", journal="99999")
+        )
+        self.assertEqual(fence.active(ROUTE).state, PROXY_RESERVED)
+        self.assertTrue(
+            fence.mark_delivered(ROUTE, first.action_id, issue="14546", journal="89688")
+        )
+
+    def test_proven_not_sent_abandons_and_reopens_delegation(self):
+        # Contract 4: the strongest reconcile disposition, and the only one that re-opens retry.
+        fence = self._bootstrapped()
+        first = fence.reserve(ROUTE, issue="14546", journal="89688")
+        fence.mark_uncertain(ROUTE, first.action_id, issue="14546", journal="89688")
+        self.assertTrue(
+            fence.mark_abandoned(
+                ROUTE, first.action_id, detail="proven not sent",
+                issue="14546", journal="89688",
+            )
+        )
+        self.assertEqual(fence.active(ROUTE).state, PROXY_ABANDONED)
+        self.assertTrue(fence.reserve(ROUTE, issue="14546", journal="89999").won)
+        # ...but never the decision that was abandoned.
+        self.assertFalse(fence.reserve(ROUTE, issue="14546", journal="89688").won)
+
+    def test_confirmed_delivered_resolves_uncertain_to_the_terminal_success(self):
+        fence = self._bootstrapped()
+        first = fence.reserve(ROUTE, issue="14546", journal="89688")
+        fence.mark_uncertain(ROUTE, first.action_id, issue="14546", journal="89688")
+        self.assertTrue(
+            fence.confirm_delivered(
+                ROUTE, first.action_id, detail="proven landed", issue="14546", journal="89688"
+            )
+        )
+        self.assertEqual(fence.active(ROUTE).state, PROXY_DELIVERED)
+        self.assertTrue(fence.reserve(ROUTE, issue="14546", journal="89999").won)
+
+    def test_a_disposition_naming_a_foreign_anchor_changes_nothing(self):
+        fence = self._bootstrapped()
+        first = fence.reserve(ROUTE, issue="14546", journal="89688")
+        fence.mark_uncertain(ROUTE, first.action_id, issue="14546", journal="89688")
+        self.assertFalse(
+            fence.mark_abandoned(
+                ROUTE, first.action_id, detail="e", issue="99999", journal="89688"
+            )
+        )
+        self.assertEqual(fence.active(ROUTE).state, PROXY_UNCERTAIN)
+
+    def test_a_legacy_completed_generation_stays_readable_and_terminal(self):
+        # `complete()` is the withdrawn acknowledgement transition (j#90329 contract 2). Nothing
+        # produces it any more; rows that already carry it must still read as a terminal state.
+        fence = self._bootstrapped()
+        first = fence.reserve(ROUTE, issue="14546", journal="89688")
+        fence.mark_delivered(ROUTE, first.action_id, issue="14546", journal="89688")
         self.assertTrue(fence.complete(ROUTE, first.action_id))
         self.assertEqual(fence.active(ROUTE).state, PROXY_COMPLETED)
 
         repeat = fence.reserve(ROUTE, issue="14546", journal="89688")
         self.assertFalse(repeat.won)
         self.assertEqual(repeat.verdict, RESERVE_DUPLICATE)
+        self.assertTrue(fence.reserve(ROUTE, issue="14546", journal="89999").won)
 
-    def test_a_completed_generation_admits_a_strictly_newer_decision(self):
+    def test_a_terminal_generation_admits_a_strictly_newer_decision(self):
         fence = self._bootstrapped()
         first = fence.reserve(ROUTE, issue="14546", journal="89688")
-        fence.mark_delivered(ROUTE, first.action_id)
-        fence.complete(ROUTE, first.action_id)
+        fence.mark_delivered(ROUTE, first.action_id, issue="14546", journal="89688")
 
         newer = fence.reserve(ROUTE, issue="14546", journal="89736")
         self.assertTrue(newer.won)
@@ -150,8 +225,7 @@ class ExactlyOnceTest(FenceTestBase):
     def test_an_older_journal_is_stale_not_a_new_generation(self):
         fence = self._bootstrapped()
         first = fence.reserve(ROUTE, issue="14546", journal="89736")
-        fence.mark_delivered(ROUTE, first.action_id)
-        fence.complete(ROUTE, first.action_id)
+        fence.mark_delivered(ROUTE, first.action_id, issue="14546", journal="89736")
 
         older = fence.reserve(ROUTE, issue="14546", journal="89688")
         self.assertFalse(older.won)
@@ -162,8 +236,7 @@ class ExactlyOnceTest(FenceTestBase):
         # "9" > "10" as strings; the comparison must be on integers.
         fence = self._bootstrapped()
         first = fence.reserve(ROUTE, issue="14546", journal="10")
-        fence.mark_delivered(ROUTE, first.action_id)
-        fence.complete(ROUTE, first.action_id)
+        fence.mark_delivered(ROUTE, first.action_id, issue="14546", journal="10")
 
         older = fence.reserve(ROUTE, issue="14546", journal="9")
         self.assertFalse(older.won)
@@ -192,8 +265,7 @@ class ExactlyOnceTest(FenceTestBase):
         # newer, so it must still carry a superseding journal ordinal.
         fence = self._bootstrapped()
         first = fence.reserve(ROUTE, issue="14546", journal="89736")
-        fence.mark_delivered(ROUTE, first.action_id)
-        fence.complete(ROUTE, first.action_id)
+        fence.mark_delivered(ROUTE, first.action_id, issue="14546", journal="89736")
 
         older_other_issue = fence.reserve(ROUTE, issue="14500", journal="89626")
         self.assertFalse(older_other_issue.won)
@@ -219,8 +291,7 @@ class GuardedWritesTest(FenceTestBase):
     def test_a_stale_action_id_never_clobbers_a_newer_generation(self):
         fence = self._bootstrapped()
         first = fence.reserve(ROUTE, issue="14546", journal="89688")
-        fence.mark_delivered(ROUTE, first.action_id)
-        fence.complete(ROUTE, first.action_id)
+        fence.mark_delivered(ROUTE, first.action_id, issue="14546", journal="89688")
         newer = fence.reserve(ROUTE, issue="14546", journal="89736")
 
         self.assertFalse(fence.mark_delivered(ROUTE, first.action_id))

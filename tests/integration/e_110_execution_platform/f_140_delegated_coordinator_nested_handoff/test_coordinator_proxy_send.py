@@ -49,7 +49,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SEND_DELIVERED,
     SEND_FAILED,
     ProxySendOutcome,
-    decision_journals_from_entries,
+    DECISION_ACTION_FIELD,
+    canonical_decision_in_journal,
+    canonical_note_text,
+    render_bootstrap_decision_marker,
     execute_proxy_delegation,
     resolve_proxy_context,
     resolve_proxy_target,
@@ -113,6 +116,12 @@ CURRENT_JOURNAL = "89736"
 OTHER_KIND_JOURNAL = "89873"
 
 LANE = "issue_14546_default_coordinator_authority"
+BOOTSTRAP_MARKER = render_bootstrap_decision_marker()
+DISPATCH_MARKER = render_bootstrap_decision_marker(lane=LANE, lane_generation="2")
+#: The action IS declared, but the lane-scoped fields the classifier joins on are absent.
+DISPATCH_MARKER_NO_LANE = (
+    f"[mozyo:workflow-event:gate=implementation_request:{DECISION_ACTION_FIELD}=dispatch_next]"
+)
 
 
 def _expectation(generation=2, decision_journal="89736"):
@@ -128,11 +137,27 @@ def _expectation(generation=2, decision_journal="89736"):
     return _resolve
 
 #: Canonical dispatch decisions carry lane + generation; the other-kind gate does not.
-DECISIONS = (
-    DecisionRecord(OLDER_JOURNAL, "implementation_request", LANE, "1"),
-    DecisionRecord(CURRENT_JOURNAL, "implementation_request", LANE, "2"),
-    DecisionRecord(OTHER_KIND_JOURNAL, "implementation_done"),
-)
+#: The named journal's note. The reader looks at this one journal only (j#90329 contract 5).
+NAMED_NOTES = {
+    CURRENT_JOURNAL: f"canonical decision\n{DISPATCH_MARKER}",
+    OLDER_JOURNAL: "canonical decision\n" + render_bootstrap_decision_marker(
+        lane=LANE, lane_generation="1"
+    ),
+    # A real canonical decision on the same issue that authorizes a DIFFERENT action.
+    OTHER_KIND_JOURNAL: f"canonical decision\n{BOOTSTRAP_MARKER}",
+}
+
+
+def _notes(mapping=None):
+    """A named-journal provider over ``{journal: notes}``."""
+    table = NAMED_NOTES if mapping is None else mapping
+
+    def _read(_issue, journal):
+        if journal in table:
+            return table[journal], True
+        return "", False
+
+    return _read
 
 
 def _attested(_name, *, locator, workspace_id, provider):
@@ -204,7 +229,7 @@ class ProxySendTestBase(unittest.TestCase):
         expectation=None,
     ):
         rows = [_row(WS, "codex")] if rows is None else rows
-        decisions = DECISIONS if decisions is None else tuple(decisions)
+        decisions = None if decisions is None else decisions
         return resolve_proxy_context(
             argparse.Namespace(repo=str(self.repo)),
             action=action,
@@ -213,7 +238,7 @@ class ProxySendTestBase(unittest.TestCase):
             repo_root=self.repo,
             env=env if env is not None else {},
             rows_provider=lambda _env: rows,
-            decision_journals_provider=lambda _issue: decisions,
+            named_journal_provider=_notes(decisions),
             workspace_provider=lambda _root: workspace,
             attestation_join=attestation or _attested,
             lane_expectation_provider=expectation or _expectation(),
@@ -264,13 +289,17 @@ class ResolutionTest(ProxySendTestBase):
         self.assertEqual(context.links.anchor, ANCHOR_GENERATION_STALE)
 
     def test_a_decision_without_lane_or_generation_is_not_verified(self):
-        context = self._context(
-            decisions=(DecisionRecord(CURRENT_JOURNAL, "implementation_request"),)
-        )
+        context = self._context(decisions={CURRENT_JOURNAL: DISPATCH_MARKER_NO_LANE})
         self.assertEqual(context.links.anchor, ANCHOR_DECISION_INCOMPLETE)
 
+    def test_a_quoted_marker_in_the_named_journal_is_not_a_decision(self):
+        context = self._context(
+            decisions={CURRENT_JOURNAL: f"the grammar is `{DISPATCH_MARKER}`"}
+        )
+        self.assertEqual(context.links.anchor, ANCHOR_UNVERIFIED)
+
     def test_an_unreachable_redmine_is_not_verified(self):
-        context = self._context(decisions=())
+        context = self._context(decisions={})
         self.assertEqual(context.links.anchor, ANCHOR_UNVERIFIED)
 
     def test_a_journal_carrying_another_decision_does_not_authorize_this_action(self):
@@ -413,11 +442,10 @@ class SendCountTest(ProxySendTestBase):
              lambda: self._context(rows=[_row(WS, "codex", locator="a"),
                                          _row(WS, "codex", locator="b")]),
              REASON_TARGET_AMBIGUOUS),
-            ("unverified anchor", lambda: self._context(decisions=()),
+            ("unverified anchor", lambda: self._context(decisions={}),
              REASON_ANCHOR_UNVERIFIED),
             ("decision without a lane/generation",
-             lambda: self._context(
-                 decisions=(DecisionRecord(CURRENT_JOURNAL, "implementation_request"),)),
+             lambda: self._context(decisions={CURRENT_JOURNAL: DISPATCH_MARKER_NO_LANE}),
              REASON_ANCHOR_DECISION_INCOMPLETE),
             ("stale lane generation", lambda: self._context(journal=OLDER_JOURNAL),
              REASON_ANCHOR_GENERATION_STALE),
@@ -480,86 +508,146 @@ class SendCountTest(ProxySendTestBase):
         self.assertEqual(port2.calls, [])
 
 
-class AcknowledgementLifecycleTest(ProxySendTestBase):
-    """The completion half of exactly-once (review j#89918 finding 1).
+class DeliveryTerminalityTest(ProxySendTestBase):
+    """The completion half of exactly-once, after Design Answer j#90329 contracts 1-4.
 
-    The first draft delivered, marked `delivered`, and stopped. Nothing in the product ever
-    completed the generation, so the route stayed held forever and every later decision — including
-    a genuinely newer one — was refused as a duplicate. A rail that works exactly once and then
-    wedges is not a repeatable single-step entrypoint, and the tests hid it by driving `complete()`
-    directly. These exercise the acknowledgement the way the product does.
+    The first draft delivered, marked `delivered`, and stopped — nothing ever completed the
+    generation, so the route wedged and every later decision was refused as a duplicate. The second
+    draft unwedged it with a `proxy-ack` command, which put the *authority* in the wrong place: the
+    proxy cannot prove the coordinator acted, and an ack surface that anyone can drive is not
+    evidence that it did.
+
+    The contract now says a positively recorded delivery IS the proxy's terminal success. So the
+    route advances with **no acknowledgement at all**: a strictly newer canonical decision mints the
+    next generation, the same decision stays duplicate forever, and only the genuinely unresolved
+    case (`uncertain`) needs an operator disposition to move.
     """
 
     NEWER_JOURNAL = "90100"
-    NEWER_DECISIONS = DECISIONS + (
-        DecisionRecord("90100", "implementation_request", LANE, "3"),
+    NEWER_DECISIONS = dict(NAMED_NOTES)
+    NEWER_DECISIONS["90100"] = "canonical decision\n" + render_bootstrap_decision_marker(
+        lane=LANE, lane_generation="3"
     )
 
-    def _ack(self, action_id):
-        from mozyo_bridge.core.state.coordinator_proxy_fence import CoordinatorProxyFence
-
-        # The production surface resolves the store from the home; drive the same method the
-        # `workflow proxy-ack` command calls, on this test's store.
-        return self.fence.complete_by_action_id(action_id, workspace_id=WS)
-
-    def test_without_an_ack_a_newer_decision_is_refused(self):
-        first, port = self._execute(self._context())
-        self.assertTrue(first.sent)
-
-        newer, port2 = self._execute(
-            self._context(
-                journal=self.NEWER_JOURNAL, decisions=self.NEWER_DECISIONS,
-                expectation=_expectation(generation=3, decision_journal=self.NEWER_JOURNAL),
-            )
+    def _route(self):
+        return ProxyRouteKey(
+            workspace_id=WS, lane_id="default", role=ROLE_COORDINATOR, action=ACTION_DISPATCH_NEXT
         )
-        self.assertFalse(newer.sent)
-        self.assertEqual(newer.reason, REASON_DUPLICATE)
-        self.assertEqual(port2.calls, [])
 
-    def test_ack_then_a_strictly_newer_decision_delivers_once(self):
+    def _newer(self):
+        return self._context(
+            journal=self.NEWER_JOURNAL, decisions=self.NEWER_DECISIONS,
+            expectation=_expectation(generation=3, decision_journal=self.NEWER_JOURNAL),
+        )
+
+    def test_a_delivery_is_terminal_so_a_newer_decision_needs_no_acknowledgement(self):
+        # THE contract-1 property: the route unwedges on delivery alone. Nothing is acked here.
         first, _ = self._execute(self._context())
         self.assertTrue(first.sent)
-        self.assertTrue(self._ack(first.action_id))
+        self.assertEqual(self.fence.active(self._route()).state, "delivered")
 
-        newer, port = self._execute(
-            self._context(
-                journal=self.NEWER_JOURNAL, decisions=self.NEWER_DECISIONS,
-                expectation=_expectation(generation=3, decision_journal=self.NEWER_JOURNAL),
-            )
-        )
+        newer, port = self._execute(self._newer())
         self.assertTrue(newer.sent)
         self.assertEqual(len(port.calls), 1)
         self.assertEqual(port.calls[0][1], self.NEWER_JOURNAL)
         self.assertNotEqual(newer.action_id, first.action_id)
 
-    def test_ack_does_not_reopen_the_same_decision(self):
+    def test_the_same_decision_stays_duplicate_after_delivery(self):
         first, _ = self._execute(self._context())
-        self.assertTrue(self._ack(first.action_id))
+        self.assertTrue(first.sent)
 
         repeat, port = self._execute(self._context())
         self.assertFalse(repeat.sent)
         self.assertEqual(repeat.reason, REASON_DUPLICATE)
         self.assertEqual(port.calls, [])
 
-    def test_an_unknown_or_stale_action_id_acks_nothing(self):
-        first, _ = self._execute(self._context())
-        self.assertFalse(self._ack("pxy_deadbeef"))
-        self.assertFalse(self._ack(""))
-        self.assertTrue(self._ack(first.action_id))
-        self.assertFalse(self._ack(first.action_id))  # already completed
+    def test_an_older_decision_never_reopens_a_delivered_route(self):
+        newer, _ = self._execute(self._newer())
+        self.assertTrue(newer.sent)
 
-    def test_a_foreign_workspace_cannot_ack(self):
+        older, port = self._execute(self._context())
+        self.assertFalse(older.sent)
+        self.assertEqual(port.calls, [])
+
+    def test_an_uncertain_generation_blocks_even_a_newer_decision(self):
+        # `uncertain` is the one state that is genuinely unresolved: the send may have landed. A
+        # newer decision must NOT be admitted over it, or the coordinator could receive two.
+        first, _ = self._execute(self._context(), port=CountingSendPort(result=SEND_FAILED))
+        self.assertFalse(first.sent)
+        self.assertEqual(self.fence.active(self._route()).state, "uncertain")
+
+        newer, port = self._execute(self._newer())
+        self.assertFalse(newer.sent)
+        self.assertEqual(newer.reason, REASON_DUPLICATE)
+        self.assertEqual(port.calls, [])
+
+    def test_a_confirmed_delivery_resolves_uncertainty_forward(self):
+        first, _ = self._execute(self._context(), port=CountingSendPort(result=SEND_FAILED))
+        self.assertTrue(
+            self.fence.confirm_delivered(
+                self._route(), first.action_id, detail="operator observed the delegation land",
+                issue=ISSUE, journal=CURRENT_JOURNAL,
+            )
+        )
+        self.assertEqual(self.fence.active(self._route()).state, "delivered")
+
+        # Forward, not backward: the newer decision proceeds, the same one stays duplicate.
+        repeat, port = self._execute(self._context())
+        self.assertFalse(repeat.sent)
+        self.assertEqual(port.calls, [])
+        newer, port2 = self._execute(self._newer())
+        self.assertTrue(newer.sent)
+        self.assertEqual(len(port2.calls), 1)
+
+    def test_a_proven_non_delivery_unwedges_the_route_without_replaying_the_decision(self):
+        # Contract 4's strongest disposition releases the route, but a decision is delegated once:
+        # the coordinator re-issues a decision, the operator does not replay the old one.
+        first, _ = self._execute(self._context(), port=CountingSendPort(result=SEND_FAILED))
+        self.assertTrue(
+            self.fence.mark_abandoned(
+                self._route(), first.action_id, detail="operator proved the send never left",
+                issue=ISSUE, journal=CURRENT_JOURNAL,
+            )
+        )
+        replay, port = self._execute(self._context())
+        self.assertFalse(replay.sent)
+        self.assertEqual(replay.reason, REASON_DUPLICATE)
+        self.assertEqual(port.calls, [])
+
+        newer, port2 = self._execute(self._newer())
+        self.assertTrue(newer.sent)
+        self.assertEqual(len(port2.calls), 1)
+        self.assertNotEqual(newer.action_id, first.action_id)
+
+    def test_a_disposition_must_name_the_generation_it_resolves(self):
+        first, _ = self._execute(self._context(), port=CountingSendPort(result=SEND_FAILED))
+        route = self._route()
+        # Wrong action id, wrong issue, wrong journal: each is a no-op against the stored anchor.
+        self.assertFalse(
+            self.fence.confirm_delivered(route, "pxy_deadbeef", detail="x",
+                                         issue=ISSUE, journal=CURRENT_JOURNAL)
+        )
+        self.assertFalse(
+            self.fence.confirm_delivered(route, first.action_id, detail="x",
+                                         issue="99999", journal=CURRENT_JOURNAL)
+        )
+        self.assertFalse(
+            self.fence.mark_abandoned(route, first.action_id, detail="x",
+                                      issue=ISSUE, journal="90999")
+        )
+        self.assertEqual(self.fence.active(route).state, "uncertain")
+
+    def test_a_delivered_generation_is_not_abandonable(self):
+        # The retryable terminal is reachable only from the unresolved state. A delivery that
+        # landed cannot be argued away into a re-send.
         first, _ = self._execute(self._context())
         self.assertFalse(
-            self.fence.complete_by_action_id(first.action_id, workspace_id=FOREIGN_WS)
+            self.fence.mark_abandoned(
+                self._route(), first.action_id, detail="wishful thinking",
+                issue=ISSUE, journal=CURRENT_JOURNAL,
+            )
         )
-        self.assertTrue(self._ack(first.action_id))
-
-    def test_an_undelivered_generation_cannot_be_acked(self):
-        # A send whose outcome was unknown stays uncertain: an ack must not paper over it.
-        result, _ = self._execute(self._context(), port=CountingSendPort(result=SEND_FAILED))
-        self.assertFalse(result.sent)
-        self.assertFalse(self._ack(result.action_id))
+        self.assertEqual(self.fence.active(self._route()).state, "delivered")
 
 
 class ConcurrentRetryOutcomeTest(ProxySendTestBase):
@@ -672,72 +760,49 @@ class ConcurrentRetryOutcomeTest(ProxySendTestBase):
         self.assertEqual(self.fence.active(self._route()).state, "uncertain")
 
 
-class DecisionJournalFoldTest(unittest.TestCase):
-    """The anchor evidence is read from the GENERIC workflow-event token (review j#89878 F1)."""
+class CanonicalDecisionGrammarTest(unittest.TestCase):
+    """A decision is read from the NAMED journal, and a quotation is never one (j#90329 c5)."""
 
-    def _entries(self):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
-            RedmineJournalEntry,
-        )
-
-        return [
-            RedmineJournalEntry(ISSUE, "89688", "[mozyo:workflow-event:gate=implementation_request]"),
-            RedmineJournalEntry(ISSUE, "89754", "[mozyo:workflow-event:gate=start]"),
-            RedmineJournalEntry(ISSUE, "89873", "[mozyo:workflow-event:gate=implementation_done]"),
-            RedmineJournalEntry(ISSUE, "89900", "no marker here, only prose about a gate"),
-            RedmineJournalEntry("99999", "89901", "[mozyo:workflow-event:gate=implementation_request]"),
-        ]
-
-    def _fold(self, entries=None, issue=ISSUE):
+    def _read(self, notes, action="bootstrap_lane"):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
             marker_fields_in_note,
         )
 
-        return decision_journals_from_entries(
-            self._entries() if entries is None else entries,
-            issue=issue,
-            parse=marker_fields_in_note,
-        )
+        return canonical_decision_in_journal(notes, action=action, parse=marker_fields_in_note)
 
-    def test_the_dispatch_decision_is_visible(self):
-        # The exact regression: `implementation_request` is NOT in the callback-gate vocabulary,
-        # so reading through that reader made the one decision `dispatch_next` needs invisible.
-        journals = [d.journal for d in self._fold() if d.token == "implementation_request"]
-        self.assertEqual(journals, ["89688"])
+    def test_a_canonical_marker_is_a_decision(self):
+        decision, refusal = self._read(f"body\n{BOOTSTRAP_MARKER}")
+        self.assertEqual(refusal, "")
+        self.assertEqual(decision.token, "implementation_request")
 
-    def test_each_journal_is_keyed_by_its_own_entry_id(self):
-        folded = {d.token: d.journal for d in self._fold()}
-        self.assertEqual(folded["start"], "89754")
-        self.assertEqual(folded["implementation_done"], "89873")
+    def test_an_inline_quotation_is_not_a_decision(self):
+        _d, refusal = self._read(f"the grammar is `{BOOTSTRAP_MARKER}` — do not copy it")
+        self.assertEqual(refusal, "no_canonical_decision")
 
-    def test_prose_is_never_a_decision(self):
-        self.assertNotIn("89900", [d.journal for d in self._fold()])
+    def test_a_fenced_quotation_is_not_a_decision(self):
+        _d, refusal = self._read(f"```\n{BOOTSTRAP_MARKER}\n```")
+        self.assertEqual(refusal, "no_canonical_decision")
 
-    def test_another_issue_s_entry_never_contributes(self):
-        self.assertNotIn("89901", [d.journal for d in self._fold()])
+    def test_two_markers_in_one_journal_are_refused(self):
+        _d, refusal = self._read(f"{BOOTSTRAP_MARKER}\n{BOOTSTRAP_MARKER}")
+        self.assertEqual(refusal, "duplicate_canonical_decision")
 
-    def test_the_canonical_dispatch_marker_s_lane_and_generation_are_preserved(self):
-        # Review j#89918 F2: dropping these is what left the decision unmatchable.
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
-            RedmineJournalEntry,
-        )
+    def test_a_marker_without_the_action_field_is_refused(self):
+        _d, refusal = self._read("[mozyo:workflow-event:gate=implementation_request]")
+        self.assertEqual(refusal, "action_not_declared")
 
-        entries = [
-            RedmineJournalEntry(
-                ISSUE, "90000",
-                "[mozyo:workflow-event:kind=implementation_request:lane=lane_a:lane_generation=3]",
-            )
-        ]
-        (record,) = self._fold(entries)
-        self.assertEqual(record.journal, "90000")
-        self.assertEqual(record.token, "implementation_request")
-        self.assertEqual(record.lane, "lane_a")
-        self.assertEqual(record.lane_generation, "3")
+    def test_a_marker_declaring_another_action_is_refused(self):
+        _d, refusal = self._read(f"{DISPATCH_MARKER}", action="bootstrap_lane")
+        self.assertEqual(refusal, "action_not_declared")
 
-    def test_a_gate_style_marker_carries_no_lane_or_generation(self):
-        (record,) = [d for d in self._fold() if d.token == "implementation_request"]
-        self.assertEqual(record.lane, "")
-        self.assertEqual(record.lane_generation, "")
+    def test_the_lane_scoped_marker_carries_lane_and_generation(self):
+        decision, refusal = self._read(DISPATCH_MARKER, action="dispatch_next")
+        self.assertEqual(refusal, "")
+        self.assertEqual((decision.lane, decision.lane_generation), (LANE, "2"))
+
+    def test_code_regions_are_stripped_before_scanning(self):
+        self.assertNotIn("mozyo", canonical_note_text(f"`{BOOTSTRAP_MARKER}`"))
+        self.assertIn("mozyo", canonical_note_text(BOOTSTRAP_MARKER))
 
 
 if __name__ == "__main__":  # pragma: no cover

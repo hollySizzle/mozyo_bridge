@@ -410,7 +410,18 @@ class LaneExpectation:
     decision_journal: str
 
 
-def _lane_scoped_status(record: "DecisionRecord", want: str, expected) -> str:
+#: Canonical-read refusals the adapter reports, mapped onto anchor statuses. The reader looks at
+#: exactly ONE journal — the one the invocation names — so each refusal is about that journal alone
+#: and can never be caused by, or poisoned by, anything else on the issue (Design Answer j#90329
+#: contract 5).
+DECISION_REFUSAL_STATUS: "dict[str, str]" = {
+    "no_canonical_decision": ANCHOR_UNVERIFIED,
+    "duplicate_canonical_decision": ANCHOR_DECISION_AMBIGUOUS,
+    "action_not_declared": ANCHOR_ACTION_MISMATCH,
+}
+
+
+def _lane_scoped_status(record: "DecisionRecord", expected) -> str:
     """Classify a lane-scoped decision against the lane's live lifecycle facts (pure)."""
     generation = _generation_ordinal(record.lane_generation)
     lane = record.lane.strip()
@@ -424,87 +435,59 @@ def _lane_scoped_status(record: "DecisionRecord", want: str, expected) -> str:
         return ANCHOR_SCOPE_MISMATCH
     if generation != expected.generation:
         return ANCHOR_GENERATION_STALE
-    if want != expected.decision_journal.strip():
-        return ANCHOR_SUPERSEDED
     return ANCHOR_VERIFIED
 
 
-def _issue_scoped_status(record: "DecisionRecord", want: str, expected, accepted) -> str:
+def _issue_scoped_status(record: "DecisionRecord", expected) -> str:
     """Classify an issue-scoped (bootstrap) decision against the issue's live facts (pure).
 
-    A bootstrap decision must NOT name a lane: it authorizes creating the first one, so a decision
-    carrying lane / generation fields is a lane-scoped decision being misused here. And the issue
-    must not already own an active lane — that precondition is what the bootstrap acts on, and once
-    it is gone the caller wants the lane-scoped action instead.
+    A bootstrap decision must not name a lane: it authorizes creating the first one. And the issue
+    must not already own an active lane — that precondition is what the bootstrap acts on.
     """
     if record.lane.strip() or record.lane_generation.strip():
         return ANCHOR_SCOPE_MISMATCH
-    # A bootstrap is authorized ONCE per issue, and the marker scanner cannot distinguish a real
-    # decision from one quoted in prose (review j#90250 F2). So two or more candidates is ambiguity,
-    # not a "latest wins" race: a quotation of the canonical grammar appears as a second decision
-    # and must make the anchor unusable rather than replace it.
-    distinct = {r.journal for r in accepted}
-    if len(distinct) >= 2:
-        return ANCHOR_DECISION_AMBIGUOUS
     if expected is None:
         return ANCHOR_LANE_UNRESOLVED
     if not isinstance(expected, IssueExpectation):
         return ANCHOR_SCOPE_MISMATCH
     if expected.owns_active_lane:
         return ANCHOR_SCOPE_MISMATCH
-    if want != expected.latest_decision_journal.strip():
-        return ANCHOR_SUPERSEDED
     return ANCHOR_VERIFIED
 
 
 def anchor_status_for(
-    journal: str,
     *,
     action: str,
-    decisions: "tuple[DecisionRecord, ...]",
+    decision: "Optional[DecisionRecord]",
+    decision_refusal: str = "",
     expected,
 ) -> str:
-    """Classify a requested journal against this action's live durable decision (pure, fail-closed).
+    """Classify the NAMED journal's canonical decision against live facts (pure, fail-closed).
 
-    ``decisions`` are the issue's workflow-event decisions in note order, read from source-of-truth
-    Redmine. ``expected`` is the **action-time** live state the decision is matched against, resolved
-    by the caller: a :class:`LaneExpectation` for a lane-scoped action, an :class:`IssueExpectation`
-    for an issue-scoped one, or ``None`` when it could not be resolved.
+    The reader hands in the single canonical decision it found in the journal the invocation named,
+    or the fixed refusal reason for why that journal carries none (Design Answer j#90329 contract 5).
+    Scanning the issue's history is gone: it is what let a quotation elsewhere become authority, and
+    then what let the anti-quotation rule make an issue permanently unusable. A named journal is a
+    **durable work intent**, not a proof of who wrote it — the proxy no longer claims the latter.
 
-    Matching the decision against itself proves nothing (review j#89969 F2), and matching every
-    action against a *lane* proves too much (review j#90068 F1): the rail's motivating case is the
-    state where no lane exists at all, so a lane-scoped-only contract could never act on it. The
-    scope kind is therefore per action:
-
-    - the journal carries none of the issue's workflow-event markers -> :data:`ANCHOR_UNVERIFIED`
-      (also what an unreachable Redmine produces);
-    - it carries a marker, but none in this action's :data:`ACTION_DECISION_TOKENS` ->
-      :data:`ANCHOR_ACTION_MISMATCH`;
-    - **lane-scoped**: the decision must name a lane and numeric generation
-      (:data:`ANCHOR_DECISION_INCOMPLETE` otherwise), that lane must have readable live facts
-      (:data:`ANCHOR_LANE_UNRESOLVED`), match them (:data:`ANCHOR_SCOPE_MISMATCH` /
-      :data:`ANCHOR_GENERATION_STALE`), and be the lane's current decision anchor
-      (:data:`ANCHOR_SUPERSEDED` — which is what refuses a canonical-shaped quotation);
-    - **issue-scoped**: the decision must NOT name a lane (a lane-scoped decision misused here is
-      :data:`ANCHOR_SCOPE_MISMATCH`), the issue must not already own an active lane (the bootstrap
-      precondition), and the journal must be the issue's newest accepted decision.
+    - a refusal from the canonical read -> its mapped status
+      (:data:`DECISION_REFUSAL_STATUS`);
+    - **lane-scoped**: the decision names a lane and numeric generation
+      (:data:`ANCHOR_DECISION_INCOMPLETE` otherwise) which must match that lane's live lifecycle
+      facts (:data:`ANCHOR_LANE_UNRESOLVED` / :data:`ANCHOR_SCOPE_MISMATCH` /
+      :data:`ANCHOR_GENERATION_STALE`);
+    - **issue-scoped**: the decision must NOT name a lane, and the issue must not already own an
+      active lane;
+    - otherwise -> :data:`ANCHOR_VERIFIED`.
     """
-    want = (journal or "").strip()
-    rows = tuple(decisions or ())
-    if not want or not any(r.journal == want for r in rows):
-        return ANCHOR_UNVERIFIED
-
+    if decision is None:
+        return DECISION_REFUSAL_STATUS.get(decision_refusal, ANCHOR_UNVERIFIED)
     normalized = normalize_action(action)
-    accepted_tokens = ACTION_DECISION_TOKENS.get(normalized, ())
-    mine = [r for r in rows if r.journal == want and r.token in accepted_tokens]
-    if not mine:
+    if not normalized:
         return ANCHOR_ACTION_MISMATCH
-
-    record = mine[-1]
     if ACTION_SCOPES.get(normalized) == SCOPE_ISSUE:
-        accepted = [r for r in rows if r.token in accepted_tokens]
-        return _issue_scoped_status(record, want, expected, accepted)
-    return _lane_scoped_status(record, want, expected)
+        return _issue_scoped_status(decision, expected)
+    return _lane_scoped_status(decision, expected)
 
 
 __all__ = (
@@ -567,6 +550,7 @@ __all__ = (
     "ZERO_SEND",
     "normalize_action",
     "DecisionRecord",
+    "DECISION_REFUSAL_STATUS",
     "IssueExpectation",
     "LaneExpectation",
     "ProxyLinks",

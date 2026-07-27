@@ -32,6 +32,7 @@ count — is testable without a live herdr or Redmine.
 from __future__ import annotations
 
 import argparse
+import re
 from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping, Optional, Protocol, Sequence
 
@@ -55,6 +56,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ZERO_SEND,
     ProxyDecision,
     ProxyLinks,
+    ACTION_DECISION_TOKENS,
     ACTION_SCOPES,
     SCOPE_ISSUE,
     DecisionRecord,
@@ -151,78 +153,114 @@ def live_agent_rows(env: Mapping[str, str]) -> Sequence[Mapping]:
 #: The workflow-event marker channel whose ``gate`` / ``kind`` field names a durable decision.
 _WORKFLOW_EVENT_CHANNEL = "workflow-event"
 
+#: The marker field that binds a decision to the proxy action it authorizes (Design Answer j#90329
+#: contract 5). Without it the same ``implementation_request`` token had to serve every purpose, so
+#: "which action does this decision authorize" was never expressed and had to be guessed from the
+#: issue's history — which is what let a quotation elsewhere on the issue become authority, and then
+#: what let the anti-quotation rule poison the issue permanently.
+DECISION_ACTION_FIELD = "proxy_action"
 
-def live_decision_journals(
-    args: argparse.Namespace, issue: str
-) -> "tuple[DecisionRecord, ...]":
-    """The issue's decision token -> journal ids, in note order, from source-of-truth Redmine.
+_FENCED_BLOCK = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE = re.compile(r"`[^`\n]*`")
 
-    Reads the **generic** workflow-event marker rather than the callback-gate reader, because the
-    two vocabularies are deliberately disjoint (review j#89878 finding 1): ``GATE_BEARING_KINDS``
-    covers only the states that must wake a coordinator, and ``implementation_request`` — the
-    coordinator's dispatch decision, and precisely what a ``dispatch_next`` delegation is
-    authorized by — is excluded from it by design. Reading through the callback reader therefore
-    made the one decision that matters invisible while leaving unrelated gates usable as anchors.
 
-    A journal's decision token is its marker's ``gate`` field, or ``kind`` when the marker uses the
-    dispatch grammar. The journal id is the **owning entry's own** ``journal_id``, never the
-    marker's self-reported ``journal=`` field (a note must not name its own anchor). Prose is never
-    inspected. Any unconfigured-credential / transport / decode failure yields ``{}`` so the anchor
-    simply fails to verify — an unreachable Redmine must never read as a verified anchor. Errors
-    are already credential/URL-redacted upstream and are not re-raised here.
+def canonical_note_text(notes: str) -> str:
+    """The note with code fences and inline code spans removed (pure).
+
+    A marker inside a fenced block or backticks is a **quotation**, not a decision — that is how a
+    review journal discussing the grammar ends up carrying the token. Stripping those regions before
+    the scanner runs is what makes a quotation neither an authority nor an ambiguity poison
+    (Design Answer j#90329 contract 5).
     """
-    issue = (issue or "").strip()
-    if not issue:
-        return ()
+    text = _FENCED_BLOCK.sub(" ", str(notes or ""))
+    return _INLINE_CODE.sub(" ", text)
+
+
+def canonical_decision_in_journal(
+    notes: str, *, action: str, parse
+) -> "tuple[Optional[DecisionRecord], str]":
+    """The single canonical decision a NAMED journal carries for ``action``, or a refusal reason.
+
+    Reads exactly one journal — the one the invocation named — instead of scanning the issue's
+    history (Design Answer j#90329 contract 5). The history scan was the root of both failures: a
+    quotation anywhere on the issue became a candidate, and the rule that refused two candidates
+    then made the issue permanently unusable. Neither can happen when the only text considered is
+    the named journal's, with quotations stripped first.
+
+    Canonicality is exact: the note must carry **exactly one** top-level workflow-event marker whose
+    token is accepted for this action AND whose :data:`DECISION_ACTION_FIELD` names that action.
+    Zero, two-or-more, or a marker that names a different action are all refusals with a fixed
+    reason; the caller turns those into zero-send statuses.
+    """
+    accepted = ACTION_DECISION_TOKENS.get(normalize_action(action), ())
+    found: list = []
+    for channel, fields in parse(canonical_note_text(notes)):
+        if channel != _WORKFLOW_EVENT_CHANNEL:
+            continue
+        token = (fields.get("gate") or fields.get("kind") or "").strip()
+        if token not in accepted:
+            continue
+        found.append((token, fields))
+    if not found:
+        return None, "no_canonical_decision"
+    if len(found) >= 2:
+        return None, "duplicate_canonical_decision"
+    token, fields = found[0]
+    declared = (fields.get(DECISION_ACTION_FIELD) or "").strip()
+    if declared != normalize_action(action):
+        return None, "action_not_declared"
+    return (
+        DecisionRecord(
+            journal="",  # filled by the caller with the OWNING entry id, never self-reported
+            token=token,
+            lane=(fields.get("lane") or "").strip(),
+            lane_generation=(fields.get("lane_generation") or "").strip(),
+        ),
+        "",
+    )
+
+
+def render_bootstrap_decision_marker(lane: str = "", lane_generation: str = "") -> str:
+    """The canonical decision marker a coordinator writes to authorize a proxy action (producer).
+
+    ``proxy_action`` is what makes the decision unambiguous about *what it authorizes*; the reader
+    refuses a marker that omits it. A lane-scoped action additionally names its lane and generation.
+    """
+    marker = f"[mozyo:workflow-event:gate=implementation_request:{DECISION_ACTION_FIELD}="
+    if lane.strip():
+        return (
+            marker + f"dispatch_next:lane={lane.strip()}:lane_generation={(lane_generation or '').strip()}]"
+        )
+    return marker + "bootstrap_lane]"
+
+
+def live_named_journal_note(args: argparse.Namespace, issue: str, journal: str) -> "tuple[str, bool]":
+    """The verbatim note of the ONE journal the invocation named, and whether it was read.
+
+    Reads only the named journal (Design Answer j#90329 contract 5) through the credential-gated
+    source-of-truth boundary. Returns ``(notes, read_ok)``; an unreachable / unconfigured Redmine or
+    a journal that is not on this issue yields ``("", False)`` so the anchor simply fails to verify —
+    an unreadable record is never a decision.
+    """
+    issue_id = (issue or "").strip()
+    journal_id = (journal or "").strip()
+    if not issue_id or not journal_id:
+        return "", False
     try:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
             LiveRedmineJournalSource,
         )
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
-            marker_fields_in_note,
-        )
 
-        entries = LiveRedmineJournalSource.from_environment().read_entries(issue)
+        entries = LiveRedmineJournalSource.from_environment().read_entries(issue_id)
     except Exception:  # noqa: BLE001 - any live-read failure fails the anchor gate closed
-        return ()
-    return decision_journals_from_entries(entries, issue=issue, parse=marker_fields_in_note)
-
-
-def decision_journals_from_entries(entries, *, issue: str, parse) -> "tuple[DecisionRecord, ...]":
-    """The decision token -> journal ids fold over already-read entries (pure over its inputs).
-
-    Split out of :func:`live_decision_journals` so the fold — which is where the anchor evidence is
-    actually decided — is testable without a live Redmine. ``parse`` is the shared structured-token
-    scanner (``marker_fields_in_note``), injected rather than imported so this stays a pure fold.
-    """
-    issue = (issue or "").strip()
-    decisions: list = []
+        return "", False
     for entry in entries or ():
-        if str(getattr(entry, "issue_id", "")).strip() != issue:
-            continue  # an entry from another issue never authorizes this anchor
-        journal = str(getattr(entry, "journal_id", "")).strip()
-        if not journal:
+        if str(getattr(entry, "issue_id", "")).strip() != issue_id:
             continue
-        for channel, fields in parse(str(getattr(entry, "notes", "") or "")):
-            if channel != _WORKFLOW_EVENT_CHANNEL:
-                continue
-            token = (fields.get("gate") or fields.get("kind") or "").strip()
-            if not token:
-                continue
-            # The canonical dispatch producer writes `lane` / `lane_generation` alongside the
-            # token. They are carried through here rather than discarded, because they are what
-            # makes the decision exact-matchable (review j#89918 finding 2); a decision without
-            # them is kept but classified `decision_incomplete` downstream, never silently
-            # accepted.
-            decisions.append(
-                DecisionRecord(
-                    journal=journal,
-                    token=token,
-                    lane=(fields.get("lane") or "").strip(),
-                    lane_generation=(fields.get("lane_generation") or "").strip(),
-                )
-            )
-    return tuple(decisions)
+        if str(getattr(entry, "journal_id", "")).strip() != journal_id:
+            continue
+        return str(getattr(entry, "notes", "") or ""), True
+    return "", False
 
 
 def live_attestation_join(assigned_name: str, *, locator: str, workspace_id: str, provider: str):
@@ -371,85 +409,44 @@ def live_lane_expectation(repo_root, lane: str) -> "Optional[LaneExpectation]":
     )
 
 
-#: The canonical acknowledgement marker grammar. The coordinator records this on the anchored issue
-#: after acting; the reconcile reads it back from source-of-truth Redmine. The opaque action id is
-#: the correlation, and the marker's OWNING journal is what makes the acknowledgement attributable.
-ACK_MARKER_GATE = "proxy_ack"
+#: Acknowledgement is NOT an authority on this rail (Design Consultation Answer j#90329 contract 2).
+#: A marker grammar and its reader lived here across two drafts, asking first "is the caller the
+#: coordinator?" (answered from caller-supplied env) and then "did the coordinator record an ack?"
+#: (answered from a Redmine note anyone with an API key can write). Neither question is answerable on
+#: this transport, so the claim was withdrawn rather than relocated a third time: a positively
+#: recorded DELIVERY is the proxy's terminal success, and a generation whose fate is genuinely
+#: unknown is resolved by an operator disposition (`workflow proxy-reconcile`), never by a marker.
 
 
-def render_proxy_ack_marker(action_id: str) -> str:
-    """The canonical acknowledgement marker for ``action_id`` (pure; the producer inverse of the reader)."""
-    return f"[mozyo:workflow-event:gate={ACK_MARKER_GATE}:proxy_action_id={(action_id or '').strip()}]"
+def live_issue_expectation(repo_root, issue: str, _decisions=(), *, action: str = ""):
+    """The action-time live facts for an issue-scoped (bootstrap) decision, or ``None``.
 
-
-def verify_ack_record(
-    args, *, issue: str, action_id: str, entries_provider=None
-) -> "tuple[bool, str, str]":
-    """Is there a coordinator-recorded acknowledgement for ``action_id`` on ``issue``? (fail-closed)
-
-    The authority for completing a delegation (Redmine #14546, review j#90250 finding 1). The
-    previous shape asked "is the process running this command the coordinator?" and answered it from
-    the process's own ``MOZYO_*`` env — values an external caller can reproduce, because a workspace
-    id, a provider and the default lane are published, not secret, and this platform gives no proof
-    that a process *is* the slot whose triplet it presents. Deriving the canonical slot name from
-    those same caller-supplied fields correlated the claim with itself.
-
-    So the question changed. Completion truth is not "who typed the command" but "what the durable
-    record says the coordinator did" (``vibes/docs/logics/ack-completion-receiver-state.md``): the
-    coordinator records a canonical acknowledgement marker on the anchored issue after acting, and
-    this reads it back through the credential-gated source-of-truth boundary. An external caller who
-    knows the published triplet — and even the action id — cannot complete anything without that
-    durable, attributable record existing.
-
-    Returns ``(ok, reason, detail)``. Fail-closed on an unreadable / unreachable Redmine (no markers
-    is not an acknowledgement), a missing marker, and a marker whose id does not match exactly.
+    The bootstrap precondition is that the issue owns **no active lane** — the state the observed
+    dead end leaves behind. Read through the lifecycle authority's own owner resolver, which is
+    fail-closed by construction: zero owners and many owners both resolve to "no owner", so a caller
+    can never fall back to "the newest lane". ``None`` (fail-closed) only when the workspace scope or
+    the store cannot be read at all.
     """
     issue_id = (issue or "").strip()
-    aid = (action_id or "").strip()
     if not issue_id:
-        return False, "proxy_ack_issue_required", (
-            "--issue is required: the acknowledgement is read from the anchored issue's durable "
-            "record, not from the invoking process"
+        return None
+    try:
+        from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+        from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey  # noqa: F401
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+            repo_scope_workspace_id,
         )
-    if not aid:
-        return False, "proxy_action_id_required", (
-            "--proxy-action-id is required; it is the opaque id the delegation carried"
-        )
 
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
-        marker_fields_in_note,
-    )
-
-    if entries_provider is not None:
-        entries = entries_provider(issue_id)
-    else:
-        try:
-            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
-                LiveRedmineJournalSource,
-            )
-
-            entries = LiveRedmineJournalSource.from_environment().read_entries(issue_id)
-        except Exception:  # noqa: BLE001 - an unreachable record is never an acknowledgement
-            return False, "proxy_ack_record_unreadable", (
-                "the anchored issue's durable record could not be read; an acknowledgement is "
-                "never assumed from an unreadable source"
-            )
-
-    for entry in entries or ():
-        if str(getattr(entry, "issue_id", "")).strip() != issue_id:
-            continue
-        journal = str(getattr(entry, "journal_id", "")).strip()
-        for channel, fields in marker_fields_in_note(str(getattr(entry, "notes", "") or "")):
-            if channel != _WORKFLOW_EVENT_CHANNEL:
-                continue
-            if (fields.get("gate") or "").strip() != ACK_MARKER_GATE:
-                continue
-            if (fields.get("proxy_action_id") or "").strip() != aid:
-                continue
-            return True, "", f"coordinator acknowledgement recorded at journal {journal}"
-    return False, "proxy_ack_not_recorded", (
-        "the anchored issue carries no coordinator acknowledgement for this action id; the "
-        "coordinator records one from its own runtime after the delegated action succeeds"
+        scope = repo_scope_workspace_id(repo_root)
+        if not scope:
+            return None
+        owner = LaneLifecycleStore().resolve_owner(scope, issue_id)
+    except Exception:  # noqa: BLE001 - an unreadable lifecycle authority resolves no expectation
+        return None
+    return IssueExpectation(
+        issue=issue_id,
+        owns_active_lane=bool(getattr(owner, "resolved", False)),
+        latest_decision_journal="",  # the named journal IS the decision now (contract 5)
     )
 
 
@@ -517,7 +514,7 @@ def resolve_proxy_context(
     repo_root,
     env: Mapping[str, str],
     rows_provider: Optional[Callable[[Mapping[str, str]], Sequence[Mapping]]] = None,
-    decision_journals_provider: Optional[Callable[..., "tuple[DecisionRecord, ...]"]] = None,
+    named_journal_provider: Optional[Callable[..., "tuple[str, bool]"]] = None,
     workspace_provider: Optional[Callable[..., str]] = None,
     attestation_join: Optional[Callable[..., "tuple[bool, str, str]"]] = None,
     lane_expectation_provider: Optional[Callable[..., "Optional[LaneExpectation]"]] = None,
@@ -532,7 +529,7 @@ def resolve_proxy_context(
     """
     resolve_ws = workspace_provider or live_workspace_id
     resolve_rows = rows_provider or live_agent_rows
-    resolve_decisions = decision_journals_provider or (lambda i: live_decision_journals(args, i))
+    read_note = named_journal_provider or (lambda i, j: live_named_journal_note(args, i, j))
 
     issue = (issue or "").strip()
     journal = (journal or "").strip()
@@ -559,9 +556,22 @@ def resolve_proxy_context(
         else ProxyTarget(status=target_status_from_cardinality(0, 0))
     )
 
-    decisions: "tuple[DecisionRecord, ...]" = ()
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+        marker_fields_in_note,
+    )
+
+    decision = None
+    decision_refusal = "no_canonical_decision"
     if issue and journal:
-        decisions = tuple(resolve_decisions(issue) or ())
+        notes, read_ok = read_note(issue, journal)
+        if read_ok:
+            decision, decision_refusal = canonical_decision_in_journal(
+                notes, action=action, parse=marker_fields_in_note
+            )
+            if decision is not None:
+                # The journal id is the OWNING entry's, never the marker's self-report.
+                decision = replace(decision, journal=journal)
+    decisions = (decision,) if decision is not None else ()
     # WHICH live facts the decision is matched against depends on the action's scope. A lane-scoped
     # action resolves the lane the DECISION names — never one the caller supplies, and never the
     # coordinator's own lane. An issue-scoped (bootstrap) action resolves the issue's ownership
@@ -570,13 +580,11 @@ def resolve_proxy_context(
         resolve_issue = issue_expectation_provider or live_issue_expectation
         expectation = resolve_issue(repo_root, issue, decisions, action=action)
     else:
-        declared_lane = next(
-            (r.lane for r in decisions if r.journal == journal and r.lane.strip()), ""
-        )
+        declared_lane = decision.lane if decision is not None else ""
         resolve_expectation = lane_expectation_provider or live_lane_expectation
         expectation = resolve_expectation(repo_root, declared_lane) if declared_lane else None
     anchor_status = anchor_status_for(
-        journal, action=action, decisions=decisions, expected=expectation
+        action=action, decision=decision, decision_refusal=decision_refusal, expected=expectation
     )
 
     links = ProxyLinks(
@@ -716,18 +724,25 @@ def execute_proxy_delegation(
         outcome = send_port.send(context, reserve.action_id, args=args)
     except Exception as exc:  # noqa: BLE001 - an unknown send outcome is uncertain, never an escape
         try:
-            fence.mark_uncertain(
-                route, reserve.action_id, detail=f"send raised {type(exc).__name__}"
+            recorded = fence.mark_uncertain(
+                route, reserve.action_id, detail=f"send raised {type(exc).__name__}",
+                issue=context.issue, journal=context.journal,
             )
         except CoordinatorProxyFenceError:
-            pass  # the store also failed; the typed result below still tells the caller
+            recorded = False  # the store also failed; say so rather than claim a recording
         return ProxyExecutionResult(
             sent=False, decision=ZERO_SEND, reason=REASON_DELIVERY_UNCERTAIN,
             action_id=reserve.action_id, fence_state=FENCE_RECONCILE,
             detail=(
-                f"the send raised {type(exc).__name__} and its effect boundary is unknown; the "
-                "generation is recorded `uncertain` and is never blind-retried. Resolve it with "
-                "`workflow proxy-reconcile` after establishing what happened."
+                f"the send raised {type(exc).__name__} and its effect boundary is unknown. "
+                + (
+                    "The generation is recorded `uncertain`"
+                    if recorded
+                    else "The generation could NOT be recorded `uncertain` (the store write did not "
+                    "land), so its stored state is unknown"
+                )
+                + " and is never blind-retried. Resolve it with `workflow proxy-reconcile` against "
+                f"action id {reserve.action_id} after establishing what happened."
             ),
         )
     context.links = replace(context.links, fence=FENCE_OPEN)
@@ -740,7 +755,10 @@ def execute_proxy_delegation(
         # `uncertain`, and since `proxy-ack` completes only a `delivered` generation, the route
         # then wedged with no way forward. A delivery the store did not record is not a delivery.
         try:
-            recorded = fence.mark_delivered(route, reserve.action_id, detail=outcome.detail)
+            recorded = fence.mark_delivered(
+                route, reserve.action_id, detail=outcome.detail,
+                issue=context.issue, journal=context.journal,
+            )
         except CoordinatorProxyFenceError as exc:
             # A store failure is the same class of unknown as a lost CAS (review j#90068 F2): the
             # send fired and the durable record does not reflect it. Typed, nonzero, never raised
@@ -781,7 +799,8 @@ def execute_proxy_delegation(
     # the detail must say so rather than claim a recording that never happened.
     try:
         recorded = fence.mark_uncertain(
-            route, reserve.action_id, detail=outcome.detail or f"send {outcome.result}"
+            route, reserve.action_id, detail=outcome.detail or f"send {outcome.result}",
+            issue=context.issue, journal=context.journal,
         )
     except CoordinatorProxyFenceError as exc:
         return ProxyExecutionResult(
@@ -863,13 +882,11 @@ class OrchestrateHandoffProxySendPort:
         send_args.summary = (
             f"coordinator proxy delegation: action={normalize_action(getattr(args, 'action', ''))} "
             f"role={context.role} lane={DEFAULT_LANE} anchor=redmine:issue={context.issue}:"
-            f"journal={context.journal} proxy_action_id={action_id}. Read the durable anchor and "
-            f"perform this one already-resolved action from your own attested runtime. "
-            f"ONLY IF it succeeded, acknowledge from that same runtime with "
-            f"`mozyo-bridge workflow proxy-ack --proxy-action-id {action_id}` — the delegation "
-            f"route stays held until you do, and the next decision cannot be delegated. If the "
-            f"action failed or its outcome is unknown, do NOT acknowledge; record the outcome on "
-            f"the durable anchor instead."
+            f"journal={context.journal}. Read the durable anchor and perform this one "
+            f"already-resolved action from your own attested runtime. Record the outcome on the "
+            f"durable anchor. No acknowledgement command is required or accepted: this delegation "
+            f"is delivered exactly once and the same decision is never delegated again; a strictly "
+            f"newer canonical decision authorizes the next one."
         )
 
         buf = io.StringIO()
@@ -896,15 +913,15 @@ __all__ = (
     "ProxyContext",
     "live_workspace_id",
     "live_agent_rows",
-    "live_decision_journals",
-    "decision_journals_from_entries",
+    "live_named_journal_note",
+    "canonical_note_text",
+    "canonical_decision_in_journal",
+    "render_bootstrap_decision_marker",
+    "DECISION_ACTION_FIELD",
     "live_attestation_join",
     "live_lane_expectation",
     "live_issue_expectation",
     "resolve_proxy_target",
-    "ACK_MARKER_GATE",
-    "render_proxy_ack_marker",
-    "verify_ack_record",
     "resolve_default_lane_authority",
     "resolve_expected_provider",
     "resolve_proxy_context",
