@@ -131,15 +131,39 @@ class LegacyProjectSkillMirrorTest(unittest.TestCase):
         references (`redmine-issue-authoring.md`, `subagent-delegation.md`)
         that are deliberately not mirrored. Pinning the set catches a silent
         add (a new canonical reference copied in without review) or drop.
+
+        The set is computed WITHOUT an `is_file()` filter (review j#90342
+        R2-F1): `is_file()` follows symlinks, so a dangling `unpinned.md`
+        symlink would drop out of `present` and the equality would hold while
+        an unpinned entry sat in the mirror.
         """
-        present = {
-            p.name for p in self.mirror_ref_dir.glob("*.md") if p.is_file()
-        }
+        present = {p.name for p in self.mirror_ref_dir.glob("*.md")}
         self.assertEqual(
             set(MIRRORED_REFERENCES),
             present,
             "legacy project mirror reference set drifted from the pinned partial "
             f"set; expected {sorted(MIRRORED_REFERENCES)}, found {sorted(present)}",
+        )
+
+    def test_mirror_references_are_regular_files_not_symlinks(self) -> None:
+        """No mirrored reference may be a symlink (review j#90342 R2-F1).
+
+        The mirror is a byte copy, so a symlink is never a correct entry. It is
+        also actively dangerous on a *pinned* name: content parity follows the
+        link and passes, and the sync's `cp` then writes through it into the
+        link target — measured overwriting an unrelated file while reporting
+        success. Banning the entry type is what closes that, and content parity
+        alone cannot see it.
+        """
+        symlinked = sorted(
+            p.name for p in self.mirror_ref_dir.glob("*.md") if p.is_symlink()
+        )
+        self.assertEqual(
+            [],
+            symlinked,
+            "legacy project mirror references must be regular files, not "
+            f"symlinks; found {symlinked}. Replace with a regular file, then "
+            "run scripts/sync_legacy_project_skill.sh from the repo root.",
         )
 
     def test_adapter_skill_md_present_and_not_a_canonical_copy(self) -> None:
@@ -438,6 +462,73 @@ class LegacySkillSyncScriptTest(unittest.TestCase):
             self.assertEqual(0, synced.returncode, msg=synced.stderr)
             after = self._check(repo)
             self.assertEqual(0, after.returncode, msg=after.stdout + after.stderr)
+
+    def test_both_modes_reject_a_dangling_unpinned_symlink(self) -> None:
+        """Review j#90342 R2-F1: `-e` is false for a dangling symlink.
+
+        The glob no-match guard was `[ -e "$path" ] || continue`, so a dangling
+        `unpinned.md` symlink was skipped as though the glob had not matched —
+        both modes exited 0 and reported the mirror up to date while an
+        unpinned entry sat in it. Same fail-open shape as R1 F1, reached
+        through the entry TYPE rather than the mode.
+        """
+        for mode in (["--check"], []):
+            with self.subTest(mode=mode or ["sync"]):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = self._stage(Path(tmp))
+                    (
+                        repo
+                        / ".claude/skills/mozyo-bridge-agent/references/unpinned.md"
+                    ).symlink_to("missing-target")
+                    result = subprocess.run(
+                        ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name), *mode],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(1, result.returncode, msg=result.stdout)
+                    self.assertNotIn("is up to date", result.stdout)
+                    self.assertNotIn(
+                        "synced legacy project skill mirror", result.stdout
+                    )
+                    self.assertIn(
+                        "unpinned reference: references/unpinned.md", result.stderr
+                    )
+
+    def test_sync_refuses_a_symlinked_pinned_reference_without_writing_through(
+        self,
+    ) -> None:
+        """A symlinked PINNED name is the dangerous case the type ban closes.
+
+        Content parity follows the link and passes, so the unpinned audit
+        cannot see it by construction. Left unchecked, the sync's `cp` writes
+        THROUGH the link into its target — measured overwriting an unrelated
+        file while exiting 0 and printing success.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage(Path(tmp))
+            victim = repo / "victim.txt"
+            victim.write_text("UNRELATED CONTENT\n", encoding="utf-8")
+            pinned = repo / ".claude/skills/mozyo-bridge-agent/references/safety.md"
+            pinned.unlink()
+            pinned.symlink_to(victim)
+
+            for mode in (["--check"], []):
+                with self.subTest(mode=mode or ["sync"]):
+                    result = subprocess.run(
+                        ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name), *mode],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(1, result.returncode, msg=result.stdout)
+                    self.assertIn(
+                        "reference is a symlink: references/safety.md", result.stderr
+                    )
+
+            self.assertEqual(
+                "UNRELATED CONTENT\n",
+                victim.read_text(encoding="utf-8"),
+                "sync wrote through the symlink into its target",
+            )
 
     def test_check_fails_when_the_mirror_directory_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1984,6 +1984,25 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             # The plugin gate keeps its own, still-correct recovery.
             self.assertIn("plugin skill mirror is up to date", stdout)
 
+    def test_legacy_mirror_dangling_symlink_is_a_release_blocker(self) -> None:
+        """Review j#90342 R2-F1 condition 4: the gate must see it too.
+
+        A dangling `unpinned.md` symlink previously passed the sub-check's
+        file-set audit, so `release check drift` reported `result: clean` with
+        an unpinned entry in the mirror.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            (
+                repo / ".claude/skills/mozyo-bridge-agent/references/unpinned.md"
+            ).symlink_to("missing-target")
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("unpinned reference: references/unpinned.md", stdout)
+            self.assertIn("result: blocker", stdout)
+            self.assertIn("reviewed delete", stdout)
+            self.assertIn("plugin skill mirror is up to date", stdout)
+
     def test_missing_legacy_sync_script_is_release_blocker(self) -> None:
         """A deleted legacy sync script must block, not silently pass.
 

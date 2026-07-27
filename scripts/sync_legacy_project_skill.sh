@@ -106,8 +106,13 @@ unpinned_found=0
 audit_unpinned_references() {
   [ -d "$dest" ] || return 0
   for path in "$dest"/*.md; do
-    # Guard the no-match case: an unmatched glob stays literal in sh.
-    [ -e "$path" ] || continue
+    # Distinguish the glob no-match case (an unmatched glob stays literal in
+    # sh) from a real directory entry. `-e` alone is NOT that test: it follows
+    # symlinks, so a *dangling* symlink is `-e`-false and would be skipped as
+    # though the glob had not matched — the fail-open review j#90342 R2-F1
+    # measured. `-L` is true for a symlink whether or not its target exists,
+    # so the pair covers every entry the glob can actually produce.
+    [ -e "$path" ] || [ -L "$path" ] || continue
     found=0
     base="$(basename "$path")"
     for name in $MIRRORED_REFERENCES; do
@@ -123,11 +128,39 @@ audit_unpinned_references() {
   done
 }
 
+# Symlinks are banned outright in the mirror's reference set — for PINNED names
+# too, which the unpinned audit above cannot see by construction.
+#
+# Review j#90342 R2-F1 named the dangling-symlink fail-open; measuring it showed
+# the same entry-type blindness does worse on a pinned name. A pinned reference
+# that is a symlink passes content parity (`cmp` follows it), and then the sync's
+# `cp` writes THROUGH it: pointing `references/safety.md` at an unrelated file
+# made the sync overwrite that file with the canonical body, exit 0, and report
+# success. The mirror is a byte copy, so a symlink is never a correct entry here;
+# banning the type is what actually closes the hazard.
+symlink_found=0
+audit_symlink_references() {
+  [ -d "$dest" ] || return 0
+  for path in "$dest"/*.md; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    if [ -L "$path" ]; then
+      echo "legacy project skill mirror reference is a symlink: references/$(basename "$path")" >&2
+      symlink_found=1
+    fi
+  done
+}
+
 unpinned_disposition() {
   echo "Unpinned reference(s) need a reviewed disposition: either delete them, or add" >&2
   echo "them to MIRRORED_REFERENCES in this script AND in" >&2
   echo "tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py." >&2
   echo "Rerunning this script does NOT clear them — it refuses while they are present." >&2
+}
+
+symlink_disposition() {
+  echo "The mirror is a byte copy; a symlinked reference is never valid here. Replace it" >&2
+  echo "with a regular file (or delete it), then rerun this script. Syncing over a symlink" >&2
+  echo "would write through it into the link target, so this script refuses instead." >&2
 }
 
 if [ "$check_only" -eq 1 ]; then
@@ -155,17 +188,21 @@ if [ "$check_only" -eq 1 ]; then
   done
 
   audit_unpinned_references
+  audit_symlink_references
 
   # Report the recovery that actually resolves each class present. Printing the
   # blanket "rerun the sync" line for an unpinned-reference drift would send the
   # operator to a command that refuses.
-  if [ "$content_drift" -ne 0 ] || [ "$unpinned_found" -ne 0 ]; then
+  if [ "$content_drift" -ne 0 ] || [ "$unpinned_found" -ne 0 ] || [ "$symlink_found" -ne 0 ]; then
     echo "" >&2
     if [ "$content_drift" -ne 0 ]; then
       echo "$recovery" >&2
     fi
     if [ "$unpinned_found" -ne 0 ]; then
       unpinned_disposition
+    fi
+    if [ "$symlink_found" -ne 0 ]; then
+      symlink_disposition
     fi
     exit 1
   fi
@@ -177,11 +214,19 @@ if [ "$check_only" -eq 1 ]; then
 fi
 
 # Sync mode. Audit BEFORE writing anything: refusing after a partial copy would
-# leave the tree in a state neither the exit code nor the banner describes.
+# leave the tree in a state neither the exit code nor the banner describes. The
+# symlink audit in particular MUST precede the copy loop — that is the write it
+# exists to prevent.
 audit_unpinned_references
-if [ "$unpinned_found" -ne 0 ]; then
+audit_symlink_references
+if [ "$unpinned_found" -ne 0 ] || [ "$symlink_found" -ne 0 ]; then
   echo "refusing to sync the legacy project skill mirror; nothing was written." >&2
-  unpinned_disposition
+  if [ "$unpinned_found" -ne 0 ]; then
+    unpinned_disposition
+  fi
+  if [ "$symlink_found" -ne 0 ]; then
+    symlink_disposition
+  fi
   exit 1
 fi
 

@@ -40,6 +40,10 @@ Grace period 中の運用:
 - `--check` mode は書き込まずに exit 1 を返す fail-closed gate で、`mozyo-bridge release check drift` の 3 番目の sub-check として実行される。content 差分、mirror file 欠落、pin 外 reference の混入、canonical source 欠落のいずれも drift として落とす。
 - **pin 外 reference は sync mode も拒否する (exit 1・書き込みなし)。** この class だけは sync が解消しない (tracked file の削除は sync の副作用ではなく reviewed decision) ため、sync が成功表示を返すと「rerun して復旧」という運用契約が収束しなくなる。解消できない drift class の存在下で成功を報告しない、が本 script の契約である (Redmine #14580 review j#90322 F1)。audit は書き込み前に走るので、拒否時の worktree は無変更のまま。
 - 復旧案内は drift class ごとに出し分ける。content 差分 / mirror file 欠落 = sync の再実行で解消。pin 外 reference = 削除するか script と test の pinned set を同一 commit で更新する (`release check drift` の blocker 行も同じ出し分けを持つ)。「どの drift でも sync を再実行」という単一案内は書かない。
+- **mirror の reference に symlink を置かない (pin 済み name も含めて禁止)。** mirror は byte copy なので symlink は正しい entry になり得ず、実害が 2 系統ある (Redmine #14580 review j#90322 R2-F1 とその実測):
+  - dangling symlink は `[ -e ]` が false になるため、素朴な glob no-match guard では「glob が未展開」と同じ扱いで skip され、pin 外 entry がある状態で両 mode が exit 0 を返す。guard は `[ -e "$path" ] || [ -L "$path" ]` の対で書く。
+  - pin 済み name が symlink だと content parity は link を辿って通過し、sync の `cp` が **link 先へ書き込む**。`references/safety.md` を無関係な file への symlink にすると、その file が canonical 本文で上書きされたうえで sync は exit 0 と成功表示を返す (実測)。
+  - script は両 mode で symlink entry を拒否し、`LegacyProjectSkillMirrorTest` も (a) exact-set 計算から `is_file()` filter を外し (これも symlink を辿るため dangling entry を落とす)、(b) symlink 不在を独立に assert する。
 - pinned reference 集合は script と `LegacyProjectSkillMirrorTest` の両方が持つ (shell から Python tuple は import できない)。`LegacySkillSyncScriptTest::test_script_pinned_set_matches_this_modules_pinned_set` が両者の一致を assert するので、片側だけ更新すると落ちる。mirror する reference を増減するときは script・test・本節を同一 commit で更新する。
 
 Removal criteria (本 grace period を解除する条件):
