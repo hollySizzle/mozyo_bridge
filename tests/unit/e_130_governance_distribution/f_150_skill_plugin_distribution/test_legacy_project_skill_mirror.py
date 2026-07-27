@@ -38,9 +38,11 @@ now, so there is nothing to cross-check and nothing to drift.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -68,7 +70,9 @@ from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.
     MIRRORED_REFERENCES,
     PATH_COMPONENT_NOT_DIRECTORY,
     PATH_COMPONENT_SYMLINK,
+    CLEANUP_FAILED,
     PLATFORM_UNSUPPORTED,
+    RECOVERY_REPLACE_ENTRY,
     RECOVERY_RESYNC,
     RULE_CONTENT_PARITY,
     SOURCE_MISSING,
@@ -76,6 +80,7 @@ from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.
     SOURCE_SYMLINK,
     SOURCE_UNREADABLE,
     UNPINNED_ENTRY,
+    WRITE_FAILED,
 )
 
 #: The thin wrapper `release check drift` and operators invoke.
@@ -184,8 +189,16 @@ class LegacyProjectSkillMirrorTest(unittest.TestCase):
 class _MirrorTreeFixture(unittest.TestCase):
     """Builds a self-contained mirror tree in a temp dir."""
 
-    def _stage(self) -> Path:
-        tmp = Path(tempfile.mkdtemp())
+    def _stage(self, *, base: str | None = None) -> Path:
+        """Build a mirror tree. ``base`` shortens the path when a case needs it.
+
+        A Unix socket path is capped near 104 bytes, so binding one inside the
+        default temp directory raises `AF_UNIX path too long` — which made the
+        socket case an environment-dependent error rather than a test. Staging
+        that case under a short base keeps it real everywhere instead of
+        skipping it.
+        """
+        tmp = Path(tempfile.mkdtemp(dir=base))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         source = tmp / SOURCE_RELATIVE
         source.mkdir(parents=True)
@@ -958,16 +971,180 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         ]
         self.assertEqual([], leftovers, "staging file survived a failed replace")
 
-    def test_payload_is_written_in_full(self) -> None:
-        """A single `os.write` may write fewer bytes than asked."""
+    def test_payload_is_written_in_full_under_injected_short_writes(self) -> None:
+        """j#90458 R8-F4. Writing a large regular file does not exercise this:
+        this platform's `os.write` returns the full count, so reverting the loop
+        to a single call passes. The short return has to be injected.
+        """
         repo = self._stage()
         canonical = self._source(repo) / "workflow.md"
-        canonical.write_bytes(b"A" * (1 << 20))
-        self.assertEqual(0, self._service(repo).sync()[0])
-        self.assertEqual(
-            b"A" * (1 << 20), (self._mirror(repo) / "workflow.md").read_bytes()
-        )
+        canonical.write_bytes(b"B" * 100)
+
+        real_write = os.write
+        calls: list[int] = []
+
+        def short_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            calls.append(len(data))
+            return real_write(fd, bytes(data[:7]))
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", short_write):
+            self.assertEqual(0, self._service(repo).sync()[0])
+
+        self.assertGreater(len(calls), 1, "the write loop collapsed into one call")
+        self.assertEqual(b"B" * 100, (self._mirror(repo) / "workflow.md").read_bytes())
         self.assertEqual(0, self._service(repo).check()[0])
+
+    def test_a_write_that_never_progresses_is_bounded(self) -> None:
+        """A zero-return write must fail, not spin."""
+        repo = self._stage()
+        (self._source(repo) / "workflow.md").write_bytes(b"C" * 100)
+
+        outcome: list[object] = []
+
+        def run() -> None:
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "write", lambda fd, data: 0
+            ):
+                outcome.append(self._service(repo).sync())
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=30)
+        self.assertFalse(worker.is_alive(), "a stalled write span looped forever")
+        code, out, err = outcome[0]  # type: ignore[misc]
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        self.assertIn("[W/", "\n".join(err))
+
+    # --- R8-F1/F2/F3: late types, teardown, and replace classification -------
+
+    def test_late_type_swaps_all_carry_rule_e_weight(self) -> None:
+        """j#90458 R8-F1. Every leaf-open failure collapsed to "unreadable", so
+        a late symlink and a late socket were reported as rule F — non-blocking,
+        advising "restore read access" — instead of the type failure they are.
+        """
+        for kind in ("symlink", "socket", "fifo", "directory"):
+            with self.subTest(kind=kind):
+                # The socket case needs a short path (see `_stage`).
+                repo = self._stage(base="/tmp" if kind == "socket" else None)
+                external = repo / "external.md"
+                shutil.copy(self._mirror(repo) / "safety.md", external)
+
+                service = self._service(repo)
+                original = service._audit_dest_entries
+
+                def swap(mirror_fd: int, kind=kind, repo=repo, external=external):  # type: ignore[no-untyped-def]
+                    result = original(mirror_fd)
+                    entry = self._mirror(repo) / "safety.md"
+                    entry.unlink()
+                    if kind == "symlink":
+                        entry.symlink_to(external)
+                    elif kind == "socket":
+                        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        try:
+                            sock.bind(str(entry))
+                        finally:
+                            sock.close()
+                        assert stat.S_ISSOCK(os.lstat(entry).st_mode)
+                    elif kind == "fifo":
+                        os.mkfifo(entry)
+                    else:
+                        entry.mkdir()
+                    return result
+
+                service._audit_dest_entries = swap  # type: ignore[method-assign]
+                audit = service.audit()
+                self.assertTrue(audit.blocks_write, f"late {kind} did not block the write")
+                self.assertEqual((RECOVERY_REPLACE_ENTRY,), audit.recovery_actions())
+
+    def test_close_failure_does_not_escape_either_mode(self) -> None:
+        """j#90458 R8-F2. `os.close` was uncaught everywhere, so a failing close
+        became a traceback in the CLI and the release gate."""
+        real_close = os.close
+
+        def failing_close(fd: int) -> None:
+            real_close(fd)
+            raise OSError(errno.EIO, "injected close failure")
+
+        for mode in ("check", "sync"):
+            with self.subTest(mode=mode):
+                repo = self._stage()
+                service = self._service(repo)
+                with unittest.mock.patch.object(
+                    legacy_mirror_sync.os, "close", failing_close
+                ):
+                    code, out, _err = getattr(service, mode)()
+                self.assertEqual(1, code)
+                self.assertEqual((), out)
+
+    def test_cleanup_failure_is_reported_with_the_primary_failure(self) -> None:
+        """j#90458 R8-F2. The staging unlink failure was swallowed, so residue
+        stayed on disk unmentioned and the next run refused it as an unpinned
+        entry — neither message described the real state.
+        """
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise OSError(errno.ENOSPC, "injected")
+
+        def failing_unlink(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise PermissionError(errno.EACCES, "injected")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", failing_write):
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "unlink", failing_unlink
+            ):
+                code, out, err = self._service(repo).sync()
+
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        report = "\n".join(err)
+        self.assertIn(WRITE_FAILED, report, "the primary failure was lost")
+        self.assertIn(CLEANUP_FAILED, report, "surviving residue went unreported")
+        self.assertIn("still present", report)
+
+    def test_replace_failure_is_classified_by_what_actually_happened(self) -> None:
+        """j#90458 R8-F3. Every `os.replace` error was reported as "it is no
+        longer a regular file" — an untrue statement for a permission failure,
+        pointing at the wrong recovery.
+        """
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        def failing_replace(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise PermissionError(errno.EACCES, "injected")
+
+        with unittest.mock.patch.object(
+            legacy_mirror_sync.os, "replace", failing_replace
+        ):
+            code, out, err = self._service(repo).sync()
+
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        report = "\n".join(err)
+        self.assertIn(WRITE_FAILED, report)
+        self.assertNotIn("no longer a regular file", report)
+        self.assertIn("check write permission", report)
+
+    def test_replace_onto_a_changed_type_still_says_so(self) -> None:
+        """The converse: don't over-correct into never naming a type change."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        def hook(event: str) -> None:
+            if event == HOOK_TEMP_CREATED:
+                entry = self._mirror(repo) / "project-map.md"
+                if entry.is_file():
+                    entry.unlink()
+                    entry.mkdir()
+
+        code, _out, err = self._service(repo, progress_hook=hook).sync()
+        self.assertEqual(1, code)
+        self.assertIn("no longer a regular file", "\n".join(err))
 
     # --- R7-F4: the capability manifest is the call surface -------------------
 
@@ -1000,7 +1177,10 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
     def test_capability_manifest_covers_the_primitives_the_module_calls(self) -> None:
         """Guard the manifest against the module drifting away from it."""
         source = Path(legacy_mirror_sync.__file__).read_text(encoding="utf-8")
-        body = source.split("class LegacyProjectSkillMirrorSync", 1)[1]
+        # Scan the WHOLE module: restricting it to the class body meant a call
+        # moved to a module-level helper escaped the fence while still being a
+        # platform-dependent primitive (j#90458 R8-F4).
+        body = source
         listed = {
             getattr(function, "__name__", "")
             for _label, function in legacy_mirror_sync._REQUIRED_DIR_FD_CALLS

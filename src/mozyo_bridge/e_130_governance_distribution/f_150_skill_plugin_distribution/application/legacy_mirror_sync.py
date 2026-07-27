@@ -50,6 +50,7 @@ distinguish its own crash residue from a file someone meant to keep.
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from collections.abc import Callable, Iterator
@@ -57,6 +58,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ..domain.legacy_mirror_contract import (
+    CLEANUP_FAILED,
     CONTENT_DRIFT,
     ENTRY_MISSING,
     ENTRY_NOT_REGULAR,
@@ -76,6 +78,7 @@ from ..domain.legacy_mirror_contract import (
     RULE_PLATFORM,
     RULE_SOURCE_ENTRIES,
     RULE_SOURCE_TOPOLOGY,
+    RULE_WRITE,
     SOURCE_MISSING,
     SOURCE_NOT_REGULAR,
     SOURCE_RELATIVE,
@@ -83,6 +86,7 @@ from ..domain.legacy_mirror_contract import (
     SOURCE_SYMLINK,
     SOURCE_UNREADABLE,
     UNPINNED_ENTRY,
+    WRITE_FAILED,
     MirrorAudit,
     Violation,
     describe_name,
@@ -132,6 +136,22 @@ def missing_platform_capabilities() -> tuple[str, ...]:
     if os.scandir not in os.supports_fd:
         missing.append("scandir(fd)")
     return tuple(missing)
+
+
+
+def _close_quietly(fd: int) -> bool:
+    """Close a descriptor, reporting failure rather than raising.
+
+    A failing `close` is not a fact about the mirror, but letting it escape
+    turned every caller — the CLI, `release check drift` — back into a
+    traceback (j#90458 R8-F2). Callers that care fold the ``False`` into their
+    typed result; the rest simply must not crash on teardown.
+    """
+    try:
+        os.close(fd)
+    except OSError:
+        return False
+    return True
 
 
 class LegacyProjectSkillMirrorSync:
@@ -243,13 +263,13 @@ class LegacyProjectSkillMirrorSync:
                     else:
                         assert violation is not None
                         return None, (violation,), False
-                os.close(parent)
+                _close_quietly(parent)
                 parent = child
             handed_over = True
             return parent, (), False
         finally:
             if not handed_over:
-                os.close(parent)
+                _close_quietly(parent)
 
     @contextmanager
     def _bound(self, relative: str, rule: str, *, create: bool = False) -> Iterator[
@@ -260,7 +280,30 @@ class LegacyProjectSkillMirrorSync:
             yield fd, violations, missing
         finally:
             if fd is not None:
-                os.close(fd)
+                _close_quietly(fd)
+
+    @staticmethod
+    def _entry_failure_kind(dir_fd: int, name: str) -> str:
+        """Why an entry could not be opened: a TYPE problem or an access one.
+
+        Collapsing every leaf-open ``OSError`` into "unreadable" mislabelled the
+        two cases the open exists to reject: a symlink (refused by
+        ``O_NOFOLLOW``) and a socket (refused as a special file) were reported
+        as rule F unreadable — non-blocking, with "restore read access" advice
+        that does not converge — instead of the rule E type failure they are
+        (j#90458 R8-F1). A no-follow ``lstat`` through the same bound descriptor
+        tells them apart; only a genuine access failure on a regular file stays
+        in the unreadable class.
+        """
+        try:
+            info = os.lstat(name, dir_fd=dir_fd)
+        except OSError:
+            return ENTRY_UNREADABLE
+        if stat.S_ISLNK(info.st_mode):
+            return ENTRY_SYMLINK
+        if not stat.S_ISREG(info.st_mode):
+            return ENTRY_NOT_REGULAR
+        return ENTRY_UNREADABLE
 
     @staticmethod
     def _read_bound(dir_fd: int, name: str) -> tuple[bytes | None, str | None]:
@@ -281,22 +324,30 @@ class LegacyProjectSkillMirrorSync:
         try:
             fd = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
         except OSError:
-            return None, ENTRY_UNREADABLE
+            return None, LegacyProjectSkillMirrorSync._entry_failure_kind(dir_fd, name)
+        payload: bytes | None = None
+        failure: str | None = None
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode):
-                return None, ENTRY_NOT_REGULAR
-            chunks: list[bytes] = []
-            while True:
-                chunk = os.read(fd, 1 << 16)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            return b"".join(chunks), None
+                failure = ENTRY_NOT_REGULAR
+            else:
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(fd, 1 << 16)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                payload = b"".join(chunks)
         except OSError:
-            return None, ENTRY_UNREADABLE
+            failure = ENTRY_UNREADABLE
         finally:
-            os.close(fd)
+            # A failing `close` used to escape as a bare `OSError`, which the
+            # CLI and the release gate turned back into a traceback
+            # (j#90458 R8-F2).
+            if not _close_quietly(fd):
+                payload, failure = None, ENTRY_UNREADABLE
+        return payload, failure
 
     # --- rules --------------------------------------------------------------
 
@@ -396,10 +447,15 @@ class LegacyProjectSkillMirrorSync:
 
             source_payload, source_failure = self._read_bound(source_fd, name)
             if source_failure is not None:
+                source_kind = {
+                    ENTRY_UNREADABLE: SOURCE_UNREADABLE,
+                    ENTRY_SYMLINK: SOURCE_SYMLINK,
+                    ENTRY_NOT_REGULAR: SOURCE_NOT_REGULAR,
+                }.get(source_failure, SOURCE_UNREADABLE)
                 found.append(
                     Violation(
                         RULE_SOURCE_ENTRIES,
-                        SOURCE_UNREADABLE if source_failure == ENTRY_UNREADABLE else source_failure,
+                        source_kind,
                         f"{SOURCE_RELATIVE}/{name}",
                         "could not be read as a regular file",
                     )
@@ -415,7 +471,7 @@ class LegacyProjectSkillMirrorSync:
                 # (j#90450 R7-F2).
                 rule = (
                     RULE_DEST_ENTRY_TYPES
-                    if mirror_failure == ENTRY_NOT_REGULAR
+                    if mirror_failure in (ENTRY_NOT_REGULAR, ENTRY_SYMLINK)
                     else RULE_CONTENT_PARITY
                 )
                 found.append(Violation(rule, mirror_failure, subject, "could not be read as a regular file"))
@@ -476,15 +532,19 @@ class LegacyProjectSkillMirrorSync:
 
     # --- writing -----------------------------------------------------------
 
-    def _replace_one(self, source_fd: int, mirror_fd: int, name: str) -> Violation | None:
+    def _replace_one(
+        self, source_fd: int, mirror_fd: int, name: str
+    ) -> tuple[Violation, ...]:
         """Copy one pinned reference into place, entirely through bound fds."""
         payload, failure = self._read_bound(source_fd, name)
         if failure is not None:
-            return Violation(
-                RULE_SOURCE_ENTRIES,
-                SOURCE_SWAPPED_DURING_SYNC,
-                f"{SOURCE_RELATIVE}/{name}",
-                "could not be read as a regular file at write time",
+            return (
+                Violation(
+                    RULE_SOURCE_ENTRIES,
+                    SOURCE_SWAPPED_DURING_SYNC,
+                    f"{SOURCE_RELATIVE}/{name}",
+                    "could not be read as a regular file at write time",
+                ),
             )
 
         temp_name = f"{_TEMP_PREFIX}{os.urandom(8).hex()}.tmp"
@@ -496,32 +556,47 @@ class LegacyProjectSkillMirrorSync:
                 dir_fd=mirror_fd,
             )
         except OSError:
-            return Violation(
-                RULE_DEST_ENTRY_SET, PATH_UNREADABLE, MIRROR_RELATIVE, "staging file could not be created"
+            return (
+                Violation(
+                    RULE_WRITE, WRITE_FAILED, MIRROR_RELATIVE, "staging file could not be created"
+                ),
             )
 
         owned = temp_name
+        residue: list[Violation] = []
         try:
             try:
                 # A single `os.write` may write fewer bytes than asked; loop
                 # until the payload is out (j#90450 R7-F3).
                 view = memoryview(payload or b"")
+                # A single `os.write` may write fewer bytes than asked
+                # (j#90450 R7-F3). A run of zero-progress writes would spin
+                # forever, so it is bounded and reported instead.
+                stalled = 0
                 while view:
-                    view = view[os.write(temp_fd, view) :]
+                    written = os.write(temp_fd, view)
+                    if written <= 0:
+                        stalled += 1
+                        if stalled > 16:
+                            raise OSError(errno.EIO, "write made no progress")
+                        continue
+                    stalled = 0
+                    view = view[written:]
                 # `fchmod` on our own descriptor: a path-based `chmod` here
                 # changed a victim's mode when the temp name was re-bound to a
                 # symlink between create and chmod (j#90418 R6-F1 case 4).
                 os.fchmod(temp_fd, 0o644)
                 created = os.fstat(temp_fd)
             except OSError:
-                return Violation(
-                    RULE_DEST_ENTRY_SET,
-                    ENTRY_UNREADABLE,
-                    f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
+                write_failure = Violation(
+                    RULE_WRITE,
+                    WRITE_FAILED,
+                    f"{MIRROR_RELATIVE}/{describe_name(name)}",
                     "staging file could not be written",
                 )
+                return (write_failure,) + self._release_staging(mirror_fd, temp_name)
             finally:
-                os.close(temp_fd)
+                _close_quietly(temp_fd)
 
             self._notify(HOOK_TEMP_CREATED)
 
@@ -535,55 +610,96 @@ class LegacyProjectSkillMirrorSync:
                 verify_fd = os.open(temp_name, _FILE_FLAGS, dir_fd=mirror_fd)
             except OSError:
                 owned = ""  # not ours any more; do not unlink someone else's entry
-                return Violation(
-                    RULE_DEST_ENTRY_SET,
-                    ENTRY_UNREADABLE,
-                    f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
-                    "staging entry was replaced while the sync held it",
+                return (
+                    Violation(
+                        RULE_WRITE,
+                        WRITE_FAILED,
+                        f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
+                        "staging entry was replaced while the sync held it",
+                    ),
                 )
             try:
                 current = os.fstat(verify_fd)
             except OSError:
                 owned = ""
-                return Violation(
-                    RULE_DEST_ENTRY_SET,
-                    ENTRY_UNREADABLE,
-                    f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
-                    "staging entry could not be re-validated",
+                return (
+                    Violation(
+                        RULE_WRITE,
+                        WRITE_FAILED,
+                        f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
+                        "staging entry could not be re-validated",
+                    ),
                 )
             finally:
-                os.close(verify_fd)
+                _close_quietly(verify_fd)
             if (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino):
                 owned = ""
-                return Violation(
-                    RULE_DEST_ENTRY_SET,
-                    ENTRY_UNREADABLE,
-                    f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
-                    "staging entry was rebound while the sync held it",
+                return (
+                    Violation(
+                        RULE_WRITE,
+                        WRITE_FAILED,
+                        f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
+                        "staging entry was rebound while the sync held it",
+                    ),
                 )
 
             try:
                 os.replace(temp_name, name, src_dir_fd=mirror_fd, dst_dir_fd=mirror_fd)
             except OSError:
-                # e.g. the destination became a directory after the preflight —
-                # `IsADirectoryError` used to escape as a traceback through the
-                # CLI and the release gate (j#90450 R7-F3). The staging file is
-                # still ours, so the `finally` below removes it.
-                return Violation(
-                    RULE_DEST_ENTRY_TYPES,
-                    ENTRY_NOT_REGULAR,
-                    f"{MIRROR_RELATIVE}/{describe_name(name)}",
-                    "could not be replaced; it is no longer a regular file",
-                )
+                # Say what actually happened. Reporting every failure as "it is
+                # no longer a regular file" stated a fact that was often untrue
+                # — an injected `PermissionError` produced exactly that message
+                # against a destination that was still a regular file — and it
+                # pointed at the wrong recovery (j#90458 R8-F3). Observe the
+                # destination through the bound descriptor and classify.
+                kind = self._entry_failure_kind(mirror_fd, name)
+                if kind in (ENTRY_SYMLINK, ENTRY_NOT_REGULAR):
+                    failure = Violation(
+                        RULE_DEST_ENTRY_TYPES,
+                        kind,
+                        f"{MIRROR_RELATIVE}/{describe_name(name)}",
+                        "could not be replaced; it is no longer a regular file",
+                    )
+                else:
+                    failure = Violation(
+                        RULE_WRITE,
+                        WRITE_FAILED,
+                        f"{MIRROR_RELATIVE}/{describe_name(name)}",
+                        "could not be replaced",
+                    )
+                owned = ""
+                return (failure,) + self._release_staging(mirror_fd, temp_name)
             owned = ""
         finally:
             if owned:
-                # Only ever this run's exact name, relative to the bound mirror.
-                try:
-                    os.unlink(owned, dir_fd=mirror_fd)
-                except OSError:
-                    pass
-        return None
+                extra = self._release_staging(mirror_fd, owned)
+                if extra:
+                    residue.extend(extra)
+        return tuple(residue)
+
+    @staticmethod
+    def _release_staging(mirror_fd: int, temp_name: str) -> tuple[Violation, ...]:
+        """Remove this run's staging entry, reporting if it could not be.
+
+        Swallowing the unlink failure left residue on disk while the
+        diagnostic said nothing about it; the next run then refused that
+        residue as an unpinned entry demanding a reviewed disposition, so
+        neither message described the real state (j#90458 R8-F2).
+        """
+        try:
+            os.unlink(temp_name, dir_fd=mirror_fd)
+        except FileNotFoundError:
+            return ()
+        except OSError:
+            return (
+                Violation(
+                    RULE_WRITE,
+                    CLEANUP_FAILED,
+                    f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
+                    "staging file could not be removed and is still present",
+                ),
+            )
+        return ()
 
     # --- entry points ------------------------------------------------------
 
@@ -624,11 +740,11 @@ class LegacyProjectSkillMirrorSync:
                         *MirrorAudit(violations=mirror_violations or ()).report_lines(),
                     )
                 for name in MIRRORED_REFERENCES:
-                    swapped = self._replace_one(source_fd, mirror_fd, name)
-                    if swapped is not None:
+                    problems = self._replace_one(source_fd, mirror_fd, name)
+                    if problems:
                         return 1, (), (
                             "aborted the legacy project skill mirror sync.",
-                            swapped.message(),
+                            *MirrorAudit(violations=problems).report_lines(),
                             "",
                             "The tree changed underneath the sync, or the write could not",
                             "complete. Nothing outside the mirror was modified. Re-run once the",

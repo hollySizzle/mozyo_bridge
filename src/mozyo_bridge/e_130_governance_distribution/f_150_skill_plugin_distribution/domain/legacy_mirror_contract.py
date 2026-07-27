@@ -61,6 +61,12 @@ RULE_DEST_ENTRY_TYPES = "E"  # every pinned mirror entry is a regular file
 RULE_CONTENT_PARITY = "F"  # every pinned mirror entry matches its source
 #: Not a tree rule: the host itself cannot support the contract's primitives.
 RULE_PLATFORM = "P"
+#: Not a tree rule either: the write itself failed for a reason that is not a
+#: statement about the tree's shape — permission, free space, a read-only
+#: mount, an I/O error. Collapsing these into "the destination is no longer a
+#: regular file" reported a fact that was not true and pointed at the wrong
+#: recovery (j#90458 R8-F3).
+RULE_WRITE = "W"
 
 #: The rules the sync cannot repair. A breach of any of them means write zero.
 #: Rule F is absent on purpose — repairing content drift IS the sync.
@@ -72,6 +78,7 @@ WRITE_BLOCKING_RULES: frozenset[str] = frozenset(
         RULE_DEST_ENTRY_SET,
         RULE_DEST_ENTRY_TYPES,
         RULE_PLATFORM,
+        RULE_WRITE,
     }
 )
 
@@ -99,6 +106,10 @@ ENTRY_UNREADABLE = "entry_unreadable"
 #: path is built on. Fail closed rather than silently degrade to path-based I/O
 #: (j#90418 R6-F1 correction condition 4).
 PLATFORM_UNSUPPORTED = "platform_unsupported"
+#: The write could not be completed, for a reason unrelated to entry type.
+WRITE_FAILED = "write_failed"
+#: The staging file could not be removed after a failed write, so it remains.
+CLEANUP_FAILED = "cleanup_failed"
 
 #: Kinds that mean "could not observe", as opposed to "observed something bad".
 UNREADABLE_KINDS: frozenset[str] = frozenset(
@@ -113,6 +124,8 @@ RECOVERY_RESTORE_MIRROR_PATH = "restore_mirror_path"
 RECOVERY_RESTORE_ACCESS = "restore_access"
 RECOVERY_DISPOSITION_UNPINNED = "disposition_unpinned"
 RECOVERY_REPLACE_ENTRY = "replace_entry"
+RECOVERY_WRITE_FAILED = "write_failed"
+RECOVERY_CLEAR_RESIDUE = "clear_residue"
 RECOVERY_RESYNC = "resync"
 
 _RECOVERY_TEXT: dict[str, tuple[str, ...]] = {
@@ -121,6 +134,17 @@ _RECOVERY_TEXT: dict[str, tuple[str, ...]] = {
         "mirror sync is built on, so it cannot guarantee that it writes inside the mirror.",
         "It refuses rather than fall back to path-based I/O, which is what allowed an",
         "aliased path to be written through. Run the sync on a POSIX host.",
+    ),
+    RECOVERY_WRITE_FAILED: (
+        "The mirror could not be written. This is not a statement about the entry's type:",
+        "check write permission on the mirror directory, free space, and whether the",
+        "filesystem is mounted read-only, then rerun. Nothing outside the mirror was",
+        "modified.",
+    ),
+    RECOVERY_CLEAR_RESIDUE: (
+        "A staging file this sync created could not be removed and is still present. It",
+        "will block the next run as an unpinned entry. It is this tool's own residue, so",
+        "deleting it is safe once the underlying permission or filesystem problem is fixed.",
     ),
     RECOVERY_RESTORE_ACCESS: (
         "Part of the tree could not be read. Restore read access (and, for the canonical",
@@ -258,6 +282,10 @@ class MirrorAudit:
             actions.append(RECOVERY_DISPOSITION_UNPINNED)
         if self.has_rule(RULE_DEST_ENTRY_TYPES):
             actions.append(RECOVERY_REPLACE_ENTRY)
+        if self.has_rule(RULE_WRITE):
+            actions.append(RECOVERY_WRITE_FAILED)
+        if CLEANUP_FAILED in kinds:
+            actions.append(RECOVERY_CLEAR_RESIDUE)
 
         resync_clears = self.has_rule(RULE_CONTENT_PARITY) or self.dest_missing
         blocked_upstream = bool(actions)
