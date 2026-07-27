@@ -46,6 +46,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     FENCE_UNAVAILABLE,
     PROVIDER_RESOLVED,
     PROVIDER_UNRESOLVED,
+    TARGET_OK,
     DELIVER,
     REASON_DELIVERY_UNCERTAIN,
     REASON_FENCE_UNAVAILABLE,
@@ -55,6 +56,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ProxyDecision,
     ProxyLinks,
     DecisionRecord,
+    LaneExpectation,
     anchor_status_for,
     decide_proxy_delegation,
     normalize_action,
@@ -106,6 +108,8 @@ class ProxyContext:
     journal: str = ""
     #: the issue's durable decisions in note order (the anchor evidence).
     decisions: "tuple[DecisionRecord, ...]" = ()
+    #: the action-time lifecycle facts for the lane the decision names (``None`` = unresolved).
+    lane_expectation: "Optional[LaneExpectation]" = None
     authority_reason: str = ""
     detail: str = ""
 
@@ -323,6 +327,123 @@ def resolve_proxy_target(
     )
 
 
+def live_lane_expectation(repo_root, lane: str) -> "Optional[LaneExpectation]":
+    """The action-time lifecycle facts for ``lane``, or ``None`` when unreadable (fail-closed).
+
+    Reads the SAME lane lifecycle authority the worker-dispatch admission joins
+    (:class:`...lane_lifecycle.LaneLifecycleStore`), so the proxy and the dispatch rail agree on
+    what a lane's current generation and decision anchor are. Only an ``active`` row with a positive
+    generation counts: a retired / unbound / generation-zero lane has no decision to act on.
+
+    ``None`` is returned for a lane with no row, a disposition that is not active, or any store
+    failure — the classifier then fails closed rather than matching the decision against itself
+    (review j#89969 finding 2).
+    """
+    lane_id = (lane or "").strip()
+    if not lane_id:
+        return None
+    try:
+        from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+        from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+            repo_scope_workspace_id,
+        )
+
+        scope = repo_scope_workspace_id(repo_root)
+        if not scope:
+            return None
+        record = LaneLifecycleStore().get(LaneLifecycleKey(scope, lane_id))
+    except Exception:  # noqa: BLE001 - an unreadable lifecycle authority resolves no expectation
+        return None
+    if record is None:
+        return None
+    generation = int(getattr(record, "lane_generation", 0) or 0)
+    if getattr(record, "lane_disposition", "") != "active" or generation <= 0:
+        return None
+    return LaneExpectation(
+        lane=lane_id,
+        generation=generation,
+        decision_journal=str(getattr(record, "decision_journal", "") or "").strip(),
+    )
+
+
+def resolve_ack_authority(repo_root, *, env) -> "tuple[bool, str, str]":
+    """May the CURRENT process acknowledge a delegation for this workspace? (fail-closed)
+
+    Returns ``(ok, reason, detail)``. The acknowledgement asserts that the **coordinator** acted on
+    a delegated decision, so possession of the delegation's opaque id can never be the credential —
+    the external caller receives that id from its own delegation envelope, and a rail that accepted
+    it would let the caller complete its own delegation and immediately open the route for the next
+    one (review j#89969 finding 1). ``logic-ack-completion-receiver-state`` is explicit that
+    completion truth is never derived from delivery.
+
+    So the ack is admitted only from the live attested default coordinator itself, re-derived here
+    exactly as every other authority link is:
+
+    - an attested launch-time sender identity must be present (an external client has none);
+    - its workspace must be this checkout's registry anchor;
+    - it must sit in the default lane;
+    - its provider must be the one ``provider_binding`` expects for the lane's bound role;
+    - its own slot must pass the generation-bound startup self-attestation join.
+
+    An operator acting on the coordinator's behalf is therefore not admitted by this surface; that
+    would need its own durable authority anchor, which is deliberately out of scope here.
+    """
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (  # noqa: E501
+        resolve_sender_identity,
+    )
+
+    workspace_id = live_workspace_id(repo_root)
+    if not workspace_id:
+        return False, "proxy_workspace_unresolved", (
+            "the workspace anchor could not be derived from the repo checkout"
+        )
+    sender = resolve_sender_identity(env, anchor_workspace_id=workspace_id)
+    if not sender.ok or sender.identity is None:
+        return False, "proxy_ack_unattested", (
+            "this shell carries no attested launch-time lane identity; an acknowledgement asserts "
+            "that the coordinator acted, so it is admitted only from the live attested default "
+            "coordinator itself — never from the external client that received the action id"
+        )
+    identity = sender.identity
+    if identity.workspace_id != workspace_id:
+        return False, "proxy_ack_foreign_workspace", (
+            "the attested sender belongs to a different workspace than this checkout"
+        )
+    if (identity.lane_id or "").strip() not in ("", DEFAULT_LANE):
+        return False, "proxy_ack_not_default_lane", (
+            "the attested sender is not in the default lane; only the default coordinator "
+            "acknowledges its own delegations"
+        )
+    status, role, _scope, _reason = resolve_default_lane_authority(repo_root)
+    if status != AUTHORITY_RESOLVED:
+        return False, "proxy_coordinator_authority_missing", (
+            "no usable durable workflow-role authority binds this workspace's default lane"
+        )
+    provider = resolve_expected_provider(repo_root, role)
+    if not provider or identity.role != provider:
+        return False, "proxy_ack_provider_mismatch", (
+            "the attested sender's provider is not the one provider_binding expects for the "
+            "bound default-lane role"
+        )
+    # The acknowledging process must BE the live attested default coordinator, not merely claim
+    # its identity: resolve that slot the same way a delegation target is resolved (single live
+    # row + generation-bound attestation join) and require the caller's own assigned name to be it.
+    target = resolve_proxy_target(
+        live_agent_rows(env), workspace_id=workspace_id, provider=provider
+    )
+    if target.status != TARGET_OK:
+        return False, "proxy_ack_unattested", (
+            f"the live default-lane coordinator slot is {target.status!r}; an acknowledgement "
+            "needs a single live generation-attested coordinator"
+        )
+    if target.assigned_name != identity.assigned_name:
+        return False, "proxy_ack_unattested", (
+            "the attested sender is not the live default-lane coordinator slot"
+        )
+    return True, "", "attested default coordinator"
+
+
 def resolve_default_lane_authority(repo_root) -> "tuple[str, str, str, str]":
     """The default lane's durable role + scope, its status, and a blocked reason (if any).
 
@@ -390,6 +511,7 @@ def resolve_proxy_context(
     decision_journals_provider: Optional[Callable[..., "tuple[DecisionRecord, ...]"]] = None,
     workspace_provider: Optional[Callable[..., str]] = None,
     attestation_join: Optional[Callable[..., "tuple[bool, str, str]"]] = None,
+    lane_expectation_provider: Optional[Callable[..., "Optional[LaneExpectation]"]] = None,
 ) -> ProxyContext:
     """Re-derive every authority link at action time and assemble the matrix input (no fence).
 
@@ -430,7 +552,17 @@ def resolve_proxy_context(
     decisions: "tuple[DecisionRecord, ...]" = ()
     if issue and journal:
         decisions = tuple(resolve_decisions(issue) or ())
-    anchor_status = anchor_status_for(journal, action=action, decisions=decisions)
+    # The lane to resolve live facts for is the one the DECISION names — never one the caller
+    # supplies, and never the coordinator's own lane. A decision that names no lane is classified
+    # `decision_incomplete` before the expectation is consulted.
+    declared_lane = next(
+        (r.lane for r in decisions if r.journal == journal and r.lane.strip()), ""
+    )
+    resolve_expectation = lane_expectation_provider or live_lane_expectation
+    expectation = resolve_expectation(repo_root, declared_lane) if declared_lane else None
+    anchor_status = anchor_status_for(
+        journal, action=action, decisions=decisions, expected=expectation
+    )
 
     links = ProxyLinks(
         action=action,
@@ -451,6 +583,7 @@ def resolve_proxy_context(
         issue=issue,
         journal=journal,
         decisions=decisions,
+        lane_expectation=expectation,
         authority_reason=authority_reason,
     )
 
@@ -666,7 +799,9 @@ __all__ = (
     "live_decision_journals",
     "decision_journals_from_entries",
     "live_attestation_join",
+    "live_lane_expectation",
     "resolve_proxy_target",
+    "resolve_ack_authority",
     "resolve_default_lane_authority",
     "resolve_expected_provider",
     "resolve_proxy_context",

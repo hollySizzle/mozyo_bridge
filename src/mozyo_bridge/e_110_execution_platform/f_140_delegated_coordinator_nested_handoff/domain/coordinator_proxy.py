@@ -108,6 +108,12 @@ ANCHOR_DECISION_INCOMPLETE = "decision_incomplete"
 #: The decision names a lane generation that is no longer the current one for that lane: the lane
 #: was re-created / advanced, so this authorization belongs to a dead generation.
 ANCHOR_GENERATION_STALE = "generation_stale"
+#: The lane the decision names has no readable live lifecycle facts, so nothing can be matched
+#: against it (review j#89969 finding 2). A decision naming a lane the runtime does not know is
+#: not a decision this rail can act on.
+ANCHOR_LANE_UNRESOLVED = "lane_unresolved"
+#: The decision's declared scope does not match the live lane it names.
+ANCHOR_SCOPE_MISMATCH = "scope_mismatch"
 
 FENCE_OPEN = "open"  # the fence reserved this delegation (the single caller cleared to deliver)
 FENCE_DUPLICATE = "duplicate"  # in flight, or this exact decision was already delegated
@@ -133,6 +139,8 @@ REASON_ANCHOR_SUPERSEDED = "proxy_anchor_superseded"
 REASON_ANCHOR_ACTION_MISMATCH = "proxy_anchor_action_mismatch"
 REASON_ANCHOR_DECISION_INCOMPLETE = "proxy_anchor_decision_incomplete"
 REASON_ANCHOR_GENERATION_STALE = "proxy_anchor_generation_stale"
+REASON_ANCHOR_LANE_UNRESOLVED = "proxy_anchor_lane_unresolved"
+REASON_ANCHOR_SCOPE_MISMATCH = "proxy_anchor_scope_mismatch"
 #: The single send fired but did not positively land; the fence holds an ``uncertain`` generation
 #: awaiting an operator reconcile (review j#89878 finding 3). NOT a success.
 REASON_DELIVERY_UNCERTAIN = "proxy_delivery_uncertain"
@@ -157,6 +165,8 @@ _ANCHOR_REASON = {
     ANCHOR_ACTION_MISMATCH: REASON_ANCHOR_ACTION_MISMATCH,
     ANCHOR_DECISION_INCOMPLETE: REASON_ANCHOR_DECISION_INCOMPLETE,
     ANCHOR_GENERATION_STALE: REASON_ANCHOR_GENERATION_STALE,
+    ANCHOR_LANE_UNRESOLVED: REASON_ANCHOR_LANE_UNRESOLVED,
+    ANCHOR_SCOPE_MISMATCH: REASON_ANCHOR_SCOPE_MISMATCH,
 }
 
 _FENCE_REASON = {
@@ -337,31 +347,53 @@ def _generation_ordinal(value: object) -> Optional[int]:
     return int(token) if token.isdigit() else None
 
 
-def anchor_status_for(journal: str, *, action: str, decisions: "tuple[DecisionRecord, ...]") -> str:
-    """Classify a requested journal as this action's current durable decision (pure, fail-closed).
+@dataclass(frozen=True)
+class LaneExpectation:
+    """The live lifecycle facts for the lane a decision names (value object).
 
-    ``decisions`` are the issue's workflow-event decisions in note order, as read from
-    source-of-truth Redmine (prose is never a source). The classification is the **pair**
-    (action, journal) *scoped to a lane generation*, because each of those three alone is
-    insufficient:
+    Resolved at action time from the lane lifecycle authority — never from the decision itself and
+    never from the caller. ``decision_journal`` is the journal the lane's lifecycle currently
+    records as its decision anchor; it is the field that makes a *quotation* of a real decision
+    distinguishable from the decision (review j#89969 finding 2).
+    """
 
-    - the journal carries none of this issue's workflow-event markers -> :data:`ANCHOR_UNVERIFIED`.
-      An unreachable Redmine produces no decisions at all, so a failed live read can never look
-      like a verified anchor;
-    - the journal carries a marker, but not one in this action's
-      :data:`ACTION_DECISION_TOKENS` -> :data:`ANCHOR_ACTION_MISMATCH`. The anchor is real; it just
-      does not authorize *this* action;
+    lane: str
+    generation: int
+    decision_journal: str
+
+
+def anchor_status_for(
+    journal: str,
+    *,
+    action: str,
+    decisions: "tuple[DecisionRecord, ...]",
+    expected: Optional[LaneExpectation],
+) -> str:
+    """Classify a requested journal against this action's live durable decision (pure, fail-closed).
+
+    ``decisions`` are the issue's workflow-event decisions in note order, read from source-of-truth
+    Redmine. ``expected`` is the **action-time** lifecycle state of the lane the decision names,
+    resolved by the caller from the lane lifecycle authority; ``None`` means it could not be
+    resolved and nothing may be matched against it.
+
+    Matching the decision against itself proves nothing — that was the defect this shape replaces
+    (review j#89969 F2): a lone marker declaring any non-empty lane and any numeric generation
+    verified, so a decision naming a lane that does not exist, or a real lane whose generation had
+    since advanced without a new marker, both passed. Every field is now checked against a live
+    fact the marker cannot assert:
+
+    - the journal carries none of the issue's workflow-event markers -> :data:`ANCHOR_UNVERIFIED`
+      (also what an unreachable Redmine produces, so a failed read never looks verified);
+    - it carries a marker, but none in this action's :data:`ACTION_DECISION_TOKENS` ->
+      :data:`ANCHOR_ACTION_MISMATCH`;
     - the accepted decision omits its ``lane`` / numeric ``lane_generation`` ->
-      :data:`ANCHOR_DECISION_INCOMPLETE`. The canonical producer always writes both; a decision
-      without them cannot be matched against any live fact, and a marker-shaped *quotation* in
-      prose lands here rather than passing as an authorization;
-    - the decision's generation is older than the newest generation declared for that same lane ->
-      :data:`ANCHOR_GENERATION_STALE`. The lane advanced; this authorization is for a dead
-      generation;
-    - a LATER journal carries the same token for the same lane and generation ->
-      :data:`ANCHOR_SUPERSEDED`. Supersession is judged **within the action's own decision series
-      for that lane**, so an unrelated later gate neither stales the real authorization nor stands
-      in for it;
+      :data:`ANCHOR_DECISION_INCOMPLETE`;
+    - the named lane has no readable lifecycle facts -> :data:`ANCHOR_LANE_UNRESOLVED`;
+    - the decision names a different lane than the resolved one -> :data:`ANCHOR_SCOPE_MISMATCH`;
+    - the declared generation is not the lane's live generation -> :data:`ANCHOR_GENERATION_STALE`;
+    - the journal is not the lane's current decision anchor -> :data:`ANCHOR_SUPERSEDED`. This is
+      what refuses a **canonical-shaped marker quoted in another journal**: the quotation reproduces
+      the token, lane and generation exactly, but it is not the journal the lifecycle points at;
     - otherwise -> :data:`ANCHOR_VERIFIED`.
     """
     want = (journal or "").strip()
@@ -370,25 +402,23 @@ def anchor_status_for(journal: str, *, action: str, decisions: "tuple[DecisionRe
         return ANCHOR_UNVERIFIED
 
     accepted_tokens = ACTION_DECISION_TOKENS.get(normalize_action(action), ())
-    accepted = [r for r in rows if r.token in accepted_tokens]
-    mine = [r for r in accepted if r.journal == want]
+    mine = [r for r in rows if r.journal == want and r.token in accepted_tokens]
     if not mine:
         return ANCHOR_ACTION_MISMATCH
 
     record = mine[-1]
     generation = _generation_ordinal(record.lane_generation)
-    if not record.lane.strip() or generation is None:
+    lane = record.lane.strip()
+    if not lane or generation is None:
         return ANCHOR_DECISION_INCOMPLETE
 
-    same_lane = [r for r in accepted if r.lane.strip() == record.lane.strip()]
-    generations = [
-        g for g in (_generation_ordinal(r.lane_generation) for r in same_lane) if g is not None
-    ]
-    if generations and generation < max(generations):
+    if expected is None:
+        return ANCHOR_LANE_UNRESOLVED
+    if lane != expected.lane.strip():
+        return ANCHOR_SCOPE_MISMATCH
+    if generation != expected.generation:
         return ANCHOR_GENERATION_STALE
-
-    current = [r for r in same_lane if _generation_ordinal(r.lane_generation) == generation]
-    if current and current[-1].journal != want:
+    if want != expected.decision_journal.strip():
         return ANCHOR_SUPERSEDED
     return ANCHOR_VERIFIED
 
@@ -415,6 +445,8 @@ __all__ = (
     "ANCHOR_ACTION_MISMATCH",
     "ANCHOR_DECISION_INCOMPLETE",
     "ANCHOR_GENERATION_STALE",
+    "ANCHOR_LANE_UNRESOLVED",
+    "ANCHOR_SCOPE_MISMATCH",
     "FENCE_OPEN",
     "FENCE_DUPLICATE",
     "FENCE_STALE",
@@ -434,6 +466,8 @@ __all__ = (
     "REASON_ANCHOR_ACTION_MISMATCH",
     "REASON_ANCHOR_DECISION_INCOMPLETE",
     "REASON_ANCHOR_GENERATION_STALE",
+    "REASON_ANCHOR_LANE_UNRESOLVED",
+    "REASON_ANCHOR_SCOPE_MISMATCH",
     "REASON_DELIVERY_UNCERTAIN",
     "REASON_DUPLICATE",
     "REASON_STALE",
@@ -443,6 +477,7 @@ __all__ = (
     "ZERO_SEND",
     "normalize_action",
     "DecisionRecord",
+    "LaneExpectation",
     "ProxyLinks",
     "ProxyDecision",
     "decide_proxy_delegation",

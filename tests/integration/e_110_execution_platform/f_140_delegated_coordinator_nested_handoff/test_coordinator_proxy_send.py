@@ -58,6 +58,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ANCHOR_ACTION_MISMATCH,
     ANCHOR_DECISION_INCOMPLETE,
     ANCHOR_GENERATION_STALE,
+    ANCHOR_LANE_UNRESOLVED,
     ANCHOR_SUPERSEDED,
     ANCHOR_UNVERIFIED,
     ANCHOR_VERIFIED,
@@ -66,6 +67,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_ANCHOR_ACTION_MISMATCH,
     REASON_ANCHOR_DECISION_INCOMPLETE,
     REASON_ANCHOR_GENERATION_STALE,
+    REASON_ANCHOR_LANE_UNRESOLVED,
     REASON_ANCHOR_SUPERSEDED,
     REASON_ANCHOR_UNVERIFIED,
     REASON_AUTHORITY_MISSING,
@@ -84,6 +86,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WORKSPACE_UNRESOLVED,
     ZERO_SEND,
     DecisionRecord,
+    LaneExpectation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (  # noqa: E501
     SCHEMA_NAME,
@@ -109,6 +112,19 @@ CURRENT_JOURNAL = "89736"
 OTHER_KIND_JOURNAL = "89873"
 
 LANE = "issue_14546_default_coordinator_authority"
+
+
+def _expectation(generation=2, decision_journal="89736"):
+    """The live lifecycle facts the classifier matches against (injected in these tests)."""
+
+    def _resolve(_repo_root, lane):
+        if lane != LANE:
+            return None
+        return LaneExpectation(
+            lane=LANE, generation=generation, decision_journal=decision_journal
+        )
+
+    return _resolve
 
 #: Canonical dispatch decisions carry lane + generation; the other-kind gate does not.
 DECISIONS = (
@@ -184,6 +200,7 @@ class ProxySendTestBase(unittest.TestCase):
         env=None,
         action=ACTION_DISPATCH_NEXT,
         attestation=None,
+        expectation=None,
     ):
         rows = [_row(WS, "codex")] if rows is None else rows
         decisions = DECISIONS if decisions is None else tuple(decisions)
@@ -198,6 +215,7 @@ class ProxySendTestBase(unittest.TestCase):
             decision_journals_provider=lambda _issue: decisions,
             workspace_provider=lambda _root: workspace,
             attestation_join=attestation or _attested,
+            lane_expectation_provider=expectation or _expectation(),
         )
 
     def _execute(self, context, *, port=None, fence=None, bootstrap=True):
@@ -234,6 +252,14 @@ class ResolutionTest(ProxySendTestBase):
 
     def test_an_older_lane_generation_is_not_verified(self):
         context = self._context(journal=OLDER_JOURNAL)
+        self.assertEqual(context.links.anchor, ANCHOR_GENERATION_STALE)
+
+    def test_a_lane_with_no_live_lifecycle_facts_is_not_verified(self):
+        context = self._context(expectation=lambda _root, _lane: None)
+        self.assertEqual(context.links.anchor, ANCHOR_LANE_UNRESOLVED)
+
+    def test_a_real_lane_advance_stales_the_decision(self):
+        context = self._context(expectation=_expectation(generation=3, decision_journal="90500"))
         self.assertEqual(context.links.anchor, ANCHOR_GENERATION_STALE)
 
     def test_a_decision_without_lane_or_generation_is_not_verified(self):
@@ -394,6 +420,9 @@ class SendCountTest(ProxySendTestBase):
              REASON_ANCHOR_DECISION_INCOMPLETE),
             ("stale lane generation", lambda: self._context(journal=OLDER_JOURNAL),
              REASON_ANCHOR_GENERATION_STALE),
+            ("lane with no live facts",
+             lambda: self._context(expectation=lambda _r, _l: None),
+             REASON_ANCHOR_LANE_UNRESOLVED),
             ("action mismatch", lambda: self._context(journal=OTHER_KIND_JOURNAL),
              REASON_ANCHOR_ACTION_MISMATCH),
             ("unattested target", lambda: self._context(attestation=_unattested("absent")),
@@ -477,7 +506,10 @@ class AcknowledgementLifecycleTest(ProxySendTestBase):
         self.assertTrue(first.sent)
 
         newer, port2 = self._execute(
-            self._context(journal=self.NEWER_JOURNAL, decisions=self.NEWER_DECISIONS)
+            self._context(
+                journal=self.NEWER_JOURNAL, decisions=self.NEWER_DECISIONS,
+                expectation=_expectation(generation=3, decision_journal=self.NEWER_JOURNAL),
+            )
         )
         self.assertFalse(newer.sent)
         self.assertEqual(newer.reason, REASON_DUPLICATE)
@@ -489,7 +521,10 @@ class AcknowledgementLifecycleTest(ProxySendTestBase):
         self.assertTrue(self._ack(first.action_id))
 
         newer, port = self._execute(
-            self._context(journal=self.NEWER_JOURNAL, decisions=self.NEWER_DECISIONS)
+            self._context(
+                journal=self.NEWER_JOURNAL, decisions=self.NEWER_DECISIONS,
+                expectation=_expectation(generation=3, decision_journal=self.NEWER_JOURNAL),
+            )
         )
         self.assertTrue(newer.sent)
         self.assertEqual(len(port.calls), 1)

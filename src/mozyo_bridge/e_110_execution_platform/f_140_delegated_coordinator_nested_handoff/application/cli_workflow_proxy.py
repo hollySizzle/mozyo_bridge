@@ -203,6 +203,7 @@ def cmd_workflow_proxy_ack(args: argparse.Namespace) -> int:
     from mozyo_bridge.core.state.coordinator_proxy_fence import CoordinatorProxyFence
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
         live_workspace_id,
+        resolve_ack_authority,
     )
 
     repo_root = repo_root_from_args(args)
@@ -210,11 +211,16 @@ def cmd_workflow_proxy_ack(args: argparse.Namespace) -> int:
     action_id = (getattr(args, "proxy_action_id", "") or "").strip()
     as_json = bool(getattr(args, "as_json", False))
 
+    # The ack authority is checked BEFORE the store is touched: possession of the action id is not
+    # a credential, and the external client that received it must never be able to complete its own
+    # delegation (review j#89969 finding 1).
+    authorized, auth_reason, auth_detail = resolve_ack_authority(repo_root, env=os.environ)
+
     fence = CoordinatorProxyFence()
     completed = False
-    if not workspace_id:
-        reason = "proxy_workspace_unresolved"
-        detail = "the workspace anchor could not be derived from the repo checkout"
+    if not authorized:
+        reason = auth_reason
+        detail = auth_detail
     elif not action_id:
         reason = "proxy_action_id_required"
         detail = "--proxy-action-id is required; it is the opaque id the delegation carried"
@@ -236,6 +242,7 @@ def cmd_workflow_proxy_ack(args: argparse.Namespace) -> int:
         "action": "proxy-ack",
         "proxy_action_id": action_id,
         "workspace_id": workspace_id,
+        "authorized": authorized,
         "completed": completed,
         "reason": reason,
         "detail": detail,

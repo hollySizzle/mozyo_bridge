@@ -38,7 +38,7 @@ authority* ではない — 実行するのは coordinator 自身の attested ru
 | 3 | role | repo-local durable role authority の default-lane binding | `proxy_coordinator_authority_missing` / `proxy_coordinator_authority_blocked` |
 | 4 | provider | 当該 role の `provider_binding` | `proxy_provider_unresolved` |
 | 5 | target | live inventory の **mzb1 assigned name** decode **＋ generation-bound startup self-attestation の join** | `proxy_target_missing` / `proxy_target_ambiguous` / `proxy_target_locator_missing` / `proxy_target_unattested` |
-| 6 | anchor | source-of-truth Redmine 上の **(action, journal, lane generation) triple**（§3） | `proxy_anchor_unverified` / `proxy_anchor_action_mismatch` / `proxy_anchor_decision_incomplete` / `proxy_anchor_generation_stale` / `proxy_anchor_superseded` |
+| 6 | anchor | Redmine 上の decision **×** lane lifecycle authority の live facts（§3） | `proxy_anchor_unverified` / `proxy_anchor_action_mismatch` / `proxy_anchor_decision_incomplete` / `proxy_anchor_lane_unresolved` / `proxy_anchor_scope_mismatch` / `proxy_anchor_generation_stale` / `proxy_anchor_superseded` |
 | 7 | fence | dedicated exactly-once store | `proxy_duplicate` / `proxy_stale` / `proxy_fence_reconcile_required` / `proxy_fence_unavailable` |
 
 不変条件:
@@ -95,11 +95,22 @@ authorize したかを照合しなければ scope は未検証のままである
     canonical producer は常に両方を書く。**scope を名指さない決定は何も authorize しない** —
     live fact と exact-match できないからである。散文中の marker-shaped **引用**もここへ落ちる
     (引用された gate token は lane も generation も持たない)。
-  - 同一 lane についてより新しい generation が宣言されている → `generation_stale`。lane が
-    advance した後の authorization は死んだ generation に属する。
-  - 同一 lane・同一 generation でより新しい journal が同じ token を持つ → `superseded`。
-    supersession は **その action 自身の決定系列・当該 lane の中**で判定する。無関係な後続 gate が
-    正しい authorization を stale に見せてはならず、代役になってもならない。
+  - 名指された lane の **live lifecycle facts が読めない** → `lane_unresolved`。runtime が知らない
+    lane を名乗る決定は、この rail が行動できる決定ではない。
+  - 決定の lane が解決された lane と異なる → `scope_mismatch`。
+  - 宣言 generation が lane の **live generation** と異なる → `generation_stale`。
+  - journal が lane lifecycle の **current decision anchor** でない → `superseded`。これが
+    **canonical-shaped marker の散文引用**を落とす箇所である: 引用は token / lane / generation を
+    完全に再現できるが、lifecycle が指している journal ではない。
+
+**決定を決定自身と突き合わせても何も証明しない。** 初版はこの自己比較だった（marker 集合内で
+lane/generation を比べるだけ）。その結果、単独 marker は「非空 lane + 数値 generation」を名乗る
+だけで verified になり、(a) 実在しない lane/generation を名乗る決定、(b) 実 lane が advance した
+のに新 marker が書かれていない古い決定、(c) canonical-shaped な引用、のいずれも通過した
+（review j#89969 F2）。expected facts は **action-time に lane lifecycle authority**
+(`LaneLifecycleStore`、worker-dispatch admission が join するのと同一の authority) から解決し、
+caller の主張にも marker の自己申告にも依存しない。active でない / generation 0 / 行が無い lane は
+`None` を返し fail-closed。
 
 ## 3b. Acknowledgement — exactly-once の「完了」半分
 
@@ -109,7 +120,20 @@ authorize したかを照合しなければ scope は未検証のままである
 される — 一度だけ動いて wedge する rail は反復可能な single-step 入口ではない（review j#89918 F1）。
 
 - **`mozyo-bridge workflow proxy-ack --proxy-action-id <id>`** が completion の production surface。
-  coordinator（または代理の operator）が、delegation が運んだ opaque id を渡す。
+- **action id の所持は credential ではない。** delegation の envelope はその id を **external
+  client 自身**へ返す。所持だけを authority にすると、caller は配送直後に自分の delegation を
+  complete して次の decision の配送を開けられる — delivery receipt を completion truth へ昇格させる
+  ことであり、`logic-ack-completion-receiver-state` が明示的に分離している誤りである
+  （review j#89969 F1）。
+- したがって ack は **live attested default coordinator 自身からのみ** 受理する。他の authority
+  link と同じく action-time に再導出する: attested launch-time sender identity の存在 / workspace が
+  この checkout の registry anchor と一致 / default lane に座る / provider が `provider_binding` の
+  期待値と一致 / **その slot 自身が generation-bound startup self-attestation join を通り、live
+  default-lane slot の assigned name と一致する**。external client は identity を持たないため
+  `proxy_ack_unattested` で拒否される。
+- authority check は **store に触れる前**に行う。admission されない caller は fence へ到達しない。
+- operator による代行はこの surface では admit しない。代行を許すなら独自の durable authority
+  anchor が要るが、本 contract の scope 外である。
 - ack を **暗黙の副作用にしない**。主張している内容が「coordinator が委譲された decision を実行
   した」であり、delivery path から観測できる事実ではないため。outcome 不明の delegation は route
   を保持し続けるのが正しい。

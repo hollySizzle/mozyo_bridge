@@ -26,6 +26,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ANCHOR_ACTION_MISMATCH,
     ANCHOR_DECISION_INCOMPLETE,
     ANCHOR_GENERATION_STALE,
+    ANCHOR_LANE_UNRESOLVED,
+    ANCHOR_SCOPE_MISMATCH,
     ANCHOR_SUPERSEDED,
     ANCHOR_UNVERIFIED,
     ANCHOR_VERIFIED,
@@ -45,6 +47,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_ANCHOR_ACTION_MISMATCH,
     REASON_ANCHOR_DECISION_INCOMPLETE,
     REASON_ANCHOR_GENERATION_STALE,
+    REASON_ANCHOR_LANE_UNRESOLVED,
+    REASON_ANCHOR_SCOPE_MISMATCH,
     REASON_ANCHOR_SUPERSEDED,
     REASON_ANCHOR_UNVERIFIED,
     REASON_AUTHORITY_BLOCKED,
@@ -68,6 +72,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WORKSPACE_UNRESOLVED,
     ZERO_SEND,
     DecisionRecord,
+    LaneExpectation,
     ProxyLinks,
     anchor_status_for,
     decide_proxy_delegation,
@@ -141,6 +146,8 @@ class TheOnlyDeliverPathTest(unittest.TestCase):
             (dict(anchor=ANCHOR_ACTION_MISMATCH), REASON_ANCHOR_ACTION_MISMATCH),
             (dict(anchor=ANCHOR_DECISION_INCOMPLETE), REASON_ANCHOR_DECISION_INCOMPLETE),
             (dict(anchor=ANCHOR_GENERATION_STALE), REASON_ANCHOR_GENERATION_STALE),
+            (dict(anchor=ANCHOR_LANE_UNRESOLVED), REASON_ANCHOR_LANE_UNRESOLVED),
+            (dict(anchor=ANCHOR_SCOPE_MISMATCH), REASON_ANCHOR_SCOPE_MISMATCH),
             (dict(fence=FENCE_DUPLICATE), REASON_DUPLICATE),
             (dict(fence=FENCE_STALE), REASON_STALE),
             (dict(fence=FENCE_RECONCILE), REASON_FENCE_RECONCILE),
@@ -220,23 +227,30 @@ class TargetCardinalityTest(unittest.TestCase):
 
 
 class AnchorStatusTest(unittest.TestCase):
-    """The (action, journal, lane generation) triple is the unit of authority (j#89878 / j#89918)."""
+    """A decision is matched against LIVE lane facts, never against itself (j#89969 F2).
 
-    #: A canonical dispatch decision names its lane AND generation; the gate-style ones do not.
+    The previous shape compared the marker set with itself, so a lone marker declaring any
+    non-empty lane and any numeric generation verified — a decision could name a lane that does not
+    exist, and a real lane advancing without a new marker left the old decision looking current.
+    """
+
+    LANE = "lane_a"
     DECISIONS = (
-        DecisionRecord("89688", "implementation_request", "lane_a", "1"),
+        DecisionRecord("89688", "implementation_request", LANE, "1"),
         DecisionRecord("89754", "start"),
         DecisionRecord("89873", "implementation_done"),
     )
+    EXPECTED = LaneExpectation(lane=LANE, generation=1, decision_journal="89688")
 
-    def _status(self, journal, decisions=None, action=ACTION_DISPATCH_NEXT):
+    def _status(self, journal, decisions=None, expected=..., action=ACTION_DISPATCH_NEXT):
         return anchor_status_for(
             journal,
             action=action,
             decisions=self.DECISIONS if decisions is None else decisions,
+            expected=self.EXPECTED if expected is ... else expected,
         )
 
-    def test_the_action_s_own_current_decision_verifies(self):
+    def test_the_lane_s_current_decision_verifies(self):
         self.assertEqual(self._status("89688"), ANCHOR_VERIFIED)
 
     def test_a_real_journal_carrying_another_decision_does_not_authorize_this_action(self):
@@ -253,43 +267,43 @@ class AnchorStatusTest(unittest.TestCase):
         self.assertEqual(self._status(""), ANCHOR_UNVERIFIED)
 
     def test_a_decision_without_a_lane_authorizes_nothing(self):
-        # Review j#89918 F2: a decision that names no scope cannot be exact-matched. This is also
-        # where a marker-shaped QUOTATION in prose lands — a quoted gate token has no lane.
         decisions = (DecisionRecord("89688", "implementation_request"),)
         self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_DECISION_INCOMPLETE)
 
     def test_a_decision_without_a_numeric_generation_authorizes_nothing(self):
         for generation in ("", "one", "1.0", "-1"):
-            decisions = (DecisionRecord("89688", "implementation_request", "lane_a", generation),)
+            decisions = (DecisionRecord("89688", "implementation_request", self.LANE, generation),)
             self.assertEqual(
                 self._status("89688", decisions=decisions), ANCHOR_DECISION_INCOMPLETE, generation
             )
 
-    def test_an_older_generation_of_the_same_lane_is_stale(self):
-        decisions = (
-            DecisionRecord("89688", "implementation_request", "lane_a", "1"),
-            DecisionRecord("89900", "implementation_request", "lane_a", "2"),
-        )
-        self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_GENERATION_STALE)
-        self.assertEqual(self._status("89900", decisions=decisions), ANCHOR_VERIFIED)
+    def test_a_lane_with_no_live_facts_authorizes_nothing(self):
+        # A decision naming a lane the runtime does not know cannot be matched against anything.
+        self.assertEqual(self._status("89688", expected=None), ANCHOR_LANE_UNRESOLVED)
 
-    def test_another_lane_s_newer_generation_does_not_stale_this_one(self):
-        decisions = (
-            DecisionRecord("89688", "implementation_request", "lane_a", "1"),
-            DecisionRecord("89900", "implementation_request", "lane_b", "7"),
+    def test_a_decision_naming_a_different_lane_is_a_scope_mismatch(self):
+        expected = LaneExpectation(lane="lane_b", generation=1, decision_journal="89688")
+        self.assertEqual(self._status("89688", expected=expected), ANCHOR_SCOPE_MISMATCH)
+
+    def test_a_real_lane_advance_stales_the_old_decision(self):
+        # THE case the self-comparison missed: the lane moved on, and no new marker was written.
+        expected = LaneExpectation(lane=self.LANE, generation=2, decision_journal="90000")
+        self.assertEqual(self._status("89688", expected=expected), ANCHOR_GENERATION_STALE)
+
+    def test_a_canonical_shaped_quotation_is_not_the_decision(self):
+        # Review j#89969 F2 probe, verbatim: a quotation reproduces the token, lane and generation
+        # exactly. It is refused because it is not the journal the lifecycle points at.
+        decisions = self.DECISIONS + (
+            DecisionRecord("99999", "implementation_request", self.LANE, "1"),
         )
+        self.assertEqual(self._status("99999", decisions=decisions), ANCHOR_SUPERSEDED)
         self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_VERIFIED)
 
-    def test_a_newer_decision_for_the_same_lane_and_generation_supersedes(self):
-        decisions = (
-            DecisionRecord("89688", "implementation_request", "lane_a", "1"),
-            DecisionRecord("89900", "implementation_request", "lane_a", "1"),
+    def test_a_fictitious_lane_and_generation_never_verify(self):
+        decisions = (DecisionRecord("89688", "implementation_request", "no_such_lane", "42"),)
+        self.assertEqual(
+            self._status("89688", decisions=decisions, expected=None), ANCHOR_LANE_UNRESOLVED
         )
-        self.assertEqual(self._status("89688", decisions=decisions), ANCHOR_SUPERSEDED)
-        self.assertEqual(self._status("89900", decisions=decisions), ANCHOR_VERIFIED)
-
-    def test_a_later_unrelated_gate_does_not_supersede_the_authorization(self):
-        self.assertEqual(self._status("89688"), ANCHOR_VERIFIED)  # 89873 is later, other token
 
     def test_an_unknown_action_can_authorize_nothing(self):
         self.assertEqual(self._status("89688", action="not_an_action"), ANCHOR_ACTION_MISMATCH)
