@@ -297,6 +297,10 @@ class LegacyProjectSkillMirrorSync:
         """
         try:
             info = os.lstat(name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            # Absence is not "could not be read": collapsing it advised
+            # restoring access to a file that is simply gone (j#90467 R9-F4).
+            return ENTRY_MISSING
         except OSError:
             return ENTRY_UNREADABLE
         if stat.S_ISLNK(info.st_mode):
@@ -451,6 +455,7 @@ class LegacyProjectSkillMirrorSync:
                     ENTRY_UNREADABLE: SOURCE_UNREADABLE,
                     ENTRY_SYMLINK: SOURCE_SYMLINK,
                     ENTRY_NOT_REGULAR: SOURCE_NOT_REGULAR,
+                    ENTRY_MISSING: SOURCE_MISSING,
                 }.get(source_failure, SOURCE_UNREADABLE)
                 found.append(
                     Violation(
@@ -535,7 +540,17 @@ class LegacyProjectSkillMirrorSync:
     def _replace_one(
         self, source_fd: int, mirror_fd: int, name: str
     ) -> tuple[Violation, ...]:
-        """Copy one pinned reference into place, entirely through bound fds."""
+        """Copy one pinned reference into place, entirely through bound fds.
+
+        Failure handling has exactly one shape: capture the staging entry's
+        identity at creation, and route every failure through
+        :meth:`_release_staging` **once**, which re-proves ownership before it
+        unlinks anything. Review j#90467 found all three ways the previous
+        shape went wrong — a discarded close result reported success (R9-F1),
+        cleanup unlinked by name and deleted a foreign entry substituted at
+        that name (R9-F2), and an inline cleanup plus the outer ``finally``
+        ran twice, claiming residue that no longer existed (R9-F3).
+        """
         payload, failure = self._read_bound(source_fd, name)
         if failure is not None:
             return (
@@ -547,6 +562,7 @@ class LegacyProjectSkillMirrorSync:
                 ),
             )
 
+        subject = f"{MIRROR_RELATIVE}/{describe_name(name)}"
         temp_name = f"{_TEMP_PREFIX}{os.urandom(8).hex()}.tmp"
         try:
             temp_fd = os.open(
@@ -562,54 +578,77 @@ class LegacyProjectSkillMirrorSync:
                 ),
             )
 
-        owned = temp_name
-        residue: list[Violation] = []
+        # Identity is captured immediately, before any write can fail: it is
+        # the only proof of ownership the cleanup path has.
+        identity: os.stat_result | None = None
+        write_failure: str | None = None
+        staging_live = True
+
+        def release() -> tuple[Violation, ...]:
+            """Release the staging entry at most once.
+
+            Every failure branch goes through here, so cleanup cannot run twice
+            (j#90467 R9-F3) and cannot be skipped when an exception — not just
+            an `OSError` — unwinds the write (which a hook raising mid-sync
+            demonstrated while this was being restructured).
+            """
+            nonlocal staging_live
+            if not staging_live:
+                return ()
+            staging_live = False
+            return self._release_staging(mirror_fd, temp_name, identity)
+
         try:
-            try:
-                # A single `os.write` may write fewer bytes than asked; loop
-                # until the payload is out (j#90450 R7-F3).
-                view = memoryview(payload or b"")
-                # A single `os.write` may write fewer bytes than asked
-                # (j#90450 R7-F3). A run of zero-progress writes would spin
-                # forever, so it is bounded and reported instead.
+            identity = os.fstat(temp_fd)
+            view = memoryview(payload or b"")
+            # A single `os.write` may write fewer bytes than asked
+            # (j#90450 R7-F3). A run of zero-progress writes would spin
+            # forever, so it is bounded and reported instead.
+            stalled = 0
+            while view:
+                written = os.write(temp_fd, view)
+                if written <= 0:
+                    stalled += 1
+                    if stalled > 16:
+                        raise OSError(errno.EIO, "write made no progress")
+                    continue
                 stalled = 0
-                while view:
-                    written = os.write(temp_fd, view)
-                    if written <= 0:
-                        stalled += 1
-                        if stalled > 16:
-                            raise OSError(errno.EIO, "write made no progress")
-                        continue
-                    stalled = 0
-                    view = view[written:]
-                # `fchmod` on our own descriptor: a path-based `chmod` here
-                # changed a victim's mode when the temp name was re-bound to a
-                # symlink between create and chmod (j#90418 R6-F1 case 4).
-                os.fchmod(temp_fd, 0o644)
-                created = os.fstat(temp_fd)
-            except OSError:
-                write_failure = Violation(
-                    RULE_WRITE,
-                    WRITE_FAILED,
-                    f"{MIRROR_RELATIVE}/{describe_name(name)}",
-                    "staging file could not be written",
+                view = view[written:]
+            # `fchmod` on our own descriptor: a path-based `chmod` here changed
+            # a victim's mode when the temp name was re-bound to a symlink
+            # between create and chmod (j#90418 R6-F1 case 4).
+            os.fchmod(temp_fd, 0o644)
+        except OSError:
+            write_failure = "staging file could not be written"
+        finally:
+            # A close can report a deferred write error, so discarding its
+            # result folded a real failure into a `synced` banner and exit 0
+            # (j#90467 R9-F1).
+            if not _close_quietly(temp_fd) and write_failure is None:
+                write_failure = (
+                    "staging file could not be closed; the write may not have reached disk"
                 )
-                return (write_failure,) + self._release_staging(mirror_fd, temp_name)
-            finally:
-                _close_quietly(temp_fd)
 
+        if write_failure is not None:
+            return (Violation(RULE_WRITE, WRITE_FAILED, subject, write_failure),) + release()
+
+        try:
             self._notify(HOOK_TEMP_CREATED)
+        except BaseException:
+            release()
+            raise
 
-            # `os.replace` renames whatever the NAME refers to, and it does not
-            # follow symlinks — so a name re-bound between create and swap gets
-            # the foreign entry installed as a pinned reference (measured while
-            # correcting R6-F1 case 4: `fchmod` on our fd protected the victim's
-            # mode, and the symlink still landed in the mirror). Confirm the
-            # name still resolves to the inode we created before swapping it in.
+        # From here to the rename, an exception must still release the staging
+        # entry; the explicit branches below handle their own cases.
+        # `os.replace` renames whatever the NAME refers to, and it does not
+        # follow symlinks — so a name re-bound between create and swap gets the
+        # foreign entry installed as a pinned reference (j#90418 R6-F1 case 4).
+        # Confirm the name still resolves to the inode we created. On mismatch
+        # nothing is unlinked: the entry is not ours.
+        try:
             try:
                 verify_fd = os.open(temp_name, _FILE_FLAGS, dir_fd=mirror_fd)
             except OSError:
-                owned = ""  # not ours any more; do not unlink someone else's entry
                 return (
                     Violation(
                         RULE_WRITE,
@@ -621,7 +660,6 @@ class LegacyProjectSkillMirrorSync:
             try:
                 current = os.fstat(verify_fd)
             except OSError:
-                owned = ""
                 return (
                     Violation(
                         RULE_WRITE,
@@ -632,8 +670,12 @@ class LegacyProjectSkillMirrorSync:
                 )
             finally:
                 _close_quietly(verify_fd)
-            if (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino):
-                owned = ""
+
+            if identity is None or (current.st_dev, current.st_ino) != (
+                identity.st_dev,
+                identity.st_ino,
+            ):
+                staging_live = False  # not ours: never unlink it
                 return (
                     Violation(
                         RULE_WRITE,
@@ -646,46 +688,75 @@ class LegacyProjectSkillMirrorSync:
             try:
                 os.replace(temp_name, name, src_dir_fd=mirror_fd, dst_dir_fd=mirror_fd)
             except OSError:
-                # Say what actually happened. Reporting every failure as "it is
-                # no longer a regular file" stated a fact that was often untrue
-                # — an injected `PermissionError` produced exactly that message
-                # against a destination that was still a regular file — and it
-                # pointed at the wrong recovery (j#90458 R8-F3). Observe the
-                # destination through the bound descriptor and classify.
+                # Say what actually happened. Reporting every failure as "it is no
+                # longer a regular file" stated a fact that was often untrue — an
+                # injected `PermissionError` produced exactly that against a
+                # destination that was still a regular file — and it pointed at the
+                # wrong recovery (j#90458 R8-F3).
                 kind = self._entry_failure_kind(mirror_fd, name)
                 if kind in (ENTRY_SYMLINK, ENTRY_NOT_REGULAR):
-                    failure = Violation(
+                    failed = Violation(
                         RULE_DEST_ENTRY_TYPES,
                         kind,
-                        f"{MIRROR_RELATIVE}/{describe_name(name)}",
+                        subject,
                         "could not be replaced; it is no longer a regular file",
                     )
                 else:
-                    failure = Violation(
-                        RULE_WRITE,
-                        WRITE_FAILED,
-                        f"{MIRROR_RELATIVE}/{describe_name(name)}",
-                        "could not be replaced",
-                    )
-                owned = ""
-                return (failure,) + self._release_staging(mirror_fd, temp_name)
-            owned = ""
-        finally:
-            if owned:
-                extra = self._release_staging(mirror_fd, owned)
-                if extra:
-                    residue.extend(extra)
-        return tuple(residue)
+                    failed = Violation(RULE_WRITE, WRITE_FAILED, subject, "could not be replaced")
+                return (failed,) + release()
+
+            staging_live = False  # the rename consumed it
+            return ()
+        except BaseException:
+            release()
+            raise
+
 
     @staticmethod
-    def _release_staging(mirror_fd: int, temp_name: str) -> tuple[Violation, ...]:
-        """Remove this run's staging entry, reporting if it could not be.
+    def _release_staging(
+        mirror_fd: int, temp_name: str, identity: os.stat_result | None
+    ) -> tuple[Violation, ...]:
+        """Remove this run's staging entry, and only this run's.
 
-        Swallowing the unlink failure left residue on disk while the
-        diagnostic said nothing about it; the next run then refused that
-        residue as an unpinned entry demanding a reviewed disposition, so
-        neither message described the real state (j#90458 R8-F2).
+        Two failures the earlier version had, both measured (j#90467):
+        unlinking by name alone deleted an ordinary file that had been
+        substituted at that name (R9-F2), and running from both an inline
+        return and the outer ``finally`` reported "still present" for residue
+        the second call had just removed (R9-F3). Ownership is re-proved
+        against the creation identity, and this is the single cleanup path.
+
+        A window remains between the check and the unlink — the same shape as
+        the documented verify-to-replace residual, and closable only by
+        directory-level exclusion.
         """
+        display = f"{MIRROR_RELATIVE}/{describe_name(temp_name)}"
+        try:
+            present = os.lstat(temp_name, dir_fd=mirror_fd)
+        except FileNotFoundError:
+            return ()
+        except OSError:
+            return (
+                Violation(
+                    RULE_WRITE,
+                    CLEANUP_FAILED,
+                    display,
+                    "staging file could not be inspected and may still be present",
+                ),
+            )
+
+        if identity is None or (present.st_dev, present.st_ino) != (
+            identity.st_dev,
+            identity.st_ino,
+        ):
+            return (
+                Violation(
+                    RULE_WRITE,
+                    CLEANUP_FAILED,
+                    display,
+                    "the staging name now refers to another entry, which was left untouched",
+                ),
+            )
+
         try:
             os.unlink(temp_name, dir_fd=mirror_fd)
         except FileNotFoundError:
@@ -695,7 +766,7 @@ class LegacyProjectSkillMirrorSync:
                 Violation(
                     RULE_WRITE,
                     CLEANUP_FAILED,
-                    f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
+                    display,
                     "staging file could not be removed and is still present",
                 ),
             )

@@ -71,6 +71,8 @@ from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.
     PATH_COMPONENT_NOT_DIRECTORY,
     PATH_COMPONENT_SYMLINK,
     CLEANUP_FAILED,
+    ENTRY_MISSING,
+    ENTRY_UNREADABLE,
     PLATFORM_UNSUPPORTED,
     RECOVERY_REPLACE_ENTRY,
     RECOVERY_RESYNC,
@@ -1104,6 +1106,154 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         self.assertIn(WRITE_FAILED, report, "the primary failure was lost")
         self.assertIn(CLEANUP_FAILED, report, "surviving residue went unreported")
         self.assertIn("still present", report)
+
+    def _fail_only_the_staging_close(self):  # type: ignore[no-untyped-def]
+        """Patch pair that fails the close of the staging fd and nothing else.
+
+        Failing *every* close stops at the preflight read and never reaches the
+        staging branch, which is why the earlier close test passed while the
+        staging path still reported success (j#90467 R9-F1).
+        """
+        real_open, real_close = os.open, os.close
+        state: dict[str, object] = {"fd": None, "fired": False}
+
+        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_CREAT:
+                state["fd"] = fd
+            return fd
+
+        def selective_close(fd: int) -> None:
+            real_close(fd)
+            if fd == state["fd"] and not state["fired"]:
+                state["fired"] = True
+                state["fd"] = None
+                raise OSError(errno.EIO, "injected staging close failure")
+
+        return tracking_open, selective_close, state
+
+    def test_staging_close_failure_is_not_reported_as_success(self) -> None:
+        """j#90467 R9-F1. `_close_quietly`'s result was discarded, so a close
+        that reported a deferred write error still produced exit 0 and the
+        `synced` banner, with the post-check agreeing."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        tracking_open, selective_close, state = self._fail_only_the_staging_close()
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "close", selective_close
+            ):
+                code, out, err = self._service(repo).sync()
+
+        self.assertTrue(state["fired"], "the staging close was never reached")
+        self.assertEqual(1, code)
+        self.assertEqual((), out, "a failed staging close still printed the banner")
+        self.assertIn(WRITE_FAILED, "\n".join(err))
+
+    def test_cleanup_leaves_a_foreign_entry_at_the_staging_name(self) -> None:
+        """j#90467 R9-F2. Cleanup unlinked by name with no ownership check, so
+        an ordinary file substituted at the staging name during the write was
+        deleted — the same invariant the verify branch already honoured."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        real_write = os.write
+        state: dict[str, object] = {"done": False, "name": None}
+
+        def rebinding_write(fd: int, data):  # type: ignore[no-untyped-def]
+            if not state["done"]:
+                state["done"] = True
+                for path in self._mirror(repo).iterdir():
+                    if path.name.startswith(".mozyo-legacy-mirror."):
+                        path.unlink()
+                        path.write_text("FOREIGN\n", encoding="utf-8")
+                        state["name"] = path.name
+                        break
+                raise OSError(errno.ENOSPC, "injected")
+            return real_write(fd, data)
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", rebinding_write):
+            code, _out, err = self._service(repo).sync()
+
+        self.assertEqual(1, code)
+        foreign = self._mirror(repo) / str(state["name"])
+        self.assertTrue(foreign.exists(), "cleanup deleted an entry that was not ours")
+        self.assertEqual("FOREIGN\n", foreign.read_text(encoding="utf-8"))
+        self.assertIn("left untouched", "\n".join(err))
+
+    def test_a_transient_cleanup_failure_is_not_reported_as_surviving_residue(
+        self,
+    ) -> None:
+        """j#90467 R9-F3. An inline cleanup plus the outer `finally` ran twice:
+        the first unlink failed, the second succeeded, and the report still
+        claimed residue was "still present" when the directory was empty."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        real_unlink = os.unlink
+        calls: list[int] = []
+
+        def transient_unlink(*args, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(1)
+            if len(calls) == 1:
+                raise PermissionError(errno.EACCES, "injected")
+            return real_unlink(*args, **kwargs)
+
+        def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise OSError(errno.ENOSPC, "injected")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", failing_write):
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "unlink", transient_unlink
+            ):
+                code, _out, err = self._service(repo).sync()
+
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(calls), "cleanup ran more than once for one staging file")
+        residue = [
+            p.name
+            for p in self._mirror(repo).iterdir()
+            if p.name.startswith(".mozyo-legacy-mirror.")
+        ]
+        claims_present = "still present" in "\n".join(err)
+        self.assertEqual(
+            bool(residue),
+            claims_present,
+            "the diagnostic disagrees with the filesystem about surviving residue",
+        )
+
+    def test_entry_deleted_between_observation_and_read_is_missing_not_unreadable(
+        self,
+    ) -> None:
+        """j#90467 R9-F4. `FileNotFoundError` was folded into "unreadable", so
+        an entry that had simply been deleted advised restoring access to a
+        file that no longer exists, and did not reach the resync recovery."""
+        repo = self._stage()
+        real_unlink = os.unlink
+        service = self._service(repo)
+        original = service._read_bound
+        seen: list[str] = []
+
+        def unlink_before_the_mirror_read(dir_fd: int, name: str):  # type: ignore[no-untyped-def]
+            if name == "safety.md":
+                seen.append(name)
+                if len(seen) == 2:  # first call is the source, second the mirror
+                    try:
+                        real_unlink(name, dir_fd=dir_fd)
+                    except OSError:
+                        pass
+            return original(dir_fd, name)
+
+        service._read_bound = unlink_before_the_mirror_read  # type: ignore[method-assign]
+        audit = service.audit()
+        self.assertGreaterEqual(len(seen), 2, "the mirror read was never reached")
+        self.assertIn(ENTRY_MISSING, audit.kinds())
+        self.assertNotIn(ENTRY_UNREADABLE, audit.kinds())
+        self.assertIn(RECOVERY_RESYNC, audit.recovery_actions())
 
     def test_replace_failure_is_classified_by_what_actually_happened(self) -> None:
         """j#90458 R8-F3. Every `os.replace` error was reported as "it is no
