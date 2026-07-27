@@ -1856,6 +1856,155 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             with self.assertRaises(KeyboardInterrupt):
                 service.sync()
 
+    def test_an_interrupt_while_recording_still_releases_the_staging_entry(self) -> None:
+        """j#90492 R14-F1. Recording a secondary happened outside the teardown
+        rail, and `_attach_secondary` deliberately lets control flow through —
+        so a `KeyboardInterrupt` arriving during `add_note` escaped
+        `_teardown_during` and the release never ran. Measured before the fix:
+        actions `write / close / note`, no release, one staging entry left.
+
+        Three things have to hold together, which is why they are one test: the
+        interrupt surfaces, the release runs exactly once, and no residue stays.
+        """
+
+        class PrimaryWrite(Exception):
+            def add_note(self, note: str) -> None:  # type: ignore[override]
+                raise KeyboardInterrupt("interrupt while recording")
+
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        service = self._service(repo)
+        real_release = service._release_staging
+        calls: list[int] = []
+
+        def counting_release(mirror_fd: int, temp_name: str, identity):  # type: ignore[no-untyped-def]
+            calls.append(1)
+            return real_release(mirror_fd, temp_name, identity)
+
+        service._release_staging = counting_release  # type: ignore[method-assign]
+        tracking_open, failing_close, state = self._fail_staging_close_with(
+            RuntimeError("injected ordinary close failure")
+        )
+
+        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise PrimaryWrite("injected write unwind")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "close", failing_close
+            ):
+                with unittest.mock.patch.object(
+                    legacy_mirror_sync.os, "write", primary_write
+                ):
+                    with self.assertRaises(KeyboardInterrupt) as caught:
+                        service.sync()
+
+        self.assertTrue(state["fired"], "the close injection never fired")
+        self.assertIsInstance(
+            caught.exception.__context__,
+            PrimaryWrite,
+            "the interrupt surfaced without the primary behind it",
+        )
+        self.assertEqual(1, len(calls), "the release did not run exactly once")
+        self.assertEqual([], self._staging_names(repo), "the staging entry was left behind")
+
+    def test_a_later_control_flow_failure_is_recorded_not_dropped(self) -> None:
+        """j#90492 R14-F2. Only the first control-flow exception was kept; a
+        second one left no trace in notes or context, while the returned and
+        ordinary channels both record every failure."""
+
+        class PrimaryWrite(Exception):
+            pass
+
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        service = self._service(repo)
+
+        def exiting_release(mirror_fd: int, temp_name: str, identity):  # type: ignore[no-untyped-def]
+            raise SystemExit("injected second control flow")
+
+        service._release_staging = exiting_release  # type: ignore[method-assign]
+        tracking_open, failing_close, state = self._fail_staging_close_with(
+            KeyboardInterrupt("injected first control flow")
+        )
+
+        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise PrimaryWrite("injected write unwind")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "close", failing_close
+            ):
+                with unittest.mock.patch.object(
+                    legacy_mirror_sync.os, "write", primary_write
+                ):
+                    with self.assertRaises(KeyboardInterrupt) as caught:
+                        service.sync()
+
+        self.assertTrue(state["fired"], "the close injection never fired")
+        primary = caught.exception.__context__
+        self.assertIsInstance(primary, PrimaryWrite)
+        notes = "\n".join(getattr(primary, "__notes__", []))
+        self.assertIn("SystemExit", notes, "the second control-flow failure was dropped")
+
+    def test_teardown_continues_when_recording_a_secondary_is_interrupted(self) -> None:
+        """The rail's own property, stated directly: whichever step fails — the
+        action, or the *recording* of what it reported — every remaining action
+        still runs (j#90492 R14-F1)."""
+
+        class Primary(Exception):
+            def add_note(self, note: str) -> None:  # type: ignore[override]
+                raise KeyboardInterrupt("interrupt while recording")
+
+        ran: list[str] = []
+
+        def failing() -> None:
+            ran.append("failing")
+            raise RuntimeError("ordinary teardown failure")
+
+        def second() -> None:
+            ran.append("second")
+
+        def third() -> None:
+            ran.append("third")
+
+        primary = Primary("write failed")
+        control = owned_descriptors._teardown_during(primary, failing, second, third)
+
+        self.assertIsInstance(control, KeyboardInterrupt)
+        self.assertEqual(["failing", "second", "third"], ran)
+
+    def test_control_flow_priority_keeps_the_first_and_records_the_rest(self) -> None:
+        """j#90492 R14-F2, stated directly: the first control-flow exception is
+        the one the caller raises, later ones land on the primary's ledger, and
+        neither decision may cost a remaining action."""
+
+        ran: list[str] = []
+
+        def first() -> None:
+            ran.append("first")
+            raise KeyboardInterrupt("first")
+
+        def second() -> None:
+            ran.append("second")
+            raise SystemExit("second")
+
+        def third() -> None:
+            ran.append("third")
+
+        primary = Exception("write failed")
+        control = owned_descriptors._teardown_during(primary, first, second, third)
+
+        self.assertIsInstance(control, KeyboardInterrupt)
+        self.assertEqual("first", str(control))
+        self.assertEqual(["first", "second", "third"], ran)
+        notes = "\n".join(getattr(primary, "__notes__", []))
+        self.assertIn("SystemExit", notes, "the second control-flow failure was dropped")
+
     def test_cleanup_helper_runs_exactly_once_when_it_raises(self) -> None:
         """j#90472 R10-F4. I claimed the single-shot guard was structurally
         unreachable; the review showed the path. `_release_staging` raising a

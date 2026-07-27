@@ -11,9 +11,11 @@ are worth reading as a unit:
 - :func:`_teardown_during` — runs teardown actions independently during an
   unwind, keeping three outcome channels distinct: a returned failure, an
   ordinary exception, and a control-flow exception that outranks the primary
-  (j#90482 R12-F2 / j#90487 R13-F1/F2/F3).
+  (j#90482 R12-F2 / j#90487 R13-F1/F2/F3 / j#90492 R14-F1/F2).
 - :func:`_attach_secondary` — records a teardown failure without ever becoming
-  the reason the caller sees a different exception.
+  the reason the caller sees a different exception. Recording it is routed
+  through :func:`_run_teardown_action` so that an interrupt arriving *while*
+  recording cannot skip the teardown that has not run yet (R14-F1).
 
 Keeping them here means the ordering and channel rules have one home rather than
 being restated at each call site.
@@ -63,12 +65,61 @@ def _describe_teardown_result(outcome: object) -> str | None:
     return None
 
 
+def _record_secondary(primary: BaseException, secondary: BaseException) -> BaseException | None:
+    """Attach ``secondary`` to ``primary``; return control-flow raised doing so.
+
+    :func:`_attach_secondary` deliberately lets a control-flow exception out —
+    an interrupt outranks a note (R13-F3) — but it must not leave the loop that
+    called it, because the actions after this one would never run (j#90492
+    R14-F1). Returning it puts it on the same channel as an interrupt from the
+    action itself, so exactly one rule decides what happens next.
+    """
+    try:
+        _attach_secondary(primary, secondary)
+    except Exception:  # noqa: BLE001 - `_attach_secondary` already absorbs these
+        return None
+    except BaseException as interrupt:  # noqa: BLE001 - routed, not raised here
+        return interrupt
+    return None
+
+
+def _record_returned_failure(primary: BaseException, outcome: object) -> BaseException | None:
+    """Record a teardown action's *returned* failure, if it reported one."""
+    try:
+        note = _describe_teardown_result(outcome)
+    except Exception:  # noqa: BLE001 - describing a failure cannot itself fail loudly
+        note = "a teardown result could not be described"
+    except BaseException as interrupt:  # noqa: BLE001 - routed, not raised here
+        return interrupt
+    if note is None:
+        return None
+    return _record_secondary(primary, RuntimeError(note))
+
+
+def _run_teardown_action(primary: BaseException, action) -> BaseException | None:
+    """Run one action, record what it reports, and never raise.
+
+    Every way this can go wrong — the action raising, the action *returning* a
+    failure, and the recording of either — funnels into one return value: a
+    control-flow exception, or ``None``. That is what keeps
+    :func:`_teardown_during`'s loop intact no matter which step fails.
+    """
+    try:
+        outcome = action()
+    except Exception as failure:  # noqa: BLE001 - recorded, not raised
+        return _record_secondary(primary, failure)
+    except BaseException as interrupt:  # noqa: BLE001 - routed, not raised here
+        return interrupt
+    else:
+        return _record_returned_failure(primary, outcome)
+
+
 def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
     """Run each teardown action independently, preserving ``primary``.
 
     Chaining them meant one failure skipped the rest (j#90482 R12-F2), so each
     runs on its own. Three outcome channels are kept distinct, because
-    collapsing them is what the last two rounds kept finding:
+    collapsing them is what several rounds kept finding:
 
     - a **returned** failure (``False`` / violation tuple) is recorded as a
       note; it is not an exception and must not be dropped (R13-F2);
@@ -77,23 +128,35 @@ def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
     - a **control-flow** ``BaseException`` (``KeyboardInterrupt``,
       ``SystemExit``, ``GeneratorExit``) outranks the primary. Demoting one to
       a note swallowed an interrupt the descriptor helper explicitly promises
-      never to swallow (R13-F3). The remaining actions still run — teardown
-      independence is the point — and the first such exception is returned for
-      the caller to raise instead of ``primary``.
+      never to swallow (R13-F3). The first such exception is returned for the
+      caller to raise instead of ``primary``.
+
+    Two properties this loop guarantees, both of which it once failed to:
+
+    - **The remaining actions always run.** Not just when the action itself
+      fails: an interrupt arriving while a secondary was being *recorded* used
+      to escape the loop, so a staging release never ran and residue stayed on
+      disk (j#90492 R14-F1). Recording is now on the same channel as the
+      action, via :func:`_run_teardown_action`.
+    - **No teardown failure is dropped.** Later control-flow exceptions used to
+      vanish once one was held (j#90492 R14-F2); they are recorded on
+      ``primary``, which is the single ledger of everything that went wrong
+      during teardown and stays reachable as the ``__context__`` of whatever
+      the caller raises.
+
+    The one bounded exception: if recording a *later* control-flow exception is
+    itself interrupted, that innermost interrupt is dropped rather than chased,
+    since the regress has no natural end. The remaining actions still run.
     """
     control_flow: BaseException | None = None
     for action in actions:
-        try:
-            outcome = action()
-        except Exception as failure:  # noqa: BLE001 - recorded, not raised
-            _attach_secondary(primary, failure)
-        except BaseException as interrupt:
-            if control_flow is None:
-                control_flow = interrupt
+        arrived = _run_teardown_action(primary, action)
+        if arrived is None:
+            continue
+        if control_flow is None:
+            control_flow = arrived
         else:
-            note = _describe_teardown_result(outcome)
-            if note is not None:
-                _attach_secondary(primary, RuntimeError(note))
+            _record_secondary(primary, arrived)
     return control_flow
 
 

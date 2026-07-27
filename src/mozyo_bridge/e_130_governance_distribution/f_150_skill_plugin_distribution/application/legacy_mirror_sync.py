@@ -58,7 +58,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .owned_descriptors import (
-    _attach_secondary,
     _close_quietly,
     _OwnedDescriptor,
     _teardown_during,
@@ -272,17 +271,19 @@ class LegacyProjectSkillMirrorSync:
             raise
         finally:
             if current.held:
-                try:
-                    closed_cleanly = current.close()
-                except Exception as cleanup_error:  # noqa: BLE001
-                    if in_flight is None:
-                        raise
-                    _attach_secondary(in_flight, cleanup_error)
+                if in_flight is None:
+                    # Nothing is unwinding, so a failing close IS the failure;
+                    # there is no primary for a returned `False` to hang off.
+                    current.close()
                 else:
-                    if not closed_cleanly and in_flight is not None:
-                        _attach_secondary(
-                            in_flight, RuntimeError("close reported a failure")
-                        )
+                    # Route through the one rail rather than recording inline:
+                    # recording outside it let an interrupt escape and skip the
+                    # teardown that had not run yet (j#90492 R14-F1). Here that
+                    # is the last action, but the rule must not be re-decided
+                    # per call site.
+                    interrupt = _teardown_during(in_flight, current.close)
+                    if interrupt is not None:
+                        raise interrupt
 
     @contextmanager
     def _bound(self, relative: str, rule: str, *, create: bool = False) -> Iterator[

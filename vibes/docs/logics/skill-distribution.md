@@ -94,6 +94,14 @@ legacy partial mirror の規則は **Python authority** が正本である (Redm
 
 **temp の ownership は prefix ではなく fd で持つ。** 現在 run が保持する exact path だけを `finally` で cleanup し、他 run の temp には触れない。prefix 一致を ownership の証明に使うと、(a) prefix を共有するだけの無関係 file を自動削除し、(b) **並行 run の active temp を削除**する (両方とも実測)。kill 等で残った residue は次回の規則 D で**通常の unpinned entry として block** し reviewed disposition を要求する——自分の crash residue と「誰かが残したい file」を実行時に区別できないため、「stale だから sync が消す」とは案内しない。
 
+**teardown の失敗経路は 3 channel を分けて扱う。** unwind 中の cleanup (staging descriptor の close / staging entry の release) は `owned_descriptors._teardown_during` の 1 経路に集約し、call site ごとに規則を決め直さない (Redmine #14580 review j#90477 R11-F1 / j#90482 R12-F2 / j#90487 R13-F1〜F3 / j#90492 R14-F1・F2)。
+
+- **returned failure** (`close()` の `False` / release の violation tuple) は例外ではない。返り値契約を自分で設計しておきながら teardown で捨てると、**typed cleanup failure が notes 空のまま消え residue だけ残る**。
+- **ordinary `Exception`** は note として記録する。実際に operation を巻き戻した例外を置き換えない。
+- **control-flow `BaseException`** (`KeyboardInterrupt` / `SystemExit` / `GeneratorExit`) は primary より優先し、caller が raise する。note へ降格しない。最初の 1 件を surface させ、後続は primary へ記録する——**片方の channel だけ「記録しない」例外を作らない**。
+- 上記のどれが起きても、また**記録処理自体が中断されても、残る teardown action は必ず独立に走る**。記録を rail の外で行うと、interrupt が loop ごと抜けて release が走らず residue が残った (実測)。
+- descriptor の ownership は **close syscall の前に**手放す。close 自身が unwind し得るため、後で sentinel を立てると `finally` が同じ fd **番号**を再度閉じる。番号は即再利用されるので、これは他人の descriptor を閉じる (実測)。
+
 test 側も同じ契約に従う。規則・violation 組合せ・recovery precedence は `test_legacy_mirror_contract.py` が **rule 単位の pure unit test** で押さえ、adversarial case は `LegacyMirrorSyncServiceTest` が Python authority に対して、CLI 契約 (default sync / `--check` / `--help` / unknown argument = exit 64 / repo-root 実行) は `LegacyMirrorWrapperCliTest` が wrapper に対して押さえる。tracked tree の exact-set / regular-file 判定は `is_file()` filter と `*.md` glob の**どちらも使わず**全 direct entry で計算する (どちらも symlink を辿る / hidden を落とすため)。**pinned set の定義は domain module の 1 箇所だけ**であり、shell 側の複製と cross-check test は撤去した。
 
 Removal criteria (本 grace period を解除する条件):
