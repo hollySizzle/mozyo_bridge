@@ -218,11 +218,25 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (
     LiveRedmineJournalError,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_work_anchor import (
+    WORK_ANCHOR_AMBIGUOUS,
+    WORK_ANCHOR_FOREIGN,
+    WORK_ANCHOR_MISSING,
+    WORK_ANCHOR_RESOLVED,
+    WORK_ANCHOR_STALE_GENERATION,
+    WORK_ANCHOR_UNBOUND,
+    LaneWorkAnchor,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_step_herdr import (
     ANCHOR_AMBIGUOUS,
     ANCHOR_RETIRED,
     ANCHOR_STORE_MISMATCH,
     ANCHOR_UNVERIFIED,
+    ANCHOR_WORK_AMBIGUOUS,
+    ANCHOR_WORK_FOREIGN,
+    ANCHOR_WORK_MISSING,
+    ANCHOR_WORK_STALE,
+    ANCHOR_WORK_UNBOUND,
 )
 
 VERIFIED_PTR = "redmine:issue=13489:journal=74766"
@@ -231,6 +245,23 @@ VERIFIED_PTR = "redmine:issue=13489:journal=74766"
 # journal record's own id (74766) is the authoritative journal anchor, NOT the token's journal
 # field (redmine_journal_source contract).
 _GATE_NOTE = "[mozyo:handoff:source=redmine:issue=13489:journal=74766:kind=review_result:to=claude] review result"
+
+#: The canonical dispatch marker that binds work to a lane + generation — the ONLY thing the work
+#: anchor is resolved from (Redmine #14586). ``lane_generation`` is what makes it a binding rather
+#: than "the newest thing on the issue".
+LANE = "issue_1"
+
+
+def _dispatch_note(lane=LANE, generation=1, body="implementation request"):
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+        render_dispatch_note,
+    )
+
+    return render_dispatch_note(body, lane=lane, lane_generation=generation)
+
+
+def _work_anchor(journal="74766", status=WORK_ANCHOR_RESOLVED, **kw):
+    return LaneWorkAnchor(status=status, journal=journal, lane=LANE, lane_generation=1, **kw)
 
 
 def _lane_record(**kw):
@@ -284,50 +315,170 @@ class CandidateIssueTest(unittest.TestCase):
         self.assertEqual((issue, status), ("", ANCHOR_MISSING))
 
 
-class VerifyLaneGateLiveTest(unittest.TestCase):
-    """The source-of-truth Redmine gate verification (F3a) — returns (journal, gate)."""
+class LaneWorkBindingTest(unittest.TestCase):
+    """The lifecycle read that supplies the generation half of the join (Redmine #14586)."""
 
-    def _run(self, source):
-        with patch.object(adapter, "_redmine_journal_source_for", return_value=source):
-            return adapter._verify_lane_gate_live(argparse.Namespace(), "13489")
-
-    def test_gate_marker_journal_is_verified(self):
-        journal, gate = self._run(_snapshot_source([{"id": 74766, "notes": _GATE_NOTE}]))
-        self.assertEqual(journal, "74766")
-        self.assertTrue(gate)  # the runtime gate (review) accompanies the verified journal
-
-    def test_note_without_gate_marker_is_unverified(self):
-        self.assertEqual(
-            self._run(_snapshot_source([{"id": 74766, "notes": "plain note, no marker"}])),
-            ("", ""),
+    def _run(self, record):
+        from mozyo_bridge.core.state import lane_lifecycle
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            sublane_herdr_projection,
         )
+
+        store = types.SimpleNamespace(get=lambda _key: record)
+        with patch.object(sublane_herdr_projection, "repo_scope_workspace_id", return_value=WS), \
+             patch.object(lane_lifecycle, "LaneLifecycleStore", lambda *a, **k: store):
+            return adapter._lane_work_binding(Path("/repo"), LANE)
+
+    def _record(self, **kw):
+        base = dict(lane_disposition="active", lane_generation=3, decision_journal="90999")
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def test_active_row_supplies_its_generation(self):
+        self.assertEqual(self._run(self._record()), 3)
+
+    def test_decision_journal_is_never_read_as_work(self):
+        # The conflation this issue removes. `decision_journal` is the record that put the lane in
+        # its current STATE (a resume, a hibernate); it is not what delegated the lane's work. A
+        # row carrying one but no usable generation must yield no binding, not the decision.
+        self.assertEqual(self._run(self._record(lane_generation=0)), 0)
+
+    def test_non_active_disposition_is_not_a_binding(self):
+        self.assertEqual(self._run(self._record(lane_disposition="retired")), 0)
+
+    def test_absent_row_is_not_a_binding(self):
+        self.assertEqual(self._run(None), 0)
+
+    def test_non_numeric_generation_is_not_a_binding(self):
+        self.assertEqual(self._run(self._record(lane_generation="two")), 0)
+
+    def test_blank_lane_short_circuits(self):
+        self.assertEqual(adapter._lane_work_binding(Path("/repo"), ""), 0)
+
+    def test_unreadable_store_fails_closed(self):
+        from mozyo_bridge.core.state import lane_lifecycle
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            sublane_herdr_projection,
+        )
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("lifecycle store unreadable")
+
+        with patch.object(sublane_herdr_projection, "repo_scope_workspace_id", return_value=WS), \
+             patch.object(lane_lifecycle, "LaneLifecycleStore", _boom):
+            self.assertEqual(adapter._lane_work_binding(Path("/repo"), LANE), 0)
+
+    def test_unresolvable_workspace_scope_fails_closed(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
+            sublane_herdr_projection,
+        )
+
+        with patch.object(sublane_herdr_projection, "repo_scope_workspace_id", return_value=""):
+            self.assertEqual(adapter._lane_work_binding(Path("/repo"), LANE), 0)
+
+
+class ResolveWorkAnchorLiveTest(unittest.TestCase):
+    """The source-of-truth Redmine work-anchor resolution (F3a as re-based by Redmine #14586)."""
+
+    def _run(self, source, *, generation=1):
+        with patch.object(adapter, "_redmine_journal_source_for", return_value=source):
+            return adapter._resolve_work_anchor_live(
+                argparse.Namespace(), "13489", lane=LANE, lane_generation=generation
+            )
+
+    def test_dispatch_marker_journal_is_the_work_anchor(self):
+        anchor = self._run(_snapshot_source([{"id": 74766, "notes": _dispatch_note()}]))
+        self.assertTrue(anchor.resolved)
+        # The OWNING entry's id, never the marker's self-report.
+        self.assertEqual(anchor.journal, "74766")
+
+    def test_gate_journal_is_not_a_work_anchor(self):
+        # THE #14586 DEFECT. A gate-bearing callback marker is a previous round's answer, not this
+        # lane's work. Before the fix this returned 74766 as the anchor for a lane that had never
+        # been dispatched against it.
+        anchor = self._run(_snapshot_source([{"id": 74766, "notes": _GATE_NOTE}]))
+        self.assertEqual(anchor.status, WORK_ANCHOR_MISSING)
+        self.assertEqual(anchor.journal, "")
+
+    def test_newest_gate_journal_never_outranks_the_lane_dispatch(self):
+        # The exact live shape of #14577 j#90416 F2: an issue with review history whose NEWEST
+        # journal is a callback, plus this lane's own (older) dispatch. The dispatch wins because
+        # it is the one that names this lane; "latest on the issue" is not a binding.
+        anchor = self._run(
+            _snapshot_source(
+                [
+                    {"id": 90409, "notes": _dispatch_note()},
+                    {"id": 90416, "notes": _GATE_NOTE},
+                ]
+            )
+        )
+        self.assertEqual(anchor.journal, "90409")
+
+    def test_note_without_dispatch_marker_is_missing(self):
+        anchor = self._run(_snapshot_source([{"id": 74766, "notes": "plain note, no marker"}]))
+        self.assertEqual(anchor.status, WORK_ANCHOR_MISSING)
 
     def test_unconfigured_credentials_fail_closed(self):
         with patch.object(
             adapter, "_redmine_journal_source_for", side_effect=LiveRedmineJournalError("unconfigured")
         ):
-            self.assertEqual(adapter._verify_lane_gate_live(argparse.Namespace(), "13489"), ("", ""))
+            anchor = adapter._resolve_work_anchor_live(
+                argparse.Namespace(), "13489", lane=LANE, lane_generation=1
+            )
+        self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_MISSING, ""))
 
     def test_transport_error_fails_closed(self):
         class _BoomSource:
             def read_entries(self, issue):
                 raise LiveRedmineJournalError("transport down")
 
-        self.assertEqual(self._run(_BoomSource()), ("", ""))
+        anchor = self._run(_BoomSource())
+        self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_MISSING, ""))
 
-    def test_marker_for_a_different_issue_is_rejected(self):
-        # A gate marker whose entry issue != the candidate issue must not verify (issue match).
-        class _MismatchSource:
-            def read_entries(self, issue):
-                return [RedmineJournalEntry(issue_id="99999", journal_id="74766", notes=_GATE_NOTE)]
+    def test_blank_issue_fails_closed_without_reading(self):
+        class _NeverRead:
+            def read_entries(self, issue):  # pragma: no cover - must not be reached
+                raise AssertionError("live read for a blank issue")
 
-        self.assertEqual(self._run(_MismatchSource()), ("", ""))
+        with patch.object(adapter, "_redmine_journal_source_for", return_value=_NeverRead()):
+            anchor = adapter._resolve_work_anchor_live(
+                argparse.Namespace(), "", lane=LANE, lane_generation=1
+            )
+        self.assertEqual(anchor.status, WORK_ANCHOR_MISSING)
 
-    def test_latest_gate_marker_wins(self):
-        journal, _ = self._run(
-            _snapshot_source([{"id": 100, "notes": _GATE_NOTE}, {"id": 200, "notes": _GATE_NOTE}])
+    def test_quoted_dispatch_marker_is_not_a_work_anchor(self):
+        # Redmine #14585 reaching the anchor gate: a callback record that ECHOES the landing
+        # marker it observed is discussing a dispatch, not issuing one.
+        marker = _dispatch_note(body="").strip()
+        self.assertIn(LANE, marker)  # the quotation names THIS lane: only the quoting refuses it
+        anchor = self._run(
+            _snapshot_source([{"id": 74766, "notes": "- observed landing marker: `%s`" % marker}])
         )
-        self.assertEqual(journal, "200")
+        self.assertEqual(anchor.status, WORK_ANCHOR_MISSING)
+        # Control: the same marker at top level DOES resolve, so the refusal is the quoting.
+        self.assertTrue(self._run(_snapshot_source([{"id": 74766, "notes": marker}])).resolved)
+
+    def test_stale_generation_fails_closed(self):
+        anchor = self._run(
+            _snapshot_source([{"id": 90409, "notes": _dispatch_note(generation=2)}]),
+            generation=1,
+        )
+        self.assertEqual(anchor.status, WORK_ANCHOR_STALE_GENERATION)
+
+    def test_cross_lane_dispatch_is_named_as_foreign(self):
+        anchor = self._run(
+            _snapshot_source([{"id": 90409, "notes": _dispatch_note(lane="other_lane")}])
+        )
+        self.assertEqual(anchor.status, WORK_ANCHOR_FOREIGN)
+        self.assertEqual(anchor.foreign_lanes, ("other_lane",))
+
+    def test_duplicate_dispatch_entries_are_ambiguous(self):
+        anchor = self._run(
+            _snapshot_source(
+                [{"id": 90409, "notes": _dispatch_note()}, {"id": 90410, "notes": _dispatch_note()}]
+            )
+        )
+        self.assertEqual(anchor.status, WORK_ANCHOR_AMBIGUOUS)
 
 
 class CanonicalEventJournalTest(unittest.TestCase):
@@ -351,75 +502,109 @@ class CanonicalEventJournalTest(unittest.TestCase):
 
 
 class ResolveLaneAnchorTest(unittest.TestCase):
-    """Compose candidate + live-Redmine verification + advisory store cross-check (F3 / F3c)."""
+    """Compose candidate + lane binding + live work anchor + advisory store cross-check (F3 / F3c)."""
 
-    def _run(self, candidate, verified, store_anchor=None):
+    def _run(self, candidate, anchor, store_anchor=None, generation=1):
         with patch.object(adapter, "_candidate_issue", return_value=candidate), patch.object(
-            adapter, "_verify_lane_gate_live", return_value=verified
+            adapter, "_lane_work_binding", return_value=generation
+        ), patch.object(
+            adapter, "_resolve_work_anchor_live", return_value=anchor
         ), patch.object(adapter, "_store_lane_anchor", return_value=store_anchor):
             return adapter._resolve_lane_anchor(
                 argparse.Namespace(), WS, Path("/repo"), "issue_1"
             )
 
-    def test_candidate_plus_verified_gate_is_verified(self):
-        status, ptr = self._run(("13489", ""), ("74766", "review"))
+    def test_candidate_plus_resolved_work_anchor_is_verified(self):
+        status, ptr = self._run(("13489", ""), _work_anchor())
         self.assertEqual(status, ANCHOR_VERIFIED)
-        self.assertEqual(ptr, VERIFIED_PTR)  # issue + journal from source-of-truth Redmine
+        self.assertEqual(ptr, VERIFIED_PTR)  # issue + the DISPATCH journal, from live Redmine
 
     def test_candidate_failure_short_circuits_without_live_read(self):
         called = {}
 
-        def _verify(_a, _i):
+        def _verify(*_a, **_kw):
             called["hit"] = True
-            return "74766", "review"
+            return _work_anchor()
 
         with patch.object(adapter, "_candidate_issue", return_value=("", ANCHOR_AMBIGUOUS)), \
-             patch.object(adapter, "_verify_lane_gate_live", side_effect=_verify):
+             patch.object(adapter, "_resolve_work_anchor_live", side_effect=_verify):
             status, _ = adapter._resolve_lane_anchor(
                 argparse.Namespace(), WS, Path("/repo"), "issue_1"
             )
         self.assertEqual(status, ANCHOR_AMBIGUOUS)
         self.assertNotIn("hit", called)  # no live read when the candidate already fails closed
 
-    def test_candidate_but_unverified_gate_fails_closed(self):
-        # A lane-metadata candidate alone (no verified Redmine gate) is NOT proof -> fail closed.
-        status, ptr = self._run(("13489", ""), ("", ""))
+    def test_lane_generation_is_passed_to_the_join(self):
+        # The binding is what makes the anchor exact; passing the wrong generation (or none)
+        # would silently widen the join back to "any round of this lane".
+        seen = {}
+
+        def _verify(_args, issue, *, lane, lane_generation):
+            seen.update(issue=issue, lane=lane, generation=lane_generation)
+            return _work_anchor()
+
+        with patch.object(adapter, "_candidate_issue", return_value=("13489", "")), patch.object(
+            adapter, "_lane_work_binding", return_value=7
+        ), patch.object(
+            adapter, "_resolve_work_anchor_live", side_effect=_verify
+        ), patch.object(adapter, "_store_lane_anchor", return_value=None):
+            adapter._resolve_lane_anchor(argparse.Namespace(), WS, Path("/repo"), "issue_1")
+        self.assertEqual(seen, {"issue": "13489", "lane": "issue_1", "generation": 7})
+
+    def test_each_work_anchor_failure_keeps_its_own_status(self):
+        # Collapsing these into one "unresolved" is what makes an operator chase a missing record
+        # that is not missing. Every domain status must reach the resolver as its own.
+        for domain_status, expected in (
+            (WORK_ANCHOR_UNBOUND, ANCHOR_WORK_UNBOUND),
+            (WORK_ANCHOR_MISSING, ANCHOR_WORK_MISSING),
+            (WORK_ANCHOR_FOREIGN, ANCHOR_WORK_FOREIGN),
+            (WORK_ANCHOR_AMBIGUOUS, ANCHOR_WORK_AMBIGUOUS),
+            (WORK_ANCHOR_STALE_GENERATION, ANCHOR_WORK_STALE),
+        ):
+            with self.subTest(domain_status):
+                status, ptr = self._run(
+                    ("13489", ""), _work_anchor(journal="", status=domain_status)
+                )
+                self.assertEqual(status, expected)
+                self.assertEqual(ptr, "")
+
+    def test_resolved_status_without_a_journal_still_fails_closed(self):
+        # `resolved` is a conjunction of status AND journal: a status token alone is a claim.
+        status, ptr = self._run(("13489", ""), _work_anchor(journal=""))
         self.assertEqual(status, ANCHOR_UNVERIFIED)
         self.assertEqual(ptr, "")
 
     def test_store_agreeing_is_verified(self):
         status, _ = self._run(
-            ("13489", ""), ("74766", "review"), store_anchor=("13489", "74766", "review")
+            ("13489", ""), _work_anchor(), store_anchor=("13489", "74766", "review")
         )
         self.assertEqual(status, ANCHOR_VERIFIED)
 
     def test_store_absent_is_verified(self):
-        status, _ = self._run(("13489", ""), ("74766", "review"), store_anchor=None)
+        status, _ = self._run(("13489", ""), _work_anchor(), store_anchor=None)
         self.assertEqual(status, ANCHOR_VERIFIED)
 
     def test_store_issue_mismatch_fails_closed(self):
+        # The dimension the store actually asserts about this lane: which ticket it routes to.
+        status, _ = self._run(("13489", ""), _work_anchor(), store_anchor=("99999", "", ""))
+        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
+
+    def test_store_ambiguous_route_fails_closed(self):
         status, _ = self._run(
-            ("13489", ""), ("74766", "review"), store_anchor=("99999", "", "")
+            ("13489", ""), _work_anchor(), store_anchor=("<ambiguous>", "", "")
         )
         self.assertEqual(status, ANCHOR_STORE_MISMATCH)
 
-    def test_store_journal_mismatch_fails_closed(self):
-        status, _ = self._run(
-            ("13489", ""), ("74766", "review"), store_anchor=("13489", "99999", "review")
+    def test_store_gate_event_does_not_have_to_equal_the_work_anchor(self):
+        # Redmine #14586: a store GATE event and the work anchor answer different questions (what
+        # state the lane is in vs what work it was given). Requiring them to be the same journal
+        # is the very conflation this issue removes — and it would fail every lane whose issue has
+        # any gate history. The issue still has to agree.
+        status, ptr = self._run(
+            ("13489", ""), _work_anchor(), store_anchor=("13489", "99999", "implementation_done")
         )
-        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
-
-    def test_store_route_present_without_canonical_event_fails_closed(self):
-        # j#74827: a store route for the lane but a forged / synthetic / non-canonical event
-        # (empty journal) must NOT verify — the store asserted the lane but cannot corroborate.
-        status, _ = self._run(("13489", ""), ("74766", "review"), store_anchor=("13489", "", ""))
-        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
-
-    def test_store_gate_mismatch_fails_closed(self):
-        status, _ = self._run(
-            ("13489", ""), ("74766", "review"), store_anchor=("13489", "74766", "implementation_done")
-        )
-        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
+        self.assertEqual(status, ANCHOR_VERIFIED)
+        self.assertEqual(ptr, VERIFIED_PTR)
 
 
 class ResolveLaneAnchorEndToEndStoreTest(unittest.TestCase):
@@ -450,9 +635,11 @@ class ResolveLaneAnchorEndToEndStoreTest(unittest.TestCase):
         )
 
     def _run(self, store):
-        # Live verifies issue 13489 / journal 74766 / gate review; only the store varies.
+        # Live resolves issue 13489 / dispatch journal 74766; only the store varies.
         with patch.object(adapter, "_candidate_issue", return_value=("13489", "")), patch.object(
-            adapter, "_verify_lane_gate_live", return_value=("74766", "review")
+            adapter, "_lane_work_binding", return_value=1
+        ), patch.object(
+            adapter, "_resolve_work_anchor_live", return_value=_work_anchor()
         ), patch.object(adapter, "_load_workflow_store", return_value=store):
             return adapter._resolve_lane_anchor(argparse.Namespace(), WS, Path("/repo"), "issue_1")
 
@@ -466,29 +653,43 @@ class ResolveLaneAnchorEndToEndStoreTest(unittest.TestCase):
         )
         self.assertEqual(status, ANCHOR_VERIFIED)
 
-    def test_forged_synthetic_event_fails_closed(self):
-        # Store route present, but the event is non-canonical (opaque) -> cannot corroborate.
+    def test_route_to_a_foreign_issue_fails_closed(self):
+        # The class of drift this cross-check exists for (j#74827): a caller-supplied store
+        # steering this lane at somebody else's ticket.
         status, _ = self._run(
-            self._store(routes=[self._route()], events=[self._event("opaque:74766")])
+            self._store(routes=[self._route(issue="99999")], events=[])
         )
         self.assertEqual(status, ANCHOR_STORE_MISMATCH)
 
-    def test_issue_mismatched_event_fails_closed(self):
+    def test_two_routes_to_distinct_issues_fail_closed(self):
         status, _ = self._run(
-            self._store(routes=[self._route()], events=[self._event("redmine:99999:74766")])
+            self._store(routes=[self._route(), self._route(issue="99999")], events=[])
         )
         self.assertEqual(status, ANCHOR_STORE_MISMATCH)
 
-    def test_route_but_no_event_fails_closed(self):
-        status, _ = self._run(self._store(routes=[self._route()], events=[]))
-        self.assertEqual(status, ANCHOR_STORE_MISMATCH)
+    def test_store_gate_events_do_not_gate_the_work_anchor(self):
+        # Redmine #14586: a store gate event is a lifecycle observation, and the anchor is the
+        # dispatch record. A non-canonical / absent / newer gate event says nothing about which
+        # record delegated this lane's work, so it no longer blocks — the issue is what must agree.
+        for label, events in (
+            ("forged synthetic event", [self._event("opaque:74766")]),
+            ("no event at all", []),
+            (
+                "valid then newer event",
+                [self._event("redmine:13489:74766"), self._event("redmine:13489:99999")],
+            ),
+        ):
+            with self.subTest(label):
+                status, _ = self._run(self._store(routes=[self._route()], events=events))
+                self.assertEqual(status, ANCHOR_VERIFIED)
 
-    def test_valid_then_latest_forged_fails_closed(self):
-        # End-to-end: the latest forged row must not fall back to the earlier valid one.
+    def test_event_on_a_foreign_issue_still_fails_closed(self):
+        # A route for this lane whose only event names another issue: the store's own two
+        # assertions disagree about the ticket, which is exactly the drift signal.
         status, _ = self._run(
             self._store(
-                routes=[self._route()],
-                events=[self._event("redmine:13489:74766"), self._event("opaque:99999")],
+                routes=[self._route(issue="99999")],
+                events=[self._event("redmine:99999:74766", issue="99999")],
             )
         )
         self.assertEqual(status, ANCHOR_STORE_MISMATCH)

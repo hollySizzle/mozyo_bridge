@@ -32,10 +32,13 @@ count — is testable without a live herdr or Redmine.
 from __future__ import annotations
 
 import argparse
-import re
 from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping, Optional, Protocol, Sequence
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.canonical_note_scan import (  # noqa: E501
+    canonical_note_lines,
+    canonical_note_text,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
     AUTHORITY_BLOCKED,
     AUTHORITY_MISSING,
@@ -160,55 +163,6 @@ _WORKFLOW_EVENT_CHANNEL = "workflow-event"
 #: what let the anti-quotation rule poison the issue permanently.
 DECISION_ACTION_FIELD = "proxy_action"
 
-_INLINE_CODE = re.compile(r"`[^`\n]*`")
-#: A fence opener / closer: ``` or ~~~ after at most three spaces of indent.
-_CODE_FENCE = re.compile(r"^ {0,3}(?:```|~~~)")
-#: A blockquote line: `>` is the first non-space character (nesting is still a leading `>`).
-_BLOCKQUOTE = re.compile(r"^ {0,3}>")
-#: An indented code block line: four or more spaces (or a tab) of indent.
-_INDENTED_CODE = re.compile(r"^(?: {4}|\t)")
-
-
-def canonical_note_text(notes: str) -> str:
-    """The note with every QUOTED region blanked, line by line (pure).
-
-    A canonical decision is the coordinator writing an instruction in its own voice. Everything
-    Markdown renders as quoted or verbatim is, by construction, not that — it is someone showing
-    what a decision looks like. The whole of Design Answer j#90329 contract 5 rests on the two being
-    distinguishable, so the rule set is stated once, here, and applied uniformly to every line:
-
-    - **A. fenced code** — from a ``` / ``~~~`` opener to its closer, fences included. An unclosed
-      fence swallows the rest of the note (fail-closed: a half-open quotation is still a quotation).
-    - **B. blockquote** — ``>`` as the first non-space character, nesting (``> >``) included. This is
-      the shape that reached live acceptance as authority (#14577 j#90392): the earlier region-based
-      strip covered only A and D, so a marker quoted with ``>`` was read as the coordinator's own.
-    - **C. indented code** — four or more spaces (or a tab) of indent, Markdown's other verbatim
-      block. Covered with B because they are one class, not two: fixing only the shape that was
-      reported leaves the next probe to find the next shape.
-    - **D. inline code** — a backtick span inside an otherwise canonical line.
-
-    Blanking (rather than deleting) keeps the line structure, so :func:`canonical_decision_in_journal`
-    can scan line by line and a marker can never be spliced together across a quoted region.
-
-    The cost of this rule set is that a decision must be written at top level: a marker indented four
-    spaces under a list bullet is refused. That direction is safe — the coordinator re-writes it at
-    column 0 — whereas the other direction hands authority to a quotation.
-    """
-    lines = str(notes or "").split("\n")
-    canonical: list = []
-    in_fence = False
-    for line in lines:
-        if _CODE_FENCE.match(line):  # A (opener or closer; both are part of the quotation)
-            in_fence = not in_fence
-            canonical.append("")
-            continue
-        if in_fence or _BLOCKQUOTE.match(line) or _INDENTED_CODE.match(line):  # A / B / C
-            canonical.append("")
-            continue
-        canonical.append(_INLINE_CODE.sub(" ", line))  # D
-    return "\n".join(canonical)
-
-
 def canonical_decision_in_journal(
     notes: str, *, action: str, parse
 ) -> "tuple[Optional[DecisionRecord], str]":
@@ -225,14 +179,18 @@ def canonical_decision_in_journal(
     Zero, two-or-more, or a marker that names a different action are all refusals with a fixed
     reason; the caller turns those into zero-send statuses.
 
-    "Top-level" is enforced, not merely described: the scan runs **per canonical line** over
-    :func:`canonical_note_text`'s output. The marker grammar's body is ``[^\\]]*``, which spans
-    newlines, so scanning the blanked note as one string would let an unclosed ``[mozyo:`` on a
-    quoted line close on a ``]`` further down and read as a marker that no single line contains.
+    What counts as a quotation is **not** decided here (Redmine #14585): the rule set lives in the
+    shared :mod:`...domain.canonical_note_scan` authority that this rail and the Redmine journal
+    reader both call, so the two cannot drift apart on the question. "Top-level" is enforced, not
+    merely described: the scan runs **per canonical line** over :func:`canonical_note_lines`'s
+    output. The marker grammar's body is ``[^\\]]*``, which spans newlines, so scanning the blanked
+    note as one string would let an unclosed ``[mozyo:`` on a quoted line close on a ``]`` further
+    down and read as a marker that no single line contains. Feeding ``parse`` one canonical line at
+    a time keeps that property structural rather than a promise about the injected ``parse``.
     """
     accepted = ACTION_DECISION_TOKENS.get(normalize_action(action), ())
     found: list = []
-    for line in canonical_note_text(notes).split("\n"):
+    for line in canonical_note_lines(notes):
         for channel, fields in parse(line):
             if channel != _WORKFLOW_EVENT_CHANNEL:
                 continue

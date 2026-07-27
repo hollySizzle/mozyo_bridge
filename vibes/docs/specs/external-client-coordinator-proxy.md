@@ -79,8 +79,10 @@ authorize したかを照合しなければ scope は未検証のままである
   にした。名指し journal だけを見れば、どちらも起こらない。
 - **canonical grammar** (producer: `render_bootstrap_decision_marker()`):
   - **canonical な行だけを scan する。** canonical decision とは coordinator が**自分の声で**書いた
-    指示であり、Markdown が「引用」「逐語」として描画するものは定義上それではない。規則は
-    `canonical_note_text()` に 1 箇所だけ列挙し、全行に同順で適用する:
+    指示であり、Markdown が「引用」「逐語」として描画するものは定義上それではない。規則の**正本は
+    共有 domain authority `domain/canonical_note_scan.py`** であり、この rail と Redmine journal
+    reader (`domain/redmine_journal_source.py`) の**両方がそれを呼ぶ** (#14585)。以下は同 authority
+    が全行に同順で適用する規則である:
     - **A. fenced code** — ` ``` ` / `~~~` の opener から closer まで (fence 行を含む)。閉じていない
       fence は以降を全部飲む (半開の引用も引用である = fail-closed)。
     - **B. blockquote** — 先頭の非空白文字が `>`。nest (`> >`) と leading whitespace を含む。
@@ -90,6 +92,12 @@ authorize したかを照合しなければ scope は未検証のままである
     grammar を引用しただけの note が `links.anchor=verified` を返し、zero-send になったのは後段の
     別 link がたまたま壊れていたからにすぎない。**引用の形は 1 つではないので、報告された形だけを
     塞ぐと次の形が残る。** B と C は同じ class として同時に塞ぐ。
+    ★★さらに、**この規則を持っていたのはこの rail だけだった** (#14577 j#90416 F1 / #14585)。同じ
+    grammar を読む sibling parser `redmine_journal_source` — `workflow watch` / callback discovery /
+    `workflow step` の anchor gate が通る read boundary — は raw note を scan したままで、そこでは
+    引用 marker が durable gate authority になった。**同じ grammar に対して「引用とは何か」の定義が
+    2 つあるのは drift 生成器である。** 規則は共有 authority に 1 箇所だけ置き、reader は policy
+    (どの channel / gate を受理するか) だけを各自が持つ。
   - 代償として **decision は top-level に書く**必要がある (list bullet の下に 4 space indent した
     marker は拒否される)。この向きの失敗は coordinator が column 0 に書き直せば済む。逆向きの失敗
     (引用に authority を渡す) は復旧できない。

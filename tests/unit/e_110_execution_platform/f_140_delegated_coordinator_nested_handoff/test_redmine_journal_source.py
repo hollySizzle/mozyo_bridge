@@ -253,5 +253,64 @@ class RenderWorkflowEventMarkerTest(unittest.TestCase):
             render_workflow_event_marker("close")
 
 
+class QuotedMarkerIsNotAGateTest(unittest.TestCase):
+    """Redmine #14585: this reader used to accept a QUOTED marker as a durable gate event.
+
+    The proxy rail learned to tell a decision from a quotation of one (#14546); this reader — the
+    one ``workflow watch``, callback discovery and the ``workflow step`` anchor gate all go through
+    — did not, so the same defect was still live on the sibling parser. In #14577 j#90416 F1 an
+    inline-quoted marker in an older journal became a fresh lane's verified anchor.
+
+    Both directions are pinned: a quotation is not a gate, and a real top-level marker still is.
+    The full shape matrix lives in ``test_canonical_note_scan``; these pin that this reader is
+    actually wired to it, which is the thing that was missing.
+    """
+
+    GATE = "[mozyo:workflow-event:gate=review_request:head=" + "a" * 40 + "]"
+
+    def _gates(self, notes):
+        return tuple(m.gate for m in extract_markers_from_note("14585", "90416", notes))
+
+    def test_top_level_marker_is_still_a_gate(self):
+        self.assertEqual(self._gates(self.GATE), ("review_request",))
+
+    def test_inline_quoted_marker_is_not_a_gate(self):
+        self.assertEqual(self._gates("the marker to write is `%s`" % self.GATE), ())
+
+    def test_blockquoted_marker_is_not_a_gate(self):
+        self.assertEqual(self._gates("> " + self.GATE), ())
+
+    def test_fenced_marker_is_not_a_gate(self):
+        self.assertEqual(self._gates("```\n" + self.GATE + "\n```"), ())
+
+    def test_indented_code_marker_is_not_a_gate(self):
+        self.assertEqual(self._gates("    " + self.GATE), ())
+
+    def test_quotation_is_not_an_ambiguity_poison_either(self):
+        # The other half of the contract: a quoted marker must not merely be *refused*, it must be
+        # invisible. If it still counted as a second marker it would make the journal unusable —
+        # the failure mode the proxy rail hit when "2+ candidates" met a quotation (#14546).
+        note = self.GATE + "\n\nfor reference, the same token quoted: `%s`" % self.GATE
+        self.assertEqual(self._gates(note), ("review_request",))
+
+    def test_a_review_journal_discussing_the_contract_yields_no_gate(self):
+        note = (
+            "## Gate: review\n\n"
+            "- 指摘事項 [事実]: the producer must emit\n"
+            "```\n" + self.GATE + "\n```\n"
+            "- but the observed note carried `%s` instead\n" % self.GATE
+        )
+        self.assertEqual(self._gates(note), ())
+
+    def test_markers_from_source_is_quote_aware_end_to_end(self):
+        source = MappingRedmineJournalSource(
+            payload={
+                "issue": {"id": "14585"},
+                "journals": [{"id": 90416, "notes": "quoted: `%s`" % self.GATE}],
+            }
+        )
+        self.assertEqual(markers_from_source(source, "14585"), ())
+
+
 if __name__ == "__main__":
     unittest.main()

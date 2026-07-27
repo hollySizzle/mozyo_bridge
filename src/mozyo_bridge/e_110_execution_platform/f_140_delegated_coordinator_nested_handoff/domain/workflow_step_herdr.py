@@ -128,9 +128,28 @@ ANCHOR_RETIRED = "retired"
 #: The candidate issue could not be verified against the source-of-truth Redmine gate (the
 #: live journal read was unconfigured / failed / found no structured gate marker, R1/F3a).
 ANCHOR_UNVERIFIED = "unverified"
-#: A caller-supplied advisory store asserts a *different* (issue, journal, gate) for this same
-#: lane than the source-of-truth Redmine verification produced (drift / forgery, F3c).
+#: A caller-supplied advisory store asserts a *different* issue for this same lane than the
+#: source-of-truth Redmine verification produced (drift / forgery, F3c).
 ANCHOR_STORE_MISMATCH = "store_mismatch"
+
+# ---------------------------------------------------------------------------
+# Exact current work-anchor statuses (Redmine #14586). The anchor a lane steps against is the
+# record that delegated THIS lane's current work, resolved by joining the lane's
+# ``(lane, lane_generation)`` binding against the canonical dispatch markers on the live record
+# (:mod:`...domain.lane_work_anchor`). Each way the join can fail is named, because "no anchor"
+# and "your issue's dispatches belong to another lane" need different operator actions.
+# ---------------------------------------------------------------------------
+#: The lane has no ``(lane, positive generation)`` binding to join on (no / non-active / unreadable
+#: lifecycle row). Nothing is guessed from the lane id alone.
+ANCHOR_WORK_UNBOUND = "work_anchor_unbound"
+#: This lane + generation carries no canonical dispatch marker on the live record.
+ANCHOR_WORK_MISSING = "work_anchor_missing"
+#: The record's canonical dispatch markers all name OTHER lanes (a cross-lane read).
+ANCHOR_WORK_FOREIGN = "work_anchor_foreign_lane"
+#: Two or more distinct entries claim to be this lane + generation's dispatch.
+ANCHOR_WORK_AMBIGUOUS = "work_anchor_ambiguous"
+#: The record has opened a newer round for this lane; this generation's work is superseded.
+ANCHOR_WORK_STALE = "work_anchor_stale_generation"
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +180,17 @@ REASON_HERDR_ANCHOR_AMBIGUOUS = "herdr_anchor_ambiguous"
 REASON_HERDR_ANCHOR_UNVERIFIED = "herdr_anchor_unverified"
 #: A caller-supplied advisory store contradicts the source-of-truth anchor for this lane (F3c).
 REASON_HERDR_ANCHOR_STORE_MISMATCH = "herdr_anchor_store_mismatch"
+#: The lane's exact current work anchor could not be resolved (Redmine #14586). Distinct from
+#: ``herdr_anchor_*``, which is about the *issue* the lane is joined to: this one is about **which
+#: record delegated the work this lane is doing now**, and it is never answered by picking the
+#: newest gate journal on that issue.
+REASON_HERDR_WORK_ANCHOR_UNRESOLVED = "herdr_work_anchor_unresolved"
+#: The record has opened a newer round for this lane than the one the lane is bound to.
+REASON_HERDR_WORK_ANCHOR_STALE = "herdr_work_anchor_stale_generation"
+#: Two or more distinct entries claim to be this lane + generation's dispatch.
+REASON_HERDR_WORK_ANCHOR_AMBIGUOUS = "herdr_work_anchor_ambiguous"
+#: The issue's canonical dispatch markers all name OTHER lanes (a cross-lane read).
+REASON_HERDR_WORK_ANCHOR_FOREIGN = "herdr_work_anchor_foreign_lane"
 #: A default-lane Codex/Claude pair carries no step-time durable role authority (j#74748 F1).
 REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED = "ambiguous_default_coordinator_role"
 #: A durable workflow-role binding (Redmine #13583) resolves this lane to a grandparent /
@@ -185,6 +215,10 @@ HERDR_STEP_REASONS = frozenset(
         REASON_HERDR_ANCHOR_AMBIGUOUS,
         REASON_HERDR_ANCHOR_UNVERIFIED,
         REASON_HERDR_ANCHOR_STORE_MISMATCH,
+        REASON_HERDR_WORK_ANCHOR_UNRESOLVED,
+        REASON_HERDR_WORK_ANCHOR_STALE,
+        REASON_HERDR_WORK_ANCHOR_AMBIGUOUS,
+        REASON_HERDR_WORK_ANCHOR_FOREIGN,
         REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED,
         REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING,
         REASON_HERDR_LANE_ROLE_UNRESOLVED,
@@ -312,11 +346,16 @@ def _blocked_lane_outcome(lane: WorkflowLane) -> WorkflowStepOutcome:
 def _anchor_blocked(
     lane: WorkflowLane, state: str, anchor_status: Optional[str], next_owner: str
 ) -> WorkflowStepOutcome:
-    """Fail-closed outcome when the lane's Redmine issue+journal anchor is not verified (F3)."""
+    """Fail-closed outcome when the lane's Redmine work anchor is not verified (F3 / #14586)."""
     reason = {
         ANCHOR_AMBIGUOUS: REASON_HERDR_ANCHOR_AMBIGUOUS,
         ANCHOR_UNVERIFIED: REASON_HERDR_ANCHOR_UNVERIFIED,
         ANCHOR_STORE_MISMATCH: REASON_HERDR_ANCHOR_STORE_MISMATCH,
+        ANCHOR_WORK_UNBOUND: REASON_HERDR_WORK_ANCHOR_UNRESOLVED,
+        ANCHOR_WORK_MISSING: REASON_HERDR_WORK_ANCHOR_UNRESOLVED,
+        ANCHOR_WORK_STALE: REASON_HERDR_WORK_ANCHOR_STALE,
+        ANCHOR_WORK_AMBIGUOUS: REASON_HERDR_WORK_ANCHOR_AMBIGUOUS,
+        ANCHOR_WORK_FOREIGN: REASON_HERDR_WORK_ANCHOR_FOREIGN,
     }.get(anchor_status or "", REASON_HERDR_ANCHOR_UNRESOLVED)
     detail = {
         ANCHOR_AMBIGUOUS: (
@@ -333,7 +372,29 @@ def _anchor_blocked(
         ),
         ANCHOR_RETIRED: "the lane's only candidate record is retired (tombstone / stale)",
         ANCHOR_MISSING: "no candidate record joins this lane to a Redmine issue",
-    }.get(anchor_status or "", "the lane's Redmine issue+journal anchor could not be verified")
+        ANCHOR_WORK_UNBOUND: (
+            "the lane has no (lane, generation) binding to join a work anchor on (no active "
+            "lifecycle row / generation zero); workflow step does not guess one from the lane id"
+        ),
+        ANCHOR_WORK_MISSING: (
+            "this lane + generation carries no canonical dispatch marker on the issue; the "
+            "coordinator records one at top level with `workflow dispatch-ir`, and workflow step "
+            "does NOT fall back to the newest gate journal on the issue (that is a previous "
+            "round's callback, not this lane's work)"
+        ),
+        ANCHOR_WORK_STALE: (
+            "the issue has opened a newer round for this lane than the generation this lane is "
+            "bound to; the work this generation was given has been superseded"
+        ),
+        ANCHOR_WORK_AMBIGUOUS: (
+            "two or more distinct journals claim to be this lane + generation's dispatch; "
+            "workflow step will not pick one"
+        ),
+        ANCHOR_WORK_FOREIGN: (
+            "the issue's canonical dispatch markers all name OTHER lanes; this lane was not the "
+            "one delegated to, and a cross-lane anchor is never adopted"
+        ),
+    }.get(anchor_status or "", "the lane's Redmine work anchor could not be verified")
     return WorkflowStepOutcome(
         state=state,
         next_action=(
@@ -656,6 +717,11 @@ __all__ = (
     "ANCHOR_RETIRED",
     "ANCHOR_UNVERIFIED",
     "ANCHOR_STORE_MISMATCH",
+    "ANCHOR_WORK_UNBOUND",
+    "ANCHOR_WORK_MISSING",
+    "ANCHOR_WORK_FOREIGN",
+    "ANCHOR_WORK_AMBIGUOUS",
+    "ANCHOR_WORK_STALE",
     "REASON_HERDR_WORKER_STEP_READY",
     "REASON_HERDR_WORKER_DISPATCH_READY",
     "REASON_HERDR_DISPATCH_AUTHORIZED",
@@ -667,6 +733,10 @@ __all__ = (
     "REASON_HERDR_ANCHOR_AMBIGUOUS",
     "REASON_HERDR_ANCHOR_UNVERIFIED",
     "REASON_HERDR_ANCHOR_STORE_MISMATCH",
+    "REASON_HERDR_WORK_ANCHOR_UNRESOLVED",
+    "REASON_HERDR_WORK_ANCHOR_STALE",
+    "REASON_HERDR_WORK_ANCHOR_AMBIGUOUS",
+    "REASON_HERDR_WORK_ANCHOR_FOREIGN",
     "REASON_HERDR_DEFAULT_COORDINATOR_UNRESOLVED",
     "REASON_HERDR_ROLE_RESOLVED_FORWARD_PENDING",
     "REASON_HERDR_LANE_ROLE_UNRESOLVED",
