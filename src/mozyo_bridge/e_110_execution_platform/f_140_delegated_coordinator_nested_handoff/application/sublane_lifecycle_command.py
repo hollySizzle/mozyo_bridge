@@ -389,6 +389,7 @@ class SublaneRetireUseCase:
         assertions: RetireAssertions,
         worktree_dirty_override: Optional[bool] = None,
         worktree_missing: bool = False,
+        checkout_in_scope: bool = True,
     ) -> SublaneRetireOutcome:
         is_git = self.ops.is_git_workspace()
         # Redmine #13331 review j#73338 (blocking): the retire TARGET is the lane worktree
@@ -399,7 +400,21 @@ class SublaneRetireUseCase:
         # caller supplies the target worktree's own dirty state, it is authoritative here
         # (fail-closed: an uninspectable target resolves to dirty upstream). Absent an
         # override the behaviour is byte-for-byte the prior repo_root-bound probe.
-        if worktree_dirty_override is not None:
+        #
+        # Redmine #14499 j#89291: a **metadata-only** intent has NO checkout in scope, so
+        # neither probe applies to it. Live acceptance on #14482 measured all three ways the
+        # coupling went wrong for the unbound terminal retire — whose CLI contract already
+        # says `--worktree` is optional and used only to widen a legacy inventory scan:
+        #   - `--worktree` omitted  -> this `else` branch probed the PRIMARY repo root and
+        #     blocked on unrelated user-owned dirtiness (`dirty_worktree`);
+        #   - the recorded (wiped) worktree supplied -> `worktree_missing_after_reboot`;
+        #   - an unrelated clean worktree supplied -> `retire_ok`, but for the wrong reason.
+        # None of the three describes the lane being terminalized. Not measuring is the
+        # correct answer, not a relaxation: there is no checkout whose state could bear on a
+        # lifecycle-metadata write. Every other intent keeps both probes exactly as before.
+        if not checkout_in_scope:
+            worktree_dirty = False
+        elif worktree_dirty_override is not None:
             worktree_dirty = worktree_dirty_override
         else:
             worktree_dirty = self.ops.worktree_dirty() if is_git else False
@@ -415,7 +430,7 @@ class SublaneRetireUseCase:
             # already fails closed on it, so this only sharpens the reported diagnosis from
             # "go commit your changes" to "the checkout is gone" — the blocked/permitted
             # verdict is unchanged either way.
-            worktree_missing=worktree_missing,
+            worktree_missing=worktree_missing and checkout_in_scope,
             integration_branch_resolved=True,
             merge_conflict=False,
             target_identity_known=assertions.target_identity_known,
@@ -430,10 +445,15 @@ class SublaneRetireUseCase:
             decision,
             issue=issue,
             lane_label=lane_label,
-            worktree_path=worktree_path,
-            branch=branch,
+            # A metadata-only intent contributes no checkout and no branch to the runbook:
+            # passing them would let it propose `git worktree remove` against a worktree it
+            # does not own and `git branch -d` against a branch it must preserve (#14499
+            # j#89291 case 3, measured).
+            worktree_path=worktree_path if checkout_in_scope else None,
+            branch=branch if checkout_in_scope else None,
             integration_branch=integration_branch,
             is_git_workspace=is_git,
+            checkout_cleanup_in_scope=checkout_in_scope,
         )
         return SublaneRetireOutcome(preflight=result)
 
@@ -748,7 +768,16 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     worktree = getattr(args, "worktree", None)
     worktree_dirty_override = None
     worktree_missing = False
-    if worktree:
+    # Redmine #14499 j#89291: `--retire-active-unbound-live-zero` is metadata-only and has no
+    # checkout in scope — its whole effect is a lifecycle CAS. It takes `--worktree` solely to
+    # widen the legacy live-zero inventory scan (never to attest, never as a cleanup target),
+    # so the generic checkout gates and the cleanup runbook must not consume it. Skipping the
+    # probes outright — rather than probing and ignoring the result — also means this intent
+    # performs no git inspection of an unrelated checkout at all.
+    checkout_in_scope = not bool(
+        getattr(args, "retire_active_unbound_live_zero", False)
+    )
+    if worktree and checkout_in_scope:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (  # noqa: E501
             LiveSublaneGitOperations,
         )
@@ -781,6 +810,7 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         assertions=assertions,
         worktree_dirty_override=worktree_dirty_override,
         worktree_missing=worktree_missing,
+        checkout_in_scope=checkout_in_scope,
     )
     # The six mutually exclusive retire intents (guarded close / hibernated-legacy migration /
     # hibernated-live reconcile / hibernated-bound terminal retire / active live-zero terminal

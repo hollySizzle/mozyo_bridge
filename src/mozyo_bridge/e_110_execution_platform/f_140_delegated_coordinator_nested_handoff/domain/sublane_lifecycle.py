@@ -852,6 +852,7 @@ def preflight_sublane_retire(
     branch: Optional[str] = None,
     integration_branch: Optional[str] = None,
     is_git_workspace: bool = True,
+    checkout_cleanup_in_scope: bool = True,
 ) -> SublaneRetirePreflight:
     """Compose the #12604 retire decision into a fail-closed preflight + runbook (pure).
 
@@ -862,12 +863,45 @@ def preflight_sublane_retire(
     this command never actuates them (the destructive core-CLI actuator is gated behind a
     Design Consultation per ``worktree-lifecycle-boundary.md``). Remote branch deletion is
     never emitted.
+
+    ``checkout_cleanup_in_scope`` (Redmine #14499 j#89291) is ``False`` for a **metadata-only**
+    retire intent — one whose whole effect is a lifecycle CAS, with no checkout of its own to
+    tidy up. The default ``True`` keeps the historical runbook byte-for-byte for every other
+    intent. Live acceptance on #14482 measured why this has to be explicit: the unbound
+    terminal retire accepts ``--worktree`` only to widen a legacy inventory scan, yet supplying
+    an unrelated clean worktree made this runbook propose ``git worktree remove`` against
+    *that* worktree and ``git branch -d`` against the lane branch. A runbook that names
+    somebody else's checkout is worse than no runbook.
     """
     journal = render_integration_decision_journal(
-        decision, issue=issue, integration_branch=integration_branch
+        decision,
+        issue=issue,
+        integration_branch=integration_branch,
+        checkout_cleanup_in_scope=checkout_cleanup_in_scope,
     )
     if not decision.may_retire:
         return SublaneRetirePreflight(decision=decision, journal=journal, runbook=())
+
+    if not checkout_cleanup_in_scope:
+        # A metadata-only intent: the terminal lifecycle write IS the action. Emitting the
+        # ordinary drain steps here would describe work that must not happen — there is no
+        # lane checkout in scope, and the branch and its commits are preserved by contract.
+        return SublaneRetirePreflight(
+            decision=decision,
+            journal=journal,
+            runbook=(
+                SublaneStep(
+                    order=1,
+                    title="metadata-only terminalization",
+                    detail=(
+                        "this retire intent's entire effect is the lifecycle CAS; no "
+                        "worktree is removed, no branch or commit is deleted, and no pane "
+                        "is closed. Nothing is left for an operator to run by hand"
+                    ),
+                    command=None,
+                ),
+            ),
+        )
 
     runbook: list[SublaneStep] = [
         SublaneStep(

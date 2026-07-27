@@ -454,7 +454,11 @@ def decide_retire_integration(
 
 
 def render_integration_decision_journal(
-    decision: RetireDecision, *, issue: str, integration_branch: Optional[str] = None
+    decision: RetireDecision,
+    *,
+    issue: str,
+    integration_branch: Optional[str] = None,
+    checkout_cleanup_in_scope: bool = True,
 ) -> str:
     """Render a retire / integration decision as a durable-record journal (pure).
 
@@ -464,6 +468,13 @@ def render_integration_decision_journal(
     Only the machine-readable decision fields and the issue id / branch name are emitted
     — never private paths or pane ids (those are added by the coordinator-side retire
     journal).
+
+    ``checkout_cleanup_in_scope`` (Redmine #14499 j#89291) is ``False`` for a metadata-only
+    retire intent, whose whole effect is a lifecycle CAS. The ``retire_ok`` ``next_action``
+    otherwise tells the coordinator to "proceed to the destructive retire (pane kill /
+    worktree remove)" — an instruction that is simply wrong for such an intent, and one that
+    lands in a *durable record*, where a later reader would take it as authorization. The
+    default ``True`` leaves every existing caller's journal byte-for-byte unchanged.
     """
     heading = (
         "## integration_blocked"
@@ -485,11 +496,18 @@ def render_integration_decision_journal(
             "- blocked_reasons: " + ", ".join(decision.blocked_reasons)
         )
         lines.append("- next_action: coordinator callback (fail-closed; lane not retired)")
-    else:
+    elif checkout_cleanup_in_scope:
         lines.append("- blocked_reasons: none")
         lines.append(
             "- next_action: coordinator may proceed to the destructive retire "
             "(pane kill / worktree remove) under the Sublane Retirement Drain preflight"
+        )
+    else:
+        lines.append("- blocked_reasons: none")
+        lines.append(
+            "- next_action: metadata-only terminalization; the lifecycle CAS is the whole "
+            "effect. No worktree is removed, no branch or commit is deleted, and no pane "
+            "is closed"
         )
     return "\n".join(lines)
 

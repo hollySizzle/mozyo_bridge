@@ -1748,3 +1748,315 @@ class Finding5IdempotentReplayThroughTheRail(unittest.TestCase):
             "not_active_unbound_state",
             "a hibernated row's problem is its disposition, not lane selection",
         )
+
+
+# ---------------------------------------------------------------------------
+# 8. j#89291: the metadata-only rail must not consume a caller worktree at all.
+# ---------------------------------------------------------------------------
+
+
+class MetadataOnlyRailIsDecoupledFromCallerWorktree(unittest.TestCase):
+    """j#89291 live-acceptance blocker, measured on #14482 and reproduced here.
+
+    ``--retire-active-unbound-live-zero`` states in its own CLI help that ``--worktree`` is
+    optional and used only to widen the legacy live-zero inventory scan. The generic retire
+    preflight and runbook did not honour that, and live acceptance found all three ways it
+    went wrong on a lane that was closed, ACTIVE+UNBOUND, integrated and live-zero:
+
+    1. ``--worktree`` omitted -> the preflight fell back to probing the PRIMARY repo root and
+       blocked on unrelated user-owned dirtiness (``dirty_worktree``);
+    2. the recorded (reboot-wiped) worktree supplied -> ``worktree_missing_after_reboot``;
+    3. an unrelated clean worktree supplied -> ``retire_ok``, but the runbook then proposed
+       ``git worktree remove`` against *that* worktree and ``git branch -d`` against the lane
+       branch.
+
+    None of the three says anything about the lane being terminalized. The correction is that
+    a metadata-only intent has no checkout in scope, so the checkout gates are not measured
+    and the cleanup runbook is not emitted. All three inputs must now reach the SAME
+    metadata-only decision, subject only to the rail's own identity and live-zero fences.
+
+    The bound intents keep every one of those behaviours — pinned below, because the whole
+    risk of this change is that it leaks into them.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "primary"
+        self.repo.mkdir()
+        _git("init", "-q", "-b", "main", cwd=self.repo)
+        _git("config", "user.email", "t@example.com", cwd=self.repo)
+        _git("config", "user.name", "t", cwd=self.repo)
+        (self.repo / "f.txt").write_text("x\n", encoding="utf-8")
+        _git("add", ".", cwd=self.repo)
+        _git("commit", "-qm", "base", cwd=self.repo)
+        self.branch = "issue_14482_0_14_0a4_release_r2"
+        _git("branch", self.branch, cwd=self.repo)
+
+        # Unrelated, user-owned dirtiness in the primary checkout: tracked and then modified,
+        # exactly the `.claude/settings.local.json` shape j#89291 hit.
+        (self.repo / ".claude").mkdir()
+        user_file = self.repo / ".claude" / "settings.local.json"
+        user_file.write_text("{}\n", encoding="utf-8")
+        _git("add", "-f", ".claude/settings.local.json", cwd=self.repo)
+        _git("commit", "-qm", "user settings", cwd=self.repo)
+        user_file.write_text('{"user": "edited"}\n', encoding="utf-8")
+
+        # An unrelated CLEAN worktree (the case-3 input that must not become a cleanup target).
+        self.unrelated = self.root / "unrelated_integration_wt"
+        _git("worktree", "add", "-q", "--detach", str(self.unrelated), "main", cwd=self.repo)
+        # The lane's recorded worktree, wiped by the reboot.
+        self.gone = self.root / "private_tmp_wiped_by_reboot"
+
+    def _args(self, worktree, *, unbound: bool) -> argparse.Namespace:
+        return argparse.Namespace(
+            issue="14482",
+            journal="89072",
+            lane_label=self.branch,
+            worktree=(str(worktree) if worktree else None),
+            branch=self.branch,
+            integration_branch="main",
+            issue_closed=True,
+            callbacks_drained=True,
+            verified=True,
+            durable_record=True,
+            target_identity_known=True,
+            latest_generation_admissible=True,
+            review_generation_json=None,
+            execute=False,
+            migrate_hibernated_legacy=False,
+            reconcile_hibernated_live=False,
+            retire_hibernated_bound=False,
+            retire_active_live_zero=not unbound,
+            retire_active_unbound_live_zero=unbound,
+            expect_lane_generation=1,
+            expect_lane_revision=1,
+            integration_journal=None,
+            repo=str(self.repo),
+            json=True,
+        )
+
+    def _run(self, worktree, *, unbound: bool) -> dict:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
+            cmd_sublane_retire,
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cmd_sublane_retire(self._args(worktree, unbound=unbound))
+        return json.loads(buf.getvalue())
+
+    def _cleanup_commands(self, payload: dict) -> list:
+        return [
+            step["command"]
+            for step in payload.get("runbook", [])
+            if step.get("command")
+            and ("worktree remove" in step["command"] or "branch -d" in step["command"])
+        ]
+
+    # -- the three required regression pins -----------------------------------
+
+    def test_all_three_worktree_inputs_reach_the_same_metadata_only_decision(self):
+        results = {
+            "omitted (dirty primary repo)": self._run(None, unbound=True),
+            "recorded missing worktree": self._run(self.gone, unbound=True),
+            "unrelated clean worktree": self._run(self.unrelated, unbound=True),
+        }
+        for label, payload in results.items():
+            decision = payload["decision"]
+            self.assertEqual(
+                decision["blocked_reasons"], [], f"{label}: unexpected checkout gate"
+            )
+            self.assertEqual(decision["state"], "retire_ok", label)
+            self.assertEqual(
+                self._cleanup_commands(payload),
+                [],
+                f"{label}: a metadata-only intent proposed checkout cleanup",
+            )
+        # And they are the same decision, not merely three passing ones.
+        decisions = {json.dumps(p["decision"], sort_keys=True) for p in results.values()}
+        self.assertEqual(len(decisions), 1, "the three inputs diverged")
+
+    def test_omitted_worktree_does_not_consume_unrelated_primary_dirtiness(self):
+        """Case 1: the primary checkout's user-owned changes are none of this rail's business."""
+        self.assertTrue(
+            _git_out("status", "--porcelain", cwd=self.repo).strip(),
+            "precondition: the primary checkout must be dirty",
+        )
+        payload = self._run(None, unbound=True)
+        self.assertNotIn("dirty_worktree", payload["decision"]["blocked_reasons"])
+        self.assertTrue(payload["retire_ok"])
+
+    def test_the_recorded_missing_worktree_does_not_block_the_metadata_only_rail(self):
+        """Case 2: the reboot-wiped path is exactly what this surface exists to converge."""
+        self.assertFalse(self.gone.exists())
+        payload = self._run(self.gone, unbound=True)
+        self.assertNotIn(
+            "worktree_missing_after_reboot", payload["decision"]["blocked_reasons"]
+        )
+
+    def test_an_unrelated_worktree_is_never_proposed_for_removal(self):
+        """Case 3: the sharpest one — the runbook named somebody else's checkout."""
+        payload = self._run(self.unrelated, unbound=True)
+        joined = json.dumps(payload)
+        self.assertNotIn("worktree remove", joined)
+        self.assertNotIn("branch -d", joined)
+        self.assertTrue(
+            self.unrelated.is_dir(), "the unrelated worktree must still exist (dry run)"
+        )
+
+    def test_the_runbook_says_what_the_intent_actually_does(self):
+        payload = self._run(None, unbound=True)
+        titles = [s["title"] for s in payload["runbook"]]
+        self.assertEqual(titles, ["metadata-only terminalization"])
+
+    # -- bound-lane behaviour must be untouched --------------------------------
+
+    def test_bound_intent_still_blocks_on_a_dirty_repo_when_worktree_is_omitted(self):
+        payload = self._run(None, unbound=False)
+        self.assertIn("dirty_worktree", payload["decision"]["blocked_reasons"])
+
+    def test_bound_intent_still_blocks_on_a_missing_recorded_worktree(self):
+        payload = self._run(self.gone, unbound=False)
+        self.assertIn(
+            "worktree_missing_after_reboot", payload["decision"]["blocked_reasons"]
+        )
+
+    def test_bound_intent_still_emits_the_full_cleanup_runbook(self):
+        payload = self._run(self.unrelated, unbound=False)
+        commands = self._cleanup_commands(payload)
+        self.assertTrue(
+            any("worktree remove" in c for c in commands), commands
+        )
+        self.assertTrue(any("branch -d" in c for c in commands), commands)
+
+    def test_the_default_preflight_runbook_is_unchanged_for_every_other_caller(self):
+        """The domain default stays `True`, so no existing caller's runbook moves."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+            preflight_sublane_retire,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+            RetireDecision,
+            RETIRE_OK,
+        )
+
+        decision = RetireDecision(state=RETIRE_OK)
+        default = preflight_sublane_retire(
+            decision, issue="1", lane_label="l", worktree_path="/wt", branch="b"
+        )
+        explicit = preflight_sublane_retire(
+            decision, issue="1", lane_label="l", worktree_path="/wt", branch="b",
+            checkout_cleanup_in_scope=True,
+        )
+        self.assertEqual(default.runbook, explicit.runbook)
+        self.assertTrue(any("worktree remove" in (s.command or "") for s in default.runbook))
+
+
+class MetadataOnlyExecuteTouchesLifecycleOnly(unittest.TestCase):
+    """j#89291: an executed metadata-only terminalize must have lifecycle-CAS-only effects."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        env = mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.path = self.home / "state.sqlite"
+
+        self.repo = self.root / "primary"
+        self.repo.mkdir()
+        _git("init", "-q", "-b", "main", cwd=self.repo)
+        _git("config", "user.email", "t@example.com", cwd=self.repo)
+        _git("config", "user.name", "t", cwd=self.repo)
+        (self.repo / "f.txt").write_text("x\n", encoding="utf-8")
+        _git("add", ".", cwd=self.repo)
+        _git("commit", "-qm", "base", cwd=self.repo)
+        _git("branch", _LANE, cwd=self.repo)
+        self.head = _git_out("rev-parse", _LANE, cwd=self.repo).strip()
+        self.sibling = self.root / "sibling_wt"
+        _git("worktree", "add", "-q", "--detach", str(self.sibling), "main", cwd=self.repo)
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_herdr_projection as projection,
+            sublane_herdr_retire as herdr_retire,
+            workflow_provider_resolution as providers,
+        )
+
+        rows = mock.patch.object(
+            projection, "list_herdr_agent_rows", side_effect=lambda *_a, **_k: []
+        )
+        rows.start()
+        self.addCleanup(rows.stop)
+        for attr, value in (
+            ("resolve_gateway_provider", "codex"),
+            ("resolve_worker_provider", "claude"),
+        ):
+            patcher = mock.patch.object(providers, attr, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # Any pane close at all is a contract violation for this surface.
+        close_patch = mock.patch.object(
+            herdr_retire,
+            "execute_herdr_retire_close",
+            side_effect=AssertionError("a metadata-only retire must close nothing"),
+        )
+        close_patch.start()
+        self.addCleanup(close_patch.stop)
+
+        out = LaneDeclarationStore(path=self.path).declare_lane(
+            LaneLifecycleKey(_WORKSPACE_ID, _LANE),
+            decision=_decision(),
+            issue_id=_ISSUE,
+            declared_slots=_pins(),
+            worktree_identity="",
+        )
+        self.assertTrue(out.applied, out.reason)
+
+    def test_execute_writes_the_lifecycle_row_and_nothing_else(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_active_unbound_live_zero_retire import (  # noqa: E501
+            _terminalize_under_exclusion,
+        )
+
+        key = LaneLifecycleKey(_WORKSPACE_ID, _LANE)
+        before = LaneLifecycleStore(path=self.path).get(key)
+        verdict = _terminalize_under_exclusion(
+            argparse.Namespace(
+                lane_label=_LANE, issue=_ISSUE, journal=_JOURNAL,
+                worktree=str(self.sibling), branch=_LANE, integration_branch="main",
+            ),
+            self.repo,
+            workspace_id=_WORKSPACE_ID,
+            lane_label=_LANE,
+            issue=_ISSUE,
+            journal=_JOURNAL,
+            expect_generation=before.lane_generation,
+            expect_revision=before.revision,
+        )
+        self.assertEqual(verdict.state, "retired", f"{verdict.reason}: {verdict.detail}")
+
+        # 1. the lifecycle row moved — and ONLY its disposition / anchor / revision.
+        after = LaneLifecycleStore(path=self.path).get(key)
+        self.assertEqual(after.lane_disposition, DISPOSITION_RETIRED)
+        self.assertEqual(after.lane_generation, before.lane_generation)
+        self.assertEqual(after.declared_slots, before.declared_slots)
+        self.assertEqual(after.worktree_identity, "")
+        self.assertEqual(after.process_release, before.process_release)
+
+        # 2. no worktree was removed — including the unrelated one passed as --worktree.
+        self.assertTrue(self.sibling.is_dir())
+        self.assertIn(str(self.sibling), _git_out("worktree", "list", cwd=self.repo))
+
+        # 3. the branch and its commit survive, unmoved.
+        self.assertEqual(_git_out("rev-parse", _LANE, cwd=self.repo).strip(), self.head)
+
+        # 4. no pane close was attempted (the patched actuator would have raised).
+
+
+def _git_out(*args, cwd) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    ).stdout
