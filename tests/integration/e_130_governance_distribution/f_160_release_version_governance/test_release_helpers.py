@@ -1731,6 +1731,10 @@ class ReleasePublishTest(unittest.TestCase):
                 release_mod.cmd_release_publish(ns)
 
 
+#: Repo-relative legacy mirror reference dir, as the sub-check prints it.
+LEGACY_MIRROR_REL = ".claude/skills/mozyo-bridge-agent/references"
+
+
 class ReleaseCheckDriftTest(unittest.TestCase):
     """Pin Redmine #10688: `mozyo-bridge release check drift` runs every
     pre-existing drift gate and strict-fails on any side.
@@ -1976,7 +1980,7 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             ).write_text("smuggled in\n", encoding="utf-8")
             result, stdout, _stderr = self._run_helper(repo)
             self.assertEqual(1, result)
-            self.assertIn("unpinned reference: references/unpinned.md", stdout)
+            self.assertIn(f"unpinned entry: {LEGACY_MIRROR_REL}/unpinned.md", stdout)
             self.assertIn("result: blocker", stdout)
             # The bullet must say the sync will NOT clear this class.
             self.assertIn("refuses while one is present", stdout)
@@ -1998,7 +2002,7 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             ).symlink_to("missing-target")
             result, stdout, _stderr = self._run_helper(repo)
             self.assertEqual(1, result)
-            self.assertIn("unpinned reference: references/unpinned.md", stdout)
+            self.assertIn(f"unpinned entry: {LEGACY_MIRROR_REL}/unpinned.md", stdout)
             self.assertIn("result: blocker", stdout)
             self.assertIn("reviewed delete", stdout)
             self.assertIn("plugin skill mirror is up to date", stdout)
@@ -2019,9 +2023,49 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             pinned.mkdir()
             result, stdout, _stderr = self._run_helper(repo)
             self.assertEqual(1, result)
-            self.assertIn("not a regular file: references/safety.md", stdout)
+            self.assertIn(f"not a regular file: {LEGACY_MIRROR_REL}/safety.md", stdout)
             self.assertIn("result: blocker", stdout)
             self.assertIn("plugin skill mirror is up to date", stdout)
+
+    def test_legacy_mirror_non_md_entry_is_a_release_blocker(self) -> None:
+        """Review j#90378 R4-F1 condition 3: the gate needs the full domain.
+
+        `unpinned.txt`, a dotfile and a stale temp all sat in the mirror with
+        `release check drift` reporting `result: clean`, because the sub-check
+        audited `*.md` only and a shell glob also skips hidden entries.
+        """
+        for name in ("unpinned.txt", ".unpinned.md"):
+            with self.subTest(entry=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = self._stage_repo(Path(tmp) / "repo")
+                    (
+                        repo / ".claude/skills/mozyo-bridge-agent/references" / name
+                    ).write_text("smuggled\n", encoding="utf-8")
+                    result, stdout, _stderr = self._run_helper(repo)
+                    self.assertEqual(1, result)
+                    self.assertIn(f"unpinned entry: {LEGACY_MIRROR_REL}/{name}", stdout)
+                    self.assertIn("result: blocker", stdout)
+                    self.assertIn("plugin skill mirror is up to date", stdout)
+
+    def test_legacy_mirror_aliased_canonical_source_is_a_release_blocker(self) -> None:
+        """Review j#90378 R4-F2 condition 2: the source side gates too.
+
+        `-f "$src/$name"` follows symlinks, so a canonical reference pointed at
+        an external file was accepted and its bytes copied into the mirror
+        while the gate reported clean.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            external = repo / "external-body.md"
+            external.write_text("EXTERNAL BODY\n", encoding="utf-8")
+            source = repo / "skills/mozyo-bridge-agent/references/safety.md"
+            source.unlink()
+            source.symlink_to(external)
+
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("canonical reference is a symlink", stdout)
+            self.assertIn("result: blocker", stdout)
 
     def test_missing_legacy_sync_script_is_release_blocker(self) -> None:
         """A deleted legacy sync script must block, not silently pass.

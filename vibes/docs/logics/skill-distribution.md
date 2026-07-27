@@ -40,13 +40,34 @@ Grace period 中の運用:
 - `--check` mode は書き込まずに exit 1 を返す fail-closed gate で、`mozyo-bridge release check drift` の 3 番目の sub-check として実行される。content 差分、mirror file 欠落、pin 外 reference の混入、canonical source 欠落のいずれも drift として落とす。
 - **pin 外 reference は sync mode も拒否する (exit 1・書き込みなし)。** この class だけは sync が解消しない (tracked file の削除は sync の副作用ではなく reviewed decision) ため、sync が成功表示を返すと「rerun して復旧」という運用契約が収束しなくなる。解消できない drift class の存在下で成功を報告しない、が本 script の契約である (Redmine #14580 review j#90322 F1)。audit は書き込み前に走るので、拒否時の worktree は無変更のまま。
 - 復旧案内は drift class ごとに出し分ける。content 差分 / mirror file 欠落 = sync の再実行で解消。pin 外 reference = 削除するか script と test の pinned set を同一 commit で更新する (`release check drift` の blocker 行も同じ出し分けを持つ)。「どの drift でも sync を再実行」という単一案内は書かない。
-- **mirror の entry と destination topology を copy 前に検証する。** pin 済み reference は **regular file** でなければならず (symlink / directory / FIFO / socket / device はすべて拒否)、`.claude` から `references` までの path component に symlink があってはならない。いずれも `--check` と sync の両 mode で拒否し、sync は書き込み前に落ちる。実測した実害 (Redmine #14580 review j#90322 R2-F1 / j#90342 R3-F1):
-  - dangling symlink は `[ -e ]` が false になるため、素朴な glob no-match guard では「glob が未展開」と同じ扱いで skip され、pin 外 entry がある状態で両 mode が exit 0 を返す。guard は `[ -e "$path" ] || [ -L "$path" ]` の対で書く。
-  - pin 済み name が symlink だと content parity は link を辿って通過し、`cp` が **link 先へ書き込む**。無関係 file への symlink にすると、その file が canonical 本文で上書きされ sync は exit 0 と成功表示を返す。
-  - pin 済み name が directory だと sync が `safety.md/safety.md` を作って成功表示を返し、FIFO だと `cp` が open で**無限に停止**する。type 判定は `-f` (stat) で行い、FIFO を open しない。
-  - `references/` 自体を外部 directory への symlink にすると、`-d "$dest"` が link を辿るため mirror は健全に見え、sync は外部 directory を書き換えて exit 0 を返す。**component ごとに `-L` で検査する**。
-- **sync は既存 entry へ書き込まず、rename で置換する。** hardlink は regular file なので type 判定では捕まらず、`cp src dest` は pin 済み name が指す inode を open/truncate して無関係 file を書き換える (実測)。destination directory 内の temp file へ copy し `mv` で directory entry を差し替えることで、旧 inode とその別名は無傷のまま、中断時も半端な reference が残らない。temp file は trap で cleanup し、`*.md` の audit に拾われない dotfile 名にする。
-- test 側も同じ契約を assert する: `LegacyProjectSkillMirrorTest` は (a) exact-set 計算から `is_file()` filter を外し (これも symlink を辿るため dangling entry を落とす)、(b) symlink 不在と regular file であることを**別々に** assert し、(c) mirror path component に symlink が無いことを assert する。assertion 名が主張する性質と実際に検査している性質を一致させる (R3-F1 は「regular file」を名乗って symlink 不在しか見ていない test を指摘した)。
+### Mirror Contract (script の正本規則)
+
+`scripts/sync_legacy_project_skill.sh` は次の 6 規則を **1 つの契約**として両 mode で適用する。規則を増やすときは script 冒頭の同一 list に足す。個別 audit を別所に足す形にしない——それが軸を 1 つずつ取りこぼした原因である (Redmine #14580 review j#90322 F1 / j#90342 R2-F1・R3-F1 / j#90378 R4-F1〜F3 が、それぞれ mode 軸・entry 種別軸・topology 軸・filename domain 軸・**source 側**軸で同じ fail-open を見つけた)。
+
+| 規則 | 内容 |
+|---|---|
+| A. source topology | canonical references path の全 component が実在する非 symlink directory |
+| B. source entries | pin 済み name が **非 symlink の regular file** |
+| C. dest topology | mirror path の**実在する** component が非 symlink directory。不在は sync が作る |
+| D. dest entry set | mirror references の**全 direct entry** (hidden / 拡張子不問 / 種別不問) が pinned set に属する |
+| E. dest entry types | 実在する pin 済み entry が非 symlink の regular file |
+| F. content parity | pin 済み entry が canonical と byte 一致 |
+
+`--check` は A-F を報告し何も書かない。sync は A-E を**書き込み前**に強制し、自分の stale temp を除去してから rename で置換する。
+
+実測した実害 (すべて修正前は exit 0 + 成功表示):
+
+- **dangling symlink**: `[ -e ]` は symlink を辿るので false。素朴な glob no-match guard では「glob 未展開」と同じ枝で skip される。guard は `[ -e ] || [ -L ]` の対で書く。
+- **pin 済み symlink**: content parity は link を辿って通過し、`cp` が link 先へ書き込む。無関係 file が canonical 本文で上書きされる。
+- **pin 済み directory / FIFO**: 前者は `safety.md/safety.md` を作って成功表示、後者は `cp` が open で**無限停止**。type 判定は `-f` (stat) で行い FIFO を open しない。
+- **dest path component の symlink**: `-d "$dest"` が辿るため mirror は健全に見え、外部 directory を書き換える。**component ごとに `-L`** で検査する。
+- **filename domain**: audit を `*.md` に限ると `unpinned.txt` / hidden entry / stale temp を素通りさせる (shell glob は hidden も除外する)。**全 direct entry**を domain にする。
+- **canonical source の alias**: `[ -d "$src" ]` / `[ -f "$src/$name" ]` も symlink を辿る。aliased source は repo が tracking しない byte を mirror へ publish するので、**内容として取り込まず正本 path の復旧を案内する**。
+- **非 directory ancestor**: `.claude/skills` を regular file にすると ENOTDIR で `-e "$dest"` が false になり「mirror missing → sync を rerun」と案内するが、その sync は `mkdir -p` で失敗する。「実在するが directory でない」と「不在」を**別 class**として扱い、rerun 案内は収束する class にだけ出す。
+
+**sync は既存 entry へ書き込まず rename で置換する。** hardlink は regular file なので type 判定では原理的に捕まらず、`cp src dest` は pin 済み name が指す inode を open/truncate して無関係 file を書き換える。destination directory 内の temp file へ copy し `mv` で directory entry を差し替えれば、旧 inode とその別名は無傷、中断時も半端な reference が残らない。**temp は audit の domain 内**に置き (規則 D)、crash residue を専用 class として報告する。sync は自分の prefix の residue だけを除去する——自分が作った file の削除は、unpinned reference の削除のような reviewed decision ではない。glob から隠して見えなくする設計は採らない。
+
+test 側も同じ契約を assert する: `LegacyProjectSkillMirrorTest` は exact-set / regular-file 判定を `is_file()` filter と `*.md` glob の**どちらも使わずに** 全 direct entry で計算し、symlink 不在と regular file を**別々に** assert し、mirror path component に symlink が無いことを assert する。assertion 名が主張する性質と実際に検査している性質を一致させる (R3-F1 は「regular file」を名乗って symlink 不在しか見ていない test を指摘した)。pinned set と temp prefix は script と test の両方が持つため、それぞれ cross-check test で一致を固定する。
 - pinned reference 集合は script と `LegacyProjectSkillMirrorTest` の両方が持つ (shell から Python tuple は import できない)。`LegacySkillSyncScriptTest::test_script_pinned_set_matches_this_modules_pinned_set` が両者の一致を assert するので、片側だけ更新すると落ちる。mirror する reference を増減するときは script・test・本節を同一 commit で更新する。
 
 Removal criteria (本 grace period を解除する条件):
