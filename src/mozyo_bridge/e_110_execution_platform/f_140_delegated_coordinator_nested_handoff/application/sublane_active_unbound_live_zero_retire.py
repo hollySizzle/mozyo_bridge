@@ -432,6 +432,7 @@ def _terminalize_under_exclusion(
     the exclusion.
     """
     from mozyo_bridge.core.state.lane_lifecycle import (
+        DISPOSITION_ACTIVE,
         DISPOSITION_RETIRED,
         LaneLifecycleError,
         LaneLifecycleKey,
@@ -504,30 +505,43 @@ def _terminalize_under_exclusion(
     # check and the write. Exactly-one is required: OWNER_AMBIGUOUS means the invariant the
     # store's write paths maintain has been violated, and no terminal write may be licensed by
     # an index that is not holding; OWNER_ABSENT means no ACTIVE row owns the issue at all.
-    owner = LaneLifecycleStore().resolve_owner(workspace_id, issue)
-    if owner.status != OWNER_RESOLVED:
-        return _blocked(
-            UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN,
-            detail=(
-                f"issue #{issue} does not resolve to exactly one ACTIVE owning lane "
-                f"({owner.status}: {owner.detail}); with no worktree binding to attest, a "
-                "unique owner is this surface's only proof that --lane-label names the lane "
-                "the audit selected"
-            ),
-            workspace_id=workspace_id,
-            lane_id=lane_label,
-        )
-    if owner.lane_id != lane_label:
-        return _blocked(
-            UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN,
-            detail=(
-                f"issue #{issue} is owned by lane {owner.lane_id!r}, not the requested "
-                f"{lane_label!r}; the requested lane is not this issue's owner, so "
-                "terminalizing it would retire a lane the caller did not select"
-            ),
-            workspace_id=workspace_id,
-            lane_id=lane_label,
-        )
+    #
+    # Scoped to ``active`` — the ONLY disposition from which this surface writes (review
+    # j#89238 finding 1). Applying it unconditionally, as the first version did, broke the
+    # idempotent replay: a terminalized row is ``retired``, which drops it out of the ACTIVE
+    # owner index, so the second run resolved OWNER_ABSENT and returned
+    # ``lane_selection_unproven`` instead of ``already_retired`` (measured: first
+    # ``retired``, replay ``blocked``). A fence guarding a write must not run on a path that
+    # performs none. The two non-active dispositions keep their own, more precise refusals:
+    # a ``retired`` row owning this issue is the idempotent success below (still re-verified
+    # against a fresh live-zero read first), and ``hibernated`` / ``superseded`` fall to the
+    # CAS's ``not_active_unbound_state``, which names the disposition rather than blaming
+    # lane selection for it.
+    if record.lane_disposition == DISPOSITION_ACTIVE:
+        owner = LaneLifecycleStore().resolve_owner(workspace_id, issue)
+        if owner.status != OWNER_RESOLVED:
+            return _blocked(
+                UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN,
+                detail=(
+                    f"issue #{issue} does not resolve to exactly one ACTIVE owning lane "
+                    f"({owner.status}: {owner.detail}); with no worktree binding to attest, a "
+                    "unique owner is this surface's only proof that --lane-label names the "
+                    "lane the audit selected"
+                ),
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+            )
+        if owner.lane_id != lane_label:
+            return _blocked(
+                UNBOUND_RETIRE_LANE_SELECTION_UNPROVEN,
+                detail=(
+                    f"issue #{issue} is owned by lane {owner.lane_id!r}, not the requested "
+                    f"{lane_label!r}; the requested lane is not this issue's owner, so "
+                    "terminalizing it would retire a lane the caller did not select"
+                ),
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+            )
 
     # The legacy twin token, derived from --worktree when one was supplied. Used ONLY to
     # widen the live-zero scan to the pre-#13377 unit, never to attest anything: an unbound

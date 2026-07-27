@@ -1541,3 +1541,210 @@ class Finding4UnreadableAuthorityIsNotEmpty(unittest.TestCase):
                 )
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(buf.getvalue())["lane_count"], 0)
+
+
+# ---------------------------------------------------------------------------
+# 7. Review j#89238: the idempotent replay the R2 owner fence broke.
+# ---------------------------------------------------------------------------
+
+
+class Finding5IdempotentReplayThroughTheRail(unittest.TestCase):
+    """j#89238: first apply -> replay must be an `already_retired` zero-write success.
+
+    The R2 owner fence (j#89191 finding 1) ran before the disposition branch, and
+    ``resolve_owner`` only considers ACTIVE rows — so a terminalized row dropped out of the
+    owner index and its replay returned ``lane_selection_unproven`` instead. A fence guarding
+    a write must not run on a path that performs none.
+
+    Why R2's 74 pins missed it: the only replay test was
+    ``test_a_second_apply_is_refused_the_caller_owns_idempotence``, which drives the **CAS
+    store** directly. There, refusing a second apply IS the contract — idempotence is the
+    caller's job. Nothing exercised the *rail*, which is the caller. These tests are
+    deliberately application-level for that reason.
+
+    The live-zero measurement is **not** mocked here: the inventory rows are injected and the
+    real four-fence measurement runs over them. Mocking it would make the "a retired replay
+    still blocks on a live pair" case vacuous, since that block comes from the measurement.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+        env = mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.path = self.home / "state.sqlite"
+        self.key = LaneLifecycleKey(_WORKSPACE_ID, _LANE)
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_herdr_projection as projection,
+            workflow_provider_resolution as providers,
+        )
+
+        self.inventory: list[dict] = []
+        rows = mock.patch.object(
+            projection, "list_herdr_agent_rows",
+            side_effect=lambda *_a, **_k: list(self.inventory),
+        )
+        rows.start()
+        self.addCleanup(rows.stop)
+        for attr, value in (
+            ("resolve_gateway_provider", "codex"),
+            ("resolve_worker_provider", "claude"),
+        ):
+            patcher = mock.patch.object(providers, attr, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        out = LaneDeclarationStore(path=self.path).declare_lane(
+            self.key,
+            decision=_decision(),
+            issue_id=_ISSUE,
+            declared_slots=_pins(),
+            worktree_identity="",
+        )
+        self.assertTrue(out.applied, out.reason)
+
+    def _row(self):
+        return LaneLifecycleStore(path=self.path).get(self.key)
+
+    def _terminalize(self, *, lane_label: str = _LANE, generation=None, revision=None):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_active_unbound_live_zero_retire import (  # noqa: E501
+            _terminalize_under_exclusion,
+        )
+
+        current = self._row()
+        return _terminalize_under_exclusion(
+            argparse.Namespace(
+                lane_label=lane_label, issue=_ISSUE, journal=_JOURNAL, worktree=None,
+                branch="b", integration_branch="main",
+            ),
+            Path("."),
+            workspace_id=_WORKSPACE_ID,
+            lane_label=lane_label,
+            issue=_ISSUE,
+            journal=_JOURNAL,
+            expect_generation=(
+                current.lane_generation if generation is None else generation
+            ),
+            expect_revision=current.revision if revision is None else revision,
+        )
+
+    # -- (a) the regression itself -------------------------------------------
+
+    def test_first_apply_then_replay_is_an_idempotent_success(self):
+        first = self._terminalize()
+        self.assertEqual(first.state, "retired", first.reason)
+        after_first = self._row()
+        self.assertEqual(after_first.lane_disposition, DISPOSITION_RETIRED)
+
+        replay = self._terminalize()
+        self.assertEqual(
+            replay.state,
+            "already_retired",
+            f"the replay must be an idempotent success, got {replay.reason}: {replay.detail}",
+        )
+        self.assertTrue(replay.ok)
+        # And it is a ZERO-write success: the row did not move again.
+        after_replay = self._row()
+        self.assertEqual(after_replay.revision, after_first.revision)
+        self.assertEqual(after_replay.lane_disposition, DISPOSITION_RETIRED)
+
+    def test_a_third_replay_is_still_idempotent(self):
+        self.assertEqual(self._terminalize().state, "retired")
+        rev = self._row().revision
+        for _ in range(2):
+            self.assertEqual(self._terminalize().state, "already_retired")
+        self.assertEqual(self._row().revision, rev, "replays must never write")
+
+    # -- (b) a retired replay must still be measured, not rubber-stamped ------
+
+    def test_a_retired_replay_with_a_live_pair_blocks_instead_of_succeeding(self):
+        """A persisted `retired` is not proof the pair is currently gone."""
+        self.assertEqual(self._terminalize().state, "retired")
+        self.inventory = [_live_row("codex", "w3N:pF"), _live_row("claude", "w3N:pG")]
+        replay = self._terminalize()
+        self.assertEqual(replay.state, "blocked")
+        self.assertEqual(replay.reason, "live_pair_present")
+        self.assertFalse(replay.ok)
+
+    def test_a_retired_replay_with_a_foreign_occupant_blocks(self):
+        self.assertEqual(self._terminalize().state, "retired")
+        self.inventory = [
+            {
+                "name": encode_assigned_name(_WORKSPACE_ID, "gemini", _LANE),
+                "pane": "w3N:pZ",
+                "agent": "gemini",
+                "agent_status": "idle",
+            }
+        ]
+        replay = self._terminalize()
+        self.assertEqual(replay.state, "blocked")
+        self.assertEqual(replay.reason, "foreign_inventory_present")
+
+    def test_a_retired_replay_of_a_DIFFERENT_issue_is_not_a_success(self):
+        """The idempotent branch requires the row to own THIS issue."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_active_unbound_live_zero_retire import (  # noqa: E501
+            _terminalize_under_exclusion,
+        )
+
+        self.assertEqual(self._terminalize().state, "retired")
+        current = self._row()
+        verdict = _terminalize_under_exclusion(
+            argparse.Namespace(
+                lane_label=_LANE, issue="99999", journal=_JOURNAL, worktree=None,
+                branch="b", integration_branch="main",
+            ),
+            Path("."),
+            workspace_id=_WORKSPACE_ID,
+            lane_label=_LANE,
+            issue="99999",
+            journal=_JOURNAL,
+            expect_generation=current.lane_generation,
+            expect_revision=current.revision,
+        )
+        self.assertEqual(verdict.state, "blocked")
+        self.assertNotEqual(verdict.reason, "already_retired")
+
+    # -- (c) the ACTIVE-path fence is untouched ------------------------------
+
+    def test_the_owner_fence_still_guards_the_active_write_path(self):
+        """Scoping the fence to `active` must not disarm it where it matters."""
+        from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore as _Store
+        from mozyo_bridge.core.state.lane_lifecycle_model import (
+            OWNER_RESOLVED,
+            OwnerResolution,
+        )
+
+        with mock.patch.object(
+            _Store,
+            "resolve_owner",
+            return_value=OwnerResolution(status=OWNER_RESOLVED, lane_id="a_different_lane"),
+        ):
+            verdict = self._terminalize()
+        self.assertEqual(verdict.reason, "lane_selection_unproven")
+        self.assertEqual(
+            self._row().lane_disposition,
+            DISPOSITION_ACTIVE,
+            "zero-write: the ACTIVE row must be untouched",
+        )
+
+    def test_a_hibernated_row_now_reports_its_disposition_not_lane_selection(self):
+        """Side effect of scoping the fence: the refusal names the real problem again."""
+        row = self._row()
+        LaneLifecycleStore(path=self.path).transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=row.revision,
+            target=DISPOSITION_HIBERNATED,
+            decision=_decision(),
+        )
+        verdict = self._terminalize()
+        self.assertEqual(verdict.state, "blocked")
+        self.assertEqual(
+            verdict.reason,
+            "not_active_unbound_state",
+            "a hibernated row's problem is its disposition, not lane selection",
+        )
