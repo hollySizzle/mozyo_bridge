@@ -1509,6 +1509,172 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         )
         self.assertEqual([], self._staging_names(repo))
 
+    def test_the_directory_walk_never_closes_a_reused_descriptor_number(self) -> None:
+        """j#90482 R12-F1. The same defect R11-F1 fixed for the staging
+        descriptor still lived in the component walk: `_close_quietly(parent)`
+        unwinding meant `parent = child` was never reached, so the `finally`
+        closed the freed number again — measured closing a `/dev/null` handle
+        that had taken it.
+        """
+        repo = self._stage()
+        real_open, real_close = os.open, os.close
+        state: dict[str, object] = {"root": None, "reused": None, "fired": False}
+
+        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            fd = real_open(path, flags, *args, **kwargs)
+            if state["root"] is None and "dir_fd" not in kwargs:
+                state["root"] = fd
+            return fd
+
+        def reusing_close(fd: int) -> None:
+            if fd == state["root"] and not state["fired"]:
+                state["fired"] = True
+                real_close(fd)
+                state["reused"] = real_open(os.devnull, os.O_RDONLY)
+                raise RuntimeError("injected walk close unwind")
+            real_close(fd)
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "close", reusing_close
+            ):
+                with self.assertRaises(RuntimeError):
+                    self._service(repo).audit()
+
+        reused = state["reused"]
+        self.assertIsNotNone(reused, "the walk close injection never fired")
+        self.assertEqual(
+            state["root"], reused, "the number was not reused; the case is not exercised"
+        )
+        try:
+            os.fstat(int(reused))  # type: ignore[arg-type]
+        except OSError as exc:
+            self.fail(f"the walk closed a descriptor it did not own (errno {exc.errno})")
+        real_close(int(reused))  # type: ignore[arg-type]
+
+    def test_a_walk_close_that_unwinds_leaks_no_descriptor(self) -> None:
+        """The other half of the walk's ownership transfer.
+
+        Detaching inside `close()` already prevents a double close, so a probe
+        that only checks "no foreign descriptor was closed" passes even when the
+        transfer is reordered. Closing the previous descriptor *before* handing
+        ownership to the child instead leaks the child: the loop variable never
+        takes it, so the `finally` has nothing to close. Measured at ten leaked
+        descriptors over ten runs.
+        """
+        repo = self._stage()
+        real_open, real_close = os.open, os.close
+        state: dict[str, object] = {"root": None, "fired": False}
+
+        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            fd = real_open(path, flags, *args, **kwargs)
+            if state["root"] is None and "dir_fd" not in kwargs:
+                state["root"] = fd
+            return fd
+
+        def unwinding_close(fd: int) -> None:
+            real_close(fd)
+            if fd == state["root"] and not state["fired"]:
+                state["fired"] = True
+                raise RuntimeError("injected walk close unwind")
+
+        def one_run() -> None:
+            state["root"] = None
+            state["fired"] = False
+            with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
+                with unittest.mock.patch.object(
+                    legacy_mirror_sync.os, "close", unwinding_close
+                ):
+                    try:
+                        self._service(repo).audit()
+                    except RuntimeError:
+                        pass
+            self.assertTrue(state["fired"], "the walk close injection never fired")
+
+        one_run()  # settle any first-call allocation
+        before = self._open_descriptor_count()
+        for _ in range(10):
+            one_run()
+        self.assertEqual(
+            before, self._open_descriptor_count(), "the walk leaked descriptors"
+        )
+
+    def test_a_failing_add_note_does_not_replace_the_primary(self) -> None:
+        """j#90482 R12-F2. Recording the secondary must never become the reason
+        the caller sees a different exception — a raising `add_note` replaced
+        the primary *and* skipped the release entirely."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        class PrimaryFailure(Exception):
+            def add_note(self, note: str) -> None:  # type: ignore[override]
+                raise RuntimeError("injected add_note failure")
+
+        real_open, real_close = os.open, os.close
+        state: dict[str, object] = {"fd": None, "fired": False}
+
+        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_CREAT:
+                state["fd"] = fd
+            return fd
+
+        def unwinding_close(fd: int) -> None:
+            real_close(fd)
+            if fd == state["fd"] and not state["fired"]:
+                state["fired"] = True
+                raise RuntimeError("injected close unwind")
+
+        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise PrimaryFailure("injected write unwind")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "close", unwinding_close
+            ):
+                with unittest.mock.patch.object(
+                    legacy_mirror_sync.os, "write", primary_write
+                ):
+                    with self.assertRaises(PrimaryFailure):
+                        self._service(repo).sync()
+
+        self.assertTrue(state["fired"], "the close injection never fired")
+        self.assertEqual([], self._staging_names(repo), "the release was skipped")
+
+    def test_a_failing_cleanup_does_not_replace_the_primary(self) -> None:
+        """j#90482 R12-F2. Chaining close and release meant one failing skipped
+        the other; each is attempted independently now, and the primary
+        survives with the cleanup failure recorded as secondary."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        class PrimaryFailure(Exception):
+            pass
+
+        service = self._service(repo)
+
+        def exploding_release(mirror_fd: int, temp_name: str, identity):  # type: ignore[no-untyped-def]
+            raise RuntimeError("injected cleanup failure")
+
+        service._release_staging = exploding_release  # type: ignore[method-assign]
+
+        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise PrimaryFailure("injected write unwind")
+
+        with unittest.mock.patch.object(
+            legacy_mirror_sync.os, "write", primary_write
+        ):
+            with self.assertRaises(PrimaryFailure) as caught:
+                service.sync()
+
+        notes = getattr(caught.exception, "__notes__", [])
+        self.assertTrue(
+            any("secondary failure during teardown" in note for note in notes),
+            "the cleanup failure was dropped instead of being recorded",
+        )
+
     def test_cleanup_helper_runs_exactly_once_when_it_raises(self) -> None:
         """j#90472 R10-F4. I claimed the single-shot guard was structurally
         unreachable; the review showed the path. `_release_staging` raising a

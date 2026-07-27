@@ -155,6 +155,22 @@ def _close_quietly(fd: int) -> bool:
 
 
 
+
+def _teardown_during(primary: BaseException, *actions) -> None:
+    """Run each teardown action, independently, without disturbing ``primary``.
+
+    Chaining them meant one failure skipped the rest: a raising close, or a
+    raising cleanup, stopped the release from running at all and left residue
+    behind (j#90482 R12-F2). Each action is attempted on its own and its
+    failure is recorded as secondary.
+    """
+    for action in actions:
+        try:
+            action()
+        except BaseException as failure:  # noqa: BLE001 - recorded, not raised
+            _attach_secondary(primary, failure)
+
+
 class _OwnedDescriptor:
     """A descriptor this run owns, closed at most once.
 
@@ -184,6 +200,12 @@ class _OwnedDescriptor:
     def fileno(self) -> int:
         return self._fd
 
+    def detach(self) -> int:
+        """Give the descriptor to someone else; this object stops owning it."""
+        fd = self._fd
+        self._fd = -1
+        return fd
+
     def close(self) -> bool:
         """Close once. ``False`` when the close reported an ``OSError``."""
         fd = self._fd
@@ -200,12 +222,20 @@ def _attach_secondary(primary: BaseException, secondary: BaseException) -> None:
     write; a close or cleanup failure is additional information, not a
     replacement (j#90477 R11-F1 condition 3).
     """
-    note = f"{type(secondary).__name__}: {secondary}"
-    add_note = getattr(primary, "add_note", None)
-    if add_note is not None:
-        add_note(f"secondary failure during teardown: {note}")
-    elif primary.__context__ is None:
-        primary.__context__ = secondary
+    try:
+        note = f"{type(secondary).__name__}: {secondary}"
+        add_note = getattr(primary, "add_note", None)
+        if add_note is not None:
+            add_note(f"secondary failure during teardown: {note}")
+        elif primary.__context__ is None:
+            primary.__context__ = secondary
+    except BaseException:
+        # Best effort, deliberately swallowing. Recording a secondary failure
+        # must never become the reason the caller sees a different exception —
+        # a raising `add_note` replaced the primary and skipped the release
+        # entirely (j#90482 R12-F2). The region is a format plus an attribute
+        # set, so nothing meaningful is hidden.
+        pass
 
 
 class LegacyProjectSkillMirrorSync:
@@ -280,7 +310,9 @@ class LegacyProjectSkillMirrorSync:
         accepted as out of scope (j#90378).
         """
         try:
-            parent = os.open(self.repo_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            current = _OwnedDescriptor(
+                os.open(self.repo_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            )
         except OSError:
             return (
                 None,
@@ -288,24 +320,26 @@ class LegacyProjectSkillMirrorSync:
                 False,
             )
 
-        # Ownership of `parent` belongs to this frame until it is handed to the
-        # caller. Every exit closes it exactly once: the early returns used to
-        # leak it, and `except BaseException` does not fire on `return` — an
-        # audit of a tree with no source and no mirror leaked two descriptors
-        # per call, 50 over 25 calls (j#90450 R7-F1).
-        handed_over = False
+        # The walk owns exactly one descriptor at a time. Ownership moves to the
+        # child *before* the previous one is closed: a close that unwinds must
+        # not leave the loop holding a freed number, because the `finally` would
+        # then close it again — and descriptor numbers are reused, so that
+        # second close hit an unrelated handle (j#90482 R12-F1, the same defect
+        # R11-F1 fixed for the staging descriptor).
         walked = ""
         try:
             for part in relative.split("/"):
                 walked = f"{walked}/{part}" if walked else part
                 try:
-                    child = os.open(part, _DIR_FLAGS, dir_fd=parent)
+                    child_fd = os.open(part, _DIR_FLAGS, dir_fd=current.fileno)
                 except OSError:
-                    violation, missing = self._classify_component(parent, part, walked, rule)
+                    violation, missing = self._classify_component(
+                        current.fileno, part, walked, rule
+                    )
                     if missing and create:
                         try:
-                            os.mkdir(part, 0o755, dir_fd=parent)
-                            child = os.open(part, _DIR_FLAGS, dir_fd=parent)
+                            os.mkdir(part, 0o755, dir_fd=current.fileno)
+                            child_fd = os.open(part, _DIR_FLAGS, dir_fd=current.fileno)
                         except OSError:
                             return (
                                 None,
@@ -317,13 +351,13 @@ class LegacyProjectSkillMirrorSync:
                     else:
                         assert violation is not None
                         return None, (violation,), False
-                _close_quietly(parent)
-                parent = child
-            handed_over = True
-            return parent, (), False
+
+                previous, current = current, _OwnedDescriptor(child_fd)
+                previous.close()
+            # Hand the leaf to the caller; the `finally` then has nothing to do.
+            return current.detach(), (), False
         finally:
-            if not handed_over:
-                _close_quietly(parent)
+            current.close()
 
     @contextmanager
     def _bound(self, relative: str, rule: str, *, create: bool = False) -> Iterator[
@@ -679,14 +713,11 @@ class LegacyProjectSkillMirrorSync:
         except BaseException as primary:
             # Not just `OSError`: a non-OSError unwinding the write reached
             # neither the hook nor the verify safety net, so the staging entry
-            # this run owned was left behind (j#90472 R10-F1). The close itself
-            # may also unwind — it must not stop the release, and it must not
-            # replace the exception the caller sees (j#90477 R11-F1).
-            try:
-                temp.close()
-            except BaseException as close_error:
-                _attach_secondary(primary, close_error)
-            release()
+            # this run owned was left behind (j#90472 R10-F1). The close and the
+            # release may each unwind too — they are attempted independently so
+            # one failing cannot skip the other, and neither replaces the
+            # exception the caller sees (j#90477 R11-F1 / j#90482 R12-F2).
+            _teardown_during(primary, temp.close, release)
             raise
         finally:
             # A close can report a deferred write error, so discarding its
@@ -711,8 +742,8 @@ class LegacyProjectSkillMirrorSync:
 
         try:
             self._notify(HOOK_TEMP_CREATED)
-        except BaseException:
-            release()
+        except BaseException as primary:
+            _teardown_during(primary, release)
             raise
 
         # From here to the rename, an exception must still release the staging
@@ -750,11 +781,7 @@ class LegacyProjectSkillMirrorSync:
                 verify.close()
                 return (verify_failure,) + release()
             except BaseException as primary:
-                try:
-                    verify.close()
-                except BaseException as close_error:
-                    _attach_secondary(primary, close_error)
-                release()
+                _teardown_during(primary, verify.close, release)
                 raise
             finally:
                 if verify.held:
@@ -800,8 +827,8 @@ class LegacyProjectSkillMirrorSync:
 
             staging_live = False  # the rename consumed it
             return ()
-        except BaseException:
-            release()
+        except BaseException as primary:
+            _teardown_during(primary, release)
             raise
 
 
