@@ -441,7 +441,26 @@ def resolve_ack_authority(repo_root, *, env) -> "tuple[bool, str, str]":
             f"the live default-lane coordinator slot is {target.status!r}; an acknowledgement "
             "needs a single live generation-attested coordinator"
         )
-    if target.assigned_name != identity.assigned_name:
+    # Correlate the acknowledging process with the live slot through the canonical mzb1 name
+    # DERIVED from the attested identity's real fields (Redmine #14546, live finding j#90142).
+    # `SenderIdentity` carries exactly `workspace_id` / `role` / `lane_id` and no assigned name;
+    # reading one off it raised `AttributeError` in the live coordinator's ack, and no test caught
+    # it because the CLI regression stubbed this function instead of driving it. The encoder is the
+    # same one the launcher and the dispatch admission use, so the derivation cannot drift from the
+    # name the slot actually carries.
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        encode_assigned_name,
+    )
+
+    try:
+        sender_assigned_name = encode_assigned_name(
+            workspace_id, identity.role, (identity.lane_id or "").strip() or DEFAULT_LANE
+        )
+    except Exception:  # noqa: BLE001 - an underivable name correlates with nothing (fail closed)
+        return False, "proxy_ack_unattested", (
+            "the attested sender's identity does not derive a canonical slot name"
+        )
+    if not sender_assigned_name or target.assigned_name != sender_assigned_name:
         return False, "proxy_ack_unattested", (
             "the attested sender is not the live default-lane coordinator slot"
         )

@@ -190,6 +190,7 @@ rules:
   - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_coordinator_proxy_send.py
   - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_cli_workflow_proxy_ack.py
   - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_cli_workflow_step_forward_leg.py
+  - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_proxy_ack_authority.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/specs/external-client-coordinator-proxy.md と @vibes/docs/specs/herdr-default-lane-workflow-role-authority.md
     と @vibes/docs/specs/herdr-native-identity.md と @vibes/docs/logics/workflow-step-command-design.md と @vibes/docs/logics/managed-state-model.md
