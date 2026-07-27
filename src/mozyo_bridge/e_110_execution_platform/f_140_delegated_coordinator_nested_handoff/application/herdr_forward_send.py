@@ -378,15 +378,53 @@ def execute_herdr_forward(
         )
 
     # (5) exactly one send with the minted action id; record the outcome guarded by that id.
+    #
+    # The outcome write is a CAS whose result is the ONLY evidence that the send and the durable
+    # record agree (Redmine #14546, review j#90068 finding 2 — the same defect the proxy leg was
+    # corrected for in j#90032 F2, still present here). It fails whenever this generation is no
+    # longer `reserved`, which an ordinary concurrent retry causes by re-entering the reserve
+    # mid-send. Reporting `sent` regardless told the caller rc 0 while the store said `uncertain`,
+    # and the correlated-callback completion only advances a `delivered` generation — so the route
+    # stranded. A store failure raises rather than returning False, so both are observed here: a
+    # delivery the store did not record is not a delivery.
     outcome = send_port.send(plan, target, reserve.action_id, args=args)
-    if outcome.result == SEND_DELIVERED:
-        fence.mark_delivered(route, reserve.action_id, detail=outcome.detail)
-    else:
-        # A failed / unknown send is uncertain: never auto-retried; a reconcile precedes any re-send.
-        fence.mark_uncertain(route, reserve.action_id, detail=outcome.detail or f"send {outcome.result}")
+    try:
+        if outcome.result == SEND_DELIVERED:
+            recorded = fence.mark_delivered(route, reserve.action_id, detail=outcome.detail)
+        else:
+            # A failed / unknown send is uncertain: never auto-retried; a reconcile precedes any
+            # re-send.
+            recorded = fence.mark_uncertain(
+                route, reserve.action_id, detail=outcome.detail or f"send {outcome.result}"
+            )
+    except ForwardOutboxFenceError as exc:
+        return ForwardExecutionResult(
+            sent=False, decision=ZERO_SEND, target_status=target.status,
+            fence_state=FENCE_HELD, reason="herdr_forward_outcome_unrecorded",
+            detail=(
+                "the send fired but its outcome could not be recorded (the forward store failed): "
+                f"{exc}. Reconcile against the durable state before deciding; never blind-retry."
+            ),
+            send=outcome,
+        )
+    if not recorded:
+        return ForwardExecutionResult(
+            sent=False, decision=ZERO_SEND, target_status=target.status,
+            fence_state=FENCE_HELD, reason="herdr_forward_outcome_unrecorded",
+            detail=(
+                "the send fired but its generation was no longer reserved when the outcome was "
+                "recorded (a concurrent retry advanced it). The durable state is authoritative: "
+                "reconcile before deciding whether the forward landed."
+            ),
+            send=outcome,
+        )
     return ForwardExecutionResult(
-        sent=True, decision=decision.decision, target_status=target.status,
-        fence_state=FENCE_OPEN, detail=f"{target.detail}; action_id={reserve.action_id}",
+        sent=outcome.result == SEND_DELIVERED,
+        decision=decision.decision if outcome.result == SEND_DELIVERED else ZERO_SEND,
+        target_status=target.status,
+        fence_state=FENCE_OPEN,
+        reason="" if outcome.result == SEND_DELIVERED else "herdr_forward_delivery_uncertain",
+        detail=f"{target.detail}; action_id={reserve.action_id}",
         send=outcome,
     )
 

@@ -228,12 +228,89 @@ class HerdrForwardSendTest(unittest.TestCase):
         port = _CountingPort(result=SEND_FAILED)
         rows = [_row(gw)]
         first = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=rows, port=port)
-        self.assertTrue(first.sent)
+        # The send fired exactly once, but it did not land — and a fired send is not a delivery
+        # (Redmine #14546, review j#90068 F2). Reporting `sent` here is what told a caller rc 0
+        # while the store held an `uncertain` generation that no callback could ever complete.
+        self.assertEqual(len(port.calls), 1)
+        self.assertFalse(first.sent)
         self.assertEqual(first.send.result, SEND_FAILED)
         # uncertain generation blocks the next attempt (no blind retry).
         second = self._run(_grandparent(), sender_lane="default", gateway_lane_ids={gw}, rows=rows, port=port)
         self.assertFalse(second.sent)
         self.assertEqual(len(port.calls), 1)
+
+
+class ForwardOutcomeWriteTest(unittest.TestCase):
+    """The outcome write is a CAS, and its result is evidence (Redmine #14546, review j#90068 F2).
+
+    Ignoring it reported `sent=True` while the store held an `uncertain` generation — and since the
+    correlated callback completes only a `delivered` generation, the route then stranded with no way
+    forward. This is the same defect the proxy leg was corrected for; it was still live here.
+
+    Driven against the REAL fence: the transition under test is a store transition, so a fake that
+    always returns True would assert the defect away.
+    """
+
+    class _RacingPort:
+        """Re-enters the reserve mid-send, exactly as a concurrent retry does."""
+
+        def __init__(self, fence, route, result=SEND_DELIVERED):
+            self.fence = fence
+            self.route = route
+            self.calls = []
+            self.racer_won = None
+            self.result = result
+
+        def send(self, plan, target, action_id, *, args):
+            self.calls.append((plan.direction, target.assigned_name, action_id))
+            self.racer_won = self.fence.reserve(self.route).won
+            return ForwardSendOutcome(result=self.result, rc=0, detail="fake send")
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.fence = ForwardOutboxFence(home=self.home)
+        self.fence.bootstrap()
+        self.args = argparse.Namespace()
+        self.route = ForwardRouteKey(
+            WS, "default", "grandparent_coordinator", "project_gateway", ""
+        )
+
+    def _run(self, port, *, rows, gateway_lane_ids):
+        return execute_herdr_forward(
+            _grandparent(), args=self.args, workspace_id=WS, sender_lane_id="default",
+            target_provider=CODEX, gateway_lane_ids=frozenset(gateway_lane_ids), rows=rows,
+            decode=decode_assigned_name, locator_of=_locator_of, fence=self.fence, send_port=port,
+        )
+
+    def test_a_delivered_send_whose_generation_moved_is_not_reported_as_delivered(self):
+        gw = project_gateway_lane_id("alpha")
+        port = self._RacingPort(self.fence, self.route)
+        result = self._run(port, rows=[_row(gw)], gateway_lane_ids={gw})
+
+        self.assertEqual(len(port.calls), 1)  # exactly one send still fired
+        self.assertFalse(port.racer_won)  # the racer re-entered and moved the generation
+        self.assertFalse(result.sent)
+        self.assertEqual(result.reason, "herdr_forward_outcome_unrecorded")
+
+    def test_the_reported_verdict_matches_the_stored_state(self):
+        gw = project_gateway_lane_id("alpha")
+        port = self._RacingPort(self.fence, self.route)
+        result = self._run(port, rows=[_row(gw)], gateway_lane_ids={gw})
+        self.assertEqual(self.fence.active(self.route).state, "uncertain")
+        self.assertFalse(result.sent)
+
+    def test_an_uncontended_delivery_still_reports_delivered(self):
+        gw = project_gateway_lane_id("alpha")
+        port = _CountingPort()
+        result = self._run(port, rows=[_row(gw)], gateway_lane_ids={gw})
+        self.assertTrue(result.sent)
+        self.assertEqual(self.fence.active(self.route).state, "delivered")
+
+    def test_a_failed_send_whose_generation_moved_is_still_a_non_delivery(self):
+        gw = project_gateway_lane_id("alpha")
+        port = self._RacingPort(self.fence, self.route, result=SEND_FAILED)
+        result = self._run(port, rows=[_row(gw)], gateway_lane_ids={gw})
+        self.assertFalse(result.sent)
 
 
 class _FakeSenderRes:

@@ -22,7 +22,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
     ACTION_DECISION_TOKENS,
+    ACTION_BOOTSTRAP_LANE,
     ACTION_DISPATCH_NEXT,
+    ACTION_SCOPES,
     ANCHOR_ACTION_MISMATCH,
     ANCHOR_DECISION_INCOMPLETE,
     ANCHOR_GENERATION_STALE,
@@ -72,7 +74,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     WORKSPACE_UNRESOLVED,
     ZERO_SEND,
     DecisionRecord,
+    IssueExpectation,
     LaneExpectation,
+    SCOPE_ISSUE,
+    SCOPE_LANE,
     ProxyLinks,
     anchor_status_for,
     decide_proxy_delegation,
@@ -97,7 +102,12 @@ def _links(**overrides) -> ProxyLinks:
 
 class ActionVocabularyTest(unittest.TestCase):
     def test_the_vocabulary_is_closed(self):
-        self.assertEqual(PROXY_ACTIONS, (ACTION_DISPATCH_NEXT,))
+        self.assertEqual(PROXY_ACTIONS, (ACTION_BOOTSTRAP_LANE, ACTION_DISPATCH_NEXT))
+
+    def test_every_action_declares_its_scope(self):
+        self.assertEqual(sorted(ACTION_SCOPES), sorted(PROXY_ACTIONS))
+        self.assertEqual(ACTION_SCOPES[ACTION_BOOTSTRAP_LANE], SCOPE_ISSUE)
+        self.assertEqual(ACTION_SCOPES[ACTION_DISPATCH_NEXT], SCOPE_LANE)
 
     def test_every_action_names_the_decision_that_authorizes_it(self):
         # Review j#89878 finding 1: an action with no decision token is an action whose anchor
@@ -108,8 +118,9 @@ class ActionVocabularyTest(unittest.TestCase):
             self.assertTrue(tokens, action)
             self.assertTrue(all(t.strip() for t in tokens), action)
 
-    def test_dispatch_next_is_authorized_by_the_dispatch_decision(self):
-        self.assertEqual(ACTION_DECISION_TOKENS[ACTION_DISPATCH_NEXT], ("implementation_request",))
+    def test_both_actions_are_authorized_by_the_dispatch_decision(self):
+        for action in PROXY_ACTIONS:
+            self.assertEqual(ACTION_DECISION_TOKENS[action], ("implementation_request",), action)
 
     def test_normalize_rejects_anything_outside_it(self):
         for value in ("", None, "sublane_retire", "close", "dispatch next", "DISPATCH_NEXT"):
@@ -307,6 +318,69 @@ class AnchorStatusTest(unittest.TestCase):
 
     def test_an_unknown_action_can_authorize_nothing(self):
         self.assertEqual(self._status("89688", action="not_an_action"), ANCHOR_ACTION_MISMATCH)
+
+
+class BootstrapScopeTest(unittest.TestCase):
+    """The rail must act from the state that has NO lane (review j#90068 finding 1).
+
+    A lane-scoped-only contract could never solve the observed dead end: `sublane create --execute`
+    stopped pre-effect with zero lane / worktree / pair, and matching every decision against a live
+    lane makes that exact state unreachable. The bootstrap action is matched against the issue's
+    ownership instead, and its precondition is the absence a lane-scoped contract required.
+    """
+
+    ISSUE = "14546"
+    #: A US-level implementation request names an issue, not a lane — the lane does not exist yet.
+    DECISIONS = (DecisionRecord("89688", "implementation_request"),)
+
+    def _status(self, journal="89688", decisions=None, expected=..., action=ACTION_BOOTSTRAP_LANE):
+        if expected is ...:
+            expected = IssueExpectation(
+                issue=self.ISSUE, owns_active_lane=False, latest_decision_journal="89688"
+            )
+        return anchor_status_for(
+            journal,
+            action=action,
+            decisions=self.DECISIONS if decisions is None else decisions,
+            expected=expected,
+        )
+
+    def test_a_fresh_issue_with_no_lane_verifies(self):
+        # THE case: no lane row exists anywhere, and the bootstrap is exactly what creates one.
+        self.assertEqual(self._status(), ANCHOR_VERIFIED)
+
+    def test_an_issue_that_already_owns_a_lane_is_past_the_bootstrap(self):
+        expected = IssueExpectation(
+            issue=self.ISSUE, owns_active_lane=True, latest_decision_journal="89688"
+        )
+        self.assertEqual(self._status(expected=expected), ANCHOR_SCOPE_MISMATCH)
+
+    def test_a_lane_scoped_decision_is_not_a_bootstrap_decision(self):
+        decisions = (DecisionRecord("89688", "implementation_request", "lane_a", "1"),)
+        self.assertEqual(self._status(decisions=decisions), ANCHOR_SCOPE_MISMATCH)
+
+    def test_an_unreadable_lifecycle_authority_fails_closed(self):
+        self.assertEqual(self._status(expected=None), ANCHOR_LANE_UNRESOLVED)
+
+    def test_a_lane_expectation_is_not_an_issue_expectation(self):
+        expected = LaneExpectation(lane="lane_a", generation=1, decision_journal="89688")
+        self.assertEqual(self._status(expected=expected), ANCHOR_SCOPE_MISMATCH)
+
+    def test_an_older_decision_on_the_issue_is_superseded(self):
+        decisions = self.DECISIONS + (DecisionRecord("90100", "implementation_request"),)
+        expected = IssueExpectation(
+            issue=self.ISSUE, owns_active_lane=False, latest_decision_journal="90100"
+        )
+        self.assertEqual(self._status(decisions=decisions, expected=expected), ANCHOR_SUPERSEDED)
+        self.assertEqual(
+            self._status(journal="90100", decisions=decisions, expected=expected), ANCHOR_VERIFIED
+        )
+
+    def test_the_lane_scoped_action_still_requires_a_lane(self):
+        # The bootstrap's laxity must not leak into dispatch_next.
+        self.assertEqual(
+            self._status(action=ACTION_DISPATCH_NEXT, expected=None), ANCHOR_DECISION_INCOMPLETE
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

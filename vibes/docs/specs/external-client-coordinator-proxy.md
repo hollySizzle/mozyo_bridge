@@ -71,8 +71,19 @@ action が任意の gate journal に乗れた（`implementation_done` が `dispa
 authorize したかを照合しなければ scope は未検証のままである（review j#89918 F2）。authority の
 単位はこの三つ組であり、どれか一つずつではない。
 
-- **action → 決定 token の closed map**（`ACTION_DECISION_TOKENS`）を持つ。
-  `dispatch_next` → `implementation_request`。
+- **action → 決定 token の closed map**（`ACTION_DECISION_TOKENS`）を持つ。両 action とも
+  `implementation_request`。
+- **action → scope の closed map**（`ACTION_SCOPES`）を持つ。同じ決定 token でも、**どの live fact
+  と突き合わせるか**が action ごとに異なる（review j#90068 F1）:
+  - `dispatch_next` = `lane_scoped`。決定は lane と数値 generation を名乗り、その lane の live
+    lifecycle facts と exact-match する。
+  - `bootstrap_lane` = `issue_scoped`。**lane がまだ存在しない状態**で成立する必要があるため、決定は
+    lane を名乗ってはならず（名乗る決定は lane-scoped の誤用 = `scope_mismatch`）、突き合わせ対象は
+    「その issue が active lane を**所有していない**こと」である。所有していれば precondition は既に
+    過ぎており `scope_mismatch`（呼ぶべきは `dispatch_next`）。
+  - **全 action を lane に突き合わせる契約は、本 rail の起点そのものに到達できない。** 観測された
+    dead end は `sublane create --execute` が pre-effect 停止し lane / worktree / pair が 0 の状態で
+    あり、lane を前提にする rail は「lane を作れない」という元の defect を解かない。
 - 決定 token を **tie できない action は語彙に置かない。** `workflow_step` はこの理由で撤回した:
   「一段進める」を authorize するのは「その時点で next action を名指す gate」であって固定 token
   ではなく、mapping を発明すれば同じ未検証 join を別の形で持ち込むだけになる。委譲可能面を狭める
@@ -205,8 +216,8 @@ classifier がその primitive を認めなければ何も発火しない**。�
 - 実装: pure matrix `...f_140_delegated_coordinator_nested_handoff/domain/coordinator_proxy.py`、
   adapter `...application/coordinator_proxy_send.py`、CLI `...application/cli_workflow_proxy.py`、
   fence `core/state/coordinator_proxy_fence.py`。
-- action vocabulary は closed: `dispatch_next` のみ。決定 token を tie できる action だけを置く
-  （§3）。proxy が仕事を発明することはない。
+- action vocabulary は closed: `bootstrap_lane` / `dispatch_next`。決定 token を tie できる action
+  だけを置く（§3）。proxy が仕事を発明することはない。
 
 ## 7. 非 goal
 

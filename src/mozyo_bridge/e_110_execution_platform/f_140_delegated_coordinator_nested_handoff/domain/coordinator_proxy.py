@@ -56,10 +56,26 @@ from typing import Optional
 # mapping would be the same unverified join in a different shape. A narrower delegable surface is
 # the fail-closed answer; it can be widened when a concrete decision token is identified.
 # ---------------------------------------------------------------------------
-#: Delegate the coordinator's already-resolved "dispatch the next managed sublane" decision.
+#: Delegate the coordinator's already-resolved dispatch decision for an EXISTING managed lane.
 ACTION_DISPATCH_NEXT = "dispatch_next"
+#: Delegate the coordinator's already-resolved decision to materialize the issue's FIRST managed
+#: lane (review j#90068 finding 1). This is the action the observed dead end actually needs: the
+#: external client's `sublane create --execute` stopped pre-effect with zero lane / worktree / pair,
+#: so a rail that can only act on an existing lane cannot solve "no lane can be created".
+ACTION_BOOTSTRAP_LANE = "bootstrap_lane"
 
-PROXY_ACTIONS: tuple[str, ...] = (ACTION_DISPATCH_NEXT,)
+PROXY_ACTIONS: tuple[str, ...] = (ACTION_BOOTSTRAP_LANE, ACTION_DISPATCH_NEXT)
+
+# ---------------------------------------------------------------------------
+# Scope kinds. An action's decision is matched against live facts, but WHICH live facts depends on
+# whether the decision is about a lane that exists or one that does not yet.
+# ---------------------------------------------------------------------------
+#: The decision names a lane; it is matched against that lane's live lifecycle facts.
+SCOPE_LANE = "lane_scoped"
+#: The decision names only an issue, and its precondition is that the issue owns NO active lane
+#: yet. Requiring lane/generation fields here would be incoherent — the lane does not exist — so
+#: the fields must be ABSENT, and the live fact matched against is the absence of an owner.
+SCOPE_ISSUE = "issue_scoped"
 
 #: The CLOSED action -> accepted decision-token map. A journal authorizes an action only when it
 #: carries a workflow-event marker naming one of that action's tokens. ``implementation_request``
@@ -67,7 +83,17 @@ PROXY_ACTIONS: tuple[str, ...] = (ACTION_DISPATCH_NEXT,)
 #: ``GATE_BEARING_KINDS`` vocabulary (a dispatch wakes nobody), which is why the adapter reads the
 #: generic workflow-event token rather than the callback-gate reader.
 ACTION_DECISION_TOKENS: "dict[str, tuple[str, ...]]" = {
+    ACTION_BOOTSTRAP_LANE: ("implementation_request",),
     ACTION_DISPATCH_NEXT: ("implementation_request",),
+}
+
+#: action -> the scope its decision is matched in. Both actions ride the same decision token — the
+#: coordinator's implementation request — but they are distinguished by what the durable record must
+#: currently look like: a bootstrap needs no owning lane and a lane-less decision, a dispatch needs
+#: the lane it names to be live at the generation it names.
+ACTION_SCOPES: "dict[str, str]" = {
+    ACTION_BOOTSTRAP_LANE: SCOPE_ISSUE,
+    ACTION_DISPATCH_NEXT: SCOPE_LANE,
 }
 
 # ---------------------------------------------------------------------------
@@ -348,6 +374,21 @@ def _generation_ordinal(value: object) -> Optional[int]:
 
 
 @dataclass(frozen=True)
+class IssueExpectation:
+    """The live lifecycle facts for the ISSUE a bootstrap decision names (value object).
+
+    ``owns_active_lane`` is the precondition the bootstrap acts on, inverted: a bootstrap
+    authorizes materializing the first lane, so an issue that already owns one has moved past it
+    (the caller wants ``dispatch_next``). ``latest_decision_journal`` is the newest accepted-token
+    decision on the issue, so an older one reads as superseded.
+    """
+
+    issue: str
+    owns_active_lane: bool
+    latest_decision_journal: str
+
+
+@dataclass(frozen=True)
 class LaneExpectation:
     """The live lifecycle facts for the lane a decision names (value object).
 
@@ -362,58 +403,16 @@ class LaneExpectation:
     decision_journal: str
 
 
-def anchor_status_for(
-    journal: str,
-    *,
-    action: str,
-    decisions: "tuple[DecisionRecord, ...]",
-    expected: Optional[LaneExpectation],
-) -> str:
-    """Classify a requested journal against this action's live durable decision (pure, fail-closed).
-
-    ``decisions`` are the issue's workflow-event decisions in note order, read from source-of-truth
-    Redmine. ``expected`` is the **action-time** lifecycle state of the lane the decision names,
-    resolved by the caller from the lane lifecycle authority; ``None`` means it could not be
-    resolved and nothing may be matched against it.
-
-    Matching the decision against itself proves nothing — that was the defect this shape replaces
-    (review j#89969 F2): a lone marker declaring any non-empty lane and any numeric generation
-    verified, so a decision naming a lane that does not exist, or a real lane whose generation had
-    since advanced without a new marker, both passed. Every field is now checked against a live
-    fact the marker cannot assert:
-
-    - the journal carries none of the issue's workflow-event markers -> :data:`ANCHOR_UNVERIFIED`
-      (also what an unreachable Redmine produces, so a failed read never looks verified);
-    - it carries a marker, but none in this action's :data:`ACTION_DECISION_TOKENS` ->
-      :data:`ANCHOR_ACTION_MISMATCH`;
-    - the accepted decision omits its ``lane`` / numeric ``lane_generation`` ->
-      :data:`ANCHOR_DECISION_INCOMPLETE`;
-    - the named lane has no readable lifecycle facts -> :data:`ANCHOR_LANE_UNRESOLVED`;
-    - the decision names a different lane than the resolved one -> :data:`ANCHOR_SCOPE_MISMATCH`;
-    - the declared generation is not the lane's live generation -> :data:`ANCHOR_GENERATION_STALE`;
-    - the journal is not the lane's current decision anchor -> :data:`ANCHOR_SUPERSEDED`. This is
-      what refuses a **canonical-shaped marker quoted in another journal**: the quotation reproduces
-      the token, lane and generation exactly, but it is not the journal the lifecycle points at;
-    - otherwise -> :data:`ANCHOR_VERIFIED`.
-    """
-    want = (journal or "").strip()
-    rows = tuple(decisions or ())
-    if not want or not any(r.journal == want for r in rows):
-        return ANCHOR_UNVERIFIED
-
-    accepted_tokens = ACTION_DECISION_TOKENS.get(normalize_action(action), ())
-    mine = [r for r in rows if r.journal == want and r.token in accepted_tokens]
-    if not mine:
-        return ANCHOR_ACTION_MISMATCH
-
-    record = mine[-1]
+def _lane_scoped_status(record: "DecisionRecord", want: str, expected) -> str:
+    """Classify a lane-scoped decision against the lane's live lifecycle facts (pure)."""
     generation = _generation_ordinal(record.lane_generation)
     lane = record.lane.strip()
     if not lane or generation is None:
         return ANCHOR_DECISION_INCOMPLETE
-
     if expected is None:
         return ANCHOR_LANE_UNRESOLVED
+    if not isinstance(expected, LaneExpectation):
+        return ANCHOR_SCOPE_MISMATCH
     if lane != expected.lane.strip():
         return ANCHOR_SCOPE_MISMATCH
     if generation != expected.generation:
@@ -423,10 +422,84 @@ def anchor_status_for(
     return ANCHOR_VERIFIED
 
 
+def _issue_scoped_status(record: "DecisionRecord", want: str, expected) -> str:
+    """Classify an issue-scoped (bootstrap) decision against the issue's live facts (pure).
+
+    A bootstrap decision must NOT name a lane: it authorizes creating the first one, so a decision
+    carrying lane / generation fields is a lane-scoped decision being misused here. And the issue
+    must not already own an active lane — that precondition is what the bootstrap acts on, and once
+    it is gone the caller wants the lane-scoped action instead.
+    """
+    if record.lane.strip() or record.lane_generation.strip():
+        return ANCHOR_SCOPE_MISMATCH
+    if expected is None:
+        return ANCHOR_LANE_UNRESOLVED
+    if not isinstance(expected, IssueExpectation):
+        return ANCHOR_SCOPE_MISMATCH
+    if expected.owns_active_lane:
+        return ANCHOR_SCOPE_MISMATCH
+    if want != expected.latest_decision_journal.strip():
+        return ANCHOR_SUPERSEDED
+    return ANCHOR_VERIFIED
+
+
+def anchor_status_for(
+    journal: str,
+    *,
+    action: str,
+    decisions: "tuple[DecisionRecord, ...]",
+    expected,
+) -> str:
+    """Classify a requested journal against this action's live durable decision (pure, fail-closed).
+
+    ``decisions`` are the issue's workflow-event decisions in note order, read from source-of-truth
+    Redmine. ``expected`` is the **action-time** live state the decision is matched against, resolved
+    by the caller: a :class:`LaneExpectation` for a lane-scoped action, an :class:`IssueExpectation`
+    for an issue-scoped one, or ``None`` when it could not be resolved.
+
+    Matching the decision against itself proves nothing (review j#89969 F2), and matching every
+    action against a *lane* proves too much (review j#90068 F1): the rail's motivating case is the
+    state where no lane exists at all, so a lane-scoped-only contract could never act on it. The
+    scope kind is therefore per action:
+
+    - the journal carries none of the issue's workflow-event markers -> :data:`ANCHOR_UNVERIFIED`
+      (also what an unreachable Redmine produces);
+    - it carries a marker, but none in this action's :data:`ACTION_DECISION_TOKENS` ->
+      :data:`ANCHOR_ACTION_MISMATCH`;
+    - **lane-scoped**: the decision must name a lane and numeric generation
+      (:data:`ANCHOR_DECISION_INCOMPLETE` otherwise), that lane must have readable live facts
+      (:data:`ANCHOR_LANE_UNRESOLVED`), match them (:data:`ANCHOR_SCOPE_MISMATCH` /
+      :data:`ANCHOR_GENERATION_STALE`), and be the lane's current decision anchor
+      (:data:`ANCHOR_SUPERSEDED` — which is what refuses a canonical-shaped quotation);
+    - **issue-scoped**: the decision must NOT name a lane (a lane-scoped decision misused here is
+      :data:`ANCHOR_SCOPE_MISMATCH`), the issue must not already own an active lane (the bootstrap
+      precondition), and the journal must be the issue's newest accepted decision.
+    """
+    want = (journal or "").strip()
+    rows = tuple(decisions or ())
+    if not want or not any(r.journal == want for r in rows):
+        return ANCHOR_UNVERIFIED
+
+    normalized = normalize_action(action)
+    accepted_tokens = ACTION_DECISION_TOKENS.get(normalized, ())
+    mine = [r for r in rows if r.journal == want and r.token in accepted_tokens]
+    if not mine:
+        return ANCHOR_ACTION_MISMATCH
+
+    record = mine[-1]
+    if ACTION_SCOPES.get(normalized) == SCOPE_ISSUE:
+        return _issue_scoped_status(record, want, expected)
+    return _lane_scoped_status(record, want, expected)
+
+
 __all__ = (
     "ACTION_DISPATCH_NEXT",
     "PROXY_ACTIONS",
+    "ACTION_BOOTSTRAP_LANE",
     "ACTION_DECISION_TOKENS",
+    "ACTION_SCOPES",
+    "SCOPE_LANE",
+    "SCOPE_ISSUE",
     "WORKSPACE_RESOLVED",
     "WORKSPACE_UNRESOLVED",
     "AUTHORITY_RESOLVED",
@@ -477,6 +550,7 @@ __all__ = (
     "ZERO_SEND",
     "normalize_action",
     "DecisionRecord",
+    "IssueExpectation",
     "LaneExpectation",
     "ProxyLinks",
     "ProxyDecision",

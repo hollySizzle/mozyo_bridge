@@ -104,26 +104,6 @@ REASON_HERDR_FORWARD_DUPLICATE = "herdr_forward_duplicate"
 #: The durable duplicate fence is unavailable (do-not-send: a send could duplicate).
 REASON_HERDR_FORWARD_FENCE_UNAVAILABLE = "herdr_forward_fence_unavailable"
 
-#: EVERY forward primitive the matrix can plan, derived from the plan builder itself (Redmine
-#: #14546, review j#90032 F1). The CLI's executable-leg classifier tests membership here instead of
-#: hand-listing tokens: a hand-listed tuple is what left the managed-gateway leg resolvable but
-#: unfirable. A direction added to :func:`plan_forward_route` without appearing here fails the
-#: coherence test that pins the two together.
-FORWARD_PRIMITIVES: frozenset = frozenset(
-    {
-        PRIMITIVE_HERDR_FORWARD_CONSULT,
-        PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE,
-        PRIMITIVE_HERDR_FORWARD_MANAGED_GATEWAY,
-    }
-)
-
-#: The roles that have a one-step forward, pinned so the coherence test can enumerate them.
-FORWARD_ROLES: tuple = (
-    ROLE_GRANDPARENT_COORDINATOR,
-    ROLE_PROJECT_GATEWAY,
-    ROLE_COORDINATOR,
-)
-
 # The ready reason for a plan, keyed by direction.
 _READY_REASON = {
     FORWARD_GRANDPARENT_TO_GATEWAY: REASON_HERDR_FORWARD_CONSULT_READY,
@@ -154,55 +134,82 @@ class ForwardRoutePlan:
     project_scope: str = ""
 
 
+#: THE declarative route table — the single place a forward direction is defined (Redmine #14546,
+#: review j#90068 finding 4). Everything else about forwards is derived from it: the planner, the
+#: primitive set the CLI's executable-leg classifier tests membership against, and the role list
+#: the coherence test walks.
+#:
+#: The previous shape kept the planner as an if-chain and the sets as two hand-written tuples that
+#: were supposed to agree with it. They did not have to: adding a role to the planner without
+#: touching either tuple left the new leg unfirable AND left the coherence test passing, because
+#: the test walked one hand-written tuple to check the other. Two hand-maintained lists checking
+#: each other is not a structural guarantee. Deriving all three from this table is.
+_FORWARD_ROUTES: "dict[str, dict]" = {
+    ROLE_GRANDPARENT_COORDINATOR: {
+        "direction": FORWARD_GRANDPARENT_TO_GATEWAY,
+        "to_role": ROLE_PROJECT_GATEWAY,
+        "primitive": PRIMITIVE_HERDR_FORWARD_CONSULT,
+        "select_mode": SELECT_SINGLE_LIVE_GATEWAY,
+        "ticketless_kind": TICKETLESS_CONSULTATION,
+        # The grandparent's consultation target scope is the resolved gateway's, not the caller's.
+        "carries_scope": False,
+    },
+    ROLE_PROJECT_GATEWAY: {
+        "direction": FORWARD_GATEWAY_TO_CHILD,
+        "to_role": ROLE_DELEGATED_COORDINATOR,
+        "primitive": PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE,
+        "select_mode": SELECT_CHILD_WITH_SELF_FENCE,
+        "ticketless_kind": TICKETLESS_WORK_INTAKE,
+        "carries_scope": True,
+    },
+    ROLE_COORDINATOR: {
+        "direction": FORWARD_COORDINATOR_TO_CHILD,
+        "to_role": ROLE_DELEGATED_COORDINATOR,
+        "primitive": PRIMITIVE_HERDR_FORWARD_MANAGED_GATEWAY,
+        "select_mode": SELECT_CHILD_WITH_SELF_FENCE,
+        "ticketless_kind": TICKETLESS_WORK_INTAKE,
+        "carries_scope": True,
+    },
+}
+
+#: Every role the table defines a forward for. Derived — never hand-listed.
+FORWARD_ROLES: tuple = tuple(_FORWARD_ROUTES)
+#: Every primitive the table can plan. Derived — the CLI classifier tests membership here, so a
+#: role added to the table is executable by construction.
+FORWARD_PRIMITIVES: frozenset = frozenset(
+    route["primitive"] for route in _FORWARD_ROUTES.values()
+)
+
+
 def plan_forward_route(role: str, project_scope: str = "") -> Optional[ForwardRoutePlan]:
     """The one-step forward plan for a resolved canonical role, or ``None`` if it has none (pure).
 
+    Built from :data:`_FORWARD_ROUTES`, so the planner, the executable-primitive set, and the
+    coherence test's role list cannot disagree — adding a direction is one table entry, and every
+    derived surface follows.
+
     - ``grandparent_coordinator`` -> a consultation forward to the single live project gateway.
     - ``project_gateway`` -> a work-intake forward to the child delegated_coordinator (self-fenced).
-    - ``coordinator`` (Redmine #14546) -> a work-intake forward from the single-workspace default
-      pair to its managed sublane gateway (the same child-with-self-fence target resolution, but a
-      **distinct** direction / primitive / reason so the two work-intake legs never share a fence
-      generation or read as one another in the durable record).
-    - any other / empty role -> ``None`` (the caller keeps the resolution-only outcome; only the
-      resolved coordinator roles have a herdr-native one-step forward).
+    - ``coordinator`` -> a work-intake forward from the single-workspace default pair to its managed
+      sublane gateway; a **distinct** direction / primitive / reason from the project-gateway leg so
+      the two never share a fence generation or read as one another.
+    - any other / empty role -> ``None`` (the caller keeps the resolution-only outcome).
 
     Pure and total: no IO, no target resolution — it only names the leg and how to resolve it.
     """
-    token = (role or "").strip()
-    if token == ROLE_GRANDPARENT_COORDINATOR:
-        return ForwardRoutePlan(
-            direction=FORWARD_GRANDPARENT_TO_GATEWAY,
-            from_role=ROLE_GRANDPARENT_COORDINATOR,
-            to_role=ROLE_PROJECT_GATEWAY,
-            primitive=PRIMITIVE_HERDR_FORWARD_CONSULT,
-            ready_reason=_READY_REASON[FORWARD_GRANDPARENT_TO_GATEWAY],
-            select_mode=SELECT_SINGLE_LIVE_GATEWAY,
-            ticketless_kind=TICKETLESS_CONSULTATION,
-            project_scope="",
-        )
-    if token == ROLE_PROJECT_GATEWAY:
-        return ForwardRoutePlan(
-            direction=FORWARD_GATEWAY_TO_CHILD,
-            from_role=ROLE_PROJECT_GATEWAY,
-            to_role=ROLE_DELEGATED_COORDINATOR,
-            primitive=PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE,
-            ready_reason=_READY_REASON[FORWARD_GATEWAY_TO_CHILD],
-            select_mode=SELECT_CHILD_WITH_SELF_FENCE,
-            ticketless_kind=TICKETLESS_WORK_INTAKE,
-            project_scope=(project_scope or "").strip(),
-        )
-    if token == ROLE_COORDINATOR:
-        return ForwardRoutePlan(
-            direction=FORWARD_COORDINATOR_TO_CHILD,
-            from_role=ROLE_COORDINATOR,
-            to_role=ROLE_DELEGATED_COORDINATOR,
-            primitive=PRIMITIVE_HERDR_FORWARD_MANAGED_GATEWAY,
-            ready_reason=_READY_REASON[FORWARD_COORDINATOR_TO_CHILD],
-            select_mode=SELECT_CHILD_WITH_SELF_FENCE,
-            ticketless_kind=TICKETLESS_WORK_INTAKE,
-            project_scope=(project_scope or "").strip(),
-        )
-    return None
+    route = _FORWARD_ROUTES.get((role or "").strip())
+    if route is None:
+        return None
+    return ForwardRoutePlan(
+        direction=route["direction"],
+        from_role=(role or "").strip(),
+        to_role=route["to_role"],
+        primitive=route["primitive"],
+        ready_reason=_READY_REASON[route["direction"]],
+        select_mode=route["select_mode"],
+        ticketless_kind=route["ticketless_kind"],
+        project_scope=(project_scope or "").strip() if route["carries_scope"] else "",
+    )
 
 
 # ---------------------------------------------------------------------------

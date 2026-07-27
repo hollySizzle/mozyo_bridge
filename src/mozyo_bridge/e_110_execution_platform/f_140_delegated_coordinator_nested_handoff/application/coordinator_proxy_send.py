@@ -55,7 +55,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ZERO_SEND,
     ProxyDecision,
     ProxyLinks,
+    ACTION_SCOPES,
+    SCOPE_ISSUE,
     DecisionRecord,
+    IssueExpectation,
     LaneExpectation,
     anchor_status_for,
     decide_proxy_delegation,
@@ -108,8 +111,9 @@ class ProxyContext:
     journal: str = ""
     #: the issue's durable decisions in note order (the anchor evidence).
     decisions: "tuple[DecisionRecord, ...]" = ()
-    #: the action-time lifecycle facts for the lane the decision names (``None`` = unresolved).
-    lane_expectation: "Optional[LaneExpectation]" = None
+    #: the action-time live facts the decision is matched against (lane- or issue-scoped;
+    #: ``None`` = unresolved).
+    lane_expectation: object = None
     authority_reason: str = ""
     detail: str = ""
 
@@ -444,6 +448,53 @@ def resolve_ack_authority(repo_root, *, env) -> "tuple[bool, str, str]":
     return True, "", "attested default coordinator"
 
 
+def live_issue_expectation(
+    repo_root, issue: str, decisions: "tuple[DecisionRecord, ...]", *, action: str
+) -> "Optional[IssueExpectation]":
+    """The action-time live facts for an issue-scoped (bootstrap) decision, or ``None``.
+
+    The bootstrap precondition is that the issue owns **no active lane** — the exact state the
+    observed dead end leaves behind (``sublane create --execute`` stopped pre-effect with zero
+    lane / worktree / pair, #14500). It is read through the lifecycle authority's own owner
+    resolver, which is fail-closed by construction: zero owners and many owners both resolve to
+    "no owner", so a caller can never fall back to "the newest lane".
+
+    ``None`` (fail-closed) only when the workspace scope or the store cannot be read at all —
+    an issue that genuinely owns no lane is a *resolved* expectation with ``owns_active_lane=False``,
+    which is what lets the bootstrap proceed from a fresh topology (review j#90068 finding 1).
+    """
+    issue_id = (issue or "").strip()
+    if not issue_id:
+        return None
+    try:
+        from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+            repo_scope_workspace_id,
+        )
+
+        scope = repo_scope_workspace_id(repo_root)
+        if not scope:
+            return None
+        owner = LaneLifecycleStore().resolve_owner(scope, issue_id)
+    except Exception:  # noqa: BLE001 - an unreadable lifecycle authority resolves no expectation
+        return None
+
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
+        ACTION_DECISION_TOKENS,
+    )
+
+    accepted = ACTION_DECISION_TOKENS.get(normalize_action(action), ())
+    latest = ""
+    for record in decisions or ():
+        if record.token in accepted:
+            latest = record.journal
+    return IssueExpectation(
+        issue=issue_id,
+        owns_active_lane=bool(getattr(owner, "resolved", False)),
+        latest_decision_journal=latest,
+    )
+
+
 def resolve_default_lane_authority(repo_root) -> "tuple[str, str, str, str]":
     """The default lane's durable role + scope, its status, and a blocked reason (if any).
 
@@ -512,6 +563,7 @@ def resolve_proxy_context(
     workspace_provider: Optional[Callable[..., str]] = None,
     attestation_join: Optional[Callable[..., "tuple[bool, str, str]"]] = None,
     lane_expectation_provider: Optional[Callable[..., "Optional[LaneExpectation]"]] = None,
+    issue_expectation_provider: Optional[Callable[..., "Optional[IssueExpectation]"]] = None,
 ) -> ProxyContext:
     """Re-derive every authority link at action time and assemble the matrix input (no fence).
 
@@ -552,14 +604,19 @@ def resolve_proxy_context(
     decisions: "tuple[DecisionRecord, ...]" = ()
     if issue and journal:
         decisions = tuple(resolve_decisions(issue) or ())
-    # The lane to resolve live facts for is the one the DECISION names — never one the caller
-    # supplies, and never the coordinator's own lane. A decision that names no lane is classified
-    # `decision_incomplete` before the expectation is consulted.
-    declared_lane = next(
-        (r.lane for r in decisions if r.journal == journal and r.lane.strip()), ""
-    )
-    resolve_expectation = lane_expectation_provider or live_lane_expectation
-    expectation = resolve_expectation(repo_root, declared_lane) if declared_lane else None
+    # WHICH live facts the decision is matched against depends on the action's scope. A lane-scoped
+    # action resolves the lane the DECISION names — never one the caller supplies, and never the
+    # coordinator's own lane. An issue-scoped (bootstrap) action resolves the issue's ownership
+    # instead, because its whole precondition is that no lane exists yet (review j#90068 F1).
+    if ACTION_SCOPES.get(normalize_action(action)) == SCOPE_ISSUE:
+        resolve_issue = issue_expectation_provider or live_issue_expectation
+        expectation = resolve_issue(repo_root, issue, decisions, action=action)
+    else:
+        declared_lane = next(
+            (r.lane for r in decisions if r.journal == journal and r.lane.strip()), ""
+        )
+        resolve_expectation = lane_expectation_provider or live_lane_expectation
+        expectation = resolve_expectation(repo_root, declared_lane) if declared_lane else None
     anchor_status = anchor_status_for(
         journal, action=action, decisions=decisions, expected=expectation
     )
@@ -701,7 +758,23 @@ def execute_proxy_delegation(
         # `uncertain`. Ignoring the CAS reported success to the caller while the store said
         # `uncertain`, and since `proxy-ack` completes only a `delivered` generation, the route
         # then wedged with no way forward. A delivery the store did not record is not a delivery.
-        if not fence.mark_delivered(route, reserve.action_id, detail=outcome.detail):
+        try:
+            recorded = fence.mark_delivered(route, reserve.action_id, detail=outcome.detail)
+        except CoordinatorProxyFenceError as exc:
+            # A store failure is the same class of unknown as a lost CAS (review j#90068 F2): the
+            # send fired and the durable record does not reflect it. Typed, nonzero, never raised
+            # at the caller and never blind-retried.
+            return ProxyExecutionResult(
+                sent=False, decision=ZERO_SEND, reason=REASON_DELIVERY_UNCERTAIN,
+                action_id=reserve.action_id, fence_state=FENCE_RECONCILE,
+                detail=(
+                    "the send was positively delivered but its outcome could not be recorded (the "
+                    f"delegation store failed): {exc}. Reconcile against the durable state before "
+                    "deciding whether the action was taken."
+                ),
+                send=outcome,
+            )
+        if not recorded:
             return ProxyExecutionResult(
                 sent=False, decision=ZERO_SEND, reason=REASON_DELIVERY_UNCERTAIN,
                 action_id=reserve.action_id, fence_state=FENCE_RECONCILE,
@@ -725,9 +798,20 @@ def execute_proxy_delegation(
     # assumed. Either way this is a non-delivery, so the caller's verdict does not change — but
     # a write that did not land means the row is already held by another generation state, and
     # the detail must say so rather than claim a recording that never happened.
-    recorded = fence.mark_uncertain(
-        route, reserve.action_id, detail=outcome.detail or f"send {outcome.result}"
-    )
+    try:
+        recorded = fence.mark_uncertain(
+            route, reserve.action_id, detail=outcome.detail or f"send {outcome.result}"
+        )
+    except CoordinatorProxyFenceError as exc:
+        return ProxyExecutionResult(
+            sent=False, decision=ZERO_SEND, reason=REASON_DELIVERY_UNCERTAIN,
+            action_id=reserve.action_id, fence_state=FENCE_RECONCILE,
+            detail=(
+                "the send did not positively land AND its outcome could not be recorded (the "
+                f"delegation store failed): {exc}. Reconcile against the durable state."
+            ),
+            send=outcome,
+        )
     return ProxyExecutionResult(
         sent=False, decision=ZERO_SEND, reason=REASON_DELIVERY_UNCERTAIN,
         action_id=reserve.action_id,
@@ -799,7 +883,12 @@ class OrchestrateHandoffProxySendPort:
             f"coordinator proxy delegation: action={normalize_action(getattr(args, 'action', ''))} "
             f"role={context.role} lane={DEFAULT_LANE} anchor=redmine:issue={context.issue}:"
             f"journal={context.journal} proxy_action_id={action_id}. Read the durable anchor and "
-            f"perform this one already-resolved action from your own attested runtime."
+            f"perform this one already-resolved action from your own attested runtime. "
+            f"ONLY IF it succeeded, acknowledge from that same runtime with "
+            f"`mozyo-bridge workflow proxy-ack --proxy-action-id {action_id}` — the delegation "
+            f"route stays held until you do, and the next decision cannot be delegated. If the "
+            f"action failed or its outcome is unknown, do NOT acknowledge; record the outcome on "
+            f"the durable anchor instead."
         )
 
         buf = io.StringIO()
@@ -830,6 +919,7 @@ __all__ = (
     "decision_journals_from_entries",
     "live_attestation_join",
     "live_lane_expectation",
+    "live_issue_expectation",
     "resolve_proxy_target",
     "resolve_ack_authority",
     "resolve_default_lane_authority",
