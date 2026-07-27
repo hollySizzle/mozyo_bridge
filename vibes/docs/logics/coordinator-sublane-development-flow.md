@@ -217,6 +217,14 @@ cockpit-visible sublane では、identity (workspace / lane / role / pane)、rou
 
 `coordinator_assistant` が implementation-shaped request を受け取った場合は、実装前の設計矛盾・scope 不足・invariant 衝突を design consultation として整理してよい。ただし、調査や reroute 用の事実整理を終えたら停止する。実装 diff は専用 sublane / worktree に移して、`implementation_gateway` 経由で `implementation_worker` へ渡す。coordinator は `$forbid("coordinator_assistant へ実装型 work を直接渡す")` を遵守する。
 
+### Coordinator-owned docs と direct-edit review exemption
+
+coordinator が所有する standalone policy / operations docs の変更は、別 auditor の review を既定では要求しない。repo file の編集権限は別問題であり、Codex が編集する場合は Repo-Local Guardrail Autonomous Lane または有効な `codex_direct_edit` gate を通す。権限を満たしたこと自体を Review Gate approval と呼ばず、変更・verification・review exemption を durable record に残す。
+
+有効な `codex_direct_edit` で Codex が当該 scope の実装主体へ明示昇任した場合も、既定は `follow_up_review: false` である。同じ監査能力を持つ別 Codex session を形式的に立てることや、実装 actor が自己 Review Gate を書くことはしない。owner が当該変更について独立 review を明示要求した場合だけ `follow_up_review: true` とし、reviewer と理由を durable gate に記録する。
+
+この exemption は通常の Claude 実装 code や、その code に付随して同じ受け入れ条件を説明する docs へ波及しない。それらは従来どおり UserStory 単位の横断 audit 対象である。`coordinator_assistant` も review authority を持たないため、この exemption の判断者または Review Gate writer にはならない。
+
 ### レーン作成単位
 
 一つの作業単位は `$work_unit()` の対応で扱う。対応は Redmine issue / journal に記録し、pane 配置から推測しない。
