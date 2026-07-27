@@ -47,6 +47,29 @@ class ResolveRoleProfileTest(unittest.TestCase):
         with self.assertRaises(RoleProfileError):
             resolve_role_profile("bogus_role", {})
 
+    def test_coordinator_roles_pin_effective_work_unit_contract(self) -> None:
+        for token in ("coordinator", "delegated_coordinator", "implementation_gateway"):
+            text = resolve_role_profile(token, {}).resolved_text
+            self.assertIn(
+                "per-dispatch override > repo-local `work_unit.granularity` "
+                "> built-in `user_story` fallback",
+                text,
+            )
+            self.assertIn(
+                "1 US 配下の Task / Test / Bug を同一 lane の 1 dispatch",
+                text,
+            )
+            self.assertIn(
+                "独立した durable owner/operator decision anchor",
+                text,
+            )
+            self.assertIn("task-level review", text)
+
+        coordinator = resolve_role_profile("coordinator", {}).resolved_text
+        gateway = resolve_role_profile("implementation_gateway", {}).resolved_text
+        self.assertIn("leaf dispatch を推定しない", coordinator)
+        self.assertIn("leaf dispatch の根拠にしない", gateway)
+
     def test_template_placeholders_unknown_role_fails_closed(self) -> None:
         with self.assertRaises(RoleProfileError):
             template_placeholders("bogus_role")
