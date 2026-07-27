@@ -72,7 +72,8 @@ script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 
 src="$repo_root/skills/mozyo-bridge-agent/references"
-dest="$repo_root/.claude/skills/mozyo-bridge-agent/references"
+dest_relative=".claude/skills/mozyo-bridge-agent/references"
+dest="$repo_root/$dest_relative"
 
 recovery="Rerun 'scripts/sync_legacy_project_skill.sh' (no --check, from the repo root) to resync the mirror."
 
@@ -163,7 +164,76 @@ symlink_disposition() {
   echo "would write through it into the link target, so this script refuses instead." >&2
 }
 
+# Destination topology: the mirror directory must be a real directory reached
+# through real directories. Review j#90342 R3-F1 measured that pointing
+# `references/` itself at an external directory made the sync write the canonical
+# bodies into that directory and exit 0 with a success banner — the earlier
+# symlink ban only looked at the reference entries, not at the path leading to
+# them. Every component below the repo root is checked with `-L`, which does not
+# follow, so a symlinked ancestor cannot hide behind the `-d "$dest"` test (that
+# one DOES follow, and reported the external directory as present).
+topology_bad=0
+audit_destination_topology() {
+  probe="$repo_root"
+  rest="$dest_relative"
+  while [ -n "$rest" ]; do
+    part="${rest%%/*}"
+    case "$rest" in
+      */*) rest="${rest#*/}" ;;
+      *) rest="" ;;
+    esac
+    probe="$probe/$part"
+    if [ -L "$probe" ]; then
+      echo "legacy project skill mirror path component is a symlink: $probe" >&2
+      topology_bad=1
+    fi
+  done
+  if [ -e "$dest" ] && [ ! -d "$dest" ]; then
+    echo "legacy project skill mirror destination is not a directory: $dest" >&2
+    topology_bad=1
+  fi
+}
+
+# Entry type: a pinned name must be a REGULAR file. A directory, FIFO, socket or
+# device under a pinned name is not something this script can sync, and review
+# j#90342 R3-F1 measured each failing badly when the copy loop reached it — a
+# directory made the sync create `safety.md/safety.md` and exit 0 with a success
+# banner, and a FIFO made `cp` block indefinitely on open. `-f` is a stat, not an
+# open, so this test never blocks on the FIFO it is there to reject.
+entry_type_bad=0
+audit_entry_types() {
+  [ -d "$dest" ] || return 0
+  for name in $MIRRORED_REFERENCES; do
+    path="$dest/$name"
+    # Missing is handled by the content audit; symlinks by the symlink audit.
+    # Written as nested `if`s rather than `[ ... ] && continue`, whose exit
+    # status under `set -e` is a known footgun when the test is false.
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      if [ ! -L "$path" ] && [ ! -f "$path" ]; then
+        echo "legacy project skill mirror reference is not a regular file: references/$name" >&2
+        entry_type_bad=1
+      fi
+    fi
+  done
+}
+
+topology_disposition() {
+  echo "The mirror destination and its pinned entries must be real directories and regular" >&2
+  echo "files. Restore the expected layout (replace the offending entry, or point the mirror" >&2
+  echo "back at $dest_relative inside the repo), then rerun this script. Syncing into an" >&2
+  echo "aliased or non-regular destination would write outside the mirror, so it refuses." >&2
+}
+
 if [ "$check_only" -eq 1 ]; then
+  # Topology first: `-d "$dest"` follows symlinks, so an aliased destination
+  # would otherwise be reported as a present, healthy mirror.
+  audit_destination_topology
+  if [ "$topology_bad" -ne 0 ]; then
+    echo "" >&2
+    topology_disposition
+    exit 1
+  fi
+
   if [ ! -d "$dest" ]; then
     echo "legacy project skill mirror missing: $dest" >&2
     echo "$recovery" >&2
@@ -189,11 +259,13 @@ if [ "$check_only" -eq 1 ]; then
 
   audit_unpinned_references
   audit_symlink_references
+  audit_entry_types
 
   # Report the recovery that actually resolves each class present. Printing the
   # blanket "rerun the sync" line for an unpinned-reference drift would send the
   # operator to a command that refuses.
-  if [ "$content_drift" -ne 0 ] || [ "$unpinned_found" -ne 0 ] || [ "$symlink_found" -ne 0 ]; then
+  if [ "$content_drift" -ne 0 ] || [ "$unpinned_found" -ne 0 ] \
+    || [ "$symlink_found" -ne 0 ] || [ "$entry_type_bad" -ne 0 ]; then
     echo "" >&2
     if [ "$content_drift" -ne 0 ]; then
       echo "$recovery" >&2
@@ -203,6 +275,9 @@ if [ "$check_only" -eq 1 ]; then
     fi
     if [ "$symlink_found" -ne 0 ]; then
       symlink_disposition
+    fi
+    if [ "$entry_type_bad" -ne 0 ]; then
+      topology_disposition
     fi
     exit 1
   fi
@@ -215,11 +290,19 @@ fi
 
 # Sync mode. Audit BEFORE writing anything: refusing after a partial copy would
 # leave the tree in a state neither the exit code nor the banner describes. The
-# symlink audit in particular MUST precede the copy loop — that is the write it
-# exists to prevent.
+# topology, symlink and entry-type audits in particular MUST precede the copy
+# loop — those are the writes they exist to prevent.
+audit_destination_topology
+if [ "$topology_bad" -ne 0 ]; then
+  echo "refusing to sync the legacy project skill mirror; nothing was written." >&2
+  topology_disposition
+  exit 1
+fi
+
 audit_unpinned_references
 audit_symlink_references
-if [ "$unpinned_found" -ne 0 ] || [ "$symlink_found" -ne 0 ]; then
+audit_entry_types
+if [ "$unpinned_found" -ne 0 ] || [ "$symlink_found" -ne 0 ] || [ "$entry_type_bad" -ne 0 ]; then
   echo "refusing to sync the legacy project skill mirror; nothing was written." >&2
   if [ "$unpinned_found" -ne 0 ]; then
     unpinned_disposition
@@ -227,13 +310,34 @@ if [ "$unpinned_found" -ne 0 ] || [ "$symlink_found" -ne 0 ]; then
   if [ "$symlink_found" -ne 0 ]; then
     symlink_disposition
   fi
+  if [ "$entry_type_bad" -ne 0 ]; then
+    topology_disposition
+  fi
   exit 1
 fi
 
 mkdir -p "$dest"
+
+# Replace by rename, never by writing into the existing entry.
+#
+# `cp "$src/$name" "$dest/$name"` opens and truncates whatever the destination
+# name resolves to. Review j#90342 R3-F1 measured that reaching an unrelated
+# file's inode through a HARDLINK under a pinned name rewrote that file — and a
+# hardlink is a regular file, so no entry-type check can see it. Copying into a
+# fresh temp file and renaming it into place replaces the *directory entry*: the
+# old inode keeps its content and its other names, and the swap is atomic, so an
+# interrupted sync never leaves a half-written reference.
+tmp="$dest/.sync_legacy_project_skill.$$.tmp"
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
 for name in $MIRRORED_REFERENCES; do
-  cp "$src/$name" "$dest/$name"
+  rm -f "$tmp"
+  cp "$src/$name" "$tmp"
+  # `cp` into a new file takes the umask; pin the mode so a restrictive umask
+  # cannot leave the mirror less readable than the canonical body it copies.
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$dest/$name"
 done
+trap - EXIT HUP INT TERM
 
 echo "synced legacy project skill mirror"
 echo "  source: $src"

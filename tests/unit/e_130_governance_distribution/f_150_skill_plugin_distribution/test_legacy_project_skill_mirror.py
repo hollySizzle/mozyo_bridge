@@ -43,6 +43,7 @@ the mirror to diverge.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -145,25 +146,59 @@ class LegacyProjectSkillMirrorTest(unittest.TestCase):
             f"set; expected {sorted(MIRRORED_REFERENCES)}, found {sorted(present)}",
         )
 
-    def test_mirror_references_are_regular_files_not_symlinks(self) -> None:
-        """No mirrored reference may be a symlink (review j#90342 R2-F1).
+    def test_mirror_references_are_regular_files(self) -> None:
+        """Every mirrored reference is a regular file (j#90342 R2-F1 / R3-F1).
 
-        The mirror is a byte copy, so a symlink is never a correct entry. It is
-        also actively dangerous on a *pinned* name: content parity follows the
-        link and passes, and the sync's `cp` then writes through it into the
-        link target — measured overwriting an unrelated file while reporting
-        success. Banning the entry type is what closes that, and content parity
-        alone cannot see it.
+        The mirror is a byte copy, so a symlink is never a correct entry, and
+        neither is a directory / FIFO / socket / device. Both were measured
+        breaking the sync: a symlinked pinned name passed content parity and
+        made `cp` write through into the link target, and a directory under a
+        pinned name made the sync create `safety.md/safety.md` and report
+        success.
+
+        R3-F1 also caught this assertion's name over-claiming what it checked —
+        it said "regular files" while only asserting non-symlink. It now
+        asserts both halves separately so each failure names its own cause.
         """
-        symlinked = sorted(
-            p.name for p in self.mirror_ref_dir.glob("*.md") if p.is_symlink()
-        )
+        entries = sorted(self.mirror_ref_dir.glob("*.md"))
+
+        symlinked = sorted(p.name for p in entries if p.is_symlink())
         self.assertEqual(
             [],
             symlinked,
-            "legacy project mirror references must be regular files, not "
-            f"symlinks; found {symlinked}. Replace with a regular file, then "
-            "run scripts/sync_legacy_project_skill.sh from the repo root.",
+            "legacy project mirror references must not be symlinks; found "
+            f"{symlinked}. Replace with a regular file, then run "
+            "scripts/sync_legacy_project_skill.sh from the repo root.",
+        )
+
+        non_regular = sorted(
+            p.name for p in entries if not p.is_symlink() and not p.is_file()
+        )
+        self.assertEqual(
+            [],
+            non_regular,
+            "legacy project mirror references must be regular files (not "
+            f"directories / FIFOs / sockets / devices); found {non_regular}.",
+        )
+
+    def test_mirror_destination_is_not_reached_through_a_symlink(self) -> None:
+        """No component of the mirror path may be a symlink (j#90342 R3-F1).
+
+        Pointing `references/` itself at an external directory made the sync
+        write the canonical bodies into that directory and exit 0 — the entry
+        checks all followed the link and saw a healthy mirror.
+        """
+        symlinked_components = []
+        probe = ROOT
+        for part in (".claude", "skills", "mozyo-bridge-agent", "references"):
+            probe = probe / part
+            if probe.is_symlink():
+                symlinked_components.append(str(probe.relative_to(ROOT)))
+        self.assertEqual(
+            [],
+            symlinked_components,
+            "the legacy project mirror must live at a real path inside the "
+            f"repo; these components are symlinks: {symlinked_components}",
         )
 
     def test_adapter_skill_md_present_and_not_a_canonical_copy(self) -> None:
@@ -529,6 +564,141 @@ class LegacySkillSyncScriptTest(unittest.TestCase):
                 victim.read_text(encoding="utf-8"),
                 "sync wrote through the symlink into its target",
             )
+
+    def test_both_modes_reject_a_non_regular_pinned_entry(self) -> None:
+        """Review j#90342 R3-F1: type-check pinned names, not just symlinks.
+
+        A directory under a pinned name made the sync exit 0 with a success
+        banner after creating `safety.md/safety.md`. A FIFO made `cp` block on
+        open indefinitely. The preflight uses `-f`, a stat rather than an open,
+        so it rejects the FIFO without blocking on it.
+        """
+        pinned = ".claude/skills/mozyo-bridge-agent/references/safety.md"
+        for kind in ("directory", "fifo"):
+            for mode in (["--check"], []):
+                with self.subTest(kind=kind, mode=mode or ["sync"]):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        repo = self._stage(Path(tmp))
+                        target = repo / pinned
+                        target.unlink()
+                        if kind == "directory":
+                            target.mkdir()
+                        else:
+                            os.mkfifo(target)
+
+                        result = subprocess.run(
+                            [
+                                "sh",
+                                str(repo / "scripts" / SYNC_SCRIPT_PATH.name),
+                                *mode,
+                            ],
+                            capture_output=True,
+                            text=True,
+                            # A blocking `cp` on the FIFO would hang the suite;
+                            # the timeout turns that regression into a failure.
+                            timeout=30,
+                        )
+                        self.assertEqual(1, result.returncode, msg=result.stdout)
+                        self.assertNotIn(
+                            "synced legacy project skill mirror", result.stdout
+                        )
+                        self.assertNotIn("is up to date", result.stdout)
+                        self.assertIn(
+                            "not a regular file: references/safety.md",
+                            result.stderr,
+                        )
+                        if kind == "directory":
+                            self.assertFalse(
+                                (target / "safety.md").exists(),
+                                "sync wrote into the directory it should reject",
+                            )
+
+    def test_both_modes_reject_a_symlinked_mirror_destination(self) -> None:
+        """Review j#90342 R3-F1: `-d "$dest"` follows symlinks.
+
+        Pointing `references/` at an external directory made the sync write the
+        canonical bodies there and exit 0 with a success banner: every entry
+        check followed the link and saw a healthy mirror.
+        """
+        for mode in (["--check"], []):
+            with self.subTest(mode=mode or ["sync"]):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = self._stage(Path(tmp))
+                    outside = repo / "outside"
+                    outside.mkdir()
+                    sentinel = outside / "safety.md"
+                    sentinel.write_text("OUTSIDE\n", encoding="utf-8")
+
+                    mirror_refs = (
+                        repo / ".claude/skills/mozyo-bridge-agent/references"
+                    )
+                    shutil.rmtree(mirror_refs)
+                    mirror_refs.symlink_to(outside, target_is_directory=True)
+
+                    result = subprocess.run(
+                        ["sh", str(repo / "scripts" / SYNC_SCRIPT_PATH.name), *mode],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(1, result.returncode, msg=result.stdout)
+                    self.assertNotIn(
+                        "synced legacy project skill mirror", result.stdout
+                    )
+                    self.assertIn("path component is a symlink", result.stderr)
+                    self.assertEqual(
+                        "OUTSIDE\n",
+                        sentinel.read_text(encoding="utf-8"),
+                        "sync wrote outside the mirror",
+                    )
+
+    def test_sync_replaces_by_rename_and_never_writes_through_a_hardlink(
+        self,
+    ) -> None:
+        """Review j#90342 R3-F1 condition 2: replace the entry, not the inode.
+
+        A hardlink IS a regular file, so no entry-type check can see it — the
+        earlier `cp src dest` opened and truncated whatever the pinned name
+        resolved to, rewriting an unrelated file's contents. Copying to a temp
+        file and renaming it into place swaps the directory entry, leaving the
+        old inode and its other names untouched.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage(Path(tmp))
+            victim = repo / "victim.txt"
+            victim.write_text("UNRELATED CONTENT\n", encoding="utf-8")
+            pinned = repo / ".claude/skills/mozyo-bridge-agent/references/safety.md"
+            pinned.unlink()
+            os.link(victim, pinned)
+
+            synced = self._sync(repo)
+            self.assertEqual(0, synced.returncode, msg=synced.stderr)
+
+            self.assertEqual(
+                "UNRELATED CONTENT\n",
+                victim.read_text(encoding="utf-8"),
+                "sync wrote through the hardlink into the shared inode",
+            )
+            # The mirror still converged: the entry now points at a fresh inode
+            # carrying the canonical bytes.
+            self.assertEqual(0, self._check(repo).returncode)
+            self.assertEqual(1, pinned.stat().st_nlink)
+
+    def test_sync_leaves_no_temp_file_behind(self) -> None:
+        """The rename staging file must not become an unpinned reference.
+
+        It is named as a dotfile (so the `*.md` audit cannot trip over it) and
+        removed by a trap, but a leaked temp file in the mirror would be a new
+        drift class invented by the fix.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage(Path(tmp))
+            self.assertEqual(0, self._sync(repo).returncode)
+            mirror_refs = repo / ".claude/skills/mozyo-bridge-agent/references"
+            leftovers = sorted(
+                p.name for p in mirror_refs.iterdir() if "tmp" in p.name
+            )
+            self.assertEqual([], leftovers)
+            self.assertEqual(0, self._check(repo).returncode)
 
     def test_check_fails_when_the_mirror_directory_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

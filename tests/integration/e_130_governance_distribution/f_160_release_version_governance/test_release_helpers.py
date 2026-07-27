@@ -2003,6 +2003,26 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             self.assertIn("reviewed delete", stdout)
             self.assertIn("plugin skill mirror is up to date", stdout)
 
+    def test_legacy_mirror_invalid_entry_type_is_a_release_blocker(self) -> None:
+        """Review j#90342 R3-F1 condition 4: the gate must see bad topology.
+
+        A directory under a pinned reference name is not something the sync can
+        resolve, so `release check drift` has to report it rather than leave it
+        to whoever next runs the script.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            pinned = (
+                repo / ".claude/skills/mozyo-bridge-agent/references/safety.md"
+            )
+            pinned.unlink()
+            pinned.mkdir()
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("not a regular file: references/safety.md", stdout)
+            self.assertIn("result: blocker", stdout)
+            self.assertIn("plugin skill mirror is up to date", stdout)
+
     def test_missing_legacy_sync_script_is_release_blocker(self) -> None:
         """A deleted legacy sync script must block, not silently pass.
 
