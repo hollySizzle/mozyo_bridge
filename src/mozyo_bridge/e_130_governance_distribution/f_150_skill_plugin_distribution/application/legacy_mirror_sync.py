@@ -1,32 +1,47 @@
 """Legacy project skill partial-mirror check / sync service (Redmine #14580).
 
-Observes the tree for the rules defined in
-:mod:`..domain.legacy_mirror_contract` and, in sync mode, replaces each pinned
-mirror entry. Every judgement about *what is a violation* and *which recovery
-converges* lives in the domain module; this layer only reports what it saw.
+Observes the tree for the rules in :mod:`..domain.legacy_mirror_contract` and,
+in sync mode, replaces each pinned mirror entry. Every judgement about *what is
+a violation* and *which recovery converges* lives in the domain module; this
+layer only reports what it saw.
 
-Filesystem discipline (design consultation answer, Redmine #14580 j#90402):
+Directory descriptors are the I/O authority
+-------------------------------------------
+Review j#90418 R6-F1 measured that ``lstat`` preflight plus path-based I/O is
+not enough: the path is re-resolved on every subsequent call, so swapping the
+tree between the audit and the write reached outside the mirror four different
+ways — a mirror entry re-pointed at an external file passed as clean because the
+content read followed it; an aliased *parent* of either side let a write land
+outside while ``O_NOFOLLOW`` on the leaf saw nothing wrong; and re-binding this
+run's own temp path to a victim symlink let a path-based ``chmod`` change the
+victim's mode and then installed the symlink as a pinned entry.
 
-- **lossless enumeration** — :func:`os.scandir` entry names are compared
-  exactly. Nothing is serialised through a shell word list, so a name
-  containing a space, tab, newline or a literal ``*`` cannot be re-split or
-  re-globbed (j#90397 R5-F1).
-- **no-follow observation** — every type test uses :func:`os.lstat`. ``stat``,
-  ``Path.is_file`` and shell ``-e``/``-d``/``-f`` all follow symlinks, which is
-  how an aliased destination, an aliased canonical source and a dangling entry
-  each passed an earlier gate.
-- **owned temp** — the staging file comes from :func:`tempfile.mkstemp` in the
-  destination directory, so this run owns an exclusive fd and an exact path. It
-  removes that path and nothing else, ever. Prefix matching is not ownership
-  (j#90397 R5-F2): it deleted an unrelated file that merely shared the prefix,
-  and it deleted a *concurrent* run's in-flight temp.
-- **entry replacement** — :func:`os.replace` swaps the directory entry, so a
-  hardlinked or otherwise aliased destination inode is never opened or
-  truncated (j#90342 R3-F1).
-- **action-time recheck** — the source is opened with ``O_NOFOLLOW`` and
-  re-validated on the fd, and the whole audit is re-run before success is
-  reported, so an alias or type swap between preflight and write is
-  fail-closed rather than silently mirrored.
+So the walk opens every component with ``O_DIRECTORY | O_NOFOLLOW`` and keeps
+the resulting descriptor. Afterwards **nothing resolves a multi-component path
+again**: entries are stat'd, read, created, renamed and unlinked relative to a
+bound descriptor, with ``O_NOFOLLOW`` on the leaf. A component swapped after the
+walk no longer affects where the I/O lands — the descriptor still refers to the
+directory that was validated.
+
+Consequences worth stating, because they are easy to undo by accident:
+
+- content parity reads through the bound descriptors and re-validates on the
+  fd with ``fstat``; a plain ``Path.read_bytes()`` would follow a symlink
+  installed after rule E ran;
+- the staging file is created with ``O_CREAT | O_EXCL | O_NOFOLLOW`` on the
+  mirror descriptor, so this run owns it; the mode is set with ``fchmod`` on
+  that fd, never ``chmod`` on a path that could have been re-bound;
+- the swap is ``os.replace`` with ``src_dir_fd`` / ``dst_dir_fd``;
+- cleanup unlinks this run's exact name relative to the same descriptor.
+
+Where the host cannot provide these primitives the service fails closed
+(:data:`~..domain.legacy_mirror_contract.PLATFORM_UNSUPPORTED`) rather than
+degrading to path-based I/O.
+
+Unreadable state is a typed violation, not an exception: a mode-000 canonical
+file used to escape the audit as a traceback, which left `release check drift`
+advising the operator to follow a disposition that was never printed
+(j#90418 R6-F3).
 
 Residue from an interrupted run is a plain unpinned entry: it blocks and asks
 for a reviewed disposition. This service never deletes it, because it cannot
@@ -37,8 +52,8 @@ from __future__ import annotations
 
 import os
 import stat
-import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from ..domain.legacy_mirror_contract import (
@@ -46,15 +61,19 @@ from ..domain.legacy_mirror_contract import (
     ENTRY_MISSING,
     ENTRY_NOT_REGULAR,
     ENTRY_SYMLINK,
+    ENTRY_UNREADABLE,
     MIRROR_RELATIVE,
     MIRRORED_REFERENCES,
     PATH_COMPONENT_MISSING,
     PATH_COMPONENT_NOT_DIRECTORY,
     PATH_COMPONENT_SYMLINK,
+    PATH_UNREADABLE,
+    PLATFORM_UNSUPPORTED,
     RULE_CONTENT_PARITY,
     RULE_DEST_ENTRY_SET,
     RULE_DEST_ENTRY_TYPES,
     RULE_DEST_TOPOLOGY,
+    RULE_PLATFORM,
     RULE_SOURCE_ENTRIES,
     RULE_SOURCE_TOPOLOGY,
     SOURCE_MISSING,
@@ -62,19 +81,47 @@ from ..domain.legacy_mirror_contract import (
     SOURCE_RELATIVE,
     SOURCE_SWAPPED_DURING_SYNC,
     SOURCE_SYMLINK,
+    SOURCE_UNREADABLE,
     UNPINNED_ENTRY,
     MirrorAudit,
     Violation,
     describe_name,
 )
 
-#: Staging-file prefix. Purely cosmetic — it makes residue recognisable to a
-#: human reading the blocker. It is NOT used to decide what may be deleted;
-#: :func:`tempfile.mkstemp` hands back the exact path this run owns.
+#: Staging-file prefix. Cosmetic only — it makes residue recognisable to a human
+#: reading the blocker. Ownership comes from the exclusive create, never from
+#: the name (j#90397 R5-F2).
 _TEMP_PREFIX = ".mozyo-legacy-mirror."
 
-#: Points a test may observe to exercise a race deterministically.
+#: Points a test may observe to exercise an interleaving deterministically.
 HOOK_TEMP_CREATED = "temp_created"
+
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+
+
+def missing_platform_capabilities() -> tuple[str, ...]:
+    """Primitives this service refuses to run without."""
+    missing: list[str] = []
+    if not hasattr(os, "O_NOFOLLOW"):
+        missing.append("O_NOFOLLOW")
+    if not hasattr(os, "O_DIRECTORY"):
+        missing.append("O_DIRECTORY")
+    if os.open not in os.supports_dir_fd:
+        missing.append("open(dir_fd=)")
+    if os.stat not in os.supports_dir_fd:
+        missing.append("stat(dir_fd=)")
+    if os.unlink not in os.supports_dir_fd:
+        missing.append("unlink(dir_fd=)")
+    if os.mkdir not in os.supports_dir_fd:
+        missing.append("mkdir(dir_fd=)")
+    # `os.replace` shares `os.rename`'s implementation; the capability set is
+    # keyed on `os.rename` even though both accept the arguments.
+    if os.rename not in os.supports_dir_fd:
+        missing.append("rename(src_dir_fd=, dst_dir_fd=)")
+    if os.scandir not in os.supports_fd:
+        missing.append("scandir(fd)")
+    return tuple(missing)
 
 
 class LegacyProjectSkillMirrorSync:
@@ -89,264 +136,386 @@ class LegacyProjectSkillMirrorSync:
         self.repo_root = Path(repo_root)
         self.source_dir = self.repo_root / SOURCE_RELATIVE
         self.mirror_dir = self.repo_root / MIRROR_RELATIVE
-        #: Seam for deterministic concurrency tests. Production callers leave
-        #: it unset; the service's behaviour does not depend on it.
+        #: Seam for deterministic interleaving tests. Production callers leave
+        #: it unset; behaviour does not depend on it.
         self._progress_hook = progress_hook
-
-    # --- observation -------------------------------------------------------
 
     def _notify(self, event: str) -> None:
         if self._progress_hook is not None:
             self._progress_hook(event)
 
-    @staticmethod
-    def _lstat(path: Path) -> os.stat_result | None:
-        """``lstat`` without following, or ``None`` when nothing is there."""
-        try:
-            return os.lstat(path)
-        except (FileNotFoundError, NotADirectoryError):
-            return None
+    # --- bound-descriptor plumbing -----------------------------------------
 
-    def _walk_components(
-        self, relative: str, rule: str
-    ) -> tuple[tuple[Violation, ...], bool]:
-        """Check each component of a repo-relative path.
+    def _classify_component(
+        self, parent_fd: int, part: str, walked: str, rule: str
+    ) -> tuple[Violation | None, bool]:
+        """Say *why* a component could not be opened as a real directory.
 
-        Returns its violations plus whether the walk stopped because a
-        component simply does not exist. That distinction is the whole point:
-        an existing non-directory component and a missing one need opposite
-        recoveries, and collapsing them produced the non-convergent "mirror
-        missing, rerun the sync" advice for an ENOTDIR tree (j#90378 R4-F3).
+        The open is the authority; this only produces the message. Errno alone
+        cannot tell a symlink from a plain non-directory — on macOS both give
+        ENOTDIR under ``O_DIRECTORY | O_NOFOLLOW`` — so the classification uses
+        a no-follow ``lstat`` through the same bound parent.
         """
-        probe = self.repo_root
-        for part in relative.split("/"):
-            probe = probe / part
-            info = self._lstat(probe)
-            display = str(probe.relative_to(self.repo_root))
-            if info is None:
-                return (), True
-            if stat.S_ISLNK(info.st_mode):
-                return (
-                    Violation(
-                        rule=rule,
-                        kind=PATH_COMPONENT_SYMLINK,
-                        subject=display,
-                        note="path components must be real directories, not symlinks",
-                    ),
-                ), False
-            if not stat.S_ISDIR(info.st_mode):
-                return (
-                    Violation(
-                        rule=rule,
-                        kind=PATH_COMPONENT_NOT_DIRECTORY,
-                        subject=display,
-                        note="exists but is not a directory",
-                    ),
-                ), False
-        return (), False
-
-    def _audit_source(self) -> tuple[Violation, ...]:
-        violations, missing = self._walk_components(
-            SOURCE_RELATIVE, RULE_SOURCE_TOPOLOGY
-        )
-        if violations:
-            return violations
-        if missing:
+        try:
+            info = os.lstat(part, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return None, True
+        except OSError:
+            return (
+                Violation(rule, PATH_UNREADABLE, walked, "could not be inspected"),
+                False,
+            )
+        if stat.S_ISLNK(info.st_mode):
             return (
                 Violation(
-                    rule=RULE_SOURCE_TOPOLOGY,
-                    kind=PATH_COMPONENT_MISSING,
-                    subject=SOURCE_RELATIVE,
-                    note="canonical body is not present",
+                    rule,
+                    PATH_COMPONENT_SYMLINK,
+                    walked,
+                    "path components must be real directories, not symlinks",
                 ),
+                False,
+            )
+        if not stat.S_ISDIR(info.st_mode):
+            return (
+                Violation(rule, PATH_COMPONENT_NOT_DIRECTORY, walked, "exists but is not a directory"),
+                False,
+            )
+        return (
+            Violation(rule, PATH_UNREADABLE, walked, "directory could not be opened"),
+            False,
+        )
+
+    def _open_bound(
+        self, relative: str, rule: str, *, create: bool = False
+    ) -> tuple[int | None, tuple[Violation, ...], bool]:
+        """Open each component no-follow, returning a descriptor for the leaf.
+
+        Returns ``(fd, violations, missing)``. The repo root itself is opened
+        without ``O_NOFOLLOW``: it is the anchor the operator invoked us with,
+        and a checkout legitimately reached through a symlinked parent was
+        accepted as out of scope (j#90378).
+        """
+        try:
+            parent = os.open(self.repo_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        except OSError:
+            return (
+                None,
+                (Violation(rule, PATH_UNREADABLE, ".", "repository root is not an accessible directory"),),
+                False,
             )
 
+        walked = ""
+        try:
+            for part in relative.split("/"):
+                walked = f"{walked}/{part}" if walked else part
+                try:
+                    child = os.open(part, _DIR_FLAGS, dir_fd=parent)
+                except OSError:
+                    violation, missing = self._classify_component(parent, part, walked, rule)
+                    if missing and create:
+                        try:
+                            os.mkdir(part, 0o755, dir_fd=parent)
+                            child = os.open(part, _DIR_FLAGS, dir_fd=parent)
+                        except OSError:
+                            return (
+                                None,
+                                (Violation(rule, PATH_UNREADABLE, walked, "could not be created"),),
+                                False,
+                            )
+                    elif missing:
+                        return None, (), True
+                    else:
+                        assert violation is not None
+                        return None, (violation,), False
+                os.close(parent)
+                parent = child
+        except BaseException:
+            os.close(parent)
+            raise
+        return parent, (), False
+
+    @contextmanager
+    def _bound(self, relative: str, rule: str, *, create: bool = False) -> Iterator[
+        tuple[int | None, tuple[Violation, ...], bool]
+    ]:
+        fd, violations, missing = self._open_bound(relative, rule, create=create)
+        try:
+            yield fd, violations, missing
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    @staticmethod
+    def _read_bound(dir_fd: int, name: str) -> tuple[bytes | None, str | None]:
+        """Read an entry through a bound descriptor, re-validating on the fd.
+
+        Returns ``(payload, failure_kind)``. The ``fstat`` is what makes this
+        safe after the type audit: the descriptor cannot be re-pointed, so a
+        symlink or FIFO installed in the meantime is refused here rather than
+        followed or blocked on.
+        """
+        try:
+            fd = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
+        except OSError:
+            return None, ENTRY_UNREADABLE
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return None, ENTRY_NOT_REGULAR
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(fd, 1 << 16)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks), None
+        except OSError:
+            return None, ENTRY_UNREADABLE
+        finally:
+            os.close(fd)
+
+    # --- rules --------------------------------------------------------------
+
+    def _audit_source_entries(self, source_fd: int) -> tuple[Violation, ...]:
         found: list[Violation] = []
         for name in MIRRORED_REFERENCES:
-            info = self._lstat(self.source_dir / name)
             subject = f"{SOURCE_RELATIVE}/{name}"
-            if info is None:
+            try:
+                info = os.lstat(name, dir_fd=source_fd)
+            except FileNotFoundError:
                 found.append(
-                    Violation(
-                        rule=RULE_SOURCE_ENTRIES,
-                        kind=SOURCE_MISSING,
-                        subject=subject,
-                        note="pinned canonical reference is missing",
-                    )
+                    Violation(RULE_SOURCE_ENTRIES, SOURCE_MISSING, subject, "pinned canonical reference is missing")
                 )
-            elif stat.S_ISLNK(info.st_mode):
+                continue
+            except OSError:
+                found.append(
+                    Violation(RULE_SOURCE_ENTRIES, SOURCE_UNREADABLE, subject, "could not be inspected")
+                )
+                continue
+            if stat.S_ISLNK(info.st_mode):
                 found.append(
                     Violation(
-                        rule=RULE_SOURCE_ENTRIES,
-                        kind=SOURCE_SYMLINK,
-                        subject=subject,
-                        note="canonical references must be regular files, not symlinks",
+                        RULE_SOURCE_ENTRIES,
+                        SOURCE_SYMLINK,
+                        subject,
+                        "canonical references must be regular files, not symlinks",
                     )
                 )
             elif not stat.S_ISREG(info.st_mode):
                 found.append(
-                    Violation(
-                        rule=RULE_SOURCE_ENTRIES,
-                        kind=SOURCE_NOT_REGULAR,
-                        subject=subject,
-                        note="canonical reference is not a regular file",
-                    )
+                    Violation(RULE_SOURCE_ENTRIES, SOURCE_NOT_REGULAR, subject, "is not a regular file")
                 )
         return tuple(found)
 
-    def _mirror_entry_names(self) -> tuple[str, ...]:
-        """Every direct entry name, hidden and odd names included."""
-        with os.scandir(self.mirror_dir) as entries:
-            return tuple(entry.name for entry in entries)
-
-    def _audit_dest(self) -> tuple[tuple[Violation, ...], bool]:
-        topology, missing = self._walk_components(MIRROR_RELATIVE, RULE_DEST_TOPOLOGY)
-        if topology:
-            return topology, False
-        if missing:
-            return (), True
-
+    def _audit_dest_entries(self, mirror_fd: int) -> tuple[Violation, ...]:
         found: list[Violation] = []
+        try:
+            names = sorted(entry.name for entry in os.scandir(mirror_fd))
+        except OSError:
+            return (
+                Violation(RULE_DEST_ENTRY_SET, PATH_UNREADABLE, MIRROR_RELATIVE, "directory could not be listed"),
+            )
+
         pinned = set(MIRRORED_REFERENCES)
-        for name in sorted(self._mirror_entry_names()):
+        for name in names:
             if name not in pinned:
                 found.append(
                     Violation(
-                        rule=RULE_DEST_ENTRY_SET,
-                        kind=UNPINNED_ENTRY,
-                        subject=f"{MIRROR_RELATIVE}/{describe_name(name)}",
-                        note="not in the pinned partial mirror set",
+                        RULE_DEST_ENTRY_SET,
+                        UNPINNED_ENTRY,
+                        f"{MIRROR_RELATIVE}/{describe_name(name)}",
+                        "not in the pinned partial mirror set",
                     )
                 )
 
         for name in MIRRORED_REFERENCES:
-            info = self._lstat(self.mirror_dir / name)
-            if info is None:
-                continue  # rule F reports the absence
             subject = f"{MIRROR_RELATIVE}/{describe_name(name)}"
+            try:
+                info = os.lstat(name, dir_fd=mirror_fd)
+            except FileNotFoundError:
+                continue  # rule F reports the absence
+            except OSError:
+                found.append(Violation(RULE_DEST_ENTRY_TYPES, ENTRY_UNREADABLE, subject, "could not be inspected"))
+                continue
             if stat.S_ISLNK(info.st_mode):
                 found.append(
                     Violation(
-                        rule=RULE_DEST_ENTRY_TYPES,
-                        kind=ENTRY_SYMLINK,
-                        subject=subject,
-                        note="mirror references must be regular files, not symlinks",
+                        RULE_DEST_ENTRY_TYPES,
+                        ENTRY_SYMLINK,
+                        subject,
+                        "mirror references must be regular files, not symlinks",
                     )
                 )
             elif not stat.S_ISREG(info.st_mode):
                 found.append(
-                    Violation(
-                        rule=RULE_DEST_ENTRY_TYPES,
-                        kind=ENTRY_NOT_REGULAR,
-                        subject=subject,
-                        note="mirror reference is not a regular file",
-                    )
+                    Violation(RULE_DEST_ENTRY_TYPES, ENTRY_NOT_REGULAR, subject, "is not a regular file")
                 )
-        return tuple(found), False
+        return tuple(found)
 
-    def _audit_content(self, dest_violations: tuple[Violation, ...]) -> tuple[Violation, ...]:
-        unusable = {
-            v.subject
-            for v in dest_violations
-            if v.rule == RULE_DEST_ENTRY_TYPES
-        }
+    def _audit_content(
+        self, source_fd: int, mirror_fd: int, dest_violations: tuple[Violation, ...]
+    ) -> tuple[Violation, ...]:
+        unusable = {v.subject for v in dest_violations if v.rule == RULE_DEST_ENTRY_TYPES}
         found: list[Violation] = []
         for name in MIRRORED_REFERENCES:
             subject = f"{MIRROR_RELATIVE}/{describe_name(name)}"
             if subject in unusable:
-                continue  # reading it would follow the very alias rule E rejected
-            mirror_path = self.mirror_dir / name
-            if self._lstat(mirror_path) is None:
+                continue  # rule E already reported it
+            try:
+                os.lstat(name, dir_fd=mirror_fd)
+            except FileNotFoundError:
+                found.append(Violation(RULE_CONTENT_PARITY, ENTRY_MISSING, subject, "mirrored reference is absent"))
+                continue
+            except OSError:
+                found.append(Violation(RULE_CONTENT_PARITY, ENTRY_UNREADABLE, subject, "could not be inspected"))
+                continue
+
+            source_payload, source_failure = self._read_bound(source_fd, name)
+            if source_failure is not None:
                 found.append(
                     Violation(
-                        rule=RULE_CONTENT_PARITY,
-                        kind=ENTRY_MISSING,
-                        subject=subject,
-                        note="mirrored reference is absent",
+                        RULE_SOURCE_ENTRIES,
+                        SOURCE_UNREADABLE if source_failure == ENTRY_UNREADABLE else source_failure,
+                        f"{SOURCE_RELATIVE}/{name}",
+                        "could not be read as a regular file",
                     )
                 )
                 continue
-            if (self.source_dir / name).read_bytes() != mirror_path.read_bytes():
-                found.append(
-                    Violation(
-                        rule=RULE_CONTENT_PARITY,
-                        kind=CONTENT_DRIFT,
-                        subject=subject,
-                        note="differs from canonical",
-                    )
-                )
+            mirror_payload, mirror_failure = self._read_bound(mirror_fd, name)
+            if mirror_failure is not None:
+                found.append(Violation(RULE_CONTENT_PARITY, mirror_failure, subject, "could not be read as a regular file"))
+                continue
+            if source_payload != mirror_payload:
+                found.append(Violation(RULE_CONTENT_PARITY, CONTENT_DRIFT, subject, "differs from canonical"))
         return tuple(found)
 
     def audit(self) -> MirrorAudit:
         """Evaluate rules A-F over the current tree."""
-        source = self._audit_source()
-        dest, dest_missing = self._audit_dest()
+        missing_capabilities = missing_platform_capabilities()
+        if missing_capabilities:
+            return MirrorAudit(
+                violations=(
+                    Violation(
+                        RULE_PLATFORM,
+                        PLATFORM_UNSUPPORTED,
+                        "host",
+                        "missing: " + ", ".join(missing_capabilities),
+                    ),
+                )
+            )
 
-        skipped: list[str] = []
-        content: tuple[Violation, ...] = ()
-        if source:
-            # A/B failed: content parity against a broken source would report a
-            # drift the sync cannot resolve, and the composite then advertised a
-            # resync that refuses (j#90397 R5-F3).
-            skipped.append(RULE_CONTENT_PARITY)
-        elif dest_missing:
-            skipped.append(RULE_CONTENT_PARITY)
-        else:
-            content = self._audit_content(dest)
+        with self._bound(SOURCE_RELATIVE, RULE_SOURCE_TOPOLOGY) as (source_fd, source_topology, source_missing):
+            source: tuple[Violation, ...] = source_topology
+            if source_missing:
+                source = (
+                    Violation(
+                        RULE_SOURCE_TOPOLOGY,
+                        PATH_COMPONENT_MISSING,
+                        SOURCE_RELATIVE,
+                        "canonical body is not present",
+                    ),
+                )
+            elif source_fd is not None:
+                source = self._audit_source_entries(source_fd)
 
-        return MirrorAudit(
-            violations=source + dest + content,
-            dest_missing=dest_missing,
-            skipped_rules=tuple(skipped),
-        )
+            with self._bound(MIRROR_RELATIVE, RULE_DEST_TOPOLOGY) as (mirror_fd, dest_topology, dest_missing):
+                dest: tuple[Violation, ...] = dest_topology
+                if mirror_fd is not None:
+                    dest = self._audit_dest_entries(mirror_fd)
+
+                skipped: list[str] = []
+                content: tuple[Violation, ...] = ()
+                if source or dest_missing or source_fd is None or mirror_fd is None:
+                    # A/B failed, or one side is absent: parity against a broken
+                    # source would report a drift the sync cannot resolve, and the
+                    # composite then advertised a resync that refuses (R5-F3).
+                    skipped.append(RULE_CONTENT_PARITY)
+                else:
+                    content = self._audit_content(source_fd, mirror_fd, dest)
+
+                return MirrorAudit(
+                    violations=source + dest + content,
+                    dest_missing=dest_missing,
+                    skipped_rules=tuple(skipped),
+                )
 
     # --- writing -----------------------------------------------------------
 
-    def _replace_one(self, name: str) -> Violation | None:
-        """Copy one pinned reference into place via an owned temp + rename."""
-        source_path = self.source_dir / name
-        try:
-            fd = os.open(source_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        except OSError:
-            # ELOOP here means the source became a symlink after preflight.
+    def _replace_one(self, source_fd: int, mirror_fd: int, name: str) -> Violation | None:
+        """Copy one pinned reference into place, entirely through bound fds."""
+        payload, failure = self._read_bound(source_fd, name)
+        if failure is not None:
             return Violation(
-                rule=RULE_SOURCE_ENTRIES,
-                kind=SOURCE_SWAPPED_DURING_SYNC,
-                subject=f"{SOURCE_RELATIVE}/{name}",
-                note="canonical reference could not be opened as a regular file",
+                RULE_SOURCE_ENTRIES,
+                SOURCE_SWAPPED_DURING_SYNC,
+                f"{SOURCE_RELATIVE}/{name}",
+                "could not be read as a regular file at write time",
             )
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                return Violation(
-                    rule=RULE_SOURCE_ENTRIES,
-                    kind=SOURCE_SWAPPED_DURING_SYNC,
-                    subject=f"{SOURCE_RELATIVE}/{name}",
-                    note="canonical reference stopped being a regular file",
-                )
-            with os.fdopen(os.dup(fd), "rb") as handle:
-                payload = handle.read()
-        finally:
-            os.close(fd)
 
-        temp_fd, temp_path = tempfile.mkstemp(
-            dir=self.mirror_dir, prefix=_TEMP_PREFIX, suffix=".tmp"
-        )
-        owned = temp_path
+        temp_name = f"{_TEMP_PREFIX}{os.urandom(8).hex()}.tmp"
         try:
-            with os.fdopen(temp_fd, "wb") as handle:
-                handle.write(payload)
+            temp_fd = os.open(
+                temp_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=mirror_fd,
+            )
+        except OSError:
+            return Violation(
+                RULE_DEST_ENTRY_SET, PATH_UNREADABLE, MIRROR_RELATIVE, "staging file could not be created"
+            )
+
+        owned = temp_name
+        try:
+            try:
+                os.write(temp_fd, payload or b"")
+                # `fchmod` on our own descriptor: a path-based `chmod` here
+                # changed a victim's mode when the temp name was re-bound to a
+                # symlink between create and chmod (j#90418 R6-F1 case 4).
+                os.fchmod(temp_fd, 0o644)
+                created = os.fstat(temp_fd)
+            finally:
+                os.close(temp_fd)
+
             self._notify(HOOK_TEMP_CREATED)
-            # `mkstemp` creates 0600; canonical and mirror are tracked 0644.
-            os.chmod(temp_path, 0o644)
-            os.replace(temp_path, self.mirror_dir / name)
+
+            # `os.replace` renames whatever the NAME refers to, and it does not
+            # follow symlinks — so a name re-bound between create and swap gets
+            # the foreign entry installed as a pinned reference (measured while
+            # correcting R6-F1 case 4: `fchmod` on our fd protected the victim's
+            # mode, and the symlink still landed in the mirror). Confirm the
+            # name still resolves to the inode we created before swapping it in.
+            try:
+                verify_fd = os.open(temp_name, _FILE_FLAGS, dir_fd=mirror_fd)
+            except OSError:
+                owned = ""  # not ours any more; do not unlink someone else's entry
+                return Violation(
+                    RULE_DEST_ENTRY_SET,
+                    ENTRY_UNREADABLE,
+                    f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
+                    "staging entry was replaced while the sync held it",
+                )
+            try:
+                current = os.fstat(verify_fd)
+            finally:
+                os.close(verify_fd)
+            if (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino):
+                owned = ""
+                return Violation(
+                    RULE_DEST_ENTRY_SET,
+                    ENTRY_UNREADABLE,
+                    f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
+                    "staging entry was rebound while the sync held it",
+                )
+
+            os.replace(temp_name, name, src_dir_fd=mirror_fd, dst_dir_fd=mirror_fd)
             owned = ""
         finally:
             if owned:
-                # Only ever this run's exact path.
+                # Only ever this run's exact name, relative to the bound mirror.
                 try:
-                    os.unlink(owned)
-                except FileNotFoundError:
+                    os.unlink(owned, dir_fd=mirror_fd)
+                except OSError:
                     pass
         return None
 
@@ -372,17 +541,32 @@ class LegacyProjectSkillMirrorSync:
                 *preflight.report_lines(),
             )
 
-        self.mirror_dir.mkdir(parents=True, exist_ok=True)
-        for name in MIRRORED_REFERENCES:
-            swapped = self._replace_one(name)
-            if swapped is not None:
+        with self._bound(SOURCE_RELATIVE, RULE_SOURCE_TOPOLOGY) as (source_fd, source_violations, source_missing):
+            if source_fd is None:
                 return 1, (), (
-                    "aborted the legacy project skill mirror sync.",
-                    swapped.message(),
-                    "",
-                    "The canonical body changed underneath the sync. Re-run once the",
-                    f"tracked {SOURCE_RELATIVE} path is stable.",
+                    "refusing to sync the legacy project skill mirror; nothing was written.",
+                    *MirrorAudit(violations=source_violations or ()).report_lines(),
                 )
+            with self._bound(MIRROR_RELATIVE, RULE_DEST_TOPOLOGY, create=True) as (
+                mirror_fd,
+                mirror_violations,
+                _mirror_missing,
+            ):
+                if mirror_fd is None:
+                    return 1, (), (
+                        "refusing to sync the legacy project skill mirror; nothing was written.",
+                        *MirrorAudit(violations=mirror_violations or ()).report_lines(),
+                    )
+                for name in MIRRORED_REFERENCES:
+                    swapped = self._replace_one(source_fd, mirror_fd, name)
+                    if swapped is not None:
+                        return 1, (), (
+                            "aborted the legacy project skill mirror sync.",
+                            swapped.message(),
+                            "",
+                            "The tree changed underneath the sync. Re-run once the tracked",
+                            f"{SOURCE_RELATIVE} path is stable.",
+                        )
 
         # Never announce success on an unverified tree: re-audit what we wrote.
         after = self.audit()

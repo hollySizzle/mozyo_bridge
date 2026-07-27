@@ -2072,6 +2072,34 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             self.assertIn("[B/source_symlink]", stdout)
             self.assertIn("result: blocker", stdout)
 
+    def test_legacy_mirror_unreadable_state_is_a_typed_release_blocker(self) -> None:
+        """Review j#90418 R6-F3: the gate must get a disposition, not a crash.
+
+        A mode-000 canonical file raised out of the sub-check, so the bullet
+        telling the operator to "follow the disposition the sub-check printed"
+        pointed at a traceback.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            target = repo / "skills/mozyo-bridge-agent/references/safety.md"
+            target.chmod(0o000)
+            try:
+                result, stdout, _stderr = self._run_helper(repo)
+            finally:
+                # Restore inside the temp dir's lifetime; an addCleanup would
+                # run after it is gone.
+                target.chmod(0o644)
+
+            self.assertEqual(1, result)
+            self.assertNotIn("Traceback", stdout)
+            self.assertIn("[B/source_unreadable]", stdout)
+            self.assertIn("Restore read access", stdout)
+            self.assertIn("result: blocker", stdout)
+            # The legacy bullet must still name its own gate. The plugin gate
+            # legitimately also trips here — the unreadable file is in the
+            # canonical body both mirrors read — so its state is not asserted.
+            self.assertIn("legacy project skill mirror drift detected", stdout)
+
     def test_missing_legacy_sync_script_is_release_blocker(self) -> None:
         """A deleted legacy sync script must block, not silently pass.
 

@@ -59,6 +59,8 @@ RULE_DEST_TOPOLOGY = "C"  # every existing mirror path component is a real dir
 RULE_DEST_ENTRY_SET = "D"  # every direct mirror entry is a pinned name
 RULE_DEST_ENTRY_TYPES = "E"  # every pinned mirror entry is a regular file
 RULE_CONTENT_PARITY = "F"  # every pinned mirror entry matches its source
+#: Not a tree rule: the host itself cannot support the contract's primitives.
+RULE_PLATFORM = "P"
 
 #: The rules the sync cannot repair. A breach of any of them means write zero.
 #: Rule F is absent on purpose — repairing content drift IS the sync.
@@ -69,6 +71,7 @@ WRITE_BLOCKING_RULES: frozenset[str] = frozenset(
         RULE_DEST_TOPOLOGY,
         RULE_DEST_ENTRY_SET,
         RULE_DEST_ENTRY_TYPES,
+        RULE_PLATFORM,
     }
 )
 
@@ -86,16 +89,44 @@ ENTRY_MISSING = "entry_missing"
 CONTENT_DRIFT = "content_drift"
 MIRROR_MISSING = "mirror_missing"
 SOURCE_SWAPPED_DURING_SYNC = "source_swapped_during_sync"
+#: The tree could not be observed at all. An unreadable path is not "clean" and
+#: not a crash: it is its own class with its own recovery (j#90418 R6-F3, where
+#: a mode-000 canonical file escaped the typed result as a traceback).
+PATH_UNREADABLE = "path_unreadable"
+SOURCE_UNREADABLE = "source_unreadable"
+ENTRY_UNREADABLE = "entry_unreadable"
+#: The host cannot provide the no-follow / directory-fd primitives the write
+#: path is built on. Fail closed rather than silently degrade to path-based I/O
+#: (j#90418 R6-F1 correction condition 4).
+PLATFORM_UNSUPPORTED = "platform_unsupported"
+
+#: Kinds that mean "could not observe", as opposed to "observed something bad".
+UNREADABLE_KINDS: frozenset[str] = frozenset(
+    {PATH_UNREADABLE, SOURCE_UNREADABLE, ENTRY_UNREADABLE}
+)
 
 #: Recovery actions, most specific first. Precedence matters: a tree whose
 #: source is broken must not be told to rerun the sync.
+RECOVERY_PLATFORM_UNSUPPORTED = "platform_unsupported"
 RECOVERY_RESTORE_SOURCE = "restore_source"
 RECOVERY_RESTORE_MIRROR_PATH = "restore_mirror_path"
+RECOVERY_RESTORE_ACCESS = "restore_access"
 RECOVERY_DISPOSITION_UNPINNED = "disposition_unpinned"
 RECOVERY_REPLACE_ENTRY = "replace_entry"
 RECOVERY_RESYNC = "resync"
 
 _RECOVERY_TEXT: dict[str, tuple[str, ...]] = {
+    RECOVERY_PLATFORM_UNSUPPORTED: (
+        "This host does not provide the no-follow / directory-descriptor primitives the",
+        "mirror sync is built on, so it cannot guarantee that it writes inside the mirror.",
+        "It refuses rather than fall back to path-based I/O, which is what allowed an",
+        "aliased path to be written through. Run the sync on a POSIX host.",
+    ),
+    RECOVERY_RESTORE_ACCESS: (
+        "Part of the tree could not be read. Restore read access (and, for the canonical",
+        "body, the tracked permissions) and rerun. An unreadable path is reported rather",
+        "than skipped: skipping it would let an unobservable tree pass as clean.",
+    ),
     RECOVERY_RESTORE_SOURCE: (
         f"The canonical body at {SOURCE_RELATIVE} must be real directories and regular files.",
         "Restore the tracked canonical path (git restore / checkout); do NOT point it at an",
@@ -211,6 +242,14 @@ class MirrorAudit:
         nothing upstream would make that rerun refuse.
         """
         actions: list[str] = []
+        kinds = self.kinds()
+        if self.has_rule(RULE_PLATFORM):
+            # Keyed on the RULE, not the kind: keying it on the kind left any
+            # other rule-P violation falling through to the resync line, which
+            # the exhaustive blocking-rule test caught.
+            return (RECOVERY_PLATFORM_UNSUPPORTED,)
+        if kinds & UNREADABLE_KINDS:
+            actions.append(RECOVERY_RESTORE_ACCESS)
         if self.source_invalid:
             actions.append(RECOVERY_RESTORE_SOURCE)
         if self.has_rule(RULE_DEST_TOPOLOGY):

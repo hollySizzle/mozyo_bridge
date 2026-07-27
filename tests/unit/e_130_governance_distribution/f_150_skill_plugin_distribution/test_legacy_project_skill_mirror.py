@@ -41,15 +41,20 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.application import (  # noqa: E402
+    legacy_mirror_sync,
+)
 from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.application.legacy_mirror_sync import (  # noqa: E402
     HOOK_TEMP_CREATED,
     LegacyProjectSkillMirrorSync,
@@ -62,11 +67,13 @@ from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.
     MIRRORED_REFERENCES,
     PATH_COMPONENT_NOT_DIRECTORY,
     PATH_COMPONENT_SYMLINK,
+    PLATFORM_UNSUPPORTED,
     RECOVERY_RESYNC,
     RULE_CONTENT_PARITY,
     SOURCE_MISSING,
     SOURCE_RELATIVE,
     SOURCE_SYMLINK,
+    SOURCE_UNREADABLE,
     UNPINNED_ENTRY,
 )
 
@@ -580,6 +587,255 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         self.assertEqual(1, pinned.stat().st_nlink)
         self.assertEqual(0, self._service(repo).check()[0])
 
+    # --- R6-F1: bound descriptors vs. TOCTOU --------------------------------
+
+    def test_entry_swapped_after_the_type_audit_is_not_read_through(self) -> None:
+        """j#90418 R6-F1 case 1. `Path.read_bytes()` re-resolves the path, so a
+        mirror entry re-pointed at an identical external file after rule E ran
+        made content parity pass and the whole audit report clean."""
+        repo = self._stage()
+        external = repo / "external.md"
+        shutil.copy(self._mirror(repo) / "safety.md", external)
+
+        service = self._service(repo)
+        original = service._audit_dest_entries
+
+        def swap_after_audit(mirror_fd: int):  # type: ignore[no-untyped-def]
+            result = original(mirror_fd)
+            entry = self._mirror(repo) / "safety.md"
+            entry.unlink()
+            entry.symlink_to(external)
+            return result
+
+        service._audit_dest_entries = swap_after_audit  # type: ignore[method-assign]
+        audit = service.audit()
+        self.assertFalse(audit.ok, "an entry swapped mid-audit was read through")
+
+    def test_source_parent_swapped_after_audit_writes_no_external_bytes(self) -> None:
+        """j#90418 R6-F1 case 2. `O_NOFOLLOW` on the leaf does not stop an
+        aliased *parent*: the sync wrote external bytes into the mirror and only
+        noticed at the final re-audit."""
+        repo = self._stage()
+        external = repo / "ext"
+        external.mkdir()
+        for name in MIRRORED_REFERENCES:
+            (external / name).write_text("EXTERNAL SOURCE BYTES\n", encoding="utf-8")
+
+        service = self._service(repo)
+        original = service.audit
+
+        def swap_after_audit():  # type: ignore[no-untyped-def]
+            result = original()
+            shutil.rmtree(self._source(repo))
+            self._source(repo).symlink_to(external, target_is_directory=True)
+            return result
+
+        service.audit = swap_after_audit  # type: ignore[method-assign]
+        code, _, _ = service.sync()
+        self.assertEqual(1, code)
+        for name in MIRRORED_REFERENCES:
+            self.assertNotIn(
+                "EXTERNAL SOURCE BYTES",
+                (self._mirror(repo) / name).read_text(encoding="utf-8"),
+                "external bytes reached the mirror through an aliased source parent",
+            )
+
+    def test_mirror_parent_swapped_after_audit_writes_nothing_outside(self) -> None:
+        """j#90418 R6-F1 case 3. The post-audit is detection, not prevention:
+        the canonical bodies had already been written into the external
+        directory by the time it ran."""
+        repo = self._stage()
+        external = repo / "ext"
+        external.mkdir()
+        for name in MIRRORED_REFERENCES:
+            (external / name).write_text("OUTSIDE\n", encoding="utf-8")
+
+        service = self._service(repo)
+        original = service.audit
+
+        def swap_after_audit():  # type: ignore[no-untyped-def]
+            result = original()
+            shutil.rmtree(self._mirror(repo))
+            self._mirror(repo).symlink_to(external, target_is_directory=True)
+            return result
+
+        service.audit = swap_after_audit  # type: ignore[method-assign]
+        code, _, _ = service.sync()
+        self.assertEqual(1, code)
+        for name in MIRRORED_REFERENCES:
+            self.assertEqual(
+                "OUTSIDE\n",
+                (external / name).read_text(encoding="utf-8"),
+                "the sync wrote outside the mirror through an aliased parent",
+            )
+
+    def test_staging_entry_rebound_mid_sync_is_not_swapped_into_place(self) -> None:
+        """j#90418 R6-F1 case 4, plus what correcting it exposed.
+
+        Re-binding this run's staging name to a victim symlink used to (a) let a
+        path-based `chmod` change the victim's mode and (b) have `os.replace`
+        install that symlink as a pinned reference — `rename` moves whatever the
+        name refers to. `fchmod` on the owned fd fixes (a); an inode identity
+        check before the swap fixes (b). The foreign entry is left alone: it is
+        not ours to delete, and the next audit reports it.
+        """
+        repo = self._stage()
+        victim = repo / "victim.txt"
+        victim.write_text("VICTIM\n", encoding="utf-8")
+        os.chmod(victim, 0o600)
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        def hook(event: str) -> None:
+            if event == HOOK_TEMP_CREATED:
+                for path in self._mirror(repo).iterdir():
+                    if path.name.startswith(".mozyo-legacy-mirror."):
+                        path.unlink()
+                        path.symlink_to(victim)
+                        break
+
+        code, out, err = self._service(repo, progress_hook=hook).sync()
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        self.assertIn("aborted", err[0])
+        self.assertEqual(0o600, stat.S_IMODE(os.stat(victim).st_mode), "victim mode changed")
+        self.assertEqual("VICTIM\n", victim.read_text(encoding="utf-8"), "victim content changed")
+        installed = [
+            name
+            for name in MIRRORED_REFERENCES
+            if (self._mirror(repo) / name).is_symlink()
+        ]
+        self.assertEqual([], installed, "a symlink was installed as a pinned reference")
+
+    def test_staging_entry_rebound_to_a_regular_file_is_not_swapped_into_place(
+        self,
+    ) -> None:
+        """The inode identity check, isolated from the no-follow open.
+
+        Re-binding the staging name to a *symlink* is already refused when the
+        verification open uses `O_NOFOLLOW`. Re-binding it to an ordinary file
+        opens fine, so only comparing the inode catches it — a mutation probe
+        that removed the comparison stayed green until this case existed.
+        """
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+        impostor_body = "IMPOSTOR\n"
+
+        def hook(event: str) -> None:
+            if event == HOOK_TEMP_CREATED:
+                for path in self._mirror(repo).iterdir():
+                    if path.name.startswith(".mozyo-legacy-mirror."):
+                        path.unlink()
+                        path.write_text(impostor_body, encoding="utf-8")
+                        break
+
+        code, out, err = self._service(repo, progress_hook=hook).sync()
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        self.assertIn("aborted", err[0])
+        for name in MIRRORED_REFERENCES:
+            self.assertNotEqual(
+                impostor_body,
+                (self._mirror(repo) / name).read_text(encoding="utf-8"),
+                "a substituted staging file was installed as a pinned reference",
+            )
+
+    def test_source_becoming_unreadable_after_the_walk_is_typed(self) -> None:
+        """The observation branch inside the bound source directory.
+
+        A mode-000 canonical *file* is still `lstat`-able, so it surfaces later
+        in the read. Dropping the directory's permissions after the walk is what
+        reaches the entry-level `OSError` branch — a probe that made it re-raise
+        stayed green until this case existed.
+        """
+        repo = self._stage()
+        source_dir = self._source(repo)
+        self.addCleanup(os.chmod, source_dir, 0o755)
+
+        service = self._service(repo)
+        original = service._audit_source_entries
+
+        def drop_permissions(source_fd: int):  # type: ignore[no-untyped-def]
+            os.chmod(source_dir, 0o000)
+            return original(source_fd)
+
+        service._audit_source_entries = drop_permissions  # type: ignore[method-assign]
+        code, out, err = service.check()
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        self.assertIn("Restore read access", "\n".join(err))
+
+    def test_unreadable_canonical_directory_is_a_typed_violation(self) -> None:
+        repo = self._stage()
+        source_dir = self._source(repo)
+        os.chmod(source_dir, 0o000)
+        self.addCleanup(os.chmod, source_dir, 0o755)
+
+        service = self._service(repo)
+        code, out, err = service.check()
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        self.assertIn("Restore read access", "\n".join(err))
+        self.assertEqual(1, service.sync()[0])
+
+    def test_platform_without_the_required_primitives_fails_closed(self) -> None:
+        """Contract: refuse rather than degrade to path-based I/O."""
+        repo = self._stage()
+        service = self._service(repo)
+        with unittest.mock.patch.object(
+            legacy_mirror_sync, "missing_platform_capabilities", return_value=("O_NOFOLLOW",)
+        ):
+            audit = service.audit()
+            self.assertFalse(audit.ok)
+            self.assertIn(PLATFORM_UNSUPPORTED, audit.kinds())
+            self.assertTrue(audit.blocks_write)
+            code, out, _ = service.sync()
+            self.assertEqual(1, code)
+            self.assertEqual((), out)
+
+    # --- R6-F3: unreadable state is typed, not an exception ------------------
+
+    def test_unreadable_canonical_reference_is_a_typed_violation(self) -> None:
+        """j#90418 R6-F3. A mode-000 canonical file raised `PermissionError`
+        out of `check()`, so the gate above printed a traceback and its
+        "follow the sub-check's disposition" advice pointed at nothing."""
+        repo = self._stage()
+        target = self._source(repo) / "safety.md"
+        os.chmod(target, 0o000)
+        self.addCleanup(os.chmod, target, 0o644)
+
+        service = self._service(repo)
+        code, out, err = service.check()
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        self.assertIn(SOURCE_UNREADABLE, service.audit().kinds())
+        report = "\n".join(err)
+        self.assertIn("Restore read access", report)
+        self.assertNotIn("Rerun 'scripts/sync_legacy_project_skill.sh'", report)
+        self.assertEqual(1, service.sync()[0])
+
+    def test_unreadable_mirror_directory_is_a_typed_violation(self) -> None:
+        repo = self._stage()
+        mirror = self._mirror(repo)
+        os.chmod(mirror, 0o000)
+        self.addCleanup(os.chmod, mirror, 0o755)
+
+        service = self._service(repo)
+        code, out, err = service.check()
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        self.assertIn("Restore read access", "\n".join(err))
+        self.assertEqual(1, service.sync()[0], "an unobservable mirror must not be written")
+
+    def test_diagnostics_carry_no_host_absolute_paths(self) -> None:
+        """Subjects stay repo-relative so the report is a stable contract."""
+        repo = self._stage()
+        (self._mirror(repo) / "unpinned.txt").write_text("x\n", encoding="utf-8")
+        for violation in self._service(repo).audit().violations:
+            self.assertNotIn(str(repo), violation.subject)
+            self.assertNotIn(str(repo), violation.note)
+
     # --- action-time recheck ------------------------------------------------
 
     def test_source_swapped_after_preflight_is_fail_closed(self) -> None:
@@ -682,6 +938,66 @@ class LegacyMirrorWrapperCliTest(_MirrorTreeFixture):
         result = self._run(repo, "--force")
         self.assertEqual(64, result.returncode)
         self.assertIn("unknown argument", result.stderr)
+
+    def test_repo_cannot_be_redirected_by_operator_argv(self) -> None:
+        """j#90418 R6-F2. The wrapper passed `--repo <own root>` and then
+        appended `"$@"`, and the parser took the last value — so an operator
+        could audit, and in default mode write, a different checkout entirely.
+        """
+        tree_a = self._stage_with_wrapper()
+        tree_b = self._stage_with_wrapper()
+        smuggled = self._mirror(tree_b) / "unpinned.txt"
+        smuggled.write_text("smuggled\n", encoding="utf-8")
+
+        for args in (["--check", "--repo", str(tree_b)], ["--repo", str(tree_b)]):
+            with self.subTest(args=args):
+                result = self._run(tree_a, *args)
+                self.assertEqual(64, result.returncode)
+                self.assertIn("unknown argument: --repo", result.stderr)
+                self.assertNotIn("unpinned.txt", result.stdout + result.stderr)
+
+        self.assertTrue(smuggled.exists(), "tree B was modified from tree A")
+        self.assertEqual(0, self._run(tree_a, "--check").returncode)
+
+    def test_repo_env_is_overwritten_by_the_wrapper(self) -> None:
+        """The internal channel must not be hijackable from the environment."""
+        tree_a = self._stage_with_wrapper()
+        tree_b = self._stage_with_wrapper()
+        (self._mirror(tree_b) / "unpinned.txt").write_text("smuggled\n", encoding="utf-8")
+
+        env = dict(os.environ)
+        env["MOZYO_LEGACY_MIRROR_REPO_ROOT"] = str(tree_b)
+        result = subprocess.run(
+            ["sh", str(tree_a / "scripts" / SYNC_SCRIPT_PATH.name), "--check"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(0, result.returncode, msg=result.stderr)
+        self.assertNotIn("unpinned.txt", result.stdout + result.stderr)
+
+    def test_module_run_without_the_wrapper_refuses(self) -> None:
+        """Running the CLI module directly must not silently pick a root."""
+        repo = self._stage_with_wrapper()
+        env = {k: v for k, v in os.environ.items() if k != "MOZYO_LEGACY_MIRROR_REPO_ROOT"}
+        env["PYTHONPATH"] = str(repo / "src")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution"
+                ".application.cli_legacy_mirror_sync",
+                "--check",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(repo),
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(64, result.returncode)
+        self.assertIn("MOZYO_LEGACY_MIRROR_REPO_ROOT", result.stderr)
 
     def test_wrapper_targets_its_own_repo_not_the_cwd(self) -> None:
         """`release check drift` runs the staged tree's wrapper; it must check

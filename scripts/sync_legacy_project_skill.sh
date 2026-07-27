@@ -54,4 +54,12 @@ if ! "$PYTHON" -c "import $module" >/dev/null 2>&1; then
   exit 1
 fi
 
-exec "$PYTHON" -m "$module" --repo "$repo_root" "$@"
+# The repo root travels on an internal channel, NOT in argv. Passing it as a
+# flag and then appending "$@" let an operator append their own `--repo` and win
+# on last-wins parsing, aiming check/sync at a different checkout entirely
+# (j#90418 R6-F2). Exported unconditionally so an inherited value cannot
+# survive.
+MOZYO_LEGACY_MIRROR_REPO_ROOT="$repo_root"
+export MOZYO_LEGACY_MIRROR_REPO_ROOT
+
+exec "$PYTHON" -m "$module" "$@"
