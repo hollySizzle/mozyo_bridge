@@ -647,6 +647,30 @@ class ConcurrentRetryOutcomeTest(ProxySendTestBase):
         self.assertFalse(result.sent)
         self.assertEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
 
+    def test_a_raising_send_is_contained_and_leaves_a_reconcilable_generation(self):
+        # Review j#90250 F3: an exception escaping the send skipped the outcome write entirely and
+        # left the generation `reserved` — a state nothing auto-resolves and which is not safely
+        # re-sendable, so the only ways out were a blind re-run or the whole-store recovery.
+        class _RaisingPort:
+            def __init__(self):
+                self.calls = []
+
+            def send(self, context, action_id, *, args):
+                self.calls.append(action_id)
+                raise RuntimeError("effect boundary unknown")
+
+        self.fence.bootstrap()
+        port = _RaisingPort()
+        result, _ = self._execute(self._context(), port=port)
+
+        self.assertEqual(len(port.calls), 1)
+        self.assertFalse(result.sent)
+        self.assertEqual(result.decision, ZERO_SEND)
+        self.assertEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
+        # `uncertain` is the state an operator reconcile acts on; `reserved` is the one nothing
+        # resolves.
+        self.assertEqual(self.fence.active(self._route()).state, "uncertain")
+
 
 class DecisionJournalFoldTest(unittest.TestCase):
     """The anchor evidence is read from the GENERIC workflow-event token (review j#89878 F1)."""

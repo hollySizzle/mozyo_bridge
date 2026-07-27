@@ -195,35 +195,47 @@ def cmd_workflow_proxy_ack(args: argparse.Namespace) -> int:
     "the coordinator acted on the delegated decision" — is not something the delivery path can
     observe. A delegation whose outcome is unknown must keep holding the route.
 
-    The coordinator (or an operator on its behalf) passes the opaque ``proxy_action_id`` the
-    delegation carried. It advances only a positively **delivered** generation in this workspace;
-    an unknown / stale id, a reserved or uncertain generation, and a foreign workspace all no-op.
+    **Who may acknowledge is decided by the durable record, not by who runs this command**
+    (Redmine #14546, review j#90250 finding 1). The previous shape derived authority from the
+    invoking process's ``MOZYO_*`` env, which an external caller can reproduce from published
+    values — the workspace id, the provider and the default lane are not secrets, and the platform
+    offers no proof that a process IS the slot whose triplet it presents. So the env is no longer
+    treated as an attestation at all. The authority is a **coordinator-recorded acknowledgement on
+    the anchored issue**, read back from source-of-truth Redmine, which is where
+    ``vibes/docs/logics/ack-completion-receiver-state.md`` puts completion truth.
+
+    That also settles the operator question the docstring and the spec previously disagreed on
+    (finding 4): there is no operator delegation to permit or forbid, because the invoker is not the
+    authority. An operator may run the reconcile; it completes only what the coordinator recorded.
     """
     from mozyo_bridge.application.commands_common import repo_root_from_args
     from mozyo_bridge.core.state.coordinator_proxy_fence import CoordinatorProxyFence
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
         live_workspace_id,
-        resolve_ack_authority,
+        verify_ack_record,
     )
 
     repo_root = repo_root_from_args(args)
     workspace_id = live_workspace_id(repo_root)
     action_id = (getattr(args, "proxy_action_id", "") or "").strip()
+    issue = (getattr(args, "issue", "") or "").strip()
     as_json = bool(getattr(args, "as_json", False))
 
-    # The ack authority is checked BEFORE the store is touched: possession of the action id is not
-    # a credential, and the external client that received it must never be able to complete its own
-    # delegation (review j#89969 finding 1).
-    authorized, auth_reason, auth_detail = resolve_ack_authority(repo_root, env=os.environ)
+    # The authority is checked BEFORE the store is touched, and it is the DURABLE RECORD — not the
+    # invoking process's env, which an external caller can reproduce from published values
+    # (review j#90250 finding 1).
+    authorized, auth_reason, auth_detail = verify_ack_record(
+        args, issue=issue, action_id=action_id
+    )
 
     fence = CoordinatorProxyFence()
     completed = False
     if not authorized:
         reason = auth_reason
         detail = auth_detail
-    elif not action_id:
-        reason = "proxy_action_id_required"
-        detail = "--proxy-action-id is required; it is the opaque id the delegation carried"
+    elif not workspace_id:
+        reason = "proxy_workspace_unresolved"
+        detail = "the workspace anchor could not be derived from the repo checkout"
     elif not fence.is_bootstrapped():
         reason = "proxy_fence_unavailable"
         detail = "the delegation store is not bootstrapped; nothing to acknowledge"
@@ -256,6 +268,109 @@ def cmd_workflow_proxy_ack(args: argparse.Namespace) -> int:
             print(f"  reason         : {reason}")
         print(f"  detail         : {detail}")
     return 0 if completed else 1
+
+
+def cmd_workflow_proxy_reconcile(args: argparse.Namespace) -> int:
+    """Resolve ONE stuck delegation generation to ``uncertain`` (Redmine #14546, review j#90250 F3).
+
+    A send whose effect boundary is unknown — the port raised, the process died mid-send — leaves
+    the generation ``reserved``, and a ``reserved`` generation is not safely re-sendable. Before
+    this surface the only ways out were a blind re-run (which relies on the crash-window transition
+    firing) or the whole-store ``--recover``, which invalidates every outstanding generation. This
+    is the scoped middle: it moves exactly the named generation to ``uncertain``, which is the state
+    that says "an operator must establish what happened" and which no path auto-retries.
+
+    It does not decide the send landed. It records that the outcome is unknown, for exactly one
+    route, leaving every other generation untouched.
+    """
+    from mozyo_bridge.application.commands_common import repo_root_from_args
+    from mozyo_bridge.core.state.coordinator_proxy_fence import (
+        CoordinatorProxyFence,
+        CoordinatorProxyFenceError,
+        ProxyRouteKey,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
+        live_workspace_id,
+        resolve_default_lane_authority,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
+        normalize_action,
+    )
+
+    repo_root = repo_root_from_args(args)
+    workspace_id = live_workspace_id(repo_root)
+    action = normalize_action(getattr(args, "action", ""))
+    action_id = (getattr(args, "proxy_action_id", "") or "").strip()
+    as_json = bool(getattr(args, "as_json", False))
+    execute = bool(getattr(args, "execute", False))
+
+    status, role, _scope, _reason = resolve_default_lane_authority(repo_root)
+    resolved = bool(workspace_id) and status == "resolved" and bool(action) and bool(action_id)
+
+    reconciled = False
+    reason = ""
+    detail = ""
+    state = ""
+    if not workspace_id:
+        reason, detail = "proxy_workspace_unresolved", "no workspace anchor for this checkout"
+    elif status != "resolved":
+        reason, detail = "proxy_coordinator_authority_missing", "no bound default-lane role"
+    elif not action:
+        reason, detail = "proxy_action_unknown", "--action must name a delegable action"
+    elif not action_id:
+        reason, detail = "proxy_action_id_required", "--proxy-action-id names the generation"
+    else:
+        fence = CoordinatorProxyFence()
+        route = ProxyRouteKey(
+            workspace_id=workspace_id, lane_id="default", role=role, action=action
+        )
+        try:
+            current = fence.active(route)
+            state = current.state
+            if current.action_id != action_id:
+                reason, detail = "proxy_reconcile_no_match", (
+                    "the route's current generation does not carry that action id"
+                )
+            elif current.state != "reserved":
+                reason, detail = "proxy_reconcile_not_reserved", (
+                    f"the generation is {current.state!r}; only a stuck `reserved` one is reconciled "
+                    "here"
+                )
+            elif not execute:
+                detail = "would mark this generation `uncertain` (re-run with --execute)"
+            else:
+                reconciled = fence.mark_uncertain(
+                    route, action_id, detail="operator reconcile: send outcome unknown"
+                )
+                reason = "" if reconciled else "proxy_reconcile_no_match"
+                detail = (
+                    "the generation is now `uncertain`; establish what happened before deciding"
+                    if reconciled
+                    else "the generation advanced before the reconcile landed"
+                )
+        except CoordinatorProxyFenceError as exc:
+            reason, detail = "proxy_fence_unavailable", f"delegation store unusable: {exc}"
+
+    payload = {
+        "action": "proxy-reconcile",
+        "delegated_action": action,
+        "proxy_action_id": action_id,
+        "workspace_id": workspace_id,
+        "generation_state": state,
+        "executed": execute,
+        "reconciled": reconciled,
+        "reason": reason,
+        "detail": detail,
+    }
+    rc = 0 if (reconciled or (resolved and not reason)) else 1
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"workflow proxy-reconcile: reconciled={reconciled} state={state or '-'}")
+        if reason:
+            print(f"  reason: {reason}")
+        print(f"  detail: {detail}")
+    return rc
 
 
 def cmd_workflow_proxy_fence(args: argparse.Namespace) -> int:
@@ -343,15 +458,23 @@ def register_proxy_parsers(workflow_sub) -> None:
     ack = workflow_sub.add_parser(
         "proxy-ack",
         description=(
-            "Acknowledge a delivered coordinator-proxy delegation (Redmine #14546). The completion "
-            "half of the exactly-once lifecycle: a delivered generation holds its route until it is "
-            "acknowledged, so without this the rail delivers once and then refuses every later "
-            "decision as a duplicate. Pass the opaque proxy_action_id the delegation carried. It "
-            "advances only a positively delivered generation in this workspace; an unknown / stale "
-            "id, a reserved or uncertain generation, and a foreign workspace all no-op with a "
-            "nonzero exit."
+            "Complete a delivered coordinator-proxy delegation from its durable acknowledgement "
+            "(Redmine #14546). A delivered generation holds its route until it is completed, so "
+            "without this the rail delivers once and then refuses every later decision as a "
+            "duplicate. The AUTHORITY is the coordinator's acknowledgement recorded on the anchored "
+            "issue, read back from source-of-truth Redmine — never the invoking process's env, "
+            "which an external caller can reproduce from published values. Pass the issue and the "
+            "opaque proxy_action_id. It advances only a positively delivered generation in this "
+            "workspace; a missing acknowledgement, an unknown / stale id, a reserved or uncertain "
+            "generation, and a foreign workspace all no-op with a nonzero exit."
         ),
         help="Acknowledge a delivered delegation so the route may take its next decision.",
+    )
+    ack.add_argument(
+        "--issue",
+        default="",
+        help="The anchored Redmine issue whose durable record carries the acknowledgement "
+             "(required — the record, not the invoking process, is the authority).",
     )
     ack.add_argument(
         "--proxy-action-id",
@@ -364,6 +487,27 @@ def register_proxy_parsers(workflow_sub) -> None:
         help="Emit exactly one structured envelope as JSON.",
     )
     ack.set_defaults(func=cmd_workflow_proxy_ack)
+
+    reconcile = workflow_sub.add_parser(
+        "proxy-reconcile",
+        description=(
+            "Resolve ONE stuck delegation generation to `uncertain` (Redmine #14546). A send whose "
+            "effect boundary is unknown leaves the generation `reserved`, which is not safely "
+            "re-sendable; this is the scoped alternative to a blind re-run or the whole-store "
+            "`proxy-fence --recover`. It records that the outcome is unknown for exactly the named "
+            "route and leaves every other generation untouched. DRY-RUN unless --execute."
+        ),
+        help="Mark one stuck delegation generation `uncertain` for operator reconcile.",
+    )
+    reconcile.add_argument("--action", default="", choices=list(PROXY_ACTIONS),
+                          help="The delegated action naming the route.")
+    reconcile.add_argument("--proxy-action-id", dest="proxy_action_id", default="",
+                           help="The generation's opaque id (required).")
+    reconcile.add_argument("--execute", action="store_true",
+                           help="Perform the transition (without it, this is a dry run).")
+    reconcile.add_argument("--json", dest="as_json", action="store_true",
+                           help="Emit exactly one structured envelope as JSON.")
+    reconcile.set_defaults(func=cmd_workflow_proxy_reconcile)
 
     fence_p = workflow_sub.add_parser(
         "proxy-fence",
@@ -389,6 +533,7 @@ def register_proxy_parsers(workflow_sub) -> None:
 __all__ = (
     "cmd_workflow_proxy",
     "cmd_workflow_proxy_ack",
+    "cmd_workflow_proxy_reconcile",
     "cmd_workflow_proxy_fence",
     "register_proxy_parsers",
 )

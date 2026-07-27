@@ -140,6 +140,11 @@ ANCHOR_GENERATION_STALE = "generation_stale"
 ANCHOR_LANE_UNRESOLVED = "lane_unresolved"
 #: The decision's declared scope does not match the live lane it names.
 ANCHOR_SCOPE_MISMATCH = "scope_mismatch"
+#: The issue carries MORE THAN ONE decision of this action's token (review j#90250 finding 2). The
+#: marker scanner recognises a token anywhere in a note and cannot tell a real decision from one
+#: QUOTED in prose or backticks, so a quotation appears as a second decision. An issue's bootstrap
+#: is authorized once; two candidates is ambiguity, and this rail never picks between them.
+ANCHOR_DECISION_AMBIGUOUS = "decision_ambiguous"
 
 FENCE_OPEN = "open"  # the fence reserved this delegation (the single caller cleared to deliver)
 FENCE_DUPLICATE = "duplicate"  # in flight, or this exact decision was already delegated
@@ -167,6 +172,7 @@ REASON_ANCHOR_DECISION_INCOMPLETE = "proxy_anchor_decision_incomplete"
 REASON_ANCHOR_GENERATION_STALE = "proxy_anchor_generation_stale"
 REASON_ANCHOR_LANE_UNRESOLVED = "proxy_anchor_lane_unresolved"
 REASON_ANCHOR_SCOPE_MISMATCH = "proxy_anchor_scope_mismatch"
+REASON_ANCHOR_DECISION_AMBIGUOUS = "proxy_anchor_decision_ambiguous"
 #: The single send fired but did not positively land; the fence holds an ``uncertain`` generation
 #: awaiting an operator reconcile (review j#89878 finding 3). NOT a success.
 REASON_DELIVERY_UNCERTAIN = "proxy_delivery_uncertain"
@@ -193,6 +199,7 @@ _ANCHOR_REASON = {
     ANCHOR_GENERATION_STALE: REASON_ANCHOR_GENERATION_STALE,
     ANCHOR_LANE_UNRESOLVED: REASON_ANCHOR_LANE_UNRESOLVED,
     ANCHOR_SCOPE_MISMATCH: REASON_ANCHOR_SCOPE_MISMATCH,
+    ANCHOR_DECISION_AMBIGUOUS: REASON_ANCHOR_DECISION_AMBIGUOUS,
 }
 
 _FENCE_REASON = {
@@ -422,7 +429,7 @@ def _lane_scoped_status(record: "DecisionRecord", want: str, expected) -> str:
     return ANCHOR_VERIFIED
 
 
-def _issue_scoped_status(record: "DecisionRecord", want: str, expected) -> str:
+def _issue_scoped_status(record: "DecisionRecord", want: str, expected, accepted) -> str:
     """Classify an issue-scoped (bootstrap) decision against the issue's live facts (pure).
 
     A bootstrap decision must NOT name a lane: it authorizes creating the first one, so a decision
@@ -432,6 +439,13 @@ def _issue_scoped_status(record: "DecisionRecord", want: str, expected) -> str:
     """
     if record.lane.strip() or record.lane_generation.strip():
         return ANCHOR_SCOPE_MISMATCH
+    # A bootstrap is authorized ONCE per issue, and the marker scanner cannot distinguish a real
+    # decision from one quoted in prose (review j#90250 F2). So two or more candidates is ambiguity,
+    # not a "latest wins" race: a quotation of the canonical grammar appears as a second decision
+    # and must make the anchor unusable rather than replace it.
+    distinct = {r.journal for r in accepted}
+    if len(distinct) >= 2:
+        return ANCHOR_DECISION_AMBIGUOUS
     if expected is None:
         return ANCHOR_LANE_UNRESOLVED
     if not isinstance(expected, IssueExpectation):
@@ -488,7 +502,8 @@ def anchor_status_for(
 
     record = mine[-1]
     if ACTION_SCOPES.get(normalized) == SCOPE_ISSUE:
-        return _issue_scoped_status(record, want, expected)
+        accepted = [r for r in rows if r.token in accepted_tokens]
+        return _issue_scoped_status(record, want, expected, accepted)
     return _lane_scoped_status(record, want, expected)
 
 
@@ -520,6 +535,7 @@ __all__ = (
     "ANCHOR_GENERATION_STALE",
     "ANCHOR_LANE_UNRESOLVED",
     "ANCHOR_SCOPE_MISMATCH",
+    "ANCHOR_DECISION_AMBIGUOUS",
     "FENCE_OPEN",
     "FENCE_DUPLICATE",
     "FENCE_STALE",
@@ -541,6 +557,7 @@ __all__ = (
     "REASON_ANCHOR_GENERATION_STALE",
     "REASON_ANCHOR_LANE_UNRESOLVED",
     "REASON_ANCHOR_SCOPE_MISMATCH",
+    "REASON_ANCHOR_DECISION_AMBIGUOUS",
     "REASON_DELIVERY_UNCERTAIN",
     "REASON_DUPLICATE",
     "REASON_STALE",

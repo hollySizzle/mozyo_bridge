@@ -387,7 +387,23 @@ def execute_herdr_forward(
     # and the correlated-callback completion only advances a `delivered` generation — so the route
     # stranded. A store failure raises rather than returning False, so both are observed here: a
     # delivery the store did not record is not a delivery.
-    outcome = send_port.send(plan, target, reserve.action_id, args=args)
+    try:
+        outcome = send_port.send(plan, target, reserve.action_id, args=args)
+    except Exception as exc:  # noqa: BLE001 - an unknown send outcome is uncertain, never an escape
+        try:
+            fence.mark_uncertain(
+                route, reserve.action_id, detail=f"send raised {type(exc).__name__}"
+            )
+        except ForwardOutboxFenceError:
+            pass
+        return ForwardExecutionResult(
+            sent=False, decision=ZERO_SEND, target_status=target.status,
+            fence_state=FENCE_HELD, reason="herdr_forward_delivery_uncertain",
+            detail=(
+                f"the send raised {type(exc).__name__} and its effect boundary is unknown; the "
+                "generation is recorded `uncertain` and is never blind-retried."
+            ),
+        )
     try:
         if outcome.result == SEND_DELIVERED:
             recorded = fence.mark_delivered(route, reserve.action_id, detail=outcome.detail)

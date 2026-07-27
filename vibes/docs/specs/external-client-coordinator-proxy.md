@@ -81,6 +81,12 @@ authorize したかを照合しなければ scope は未検証のままである
     lane を名乗ってはならず（名乗る決定は lane-scoped の誤用 = `scope_mismatch`）、突き合わせ対象は
     「その issue が active lane を**所有していない**こと」である。所有していれば precondition は既に
     過ぎており `scope_mismatch`（呼ぶべきは `dispatch_next`）。
+  - `bootstrap_lane` の decision は当該 issue 上に **ちょうど 1 件**でなければならない。marker
+    scanner は note 内の任意位置の token を認識し、**散文や backtick 中の引用と実 decision を
+    区別できない**ため、引用は 2 件目の decision として現れる（review j#90250 F2）。bootstrap は
+    issue につき一度 authorize されるものなので、2 件以上は ambiguity であり
+    `proxy_anchor_decision_ambiguous` で zero-send する。「最新が勝つ」規則は引用に authority を
+    渡してしまう。
   - **全 action を lane に突き合わせる契約は、本 rail の起点そのものに到達できない。** 観測された
     dead end は `sublane create --execute` が pre-effect 停止し lane / worktree / pair が 0 の状態で
     あり、lane を前提にする rail は「lane を作れない」という元の defect を解かない。
@@ -130,7 +136,20 @@ caller の主張にも marker の自己申告にも依存しない。active で�
 結果、最初の positive delivery の後は、より新しい durable decision すら永久に `duplicate` 拒否
 される — 一度だけ動いて wedge する rail は反復可能な single-step 入口ではない（review j#89918 F1）。
 
-- **`mozyo-bridge workflow proxy-ack --proxy-action-id <id>`** が completion の production surface。
+- **authority は「誰が command を叩いたか」ではなく「durable record が何と言っているか」**
+  （review j#90250 F1）。旧設計は invoking process の `MOZYO_*` env を attestation として扱っていたが、
+  workspace id / provider / default lane は**公開値であって秘密ではなく**、この platform は「その
+  process がその triplet の slot **である**」ことを証明する手段を持たない。caller 供給 field から
+  canonical slot 名を再計算する照合は、主張を主張自身と突き合わせているにすぎない。**env は
+  attestation として扱わない。**
+- coordinator は action 成功後、anchored issue に **canonical acknowledgement marker**
+  `[mozyo:workflow-event:gate=proxy_ack:proxy_action_id=<id>]` を記録する。
+  `mozyo-bridge workflow proxy-ack --issue <id> --proxy-action-id <id>` はそれを source-of-truth
+  Redmine から読み戻して completion を判定する。record が無ければ、公開 triplet と action id を
+  正確に供給しても **store に一切触れず**拒否する。読めない Redmine は acknowledgement ではない。
+- したがって **operator 代行の可否という論点は消える**（review j#90250 F4）。invoker は authority
+  ではないので、operator が reconcile を叩いてもよいが、完了するのは coordinator が記録した分だけ。
+  spec / CLI docstring / 実装はこの単一契約で揃える。
 - **action id の所持は credential ではない。** delegation の envelope はその id を **external
   client 自身**へ返す。所持だけを authority にすると、caller は配送直後に自分の delegation を
   complete して次の decision の配送を開けられる — delivery receipt を completion truth へ昇格させる
@@ -167,6 +186,14 @@ attestation であり key に含めない（target rename が generation を進�
 - **supersede しない journal は stale。** Redmine journal id は整数なので比較は**数値**で行う
   （文字列比較では `"9" > "10"` となり古い決定が新しく見える）。非数値 journal は fail-closed。
 - crash window（未解決の reserve）は `uncertain` へ遷移し、blind retry しない。
+- **send が例外を投げた場合も typed uncertain に閉じる**（review j#90250 F3）。例外が escape すると
+  outcome write ごと飛ばして generation が `reserved` のまま残り、これは何も自動解決せず安全に
+  再送もできない状態になる。effect boundary 不明はまさに `uncertain` の意味なので、そう記録して
+  typed 非 delivery を返す。
+- **generation-scoped reconcile**: `mozyo-bridge workflow proxy-reconcile --action <token>
+  --proxy-action-id <id>`（既定 dry-run、`--execute` で適用）が、その 1 generation だけを
+  `uncertain` へ落とす。blind re-run にも、全 generation を無効化する `proxy-fence --recover` にも
+  頼らずに済む中間手段。send が着地したとは判定しない — 「outcome 不明」を記録するだけ。
 - store identity は DB-external `store_nonce` sidecar。**execution path は store を
   auto-bootstrap しない** — 損失後の silent re-create は、既に delivered な委譲の再送を許す。
   init / recovery は `workflow proxy-fence --bootstrap` / `--recover` のみ。

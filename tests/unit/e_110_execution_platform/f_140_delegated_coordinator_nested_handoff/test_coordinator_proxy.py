@@ -26,6 +26,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTION_DISPATCH_NEXT,
     ACTION_SCOPES,
     ANCHOR_ACTION_MISMATCH,
+    ANCHOR_DECISION_AMBIGUOUS,
     ANCHOR_DECISION_INCOMPLETE,
     ANCHOR_GENERATION_STALE,
     ANCHOR_LANE_UNRESOLVED,
@@ -47,6 +48,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     PROXY_ACTIONS,
     REASON_ACTION_UNKNOWN,
     REASON_ANCHOR_ACTION_MISMATCH,
+    REASON_ANCHOR_DECISION_AMBIGUOUS,
     REASON_ANCHOR_DECISION_INCOMPLETE,
     REASON_ANCHOR_GENERATION_STALE,
     REASON_ANCHOR_LANE_UNRESOLVED,
@@ -159,6 +161,7 @@ class TheOnlyDeliverPathTest(unittest.TestCase):
             (dict(anchor=ANCHOR_GENERATION_STALE), REASON_ANCHOR_GENERATION_STALE),
             (dict(anchor=ANCHOR_LANE_UNRESOLVED), REASON_ANCHOR_LANE_UNRESOLVED),
             (dict(anchor=ANCHOR_SCOPE_MISMATCH), REASON_ANCHOR_SCOPE_MISMATCH),
+            (dict(anchor=ANCHOR_DECISION_AMBIGUOUS), REASON_ANCHOR_DECISION_AMBIGUOUS),
             (dict(fence=FENCE_DUPLICATE), REASON_DUPLICATE),
             (dict(fence=FENCE_STALE), REASON_STALE),
             (dict(fence=FENCE_RECONCILE), REASON_FENCE_RECONCILE),
@@ -366,14 +369,40 @@ class BootstrapScopeTest(unittest.TestCase):
         expected = LaneExpectation(lane="lane_a", generation=1, decision_journal="89688")
         self.assertEqual(self._status(expected=expected), ANCHOR_SCOPE_MISMATCH)
 
-    def test_an_older_decision_on_the_issue_is_superseded(self):
+    def test_a_quoted_canonical_marker_makes_the_bootstrap_ambiguous(self):
+        # Review j#90250 F2, the probe verbatim: a real decision at j100 and a note at j101 that
+        # merely QUOTES the canonical grammar. The scanner cannot tell them apart, so neither may
+        # authorize — "latest wins" would hand the quotation the authority.
+        real = DecisionRecord("100", "implementation_request")
+        quoted = DecisionRecord("101", "implementation_request")
+        expected = IssueExpectation(
+            issue=self.ISSUE, owns_active_lane=False, latest_decision_journal="101"
+        )
+        self.assertEqual(
+            self._status(journal="101", decisions=(real, quoted), expected=expected),
+            ANCHOR_DECISION_AMBIGUOUS,
+        )
+        self.assertEqual(
+            self._status(journal="100", decisions=(real, quoted), expected=expected),
+            ANCHOR_DECISION_AMBIGUOUS,
+        )
+
+    def test_a_single_canonical_decision_still_verifies(self):
+        self.assertEqual(self._status(), ANCHOR_VERIFIED)
+
+    def test_two_decisions_on_one_issue_are_never_resolved_by_recency(self):
+        # Whether the second is a re-issue or a quotation cannot be told apart from the note, so
+        # neither is picked. This replaces the previous "latest wins" behaviour (j#90250 F2).
         decisions = self.DECISIONS + (DecisionRecord("90100", "implementation_request"),)
         expected = IssueExpectation(
             issue=self.ISSUE, owns_active_lane=False, latest_decision_journal="90100"
         )
-        self.assertEqual(self._status(decisions=decisions, expected=expected), ANCHOR_SUPERSEDED)
         self.assertEqual(
-            self._status(journal="90100", decisions=decisions, expected=expected), ANCHOR_VERIFIED
+            self._status(decisions=decisions, expected=expected), ANCHOR_DECISION_AMBIGUOUS
+        )
+        self.assertEqual(
+            self._status(journal="90100", decisions=decisions, expected=expected),
+            ANCHOR_DECISION_AMBIGUOUS,
         )
 
     def test_the_lane_scoped_action_still_requires_a_lane(self):

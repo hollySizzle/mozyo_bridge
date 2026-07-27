@@ -312,6 +312,25 @@ class ForwardOutcomeWriteTest(unittest.TestCase):
         result = self._run(port, rows=[_row(gw)], gateway_lane_ids={gw})
         self.assertFalse(result.sent)
 
+    def test_a_raising_send_is_contained_and_leaves_a_reconcilable_generation(self):
+        # Review j#90250 F3: the same escape existed on this leg.
+        class _RaisingPort:
+            def __init__(self):
+                self.calls = []
+
+            def send(self, plan, target, action_id, *, args):
+                self.calls.append(action_id)
+                raise RuntimeError("effect boundary unknown")
+
+        gw = project_gateway_lane_id("alpha")
+        port = _RaisingPort()
+        result = self._run(port, rows=[_row(gw)], gateway_lane_ids={gw})
+
+        self.assertEqual(len(port.calls), 1)
+        self.assertFalse(result.sent)
+        self.assertEqual(result.reason, "herdr_forward_delivery_uncertain")
+        self.assertEqual(self.fence.active(self.route).state, "uncertain")
+
 
 class _FakeSenderRes:
     def __init__(self, ws):

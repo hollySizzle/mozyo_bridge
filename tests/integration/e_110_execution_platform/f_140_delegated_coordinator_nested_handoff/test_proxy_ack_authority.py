@@ -1,20 +1,22 @@
-"""``resolve_ack_authority`` tests driven by a REAL ``SenderIdentity`` (Redmine #14546, j#90142).
+"""Acknowledgement authority tests (Redmine #14546, review j#90250 finding 1).
 
-The live coordinator's first acknowledgement raised ``AttributeError``: the code correlated the
-acknowledging process with the live slot through ``identity.assigned_name``, and ``SenderIdentity``
-has no such field — it carries exactly ``workspace_id`` / ``role`` / ``lane_id``. The attribute was
-verified on a *different* class (``HerdrAgentIdentity``, which does have it) and never on the one
-the resolver actually returns.
+The previous authority asked "is the process running this command the coordinator?" and answered it
+from the process's own ``MOZYO_*`` env. A workspace id, a provider and the default lane are
+published values, not secrets, and this platform offers no proof that a process *is* the slot whose
+triplet it presents — so an external caller could reproduce them exactly and be admitted. Deriving
+the canonical slot name from those same caller-supplied fields correlated the claim with itself.
 
-No test caught it because the CLI regression stubbed ``resolve_ack_authority`` wholesale: it pinned
-what the command does with an authority verdict, and never that the authority itself can be computed.
-So these drive the real function with a real resolved identity, from real env values through
-``resolve_sender_identity``, with only the inventory and attestation store injected. Anything that
-touches a field the identity does not have fails here rather than in production.
+The authority is now the coordinator's acknowledgement **recorded on the anchored issue**, read back
+from source-of-truth Redmine. What is pinned here is that supplying the published triplet — and even
+the exact action id — reaches no store at all without that durable record existing.
 """
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -23,183 +25,208 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
-    coordinator_proxy_send as send_mod,
+    cli_workflow_proxy,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_proxy import (  # noqa: E501
+    cmd_workflow_proxy_ack,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
-    resolve_ack_authority,
+    render_proxy_ack_marker,
+    verify_ack_record,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-    AGENT_KEY_LOCATOR,
-    AGENT_KEY_NAME,
-    encode_assigned_name,
-)
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (  # noqa: E501
-    SenderIdentity,
-    resolve_sender_identity,
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+    RedmineJournalEntry,
 )
 
 WS = "e1487dcb1f2d4412b28e825fdeccf9e8"
-FOREIGN_WS = "ffffffffffffffffffffffffffffffff"
-PROVIDER = "codex"
-LOCATOR = "w3C:p3"
+ISSUE = "14546"
+ACTION_ID = "pxy_2d60ab6542c34b8a048bb0a7373cb083"
+
+#: Everything an external caller can know: the published triplet and the action id itself.
+PUBLIC_ENV = {
+    "MOZYO_WORKSPACE_ID": WS,
+    "MOZYO_AGENT_ROLE": "codex",
+    "MOZYO_LANE_ID": "default",
+}
 
 
-def _env(workspace_id=WS, role=PROVIDER, lane="default"):
-    return {
-        "MOZYO_WORKSPACE_ID": workspace_id,
-        "MOZYO_AGENT_ROLE": role,
-        "MOZYO_LANE_ID": lane,
-    }
+def _entries(*notes, issue=ISSUE):
+    return [RedmineJournalEntry(issue, str(900 + i), note) for i, note in enumerate(notes)]
 
 
-def _row(workspace_id=WS, provider=PROVIDER, lane="default", locator=LOCATOR):
-    return {
-        AGENT_KEY_NAME: encode_assigned_name(workspace_id, provider, lane),
-        AGENT_KEY_LOCATOR: locator,
-    }
-
-
-class SenderIdentityShapeTest(unittest.TestCase):
-    """Pin the shape the correlation is allowed to depend on."""
-
-    def test_sender_identity_has_no_assigned_name(self):
-        # The exact live failure: reading this field raised AttributeError in the coordinator.
-        identity = SenderIdentity(workspace_id=WS, role=PROVIDER, lane_id="default")
-        self.assertFalse(hasattr(identity, "assigned_name"))
-        self.assertEqual(
-            sorted(SenderIdentity.__dataclass_fields__), ["lane_id", "role", "workspace_id"]
+class AckRecordAuthorityTest(unittest.TestCase):
+    def _verify(self, entries, *, issue=ISSUE, action_id=ACTION_ID):
+        return verify_ack_record(
+            argparse.Namespace(), issue=issue, action_id=action_id,
+            entries_provider=lambda _i: entries,
         )
 
-    def test_a_real_resolution_yields_that_shape(self):
-        resolution = resolve_sender_identity(_env(), anchor_workspace_id=WS)
-        self.assertTrue(resolution.ok)
-        self.assertFalse(hasattr(resolution.identity, "assigned_name"))
+    def test_a_recorded_acknowledgement_authorizes(self):
+        ok, reason, _detail = self._verify(_entries(render_proxy_ack_marker(ACTION_ID)))
+        self.assertTrue(ok, reason)
+
+    def test_no_record_authorizes_nothing(self):
+        ok, reason, _detail = self._verify(_entries("the coordinator says it acted"))
+        self.assertFalse(ok)
+        self.assertEqual(reason, "proxy_ack_not_recorded")
+
+    def test_a_record_for_another_action_id_does_not_authorize(self):
+        ok, reason, _detail = self._verify(_entries(render_proxy_ack_marker("pxy_other")))
+        self.assertFalse(ok)
+        self.assertEqual(reason, "proxy_ack_not_recorded")
+
+    def test_a_record_on_another_issue_does_not_authorize(self):
+        entries = _entries(render_proxy_ack_marker(ACTION_ID), issue="99999")
+        ok, reason, _detail = self._verify(entries)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "proxy_ack_not_recorded")
+
+    def test_an_unreadable_record_authorizes_nothing(self):
+        def _raise(_issue):
+            raise RuntimeError("redmine unreachable")
+
+        ok, reason, _detail = verify_ack_record(
+            argparse.Namespace(), issue=ISSUE, action_id=ACTION_ID, entries_provider=None,
+        )
+        # No credentials configured in the test environment -> unreadable, never assumed.
+        self.assertFalse(ok)
+        self.assertIn(reason, ("proxy_ack_record_unreadable", "proxy_ack_not_recorded"))
+
+    def test_the_issue_and_action_id_are_both_required(self):
+        self.assertFalse(self._verify(_entries(), issue="")[0])
+        self.assertFalse(self._verify(_entries(), action_id="")[0])
 
 
-class AckAuthorityWithRealIdentityTest(unittest.TestCase):
+class _RecordingFence:
+    def __init__(self) -> None:
+        self.completions: list = []
+
+    def is_bootstrapped(self) -> bool:
+        return True
+
+    def complete_by_action_id(self, action_id, *, workspace_id, **_kw):
+        self.completions.append((action_id, workspace_id))
+        return True
+
+
+class ExternalCallerCannotCompleteTest(unittest.TestCase):
+    """The forgery the previous authority admitted, driven through the CLI."""
+
     def setUp(self) -> None:
-        self._patch("live_workspace_id", lambda _root: WS)
-        self._patch("live_agent_rows", lambda _env: [_row()])
-        self._patch(
-            "live_attestation_join",
-            lambda _name, *, locator, workspace_id, provider: (True, "ok", "attested"),
+        self.fence = _RecordingFence()
+        import mozyo_bridge.core.state.coordinator_proxy_fence as fence_mod
+
+        original = fence_mod.CoordinatorProxyFence
+        fence_mod.CoordinatorProxyFence = lambda: self.fence
+        self.addCleanup(setattr, fence_mod, "CoordinatorProxyFence", original)
+
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send as send_mod  # noqa: E501
+
+        self.send_mod = send_mod
+        ws_original = send_mod.live_workspace_id
+        send_mod.live_workspace_id = lambda _root: WS
+        self.addCleanup(setattr, send_mod, "live_workspace_id", ws_original)
+
+    def _record(self, entries):
+        original = self.send_mod.verify_ack_record
+
+        def _verify(args, *, issue, action_id, entries_provider=None):
+            return original(args, issue=issue, action_id=action_id,
+                            entries_provider=lambda _i: entries)
+
+        self.send_mod.verify_ack_record = _verify
+        self.addCleanup(setattr, self.send_mod, "verify_ack_record", original)
+
+    def _run(self, *, issue=ISSUE, action_id=ACTION_ID, env=None):
+        args = argparse.Namespace(
+            repo=str(ROOT), issue=issue, proxy_action_id=action_id, as_json=True
         )
-        self._patch("resolve_default_lane_authority", lambda _root: ("resolved", "coordinator", "s", ""))
-        self._patch("resolve_expected_provider", lambda _root, _role: PROVIDER)
+        import os
 
-    def _patch(self, name, value):
-        original = getattr(send_mod, name)
-        setattr(send_mod, name, value)
-        self.addCleanup(setattr, send_mod, name, original)
+        saved = {k: os.environ.get(k) for k in PUBLIC_ENV}
+        if env:
+            os.environ.update(env)
 
-    def _run(self, env):
-        return resolve_ack_authority(str(ROOT), env=env)
+            def _restore():
+                for key, value in saved.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
-    def test_the_live_coordinator_is_admitted(self):
-        # The production path end to end: real env -> real SenderIdentity -> slot correlation.
-        ok, reason, _detail = self._run(_env())
-        self.assertTrue(ok, reason)
-        self.assertEqual(reason, "")
+            self.addCleanup(_restore)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cmd_workflow_proxy_ack(args)
+        return rc, json.loads(buf.getvalue())
 
-    def test_an_unattested_shell_is_refused(self):
-        ok, reason, _detail = self._run({})
-        self.assertFalse(ok)
-        self.assertEqual(reason, "proxy_ack_unattested")
+    def test_the_exact_published_triplet_and_action_id_touch_no_store(self):
+        # THE forgery: everything the external caller can know, and nothing recorded.
+        self._record(_entries("no acknowledgement here"))
+        rc, out = self._run(env=PUBLIC_ENV)
+        self.assertEqual(rc, 1)
+        self.assertFalse(out["authorized"])
+        self.assertFalse(out["completed"])
+        self.assertEqual(out["reason"], "proxy_ack_not_recorded")
+        self.assertEqual(self.fence.completions, [])
 
-    def test_a_foreign_workspace_env_is_refused(self):
-        # `resolve_sender_identity` itself rejects an env/anchor workspace mismatch.
-        ok, reason, _detail = self._run(_env(workspace_id=FOREIGN_WS))
-        self.assertFalse(ok)
-        self.assertEqual(reason, "proxy_ack_unattested")
+    def test_a_recorded_acknowledgement_completes(self):
+        self._record(_entries(render_proxy_ack_marker(ACTION_ID)))
+        rc, out = self._run()
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["authorized"])
+        self.assertTrue(out["completed"])
+        self.assertEqual(self.fence.completions, [(ACTION_ID, WS)])
 
-    def test_a_non_default_lane_agent_is_refused(self):
-        ok, reason, _detail = self._run(_env(lane="issue_14546"))
-        self.assertFalse(ok)
-        self.assertEqual(reason, "proxy_ack_not_default_lane")
+    def test_env_is_irrelevant_to_the_verdict(self):
+        # With the record present, an empty env still completes; with it absent, a perfect env
+        # still does not. The invoking process is simply not the authority any more.
+        self._record(_entries(render_proxy_ack_marker(ACTION_ID)))
+        rc, _out = self._run()
+        self.assertEqual(rc, 0)
 
-    def test_a_provider_that_is_not_the_bound_one_is_refused(self):
-        ok, reason, _detail = self._run(_env(role="claude"))
-        self.assertFalse(ok)
-        self.assertEqual(reason, "proxy_ack_provider_mismatch")
+    def test_an_unbootstrapped_store_completes_nothing(self):
+        self._record(_entries(render_proxy_ack_marker(ACTION_ID)))
+        self.fence.is_bootstrapped = lambda: False
+        rc, out = self._run()
+        self.assertEqual(rc, 1)
+        self.assertTrue(out["authorized"])
+        self.assertFalse(out["completed"])
+        self.assertEqual(out["reason"], "proxy_fence_unavailable")
+        self.assertEqual(self.fence.completions, [])
 
-    def test_a_slot_whose_canonical_name_is_not_the_sender_s_is_refused(self):
-        # A defensive branch: the earlier links already exclude a foreign workspace / lane /
-        # provider, so this is reached only if target resolution ever yields a slot the sender's
-        # own identity does not derive. It must still refuse rather than admit on "close enough".
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
-            ProxyTarget,
+    def test_an_authorized_ack_still_needs_a_matching_delivered_generation(self):
+        self._record(_entries(render_proxy_ack_marker(ACTION_ID)))
+        self.fence.complete_by_action_id = lambda *_a, **_k: False
+        rc, out = self._run()
+        self.assertEqual(rc, 1)
+        self.assertTrue(out["authorized"])
+        self.assertFalse(out["completed"])
+        self.assertEqual(out["reason"], "proxy_ack_no_match")
+
+    def test_a_missing_action_id_is_refused_before_the_store(self):
+        self._record(_entries(render_proxy_ack_marker(ACTION_ID)))
+        rc, out = self._run(action_id="")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out["reason"], "proxy_action_id_required")
+        self.assertEqual(self.fence.completions, [])
+
+    def test_a_missing_issue_is_refused_before_the_store(self):
+        self._record(_entries(render_proxy_ack_marker(ACTION_ID)))
+        rc, out = self._run(issue="")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out["reason"], "proxy_ack_issue_required")
+        self.assertEqual(self.fence.completions, [])
+
+    def test_the_command_is_registered_with_an_issue_argument(self):
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="workflow_command")
+        cli_workflow_proxy.register_proxy_parsers(sub)
+        parsed = parser.parse_args(
+            ["proxy-ack", "--issue", ISSUE, "--proxy-action-id", ACTION_ID]
         )
-
-        self._patch(
-            "resolve_proxy_target",
-            lambda _rows, *, workspace_id, provider, attestation_join=None: ProxyTarget(
-                status="ok",
-                assigned_name=encode_assigned_name(FOREIGN_WS, PROVIDER, "default"),
-                locator=LOCATOR,
-                live=1,
-                with_locator=1,
-            ),
-        )
-        ok, reason, _detail = self._run(_env())
-        self.assertFalse(ok)
-        self.assertEqual(reason, "proxy_ack_unattested")
-
-    def test_an_unattested_live_slot_is_refused(self):
-        self._patch(
-            "live_attestation_join",
-            lambda _name, *, locator, workspace_id, provider: (False, "stale", "stale record"),
-        )
-        ok, reason, _detail = self._run(_env())
-        self.assertFalse(ok)
-        self.assertEqual(reason, "proxy_ack_unattested")
-
-    def test_an_unresolvable_workspace_is_refused(self):
-        self._patch("live_workspace_id", lambda _root: "")
-        ok, reason, _detail = self._run(_env())
-        self.assertFalse(ok)
-        self.assertEqual(reason, "proxy_workspace_unresolved")
-
-    def test_a_missing_role_authority_is_refused(self):
-        self._patch("resolve_default_lane_authority", lambda _root: ("missing", "", "", ""))
-        ok, reason, _detail = self._run(_env())
-        self.assertFalse(ok)
-        self.assertEqual(reason, "proxy_coordinator_authority_missing")
-
-    def test_the_correlation_uses_only_fields_the_identity_has(self):
-        # A structural guard against the recurrence: the resolved identity is passed through a
-        # namespace that raises on ANY attribute the real dataclass does not declare, so reading a
-        # field off the wrong class fails here.
-        declared = set(SenderIdentity.__dataclass_fields__)
-
-        class _StrictIdentity:
-            def __init__(self, inner):
-                self._inner = inner
-
-            def __getattr__(self, name):
-                if name not in declared:
-                    raise AssertionError(
-                        f"the ack correlation read {name!r}, which SenderIdentity does not have"
-                    )
-                return getattr(self._inner, name)
-
-        original = send_mod.resolve_sender_identity if hasattr(send_mod, "resolve_sender_identity") else None
-        self.assertIsNone(original)  # it is imported inside the function, so patch the source
-
-        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution as target_mod  # noqa: E501
-
-        real = target_mod.resolve_sender_identity
-
-        def _strict(env, **kwargs):
-            resolution = real(env, **kwargs)
-            if resolution.ok and resolution.identity is not None:
-                object.__setattr__(resolution, "identity", _StrictIdentity(resolution.identity))
-            return resolution
-
-        target_mod.resolve_sender_identity = _strict
-        self.addCleanup(setattr, target_mod, "resolve_sender_identity", real)
-
-        ok, reason, _detail = self._run(_env())
-        self.assertTrue(ok, reason)
+        self.assertIs(parsed.func, cmd_workflow_proxy_ack)
+        self.assertEqual(parsed.issue, ISSUE)
 
 
 if __name__ == "__main__":  # pragma: no cover

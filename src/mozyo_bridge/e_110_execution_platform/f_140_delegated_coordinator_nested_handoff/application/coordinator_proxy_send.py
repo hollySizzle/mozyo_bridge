@@ -371,146 +371,85 @@ def live_lane_expectation(repo_root, lane: str) -> "Optional[LaneExpectation]":
     )
 
 
-def resolve_ack_authority(repo_root, *, env) -> "tuple[bool, str, str]":
-    """May the CURRENT process acknowledge a delegation for this workspace? (fail-closed)
-
-    Returns ``(ok, reason, detail)``. The acknowledgement asserts that the **coordinator** acted on
-    a delegated decision, so possession of the delegation's opaque id can never be the credential —
-    the external caller receives that id from its own delegation envelope, and a rail that accepted
-    it would let the caller complete its own delegation and immediately open the route for the next
-    one (review j#89969 finding 1). ``logic-ack-completion-receiver-state`` is explicit that
-    completion truth is never derived from delivery.
-
-    So the ack is admitted only from the live attested default coordinator itself, re-derived here
-    exactly as every other authority link is:
-
-    - an attested launch-time sender identity must be present (an external client has none);
-    - its workspace must be this checkout's registry anchor;
-    - it must sit in the default lane;
-    - its provider must be the one ``provider_binding`` expects for the lane's bound role;
-    - its own slot must pass the generation-bound startup self-attestation join.
-
-    An operator acting on the coordinator's behalf is therefore not admitted by this surface; that
-    would need its own durable authority anchor, which is deliberately out of scope here.
-    """
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (  # noqa: E501
-        resolve_sender_identity,
-    )
-
-    workspace_id = live_workspace_id(repo_root)
-    if not workspace_id:
-        return False, "proxy_workspace_unresolved", (
-            "the workspace anchor could not be derived from the repo checkout"
-        )
-    sender = resolve_sender_identity(env, anchor_workspace_id=workspace_id)
-    if not sender.ok or sender.identity is None:
-        return False, "proxy_ack_unattested", (
-            "this shell carries no attested launch-time lane identity; an acknowledgement asserts "
-            "that the coordinator acted, so it is admitted only from the live attested default "
-            "coordinator itself — never from the external client that received the action id"
-        )
-    identity = sender.identity
-    if identity.workspace_id != workspace_id:
-        return False, "proxy_ack_foreign_workspace", (
-            "the attested sender belongs to a different workspace than this checkout"
-        )
-    if (identity.lane_id or "").strip() not in ("", DEFAULT_LANE):
-        return False, "proxy_ack_not_default_lane", (
-            "the attested sender is not in the default lane; only the default coordinator "
-            "acknowledges its own delegations"
-        )
-    status, role, _scope, _reason = resolve_default_lane_authority(repo_root)
-    if status != AUTHORITY_RESOLVED:
-        return False, "proxy_coordinator_authority_missing", (
-            "no usable durable workflow-role authority binds this workspace's default lane"
-        )
-    provider = resolve_expected_provider(repo_root, role)
-    if not provider or identity.role != provider:
-        return False, "proxy_ack_provider_mismatch", (
-            "the attested sender's provider is not the one provider_binding expects for the "
-            "bound default-lane role"
-        )
-    # The acknowledging process must BE the live attested default coordinator, not merely claim
-    # its identity: resolve that slot the same way a delegation target is resolved (single live
-    # row + generation-bound attestation join) and require the caller's own assigned name to be it.
-    target = resolve_proxy_target(
-        live_agent_rows(env), workspace_id=workspace_id, provider=provider
-    )
-    if target.status != TARGET_OK:
-        return False, "proxy_ack_unattested", (
-            f"the live default-lane coordinator slot is {target.status!r}; an acknowledgement "
-            "needs a single live generation-attested coordinator"
-        )
-    # Correlate the acknowledging process with the live slot through the canonical mzb1 name
-    # DERIVED from the attested identity's real fields (Redmine #14546, live finding j#90142).
-    # `SenderIdentity` carries exactly `workspace_id` / `role` / `lane_id` and no assigned name;
-    # reading one off it raised `AttributeError` in the live coordinator's ack, and no test caught
-    # it because the CLI regression stubbed this function instead of driving it. The encoder is the
-    # same one the launcher and the dispatch admission use, so the derivation cannot drift from the
-    # name the slot actually carries.
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-        encode_assigned_name,
-    )
-
-    try:
-        sender_assigned_name = encode_assigned_name(
-            workspace_id, identity.role, (identity.lane_id or "").strip() or DEFAULT_LANE
-        )
-    except Exception:  # noqa: BLE001 - an underivable name correlates with nothing (fail closed)
-        return False, "proxy_ack_unattested", (
-            "the attested sender's identity does not derive a canonical slot name"
-        )
-    if not sender_assigned_name or target.assigned_name != sender_assigned_name:
-        return False, "proxy_ack_unattested", (
-            "the attested sender is not the live default-lane coordinator slot"
-        )
-    return True, "", "attested default coordinator"
+#: The canonical acknowledgement marker grammar. The coordinator records this on the anchored issue
+#: after acting; the reconcile reads it back from source-of-truth Redmine. The opaque action id is
+#: the correlation, and the marker's OWNING journal is what makes the acknowledgement attributable.
+ACK_MARKER_GATE = "proxy_ack"
 
 
-def live_issue_expectation(
-    repo_root, issue: str, decisions: "tuple[DecisionRecord, ...]", *, action: str
-) -> "Optional[IssueExpectation]":
-    """The action-time live facts for an issue-scoped (bootstrap) decision, or ``None``.
+def render_proxy_ack_marker(action_id: str) -> str:
+    """The canonical acknowledgement marker for ``action_id`` (pure; the producer inverse of the reader)."""
+    return f"[mozyo:workflow-event:gate={ACK_MARKER_GATE}:proxy_action_id={(action_id or '').strip()}]"
 
-    The bootstrap precondition is that the issue owns **no active lane** — the exact state the
-    observed dead end leaves behind (``sublane create --execute`` stopped pre-effect with zero
-    lane / worktree / pair, #14500). It is read through the lifecycle authority's own owner
-    resolver, which is fail-closed by construction: zero owners and many owners both resolve to
-    "no owner", so a caller can never fall back to "the newest lane".
 
-    ``None`` (fail-closed) only when the workspace scope or the store cannot be read at all —
-    an issue that genuinely owns no lane is a *resolved* expectation with ``owns_active_lane=False``,
-    which is what lets the bootstrap proceed from a fresh topology (review j#90068 finding 1).
+def verify_ack_record(
+    args, *, issue: str, action_id: str, entries_provider=None
+) -> "tuple[bool, str, str]":
+    """Is there a coordinator-recorded acknowledgement for ``action_id`` on ``issue``? (fail-closed)
+
+    The authority for completing a delegation (Redmine #14546, review j#90250 finding 1). The
+    previous shape asked "is the process running this command the coordinator?" and answered it from
+    the process's own ``MOZYO_*`` env — values an external caller can reproduce, because a workspace
+    id, a provider and the default lane are published, not secret, and this platform gives no proof
+    that a process *is* the slot whose triplet it presents. Deriving the canonical slot name from
+    those same caller-supplied fields correlated the claim with itself.
+
+    So the question changed. Completion truth is not "who typed the command" but "what the durable
+    record says the coordinator did" (``vibes/docs/logics/ack-completion-receiver-state.md``): the
+    coordinator records a canonical acknowledgement marker on the anchored issue after acting, and
+    this reads it back through the credential-gated source-of-truth boundary. An external caller who
+    knows the published triplet — and even the action id — cannot complete anything without that
+    durable, attributable record existing.
+
+    Returns ``(ok, reason, detail)``. Fail-closed on an unreadable / unreachable Redmine (no markers
+    is not an acknowledgement), a missing marker, and a marker whose id does not match exactly.
     """
     issue_id = (issue or "").strip()
+    aid = (action_id or "").strip()
     if not issue_id:
-        return None
-    try:
-        from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-            repo_scope_workspace_id,
+        return False, "proxy_ack_issue_required", (
+            "--issue is required: the acknowledgement is read from the anchored issue's durable "
+            "record, not from the invoking process"
+        )
+    if not aid:
+        return False, "proxy_action_id_required", (
+            "--proxy-action-id is required; it is the opaque id the delegation carried"
         )
 
-        scope = repo_scope_workspace_id(repo_root)
-        if not scope:
-            return None
-        owner = LaneLifecycleStore().resolve_owner(scope, issue_id)
-    except Exception:  # noqa: BLE001 - an unreadable lifecycle authority resolves no expectation
-        return None
-
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
-        ACTION_DECISION_TOKENS,
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+        marker_fields_in_note,
     )
 
-    accepted = ACTION_DECISION_TOKENS.get(normalize_action(action), ())
-    latest = ""
-    for record in decisions or ():
-        if record.token in accepted:
-            latest = record.journal
-    return IssueExpectation(
-        issue=issue_id,
-        owns_active_lane=bool(getattr(owner, "resolved", False)),
-        latest_decision_journal=latest,
+    if entries_provider is not None:
+        entries = entries_provider(issue_id)
+    else:
+        try:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+                LiveRedmineJournalSource,
+            )
+
+            entries = LiveRedmineJournalSource.from_environment().read_entries(issue_id)
+        except Exception:  # noqa: BLE001 - an unreachable record is never an acknowledgement
+            return False, "proxy_ack_record_unreadable", (
+                "the anchored issue's durable record could not be read; an acknowledgement is "
+                "never assumed from an unreadable source"
+            )
+
+    for entry in entries or ():
+        if str(getattr(entry, "issue_id", "")).strip() != issue_id:
+            continue
+        journal = str(getattr(entry, "journal_id", "")).strip()
+        for channel, fields in marker_fields_in_note(str(getattr(entry, "notes", "") or "")):
+            if channel != _WORKFLOW_EVENT_CHANNEL:
+                continue
+            if (fields.get("gate") or "").strip() != ACK_MARKER_GATE:
+                continue
+            if (fields.get("proxy_action_id") or "").strip() != aid:
+                continue
+            return True, "", f"coordinator acknowledgement recorded at journal {journal}"
+    return False, "proxy_ack_not_recorded", (
+        "the anchored issue carries no coordinator acknowledgement for this action id; the "
+        "coordinator records one from its own runtime after the delegated action succeeds"
     )
 
 
@@ -767,7 +706,30 @@ def execute_proxy_delegation(
         return _fenced_zero_send(context, state, reserve.detail)
 
     # (4) exactly one send with the minted action id.
-    outcome = send_port.send(context, reserve.action_id, args=args)
+    #
+    # The send itself may raise (review j#90250 finding 3). An exception escaping here skipped the
+    # outcome write entirely and left the generation `reserved` — a state nothing auto-resolves and
+    # which is not safely re-sendable, so the only ways out were a blind re-run or the whole-store
+    # recovery. An unknown effect boundary is exactly what `uncertain` means, so it is recorded as
+    # that and reported as a typed non-delivery.
+    try:
+        outcome = send_port.send(context, reserve.action_id, args=args)
+    except Exception as exc:  # noqa: BLE001 - an unknown send outcome is uncertain, never an escape
+        try:
+            fence.mark_uncertain(
+                route, reserve.action_id, detail=f"send raised {type(exc).__name__}"
+            )
+        except CoordinatorProxyFenceError:
+            pass  # the store also failed; the typed result below still tells the caller
+        return ProxyExecutionResult(
+            sent=False, decision=ZERO_SEND, reason=REASON_DELIVERY_UNCERTAIN,
+            action_id=reserve.action_id, fence_state=FENCE_RECONCILE,
+            detail=(
+                f"the send raised {type(exc).__name__} and its effect boundary is unknown; the "
+                "generation is recorded `uncertain` and is never blind-retried. Resolve it with "
+                "`workflow proxy-reconcile` after establishing what happened."
+            ),
+        )
     context.links = replace(context.links, fence=FENCE_OPEN)
     if outcome.result == SEND_DELIVERED:
         # The outcome write is a CAS, and its result is the only evidence that the delivery and
@@ -940,7 +902,9 @@ __all__ = (
     "live_lane_expectation",
     "live_issue_expectation",
     "resolve_proxy_target",
-    "resolve_ack_authority",
+    "ACK_MARKER_GATE",
+    "render_proxy_ack_marker",
+    "verify_ack_record",
     "resolve_default_lane_authority",
     "resolve_expected_provider",
     "resolve_proxy_context",
