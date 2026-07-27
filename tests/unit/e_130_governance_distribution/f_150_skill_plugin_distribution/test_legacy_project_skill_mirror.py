@@ -1255,6 +1255,154 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         self.assertNotIn(ENTRY_UNREADABLE, audit.kinds())
         self.assertIn(RECOVERY_RESYNC, audit.recovery_actions())
 
+    def _staging_names(self, repo: Path) -> list[str]:
+        return [
+            p.name
+            for p in self._mirror(repo).iterdir()
+            if p.name.startswith(".mozyo-legacy-mirror.")
+        ]
+
+    def test_a_non_oserror_unwinding_the_write_still_releases_the_staging(self) -> None:
+        """j#90472 R10-F1. The write span typed only `OSError`, so any other
+        exception reached neither the hook nor the verify safety net and left
+        this run's staging entry behind for the next audit to stop on."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        def exploding_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise RuntimeError("injected non-OSError")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", exploding_write):
+            with self.assertRaises(RuntimeError):
+                self._service(repo).sync()
+
+        self.assertEqual([], self._staging_names(repo), "the staging entry survived")
+
+    def test_a_non_oserror_unwind_still_spares_a_foreign_entry(self) -> None:
+        """The release on that path must keep proving ownership."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        real_write = os.write
+        state: dict[str, object] = {"done": False, "name": None}
+
+        def rebinding_then_raising(fd: int, data):  # type: ignore[no-untyped-def]
+            if not state["done"]:
+                state["done"] = True
+                for path in self._mirror(repo).iterdir():
+                    if path.name.startswith(".mozyo-legacy-mirror."):
+                        path.unlink()
+                        path.write_text("FOREIGN\n", encoding="utf-8")
+                        state["name"] = path.name
+                        break
+                raise RuntimeError("injected non-OSError")
+            return real_write(fd, data)
+
+        with unittest.mock.patch.object(
+            legacy_mirror_sync.os, "write", rebinding_then_raising
+        ):
+            with self.assertRaises(RuntimeError):
+                self._service(repo).sync()
+
+        foreign = self._mirror(repo) / str(state["name"])
+        self.assertTrue(foreign.exists(), "the unwind deleted an entry that was not ours")
+        self.assertEqual("FOREIGN\n", foreign.read_text(encoding="utf-8"))
+
+    def test_verify_open_failure_releases_the_staging(self) -> None:
+        """j#90472 R10-F2. Failing to observe the entry is not evidence that it
+        is foreign; skipping cleanup guaranteed residue instead."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        real_open = os.open
+
+        def failing_verify_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if (
+                isinstance(path, str)
+                and path.startswith(".mozyo-legacy-mirror.")
+                and not flags & os.O_CREAT
+            ):
+                raise OSError(errno.EMFILE, "injected")
+            return real_open(path, flags, *args, **kwargs)
+
+        with unittest.mock.patch.object(
+            legacy_mirror_sync.os, "open", failing_verify_open
+        ):
+            code, out, _err = self._service(repo).sync()
+
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        self.assertEqual([], self._staging_names(repo), "verify failure left residue")
+
+    def test_verify_fstat_failure_releases_the_staging(self) -> None:
+        """The sibling branch of the same window."""
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        real_open, real_fstat = os.open, os.fstat
+        verify_fds: set[int] = set()
+
+        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            fd = real_open(path, flags, *args, **kwargs)
+            if (
+                isinstance(path, str)
+                and path.startswith(".mozyo-legacy-mirror.")
+                and not flags & os.O_CREAT
+            ):
+                verify_fds.add(fd)
+            return fd
+
+        def failing_verify_fstat(fd: int):  # type: ignore[no-untyped-def]
+            if fd in verify_fds:
+                raise OSError(errno.EIO, "injected")
+            return real_fstat(fd)
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
+            with unittest.mock.patch.object(
+                legacy_mirror_sync.os, "fstat", failing_verify_fstat
+            ):
+                code, out, _err = self._service(repo).sync()
+
+        self.assertTrue(verify_fds, "the verify open was never reached")
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        self.assertEqual([], self._staging_names(repo), "verify failure left residue")
+
+    def test_cleanup_helper_runs_exactly_once_when_it_raises(self) -> None:
+        """j#90472 R10-F4. I claimed the single-shot guard was structurally
+        unreachable; the review showed the path. `_release_staging` raising a
+        non-`OSError` inside the replace-failure return unwinds into the outer
+        handler, which calls `release()` again — the guard is what keeps that at
+        one call, and the original exception must still surface.
+        """
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+
+        service = self._service(repo)
+        calls: list[int] = []
+
+        def exploding_release(mirror_fd: int, temp_name: str, identity):  # type: ignore[no-untyped-def]
+            calls.append(1)
+            raise RuntimeError("injected helper failure")
+
+        service._release_staging = exploding_release  # type: ignore[method-assign]
+
+        def failing_replace(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise PermissionError(errno.EACCES, "injected")
+
+        with unittest.mock.patch.object(
+            legacy_mirror_sync.os, "replace", failing_replace
+        ):
+            with self.assertRaises(RuntimeError):
+                service.sync()
+
+        self.assertEqual(1, len(calls), "the cleanup helper ran more than once")
+
     def test_replace_failure_is_classified_by_what_actually_happened(self) -> None:
         """j#90458 R8-F3. Every `os.replace` error was reported as "it is no
         longer a regular file" — an untrue statement for a permission failure,

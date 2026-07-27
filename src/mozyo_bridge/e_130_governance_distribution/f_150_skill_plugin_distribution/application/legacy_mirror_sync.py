@@ -620,14 +620,26 @@ class LegacyProjectSkillMirrorSync:
             os.fchmod(temp_fd, 0o644)
         except OSError:
             write_failure = "staging file could not be written"
+        except BaseException:
+            # Not just `OSError`: a non-OSError unwinding the write reached
+            # neither the hook nor the verify safety net, so the staging entry
+            # this run owned was left behind and the next audit stopped on its
+            # own residue (j#90472 R10-F1). Close first, then release once,
+            # then re-raise unchanged.
+            _close_quietly(temp_fd)
+            temp_fd = -1
+            release()
+            raise
         finally:
             # A close can report a deferred write error, so discarding its
             # result folded a real failure into a `synced` banner and exit 0
-            # (j#90467 R9-F1).
-            if not _close_quietly(temp_fd) and write_failure is None:
-                write_failure = (
-                    "staging file could not be closed; the write may not have reached disk"
-                )
+            # (j#90467 R9-F1). `temp_fd` is -1 only on the re-raise path above,
+            # which already closed and released.
+            if temp_fd != -1:
+                if not _close_quietly(temp_fd) and write_failure is None:
+                    write_failure = (
+                        "staging file could not be closed; the write may not have reached disk"
+                    )
 
         if write_failure is not None:
             return (Violation(RULE_WRITE, WRITE_FAILED, subject, write_failure),) + release()
@@ -649,27 +661,33 @@ class LegacyProjectSkillMirrorSync:
             try:
                 verify_fd = os.open(temp_name, _FILE_FLAGS, dir_fd=mirror_fd)
             except OSError:
+                # Not observing the entry is not evidence that it is foreign.
+                # `_release_staging` re-proves identity and leaves anything
+                # that is not ours untouched, so routing through it is strictly
+                # safer than leaving guaranteed residue (j#90472 R10-F2).
                 return (
                     Violation(
                         RULE_WRITE,
                         WRITE_FAILED,
                         f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
-                        "staging entry was replaced while the sync held it",
+                        "staging entry could not be re-opened for verification",
                     ),
-                )
+                ) + release()
             try:
                 current = os.fstat(verify_fd)
             except OSError:
-                return (
-                    Violation(
-                        RULE_WRITE,
-                        WRITE_FAILED,
-                        f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
-                        "staging entry could not be re-validated",
-                    ),
+                verify_failure = Violation(
+                    RULE_WRITE,
+                    WRITE_FAILED,
+                    f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
+                    "staging entry could not be re-validated",
                 )
-            finally:
                 _close_quietly(verify_fd)
+                verify_fd = -1
+                return (verify_failure,) + release()
+            finally:
+                if verify_fd != -1:
+                    _close_quietly(verify_fd)
 
             if identity is None or (current.st_dev, current.st_ino) != (
                 identity.st_dev,
