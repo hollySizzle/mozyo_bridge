@@ -694,7 +694,25 @@ def execute_proxy_delegation(
     outcome = send_port.send(context, reserve.action_id, args=args)
     context.links = replace(context.links, fence=FENCE_OPEN)
     if outcome.result == SEND_DELIVERED:
-        fence.mark_delivered(route, reserve.action_id, detail=outcome.detail)
+        # The outcome write is a CAS, and its result is the only evidence that the delivery and
+        # the durable record agree (review j#90032 finding 2). It fails whenever the generation
+        # this send belongs to is no longer `reserved` — the ordinary way that happens is a
+        # concurrent retry re-entering the reserve mid-send, which transitions the row to
+        # `uncertain`. Ignoring the CAS reported success to the caller while the store said
+        # `uncertain`, and since `proxy-ack` completes only a `delivered` generation, the route
+        # then wedged with no way forward. A delivery the store did not record is not a delivery.
+        if not fence.mark_delivered(route, reserve.action_id, detail=outcome.detail):
+            return ProxyExecutionResult(
+                sent=False, decision=ZERO_SEND, reason=REASON_DELIVERY_UNCERTAIN,
+                action_id=reserve.action_id, fence_state=FENCE_RECONCILE,
+                detail=(
+                    "the send was positively delivered but its generation was no longer reserved "
+                    "when the outcome was recorded (a concurrent retry advanced it). The durable "
+                    "state is authoritative: reconcile with the coordinator before deciding "
+                    "whether the action was taken. This is never blind-retried."
+                ),
+                send=outcome,
+            )
         return ProxyExecutionResult(
             sent=True, decision=DELIVER, action_id=reserve.action_id, fence_state=FENCE_OPEN,
             detail=f"delegated once to {context.target.assigned_name}", send=outcome,
@@ -703,16 +721,28 @@ def execute_proxy_delegation(
     # The fence holds an `uncertain` generation for an operator reconcile, and the caller — which
     # has no runtime of its own and will typically branch on the exit code — must be told the
     # delegation did not land. Reporting `sent` here would make a lost delegation script as success.
-    fence.mark_uncertain(
+    # The same principle applies to the non-delivery write: its CAS result is observed, not
+    # assumed. Either way this is a non-delivery, so the caller's verdict does not change — but
+    # a write that did not land means the row is already held by another generation state, and
+    # the detail must say so rather than claim a recording that never happened.
+    recorded = fence.mark_uncertain(
         route, reserve.action_id, detail=outcome.detail or f"send {outcome.result}"
     )
     return ProxyExecutionResult(
         sent=False, decision=ZERO_SEND, reason=REASON_DELIVERY_UNCERTAIN,
-        action_id=reserve.action_id, fence_state=FENCE_OPEN,
+        action_id=reserve.action_id,
+        fence_state=FENCE_OPEN if recorded else FENCE_RECONCILE,
         detail=(
-            "the single send fired but did not positively land; the delegation generation is "
-            "recorded `uncertain` and is never blind-retried. Reconcile with the coordinator, "
-            f"then decide explicitly. {outcome.detail}"
+            (
+                "the single send fired but did not positively land; the delegation generation is "
+                "recorded `uncertain` and is never blind-retried. Reconcile with the coordinator, "
+                "then decide explicitly. "
+                if recorded
+                else "the single send fired but did not positively land, AND its generation was "
+                "no longer reserved when the outcome was recorded (a concurrent retry advanced "
+                "it). Reconcile against the durable state before deciding. "
+            )
+            + outcome.detail
         ),
         send=outcome,
     )

@@ -40,6 +40,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.coordinator_proxy_fence import (  # noqa: E501
+    RESERVE_NEEDS_RECONCILE,
     CoordinatorProxyFence,
     ProxyRouteKey,
 )
@@ -559,6 +560,92 @@ class AcknowledgementLifecycleTest(ProxySendTestBase):
         result, _ = self._execute(self._context(), port=CountingSendPort(result=SEND_FAILED))
         self.assertFalse(result.sent)
         self.assertFalse(self._ack(result.action_id))
+
+
+class ConcurrentRetryOutcomeTest(ProxySendTestBase):
+    """The outcome write is a CAS, and its result is evidence (review j#90032 finding 2).
+
+    Ignoring it produced the one failure mode this whole rail exists to prevent: the caller was told
+    the delegation was delivered while the store said `uncertain`. Because `proxy-ack` completes only
+    a `delivered` generation, the route then had no way forward at all — an exactly-once rail that
+    reports success and wedges is worse than one that reports failure.
+
+    These drive the REAL fence, not a stub: the race is a store-level transition, so a fake that
+    always returns True would assert the very thing under test away.
+    """
+
+    class _RacingSendPort:
+        """Re-enters the reserve mid-send, exactly as a concurrent retry does."""
+
+        def __init__(self, fence, route, result=SEND_DELIVERED):
+            self.fence = fence
+            self.route = route
+            self.calls = []
+            self.racer_verdict = ""
+            self._result = result
+
+        def send(self, context, action_id, *, args):
+            self.calls.append((context.issue, context.journal, action_id))
+            racer = self.fence.reserve(
+                self.route, issue=context.issue, journal=context.journal
+            )
+            self.racer_verdict = racer.verdict
+            return ProxySendOutcome(result=self._result, rc=0)
+
+    def _route(self):
+        return ProxyRouteKey(
+            workspace_id=WS, lane_id="default", role=ROLE_COORDINATOR, action=ACTION_DISPATCH_NEXT
+        )
+
+    def test_a_delivered_send_whose_generation_moved_is_not_reported_as_delivered(self):
+        self.fence.bootstrap()
+        route = self._route()
+        port = self._RacingSendPort(self.fence, route)
+        result, _ = self._execute(self._context(), port=port)
+
+        self.assertEqual(len(port.calls), 1)  # exactly one send still fired
+        self.assertEqual(port.racer_verdict, RESERVE_NEEDS_RECONCILE)
+        self.assertFalse(result.sent)
+        self.assertEqual(result.decision, ZERO_SEND)
+        self.assertEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
+
+    def test_the_reported_verdict_matches_the_stored_state(self):
+        # The defect was precisely a divergence between these two.
+        self.fence.bootstrap()
+        route = self._route()
+        port = self._RacingSendPort(self.fence, route)
+        result, _ = self._execute(self._context(), port=port)
+
+        self.assertEqual(self.fence.active(route).state, "uncertain")
+        self.assertFalse(result.sent)
+
+    def test_a_wedged_route_is_not_completable_by_ack_and_says_so(self):
+        self.fence.bootstrap()
+        route = self._route()
+        port = self._RacingSendPort(self.fence, route)
+        result, _ = self._execute(self._context(), port=port)
+
+        # `proxy-ack` completes only a delivered generation, so a route left uncertain must never
+        # have been reported as delivered in the first place.
+        self.assertFalse(
+            self.fence.complete_by_action_id(result.action_id, workspace_id=WS)
+        )
+        self.assertFalse(result.sent)
+
+    def test_an_uncontended_delivery_still_reports_delivered(self):
+        self.fence.bootstrap()
+        result, port = self._execute(self._context())
+        self.assertTrue(result.sent)
+        self.assertEqual(len(port.calls), 1)
+        self.assertEqual(self.fence.active(self._route()).state, "delivered")
+
+    def test_a_failed_send_whose_generation_moved_is_still_a_non_delivery(self):
+        self.fence.bootstrap()
+        route = self._route()
+        port = self._RacingSendPort(self.fence, route, result=SEND_FAILED)
+        result, _ = self._execute(self._context(), port=port)
+        self.assertFalse(result.sent)
+        self.assertEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
 
 
 class DecisionJournalFoldTest(unittest.TestCase):

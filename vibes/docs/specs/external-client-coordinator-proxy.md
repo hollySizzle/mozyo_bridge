@@ -169,12 +169,33 @@ vocabulary は closed であり、委譲は implementation request でも review
 でもない）。summary に action / durable anchor / opaque `proxy_action_id` を載せ、coordinator 側
 の記録が何を渡されたかを相関できるようにする。
 
+**outcome write の CAS 結果は必ず観測する。** `mark_delivered` / `mark_uncertain` は generation が
+まだ `reserved` の場合にだけ成功する CAS である。競合 retry が送信中に reserve へ再入すると row は
+`uncertain` へ遷移し、その後 positive delivery が戻っても CAS は False になる。この結果を無視すると
+caller には rc 0 を返しながら store は `uncertain`、`proxy-ack` は delivered-only なので route は
+完了不能に wedge する（review j#90032 F2）。**store が記録しなかった delivery は delivery ではない。**
+CAS False は success にせず `proxy_delivery_uncertain` + 非ゼロ終了へ落とし、blind retry しない。
+
 send が **発火した**ことは、着地した証拠ではない。positive delivery でない場合:
 
 - generation は `uncertain` を保持し、blind retry しない（reconcile が先）。
 - 結果は **delivery ではない**。`sent=False` / `reason=proxy_delivery_uncertain` を返し、CLI は
   **非ゼロ終了**する。caller は自前 runtime を持たず exit code で分岐するため、着かなかった委譲を
   成功として script させてはならない。rc 0 は positive delivery のときだけである。
+
+## 5b. Executable leg wiring
+
+resolver が `execution=ready` + direction 別 primitive を返しても、**CLI の executable-leg
+classifier がその primitive を認めなければ何も発火しない**。初版は classifier が既存 2 token を
+手書き列挙していたため、`herdr_forward_managed_gateway` は解決可能かつ発火不能で、`workflow step`
+は rc 0 / `execution: ready` を返して何も送らなかった。本US の中核 acceptance がコード上到達不能
+だった（review j#90032 F1）。
+
+- classifier の membership は **route matrix から導出**する（`FORWARD_PRIMITIVES`）。手書き列挙は
+  しない。direction を追加して executor を置き去りにすることが構造的に起こらないようにする。
+- forward leg は専用 fence と専用 executor に乗るため、generic `WorkflowStepOutcome.executable`
+  集合には**入れない**（そちらは tmux primitive rail）。両者の関係は coherence test で固定する。
+- 非 dry-run で leg 1 回 / dry-run で 0 回 / leg の rc 伝播を **top-level CLI** で回帰化する。
 
 ## 6. Surface
 

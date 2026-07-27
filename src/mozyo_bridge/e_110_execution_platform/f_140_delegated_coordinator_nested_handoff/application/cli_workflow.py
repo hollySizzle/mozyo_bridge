@@ -498,21 +498,23 @@ def _maybe_operator_startup_resume_outcome(
 def _is_herdr_forward_leg(outcome: WorkflowStepOutcome) -> bool:
     """True when the outcome is the executable Increment-3 herdr coordinator-forward leg (#13583).
 
-    A resolved grandparent / project-gateway lane forwards a single ticketless consultation /
-    work-intake. Like the herdr worker-dispatch leg, this rides its own dedicated duplicate fence
-    and is driven by a dedicated executor — it is deliberately NOT part of the generic
-    ``WorkflowStepOutcome.executable`` set (which is the tmux ``_primitive_argv`` rail).
+    A resolved grandparent / project-gateway / single-workspace coordinator lane forwards a single
+    ticketless consultation / work-intake. Like the herdr worker-dispatch leg, this rides its own
+    dedicated duplicate fence and is driven by a dedicated executor — it is deliberately NOT part of
+    the generic ``WorkflowStepOutcome.executable`` set (which is the tmux ``_primitive_argv`` rail).
+
+    The membership test is derived from the route matrix rather than a hand-listed tuple (Redmine
+    #14546, review j#90032 finding 1): listing the tokens by hand is what left the
+    ``herdr_forward_managed_gateway`` leg resolvable but unfirable — ``workflow step`` returned
+    ``ready`` and rc 0 while sending nothing, which is precisely the acceptance the coordinator leg
+    exists to satisfy. A leg that the matrix can plan is a leg this classifier admits, so adding a
+    direction can never again leave the executor behind.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (
-        PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE,
-        PRIMITIVE_HERDR_FORWARD_CONSULT,
+        FORWARD_PRIMITIVES,
     )
 
-    return (
-        outcome.execution == EXECUTION_READY
-        and outcome.primitive
-        in (PRIMITIVE_HERDR_FORWARD_CONSULT, PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE)
-    )
+    return outcome.execution == EXECUTION_READY and outcome.primitive in FORWARD_PRIMITIVES
 
 
 def _execute_herdr_forward_leg(

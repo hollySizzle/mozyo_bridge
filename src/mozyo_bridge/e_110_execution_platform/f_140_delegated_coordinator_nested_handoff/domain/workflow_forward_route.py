@@ -104,6 +104,26 @@ REASON_HERDR_FORWARD_DUPLICATE = "herdr_forward_duplicate"
 #: The durable duplicate fence is unavailable (do-not-send: a send could duplicate).
 REASON_HERDR_FORWARD_FENCE_UNAVAILABLE = "herdr_forward_fence_unavailable"
 
+#: EVERY forward primitive the matrix can plan, derived from the plan builder itself (Redmine
+#: #14546, review j#90032 F1). The CLI's executable-leg classifier tests membership here instead of
+#: hand-listing tokens: a hand-listed tuple is what left the managed-gateway leg resolvable but
+#: unfirable. A direction added to :func:`plan_forward_route` without appearing here fails the
+#: coherence test that pins the two together.
+FORWARD_PRIMITIVES: frozenset = frozenset(
+    {
+        PRIMITIVE_HERDR_FORWARD_CONSULT,
+        PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE,
+        PRIMITIVE_HERDR_FORWARD_MANAGED_GATEWAY,
+    }
+)
+
+#: The roles that have a one-step forward, pinned so the coherence test can enumerate them.
+FORWARD_ROLES: tuple = (
+    ROLE_GRANDPARENT_COORDINATOR,
+    ROLE_PROJECT_GATEWAY,
+    ROLE_COORDINATOR,
+)
+
 # The ready reason for a plan, keyed by direction.
 _READY_REASON = {
     FORWARD_GRANDPARENT_TO_GATEWAY: REASON_HERDR_FORWARD_CONSULT_READY,
@@ -273,6 +293,8 @@ __all__ = (
     "PRIMITIVE_HERDR_FORWARD_CONSULT",
     "PRIMITIVE_HERDR_FORWARD_CHILD_INTAKE",
     "PRIMITIVE_HERDR_FORWARD_MANAGED_GATEWAY",
+    "FORWARD_PRIMITIVES",
+    "FORWARD_ROLES",
     "REASON_HERDR_FORWARD_CONSULT_READY",
     "REASON_HERDR_FORWARD_CHILD_INTAKE_READY",
     "REASON_HERDR_FORWARD_MANAGED_GATEWAY_READY",
