@@ -40,6 +40,14 @@ class ScaffoldRulesTest(unittest.TestCase):
             result = args.func(args)
         return result, stdout.getvalue()
 
+    def init_git_repository(self, project: Path) -> None:
+        subprocess.run(
+            ["git", "init", "--quiet", str(project)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
     def test_rules_install_and_scaffold_asana_thin_router(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -924,6 +932,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                     str(home),
                 ]
             )
+            self.init_git_repository(project)
 
             catalog_path = project / ".mozyo-bridge/docs/catalog.yaml"
             base_catalog = (
@@ -992,6 +1001,202 @@ class ScaffoldRulesTest(unittest.TestCase):
                 real_gap_output,
             )
 
+    def test_docs_validate_file_coverage_obeys_git_ignore_authority(self) -> None:
+        """Coverage uses Git's tracked/untracked/ignored source boundary."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            self.init_git_repository(project)
+
+            base_catalog = (
+                project / ".mozyo-bridge/docs/catalog.yaml.example"
+            ).read_text(encoding="utf-8")
+            catalog = base_catalog.replace(
+                "coverage_roots:\n  - src\n  - tests\n  - docs\n",
+                "coverage_roots:\n  - source\n",
+                1,
+            ).replace(
+                "      - src/**\n",
+                "      - src/**\n      - source/covered*.rb\n",
+                1,
+            )
+            (project / ".mozyo-bridge/docs/catalog.yaml").write_text(
+                catalog,
+                encoding="utf-8",
+            )
+
+            source = project / "source"
+            nested = source / "nested"
+            source.mkdir()
+            nested.mkdir()
+            (source / "covered.rb").write_text("# covered\n", encoding="utf-8")
+            (project / ".gitignore").write_text(
+                "source/dependency/\n",
+                encoding="utf-8",
+            )
+            (nested / ".gitignore").write_text(
+                "ignored.rb\ntracked_ignored.rb\n",
+                encoding="utf-8",
+            )
+
+            def run_coverage() -> tuple[int, str]:
+                return self.run_cli(
+                    [
+                        "docs",
+                        "validate",
+                        "--repo",
+                        str(project),
+                        "--check-file-coverage",
+                    ]
+                )
+
+            clean_code, clean_output = run_coverage()
+            self.assertEqual(0, clean_code, msg=clean_output)
+
+            dependency = source / "dependency"
+            dependency.mkdir()
+            (dependency / "orphan.rb").write_text(
+                "# ignored dependency\n",
+                encoding="utf-8",
+            )
+            (nested / "ignored.rb").write_text(
+                "# nested ignore\n",
+                encoding="utf-8",
+            )
+            outside = Path(tmp) / "outside.rb"
+            outside.write_text("# outside\n", encoding="utf-8")
+            (source / "linked.rb").symlink_to(outside)
+
+            installed_code, installed_output = run_coverage()
+            self.assertEqual(0, installed_code, msg=installed_output)
+
+            orphan = source / "orphan.rb"
+            orphan.write_text("# untracked source\n", encoding="utf-8")
+            orphan_code, orphan_output = run_coverage()
+            self.assertEqual(1, orphan_code)
+            self.assertIn(
+                "no file_convention matched: source/orphan.rb",
+                orphan_output,
+            )
+            orphan.unlink()
+
+            tracked_ignored = nested / "tracked_ignored.rb"
+            tracked_ignored.write_text("# tracked but ignored\n", encoding="utf-8")
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(project),
+                    "add",
+                    "-f",
+                    "source/nested/tracked_ignored.rb",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            tracked_code, tracked_output = run_coverage()
+            self.assertEqual(1, tracked_code)
+            self.assertIn(
+                "no file_convention matched: source/nested/tracked_ignored.rb",
+                tracked_output,
+            )
+
+    def test_docs_validate_file_coverage_fails_closed_when_git_is_unavailable(
+        self,
+    ) -> None:
+        """Coverage never silently allows an uncertain Git source set."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            shutil.copyfile(
+                project / ".mozyo-bridge/docs/catalog.yaml.example",
+                project / ".mozyo-bridge/docs/catalog.yaml",
+            )
+
+            outside_code, outside_output = self.run_cli(
+                [
+                    "docs",
+                    "validate",
+                    "--repo",
+                    str(project),
+                    "--check-file-coverage",
+                ]
+            )
+            self.assertEqual(1, outside_code)
+            self.assertIn("file coverage source enumeration failed", outside_output)
+
+            with patch(
+                "mozyo_bridge.docs_tools.validate.subprocess.run",
+                side_effect=FileNotFoundError("git unavailable"),
+            ):
+                unavailable_code, unavailable_output = self.run_cli(
+                    [
+                        "docs",
+                        "validate",
+                        "--repo",
+                        str(project),
+                        "--check-file-coverage",
+                    ]
+                )
+            self.assertEqual(1, unavailable_code)
+            self.assertIn("Git is unavailable", unavailable_output)
+
+            self.init_git_repository(project)
+            successful_root_check = subprocess.CompletedProcess(
+                args=["git"],
+                returncode=0,
+                stdout=f"{project}\n",
+                stderr="",
+            )
+            failed_listing = subprocess.CompletedProcess(
+                args=["git"],
+                returncode=2,
+                stdout=b"",
+                stderr=b"simulated ls-files failure",
+            )
+            with patch(
+                "mozyo_bridge.docs_tools.validate.subprocess.run",
+                side_effect=[successful_root_check, failed_listing],
+            ):
+                failed_code, failed_output = self.run_cli(
+                    [
+                        "docs",
+                        "validate",
+                        "--repo",
+                        str(project),
+                        "--check-file-coverage",
+                    ]
+                )
+            self.assertEqual(1, failed_code)
+            self.assertIn("cannot enumerate Git source paths", failed_output)
+
     def test_docs_cli_round_trips_against_shipped_catalog_example(self) -> None:
         """The packaged `docs ...` CLI must work on the catalog skeleton.
 
@@ -1019,6 +1224,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                     str(home),
                 ]
             )
+            self.init_git_repository(project)
             example = project / ".mozyo-bridge/docs/catalog.yaml.example"
             catalog = project / ".mozyo-bridge/docs/catalog.yaml"
             _shutil.copyfile(example, catalog)
@@ -1370,6 +1576,7 @@ class ScaffoldRulesTest(unittest.TestCase):
                     str(home),
                 ]
             )
+            self.init_git_repository(project)
             _shutil.copyfile(
                 project / ".mozyo-bridge/docs/catalog.yaml.example",
                 project / ".mozyo-bridge/docs/catalog.yaml",
