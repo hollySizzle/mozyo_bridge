@@ -186,6 +186,10 @@ class FailClosedTest(unittest.TestCase):
             ("definition title on the next line", '[foo]: /url\n  "%s"' % marker),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % marker),
             ("image alt text", "![a %s b](img.png)" % marker),
+            # #14584 j#91735: a narrow tail refusal erasing the markup that the
+            # note-wide one would have refused.
+            ("link tail hiding a later tag", "see [d](/u) <code>\nq\n\n%s" % marker),
+            ("hanging indent hiding a later tag", "prose\n    <code>\n\n%s" % marker),
         ):
             with self.subTest(label):
                 self.assertEqual(_resolve([_entry("90409", note)]).status, WORK_ANCHOR_MISSING)

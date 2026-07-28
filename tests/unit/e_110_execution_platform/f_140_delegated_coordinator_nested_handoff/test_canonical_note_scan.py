@@ -489,6 +489,37 @@ class BackslashEscapeTest(unittest.TestCase):
         self.assertEqual(_gates(f"text \\\\`{MARKER}`"), ())
 
 
+class PassOrderTest(unittest.TestCase):
+    """A pass may not hide what a WIDER pass has not read yet (#14584 j#91735).
+
+    Rule E refuses to the end of the note. The tail passes and the hanging-indent blanking refuse
+    only to the end of a paragraph or a line, and every one of them is capable of erasing the very
+    ``<code>`` that E would have refused the rest of the note for. Running the narrow ones first did
+    exactly that, and markers below the markup came back as authority.
+
+    The reported case was the link tail. Three more passes had the same reach, so these pin the
+    invariant rather than the report: E is read on the output of the passes that hide what the
+    renderer hides, and applied after the ones that hide more.
+    """
+
+    def test_a_tail_refusal_does_not_hide_markup_from_the_note_wide_one(self):
+        for label, note in (
+            ("link tail", f"see [docs](/u) <code>\nquoted\n\n{MARKER}"),
+            ("unmatched backtick tail", f"see `literal <code> more\nquoted\n\n{MARKER}"),
+            ("image tail", f"see ![a](i.png) <code>\nq\n\n{MARKER}"),
+            ("hanging indent", f"prose\n    <code>\n\n{MARKER}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ())
+
+    def test_a_closed_span_may_still_hide_markup_from_it(self):
+        # The other side: a CLOSED span hides exactly what the renderer hides, so reading E after it
+        # is correct and a backticked tag still costs nothing. Collapsing the two span passes into
+        # one — the shape this fix separates — would break this or the cases above.
+        self.assertEqual(_gates(f"we render `<div>` here\n\n{MARKER}"), ("review_request",))
+        self.assertEqual(_gates(f"see `[docs](http://x)` here\n\n{MARKER}"), ("review_request",))
+
+
 class ScanIsPerLineTest(unittest.TestCase):
     """Blanking must not let a marker be spliced together across a quotation."""
 

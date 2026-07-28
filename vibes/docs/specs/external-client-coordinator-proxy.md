@@ -191,6 +191,14 @@ authorize したかを照合しなければ scope は未検証のままである
     (引用に authority を渡す) は復旧できない。**実 journal への影響は live 実測で確認する** —
     20 issue で R3→R4 は 154 marker、R4→R5 は 166 marker、いずれも**集合が完全一致**した
     (硬化で落ちた実 marker は 0)。
+  - ★★★**狭い拒否の pass は、広い拒否の pass がまだ読んでいないものを消してはならない** (#14584 j#91735)。
+    E は note 末尾まで、tail 系 (未対応 backtick run / link 構文) と hanging-indent blank は paragraph /
+    行までしか拒否しない。狭い方を先に走らせると、**E が note 末尾まで拒否する根拠だった `<code>` 自体を
+    消してしまい**、その下の marker が authority に戻る。指摘は link tail についてだったが、実測したら
+    未対応 backtick tail / image tail / hanging indent の**3 経路も同型**だった。
+    → 順序を **「renderer が隠すものを隠す (A-C と *閉じた* code span)」→ 「E を読む」→ 「renderer より
+    多く隠す (tail 系・hanging indent)」→ 「E を適用」** に固定する。
+    **pass を足すたびに順序を考えるのではなく、広い拒否の観測を先に固定する。**
   - **scan は行単位で行う。** marker body の grammar は `[^\]]*` で改行を跨ぐため、blank 化した note
     を 1 文字列として scan すると、canonical 行の閉じていない `[mozyo:` が引用行を越えて後続の `]`
     で閉じ、**どの 1 行にも存在しない marker** が成立しうる。

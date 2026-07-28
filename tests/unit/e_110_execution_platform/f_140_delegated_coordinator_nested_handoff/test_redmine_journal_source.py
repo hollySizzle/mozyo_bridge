@@ -352,6 +352,10 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             ("definition title on the next line", '[foo]: /url\n  "%s"' % self.GATE),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % self.GATE),
             ("image alt text", "![a %s b](img.png)" % self.GATE),
+            # #14584 j#91735: a narrow tail refusal erasing the markup that the
+            # note-wide one would have refused.
+            ("link tail hiding a later tag", "see [d](/u) <code>\nq\n\n%s" % self.GATE),
+            ("hanging indent hiding a later tag", "prose\n    <code>\n\n%s" % self.GATE),
         ):
             with self.subTest(label):
                 self.assertEqual(self._gates(note), ())

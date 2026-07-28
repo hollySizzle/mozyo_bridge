@@ -71,7 +71,14 @@ blanked. CommonMark renders it as literal text, but a paragraph whose quoting is
 exactly the text whose authorship this scan cannot establish, and this is the recoverable direction
 (below).
 
-Two properties of the scan are load-bearing rather than incidental:
+**A pass may not hide what a WIDER pass has not read yet.** E refuses to the end of the note; the
+tail refusals (an unmatched backtick run, link syntax) and the hanging-indent blanking refuse only
+to the end of a paragraph or a line. Running a narrow one first lets it erase the very ``<code>``
+that E would have refused the rest of the note for — reported for the link tail, and equally true of
+the other three (#14584 j#91735). So the order is: hide what the renderer hides (A–C, and CLOSED
+code spans), **read E**, then hide what this module hides beyond the renderer, then apply E.
+
+Three properties of the scan are load-bearing rather than incidental:
 
 - **Quoted regions are blanked, not deleted.** The line structure survives, so a marker can never be
   spliced together out of fragments that sat on either side of a quotation.
@@ -303,29 +310,35 @@ def _blank_from_link_syntax(text: str) -> str:
     return text
 
 
-def _blank_code_spans(text: str) -> str:
-    """``text`` with every inline code span blanked, preserving every character position (pure).
+def _backtick_runs(text: str) -> "list[tuple[int, int]]":
+    """The delimiter backtick strings in ``text`` as ``(start, end)`` (pure).
+
+    A backslash-escaped backtick is a literal, not a delimiter (§2.4): counting it would pair a run
+    that never opened a span with the real opener after it, releasing the span's content (#14584
+    j#91593 F1). Such a run is shortened by its escaped first character, and disappears entirely if
+    that was all of it.
+    """
+    runs = [
+        (match.start() + 1, match.end()) if _is_escaped(text, match.start()) else
+        (match.start(), match.end())
+        for match in _BACKTICK_RUN.finditer(text)
+    ]
+    return [(start, end) for start, end in runs if end > start]
+
+
+def _blank_closed_code_spans(text: str) -> str:
+    """``text`` with every CLOSED inline code span blanked, character positions preserved (pure).
 
     A span runs from a backtick string to the next backtick string of EXACTLY the same length
     (CommonMark 0.31.2 §6.1); runs of other lengths in between are span content. Newlines survive so
     the caller can split back into lines: a span's line endings are span content, which is why this
     works on a whole paragraph rather than a line (#14584 j#91194 F1).
 
-    A backtick string with no match refuses the rest of the PARAGRAPH rather than being ignored —
-    see the module docstring.
+    A run with no match is left ALONE here and refused later by :func:`_blank_paragraph_tail`. The
+    split matters: this pass hides exactly what the renderer hides, so rule E may be read on its
+    output, while the tail pass hides more than the renderer does and must not (#14584 j#91735).
     """
-    # A backslash-escaped backtick is a literal, not a delimiter (§2.4): counting it would pair a
-    # run that never opened a span with the real opener after it, releasing the span's content
-    # (#14584 j#91593 F1). Such a run is shortened by its escaped first character, and disappears
-    # entirely if that was all of it.
-    runs = [
-        (match.start() + 1, match.end()) if _is_escaped(text, match.start()) else
-        (match.start(), match.end())
-        for match in _BACKTICK_RUN.finditer(text)
-    ]
-    runs = [(start, end) for start, end in runs if end > start]
-    if not runs:
-        return text
+    runs = _backtick_runs(text)
     chars = list(text)
     index = 0
     while index < len(runs):
@@ -335,13 +348,39 @@ def _blank_code_spans(text: str) -> str:
             (n for n in range(index + 1, len(runs)) if runs[n][1] - runs[n][0] == width),
             None,
         )
-        if closer is None:  # unmatched backtick string: refuse to the end of the paragraph
-            start, end, index = opener_start, len(text), len(runs)
-        else:
-            start, end, index = opener_start, runs[closer][1], closer + 1
-        for position in range(start, end):
+        if closer is None:
+            index += 1
+            continue
+        for position in range(opener_start, runs[closer][1]):
             if chars[position] != "\n":
                 chars[position] = " "
+        index = closer + 1
+    return "".join(chars)
+
+
+def _blank_paragraph_tail(text: str) -> str:
+    """``text`` blanked from the first construct that refuses the rest of the paragraph (pure).
+
+    Two of them, for the same reason: an unmatched backtick string leaves a paragraph whose quoting
+    does not balance, and link syntax opens a region whose end this module refuses to compute. Both
+    hide MORE than the renderer does, which is why they run after rule E has been read.
+    """
+    unmatched = [
+        start
+        for index, (start, end) in enumerate(_backtick_runs(text))
+        if not any(
+            other[1] - other[0] == end - start for other in _backtick_runs(text)[index + 1:]
+        )
+    ]
+    starts = [match.start() for match in _LINK_HIDDEN_PART.finditer(text)
+              if not _is_escaped(text, match.start())]
+    candidates = unmatched + starts
+    if not candidates:
+        return text
+    chars = list(text)
+    for index in range(min(candidates), len(text)):
+        if chars[index] != "\n":
+            chars[index] = " "
     return "".join(chars)
 
 
@@ -354,6 +393,14 @@ def canonical_note_lines(notes: str) -> tuple[str, ...]:
 
     A quoted line becomes ``""`` rather than disappearing, so the caller can scan line by line and a
     marker can never be spliced across a quotation.
+
+    **A pass may not hide what a WIDER pass has not read yet.** Rule E refuses to the end of the
+    note; the tail passes and the hanging-indent blanking refuse only to the end of a paragraph or a
+    line. Running the narrow ones first let them erase the very ``<code>`` that would have refused
+    the rest of the note, and markers below it came back as authority (#14584 j#91735 — reported for
+    the link tail, and true of the unmatched-backtick tail, the image tail and hanging indent too).
+    So E is read on the output of the passes that hide exactly what the renderer hides, and applied
+    after the ones that hide more.
     """
     # Line endings are normalized first: Redmine returns CRLF, and the block rules below admit only
     # U+0020 / U+0009 as whitespace, so a stray "\r" would keep every fence closer from closing.
@@ -363,6 +410,24 @@ def canonical_note_lines(notes: str) -> tuple[str, ...]:
         return tuple("" for _line in lines_in)  # renderer-dependent structure: refuse the note
     classified = _classify_block_structure(lines_in)
     lines = [text for text, _paragraph, _blanked in classified]
+    paragraphs = _paragraph_runs(classified)
+    for start, end in paragraphs:  # renderer-faithful: a closed span hides what the renderer hides
+        lines[start:end] = _blank_closed_code_spans("\n".join(lines[start:end])).split("\n")
+    # E is READ here, before anything that hides more than the renderer does.
+    cutoff = next(
+        (index for index, line in enumerate(lines) if _first_hidden_construct(line) >= 0), None
+    )
+    for start, end in paragraphs:  # refuses more than the renderer: tails
+        lines[start:end] = _blank_paragraph_tail("\n".join(lines[start:end])).split("\n")
+    lines = ["" if blanked else line for line, (_t, _p, blanked) in zip(lines, classified)]
+    if cutoff is not None:  # E is APPLIED last, on the position it observed for itself
+        return tuple(lines[:cutoff] + [""] * (len(lines) - cutoff))
+    return tuple(lines)
+
+
+def _paragraph_runs(classified: "list[tuple[str, int | None, bool]]") -> "list[tuple[int, int]]":
+    """The ``(start, end)`` line ranges of each paragraph in ``classified`` (pure)."""
+    runs: list[tuple[int, int]] = []
     start = 0
     while start < len(classified):
         paragraph = classified[start][1]
@@ -372,17 +437,9 @@ def canonical_note_lines(notes: str) -> tuple[str, ...]:
         end = start
         while end < len(classified) and classified[end][1] == paragraph:
             end += 1
-        joined = _blank_code_spans("\n".join(lines[start:end]))
-        lines[start:end] = _blank_from_link_syntax(joined).split("\n")
+        runs.append((start, end))
         start = end
-    lines = ["" if blanked else line for line, (_t, _p, blanked) in zip(lines, classified)]
-    # Hidden constructs are decided last, on what the rules above left standing — so a `<tag>` or
-    # a link inside a code span or a fence is already gone and costs nothing. From the first one
-    # still in the writer's own text, nothing further in the note is establishable.
-    for index, line in enumerate(lines):
-        if _first_hidden_construct(line) >= 0:
-            return tuple(lines[:index] + [""] * (len(lines) - index))
-    return tuple(lines)
+    return runs
 
 
 def canonical_note_text(notes: str) -> str:
