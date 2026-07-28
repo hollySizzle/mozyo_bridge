@@ -337,6 +337,24 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(self._gates(note), ())
 
+    def test_markup_and_escaped_delimiters_are_not_a_gate_either(self):
+        # #14584 j#91593 F1-F3 reaching THIS reader. The comment / attribute shapes are the sharp
+        # ones: `pandoc -t plain` renders the marker as nothing at all, so an INVISIBLE string was
+        # becoming a durable gate event.
+        for label, note in (
+            ("html comment", "text <!-- %s --> text" % self.GATE),
+            ("attribute value", 'text <span title="%s">visible</span>' % self.GATE),
+            ("CDATA", "<![CDATA[\n%s\n]]>" % self.GATE),
+            ("nested quoting tags", "<blockquote>\n<blockquote>\nq\n</blockquote>\n%s\n</blockquote>" % self.GATE),
+            ("escaped backtick", "\\` x `%s`" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ())
+
+    def test_a_gate_recorded_above_the_markup_still_counts(self):
+        # The bound: refusing from where markup starts must not erase what came before it.
+        self.assertEqual(self._gates(self.GATE + "\n\nwe render <div> here"), ("review_request",))
+
     def test_a_crlf_note_still_yields_its_gate(self):
         # Redmine returns CRLF. If normalization were missing, the strict whitespace class above
         # would stop every real fence closing and this reader would go blind.

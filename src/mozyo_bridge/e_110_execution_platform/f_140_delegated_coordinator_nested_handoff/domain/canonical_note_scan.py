@@ -21,6 +21,17 @@ stated once, and both readers call it:
 - **C. indented code** — four or more **columns** of indent, Markdown's other verbatim block.
 - **D. inline code** — a backtick span, which may open on one line of a paragraph and close on
   another (§6.1 normalizes a span's line endings to spaces).
+- **E. raw HTML** — from the first unescaped markup start (``<`` + a letter / ``!`` / ``?`` / ``/``)
+  left standing by A–D, everything to the END OF THE NOTE. This rule does not tokenize: it has no
+  tag set, no nesting depth, no attribute or comment handling. Three rounds tried to model raw HTML
+  piece by piece — a tag whitelist, then nesting, then attributes and comments — and each shipped
+  with the next token type still open (#14584 j#91406 F3, j#91593 F2/F3). A partial HTML parser
+  deciding authority IS the defect, so this asks only whether markup begins, never where it ends.
+  A marker inside a comment or an attribute is not even a quotation: it renders as **nothing**, and
+  an invisible string was becoming a durable gate event.
+- **Backslash escapes (§2.4)** — an escaped delimiter is a literal. Counting an escaped backtick as
+  a run pairs it with the REAL opener after it, so the span those two delimiters actually formed
+  stops being blanked; ``\\<`` starts no markup.
 
 None of B, C or D is a property of a single line, which is why the scan decides block structure
 first and applies D per paragraph afterwards. Every version of this module that asked a line about
@@ -60,12 +71,12 @@ Two properties of the scan are load-bearing rather than incidental:
   :func:`canonical_marker_fields`, which still reads one line at a time.)
 
 The cost is that a canonical marker must be written at top level and on one line: a marker indented
-four columns under a list bullet, split across lines, lazily continuing a blockquote, or sharing its
-paragraph with an unbalanced backtick run, is refused. Both canonical producers
-(:func:`...redmine_journal_source.render_gate_note` /
+four columns under a list bullet, split across lines, lazily continuing a blockquote, sharing its
+paragraph with an unbalanced backtick run, or standing anywhere below a line that starts markup, is
+refused. Both canonical producers (:func:`...redmine_journal_source.render_gate_note` /
 :func:`...redmine_journal_source.render_dispatch_note`) already render at column 0 on one line, and
-that direction of failure is recoverable — the writer re-records at column 0. The other direction,
-handing authority to a quotation, is not.
+that direction of failure is recoverable — the writer re-records at column 0, or backticks the tag
+they were talking about. The other direction, handing authority to a quotation, is not.
 """
 
 from __future__ import annotations
@@ -117,18 +128,9 @@ _INTERRUPTS_PARAGRAPH = (
     re.compile(r"^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)"),  # list item
 )
 
-#: Raw-HTML tags that put what follows them inside a verbatim or quoted element. Their block runs to
-#: their own closing tag — NOT to the next blank line: an unclosed ``<code>`` leaves every later line
-#: inside that element in the rendered document, which is exactly the state a blank line does not
-#: leave. This is wider than CommonMark §4.6's type-1 list on purpose; the extra tags are the ones
-#: the quotation contract names.
-_HTML_QUOTING_TAGS = ("pre", "script", "style", "textarea", "code", "blockquote")
-#: An HTML block start: any tag at the head of a line. Recognizing this broadly is deliberate — an
-#: unmodelled HTML construct must fall to "quoted", never to "the writer's own voice".
-_HTML_BLOCK_START = re.compile(r"^ {0,3}</?[A-Za-z][A-Za-z0-9-]*", re.IGNORECASE)
-#: Inline raw HTML that renders its content verbatim or as a quotation. The scan blanks from such an
-#: opening tag to its closing tag, and to the end of the paragraph if it never closes.
-_HTML_INLINE_OPEN = re.compile(r"<(?P<tag>code|pre|blockquote|script|style|textarea)\b[^>]*>", re.I)
+#: Anything that starts raw HTML: a tag, a closing tag, a comment / declaration / CDATA (``<!``) or
+#: a processing instruction (``<?``). This module does NOT tokenize what follows.
+_HTML_START = re.compile(r"<[A-Za-z!?/]")
 
 
 def _indent_columns(line: str) -> int:
@@ -187,7 +189,6 @@ def _classify_block_structure(lines: "list[str]") -> "list[str]":
     """
     classified: list[tuple[str, "int | None", bool]] = []
     fence: "tuple[str, int] | None" = None
-    html_closers: "tuple[str, ...] | None" = None
     quoted_paragraph = False
     paragraph: "int | None" = None
     counter = 0
@@ -195,14 +196,6 @@ def _classify_block_structure(lines: "list[str]") -> "list[str]":
         if fence is not None:  # A: inside a fence, only its own closer gets out
             if _closes_fence(line, *fence):
                 fence = None
-            classified.append(("", None, False))
-            paragraph = None
-            continue
-        if html_closers is not None:  # E: inside a raw-HTML block
-            if html_closers and any(closer in line.lower() for closer in html_closers):
-                html_closers = None  # §4.6 type 1: ends on the line carrying its closing tag
-            elif not html_closers and _ONLY_SPACE.match(line):
-                html_closers = None  # every other type: ends at the first blank line
             classified.append(("", None, False))
             paragraph = None
             continue
@@ -228,11 +221,6 @@ def _classify_block_structure(lines: "list[str]") -> "list[str]":
             quoted_paragraph, paragraph = True, None
             classified.append(("", None, False))
             continue
-        html = _html_block_closers(line)
-        if html is not None:  # E: a raw-HTML block starts here
-            html_closers, quoted_paragraph, paragraph = html, False, None
-            classified.append(("", None, False))
-            continue
         if quoted_paragraph and not any(p.match(line) for p in _INTERRUPTS_PARAGRAPH):
             classified.append(("", None, False))  # B: lazy continuation of the quote (§5.1)
             continue
@@ -244,40 +232,27 @@ def _classify_block_structure(lines: "list[str]") -> "list[str]":
     return classified
 
 
-def _html_block_closers(line: str) -> "tuple[str, ...] | None":
-    """The closing tags that end the raw-HTML block ``line`` starts, ``()`` for blank-line-ended,
-    ``None`` if it starts none (pure).
+def _is_escaped(text: str, index: int) -> bool:
+    """True if ``text[index]`` is preceded by an ODD number of backslashes (pure, CommonMark §2.4)."""
+    backslashes = 0
+    while index - backslashes - 1 >= 0 and text[index - backslashes - 1] == "\\":
+        backslashes += 1
+    return backslashes % 2 == 1
 
-    Raw HTML reaches the renderer as markup, so ``<pre>`` / ``<code>`` / ``<blockquote>`` around a
-    marker are quotation by exactly the contract this module states — and the scan did not model
-    them at all (#14584 j#91406 F3). Any tag at the head of a line is treated as a block start: an
-    HTML construct this module does not model must fall to "quoted", never to "the writer's voice".
+
+def _first_raw_html(line: str) -> int:
+    """The offset where raw HTML starts on ``line``, or ``-1`` (pure).
+
+    Deliberately does not say WHICH construct it is. Three rounds of modelling raw HTML piece by
+    piece — a tag whitelist, then nesting, then attributes and comments — each shipped with the next
+    token type still unhandled (#14584 j#91406 F3, j#91593 F2/F3). A partial HTML parser deciding
+    authority is the defect; this asks only "does markup start here", and the caller refuses
+    everything from here to the end of the note.
     """
-    if _HTML_BLOCK_START.match(line) is None:
-        return None
-    name = line.lstrip(" \t").lstrip("<").lstrip("/").split(">")[0].split()[0].lower()
-    if name in _HTML_QUOTING_TAGS:
-        return (f"</{name}>",)
-    return ()
-
-
-def _blank_inline_html(text: str) -> str:
-    """``text`` with every inline raw-HTML verbatim / quotation region blanked (pure).
-
-    From an opening :data:`_HTML_INLINE_OPEN` tag to its closing tag, or to the end of the paragraph
-    if it never closes — the same fail-closed rule an unmatched backtick string gets.
-    """
-    chars = list(text)
-    position = 0
-    while True:
-        opening = _HTML_INLINE_OPEN.search(text, position)
-        if opening is None:
-            return "".join(chars)
-        closing = re.compile(rf"</{opening.group('tag')}[ \t]*>", re.I).search(text, opening.end())
-        position = closing.end() if closing is not None else len(text)
-        for index in range(opening.start(), position):
-            if chars[index] != "\n":
-                chars[index] = " "
+    for match in _HTML_START.finditer(line):
+        if not _is_escaped(line, match.start()):
+            return match.start()
+    return -1
 
 
 def _blank_code_spans(text: str) -> str:
@@ -291,22 +266,31 @@ def _blank_code_spans(text: str) -> str:
     A backtick string with no match refuses the rest of the PARAGRAPH rather than being ignored —
     see the module docstring.
     """
-    runs = list(_BACKTICK_RUN.finditer(text))
+    # A backslash-escaped backtick is a literal, not a delimiter (§2.4): counting it would pair a
+    # run that never opened a span with the real opener after it, releasing the span's content
+    # (#14584 j#91593 F1). Such a run is shortened by its escaped first character, and disappears
+    # entirely if that was all of it.
+    runs = [
+        (match.start() + 1, match.end()) if _is_escaped(text, match.start()) else
+        (match.start(), match.end())
+        for match in _BACKTICK_RUN.finditer(text)
+    ]
+    runs = [(start, end) for start, end in runs if end > start]
     if not runs:
         return text
     chars = list(text)
     index = 0
     while index < len(runs):
-        opener = runs[index]
-        width = opener.end() - opener.start()
+        opener_start, opener_end = runs[index]
+        width = opener_end - opener_start
         closer = next(
-            (n for n in range(index + 1, len(runs)) if runs[n].end() - runs[n].start() == width),
+            (n for n in range(index + 1, len(runs)) if runs[n][1] - runs[n][0] == width),
             None,
         )
         if closer is None:  # unmatched backtick string: refuse to the end of the paragraph
-            start, end, index = opener.start(), len(text), len(runs)
+            start, end, index = opener_start, len(text), len(runs)
         else:
-            start, end, index = opener.start(), runs[closer].end(), closer + 1
+            start, end, index = opener_start, runs[closer][1], closer + 1
         for position in range(start, end):
             if chars[position] != "\n":
                 chars[position] = " "
@@ -340,13 +324,16 @@ def canonical_note_lines(notes: str) -> tuple[str, ...]:
         end = start
         while end < len(classified) and classified[end][1] == paragraph:
             end += 1
-        joined = _blank_inline_html("\n".join(lines[start:end]))
-        lines[start:end] = _blank_code_spans(joined).split("\n")
+        lines[start:end] = _blank_code_spans("\n".join(lines[start:end])).split("\n")
         start = end
-    return tuple(
-        "" if blanked else line
-        for line, (_text, _paragraph, blanked) in zip(lines, classified)
-    )
+    lines = ["" if blanked else line for line, (_t, _p, blanked) in zip(lines, classified)]
+    # Raw HTML is decided last, on what the rules above left standing — so a `<tag>` inside a code
+    # span or a fence is already gone and does not cost anything. From the first markup that is
+    # still in the writer's own text, nothing further in the note is establishable.
+    for index, line in enumerate(lines):
+        if _first_raw_html(line) >= 0:
+            return tuple(lines[:index] + [""] * (len(lines) - index))
+    return tuple(lines)
 
 
 def canonical_note_text(notes: str) -> str:

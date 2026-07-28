@@ -171,6 +171,26 @@ class FailClosedTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(_resolve([_entry("90409", note)]).status, WORK_ANCHOR_MISSING)
 
+    def test_markup_and_escaped_delimiters_are_missing_too(self):
+        # #14584 j#91593 F1-F3 at the join: each of these resolved to a work anchor before the fix,
+        # including the ones whose marker renders as nothing at all (comment / attribute).
+        marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
+        for label, note in (
+            ("html comment", "text <!-- %s --> text" % marker),
+            ("attribute value", 'text <span title="%s">visible</span>' % marker),
+            ("CDATA", "<![CDATA[\n%s\n]]>" % marker),
+            ("nested quoting tags", "<blockquote>\n<blockquote>\nq\n</blockquote>\n%s\n</blockquote>" % marker),
+            ("escaped backtick", "\\` x `%s`" % marker),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_resolve([_entry("90409", note)]).status, WORK_ANCHOR_MISSING)
+
+    def test_a_dispatch_recorded_above_the_markup_still_resolves(self):
+        # The bound at the join: markup later in the note must not un-dispatch the work above it.
+        marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
+        anchor = _resolve([_entry("90409", marker + "\n\nwe render <div> here")])
+        self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
+
     def test_a_crlf_dispatch_record_still_resolves(self):
         # The paired positive at the join: Redmine writes CRLF, so this is the ordinary case.
         marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()

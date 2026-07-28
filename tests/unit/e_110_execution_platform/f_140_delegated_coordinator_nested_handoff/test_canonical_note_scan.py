@@ -345,23 +345,80 @@ class RawHtmlTest(unittest.TestCase):
         # an unclosed <code> is still inside it in the rendered document.
         self.assertEqual(_gates(f"<code>\nquoted\n\n{MARKER}"), ())
 
-    def test_an_unknown_tag_at_the_head_of_a_line_is_refused(self):
-        # Fail closed on markup this module does not model, rather than guess it is harmless.
-        self.assertEqual(_gates(f"<figure>\n{MARKER}\n</figure>"), ())
+    def test_every_raw_html_token_type_is_refused(self):
+        # Comments, processing instructions, declarations and CDATA are not tags, and a marker in
+        # any of them renders as NOTHING — `pandoc -t plain` of a commented marker is just the
+        # surrounding words. Invisible text became gate authority (#14584 j#91593 F2).
+        for label, note in (
+            ("comment block", f"<!--\n{MARKER}\n-->"),
+            ("comment inline", f"text <!-- {MARKER} --> text"),
+            ("processing instruction", f"<?php\n{MARKER}\n?>"),
+            ("declaration", f"<!DOCTYPE\n{MARKER}\n>"),
+            ("CDATA", f"<![CDATA[\n{MARKER}\n]]>"),
+            ("attribute value", f'text <span title="{MARKER}">visible</span>'),
+            ("unknown tag", f"<figure>\n{MARKER}\n</figure>"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ())
 
-    def test_a_marker_after_a_closed_html_block_is_canonical(self):
-        # The paired positive: the refusal must end where the markup does.
-        self.assertEqual(_gates(f"<div>\nquoted\n</div>\n\n{MARKER}"), ("review_request",))
+    def test_nesting_and_close_like_text_do_not_end_the_refusal(self):
+        # Depth and tokenization are exactly what this module stopped trying to model: an inner
+        # </tag>, or one written inside an attribute or a comment, used to end the quotation early
+        # while the renderer kept the marker inside the outer element (#14584 j#91593 F3).
+        for label, note in (
+            ("nested block tags", f"<blockquote>\n<blockquote>\nq\n</blockquote>\n{MARKER}\n</blockquote>"),
+            ("nested inline tags", f"text <code>outer <code>inner</code> {MARKER} </code>"),
+            ("close-like text in an attribute", f'<pre>\n<b t="</pre>">x</b>\n{MARKER}\n</pre>'),
+            ("close-like text in a comment", f"<pre>\n<!-- </pre> -->\n{MARKER}\n</pre>"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ())
 
-    def test_an_unclosed_non_quoting_tag_ends_at_the_blank_line(self):
-        # The other side of the rule above, and the one that keeps this refusal bounded: only tags
-        # that put what follows INSIDE a verbatim or quoted element run to their closing tag.
-        # Everything else ends where its block does, or an unclosed <div> would eat the rest of the
-        # note. (Without this case the "every tag runs to its closer" mutation goes undetected.)
-        self.assertEqual(_gates(f"<div>\nquoted\n\n{MARKER}"), ("review_request",))
+    def test_markup_anywhere_refuses_the_rest_of_the_note(self):
+        # The accepted cost of not tokenizing: this module cannot say where markup ENDS without
+        # parsing it, so it refuses from where markup begins. Prose that merely mentions a tag pays
+        # this too. Recoverable — the writer backticks the tag, or records above it.
+        self.assertEqual(_gates(f"we render <div> here\n\n{MARKER}"), ())
+        self.assertEqual(_gates(f"<div>\nquoted\n</div>\n\n{MARKER}"), ())
 
-    def test_prose_mentioning_a_tag_mid_line_is_not_a_block(self):
-        self.assertEqual(_gates(f"we render <div> here\n\n{MARKER}"), ("review_request",))
+    def test_the_refusal_starts_where_the_markup_does_and_not_before(self):
+        # The bound that keeps the rule from being "refuse every note": a marker ABOVE the markup
+        # is still the writer's own voice.
+        self.assertEqual(_gates(f"{MARKER}\n\nwe render <div> here"), ("review_request",))
+
+    def test_markup_inside_a_quotation_costs_nothing(self):
+        # Raw HTML is decided on what the other rules left standing, so a tag inside a code span or
+        # a fence is already blanked and never triggers the refusal.
+        self.assertEqual(_gates(f"we render `<div>` here\n\n{MARKER}"), ("review_request",))
+        self.assertEqual(_gates(f"```\n<div>\n```\n\n{MARKER}"), ("review_request",))
+
+    def test_an_escaped_angle_bracket_is_not_markup(self):
+        # A backslash-escaped `<` is a literal (§2.4), so it starts nothing.
+        self.assertEqual(_gates(f"we render \\<div> here\n\n{MARKER}"), ("review_request",))
+
+
+class BackslashEscapeTest(unittest.TestCase):
+    """A backslash-escaped delimiter is a literal, not a delimiter (CommonMark 0.31.2 §2.4).
+
+    Counting an escaped backtick as a run paired it with the REAL opener after it, so the span
+    those two delimiters actually formed stopped being blanked and released its content
+    (#14584 j#91593 F1).
+    """
+
+    def test_an_escaped_backtick_does_not_open_a_span(self):
+        self.assertEqual(_gates(f"\\` x `{MARKER}`"), ())
+
+    def test_an_escaped_backtick_does_not_pair_with_a_real_one(self):
+        self.assertEqual(_gates(f"text \\`code` {MARKER}`"), ())
+
+    def test_an_escaped_backtick_inside_a_span_is_span_content(self):
+        # The paired positive: the span still closes on its real delimiter, so the marker after it
+        # is the writer's own voice.
+        self.assertEqual(_gates(f"`a\\`b` {MARKER}"), ("review_request",))
+
+    def test_an_escaped_backslash_does_not_escape_the_backtick(self):
+        # `\\` is a literal backslash; the backtick after it is still a delimiter.
+        self.assertEqual(_gates(f"text \\\\`{MARKER}`"), ())
 
 
 class ScanIsPerLineTest(unittest.TestCase):

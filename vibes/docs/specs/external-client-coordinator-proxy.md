@@ -94,11 +94,20 @@ authorize したかを照合しなければ scope は未検証のままである
       delimiter 間の marker が解放される)。当該行自体は従来どおり blank 化する。
     - **D. inline code** — backtick span。**同一 paragraph 内であれば opener と closer は別の行に
       あってよい** (§6.1 は span の line ending を space へ正規化する)。
-    - **E. raw HTML** — 行頭の tag は HTML block を開く (§4.6)。`code` / `pre` / `blockquote` /
-      `script` / `style` / `textarea` は**自身の閉じ tag まで**(blank line では終わらない — 閉じて
-      いない `<code>` は以降の全行を当該 element の内側に置く)。他の tag は blank line で終わる。
-      inline の同 tag も opener から closer まで、閉じなければ paragraph 末尾まで blank 化する。
-      **modelしていない markup は quoted 側へ倒す。**
+    - **E. raw HTML** — **tokenize しない。** 他の規則が blank した後に残った text に escape されて
+      いない markup 起動 (`<` + letter / `!` / `?` / `/`) が現れたら、**その行以降 note 末尾まで**を
+      拒否する。tag 集合も nesting depth も attribute も comment も持たない。
+      ★★★ここは 3 世代「HTML を少しずつ model する」設計で失敗した (#14584 j#91406 F3 = tag 未対応、
+      j#91593 F2 = block type 2-5 / 属性 / comment 未対応、j#91593 F3 = nesting と attribute 内の
+      close-like text)。**部分実装の HTML parser を authority 判定に置くこと自体が defect** であり、
+      次の token 種で同じ finding が出る。よって「どこで markup が終わるか」を答えるのをやめ、
+      「markup が始まるか」だけを見る。**判定は最後に行う** — code span や fence の中の `<tag>` は
+      既に blank 済みなので費用ゼロである。
+      なお **marker が comment / 属性値の中にある場合、描画結果に一切現れない** (`pandoc -t plain`
+      で消える)。「引用」ですらなく**不可視の文字列**が gate authority になっていた。
+    - **§2.4 backslash escape** — escape された delimiter は literal であり delimiter ではない。
+      escaped backtick を run に数えると、その run が後続の**本物の opener と対になり**、実際に span を
+      形成していた 2 delimiter の間が blank されなくなる (j#91593 F1)。`\<` も同様に markup を起動しない。
     - **字類と line ending。** block 構造上の空白は **U+0020 と U+0009 のみ** (§2.1)。Python の `\s`
       は Unicode 空白全部に一致するため、blank line 判定・fence closer・interrupter のいずれでも
       NBSP / EM SPACE / form feed を空白と誤認し、開いている引用を閉じてしまう。**line ending は
@@ -138,9 +147,14 @@ authorize したかを照合しなければ scope は未検証のままである
     ★★★**列挙者を自分に置く限りこの漏れは反復する** (#14584 j#91194)。同じ面で手作業の列挙が
     3 round 連続で漏れた — B/C 漏れ (#14577 j#90392)、delimiter 漏れ (j#91152)、block 構造漏れ
     (j#91194)。**「規則の側から掃いた」も、掃く規則を自分で列挙している限り同じ失敗である。**
-    以後この面の検証は **実 CommonMark 実装を differential oracle として使う**: note を renderer に
-    かけて marker が `<code>` / `<pre>` / `<blockquote>` の内側かを判定し、scanner の判定と機械的に
-    突き合わせる。renderer は**検証時の instrument であって runtime 依存ではない** (package に足さない)。
+    以後この面の検証は **実 CommonMark 実装を differential oracle として使う**。renderer は**検証時の
+    instrument であって runtime 依存ではない** (package に足さない)。
+    ★★★**oracle の述語を間違えると、corpus をいくら回しても差分は出ない** (#14584 j#91593 F2)。
+    「`<code>`/`<pre>`/`<blockquote>` の内側でないこと」を canonical の定義にしていたため、comment や
+    属性値の中の marker は「引用されていない」と判定され、651 shape を通しても検出できなかった。
+    正しい述語は **「marker が可視の散文テキストとして描画されること」** である: HTML 出力上の位置が
+    verbatim / quotation element の内側でないことに加え、**plain text 出力にその文字列が残ること**を
+    要求する (comment / 属性 / `script` / `style` / `textarea` の中身はここで消える)。
     ★★★**oracle を入れても、corpus の生成軸を自分で決めている限り同じ漏れが残る** (#14584 j#91406)。
     R3 は oracle を導入した上でなお字類・hanging indent・raw HTML の 3 軸を落とし、しかも
     「HTML 軸未実施」と自分の review_request に書いたまま head を出した。よって **corpus の生成軸は
@@ -150,10 +164,11 @@ authorize したかを照合しなければ scope は未検証のままである
     review_request を出さない。**
   - 代償として **decision は top-level に書く**必要がある (4 column 以上 indent した marker、
     blockquote を lazy 継続する行の marker、対応しない backtick run を含む paragraph の marker、
-    raw HTML block 内の marker、単独 `\r` を含む note は拒否される)。この向きの失敗は coordinator が
-    blank line を挟んで column 0 に書き直せば済む。逆向きの失敗 (引用に authority を渡す) は
-    復旧できない。**実 journal への影響は live 実測で確認する** — 20 issue / 154 marker で R3 と R4 の
-    marker 集合は完全一致した (硬化で落ちた実 marker は 0)。
+    **markup 起動 `<` 以降の全行**、単独 `\r` を含む note は拒否される)。この向きの失敗は coordinator が
+    blank line を挟んで column 0 に書き直す、または tag を backtick で囲めば済む。逆向きの失敗
+    (引用に authority を渡す) は復旧できない。**実 journal への影響は live 実測で確認する** —
+    20 issue で R3→R4 は 154 marker、R4→R5 は 166 marker、いずれも**集合が完全一致**した
+    (硬化で落ちた実 marker は 0)。
   - **scan は行単位で行う。** marker body の grammar は `[^\]]*` で改行を跨ぐため、blank 化した note
     を 1 文字列として scan すると、canonical 行の閉じていない `[mozyo:` が引用行を越えて後続の `]`
     で閉じ、**どの 1 行にも存在しない marker** が成立しうる。
