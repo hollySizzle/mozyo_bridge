@@ -262,6 +262,15 @@ authorize したかを照合しなければ scope は未検証のままである
       拾うため、`١.` / `１.` / `१.` が container と誤認され**実 gate を消した**。正: `[0-9]{1,9}[.)]`。
       **これは `\s` が Markdown の空白より広かった件 (j#91406 F1) と同型で、同じ原因が別の class に
       残っていた。** 規約由来の class は module 全体で 1 度に洗う。
+      ★★★**probe で見たことを「test で担保した」と書かない** (#14584 j#92071)。上の Unicode 数字は
+      3 形 (`١.` / `１.` / `१.`) を scanner / gate reader / work-anchor の 3 層で回復させる remedy だった
+      が、**committed test で 3 形あったのは scanner 層だけ**で、downstream 2 層は 2 形しか無かった。
+      挙動は 3 層とも正しく、ad-hoc probe でもそう観測していた — **欠けていたのは、次に層固有の変更が
+      入ったときに落ちる回帰証跡**である。それを「3 層で確認・回復」と記録したので、記録が
+      committed test より広い主張になっていた。**remedy が層を数えているなら、その層数を test の側で
+      数え直す。** subTest は `Ran` を増やさないので、件数は担保の指標にならない — **担保は
+      「その case を落とす mutation があるか」で示す** (ここでは class を `\d` へ戻すと当該 2 層の
+      Devanagari case だけが赤化する)。
       ★★★**oracle の述語は連言でなければならない** (#14584 j#91863)。R6 で「plain に残る」を
       「text node である」へ**置き換えた**が、raw HTML passthrough は tag 除去後の残骸が text に見える
       ため text-node 判定を通り、plain が空であることを見ていなかった。正しくは
