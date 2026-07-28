@@ -182,6 +182,44 @@ the call anyway and later retentions try again.
 """
 
 
+def _took_the_interrupt(
+    unadmitted: list[_Occurrence], interrupt: BaseException, first: BaseException | None
+) -> BaseException | None:
+    """Take priority for ``interrupt`` and queue it, without letting one out.
+
+    Catching a control-flow exception is not the same as handling it: the
+    ``except`` body is ordinary code outside the ``try`` that caught it, so a
+    *second* interrupt arriving while the first was being turned into an
+    occurrence escaped the retention entirely and skipped a cleanup that had
+    not run yet (j#90807 R22-F1). Both retention rails route their handler
+    through here, so the rule is decided once rather than per call site.
+
+    A nested interrupt gets one attempt at retaining *both* — the interrupt it
+    landed on and itself — and is then absorbed. Surfacing it would cost the
+    remaining teardown actions, and those outrank a second interrupt whose
+    arrival is already represented by the first.
+
+    What is left is the call instruction itself — the same one-instruction
+    residue as the queue append, and no wider.
+    """
+    occurrence: _Occurrence | None = None
+    try:
+        if first is None:
+            first = interrupt
+        occurrence = _Occurrence(interrupt)
+        unadmitted.append(occurrence)
+    except BaseException as nested:  # noqa: BLE001 - absorbed, never raised
+        try:
+            # Identity, so a nested arrival *after* the append does not queue
+            # the same occurrence twice — the commit-boundary lesson again.
+            if occurrence is not None and not any(queued is occurrence for queued in unadmitted):
+                unadmitted.append(occurrence)
+            unadmitted.append(_Occurrence(nested))
+        except BaseException:  # noqa: BLE001 - the regress ends here, by design
+            pass
+    return first
+
+
 class _Retention:
     """One unwind's retention, with the occurrences the carrier has not taken.
 
@@ -253,9 +291,7 @@ class _Retention:
             except Exception:  # noqa: BLE001 - nothing to route; admitted below
                 break
             except BaseException as interrupt:  # noqa: BLE001 - routed, not raised
-                if first is None:
-                    first = interrupt
-                unadmitted.append(_Occurrence(interrupt))
+                first = _took_the_interrupt(unadmitted, interrupt, first)
         return self._admit_before_leaving(unadmitted, first)
 
     def _admit_before_leaving(
@@ -286,9 +322,7 @@ class _Retention:
             except Exception:  # noqa: BLE001 - the queue is a plain list; retry
                 continue
             except BaseException as interrupt:  # noqa: BLE001 - routed, not raised
-                if first is None:
-                    first = interrupt
-                unadmitted.append(_Occurrence(interrupt))
+                first = _took_the_interrupt(unadmitted, interrupt, first)
         return first
 
     def _admit(self, unadmitted: list[_Occurrence]) -> None:

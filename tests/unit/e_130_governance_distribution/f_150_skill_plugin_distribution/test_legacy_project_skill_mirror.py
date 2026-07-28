@@ -2513,6 +2513,125 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
                 else:
                     self.assertIsNone(first, "an ordinary failure is not control flow")
 
+    def _interrupt_while_taking_an_interrupt(self, match: str):
+        """Raise once inside `_took_the_interrupt`, on the line holding `match`."""
+        line = self._source_line(owned_descriptors._took_the_interrupt, match)
+        code = owned_descriptors._took_the_interrupt.__code__
+        nested = GeneratorExit("a second interrupt while recording the first")
+        fired: list[bool] = []
+
+        def local(frame, event, arg):  # type: ignore[no-untyped-def]
+            if event == "line" and frame.f_lineno == line and not fired:
+                fired.append(True)
+                raise nested
+            return local
+
+        def tracer(frame, event, arg):  # type: ignore[no-untyped-def]
+            return local if frame.f_code is code else None
+
+        return tracer, fired, nested
+
+    def _interrupt_the_main_rail(self):
+        """Interrupt the carrier once, so the main retention rail handles it."""
+        real_ledger = owned_descriptors._ledger
+        fired: list[bool] = []
+        interrupt = KeyboardInterrupt("the carrier was interrupted")
+
+        def interrupts_once(primary):  # type: ignore[no-untyped-def]
+            if not fired:
+                fired.append(True)
+                raise interrupt
+            return real_ledger(primary)
+
+        return (
+            unittest.mock.patch.object(owned_descriptors, "_ledger", interrupts_once),
+            interrupt,
+        )
+
+    def _interrupt_the_final_rail(self):
+        """Fail the main admission, then interrupt the exit rail."""
+        real_enqueue = owned_descriptors._Retention._enqueue
+        calls: list[int] = []
+        interrupt = KeyboardInterrupt("the final admission was interrupted")
+
+        def scheduled(retention, occurrence):  # type: ignore[no-untyped-def]
+            calls.append(1)
+            if len(calls) == 1:
+                raise MemoryError("the main admission failed")
+            if len(calls) == 2:
+                raise interrupt
+            return real_enqueue(retention, occurrence)
+
+        return (
+            unittest.mock.patch.object(
+                owned_descriptors._Retention, "_enqueue", scheduled
+            ),
+            interrupt,
+        )
+
+    def test_a_nested_interrupt_never_skips_a_remaining_action(self) -> None:
+        """j#90807 R22-F1. Catching a control-flow exception is not the same as
+        handling it: the `except` body is ordinary code outside the `try` that
+        caught it, so a second interrupt arriving while the first was being
+        turned into an occurrence escaped the retention and skipped a cleanup.
+        Measured before the fix on the main rail: `actions=['failing']`, the
+        `GeneratorExit` escaping `_teardown_during`, an empty ledger, and the
+        first interrupt's priority lost as well.
+
+        Both rails and both boundaries inside the conversion, because the last
+        three rounds each fixed one rail and left the other shaped the same way.
+        """
+        for rail, drive in (
+            ("main", self._interrupt_the_main_rail),
+            ("final", self._interrupt_the_final_rail),
+        ):
+            for boundary, match in (
+                ("after the occurrence exists", "unadmitted.append(occurrence)"),
+                ("before it exists", "occurrence = _Occurrence(interrupt)"),
+            ):
+                with self.subTest(rail=rail, boundary=boundary):
+                    patch, interrupt = drive()
+                    tracer, fired, nested = self._interrupt_while_taking_an_interrupt(match)
+
+                    ran: list[str] = []
+
+                    def failing() -> None:
+                        ran.append("failing")
+                        raise RuntimeError("teardown failure")
+
+                    def quiet() -> None:
+                        ran.append("quiet")
+
+                    primary = Exception("write failed")
+                    with patch:
+                        sys.settrace(tracer)
+                        try:
+                            control = owned_descriptors._teardown_during(
+                                primary, failing, quiet
+                            )
+                        finally:
+                            sys.settrace(None)
+
+                    self.assertTrue(fired, "the nested injection never fired")
+                    self.assertEqual(
+                        ["failing", "quiet"], ran, "a remaining action was skipped"
+                    )
+                    self.assertIs(control, interrupt, "the first interrupt lost priority")
+
+                    ledger = owned_descriptors.teardown_failures(primary)
+                    self.assertEqual(
+                        1,
+                        sum(1 for entry in ledger if entry is nested),
+                        "the nested interrupt was not retained",
+                    )
+                    if match == "unadmitted.append(occurrence)":
+                        # Its occurrence already existed, so both are keepable.
+                        self.assertEqual(
+                            1,
+                            sum(1 for entry in ledger if entry is interrupt),
+                            "the interrupt being recorded was lost",
+                        )
+
     def test_an_interrupt_during_the_final_admission_still_counts(self) -> None:
         """j#90779 R21-F1. The exit rail added for R20-F1 swallowed control flow
         with a `continue`, under a comment claiming priority was already
