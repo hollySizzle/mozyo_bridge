@@ -275,6 +275,17 @@ class FailClosedTest(unittest.TestCase):
         anchor = _resolve([_entry("90409", "- <!@b>\n\n" + marker)])
         self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
 
+    def test_a_unicode_digit_prefix_does_not_erase_the_anchor(self):
+        # The same liveness case at the join (#14584 j#92045).
+        marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
+        for label, note in (
+            ("Arabic-Indic one", "\u0661. <!--a@b>\n\n%s" % marker),
+            ("fullwidth one", "\uff11. <!--a@b>\n\n%s" % marker),
+        ):
+            with self.subTest(label):
+                anchor = _resolve([_entry("90409", note)])
+                self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
+
     def test_a_crlf_dispatch_record_still_resolves(self):
         # The paired positive at the join: Redmine writes CRLF, so this is the ordinary case.
         marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()

@@ -257,6 +257,11 @@ authorize したかを照合しなければ scope は未検証のままである
       ordered marker の **start number が 1** であり、`01.` / `000000001.` も 1 である。literal `1` で
       書いたため leading zero 付きを prose と誤判定し、**描画されない block 内 marker を受理した**。
       正: `0{0,8}1[.)]` (1–9 桁で値が 1)。**規約の文言をそのまま述語へ写し、写せないなら理由を書く。**
+      ★★★**character class は「規約の集合」であって「言語の略記」ではない** (#14584 j#92045)。ordered
+      marker は §5.2 で **1–9 個の Arabic digits (0–9)** だが Python の `\d` は Unicode decimal digit も
+      拾うため、`١.` / `１.` / `१.` が container と誤認され**実 gate を消した**。正: `[0-9]{1,9}[.)]`。
+      **これは `\s` が Markdown の空白より広かった件 (j#91406 F1) と同型で、同じ原因が別の class に
+      残っていた。** 規約由来の class は module 全体で 1 度に洗う。
       ★★★**oracle の述語は連言でなければならない** (#14584 j#91863)。R6 で「plain に残る」を
       「text node である」へ**置き換えた**が、raw HTML passthrough は tag 除去後の残骸が text に見える
       ため text-node 判定を通り、plain が空であることを見ていなかった。正しくは

@@ -654,6 +654,22 @@ class PassOrderTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(_gates(note), ("review_request",))
 
+    def test_an_ordered_marker_is_arabic_digits_only(self):
+        # CommonMark's ordered marker is one to nine ARABIC digits (§5.2); Python's `\d` also
+        # matches every other Unicode decimal digit, so these read as list containers and the gate
+        # below them was erased (#14584 j#92045). Same shape as `\s` being wider than Markdown's
+        # whitespace — the character classes have to be the specification's, not the language's.
+        for label, note in (
+            ("Arabic-Indic one", f"\u0661. <!--a@b>\n\n{MARKER}"),
+            ("fullwidth one", f"\uff11. <!--a@b>\n\n{MARKER}"),
+            ("Devanagari one", f"\u0967. <!--a@b>\n\n{MARKER}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ("review_request",))
+        # ...and the ASCII controls that really are lists still open a container.
+        self.assertEqual(_gates(f"1. <!--a@b>\n\n{MARKER}"), ())
+        self.assertEqual(_gates(f"2. <!--a@b>\n\n{MARKER}"), ())
+
     def test_the_ninth_digit_is_the_last_one_a_marker_may_have(self):
         # The tenth-digit edge of the same rule. It does not show through the block-start test —
         # the container prefix caps at nine digits too, so both spellings fail it — but it does

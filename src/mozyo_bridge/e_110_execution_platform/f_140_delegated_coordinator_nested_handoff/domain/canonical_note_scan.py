@@ -190,7 +190,11 @@ _HIDDEN_CONSTRUCT_START = re.compile(r"<[A-Za-z!?/]")
 _HTML_BLOCK_OPENER = re.compile(r"<!--|<\?|<![A-Za-z]")
 #: A list marker, which opens a container (CommonMark §5.2). What may follow it is decided in
 #: COLUMNS by :func:`_is_block_start_column`, not by counting characters.
-_LIST_MARKER = re.compile(r"[-+*]|\d{1,9}[.)]")
+# ``[0-9]`` rather than ``\d``: Python's class covers every Unicode decimal digit, while
+#: CommonMark's ordered marker is one to nine ARABIC digits (§5.2). Reading `١.` as a list
+#: made it a container and erased the gate below it (#14584 j#92045) — the same shape as `\s`
+#: being wider than Markdown's whitespace (j#91406 F1).
+_LIST_MARKER = re.compile(r"[-+*]|[0-9]{1,9}[.)]")
 _AUTOLINK = re.compile(
     r"<(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*"
     r"|[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -211,13 +215,20 @@ def _indent_columns(line: str) -> int:
     """
     column = 0
     for char in line:
-        if char == " ":
-            column += 1
-        elif char == "\t":
-            column += _TAB_STOP - (column % _TAB_STOP)
-        else:
+        if char not in " \t":
             break
+        column += _column_step(char, column)
     return column
+
+
+def _column_step(char: str, column: int) -> int:
+    """How many COLUMNS ``char`` advances from ``column`` (pure, CommonMark 0.31.2 §2.2).
+
+    The one place this arithmetic lives. It was written twice — once here and once in the container
+    prefix walk — and the copy that was added later counted characters, so two tabs read as two
+    columns and a real gate was refused (#14584 j#91938).
+    """
+    return 1 if char == " " else _TAB_STOP - (column % _TAB_STOP)
 
 
 def _fence_opener(line: str) -> "tuple[str, int] | None":
@@ -414,7 +425,7 @@ def _is_block_start_column(prefix: str) -> bool:
     while index < len(prefix) and prefix[index] in " \t":
         # The boundary holds after the step, not before it: a tab at column 0, 1 or 2 lands on
         # column 4, and checking beforehand consumed it as indentation anyway (#14584 j#91954 F1).
-        step = 1 if prefix[index] == " " else _TAB_STOP - (column % _TAB_STOP)
+        step = _column_step(prefix[index], column)
         if column + step > 3:
             break
         column += step
@@ -427,7 +438,7 @@ def _is_block_start_column(prefix: str) -> bool:
         index = marker.end()
         width = 0
         while index < len(prefix) and prefix[index] in " \t":
-            step = 1 if prefix[index] == " " else _TAB_STOP - (column % _TAB_STOP)
+            step = _column_step(prefix[index], column)
             width += step
             column += step
             index += 1

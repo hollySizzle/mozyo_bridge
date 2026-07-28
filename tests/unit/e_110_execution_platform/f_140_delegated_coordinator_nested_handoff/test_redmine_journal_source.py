@@ -432,6 +432,15 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             self._gates("- <https://example.test/>\n\n%s" % self.GATE), ("review_request",)
         )
 
+    def test_a_unicode_digit_prefix_does_not_erase_the_gate(self):
+        # #14584 j#92045: only ARABIC digits make an ordered list marker.
+        for label, note in (
+            ("Arabic-Indic one", "\u0661. <!--a@b>\n\n%s" % self.GATE),
+            ("fullwidth one", "\uff11. <!--a@b>\n\n%s" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ("review_request",))
+
     def test_a_gate_recorded_above_the_markup_still_counts(self):
         # The bound: refusing from where markup starts must not erase what came before it.
         self.assertEqual(self._gates(self.GATE + "\n\nwe render <div> here"), ("review_request",))
