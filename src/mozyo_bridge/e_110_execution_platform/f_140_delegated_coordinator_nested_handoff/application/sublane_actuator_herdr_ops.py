@@ -338,6 +338,7 @@ class HerdrSublaneActuatorOps:
         startup_fence: "StartupTransactionFence | None" = None,
         admission_lock_held: bool = False,
         providers: "Sequence[str] | None" = None,
+        pair_order: "Sequence[str] | None" = None,
     ):
         """Run the production session composition and return its durable launch result.
 
@@ -354,6 +355,12 @@ class HerdrSublaneActuatorOps:
                     if providers is None
                     else tuple(providers)
                 ),
+                # Redmine #14569 R2-F1: when the caller shrank `providers` to one leg, the
+                # lane's stable `(gateway, worker)` order is the only thing that can still
+                # say which role the declared ratio's share belongs to. It is passed in
+                # already resolved — never re-resolved here, which would add a failure mode
+                # to a launch whose caller has proven the binding once already.
+                pair_order=tuple(pair_order) if pair_order else None,
                 lane_id=self.lane_label,
                 env=self.env,
                 runner=self.runner,
@@ -664,6 +671,7 @@ class HerdrSublaneActuatorOps:
                         if self.replacement_target_only and target_provider
                         else None
                     ),
+                    pair_order=managed_pair,
                 ),
                 target_only=self.replacement_target_only,
             )

@@ -65,6 +65,7 @@ def prepare_actuator_lane_session(
     startup_fence: StartupTransactionFence | None = None,
     admission_lock_held: bool = False,
     launch_context: object = None,
+    pair_order: object = None,
 ) -> SessionStartResult:
     """Compose one actuator launch, optionally beneath its caller-held store lock.
 
@@ -93,6 +94,9 @@ def prepare_actuator_lane_session(
     return session_start(
         repo_root=Path(worktree_path),
         providers=list(providers),
+        # Redmine #14569 R2-F1: `providers` may be a target-only SUBSET, so the ratio's
+        # order-relative side must read the lane's stable pair order instead of it.
+        pair_order=list(pair_order) if pair_order else None,
         lane_id=lane_id,
         env=env,
         runner=runner,

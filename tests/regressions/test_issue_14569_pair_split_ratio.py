@@ -552,7 +552,7 @@ class LaunchRatioTest(unittest.TestCase):
     """
 
     def _prepare(self, tmp, *, herdr, lane_placement, providers=("codex", "claude"),
-                 lane="lane-1", dry_run=False, existing_rows=None):
+                 lane="lane-1", dry_run=False, pair_order=None):
         repo = Path(tmp) / "repo"
         repo.mkdir(exist_ok=True)
         home = Path(tmp) / "home"
@@ -579,6 +579,7 @@ class LaunchRatioTest(unittest.TestCase):
                 runner=herdr.run,
                 dry_run=dry_run,
                 lane_placement=lane_placement,
+                pair_order=pair_order,
                 attestation_reader=_attesting_reader(herdr),
                 probe=_FAST_PROBE,
             )
@@ -717,7 +718,8 @@ class LaunchRatioTest(unittest.TestCase):
             herdr.run([str(Path(tmp) / "fake-herdr"), "pane", "close", secondary.locator])
             before = len(self._resize_calls(herdr))
             healed = self._prepare(
-                tmp, herdr=herdr, lane_placement=config, providers=(secondary.provider,)
+                tmp, herdr=herdr, lane_placement=config, providers=(secondary.provider,),
+                pair_order=("codex", "claude"),
             )
         self.assertEqual([s.provider for s in healed.slots], [secondary.provider])
         self.assertEqual(healed.ratio_outcome, RATIO_APPLIED, healed.ratio_detail)
@@ -741,12 +743,134 @@ class LaunchRatioTest(unittest.TestCase):
             herdr.run([str(Path(tmp) / "fake-herdr"), "pane", "close", primary.locator])
             before = len(self._resize_calls(herdr))
             healed = self._prepare(
-                tmp, herdr=herdr, lane_placement=config, providers=("codex",)
+                tmp, herdr=herdr, lane_placement=config, providers=("codex",),
+                pair_order=("codex", "claude"),
             )
         self.assertEqual(healed.ratio_outcome, RATIO_DEFERRED, healed.ratio_detail)
         self.assertIn("codex", healed.ratio_detail)
         self.assertEqual(len(self._resize_calls(herdr)), before)
         self.assertTrue(healed.ratio_ok)
+
+    def _first_side_provider(self, herdr, anchor_locator):
+        """The provider physically holding the FIRST (top) side, read from the live layout."""
+        out = herdr.run(
+            ["herdr", "pane", "layout", "--pane", anchor_locator],
+            capture_output=True, text=True,
+        )
+        snapshot = parse_pane_layout(out.stdout)
+        first_pane = min(snapshot.panes.items(), key=lambda kv: kv[1].y)[0]
+        name = next(a["name"] for a in herdr.agents if a["pane_id"] == first_pane)
+        return decode_assigned_name(name).identity.role
+
+    def test_an_undeclared_order_still_means_the_binding_order_on_a_shrunk_request(self) -> None:
+        # Review j#91263 R2-F1. The `sublane` product default leaves `order` UNDECLARED on
+        # purpose — so the repo-local binding's `(gateway, worker)` order is respected, not
+        # overridden. That is a positive claim, not the absence of one. A target-only
+        # replacement shrinks the request to a single provider, so the request can no longer
+        # carry it; the caller's stable pair order must. Healing the GATEWAY previously made
+        # the surviving worker the first side and handed it the gateway's declared 0.8.
+        gateway, worker = "codex", "claude"
+        herdr = FakeHerdr()
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh = self._prepare(
+                tmp, herdr=herdr, lane_placement=config, providers=(gateway, worker)
+            )
+            self.assertEqual(fresh.ratio_outcome, RATIO_APPLIED, fresh.ratio_detail)
+            self.assertEqual(
+                self._first_side_provider(herdr, fresh.slots[0].locator), gateway
+            )
+            victim = next(s for s in fresh.slots if s.provider == gateway)
+            herdr.run([str(Path(tmp) / "fake-herdr"), "pane", "close", victim.locator])
+            before = len(self._resize_calls(herdr))
+            healed = self._prepare(
+                tmp, herdr=herdr, lane_placement=config, providers=(gateway,),
+                pair_order=(gateway, worker),
+            )
+        # The gateway could only be launched as the split (second side), so its declared
+        # share cannot be honoured without moving a live pane. Say so; divide nothing.
+        self.assertEqual(healed.ratio_outcome, RATIO_DEFERRED, healed.ratio_detail)
+        self.assertEqual(len(self._resize_calls(herdr)), before)
+        self.assertAlmostEqual(
+            herdr.split_ratio_of(healed.slots[0].locator), 0.5, places=6
+        )
+
+    def test_an_undeclared_order_worker_heal_keeps_the_share_on_the_gateway(self) -> None:
+        # The other side of R2-F1: healing the WORKER leaves the gateway on the first side,
+        # so the declared share is honoured and really does land on the gateway.
+        gateway, worker = "codex", "claude"
+        herdr = FakeHerdr()
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh = self._prepare(
+                tmp, herdr=herdr, lane_placement=config, providers=(gateway, worker)
+            )
+            victim = next(s for s in fresh.slots if s.provider == worker)
+            herdr.run([str(Path(tmp) / "fake-herdr"), "pane", "close", victim.locator])
+            before = len(self._resize_calls(herdr))
+            healed = self._prepare(
+                tmp, herdr=herdr, lane_placement=config, providers=(worker,),
+                pair_order=(gateway, worker),
+            )
+            side = self._first_side_provider(herdr, healed.slots[0].locator)
+            live = herdr.split_ratio_of(healed.slots[0].locator)
+        self.assertEqual(healed.ratio_outcome, RATIO_APPLIED, healed.ratio_detail)
+        self.assertGreater(len(self._resize_calls(herdr)), before)
+        self.assertEqual(side, gateway)
+        self.assertAlmostEqual(live, 0.8, places=6)
+
+    def test_a_rebound_binding_keeps_the_share_on_ITS_first_role(self) -> None:
+        # The order that matters is the LANE's, not a hard-coded `(codex, claude)`. With a
+        # rebound binding the worker leads, so a target-only heal of the now-second provider
+        # must put the declared share on the rebound first role.
+        first, second = "claude", "codex"
+        herdr = FakeHerdr()
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh = self._prepare(
+                tmp, herdr=herdr, lane_placement=config, providers=(first, second)
+            )
+            victim = next(s for s in fresh.slots if s.provider == second)
+            herdr.run([str(Path(tmp) / "fake-herdr"), "pane", "close", victim.locator])
+            healed = self._prepare(
+                tmp, herdr=herdr, lane_placement=config, providers=(second,),
+                pair_order=(first, second),
+            )
+            side = self._first_side_provider(herdr, healed.slots[0].locator)
+            live = herdr.split_ratio_of(healed.slots[0].locator)
+        self.assertEqual(healed.ratio_outcome, RATIO_APPLIED, healed.ratio_detail)
+        self.assertEqual(side, first)
+        self.assertAlmostEqual(live, 0.8, places=6)
+
+    def test_a_shrunk_request_with_no_stable_order_defers_rather_than_guessing(self) -> None:
+        # The fail-safe end of R2-F1: a caller that shrinks the request and supplies NO
+        # stable pair order has left the run unable to attribute the first side. The single
+        # provider it holds is trivially "first" in its own shrunk list — which is exactly
+        # the false attribution the finding was. Defer; touch nothing.
+        herdr = FakeHerdr()
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh = self._prepare(tmp, herdr=herdr, lane_placement=config)
+            victim = fresh.slots[0]
+            herdr.run([str(Path(tmp) / "fake-herdr"), "pane", "close", victim.locator])
+            before = len(self._resize_calls(herdr))
+            healed = self._prepare(
+                tmp, herdr=herdr, lane_placement=config, providers=(victim.provider,)
+            )
+        self.assertEqual(healed.ratio_outcome, RATIO_DEFERRED, healed.ratio_detail)
+        self.assertEqual(len(self._resize_calls(herdr)), before)
+
+    def test_a_full_pair_request_needs_no_caller_supplied_order(self) -> None:
+        # The fallback must not make the ordinary path depend on a new argument: an
+        # unshrunk request IS the pair order, so a fresh pair still divides with no
+        # `pair_order` supplied at all.
+        herdr = FakeHerdr()
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.7}})
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh = self._prepare(tmp, herdr=herdr, lane_placement=config)
+            side = self._first_side_provider(herdr, fresh.slots[0].locator)
+        self.assertEqual(fresh.ratio_outcome, RATIO_APPLIED, fresh.ratio_detail)
+        self.assertEqual(side, "codex")
 
     def test_a_target_only_run_into_an_empty_container_stays_not_applicable(self) -> None:
         # The boundary the R1-F1 fix must NOT cross: a single launch that only OCCUPIES a

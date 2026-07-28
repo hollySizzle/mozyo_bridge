@@ -645,10 +645,25 @@ geometry が直後に変わるため)。
   そこへ `ratio` を適用すると `order[0]` の取り分が `order[1]` に渡る。live pane の swap / bounce は
   禁止なので **適用せず `deferred_until_full_relaunch` を明示**する (どちらも主張しない)。full relaunch で
   order と ratio が同時に実現する。deferral は失敗ではない (pair は使用可能)。
-  判定は **`order` が宣言されており、かつ split した slot の provider が `order[0]` である**ときに限る —
-  これは `slot_placement` が `order` 軸に対して既に使っている規則と **同一**である (ratio 専用の第二の
-  「primary」定義を作らない)。`order` 未宣言なら破るべき順序の主張が無いので deferral は起きず、
-  first 側の pane へ適用する。sibling の provider は判定に不要である。
+  判定は **split した slot の provider が effective order の先頭であるか**による — これは
+  `slot_placement` が `order` 軸に対して既に使っている規則と **同一**である (ratio 専用の第二の
+  「primary」定義を作らない)。sibling の provider は判定に不要である。
+
+  **effective order の解決 (Redmine #14569 review j#91263 R2-F1)**。3 層で解決する。
+
+  1. 宣言 (または product default) された `order` — primary を直接名指しする。
+  2. 無ければ **その run の lane が持つ stable な managed pair 順**。**`order` 未宣言は「順序主張が
+     無い」ではない** — sublane で `order` を宣言しないのは binding が解決した `(gateway, worker)` 順を
+     **尊重する**ためであり (§5.1 Product default の非対称性の理由、j#91127)、その順序は本 block の
+     上位で解決される。したがって `prepare_session` は caller から `pair_order` として受け取る。
+  3. どちらも無ければ空 — 帰属できない。
+
+  第 2 層が必要なのは、**target-only replacement が要求を 1 provider へ縮小する**ためである
+  (`replacement_target_only` → `startup_providers = (provider,)`)。縮小後の要求はもはや pair 順ではないので、
+  それを effective order として読むと gateway を heal したときに生存 worker が first 側になり、**宣言 share が
+  逆の role へ渡ったまま `applied` と報告される** (R2-F1 の実測)。縮小した caller が stable な順序を渡す。
+  空 (縮小されたのに stable 順序が渡されなかった) の場合は **deferral 側へ倒す** — 縮小 list の中では
+  その 1 provider が自明に「先頭」になり、それこそが R2-F1 の誤帰属だからである。
 - **失敗は成功扱いしない**: layout の read / parse 失敗、pair split の同定失敗、`pane resize` の拒否、
   最終照合の不一致はいずれも `failed` とし、`SessionStartResult.ok` を False にする。ただし
   `owes_rollback` には入れない — 分割が意図と違うだけの pair は使用可能であり、それを理由に agent を

@@ -453,23 +453,52 @@ def find_sibling_split(
     return matches[0] if len(matches) == 1 else None
 
 
-def order_is_deferred(
-    anchor_provider: str, config_order: "Optional[Sequence[str]]"
-) -> bool:
-    """True iff the configured primary is the very slot this run had to place SECOND.
+def effective_pair_order(
+    config_order: "Optional[Sequence[str]]",
+    pair_order: "Optional[Sequence[str]]",
+) -> "tuple[str, ...]":
+    """Whose side the declared ratio belongs to, as a provider order (Redmine #14569).
+
+    Three layers, in the only order that survives a caller which shrank its request:
+
+    1. a **declared / product-default** ``order`` names the primary outright;
+    2. otherwise the run's **stable managed pair order** — supplied by the caller that knows
+       it. An undeclared ``order`` is not "no order": the ``sublane`` product default leaves
+       it undeclared precisely so the repo-local role binding's ``(gateway, worker)`` order
+       is respected rather than overridden, and that binding is resolved above this layer;
+    3. otherwise empty — nothing can be attributed.
+
+    Review j#91263 R2-F1 is layer 2. The rail previously read the effective order off the
+    slots this run requested, which is correct only while the request IS the pair: a
+    target-only replacement shrinks it to one provider, so healing the GATEWAY made the
+    surviving worker the first side and the declared share went to the wrong role — reported
+    as ``applied``. The shrunk request cannot answer the question, so the caller's stable
+    order does; when even that is absent the answer is empty, and
+    :func:`order_is_deferred` then defers rather than dividing a side it cannot attribute.
+    """
+    if config_order:
+        return tuple(str(p) for p in config_order)
+    return tuple(str(p) for p in (pair_order or ()))
+
+
+def order_is_deferred(anchor_provider: str, effective_order: "Sequence[str]") -> bool:
+    """True iff the effective primary is the very slot this run had to place SECOND.
 
     Deliberately the SAME rule ``herdr_lane_topology.slot_placement`` already applies to the
     ``order`` axis: a splitting slot lands on the second side, so when it carries the
-    configured ``order[0]`` the physical order cannot be satisfied. Applying the ratio there
+    effective ``order[0]`` the physical order cannot be satisfied. Applying the ratio there
     would hand ``order[0]``'s declared share to ``order[1]``, and moving a live pane is
     forbidden — hence :data:`RATIO_DEFERRED`.
 
-    With **no** declared ``order`` there is no order claim to violate (the ``sublane``
-    product default leaves ``order`` undeclared precisely so the repo-local role binding
-    decides), so nothing is deferred and the ratio applies to whichever pane holds the first
-    side. One rule for both axes; a second, ratio-only notion of "primary" would drift.
+    An EMPTY effective order defers too. That is the fail-safe end of
+    :func:`effective_pair_order`: a run that cannot attribute the first side must not divide
+    it, and a single-provider request whose caller supplied no stable pair order is exactly
+    that case — the one provider it holds is trivially "first" in its own shrunk list, which
+    is precisely the false attribution R2-F1 was.
     """
-    return bool(config_order) and anchor_provider == str(config_order[0])
+    if not effective_order:
+        return True
+    return anchor_provider == str(effective_order[0])
 
 
 def _reclaim_root_panes(
@@ -648,6 +677,7 @@ def _pair_geometry(
     *,
     config_split: Optional[str],
     config_order: "Optional[Sequence[str]]",
+    pair_order: "Optional[Sequence[str]]",
     config_ratio: Optional[float],
     launched: int,
     initial_occupancy: int,
@@ -703,11 +733,13 @@ def _pair_geometry(
             "the slot this run split occupies the first side of its divider, which is not "
             "how herdr places a split; refusing to divide an unrecognised layout"
         )
-    if order_is_deferred(anchor.provider, config_order):
+    effective_order = effective_pair_order(config_order, pair_order)
+    if order_is_deferred(anchor.provider, effective_order):
         return RATIO_DEFERRED, (
-            f"the configured primary {anchor.provider!r} could only be launched as the "
+            f"the effective primary {anchor.provider!r} could only be launched as the "
             f"split beside a live sibling, so the declared ratio {config_ratio:g} would go "
-            f"to the other side; no live pane is swapped or resized"
+            f"to the other side; no live pane is swapped or resized "
+            f"(effective order: {list(effective_order) or 'unattributable'})"
         )
     pair = PairPanes(first_pane=sibling, second_pane=anchor.locator)
     split, first, reason = _measure_pair(layout, pair, config_split)
@@ -731,6 +763,7 @@ def finalize_container_geometry(
     *,
     config_split: Optional[str],
     config_order: "Optional[Sequence[str]]",
+    pair_order: "Optional[Sequence[str]]",
     config_ratio: Optional[float],
     launched: int,
     initial_occupancy: int,
@@ -756,6 +789,7 @@ def finalize_container_geometry(
         result,
         config_split=config_split,
         config_order=config_order,
+        pair_order=pair_order,
         config_ratio=config_ratio,
         launched=launched,
         initial_occupancy=initial_occupancy,
@@ -780,6 +814,7 @@ __all__ = (
     "PaneRect",
     "PairPanes",
     "SplitInfo",
+    "effective_pair_order",
     "finalize_container_geometry",
     "find_pair_split",
     "find_sibling_split",

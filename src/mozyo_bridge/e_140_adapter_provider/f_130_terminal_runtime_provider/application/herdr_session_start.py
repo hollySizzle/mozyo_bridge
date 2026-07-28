@@ -276,6 +276,7 @@ def prepare_session(
     providers: Sequence[str],
     lane_id: str,
     env: Mapping[str, str],
+    pair_order: Optional[Sequence[str]] = None,
     runner: Optional[Runner] = None,
     timeout: float = COMMAND_TIMEOUT_SECONDS,
     dry_run: bool = False,
@@ -308,6 +309,10 @@ def prepare_session(
 
     A dry run takes no lock: it plans, actuates nothing, and creating a fail-closed path
     for a read-only report would only make diagnosis harder during maintenance.
+
+    ``pair_order`` is the lane's STABLE managed pair order, for a caller that shrank
+    ``providers`` to a subset; only the ratio's ``order[0]``-relative side reads it
+    (contract: :func:`...herdr_pair_split_ratio.effective_pair_order`, #14569 j#91263).
     """
     # The signature is spelled out rather than `**kwargs` (review j#80305 R8-F2): the
     # explicit keyword-only contract is public (introspection / typing / IDE / wrapping
@@ -320,6 +325,7 @@ def prepare_session(
         providers=providers,
         lane_id=lane_id,
         env=env,
+        pair_order=pair_order,
         runner=runner,
         timeout=timeout,
         dry_run=dry_run,
@@ -361,6 +367,7 @@ def _prepare_session_locked(
     providers: Sequence[str],
     lane_id: str,
     env: Mapping[str, str],
+    pair_order: Optional[Sequence[str]] = None,
     runner: Optional[Runner] = None,
     timeout: float = COMMAND_TIMEOUT_SECONDS,
     dry_run: bool = False,
@@ -906,15 +913,15 @@ def _prepare_session_locked(
                     ),
                 )
 
-    # Finish the container — reclaim the empty root panes we created (#13330 / #13411) and
-    # then divide the pair at the declared ratio (#14569). Both belong to the cohesive
-    # sibling: they run only after EVERY launch succeeded, in that order (closing the root
-    # collapses the split tree the ratio is measured against), and both record onto
-    # `result` rather than raising. The ratio is actuated ONLY on a divider this run just
-    # created — never on a live pair — and is verified by reading `pane layout` back.
+    # Finish the container — reclaim the empty root panes we created (#13330 / #13411), then
+    # divide the pair at the declared ratio (#14569). Both belong to the cohesive sibling:
+    # they run only after EVERY launch succeeded, in that order (closing the root collapses
+    # the split tree the ratio is measured against), and record onto `result` rather than
+    # raising. The ratio touches ONLY a divider this run just created, never a live pair.
     finalize_container_geometry(
         result, config_split=config_split, config_order=config_order,
-        config_ratio=config_ratio, launched=len(launch_plans),
+        pair_order=pair_order or providers, config_ratio=config_ratio,
+        launched=len(launch_plans),
         initial_occupancy=plan_of_container.occupancy, dry_run=dry_run,
         binary=binary, runner=runner, timeout=timeout, env=env,
     )
