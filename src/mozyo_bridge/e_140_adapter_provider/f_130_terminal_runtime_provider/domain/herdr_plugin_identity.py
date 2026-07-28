@@ -44,6 +44,13 @@ from __future__ import annotations
 
 import dataclasses
 import re
+
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.absolute_path_rule import (
+    ABSOLUTE_ROOT_RE,
+    RELATIVE_CONTINUATION_RE,
+    contains_absolute_path,
+    keeps_absolute_root,
+)
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Optional
@@ -87,76 +94,20 @@ MAX_RENDERED_FIELD_LENGTH = 2000
 _COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _SEGMENT_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 
-#: Where an absolute filesystem path can BEGIN: a UNC root, a drive root, or a
-#: POSIX ``/``. Every occurrence is a path unless :data:`_RELATIVE_CONTINUATION_RE`
-#: positively proves otherwise.
-#:
-#: **This is the canonical definition for the repository, not a second one.** The
-#: previous version of this module wrote its own rule — "a ``/``, a segment, and
-#: another ``/``" — which read ``/etc``, ``/``, ``/秘密`` and ``/tmp-☃/secret`` as
-#: *not* paths (review j#92194 F1 measured all four passing the constructor and
-#: both sink guards). A hardened rule for exactly this question already existed in
-#: this repo, in ``herdr_probe_redaction`` (Redmine #14258, twenty-one review
-#: rounds). Writing a third rule instead of reusing it is how the weakest copy ends
-#: up on the newest surface, so the definition now lives here and
-#: ``herdr_probe_redaction`` imports it: one rule, one place, both layers.
-_ABS_ROOT_RE = re.compile(r"\\\\|(?<![A-Za-z0-9_.\-])[A-Za-z]:[\\/]|/")
-
-#: The only positive proof that a root occurrence is not a path: the ``/`` sits
-#: INSIDE a token (``relative/path.yaml``, ``github:owner/repo@sha``), i.e. the
-#: preceding character continues a word. ``:`` deliberately does not qualify —
-#: ``config:/Users/…`` is a labelled absolute path.
-_RELATIVE_CONTINUATION_RE = re.compile(r"[A-Za-z0-9_.\-]$")
+#: The absolute-path rule is NOT defined here. It is shared with the #14258
+#: launcher-probe redaction, so it lives in a module belonging to neither consumer
+#: (``absolute_path_rule``). Coordinator ruling j#92243 requires one *neutral*
+#: authority; the previous arrangement had the generic redaction importing this
+#: plugin-specific module, which is the dependency pointing the wrong way. These
+#: names are re-exported for callers that already use them.
+_ABS_ROOT_RE = ABSOLUTE_ROOT_RE
+_RELATIVE_CONTINUATION_RE = RELATIVE_CONTINUATION_RE
 
 #: Control characters. ``\n`` matters most: this surface's text is written to be
 #: pasted into a durable record, and a newline inside a *field* lets that field
 #: forge a line of the record (review j#92092 F2 measured a forged ``BREACH:``
 #: line). A field never legitimately contains one; only the assembled artifact does.
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-
-
-def keeps_absolute_root(text: str, start: int, root: str) -> bool:
-    """True iff this root occurrence is provably NOT an absolute path.
-
-    Deliberately inverted: the question is not "does this look like a path?" but
-    "is there positive proof that it is not one?". Exactly one thing proves it — a
-    ``/`` that continues a word, and is therefore inside a relative token. A drive
-    or UNC root is never exempt; neither can occur inside a relative path. The
-    proof is judged per occurrence and covers nothing beyond itself.
-    """
-    if root != "/":
-        return False
-    return bool(_RELATIVE_CONTINUATION_RE.search(text[:start]))
-
-
-def contains_absolute_path(text: str) -> bool:
-    """Whether ``text`` carries an absolute filesystem path occurrence.
-
-    Catches a single-component path (``/etc``), the root itself (``/``), a
-    non-ASCII path (``/秘密``), a mixed-alphabet path (``/tmp-☃/secret``), a drive
-    root and a UNC root — all of which the previous rule read as safe. Does *not*
-    flag a relative token (``relative/path.yaml``) or this surface's own identity
-    spellings (``github:owner/repo@sha``, ``install/enable``), because in those the
-    ``/`` continues a word.
-
-    A consequence worth stating: a bare ``/`` used as prose punctuation
-    (``HOME / XDG_CONFIG_HOME``) *is* flagged. That is the correct direction — the
-    prose was rewritten to suit the boundary rather than the boundary widened to
-    suit the prose.
-
-    **Evaluated line by line, like the redactor it shares its rule with.** Reusing
-    the hardened *patterns* without the hardened *structure* reintroduced the bug
-    they were meant to prevent: ``$`` also matches just before a trailing newline,
-    so on multi-line text ``line\\n/etc/passwd`` had ``"line\\n"`` as its preceding
-    context, ``e`` satisfied the relative-continuation proof, and the path was
-    read as safe. Splitting first is what makes the proof mean "the character
-    before it on this line".
-    """
-    return any(
-        not keeps_absolute_root(line, match.start(), match.group(0))
-        for line in text.splitlines() or [text]
-        for match in _ABS_ROOT_RE.finditer(line)
-    )
 
 
 def require_renderable_field(value: object, field: str) -> str:

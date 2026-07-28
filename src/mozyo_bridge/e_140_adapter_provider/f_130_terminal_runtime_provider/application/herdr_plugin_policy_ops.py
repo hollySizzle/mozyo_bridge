@@ -79,17 +79,27 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     source_ref_from_parts,
 )
 
-#: The only enable denials reachable without a verdict: they are decided before —
-#: or instead of — judging any particular plugin. Every other reason names a
-#: judgement about a plugin, so it cannot exist without that plugin's verdict.
-VERDICTLESS_ENABLE_REASONS: frozenset[str] = frozenset(
-    {
-        REASON_INVALID_TARGET_ID,
-        REASON_INVENTORY_INCOMPLETE,
-        REASON_AMBIGUOUS_TARGET,
-        REASON_TARGET_NOT_INSTALLED,
-    }
-)
+#: The enable denials reachable without a verdict, each with the **state it
+#: means**: ``reason -> (is the plugin id echoed?, was something found?)``.
+#:
+#: Closing the reason *set* alone was not enough (review j#92285 F1): the
+#: constructor accepted ``found=True`` beside ``target_not_installed`` and an
+#: absent id beside ``found=True``, so a public plan could report "found but not
+#: installed" or "withheld but found" — states the planner cannot produce.
+#:
+#: This table is the planner's own; :func:`plan_enable` reads its states from here
+#: rather than restating them, and a regression drives the planner and requires
+#: the set it reaches to equal this table. A hand-written list on the checking
+#: side is what drifts.
+VERDICTLESS_ENABLE_STATES: "dict[str, tuple[bool, bool]]" = {
+    REASON_INVALID_TARGET_ID: (False, False),
+    REASON_INVENTORY_INCOMPLETE: (True, False),
+    REASON_AMBIGUOUS_TARGET: (True, True),
+    REASON_TARGET_NOT_INSTALLED: (True, False),
+}
+
+#: Kept as the set view for callers that only need membership.
+VERDICTLESS_ENABLE_REASONS: frozenset[str] = frozenset(VERDICTLESS_ENABLE_STATES)
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 #: Same set minus the newline, which is what structures the text report.
@@ -460,13 +470,21 @@ class EnablePlan:
                     "plugin, decision and found state"
                 )
         elif self.decision.admitted or self.decision.reason not in (
-            VERDICTLESS_ENABLE_REASONS
+            VERDICTLESS_ENABLE_STATES
         ):
             raise HerdrPluginPolicyError(
                 f"without a verdict an enable plan may only deny for one of "
-                f"{sorted(VERDICTLESS_ENABLE_REASONS)}; a per-plugin reason cannot "
+                f"{sorted(VERDICTLESS_ENABLE_STATES)}; a per-plugin reason cannot "
                 f"be reached without the plugin it judged"
             )
+        else:
+            expected = VERDICTLESS_ENABLE_STATES[self.decision.reason]
+            if (self.plugin_id is not None, self.found) != expected:
+                raise HerdrPluginPolicyError(
+                    f"a {self.decision.reason!r} denial reports "
+                    f"(id echoed, found) = {expected}; this plan reports "
+                    f"{(self.plugin_id is not None, self.found)}"
+                )
 
     @property
     def ok(self) -> bool:
@@ -481,6 +499,23 @@ class EnablePlan:
             "decision": _decision_payload(self.decision),
             "plugin": _verdict_payload(self.verdict) if self.verdict else None,
         }
+
+
+def _verdictless_plan(reason: str, detail: str, operand: Optional[str]) -> EnablePlan:
+    """Build a verdictless enable plan, deriving its state from the shared table.
+
+    The planner does not restate `plugin_id` / `found` per branch; it reads them
+    from :data:`VERDICTLESS_ENABLE_STATES`, which is the same table the constructor
+    checks against. Two hand-written copies of "what this reason means" is how the
+    constructor came to accept states the planner cannot produce (review j#92285 F1).
+    """
+    id_present, found = VERDICTLESS_ENABLE_STATES[reason]
+    return EnablePlan(
+        plugin_id=operand if id_present else None,
+        found=found,
+        verdict=None,
+        decision=PolicyDecision.deny(reason, detail),
+    )
 
 
 def plan_enable(status: PolicyStatus, plugin_id: object) -> EnablePlan:
@@ -502,27 +537,19 @@ def plan_enable(status: PolicyStatus, plugin_id: object) -> EnablePlan:
     """
     operand = normalize_operand(plugin_id)
     if operand is None:
-        return EnablePlan(
-            plugin_id=None,
-            found=False,
-            verdict=None,
-            decision=PolicyDecision.deny(
-                REASON_INVALID_TARGET_ID,
-                "the named plugin id is not a bounded identifier; no installed "
-                "plugin could carry it, and it is not echoed back",
-            ),
+        return _verdictless_plan(
+            REASON_INVALID_TARGET_ID,
+            "the named plugin id is not a bounded identifier; no installed "
+            "plugin could carry it, and it is not echoed back",
+            operand,
         )
     if not status.fully_read:
-        return EnablePlan(
-            plugin_id=operand,
-            found=False,
-            verdict=None,
-            decision=PolicyDecision.deny(
-                REASON_INVENTORY_INCOMPLETE,
-                f"{len(status.malformed)} inventory record(s) could not be read, so "
-                f"the inventory has not been fully classified; no enable answer "
-                f"drawn from it is trustworthy",
-            ),
+        return _verdictless_plan(
+            REASON_INVENTORY_INCOMPLETE,
+            f"{len(status.malformed)} inventory record(s) could not be read, so "
+            f"the inventory has not been fully classified; no enable answer "
+            f"drawn from it is trustworthy",
+            operand,
         )
     matches = [
         verdict
@@ -530,26 +557,18 @@ def plan_enable(status: PolicyStatus, plugin_id: object) -> EnablePlan:
         if verdict.observation.plugin_id == operand
     ]
     if len(matches) > 1:
-        return EnablePlan(
-            plugin_id=operand,
-            found=True,
-            verdict=None,
-            decision=PolicyDecision.deny(
-                REASON_AMBIGUOUS_TARGET,
-                f"{len(matches)} installed plugins answer to this id; which one an "
-                f"enable would affect has no single answer",
-            ),
+        return _verdictless_plan(
+            REASON_AMBIGUOUS_TARGET,
+            f"{len(matches)} installed plugins answer to this id; which one an "
+            f"enable would affect has no single answer",
+            operand,
         )
     if not matches:
-        return EnablePlan(
-            plugin_id=operand,
-            found=False,
-            verdict=None,
-            decision=PolicyDecision.deny(
-                REASON_TARGET_NOT_INSTALLED,
-                "no installed plugin answers to this id, so there is nothing whose "
-                "identity could be established",
-            ),
+        return _verdictless_plan(
+            REASON_TARGET_NOT_INSTALLED,
+            "no installed plugin answers to this id, so there is nothing whose "
+            "identity could be established",
+            operand,
         )
     verdict = matches[0]
     return EnablePlan(
@@ -584,6 +603,15 @@ class InstallPlan:
         if self.decision != plan_install(self.ref):
             raise HerdrPluginPolicyError(
                 "install plan decision disagrees with the policy for this reference"
+            )
+        # Presence is coupled, not independent (review j#92285 F2). The factory
+        # derives both from the same owner/repo validation, so it produces both or
+        # neither; one-sided states let a record withhold its target while
+        # disclosing that target's exact source, or name a target it reports as
+        # unknown.
+        if (self.spec is None) != (self.ref is None):
+            raise HerdrPluginPolicyError(
+                "an install plan names a target and its reference, or neither"
             )
         if self.spec is not None and self.ref is not None:
             if self.spec != f"{self.ref.owner}/{self.ref.repo}":
@@ -831,6 +859,7 @@ __all__ = (
     "guard_rendered_text",
     "sanitize_renderable",
     "VERDICTLESS_ENABLE_REASONS",
+    "VERDICTLESS_ENABLE_STATES",
     "classify_inventory",
     "normalize_operand",
     "format_enable_plan_text",

@@ -96,6 +96,22 @@ _ABS_PATH_TOKEN = re.compile(r"/[A-Za-z0-9._-]+/")
 LEAK_MARKER = "/opt/private-probe/leaked-secret/value.txt"
 
 
+def _leaked(rendered: str, injected: str) -> bool:
+    """Whether ``rendered`` leaked ``injected``, by three independent tests.
+
+    Conjoined rather than substituted (the suite's own rule for fixing an oracle):
+    the exact injected value, this file's independently written path regex, and
+    production's own detector. The third was added after review j#92194 showed the
+    test regex and production's shared a blind spot; keeping the first two means a
+    bug in production's detector cannot make this oracle blind with it.
+    """
+    return (
+        injected in rendered
+        or _ABS_PATH_TOKEN.search(rendered) is not None
+        or ops.contains_absolute_path(rendered)
+    )
+
+
 def _string_leaf_paths(node: object, prefix: "tuple" = ()) -> "list[tuple]":
     """Every path to a string leaf inside a nested record (for the leak oracle)."""
     if isinstance(node, str):
@@ -943,7 +959,7 @@ class StatusReportTests(unittest.TestCase):
             record = _with_leaf(plugin_record(), path, LEAK_MARKER)
             status = self._status(record)
             rendered = json.dumps(status.as_payload()) + ops.format_status_text(status)
-            if LEAK_MARKER in rendered or _ABS_PATH_TOKEN.search(rendered):
+            if _leaked(rendered, LEAK_MARKER):
                 leaks.append(".".join(str(part) for part in path))
         self.assertEqual(leaks, [], f"payload leaf(s) reached the report: {leaks}")
 
@@ -976,33 +992,61 @@ class StatusReportTests(unittest.TestCase):
                 rendered = json.dumps(plan.as_payload()) + ops.format_enable_plan_text(
                     plan
                 )
-                if operand in rendered or _ABS_PATH_TOKEN.search(rendered):
+                if _leaked(rendered, operand):
                     leaks.append(("enable", operand[:24]))
             install = ops.plan_candidate_install(operand, None)
             rendered = json.dumps(install.as_payload()) + ops.format_install_plan_text(
                 install
             )
-            if operand in rendered or _ABS_PATH_TOKEN.search(rendered):
+            if _leaked(rendered, operand):
                 leaks.append(("install", operand[:24]))
             spec_install = ops.plan_candidate_install(f"{operand}/{operand}", None)
             rendered = json.dumps(
                 spec_install.as_payload()
             ) + ops.format_install_plan_text(spec_install)
-            if operand in rendered or _ABS_PATH_TOKEN.search(rendered):
+            if _leaked(rendered, operand):
                 leaks.append(("install-spec", operand[:24]))
         self.assertEqual(leaks, [], f"operand(s) reached a report: {leaks}")
 
     def test_a_newline_operand_cannot_forge_a_report_line(self):
         # Worse than disclosure: this text is written to be pasted into a durable
-        # record, and `BREACH:` is how the report announces a live violation.
+        # record. The probe deliberately does NOT look for `BREACH:` — that line is
+        # one this report legitimately writes (see the test below), so its absence
+        # would prove nothing. It looks for a marker only the operand can supply.
+        forged = "ZZFORGEDLINEZZ"
         plan = ops.plan_enable(
             ops.PolicyStatus(verdicts=(), malformed=()),
-            "a\nBREACH: this plugin is enabled now and is not admissible\nb",
+            f"a\n{forged}\nb",
         )
         text = ops.format_enable_plan_text(plan)
-        self.assertNotIn("BREACH:", text)
+        self.assertFalse(
+            any(line.strip().startswith(forged) for line in text.splitlines())
+        )
+        self.assertNotIn(forged, text)
         self.assertEqual(plan.decision.reason, REASON_INVALID_TARGET_ID)
         self.assertFalse(plan.ok)
+
+    def test_an_enable_plan_legitimately_prints_a_breach_line(self):
+        # The reason the probe above cannot use `BREACH:`: an enable plan whose
+        # plugin is enabled and inadmissible reports exactly that. An oracle that
+        # treats this as forgery is measuring the wrong question — the mistake this
+        # suite made three times (reviews j#92141, j#92194, j#92241).
+        status = ops.classify_inventory(
+            ops.parse_inventory(
+                inventory_document(
+                    plugin_record(
+                        plugin_id="herdr-reviewr",
+                        owner="persiyanov",
+                        repo="herdr-reviewr",
+                        commit=OTHER_COMMIT,
+                    )
+                )
+            )
+        )
+        text = ops.format_enable_plan_text(ops.plan_enable(status, "herdr-reviewr"))
+        self.assertTrue(
+            any(line.strip().startswith("BREACH:") for line in text.splitlines())
+        )
 
     def test_a_valid_operand_is_still_echoed(self):
         # The closed token must not swallow the ordinary case, or the oracle above
@@ -1671,22 +1715,106 @@ class RelationalInvariantTests(unittest.TestCase):
                 with self.assertRaises(HerdrPluginPolicyError):
                     dataclasses.replace(real, **divergence)
 
-    def test_a_verdictless_enable_plan_needs_a_reason_that_admits_no_verdict(self):
-        allowed = (
-            REASON_INVALID_TARGET_ID,
-            REASON_INVENTORY_INCOMPLETE,
-            REASON_AMBIGUOUS_TARGET,
-            REASON_TARGET_NOT_INSTALLED,
+    def _planner_verdictless_states(self):
+        """Drive the planner and collect the verdictless states it actually reaches.
+
+        Derived from the planner rather than hand-listed. Review j#92285 F1: the
+        previous version of this test used one `(id present, found=False)` shape
+        for all four reasons, so it never looked at what each reason *means* — and
+        the constructor, checking only the reason set, accepted `found=True` beside
+        `target_not_installed`.
+        """
+        clean = ops.classify_inventory(ops.parse_inventory(inventory_document()))
+        installed = ops.classify_inventory(
+            ops.parse_inventory(inventory_document(plugin_record()))
         )
-        for reason in allowed:
-            with self.subTest(reason=reason):
+        duplicated = ops.classify_inventory(
+            ops.parse_inventory(
+                inventory_document(
+                    plugin_record(),
+                    plugin_record(
+                        plugin_id="herdr-file-viewer",
+                        owner="persiyanov",
+                        repo="herdr-reviewr",
+                        commit=OTHER_COMMIT,
+                    ),
+                )
+            )
+        )
+        unreadable = ops.PolicyStatus(
+            verdicts=(), malformed=(ops.MalformedEntry(index=0, detail="x"),)
+        )
+        drives = (
+            (clean, LEAK_MARKER),
+            (clean, "herdr-file-viewer"),
+            (unreadable, "herdr-file-viewer"),
+            (duplicated, "herdr-file-viewer"),
+            (installed, "herdr-file-viewer"),
+        )
+        states = {}
+        for status, operand in drives:
+            plan = ops.plan_enable(status, operand)
+            if plan.verdict is None:
+                states[plan.decision.reason] = (plan.plugin_id is not None, plan.found)
+        return states
+
+    #: What each verdictless situation MEANS, written from the situation rather
+    #: than read out of the table. Once the planner started deriving its state
+    #: from `VERDICTLESS_ENABLE_STATES`, comparing planner output against that
+    #: table became comparing the table with itself — a mutation of the table
+    #: passed unnoticed (measured). An expectation has to come from somewhere the
+    #: subject cannot reach.
+    EXPECTED_VERDICTLESS_MEANING = {
+        # reason: (is the id echoed back?, did anything answer to it?)
+        # not an identifier at all -> nothing to echo, nothing found
+        REASON_INVALID_TARGET_ID: (False, False),
+        # a real id, but the inventory could not be fully read -> no answer either way
+        REASON_INVENTORY_INCOMPLETE: (True, False),
+        # more than one plugin answers to it -> plugins WERE found, just not one
+        REASON_AMBIGUOUS_TARGET: (True, True),
+        # no plugin answers to it -> nothing found
+        REASON_TARGET_NOT_INSTALLED: (True, False),
+    }
+
+    def test_the_verdictless_table_says_what_each_situation_means(self):
+        self.assertEqual(
+            dict(ops.VERDICTLESS_ENABLE_STATES), self.EXPECTED_VERDICTLESS_MEANING
+        )
+
+    def test_the_planner_reaches_exactly_those_situations(self):
+        # source-to-set coverage: every verdictless outcome the planner can
+        # produce is in the table, and every table entry is reachable.
+        self.assertEqual(
+            self._planner_verdictless_states(), self.EXPECTED_VERDICTLESS_MEANING
+        )
+
+    def test_each_verdictless_reason_accepts_only_its_own_state(self):
+        for reason, (id_present, found) in ops.VERDICTLESS_ENABLE_STATES.items():
+            plugin_id = "herdr-file-viewer" if id_present else None
+            with self.subTest(reason=reason, control="positive"):
                 ops.EnablePlan(
-                    plugin_id="herdr-file-viewer",
-                    found=False,
+                    plugin_id=plugin_id,
+                    found=found,
                     verdict=None,
                     decision=PolicyDecision.deny(reason, "d"),
                 )
-        # A per-plugin reason cannot be reached without the plugin it judged.
+            # One field at a time, so each mutation is attributable.
+            for mutation in ("plugin_id", "found"):
+                with self.subTest(reason=reason, mutated=mutation):
+                    kwargs = dict(
+                        plugin_id=plugin_id,
+                        found=found,
+                        verdict=None,
+                        decision=PolicyDecision.deny(reason, "d"),
+                    )
+                    if mutation == "plugin_id":
+                        kwargs["plugin_id"] = None if id_present else "herdr-file-viewer"
+                    else:
+                        kwargs["found"] = not found
+                    with self.assertRaises(HerdrPluginPolicyError):
+                        ops.EnablePlan(**kwargs)
+
+    def test_a_per_plugin_reason_cannot_be_reached_without_its_plugin(self):
         for reason in (REASON_AGENT_INPUT_WRITER, REASON_UNPINNED_SOURCE):
             with self.subTest(reason=reason):
                 with self.assertRaises(HerdrPluginPolicyError):
@@ -1696,6 +1824,42 @@ class RelationalInvariantTests(unittest.TestCase):
                         verdict=None,
                         decision=PolicyDecision.deny(reason, "d"),
                     )
+
+    def test_an_install_plan_names_a_target_or_names_none(self):
+        # Review j#92285 F2: one-sided presence let the record say "<withheld>"
+        # while disclosing the exact source, or name a target while reporting
+        # source=null / class=unknown. The factory can produce neither.
+        reviewed = PluginSourceRef.pinned(
+            SOURCE_KIND_GITHUB, "smarzban", "herdr-file-viewer", FILE_VIEWER_COMMIT
+        )
+        with self.assertRaises(HerdrPluginPolicyError):
+            ops.InstallPlan(spec=None, ref=reviewed, decision=plan_install(reviewed))
+        with self.assertRaises(HerdrPluginPolicyError):
+            ops.InstallPlan(
+                spec="smarzban/herdr-file-viewer",
+                ref=None,
+                decision=plan_install(None),
+            )
+        real = ops.plan_candidate_install(
+            "smarzban/herdr-file-viewer", FILE_VIEWER_COMMIT
+        )
+        for divergence in (dict(spec=None), dict(ref=None)):
+            with self.subTest(divergence=sorted(divergence)):
+                with self.assertRaises(HerdrPluginPolicyError):
+                    dataclasses.replace(real, **divergence)
+
+    def test_the_factory_never_produces_a_one_sided_install_plan(self):
+        for spec, ref in (
+            ("smarzban/herdr-file-viewer", FILE_VIEWER_COMMIT),
+            ("smarzban/herdr-file-viewer", None),
+            ("smarzban/herdr-file-viewer", "not-a-commit"),
+            ("no-separator", FILE_VIEWER_COMMIT),
+            ("bad owner/repo", FILE_VIEWER_COMMIT),
+            (LEAK_MARKER, FILE_VIEWER_COMMIT),
+        ):
+            with self.subTest(spec=spec[:24], ref=ref):
+                plan = ops.plan_candidate_install(spec, ref)
+                self.assertEqual(plan.spec is None, plan.ref is None)
 
     def test_the_two_renderings_never_disagree_about_admission(self):
         # The property the inconsistency actually broke: a machine-readable and a

@@ -6,7 +6,12 @@ condition — no private absolute path in public evidence — has to be enforced
 arbitrary third-party output, rather than assumed from any format.
 
 Carved out of ``herdr_pane_lifecycle`` (module-health leaf extraction, not an allowlist bump).
-It depends only on ``re`` and ``Path``, which is what makes it a leaf.
+Beyond ``os``, ``re`` and ``Path`` it imports exactly one thing: the repository's
+absolute-path rule (``domain.absolute_path_rule``) — the root patterns and the
+positive-proof predicate. That module belongs to neither consumer, so this surface and
+the managed-lane plugin policy (Redmine #14619) cannot disagree about what an absolute
+path is. The quoted-run and URL-collapse transformations below are NOT shared: they are
+redaction behaviour, not part of the rule.
 """
 
 from __future__ import annotations
@@ -15,9 +20,9 @@ import os
 import re
 from pathlib import Path
 
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_identity import (
-    _ABS_ROOT_RE as _canonical_abs_root_re,
-    _RELATIVE_CONTINUATION_RE as _canonical_relative_continuation_re,
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.absolute_path_rule import (
+    ABSOLUTE_ROOT_RE as _canonical_abs_root_re,
+    RELATIVE_CONTINUATION_RE as _canonical_relative_continuation_re,
     keeps_absolute_root as _canonical_keeps_absolute_root,
 )
 
@@ -45,11 +50,11 @@ REDACTED_PROBE_PATH = "<target config>"
 #: so ``s:/`` inside ``https://`` is not one. That is a rule about the SHAPE of the root, not
 #: a safety allowlist — and it costs nothing, because the ``/`` alternative still finds that
 #: position and the URL proof is what preserves it.
-#: Imported rather than restated: the canonical definition lives in the domain
-#: (``herdr_plugin_identity``) so this module and the plugin-policy boundary share
-#: one rule. Redmine #14619 review j#92194 F1 measured what two copies cost — the
-#: newer copy silently read ``/etc`` and ``/`` as safe. The pattern is unchanged
-#: from the #14258 version this module hardened.
+#: Imported rather than restated: the canonical rule lives in ``absolute_path_rule``,
+#: a module owned by neither consumer. Redmine #14619 review j#92194 F1 measured what
+#: two copies cost — the second copy silently read ``/etc`` and ``/`` as safe — and
+#: j#92241 F3 that sharing only the patterns leaves the predicate duplicated. The
+#: patterns are unchanged from the #14258 version this module hardened.
 _ABS_ROOT_RE = _canonical_abs_root_re
 
 #: A quoted run, escape-aware: the closing quote is the first UNescaped one. The naive

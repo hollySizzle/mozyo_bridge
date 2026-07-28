@@ -9,11 +9,13 @@ allow / deny 境界を durable に固定する。設計根拠は #13175 PoC
 
 この runbook は **利用手順の正本**であり、CLI `--help` を replay 可能な形にしたもの。実装は
 `e_140_adapter_provider/f_130_terminal_runtime_provider` の `herdr_pin_posture` /
-`herdr_integration_install` / `herdr_plugin_identity` + `herdr_plugin_policy`(domain)と
-`*_ops`(application)、CLI は `cli_herdr_distribution`。plugin policy の domain は
-「**plugin が何であるか**」(`herdr_plugin_identity`: source identity と正規化済み observation)
-と「**何が許可されるか**」(`herdr_plugin_policy`: review registry と admission 判定) で
-分かれており、依存は前者→後者の一方向のみ。owner 別に:
+`herdr_integration_install` / `absolute_path_rule` + `herdr_plugin_identity` +
+`herdr_plugin_policy`(domain)と `*_ops`(application)、CLI は `cli_herdr_distribution`。
+plugin policy の domain は「**plugin が何であるか**」(`herdr_plugin_identity`: source
+identity と正規化済み observation) と「**何が許可されるか**」(`herdr_plugin_policy`:
+review registry と admission 判定) で分かれており、依存は前者→後者の一方向のみ。
+絶対 path 判定は**どちらにも属さない** `absolute_path_rule` が持ち、#14258 の
+`herdr_probe_redaction` と共有する。owner 別に:
 
 | 節 | 対象 | Redmine |
 |---|---|---|
@@ -416,8 +418,11 @@ observed 側に無かった。**同じ概念を 2 箇所で書くと、片方だ
 
 ### ★path 判定は repository 単一 authority を使う
 
-絶対 path の判定規則は **`herdr_plugin_identity` の 1 箇所**にあり、`herdr_probe_redaction`
-(#14258) がそれを import する。**root pattern と relative-continuation pattern だけでなく、
+絶対 path の判定規則は **`domain/absolute_path_rule` の 1 箇所**にあり、`herdr_plugin_identity`
+(#14619) と `herdr_probe_redaction` (#14258) の**両方がそこへ収束する**。この module は
+**どちらの consumer にも属さない**。以前は汎用の #14258 redaction が後発で用途特化の
+#14619 identity module を import しており、**依存が逆向き**だった（review j#92285 F3、
+coordinator 裁定 j#92243 の「one *neutral* authority」に反する）。**root pattern と relative-continuation pattern だけでなく、
 positive-proof predicate (`keeps_absolute_root`) も共有する** — 最初は regex object しか
 共有せず、同じ規則が 2 実装のまま残っていた（review j#92241 F3）。しかも当時の test は
 **regex の identity しか検査しておらず、「単一 authority」という主張を falsify できなかった**。
@@ -444,6 +449,15 @@ per-field の型・語彙検査を全 field に課しても、**field 間の関�
 なった。
 
 - `PluginObservation`: `ref` を持つなら `source_kind` は `github` でなければならない。
+- **verdictless な enable 拒否は、reason だけでなく *その reason が意味する state* を閉じる。**
+  `VERDICTLESS_ENABLE_STATES` が `reason → (id を echo するか, 何か見つかったか)` を持ち、
+  **planner はここから state を導き、constructor は同じ表と照合する**。reason の集合だけを
+  閉じていたとき、`target_not_installed` なのに `found=True`、`invalid_target_id` なのに
+  `found=True` という **planner が到達できない state** を public plan が報告できた
+  （review j#92285 F1）。
+- **`InstallPlan` の `spec` と `ref` は presence が連動する。** factory は同じ owner/repo
+  検証から両方を作るので、片側だけ存在する state は到達不能である。それを許すと、
+  「target は `<withheld>` なのに source と class は開示する」record が作れる（同 F2）。
 - **computed result はすべて「policy から再計算した値と一致すること」で閉じる。**
   `PluginVerdict` は `resolve_reference` / `decide_enable` / `decide_install` の結果と、
   `InstallPlan` は `plan_install(ref)` と一致すること。`EnablePlan` は verdict を持つなら
