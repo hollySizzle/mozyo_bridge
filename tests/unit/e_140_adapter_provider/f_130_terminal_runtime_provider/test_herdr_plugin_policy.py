@@ -47,6 +47,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     REASON_UNPINNED_SOURCE,
     REASON_UNREVIEWED_BUILD,
     REASON_AMBIGUOUS_TARGET,
+    REASON_INVALID_TARGET_ID,
     REASON_INVENTORY_INCOMPLETE,
     REASON_TARGET_NOT_INSTALLED,
     REASON_UNREVIEWED_PIN,
@@ -55,7 +56,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     SOURCE_KIND_GITHUB,
     SOURCE_KIND_LINK,
     SOURCE_KIND_UNRECOGNIZED,
-    VERSION_UNRECOGNIZED,
     HerdrPluginPolicyError,
     PluginObservation,
     PluginSourceRef,
@@ -523,6 +523,70 @@ class ObservationTests(unittest.TestCase):
             names & {"manifest_path", "plugin_root", "managed_path", "path"}, set()
         )
 
+    def test_every_field_is_validated_at_construction(self):
+        # Review j#92092 finding 1: `__post_init__` hand-listed three checks while
+        # the docstring claimed all eight fields were closed. Direct construction
+        # with a path in `declares_build` succeeded and reached the report.
+        valid = dict(
+            plugin_id="p",
+            enabled=True,
+            source_kind=SOURCE_KIND_GITHUB,
+            ref=None,
+            declares_build=False,
+            declares_panes=False,
+            declares_actions=False,
+        )
+        PluginObservation(**valid)  # the fixture itself must be constructible
+        hostile = {
+            "plugin_id": (7, "", "a/b", "x" * 5000, LEAK_MARKER),
+            "enabled": (1, 0, "yes", None),
+            "source_kind": (["x"], 7, "not-a-kind", None),
+            "ref": ("github:o/r", 7, object()),
+            "declares_build": (LEAK_MARKER, 1, None),
+            "declares_panes": (LEAK_MARKER, 1, None),
+            "declares_actions": (LEAK_MARKER, 1, None),
+        }
+        # Every field of the dataclass must appear here, or the table has the same
+        # gap the implementation had.
+        self.assertEqual(
+            {field.name for field in dataclasses.fields(PluginObservation)},
+            set(hostile),
+        )
+        for field_name, values in hostile.items():
+            for value in values:
+                with self.subTest(field=field_name, value=repr(value)[:24]):
+                    with self.assertRaises(HerdrPluginPolicyError):
+                        PluginObservation(**{**valid, field_name: value})
+
+    def test_a_field_without_a_validator_cannot_be_constructed(self):
+        # The guard that makes the check table self-policing: adding a field and
+        # forgetting its validator must fail loudly rather than pass silently,
+        # because forgetting is exactly what happened.
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_identity as identity
+
+        trimmed = dict(identity._OBSERVATION_FIELD_CHECKS)
+        trimmed.pop("declares_build")
+        with mock.patch.object(
+            identity, "_OBSERVATION_FIELD_CHECKS", trimmed
+        ):
+            with self.assertRaises(HerdrPluginPolicyError):
+                PluginObservation(
+                    plugin_id="p",
+                    enabled=True,
+                    source_kind=SOURCE_KIND_GITHUB,
+                    ref=None,
+                    declares_build=False,
+                    declares_panes=False,
+                    declares_actions=False,
+                )
+
+    def test_an_identifier_is_bounded(self):
+        # Self-reported alongside j#92092 F3: the alphabet alone bounds shape but
+        # not length, and a 5,000-character id was accepted and rendered.
+        with self.assertRaises(HerdrPluginPolicyError):
+            observe_plugin(plugin_record(plugin_id="x" * 5000))
+        observe_plugin(plugin_record(plugin_id="x" * 64))
+
     def test_enabled_must_be_a_real_boolean(self):
         # bool is a subclass of int, so an isinstance(..., int) check would read 1 as
         # True — and this flag is what decides whether a denial is a live breach.
@@ -882,6 +946,74 @@ class StatusReportTests(unittest.TestCase):
                 leaks.append(".".join(str(part) for part in path))
         self.assertEqual(leaks, [], f"payload leaf(s) reached the report: {leaks}")
 
+    def test_no_plan_operand_can_reach_a_report(self):
+        # Review j#92092 finding 2: the inventory oracle above covers ONE of this
+        # surface's untrusted inputs. A plan operand never passes through the
+        # inventory, so the oracle structurally could not see it — and the raw
+        # operand went into both the text and the JSON. This is the same oracle
+        # applied to the second input path.
+        empty = ops.PolicyStatus(verdicts=(), malformed=())
+        populated = self._status(plugin_record())
+        # An operand that IS a valid bounded identifier is deliberately echoed — it
+        # names what the operator asked about, it is theirs rather than a third
+        # party's, and its alphabet admits no path separator or control character.
+        # So the hostile set here is "operands that are not identifiers", which is
+        # narrower than the inventory oracle's "every string leaf": the two inputs
+        # have different owners and therefore different rules.
+        hostile = (
+            LEAK_MARKER,
+            "a\nBREACH: forged\nb",
+            "id with spaces",
+            "x" * 5000,
+            "../../etc/passwd",
+            "tab\tseparated",
+        )
+        leaks = []
+        for operand in hostile:
+            for status in (empty, populated):
+                plan = ops.plan_enable(status, operand)
+                rendered = json.dumps(plan.as_payload()) + ops.format_enable_plan_text(
+                    plan
+                )
+                if operand in rendered or _ABS_PATH_TOKEN.search(rendered):
+                    leaks.append(("enable", operand[:24]))
+            install = ops.plan_candidate_install(operand, None)
+            rendered = json.dumps(install.as_payload()) + ops.format_install_plan_text(
+                install
+            )
+            if operand in rendered or _ABS_PATH_TOKEN.search(rendered):
+                leaks.append(("install", operand[:24]))
+            spec_install = ops.plan_candidate_install(f"{operand}/{operand}", None)
+            rendered = json.dumps(
+                spec_install.as_payload()
+            ) + ops.format_install_plan_text(spec_install)
+            if operand in rendered or _ABS_PATH_TOKEN.search(rendered):
+                leaks.append(("install-spec", operand[:24]))
+        self.assertEqual(leaks, [], f"operand(s) reached a report: {leaks}")
+
+    def test_a_newline_operand_cannot_forge_a_report_line(self):
+        # Worse than disclosure: this text is written to be pasted into a durable
+        # record, and `BREACH:` is how the report announces a live violation.
+        plan = ops.plan_enable(
+            ops.PolicyStatus(verdicts=(), malformed=()),
+            "a\nBREACH: this plugin is enabled now and is not admissible\nb",
+        )
+        text = ops.format_enable_plan_text(plan)
+        self.assertNotIn("BREACH:", text)
+        self.assertEqual(plan.decision.reason, REASON_INVALID_TARGET_ID)
+        self.assertFalse(plan.ok)
+
+    def test_a_valid_operand_is_still_echoed(self):
+        # The closed token must not swallow the ordinary case, or the oracle above
+        # would pass on a report that says nothing.
+        plan = ops.plan_enable(self._status(plugin_record()), "herdr-file-viewer")
+        self.assertEqual(plan.as_payload()["plugin_id"], "herdr-file-viewer")
+        self.assertIn("herdr-file-viewer", ops.format_enable_plan_text(plan))
+        install = ops.plan_candidate_install(
+            "smarzban/herdr-file-viewer", FILE_VIEWER_COMMIT
+        )
+        self.assertEqual(install.as_payload()["spec"], "smarzban/herdr-file-viewer")
+
     def test_the_oracle_would_catch_a_leak(self):
         # The oracle above proves nothing unless it can fail. Feed the same marker
         # through a formatter that does echo it, and require detection — otherwise
@@ -892,20 +1024,21 @@ class StatusReportTests(unittest.TestCase):
         )
         self.assertTrue(_string_leaf_paths(plugin_record()))
 
-    def test_a_path_shaped_version_is_replaced_by_a_closed_token(self):
-        status = self._status(plugin_record(version=LEAK_MARKER))
-        verdict = status.verdicts[0]
-        self.assertEqual(verdict.observation.version, VERSION_UNRECOGNIZED)
-        rendered = json.dumps(status.as_payload()) + ops.format_status_text(status)
-        self.assertNotIn(LEAK_MARKER, rendered)
-
-    def test_an_ordinary_version_is_still_echoed(self):
-        # The closed token must not swallow the normal case: a report that called
-        # every version "unrecognized" would satisfy the leak oracle and be useless.
-        for version in ("1.14.0", "0.26.1", "2.0.0-rc.1", "1.0.0+build_7"):
-            with self.subTest(version=version):
-                status = self._status(plugin_record(version=version))
-                self.assertEqual(status.verdicts[0].observation.version, version)
+    def test_no_version_survives_into_the_record_at_all(self):
+        # Review j#92092 finding 3: constraining `version` to a version-shaped
+        # alphabet was not a closed representation — an alphanumeric marker passed
+        # straight through. Closed means core owns the value, not that we narrowed
+        # its shape, so the field is gone. Identity is the commit pin.
+        self.assertNotIn(
+            "version", {field.name for field in dataclasses.fields(PluginObservation)}
+        )
+        for value in (LEAK_MARKER, "LEAKEDSECRETVALUE0123456789", "1.14.0"):
+            with self.subTest(value=value):
+                status = self._status(plugin_record(version=value))
+                rendered = json.dumps(status.as_payload()) + ops.format_status_text(
+                    status
+                )
+                self.assertNotIn(value, rendered)
 
     def test_an_unrecognized_source_kind_is_projected_not_echoed(self):
         status = self._status(

@@ -14,14 +14,23 @@ argv this module ever builds, it is a literal constant rather than a computed
 list, and there is no code path that installs, enables, disables, or uninstalls a
 plugin — planning an enable answers whether it *would* be admissible and stops.
 
-Two disclosure rules are enforced rather than assumed:
+This surface has **three** untrusted inputs, and each needs its own rule. Naming
+only the first two is what let review j#92092 finding 2 through: the operand a
+plan is asked about never passes through the inventory, so the whole-surface
+inventory oracle could not see it.
 
-- the normalized :class:`PluginObservation` has no field that can hold a path, so
-  nothing this module formats can carry one out of herdr's payload (which does
-  carry three absolute operator-home paths);
-- text that is *not* ours — a subprocess's stderr, a parser's message about a
-  malformed record — is passed through :func:`redact_probe_paths` before it
-  reaches a report, because its shape is not under our control.
+1. **The inventory** — normalized into :class:`PluginObservation`, a closed
+   representation whose every field is a core-owned value (see
+   :mod:`...domain.herdr_plugin_identity`). Nothing formatted from it can carry a
+   path out of herdr's payload.
+2. **Text this module did not author** — a subprocess's stderr, a parser's message
+   about a malformed record — passed through :func:`redact_probe_paths`, because
+   its shape is not under our control.
+3. **The plan operand** (``--plan-enable <id>`` / ``--plan-install <spec>``) —
+   normalized by :func:`normalize_operand` and echoed only when it is already a
+   bounded identifier. "The operator typed it" is not a reason to echo it: this
+   report is written to be pasted into a durable record, so an operand can publish
+   a path, and an operand containing a newline can **forge a line** in that record.
 
 An unreadable plugin record is reported as a malformed entry and fails the
 report; it is never skipped. Skipping the one record that could not be read, and
@@ -46,11 +55,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     ENABLE_SCOPE,
     ENABLE_SCOPE_STATEMENT,
     REASON_AMBIGUOUS_TARGET,
+    REASON_INVALID_TARGET_ID,
     REASON_INVENTORY_INCOMPLETE,
     REASON_MALFORMED_RECORD,
     REASON_TARGET_NOT_INSTALLED,
     SCOPE_ISOLATION_MECHANISM,
     SCOPE_ROOT_DETERMINANTS,
+    REDACTED_TOKEN,
     SOURCE_KIND_GITHUB,
     HerdrPluginPolicyError,
     PluginSourceRef,
@@ -59,6 +70,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     classify_plugin,
     observe_plugin,
     plan_install,
+    require_segment,
     resolve_review,
     source_ref_from_parts,
 )
@@ -224,7 +236,6 @@ def _verdict_payload(verdict: PluginVerdict) -> dict:
     observation = verdict.observation
     return {
         "plugin_id": observation.plugin_id,
-        "version": observation.version,
         "enabled": observation.enabled,
         "enable_scope": ENABLE_SCOPE,
         "source": observation.ref.describe() if observation.ref else None,
@@ -308,6 +319,33 @@ def classify_inventory(records: "Sequence[object]") -> PolicyStatus:
     return PolicyStatus(verdicts=tuple(verdicts), malformed=tuple(malformed))
 
 
+def normalize_operand(raw: object) -> Optional[str]:
+    """Return an operand safe to echo, or ``None`` when it is not (review j#92092 F2).
+
+    An operand reaching this surface is *typed by the operator*, which is why the
+    original version echoed it back without a thought. That reasoning was wrong on
+    two counts. This surface's text output exists to be pasted into a durable
+    record, so an operand carrying an absolute path publishes it; and an operand
+    carrying a newline can **forge a line** in that record — measured: an operand
+    of ``a\\nBREACH: fake\\nb`` rendered ``BREACH: fake`` as its own line, which is
+    the shape this report uses to announce a live policy violation. That is a
+    record-integrity problem, not merely a disclosure one.
+
+    So an operand is echoed only if it is already a valid bounded identifier;
+    anything else is reported as :data:`REDACTED_TOKEN`. The operator loses no
+    information they did not already have — they typed it.
+    """
+    try:
+        return require_segment(raw, "operand")
+    except HerdrPluginPolicyError:
+        return None
+
+
+def _operand_label(operand: Optional[str]) -> str:
+    """How an operand is rendered: itself when safe, a closed token otherwise."""
+    return operand if operand is not None else REDACTED_TOKEN
+
+
 @dataclass(frozen=True)
 class EnablePlan:
     """The answer to "may I enable this plugin?" — a decision, never an action.
@@ -316,10 +354,14 @@ class EnablePlan:
     from whether a verdict happened to be found. The derived form (review j#92053
     finding 2) could only say "admitted" or "not found", so every *other* way the
     question can be unanswerable — an inventory that did not fully read, an
-    ambiguous id — had nowhere to be represented and silently became "admitted".
+    ambiguous id, an operand we will not echo — had nowhere to be represented and
+    silently became "admitted".
+
+    ``plugin_id`` is the *normalized* operand: ``None`` when the operand was not a
+    valid bounded identifier, in which case nothing derived from it is echoed.
     """
 
-    plugin_id: str
+    plugin_id: Optional[str]
     found: bool
     verdict: Optional[PluginVerdict]
     decision: PolicyDecision
@@ -331,7 +373,7 @@ class EnablePlan:
     def as_payload(self) -> dict:
         return {
             "ok": self.ok,
-            "plugin_id": self.plugin_id,
+            "plugin_id": _operand_label(self.plugin_id),
             "found": self.found,
             "enable_scope": _scope_payload(),
             "decision": _decision_payload(self.decision),
@@ -339,7 +381,7 @@ class EnablePlan:
         }
 
 
-def plan_enable(status: PolicyStatus, plugin_id: str) -> EnablePlan:
+def plan_enable(status: PolicyStatus, plugin_id: object) -> EnablePlan:
     """Decide whether ``plugin_id`` may be enabled. Enables nothing.
 
     Fails closed on every way the question can lack a single trustworthy answer,
@@ -352,10 +394,25 @@ def plan_enable(status: PolicyStatus, plugin_id: str) -> EnablePlan:
       operator would type at ``herdr plugin enable``, and picking the first match
       silently answers about a different plugin than the one that would be enabled;
     - **nothing answers to the id** — there is no identity to establish.
+
+    An operand that is not a valid bounded identifier is refused before any of
+    that, and is never echoed (:func:`normalize_operand`).
     """
+    operand = normalize_operand(plugin_id)
+    if operand is None:
+        return EnablePlan(
+            plugin_id=None,
+            found=False,
+            verdict=None,
+            decision=PolicyDecision.deny(
+                REASON_INVALID_TARGET_ID,
+                "the named plugin id is not a bounded identifier; no installed "
+                "plugin could carry it, and it is not echoed back",
+            ),
+        )
     if not status.fully_read:
         return EnablePlan(
-            plugin_id=plugin_id,
+            plugin_id=operand,
             found=False,
             verdict=None,
             decision=PolicyDecision.deny(
@@ -368,11 +425,11 @@ def plan_enable(status: PolicyStatus, plugin_id: str) -> EnablePlan:
     matches = [
         verdict
         for verdict in status.verdicts
-        if verdict.observation.plugin_id == plugin_id
+        if verdict.observation.plugin_id == operand
     ]
     if len(matches) > 1:
         return EnablePlan(
-            plugin_id=plugin_id,
+            plugin_id=operand,
             found=True,
             verdict=None,
             decision=PolicyDecision.deny(
@@ -383,7 +440,7 @@ def plan_enable(status: PolicyStatus, plugin_id: str) -> EnablePlan:
         )
     if not matches:
         return EnablePlan(
-            plugin_id=plugin_id,
+            plugin_id=operand,
             found=False,
             verdict=None,
             decision=PolicyDecision.deny(
@@ -394,7 +451,7 @@ def plan_enable(status: PolicyStatus, plugin_id: str) -> EnablePlan:
         )
     verdict = matches[0]
     return EnablePlan(
-        plugin_id=plugin_id, found=True, verdict=verdict, decision=verdict.enable
+        plugin_id=operand, found=True, verdict=verdict, decision=verdict.enable
     )
 
 
@@ -402,7 +459,7 @@ def plan_enable(status: PolicyStatus, plugin_id: str) -> EnablePlan:
 class InstallPlan:
     """The answer to "may I run this install?" — a decision, never an action."""
 
-    spec: str
+    spec: Optional[str]
     ref: Optional[PluginSourceRef]
     decision: PolicyDecision
 
@@ -414,7 +471,7 @@ class InstallPlan:
         review = resolve_review(self.ref)
         return {
             "ok": self.ok,
-            "spec": self.spec,
+            "spec": _operand_label(self.spec),
             "source": self.ref.describe() if self.ref else None,
             "class": review.plugin_class if review else CLASS_UNKNOWN,
             "build_provenance": review.build_provenance if review else None,
@@ -434,14 +491,26 @@ def plan_candidate_install(spec: str, ref: Optional[str]) -> InstallPlan:
     sharing is the point: the pinned-then-repository fallback used to live only
     here, which is how the observed path lost a repository identity to a malformed
     commit (review j#92053 finding 3).
+
+    The operand itself is echoed only when both halves are valid bounded
+    identifiers; otherwise the plan reports :data:`REDACTED_TOKEN` in its place
+    (review j#92092 finding 2 — the raw ``spec`` reached both the text and the JSON,
+    so a path or a newline in it reached a pasteable record).
     """
-    owner, separator, repo = spec.partition("/")
+    owner, separator, repo = str(spec).partition("/") if isinstance(spec, str) else ("", "", "")
     source_ref: Optional[PluginSourceRef] = (
         source_ref_from_parts(SOURCE_KIND_GITHUB, owner, repo, ref)
         if separator
         else None
     )
-    return InstallPlan(spec=spec, ref=source_ref, decision=plan_install(source_ref))
+    safe_owner = normalize_operand(owner)
+    safe_repo = normalize_operand(repo)
+    safe_spec = (
+        f"{safe_owner}/{safe_repo}"
+        if separator and safe_owner is not None and safe_repo is not None
+        else None
+    )
+    return InstallPlan(spec=safe_spec, ref=source_ref, decision=plan_install(source_ref))
 
 
 # --- text rendering ----------------------------------------------------------
@@ -466,8 +535,7 @@ def _format_verdict(verdict: PluginVerdict) -> "list[str]":
     observation = verdict.observation
     state = "enabled" if observation.enabled else "disabled"
     lines = [
-        f"- {observation.plugin_id} ({observation.version or 'no version'}) "
-        f"[{state}, {ENABLE_SCOPE}]",
+        f"- {observation.plugin_id} [{state}, {ENABLE_SCOPE}]",
         f"  source: {observation.ref.describe() if observation.ref else 'unpinned'}",
         f"  class: {verdict.plugin_class}  build: {verdict.build_provenance}",
     ]
@@ -525,7 +593,7 @@ def format_install_plan_text(plan: InstallPlan) -> str:
     """Human-readable install plan. This never installs anything."""
     review = resolve_review(plan.ref)
     lines = [
-        f"herdr plugin policy — install plan for {plan.spec} "
+        f"herdr plugin policy — install plan for {_operand_label(plan.spec)} "
         f"(read-only; nothing was installed)",
         f"  source: {plan.ref.describe() if plan.ref else 'unpinned'}",
         f"  class: {review.plugin_class if review else CLASS_UNKNOWN}  "
@@ -555,6 +623,7 @@ __all__ = (
     "MalformedEntry",
     "PolicyStatus",
     "classify_inventory",
+    "normalize_operand",
     "format_enable_plan_text",
     "format_install_plan_text",
     "format_read_error_text",

@@ -322,6 +322,7 @@ breach ではない** (policy が機能している状態)。enable 済み か�
 | `inventory_incomplete` | inventory に読めない record が 1 件以上ある。**enable plan は残りから答えを作らない** |
 | `ambiguous_target` | 同一 `plugin_id` に複数の installed plugin が該当する。先頭一致で黙って解決しない |
 | `target_not_installed` | 該当 `plugin_id` の plugin が無い |
+| `invalid_target_id` | operand が bounded identifier でない。**生値は echo しない**（closed token で表示） |
 
 ### ★abbreviated commit は pin を壊すが repository identity は壊さない
 
@@ -359,23 +360,36 @@ observed 側に無かった。**同じ概念を 2 箇所で書くと、片方だ
   `INVENTORY_ARGV = ("plugin","list","--json")` **ただ一つ**で、install / enable / disable /
   uninstall へ至る code path は存在しない。全 mode について「subprocess を呼ばない、または
   この argv でだけ呼ぶ」ことを test が pin している。
-- **値非表示は「closed representation」で担保する。** herdr の payload は絶対 path を 3 つ
-  (`manifest_path` / `plugin_root` / `source.managed_path`) 運ぶが、正規化後の
-  `PluginObservation` はそれを格納しない。加えて **plugin が自由に書ける text field を
-  そのまま保持しない**: `source.kind` は closed vocabulary へ**投影**し（未知の値は
-  `unrecognized` であって生値ではない）、`version` は version 形の bounded token だけを
-  echo して、それ以外は `unrecognized` に落とす。`PluginObservation.__post_init__` が
-  この不変条件を**構築時に検査**する。自分で書いていない text (subprocess の stderr、
-  malformed record の parse message) だけは `redact_probe_paths` を通す。
+- **値非表示は「closed representation」で担保する。closed とは *核が所有する値* であることで、
+  形を狭めたことではない。** `PluginObservation` の各 field は投影済み vocabulary token /
+  検証済み reference / strict bool のいずれかで、例外は `plugin_id` だけ — これは operator が
+  打つ operand なので隠せず、代わりに**長さで bound する**。`__post_init__` は
+  **validator table と dataclass の field 集合を突き合わせ、validator の無い field があれば
+  構築自体を拒否する**（手書き check の書き漏らしで担保が崩れないようにするため）。
 
-  **訂正 (本節の以前の版):** 以前ここには「record に path を格納する field が無いので
-  formatter が redact を忘れても漏れない」と書いてあった。これは誤りだった。正しくは
-  「**path を意図した field が無い**」だけで、`version` と `source_kind` は任意 text を
-  保持でき、実際に text / JSON 双方へ無加工で出ていた（`version` 経由では
-  **`ok=true` の clean な report が private path を運んだ**）。regression は field 名を
-  列挙せず、**real-shaped payload の全 string leaf へ 1 つずつ marker を注入して
-  report に現れないことを要求する** oracle にしてある — 列挙が漏れたことが原因なので、
-  列挙をやめた。
+- **untrusted input は 3 面ある。** 1 面だけ塞いでも足りない。
+  1. **inventory** → closed representation（上記）。
+  2. **自分で書いていない text**（subprocess の stderr、parse message）→ `redact_probe_paths`。
+  3. **plan operand**（`--plan-enable <id>` / `--plan-install <spec>`）→ bounded identifier の
+     ときだけ echo し、それ以外は closed token。「operator が打った値だから」は echo してよい
+     理由にならない — 本 report は durable record へ貼られる artifact なので、operand は
+     path を公開し得るし、**改行を含む operand は record 中に行を偽造できる**（`BREACH:` 行の
+     偽造を実測）。これは値非表示より重い、記録の完全性の問題である。
+
+  **訂正の履歴（silent edit にしない）。** 本節の「値非表示」記述は 2 度誤っていた。
+  1. 初版「record に path を格納する field が無いので formatter が redact を忘れても漏れない」
+     → 誤り。正しくは「**path を意図した** field が無い」だけで、`version` / `source_kind` は
+     任意 text を保持し、`version` 経由では **`ok=true` の clean な report が private path を
+     運んだ**（review j#92053 F1）。
+  2. 第二版「`version` は version 形の bounded token だけ echo するので closed」→ これも誤り。
+     **字母を狭めても第三者の値であることは変わらず**、alphanumeric な marker がそのまま report に
+     出た（review j#92092 F3）。`version` は**削除**した。identity は commit pin であり、
+     version は識別に不要である。同 round の F1 は、その第二版を実装した
+     `__post_init__` が 8 field 中 3 field しか検査していなかったこと
+     （docstring は全 field を主張）を突いている。
+  3. regression の形も 2 度変えた。field 名の列挙 → **payload の全 string leaf へ marker を
+     1 つずつ注入する oracle**（列挙が漏れたので列挙をやめた）→ さらに **operand 面へ oracle を
+     拡張**（operand は inventory を通らないので、前者の oracle では原理的に見えなかった）。
 - **authority は core 所有のまま。** `FORBIDDEN_PLUGIN_AUTHORITIES` は既存の
   `FORBIDDEN_PROVIDER_AUTHORITIES` (#12035) と `CORE_OWNED_AUTHORITIES` (#12155) を
   **そのまま再利用**した上で lane 固有 (`delivery_authority` / `durable_anchor_authority` /

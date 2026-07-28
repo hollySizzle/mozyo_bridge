@@ -14,19 +14,35 @@ than a line count:
   module. The dependency arrow points one way only.
 
 The disclosure boundary lives here, because this is where third-party data stops
-being third-party data. herdr's payload carries three absolute operator-home
-paths (``manifest_path`` / ``plugin_root`` / ``source.managed_path``) and two
-free-text fields, so :class:`PluginObservation` is a **closed representation**:
-every field is either core-owned vocabulary or a validated segment, and
-``__post_init__`` checks that rather than trusting it. Review j#92053 finding 1
-measured what the weaker version was worth — "no field is *meant* to hold a path"
-let ``version`` and ``source_kind`` carry one straight into a report.
+being third-party data. :class:`PluginObservation` is a **closed representation**:
+every field is a core-owned value — a projected vocabulary token, a validated
+reference, a strict boolean — except the plugin id, which is a *bounded*
+identifier and is echoed only because it is the operand an operator types.
+``__post_init__`` checks every field against a validator table and refuses to
+construct a record whose field has no validator, so the guarantee does not depend
+on anyone remembering to extend a hand-written check.
+
+Two review rounds shaped that definition, and each correction is recorded because
+each was a case of the claim outrunning the code:
+
+- j#92053 F1 — "no field is *meant* to hold a path" was not a boundary. ``version``
+  and ``source_kind`` were only checked for *being* strings and carried a private
+  path straight into a report.
+- j#92092 F1 — the replacement ``__post_init__`` hand-listed three checks while
+  this docstring claimed all eight fields were closed. The five unchecked fields
+  accepted arbitrary text (a path in ``declares_build`` reached the report) or
+  raised a raw ``TypeError``.
+- j#92092 F3 — narrowing ``version`` to a version-shaped alphabet still was not
+  closed. **Closed means the value is one core owns, not one whose shape we
+  constrained.** ``version`` is gone: identity is the commit pin, so nothing
+  needed it.
 
 Pure: no file IO, no subprocess, no network.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -53,15 +69,19 @@ OBSERVED_SOURCE_KINDS: frozenset[str] = frozenset(
     }
 )
 
-#: What an unusable version string is reported as. Not the raw value.
-VERSION_UNRECOGNIZED = "unrecognized"
+#: What an operand we will not echo is rendered as. A closed token, never the value.
+REDACTED_TOKEN = "<withheld>"
+
+#: Upper bound on any identifier segment this module will echo. Review j#92092
+#: found ``version`` echoed third-party text; the same class applied to
+#: ``plugin_id``, which has no upper bound in its alphabet alone — a 5,000-character
+#: id was accepted and rendered. An id *must* be echoed (it is the operand an
+#: operator types at ``herdr plugin enable``), so the remedy here is a bound rather
+#: than suppression.
+MAX_SEGMENT_LENGTH = 64
 
 _COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _SEGMENT_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
-#: A version we are willing to echo: the ordinary version alphabet, bounded. It
-#: admits no ``/``, ``\``, ``:``, or whitespace, so no value that passes can be a
-#: filesystem path or a URL.
-_VERSION_RE = re.compile(r"\A[0-9A-Za-z.+_-]{1,64}\Z")
 
 
 def normalize_source_kind(raw: object) -> str:
@@ -88,22 +108,6 @@ def normalize_source_kind(raw: object) -> str:
     return SOURCE_KIND_UNRECOGNIZED
 
 
-def normalize_version(raw: object) -> str:
-    """Return a version safe to echo, or :data:`VERSION_UNRECOGNIZED` (review j#92053 F1).
-
-    A version is display-only — identity is the commit pin — but it is authored by
-    the plugin, so an arbitrary string could reach the report. It is *not* rejected
-    as a malformed record: an odd version is cosmetic, and (since finding 2's fix
-    makes a malformed record block enable planning) treating it as malformed would
-    let a cosmetic oddity block an operator's admin question. Instead the value is
-    kept only when it looks like a version, and replaced by a closed token when it
-    does not.
-    """
-    if isinstance(raw, str) and _VERSION_RE.match(raw):
-        return raw
-    return VERSION_UNRECOGNIZED
-
-
 class HerdrPluginPolicyError(ValueError):
     """A plugin record, review entry, or registry is unreadable / self-contradictory.
 
@@ -126,8 +130,13 @@ def require_segment(value: object, field: str) -> str:
         )
     if not _SEGMENT_RE.match(value):
         raise HerdrPluginPolicyError(
-            f"{field} {value!r} is not a bare identifier segment "
+            f"{field} is not a bare identifier segment "
             f"(letters, digits, '.', '_', '-')"
+        )
+    if len(value) > MAX_SEGMENT_LENGTH:
+        raise HerdrPluginPolicyError(
+            f"{field} exceeds {MAX_SEGMENT_LENGTH} characters; an identifier this "
+            f"long is third-party text, not an identifier"
         )
     return value
 
@@ -258,20 +267,75 @@ def read_source_ref(source: object) -> Optional[PluginSourceRef]:
     )
 
 
+def _check_plugin_id(value: object, name: str) -> None:
+    require_segment(value, name)
+
+
+def _check_source_kind(value: object, name: str) -> None:
+    # Type before membership: an unhashable value would raise a raw ``TypeError``
+    # out of the frozenset test rather than a policy error (review j#92092 F1).
+    if not isinstance(value, str):
+        raise HerdrPluginPolicyError(
+            f"{name} must be a string, got {type(value).__name__}"
+        )
+    if value not in OBSERVED_SOURCE_KINDS:
+        raise HerdrPluginPolicyError(
+            f"{name} is outside the observed vocabulary "
+            f"{sorted(OBSERVED_SOURCE_KINDS)}"
+        )
+
+
+def _check_strict_bool(value: object, name: str) -> None:
+    if not isinstance(value, bool):
+        raise HerdrPluginPolicyError(
+            f"{name} must be a boolean, got {type(value).__name__}"
+        )
+
+
+def _check_optional_ref(value: object, name: str) -> None:
+    if value is not None and not isinstance(value, PluginSourceRef):
+        raise HerdrPluginPolicyError(
+            f"{name} must be a PluginSourceRef or None, got {type(value).__name__}"
+        )
+
+
+#: One validator per :class:`PluginObservation` field. ``__post_init__`` walks the
+#: dataclass's own field list against this table and refuses to construct anything
+#: when a field has no entry, so a field added later cannot slip through
+#: unvalidated. Review j#92092 finding 1 is exactly that failure: the previous
+#: ``__post_init__`` hand-listed three checks while the docstring claimed all
+#: eight fields were closed, and the five unchecked ones accepted arbitrary text
+#: (a path in ``declares_build`` reached the report) or raised raw ``TypeError``.
+#: The table is still an enumeration — but a *detected* one.
+_OBSERVATION_FIELD_CHECKS = {
+    "plugin_id": _check_plugin_id,
+    "enabled": _check_strict_bool,
+    "source_kind": _check_source_kind,
+    "ref": _check_optional_ref,
+    "declares_build": _check_strict_bool,
+    "declares_panes": _check_strict_bool,
+    "declares_actions": _check_strict_bool,
+}
+
+
 @dataclass(frozen=True)
 class PluginObservation:
-    """A herdr plugin as observed, normalized to path-free facts.
+    """A herdr plugin as observed, reduced to core-owned facts.
 
-    Deliberately holds no ``manifest_path`` / ``plugin_root`` / ``managed_path``:
-    the three absolute operator-home paths in herdr's payload have nowhere to go,
-    so no formatter can leak one. ``declares_build`` / ``declares_panes`` /
-    ``declares_actions`` record only *whether* the local manifest declares each
-    surface — never the commands, which are third-party strings that can embed a
-    private path.
+    Holds no ``manifest_path`` / ``plugin_root`` / ``managed_path`` (the three
+    absolute operator-home paths in herdr's payload) and — since review j#92092
+    finding 3 — no ``version`` either. A narrow alphabet is not a closed
+    representation: "closed" means the value is one core owns, not one whose
+    *shape* we constrained, and a version-shaped marker was still third-party text
+    reaching the report. Identity is the commit pin, so nothing needed the version.
+
+    What remains is a plugin id (a bounded identifier, which must be echoed because
+    it is the operand an operator types), a projected source kind, a validated
+    reference, and three booleans recording only *whether* the local manifest
+    declares each surface — never the commands, which are third-party strings.
     """
 
     plugin_id: str
-    version: str
     enabled: bool
     source_kind: str
     ref: Optional[PluginSourceRef]
@@ -280,22 +344,16 @@ class PluginObservation:
     declares_actions: bool
 
     def __post_init__(self) -> None:
-        # The closed-representation invariant, checked rather than trusted: every
-        # field here is either core-owned vocabulary or a validated segment, so no
-        # third-party free text survives into a report. Review j#92053 finding 1
-        # measured what "no field is *meant* to hold a path" was worth without this
-        # check — `version` and `source_kind` held whatever the plugin wrote.
-        if self.source_kind not in OBSERVED_SOURCE_KINDS:
+        missing = {
+            field.name for field in dataclasses.fields(self)
+        } - _OBSERVATION_FIELD_CHECKS.keys()
+        if missing:
             raise HerdrPluginPolicyError(
-                f"source_kind {self.source_kind!r} is outside the observed "
-                f"vocabulary {sorted(OBSERVED_SOURCE_KINDS)}"
+                f"no closed-representation validator for field(s) {sorted(missing)}; "
+                f"every field must be checked or the record is not closed"
             )
-        if self.version != VERSION_UNRECOGNIZED and not _VERSION_RE.match(self.version):
-            raise HerdrPluginPolicyError(
-                "version must be a bounded version-shaped token or "
-                f"{VERSION_UNRECOGNIZED!r}"
-            )
-        _require_segment(self.plugin_id, "plugin_id")
+        for name, check in _OBSERVATION_FIELD_CHECKS.items():
+            check(getattr(self, name), name)
 
 
 def _require_bool(record: "Mapping[object, object]", key: str) -> bool:
@@ -346,7 +404,6 @@ def observe_plugin(record: object) -> PluginObservation:
     source = record.get("source")
     return PluginObservation(
         plugin_id=_require_segment(record.get("plugin_id"), "plugin_id"),
-        version=normalize_version(record.get("version")),
         enabled=_require_bool(record, "enabled"),
         source_kind=normalize_source_kind(
             source.get("kind") if isinstance(source, Mapping) else None
@@ -364,12 +421,12 @@ __all__ = (
     "SOURCE_KIND_GITHUB",
     "SOURCE_KIND_LINK",
     "SOURCE_KIND_UNRECOGNIZED",
-    "VERSION_UNRECOGNIZED",
+    "MAX_SEGMENT_LENGTH",
+    "REDACTED_TOKEN",
     "HerdrPluginPolicyError",
     "PluginObservation",
     "PluginSourceRef",
     "normalize_source_kind",
-    "normalize_version",
     "observe_plugin",
     "read_source_ref",
     "require_segment",

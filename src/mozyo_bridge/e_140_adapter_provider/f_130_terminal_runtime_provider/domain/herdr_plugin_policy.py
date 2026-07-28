@@ -98,13 +98,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     SOURCE_KIND_GITHUB,
     SOURCE_KIND_LINK,
     SOURCE_KIND_UNRECOGNIZED,
-    VERSION_UNRECOGNIZED,
+    MAX_SEGMENT_LENGTH,
+    REDACTED_TOKEN,
     HerdrPluginPolicyError,
     PluginObservation,
     PluginSourceRef,
     require_segment,
     normalize_source_kind,
-    normalize_version,
     observe_plugin,
     read_source_ref,
     source_ref_from_parts,
@@ -207,6 +207,9 @@ REASON_AMBIGUOUS_TARGET = "ambiguous_target"
 #: The named plugin is not installed, so there is nothing whose identity could be
 #: established.
 REASON_TARGET_NOT_INSTALLED = "target_not_installed"
+#: The operand naming the target is not a bounded identifier. No installed plugin
+#: could carry it, and it is not echoed back (review j#92092 F2).
+REASON_INVALID_TARGET_ID = "invalid_target_id"
 
 DENY_REASONS: frozenset[str] = frozenset(
     {
@@ -222,6 +225,7 @@ DENY_REASONS: frozenset[str] = frozenset(
         REASON_INVENTORY_INCOMPLETE,
         REASON_AMBIGUOUS_TARGET,
         REASON_TARGET_NOT_INSTALLED,
+        REASON_INVALID_TARGET_ID,
     }
 )
 
@@ -676,13 +680,14 @@ __all__ = (
     "OBSERVED_SOURCE_KINDS",
     "REASON_AMBIGUOUS_TARGET",
     "REASON_INVENTORY_INCOMPLETE",
+    "REASON_INVALID_TARGET_ID",
     "REASON_TARGET_NOT_INSTALLED",
     "SOURCE_KIND_ABSENT",
     "SOURCE_KIND_LINK",
     "SOURCE_KIND_UNRECOGNIZED",
-    "VERSION_UNRECOGNIZED",
+    "MAX_SEGMENT_LENGTH",
+    "REDACTED_TOKEN",
     "normalize_source_kind",
-    "normalize_version",
     "resolve_reference",
     "source_ref_from_parts",
     "BUILD_NONE",
