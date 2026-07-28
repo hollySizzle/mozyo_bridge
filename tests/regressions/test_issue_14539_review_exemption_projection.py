@@ -3158,5 +3158,250 @@ class ReviewJ92174SharedBodyReaderTests(unittest.TestCase):
         )
 
 
+class ReviewJ92227DispatchAuthorityTests(unittest.TestCase):
+    """R24: the whole-note / cardinality contract had never reached the dispatch channels.
+
+    R23 taught the shared gate reader that a same-gate sibling it cannot count poisons the note.
+    The two dedicated authority channels — where the channel IS the gate — kept skipping an
+    unrenderable sibling and dispatching on the survivor, and the send side resolved two valid
+    authorizations at ONE journal by note order while the discharge side called the identical
+    record ambiguous. Both effects are real: a worker send and a terminal discharge.
+    """
+
+    WS, LANE, ISSUE, TGT = "ws", "r1", "14539", "tgt"
+
+    class _Entry:
+        def __init__(self, journal, notes, issue):
+            self.journal_id, self.notes, self.issue_id = str(journal), notes, issue
+
+    def _entry(self, journal, notes):
+        return self._Entry(journal, notes, self.ISSUE)
+
+    def _auth(self, action_id):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authorization import (  # noqa: E501
+            build_dispatch_authorization_marker,
+        )
+
+        return build_dispatch_authorization_marker(
+            action_id=action_id,
+            source_gate="review_result",
+            issue=self.ISSUE,
+            workspace_id=self.WS,
+            lane_id=self.LANE,
+            target_assigned_name=self.TGT,
+        )
+
+    def _decide(self, entries):
+        """The REAL send effect entry, driven through its two injection seams."""
+        import argparse
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_dispatch_authority import (  # noqa: E501
+            resolve_dispatch_decision,
+        )
+
+        return resolve_dispatch_decision(
+            argparse.Namespace(),
+            workspace_id=self.WS,
+            lane_id=self.LANE,
+            issue=self.ISSUE,
+            env={},
+            journal_source_factory=lambda _args: type(
+                "_Source", (), {"read_entries": lambda _s, _i: entries}
+            )(),
+            # A single idle slot: the ONLY runtime shape that can reach AUTHORIZE, so a blocked
+            # verdict below is the authorization's doing and not the target's.
+            agent_rows=lambda _env: [{"name": self.TGT, "agent_status": "idle"}],
+        )
+
+    def _valid_index(self, entries):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authorization import (  # noqa: E501
+            parse_dispatch_authorizations,
+        )
+
+        index = {}
+        for auth in parse_dispatch_authorizations(entries):
+            if auth.valid:
+                index.setdefault(auth.journal, []).append(auth)
+        return index
+
+    def _row(self, action_id="a1"):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_disposition import (  # noqa: E501
+            DispatchRowIdentity,
+        )
+
+        return DispatchRowIdentity(
+            issue=self.ISSUE,
+            workspace_id=self.WS,
+            lane_id=self.LANE,
+            target_assigned_name=self.TGT,
+            journal="7",
+            action_id=action_id,
+        )
+
+    def _correlate(self, entries, index, review_requests=()):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_disposition import (  # noqa: E501
+            correlate_dispatch_disposition,
+        )
+
+        return correlate_dispatch_disposition(
+            self._row(),
+            entries,
+            authorize_journals=index,
+            review_request_journals=list(review_requests),
+        )
+
+    # -- finding 1: authorization, unrenderable same-channel sibling --------------------
+
+    def test_a_clean_authorization_still_dispatches(self):
+        """Control: the canonical producer's own output must keep authorizing."""
+        decision = self._decide([self._entry(7, self._auth("a1"))])
+        self.assertEqual(decision.decision, "authorize")
+
+    def test_a_forged_sibling_blocks_the_dispatch(self):
+        clean = self._auth("a1")
+        forged = clean.replace("action=dispatch_worker", "action = dispatch_worker")
+        decision = self._decide([self._entry(7, clean + "\n" + forged)])
+        self.assertEqual(decision.decision, "blocked")
+
+    def test_the_poisoned_authorization_keeps_its_identity_so_it_is_reported(self):
+        """Blocked, not monitored: an all-blank record matches no lane and vanishes."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authorization import (  # noqa: E501
+            AMBIGUITY_UNREADABLE_SIBLING,
+            parse_dispatch_authorizations,
+        )
+
+        clean = self._auth("a1")
+        forged = clean.replace("action=dispatch_worker", "action = dispatch_worker")
+        parsed = parse_dispatch_authorizations([self._entry(7, clean + "\n" + forged)])
+        survivor = next(a for a in parsed if a.action_id == "a1")
+        self.assertEqual(survivor.ambiguity, AMBIGUITY_UNREADABLE_SIBLING)
+        self.assertFalse(survivor.valid)
+        self.assertTrue(
+            survivor.matches_lane(
+                workspace_id=self.WS, lane_id=self.LANE, issue=self.ISSUE
+            )
+        )
+
+    def test_the_poison_reaches_every_consumer_that_gates_on_valid(self):
+        """One flag, not four patched call sites: retire / writer / intake all read ``valid``."""
+        clean = self._auth("a1")
+        forged = clean.replace("action=dispatch_worker", "action = dispatch_worker")
+        self.assertEqual(self._valid_index([self._entry(7, clean + "\n" + forged)]), {})
+
+    def test_a_forged_marker_in_ANOTHER_journal_does_not_poison_this_one(self):
+        """The boundary: the poison is note-scoped, not history-scoped."""
+        clean = self._auth("a1")
+        forged = clean.replace("action=dispatch_worker", "action = dispatch_worker")
+        decision = self._decide(
+            [self._entry(5, forged), self._entry(7, clean)]
+        )
+        self.assertEqual(decision.decision, "authorize")
+
+    # -- finding 2: two valid authorizations at ONE journal -----------------------------
+
+    def test_two_valid_authorizations_at_one_journal_block_the_dispatch(self):
+        note = self._auth("a1") + "\n" + self._auth("a2")
+        self.assertEqual(self._decide([self._entry(7, note)]).decision, "blocked")
+
+    def test_the_send_and_discharge_entries_agree_on_the_same_record(self):
+        """The parity this finding was really about: one durable record, one answer.
+
+        Before R25 the identical note read ``authorize`` when the sender asked and
+        ``ambiguous`` when the retire asked — the discharge side had carried the cardinality
+        rule since j#80644 R6-F2 and the send side had never been given it.
+        """
+        entries = [self._entry(7, self._auth("a1") + "\n" + self._auth("a2"))]
+        self.assertEqual(self._decide(entries).decision, "blocked")
+        self.assertEqual(
+            self._correlate(entries, self._valid_index(entries)).state, "ambiguous"
+        )
+
+    def test_a_re_authorization_at_a_LATER_journal_still_supersedes(self):
+        """The boundary: last-wins is about supersession BETWEEN journals; keep it."""
+        decision = self._decide(
+            [self._entry(5, self._auth("a1")), self._entry(7, self._auth("a2"))]
+        )
+        self.assertEqual(decision.decision, "authorize")
+        self.assertEqual(decision.authorization.action_id, "a2")
+
+    # -- finding 3: disposition, unrenderable same-channel sibling ----------------------
+
+    def _disposition_history(self, note):
+        return [
+            self._entry(7, self._auth("a1")),
+            self._entry(9, "## Gate: Review Request\n[mozyo:workflow-event:gate=review_request]"),
+            self._entry(11, note),
+        ]
+
+    def _disposition(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_disposition import (  # noqa: E501
+            render_dispatch_disposition_marker,
+        )
+
+        return render_dispatch_disposition_marker(
+            action_id="a1",
+            dispatch_journal="7",
+            workspace_id=self.WS,
+            lane_id=self.LANE,
+            target_assigned_name=self.TGT,
+            terminal_journal="9",
+        )
+
+    def test_a_clean_disposition_still_discharges(self):
+        """Control: the canonical discharge path must keep working."""
+        entries = self._disposition_history(self._disposition())
+        index = self._valid_index([self._entry(7, self._auth("a1"))])
+        self.assertEqual(
+            self._correlate(entries, index, review_requests=["9"]).state, "discharged"
+        )
+
+    def test_a_forged_disposition_sibling_refuses_the_discharge(self):
+        clean = self._disposition()
+        forged = clean.replace("action_id=a1", "action_id = a1")
+        entries = self._disposition_history(clean + "\n" + forged)
+        index = self._valid_index([self._entry(7, self._auth("a1"))])
+        self.assertEqual(
+            self._correlate(entries, index, review_requests=["9"]).state, "ambiguous"
+        )
+
+    def test_the_poisoned_disposition_is_still_returned_so_the_round_reads_ambiguous(self):
+        """Dropping it would report OWED — "still running" — for a record that exists."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_disposition import (  # noqa: E501
+            parse_dispatch_dispositions,
+        )
+
+        clean = self._disposition()
+        forged = clean.replace("action_id=a1", "action_id = a1")
+        parsed = parse_dispatch_dispositions(self._entry(11, clean + "\n" + forged))
+        self.assertEqual([d.note_ambiguous for d in parsed], [True])
+
+    def test_the_disposition_writer_refuses_to_call_a_poisoned_prior_already_recorded(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.dispatch_disposition_writer import (  # noqa: E501
+            record_dispatch_disposition,
+        )
+
+        clean = self._disposition()
+        forged = clean.replace("action_id=a1", "action_id = a1")
+        writes = []
+
+        def _record(note):
+            entries = self._disposition_history(note)
+            return record_dispatch_disposition(
+                issue=self.ISSUE,
+                dispatch_journal="7",
+                terminal_journal="9",
+                workspace_id=self.WS,
+                lane_id=self.LANE,
+                target_assigned_name=self.TGT,
+                action_id="a1",
+                source=type("_S", (), {"read_entries": lambda _s, _i: entries})(),
+                append_note=lambda issue, text: writes.append((issue, text)),
+            )
+
+        self.assertEqual(_record(clean).state, "already_recorded")  # control
+        self.assertEqual(_record(clean + "\n" + forged).state, "refused")
+        self.assertEqual(writes, [])  # zero-write on both paths
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

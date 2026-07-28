@@ -49,6 +49,20 @@ CONCLUSION_AUTHORIZED = "authorized"
 TARGET_ROLE_WORKER = "implementation_worker"
 AUTHORIZER_COORDINATOR = "coordinator"
 
+# Why a structurally perfect authorization still cannot be counted (Redmine #14539 review
+# j#92227). Both are properties of the RECORD AROUND the marker, not of the marker's own body,
+# which is why they are carried separately from the required-field check.
+#: The note carries another dispatch-authorization marker the canonical producer could not
+#: render. Returning the readable siblings would make a note containing one clean and one forged
+#: authorization read exactly like a clean note.
+AMBIGUITY_UNREADABLE_SIBLING = "unreadable_sibling"
+#: One journal carries more than one valid authorization for the same lane + issue. Two markers
+#: at ONE journal is an ambiguity to surface, never a supersession to resolve by note order.
+AMBIGUITY_DUPLICATE_AT_JOURNAL = "duplicate_authorization_at_journal"
+AUTHORIZATION_AMBIGUITIES: frozenset[str] = frozenset(
+    {AMBIGUITY_UNREADABLE_SIBLING, AMBIGUITY_DUPLICATE_AT_JOURNAL}
+)
+
 # The required structured fields. ``journal`` is the entry's own durable id (supplied by the
 # reader, never trusted from the note body) so it is not part of this set.
 _REQUIRED_FIELDS = (
@@ -115,10 +129,21 @@ class DispatchAuthorization:
     conclusion: str
     authorized_by_role: str
     journal: str = ""
+    #: Why this authorization cannot be counted even though its OWN fields may be perfect —
+    #: one of :data:`AUTHORIZATION_AMBIGUITIES`, or ``""`` when nothing about its context is
+    #: ambiguous. A non-empty value makes :attr:`valid` False while leaving the identity fields
+    #: intact, so the lane correlator still SELECTS it and the decider surfaces a blocked
+    #: dispatch rather than silently monitoring (Redmine #14539 review j#92227 findings 1 / 2).
+    ambiguity: str = ""
 
     @property
     def valid(self) -> bool:
         """True only when every required field is present and the authority fields hold exactly."""
+        if self.ambiguity:
+            # Its own body may be flawless; the note or journal it lives in cannot be read as
+            # naming exactly one authorization, and a dispatch is not authorized by "one of the
+            # markers here is fine".
+            return False
         if not all((getattr(self, name) or "").strip() for name in _REQUIRED_FIELDS):
             return False
         return (
@@ -141,9 +166,12 @@ class DispatchAuthorization:
         return self.target_assigned_name == (target_assigned_name or "").strip()
 
 
-def _authorization_from_fields(fields: Mapping[str, str], journal: str) -> DispatchAuthorization:
+def _authorization_from_fields(
+    fields: Mapping[str, str], journal: str, *, ambiguity: str = ""
+) -> DispatchAuthorization:
     """Build a :class:`DispatchAuthorization` from parsed marker fields (pure)."""
     return DispatchAuthorization(
+        ambiguity=ambiguity,
         action_id=(fields.get("action_id") or "").strip(),
         source_gate=(fields.get("source_gate") or "").strip(),
         issue=(fields.get("issue") or "").strip(),
@@ -170,6 +198,18 @@ def parse_dispatch_authorizations(
     such token contributes nothing; invalid / partial markers are still parsed (the caller's
     :meth:`DispatchAuthorization.valid` gate rejects them) so a malformed authorization can be
     diagnosed rather than silently vanish.
+
+    An unrenderable marker POISONS ITS WHOLE NOTE for this channel (Redmine #14539 review
+    j#92227 finding 1). Emitting it as an all-blank invalid authorization was diagnosable and
+    ineffective: with no identity fields it matched no lane, so the lane correlator dropped it
+    and dispatched on its clean sibling — a note carrying one canonical and one forged
+    authorization decided exactly like a clean note. The spine rule this US wrote for gate
+    markers is not gate-specific: "same-gate の数えられない sibling が同一 note にあれば、その gate
+    の読取は note 全体を fail-closed にする". Here the channel IS the gate, so the poison is
+    note-and-channel scoped: every authorization from that note keeps its identity (so it is
+    still SELECTED and reported) and carries :data:`AMBIGUITY_UNREADABLE_SIBLING`, making it
+    invalid for every consumer that gates on ``valid`` — worker send, disposition write,
+    gateway intake, and retire admission alike.
     """
     out: list[DispatchAuthorization] = []
     for entry in entries:
@@ -177,18 +217,22 @@ def parse_dispatch_authorizations(
         journal = str(getattr(entry, "journal_id", "") or "").strip()
         if not notes:
             continue
-        for match in _MARKER_RE.finditer(notes):
-            if match.group("channel") != DISPATCH_AUTHORIZATION_CHANNEL:
-                continue
-            fields = _parse_fields(match.group("body"))
-            if fields is None:
-                # A body the canonical producer could not render authorizes nothing. It is still
-                # EMITTED as an invalid authorization so a malformed record is diagnosable rather
-                # than silently vanishing — the same reason this function never dropped partial
-                # markers — but ``valid`` is False, so no dispatch follows from it.
-                out.append(_authorization_from_fields({}, journal))
-                continue
-            out.append(_authorization_from_fields(fields, journal))
+        parsed: list[Mapping[str, str] | None] = [
+            _parse_fields(match.group("body"))
+            for match in _MARKER_RE.finditer(notes)
+            if match.group("channel") == DISPATCH_AUTHORIZATION_CHANNEL
+        ]
+        poisoned = any(fields is None for fields in parsed)
+        for fields in parsed:
+            # The unrenderable marker itself is still emitted (blank fields) so a malformed
+            # record stays visible, and its readable siblings are emitted WITH the poison.
+            out.append(
+                _authorization_from_fields(
+                    fields if fields is not None else {},
+                    journal,
+                    ambiguity=AMBIGUITY_UNREADABLE_SIBLING if poisoned else "",
+                )
+            )
     return tuple(out)
 
 

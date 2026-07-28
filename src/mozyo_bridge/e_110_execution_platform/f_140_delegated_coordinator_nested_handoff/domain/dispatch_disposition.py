@@ -92,6 +92,10 @@ class DispatchDisposition:
     terminal_journal: str
     conclusion: str
     recorded_by_role: str
+    #: True when the NOTE this disposition came from also carries a dispatch-disposition marker
+    #: the canonical producer could not render (Redmine #14539 review j#92227 finding 3). Its own
+    #: fields may be perfect; the record around it cannot be read as making exactly this claim.
+    note_ambiguous: bool = False
 
     @property
     def causal_key(self) -> tuple[str, str, str, str, str, str]:
@@ -185,23 +189,36 @@ def parse_dispatch_dispositions(entry) -> tuple[DispatchDisposition, ...]:
     not live in. A marker missing any required field is dropped rather than half-read; the
     fixed-field check is left to the caller so an invalid-but-present marker can be surfaced
     as a *block* rather than silently ignored.
+
+    An unrenderable marker POISONS ITS WHOLE NOTE for this channel (Redmine #14539 review
+    j#92227 finding 3). Skipping it and returning the readable siblings made a note carrying one
+    canonical and one forged disposition read exactly like a clean note, and the correlator
+    discharged on the survivor. The spine rule this US wrote for gate markers applies wherever a
+    channel carries authority: "same-gate の数えられない sibling が同一 note にあれば、その gate の
+    読取は note 全体を fail-closed にする". The siblings are still returned — dropping them would
+    make the round look merely OWED (still running) instead of AMBIGUOUS — but each carries
+    :attr:`DispatchDisposition.note_ambiguous` so every consumer refuses to act on it.
     """
     notes = _norm(getattr(entry, "notes", ""))
     issue = _norm(getattr(entry, "issue_id", ""))
     journal = _norm(getattr(entry, "journal_id", ""))
     if not notes or not issue:
         return ()
+    parsed = [
+        _parse_fields(match.group("body"))
+        for match in _MARKER_RE.finditer(notes)
+        if match.group("channel") == MARKER_CHANNEL_DISPATCH_DISPOSITION
+    ]
+    poisoned = any(fields is None for fields in parsed)
     found: list[DispatchDisposition] = []
-    for match in _MARKER_RE.finditer(notes):
-        if match.group("channel") != MARKER_CHANNEL_DISPATCH_DISPOSITION:
-            continue
-        fields = _parse_fields(match.group("body"))
+    for fields in parsed:
         if fields is None:
-            continue  # not renderable by the canonical producer: it declares nothing
+            continue  # not renderable by the canonical producer: it declares nothing itself
         if any(not _norm(fields.get(name)) for name in _REQUIRED_FIELDS):
             continue  # incomplete: names no exact round
         found.append(
             DispatchDisposition(
+                note_ambiguous=poisoned,
                 issue=issue,
                 journal=journal,
                 action_id=_norm(fields["action_id"]),
@@ -348,6 +365,16 @@ def correlate_dispatch_disposition(
                 _norm(row.action_id),
             ):
                 continue
+            if disp.note_ambiguous:
+                # Whole-note poison (review j#92227 finding 3): this claim's own fields are
+                # fine, but its note also carries a disposition marker no canonical producer
+                # could render. Reading the survivor is the readable-subset behaviour the marker
+                # contract refuses — a forged sibling would be indistinguishable from none.
+                return CorrelationVerdict(
+                    CORRELATION_AMBIGUOUS,
+                    f"journal {disp.journal} carries a dispatch-disposition marker the canonical "
+                    "producer could not render; refusing to discharge on its readable siblings",
+                )
             if not disp.fixed_fields_valid:
                 return CorrelationVerdict(
                     CORRELATION_AMBIGUOUS,

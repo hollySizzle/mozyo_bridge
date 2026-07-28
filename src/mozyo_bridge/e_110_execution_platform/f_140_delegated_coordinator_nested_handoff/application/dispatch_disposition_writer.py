@@ -192,6 +192,11 @@ def record_dispatch_disposition(
                 prior.terminal_journal == _norm(terminal_journal)
                 and prior.recorded_by_role == RECORDED_BY_IMPLEMENTATION_GATEWAY
                 and prior.fixed_fields_valid
+                # A prior claim from a note poisoned by an unrenderable sibling is not proof
+                # that THIS disposition is already recorded (review j#92227 finding 3); it falls
+                # through to the conflicting-record refusal, which is still zero-write but tells
+                # the operator the durable record needs a human look.
+                and not prior.note_ambiguous
             ):
                 return DispositionWriteResult(
                     state=WRITE_ALREADY_RECORDED,

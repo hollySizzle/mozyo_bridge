@@ -22,6 +22,7 @@ injectable so the required regressions drive the whole authority hermetically.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authority import (
@@ -39,6 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     decide_dispatch_authority,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authorization import (
+    AMBIGUITY_DUPLICATE_AT_JOURNAL,
     DispatchAuthorization,
     parse_dispatch_authorizations,
 )
@@ -85,12 +87,30 @@ def _select_authorization(
     at this lane* is still selected so the decider surfaces it as invalid (fail closed), whereas
     no lane-matched authorization at all is ``None`` (monitor — not authorized yet). Note order
     means the last matching marker wins (a re-authorization supersedes an earlier one).
+
+    "Last wins" is a rule about SUPERSESSION, and supersession happens BETWEEN journals — a
+    later coordinator record replaces an earlier one. Two authorizations at ONE journal are not
+    a supersession; they are one record naming two different rounds, and picking the later of
+    them by note order is guessing (Redmine #14539 review j#92227 finding 2). The downstream
+    correlator has always said so — ``correlate_dispatch_disposition`` refuses a row whose
+    journal carries 2+ valid AUTHORIZE, with "Cardinality is the gate input here — 0, 1 and 2+
+    are three different answers and only 1 can correlate" (review j#80644 R6-F2). That rule
+    existed only on the discharge side, so the identical durable record read as ``ambiguous``
+    when the retire asked and ``authorize`` when the sender asked. Selection therefore groups by
+    journal, keeps last-journal-wins, and marks the winner ambiguous when its OWN journal names
+    more than one — zero send, surfaced as blocked rather than monitored.
     """
-    selected: Optional[DispatchAuthorization] = None
+    by_journal: dict[str, list[DispatchAuthorization]] = {}
     for auth in parse_dispatch_authorizations(entries):
         if auth.matches_lane(workspace_id=workspace_id, lane_id=lane_id, issue=issue):
-            selected = auth
-    return selected
+            by_journal.setdefault(auth.journal, []).append(auth)
+    if not by_journal:
+        return None
+    # Insertion order is note order, so the last key is the newest journal naming this lane.
+    at_journal = by_journal[list(by_journal)[-1]]
+    if len(at_journal) > 1:
+        return replace(at_journal[-1], ambiguity=AMBIGUITY_DUPLICATE_AT_JOURNAL)
+    return at_journal[-1]
 
 
 def _is_superseded(
