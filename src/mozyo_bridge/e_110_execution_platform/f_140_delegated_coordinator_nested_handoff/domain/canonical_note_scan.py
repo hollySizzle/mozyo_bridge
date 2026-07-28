@@ -92,17 +92,43 @@ MARKER_RE = re.compile(r"\[mozyo:(?P<channel>[a-z0-9_-]+):(?P<body>[^\]]*)\]")
 _CODE_FENCE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<rest>.*)$")
 #: A backtick string: a MAXIMAL run of backticks. Code-span delimiters are matched by run length.
 _BACKTICK_RUN = re.compile(r"`+")
-#: Only whitespace — what a fence closer is allowed to carry after its run, and what a blank line is.
-_ONLY_SPACE = re.compile(r"^\s*$")
+#: Only Markdown's block whitespace — what a fence closer may carry, and what a blank line is.
+#: NOT ``\s``: Python's ``\s`` matches every Unicode space, while CommonMark 0.31.2 §2.1 admits only
+#: U+0020 and U+0009 here, so ``\s`` reads ``` ```<U+00A0> ``` as a fence closer and a non-breaking
+#: space as a blank line — both of which release the quoted text below them (#14584 j#91406 F1).
+_ONLY_SPACE = re.compile(r"^[ \t]*$")
+#: A line ending, per CommonMark 0.31.2 §2.1. Redmine returns journal bodies with CRLF, so this is
+#: what makes the strict space class above safe: without it every ``\r`` would sit on the end of a
+#: fence closer and stop it closing, and the scan would swallow the whole note.
+_LINE_ENDING = re.compile(r"\r\n|\r|\n")
+#: A carriage return that is NOT part of a CRLF. The spec calls it a line ending; pandoc does not
+#: split on it. Both readings have shapes the other refuses, so where they disagree the text's block
+#: structure — and therefore its authorship — is renderer-dependent, and the note is refused whole.
+_BARE_CARRIAGE_RETURN = re.compile(r"\r(?!\n)")
 #: Markdown's tab stop. Indentation is measured in COLUMNS, not characters (CommonMark 0.31.2 §2.2).
 _TAB_STOP = 4
 #: The blocks that can interrupt a paragraph, so a blockquote's paragraph cannot lazily continue into
-#: them. Fences and blockquotes interrupt too, but are recognized before this is consulted.
+#: them. Fences and blockquotes interrupt too, but are recognized before this is consulted. The
+#: delimiters take ``[ \t]`` for the same reason as :data:`_ONLY_SPACE`: an interrupter recognized
+#: too eagerly ends the quotation early, which releases the line after it.
 _INTERRUPTS_PARAGRAPH = (
-    re.compile(r"^ {0,3}#{1,6}(?:\s|$)"),  # ATX heading
+    re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)"),  # ATX heading
     re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$"),  # thematic break
-    re.compile(r"^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:\s|$)"),  # list item
+    re.compile(r"^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)"),  # list item
 )
+
+#: Raw-HTML tags that put what follows them inside a verbatim or quoted element. Their block runs to
+#: their own closing tag — NOT to the next blank line: an unclosed ``<code>`` leaves every later line
+#: inside that element in the rendered document, which is exactly the state a blank line does not
+#: leave. This is wider than CommonMark §4.6's type-1 list on purpose; the extra tags are the ones
+#: the quotation contract names.
+_HTML_QUOTING_TAGS = ("pre", "script", "style", "textarea", "code", "blockquote")
+#: An HTML block start: any tag at the head of a line. Recognizing this broadly is deliberate — an
+#: unmodelled HTML construct must fall to "quoted", never to "the writer's own voice".
+_HTML_BLOCK_START = re.compile(r"^ {0,3}</?[A-Za-z][A-Za-z0-9-]*", re.IGNORECASE)
+#: Inline raw HTML that renders its content verbatim or as a quotation. The scan blanks from such an
+#: opening tag to its closing tag, and to the end of the paragraph if it never closes.
+_HTML_INLINE_OPEN = re.compile(r"<(?P<tag>code|pre|blockquote|script|style|textarea)\b[^>]*>", re.I)
 
 
 def _indent_columns(line: str) -> int:
@@ -159,37 +185,99 @@ def _classify_block_structure(lines: "list[str]") -> "list[str]":
     and C (indented code) are decided here, because all three are block-level state that one line
     cannot answer on its own. Rule D is inline and is applied afterwards, per paragraph.
     """
-    canonical: list[str] = []
+    classified: list[tuple[str, "int | None", bool]] = []
     fence: "tuple[str, int] | None" = None
+    html_closers: "tuple[str, ...] | None" = None
     quoted_paragraph = False
+    paragraph: "int | None" = None
+    counter = 0
     for line in lines:
         if fence is not None:  # A: inside a fence, only its own closer gets out
             if _closes_fence(line, *fence):
                 fence = None
-            canonical.append("")
+            classified.append(("", None, False))
+            paragraph = None
+            continue
+        if html_closers is not None:  # E: inside a raw-HTML block
+            if html_closers and any(closer in line.lower() for closer in html_closers):
+                html_closers = None  # §4.6 type 1: ends on the line carrying its closing tag
+            elif not html_closers and _ONLY_SPACE.match(line):
+                html_closers = None  # every other type: ends at the first blank line
+            classified.append(("", None, False))
+            paragraph = None
             continue
         if _ONLY_SPACE.match(line):  # a blank line ends every paragraph, lazy or not
-            quoted_paragraph = False
-            canonical.append("")
+            quoted_paragraph, paragraph = False, None
+            classified.append(("", None, False))
             continue
-        if _indent_columns(line) >= _TAB_STOP:  # C: measured in columns, so " \t" counts
-            canonical.append("")
+        if _indent_columns(line) >= _TAB_STOP:
+            # C: four columns starts an indented code block — but only where a block CAN start. In
+            # an open paragraph this is hanging indent, which cannot interrupt it (§4.4), so the
+            # line stays in the paragraph: a span's delimiters may be on it, and cutting the
+            # paragraph here is what released the marker in between (#14584 j#91406 F2). It is
+            # still blanked afterwards, which keeps this module's long-standing refusal of a marker
+            # written under a deep indent.
+            classified.append((line, paragraph, True) if paragraph is not None else ("", None, False))
             continue
         opener = _fence_opener(line)
         if opener is not None:  # A: the opener line is part of the quotation too
-            fence, quoted_paragraph = opener, False
-            canonical.append("")
+            fence, quoted_paragraph, paragraph = opener, False, None
+            classified.append(("", None, False))
             continue
         if line.lstrip(" \t").startswith(">"):  # B: the explicit blockquote marker
-            quoted_paragraph = True
-            canonical.append("")
+            quoted_paragraph, paragraph = True, None
+            classified.append(("", None, False))
+            continue
+        html = _html_block_closers(line)
+        if html is not None:  # E: a raw-HTML block starts here
+            html_closers, quoted_paragraph, paragraph = html, False, None
+            classified.append(("", None, False))
             continue
         if quoted_paragraph and not any(p.match(line) for p in _INTERRUPTS_PARAGRAPH):
-            canonical.append("")  # B: lazy continuation — still the quoted paragraph (§5.1)
+            classified.append(("", None, False))  # B: lazy continuation of the quote (§5.1)
             continue
         quoted_paragraph = False
-        canonical.append(line)
-    return canonical
+        if paragraph is None or any(p.match(line) for p in _INTERRUPTS_PARAGRAPH):
+            counter += 1  # a block that interrupts a paragraph also starts a new one
+            paragraph = counter
+        classified.append((line, paragraph, False))
+    return classified
+
+
+def _html_block_closers(line: str) -> "tuple[str, ...] | None":
+    """The closing tags that end the raw-HTML block ``line`` starts, ``()`` for blank-line-ended,
+    ``None`` if it starts none (pure).
+
+    Raw HTML reaches the renderer as markup, so ``<pre>`` / ``<code>`` / ``<blockquote>`` around a
+    marker are quotation by exactly the contract this module states — and the scan did not model
+    them at all (#14584 j#91406 F3). Any tag at the head of a line is treated as a block start: an
+    HTML construct this module does not model must fall to "quoted", never to "the writer's voice".
+    """
+    if _HTML_BLOCK_START.match(line) is None:
+        return None
+    name = line.lstrip(" \t").lstrip("<").lstrip("/").split(">")[0].split()[0].lower()
+    if name in _HTML_QUOTING_TAGS:
+        return (f"</{name}>",)
+    return ()
+
+
+def _blank_inline_html(text: str) -> str:
+    """``text`` with every inline raw-HTML verbatim / quotation region blanked (pure).
+
+    From an opening :data:`_HTML_INLINE_OPEN` tag to its closing tag, or to the end of the paragraph
+    if it never closes — the same fail-closed rule an unmatched backtick string gets.
+    """
+    chars = list(text)
+    position = 0
+    while True:
+        opening = _HTML_INLINE_OPEN.search(text, position)
+        if opening is None:
+            return "".join(chars)
+        closing = re.compile(rf"</{opening.group('tag')}[ \t]*>", re.I).search(text, opening.end())
+        position = closing.end() if closing is not None else len(text)
+        for index in range(opening.start(), position):
+            if chars[index] != "\n":
+                chars[index] = " "
 
 
 def _blank_code_spans(text: str) -> str:
@@ -235,18 +323,30 @@ def canonical_note_lines(notes: str) -> tuple[str, ...]:
     A quoted line becomes ``""`` rather than disappearing, so the caller can scan line by line and a
     marker can never be spliced across a quotation.
     """
-    lines = _classify_block_structure(str(notes or "").split("\n"))
+    # Line endings are normalized first: Redmine returns CRLF, and the block rules below admit only
+    # U+0020 / U+0009 as whitespace, so a stray "\r" would keep every fence closer from closing.
+    text = str(notes or "")
+    lines_in = _LINE_ENDING.split(text)
+    if _BARE_CARRIAGE_RETURN.search(text) is not None:
+        return tuple("" for _line in lines_in)  # renderer-dependent structure: refuse the note
+    classified = _classify_block_structure(lines_in)
+    lines = [text for text, _paragraph, _blanked in classified]
     start = 0
-    while start < len(lines):
-        if not lines[start]:
+    while start < len(classified):
+        paragraph = classified[start][1]
+        if paragraph is None:
             start += 1
             continue
         end = start
-        while end < len(lines) and lines[end]:
+        while end < len(classified) and classified[end][1] == paragraph:
             end += 1
-        lines[start:end] = _blank_code_spans("\n".join(lines[start:end])).split("\n")
+        joined = _blank_inline_html("\n".join(lines[start:end]))
+        lines[start:end] = _blank_code_spans(joined).split("\n")
         start = end
-    return tuple(lines)
+    return tuple(
+        "" if blanked else line
+        for line, (_text, _paragraph, blanked) in zip(lines, classified)
+    )
 
 
 def canonical_note_text(notes: str) -> str:

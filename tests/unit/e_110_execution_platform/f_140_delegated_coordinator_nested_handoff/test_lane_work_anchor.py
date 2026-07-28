@@ -154,6 +154,29 @@ class FailClosedTest(unittest.TestCase):
         anchor = _resolve([_entry("90409", "> quoted example\n\n" + marker)])
         self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
 
+    def test_character_class_and_markup_quotation_is_missing_too(self):
+        # #14584 j#91406 F1-F3 at the join: each of these resolved to a work anchor before the fix.
+        marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
+        nbsp = "\u00a0"  # escape, not a literal: an invisible fixture degrades silently
+        for label, note in (
+            ("NBSP after a fence run", "```\n```%s\n%s\n```" % (nbsp, marker)),
+            ("NBSP as a blank line", "> quoted\n%s\n%s" % (nbsp, marker)),
+            ("NBSP in an interrupter", "> quoted\n#%shead\n%s" % (nbsp, marker)),
+            ("bare carriage return", "> quoted\r#\thead\r%s" % marker),
+            ("hanging indent in a span", "`start\n    cont\n%s\nend`" % marker),
+            ("inline raw HTML code", "text <code>%s</code>" % marker),
+            ("raw HTML pre block", "<pre>\n%s\n</pre>" % marker),
+            ("raw HTML blockquote block", "<blockquote>\n%s\n</blockquote>" % marker),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_resolve([_entry("90409", note)]).status, WORK_ANCHOR_MISSING)
+
+    def test_a_crlf_dispatch_record_still_resolves(self):
+        # The paired positive at the join: Redmine writes CRLF, so this is the ordinary case.
+        marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
+        anchor = _resolve([_entry("90409", "## Gate\r\n\r\n" + marker)])
+        self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
+
     def test_a_real_dispatch_after_a_closed_fence_still_resolves(self):
         # The paired positive at the join: refusing mismatched delimiters must not start refusing
         # dispatches that merely follow a quotation. A run at least as long as the opener closes it.

@@ -318,6 +318,30 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(self._gates(note), ())
 
+    def test_character_class_and_markup_quotation_is_not_a_gate_either(self):
+        # #14584 j#91406 F1-F3 reaching THIS reader: quotation that survives because Markdown's
+        # whitespace is narrower than Python's, because an indent inside a paragraph is not a code
+        # block, or because the quoting is raw HTML. Confirmed against a real renderer; the matrix
+        # is in ``test_canonical_note_scan``.
+        nbsp = "\u00a0"  # escape, not a literal: an invisible fixture degrades silently
+        for label, note in (
+            ("NBSP after a fence run", "```\n```%s\n%s\n```" % (nbsp, self.GATE)),
+            ("NBSP as a blank line", "> quoted\n%s\n%s" % (nbsp, self.GATE)),
+            ("NBSP in an interrupter", "> quoted\n#%shead\n%s" % (nbsp, self.GATE)),
+            ("bare carriage return", "> quoted\r#\thead\r%s" % self.GATE),
+            ("hanging indent in a span", "`start\n    cont\n%s\nend`" % self.GATE),
+            ("inline raw HTML code", "text <code>%s</code>" % self.GATE),
+            ("raw HTML pre block", "<pre>\n%s\n</pre>" % self.GATE),
+            ("raw HTML blockquote block", "<blockquote>\n%s\n</blockquote>" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ())
+
+    def test_a_crlf_note_still_yields_its_gate(self):
+        # Redmine returns CRLF. If normalization were missing, the strict whitespace class above
+        # would stop every real fence closing and this reader would go blind.
+        self.assertEqual(self._gates("```\r\nq\r\n```\r\n" + self.GATE), ("review_request",))
+
     def test_a_blank_line_still_releases_the_writers_own_voice(self):
         # The paired positive for all three: one blank line away, the marker is a gate again.
         self.assertEqual(self._gates("> quoted\n\n" + self.GATE), ("review_request",))

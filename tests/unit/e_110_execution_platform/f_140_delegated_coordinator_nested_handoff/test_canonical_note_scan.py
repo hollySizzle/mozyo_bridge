@@ -241,6 +241,129 @@ class BlockStructureTest(unittest.TestCase):
                 self.assertEqual(_gates(f"> quoted\n{interrupter}\n{MARKER}"), ("review_request",))
 
 
+class MarkdownCharacterClassTest(unittest.TestCase):
+    """Markdown's whitespace is U+0020 and U+0009 — not Python's ``\\s`` (#14584 j#91406 F1).
+
+    ``\\s`` matches every Unicode space, so a non-breaking space read as "blank" ends a quotation
+    that is still open, and one trailing a fence run closes a block that is still verbatim. Both
+    hand back the text below them. The reach is wider than it looks: the same class decides blank
+    lines, fence closers, and the interrupters that end a lazy blockquote.
+    """
+
+    # Escape sequences, never literal characters: an invisible fixture silently degrades
+    # into a plain space and the test then asserts nothing (it did, mid-#14584 R4).
+    NBSP, EM_SPACE, FORM_FEED, VTAB = "\u00a0", "\u2003", "\u000c", "\u000b"
+
+    def _not_markdown_space(self):
+        return (("NBSP", self.NBSP), ("EM SPACE", self.EM_SPACE),
+                ("form feed", self.FORM_FEED), ("vertical tab", self.VTAB))
+
+    def test_a_unicode_space_does_not_close_a_fence(self):
+        for label, space in self._not_markdown_space():
+            with self.subTest(label):
+                self.assertEqual(_gates(f"```\n```{space}\n{MARKER}\n```"), ())
+
+    def test_a_unicode_space_is_not_a_blank_line(self):
+        for label, space in self._not_markdown_space():
+            with self.subTest(label):
+                self.assertEqual(_gates(f"> quoted\n{space}\n{MARKER}"), ())
+
+    def test_a_unicode_space_does_not_make_an_interrupter(self):
+        # `#<NBSP>head` is not an ATX heading, so it cannot end the blockquote's paragraph.
+        for label, space in self._not_markdown_space():
+            with self.subTest(label):
+                self.assertEqual(_gates(f"> quoted\n#{space}head\n{MARKER}"), ())
+                self.assertEqual(_gates(f"> quoted\n-{space}item\n{MARKER}"), ())
+
+    def test_space_and_tab_still_do_all_three(self):
+        # The paired positive. Narrowing the class must not stop Markdown's own spaces working.
+        for label, space in (("space", " "), ("tab", "\t")):
+            with self.subTest(label):
+                self.assertEqual(_gates(f"```\nq\n```{space}\n{MARKER}"), ("review_request",))
+                self.assertEqual(_gates(f"> quoted\n{space}\n{MARKER}"), ("review_request",))
+                self.assertEqual(_gates(f"> quoted\n#{space}head\n{MARKER}"), ("review_request",))
+
+    def test_crlf_notes_are_read_the_same_as_lf(self):
+        # Load-bearing for the class above: Redmine returns CRLF. Without normalizing the line
+        # ending, every "\r" would sit after a fence run and stop it closing — the scan would go
+        # from leaking quotations to swallowing the whole note.
+        self.assertEqual(_gates(f"```\r\nq\r\n```\r\n{MARKER}"), ("review_request",))
+        self.assertEqual(_gates(f"```\r\n{MARKER}\r\n```"), ())
+
+    def test_a_bare_carriage_return_refuses_the_whole_note(self):
+        # CommonMark calls a lone CR a line ending; pandoc does not split on it. Each reading has
+        # shapes the other refuses, so where they disagree the note's structure — and its
+        # authorship — is renderer-dependent, and nothing in it is authority.
+        self.assertEqual(_gates(f"> quoted\r#\thead\r{MARKER}"), ())
+        self.assertEqual(_gates(f"prose\r{MARKER}"), ())
+
+
+class ParagraphContinuationTest(unittest.TestCase):
+    """An indented line inside an open paragraph is hanging indent, not a code block (§4.4).
+
+    Indented code cannot interrupt a paragraph. Treating four columns as a block start regardless
+    cut the paragraph in two, and a code span whose delimiters were on either side stopped covering
+    the lines between them (#14584 j#91406 F2).
+    """
+
+    def test_hanging_indent_does_not_break_a_multi_line_span(self):
+        for label, indent in (("four spaces", "    "), ("tab", "\t"), ("space+tab", " \t")):
+            with self.subTest(label):
+                self.assertEqual(_gates(f"`start\n{indent}continuation\n{MARKER}\nend`"), ())
+
+    def test_a_marker_written_under_a_deep_indent_is_still_refused(self):
+        # The paragraph now survives the indented line, but the LINE is still blanked: this module
+        # has refused a marker written four columns deep since #14585, and that has not changed.
+        self.assertEqual(_gates(f"- observed:\n    {MARKER}"), ())
+        self.assertEqual(_gates(f"prose\n    {MARKER}"), ())
+
+    def test_a_real_indented_code_block_still_starts_one(self):
+        self.assertEqual(_gates(f"    {MARKER}"), ())
+
+    def test_a_paragraph_after_a_blank_line_is_canonical_again(self):
+        self.assertEqual(_gates(f"prose\n    indented\n\n{MARKER}"), ("review_request",))
+
+
+class RawHtmlTest(unittest.TestCase):
+    """Raw HTML reaches the renderer as markup, so it can quote a marker (#14584 j#91406 F3).
+
+    R3 declared the contract in terms of what the renderer puts inside ``<code>`` / ``<pre>`` /
+    ``<blockquote>`` and then did not model raw HTML at all. An HTML construct this module does not
+    model falls to "quoted": the refusal is recoverable, handing authority to markup is not.
+    """
+
+    def test_inline_html_code_is_quoted(self):
+        self.assertEqual(_gates(f"text <code>{MARKER}</code> text"), ())
+
+    def test_html_blocks_are_quoted(self):
+        for tag in ("pre", "code", "blockquote", "script", "style", "textarea"):
+            with self.subTest(tag):
+                self.assertEqual(_gates(f"<{tag}>\n{MARKER}\n</{tag}>"), ())
+
+    def test_an_unclosed_quoting_tag_swallows_past_the_blank_line(self):
+        # A blank line ends most HTML blocks, but it does not close the ELEMENT: everything after
+        # an unclosed <code> is still inside it in the rendered document.
+        self.assertEqual(_gates(f"<code>\nquoted\n\n{MARKER}"), ())
+
+    def test_an_unknown_tag_at_the_head_of_a_line_is_refused(self):
+        # Fail closed on markup this module does not model, rather than guess it is harmless.
+        self.assertEqual(_gates(f"<figure>\n{MARKER}\n</figure>"), ())
+
+    def test_a_marker_after_a_closed_html_block_is_canonical(self):
+        # The paired positive: the refusal must end where the markup does.
+        self.assertEqual(_gates(f"<div>\nquoted\n</div>\n\n{MARKER}"), ("review_request",))
+
+    def test_an_unclosed_non_quoting_tag_ends_at_the_blank_line(self):
+        # The other side of the rule above, and the one that keeps this refusal bounded: only tags
+        # that put what follows INSIDE a verbatim or quoted element run to their closing tag.
+        # Everything else ends where its block does, or an unclosed <div> would eat the rest of the
+        # note. (Without this case the "every tag runs to its closer" mutation goes undetected.)
+        self.assertEqual(_gates(f"<div>\nquoted\n\n{MARKER}"), ("review_request",))
+
+    def test_prose_mentioning_a_tag_mid_line_is_not_a_block(self):
+        self.assertEqual(_gates(f"we render <div> here\n\n{MARKER}"), ("review_request",))
+
+
 class ScanIsPerLineTest(unittest.TestCase):
     """Blanking must not let a marker be spliced together across a quotation."""
 

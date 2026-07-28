@@ -89,8 +89,23 @@ authorize したかを照合しなければ scope は未検証のままである
       **そこから lazy に継続する paragraph** を含む (`> quoted` の次行に blank line 無しで続く行は
       同じ blockquote の中である。CommonMark 0.31.2 §5.1)。
     - **C. indented code** — 4 **column** 以上の indent。tab は 4-column tab stop へ展開する (§2.2)。
+      ただし **indented code は paragraph を interrupt できない** (§4.4)。開いている paragraph の中の
+      4-column 行は hanging indent であり、**paragraph を切らない** (切ると span state が失われ、
+      delimiter 間の marker が解放される)。当該行自体は従来どおり blank 化する。
     - **D. inline code** — backtick span。**同一 paragraph 内であれば opener と closer は別の行に
       あってよい** (§6.1 は span の line ending を space へ正規化する)。
+    - **E. raw HTML** — 行頭の tag は HTML block を開く (§4.6)。`code` / `pre` / `blockquote` /
+      `script` / `style` / `textarea` は**自身の閉じ tag まで**(blank line では終わらない — 閉じて
+      いない `<code>` は以降の全行を当該 element の内側に置く)。他の tag は blank line で終わる。
+      inline の同 tag も opener から closer まで、閉じなければ paragraph 末尾まで blank 化する。
+      **modelしていない markup は quoted 側へ倒す。**
+    - **字類と line ending。** block 構造上の空白は **U+0020 と U+0009 のみ** (§2.1)。Python の `\s`
+      は Unicode 空白全部に一致するため、blank line 判定・fence closer・interrupter のいずれでも
+      NBSP / EM SPACE / form feed を空白と誤認し、開いている引用を閉じてしまう。**line ending は
+      先に正規化する** (Redmine は CRLF を返す。正規化しないと厳格化した字類の下で全 fence closer が
+      閉じなくなる)。**CRLF でない単独 `\r` は note 全体を拒否する**: spec は line ending と定め、
+      pandoc は分割しない。どちらの読みにも他方が拒否する形があり、**構造が renderer 依存 = 著者性を
+      確定できない**。
     ★★★**B / C / D はいずれも「1 行だけを見て決まる性質」ではない。** 行に自分自身を尋ねる実装は
     毎回、尋ねなかった形を漏らした (#14584 j#91194 F1-F3): indent を文字数で数えると Markdown が
     4 column と読む ` \t` を 2 と読み、`>` 行だけを見る blockquote 判定は次の 1 行を解放し、行末で
@@ -125,12 +140,20 @@ authorize したかを照合しなければ scope は未検証のままである
     (j#91194)。**「規則の側から掃いた」も、掃く規則を自分で列挙している限り同じ失敗である。**
     以後この面の検証は **実 CommonMark 実装を differential oracle として使う**: note を renderer に
     かけて marker が `<code>` / `<pre>` / `<blockquote>` の内側かを判定し、scanner の判定と機械的に
-    突き合わせる。case list も container × delimiter の直積として生成し、人手で列挙しない。
-    renderer は**検証時の instrument であって runtime 依存ではない** (package に足さない)。
+    突き合わせる。renderer は**検証時の instrument であって runtime 依存ではない** (package に足さない)。
+    ★★★**oracle を入れても、corpus の生成軸を自分で決めている限り同じ漏れが残る** (#14584 j#91406)。
+    R3 は oracle を導入した上でなお字類・hanging indent・raw HTML の 3 軸を落とし、しかも
+    「HTML 軸未実施」と自分の review_request に書いたまま head を出した。よって **corpus の生成軸は
+    CommonMark の目次から起こす** — container (blockquote / list / HTML block)、leaf (fence /
+    indented / ATX / setext / thematic break / paragraph)、inline (code span / raw HTML)、字類
+    (Unicode 空白各種)、line ending (LF / CRLF / CR)。**未確認の軸が残っていると自分で書ける状態で
+    review_request を出さない。**
   - 代償として **decision は top-level に書く**必要がある (4 column 以上 indent した marker、
-    blockquote を lazy 継続する行の marker、対応しない backtick run を含む paragraph の marker は
-    拒否される)。この向きの失敗は coordinator が blank line を挟んで column 0 に書き直せば済む。
-    逆向きの失敗 (引用に authority を渡す) は復旧できない。
+    blockquote を lazy 継続する行の marker、対応しない backtick run を含む paragraph の marker、
+    raw HTML block 内の marker、単独 `\r` を含む note は拒否される)。この向きの失敗は coordinator が
+    blank line を挟んで column 0 に書き直せば済む。逆向きの失敗 (引用に authority を渡す) は
+    復旧できない。**実 journal への影響は live 実測で確認する** — 20 issue / 154 marker で R3 と R4 の
+    marker 集合は完全一致した (硬化で落ちた実 marker は 0)。
   - **scan は行単位で行う。** marker body の grammar は `[^\]]*` で改行を跨ぐため、blank 化した note
     を 1 文字列として scan すると、canonical 行の閉じていない `[mozyo:` が引用行を越えて後続の `]`
     で閉じ、**どの 1 行にも存在しない marker** が成立しうる。
