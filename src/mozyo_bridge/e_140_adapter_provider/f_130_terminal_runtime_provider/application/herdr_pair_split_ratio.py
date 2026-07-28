@@ -101,6 +101,26 @@ RATIO_OUTCOMES: tuple[str, ...] = (
     RATIO_FAILED,
 )
 
+#: The outcomes a run may call SUCCESSFUL on this axis. Deliberately enumerated rather than
+#: derived as "everything except :data:`RATIO_FAILED`" (review j#91418 R5-F1).
+#:
+#: The derived form was the defect: :attr:`SessionStartResult.ratio_ok` asked
+#: ``outcome != RATIO_FAILED``, so a typo (``appllied``), a case variant (``APPLIED``), a
+#: truncation (``deferred_until_full_relaunc``), an empty string, or any unrelated token all
+#: reported the run as a success — while the SIBLING axis in the same module raises on an
+#: unknown slot outcome. Declaring a closed vocabulary and then judging by a single negative
+#: comparison means the declaration decides nothing.
+#:
+#: Subtracting from :data:`RATIO_OUTCOMES` would only move the defect: a token added to the
+#: vocabulary would silently join the success side. Enumerating both halves makes adding one
+#: a decision, and the #14569 regression pins it with TWO guards — the partition
+#: (``RATIO_OUTCOMES == RATIO_SUCCESS_OUTCOMES | {RATIO_FAILED}``) AND this set's literal
+#: membership. The partition alone is not enough: growing both sets together keeps it true,
+#: which was measured before the second guard was added.
+RATIO_SUCCESS_OUTCOMES: frozenset[str] = frozenset(
+    {RATIO_NOT_APPLICABLE, RATIO_MATCHED, RATIO_APPLIED, RATIO_DEFERRED}
+)
+
 #: How far the measured split ratio may sit from the declared one and still count as
 #: applied. herdr stores split ratios as ``f32`` and its resize arithmetic leaves visible
 #: residue (measured j#91140: ``0.40000004`` / ``0.50000006`` / ``0.70000005``), so an exact
@@ -852,6 +872,7 @@ __all__ = (
     "RATIO_MATCHED",
     "RATIO_NOT_APPLICABLE",
     "RATIO_OUTCOMES",
+    "RATIO_SUCCESS_OUTCOMES",
     "RATIO_TOLERANCE",
     "LayoutSnapshot",
     "PaneRect",

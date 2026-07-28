@@ -201,18 +201,28 @@ class SessionStartResult:
 
     @property
     def ratio_ok(self) -> bool:
-        """True unless the declared pair split ratio was owed and could not be established.
+        """True only for a RECOGNISED, non-failing pair-split-ratio outcome.
 
-        ``deferred_until_full_relaunch`` is deliberately NOT a failure: it is the honest,
-        documented outcome of an order-deferred heal, in which applying the ratio would put
-        ``order[0]``'s share on the wrong provider and the alternative — moving a live pane
-        — is forbidden. The run says what it did not do; it did not do the wrong thing.
+        Membership in the closed success vocabulary, not ``!= failed`` (review j#91418
+        R5-F1). The negative comparison reported every unrecognised token as a success — a
+        producer typo, a case variant, a truncation, an empty string — so a run whose ratio
+        verdict nobody could interpret still exited 0. An outcome this axis cannot read is
+        not evidence that the pair was divided correctly, which is the same reason
+        :attr:`SlotResult.disposition` refuses an unknown slot outcome rather than
+        defaulting one.
+
+        ``deferred_until_full_relaunch`` IS in the success set, deliberately: it is the
+        honest, documented outcome of an order-deferred heal, in which applying the ratio
+        would put ``order[0]``'s share on the wrong provider and the alternative — moving a
+        live pane — is forbidden. The run says what it did not do; it did not do the wrong
+        thing. The unknown token stays on :attr:`ratio_outcome` (and so in
+        :meth:`as_payload`) so the reader can see WHICH token was unreadable.
         """
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import (  # noqa: E501
-            RATIO_FAILED,
+            RATIO_SUCCESS_OUTCOMES,
         )
 
-        return self.ratio_outcome != RATIO_FAILED
+        return self.ratio_outcome in RATIO_SUCCESS_OUTCOMES
 
     @property
     def ok(self) -> bool:

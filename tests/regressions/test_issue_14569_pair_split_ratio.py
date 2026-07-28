@@ -73,6 +73,8 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     RATIO_FAILED,
     RATIO_MATCHED,
     RATIO_NOT_APPLICABLE,
+    RATIO_OUTCOMES,
+    RATIO_SUCCESS_OUTCOMES,
     PaneRect,
     find_pair_split,
     governing_split,
@@ -1339,6 +1341,57 @@ class RunSuccessAxisTest(unittest.TestCase):
         result = SessionStartResult(workspace_id="ws", lane_id="lane", dry_run=True)
         result.ratio_outcome = RATIO_FAILED
         self.assertTrue(result.ok)
+
+    def test_an_unrecognised_outcome_is_never_success(self) -> None:
+        """Review j#91418 R5-F1: an outcome this axis cannot read is not evidence of success.
+
+        ``ratio_ok`` used to ask ``!= RATIO_FAILED``, so EVERY token outside the closed
+        vocabulary reported the run as successful — a producer typo, a case variant, a
+        truncation, an empty string. Declaring a closed vocabulary and then judging by one
+        negative comparison means the declaration decides nothing.
+        """
+        unrecognised = [
+            "appllied",                     # a producer typo
+            "APPLIED",                      # a case variant of a real token
+            "deferred_until_full_relaunc",  # a truncation of a real token
+            "",                             # never assigned / cleared
+            "definitely_fine",              # an unrelated token
+        ]
+        for token in unrecognised:
+            with self.subTest(ratio_outcome=token):
+                self.assertNotIn(token, RATIO_OUTCOMES)
+                result = SessionStartResult(workspace_id="ws", lane_id="lane")
+                result.slots = [self._slot()]
+                result.ratio_outcome = token
+                self.assertFalse(result.ratio_ok)
+                self.assertFalse(result.ok)
+                self.assertFalse(result.as_payload()["ok"])
+                # ...and the unreadable token survives into the payload, so a reader can see
+                # WHICH one it was rather than only that something was wrong.
+                self.assertEqual(result.as_payload()["ratio_outcome"], token)
+
+    def test_the_success_set_and_the_vocabulary_cannot_drift_apart(self) -> None:
+        # Two guards, because either one alone can be satisfied by the drift it should
+        # catch. Measured, not assumed: growing BOTH sets together keeps the partition
+        # equality true, so the equality alone would let a new token join the success side
+        # silently — the same shape R5-F1 was.
+        #
+        #  (a) the success half, literally. Growing it (or swapping the enumeration for a
+        #      subtraction that later absorbs a newcomer) changes this value and goes red.
+        self.assertEqual(
+            RATIO_SUCCESS_OUTCOMES,
+            frozenset({"not_applicable", "matched", "applied", "deferred_until_full_relaunch"}),
+        )
+        #  (b) the partition. Adding a token to the vocabulary alone — the natural way to
+        #      extend it — leaves it unclassified and goes red here.
+        self.assertEqual(set(RATIO_OUTCOMES), RATIO_SUCCESS_OUTCOMES | {RATIO_FAILED})
+        self.assertNotIn(RATIO_FAILED, RATIO_SUCCESS_OUTCOMES)
+        for outcome in RATIO_OUTCOMES:
+            with self.subTest(outcome=outcome):
+                result = SessionStartResult(workspace_id="ws", lane_id="lane")
+                result.slots = [self._slot()]
+                result.ratio_outcome = outcome
+                self.assertEqual(result.ratio_ok, outcome in RATIO_SUCCESS_OUTCOMES)
 
     def test_the_resting_outcome_is_not_applicable(self) -> None:
         # A run that never had an opinion about a divider must not claim one, and must not

@@ -641,6 +641,13 @@ geometry が直後に変わるため)。
 - **outcome は独立軸**として `SessionStartResult.ratio_outcome` に出す (`not_applicable` / `matched` /
   `applied` / `deferred_until_full_relaunch` / `failed`)。`ratio` は 2 pane の **divider** の性質であり
   どちらの agent の health でもないので、slot health に畳まない。
+  **成功判定はこの閉じた語彙への membership で行う** (review j#91418 R5-F1)。成功とみなすのは
+  `failed` 以外の **4 値を明示列挙した集合**であり、`!= failed` という否定形では判定しない — 否定形だと
+  producer の typo (`appllied`) / case 違い (`APPLIED`) / 末尾欠け / 空文字といった **語彙外の値がすべて
+  成功へ default** し、verdict を解釈できない run が成功として報告される (実測)。**語彙外の token は
+  非成功**とし、診断のため payload には生のまま残す。成功集合は `RATIO_OUTCOMES` からの引き算で導出せず
+  (導出すると語彙に token を足しただけで自動的に成功側へ入る)、**集合の literal と分割の両方を test で
+  pin** する。片方だけでは、両集合を同時に増やす drift を通してしまうことを実測している。
 - **order-deferred heal**: configured `order[0]` が物理的に 2 番目 (生存 sibling の隣) に着地した場合、
   そこへ `ratio` を適用すると `order[0]` の取り分が `order[1]` に渡る。live pane の swap / bounce は
   禁止なので **適用せず `deferred_until_full_relaunch` を明示**する (どちらも主張しない)。full relaunch で
