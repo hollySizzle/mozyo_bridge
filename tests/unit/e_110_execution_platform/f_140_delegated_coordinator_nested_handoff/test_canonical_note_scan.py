@@ -584,6 +584,43 @@ class PassOrderTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(_gates(note), ())
 
+    def test_a_list_marker_is_a_container_prefix_not_prose(self):
+        # A block may begin at a list item's content column, not only at the physical head of a
+        # line (CommonMark §3.2 / §5.2): prepending `- ` to <!--a@b> gives a list item whose content
+        # is the same raw HTML block. Reading "block start" as "line head" blanked that opener as an
+        # autolink, and a marker inside an unrendered block became a gate (#14584 j#91918).
+        for label, note in (
+            ("unordered type 2", f"- <!--a@b>\n  {MARKER}"),
+            ("unordered type 3", f"- <?a@b>\n  {MARKER}"),
+            ("unordered type 4", f"- <!A@b> {MARKER}"),
+            ("ordered with a dot", f"1. <!--a@b>\n   {MARKER}"),
+            ("ordered with a paren", f"1) <!--a@b>\n   {MARKER}"),
+            ("star marker", f"* <!--a@b>\n  {MARKER}"),
+            ("nested list", f"- - <!--a@b>\n    {MARKER}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ())
+
+    def test_container_nesting_is_recognized_at_every_level(self):
+        # The case above does not actually exercise nesting: its marker line is four columns deep,
+        # so the hanging-indent rule blanks it whichever way this predicate goes. With the marker in
+        # the next paragraph, only the container prefix decides — one container level short and the
+        # opener is blanked as an autolink instead.
+        #
+        # Declared over-blank: the list item ends at the blank line, so the renderer does show this
+        # marker. Rule E refuses to the end of the note by design, and that is the recoverable side.
+        self.assertEqual(_gates(f"- - <!--a@b>\n\n{MARKER}"), ())
+        # ...and the paired positive: nesting does not make an ordinary autolink into a block.
+        self.assertEqual(_gates(f"- - <!@b>\n\n{MARKER}"), ("review_request",))
+
+    def test_a_list_does_not_cost_the_gate_below_it(self):
+        # The paired positive, in the direction that has already been lost twice: inside a list the
+        # opener test is the same one, so an ordinary autolink is still just an autolink, and prose
+        # that merely follows a bullet is not a block start at all.
+        self.assertEqual(_gates(f"- <!@b>\n\n{MARKER}"), ("review_request",))
+        self.assertEqual(_gates(f"- <https://example.test/>\n\n{MARKER}"), ("review_request",))
+        self.assertEqual(_gates(f"- item <!--a@b>\n\n{MARKER}"), ("review_request",))
+
     def test_only_a_real_block_opener_counts(self):
         # The other side of the same boundary, and the direction that costs real authority: `<!`
         # opens a block only before `--` or an ASCII letter. `<!@b>`, `<!1@b>` and `<!-@b>` are

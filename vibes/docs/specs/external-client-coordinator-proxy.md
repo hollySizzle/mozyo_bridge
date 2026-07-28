@@ -230,6 +230,12 @@ authorize したかを照合しなければ scope は未検証のままである
       **後続の実 gate event / work anchor を消した**。
       ★★★**この境界は両方向に外した** (R11 で広すぎ→狭すぎ、次で広すぎ)。**片側だけを pin すると、
       直すたびに反対側へ倒れる。** 実 block 3形と実 autolink 3形を**同じ test に並べて**両側から pin する。
+      ★★★**「どの token か」と「どの position か」は別の軸である** (#14584 j#91918)。token の
+      intersection を正しく取っても、**block start position を物理行頭と同一視**していたため、
+      `- <!--a@b>` (list item の content column に開く同じ block) を autolink として blank し、
+      不可視 marker が authority になった。**list marker は container prefix であって prose ではない**
+      (§3.2 / §5.2)。→ 判定は **`0–3 spaces` + `(list marker + 空白 + 0–3 spaces)*` を剥いだ column** で行う。
+      opener 判定自体は変えないので、**list 内の正規 autolink は従来どおり blank され後続 gate を消さない**。
       ★★★**oracle の述語は連言でなければならない** (#14584 j#91863)。R6 で「plain に残る」を
       「text node である」へ**置き換えた**が、raw HTML passthrough は tag 除去後の残骸が text に見える
       ため text-node 判定を通り、plain が空であることを見ていなかった。正しくは

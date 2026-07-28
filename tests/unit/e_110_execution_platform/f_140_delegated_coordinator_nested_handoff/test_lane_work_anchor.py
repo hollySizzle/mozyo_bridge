@@ -198,6 +198,10 @@ class FailClosedTest(unittest.TestCase):
             ("html block type 2", "<!--a@b>\n%s" % marker),
             ("html block type 3", "<?a@b>\n%s" % marker),
             ("html block type 4", "<!A@b> %s" % marker),
+            # #14584 j#91918: a list marker is a container prefix, so a block can open
+            # at the item content column too.
+            ("html block inside a list item", "- <!--a@b>\n  %s" % marker),
+            ("html block inside an ordered item", "1. <?a@b>\n   %s" % marker),
             ("definition title on the next line", '[foo]: /url\n  "%s"' % marker),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % marker),
             ("image alt text", "![a %s b](img.png)" % marker),
@@ -238,6 +242,12 @@ class FailClosedTest(unittest.TestCase):
             with self.subTest(label):
                 anchor = _resolve([_entry("90409", note)])
                 self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
+
+    def test_an_autolink_inside_a_list_does_not_erase_the_anchor(self):
+        # The same positive at the join (#14584 j#91918).
+        marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
+        anchor = _resolve([_entry("90409", "- <!@b>\n\n" + marker)])
+        self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
 
     def test_a_crlf_dispatch_record_still_resolves(self):
         # The paired positive at the join: Redmine writes CRLF, so this is the ordinary case.

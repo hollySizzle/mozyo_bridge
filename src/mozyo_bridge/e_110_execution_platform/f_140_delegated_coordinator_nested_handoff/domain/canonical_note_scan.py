@@ -183,6 +183,11 @@ _HIDDEN_CONSTRUCT_START = re.compile(r"<[A-Za-z!?/]")
 #: exactly ``<!--``, type 3 is ``<?``, type 4 is ``<!`` and an ASCII letter. Nothing wider — ``<!``
 #: followed by anything else opens no block, and treating it as one erased live gate events.
 _HTML_BLOCK_OPENER = re.compile(r"<!--|<\?|<![A-Za-z]")
+#: Everything that can stand between the start of a line and the column where a block may begin:
+#: indentation, and the list markers of any containers the line is inside (CommonMark §3.2 / §5.2).
+#: A list marker is a container prefix, not prose, so ``- <!--a@b>`` opens a block just as
+#: ``<!--a@b>`` does — treating "block start" as "physical line head" hid one (#14584 j#91918).
+_CONTAINER_PREFIX = re.compile(r"^ {0,3}(?:(?:[-+*]|\d{1,9}[.)])[ \t]+ {0,3})*$")
 _AUTOLINK = re.compile(
     r"<(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*"
     r"|[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -372,10 +377,14 @@ def _starts_html_block(text: str, offset: int) -> bool:
     are ordinary email autolinks, and refusing them erased the gate recorded below (#14584 j#91898).
     This boundary has now been wrong in both directions, so the tests pin real blocks and real
     autolinks side by side rather than one at a time.
+
+    WHERE a block may begin is a second question, and getting the token set right said nothing about
+    it. A list marker is a container prefix rather than prose (§3.2 / §5.2), so ``- <!--a@b>`` opens
+    the same block ``<!--a@b>`` does; reading "block start" as "physical line head" blanked that
+    opener as an autolink and a marker inside an unrendered block became a gate (#14584 j#91918).
     """
     line_start = text.rfind("\n", 0, offset) + 1
-    indent = text[line_start:offset]
-    if indent.strip(" ") != "" or len(indent) > 3:
+    if not _CONTAINER_PREFIX.match(text[line_start:offset]):
         return False
     return bool(_HTML_BLOCK_OPENER.match(text, offset))
 

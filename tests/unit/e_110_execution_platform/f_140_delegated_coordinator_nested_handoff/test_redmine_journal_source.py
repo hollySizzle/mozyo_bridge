@@ -364,6 +364,10 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             ("html block type 2", "<!--a@b>\n%s" % self.GATE),
             ("html block type 3", "<?a@b>\n%s" % self.GATE),
             ("html block type 4", "<!A@b> %s" % self.GATE),
+            # #14584 j#91918: a list marker is a container prefix, so a block can open
+            # at the item content column too.
+            ("html block inside a list item", "- <!--a@b>\n  %s" % self.GATE),
+            ("html block inside an ordered item", "1. <?a@b>\n   %s" % self.GATE),
             ("definition title on the next line", '[foo]: /url\n  "%s"' % self.GATE),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % self.GATE),
             ("image alt text", "![a %s b](img.png)" % self.GATE),
@@ -395,6 +399,14 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
         ):
             with self.subTest(label):
                 self.assertEqual(self._gates(note), ("review_request",))
+
+    def test_an_autolink_inside_a_list_does_not_erase_the_gate(self):
+        # The other side of the container rule (#14584 j#91918): a list item holding an ordinary
+        # autolink is not a block start, and the gate below it stands.
+        self.assertEqual(self._gates("- <!@b>\n\n%s" % self.GATE), ("review_request",))
+        self.assertEqual(
+            self._gates("- <https://example.test/>\n\n%s" % self.GATE), ("review_request",)
+        )
 
     def test_a_gate_recorded_above_the_markup_still_counts(self):
         # The bound: refusing from where markup starts must not erase what came before it.
