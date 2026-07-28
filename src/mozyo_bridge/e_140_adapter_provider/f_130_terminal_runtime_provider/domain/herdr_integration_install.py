@@ -330,8 +330,12 @@ class AgentInstallOutcome:
 
     ``ok`` is the sole success authority. On success ``diff`` is the exact change
     herdr made to that agent's config dir; on failure ``reason`` is a closed reason.
-    ``rolled_back`` records whether this agent's mutation was reverted (because a
-    later agent failed the transaction).
+    ``rolled_back`` records whether this agent's **mutation** was reverted (because a
+    later agent failed the transaction, or because its own apply failed). It is a
+    statement about a revert that happened, so a refusal that never wrote anything
+    leaves it ``False`` — there is no mutation to have reverted, and reporting one
+    would tell a consumer that home was touched and repaired when it was not (Redmine
+    #13249 review j#91805 finding 2).
     """
 
     agent: str

@@ -99,10 +99,20 @@ config を読む。したがって installer は posture 検証時に config の
 「同じ file か」を再検証する。いずれかが崩れていれば `config_pin_mismatch` で fail-closed
 (直前検出なら herdr 未実行、直後検出なら verified rollback して非成功)。
 
-**残存 window (実装保証の限界)**: 直前の再検証と herdr 自身の read は atomic ではないため、その
-極小区間での差し替えは検出できない。直後の再検証はこの区間の差し替えを **事後に検出して rollback
-する**ことで「気付かれないまま hook が残る」経路を塞ぐが、区間そのものを無くすものではない。config
-file への write 権限を持つ主体を排除するのは operator 側の責務であり、本 installer の保証範囲外。
+**残存 window (実装保証の限界。何を検出できて何を検出できないかを正確に書く)**:
+
+- 検出**できる**もの: 直前 check の時点、または直後 check の時点で **まだ残っている** drift。
+  直後 check で見つかった場合は verified rollback を行うので、hook が残ったまま成功にはならない。
+- 検出**できない**もの: herdr 実行中に unpinned へ差し替え、**herdr が読んだ後・installer の直後
+  check の前に元へ戻す** transient swap。この場合 **herdr は unpinned config を読み、hook はそのまま
+  残り、report は成功になる**。直後 check は「今 drift しているか」しか答えられないため、原理的に
+  検出できない。
+- これを塞ぐには herdr 側が「本 process が開いている config」を読む必要があり、installer からは
+  強制できない。したがって **config file への write 権限を持つ主体を排除することが operator 側の
+  責務**であり、本 installer の保証範囲外である。
+- この既知の限界は characterization test (`test_KNOWN_LIMIT_transient_config_swap_is_not_detected`)
+  で固定してある。期待挙動の pin ではなく **限界の pin** であり、将来 fail するようになったら本節と
+  test を同時に更新する。
 
 ### plan gate は過去の観測、mutation は現在の行為 (action-time 再検証)
 
@@ -115,8 +125,17 @@ symlink に差し替えたりできるため、installer は同じ問いを **ac
 - **rollback の書き込み前** (guard は「書く場所」に置く。drift 後の root へ backup を書き戻すと
   operator の bytes を home 外へ押し出すため)
 
-staged 時点の realpath と一致しない場合も drift として扱う (「home 内のどこか安全な場所」ではなく
-**同一 identity** を要求する)。drift は `config_dir_missing` / `unsafe_config_path` で fail-closed。
+**identity は path ではなく filesystem object** (`realpath` + `st_dev` + `st_ino`)。同一 path に
+別 directory を作り直す replacement は、containment も realpath 一致もすべて通過するが
+**installer が snapshot していない別 object** である。これを許すと (1) herdr の write が読んでいない
+dir に着地し、(2) rollback が **他人の dir の中身を削除して staged backup を書き込む**破壊的操作に
+なる。したがって staged identity と `(dev, ino)` まで一致しない場合も drift とする。snapshot と
+backup の**両方が同一 object から得られた**ことも、読み取り後の再検証で確認する。drift は
+`config_dir_missing` / `unsafe_config_path` で fail-closed。
+
+**限界**: これらの操作は path 経由であり、開いた descriptor に固定されていない。identity check は
+読み取り区間・各 invoke・各 rollback write を **括る**ので、括りをまたいで残る swap は捕捉できるが、
+括りの内側で個々の file 操作との間に起きる swap は捕捉できない。
 
 ### 「完全に読めた」ことが rollback 開始の前提 (列挙失敗も含む)
 
@@ -131,13 +150,24 @@ snapshot からも backup からも同時に消えるため、file 単位の unr
 exact diff も最終 home state も観測できていないためで、この場合は backup から verified rollback を
 行い `config_dir_unreadable` で closed 扱いとする。
 
+### report contract (consumer が構造から再現できること)
+
+- `applied` — transaction が **実際に mutation へ到達したか**。最初の herdr 呼び出し前に拒否した
+  場合は `false`。
+- `rolled_back` — **その agent の mutation が revert されたか**。何も書いていない拒否では `false`
+  であり、「rollback した」とは表示しない (`nothing was mutated` と表示する)。
+- 失敗は必ず **closed reason** として `plans` または `outcomes` に載る。plan 通過後に binary や
+  config が drift した場合も、自由文 detail だけでなく `herdr_unresolved` / `config_pin_mismatch`
+  を structured reason として投影する。JSON / text いずれの consumer も「mutation の有無」「rollback
+  の有無」「失敗理由」を散文の解析なしに再現できる。
+
 ### Fail-closed (成功扱いしないケース)
 
 | reason | 意味 |
 |---|---|
 | `unknown_agent` | claude / codex 以外の agent |
 | `config_dir_missing` | 対象 `~/.claude` / `~/.codex` が存在しない (先に作成すること)。plan 後に消えた場合も action-time 再検証で同じ reason |
-| `unsafe_config_path` | config dir が symlink / traversal で home 外へ解決、または staged 時点と identity が変わった |
+| `unsafe_config_path` | config dir が symlink / traversal で home 外へ解決、または staged 時点と **filesystem identity** (`realpath`+`dev`+`ino`) が変わった (同一 path への別 directory 差し替えを含む) |
 | `unpinned_remote` | herdr posture が pinned でない (§1 を先に満たすこと) |
 | `config_pin_mismatch` | 検証した config と herdr が読む effective config が一致しない — 環境 (`HERDR_CONFIG_PATH`) が別 file を名指す、または検証後に同一 path の bytes / file identity が変わった |
 | `config_dir_unreadable` | config dir を完全に読めない (file read 失敗 / 列挙失敗 / root 不在・非 directory)、または apply 後に読み戻せない |

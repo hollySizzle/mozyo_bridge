@@ -42,9 +42,14 @@ Boundaries kept enforced here:
   :data:`HERDR_CONFIG_PATH_ENV`; an environment naming a different config is refused
   rather than overridden, so a pinned file can never be a decoy for an unpinned run.
   Because a pin is a claim about *content*, the file's digest and identity are captured
-  when it verifies and re-asserted immediately before and after each invocation; the
-  residual window between the last check and herdr's own read cannot be closed here,
-  so the check *after* the run exists to catch and roll back a swap that slipped in.
+  when it verifies and re-asserted immediately before and after each invocation. What
+  those two checks can prove is bounded and worth stating exactly: they detect drift
+  that is **still present** when one of them runs, and a drift caught after the run is
+  rolled back rather than left installed. They cannot see a config swapped to unpinned
+  and restored *within* the invocation — herdr would read the unpinned bytes and the
+  hook would remain. Closing that would require herdr to read a config this process
+  holds open, which is not something this installer can impose; the runbook assigns it
+  to operator write-authority over the config file instead.
 - **Completeness is part of the data, not a later check.** Every read of a config dir
   returns its snapshot / backup together with the listing and read failures that
   produced it (:class:`~...herdr_integration_install_dir_io.DirRead`,
@@ -84,9 +89,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_integration_install_dir_io import (
     DirBackup,
+    DirIdentity,
     DirRead,
     backup_dir,
     config_dir_drift,
+    observe_config_dir,
     read_dir,
     rollback_dir,
 )
@@ -298,9 +305,13 @@ def _config_pin_drift(
     — a swap to a different pinned file would pass the posture check, and a content
     edit that keeps the posture pinned is not what was approved.
 
-    This narrows, but cannot erase, the window between the check and herdr's own read;
-    that is why the caller re-checks *after* the run too, so a swap that slipped through
-    is still caught and rolled back rather than left installed.
+    Scope of what this can prove, stated precisely because the difference matters: a
+    check sees the config *as it stands when the check runs*. Calling it before and
+    after the invocation therefore catches drift that persists past either point, and
+    the post-run call is what turns a late-detected swap into a rollback instead of an
+    installed hook. A swap made and undone entirely between the two calls leaves no
+    trace for either to find; that residual is documented rather than implied to be
+    covered (Redmine #13249 review j#91805 finding 3).
     """
     if inputs.herdr_config is None:
         return f"the herdr config is no longer known {when}"
@@ -427,12 +438,22 @@ def apply_install(inputs: InstallInputs) -> InstallReport:
         )
     binary, binary_detail = _resolve_binary(inputs)
     if binary is None:
+        # The plan proved the binary resolved, so losing it here is drift — and drift
+        # has to arrive as a closed reason, not as prose attached to plans that still
+        # say `ready` (j#91805 finding 2B).
         return InstallReport(
             applied=False,
             ok=False,
-            plans=plan_report.plans,
-            detail=f"apply refused: herdr binary unresolved ({binary_detail})",
+            plans=_gated_plans(
+                inputs,
+                REASON_HERDR_UNRESOLVED,
+                f"the trusted herdr binary no longer resolves ({binary_detail}); "
+                f"nothing was mutated",
+            ),
+            detail=f"apply refused: herdr binary unresolved ({binary_detail}); nothing "
+            f"was mutated",
             pin_mode=plan_report.pin_mode,
+            herdr_config_bound=plan_report.herdr_config_bound,
         )
     bound_config = plan_report.herdr_config_bound
     # Re-observe the posture here, at the start of the transaction, and keep the
@@ -446,12 +467,39 @@ def apply_install(inputs: InstallInputs) -> InstallReport:
         return InstallReport(
             applied=False,
             ok=False,
-            plans=plan_report.plans,
+            plans=_gated_plans(
+                inputs,
+                REASON_CONFIG_PIN_MISMATCH,
+                f"the verified herdr config could not be bound to the run "
+                f"({pin_detail}); nothing was mutated",
+            ),
             detail=f"apply refused: the verified herdr config could not be bound to "
             f"the run ({pin_detail}); nothing was mutated",
             pin_mode=plan_report.pin_mode,
         )
     return _run_apply_transaction(inputs, binary, pin)
+
+
+def _gated_plans(
+    inputs: InstallInputs, reason: str, detail: str
+) -> "tuple[AgentInstallPlan, ...]":
+    """Project a whole-transaction refusal onto every agent as a closed reason.
+
+    A refusal that only carries prose leaves consumers with plans still marked
+    ``ready`` and no reason anywhere in the structured payload — the closed vocabulary
+    exists precisely so "why did this stop" is machine-readable (Redmine #13249 review
+    j#91805 finding 2).
+    """
+    return tuple(
+        AgentInstallPlan(
+            agent=agent,
+            config_dir=str(_config_dir(inputs.home, agent)),
+            ready=False,
+            reason=reason,
+            detail=detail,
+        )
+        for agent in inputs.agents
+    )
 
 
 def _run_apply_transaction(
@@ -477,12 +525,13 @@ def _run_apply_transaction(
     # zero mutation when either pass is incomplete, or when the backup does not cover
     # every snapshot path (a file readable at snapshot time can fail the separate
     # backup read). Snapshots are captured here (pre-mutation) and reused.
-    staged: "list[tuple[str, Path, str, DirSnapshot, dict]]" = []
+    staged: "list[tuple[str, Path, DirIdentity, DirSnapshot, dict]]" = []
     for agent in inputs.agents:
         config_dir = _config_dir(inputs.home, agent)
-        # Re-validate the target NOW: the plan gate's answer is about the past, and
-        # everything below reads, writes, or hands the dir to herdr (j#91762 F1).
-        drift = config_dir_drift(config_dir, inputs.home)
+        # Re-validate the target NOW and stage *which object* it is: the plan gate's
+        # answer is about the past, and everything below reads, writes, or hands the
+        # dir to herdr (j#91762 F1 / j#91805 F1).
+        staged_identity, drift = observe_config_dir(config_dir, inputs.home)
         if drift is not None:
             drift_reason, drift_detail = drift
             return InstallReport(
@@ -502,9 +551,33 @@ def _run_apply_transaction(
                 pin_mode=pin_mode,
                 herdr_config_bound=bound_config,
             )
-        staged_real = os.path.realpath(config_dir)
         before_read = read_dir(config_dir)
         backup = backup_dir(config_dir)
+        # The snapshot and the backup have to describe ONE object. Re-checking the
+        # identity after them turns "these two reads happened" into "these two reads
+        # are of the dir this transaction staged" (j#91805 finding 1).
+        read_drift = config_dir_drift(config_dir, inputs.home, expected=staged_identity)
+        if read_drift is not None:
+            drift_reason, drift_detail = read_drift
+            return InstallReport(
+                applied=False,
+                ok=False,
+                plans=(
+                    AgentInstallPlan(
+                        agent=agent,
+                        config_dir=str(config_dir),
+                        ready=False,
+                        reason=drift_reason,
+                        detail=f"the config dir changed while it was being snapshotted "
+                        f"and backed up, so neither describes a single object: "
+                        f"{drift_detail}",
+                    ),
+                ),
+                detail="apply refused: a target config dir changed while it was being "
+                "read; nothing was mutated",
+                pin_mode=pin_mode,
+                herdr_config_bound=bound_config,
+            )
         missing_from_backup = before_read.snapshot.paths - set(backup.files)
         if not before_read.complete or not backup.complete or missing_from_backup:
             gaps = f"snapshot [{before_read.gap_detail}], backup [{backup.gap_detail}]"
@@ -530,17 +603,17 @@ def _run_apply_transaction(
                 herdr_config_bound=bound_config,
             )
         staged.append(
-            (agent, config_dir, staged_real, before_read.snapshot, backup.files)
+            (agent, config_dir, staged_identity, before_read.snapshot, backup.files)
         )
-    applied: "list[tuple[str, Path, str, dict, DirSnapshot]]" = []
+    applied: "list[tuple[str, Path, DirIdentity, dict, DirSnapshot]]" = []
     outcomes: "list[AgentInstallOutcome]" = []
-    for agent, config_dir, staged_real, before, backup in staged:
+    for agent, config_dir, staged_identity, before, backup in staged:
         failure: "Optional[tuple[str, str]]" = None
         after: Optional[DirSnapshot] = None
         # Nothing has been written for this agent yet, so a drift caught here must not
         # trigger a rollback write into whatever the path now points at.
         mutated = False
-        drift = config_dir_drift(config_dir, inputs.home, expected_real=staged_real)
+        drift = config_dir_drift(config_dir, inputs.home, expected=staged_identity)
         pin_drift = _config_pin_drift(inputs, pin, when="before invoking herdr")
         if drift is not None:
             failure = (drift[0], f"refused before invoking herdr: {drift[1]}")
@@ -550,7 +623,7 @@ def _run_apply_transaction(
             ok, detail = _invoke_herdr(runner, binary, agent, env)
             mutated = True  # herdr may have written whatever its exit code says
             after_drift = config_dir_drift(
-                config_dir, inputs.home, expected_real=staged_real
+                config_dir, inputs.home, expected=staged_identity
             )
             # Re-assert the config pin after the run as well: the check before the
             # invocation cannot be atomic with herdr's own read, so a swap inside that
@@ -595,20 +668,21 @@ def _run_apply_transaction(
                     backup,
                     before,
                     home=inputs.home,
-                    expected_real=staged_real,
+                    expected=staged_identity,
                 )
                 if mutated
                 else True
             )
-            if restored:
-                failed_detail, rolled = failure_detail, True
-            else:
+            if not restored:
                 failed_detail = (
                     f"apply failed ({failure_detail}) AND rollback left residue in "
                     f"{config_dir}; home NOT restored"
                 )
                 failed_reason = REASON_ROLLBACK_INCOMPLETE
-                rolled = False
+            elif mutated:
+                failed_detail = failure_detail
+            else:
+                failed_detail = f"{failure_detail} (nothing was mutated for this agent)"
             outcomes.append(
                 AgentInstallOutcome(
                     agent=agent,
@@ -616,23 +690,34 @@ def _run_apply_transaction(
                     ok=False,
                     reason=failed_reason,
                     detail=failed_detail,
-                    rolled_back=rolled,
+                    # `rolled_back` says this agent's mutation was reverted. When the
+                    # refusal landed before anything was written there is no mutation
+                    # to revert, and claiming one would misreport what happened
+                    # (Redmine #13249 review j#91805 finding 2).
+                    rolled_back=mutated and restored,
                 )
             )
             reverted, all_restored = _rollback_applied(
                 applied, outcomes, home=inputs.home
             )
             all_restored = all_restored and restored
-            reverted_desc = ", ".join(reverted) if reverted else "its partial write"
-            if all_restored:
+            reverted_desc = ", ".join(
+                ([f"{agent}'s partial write"] if mutated else []) + list(reverted)
+            )
+            if not all_restored:
+                note = (
+                    f"apply failed for {agent} ({failure[0]}); rollback INCOMPLETE — "
+                    f"residue remains, home NOT fully restored (verify the config dirs)"
+                )
+            elif reverted_desc:
                 note = (
                     f"apply failed for {agent} ({failure[0]}); rolled back "
                     f"{reverted_desc} — home left as found"
                 )
             else:
                 note = (
-                    f"apply failed for {agent} ({failure[0]}); rollback INCOMPLETE — "
-                    f"residue remains, home NOT fully restored (verify the config dirs)"
+                    f"apply refused at {agent} ({failure[0]}); nothing was mutated — "
+                    f"home left as found"
                 )
             return InstallReport(
                 # `applied` reports whether the transaction actually reached a
@@ -645,7 +730,7 @@ def _run_apply_transaction(
                 pin_mode=pin_mode,
                 herdr_config_bound=bound_config,
             )
-        applied.append((agent, config_dir, staged_real, backup, before))
+        applied.append((agent, config_dir, staged_identity, backup, before))
         outcomes.append(
             AgentInstallOutcome(
                 agent=agent,
@@ -689,7 +774,7 @@ def _invoke_herdr(
 
 
 def _rollback_applied(
-    applied: "list[tuple[str, Path, str, dict, DirSnapshot]]",
+    applied: "list[tuple[str, Path, DirIdentity, dict, DirSnapshot]]",
     outcomes: "list[AgentInstallOutcome]",
     *,
     home: Path,
@@ -707,9 +792,9 @@ def _rollback_applied(
     reverted: "list[str]" = []
     all_restored = True
     by_agent = {o.agent: i for i, o in enumerate(outcomes)}
-    for agent, config_dir, staged_real, backup, before in applied:
+    for agent, config_dir, staged_identity, backup, before in applied:
         restored = rollback_dir(
-            config_dir, backup, before, home=home, expected_real=staged_real
+            config_dir, backup, before, home=home, expected=staged_identity
         )
         reverted.append(agent)
         all_restored = all_restored and restored

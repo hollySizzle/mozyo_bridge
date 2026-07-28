@@ -762,6 +762,64 @@ class InstallOpsTest(unittest.TestCase):
         # nothing at all was written into the escaped location
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_a_drifted_target_is_never_even_read(self) -> None:
+        # The preflight validates BEFORE reading, so a dir that has been re-pointed
+        # outside home is not snapshotted or backed up at all. Catching it after the
+        # reads would still refuse, but it would mean having read a location outside
+        # home first — which is itself the thing the path gate exists to prevent.
+        import shutil
+
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "not-ours.txt").write_text("stranger", encoding="utf-8")
+        reads: "list[str]" = []
+        real_read = install_ops.read_dir
+
+        def spy_read(root):
+            reads.append(str(root))
+            return real_read(root)
+
+        def repoint():
+            shutil.rmtree(self.home / ".claude")
+            os.symlink(outside, self.home / ".claude")
+
+        fake = FakeHerdrIntegration()
+        self._drift_at_apply(repoint)
+        with mock.patch.object(install_ops, "read_dir", spy_read):
+            report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(reads, [])  # the escaped location was never read
+
+    def test_apply_refused_when_dir_drifts_between_the_read_and_the_invocation(self) -> None:
+        # The window the per-invocation check owns: the reads completed against the
+        # staged object, and the swap happens after that bracket closes but before
+        # herdr is handed the dir. Only the pre-invocation check stands there.
+        import shutil
+
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        real_drift = install_ops.config_dir_drift
+        state = {"drifted": False}
+
+        def drift_after_read_bracket(config_dir, home, *, expected=None):
+            result = real_drift(config_dir, home, expected=expected)
+            if not state["drifted"]:
+                # this call IS the post-read bracket check; drift right after it
+                state["drifted"] = True
+                shutil.rmtree(self.home / ".claude")
+                os.symlink(outside, self.home / ".claude")
+            return result
+
+        fake = FakeHerdrIntegration()
+        with mock.patch.object(install_ops, "config_dir_drift", drift_after_read_bracket):
+            report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertFalse(report.applied)
+        self.assertEqual(fake.calls, [])  # herdr was never handed the drifted dir
+        self.assertEqual(report.outcomes[0].reason, REASON_UNSAFE_CONFIG_PATH)
+        self.assertEqual(list(outside.iterdir()), [])
+
     def test_apply_refused_when_dir_is_repointed_after_preflight(self) -> None:
         # Review j#91762 finding 1 requires the dir to be re-validated before EACH
         # runner call, not only once before the preflight. Drift injected after the
@@ -785,7 +843,7 @@ class InstallOpsTest(unittest.TestCase):
         self.assertFalse(report.ok)
         self.assertFalse(report.applied)
         self.assertEqual(fake.calls, [])  # herdr never invoked
-        self.assertEqual(report.outcomes[0].reason, REASON_UNSAFE_CONFIG_PATH)
+        self.assertEqual(report.plans[0].reason, REASON_UNSAFE_CONFIG_PATH)
         self.assertEqual(list(outside.iterdir()), [])  # nothing written outside home
 
     def test_dir_repointed_while_herdr_runs_is_not_reported_ok(self) -> None:
@@ -811,6 +869,159 @@ class InstallOpsTest(unittest.TestCase):
         self.assertEqual(report.outcomes[0].reason, REASON_ROLLBACK_INCOMPLETE)
         self.assertFalse(report.outcomes[0].rolled_back)
         self.assertEqual(list(outside.iterdir()), [])  # no restore write escaped home
+
+    def _replace_claude_dir_same_path(self, *, seed=None) -> Path:
+        """Move .claude aside and put a DIFFERENT directory at the same path."""
+        import shutil
+
+        stashed = self.tmp / "stashed-claude"
+        shutil.move(str(self.home / ".claude"), str(stashed))
+        (self.home / ".claude").mkdir()
+        if seed:
+            (self.home / ".claude" / seed).write_text("operator data", encoding="utf-8")
+        return stashed
+
+    def test_apply_refused_when_the_dir_is_replaced_by_a_different_inode(self) -> None:
+        # Review j#91805 finding 1: a replacement directory at the SAME path passes
+        # every path-shaped check while being an object this transaction never read.
+        (self.home / ".claude" / "settings.json").write_text("orig", encoding="utf-8")
+        stash = {}
+        real_backup = install_ops.backup_dir
+
+        def replace_after_backup(root):
+            result = real_backup(root)
+            stash["dir"] = self._replace_claude_dir_same_path()
+            return result
+
+        fake = FakeHerdrIntegration()
+        with mock.patch.object(install_ops, "backup_dir", replace_after_backup):
+            report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertFalse(report.applied)
+        self.assertEqual(fake.calls, [])  # herdr never invoked
+        self.assertEqual(report.plans[0].reason, REASON_UNSAFE_CONFIG_PATH)
+        # the replacement was not written into, and the staged dir was left alone
+        self.assertEqual(list((self.home / ".claude").iterdir()), [])
+        self.assertTrue((stash["dir"] / "settings.json").exists())
+
+    def test_rollback_never_writes_into_a_replacement_dir(self) -> None:
+        # Review j#91805 finding 1B: when the swap happens during the run, the rollback
+        # must not "restore" the staged backup into the replacement — that would delete
+        # a stranger's contents and write another dir's bytes over them.
+        (self.home / ".claude" / "settings.json").write_text("orig", encoding="utf-8")
+
+        class ReplacingFake(FakeHerdrIntegration):
+            def run(inner, argv, **kw):  # noqa: N805 - mirrors the runner signature
+                result = FakeHerdrIntegration.run(inner, argv, **kw)
+                self._replace_claude_dir_same_path(seed="replacement-data.txt")
+                return subprocess.CompletedProcess(list(argv), 1, stdout="", stderr="x")
+
+        fake = ReplacingFake()
+        report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.reason, REASON_ROLLBACK_INCOMPLETE)
+        self.assertFalse(outcome.rolled_back)
+        replacement = self.home / ".claude"
+        # the stranger's file survives, and no staged byte was written into it
+        self.assertEqual(
+            (replacement / "replacement-data.txt").read_text(encoding="utf-8"),
+            "operator data",
+        )
+        self.assertFalse((replacement / "settings.json").exists())
+
+    def test_transaction_start_pin_drift_reports_a_closed_reason(self) -> None:
+        # Review j#91805 finding 2B: a refusal must arrive as a closed reason, not as
+        # prose next to plans that still say ready.
+        real_plan = install_ops.plan_install
+
+        def unpin_after_plan(inputs):
+            report = real_plan(inputs)
+            self.herdr_config.write_text(
+                "[update]\nversion_check = true\nmanifest_check = true\n",
+                encoding="utf-8",
+            )
+            return report
+
+        fake = FakeHerdrIntegration()
+        with mock.patch.object(install_ops, "plan_install", unpin_after_plan):
+            report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(report.plans[0].ready)
+        self.assertEqual(report.plans[0].reason, REASON_CONFIG_PIN_MISMATCH)
+
+    def test_binary_drift_after_the_plan_reports_a_closed_reason(self) -> None:
+        # Same contract as the pin-drift refusal: the plan proved the binary resolved,
+        # so losing it afterwards is drift and must arrive as `herdr_unresolved` in the
+        # structured payload rather than only in prose.
+        real_resolve = install_ops._resolve_binary
+        state = {"n": 0}
+
+        def vanish_after_plan(inputs):
+            state["n"] += 1
+            if state["n"] >= 2:
+                return None, "herdr binary vanished"
+            return real_resolve(inputs)
+
+        fake = FakeHerdrIntegration()
+        with mock.patch.object(install_ops, "_resolve_binary", vanish_after_plan):
+            report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertFalse(report.applied)
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(report.plans[0].ready)
+        self.assertEqual(report.plans[0].reason, REASON_HERDR_UNRESOLVED)
+
+    def test_zero_mutation_refusal_does_not_claim_a_rollback(self) -> None:
+        # Review j#91805 finding 2A: `rolled_back` says this agent's mutation was
+        # reverted. A refusal that never wrote anything has no mutation to revert.
+        real_backup = install_ops.backup_dir
+
+        def unpin_after_backup(root):
+            result = real_backup(root)
+            self.herdr_config.write_text(
+                "[update]\nversion_check = true\nmanifest_check = true\n",
+                encoding="utf-8",
+            )
+            return result
+
+        fake = FakeHerdrIntegration()
+        with mock.patch.object(install_ops, "backup_dir", unpin_after_backup):
+            report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.applied)
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(report.outcomes[0].rolled_back)
+        self.assertIn("nothing was mutated", report.detail)
+        self.assertNotIn("rolled back", report.detail)
+
+    def test_KNOWN_LIMIT_transient_config_swap_is_not_detected(self) -> None:
+        # This pins a DISCLOSED LIMITATION, not desired behaviour (Redmine #13249
+        # review j#91805 finding 3). The pin is re-asserted before and after each
+        # invocation, which catches drift that persists across either check. A config
+        # swapped to unpinned and restored *within* the invocation is invisible to both
+        # checks, so herdr can read unpinned bytes and the hook stays installed. Closing
+        # this would require herdr to read a config this process holds open, which the
+        # runbook assigns to operator write-authority instead. If this test ever starts
+        # failing because the apply now refuses, that is an improvement — update the
+        # runbook's residual-window section and this test together.
+        unpinned = "[update]\nversion_check = true\nmanifest_check = true\n"
+        pinned_bytes = self.herdr_config.read_bytes()
+        seen: "list[str]" = []
+
+        class TransientSwapFake(FakeHerdrIntegration):
+            def run(inner, argv, env=None, **kw):  # noqa: N805
+                cfg = Path(env[HERDR_CONFIG_PATH_ENV])
+                cfg.write_text(unpinned, encoding="utf-8")
+                seen.append(cfg.read_text(encoding="utf-8"))  # what herdr would read
+                cfg.write_bytes(pinned_bytes)  # restored before herdr returns
+                return FakeHerdrIntegration.run(inner, argv, env=env, **kw)
+
+        fake = TransientSwapFake()
+        report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertIn("version_check = true", seen[0])  # unpinned bytes were readable
+        self.assertTrue(report.ok)  # …and the apply does NOT detect it
+        self.assertTrue((self.home / ".claude" / _HOOK_REL).exists())  # hook remains
 
     def test_apply_refused_when_verified_config_changes_before_the_runner(self) -> None:
         # Review j#91762 finding 2: pinning the config PATH is not pinning the pin —
@@ -882,7 +1093,7 @@ class InstallOpsTest(unittest.TestCase):
         (config_dir / "settings.json").write_text("orig", encoding="utf-8")
         before_read = dir_io.read_dir(config_dir)
         backup = dir_io.backup_dir(config_dir)
-        staged_real = os.path.realpath(config_dir)
+        staged_identity, _ = dir_io.observe_config_dir(config_dir, self.home)
         shutil.rmtree(config_dir)
         os.symlink(outside, config_dir)
         restored = dir_io.rollback_dir(
@@ -890,7 +1101,7 @@ class InstallOpsTest(unittest.TestCase):
             backup.files,
             before_read.snapshot,
             home=self.home,
-            expected_real=staged_real,
+            expected=staged_identity,
         )
         self.assertFalse(restored)
         self.assertEqual(list(outside.iterdir()), [])  # nothing written outside home

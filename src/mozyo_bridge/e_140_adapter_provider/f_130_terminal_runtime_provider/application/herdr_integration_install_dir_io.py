@@ -19,6 +19,17 @@ every downstream set at once and reads as *absent*, which no per-file check can 
 the bytes are written: restoring a backup into a dir that has since been re-pointed
 would push operator content outside home (review j#91762 finding 1).
 
+"The dir it was staged against" means a :class:`DirIdentity` — the filesystem object,
+not the name. A resolved path only says what the target is *called*, and a replacement
+directory created at the same path answers every path-shaped question correctly while
+being something this transaction never read (review j#91805 finding 1).
+
+Known limit, stated so it is not mistaken for a guarantee: these operations address the
+target by path, not by a held descriptor. The identity checks bracket the reads, each
+invocation, and every rollback write, so a swap that persists across a bracket is
+caught; a swap that occurs between a check and an individual file operation inside that
+bracket is not.
+
 Credential-shaped files are never read, hashed, copied, diffed, or restored by anything
 here (:func:`~...domain.herdr_integration_install.is_credential_shaped`).
 """
@@ -41,8 +52,70 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 
 
+@dataclass(frozen=True)
+class DirIdentity:
+    """*Which directory object* a transaction is staged against — not which name.
+
+    A path, even a fully resolved one, names a slot; the thing in the slot can be
+    swapped for a different directory without the name changing at all. Comparing
+    resolved paths therefore answers "is it still called that", which is not the
+    question a transaction needs: it needs "is it still the same dir I snapshotted, so
+    that my backup describes it and my rollback belongs in it". Only the filesystem's
+    own identity — ``st_dev`` / ``st_ino`` — answers that, so it travels with the
+    realpath here (Redmine #13249 review j#91805 finding 1).
+    """
+
+    realpath: str
+    device: int
+    inode: int
+
+
+def observe_config_dir(
+    config_dir: Path, home: Path
+) -> "tuple[Optional[DirIdentity], Optional[tuple[str, str]]]":
+    """Validate a target config dir **now** and return the object it currently is.
+
+    Returns ``(identity, None)`` when the dir is present, a real directory, and safely
+    contained in ``home``; otherwise ``(None, (reason, detail))``. Callers stage the
+    returned identity and hand it back to :func:`config_dir_drift` at every later
+    action, so the checks and the staged token come from the same observation rather
+    than from two independent look-ups.
+    """
+    display = str(config_dir)
+    try:
+        st = os.stat(config_dir)
+    except FileNotFoundError:
+        return None, (
+            REASON_CONFIG_DIR_MISSING,
+            f"config dir {display} is not present; it existed when the plan gate ran, "
+            f"so it changed underneath this operation",
+        )
+    except OSError as exc:
+        return None, (
+            REASON_UNSAFE_CONFIG_PATH,
+            f"config path {display} could not be examined ({exc.__class__.__name__})",
+        )
+    if not stat.S_ISDIR(st.st_mode):
+        return None, (
+            REASON_UNSAFE_CONFIG_PATH,
+            f"config path {display} is not a directory; refusing to touch it",
+        )
+    home_real = os.path.realpath(home)
+    config_real = os.path.realpath(config_dir)
+    if not is_safe_config_dir(resolved=config_real, home_resolved=home_real):
+        return None, (
+            REASON_UNSAFE_CONFIG_PATH,
+            f"config path {display} resolves to {config_real}, which is outside home "
+            f"(symlink / traversal); refusing to touch it",
+        )
+    return (
+        DirIdentity(realpath=config_real, device=st.st_dev, inode=st.st_ino),
+        None,
+    )
+
+
 def config_dir_drift(
-    config_dir: Path, home: Path, *, expected_real: Optional[str] = None
+    config_dir: Path, home: Path, *, expected: Optional[DirIdentity] = None
 ) -> "Optional[tuple[str, str]]":
     """Re-validate a target config dir **now**; return ``(reason, detail)`` or ``None``.
 
@@ -55,38 +128,23 @@ def config_dir_drift(
     and can put herdr's write outside home entirely (Redmine #13249 review j#91762
     finding 1).
 
-    ``expected_real`` pins the identity observed at preflight: the dir must still
-    resolve to the *same* realpath, not merely to *some* safe path under home.
+    ``expected`` pins the *object* staged earlier. A replacement directory created at
+    the same path is a different object wearing the same name: it passes every
+    containment and resolved-path test, yet herdr's write would land in something this
+    transaction never snapshotted and a rollback would overwrite a stranger's contents
+    with the staged backup (review j#91805 finding 1).
     """
-    display = str(config_dir)
-    try:
-        present = config_dir.exists()
-    except OSError as exc:
+    identity, problem = observe_config_dir(config_dir, home)
+    if problem is not None:
+        return problem
+    if expected is not None and identity != expected:
         return (
             REASON_UNSAFE_CONFIG_PATH,
-            f"config path {display} could not be examined ({exc.__class__.__name__})",
-        )
-    if not present:
-        return (
-            REASON_CONFIG_DIR_MISSING,
-            f"config dir {display} is no longer present; it existed when the plan "
-            f"gate ran, so it changed underneath this operation",
-        )
-    home_real = os.path.realpath(home)
-    config_real = os.path.realpath(config_dir)
-    if not os.path.isdir(config_real) or not is_safe_config_dir(
-        resolved=config_real, home_resolved=home_real
-    ):
-        return (
-            REASON_UNSAFE_CONFIG_PATH,
-            f"config path {display} now resolves to {config_real}, which is outside "
-            f"home or is not a directory (symlink / traversal); refusing to touch it",
-        )
-    if expected_real is not None and config_real != expected_real:
-        return (
-            REASON_UNSAFE_CONFIG_PATH,
-            f"config path {display} now resolves to {config_real} but this operation "
-            f"was staged against {expected_real}; the target changed identity",
+            f"config dir {config_dir} is no longer the directory this operation was "
+            f"staged against (staged {expected.realpath} "
+            f"dev={expected.device} ino={expected.inode}, now "
+            f"{identity.realpath} dev={identity.device} ino={identity.inode}); "
+            f"refusing to touch a different object",
         )
     return None
 
@@ -300,16 +358,19 @@ def rollback_dir(
     before: DirSnapshot,
     *,
     home: Path,
-    expected_real: str,
+    expected: DirIdentity,
 ) -> bool:
     """Restore ``root``'s non-credential files to their pre-apply state, and **verify** it.
 
     This function is where the installer *writes*, so the target-identity guard lives
     here rather than only at its call sites: if ``root`` no longer resolves to the dir
     this rollback was staged against, restoring the backup would push operator bytes
-    into some other location — outside home, in the symlink case. A drifted root is
-    therefore reported unrestorable **before any write**, never repaired blindly
-    (Redmine #13249 review j#91762 finding 1).
+    into some other location — outside home in the symlink case, and into a stranger's
+    directory when a replacement was created at the same path, where the "restore"
+    would delete that directory's contents and overwrite them with bytes belonging to
+    a different dir. A drifted target is therefore reported unrestorable **before any
+    write**, never repaired blindly (Redmine #13249 reviews j#91762 finding 1 /
+    j#91805 finding 1).
 
     Removes any non-credential file herdr added (present now, absent in ``before``),
     then rewrites every backed-up file's original bytes (restoring changed / removed
@@ -322,7 +383,7 @@ def rollback_dir(
     therefore makes this return ``False`` (Redmine #13249 review j#83613 finding 1),
     so a caller can never claim ``home left as found`` on an unproven rollback.
     """
-    if config_dir_drift(root, home, expected_real=expected_real) is not None:
+    if config_dir_drift(root, home, expected=expected) is not None:
         return False
     before_paths = before.paths
     for rel, abspath in scan_dir(root).files:
@@ -352,10 +413,12 @@ def rollback_dir(
 __all__ = (
     "UNREADABLE_SENTINEL",
     "DirBackup",
+    "DirIdentity",
     "DirRead",
     "DirScan",
     "backup_dir",
     "config_dir_drift",
+    "observe_config_dir",
     "has_unreadable",
     "read_dir",
     "rollback_dir",
