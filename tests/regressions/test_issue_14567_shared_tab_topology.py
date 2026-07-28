@@ -1489,6 +1489,14 @@ class _SharedTabHerdr(_Herdr):
             height=self.split_cross,
         )
 
+    #: The canonical AXIS each ``pane resize --direction`` token addresses. herdr carries the
+    #: sign of the move in the token (:func:`herdr_pair_split_ratio.resize_step`), so
+    #: shrinking a divider issues ``left`` / ``up`` while the layout only ever labels a split
+    #: ``right`` / ``down``. Matching the token against the label directly finds no split at
+    #: all and silently applies nothing — every ``ratio < 0.5`` run then fails for a fixture
+    #: reason (review j#92117 R3-F1). The token selects the axis; it does not name it.
+    RESIZE_AXIS = {"right": "right", "left": "right", "down": "down", "up": "down"}
+
     def _apply_resize(self, direction, amount, pane=""):
         """Resolve the resize the way herdr does: the NEAREST same-axis ancestor split.
 
@@ -1498,14 +1506,20 @@ class _SharedTabHerdr(_Herdr):
         pair's, so a fake that always moved the pair's could never show that failure, and
         the guard's pin would be vacuous.
 
-        Modelled as the smallest same-direction split whose rect contains the pane, read off
-        the rendered layout so the fake and the code agree on one geometry. Whether the
-        winner was the lane's own pair divider or the INTER-LANE one is recorded separately:
-        the latter is the outcome that re-lays-out a neighbouring lane, and a test asserts it
-        never happens rather than trusting the argv.
+        Modelled as the smallest split ON THE ADDRESSED AXIS whose rect contains the pane,
+        read off the rendered layout so the fake and the code agree on one geometry. The
+        axis comes from :data:`RESIZE_AXIS`, never from the raw token: the token also
+        carries the direction of travel, which :func:`apply_resize_amount` (not the
+        candidate search) is what consumes. Whether the winner was the lane's own pair
+        divider or the INTER-LANE one is recorded separately: the latter is the outcome that
+        re-lays-out a neighbouring lane, and a test asserts it never happens rather than
+        trusting the argv.
         """
         key, index = self._column_of(pane)
         if index < 0:
+            return
+        axis = self.RESIZE_AXIS.get(direction)
+        if axis is None:
             return
         layout = self._layout_payload(pane)["result"]["layout"]
         rect = next(
@@ -1525,7 +1539,7 @@ class _SharedTabHerdr(_Herdr):
         candidates = [
             split
             for split in layout["splits"]
-            if split["direction"] == direction and contains(split["rect"], rect)
+            if split["direction"] == axis and contains(split["rect"], rect)
         ]
         if not candidates:
             return
@@ -1547,6 +1561,96 @@ class _SharedTabHerdr(_Herdr):
         """The live ratio of the column holding ``pane_id`` — herdr's state, not the ask."""
         key, index = self._column_of(pane_id)
         return self.column_ratios[key][index] if index >= 0 else -1.0
+
+
+class SharedTabFakeModelTest(unittest.TestCase):
+    """Executable pins on :class:`_SharedTabHerdr` itself — the model the claims below rest on.
+
+    Review j#92117 F2: the composition pins assert ``inter_lane_resizes == []``, which proves
+    nothing unless the recorder can fire. j#92111 showed it could with a one-off manual
+    probe, but a mutation clearing the list on every call left all five composition pins
+    green — so nothing that RUNS pinned the observable's liveness, and a future change could
+    make every one of those assertions vacuous without a single test noticing. A manual probe
+    is evidence about a moment; only a test is evidence about the repository.
+
+    These drive the fake directly (constructing the container state rather than launching
+    into it) because the property under test is the fake's own resolution rule, and the
+    launch path cannot reach a one-pane column at measurement time — that is exactly the
+    structural argument recorded in j#92111, and it is why the liveness has to be pinned
+    here instead.
+    """
+
+    KEY = "wZ:t1"
+
+    def _herdr(self, columns, lanes, directions=None):
+        herdr = _SharedTabHerdr(created_workspace="wZ")
+        herdr.columns[self.KEY] = [list(column) for column in columns]
+        herdr.column_lanes[self.KEY] = list(lanes)
+        herdr.column_ratios[self.KEY] = [0.5 for _ in columns]
+        herdr.column_directions[self.KEY] = list(directions or ["down"] * len(columns))
+        return herdr
+
+    def test_a_one_pane_column_resolves_to_the_inter_lane_divider(self) -> None:
+        # A column with no pair divider of its own has no same-axis split inside it, so the
+        # nearest one containing the pane is the divider BETWEEN lanes. This is the input
+        # that makes `inter_lane_resizes` non-empty; without it, every `== []` assertion in
+        # this file passes for a recorder that never fires.
+        # Both tokens of the axis are driven, which also pins the R3-F1 normalization.
+        for token in ("right", "left"):
+            with self.subTest(token=token):
+                herdr = self._herdr(
+                    [["wZ:pA"], ["wZ:pB1", "wZ:pB2"]], ["lane-a", "lane-b"]
+                )
+                herdr._apply_resize(token, 0.2, pane="wZ:pA")
+                self.assertEqual(
+                    herdr.inter_lane_resizes,
+                    [0],
+                    "the observable the composition pins rely on must actually fire",
+                )
+                self.assertEqual(
+                    herdr.resized_columns,
+                    [],
+                    "resolving to the inter-lane divider must not report a pair as moved",
+                )
+                self.assertEqual(
+                    herdr.column_ratios[self.KEY],
+                    [0.5, 0.5],
+                    "no pair ratio may change when no pair divider was addressed",
+                )
+
+    def test_a_pair_column_resolves_to_its_own_divider_on_both_tokens(self) -> None:
+        # R3-F1: the token carries the direction of TRAVEL, the axis is what selects the
+        # split. `up` must find the same `down` divider that `down` does, and move it the
+        # other way. Matching the token against the layout's label instead finds nothing and
+        # silently applies no resize at all.
+        for token, expected in (("down", 0.7), ("up", 0.3)):
+            with self.subTest(token=token):
+                herdr = self._herdr(
+                    [["wZ:pA1", "wZ:pA2"], ["wZ:pB1", "wZ:pB2"]], ["lane-a", "lane-b"]
+                )
+                herdr._apply_resize(token, 0.2, pane="wZ:pA1")
+                self.assertEqual(herdr.inter_lane_resizes, [])
+                self.assertEqual(herdr.resized_columns, [0])
+                self.assertAlmostEqual(
+                    herdr.column_ratios[self.KEY][0], expected, places=6
+                )
+                self.assertAlmostEqual(
+                    herdr.column_ratios[self.KEY][1],
+                    0.5,
+                    places=6,
+                    msg="the neighbouring lane's divider must not move",
+                )
+
+    def test_an_unknown_direction_token_moves_nothing(self) -> None:
+        # `RESIZE_AXIS` is a closed map. An unrecognised token must resolve to no axis and
+        # actuate nothing, rather than defaulting to one and moving a divider by guess.
+        herdr = self._herdr(
+            [["wZ:pA1", "wZ:pA2"], ["wZ:pB1", "wZ:pB2"]], ["lane-a", "lane-b"]
+        )
+        herdr._apply_resize("sideways", 0.2, pane="wZ:pA1")
+        self.assertEqual(herdr.resized_columns, [])
+        self.assertEqual(herdr.inter_lane_resizes, [])
+        self.assertEqual(herdr.column_ratios[self.KEY], [0.5, 0.5])
 
 
 class SharedTabPairRatioCompositionTest(unittest.TestCase):
@@ -1777,6 +1881,62 @@ class SharedTabPairRatioCompositionTest(unittest.TestCase):
                 [],
                 "no resize may resolve to the divider BETWEEN lanes",
             )
+
+    def test_a_ratio_below_half_shrinks_only_this_lanes_divider(self) -> None:
+        # `ratio < 0.5` is the half of the declared domain (0.1..0.9) that makes production
+        # issue the SHRINK token — `left` on the `right` axis, `up` on `down`
+        # (`resize_step`). Every other pin in this file declares 0.7 and therefore only ever
+        # drives the grow tokens, so the shrink direction reached the shared tab untested
+        # (review j#92117 R3-F1).
+        #
+        # Driven on BOTH axes: `right` is the collision case where the pair shares the
+        # inter-lane axis, `down` is the control where they differ. The defect was not
+        # specific to the collision — every `ratio < 0.5` run was affected.
+        for axis in ("right", "down"):
+            with self.subTest(axis=axis):
+                with tempfile.TemporaryDirectory() as tmp:
+                    herdr = self._shared_herdr()
+                    result, _ws, panes = _prepare(
+                        tmp,
+                        herdr=herdr,
+                        providers=["codex", "claude"],
+                        lane="lane-a",
+                        sublane_tab_topology=SHARED,
+                        lane_placement=LanePlacementConfig.from_record(
+                            {"sublane": {"split": axis, "ratio": 0.3}}
+                        ),
+                        rows=self._foreign_lane_rows(),
+                        attested=True,
+                    )
+                    herdr.assert_no_locator_collision(self, result)
+                    # The run really did issue a shrink token — otherwise this pins nothing.
+                    shrink = {"right": "left", "down": "up"}[axis]
+                    self.assertIn(
+                        shrink,
+                        [
+                            call[call.index("--direction") + 1]
+                            for call in self._resizes(herdr)
+                            if "--direction" in call
+                        ],
+                        f"a declared 0.3 on the {axis} axis must issue `{shrink}`",
+                    )
+                    self.assertIn(
+                        result.ratio_outcome,
+                        (RATIO_APPLIED, RATIO_MATCHED),
+                        result.ratio_detail,
+                    )
+                    self.assertTrue(result.ok, result.ratio_detail)
+                    self.assertAlmostEqual(
+                        herdr.pair_ratio_of(panes["codex"]), 0.3, places=6
+                    )
+                    self.assertAlmostEqual(
+                        herdr.pair_ratio_of(self.FOREIGN[0]), 0.5, places=6
+                    )
+                    self.assertEqual(
+                        herdr.inter_lane_resizes,
+                        [],
+                        "shrinking must not resolve to the divider BETWEEN lanes",
+                    )
 
     def test_per_lane_tab_keeps_the_pre_14567_predicate(self) -> None:
         # Under `per_lane_tab` the lane occupancy IS the container occupancy, so a
