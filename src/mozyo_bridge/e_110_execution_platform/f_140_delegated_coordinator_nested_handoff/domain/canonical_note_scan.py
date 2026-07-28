@@ -29,6 +29,11 @@ stated once, and both readers call it:
   deciding authority IS the defect, so this asks only whether markup begins, never where it ends.
   A marker inside a comment or an attribute is not even a quotation: it renders as **nothing**, and
   an invisible string was becoming a durable gate event.
+- **F. link syntax** — a destination and title ``](…)``, a reference label ``][…]`` and a reference
+  definition's tail ``]: …``. A marker written in one of them renders as a URL, an attribute, or
+  nothing at all. Unlike E these regions are BOUNDED and only they are blanked: refusing to the end
+  of the note from ``][`` was measured against live journals and lost seven real gate events,
+  because ``[P1][documented_rule …]`` is ordinary review prose.
 - **Backslash escapes (§2.4)** — an escaped delimiter is a literal. Counting an escaped backtick as
   a run pairs it with the REAL opener after it, so the span those two delimiters actually formed
   stops being blanked; ``\\<`` starts no markup.
@@ -129,8 +134,15 @@ _INTERRUPTS_PARAGRAPH = (
 )
 
 #: Anything that starts raw HTML: a tag, a closing tag, a comment / declaration / CDATA (``<!``) or
-#: a processing instruction (``<?``). This module does NOT tokenize what follows.
-_HTML_START = re.compile(r"<[A-Za-z!?/]")
+#: a processing instruction (``<?``). This module does NOT tokenize what follows — it refuses from
+#: here to the end of the note (see :func:`_first_hidden_construct`).
+_HIDDEN_CONSTRUCT_START = re.compile(r"<[A-Za-z!?/]")
+#: The parts of Markdown's link syntax the renderer does not show as prose: a destination and title
+#: ``](…)``, a reference label ``][…]``, and a link reference definition's tail ``]: …``. A marker
+#: written in one of them renders as a URL, an attribute, or nothing. Unlike raw HTML these are
+#: BOUNDED — refusing to the end of the note instead costs real markers, measured on live journals:
+#: ``[P1][documented_rule …]`` is ordinary review prose, and seven live gate events were lost.
+_LINK_HIDDEN_PART = re.compile(r"\]\(|\]\[|\]:")
 
 
 def _indent_columns(line: str) -> int:
@@ -240,19 +252,69 @@ def _is_escaped(text: str, index: int) -> bool:
     return backslashes % 2 == 1
 
 
-def _first_raw_html(line: str) -> int:
-    """The offset where raw HTML starts on ``line``, or ``-1`` (pure).
+def _first_hidden_construct(line: str) -> int:
+    """The offset where a construct with hidden content starts on ``line``, or ``-1`` (pure).
 
-    Deliberately does not say WHICH construct it is. Three rounds of modelling raw HTML piece by
-    piece — a tag whitelist, then nesting, then attributes and comments — each shipped with the next
-    token type still unhandled (#14584 j#91406 F3, j#91593 F2/F3). A partial HTML parser deciding
-    authority is the defect; this asks only "does markup start here", and the caller refuses
-    everything from here to the end of the note.
+    Deliberately does not say WHICH construct it is, and never asks where it ends. Three rounds of
+    modelling raw HTML piece by piece — a tag whitelist, then nesting, then attributes and comments
+    — each shipped with the next token type still unhandled (#14584 j#91406 F3, j#91593 F2/F3). A
+    partial parser deciding authority is the defect, so this asks only "does one start here" and the
+    caller refuses everything from here to the end of the note.
+
+    Markdown's link syntax hides content too, but is handled by :func:`_blank_link_hidden_parts`
+    instead: its regions are bounded, and refusing to the end of the note for them costs real
+    markers rather than hypothetical ones.
     """
-    for match in _HTML_START.finditer(line):
+    for match in _HIDDEN_CONSTRUCT_START.finditer(line):
         if not _is_escaped(line, match.start()):
             return match.start()
     return -1
+
+
+def _blank_link_hidden_parts(text: str) -> str:
+    """``text`` with every link destination, title and reference label blanked (pure).
+
+    A marker written as ``[text](THIS)`` renders as a URL, as ``[text][THIS]`` as a lookup that
+    resolves to nothing, and as ``[label]: THIS`` as a definition the reader never sees — three more
+    ways an INVISIBLE string was becoming a durable gate event (#14584 j#91593 F2's class).
+
+    Each region is bounded: to the matching ``)``, the closing ``]``, or the end of the line. An
+    unterminated one refuses the rest of the paragraph, like an unmatched backtick string.
+    """
+    chars = list(text)
+    position = 0
+    while True:
+        opening = _LINK_HIDDEN_PART.search(text, position)
+        if opening is None:
+            return "".join(chars)
+        start = opening.start()
+        if _is_escaped(text, start):
+            position = opening.end()
+            continue
+        end = _link_region_end(text, opening.group(), opening.end())
+        for index in range(start, end):
+            if chars[index] != "\n":
+                chars[index] = " "
+        position = end
+
+
+def _link_region_end(text: str, opener: str, start: int) -> int:
+    """Where the link region opened by ``opener`` ends (pure); the paragraph end if it never does."""
+    if opener == "]:":  # a reference definition's destination and title run to the line end
+        newline = text.find("\n", start)
+        return len(text) if newline < 0 else newline
+    if opener == "][":
+        closing = text.find("]", start)
+        return len(text) if closing < 0 else closing + 1
+    depth = 1  # "](" — destinations may contain balanced parentheses
+    for index in range(start, len(text)):
+        if text[index] == "(" and not _is_escaped(text, index):
+            depth += 1
+        elif text[index] == ")" and not _is_escaped(text, index):
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return len(text)
 
 
 def _blank_code_spans(text: str) -> str:
@@ -324,14 +386,15 @@ def canonical_note_lines(notes: str) -> tuple[str, ...]:
         end = start
         while end < len(classified) and classified[end][1] == paragraph:
             end += 1
-        lines[start:end] = _blank_code_spans("\n".join(lines[start:end])).split("\n")
+        joined = _blank_code_spans("\n".join(lines[start:end]))
+        lines[start:end] = _blank_link_hidden_parts(joined).split("\n")
         start = end
     lines = ["" if blanked else line for line, (_t, _p, blanked) in zip(lines, classified)]
-    # Raw HTML is decided last, on what the rules above left standing — so a `<tag>` inside a code
-    # span or a fence is already gone and does not cost anything. From the first markup that is
+    # Hidden constructs are decided last, on what the rules above left standing — so a `<tag>` or
+    # a link inside a code span or a fence is already gone and costs nothing. From the first one
     # still in the writer's own text, nothing further in the note is establishable.
     for index, line in enumerate(lines):
-        if _first_raw_html(line) >= 0:
+        if _first_hidden_construct(line) >= 0:
             return tuple(lines[:index] + [""] * (len(lines) - index))
     return tuple(lines)
 

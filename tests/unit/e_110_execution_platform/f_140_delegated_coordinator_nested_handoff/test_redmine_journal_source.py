@@ -347,6 +347,8 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             ("CDATA", "<![CDATA[\n%s\n]]>" % self.GATE),
             ("nested quoting tags", "<blockquote>\n<blockquote>\nq\n</blockquote>\n%s\n</blockquote>" % self.GATE),
             ("escaped backtick", "\\` x `%s`" % self.GATE),
+            ("link destination", "[text](%s)" % self.GATE),
+            ("link title", '[text](http://example.com "%s")' % self.GATE),
         ):
             with self.subTest(label):
                 self.assertEqual(self._gates(note), ())

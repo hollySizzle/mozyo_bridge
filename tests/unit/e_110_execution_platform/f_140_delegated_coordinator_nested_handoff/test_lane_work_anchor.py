@@ -181,6 +181,8 @@ class FailClosedTest(unittest.TestCase):
             ("CDATA", "<![CDATA[\n%s\n]]>" % marker),
             ("nested quoting tags", "<blockquote>\n<blockquote>\nq\n</blockquote>\n%s\n</blockquote>" % marker),
             ("escaped backtick", "\\` x `%s`" % marker),
+            ("link destination", "[text](%s)" % marker),
+            ("link title", '[text](http://example.com "%s")' % marker),
         ):
             with self.subTest(label):
                 self.assertEqual(_resolve([_entry("90409", note)]).status, WORK_ANCHOR_MISSING)

@@ -105,6 +105,11 @@ authorize したかを照合しなければ scope は未検証のままである
       既に blank 済みなので費用ゼロである。
       なお **marker が comment / 属性値の中にある場合、描画結果に一切現れない** (`pandoc -t plain`
       で消える)。「引用」ですらなく**不可視の文字列**が gate authority になっていた。
+    - **F. link 構文** — destination と title `](…)`、reference label `][…]`、reference definition の
+      末尾 `]: …`。marker をここに書くと URL / attribute / **何も描画されない**ものになる。
+      E と違い**この領域は有界なので blank にとどめる**: `][` 以降を note 末尾まで拒否する版を live
+      journal で実測したところ **実 gate event を 7 件落とした** (`[P1][documented_rule …]` は
+      review 散文として普通に現れる)。**「拒否が高すぎる」ことは live 実測でしか分からない。**
     - **§2.4 backslash escape** — escape された delimiter は literal であり delimiter ではない。
       escaped backtick を run に数えると、その run が後続の**本物の opener と対になり**、実際に span を
       形成していた 2 delimiter の間が blank されなくなる (j#91593 F1)。`\<` も同様に markup を起動しない。
@@ -155,6 +160,12 @@ authorize したかを照合しなければ scope は未検証のままである
     正しい述語は **「marker が可視の散文テキストとして描画されること」** である: HTML 出力上の位置が
     verbatim / quotation element の内側でないことに加え、**plain text 出力にその文字列が残ること**を
     要求する (comment / 属性 / `script` / `style` / `textarea` の中身はここで消える)。
+    ★★★**述語は 1 箇所にしか置かない。** corpus harness が旧述語のコピーを持ったままだったため、
+    oracle を直した後も corpus は旧規則で採点し続けていた (#14584 R5 自己検出)。**scanner に対して
+    「同じ grammar の定義が 2 つあるのは drift 生成器」と書いたのと同じ誤りを、検証側で犯した。**
+    ★★★**「描画結果に現れない」を「判定不能」として skip しない。** harness は marker が render 出力に
+    無い場合を skip していたが、それは**最も強い「書き手の声ではない」証拠**である。skip を廃止したら
+    link destination / title 内 marker の under-blank が 6 件出た。
     ★★★**oracle を入れても、corpus の生成軸を自分で決めている限り同じ漏れが残る** (#14584 j#91406)。
     R3 は oracle を導入した上でなお字類・hanging indent・raw HTML の 3 軸を落とし、しかも
     「HTML 軸未実施」と自分の review_request に書いたまま head を出した。よって **corpus の生成軸は
