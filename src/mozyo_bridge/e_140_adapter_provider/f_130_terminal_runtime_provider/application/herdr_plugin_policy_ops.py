@@ -426,6 +426,21 @@ class EnablePlan:
             raise HerdrPluginPolicyError("decision must be a PolicyDecision")
         if self.verdict is not None and not isinstance(self.verdict, PluginVerdict):
             raise HerdrPluginPolicyError("verdict must be a PluginVerdict or None")
+        # Relational invariant (review j#92194 F2): an admitted enable plan must
+        # rest on something. Without this, `EnablePlan(plugin_id=None, found=False,
+        # verdict=None, decision=admit)` was constructible and rendered
+        # `ok=true / plugin=null` — an admission with nothing behind it.
+        if self.decision.admitted and (
+            not self.found
+            or self.verdict is None
+            or self.plugin_id is None
+            or not self.verdict.enable.admitted
+            or self.verdict.observation.plugin_id != self.plugin_id
+        ):
+            raise HerdrPluginPolicyError(
+                "an admitted enable plan requires the named plugin to have been "
+                "found and to have carried an admitting verdict"
+            )
 
     @property
     def ok(self) -> bool:
@@ -535,6 +550,13 @@ class InstallPlan:
             raise HerdrPluginPolicyError("ref must be a PluginSourceRef or None")
         if not isinstance(self.decision, PolicyDecision):
             raise HerdrPluginPolicyError("decision must be a PolicyDecision")
+        # Relational invariant (review j#92194 F2): an install may only be admitted
+        # against an exactly pinned reference. `InstallPlan(ref=None,
+        # decision=admit)` reported ok=true for a candidate with no identity at all.
+        if self.decision.admitted and (self.ref is None or not self.ref.is_pinned):
+            raise HerdrPluginPolicyError(
+                "an admitted install plan requires an exactly pinned reference"
+            )
 
     @property
     def ok(self) -> bool:

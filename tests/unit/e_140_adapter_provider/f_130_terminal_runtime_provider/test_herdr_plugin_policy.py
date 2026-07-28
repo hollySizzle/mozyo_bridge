@@ -1251,6 +1251,352 @@ class RenderableDtoBoundaryTests(unittest.TestCase):
                     dataclasses.replace(plan, plugin_id=hostile)
 
 
+#: Absolute-path forms derived from the POSIX / Windows *specification*, not from
+#: production's regex. Review j#92194 F1: the previous oracle was written in the
+#: same shape as the implementation (`/segment/`), so both were blind to `/etc`,
+#: `/`, `/秘密` and `/tmp-☃/secret` at once — two layers that fail together are one
+#: layer. An oracle only tests a detector if it was derived independently.
+SPEC_ABSOLUTE_PATHS = (
+    "/etc",                    # single component
+    "/",                       # the root itself
+    "/秘密",                    # non-ASCII component
+    "/tmp-☃/secret",           # mixed alphabet
+    "/etc/passwd",             # multi component
+    "/a//b",                   # doubled separator
+    "/trailing/",              # trailing separator
+    "C:/Users/x",              # drive root, forward slash
+    "C:\\Users\\x",            # drive root, backslash
+    "\\\\server\\share",       # UNC root
+    "config:/Users/x",         # labelled absolute path
+)
+
+#: Strings that must NOT be read as absolute paths, or the guard becomes a denial
+#: of service on this surface's own output.
+SPEC_NON_PATHS = (
+    "github:smarzban/herdr-file-viewer@" + FILE_VIEWER_COMMIT,
+    "install/enable",
+    "relative/path.yaml",
+    "owner/repo",
+    "plain diagnostic prose with no separator",
+    "",
+)
+
+
+class PathDetectorOracleTests(unittest.TestCase):
+    """The detector, judged against a specification-derived corpus."""
+
+    def test_every_specified_absolute_path_is_detected(self):
+        missed = [
+            value
+            for value in SPEC_ABSOLUTE_PATHS
+            if not ops.contains_absolute_path(value)
+        ]
+        self.assertEqual(missed, [], f"absolute path(s) not detected: {missed}")
+
+    def test_no_legitimate_string_is_detected_as_a_path(self):
+        flagged = [
+            value for value in SPEC_NON_PATHS if ops.contains_absolute_path(value)
+        ]
+        self.assertEqual(flagged, [], f"non-path(s) wrongly detected: {flagged}")
+
+    def test_a_path_after_a_line_break_is_detected(self):
+        # The bug reusing the hardened patterns without the hardened structure:
+        # `$` also matches before a trailing newline, so the character ending the
+        # PREVIOUS line satisfied the relative-continuation proof.
+        for value in SPEC_ABSOLUTE_PATHS:
+            with self.subTest(value=value):
+                self.assertTrue(ops.contains_absolute_path(f"a line\n{value} tail"))
+
+    def test_the_detector_is_the_repository_wide_rule(self):
+        # One rule, one place: the redactor hardened over #14258's review rounds
+        # and this boundary must not be able to disagree.
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_probe_redaction as redaction
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_identity as identity
+
+        self.assertIs(redaction._ABS_ROOT_RE, identity._ABS_ROOT_RE)
+        self.assertIs(
+            redaction._RELATIVE_CONTINUATION_RE, identity._RELATIVE_CONTINUATION_RE
+        )
+        for value in SPEC_ABSOLUTE_PATHS:
+            with self.subTest(value=value):
+                self.assertNotEqual(redaction.redact_probe_paths(value), value)
+
+
+class EdgeMatrixTests(unittest.TestCase):
+    """Every named edge from the j#92149 sweep, pinned directly.
+
+    Review j#92194 F3: the previous version enumerated dataclasses automatically
+    and so silently dropped `InventoryReadError` — which is not a dataclass, and
+    was the one edge I had found myself. The matrix is now written by name, and a
+    coverage assertion checks it against the sweep's edge list in both directions.
+    """
+
+    SWEPT_EDGES = {
+        "E1_inventory_record",
+        "E2_operand_factory",
+        "E3_enable_plan_direct",
+        "E4_install_plan_direct",
+        "E5_dataclasses_replace",
+        "E6_malformed_entry_detail",
+        "E7_policy_decision_detail",
+        "E8_plugin_verdict_anchor",
+        "E9_inventory_read_error_detail",
+        "E10_inventory_document_unreadable",
+    }
+
+    def _edges(self, hostile):
+        """Each named edge as a callable producing the artifact it can render."""
+        empty = ops.PolicyStatus(verdicts=(), malformed=())
+
+        def rendered(status):
+            return json.dumps(status.as_payload()) + ops.format_status_text(status)
+
+        def e1():
+            record = plugin_record()
+            record["version"] = hostile
+            record["source"] = {"kind": hostile}
+            return rendered(
+                ops.classify_inventory(
+                    ops.parse_inventory(inventory_document(record))
+                )
+            )
+
+        def e2():
+            plan = ops.plan_enable(empty, hostile)
+            return json.dumps(plan.as_payload()) + ops.format_enable_plan_text(plan)
+
+        def e3():
+            plan = ops.EnablePlan(
+                plugin_id=hostile,
+                found=True,
+                verdict=None,
+                decision=PolicyDecision.deny(REASON_TARGET_NOT_INSTALLED, "x"),
+            )
+            return json.dumps(plan.as_payload()) + ops.format_enable_plan_text(plan)
+
+        def e4():
+            plan = ops.InstallPlan(
+                spec=hostile,
+                ref=None,
+                decision=PolicyDecision.deny(REASON_UNPINNED_SOURCE, "x"),
+            )
+            return json.dumps(plan.as_payload()) + ops.format_install_plan_text(plan)
+
+        def e5():
+            status = ops.classify_inventory(
+                ops.parse_inventory(inventory_document(plugin_record()))
+            )
+            plan = dataclasses.replace(
+                ops.plan_enable(status, "herdr-file-viewer"), plugin_id=hostile
+            )
+            return json.dumps(plan.as_payload()) + ops.format_enable_plan_text(plan)
+
+        def e6():
+            return rendered(
+                ops.PolicyStatus(
+                    verdicts=(),
+                    malformed=(ops.MalformedEntry(index=0, detail=hostile),),
+                )
+            )
+
+        def e7():
+            return PolicyDecision.admit(hostile).detail
+
+        def e8():
+            status = ops.classify_inventory(
+                ops.parse_inventory(inventory_document(plugin_record()))
+            )
+            return dataclasses.replace(
+                status.verdicts[0], review_anchor=hostile
+            ).review_anchor
+
+        def e9():
+            return ops.format_read_error_text(
+                ops.InventoryReadError(ops.READ_HERDR_ERROR, hostile)
+            )
+
+        def e10():
+            try:
+                ops.read_inventory_document(Path(hostile))
+            except ops.InventoryReadError as exc:
+                return ops.format_read_error_text(exc)
+            except (OSError, ValueError):
+                return ""
+            return ""
+
+        return {
+            "E1_inventory_record": e1,
+            "E2_operand_factory": e2,
+            "E3_enable_plan_direct": e3,
+            "E4_install_plan_direct": e4,
+            "E5_dataclasses_replace": e5,
+            "E6_malformed_entry_detail": e6,
+            "E7_policy_decision_detail": e7,
+            "E8_plugin_verdict_anchor": e8,
+            "E9_inventory_read_error_detail": e9,
+            "E10_inventory_document_unreadable": e10,
+        }
+
+    def test_the_matrix_covers_exactly_the_swept_edges(self):
+        # Both directions: a swept edge with no probe, and a probe for an edge the
+        # sweep never named, are each a gap.
+        self.assertEqual(set(self._edges("x")), self.SWEPT_EDGES)
+
+    def test_no_edge_renders_a_path_or_a_forged_line(self):
+        # The two invariants, asked separately. Conflating them with `or` is how I
+        # misread two edges as leaking during the sweep itself.
+        # The forged-line probe must use a marker that ONLY the hostile input can
+        # produce. An earlier version looked for a line starting with `BREACH:` —
+        # but that is a line this report legitimately writes when an enabled plugin
+        # is inadmissible, so every edge that produced a real breach read as a
+        # forgery. Same mistake as during the sweep itself: a predicate that cannot
+        # tell our own output from injected output measures nothing.
+        forge_marker = "ZZFORGEDLINEZZ"
+        hostile_values = (
+            LEAK_MARKER,
+            "/etc",
+            "/",
+            "/秘密",
+            f"a\n{forge_marker}\nb",
+            "bell\x07here",
+        )
+        path_leaks, forged_lines = [], []
+        for hostile in hostile_values:
+            for name, edge in self._edges(hostile).items():
+                try:
+                    artifact = edge()
+                except HerdrPluginPolicyError:
+                    continue  # refused at construction is closed
+                if ops.contains_absolute_path(artifact):
+                    path_leaks.append((name, hostile[:16]))
+                if any(
+                    line.strip().startswith(forge_marker)
+                    for line in artifact.splitlines()
+                ) or any(ch in artifact for ch in "\r\x07\x00"):
+                    forged_lines.append((name, hostile[:16]))
+        self.assertEqual(path_leaks, [], f"path reached a report: {path_leaks}")
+        self.assertEqual(forged_lines, [], f"forged line: {forged_lines}")
+
+
+class RelationalInvariantTests(unittest.TestCase):
+    """Field-wise validity is not consistency (review j#92194 F2).
+
+    Every DTO here passed its per-field checks while carrying a combination the
+    policy would never produce — an observation that could not recognize its own
+    source yet classified as `ux_only`, an admitted plan with nothing behind it, a
+    verdict whose class said `unknown` while its decision said admit (so an
+    enabled, unreviewed plugin reported `breach=False`).
+    """
+
+    def _status(self):
+        return ops.classify_inventory(
+            ops.parse_inventory(inventory_document(plugin_record()))
+        )
+
+    def test_an_unrecognized_source_cannot_carry_a_resolved_reference(self):
+        reviewed_pin = PluginSourceRef.pinned(
+            SOURCE_KIND_GITHUB, "smarzban", "herdr-file-viewer", FILE_VIEWER_COMMIT
+        )
+        for kind in (SOURCE_KIND_UNRECOGNIZED, SOURCE_KIND_LINK, SOURCE_KIND_ABSENT):
+            with self.subTest(kind=kind):
+                with self.assertRaises(HerdrPluginPolicyError):
+                    PluginObservation(
+                        plugin_id="herdr-file-viewer",
+                        enabled=True,
+                        source_kind=kind,
+                        ref=reviewed_pin,
+                        declares_build=True,
+                        declares_panes=True,
+                        declares_actions=True,
+                    )
+
+    def test_a_verdict_cannot_disagree_with_the_policy(self):
+        real = self._status().verdicts[0]
+        divergences = (
+            dict(plugin_class=CLASS_UNKNOWN),
+            dict(build_provenance=BUILD_NONE),
+            dict(review_anchor="not the reviewed anchor"),
+            dict(enable=PolicyDecision.admit("invented")),
+            dict(install=PolicyDecision.admit("invented")),
+            dict(enable=PolicyDecision.deny(REASON_AGENT_INPUT_WRITER, "invented")),
+        )
+        for divergence in divergences:
+            with self.subTest(divergence=sorted(divergence)):
+                with self.assertRaises(HerdrPluginPolicyError):
+                    dataclasses.replace(real, **divergence)
+
+    def test_an_unreviewed_plugin_cannot_be_given_an_admitting_verdict(self):
+        unknown = observe_plugin(
+            plugin_record(plugin_id="x", owner="s", repo="x", commit=OTHER_COMMIT)
+        )
+        with self.assertRaises(HerdrPluginPolicyError):
+            PluginVerdict(
+                observation=unknown,
+                plugin_class=CLASS_UNKNOWN,
+                build_provenance=BUILD_UNREVIEWED,
+                review_anchor="",
+                enable=PolicyDecision.admit("invented"),
+                install=PolicyDecision.admit("invented"),
+            )
+
+    def test_the_real_verdict_still_constructs(self):
+        # Positive control: recomputation must accept what the policy produces, or
+        # the invariant is a denial of service rather than a boundary.
+        real = self._status().verdicts[0]
+        self.assertTrue(real.enable.admitted)
+        dataclasses.replace(real, observation=real.observation)
+
+    def test_an_admitted_enable_plan_needs_something_behind_it(self):
+        status = self._status()
+        real = ops.plan_enable(status, "herdr-file-viewer")
+        self.assertTrue(real.ok)
+        broken = (
+            dict(found=False),
+            dict(verdict=None),
+            dict(plugin_id=None),
+            dict(plugin_id="a-different-plugin"),
+        )
+        for divergence in broken:
+            with self.subTest(divergence=sorted(divergence)):
+                with self.assertRaises(HerdrPluginPolicyError):
+                    dataclasses.replace(real, **divergence)
+        with self.assertRaises(HerdrPluginPolicyError):
+            ops.EnablePlan(
+                plugin_id=None,
+                found=False,
+                verdict=None,
+                decision=PolicyDecision.admit("nothing behind it"),
+            )
+
+    def test_an_admitted_install_plan_needs_a_pinned_reference(self):
+        for ref in (
+            None,
+            PluginSourceRef.repository(SOURCE_KIND_GITHUB, "smarzban", "x"),
+        ):
+            with self.subTest(ref=ref):
+                with self.assertRaises(HerdrPluginPolicyError):
+                    ops.InstallPlan(
+                        spec="smarzban/x",
+                        ref=ref,
+                        decision=PolicyDecision.admit("nothing pinned"),
+                    )
+
+    def test_a_denied_plan_may_carry_no_reference(self):
+        # The precondition applies to admission only; a denial legitimately has
+        # nothing behind it, and refusing that would break every deny path.
+        ops.InstallPlan(
+            spec=None,
+            ref=None,
+            decision=PolicyDecision.deny(REASON_UNPINNED_SOURCE, "no identity"),
+        )
+        ops.EnablePlan(
+            plugin_id=None,
+            found=False,
+            verdict=None,
+            decision=PolicyDecision.deny(REASON_INVALID_TARGET_ID, "not an id"),
+        )
+
+
 class SinkGuardTests(unittest.TestCase):
     """The second layer: the one place everything leaves through."""
 

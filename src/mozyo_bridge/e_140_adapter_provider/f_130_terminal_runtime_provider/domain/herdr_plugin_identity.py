@@ -87,13 +87,26 @@ MAX_RENDERED_FIELD_LENGTH = 2000
 _COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _SEGMENT_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 
-#: An absolute filesystem path occurrence: a POSIX root followed by a segment and
-#: another separator, a drive root, or a UNC root. Deliberately requires a second
-#: separator on the POSIX form, so ordinary prose (``HOME / XDG_CONFIG_HOME``) and
-#: a one-slash identity (``github:owner/repo@sha``) are not paths.
-_ABSOLUTE_PATH_RE = re.compile(
-    r"\\\\[^\s\\]|(?<![A-Za-z0-9_.\-])[A-Za-z]:[\\/]|/[A-Za-z0-9._\-]+/"
-)
+#: Where an absolute filesystem path can BEGIN: a UNC root, a drive root, or a
+#: POSIX ``/``. Every occurrence is a path unless :data:`_RELATIVE_CONTINUATION_RE`
+#: positively proves otherwise.
+#:
+#: **This is the canonical definition for the repository, not a second one.** The
+#: previous version of this module wrote its own rule — "a ``/``, a segment, and
+#: another ``/``" — which read ``/etc``, ``/``, ``/秘密`` and ``/tmp-☃/secret`` as
+#: *not* paths (review j#92194 F1 measured all four passing the constructor and
+#: both sink guards). A hardened rule for exactly this question already existed in
+#: this repo, in ``herdr_probe_redaction`` (Redmine #14258, twenty-one review
+#: rounds). Writing a third rule instead of reusing it is how the weakest copy ends
+#: up on the newest surface, so the definition now lives here and
+#: ``herdr_probe_redaction`` imports it: one rule, one place, both layers.
+_ABS_ROOT_RE = re.compile(r"\\\\|(?<![A-Za-z0-9_.\-])[A-Za-z]:[\\/]|/")
+
+#: The only positive proof that a root occurrence is not a path: the ``/`` sits
+#: INSIDE a token (``relative/path.yaml``, ``github:owner/repo@sha``), i.e. the
+#: preceding character continues a word. ``:`` deliberately does not qualify —
+#: ``config:/Users/…`` is a labelled absolute path.
+_RELATIVE_CONTINUATION_RE = re.compile(r"[A-Za-z0-9_.\-]$")
 
 #: Control characters. ``\n`` matters most: this surface's text is written to be
 #: pasted into a durable record, and a newline inside a *field* lets that field
@@ -102,9 +115,48 @@ _ABSOLUTE_PATH_RE = re.compile(
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
+def keeps_absolute_root(text: str, start: int, root: str) -> bool:
+    """True iff this root occurrence is provably NOT an absolute path.
+
+    Deliberately inverted: the question is not "does this look like a path?" but
+    "is there positive proof that it is not one?". Exactly one thing proves it — a
+    ``/`` that continues a word, and is therefore inside a relative token. A drive
+    or UNC root is never exempt; neither can occur inside a relative path. The
+    proof is judged per occurrence and covers nothing beyond itself.
+    """
+    if root != "/":
+        return False
+    return bool(_RELATIVE_CONTINUATION_RE.search(text[:start]))
+
+
 def contains_absolute_path(text: str) -> bool:
-    """Whether ``text`` carries an absolute filesystem path occurrence."""
-    return bool(_ABSOLUTE_PATH_RE.search(text))
+    """Whether ``text`` carries an absolute filesystem path occurrence.
+
+    Catches a single-component path (``/etc``), the root itself (``/``), a
+    non-ASCII path (``/秘密``), a mixed-alphabet path (``/tmp-☃/secret``), a drive
+    root and a UNC root — all of which the previous rule read as safe. Does *not*
+    flag a relative token (``relative/path.yaml``) or this surface's own identity
+    spellings (``github:owner/repo@sha``, ``install/enable``), because in those the
+    ``/`` continues a word.
+
+    A consequence worth stating: a bare ``/`` used as prose punctuation
+    (``HOME / XDG_CONFIG_HOME``) *is* flagged. That is the correct direction — the
+    prose was rewritten to suit the boundary rather than the boundary widened to
+    suit the prose.
+
+    **Evaluated line by line, like the redactor it shares its rule with.** Reusing
+    the hardened *patterns* without the hardened *structure* reintroduced the bug
+    they were meant to prevent: ``$`` also matches just before a trailing newline,
+    so on multi-line text ``line\\n/etc/passwd`` had ``"line\\n"`` as its preceding
+    context, ``e`` satisfied the relative-continuation proof, and the path was
+    read as safe. Splitting first is what makes the proof mean "the character
+    before it on this line".
+    """
+    return any(
+        not keeps_absolute_root(line, match.start(), match.group(0))
+        for line in text.splitlines() or [text]
+        for match in _ABS_ROOT_RE.finditer(line)
+    )
 
 
 def require_renderable_field(value: object, field: str) -> str:
@@ -409,6 +461,15 @@ class PluginObservation:
             )
         for name, check in _OBSERVATION_FIELD_CHECKS.items():
             check(getattr(self, name), name)
+        # Relational invariant, not a field one (review j#92194 F2). Field-level
+        # checks let `source_kind="unrecognized"` sit beside a *reviewed* pin, and
+        # the classifier reads the ref — so an observation that says "I could not
+        # recognize this source" still classified as ux_only and admitted.
+        if self.ref is not None and self.source_kind != SOURCE_KIND_GITHUB:
+            raise HerdrPluginPolicyError(
+                f"a resolved source reference requires source_kind "
+                f"{SOURCE_KIND_GITHUB!r}, not {self.source_kind!r}"
+            )
 
 
 def _require_bool(record: "Mapping[object, object]", key: str) -> bool:

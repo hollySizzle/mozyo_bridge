@@ -15,6 +15,11 @@ import os
 import re
 from pathlib import Path
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_identity import (
+    _ABS_ROOT_RE as _canonical_abs_root_re,
+    _RELATIVE_CONTINUATION_RE as _canonical_relative_continuation_re,
+)
+
 #: What a redacted filesystem path is rendered as in a public verdict detail.
 REDACTED_PROBE_PATH = "<target config>"
 
@@ -39,7 +44,12 @@ REDACTED_PROBE_PATH = "<target config>"
 #: so ``s:/`` inside ``https://`` is not one. That is a rule about the SHAPE of the root, not
 #: a safety allowlist — and it costs nothing, because the ``/`` alternative still finds that
 #: position and the URL proof is what preserves it.
-_ABS_ROOT_RE = re.compile(r"\\\\|(?<![A-Za-z0-9_.\-])[A-Za-z]:[\\/]|/")
+#: Imported rather than restated: the canonical definition lives in the domain
+#: (``herdr_plugin_identity``) so this module and the plugin-policy boundary share
+#: one rule. Redmine #14619 review j#92194 F1 measured what two copies cost — the
+#: newer copy silently read ``/etc`` and ``/`` as safe. The pattern is unchanged
+#: from the #14258 version this module hardened.
+_ABS_ROOT_RE = _canonical_abs_root_re
 
 #: A quoted run, escape-aware: the closing quote is the first UNescaped one. The naive
 #: same-quote rule closed at the first escaped quote and left the rest of the path behind
@@ -69,7 +79,7 @@ _URL_OCCURRENCE_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://")
 #: i.e. the preceding character continues a word. ``:`` deliberately does not qualify —
 #: ``config:/Users/…`` is a labelled absolute path, and treating the label as proof of
 #: relativity is exactly the fail-open the allowlist had.
-_RELATIVE_CONTINUATION_RE = re.compile(r"[A-Za-z0-9_.\-]$")
+_RELATIVE_CONTINUATION_RE = _canonical_relative_continuation_re
 
 
 def _collapse_url_tokens(line: str) -> str:

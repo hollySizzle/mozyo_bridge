@@ -253,8 +253,8 @@ SCOPE_ROOT_DETERMINANTS: "tuple[str, ...]" = (
 )
 #: The only isolation mechanism that actually separates plugin state (#14614).
 SCOPE_ISOLATION_MECHANISM = (
-    "a separate HOME / XDG_CONFIG_HOME config root; splitting herdr sessions does not "
-    "isolate plugin state"
+    "a separate HOME or XDG_CONFIG_HOME config root; splitting herdr sessions does "
+    "not isolate plugin state"
 )
 
 @dataclass(frozen=True)
@@ -392,9 +392,9 @@ REVIEWED_PLUGINS: "dict[PluginSourceRef, ReviewedPlugin]" = build_review_registr
             build_provenance=BUILD_UNREVIEWED,
             review_anchor="#14614 j#91226",
             rationale=(
-                "Declares workspaces > tabs > panes in YAML with split / ratio / cwd / "
-                "env / focus / wait_for, which expresses the same three axes as the "
-                "layout work (#14567 / #14568 / #14569) and is genuinely useful as a "
+                "Declares workspaces, tabs and panes in YAML with split, ratio, cwd, "
+                "env, focus and wait_for, which expresses the same three axes as the "
+                "layout work (#14567, #14568, #14569) and is genuinely useful as a "
                 "reference schema and expected-layout oracle in tests. It is a one-shot "
                 "workspace applier with no concept of lane identity, generation, "
                 "occupancy, retire, or durable anchor, so it holds no authority over a "
@@ -580,7 +580,7 @@ def decide_enable(
     if review.plugin_class == CLASS_TEST_ORACLE:
         return PolicyDecision.deny(
             REASON_NO_LANE_AUTHORITY,
-            "recognized as a test oracle / reference schema; it carries no lane "
+            "recognized as a test oracle and reference schema; it carries no lane "
             "identity, generation, occupancy, or retire concept, so it holds no "
             "authority over a live lane",
         )
@@ -683,6 +683,33 @@ class PluginVerdict:
         for name in ("enable", "install"):
             if not isinstance(getattr(self, name), PolicyDecision):
                 raise HerdrPluginPolicyError(f"{name} must be a PolicyDecision")
+        # A verdict is a *computed* result, so the only defensible invariant is
+        # that it equals what the policy computes. Checking each field separately
+        # let `class=unknown` sit beside `enable=admit`, which made an enabled,
+        # unreviewed plugin report `breach=False` (review j#92194 F2). Recomputing
+        # makes a verdict that disagrees with the policy unconstructible, which is
+        # stronger than any list of pairwise rules — and it cannot fall behind the
+        # policy the way such a list would.
+        review, _ = resolve_reference(self.observation.ref)
+        expected_class = review.plugin_class if review else CLASS_UNKNOWN
+        expected_build = review.build_provenance if review else BUILD_UNREVIEWED
+        expected_anchor = review.review_anchor if review else ""
+        if (self.plugin_class, self.build_provenance, self.review_anchor) != (
+            expected_class,
+            expected_build,
+            expected_anchor,
+        ):
+            raise HerdrPluginPolicyError(
+                "verdict classification disagrees with the policy for this "
+                "observation"
+            )
+        if (
+            self.enable != decide_enable(self.observation, review)
+            or self.install != decide_install(self.observation, review)
+        ):
+            raise HerdrPluginPolicyError(
+                "verdict decisions disagree with the policy for this observation"
+            )
 
     @property
     def breach(self) -> bool:

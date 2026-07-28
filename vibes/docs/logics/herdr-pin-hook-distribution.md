@@ -414,9 +414,48 @@ observed 側に無かった。**同じ概念を 2 箇所で書くと、片方だ
    違反したら **何も出力せず non-zero で終える** — private path や偽造行を含む report を
    durable record へ貼るくらいなら、出力しない方がよい。
 
-regression も同型に組んである: **両 module が export する frozen dataclass のうち text field を
-持つものを機械列挙**し、sample table が全部を覆っているかを test が検査する（覆っていなければ
-落ちる）。新しい DTO を足したら自動的に掃かれる。
+### ★path 判定は repository 単一 authority を使う
+
+絶対 path の判定規則は **`herdr_plugin_identity` の 1 箇所**にあり、`herdr_probe_redaction`
+(#14258) がそれを import する。以前は本 boundary が独自に「`/` + segment + `/`」という第三の
+規則を書いており、**`/etc` / `/` / `/秘密` / `/tmp-☃/secret` をすべて安全と読んだ**
+（review j#92194 F1）。同じ問いに対する硬化済み実装が repo 内に既にあったのに再利用せず、
+**最も新しい面に最も弱い写しを置いていた**。
+
+規則は「root 出現はすべて path。**語の途中の `/` だけが path でない証明**」という反転形で、
+**行単位で評価する**。patterns だけ写して評価構造（行分割）を写さなかったとき、`$` が
+改行直前にも一致するため `line\n/etc/passwd` が「前の行の末尾文字」を継続証明として
+安全と読んだ — これも実測して直した。
+
+帰結として **prose 中の裸の ` / ` も path として発火する**。文言側を直した（`HOME / XDG` →
+`HOME or XDG`、`split / ratio` → `split, ratio`）。**境界に prose を合わせるのが正しい向き**で、
+prose に合わせて境界を緩めるのではない。
+
+### ★field の妥当性は組合せの整合性ではない
+
+per-field の型・語彙検査を全 field に課しても、**field 間の関係**は閉じない
+（review j#92194 F2）。実測で: `source_kind=unrecognized` の observation が reviewed pin を
+併せ持って `ux_only` / admitted に、`EnablePlan(found=False, verdict=None, decision=admit)` が
+`ok=true` に、`class=unknown` × `enable=admit` の verdict が enabled plugin で `breach=False` に
+なった。
+
+- `PluginObservation`: `ref` を持つなら `source_kind` は `github` でなければならない。
+- `PluginVerdict`: **policy から再計算した値と一致すること**。個別の pairwise 規則を並べるより
+  強く、しかも policy の変更に置いていかれない。
+- `EnablePlan` / `InstallPlan`: **admit にだけ**前提を課す（found + verdict + 一致する id /
+  exactly pinned ref）。deny は前提を持たなくてよい。
+
+### regression の形
+
+1. **path detector は仕様由来の corpus** で pin する（single-component / root / non-ASCII /
+   mixed / doubled / trailing / drive / UNC / labelled と、誤検出してはならない自前 identity）。
+   production の正規表現から書き起こさない — 以前は test 側 oracle が実装と同形だったので
+   **2 層が同時に盲目**だった。
+2. **E1–E10 を名前付き matrix**として直接 pin する。dataclass の自動列挙をやめた理由は、
+   `InventoryReadError` が dataclass でないため **自分で見つけた E9 が回帰から落ちていた**
+   から。coverage assertion は双方向。
+3. **偽造行の probe には、hostile 入力にしか現れない marker を使う**。`BREACH:` で探すと、
+   本 report が正当に書く breach 行を偽造と誤判定する（実際に誤判定した）。
 - **authority は core 所有のまま。** `FORBIDDEN_PLUGIN_AUTHORITIES` は既存の
   `FORBIDDEN_PROVIDER_AUTHORITIES` (#12035) と `CORE_OWNED_AUTHORITIES` (#12155) を
   **そのまま再利用**した上で lane 固有 (`delivery_authority` / `durable_anchor_authority` /
