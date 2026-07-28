@@ -1371,19 +1371,33 @@ class RunSuccessAxisTest(unittest.TestCase):
                 self.assertEqual(result.as_payload()["ratio_outcome"], token)
 
     def test_the_success_set_and_the_vocabulary_cannot_drift_apart(self) -> None:
-        # Two guards, because either one alone can be satisfied by the drift it should
-        # catch. Measured, not assumed: growing BOTH sets together keeps the partition
-        # equality true, so the equality alone would let a new token join the success side
-        # silently — the same shape R5-F1 was.
+        # Three guards. Each was added because the previous set was measured to pass a
+        # drift it was supposed to catch — none of them implies another.
         #
-        #  (a) the success half, literally. Growing it (or swapping the enumeration for a
+        #  (a) the PUBLIC vocabulary, literally, in order. `ratio_outcome` reaches external
+        #      readers through the payload, so every token is a compatibility surface.
+        #      Guards (b) and (c) both compare through the constants, so renaming what a
+        #      constant HOLDS left them green — measured on `RATIO_FAILED = "failure"`
+        #      (review j#91454 R6-F1): the classification was pinned, the literal was not.
+        self.assertEqual(
+            RATIO_OUTCOMES,
+            (
+                "not_applicable",
+                "matched",
+                "applied",
+                "deferred_until_full_relaunch",
+                "failed",
+            ),
+        )
+        #  (b) the success half, literally. Growing it (or swapping the enumeration for a
         #      subtraction that later absorbs a newcomer) changes this value and goes red.
         self.assertEqual(
             RATIO_SUCCESS_OUTCOMES,
             frozenset({"not_applicable", "matched", "applied", "deferred_until_full_relaunch"}),
         )
-        #  (b) the partition. Adding a token to the vocabulary alone — the natural way to
-        #      extend it — leaves it unclassified and goes red here.
+        #  (c) the partition. Adding a token to the vocabulary alone — the natural way to
+        #      extend it — leaves it unclassified and goes red here. Measured, not assumed:
+        #      growing BOTH sets together keeps this equality true, which is why (b) exists.
         self.assertEqual(set(RATIO_OUTCOMES), RATIO_SUCCESS_OUTCOMES | {RATIO_FAILED})
         self.assertNotIn(RATIO_FAILED, RATIO_SUCCESS_OUTCOMES)
         for outcome in RATIO_OUTCOMES:
@@ -1399,6 +1413,104 @@ class RunSuccessAxisTest(unittest.TestCase):
         result = SessionStartResult(workspace_id="ws", lane_id="lane")
         self.assertEqual(result.ratio_outcome, RATIO_NOT_APPLICABLE)
         self.assertTrue(result.ratio_ok)
+
+
+class CliSuccessBoundaryTest(unittest.TestCase):
+    """Review j#91454 R6-F2: what the OPERATOR sees, not just what the model holds.
+
+    ``ratio_ok`` / ``ok`` / ``payload["ok"]`` are internal values; the close condition
+    ("ratio 適用失敗を成功扱いしない") is about the boundary a consumer reads — the rendered
+    text, the JSON payload, and the process exit code. None of those was pinned, so a
+    renderer that dropped the ratio line, a failure sentence that stopped being printed, or a
+    ``return`` that went back to a hardcoded 0 would all pass this issue's tests.
+
+    Driven through the real ``cmd_herdr_session_start`` with the use case replaced at its
+    seam, so the argparse handler, the renderer, the payload and the return value are the
+    production ones. No agent is launched.
+    """
+
+    def _run_cli(self, *, ratio_outcome, as_json, healthy=True):
+        """Return ``(rc, stdout)`` from the production CLI for a crafted result."""
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start_cli as cli,
+        )
+
+        result = SessionStartResult(workspace_id="ws", lane_id="lane")
+        result.slots = [
+            SlotResult(
+                provider="codex",
+                assigned_name="mzb1_ws_codex_lane",
+                outcome="launched",
+                locator="w1:p2",
+                health=HEALTH_HEALTHY if healthy else "exited",
+            )
+        ]
+        result.ratio_outcome = ratio_outcome
+        result.ratio_detail = "seam probe detail"
+
+        import argparse
+        import io
+        import contextlib
+
+        args = argparse.Namespace(
+            repo=None, agent=["codex"], lane="lane", dry_run=False, json=as_json
+        )
+        buffer = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            args.repo = str(repo)
+            with patch.object(cli._use_case, "prepare_session", lambda **_kw: result):
+                with contextlib.redirect_stdout(buffer):
+                    rc = cli.cmd_herdr_session_start(args)
+        return rc, buffer.getvalue()
+
+    def test_an_unknown_ratio_outcome_is_a_non_zero_exit_with_the_raw_token(self) -> None:
+        token = "failure_typo"
+        self.assertNotIn(token, RATIO_OUTCOMES)
+        rc, out = self._run_cli(ratio_outcome=token, as_json=False)
+        # The operator sees WHICH token could not be read...
+        self.assertIn(token, out)
+        # ...that the run did not succeed...
+        self.assertIn("did NOT fully succeed", out)
+        # ...and the process says so too.
+        self.assertEqual(rc, 1)
+
+    def test_an_unknown_ratio_outcome_is_ok_false_in_json_with_a_non_zero_exit(self) -> None:
+        token = "failure_typo"
+        rc, out = self._run_cli(ratio_outcome=token, as_json=True)
+        payload = json.loads(out)
+        self.assertIs(payload["ok"], False)
+        self.assertEqual(payload["ratio_outcome"], token)
+        self.assertEqual(rc, 1)
+
+    def test_the_declared_failure_outcome_is_also_a_non_zero_exit(self) -> None:
+        # The recognised failure and the unrecognised token must reach the SAME boundary;
+        # otherwise "unknown is not success" would hold only in the model.
+        rc, out = self._run_cli(ratio_outcome=RATIO_FAILED, as_json=False)
+        self.assertIn(RATIO_FAILED, out)
+        self.assertIn("did NOT fully succeed", out)
+        self.assertEqual(rc, 1)
+
+    def test_a_recognised_success_outcome_still_exits_zero(self) -> None:
+        # The control: the exit code tracks the OUTCOME, not merely "this test set it".
+        # Without this, returning 1 unconditionally would satisfy every assertion above.
+        for outcome in sorted(RATIO_SUCCESS_OUTCOMES):
+            with self.subTest(ratio_outcome=outcome):
+                rc, out = self._run_cli(ratio_outcome=outcome, as_json=False)
+                self.assertEqual(rc, 0, out)
+                self.assertNotIn("did NOT fully succeed", out)
+
+    def test_an_applied_ratio_is_reported_on_the_text_surface(self) -> None:
+        # `not_applicable` is the one outcome the renderer deliberately stays silent about
+        # (a run with no opinion says nothing); every other outcome must be visible, so an
+        # operator can tell a measured division from an unmeasured one.
+        rc, out = self._run_cli(ratio_outcome=RATIO_APPLIED, as_json=False)
+        self.assertEqual(rc, 0)
+        self.assertIn("pair split ratio: applied", out)
+        rc, out = self._run_cli(ratio_outcome=RATIO_NOT_APPLICABLE, as_json=False)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("pair split ratio", out)
 
 
 if __name__ == "__main__":  # pragma: no cover - unittest entry point
