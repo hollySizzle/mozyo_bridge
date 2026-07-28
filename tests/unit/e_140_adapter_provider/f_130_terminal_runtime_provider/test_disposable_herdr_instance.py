@@ -53,6 +53,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_observation import (  # noqa: E402,E501
     SharedSpaceSmokeError,
 )
+from tests.support.private_path_fixtures import macos_home_path  # noqa: E402
 
 _MODULE_PATH = Path(live_module.__file__)
 
@@ -767,7 +768,11 @@ class WithholdReasonVocabularyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             instance = self._instance(tmp)
             for poison in (
-                "/Users/someone/secret/path exploded",
+                # Composed at runtime, never written as a tracked literal: the
+                # value handed to the producer is a personal-home-shaped absolute
+                # path, which is exactly what `release check tree` blocks in
+                # source (`tests/support/private_path_fixtures`, Redmine #14656).
+                macos_home_path("someone", "secret", "path") + " exploded",
                 "OSError: [Errno 13] Permission denied: '/private/tmp/x'",
                 "",
                 "workers_unverified ",
