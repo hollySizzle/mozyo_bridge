@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_herdr_instance import (  # noqa: E501
+    WITHHOLD_WORKERS_NOT_CONTAINED,
+    WITHHOLD_WORKERS_UNVERIFIED,
     DisposableHerdrInstance,
     EndpointGateCounters,
     EndpointGateEvidence,
@@ -109,6 +111,10 @@ class _ForkedRun:
     #: Exception class name only.  A type name is a closed-enough token for evidence;
     #: the message could carry a path and never enters the report.
     failure_kind: str = ""
+    #: Closed tokens for receipts that were refused rather than accepted.
+    receipt_anomalies: tuple = ()
+    #: Exact pane locators recovered from refused receipts, kept for cleanup only.
+    salvaged_locators: tuple = ()
 
     @property
     def workers_contained(self) -> bool:
@@ -229,17 +235,24 @@ def _run_forked_projects(
     # arrived with it.  Losing them meant losing the exact pane locators cleanup needs
     # and the gate counters a worker had already proven (review j#91687 F3).
     collected: dict = {}
+    #: Closed tokens naming what was wrong with a rejected receipt.
+    anomalies: list = []
+    #: Exact pane locators from receipts we could not accept.  Cleanup still needs them
+    #: even though they must not count towards the success evidence.
+    locator_tape: list = []
     orphaned = 0
     round_failed = False
     failure_kind = ""
     try:
         try:
-            _collect_forked_receipts(
+                _collect_forked_receipts(
                 processes=processes,
                 started=started,
                 specs=specs,
                 output=output,
                 collected=collected,
+                anomalies=anomalies,
+                locator_tape=locator_tape,
                 timeout=bounded,
             )
         except Exception as exc:  # noqa: BLE001 - the round's verdict must survive it
@@ -253,12 +266,41 @@ def _run_forked_projects(
         # Runs even if ``start()`` itself failed halfway through the fleet: only the
         # handles that actually started are in ``started``.
         orphaned = _reap_exact_workers(started)
+    if anomalies and not round_failed:
+        # A malformed receipt is a failed round, not a quietly shorter one.
+        round_failed = True
+        failure_kind = anomalies[0]
     return _ForkedRun(
         receipts=tuple(_fill_unreported(specs, collected)),
         orphaned_workers=orphaned,
         round_failed=round_failed,
         failure_kind=failure_kind,
+        receipt_anomalies=tuple(anomalies),
+        salvaged_locators=tuple(locator_tape),
     )
+
+
+#: Closed vocabulary for why a receipt was refused.
+RECEIPT_ANOMALY_DUPLICATE_INDEX = "receipt_duplicate_index"
+RECEIPT_ANOMALY_INDEX_OUT_OF_RANGE = "receipt_index_out_of_range"
+RECEIPT_ANOMALY_PROJECT_MISMATCH = "receipt_project_mismatch"
+
+
+def _receipt_anomaly(receipt, specs: Sequence[_ProjectSpec], collected: dict) -> str:
+    """Why this receipt cannot be trusted as project ``receipt.index``, or ``""``.
+
+    The index is self-reported by the worker, so it is checked rather than believed
+    (review j#91741 F3): it must name a project this round actually launched, must not
+    have been claimed already, and must agree with that project's key.
+    """
+    index = receipt.index
+    if not isinstance(index, int) or not 0 <= index < len(specs):
+        return RECEIPT_ANOMALY_INDEX_OUT_OF_RANGE
+    if index in collected:
+        return RECEIPT_ANOMALY_DUPLICATE_INDEX
+    if receipt.observation.project_key != specs[index].project_key:
+        return RECEIPT_ANOMALY_PROJECT_MISMATCH
+    return ""
 
 
 def _fill_unreported(specs: Sequence[_ProjectSpec], collected: "dict") -> list:
@@ -295,6 +337,8 @@ def _collect_forked_receipts(
     specs: Sequence[_ProjectSpec],
     output,
     collected: dict,
+    anomalies: list,
+    locator_tape: list,
     timeout: float,
 ) -> None:
     """Start the fleet, join it under the bound, and publish each receipt as it lands.
@@ -306,8 +350,12 @@ def _collect_forked_receipts(
     already made it (review j#91687 F3).
     """
     for process in processes:
-        process.start()
+        # Registered BEFORE it is started.  Between ``start()`` and an append that
+        # followed it, a ``BaseException`` left a live child that no ``finally`` knew
+        # about (review j#91741 F1).  A handle that never started is harmless here:
+        # ``is_alive()`` is False for it, so the reap skips it without signalling.
         started.append(process)
+        process.start()
     for process in processes:
         process.join(timeout=max(1.0, timeout))
         if process.is_alive():
@@ -322,8 +370,17 @@ def _collect_forked_receipts(
             receipt = output.get(timeout=1.0)
         except queue.Empty:
             break
-        if isinstance(receipt, _ProcessReceipt):
-            collected[receipt.index] = receipt
+        if not isinstance(receipt, _ProcessReceipt):
+            continue
+        anomaly = _receipt_anomaly(receipt, specs, collected)
+        if anomaly:
+            # Never silently overwritten: a duplicate index used to drop the earlier
+            # receipt's exact pane locator on the floor (review j#91741 F3).  The tape
+            # keeps it for cleanup; the anomaly keeps it out of the success evidence.
+            anomalies.append(anomaly)
+            locator_tape.extend(receipt.launched_locators)
+            continue
+        collected[receipt.index] = receipt
     output.close()
     output.join_thread()
 
@@ -386,6 +443,7 @@ def run_disposable_shared_space_smoke(
     # Seeded to the fail-closed values: only a completed fork round may lower them.
     orphaned_workers = -1
     round_failure_kind = ""
+    receipt_anomalies: tuple = ()
     # Only a completed round may claim containment.  The lifecycle policy below is the
     # authority; this mirrors it for the evidence dict.
     workers_contained = False
@@ -417,7 +475,7 @@ def run_disposable_shared_space_smoke(
                 # assignment below.  Withhold the path release on the LIFECYCLE first,
                 # so both the context manager's ``__exit__`` and the outer ``finally``
                 # inherit it no matter how we leave (review j#91687 F1/F2).
-                instance.withhold_root_release("workers_unverified")
+                instance.withhold_root_release(WITHHOLD_WORKERS_UNVERIFIED)
                 forked = _run_forked_projects(
                     harnesses=harnesses,
                     specs=specs,
@@ -432,13 +490,23 @@ def run_disposable_shared_space_smoke(
                 # client-call capability could address whatever binds it next.
                 workers_contained = forked.workers_contained
                 round_failure_kind = forked.failure_kind
+                receipt_anomalies = forked.receipt_anomalies
                 if workers_contained:
                     # The only positive verdict: every started worker is provably gone.
                     instance.permit_root_release()
                 else:
-                    instance.withhold_root_release("workers_not_contained")
+                    instance.withhold_root_release(WITHHOLD_WORKERS_NOT_CONTAINED)
                 observations = [receipt.observation for receipt in receipts]
                 worker_gate_receipts = [receipt.endpoint_gate for receipt in receipts]
+                if forked.salvaged_locators:
+                    # Refused receipts still name real panes; cleanup must close them
+                    # even though they do not count as evidence (review j#91741 F3).
+                    cleanup_harness.recorder.merge_receipts(
+                        launched_locators=forked.salvaged_locators,
+                        created_workspaces={},
+                        agent_start_names=(),
+                        coordinators_create_count=0,
+                    )
                 for receipt in receipts:
                     cleanup_harness.recorder.merge_receipts(
                         launched_locators=receipt.launched_locators,
@@ -492,6 +560,7 @@ def run_disposable_shared_space_smoke(
     evidence["workers_contained"] = workers_contained
     #: Closed token: the exception class that ended the fork round, or "".
     evidence["fork_round_failure"] = round_failure_kind
+    evidence["receipt_anomalies"] = list(receipt_anomalies)
     evidence["success"] = bool(
         summary.converged
         and summary.residue_clear

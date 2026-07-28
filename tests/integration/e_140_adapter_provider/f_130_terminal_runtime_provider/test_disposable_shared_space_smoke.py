@@ -334,7 +334,7 @@ class PartialReceiptRetentionTests(unittest.TestCase):
                 _driver_module._collect_forked_receipts(
                     processes=processes, started=[], specs=specs,
                     output=self._Queue([self._receipt(0)]),
-                    collected=collected, timeout=5.0,
+                    collected=collected, anomalies=[], locator_tape=[], timeout=5.0,
                 )
             self.assertIn(0, collected, "the received receipt was thrown away")
             self.assertEqual(collected[0].launched_locators, ("w1:p3",))
@@ -359,7 +359,8 @@ class PartialReceiptRetentionTests(unittest.TestCase):
         """End to end through ``_run_forked_projects``: the fix's actual contract."""
         real = _driver_module._collect_forked_receipts
 
-        def _partial(*, processes, started, specs, output, collected, timeout):
+        def _partial(*, processes, started, specs, output, collected,
+                     anomalies, locator_tape, timeout):
             collected[0] = self._receipt(0)
             raise OSError("injected after one receipt landed")
 
@@ -381,6 +382,213 @@ class PartialReceiptRetentionTests(unittest.TestCase):
             self.assertIsNotNone(forked.receipts[0].endpoint_gate)
             self.assertIsNone(forked.receipts[1].endpoint_gate)
         del real
+
+
+class StartRegistrationGapTests(unittest.TestCase):
+    """A child that exists must already be registered for reaping (j#91741 F1).
+
+    Registering after ``start()`` left a two-instruction window in which a
+    ``BaseException`` produced a live worker no ``finally`` knew about.
+    """
+
+    def test_an_interrupt_inside_start_still_leaves_the_handle_registered(self) -> None:
+        state = {"alive": False}
+
+        class _InterruptingProcess:
+            name = "mozyo-smoke-p0"
+
+            def start(self):
+                state["alive"] = True  # the child exists from here
+                raise KeyboardInterrupt("injected between start and registration")
+
+            def is_alive(self):
+                return state["alive"]
+
+            def join(self, timeout=None):
+                pass
+
+            def terminate(self):
+                state["alive"] = False
+
+            def kill(self):
+                state["alive"] = False
+
+        started: list = []
+        with self.assertRaises(KeyboardInterrupt):
+            _driver_module._collect_forked_receipts(
+                processes=[_InterruptingProcess()], started=started, specs=[],
+                output=None, collected={}, anomalies=[], locator_tape=[], timeout=5.0,
+            )
+        self.assertTrue(state["alive"], "premise: the child was really created")
+        self.assertEqual(len(started), 1, "the live child was not registered for reap")
+
+        survivors = _driver_module._reap_exact_workers(started)
+        self.assertFalse(state["alive"], "the registered handle must be reaped")
+        self.assertEqual(survivors, 0)
+
+    def test_a_handle_that_never_started_is_harmless_to_the_reap(self) -> None:
+        """Baseline: registering first must not make the reap signal a dead handle."""
+
+        class _NeverStarted:
+            name = "mozyo-smoke-never"
+
+            def __init__(self):
+                self.signalled = False
+
+            def is_alive(self):
+                return False
+
+            def join(self, timeout=None):
+                pass
+
+            def terminate(self):
+                self.signalled = True
+
+            def kill(self):
+                self.signalled = True
+
+        handle = _NeverStarted()
+        self.assertEqual(_driver_module._reap_exact_workers([handle]), 0)
+        self.assertFalse(handle.signalled, "an unstarted handle must not be signalled")
+
+
+class ReceiptIdentityTests(unittest.TestCase):
+    """A worker's self-reported index is checked, not believed (j#91741 F3)."""
+
+    class _Inert:
+        name = "mozyo-smoke-x"
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            pass
+
+        def is_alive(self):
+            return False
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    class _Queue:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def get(self, timeout=None):
+            if self._items:
+                return self._items.pop(0)
+            import queue as _q
+
+            raise _q.Empty
+
+        def close(self):
+            pass
+
+        def join_thread(self):
+            pass
+
+    def _receipt(self, index, locator, project_key=None):
+        return _driver_module._ProcessReceipt(
+            index=index,
+            observation=ProjectSmokeObservation(
+                project_key=project_key or f"p{index}", workspace_id="w1",
+                outcome="created", coordinators_workspace_id="w1",
+            ),
+            launched_locators=(locator,),
+            endpoint_gate=EndpointGateCounters(1, 1, 0, 0, ()),
+        )
+
+    def _specs(self, tmp: Path, count: int = 2):
+        specs = []
+        for index in range(count):
+            repo = tmp / f"p{index}"
+            repo.mkdir(parents=True, exist_ok=True)
+            specs.append(_ProjectSpec(f"p{index}", repo))
+        return specs
+
+    def _drive(self, tmp: Path, receipts):
+        collected: dict = {}
+        anomalies: list = []
+        tape: list = []
+        _driver_module._collect_forked_receipts(
+            processes=[self._Inert() for _ in receipts], started=[],
+            specs=self._specs(tmp), output=self._Queue(receipts),
+            collected=collected, anomalies=anomalies, locator_tape=tape, timeout=5.0,
+        )
+        return collected, anomalies, tape
+
+    def test_a_duplicate_index_is_refused_and_its_locator_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            collected, anomalies, tape = self._drive(
+                Path(tmp), [self._receipt(0, "w1:p1"), self._receipt(0, "w1:p2")]
+            )
+            self.assertEqual(
+                collected[0].launched_locators, ("w1:p1",),
+                "the FIRST receipt must survive; it is not silently overwritten",
+            )
+            self.assertEqual(
+                anomalies, [_driver_module.RECEIPT_ANOMALY_DUPLICATE_INDEX]
+            )
+            self.assertIn(
+                "w1:p2", tape, "a refused receipt's pane still has to be cleaned up"
+            )
+
+    def test_an_out_of_range_index_is_refused_and_its_locator_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            collected, anomalies, tape = self._drive(
+                Path(tmp), [self._receipt(99, "w1:p9")]
+            )
+            self.assertEqual(collected, {})
+            self.assertEqual(
+                anomalies, [_driver_module.RECEIPT_ANOMALY_INDEX_OUT_OF_RANGE]
+            )
+            self.assertIn("w1:p9", tape)
+
+    def test_a_project_key_mismatch_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            collected, anomalies, tape = self._drive(
+                Path(tmp), [self._receipt(0, "w1:p4", project_key="somewhere-else")]
+            )
+            self.assertEqual(collected, {})
+            self.assertEqual(
+                anomalies, [_driver_module.RECEIPT_ANOMALY_PROJECT_MISMATCH]
+            )
+            self.assertIn("w1:p4", tape)
+
+    def test_well_formed_receipts_are_accepted_with_no_anomaly(self) -> None:
+        """Baseline: validation must not reject what the workers really send."""
+        with tempfile.TemporaryDirectory() as tmp:
+            collected, anomalies, tape = self._drive(
+                Path(tmp), [self._receipt(0, "w1:p1"), self._receipt(1, "w1:p2")]
+            )
+            self.assertEqual(sorted(collected), [0, 1])
+            self.assertEqual(anomalies, [])
+            self.assertEqual(tape, [])
+
+    def test_an_anomaly_makes_the_round_fail_with_a_closed_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs = self._specs(Path(tmp))
+
+            def _dup(*, processes, started, specs, output, collected,
+                     anomalies, locator_tape, timeout):
+                anomalies.append(_driver_module.RECEIPT_ANOMALY_DUPLICATE_INDEX)
+                locator_tape.append("w1:p7")
+
+            with mock.patch.object(
+                _driver_module, "_collect_forked_receipts", _dup
+            ):
+                forked = _run_forked_projects(
+                    harnesses=[object(), object()], specs=specs,
+                    timeout=5.0, gate_runner=None,
+                )
+            self.assertTrue(forked.round_failed)
+            self.assertEqual(
+                forked.failure_kind, _driver_module.RECEIPT_ANOMALY_DUPLICATE_INDEX
+            )
+            self.assertEqual(forked.salvaged_locators, ("w1:p7",))
 
 
 class WorkerTimeoutAndCleanupTests(unittest.TestCase):
@@ -447,7 +655,8 @@ class WorkerTimeoutAndCleanupTests(unittest.TestCase):
         """The property the missing ``finally`` cost: cleanup on the exception path."""
         started_names = []
 
-        def _boom(*, processes, started, specs, output, collected, timeout):
+        def _boom(*, processes, started, specs, output, collected,
+                  anomalies, locator_tape, timeout):
             for process in processes:
                 process.start()
                 started.append(process)

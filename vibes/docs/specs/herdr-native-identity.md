@@ -1153,6 +1153,12 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     溜めると、`output.close()` 等 tail の失敗が **既に届いた receipt ごと巻き戻す**。exact pane
     locator を失うと receipt-tape 駆動の cleanup が実行できず、観測済み gate counter も失う
     (review j#91687 F3)。例外時に missing placeholder で埋めるのは **未受領 index のみ**とする。
+  - **receipt の index は worker の自己申告であり、信頼せず検証する**。範囲外 index は無視され、
+    duplicate index は先着を**無言で上書き**して exact locator を落としていた
+    (review j#91741 F3 実測)。expected range / unique / project identity を検証し、anomaly は
+    closed token の typed round failure にする。**ただし拒否した receipt が持つ locator も
+    cleanup 用に lossless に保持する** — 拒否は「evidence に採らない」であって「その pane を
+    放置してよい」ではない。
   - **root release は lifecycle の state であり、call 引数ではない**。引数にすると渡した call site しか
     縛れず、`with instance:` の暗黙 `__exit__` が既定値で先に解放してしまう (review j#91687 F1 実測)。
     `withhold_root_release(reason)` / `permit_root_release()` で instance に policy を持たせ、
@@ -1162,10 +1168,22 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     `KeyboardInterrupt` / `SystemExit` で巻き戻っても policy は withhold のままで、
     両 teardown が path を解放しない (review j#91687 F2: 修正前は `release_root` 引数が
     `[True, True]` になっていた)。
-  - **evidence は action 後の実状態を観測して作る**。`owned_root_present` は teardown 後の
-    `root.exists()` を観測した値で、`owned_root_released` はその否定である。flag の反転で作ると
-    「root は消えたのに withheld」「root は残っているのに released」の両方向に実状態と乖離する
-    (review j#91687 F4 実測)。success は `owned_root_present == False` を連言する。
+  - **evidence は action 後の実状態を観測して作る。ただし観測 API が「不明」を潰さないこと**。
+    flag の反転で作ると「root は消えたのに withheld」「root は残っているのに released」の両方向に
+    乖離する (review j#91687 F4 実測)。さらに `Path.exists()` は `stat` の失敗を **`False` へ畳んで
+    例外を投げない**ため、読めない root が「不存在」に化け、released と報告され rmtree も skip される
+    (review j#91741 F2 実測)。よって presence は `os.lstat` を直接呼ぶ **tri-state**
+    (`absent` / `present` / `unknown`) とし、**`FileNotFoundError` のみを absent** とする。
+    release 前判定と release 後観測は同一 authority を使い、`unknown` は absent 扱いにしない。
+    evidence は `owned_root_observation` (closed token) を出し、`owned_root_released` は
+    **positive な `absent` 観測のときだけ true**。success は `owned_root_present == False` を連言する。
+  - **worker cleanup registry への登録は `start()` より前に行う**。登録が起動の後にあると、その
+    2 命令の間の `BaseException` で「生存しているが reap 対象に無い」child が生まれる
+    (review j#91741 F1 実測)。未起動 handle は `is_alive()` が false なので、先に登録しても
+    signal されない。
+  - **evidence へ出す reason は closed vocabulary として producer boundary で検証する**。
+    docstring で「closed token」と書くだけでは強制にならず、caller の例外文や path が
+    CLI JSON / durable record へ混入しうる (review j#91741 F4 実測)。未知の値は typed error で拒否する。
     `endpoint_residue` は socket 2 path のみを数える field なので、**root/config だけが残る状態を
     表さない**。root の残存は `owned_root_present` で表し、residue field に代弁させない。
   - **process が生成されなかった startup failure でも owned tree は解放する**。`start()` は `Popen`

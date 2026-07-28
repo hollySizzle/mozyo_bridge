@@ -1949,6 +1949,7 @@ file_conventions:
     name: disposable Herdr instance lifecycle and shared-space live smoke actuation
     patterns:
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_herdr_instance.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_endpoint_gate_evidence.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_shared_space_smoke.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_harness.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_observation.py

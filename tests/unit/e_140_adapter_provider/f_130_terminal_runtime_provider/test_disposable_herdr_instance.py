@@ -682,6 +682,122 @@ class RootReleaseContainmentTests(unittest.TestCase):
             self.assertTrue(instance.as_evidence()["owned_root_released"])
 
 
+class RootObservationTriStateTests(unittest.TestCase):
+    """"Cannot tell" is not "gone" (review j#91741 F2).
+
+    ``Path.exists()`` folds a ``stat`` failure into ``False`` without raising, so an
+    unreadable owned tree was reported as released while it sat on disk — and the same
+    false negative made ``rmtree`` skip it.
+    """
+
+    def _instance(self, tmp: str) -> DisposableHerdrInstance:
+        return DisposableHerdrInstance(
+            binary="/bin/true",
+            root=Path(tmp) / "instance",
+            base_env={"HOME": str(Path(tmp) / "operator")},
+            runner=lambda argv, **k: subprocess.CompletedProcess(argv, 0, "[]", ""),
+            popen_factory=lambda argv, **k: _Process(),
+            sleeper=lambda _s: None,
+            ambient_env={},
+        )
+
+    def test_an_unreadable_root_is_unknown_and_never_reported_released(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp)
+            instance.start()
+            self.addCleanup(instance.shutdown)
+            root = instance.root
+            self.assertTrue(root.exists(), "premise: the tree is on disk")
+
+            real_lstat = os.lstat
+
+            def _denied(path, *args, **kwargs):
+                if str(path) == str(root):
+                    raise PermissionError(13, "injected")
+                return real_lstat(path, *args, **kwargs)
+
+            with mock.patch.object(live_module.os, "lstat", _denied):
+                instance._observe_root()
+                evidence = instance.as_evidence()
+
+            self.assertEqual(
+                evidence["owned_root_observation"],
+                live_module.ROOT_OBSERVATION_UNKNOWN,
+            )
+            self.assertTrue(evidence["owned_root_present"])
+            self.assertFalse(
+                evidence["owned_root_released"],
+                "an unreadable tree must never be reported as released",
+            )
+            self.assertTrue(root.exists(), "and it really is still there")
+
+    def test_a_readable_present_and_absent_root_are_both_named(self) -> None:
+        """Baseline: the tri-state must still answer the two ordinary cases."""
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp)
+            instance.start()
+            instance._observe_root()
+            self.assertEqual(
+                instance.as_evidence()["owned_root_observation"],
+                live_module.ROOT_OBSERVATION_PRESENT,
+            )
+            instance.shutdown()
+            evidence = instance.as_evidence()
+            self.assertEqual(
+                evidence["owned_root_observation"], live_module.ROOT_OBSERVATION_ABSENT
+            )
+            self.assertTrue(evidence["owned_root_released"])
+
+
+class WithholdReasonVocabularyTests(unittest.TestCase):
+    """The reason token reaches evidence verbatim, so it is validated (j#91741 F4)."""
+
+    def _instance(self, tmp: str) -> DisposableHerdrInstance:
+        return DisposableHerdrInstance(
+            binary="/bin/true",
+            root=Path(tmp) / "instance",
+            base_env={"HOME": str(Path(tmp) / "operator")},
+            runner=lambda argv, **k: subprocess.CompletedProcess(argv, 0, "[]", ""),
+            popen_factory=lambda argv, **k: _Process(),
+            sleeper=lambda _s: None,
+            ambient_env={},
+        )
+
+    def test_an_unlisted_reason_is_refused_at_the_producer_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp)
+            for poison in (
+                "/Users/someone/secret/path exploded",
+                "OSError: [Errno 13] Permission denied: '/private/tmp/x'",
+                "",
+                "workers_unverified ",
+            ):
+                with self.subTest(reason=poison[:24]):
+                    with self.assertRaises(SharedSpaceSmokeError):
+                        instance.withhold_root_release(poison)
+            self.assertEqual(instance.root_withhold_reason, "")
+            self.assertFalse(instance.root_release_withheld, "no state may change")
+
+    def test_the_listed_reasons_are_accepted(self) -> None:
+        """Baseline: validation must not reject the vocabulary the driver uses."""
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp)
+            for reason in sorted(live_module.ROOT_WITHHOLD_REASONS):
+                with self.subTest(reason=reason):
+                    instance.withhold_root_release(reason)
+                    self.assertTrue(instance.root_release_withheld)
+                    self.assertEqual(instance.root_withhold_reason, reason)
+                    instance.permit_root_release()
+
+    def test_no_evidence_field_can_carry_a_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp)
+            instance.withhold_root_release(live_module.WITHHOLD_WORKERS_NOT_CONTAINED)
+            rendered = repr(instance.as_evidence())
+            self.assertNotIn(tmp, rendered)
+            self.assertNotIn("/Users/", rendered)
+
+
 class CrossProcessGateEvidenceTests(unittest.TestCase):
     """The negative proof must span every process that held the capability (F1)."""
 
