@@ -207,6 +207,25 @@ def strict_marker_fields(
     return fields
 
 
+def strict_gate_markers(notes: str, gate: str) -> tuple:
+    """Every STRICTLY readable workflow-event marker in ``notes`` declaring exactly ``gate`` (pure).
+
+    The one call every Hibernate / terminal authority consumer makes (Redmine #14539 review
+    j#91943 finding 1), so "which markers count as this gate's evidence" has a single definition:
+    the workflow-event channel only (the handoff channel is a delivery notification), a body the
+    canonical producer could render, and a logical gate set that is exactly ``{gate}`` — a marker
+    naming two gates proves neither, so it matches nothing.
+    """
+    found = []
+    for channel, components in marker_components_in_note(notes or ""):
+        if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+            continue
+        fields = strict_marker_fields(components)
+        if fields is not None and marker_logical_gates(fields) == {gate}:
+            found.append(fields)
+    return tuple(found)
+
+
 def marker_logical_gates(fields: "dict[str, str] | None") -> frozenset:
     """Every gate token a marker's fields declare, across both aliases (pure).
 
@@ -791,6 +810,7 @@ __all__ = (
     "marker_components_in_note",
     "marker_fields_in_note",
     "marker_logical_gates",
+    "strict_gate_markers",
     "strict_marker_fields",
     "extract_markers_from_note",
     "extract_marker",

@@ -114,7 +114,10 @@ from .hibernate_evidence_marker import (
     HibernateEvidence,
     resolve_hibernate_evidence,
 )
-from .redmine_journal_source import MARKER_CHANNEL_WORKFLOW_EVENT, marker_fields_in_note
+from .redmine_journal_source import (
+    MARKER_CHANNEL_WORKFLOW_EVENT,
+    strict_gate_markers,
+)
 from .sublane_admission import REVIEW_APPROVED
 
 #: The gate whose marker declares the review generation a ``review_result`` must answer.
@@ -279,12 +282,16 @@ class _Declaration:
 
 
 def _markers_of(notes: str, gate: str) -> tuple:
-    return tuple(
-        fields
-        for channel, fields in marker_fields_in_note(notes or "")
-        if channel == MARKER_CHANNEL_WORKFLOW_EVENT
-        and str(fields.get("gate", "") or fields.get("kind", "") or "").strip() == gate
-    )
+    """Every STRICTLY readable ``gate`` marker in a note (pure).
+
+    Reads through the shared strict reader (Redmine #14539 review j#91943 finding 1). The lenient
+    field fold this used to call collapses a repeated key by last-write-wins and normalizes
+    whitespace, so a body no canonical producer can render arrived looking clean — and this is an
+    authority surface: what it returns becomes the hibernate basis. A marker that is not renderable
+    yields nothing, and ``gate`` / ``kind`` are unioned so a second claim cannot hide in the other
+    spelling (a marker naming two gates matches neither).
+    """
+    return strict_gate_markers(notes, gate)
 
 
 def _latest_gate_declaration(

@@ -1938,68 +1938,305 @@ class ReviewJ91896StrictMarkerGrammarTests(unittest.TestCase):
 
 
 class ReviewJ91896TargetBindingTests(unittest.TestCase):
-    """R13-F1: counter equality is not identity, and the check-to-act window has to close."""
+    """R13-F1, pinned BEHAVIOURALLY: the destructive close must not run (review j#91943 F2).
 
-    def test_the_guarded_close_requires_a_resolved_target(self):
-        import inspect
+    The first version of these pins asserted on ``inspect.getsource`` — substrings, counts and
+    ordering. That is green under a helper extraction, a same-named dead branch, an inverted
+    condition, or an ignored attest result, i.e. it pins the text and not the safety boundary.
+    Each case here drives ``run_guarded_retire_close`` against a temp lifecycle store with the
+    close mocked, and asserts the close was called ZERO times.
+    """
 
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
-            sublane_retire_actuation,
-        )
+    LANE = "issue_14539_target_binding"
+    ISSUE = "14539"
 
-        source = inspect.getsource(sublane_retire_actuation.run_guarded_retire_close)
-        self.assertIn("evidence_target is None", source)
-        self.assertIn("REASON_LANE_TARGET_UNRESOLVED", source)
+    def _run(self, *, target_kind: str):
+        """Drive one guarded close; return ``(close_call_count, result)``.
 
-    def test_the_guarded_close_binds_the_exact_lifecycle_key(self):
-        """The foreign-workspace defect: ws_A's counters satisfied a close in ws_B."""
-        import inspect
-
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
-            sublane_retire_actuation,
-        )
-
-        source = inspect.getsource(sublane_retire_actuation.run_guarded_retire_close)
-        self.assertIn(
-            "(evidence_target.workspace, evidence_target.lane) != (workspace_id, lane_label)",
-            source,
-        )
-
-    def test_the_attestation_runs_again_immediately_before_the_close(self):
-        """The commit point: everything between the preflight and the close is a window."""
-        import inspect
-
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
-            sublane_retire_actuation,
-        )
-
-        source = inspect.getsource(sublane_retire_actuation.run_guarded_retire_close)
-        # Two CALL SITES (the ``def`` line also contains the token, so match the assignment),
-        # and the last one is after the plan and before the only destructive call.
-        self.assertEqual(source.count("= _attest()"), 2)
-        last_attest = source.rindex("= _attest()")
-        plan = source.index("plan = plan_herdr_retire_close(")
-        close = source.index("execute_herdr_retire_close(plan)")
-        self.assertLess(plan, last_attest)
-        self.assertLess(last_attest, close)
-
-    def test_the_precise_owner_diagnosis_is_not_preempted(self):
-        """The target requirement must not swallow #13754's own reasons.
-
-        A lane with no lifecycle binding still has to report ``lane_owner_unverified``; the newer
-        refusal only applies once the lane is otherwise attestable.
+        ``target_kind`` selects the boundary: ``ok`` (the control), ``foreign`` (a target naming
+        another workspace), ``none`` (unresolvable), ``advanced`` (the row moves on after the
+        first attestation, which is the check-to-act race).
         """
-        import inspect
+        import argparse
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
 
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            DecisionPointer,
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+        from mozyo_bridge.core.state.lane_metadata import record_lane_created
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
-            sublane_retire_actuation,
+            sublane_herdr_projection as proj,
+            sublane_herdr_retire as retire_mod,
+            sublane_retire_actuation as actuation,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
+            RetireEvidenceTarget,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            derive_directory_lane_token,
         )
 
-        source = inspect.getsource(sublane_retire_actuation.run_guarded_retire_close)
-        self.assertLess(
-            source.index("attested, reason, detail = _attest()"),
-            source.index("if evidence_target is None:"),
+        def _row(ws, role, lane, locator):
+            return {
+                "workspace_id": ws,
+                "agent_role": role,
+                "lane_id": lane,
+                "locator": locator,
+                "name": f"mzb1_{ws}_{role}_{lane or 'default'}",
+                "health": "healthy",
+            }
+
+        calls: list = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            root = Path(tmp) / "ws"
+            root.mkdir()
+            (root / ".mozyo-bridge").mkdir()
+            (root / ".mozyo-bridge" / "config.yaml").write_text(
+                "terminal_transport:\n  backend: herdr\n", encoding="utf-8"
+            )
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ws_id = register_workspace(root, home=home).record.workspace_id
+                token = derive_directory_lane_token(str(root.resolve()), self.LANE)
+                store = LaneLifecycleStore()
+                store.declare_active(
+                    LaneLifecycleKey(ws_id, self.LANE),
+                    decision=DecisionPointer(
+                        source="redmine", issue_id=self.ISSUE, journal_id="1"
+                    ),
+                    issue_id=self.ISSUE,
+                    worktree_identity=token,
+                )
+                record_lane_created(
+                    lane_workspace_token=token,
+                    repo_workspace_id=ws_id,
+                    issue_id=self.ISSUE,
+                    lane_label=self.LANE,
+                    branch=self.LANE,
+                    worktree_path=str(root),
+                    lane_id=self.LANE,
+                    home=home,
+                )
+                declared = store.get(LaneLifecycleKey(ws_id, self.LANE))
+
+                if target_kind == "none":
+                    target = None
+                elif target_kind == "foreign":
+                    target = RetireEvidenceTarget(
+                        workspace="foreign_workspace",
+                        lane=self.LANE,
+                        lane_generation=declared.lane_generation,
+                        policy_pointer="",
+                        revision=declared.revision,
+                    )
+                else:
+                    target = RetireEvidenceTarget(
+                        workspace=ws_id,
+                        lane=self.LANE,
+                        lane_generation=declared.lane_generation,
+                        policy_pointer="",
+                        revision=declared.revision,
+                    )
+
+                rows = [
+                    _row(ws_id, "codex", self.LANE, "w2:p8"),
+                    _row(ws_id, "claude", self.LANE, "w2:p9"),
+                ]
+
+                def _fake_close(plan, **kw):
+                    calls.append(plan)
+                    return retire_mod.HerdrRetireCloseResult(
+                        workspace_id=plan.workspace_id,
+                        lane_id=plan.lane_id,
+                        closed=plan.close_targets,
+                        foreign_names=plan.foreign_names,
+                    )
+
+                def _rows_then_advance(*_a, **_kw):
+                    """The race: the row moves on between the first attest and the close."""
+                    if target_kind == "advanced":
+                        store.transition_disposition(
+                            LaneLifecycleKey(ws_id, self.LANE),
+                            expected_disposition=declared.lane_disposition,
+                            expected_revision=declared.revision,
+                            target="hibernated",
+                            decision=DecisionPointer(
+                                source="redmine", issue_id=self.ISSUE, journal_id="2"
+                            ),
+                        )
+                    return rows
+
+                args = argparse.Namespace(
+                    worktree=str(root), lane_label=self.LANE, issue=self.ISSUE
+                )
+                with patch.object(
+                    proj, "list_herdr_agent_rows", side_effect=_rows_then_advance
+                ), patch.object(
+                    retire_mod, "execute_herdr_retire_close", side_effect=_fake_close
+                ):
+                    result = actuation.run_guarded_retire_close(
+                        args, root, evidence_target=target
+                    )
+        return len(calls), result
+
+    def test_the_control_history_actually_closes(self):
+        """Without a control the three refusals below could all be a broken fixture."""
+        closes, _ = self._run(target_kind="ok")
+        self.assertEqual(closes, 1)
+
+    def test_a_foreign_workspace_target_closes_nothing(self):
+        """Counter equality is not identity: another workspace's row must not drive this close."""
+        closes, result = self._run(target_kind="foreign")
+        self.assertEqual(closes, 0)
+        self.assertEqual(result.reason, "lane_target_unresolved")
+
+    def test_an_unresolvable_target_closes_nothing(self):
+        closes, result = self._run(target_kind="none")
+        self.assertEqual(closes, 0)
+        self.assertEqual(result.reason, "lane_target_unresolved")
+
+    def test_a_row_that_advances_after_the_first_attest_closes_nothing(self):
+        """The check-to-act race: the row moves on between the attestation and the close."""
+        closes, result = self._run(target_kind="advanced")
+        self.assertEqual(closes, 0)
+        self.assertEqual(result.reason, "lane_generation_drift")
+
+
+class ReviewJ91943HibernateAuthorityReaderTests(unittest.TestCase):
+    """R15-F1: the Hibernate authority surface still read the LENIENT collapsed fold.
+
+    R15 claimed ``strict_marker_fields`` was "the reader every authority consumer shares". It was
+    not: the basis declaration scan, the park evidence scan and the dogfood receipt scan all still
+    called ``marker_fields_in_note``, so four bodies the canonical producer cannot emit each
+    yielded a receipt byte-identical to the genuine one.
+    """
+
+    HEAD = "a" * 40
+
+    class _Selected:
+        repo_workspace_id = "ws"
+        lane_id = "r1"
+        lane_generation = 1
+
+    def _delegation(self, gate_field="gate=dogfood_delegated"):
+        return (
+            f"[mozyo:workflow-event:{gate_field}:workspace=ws:lane=r1:lane_generation=1:"
+            f"head={self.HEAD}:release_issue=900:acceptance=j%23123]"
         )
+
+    def _receipts(self, receipt_marker, *, delegation=None, reads=None):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            read_dogfood_receipts,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+            EvidenceJournal,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+        )
+
+        page = [RedmineJournalEntry(issue_id="900", journal_id="9", notes=receipt_marker)]
+
+        def _entries(issue):
+            if reads is not None:
+                reads.append(issue)
+            return page
+
+        return read_dogfood_receipts(
+            [EvidenceJournal(journal_id="1", notes=delegation or self._delegation())],
+            self._Selected(),
+            _entries,
+        )
+
+    def _receipt(self, gate_field="gate=dogfood_receipt", channel="workflow-event",
+                source="source_issue=500"):
+        return f"[mozyo:{channel}:{gate_field}:{source}:head={self.HEAD}]"
+
+    def test_the_genuine_receipt_is_read(self):
+        """The control: without it every refusal below could be a broken fixture."""
+        got = self._receipts(self._receipt())
+        self.assertEqual(
+            {k: (v.source_issue, v.head) for k, v in got.items()},
+            {"900": ("500", self.HEAD)},
+        )
+
+    def test_the_four_producer_impossible_receipts_yield_nothing(self):
+        for label, marker in (
+            ("whitespace", self._receipt(gate_field="gate = dogfood_receipt")),
+            ("duplicate key", self._receipt(source="source_issue=999:source_issue=500")),
+            ("unknown second alias",
+             self._receipt(gate_field="gate=dogfood_receipt:kind=unknown_gate")),
+            ("handoff channel", self._receipt(channel="handoff")),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._receipts(marker), {})
+
+    def test_a_malformed_current_delegation_triggers_no_external_read(self):
+        """``read_dogfood_receipts``' own docstring promises zero reads for a malformed one."""
+        for label, gate_field in (
+            ("whitespace", "gate = dogfood_delegated"),
+            ("unknown second alias", "gate=dogfood_delegated:kind=unknown_gate"),
+        ):
+            with self.subTest(label):
+                reads: list = []
+                got = self._receipts(
+                    self._receipt(),
+                    delegation=self._delegation(gate_field=gate_field),
+                    reads=reads,
+                )
+                self.assertEqual(reads, [])
+                self.assertEqual(got, {})
+
+    def test_the_genuine_delegation_does_read_once(self):
+        """Negative control for the above: only the delegation's renderability differs."""
+        reads: list = []
+        self._receipts(self._receipt(), reads=reads)
+        self.assertEqual(reads, ["900"])
+
+    def test_park_evidence_refuses_a_producer_impossible_body(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            _park_evidences,
+        )
+
+        clean = (
+            f"[mozyo:workflow-event:gate=park_declared:workspace=ws:lane=r1:"
+            f"lane_generation=1:head={self.HEAD}]"
+        )
+        self.assertEqual(len(_park_evidences(clean)), 1)
+        for label, marker in (
+            ("whitespace", clean.replace("gate=park_declared", "gate = park_declared")),
+            ("unknown second alias",
+             clean.replace("gate=park_declared", "gate=park_declared:kind=unknown_gate")),
+            ("handoff channel", clean.replace("[mozyo:workflow-event:", "[mozyo:handoff:")),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_park_evidences(marker), [])
+
+    def test_the_basis_marker_scan_refuses_a_producer_impossible_body(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_basis_producer import (  # noqa: E501
+            _markers_of,
+        )
+
+        clean = f"[mozyo:workflow-event:gate=integration_disposition:head={self.HEAD}]"
+        self.assertEqual(len(_markers_of(clean, "integration_disposition")), 1)
+        for label, marker in (
+            ("whitespace",
+             clean.replace("gate=integration_disposition", "gate = integration_disposition")),
+            ("unknown second alias",
+             clean.replace("gate=integration_disposition",
+                           "gate=integration_disposition:kind=unknown_gate")),
+            ("handoff channel", clean.replace("[mozyo:workflow-event:", "[mozyo:handoff:")),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_markers_of(marker, "integration_disposition"), ())
 
 
 if __name__ == "__main__":  # pragma: no cover

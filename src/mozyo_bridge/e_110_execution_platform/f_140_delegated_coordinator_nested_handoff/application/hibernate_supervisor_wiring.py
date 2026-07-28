@@ -83,7 +83,10 @@ from ..domain.hibernate_evidence_marker import (
     parse_hibernate_evidence,
 )
 from ..domain.hibernate_issuer_policy import resolve_journal_issuer
-from ..domain.redmine_journal_source import RedmineJournalEntry, marker_fields_in_note
+from ..domain.redmine_journal_source import (
+    RedmineJournalEntry,
+    strict_gate_markers,
+)
 from .hibernate_lane_topology import (
     LaneTopologyObservation,
     _full_sha,
@@ -151,11 +154,16 @@ EntriesReader = Callable[[str], Optional[Sequence[RedmineJournalEntry]]]
 
 
 def _park_evidences(notes: str) -> "list[HibernateEvidence]":
-    """Every strictly-parseable park evidence in a note (canonical parser, no second grammar)."""
+    """Every strictly-parseable park evidence in a note (canonical parser, no second grammar).
+
+    "Strictly" now starts at the marker BODY (Redmine #14539 review j#91943 finding 1): the shared
+    reader refuses a body the canonical producer could not render — whitespace-contaminated, empty
+    component, missing ``=``, repeated key — before the evidence parser sees a clean-looking field
+    mapping. Only the workflow-event channel is authority; the handoff channel is a delivery
+    notification and declares no gate.
+    """
     found = []
-    for _channel, fields in marker_fields_in_note(notes or ""):
-        if str(fields.get("gate", "") or "").strip() != EVIDENCE_PARK_DECLARED:
-            continue
+    for fields in strict_gate_markers(notes, EVIDENCE_PARK_DECLARED):
         parsed = parse_hibernate_evidence(fields, kind=EVIDENCE_PARK_DECLARED)
         if isinstance(parsed, HibernateEvidence):
             found.append(parsed)
@@ -238,9 +246,12 @@ def read_dogfood_receipts(
         return {}
     claims: set[tuple[str, str]] = set()
     for entry in release_page:
-        for _channel, fields in marker_fields_in_note(entry.notes or ""):
-            if str(fields.get("gate", "") or "").strip() != DOGFOOD_RECEIPT_GATE:
-                continue
+        # The receipt is corroborating AUTHORITY, so it is read strictly (review j#91943 finding
+        # 1). The lenient fold accepted four bodies the canonical producer cannot emit — a
+        # whitespace-contaminated gate, a repeated ``source_issue`` resolved by last-write-wins,
+        # an unknown second gate alias, and a handoff-channel marker — each yielding a receipt
+        # byte-identical to the genuine one.
+        for fields in strict_gate_markers(entry.notes or "", DOGFOOD_RECEIPT_GATE):
             claimed_source = str(fields.get("source_issue", "") or "").strip()
             head = str(fields.get("head", "") or "").strip()
             if claimed_source and _full_sha(head):
