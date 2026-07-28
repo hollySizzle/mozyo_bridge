@@ -179,6 +179,68 @@ class DelimiterIdentityTest(unittest.TestCase):
         self.assertEqual(_gates(f"``code`` {MARKER}"), ("review_request",))
 
 
+class BlockStructureTest(unittest.TestCase):
+    """Quotation is a property of the BLOCK, not of the line (#14584 j#91194 F1–F3).
+
+    Three versions of this module asked each line about itself, and each one leaked the shape it did
+    not ask about. Every case below was confirmed against a real CommonMark implementation (pandoc
+    renders the marker inside ``<code>`` / ``<pre>`` / ``<blockquote>``) before it was pinned here —
+    the enumeration is no longer the thing being trusted.
+
+    Each refusal is paired with the positive one line away from it, because all three fixes work by
+    carrying MORE state across lines, and that is exactly how a scan starts swallowing real markers.
+    """
+
+    # --- F1: a code span's delimiters can sit on different lines of one paragraph -----------
+    def test_marker_inside_a_multi_line_code_span_is_quoted(self):
+        # The middle line holds no backtick at all, so a per-line scan never looks at it.
+        self.assertEqual(_gates(f"`start\n{MARKER}\nend`"), ())
+
+    def test_marker_inside_a_multi_line_two_backtick_span_is_quoted(self):
+        self.assertEqual(_gates(f"``start\n{MARKER}\nend``"), ())
+
+    def test_a_span_cannot_reach_across_a_blank_line(self):
+        # The paired positive: a blank line ends the paragraph, so the span never opens over it and
+        # the marker below is the writer's own voice.
+        self.assertEqual(_gates(f"`start\n\n{MARKER}"), ("review_request",))
+
+    def test_marker_after_a_closed_multi_line_span_is_canonical(self):
+        self.assertEqual(_gates(f"`start\nend`\n\n{MARKER}"), ("review_request",))
+
+    # --- F2: indentation is measured in columns, and a tab advances to the next stop --------
+    def test_space_then_tab_reaching_four_columns_is_indented_code(self):
+        for spaces in (" ", "  ", "   "):
+            with self.subTest(repr(spaces + "\t")):
+                self.assertEqual(_gates(f"{spaces}\t{MARKER}"), ())
+
+    def test_three_columns_of_indent_is_still_top_level(self):
+        # The paired positive on the other side of the same boundary.
+        for indent in ("", " ", "  ", "   "):
+            with self.subTest(repr(indent)):
+                self.assertEqual(_gates(indent + MARKER), ("review_request",))
+
+    # --- F3: a blockquote's paragraph continues into the line below it ----------------------
+    def test_lazy_continuation_of_a_blockquote_is_quoted(self):
+        # No blank line, so CommonMark renders this marker inside the blockquote (§5.1).
+        self.assertEqual(_gates(f"> quoted grammar\n{MARKER}"), ())
+
+    def test_lazy_continuation_survives_intermediate_lines(self):
+        self.assertEqual(_gates(f"> quoted\nstill quoted\n{MARKER}"), ())
+
+    def test_a_blank_line_ends_the_lazy_continuation(self):
+        self.assertEqual(_gates(f"> quoted\n\n{MARKER}"), ("review_request",))
+
+    def test_a_block_that_interrupts_the_paragraph_ends_the_quotation(self):
+        # A heading / list / fence cannot be lazy continuation text, so it closes the blockquote and
+        # what follows is top level. Without this the scan would swallow the rest of the note.
+        for label, interrupter in (
+            ("heading", "## Gate: review_request"),
+            ("list item", "- item"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(f"> quoted\n{interrupter}\n{MARKER}"), ("review_request",))
+
+
 class ScanIsPerLineTest(unittest.TestCase):
     """Blanking must not let a marker be spliced together across a quotation."""
 
@@ -189,12 +251,15 @@ class ScanIsPerLineTest(unittest.TestCase):
         note = "[mozyo:workflow-event:gate=review_request\n> quoted line\nstill prose]"
         self.assertEqual(_gates(note), ())
 
+    # The blank line in these fixtures is load-bearing, not formatting. Without it the last line
+    # lazily continues the blockquote's paragraph and is quoted too (#14584 j#91194 F3) — these two
+    # cases used to assert the opposite, which is how a wrong fixture pinned a wrong scan.
     def test_quoted_line_keeps_its_position(self):
         # Blanking rather than deleting is what preserves that property.
-        self.assertEqual(canonical_note_lines("a\n> quoted\nb"), ("a", "", "b"))
+        self.assertEqual(canonical_note_lines("a\n> quoted\n\nb"), ("a", "", "", "b"))
 
     def test_canonical_text_rejoins_the_same_lines(self):
-        self.assertEqual(canonical_note_text("a\n> quoted\nb"), "a\n\nb")
+        self.assertEqual(canonical_note_text("a\n> quoted\n\nb"), "a\n\n\nb")
 
     def test_fence_state_resumes_after_the_closer(self):
         note = "```\n" + MARKER + "\n```\n" + MARKER

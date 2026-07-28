@@ -136,9 +136,23 @@ class FailClosedTest(unittest.TestCase):
             ("run bearing an info string", "```\n```python\n%s\n```" % marker),
             ("backtick in the opener info string", "```a`b\n```\n%s\n```" % marker),
             ("unmatched backtick string", "``%s`" % marker),
+            # #14584 j#91194 F1-F3: quotation only a multi-line view of the note can see. Each was
+            # confirmed against a real CommonMark renderer before being pinned.
+            ("multi-line code span", "`start\n%s\nend`" % marker),
+            ("one space + tab indent", " \t%s" % marker),
+            ("three spaces + tab indent", "   \t%s" % marker),
+            ("blockquote lazy continuation", "> quoted grammar\n%s" % marker),
+            ("lazy continuation two lines down", "> quoted\nstill quoted\n%s" % marker),
         ):
             with self.subTest(label):
                 self.assertEqual(_resolve([_entry("90409", note)]).status, WORK_ANCHOR_MISSING)
+
+    def test_a_real_dispatch_one_blank_line_below_a_quotation_still_resolves(self):
+        # The paired positive at the join for F1-F3: the extra state these refusals carry across
+        # lines must stop at the paragraph, or a real dispatch under a quoted example goes missing.
+        marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
+        anchor = _resolve([_entry("90409", "> quoted example\n\n" + marker)])
+        self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
 
     def test_a_real_dispatch_after_a_closed_fence_still_resolves(self):
         # The paired positive at the join: refusing mismatched delimiters must not start refusing

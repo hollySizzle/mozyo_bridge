@@ -85,9 +85,17 @@ authorize したかを照合しなければ scope は未検証のままである
     が全行に同順で適用する規則である:
     - **A. fenced code** — ` ``` ` / `~~~` の opener から closer まで (fence 行を含む)。閉じていない
       fence は以降を全部飲む (半開の引用も引用である = fail-closed)。
-    - **B. blockquote** — 先頭の非空白文字が `>`。nest (`> >`) と leading whitespace を含む。
-    - **C. indented code** — 4 space 以上 (または tab) の indent。
-    - **D. inline code** — canonical 行内の backtick span。
+    - **B. blockquote** — 先頭の非空白文字が `>`。nest (`> >`) と leading whitespace に加え、
+      **そこから lazy に継続する paragraph** を含む (`> quoted` の次行に blank line 無しで続く行は
+      同じ blockquote の中である。CommonMark 0.31.2 §5.1)。
+    - **C. indented code** — 4 **column** 以上の indent。tab は 4-column tab stop へ展開する (§2.2)。
+    - **D. inline code** — backtick span。**同一 paragraph 内であれば opener と closer は別の行に
+      あってよい** (§6.1 は span の line ending を space へ正規化する)。
+    ★★★**B / C / D はいずれも「1 行だけを見て決まる性質」ではない。** 行に自分自身を尋ねる実装は
+    毎回、尋ねなかった形を漏らした (#14584 j#91194 F1-F3): indent を文字数で数えると Markdown が
+    4 column と読む ` \t` を 2 と読み、`>` 行だけを見る blockquote 判定は次の 1 行を解放し、行末で
+    閉じる span 判定は delimiter 間の全行を解放する。よって scan は **block 構造を先に確定し、D は
+    paragraph 単位で後から適用する**。
     ★★★**A と D は delimiter の規則であり、delimiter は「一致したときだけ」delimiter である**
     (#14584 j#91152 F1)。fence を単一 boolean で toggle し、span を「任意の backtick 2 個の間」と
     読む実装は、renderer が逐語として描画した region を canonical text として返す。CommonMark
@@ -99,9 +107,9 @@ authorize したかを照合しなければ scope は未検証のままである
       fence 内の marker が canonical text として解放される。
     - code span は backtick string から**ちょうど同じ長さ**の次の backtick string までであり、
       間にある別長の run は span の content である。
-    - **対応しない backtick string は無視せず、その行の残りを拒否する。** CommonMark は逐語
-      text として描画するが、引用が閉じていない行はこの scan が著者性を確定できない行であり、
-      拒否は復旧可能な向きである (下記「代償」と同じ)。
+    - **対応しない backtick string は無視せず、その paragraph の残りを拒否する。** CommonMark は
+      逐語 text として描画するが、引用が閉じていない paragraph はこの scan が著者性を確定できない
+      text であり、拒否は復旧可能な向きである (下記「代償」と同じ)。
     ★**A と D だけを覆った初版は live acceptance で破れた** (#14577 j#90392)。journal に `>` で
     grammar を引用しただけの note が `links.anchor=verified` を返し、zero-send になったのは後段の
     別 link がたまたま壊れていたからにすぎない。**引用の形は 1 つではないので、報告された形だけを
@@ -112,12 +120,17 @@ authorize したかを照合しなければ scope は未検証のままである
     引用 marker が durable gate authority になった。**同じ grammar に対して「引用とは何か」の定義が
     2 つあるのは drift 生成器である。** 規則は共有 authority に 1 箇所だけ置き、reader は policy
     (どの channel / gate を受理するか) だけを各自が持つ。
-    この形の finding は **B/C (#14577 j#90392) に続いて 2 度目**であり、`review-escalation`
-    projection が同一 subsystem の反復として `full_surface_adversarial` を返した (#14584 j#91158)。
-    以後この規則面は「報告された形」ではなく **delimiter 規則の側から全 edge を掃く**。
-  - 代償として **decision は top-level に書く**必要がある (list bullet の下に 4 space indent した
-    marker、対応しない backtick run を含む行の marker は拒否される)。この向きの失敗は coordinator が
-    column 0 に書き直せば済む。逆向きの失敗 (引用に authority を渡す) は復旧できない。
+    ★★★**列挙者を自分に置く限りこの漏れは反復する** (#14584 j#91194)。同じ面で手作業の列挙が
+    3 round 連続で漏れた — B/C 漏れ (#14577 j#90392)、delimiter 漏れ (j#91152)、block 構造漏れ
+    (j#91194)。**「規則の側から掃いた」も、掃く規則を自分で列挙している限り同じ失敗である。**
+    以後この面の検証は **実 CommonMark 実装を differential oracle として使う**: note を renderer に
+    かけて marker が `<code>` / `<pre>` / `<blockquote>` の内側かを判定し、scanner の判定と機械的に
+    突き合わせる。case list も container × delimiter の直積として生成し、人手で列挙しない。
+    renderer は**検証時の instrument であって runtime 依存ではない** (package に足さない)。
+  - 代償として **decision は top-level に書く**必要がある (4 column 以上 indent した marker、
+    blockquote を lazy 継続する行の marker、対応しない backtick run を含む paragraph の marker は
+    拒否される)。この向きの失敗は coordinator が blank line を挟んで column 0 に書き直せば済む。
+    逆向きの失敗 (引用に authority を渡す) は復旧できない。
   - **scan は行単位で行う。** marker body の grammar は `[^\]]*` で改行を跨ぐため、blank 化した note
     を 1 文字列として scan すると、canonical 行の閉じていない `[mozyo:` が引用行を越えて後続の `]`
     で閉じ、**どの 1 行にも存在しない marker** が成立しうる。

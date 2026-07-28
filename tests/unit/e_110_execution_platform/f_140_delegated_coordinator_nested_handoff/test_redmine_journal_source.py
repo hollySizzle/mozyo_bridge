@@ -303,6 +303,25 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(self._gates(note), ())
 
+    def test_block_level_quotation_is_not_a_gate_either(self):
+        # #14584 j#91194 F1-F3 reaching THIS reader: quotation that only a multi-LINE view can see.
+        # Each shape was confirmed with a real CommonMark renderer; the matrix is in
+        # ``test_canonical_note_scan.BlockStructureTest``.
+        for label, note in (
+            ("multi-line code span", "`start\n%s\nend`" % self.GATE),
+            ("multi-line two-backtick span", "``start\n%s\nend``" % self.GATE),
+            ("one space + tab indent", " \t%s" % self.GATE),
+            ("three spaces + tab indent", "   \t%s" % self.GATE),
+            ("blockquote lazy continuation", "> quoted grammar\n%s" % self.GATE),
+            ("lazy continuation two lines down", "> quoted\nstill quoted\n%s" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ())
+
+    def test_a_blank_line_still_releases_the_writers_own_voice(self):
+        # The paired positive for all three: one blank line away, the marker is a gate again.
+        self.assertEqual(self._gates("> quoted\n\n" + self.GATE), ("review_request",))
+
     def test_a_matching_delimiter_still_releases_the_writers_own_voice(self):
         # The paired positive: >= opener length closes, so this marker is NOT quoted.
         self.assertEqual(self._gates("```\nquoted\n````\n" + self.GATE), ("review_request",))
