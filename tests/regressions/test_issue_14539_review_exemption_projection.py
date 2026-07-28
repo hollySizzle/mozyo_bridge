@@ -2796,7 +2796,19 @@ class ReviewJ92106BespokeParserTests(unittest.TestCase):
             # a hand-rolled marker parser.
             if r"\[mozyo:" not in text:
                 continue
-            if re.search(r"body\s*\.\s*split\(", text):
+            # The SPLIT is what is detected, not the name of the variable holding the body
+            # (review j#92174 finding 3). Matching ``body.split(`` was a spelling, not an
+            # inventory: ``recovery_anchor_delivery`` wrote ``match.group("body").split(":")``
+            # and ``recovered_pair_pin_reconciliation`` the same, so two private grammars sat
+            # outside this gate. Both happened to be strict, which is exactly why the gate could
+            # not be trusted — it was green for a reason it never checked.
+            #
+            # Splitting on ``":"`` is how a body becomes components and partitioning on ``"="``
+            # is how a component becomes a field; a module that scans the marker token and does
+            # either owns a grammar, whatever it calls its variables.
+            if re.search(
+                r"\.\s*split\(\s*[\"']:[\"']\s*\)|\.\s*partition\(\s*[\"']=[\"']\s*\)", text
+            ):
                 offenders.add(path.name)
         self.assertEqual(
             offenders,
@@ -2953,6 +2965,196 @@ class ReviewJ92060EffectReachingReaderTests(unittest.TestCase):
             "these modules call the LENIENT marker fold; if the result reaches a send / "
             "actuation / admission it must use the strict reader, and if it genuinely does not, "
             "add it to the allowlist above WITH the reason",
+        )
+
+
+class ReviewJ92174MultiGateSiblingTests(unittest.TestCase):
+    """R23-F1: same-gate poison fired on UNREADABLE siblings only.
+
+    R21 taught ``strict_gate_markers`` that a same-gate sibling it cannot parse poisons the note.
+    A marker naming two gates parses perfectly and still proves neither (ruling #14219 j#86718),
+    so as this gate's evidence it is exactly as unusable — but it failed the ``== {gate}`` check
+    quietly and was skipped, handing authority to its clean sibling. Readability and countability
+    are different questions and only the first one was being asked.
+    """
+
+    CLEAN = "[mozyo:workflow-event:kind=implementation_request:lane=r1:lane_generation=1]"
+    MULTI = "[mozyo:workflow-event:gate=implementation_request:kind=unknown_gate]"
+
+    def _markers(self, notes):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            strict_gate_markers,
+        )
+
+        return strict_gate_markers(notes, "implementation_request")
+
+    def test_a_readable_multi_gate_sibling_poisons_the_note(self):
+        self.assertEqual(len(self._markers(self.CLEAN)), 1)  # control
+        self.assertEqual(self._markers(self.CLEAN + "\n" + self.MULTI), ())
+
+    def test_a_lone_multi_gate_marker_is_evidence_for_neither_gate(self):
+        """It matched nothing before too — but by being skipped, not by being refused."""
+        self.assertEqual(self._markers(self.MULTI), ())
+
+    def test_a_multi_gate_sibling_naming_only_OTHER_gates_is_left_alone(self):
+        """The boundary: poison is same-gate, not "any ambiguous marker anywhere"."""
+        other = "[mozyo:workflow-event:gate=park_record:kind=some_other_gate]"
+        self.assertEqual(len(self._markers(self.CLEAN + "\n" + other)), 1)
+
+    def test_a_marker_repeating_the_gate_token_in_both_aliases_still_counts(self):
+        """One gate written twice is one claim, not two — it must keep parsing."""
+        both = "[mozyo:workflow-event:gate=implementation_request:kind=implementation_request]"
+        self.assertEqual(len(self._markers(both)), 1)
+
+    def test_the_dispatch_anchor_refuses_the_multi_gate_note(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+            dispatch_generations,
+            resolve_dispatch_entry_journal,
+        )
+
+        entries = [
+            RedmineJournalEntry(
+                issue_id="1", journal_id="7", notes=self.CLEAN + "\n" + self.MULTI
+            )
+        ]
+        self.assertEqual(
+            resolve_dispatch_entry_journal(entries, lane="r1", lane_generation=1), ""
+        )
+        self.assertEqual(dispatch_generations(entries, lane="r1"), ())
+
+
+class ReviewJ92174HeadingDoesNotRescueTests(unittest.TestCase):
+    """R23-F2: a heading let a malformed same-gate marker mint an exemption.
+
+    R21 made a marker-qualified journal prove its marker is renderable, and scoped that to
+    journals qualifying ONLY through a marker. The carve-out conflated two questions: a heading
+    is enough to DECLARE the gate, but it cannot make the marker beside it readable. Honouring
+    the heading and ignoring the marker is the readable-subset behaviour the layer below refuses.
+    """
+
+    HEAD = "a" * 40
+    HEADING = "## Gate: codex_direct_edit"
+    MALFORMED = "[mozyo:workflow-event:gate = codex_direct_edit]"
+    FIELDS = (
+        "\n- role: 実装者\n- direct_edit: true\n- allowed_paths: src/**\n"
+        "- reason: r\n- follow_up_review: false\n"
+    )
+
+    def _scope(self):
+        return (
+            f"## Gate: Implementation Done\n- commit: {self.HEAD}\n"
+            "- changed_paths:\n  - src/a.py\n"
+        )
+
+    def _state(self, declaration):
+        return fold_review_exemption(
+            [("101", declaration + self.FIELDS), ("102", self._scope())]
+        ).state
+
+    def test_a_heading_alone_still_mints(self):
+        """Control: the legacy heading-only form is untouched."""
+        self.assertEqual(self._state(self.HEADING), EXEMPTION_EXEMPT)
+
+    def test_a_heading_does_not_rescue_a_malformed_same_gate_marker(self):
+        self.assertEqual(
+            self._state(self.HEADING + "\n" + self.MALFORMED), EXEMPTION_INVALID
+        )
+
+    def test_a_heading_plus_a_RENDERABLE_marker_still_mints(self):
+        """The boundary: the marker rule must refuse bodies, not the pairing itself."""
+        self.assertEqual(
+            self._state(self.HEADING + "\n[mozyo:workflow-event:gate=codex_direct_edit]"),
+            EXEMPTION_EXEMPT,
+        )
+
+    def test_the_heading_and_marker_pair_still_SHADOWS_an_older_valid_gate(self):
+        """Refusing to mint must not become refusing to see — the R2-F1 invariant."""
+        older = "[mozyo:workflow-event:gate=codex_direct_edit]" + self.FIELDS
+        newer = self.HEADING + "\n" + self.MALFORMED + self.FIELDS
+        facts = fold_review_exemption(
+            [("101", older), ("102", self._scope()), ("103", newer)]
+        )
+        self.assertEqual(facts.state, EXEMPTION_INVALID)
+
+    def test_a_malformed_marker_for_ANOTHER_gate_beside_the_heading_is_ignored(self):
+        """The heading journal is not poisoned by an unrelated gate's bad marker."""
+        other = "[mozyo:workflow-event:gate = park_record]"
+        self.assertEqual(self._state(self.HEADING + "\n" + other), EXEMPTION_EXEMPT)
+
+
+class ReviewJ92174SharedBodyReaderTests(unittest.TestCase):
+    """R23-F3: two private body parsers sat outside the inventory pin.
+
+    Both were strict, so nothing was leaking — but the pin that is supposed to enumerate private
+    grammars matched the literal ``body.split(`` and both wrote ``group("body").split(":")``, so
+    the gate was green for a reason it never checked. Routing them to the shared reader is also a
+    tightening: their own loop stripped each component before judging it.
+    """
+
+    def _authorization(self, body):
+        return f"[mozyo:recovery-delivery-authorization:{body}]"
+
+    def _canonical_fields(self):
+        return (
+            "conclusion=authorized:authorized_by_role=owner:issue=14539:lane=r1:"
+            "workspace_id=ws:anchor_journal=1:retry_of_action_sha256=d:"
+            "prior_zero_send_journal=2"
+        )
+
+    def _parse(self, note):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
+            parse_recovery_delivery_authorizations,
+        )
+
+        class _E:
+            def __init__(self, notes):
+                self.journal_id = "7"
+                self.notes = notes
+
+        return parse_recovery_delivery_authorizations([_E(note)])
+
+    def test_the_canonical_authorization_still_parses(self):
+        parsed = self._parse(self._authorization(self._canonical_fields()))
+        self.assertEqual([a.issue for a in parsed], ["14539"])
+
+    def test_a_whitespace_contaminated_component_is_now_refused(self):
+        """The private loop stripped first, so ``issue = 14539`` read as a clean field."""
+        contaminated = self._canonical_fields().replace("issue=14539", "issue = 14539")
+        self.assertEqual(self._parse(self._authorization(contaminated)), ())
+
+    def test_an_empty_component_is_refused(self):
+        body = self._canonical_fields().replace("lane=r1", "lane=r1:")
+        self.assertEqual(self._parse(self._authorization(body)), ())
+
+    def test_a_repeated_key_is_refused_even_with_an_identical_value(self):
+        """A closed vocabulary renders each key once, so a second occurrence is not producer
+        output — this is the one axis the shared reader alone would have allowed."""
+        body = self._canonical_fields().replace("lane=r1", "lane=r1:lane=r1")
+        self.assertEqual(self._parse(self._authorization(body)), ())
+
+    def test_a_missing_field_is_refused(self):
+        body = self._canonical_fields().replace(":prior_zero_send_journal=2", "")
+        self.assertEqual(self._parse(self._authorization(body)), ())
+
+    def test_an_extra_field_is_refused(self):
+        body = self._canonical_fields() + ":unexpected=1"
+        self.assertEqual(self._parse(self._authorization(body)), ())
+
+    def test_the_r19_owner_marker_reader_is_tightened_the_same_way(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovered_pair_pin_reconciliation import (  # noqa: E501
+            _strict_authority_fields,
+        )
+
+        body = (
+            "gate=recovered_pair_pin_reconciliation:kind=owner_authority:issue=14539:"
+            "lane=r1:lane_generation=1:source_revision=1:expected_revision=2:"
+            "lifecycle_decision_journal=9:target_action_digest=d"
+        )
+        canonical = f"[mozyo:workflow-event:{body}]"
+        self.assertIsNotNone(_strict_authority_fields(canonical))  # control
+        self.assertIsNone(
+            _strict_authority_fields(canonical.replace("issue=14539", "issue = 14539"))
         )
 
 

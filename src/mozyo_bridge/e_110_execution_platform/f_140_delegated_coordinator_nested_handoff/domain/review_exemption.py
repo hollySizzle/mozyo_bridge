@@ -528,16 +528,22 @@ def _journal_exemption(notes: str) -> Optional[ReviewExemptionFacts]:
     if not qualifies:
         return None
 
-    # …and a journal that qualifies ONLY through a marker must carry a marker the canonical
-    # producer could actually render (Redmine #14539 review j#92106 finding 1). The allowlist
-    # entry that called this "structural qualification only" was wrong on the effect chain: this
-    # qualification decides whether the fields below are read as authority, and a valid read MINTS
-    # an exemption that reaches the glance projection and the terminal retire admission. So an
-    # unreadable marker qualifies the journal (it shadows) and yields EXEMPTION_INVALID (review
-    # still owed) rather than an exemption.
+    # …and a journal that NAMES this gate in a marker must carry a marker the canonical producer
+    # could actually render (Redmine #14539 review j#92106 finding 1). The allowlist entry that
+    # called this "structural qualification only" was wrong on the effect chain: this qualification
+    # decides whether the fields below are read as authority, and a valid read MINTS an exemption
+    # that reaches the glance projection and the terminal retire admission. So an unreadable marker
+    # qualifies the journal (it shadows) and yields EXEMPTION_INVALID (review still owed) rather
+    # than an exemption.
+    #
+    # A heading does NOT rescue it (review j#92174 finding 2). Restricting this to marker-only
+    # journals conflated two different questions: a heading is enough to DECLARE the gate, but it
+    # cannot make a same-gate marker readable, and a note carrying one is a note whose evidence
+    # this reader cannot count. Honouring the heading and ignoring the marker beside it is the
+    # readable-subset behaviour ``strict_gate_markers`` refuses one layer down, so the note is
+    # fail-closed here too — it still shadows, it just does not mint.
     if declared_by_marker and not strict_gate_markers(text, MARKER_GATE_CODEX_DIRECT_EDIT):
-        if _HEADING_RE.search(text) is None:
-            return ReviewExemptionFacts(state=EXEMPTION_INVALID)
+        return ReviewExemptionFacts(state=EXEMPTION_INVALID)
 
     role, role_conflict = _unique_field(_ROLE_FIELD_RE, text)
     direct_edit_raw, direct_edit_conflict = _unique_field(_DIRECT_EDIT_FIELD_RE, text)

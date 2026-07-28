@@ -9,6 +9,7 @@ from typing import Any
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     MARKER_CHANNEL_WORKFLOW_EVENT,
+    strict_marker_body_fields,
 )
 
 
@@ -40,30 +41,21 @@ def recovery_action_digest(value: object) -> str:
 
 
 def _strict_authority_fields(notes: object) -> dict[str, str] | None:
-    """Parse exactly one closed R19 owner marker without lossy field folding."""
+    """Exactly one closed R19 owner marker, read by the SHARED strict grammar (pure).
+
+    This module owns the closed field set and the one-marker rule; what counts as a renderable
+    body belongs to :func:`strict_marker_body_fields` (Redmine #14539 review j#92174 finding 3).
+    The private split that used to live here stripped each component first, so ``issue = 14539``
+    read as a clean field — routing it to the shared reader tightens that and leaves every other
+    refusal in place.
+    """
 
     if not isinstance(notes, str):
         return None
     matches = tuple(_AUTHORITY_RE.finditer(notes))
     if len(matches) != 1:
         return None
-    fields: dict[str, str] = {}
-    for raw_token in matches[0].group("body").split(":"):
-        token = raw_token.strip()
-        key, separator, value = token.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if (
-            not separator
-            or not key
-            or not value
-            or key in fields
-            or key not in _AUTHORITY_FIELDS
-            or any(character.isspace() for character in key)
-        ):
-            return None
-        fields[key] = value
-    return fields if frozenset(fields) == _AUTHORITY_FIELDS else None
+    return strict_marker_body_fields(matches[0].group("body"), expected=_AUTHORITY_FIELDS)
 
 
 @dataclass(frozen=True)

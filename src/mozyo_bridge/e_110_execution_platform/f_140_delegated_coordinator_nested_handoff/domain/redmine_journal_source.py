@@ -207,6 +207,42 @@ def strict_marker_fields(
     return fields
 
 
+def strict_marker_body_fields(
+    body: str,
+    *,
+    expected=None,
+    canonicalize=None,
+) -> "dict[str, str] | None":
+    """One CLOSED-VOCABULARY marker body's fields, or ``None`` if unrenderable (pure).
+
+    The shared entry point for readers that own their own channel regex — a recovery-delivery
+    authorization, an R19 owner marker — and previously split the captured body themselves
+    (Redmine #14539 review j#92174 finding 3). Those private grammars happened to be strict, but
+    "happened to be" is the problem: the pin that is supposed to inventory hand-rolled parsers
+    could not see them, so a later loosening would have reached an effect with the gate green.
+
+    Stricter than :func:`strict_marker_fields` on the two axes a closed vocabulary allows:
+
+    - a key repeated AT ALL is refused, not just one repeated with a different value — a closed
+      field set is rendered once per key, so a second occurrence is already not producer output;
+    - with ``expected``, the field set must be EXACTLY that set, so a missing or extra key is
+      refused rather than being caught field-by-field downstream.
+
+    Everything the shared reader refuses it refuses too, which is why routing the private parsers
+    here TIGHTENS them: they stripped each component before judging it, so ``issue = 14539`` — a
+    body the canonical producer cannot render — read as a clean ``issue`` field.
+    """
+    components = _parse_marker_components(body)
+    fields = strict_marker_fields(components, canonicalize=canonicalize)
+    if fields is None:
+        return None
+    if len(fields) != len(components):
+        return None
+    if expected is not None and frozenset(fields) != frozenset(expected):
+        return None
+    return fields
+
+
 def strict_marker_fields_in_note(notes: str):
     """Every marker as ``(channel, fields)``, or ``None`` if ANY of them is unreadable (pure).
 
@@ -285,20 +321,26 @@ def strict_gate_markers(notes: str, gate: str, *, canonicalize=None) -> tuple:
         if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
             continue
         fields = strict_marker_fields(components, canonicalize=canonicalize)
-        if fields is None:
-            # An unreadable marker that RAW-DECLARES this gate poisons the whole note (Redmine
-            # #14539 review j#92106 finding 3). Skipping it and returning the readable siblings is
-            # the subset behaviour ``strict_marker_fields_in_note`` already refuses: a note
-            # carrying one clean and one forged marker for the SAME gate would read exactly like a
-            # clean note. The contract says it twice — "fragment を捨てて残りを一致させず marker
-            # 全体を fail-closed とする" and "同一種別の読めない marker を読み飛ばして別の marker を
-            # 採ることもしない". An unreadable marker for some OTHER gate is not this gate's
-            # business and is left alone.
-            if _raw_declares_gate(components, gate):
-                return ()
-            continue
         if marker_logical_gates(fields) == {gate}:
             found.append(fields)
+            continue
+        # This marker is not this gate's evidence. If it NAMES this gate anyway, it is a same-gate
+        # claim we cannot honour, and the whole note is fail-closed (Redmine #14539 review j#92106
+        # finding 3, widened by j#92174 finding 1). Skipping it and returning the readable siblings
+        # is the subset behaviour ``strict_marker_fields_in_note`` already refuses: a note carrying
+        # one clean and one uncountable marker for the SAME gate would read exactly like a clean
+        # note. The contract says it twice — "fragment を捨てて残りを一致させず marker 全体を
+        # fail-closed とする" and "同一種別の読めない marker を読み飛ばして別の marker を採ることも
+        # しない".
+        #
+        # "Uncountable" is deliberately wider than "unparseable": a marker whose body parses
+        # cleanly but names TWO gates proves neither (ruling #14219 j#86718), so as this gate's
+        # evidence it is exactly as unusable as a malformed one. Testing readability first — the
+        # earlier shape here — let ``gate=implementation_request:kind=unknown_gate`` parse, fail
+        # the ``== {gate}`` check, and be silently skipped, handing authority to its clean sibling.
+        # A marker naming some OTHER gate is not this gate's business and is left alone.
+        if _raw_declares_gate(components, gate):
+            return ()
     return tuple(found)
 
 
