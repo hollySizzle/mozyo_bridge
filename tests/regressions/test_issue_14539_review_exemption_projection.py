@@ -37,6 +37,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     _resolve_latest_generation_admissible,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_integration_disposition import (
+    canonical_marker_value,
     fold_integration_disposition,
     fold_work_unit,
     has_conflicting_disposition_declaration,
@@ -47,6 +48,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     marker_components_in_note,
     marker_fields_in_note,
+    marker_logical_gates,
+    strict_marker_fields,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (
     fold_issue_gate_facts,
@@ -1841,6 +1844,162 @@ class ReviewJ91797WorkUnitTests(unittest.TestCase):
         older = "## Gate: Review Request\n- work_unit: user_story\n"
         newer = "## Gate: Review Request\n- work_unit: leaf_issue\n"
         self.assertEqual(fold_work_unit([("100", older), ("200", newer)]), "leaf_issue")
+
+
+class ReviewJ91896StrictMarkerGrammarTests(unittest.TestCase):
+    """R13-F2/F3: ONE strict reader, over uncollapsed components, shared by every authority.
+
+    The previous rounds fixed the terminal-retire conflict detector while the shared issuer
+    resolver kept reading the lenient collapsed dict — so a repeated key was erased before it got
+    there and surrounding whitespace was normalized into a clean-looking field. Both counterexamples
+    resolved to a coordinator issuer with strict evidence intact.
+    """
+
+    def _components(self, body: str):
+        return [c for ch, c in marker_components_in_note(f"[mozyo:workflow-event:{body}]")][0]
+
+    def _evidence_body(self, gate_field="gate=integration_disposition", extra="",
+                       disposition="disposition=merge"):
+        return (
+            f"{gate_field}:workspace={EVIDENCE_WORKSPACE}:lane={EVIDENCE_LANE}:"
+            f"lane_generation={EVIDENCE_LANE_GENERATION}{extra}:head={HEAD}:"
+            f"integration_head={INTEGRATION_HEAD}:integration_branch={INTEGRATION_BRANCH}:"
+            f"{disposition}"
+        )
+
+    def _issuer(self, body: str):
+        return resolve_journal_issuer(
+            "103", f"[mozyo:workflow-event:{body}]", policy_pointer=EVIDENCE_POLICY_POINTER
+        )
+
+    def test_whitespace_around_a_component_refuses_the_marker(self):
+        """F3: the contract lists whitespace contamination beside empty and missing-``=``."""
+        body = self._evidence_body(gate_field="gate = integration_disposition")
+        self.assertIsNone(strict_marker_fields(self._components(body)))
+        self.assertEqual(self._issuer(body).role, "unknown")
+
+    def test_whitespace_around_a_value_refuses_the_marker(self):
+        body = self._evidence_body(disposition="disposition= merge")
+        self.assertIsNone(strict_marker_fields(self._components(body)))
+
+    def test_an_empty_key_refuses_the_marker(self):
+        body = self._evidence_body(extra=":=orphan")
+        self.assertIsNone(strict_marker_fields(self._components(body)))
+
+    def test_a_repeated_key_survives_the_collapse_and_refuses(self):
+        """F2 counterexample B: the lenient dict erased the duplicate before anyone saw it."""
+        body = self._evidence_body(gate_field="gate=park_declared:gate=integration_disposition")
+        self.assertIsNone(strict_marker_fields(self._components(body)))
+        self.assertEqual(self._issuer(body).role, "unknown")
+
+    def test_an_unrecognized_second_gate_still_counts_as_a_claim(self):
+        """F2 counterexample A: skipping the unknown token made ONE contract look declared."""
+        body = self._evidence_body(gate_field="gate=integration_disposition:kind=unknown_gate")
+        fields = strict_marker_fields(self._components(body))
+        self.assertEqual(
+            sorted(marker_logical_gates(fields)), ["integration_disposition", "unknown_gate"]
+        )
+        self.assertEqual(self._issuer(body).role, "unknown")
+
+    def test_a_sole_unrecognized_gate_resolves_nothing(self):
+        """An unknown gate is not a contract, so it must not yield an anchored issuer either."""
+        issuer = self._issuer(self._evidence_body(gate_field="gate=not_a_contract"))
+        self.assertEqual(issuer.role, "unknown")
+        self.assertFalse(issuer.authority_anchor)
+
+    def test_the_clean_marker_still_resolves_the_coordinator(self):
+        """Negative control for all of the above."""
+        issuer = self._issuer(self._evidence_body())
+        self.assertEqual(issuer.role, "coordinator")
+        self.assertTrue(issuer.authority_anchor)
+
+    def test_a_delivery_marker_beside_the_evidence_does_not_unresolve_it(self):
+        """The alias union is only safe because the handoff CHANNEL is not authority.
+
+        A handoff delivery record carries ``kind=``, so once ``kind`` became a gate alias a
+        delivery note sitting in the same journal would have read as a second authority claim.
+        """
+        note = (
+            "[mozyo:handoff:source=redmine:issue=14539:journal=1:kind=review_result:to=claude]\n"
+            f"[mozyo:workflow-event:{self._evidence_body()}]\n"
+        )
+        issuer = resolve_journal_issuer("103", note, policy_pointer=EVIDENCE_POLICY_POINTER)
+        self.assertEqual(issuer.role, "coordinator")
+
+    def test_every_authority_consumer_agrees_on_a_canonical_duplicate(self):
+        """The three consumers share one reader AND one canonicalizer, so they cannot disagree."""
+        body = self._evidence_body(disposition="disposition=merged:disposition=merge")
+        note = f"## Integration disposition\n[mozyo:workflow-event:{body}]\n"
+        self.assertFalse(has_conflicting_disposition_declaration([("103", note)]))
+        self.assertEqual(self._issuer(body).role, "coordinator")
+        self.assertIsNotNone(
+            strict_marker_fields(self._components(body), canonicalize=canonical_marker_value)
+        )
+
+
+class ReviewJ91896TargetBindingTests(unittest.TestCase):
+    """R13-F1: counter equality is not identity, and the check-to-act window has to close."""
+
+    def test_the_guarded_close_requires_a_resolved_target(self):
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_retire_actuation,
+        )
+
+        source = inspect.getsource(sublane_retire_actuation.run_guarded_retire_close)
+        self.assertIn("evidence_target is None", source)
+        self.assertIn("REASON_LANE_TARGET_UNRESOLVED", source)
+
+    def test_the_guarded_close_binds_the_exact_lifecycle_key(self):
+        """The foreign-workspace defect: ws_A's counters satisfied a close in ws_B."""
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_retire_actuation,
+        )
+
+        source = inspect.getsource(sublane_retire_actuation.run_guarded_retire_close)
+        self.assertIn(
+            "(evidence_target.workspace, evidence_target.lane) != (workspace_id, lane_label)",
+            source,
+        )
+
+    def test_the_attestation_runs_again_immediately_before_the_close(self):
+        """The commit point: everything between the preflight and the close is a window."""
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_retire_actuation,
+        )
+
+        source = inspect.getsource(sublane_retire_actuation.run_guarded_retire_close)
+        # Two CALL SITES (the ``def`` line also contains the token, so match the assignment),
+        # and the last one is after the plan and before the only destructive call.
+        self.assertEqual(source.count("= _attest()"), 2)
+        last_attest = source.rindex("= _attest()")
+        plan = source.index("plan = plan_herdr_retire_close(")
+        close = source.index("execute_herdr_retire_close(plan)")
+        self.assertLess(plan, last_attest)
+        self.assertLess(last_attest, close)
+
+    def test_the_precise_owner_diagnosis_is_not_preempted(self):
+        """The target requirement must not swallow #13754's own reasons.
+
+        A lane with no lifecycle binding still has to report ``lane_owner_unverified``; the newer
+        refusal only applies once the lane is otherwise attestable.
+        """
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_retire_actuation,
+        )
+
+        source = inspect.getsource(sublane_retire_actuation.run_guarded_retire_close)
+        self.assertLess(
+            source.index("attested, reason, detail = _attest()"),
+            source.index("if evidence_target is None:"),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

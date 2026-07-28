@@ -99,6 +99,11 @@ REASON_LIFECYCLE_UNREADABLE = "lifecycle_unreadable"
 #: slots. The exact ``(lane_generation, revision)`` the decision was made against is therefore
 #: re-read immediately before the close, and any drift is zero-actuation.
 REASON_LANE_GENERATION_DRIFT = "lane_generation_drift"
+#: The destructive generic close could not resolve the lane's durable lifecycle target, or the
+#: resolved target names a DIFFERENT lane unit than the one this close resolved from its own
+#: inputs (Redmine #14539 review j#91896 finding 1). Counter equality is not identity: an
+#: expectation measured in one workspace must never satisfy a close in another.
+REASON_LANE_TARGET_UNRESOLVED = "lane_target_unresolved"
 #: Worktree-binding attestation (Redmine #13754 R2-F1, design j#78572, A+C). The lane's
 #: durable lifecycle records a canonical worktree binding; the caller's ``--worktree``
 #: must resolve to that exact token before any close, or a sibling lane's worktree could

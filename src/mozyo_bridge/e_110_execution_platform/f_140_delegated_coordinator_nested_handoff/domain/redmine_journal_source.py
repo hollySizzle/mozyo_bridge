@@ -139,20 +139,89 @@ def _parse_marker_components(body: str) -> tuple[tuple[str, str], ...]:
     Contract` requires the opposite: "空 component・``=`` を欠く fragment・空 key・whitespace 混入は
     canonical producer が描画し得ない marker であり fragment を捨てて残りを一致させず marker 全体を
     fail-closed とする".
+
+    Nothing is normalized either: the components are returned exactly as the body splits, WITH
+    whatever surrounding whitespace they carry (review j#91896 finding 3). Stripping here erased
+    the one piece of evidence that says ``gate = integration_disposition`` is not a marker the
+    canonical producer could have rendered, so the whitespace-contaminated body read as clean.
+    Deciding what is well-formed belongs to :func:`strict_marker_fields`, not to the scanner.
     """
     components: list[tuple[str, str]] = []
     for token in body.split(":"):
-        stripped = token.strip()
-        if not stripped:
-            # An empty component IS a component — reporting it is the whole point.
-            components.append(("", ""))
-            continue
-        key, eq, value = stripped.partition("=")
+        key, eq, value = token.partition("=")
         if not eq:
-            components.append(("", stripped))
+            # No ``=`` at all (an empty component included): report it with an empty key so a
+            # caller checking well-formedness can see it, and keep the raw text as the value.
+            components.append(("", token))
             continue
-        components.append((key.strip(), value.strip()))
+        components.append((key, value))
     return tuple(components)
+
+
+#: The two spellings of the ONE logical field naming a marker's gate. Read as a set, never
+#: first-non-empty: a second, different gate spelled in the other alias is a second authority
+#: claim, not a fallback (Redmine #14539 reviews j#91847 F3 / j#91896 F2).
+MARKER_GATE_ALIASES: tuple[str, ...] = ("gate", "kind")
+
+
+def strict_marker_fields(
+    components: Sequence[Tuple[str, str]],
+    *,
+    canonicalize=None,
+) -> "dict[str, str] | None":
+    """One marker's fields when its body is canonical-producer-renderable, else ``None`` (pure).
+
+    THE strict reader every authority consumer shares (Redmine #14539 review j#91896 findings 2
+    and 3). :func:`marker_fields_in_note` folds a body to a dict with last-write-wins, which is
+    fine for display and routing and unusable for authority: a repeated key is erased before the
+    consumer sees it, and surrounding whitespace is normalized into a clean-looking field.
+
+    A marker is refused — ``None``, meaning "this marker declares nothing" — when ANY component
+    is one the canonical producer could not render:
+
+    - an empty component, or one carrying no ``=``;
+    - an empty key;
+    - whitespace anywhere around a key or a value.
+
+    The central `### Hibernate Evidence Marker Contract` requires exactly that, and requires it of
+    the WHOLE marker: "fragment を捨てて残りを一致させず marker 全体を fail-closed とする".
+
+    A key repeated with the same value collapses to one declaration; repeated with DIFFERENT
+    values the marker is refused. ``canonicalize(key, value) -> str`` lets a caller declare which
+    keys have a governed vocabulary, so two spellings of one token (``merged`` / ``merge``) count
+    as the same declaration; without it values compare literally, which is the fail-closed reading
+    for a key with no canonical form.
+    """
+    fields: dict[str, str] = {}
+    seen: dict[str, str] = {}
+    for key, value in components or ():
+        if not key or key != key.strip() or value != value.strip():
+            return None
+        canonical = canonicalize(key, value) if canonicalize else value
+        if key in seen:
+            if seen[key] != canonical:
+                return None
+            continue
+        seen[key] = canonical
+        fields[key] = value
+    return fields
+
+
+def marker_logical_gates(fields: "dict[str, str] | None") -> frozenset:
+    """Every gate token a marker's fields declare, across both aliases (pure).
+
+    ``frozenset()`` for ``None`` (a refused marker declares nothing). More than one token means
+    the marker claims two authority contracts at once, which by ruling #14219 j#86718 proves
+    neither — including when the second token is one no contract recognizes, because an
+    unrecognized claim is still a claim and must not be silently dropped (review j#91896 F2).
+    """
+    if not fields:
+        return frozenset()
+    return frozenset(
+        token
+        for token in (str(fields.get(alias, "") or "").strip() for alias in MARKER_GATE_ALIASES)
+        if token
+    )
 
 
 def marker_fields_in_note(notes: str) -> tuple[tuple[str, dict[str, str]], ...]:
@@ -718,8 +787,11 @@ __all__ = (
     "MARKER_CHANNEL_WORKFLOW_EVENT",
     "GATE_BEARING_KINDS",
     "RedmineJournalEntry",
+    "MARKER_GATE_ALIASES",
     "marker_components_in_note",
     "marker_fields_in_note",
+    "marker_logical_gates",
+    "strict_marker_fields",
     "extract_markers_from_note",
     "extract_marker",
     "extract_markers",

@@ -169,6 +169,7 @@ def _resolve_review_exemption_admissible(
         import json
 
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_integration_disposition import (  # noqa: E501
+            canonical_marker_value,
             fold_integration_disposition,
             has_conflicting_disposition_declaration,
         )
@@ -187,7 +188,8 @@ def _resolve_review_exemption_admissible(
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
             MARKER_CHANNEL_WORKFLOW_EVENT,
-            marker_fields_in_note,
+            marker_components_in_note,
+            strict_marker_fields,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (  # noqa: E501
             fold_issue_gate_facts,
@@ -245,12 +247,26 @@ def _resolve_review_exemption_admissible(
         # was satisfied by a journal that carried no evidence at all. A current declaration with no
         # marker (heading-only / legacy) therefore yields no strict evidence — for THIS journal,
         # never a fallback to a stale one.
-        marker_fields = [
-            fields
-            for channel, fields in marker_fields_in_note(current_notes or "")
-            if channel == MARKER_CHANNEL_WORKFLOW_EVENT
-        ]
-        evidence = resolve_integration_evidence(marker_fields)
+        # Read through THE shared strict reader, not the lenient dict fold (review j#91896
+        # findings 2 and 3): an unreadable marker body — whitespace-contaminated, empty component,
+        # repeated key — is refused whole rather than normalized into clean-looking fields. A
+        # ``None`` here means this declaration carries no usable evidence at all.
+        strict_markers = []
+        for channel, components in marker_components_in_note(current_notes or ""):
+            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+                continue
+            # The SAME canonicalizer the conflict detector uses, so the two consumers agree
+            # about what "one declaration written twice" means.
+            fields = strict_marker_fields(components, canonicalize=canonical_marker_value)
+            if fields is None:
+                strict_markers = None
+                break
+            strict_markers.append(fields)
+        evidence = (
+            IntegrationEvidenceError("marker_not_renderable")
+            if strict_markers is None
+            else resolve_integration_evidence(strict_markers)
+        )
         if isinstance(evidence, IntegrationEvidenceError):
             source_head = ""
         else:

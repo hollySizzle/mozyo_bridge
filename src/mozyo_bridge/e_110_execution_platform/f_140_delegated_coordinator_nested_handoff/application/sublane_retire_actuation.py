@@ -63,6 +63,7 @@ def run_guarded_retire_close(
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
         ACTUATION_CLOSED,
         REASON_INVENTORY_UNREADABLE,
+        REASON_LANE_TARGET_UNRESOLVED,
         REASON_NO_WORKTREE_ANCHOR,
         REASON_PROVIDER_NOT_LAUNCHABLE,
         REASON_PROVIDER_UNRESOLVED,
@@ -157,17 +158,53 @@ def run_guarded_retire_close(
     # panes. So the lane row it was ADMITTED against is re-read here, and a row that advanced a
     # generation or revision in between is zero-actuation rather than a close of the new lane's
     # slots on the old lane's evidence.
-    attested, reason, detail = attest_retire_target(
-        workspace_id,
-        lane_label,
-        issue=getattr(args, "issue", "") or "",
-        worktree_identity=metadata_token,
-        expected_generation=getattr(evidence_target, "lane_generation", None),
-        expected_revision=getattr(evidence_target, "revision", None),
-    )
+    # The target must be RESOLVED, and it must be the SAME lane unit this close is about
+    # (Redmine #14539 review j#91896 finding 1). R13 forwarded only the generation / revision
+    # counters, so an evidence target measured in workspace A satisfied a close in workspace B
+    # whose row happened to carry the same counters — the key itself was re-derived from
+    # ``--worktree``, never bound. And an unresolvable target degraded to ``None`` for both axes,
+    # silently disabling the very fence it was added to be.
+    def _attest():
+        return attest_retire_target(
+            workspace_id,
+            lane_label,
+            issue=getattr(args, "issue", "") or "",
+            worktree_identity=metadata_token,
+            expected_generation=getattr(evidence_target, "lane_generation", None),
+            expected_revision=getattr(evidence_target, "revision", None),
+        )
+
+    # The owner / worktree axes run FIRST so their precise #13754 diagnoses survive: a lane with
+    # no lifecycle binding must still report ``lane_owner_unverified``, not the newer refusal.
+    attested, reason, detail = _attest()
     if not attested:
         return blocked_actuation(
             reason, detail=detail, workspace_id=workspace_id, lane_id=lane_label
+        )
+    # Only THEN the target requirement. An unresolvable target has no expectation to hold the
+    # close to, and a target naming a different lane unit is not this close's target — counter
+    # equality is not identity, which is what let an evidence target measured in workspace A
+    # satisfy a close in workspace B (Redmine #14539 review j#91896 finding 1).
+    if evidence_target is None:
+        return blocked_actuation(
+            REASON_LANE_TARGET_UNRESOLVED,
+            detail=(
+                "the lane's durable lifecycle target could not be resolved, so there is no "
+                "expectation to hold the close to; refusing to actuate"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+        )
+    if (evidence_target.workspace, evidence_target.lane) != (workspace_id, lane_label):
+        return blocked_actuation(
+            REASON_LANE_TARGET_UNRESOLVED,
+            detail=(
+                f"the resolved target names {evidence_target.workspace}/{evidence_target.lane} "
+                f"but this close resolved {workspace_id}/{lane_label}; the evidence and the "
+                "close are about different lane units"
+            ),
+            workspace_id=workspace_id,
+            lane_id=lane_label,
         )
     try:
         rows = list_herdr_agent_rows(os.environ)
@@ -223,6 +260,16 @@ def run_guarded_retire_close(
         legacy_workspace_id=legacy_token,
         managed_roles=managed_roles,
     )
+    # THE COMMIT POINT (review j#91896 finding 1). The attestation above ran before the inventory
+    # read and the plan; everything between is a window in which the row can advance a generation
+    # or be recreated. Re-reading it here — immediately before the only destructive call — is what
+    # makes the fence a check-to-act guard rather than a check-then-hope. Drift is zero actuation:
+    # nothing has been closed yet at this point.
+    attested, reason, detail = _attest()
+    if not attested:
+        return blocked_actuation(
+            reason, detail=detail, workspace_id=workspace_id, lane_id=lane_label
+        )
     result = execute_herdr_retire_close(plan)
     # The zero-close fence (Redmine #13754): a close that closed nothing is a retire ONLY
     # when both authorities agree the lane is gone — the durable lifecycle records it

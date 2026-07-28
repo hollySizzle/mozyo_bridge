@@ -30,8 +30,14 @@ from .hibernate_evidence_authority import (
     ResolvedIssuer,
     contract_writer_role,
 )
+from .glance_integration_disposition import canonical_marker_value
 from .hibernate_evidence_envelope import EnvelopeParseError, parse_lane_envelope
-from .redmine_journal_source import marker_fields_in_note
+from .redmine_journal_source import (
+    MARKER_CHANNEL_WORKFLOW_EVENT,
+    marker_components_in_note,
+    marker_logical_gates,
+    strict_marker_fields,
+)
 
 #: The ruling that defines the gate->writer-role contract this policy binds to.
 POLICY_RULING_POINTER = "redmine:#14219:j#85530:Q3"
@@ -67,21 +73,34 @@ def resolve_journal_issuer(
         return ResolvedIssuer()
 
     gates: dict[str, list[dict]] = {}
-    for _channel, fields in marker_fields_in_note(notes or ""):
-        # ``gate`` and ``kind`` are two spellings of ONE logical field, so BOTH are read
-        # (Redmine #14539 review j#91847 finding 3). Reading ``gate`` alone let a marker spell a
-        # second, different authority gate as ``kind`` and have it ignored — so
-        # ``gate=integration_disposition:kind=park_declared`` resolved cleanly to the coordinator,
-        # which is exactly the "two authority gates prove neither" edge this function documents.
-        declared = {
-            str(fields.get(alias, "") or "").strip() for alias in ("gate", "kind")
-        }
+    for channel, components in marker_components_in_note(notes or ""):
+        # ONLY the workflow-event channel is authority. The handoff channel is a delivery
+        # NOTIFICATION (the same F5 boundary the glance grammar holds) and it carries a ``kind``
+        # field, so once ``kind`` became an authority alias a delivery record sitting in the same
+        # journal as an evidence marker would have read as a second gate claim and unresolved a
+        # perfectly good issuer. Restricting the channel is what makes the alias union safe.
+        if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+            continue
+        # The SHARED strict reader, over UNCOLLAPSED components (Redmine #14539 review j#91896
+        # finding 2). Reading the folded dict lost two things at once: a repeated ``gate`` key was
+        # erased by last-write-wins, and surrounding whitespace was normalized away. Either let a
+        # marker the canonical producer could not render resolve to a clean coordinator issuer.
+        # The SAME canonicalizer every other authority consumer passes: two spellings of one
+        # governed token are one declaration, so a canonically-equal duplicate does not make the
+        # body ambiguous. Without this the three consumers would disagree about the same marker.
+        fields = strict_marker_fields(components, canonicalize=canonical_marker_value)
+        if fields is None:
+            # A marker whose body is not renderable declares nothing — and "nothing" must not mean
+            # "skip it and read the next one", so a note carrying one is left unresolved below
+            # unless some OTHER marker establishes exactly one gate. That is the same fail-closed
+            # shape as the conflict case: it never promotes, only withholds.
+            return ResolvedIssuer()
+        declared = marker_logical_gates(fields)
         for gate in declared:
-            if not gate:
-                continue
-            role = contract_writer_role(gate)
-            if role == ISSUER_UNKNOWN:
-                continue
+            # An UNRECOGNIZED gate token still counts as a claim (review j#91896 finding 2):
+            # skipping it let ``gate=integration_disposition:kind=unknown_gate`` resolve as if only
+            # one contract had been named. Its role is unknown, so the note ends up with two gates
+            # and proves neither.
             gates.setdefault(gate, []).append(fields)
 
     if len(gates) != 1:
@@ -90,6 +109,10 @@ def resolve_journal_issuer(
         return ResolvedIssuer()
     (gate, marker_list), = gates.items()
     role = contract_writer_role(gate)
+    if role == ISSUER_UNKNOWN:
+        # The one gate the note names has no contractual writer, so nothing is resolved. Returning
+        # an ANCHORED unknown would be a resolution-shaped value for an unresolved question.
+        return ResolvedIssuer()
 
     anchor = (
         f"{POLICY_RULING_POINTER} {policy_pointer} "

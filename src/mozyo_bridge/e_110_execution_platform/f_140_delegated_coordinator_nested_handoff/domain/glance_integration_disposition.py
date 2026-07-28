@@ -41,6 +41,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MARKER_CHANNEL_WORKFLOW_EVENT,
     marker_components_in_note,
     marker_fields_in_note,
+    marker_logical_gates,
+    strict_marker_fields,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     INTEGRATION_BLOCKED,
@@ -61,6 +63,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 #: ``redmine_journal_source.GATE_BEARING_KINDS``: that set is the *callback-required* gate
 #: vocabulary, and an integration disposition must not become a callback-bearing gate.
 MARKER_GATE_INTEGRATION_DISPOSITION = "integration_disposition"
+
+def canonical_marker_value(key: str, value: str) -> str:
+    """The comparison form of one marker field value for the strict reader (pure).
+
+    Only the governed disposition key has a canonical vocabulary; everything else compares
+    literally, so a repeated ``head`` with two different SHAs is still a conflict.
+    """
+    return canonical_disposition(value) if key == FIELD_DISPOSITION_KEY else value
+
 
 #: The marker field key carrying the disposition token. Named because the authority conflict check
 #: canonicalizes THIS key's values before comparing them (``merged`` and ``merge`` are one
@@ -423,41 +434,30 @@ def has_conflicting_disposition_declaration(
         # surfaces was not enough: each surface also has to be checked for internal multiplicity.
         # A malformed fragment (no ``=``) is refused for the same reason — an authority marker
         # whose body does not parse cleanly is not a declaration this path may act on.
+        # …and INSIDE each marker, through THE shared strict reader (Redmine #14539 reviews
+        # j#91847 F3/F4 and j#91896 F2/F3). It is the same function the issuer resolver uses, so
+        # "what makes a marker body readable" has one definition: every component must be a
+        # whitespace-clean ``key=value`` with a non-empty key, and a key repeated with a different
+        # (canonical) value refuses the marker. The disposition canonicalizer is passed in, so
+        # ``merged`` and ``merge`` are one declaration written twice while every other key
+        # compares literally — the fail-closed reading for a key with no canonical vocabulary.
         for channel, components in marker_components_in_note(text):
             if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
                 continue
-            keyed: dict[str, set[str]] = {}
-            malformed = False
-            for key, value in components:
-                if not key:
-                    # An empty component, or a fragment carrying no ``key=value`` at all. The
-                    # contract refuses the WHOLE marker rather than dropping the fragment.
-                    malformed = True
-                    continue
-                keyed.setdefault(key, set()).add(value)
-            # ``gate`` and ``kind`` are two spellings of ONE logical field, so they are UNIONED,
-            # never first-non-empty (Redmine #14539 review j#91847 finding 3). Reading
-            # ``keyed.get("gate") or keyed.get("kind")`` meant a present ``gate`` masked a
-            # conflicting ``kind``, and ``gate=integration_disposition:kind=park_declared`` — a
-            # note claiming two authority contracts, which by ruling j#86718 proves neither —
-            # passed the conflict check entirely.
-            gates = keyed.get("gate", set()) | keyed.get("kind", set())
+            fields = strict_marker_fields(
+                components, canonicalize=canonical_marker_value
+            )
+            if fields is None:
+                # Unreadable. A body the canonical producer could not render is refused WHOLE, and
+                # since it cannot be read it cannot even be shown to be about another gate — in a
+                # journal that already qualifies as a disposition declaration that is a conflict.
+                return True
+            # ``gate`` / ``kind`` are two spellings of one logical field: UNIONED, never
+            # first-non-empty, so a second gate cannot hide in the other alias.
+            gates = marker_logical_gates(fields)
             if MARKER_GATE_INTEGRATION_DISPOSITION not in gates:
                 continue
-            if malformed or len(gates) > 1:
-                return True
-            # Repetition is judged on the CANONICAL value, matching the field and heading surfaces
-            # above (review j#91847 finding 4): ``disposition=merged`` and ``disposition=merge``
-            # are one declaration written twice, not a conflict. Non-governed keys have no
-            # canonical form, so they compare literally — for those, any repetition at all is a
-            # conflict, which is the fail-closed reading of a key that should appear once.
-            for key, values in keyed.items():
-                if len(values) == 1:
-                    continue
-                if key == FIELD_DISPOSITION_KEY:
-                    if len({canonical_disposition(v) for v in values}) > 1:
-                        return True
-                    continue
+            if len(gates) > 1:
                 return True
     return False
 
@@ -466,6 +466,7 @@ __all__ = (
     "MARKER_GATE_INTEGRATION_DISPOSITION",
     "IntegrationDispositionFacts",
     "canonical_disposition",
+    "canonical_marker_value",
     "fold_integration_disposition",
     "fold_work_unit",
     "has_conflicting_disposition_declaration",
