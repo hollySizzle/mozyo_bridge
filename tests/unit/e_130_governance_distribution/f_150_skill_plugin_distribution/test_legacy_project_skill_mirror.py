@@ -750,12 +750,19 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
     def test_staging_entry_rebound_to_a_regular_file_is_not_swapped_into_place(
         self,
     ) -> None:
-        """The inode identity check, isolated from the no-follow open.
+        """The inode identity check, isolated from the no-follow type check.
 
-        Re-binding the staging name to a *symlink* is already refused when the
-        verification open uses `O_NOFOLLOW`. Re-binding it to an ordinary file
-        opens fine, so only comparing the inode catches it — a mutation probe
-        that removed the comparison stayed green until this case existed.
+        Re-binding the staging name to a *symlink* is already refused by the
+        type of the entry. Re-binding it to an ordinary file is not, so only
+        comparing the inode catches it — a mutation probe that removed the
+        comparison stayed green until this case existed.
+
+        This is also the case that measured the comparison being unsound on its
+        own: on a filesystem that recycles inode numbers the impostor inherited
+        the number and was installed, and this test failed 3 runs out of 3 on
+        Linux overlayfs while passing on tmpfs and APFS (Redmine #14652). It is
+        the outcome-level half of that fix; the property-level half is below,
+        and does not depend on the host recycling anything.
         """
         repo = self._stage()
         canonical = self._source(repo) / "workflow.md"
@@ -780,6 +787,137 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
                 (self._mirror(repo) / name).read_text(encoding="utf-8"),
                 "a substituted staging file was installed as a pinned reference",
             )
+
+    # --- #14652: an inode number is an identity only while it is pinned ------
+
+    def test_ownership_refuses_to_answer_once_the_descriptor_is_closed(self) -> None:
+        """Why the staging descriptor is the last thing closed.
+
+        The name here still refers to the very file that was created — nothing
+        was substituted — so comparing `(st_dev, st_ino)` would answer "ours",
+        and would keep answering "ours" for whatever file inherited the number
+        next. It is refused instead. Fail-closed is not "usually right": an
+        unpinned comparison is not a weaker proof of ownership, it is not one.
+
+        Host-independent by construction. The outcome this prevents needs a
+        filesystem that recycles inode numbers; this asks the question the
+        recycling makes unanswerable, and that question has the same answer
+        everywhere.
+        """
+        repo = self._stage()
+        mirror_fd = os.open(self._mirror(repo), os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, mirror_fd)
+        name = ".mozyo-legacy-mirror.pin-probe.tmp"
+        descriptor = owned_descriptors._OwnedDescriptor(
+            os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=mirror_fd)
+        )
+        self.addCleanup(os.unlink, name, dir_fd=mirror_fd)
+        ownership = owned_descriptors._StagingOwnership(descriptor)
+        ownership.prove()
+
+        self.assertEqual(
+            owned_descriptors._OWNERSHIP_CONFIRMED,
+            ownership.resolve(mirror_fd, name),
+            "the pinned entry was not recognised as ours",
+        )
+        descriptor.close()
+        self.assertEqual(
+            owned_descriptors._OWNERSHIP_UNPROVEN,
+            ownership.resolve(mirror_fd, name),
+            "an unpinned inode number was accepted as an identity",
+        )
+
+    def test_the_staging_descriptor_still_pins_the_inode_at_every_ownership_question(
+        self,
+    ) -> None:
+        """The pin has to be live where the question is asked, in production.
+
+        Measured rather than read off a flag: at each point the sync asks who
+        owns the staging name, `fstat` on the staging descriptor must still
+        succeed — it raises `EBADF` once the descriptor is gone — and must still
+        report the inode the proof was taken from.
+
+        Both callers are covered, which needs both paths: the clean write asks
+        before the swap, and the failed write asks again in the release.
+        """
+        real_resolve = owned_descriptors._StagingOwnership.resolve
+
+        for label, break_the_write in (("clean write", False), ("failed write", True)):
+            with self.subTest(label):
+                repo = self._stage()
+                canonical = self._source(repo) / "workflow.md"
+                canonical.write_text(
+                    canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8"
+                )
+                pinned: list[bool] = []
+
+                def observing_resolve(self, dir_fd, name):  # type: ignore[no-untyped-def]
+                    identity = self._identity
+                    try:
+                        live = os.fstat(self._descriptor.fileno)
+                    except OSError:
+                        pinned.append(False)  # the descriptor is already gone
+                    else:
+                        pinned.append(
+                            identity is not None
+                            and (live.st_dev, live.st_ino) == (identity.st_dev, identity.st_ino)
+                        )
+                    return real_resolve(self, dir_fd, name)
+
+                def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+                    raise OSError(errno.ENOSPC, "injected")
+
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        unittest.mock.patch.object(
+                            owned_descriptors._StagingOwnership, "resolve", observing_resolve
+                        )
+                    )
+                    if break_the_write:
+                        stack.enter_context(
+                            unittest.mock.patch.object(
+                                legacy_mirror_sync.os, "write", failing_write
+                            )
+                        )
+                    self._service(repo).sync()
+
+                self.assertTrue(pinned, "ownership was never asked")
+                self.assertTrue(
+                    all(pinned), "ownership was asked while the inode was not pinned"
+                )
+
+    def test_a_deferred_write_error_is_reported_before_anything_is_installed(self) -> None:
+        """#14652. The close used to be in position to catch a write error the
+        host had deferred, because it ran before the swap. It now runs after —
+        so the flush is what has to catch one, while the file is still staging.
+
+        A flush that fails must therefore leave the mirror entry exactly as it
+        was, and must not be folded into a success (j#90467 R9-F1).
+        """
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+        entry = self._mirror(repo) / "workflow.md"
+        before = entry.read_text(encoding="utf-8")
+        fired: list[int] = []
+
+        def failing_fsync(fd: int) -> None:
+            fired.append(fd)
+            raise OSError(errno.EIO, "injected deferred write error")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "fsync", failing_fsync):
+            code, out, err = self._service(repo).sync()
+
+        self.assertTrue(fired, "the staging flush was never reached")
+        self.assertEqual(1, code)
+        self.assertEqual((), out, "a failed flush still printed the banner")
+        self.assertIn("could not be flushed to disk", "\n".join(err))
+        self.assertEqual(
+            before,
+            entry.read_text(encoding="utf-8"),
+            "a flush that failed still installed the entry",
+        )
+        self.assertEqual([], self._staging_names(repo), "the failed flush left residue")
 
     def test_source_becoming_unreadable_after_the_walk_is_typed(self) -> None:
         """The observation branch inside the bound source directory.
@@ -1335,67 +1473,112 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         self.assertTrue(foreign.exists(), "the unwind deleted an entry that was not ours")
         self.assertEqual("FOREIGN\n", foreign.read_text(encoding="utf-8"))
 
-    def test_verify_open_failure_releases_the_staging(self) -> None:
-        """j#90472 R10-F2. Failing to observe the entry is not evidence that it
-        is foreign; skipping cleanup guaranteed residue instead."""
+    def test_an_unreadable_staging_name_at_swap_time_releases_the_staging(self) -> None:
+        """j#90472 R10-F2, on the observation #14652 replaced the verify open
+        with. Failing to observe the entry is not evidence that it is foreign;
+        skipping cleanup guaranteed residue instead.
+
+        Only the first observation fails, so the release's own observation still
+        answers — a permanently failing `lstat` would test the *unreadable
+        cleanup* branch instead, which is the next test's job.
+        """
         repo = self._stage()
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        real_open = os.open
+        real_lstat = os.lstat
+        fired: list[str] = []
 
-        def failing_verify_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        def failing_staging_lstat(path, *args, **kwargs):  # type: ignore[no-untyped-def]
             if (
                 isinstance(path, str)
                 and path.startswith(".mozyo-legacy-mirror.")
-                and not flags & os.O_CREAT
+                and not fired
             ):
-                raise OSError(errno.EMFILE, "injected")
-            return real_open(path, flags, *args, **kwargs)
+                fired.append(path)
+                raise OSError(errno.EIO, "injected")
+            return real_lstat(path, *args, **kwargs)
 
         with unittest.mock.patch.object(
-            legacy_mirror_sync.os, "open", failing_verify_open
+            owned_descriptors.os, "lstat", failing_staging_lstat
         ):
-            code, out, _err = self._service(repo).sync()
+            code, out, err = self._service(repo).sync()
 
+        self.assertTrue(fired, "the staging observation was never reached")
         self.assertEqual(1, code)
         self.assertEqual((), out)
-        self.assertEqual([], self._staging_names(repo), "verify failure left residue")
+        self.assertIn("could not be re-validated", "\n".join(err))
+        self.assertEqual([], self._staging_names(repo), "the failed observation left residue")
 
-    def test_verify_fstat_failure_releases_the_staging(self) -> None:
-        """The sibling branch of the same window."""
+    def test_a_staging_entry_gone_before_the_swap_is_reported_without_residue(self) -> None:
+        """The sibling branch: the name resolves to nothing at all.
+
+        There is nothing to install and nothing to clean up, so the run reports
+        the aborted swap and claims no surviving residue — claiming residue that
+        is not there was its own defect (j#90467 R9-F3).
+        """
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+        removed: list[str] = []
+
+        def hook(event: str) -> None:
+            if event == HOOK_TEMP_CREATED:
+                for path in self._mirror(repo).iterdir():
+                    if path.name.startswith(".mozyo-legacy-mirror."):
+                        path.unlink()
+                        removed.append(path.name)
+                        break
+
+        code, out, err = self._service(repo, progress_hook=hook).sync()
+
+        self.assertTrue(removed, "the staging entry was never observed to remove")
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        report = "\n".join(err)
+        self.assertIn("was gone before it could be installed", report)
+        self.assertNotIn("still present", report)
+        self.assertEqual([], self._staging_names(repo))
+
+    def test_an_unprovable_staging_identity_never_unlinks(self) -> None:
+        """#14652. Without the identity there is no ownership proof, so the
+        entry is reported and left rather than removed on a guess.
+
+        The identity is read from the pinned descriptor, so the way to lose it
+        is for that read to fail. What must not happen is the cleanup treating
+        "no proof" as "not ours" and saying so, or as "ours" and unlinking.
+        """
         repo = self._stage()
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
         real_open, real_fstat = os.open, os.fstat
-        verify_fds: set[int] = set()
+        staging_fds: set[int] = set()
 
         def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
             fd = real_open(path, flags, *args, **kwargs)
-            if (
-                isinstance(path, str)
-                and path.startswith(".mozyo-legacy-mirror.")
-                and not flags & os.O_CREAT
-            ):
-                verify_fds.add(fd)
+            if flags & os.O_CREAT:
+                staging_fds.add(fd)
             return fd
 
-        def failing_verify_fstat(fd: int):  # type: ignore[no-untyped-def]
-            if fd in verify_fds:
+        def failing_identity_fstat(fd: int):  # type: ignore[no-untyped-def]
+            if fd in staging_fds:
                 raise OSError(errno.EIO, "injected")
             return real_fstat(fd)
 
         with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
             with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "fstat", failing_verify_fstat
+                owned_descriptors.os, "fstat", failing_identity_fstat
             ):
-                code, out, _err = self._service(repo).sync()
+                code, out, err = self._service(repo).sync()
 
-        self.assertTrue(verify_fds, "the verify open was never reached")
+        self.assertTrue(staging_fds, "the staging create was never reached")
         self.assertEqual(1, code)
         self.assertEqual((), out)
-        self.assertEqual([], self._staging_names(repo), "verify failure left residue")
+        self.assertIn("ownership could not be proved", "\n".join(err))
+        self.assertEqual(
+            1, len(self._staging_names(repo)), "an unprovable entry was unlinked anyway"
+        )
 
     def test_a_close_that_unwinds_still_releases_the_staging(self) -> None:
         """j#90477 R11-F1. `_close_quietly` re-raises anything that is not an
@@ -1719,15 +1902,21 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
 
         return tracking_open, failing_close, state
 
-    def test_a_close_primary_survives_a_raising_release(self) -> None:
-        """j#90487 R13-F1. When the close is itself the primary, the release ran
-        bare — a raising release replaced it and left residue. Both must be
-        independent, with the first ordinary primary surviving."""
+    def test_a_raising_release_does_not_take_the_close_with_it(self) -> None:
+        """j#90487 R13-F1, at the position #14652 moved it to.
 
-        class PrimaryClose(Exception):
+        The rule is unchanged — the close and the release are independent, the
+        first primary survives, and neither failure is dropped. What changed is
+        which of the two runs first. The release now goes first because it needs
+        the descriptor the close is about to give up, so the roles are reversed
+        from R13-F1: the release is the primary and the close is the action that
+        must still run and still be recorded.
+        """
+
+        class PrimaryCleanup(Exception):
             pass
 
-        class SecondaryCleanup(Exception):
+        class SecondaryClose(Exception):
             pass
 
         repo = self._stage()
@@ -1736,27 +1925,117 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
 
         service = self._service(repo)
 
-        def exploding_release(mirror_fd: int, temp_name: str, identity):  # type: ignore[no-untyped-def]
-            raise SecondaryCleanup("injected cleanup failure")
+        def exploding_release(mirror_fd: int, temp_name: str, ownership):  # type: ignore[no-untyped-def]
+            raise PrimaryCleanup("injected cleanup failure")
 
         service._release_staging = exploding_release  # type: ignore[method-assign]
         tracking_open, failing_close, state = self._fail_staging_close_with(
-            PrimaryClose("injected close primary")
+            SecondaryClose("injected close failure")
         )
+
+        def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise OSError(errno.ENOSPC, "injected")
 
         with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
             with unittest.mock.patch.object(
                 legacy_mirror_sync.os, "close", failing_close
             ):
-                with self.assertRaises(PrimaryClose) as caught:
-                    service.sync()
+                with unittest.mock.patch.object(
+                    legacy_mirror_sync.os, "write", failing_write
+                ):
+                    with self.assertRaises(PrimaryCleanup) as caught:
+                        service.sync()
 
-        self.assertTrue(state["fired"], "the staging close injection never fired")
+        self.assertTrue(state["fired"], "the staging close never ran after the release raised")
         notes = getattr(caught.exception, "__notes__", [])
         self.assertTrue(
-            any("SecondaryCleanup" in note for note in notes),
-            "the cleanup failure was dropped",
+            any("SecondaryClose" in note for note in notes),
+            "the close failure was dropped",
         )
+
+    def _staging_lifetime_events(self, repo: Path):  # type: ignore[no-untyped-def]
+        """A service whose staging release and staging close announce themselves.
+
+        Returns ``(service, events, open_patch, close_patch)``. The close is
+        observed through the real `os.close` call, so what lands in ``events``
+        is the syscall happening, not a flag the implementation set.
+        """
+        service = self._service(repo)
+        events: list[str] = []
+        real_release = service._release_staging
+        real_open, real_close = os.open, os.close
+        staging_fds: set[int] = set()
+
+        def watching_release(mirror_fd: int, temp_name: str, ownership):  # type: ignore[no-untyped-def]
+            events.append("release")
+            return real_release(mirror_fd, temp_name, ownership)
+
+        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_CREAT:
+                staging_fds.add(fd)
+            return fd
+
+        def watching_close(fd: int) -> None:
+            if fd in staging_fds:
+                staging_fds.discard(fd)
+                events.append("close")
+            real_close(fd)
+
+        service._release_staging = watching_release  # type: ignore[method-assign]
+        return service, events, tracking_open, watching_close
+
+    def test_the_staging_release_always_precedes_the_staging_close(self) -> None:
+        """#14652. The release consults the ownership proof, and that proof is
+        only sound while the staging descriptor still pins the inode — so the
+        release has to happen before the close on every path that has one.
+
+        Two paths, because one alone would be vacuous: the write-failure path
+        releases and then closes, and the success path has the rename consume
+        the entry so the close is the only event. What must never appear is a
+        release after a close.
+        """
+        for label, break_the_write in (("failed write", True), ("clean write", False)):
+            with self.subTest(label):
+                repo = self._stage()
+                canonical = self._source(repo) / "workflow.md"
+                canonical.write_text(
+                    canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8"
+                )
+                service, events, tracking_open, watching_close = self._staging_lifetime_events(
+                    repo
+                )
+
+                def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+                    raise OSError(errno.ENOSPC, "injected")
+
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open)
+                    )
+                    stack.enter_context(
+                        unittest.mock.patch.object(legacy_mirror_sync.os, "close", watching_close)
+                    )
+                    if break_the_write:
+                        stack.enter_context(
+                            unittest.mock.patch.object(
+                                legacy_mirror_sync.os, "write", failing_write
+                            )
+                        )
+                    service.sync()
+
+                self.assertIn("close", events, "the staging close was never observed")
+                self.assertEqual(
+                    break_the_write,
+                    "release" in events,
+                    "the release did not run exactly on the path that needs it",
+                )
+                if break_the_write:
+                    self.assertLess(
+                        events.index("release"),
+                        events.index("close"),
+                        "the release consulted the ownership proof after the pin was gone",
+                    )
 
     def test_the_walk_keeps_the_first_close_failure(self) -> None:
         """j#90487 R13-F1. In the walk, a previous-close primary was overwritten
@@ -1938,7 +2217,12 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
     def test_a_later_control_flow_failure_is_recorded_not_dropped(self) -> None:
         """j#90492 R14-F2. Only the first control-flow exception was kept; a
         second one left no trace in notes or context, while the returned and
-        ordinary channels both record every failure."""
+        ordinary channels both record every failure.
+
+        "First" is by arrival, so the injections follow the teardown order: the
+        release runs before the close (#14652), and it is the release's
+        interrupt that has to surface.
+        """
 
         class PrimaryWrite(Exception):
             pass
@@ -1949,12 +2233,12 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
 
         service = self._service(repo)
 
-        def exiting_release(mirror_fd: int, temp_name: str, identity):  # type: ignore[no-untyped-def]
-            raise SystemExit("injected second control flow")
+        def interrupting_release(mirror_fd: int, temp_name: str, ownership):  # type: ignore[no-untyped-def]
+            raise KeyboardInterrupt("injected first control flow")
 
-        service._release_staging = exiting_release  # type: ignore[method-assign]
+        service._release_staging = interrupting_release  # type: ignore[method-assign]
         tracking_open, failing_close, state = self._fail_staging_close_with(
-            KeyboardInterrupt("injected first control flow")
+            SystemExit("injected second control flow")
         )
 
         def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]

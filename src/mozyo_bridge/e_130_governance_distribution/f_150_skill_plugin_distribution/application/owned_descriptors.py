@@ -8,6 +8,9 @@ are worth reading as a unit:
 - :class:`_OwnedDescriptor` — a descriptor closed at most once, with ownership
   released *before* the close syscall, because the close can itself unwind
   (j#90477 R11-F1 / j#90482 R12-F1).
+- :class:`_StagingOwnership` — the one answer to "does this name still refer to
+  the file this run created?", which is only answerable while the creating
+  descriptor is still open (Redmine #14652).
 - :func:`_teardown_during` — runs teardown actions independently during an
   unwind, keeping three outcome channels distinct: a returned failure, an
   ordinary exception, and a control-flow exception that outranks the primary
@@ -585,9 +588,9 @@ class _OwnedDescriptor:
     unrelated descriptor: a measured run closed a `/dev/null` handle that had
     just been assigned the freed number (j#90477 R11-F1).
 
-    Both the staging descriptor and the verification descriptor go through this
-    one structure, so the ordering cannot be right in one place and wrong in
-    the other.
+    Every descriptor the mirror sync owns — the directory walk's, the leaf
+    reads', the staging file's — goes through this one structure, so the
+    ordering cannot be right in one place and wrong in the other.
     """
 
     __slots__ = ("_fd",)
@@ -616,6 +619,81 @@ class _OwnedDescriptor:
             return True
         self._fd = -1  # detach first: a raising close must not close it twice
         return _close_quietly(fd)
+
+
+#: What a staging name refers to now, relative to the file this run created.
+#:
+#: The set is exhaustive and each caller handles every kind explicitly. Falling
+#: through to the unlink on an answer nobody recognised would be fail-open, and
+#: this is the value the release consults before deleting anything.
+_OWNERSHIP_CONFIRMED = "confirmed"
+_OWNERSHIP_ABSENT = "absent"
+_OWNERSHIP_FOREIGN = "foreign"
+_OWNERSHIP_UNREADABLE = "unreadable"
+_OWNERSHIP_UNPROVEN = "unproven"
+
+
+class _StagingOwnership:
+    """Whether a name still refers to the file this run created.
+
+    ``(st_dev, st_ino)`` is not an identity on its own. A filesystem may hand
+    the same inode number straight back out once the inode is released, and
+    Linux does: on the overlayfs ``/tmp`` of ``python:3.12-slim``, unlinking
+    this run's staging entry and creating an ordinary file at the same name
+    reused the number **20 times out of 20**. The substituted file therefore
+    compared equal to the one this run had created, passed as owned, and
+    ``os.replace`` installed it as a pinned reference (Redmine #14652). The
+    same measurement on tmpfs and on APFS reused it 0 times out of 20, which is
+    why the case stayed green on macOS — and why it only surfaced once #14651
+    stopped a mistaken capability probe from failing the whole module closed on
+    Linux first.
+
+    What turns the number back into an identity is an open descriptor: an inode
+    is not released while a descriptor still refers to it, so its number cannot
+    be handed out again. Measured the same way on the same overlayfs, with the
+    creating descriptor still open: 0 reuses out of 20.
+
+    So this object holds that descriptor and refuses to answer once it is gone.
+    Refusing is the point. An unpinned comparison is not a weaker proof of
+    ownership, it is not a proof at all, and both callers act on the answer —
+    one installs the entry, the other deletes it.
+    """
+
+    __slots__ = ("_descriptor", "_identity")
+
+    def __init__(self, descriptor: _OwnedDescriptor) -> None:
+        self._descriptor = descriptor
+        self._identity: os.stat_result | None = None
+
+    def prove(self) -> None:
+        """Capture the pinned file's identity. Raises whatever ``fstat`` does.
+
+        Read from the descriptor rather than accepted from a caller, so what is
+        compared later cannot have come from anywhere but the file this object
+        pins.
+        """
+        self._identity = os.fstat(self._descriptor.fileno)
+
+    def resolve(self, dir_fd: int, name: str) -> str:
+        """What ``name`` refers to now, as one of the ``_OWNERSHIP_*`` kinds.
+
+        Absence is answered before the pin is consulted, because it is true
+        either way: there is nothing at the name to install or to delete.
+        Claiming surviving residue that was not there was its own defect
+        (j#90467 R9-F3). Every answer that asserts an *identity* needs the pin.
+        """
+        try:
+            present = os.lstat(name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return _OWNERSHIP_ABSENT
+        except OSError:
+            return _OWNERSHIP_UNREADABLE
+        identity = self._identity
+        if identity is None or not self._descriptor.held:
+            return _OWNERSHIP_UNPROVEN
+        if (present.st_dev, present.st_ino) != (identity.st_dev, identity.st_ino):
+            return _OWNERSHIP_FOREIGN
+        return _OWNERSHIP_CONFIRMED
 
 
 def _attach_secondary(primary: BaseException, secondary: object) -> None:

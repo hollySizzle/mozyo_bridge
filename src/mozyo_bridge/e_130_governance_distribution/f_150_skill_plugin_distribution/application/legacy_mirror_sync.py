@@ -31,6 +31,12 @@ Consequences worth stating, because they are easy to undo by accident:
 - the staging file is created with ``O_CREAT | O_EXCL | O_NOFOLLOW`` on the
   mirror descriptor, so this run owns it; the mode is set with ``fchmod`` on
   that fd, never ``chmod`` on a path that could have been re-bound;
+- **that same descriptor stays open until the swap and the cleanup are done**,
+  because the ownership proof compares inode numbers and a released inode
+  number is handed straight back out on Linux — a substituted file inherited
+  it and was installed as a pinned reference (Redmine #14652). Deferred write
+  errors, which the close used to be in position to report before anything was
+  installed, are reported by an explicit ``fsync`` instead;
 - the swap is ``os.replace`` with ``src_dir_fd`` / ``dst_dir_fd``;
 - cleanup unlinks this run's exact name relative to the same descriptor.
 
@@ -63,7 +69,12 @@ from pathlib import Path
 
 from .owned_descriptors import (
     _close_quietly,
+    _OWNERSHIP_ABSENT,
+    _OWNERSHIP_CONFIRMED,
+    _OWNERSHIP_FOREIGN,
+    _OWNERSHIP_UNREADABLE,
     _OwnedDescriptor,
+    _StagingOwnership,
     _teardown_during,
 )
 from .platform_capabilities import missing_platform_capabilities
@@ -537,6 +548,33 @@ class LegacyProjectSkillMirrorSync:
         cleanup unlinked by name and deleted a foreign entry substituted at
         that name (R9-F2), and an inline cleanup plus the outer ``finally``
         ran twice, claiming residue that no longer existed (R9-F3).
+
+        Descriptor lifetime and the close are ordered deliberately, and the
+        order is load-bearing on both sides (Redmine #14652):
+
+        - **the staging descriptor is closed last**, after the swap and after
+          the release. The ownership proof compares inode numbers, and an inode
+          number is an identity only while the inode cannot be recycled — which
+          is exactly what holding this descriptor guarantees. Closing it before
+          the proof is consumed let a file substituted at the staging name
+          inherit the same number and be installed as a pinned reference on
+          Linux (:class:`_StagingOwnership` carries the measurement);
+        - **so an explicit ``fsync`` reports deferred write errors** where the
+          close used to: while the file is still only staging and nothing has
+          been installed. The close still runs on every path and its result is
+          still a violation, never discarded (R9-F1) — see
+          :meth:`_close_staging`.
+
+        ``os.fsync`` is deliberately *not* added to
+        :mod:`.platform_capabilities`. That manifest exists for the
+        descriptor-relative primitives whose absence would otherwise degrade
+        this service to path-based I/O, and it must list every one of them
+        (j#90450 R7-F4). ``fsync`` is in neither position: it takes no
+        ``dir_fd``, it has no path-based fallback to degrade to, and Python
+        provides it everywhere. A host that refuses it on a regular file gets a
+        typed write failure and the sync refuses to write — the same
+        fail-closed stance the rest of this module takes, stated here so it
+        reads as a decision rather than an omission.
         """
         payload, failure = self._read_bound(source_fd, name)
         if failure is not None:
@@ -551,6 +589,7 @@ class LegacyProjectSkillMirrorSync:
 
         subject = f"{MIRROR_RELATIVE}/{describe_name(name)}"
         temp_name = f"{_TEMP_PREFIX}{os.urandom(8).hex()}.tmp"
+        staging_subject = f"{MIRROR_RELATIVE}/{describe_name(temp_name)}"
         try:
             temp = _OwnedDescriptor(
                 os.open(
@@ -567,10 +606,10 @@ class LegacyProjectSkillMirrorSync:
                 ),
             )
 
-        # Identity is captured immediately, before any write can fail: it is
-        # the only proof of ownership the cleanup path has.
-        identity: os.stat_result | None = None
-        write_failure: str | None = None
+        # The descriptor this holds is not just a handle to write through: it is
+        # what makes the inode comparison an identity at all, so it outlives
+        # every use of the proof (Redmine #14652).
+        ownership = _StagingOwnership(temp)
         staging_live = True
 
         def release() -> tuple[Violation, ...]:
@@ -585,135 +624,91 @@ class LegacyProjectSkillMirrorSync:
             if not staging_live:
                 return ()
             staging_live = False
-            return self._release_staging(mirror_fd, temp_name, identity)
+            return self._release_staging(mirror_fd, temp_name, ownership)
 
-        try:
-            identity = os.fstat(temp.fileno)
-            view = memoryview(payload or b"")
-            # A single `os.write` may write fewer bytes than asked
-            # (j#90450 R7-F3). A run of zero-progress writes would spin
-            # forever, so it is bounded and reported instead.
-            stalled = 0
-            while view:
-                written = os.write(temp.fileno, view)
-                if written <= 0:
-                    stalled += 1
-                    if stalled > 16:
-                        raise OSError(errno.EIO, "write made no progress")
-                    continue
+        def install() -> tuple[Violation, ...]:
+            """Write the payload and swap it into place, without closing.
+
+            Split from the rails around it only so that the close has exactly
+            one home — after this, on every path — rather than a copy per
+            branch.
+            """
+            nonlocal staging_live
+
+            write_failure: str | None = None
+            flushing = False
+            try:
+                # Identity is captured from the descriptor, immediately, before
+                # any write can fail: it is the only proof of ownership the
+                # cleanup path has.
+                ownership.prove()
+                view = memoryview(payload or b"")
+                # A single `os.write` may write fewer bytes than asked
+                # (j#90450 R7-F3). A run of zero-progress writes would spin
+                # forever, so it is bounded and reported instead.
                 stalled = 0
-                view = view[written:]
-            # `fchmod` on our own descriptor: a path-based `chmod` here changed
-            # a victim's mode when the temp name was re-bound to a symlink
-            # between create and chmod (j#90418 R6-F1 case 4).
-            os.fchmod(temp.fileno, 0o644)
-        except OSError:
-            write_failure = "staging file could not be written"
-        except BaseException as primary:
-            # Not just `OSError`: a non-OSError unwinding the write reached
-            # neither the hook nor the verify safety net, so the staging entry
-            # this run owned was left behind (j#90472 R10-F1). The close and the
-            # release may each unwind too — they are attempted independently so
-            # one failing cannot skip the other, and neither replaces the
-            # exception the caller sees (j#90477 R11-F1 / j#90482 R12-F2).
-            interrupt = _teardown_during(primary, temp.close, release)
-            if interrupt is not None:
-                raise interrupt
-            raise
-        finally:
-            # A close can report a deferred write error, so discarding its
-            # result folded a real failure into a `synced` banner and exit 0
-            # (j#90467 R9-F1). `held` is false on the re-raise path above,
-            # which already closed and released.
-            if temp.held:
-                try:
-                    closed_cleanly = temp.close()
-                except BaseException as close_primary:
-                    # The close IS the primary here. The release must still run,
-                    # independently, and must not replace it — a raising release
-                    # took its place and left residue (j#90487 R13-F1).
-                    interrupt = _teardown_during(close_primary, release)
-                    if interrupt is not None:
-                        raise interrupt
-                    raise
-                if not closed_cleanly and write_failure is None:
-                    write_failure = (
-                        "staging file could not be closed; the write may not have reached disk"
-                    )
-
-        if write_failure is not None:
-            return (Violation(RULE_WRITE, WRITE_FAILED, subject, write_failure),) + release()
-
-        try:
-            self._notify(HOOK_TEMP_CREATED)
-        except BaseException as primary:
-            interrupt = _teardown_during(primary, release)
-            if interrupt is not None:
-                raise interrupt
-            raise
-
-        # From here to the rename, an exception must still release the staging
-        # entry; the explicit branches below handle their own cases.
-        # `os.replace` renames whatever the NAME refers to, and it does not
-        # follow symlinks — so a name re-bound between create and swap gets the
-        # foreign entry installed as a pinned reference (j#90418 R6-F1 case 4).
-        # Confirm the name still resolves to the inode we created. On mismatch
-        # nothing is unlinked: the entry is not ours.
-        try:
-            try:
-                verify = _OwnedDescriptor(os.open(temp_name, _FILE_FLAGS, dir_fd=mirror_fd))
+                while view:
+                    written = os.write(temp.fileno, view)
+                    if written <= 0:
+                        stalled += 1
+                        if stalled > 16:
+                            raise OSError(errno.EIO, "write made no progress")
+                        continue
+                    stalled = 0
+                    view = view[written:]
+                # `fchmod` on our own descriptor: a path-based `chmod` here
+                # changed a victim's mode when the temp name was re-bound to a
+                # symlink between create and chmod (j#90418 R6-F1 case 4).
+                os.fchmod(temp.fileno, 0o644)
+                flushing = True
+                # The close used to run before the swap, which is what made it
+                # the place a deferred write error surfaced in time to stop an
+                # install (j#90467 R9-F1). The close now has to come last, so
+                # the flush is what reports one — here, while the entry is
+                # still only staging and nothing has been installed.
+                os.fsync(temp.fileno)
             except OSError:
-                # Not observing the entry is not evidence that it is foreign.
-                # `_release_staging` re-proves identity and leaves anything
-                # that is not ours untouched, so routing through it is strictly
-                # safer than leaving guaranteed residue (j#90472 R10-F2).
-                return (
-                    Violation(
-                        RULE_WRITE,
-                        WRITE_FAILED,
-                        f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
-                        "staging entry could not be re-opened for verification",
-                    ),
-                ) + release()
-            try:
-                current = os.fstat(verify.fileno)
-            except OSError:
-                verify_failure = Violation(
-                    RULE_WRITE,
-                    WRITE_FAILED,
-                    f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
-                    "staging entry could not be re-validated",
+                write_failure = (
+                    "staging file could not be flushed to disk"
+                    if flushing
+                    else "staging file could not be written"
                 )
-                verify.close()
-                return (verify_failure,) + release()
-            except BaseException as primary:
-                interrupt = _teardown_during(primary, verify.close, release)
-                if interrupt is not None:
-                    raise interrupt
-                raise
-            finally:
-                if verify.held:
-                    try:
-                        verify.close()
-                    except BaseException as close_primary:
-                        interrupt = _teardown_during(close_primary, release)
-                        if interrupt is not None:
-                            raise interrupt
-                        raise
 
-            if identity is None or (current.st_dev, current.st_ino) != (
-                identity.st_dev,
-                identity.st_ino,
-            ):
+            if write_failure is not None:
+                return (Violation(RULE_WRITE, WRITE_FAILED, subject, write_failure),) + release()
+
+            self._notify(HOOK_TEMP_CREATED)
+
+            # `os.replace` renames whatever the NAME refers to, and it does not
+            # follow symlinks — so a name re-bound between create and swap gets
+            # the foreign entry installed as a pinned reference (j#90418 R6-F1
+            # case 4). Ask whether the name still refers to the file we created;
+            # only `_OWNERSHIP_CONFIRMED` may proceed.
+            resolved = ownership.resolve(mirror_fd, temp_name)
+            if resolved == _OWNERSHIP_FOREIGN:
                 staging_live = False  # not ours: never unlink it
                 return (
                     Violation(
                         RULE_WRITE,
                         WRITE_FAILED,
-                        f"{MIRROR_RELATIVE}/{describe_name(temp_name)}",
+                        staging_subject,
                         "staging entry was rebound while the sync held it",
                     ),
                 )
+            if resolved != _OWNERSHIP_CONFIRMED:
+                # Not observing the entry is not evidence that it is foreign.
+                # `_release_staging` re-proves ownership and leaves anything
+                # that is not ours untouched, so routing through it is strictly
+                # safer than leaving guaranteed residue (j#90472 R10-F2).
+                if resolved == _OWNERSHIP_ABSENT:
+                    detail = "staging entry was gone before it could be installed"
+                elif resolved == _OWNERSHIP_UNREADABLE:
+                    detail = "staging entry could not be re-validated"
+                else:
+                    detail = "staging entry's ownership could not be proved"
+                return (
+                    Violation(RULE_WRITE, WRITE_FAILED, staging_subject, detail),
+                ) + release()
 
             try:
                 os.replace(temp_name, name, src_dir_fd=mirror_fd, dst_dir_fd=mirror_fd)
@@ -737,16 +732,54 @@ class LegacyProjectSkillMirrorSync:
 
             staging_live = False  # the rename consumed it
             return ()
+
+        try:
+            problems = install()
         except BaseException as primary:
-            interrupt = _teardown_during(primary, release)
+            # Not just `OSError`: a non-OSError unwinding the write reached
+            # neither the hook nor the swap safety net, so the staging entry
+            # this run owned was left behind (j#90472 R10-F1). The release and
+            # the close may each unwind too — they are attempted independently
+            # so one failing cannot skip the other, and neither replaces the
+            # exception the caller sees (j#90477 R11-F1 / j#90482 R12-F2 /
+            # j#90487 R13-F1). The release runs FIRST: it needs the descriptor
+            # the close is about to give up.
+            interrupt = _teardown_during(primary, release, temp.close)
             if interrupt is not None:
                 raise interrupt
             raise
+        return problems + self._close_staging(temp, subject)
 
+    @staticmethod
+    def _close_staging(temp: _OwnedDescriptor, subject: str) -> tuple[Violation, ...]:
+        """Close the staging descriptor last, and report a close that failed.
+
+        Last, because the ownership proof is a comparison of inode numbers and
+        those are only identities while the inode is pinned by this descriptor
+        (:class:`_StagingOwnership`); the release and the swap both consult it.
+
+        Reported, because discarding a close result folded a real deferred
+        write error into a `synced` banner and exit 0 (j#90467 R9-F1). Nothing
+        is written between the ``fsync`` and this, so a failure here is a
+        backstop rather than the detector it used to be — but a backstop that
+        returns silence is not one.
+        """
+        if not temp.held:
+            return ()
+        if temp.close():
+            return ()
+        return (
+            Violation(
+                RULE_WRITE,
+                WRITE_FAILED,
+                subject,
+                "staging file could not be closed cleanly",
+            ),
+        )
 
     @staticmethod
     def _release_staging(
-        mirror_fd: int, temp_name: str, identity: os.stat_result | None
+        mirror_fd: int, temp_name: str, ownership: _StagingOwnership
     ) -> tuple[Violation, ...]:
         """Remove this run's staging entry, and only this run's.
 
@@ -755,42 +788,34 @@ class LegacyProjectSkillMirrorSync:
         substituted at that name (R9-F2), and running from both an inline
         return and the outer ``finally`` reported "still present" for residue
         the second call had just removed (R9-F3). Ownership is re-proved
-        against the creation identity, and this is the single cleanup path.
+        through :class:`_StagingOwnership`, and this is the single cleanup path.
 
-        A window remains between the check and the unlink. It is NOT the same
-        shape as the verify-to-replace residual, and the docs say so: that one
-        can install a foreign inode, this one can delete a foreign entry. Both
-        sit inside the threat model where an actor able to modify the mirror
+        Only ``_OWNERSHIP_CONFIRMED`` unlinks. Every other answer — including
+        the one that says the descriptor pinning the inode has already been
+        closed, so no comparison can be trusted — leaves the entry alone and
+        reports it.
+
+        A window remains between the answer and the unlink. It is NOT the same
+        shape as the swap-time residual, and the docs say so: that one can
+        install a foreign inode, this one can delete a foreign entry. Both sit
+        inside the threat model where an actor able to modify the mirror
         directory can modify entries directly, and closing either needs
         directory-level exclusion (j#90472 R10-F3).
         """
         display = f"{MIRROR_RELATIVE}/{describe_name(temp_name)}"
-        try:
-            present = os.lstat(temp_name, dir_fd=mirror_fd)
-        except FileNotFoundError:
+        resolved = ownership.resolve(mirror_fd, temp_name)
+        if resolved == _OWNERSHIP_ABSENT:
             return ()
-        except OSError:
-            return (
-                Violation(
-                    RULE_WRITE,
-                    CLEANUP_FAILED,
-                    display,
-                    "staging file could not be inspected and may still be present",
-                ),
-            )
-
-        if identity is None or (present.st_dev, present.st_ino) != (
-            identity.st_dev,
-            identity.st_ino,
-        ):
-            return (
-                Violation(
-                    RULE_WRITE,
-                    CLEANUP_FAILED,
-                    display,
-                    "the staging name now refers to another entry, which was left untouched",
-                ),
-            )
+        if resolved != _OWNERSHIP_CONFIRMED:
+            if resolved == _OWNERSHIP_UNREADABLE:
+                detail = "staging file could not be inspected and may still be present"
+            elif resolved == _OWNERSHIP_FOREIGN:
+                detail = "the staging name now refers to another entry, which was left untouched"
+            else:
+                detail = (
+                    "the staging entry's ownership could not be proved, so it was left in place"
+                )
+            return (Violation(RULE_WRITE, CLEANUP_FAILED, display, detail),)
 
         try:
             os.unlink(temp_name, dir_fd=mirror_fd)
