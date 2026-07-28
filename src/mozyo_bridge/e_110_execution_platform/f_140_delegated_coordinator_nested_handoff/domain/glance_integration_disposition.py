@@ -365,12 +365,23 @@ def has_conflicting_disposition_declaration(
 
     Only structurally qualifying journals are examined, on the same terms as
     :func:`_journal_disposition`, so a stray ``disposition:`` line elsewhere is never a conflict.
+
+    ALL THREE governed surfaces are enumerated: ``disposition:`` field lines, workflow-event marker
+    fields, and the heading's own inline ``: <value>`` form — each with ``finditer``, never
+    ``search``. The heading was the one this function first read with ``search``, so a journal
+    carrying ``## Integration disposition: merge`` and
+    ``## Integration disposition: explicit_deferral`` reported no conflict at all (Redmine #14539
+    review j#91747 finding 4). A partial enumeration is not a conflict detector: whichever surface
+    is read singly becomes the bypass.
     """
     for _, notes in journals or ():
         text = notes or ""
-        heading = _HEADING_RE.search(text)
+        headings = [
+            m.group("value") for m in _HEADING_RE.finditer(text) if m.group("value")
+        ]
+        qualifies = _HEADING_RE.search(text) is not None
         marker_value = _marker_disposition_value(text)
-        if heading is None and marker_value is None:
+        if not qualifies and marker_value is None:
             continue
         declared = {
             canonical_disposition(m.group("value"))
@@ -385,8 +396,7 @@ def has_conflicting_disposition_declaration(
             raw = (fields.get("disposition") or "").strip()
             if raw:
                 declared.add(canonical_disposition(raw))
-        if heading is not None and heading.group("value"):
-            declared.add(canonical_disposition(heading.group("value")))
+        declared.update(canonical_disposition(value) for value in headings)
         if len(declared) > 1:
             return True
     return False

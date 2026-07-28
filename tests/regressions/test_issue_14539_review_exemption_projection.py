@@ -122,6 +122,14 @@ CLOSE = close()
 #: because under patch_equivalent they differ and the fence must bind to the SOURCE head.
 INTEGRATION_HEAD = "7c1d2e3f4a5b60718293a4b5c6d7e8f90a1b2c3d"
 
+#: The lane identity the strict integration evidence must name. The retire is TOLD this via its own
+#: arguments (review j#91747 finding 3) — the observation file can never certify its own binding.
+EVIDENCE_WORKSPACE = "ws"
+EVIDENCE_LANE = "r1"
+EVIDENCE_LANE_GENERATION = "1"
+INTEGRATION_BRANCH = "main-next"
+
+
 #: A legacy, lane-unbound disposition note. Valid for the glance projection forever; NOT automated
 #: terminal-retire evidence (review j#91696 finding 2), which is its own pin below.
 INTEGRATION_MERGED_LEGACY = "## Integration disposition\n- disposition: merged\n"
@@ -138,13 +146,33 @@ def integration_merged(source_head: str = HEAD) -> str:
     return (
         "## Integration disposition\n"
         "- disposition: merged\n"
-        "[mozyo:workflow-event:gate=integration_disposition:workspace=ws:lane=r1:"
-        f"lane_generation=1:head={source_head}:integration_head={INTEGRATION_HEAD}:"
-        "integration_branch=main-next:disposition=merge]\n"
+        "[mozyo:workflow-event:gate=integration_disposition:"
+        f"workspace={EVIDENCE_WORKSPACE}:lane={EVIDENCE_LANE}:"
+        f"lane_generation={EVIDENCE_LANE_GENERATION}:head={source_head}:"
+        f"integration_head={INTEGRATION_HEAD}:"
+        f"integration_branch={INTEGRATION_BRANCH}:disposition=merge]\n"
     )
 
 
 INTEGRATION_MERGED = integration_merged()
+
+
+
+def retire_args(obs_path, *, issue="14539", assertion=False, **over):
+    """The retire namespace for the exemption route, with the evidence identity bound."""
+    ns = dict(
+        review_generation_json=None,
+        review_exemption_json=obs_path,
+        latest_generation_admissible=assertion,
+        issue=issue,
+        lane_label="issue_14539_review_exemption_projection",
+        integration_branch=INTEGRATION_BRANCH,
+        evidence_workspace=EVIDENCE_WORKSPACE,
+        evidence_lane=EVIDENCE_LANE,
+        evidence_lane_generation=EVIDENCE_LANE_GENERATION,
+    )
+    ns.update(over)
+    return argparse.Namespace(**ns)
 
 
 def state_of(journals, *, issue_open=True):
@@ -265,14 +293,11 @@ class TerminalRetireAdmissionTests(unittest.TestCase):
     """Acceptance 2/3: re-verify at action time; never require a false assert."""
 
     def _resolve(self, **over):
-        base = dict(
-            review_generation_json=None,
-            review_exemption_json=None,
-            latest_generation_admissible=False,
-            issue="14539",
-        )
+        base = dict(review_exemption_json=None)
         base.update(over)
-        return _resolve_latest_generation_admissible(argparse.Namespace(**base))
+        return _resolve_latest_generation_admissible(
+            retire_args(base.pop("review_exemption_json"), **base)
+        )
 
     def _obs(self, tmp, journals):
         path = Path(tmp) / "exemption.json"
@@ -390,12 +415,7 @@ class ReviewJ90137Tests(unittest.TestCase):
 
     def _resolve(self, obs_path, *, issue="14539", assertion=False):
         return _resolve_latest_generation_admissible(
-            argparse.Namespace(
-                review_generation_json=None,
-                review_exemption_json=obs_path,
-                latest_generation_admissible=assertion,
-                issue=issue,
-            )
+            retire_args(obs_path, issue=issue, assertion=assertion)
         )
 
     def _obs(self, tmp, journals, *, issue="14539", name="o.json"):
@@ -517,12 +537,7 @@ class ReviewJ90244Tests(unittest.TestCase):
 
     def _resolve(self, obs_path, *, issue="14539"):
         return _resolve_latest_generation_admissible(
-            argparse.Namespace(
-                review_generation_json=None,
-                review_exemption_json=obs_path,
-                latest_generation_admissible=False,
-                issue=issue,
-            )
+            retire_args(obs_path, issue=issue, assertion=False)
         )
 
     def _obs(self, tmp, journals, name="o.json"):
@@ -620,12 +635,7 @@ class ReviewJ90289Tests(unittest.TestCase):
 
     def _resolve(self, obs_path, *, issue="14539"):
         return _resolve_latest_generation_admissible(
-            argparse.Namespace(
-                review_generation_json=None,
-                review_exemption_json=obs_path,
-                latest_generation_admissible=False,
-                issue=issue,
-            )
+            retire_args(obs_path, issue=issue, assertion=False)
         )
 
     def _obs(self, tmp, journals):
@@ -728,12 +738,7 @@ class ReviewJ91577CombinedGateTests(unittest.TestCase):
 
     def _resolve(self, obs_path, *, issue="14539"):
         return _resolve_latest_generation_admissible(
-            argparse.Namespace(
-                review_generation_json=None,
-                review_exemption_json=obs_path,
-                latest_generation_admissible=False,
-                issue=issue,
-            )
+            retire_args(obs_path, issue=issue, assertion=False)
         )
 
     def _obs(self, tmp, journals):
@@ -837,12 +842,7 @@ class ReviewJ91577EvidenceIdentityTests(unittest.TestCase):
 
     def _resolve(self, obs_path, *, issue="14539"):
         return _resolve_latest_generation_admissible(
-            argparse.Namespace(
-                review_generation_json=None,
-                review_exemption_json=obs_path,
-                latest_generation_admissible=False,
-                issue=issue,
-            )
+            retire_args(obs_path, issue=issue, assertion=False)
         )
 
     def _obs(self, tmp, journals):
@@ -1069,12 +1069,7 @@ class ReviewJ91696IntegrationEvidenceTests(unittest.TestCase):
 
     def _resolve(self, obs_path, *, issue="14539"):
         return _resolve_latest_generation_admissible(
-            argparse.Namespace(
-                review_generation_json=None,
-                review_exemption_json=obs_path,
-                latest_generation_admissible=False,
-                issue=issue,
-            )
+            retire_args(obs_path, issue=issue, assertion=False)
         )
 
     def _obs(self, tmp, journals):
@@ -1191,6 +1186,244 @@ class ReviewJ91696IntegrationEvidenceTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as t:
             self.assertFalse(self._resolve(self._obs(t, journals)))
+
+
+class ReviewJ91747MarkerPathTests(unittest.TestCase):
+    """R7-F1: progression suppression must be ONE decision, taken after the outcome is known.
+
+    R6's fix added the F10 check on the heading path but left the marker branch removing the
+    progression gates unconditionally and BEFORE the conclusion was resolved. So the two halves of
+    the same rule disagreed in opposite directions: a canonical ``conclusion=approved`` review lost
+    its Close, while a heading-only open round kept one. The record's meaning must not depend on
+    whether a structured marker happens to be present.
+    """
+
+    COMMIT = "2222222222222222222222222222222222222222"
+
+    def _history(self, newest):
+        request = (
+            f"## Gate: Review Request\n"
+            f"- commit: {self.COMMIT}\n"
+            f"[mozyo:workflow-event:gate=review_request:head={self.COMMIT}]\n"
+        )
+        return [
+            ("99", IMPLEMENTATION_DONE),
+            ("100", request),
+            ("200", newest),
+            ("203", integration_merged(self.COMMIT)),
+        ]
+
+    def _combined(self, *, conclusion, marker_conclusion=None):
+        body = (
+            f"## Gate: Review + Close\n"
+            f"- commit: {self.COMMIT}\n"
+            f"- 結論: {conclusion}\n"
+            "- changed_paths:\n"
+            "  - `vibes/docs/logics/coordinator-sublane-development-flow.md`\n"
+        )
+        if marker_conclusion is not None:
+            body += (
+                f"[mozyo:workflow-event:gate=review_result:conclusion={marker_conclusion}"
+                f":head={self.COMMIT}:req=100]\n"
+            )
+        return body
+
+    def test_an_approved_review_keeps_its_close_with_and_without_a_marker(self):
+        """The literal defect: the marker branch dropped Close before reading the conclusion."""
+        with_marker = self._history(
+            self._combined(conclusion="承認", marker_conclusion="approved")
+        )
+        without_marker = self._history(self._combined(conclusion="承認"))
+        marked, marked_state = state_of(with_marker, issue_open=False)
+        plain, plain_state = state_of(without_marker, issue_open=False)
+        self.assertEqual(marked.latest_gate, "close")
+        self.assertEqual(plain.latest_gate, "close")
+        self.assertEqual(marked_state, plain_state)
+        self.assertEqual(marked_state, LANE_STATE_RETIRE_READY)
+
+    def test_a_changes_requested_marker_still_suppresses_the_close(self):
+        """The other direction must not regress: an open round is still not advanced past."""
+        facts, state = state_of(
+            self._history(
+                self._combined(conclusion="要修正", marker_conclusion="changes_requested")
+            )
+        )
+        self.assertNotEqual(facts.latest_gate, "close")
+        self.assertNotEqual(state, LANE_STATE_RETIRE_READY)
+
+    def test_a_blocker_marker_still_suppresses_the_close(self):
+        facts, _ = state_of(
+            self._history(self._combined(conclusion="blocker", marker_conclusion="blocker"))
+        )
+        self.assertNotEqual(facts.latest_gate, "close")
+
+    def test_a_review_request_marker_still_suppresses_the_close(self):
+        newest = (
+            f"## Gate: Review Request + Close\n"
+            f"- commit: {self.COMMIT}\n"
+            f"[mozyo:workflow-event:gate=review_request:head={self.COMMIT}]\n"
+        )
+        facts, state = state_of(self._history(newest))
+        self.assertNotEqual(facts.latest_gate, "close")
+        self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
+
+
+class ReviewJ91747EvidenceBindingTests(unittest.TestCase):
+    """R7-F2/F3: the strict evidence must come from the CURRENT declaration and name THIS lane."""
+
+    def _obs(self, tmp, journals):
+        path = Path(tmp) / "o.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "issue": "14539",
+                    "journals": [{"journal_id": j, "notes": n} for j, n in journals],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def _resolve(self, journals, **over):
+        with tempfile.TemporaryDirectory() as t:
+            return _resolve_latest_generation_admissible(
+                retire_args(self._obs(t, journals), **over)
+            )
+
+    def test_a_newer_legacy_note_cannot_borrow_an_older_markers_source_head(self):
+        """F2: source head from j100, freshness journal id from j300 — two declarations, one fence.
+
+        The ordering fence said "the integration is no older than the change scope"; j300 satisfied
+        it while carrying no evidence, and j100 supplied a head it was too old to supply.
+        """
+        journals = [
+            ("50", GATE_EXEMPT),
+            ("100", integration_merged(HEAD)),
+            ("200", IMPLEMENTATION_DONE),
+            ("300", INTEGRATION_MERGED_LEGACY),
+            ("400", CLOSE),
+        ]
+        self.assertFalse(self._resolve(journals))
+
+    def test_the_same_history_with_the_evidence_on_the_current_declaration_admits(self):
+        """Negative control: only WHICH journal carries the enveloped marker differs."""
+        journals = [
+            ("50", GATE_EXEMPT),
+            ("100", INTEGRATION_MERGED_LEGACY),
+            ("200", IMPLEMENTATION_DONE),
+            ("300", integration_merged(HEAD)),
+            ("400", CLOSE),
+        ]
+        self.assertTrue(self._resolve(journals))
+
+    #: Exemption, scope, enveloped merge, Close — the shape every binding test varies one axis of.
+    def _bound_history(self):
+        return [
+            ("101", GATE_EXEMPT),
+            ("102", IMPLEMENTATION_DONE),
+            ("103", integration_merged(HEAD)),
+            ("104", CLOSE),
+        ]
+
+    def test_the_bound_history_admits(self):
+        self.assertTrue(self._resolve(self._bound_history()))
+
+    def test_each_envelope_dimension_must_match_the_retires_own_arguments(self):
+        """F3: requiring a lane-enveloped marker and ignoring the envelope is not a fence."""
+        for label, override in (
+            ("workspace", {"evidence_workspace": "foreign_ws"}),
+            ("lane", {"evidence_lane": "foreign_lane"}),
+            ("generation", {"evidence_lane_generation": "999"}),
+            ("integration_branch", {"integration_branch": "unrelated"}),
+        ):
+            with self.subTest(label):
+                self.assertFalse(self._resolve(self._bound_history(), **override))
+
+    def test_an_absent_expected_identity_fails_closed(self):
+        """A missing expectation must block, never skip its own check."""
+        for label, override in (
+            ("workspace", {"evidence_workspace": None}),
+            ("lane", {"evidence_lane": ""}),
+            ("generation", {"evidence_lane_generation": None}),
+            ("integration_branch", {"integration_branch": None}),
+        ):
+            with self.subTest(label):
+                self.assertFalse(self._resolve(self._bound_history(), **override))
+
+    def test_a_foreign_lanes_evidence_does_not_admit(self):
+        """The reviewer's reproduction, end to end: only the source head matched."""
+        foreign = (
+            "## Integration disposition\n"
+            "- disposition: merged\n"
+            "[mozyo:workflow-event:gate=integration_disposition:workspace=foreign_ws:"
+            f"lane=foreign_lane:lane_generation=999:head={HEAD}:"
+            f"integration_head={INTEGRATION_HEAD}:integration_branch=unrelated:disposition=merge]\n"
+        )
+        journals = [
+            ("101", GATE_EXEMPT),
+            ("102", IMPLEMENTATION_DONE),
+            ("103", foreign),
+            ("104", CLOSE),
+        ]
+        self.assertFalse(self._resolve(journals))
+
+
+class ReviewJ91747InlineHeadingConflictTests(unittest.TestCase):
+    """R7-F4: the conflict detector enumerated two of three governed surfaces."""
+
+    def test_two_inline_headings_disagreeing_is_a_conflict(self):
+        note = (
+            "## Integration disposition: merge\n"
+            "## Integration disposition: explicit_deferral\n"
+        )
+        self.assertTrue(has_conflicting_disposition_declaration([("103", note)]))
+
+    def test_the_reverse_order_is_equally_a_conflict(self):
+        note = (
+            "## Integration disposition: explicit_deferral\n"
+            "## Integration disposition: merge\n"
+        )
+        self.assertTrue(has_conflicting_disposition_declaration([("103", note)]))
+
+    def test_repeated_inline_headings_that_agree_are_not_a_conflict(self):
+        """Negative control: the same value twice — including via an alias — is one declaration."""
+        note = (
+            "## Integration disposition: merge\n"
+            "## Integration disposition: merged\n"
+        )
+        self.assertFalse(has_conflicting_disposition_declaration([("103", note)]))
+
+    def test_an_inline_heading_conflicting_with_a_marker_is_a_conflict(self):
+        note = (
+            "## Integration disposition: explicit_deferral\n"
+            + integration_merged(HEAD).split("\n", 1)[1]
+        )
+        self.assertTrue(has_conflicting_disposition_declaration([("103", note)]))
+
+    def test_the_retire_refuses_the_multiple_heading_record(self):
+        note = (
+            "## Integration disposition: merge\n"
+            "## Integration disposition: explicit_deferral\n"
+            + integration_merged(HEAD).split("\n", 2)[2]
+        )
+        journals = [
+            ("101", GATE_EXEMPT),
+            ("102", IMPLEMENTATION_DONE),
+            ("103", note),
+            ("104", CLOSE),
+        ]
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / "o.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "issue": "14539",
+                        "journals": [{"journal_id": j, "notes": n} for j, n in journals],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertFalse(_resolve_latest_generation_admissible(retire_args(str(path))))
 
 
 if __name__ == "__main__":  # pragma: no cover

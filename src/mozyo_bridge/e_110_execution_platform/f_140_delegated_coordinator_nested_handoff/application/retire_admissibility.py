@@ -124,21 +124,49 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
 
         integration = fold_integration_disposition(journals)
 
-        # j#91696 F2: the STRICT integration evidence (#14219 T2b), which binds the disposition to
-        # a lane and separates the reviewed source head from the integration head. Absent /
-        # malformed / lane-unbound / conflicting evidence yields "", which fails closed in the
-        # fence. The lenient fold above stays as an independent conjunct: a NEWER legacy deferral
-        # must still block, which strict-only would miss (that module's own docstring names this).
+        # j#91696 F2 / j#91747 F2: the STRICT integration evidence (#14219 T2b), read from the
+        # CURRENT declaration only. ``fold_integration_disposition`` already decided which journal
+        # is current, and `hibernate_basis_producer._latest_disposition_declaration` reads exactly
+        # that journal's markers for the same reason — one authority selection, not two. Resolving
+        # every marker in the issue instead let an OLD enveloped merge supply the source head while
+        # a NEWER heading-only legacy note supplied the freshness journal id, so the ordering fence
+        # was satisfied by a journal that carried no evidence at all. A current declaration with no
+        # marker (heading-only / legacy) therefore yields no strict evidence — for THIS journal,
+        # never a fallback to a stale one.
+        current_notes = next(
+            (notes for jid, notes in journals if jid.strip() == integration.journal), ""
+        )
         marker_fields = [
             fields
-            for _, notes in journals
-            for channel, fields in marker_fields_in_note(notes or "")
+            for channel, fields in marker_fields_in_note(current_notes or "")
             if channel == MARKER_CHANNEL_WORKFLOW_EVENT
         ]
         evidence = resolve_integration_evidence(marker_fields)
-        source_head = (
-            "" if isinstance(evidence, IntegrationEvidenceError) else evidence.source_head
-        )
+        if isinstance(evidence, IntegrationEvidenceError):
+            source_head = ""
+        else:
+            # j#91747 F3: the envelope is the reason this evidence is trustworthy, so it must
+            # actually name THIS retire's lane. Requiring a lane-enveloped marker and then dropping
+            # the envelope is not an identity fence — a marker bound to a foreign workspace / lane /
+            # generation, on an unrelated integration branch, admitted on its source head alone.
+            #
+            # The expected identity comes from the retire's OWN arguments, never from the
+            # observation file: a value the same untrusted document supplies could not fence it.
+            # ``--lane-label`` is deliberately NOT reused for the envelope's ``lane`` — the lane
+            # registry distinguishes ``lane_id`` from ``lane_label`` and the envelope carries the
+            # former, so equating them would be a category error rather than a fence. Each expected
+            # value must be present; an absent one fails closed rather than skipping its check.
+            expected = (
+                (str(getattr(args, "evidence_workspace", "") or "").strip(),
+                 evidence.envelope.workspace),
+                (str(getattr(args, "evidence_lane", "") or "").strip(), evidence.envelope.lane),
+                (str(getattr(args, "evidence_lane_generation", "") or "").strip(),
+                 str(evidence.envelope.lane_generation)),
+                (str(getattr(args, "integration_branch", "") or "").strip(),
+                 evidence.integration_branch),
+            )
+            bound = all(want and want == got for want, got in expected)
+            source_head = evidence.source_head if bound else ""
 
         return bool(
             evaluate_exemption_integration_admissible(

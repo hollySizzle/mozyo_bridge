@@ -784,11 +784,10 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         if marker_review_gates:
             # F8: the structured review authority replaces a conflicting heading review gate.
             gates -= _MARKER_ESTABLISHED_GATES
-            # F10: an open review round is current, so a conflicting close / owner-close heading may
-            # not advance the lane past it (blocked stays — a stop is safe-side; impl_done stays —
-            # it is a sticky-fact gate below review).
-            gates -= _REVIEW_SUPERSEDES_PROGRESSION
             gates |= marker_review_gates
+            # F10 used to be applied HERE, unconditionally and before the conclusion was known.
+            # It now runs once below, after the outcome is resolved, for both the marker and the
+            # heading path (Redmine #14539 review j#91747 finding 1) — see there.
         marker_disposition, marker_conclusion, marker_blocker = _review_result_disposition(
             issue_markers, jid_s
         )
@@ -800,13 +799,21 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
             )
         else:
             conclusion, blocker = REVIEW_PENDING, False
-        # F10 applies to the HEADING path too (Redmine #14539 review j#91696 finding 1). The
-        # invariant above is stated unconditionally — an open review round may not be advanced past
-        # by a conflicting close / owner-close — but it was only ever enforced inside the marker
-        # branch. A heading-only ``## Gate: Review Request + Close`` therefore reduced to ``close``
-        # and projected ``retire_ready``, i.e. the lane retired past its own open review round. An
-        # APPROVED review is not an open round, so ``## Gate: Review + Close`` with ``結論: 承認``
-        # keeps advancing — that is the governed combination this must not break.
+        # F10, in ONE place, for BOTH paths, and only once the outcome is known (Redmine #14539
+        # reviews j#91696 finding 1 and j#91747 finding 1). An open review round may not be
+        # advanced past by a conflicting close / owner-close heading.
+        #
+        # It used to be applied twice and wrongly on each side: the marker branch removed the
+        # progression gates unconditionally, BEFORE the conclusion was resolved, so a canonical
+        # ``conclusion=approved`` review lost its Close; the heading path did not apply it at all,
+        # so a heading-only ``Review Request + Close`` kept its Close and projected retire_ready.
+        # The two halves of the same record therefore disagreed depending only on whether a marker
+        # was present. Resolving the outcome first and asking once fixes both directions: an
+        # APPROVED review is not an open round and keeps advancing — the governed close-time
+        # combination — while request / changes_requested / blocker / pending suppress.
+        #
+        # ``gates`` cannot empty out here: the predicate is true only when ``review_request`` or
+        # ``review`` is present, and neither is in :data:`_REVIEW_SUPERSEDES_PROGRESSION`.
         if _is_open_review_round(gates, conclusion):
             gates -= _REVIEW_SUPERSEDES_PROGRESSION
         top_gate = max(gates, key=lambda g: _GATE_PRECEDENCE.get(g, 0))
