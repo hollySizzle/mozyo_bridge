@@ -1430,7 +1430,23 @@ class CliSuccessBoundaryTest(unittest.TestCase):
     """
 
     def _run_cli(self, *, ratio_outcome, as_json, healthy=True):
-        """Return ``(rc, stdout)`` from the production CLI for a crafted result."""
+        """Return ``(rc, stdout)`` from the production CLI for a crafted result.
+
+        Everything the handler reads BEFORE the patched use case is pinned to this temp
+        tree, because those reads are inputs to the assertions below (review j#91491
+        R7-F1). There are three, and the last one was missed:
+
+        - ``repo_root_from_args`` -> the temp repo passed on ``args``;
+        - ``load_repo_local_config(repo_root)`` -> the same temp repo, which has no config;
+        - ``resolve_coordinator_placement_mode()`` -> the **operator-scoped home**, read
+          from ambient ``MOZYO_BRIDGE_HOME``. Left unset, a developer or CI whose real home
+          holds a malformed ``coordinator-placement.yaml`` sees all five scenarios die with
+          ``SystemExit(2)`` before the renderer runs — measured: ``FAILED (errors=8)`` with
+          such a home, ``OK`` with an empty one, same subject and same code.
+
+        The point of the seam is that the renderer, the payload and the return code are
+        production; the *environment* they read is not part of what this test is asserting.
+        """
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
             herdr_session_start_cli as cli,
         )
@@ -1459,10 +1475,13 @@ class CliSuccessBoundaryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
             args.repo = str(repo)
-            with patch.object(cli._use_case, "prepare_session", lambda **_kw: result):
-                with contextlib.redirect_stdout(buffer):
-                    rc = cli.cmd_herdr_session_start(args)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with patch.object(cli._use_case, "prepare_session", lambda **_kw: result):
+                    with contextlib.redirect_stdout(buffer):
+                        rc = cli.cmd_herdr_session_start(args)
         return rc, buffer.getvalue()
 
     def test_an_unknown_ratio_outcome_is_a_non_zero_exit_with_the_raw_token(self) -> None:
@@ -1500,6 +1519,29 @@ class CliSuccessBoundaryTest(unittest.TestCase):
                 rc, out = self._run_cli(ratio_outcome=outcome, as_json=False)
                 self.assertEqual(rc, 0, out)
                 self.assertNotIn("did NOT fully succeed", out)
+
+    def test_the_seam_is_unaffected_by_a_hostile_operator_home(self) -> None:
+        """Review j#91491 R7-F1: pin the ISOLATION, not just today's clean environment.
+
+        ``cmd_herdr_session_start`` reads the operator-scoped
+        ``$MOZYO_BRIDGE_HOME/coordinator-placement.yaml`` BEFORE the patched use case, so a
+        developer or CI whose home holds a malformed one saw every scenario above die with
+        ``SystemExit(2)`` before the renderer ran — the assertions were about the
+        environment, not the subject. Point the ambient home at a broken file and the
+        assertions must still hold, because ``_run_cli`` overrides it.
+        """
+        hostile = Path(tempfile.mkdtemp(prefix="mzb14569-hostile-home-"))
+        self.addCleanup(shutil.rmtree, hostile, True)
+        (hostile / "coordinator-placement.yaml").write_text(
+            "mode: [not, a, string]\n", encoding="utf-8"
+        )
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(hostile)}, clear=False):
+            rc, out = self._run_cli(ratio_outcome="failure_typo", as_json=False)
+            self.assertEqual(rc, 1)
+            self.assertIn("failure_typo", out)
+            rc, out = self._run_cli(ratio_outcome=RATIO_APPLIED, as_json=False)
+            self.assertEqual(rc, 0)
+            self.assertIn("pair split ratio: applied", out)
 
     def test_an_applied_ratio_is_reported_on_the_text_surface(self) -> None:
         # `not_applicable` is the one outcome the renderer deliberately stays silent about
