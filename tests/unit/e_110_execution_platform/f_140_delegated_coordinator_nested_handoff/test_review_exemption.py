@@ -31,18 +31,22 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     EXEMPTION_NONE,
     EXEMPTION_PATH_COVERAGE_UNPROVEN,
     EXEMPTION_REVIEW_REQUIRED,
+    REASON_CLOSE_COMMIT_MISMATCH,
     REASON_CLOSE_NOT_RECORDED,
     REASON_EXEMPTION_INVALID,
     REASON_EXEMPTION_SUPERSEDED,
     REASON_FOLLOW_UP_REVIEW_REQUIRED,
+    REASON_INTEGRATION_EVIDENCE_STALE,
     REASON_INTEGRATION_NOT_COMPLETE,
     REASON_NO_EXEMPTION_RECORDED,
     REASON_PATH_COVERAGE_UNPROVEN,
     REVIEW_EXEMPTION_STATES,
     ReviewExemptionFacts,
+    _glob_match,
     evaluate_exemption_integration_admissible,
     fold_declared_change_scope,
     fold_review_exemption,
+    is_canonical_relative_path,
     uncovered_paths,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_generation import (
@@ -370,13 +374,141 @@ class GovernedPathListShapeTests(unittest.TestCase):
         )
 
 
+class ConflictingDuplicateFieldTests(unittest.TestCase):
+    """Review j#91577 finding 3: a field declared twice with different values is not readable.
+
+    ``search()`` took the FIRST occurrence, so a gate carrying both ``follow_up_review: false``
+    and ``follow_up_review: true`` folded to ``exempt`` — the durable text says the owner required
+    a review, and the reader answered with whichever line came first.
+    """
+
+    def _fold(self, extra_line):
+        body = gate() + extra_line + "\n"
+        return fold_review_exemption([("101", body), ("102", scope())])
+
+    def test_a_conflicting_follow_up_review_invalidates_the_gate(self):
+        self.assertEqual(self._fold("- follow_up_review: true").state, EXEMPTION_INVALID)
+
+    def test_a_conflicting_direct_edit_invalidates_the_gate(self):
+        self.assertEqual(self._fold("- direct_edit: false").state, EXEMPTION_INVALID)
+
+    def test_a_conflicting_role_invalidates_the_gate(self):
+        self.assertEqual(self._fold("- role: reviewer").state, EXEMPTION_INVALID)
+
+    def test_a_conflicting_reason_invalidates_the_gate(self):
+        self.assertEqual(self._fold("- reason: something else").state, EXEMPTION_INVALID)
+
+    def test_a_conflicting_allowed_paths_invalidates_the_gate(self):
+        """A second, NARROWER path authority is the one that most obviously must not be ignored."""
+        self.assertEqual(self._fold("- allowed_paths: README.md").state, EXEMPTION_INVALID)
+
+    def test_a_conflict_beats_the_ordering_in_both_directions(self):
+        """Not "the last one wins" either — the record is ambiguous however it is ordered."""
+        widened = gate(follow_up_review="true") + "- follow_up_review: false\n"
+        self.assertEqual(
+            fold_review_exemption([("101", widened), ("102", scope())]).state, EXEMPTION_INVALID
+        )
+
+    def test_an_exactly_duplicated_identical_field_is_not_a_conflict(self):
+        """The stated rule for the equal-duplicate case: same value twice is one declaration.
+
+        This is also the negative control — without it, "invalid" above could just mean "any
+        second occurrence at all", which would fail-close on a harmless transcription artifact.
+        """
+        self.assertEqual(self._fold("- follow_up_review: false").state, EXEMPTION_EXEMPT)
+
+    def test_a_conflicting_commit_yields_an_unproven_scope(self):
+        """The same rule in the scope fold: two target commits declare neither identity."""
+        two_commits = scope() + f"- commit: {'9' * 40}\n"
+        resolved = fold_declared_change_scope([("102", two_commits)])
+        self.assertEqual(resolved.commit, "")
+        self.assertFalse(resolved.proven)
+        self.assertEqual(
+            fold_review_exemption([("101", gate()), ("102", two_commits)]).state,
+            EXEMPTION_PATH_COVERAGE_UNPROVEN,
+        )
+
+
+class ClosedGlobVocabularyTests(unittest.TestCase):
+    """Review j#91577 finding 4: the matcher accepted a grammar its contract does not declare.
+
+    ``_glob_match``'s contract is ``**`` / ``*`` / ``?`` / exact segment. Delegating a segment to
+    ``fnmatchcase`` also brought in ``[...]`` character classes, and dropping empty segments
+    normalized absolute paths and double slashes into forms that then matched.
+    """
+
+    def test_a_character_class_is_a_literal_not_a_class(self):
+        self.assertFalse(_glob_match("src/a.py", "src/[ab].py"))
+        # It matches the literal segment, which is what "every other character is a literal" means.
+        self.assertTrue(_glob_match("src/[ab].py", "src/[ab].py"))
+
+    def test_the_declared_vocabulary_still_works(self):
+        """Negative control: the fix closes the grammar without narrowing what it promised."""
+        self.assertTrue(_glob_match("src/a.py", "src/*.py"))
+        self.assertTrue(_glob_match("src/a/b/c.py", "src/**"))
+        self.assertTrue(_glob_match("src/a.py", "src/?.py"))
+        self.assertTrue(_glob_match("src/a.py", "src/a.py"))
+        self.assertFalse(_glob_match("src/a/b.py", "src/*"))
+
+    def test_an_absolute_changed_path_is_never_normalized_into_coverage(self):
+        self.assertFalse(_glob_match("/src/a.py", "src/**"))
+        self.assertEqual(uncovered_paths(["/src/a.py"], ["src/**"]), ("/src/a.py",))
+
+    def test_a_double_slash_pattern_covers_nothing(self):
+        self.assertFalse(_glob_match("src/a.py", "src//**"))
+        self.assertEqual(uncovered_paths(["src/a.py"], ["src//**"]), ("src/a.py",))
+
+    def test_traversal_and_trailing_slash_are_not_canonical(self):
+        for bad in ("../src/a.py", "src/./a.py", "src/", "src\\a.py", ""):
+            self.assertFalse(is_canonical_relative_path(bad), bad)
+        for good in ("src/a.py", "src/**", ".mozyo-bridge/docs/catalog.yaml"):
+            self.assertTrue(is_canonical_relative_path(good), good)
+
+    def test_a_malformed_gate_glob_withholds_the_exemption(self):
+        """End to end: an unusable path authority cannot prove coverage, so no exemption.
+
+        The declared scope is EXACTLY the path the malformed glob would cover if it were
+        normalized, so this pin turns on the leading ``/`` alone. (A scope with any other path in
+        it would be uncovered either way, and the test would pass without testing anything.)
+        """
+        only = "vibes/docs/rules/agent-workflow.md"
+        self.assertEqual(
+            fold_review_exemption(
+                [("101", gate(allowed_paths="/vibes/docs/rules/**")), ("102", scope(only))]
+            ).state,
+            EXEMPTION_PATH_COVERAGE_UNPROVEN,
+        )
+        # Negative control: the same gate and the same scope, with the glob written canonically.
+        self.assertEqual(
+            fold_review_exemption(
+                [("101", gate(allowed_paths="vibes/docs/rules/**")), ("102", scope(only))]
+            ).state,
+            EXEMPTION_EXEMPT,
+        )
+
+
 class ExemptionIntegrationAdmissibilityTests(unittest.TestCase):
     """The terminal-retire fence: every conjunct, each with its own distinct reason."""
 
-    EXEMPT = ReviewExemptionFacts(state=EXEMPTION_EXEMPT, journal="101")
+    #: A COMPLIANT exempt fact: ``fold_review_exemption`` only ever yields ``exempt`` from a PROVEN
+    #: scope, so the covered commit and the journal that declared it are always populated. The
+    #: earlier fixture omitted both and so could not express the identity binding at all
+    #: (review j#91577 finding 2).
+    EXEMPT = ReviewExemptionFacts(
+        state=EXEMPTION_EXEMPT,
+        journal="101",
+        covered_commit=HEAD,
+        covered_scope_journal="102",
+    )
 
     def _evaluate(self, exemption=None, **over):
-        kwargs = dict(currently_in_force=True, close_recorded=True, integration_complete=True)
+        kwargs = dict(
+            currently_in_force=True,
+            close_recorded=True,
+            integration_complete=True,
+            close_commit=HEAD,
+            integration_journal="103",
+        )
         kwargs.update(over)
         return evaluate_exemption_integration_admissible(
             self.EXEMPT if exemption is None else exemption, **kwargs
@@ -422,6 +554,53 @@ class ExemptionIntegrationAdmissibilityTests(unittest.TestCase):
         )
         self.assertFalse(result.admissible)
         self.assertEqual(result.reason, REASON_FOLLOW_UP_REVIEW_REQUIRED)
+
+    def test_a_close_naming_another_commit_blocks(self):
+        """j#91577 F2: three true booleans about three different commits are not one proof."""
+        result = self._evaluate(close_commit="9" * 40)
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, REASON_CLOSE_COMMIT_MISMATCH)
+
+    def test_a_close_declaring_no_commit_blocks(self):
+        result = self._evaluate(close_commit="")
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, REASON_CLOSE_COMMIT_MISMATCH)
+
+    def test_an_abbreviated_close_commit_is_not_resolved_against_the_full_one(self):
+        """A safety fence with no repository to resolve against must not guess equality."""
+        result = self._evaluate(close_commit=HEAD[:8])
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, REASON_CLOSE_COMMIT_MISMATCH)
+
+    def test_the_close_commit_comparison_ignores_case_and_surrounding_space(self):
+        """The negative control for the three above: the SAME commit still admits."""
+        self.assertTrue(self._evaluate(close_commit=f"  {HEAD.upper()}  ").admissible)
+
+    def test_integration_evidence_older_than_the_change_scope_blocks(self):
+        """j#91577 F2: a merge recorded before this commit was declared is about an earlier one."""
+        result = self._evaluate(integration_journal="101")
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, REASON_INTEGRATION_EVIDENCE_STALE)
+
+    def test_integration_evidence_at_the_scope_journal_is_not_stale(self):
+        """Negative control: only STRICTLY older is stale — the same journal still correlates."""
+        self.assertTrue(self._evaluate(integration_journal="102").admissible)
+
+    def test_an_unparseable_journal_id_on_either_side_blocks(self):
+        self.assertEqual(
+            self._evaluate(integration_journal="").reason, REASON_INTEGRATION_EVIDENCE_STALE
+        )
+        self.assertEqual(
+            self._evaluate(
+                ReviewExemptionFacts(
+                    state=EXEMPTION_EXEMPT,
+                    journal="101",
+                    covered_commit=HEAD,
+                    covered_scope_journal="",
+                )
+            ).reason,
+            REASON_INTEGRATION_EVIDENCE_STALE,
+        )
 
     def test_a_superseded_exemption_blocks(self):
         """Review j#90137 F3: the retire consumes the SAME supersession-aware fact as the glance.

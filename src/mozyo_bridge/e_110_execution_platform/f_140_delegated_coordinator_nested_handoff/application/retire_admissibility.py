@@ -52,6 +52,12 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
       fact the glance classifier consumes — not the bare gate state. A review round opened AFTER
       the exemption re-owes the review, and the retire must agree with the glance about that.
 
+    A third fence makes the three durable facts belong to the same WORK, not merely to the same
+    issue (review j#91577 finding 2): the Close gate's commit must equal the commit the
+    exemption's coverage was proven for, and the integration disposition must not predate the
+    declaration of that commit's change scope. Conjoining three booleans admitted a lane whose
+    Close and merge both belonged to an earlier commit while the current one was never integrated.
+
     Every other failure mode — unreadable file, malformed journals, invalid gate, unproven path
     coverage, ``follow_up_review: true``, missing Close, incomplete integration — is likewise
     fail-closed to ``False``.
@@ -92,13 +98,19 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
         if gate_facts is None:
             # No recognized gate at all -> no Close evidence, no exemption authority.
             return False
+        integration = fold_integration_disposition(journals)
         return bool(
             evaluate_exemption_integration_admissible(
                 gate_facts.review_exemption,
                 # F3: the SAME supersession-aware fact the glance classifier consumes.
                 currently_in_force=gate_facts.review_exempt,
                 close_recorded=gate_facts.latest_gate == GATE_CLOSE,
-                integration_complete=fold_integration_disposition(journals).complete,
+                integration_complete=integration.complete,
+                # j#91577 F2: the identity the three facts must share. ``latest_gate_commit`` is
+                # the Close journal's own commit precisely because ``close_recorded`` above is
+                # "the LATEST gate is Close", so the two read the same journal.
+                close_commit=gate_facts.latest_gate_commit,
+                integration_journal=integration.journal,
             ).admissible
         )
     except Exception:  # noqa: BLE001 - unreadable / malformed durable observation -> fail closed

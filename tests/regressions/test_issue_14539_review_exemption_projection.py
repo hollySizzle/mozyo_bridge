@@ -101,7 +101,18 @@ IMPLEMENTATION_DONE = (
     "  - `vibes/docs/rules/agent-workflow.md`\n"
     "  - `vibes/docs/logics/coordinator-sublane-development-flow.md`\n"
 )
-CLOSE = f"## Gate: Close\n- commit: {HEAD}\n"
+def close(commit: str = HEAD) -> str:
+    """A governed Close gate naming the commit it closes.
+
+    Parameterized by review j#91577 finding 2: the Close's commit must be the commit the
+    exemption's coverage was proven for, so a fixture cannot leave the two unrelated (the
+    previous constant always named ``HEAD``, which silently made a later fixture assert admission
+    for a history whose Close named a different commit than its own proven scope).
+    """
+    return f"## Gate: Close\n- commit: {commit}\n"
+
+
+CLOSE = close()
 INTEGRATION_MERGED = "## Integration disposition\n- disposition: merged\n"
 
 
@@ -602,8 +613,11 @@ class ReviewJ90289Tests(unittest.TestCase):
     def _open_history(self, newest):
         return [("100", self.OLD_SCOPE), ("101", GATE_EXEMPT), ("200", newest)]
 
-    def _retire_history(self, newest):
-        return self._open_history(newest) + [("203", INTEGRATION_MERGED), ("204", CLOSE)]
+    def _retire_history(self, newest, *, close_commit=NEW_COMMIT):
+        return self._open_history(newest) + [
+            ("203", INTEGRATION_MERGED),
+            ("204", close(close_commit)),
+        ]
 
     #: The defect's shape: a new implementation result, a new commit, no changed_paths at all.
     NEW_COMMIT_NO_PATHS = f"## Gate: Implementation Done\n- commit: {NEW_COMMIT}\n"
@@ -659,6 +673,286 @@ class ReviewJ90289Tests(unittest.TestCase):
         )
         self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
         self.assertEqual(facts.review_exemption.covered_commit, self.OLD_COMMIT)
+
+
+class ReviewJ91577CombinedGateTests(unittest.TestCase):
+    """R4-F1: a combined gate heading must not lose its non-top-precedence facts.
+
+    ``fold_issue_gate_facts`` reduced each journal's recognized gates to the max-precedence one,
+    and both the change-bearing set (R3-F1's fix) and the review-round set read only that. A
+    governed ``## Gate: Implementation Done + Close`` therefore announced no new target commit,
+    and a ``## Gate: Review Request + Close`` opened no review round — in both cases because
+    ``close`` outranks them inside the same journal. The grammar itself treats ``+``-combined
+    headings as a first-class shape, so dropping the other halves contradicted it.
+    """
+
+    OLD_COMMIT = "1111111111111111111111111111111111111111"
+    NEW_COMMIT = "2222222222222222222222222222222222222222"
+    OLD_SCOPE = (
+        f"## Gate: Implementation Done\n"
+        f"- commit: {OLD_COMMIT}\n"
+        "- changed_paths:\n"
+        "  - `vibes/docs/rules/agent-workflow.md`\n"
+    )
+
+    def _resolve(self, obs_path, *, issue="14539"):
+        return _resolve_latest_generation_admissible(
+            argparse.Namespace(
+                review_generation_json=None,
+                review_exemption_json=obs_path,
+                latest_generation_admissible=False,
+                issue=issue,
+            )
+        )
+
+    def _obs(self, tmp, journals):
+        path = Path(tmp) / "o.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "issue": "14539",
+                    "journals": [{"journal_id": j, "notes": n} for j, n in journals],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_a_combined_impl_done_close_declares_its_new_target_commit(self):
+        """The scope must move to the new commit, leaving it unproven — not stay on the old one."""
+        combined = f"## Gate: Implementation Done + Close\n- commit: {self.NEW_COMMIT}\n"
+        facts, state = state_of(
+            [("100", self.OLD_SCOPE), ("101", GATE_EXEMPT), ("200", combined)]
+        )
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_PATH_COVERAGE_UNPROVEN)
+        self.assertNotEqual(facts.review_exemption.covered_commit, self.OLD_COMMIT)
+        self.assertFalse(facts.review_exempt)
+
+    def test_a_combined_review_request_close_is_still_an_open_review_round(self):
+        """A review round the exemption does not precede re-owes the review."""
+        combined = f"## Gate: Review Request + Close\n- commit: {self.NEW_COMMIT}\n"
+        facts, _ = state_of(
+            [("100", self.OLD_SCOPE), ("101", GATE_EXEMPT), ("200", combined)]
+        )
+        self.assertFalse(facts.review_exempt)
+
+    def test_the_combined_forms_do_not_admit_the_terminal_retire(self):
+        for label, heading in (
+            ("impl_done", "## Gate: Implementation Done + Close"),
+            ("review_request", "## Gate: Review Request + Close"),
+        ):
+            with self.subTest(label):
+                combined = f"{heading}\n- commit: {self.NEW_COMMIT}\n"
+                journals = [
+                    ("100", self.OLD_SCOPE),
+                    ("101", GATE_EXEMPT),
+                    ("200", combined),
+                    ("203", INTEGRATION_MERGED),
+                ]
+                with tempfile.TemporaryDirectory() as t:
+                    self.assertFalse(self._resolve(self._obs(t, journals)))
+
+    def test_the_same_combined_journal_with_its_paths_declared_admits(self):
+        """Negative control: only whether the combined journal declares its paths differs.
+
+        Without this, the pins above would also pass if a combined heading were simply refused
+        outright, which would break the governed shape rather than read it.
+        """
+        combined = (
+            f"## Gate: Implementation Done + Close\n"
+            f"- commit: {self.NEW_COMMIT}\n"
+            "- changed_paths:\n"
+            "  - `vibes/docs/logics/coordinator-sublane-development-flow.md`\n"
+        )
+        journals = [
+            ("100", self.OLD_SCOPE),
+            ("101", GATE_EXEMPT),
+            ("200", combined),
+            ("203", INTEGRATION_MERGED),
+        ]
+        facts, _ = state_of(journals, issue_open=False)
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
+        self.assertEqual(facts.review_exemption.covered_commit, self.NEW_COMMIT)
+        with tempfile.TemporaryDirectory() as t:
+            self.assertTrue(self._resolve(self._obs(t, journals)))
+
+    def test_a_close_only_journal_still_declares_nothing(self):
+        """The R3 boundary is unchanged: ``close`` alone reports on work already scoped."""
+        facts, _ = state_of(
+            [("100", self.OLD_SCOPE), ("101", GATE_EXEMPT), ("200", close(self.NEW_COMMIT))]
+        )
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
+        self.assertEqual(facts.review_exemption.covered_commit, self.OLD_COMMIT)
+
+
+class ReviewJ91577EvidenceIdentityTests(unittest.TestCase):
+    """R4-F2: the exemption, the Close and the integration must be about the SAME commit.
+
+    The fence conjoined three booleans, so each fact only had to exist SOMEWHERE in the issue's
+    record. A lane could therefore retire on an earlier commit's Close and merge while the commit
+    the exemption actually covered was never integrated.
+    """
+
+    OLD_COMMIT = "1111111111111111111111111111111111111111"
+    NEW_COMMIT = "2222222222222222222222222222222222222222"
+
+    def _scope(self, commit, path):
+        return (
+            f"## Gate: Implementation Done\n"
+            f"- commit: {commit}\n"
+            "- changed_paths:\n"
+            f"  - `{path}`\n"
+        )
+
+    def _resolve(self, obs_path, *, issue="14539"):
+        return _resolve_latest_generation_admissible(
+            argparse.Namespace(
+                review_generation_json=None,
+                review_exemption_json=obs_path,
+                latest_generation_admissible=False,
+                issue=issue,
+            )
+        )
+
+    def _obs(self, tmp, journals):
+        path = Path(tmp) / "o.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "issue": "14539",
+                    "journals": [{"journal_id": j, "notes": n} for j, n in journals],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def _history(self, *, close_commit, second_scope=True):
+        """commit A scoped, exempted and merged; then commit B scoped; then a Close."""
+        journals = [
+            ("100", self._scope(self.OLD_COMMIT, "vibes/docs/rules/agent-workflow.md")),
+            ("101", GATE_EXEMPT),
+            ("102", INTEGRATION_MERGED),
+        ]
+        if second_scope:
+            journals.append(
+                (
+                    "103",
+                    self._scope(
+                        self.NEW_COMMIT,
+                        "vibes/docs/logics/coordinator-sublane-development-flow.md",
+                    ),
+                )
+            )
+        journals.append(("104", close(close_commit)))
+        return journals
+
+    def test_a_close_naming_the_previous_commit_does_not_admit(self):
+        """The literal defect: the coverage is proven for B, the Close and merge belong to A."""
+        journals = self._history(close_commit=self.OLD_COMMIT)
+        facts = fold_issue_gate_facts(journals)
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
+        self.assertEqual(facts.review_exemption.covered_commit, self.NEW_COMMIT)
+        with tempfile.TemporaryDirectory() as t:
+            self.assertFalse(self._resolve(self._obs(t, journals)))
+
+    def test_a_close_naming_the_covered_commit_still_needs_fresh_integration(self):
+        """Fixing only the Close leaves the merge evidence older than the scope it must cover."""
+        with tempfile.TemporaryDirectory() as t:
+            self.assertFalse(
+                self._resolve(self._obs(t, self._history(close_commit=self.NEW_COMMIT)))
+            )
+
+    def test_the_same_history_integrated_after_the_new_scope_admits(self):
+        """Negative control: only WHERE the merge sits relative to the new scope differs."""
+        journals = [
+            ("100", self._scope(self.OLD_COMMIT, "vibes/docs/rules/agent-workflow.md")),
+            ("101", GATE_EXEMPT),
+            (
+                "103",
+                self._scope(
+                    self.NEW_COMMIT,
+                    "vibes/docs/logics/coordinator-sublane-development-flow.md",
+                ),
+            ),
+            ("104", INTEGRATION_MERGED),
+            ("105", close(self.NEW_COMMIT)),
+        ]
+        with tempfile.TemporaryDirectory() as t:
+            self.assertTrue(self._resolve(self._obs(t, journals)))
+
+    def test_a_single_commit_lane_is_unaffected(self):
+        """The ordinary shape this issue exists to admit keeps admitting."""
+        with tempfile.TemporaryDirectory() as t:
+            self.assertTrue(
+                self._resolve(
+                    self._obs(
+                        t,
+                        [
+                            ("101", GATE_EXEMPT),
+                            ("102", IMPLEMENTATION_DONE),
+                            ("103", INTEGRATION_MERGED),
+                            ("104", CLOSE),
+                        ],
+                    )
+                )
+            )
+
+    def test_a_close_declaring_no_commit_at_all_does_not_admit(self):
+        journals = [
+            ("101", GATE_EXEMPT),
+            ("102", IMPLEMENTATION_DONE),
+            ("103", INTEGRATION_MERGED),
+            ("104", "## Gate: Close\n- 親USへの引き継ぎ: なし\n"),
+        ]
+        with tempfile.TemporaryDirectory() as t:
+            self.assertFalse(self._resolve(self._obs(t, journals)))
+
+
+class ReviewJ91577AmbiguousGateTests(unittest.TestCase):
+    """R4-F3/F4 at the projection boundary: ambiguous authority and over-granted coverage."""
+
+    def test_a_gate_contradicting_itself_keeps_the_review_owed(self):
+        contradictory = GATE_EXEMPT + "- follow_up_review: true\n"
+        facts, state = state_of(
+            [("99", IMPLEMENTATION_DONE), ("100", REVIEW_REQUEST), ("101", contradictory)]
+        )
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_INVALID)
+        self.assertFalse(facts.review_exempt)
+        self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
+
+    def test_a_second_narrower_allowed_paths_keeps_the_review_owed(self):
+        contradictory = GATE_EXEMPT + "- allowed_paths: README.md\n"
+        facts, _ = state_of([("99", IMPLEMENTATION_DONE), ("101", contradictory)])
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_INVALID)
+
+    def test_a_character_class_glob_does_not_cover_the_changed_paths(self):
+        """F4: ``[...]`` is outside the declared vocabulary, so it proves no coverage."""
+        gate_class = GATE_EXEMPT.replace(
+            "- allowed_paths: vibes/docs/rules/**, vibes/docs/logics/**",
+            "- allowed_paths: vibes/docs/[rl]*/**",
+        )
+        facts, state = state_of([("99", IMPLEMENTATION_DONE), ("101", gate_class)])
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_PATH_COVERAGE_UNPROVEN)
+        self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
+
+    def test_the_declared_glob_vocabulary_still_covers(self):
+        """Negative control for both: the compliant gate on the same history still exempts."""
+        facts, _ = state_of([("99", IMPLEMENTATION_DONE), ("101", GATE_EXEMPT)])
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
+
+    def test_an_absolute_changed_path_is_not_silently_covered(self):
+        absolute_scope = (
+            f"## Gate: Implementation Done\n"
+            f"- commit: {HEAD}\n"
+            "- changed_paths:\n"
+            "  - `/vibes/docs/rules/agent-workflow.md`\n"
+        )
+        facts, _ = state_of([("99", absolute_scope), ("101", GATE_EXEMPT)])
+        self.assertEqual(facts.review_exemption.state, EXEMPTION_PATH_COVERAGE_UNPROVEN)
+        self.assertEqual(
+            facts.review_exemption.uncovered, ("/vibes/docs/rules/agent-workflow.md",)
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

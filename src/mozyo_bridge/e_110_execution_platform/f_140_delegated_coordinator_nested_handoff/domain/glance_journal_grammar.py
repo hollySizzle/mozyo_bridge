@@ -322,8 +322,13 @@ _MARKER_SHADOW = "shadow"
 
 # An explicit commit-hash field on a gate journal (``commit`` / ``commit_or_diff`` /
 # ``commit_hash`` / ``target_commit`` … : <hex>). Markdown emphasis / list markers tolerated.
+#: The hash is CAPTURED, not merely detected: ``commit_bearing`` only needs "a commit is declared",
+#: but the review-exemption retire fence needs the identity itself (Redmine #14539 j#91577 F2).
+#: The upper bound is 64 (SHA-256) rather than 40 so a longer hash is captured whole instead of
+#: truncated into a value that could never equal the exemption module's — the match set is
+#: unchanged, since a 64-hex run already matched here as its first 40 characters.
 _COMMIT_FIELD_RE = re.compile(
-    r"(?im)^\s*[-*]?\s*\**\s*(?:commit|commit_or_diff|commit_hash|target_commit(?:_or_diff)?)\**\s*[:：]\s*\**`?\s*[0-9a-f]{7,40}"
+    r"(?im)^\s*[-*]?\s*\**\s*(?:commit|commit_or_diff|commit_hash|target_commit(?:_or_diff)?)\**\s*[:：]\s*\**`?\s*(?P<value>[0-9a-f]{7,64})"
 )
 
 
@@ -620,7 +625,10 @@ class GateFacts:
 
     ``review_exemption`` is the LATEST typed ``codex_direct_edit`` exemption (Redmine #14539);
     ``review_exempt`` is the derived "no independent review is owed *right now*" fact — the
-    exemption is in force AND no newer review round supersedes it.
+    exemption is in force AND no newer review round supersedes it. ``latest_gate_commit`` is the
+    commit the LATEST gate journal declares (``""`` when it declares none, or two different ones),
+    which is what lets a consumer check that the latest gate is about the same commit as the rest
+    of the evidence rather than merely existing.
     """
 
     latest_gate: str
@@ -635,6 +643,7 @@ class GateFacts:
     work_unit: str = ""
     review_exemption: ReviewExemptionFacts = field(default_factory=ReviewExemptionFacts)
     review_exempt: bool = False
+    latest_gate_commit: str = ""
 
 
 @dataclass(frozen=True)
@@ -644,6 +653,23 @@ class _RecognizedJournal:
     review_conclusion: str
     commit_bearing: bool
     blocker: bool = False  # an audit review that concluded ``blocker``
+    #: EVERY gate this journal recognized, not just the max-precedence one. A governed journal may
+    #: combine gates in one heading (``## Gate: Review Request + Close``), and ``gate`` keeps only
+    #: the most advanced of them — correct for "what state is the lane in", wrong for any question
+    #: about whether a PARTICULAR gate occurred. Asking the reduced value cost the review-round and
+    #: change-bearing facts of every combined journal (Redmine #14539 review j#91577 finding 1).
+    #: Defaults to empty so a directly-constructed instance stays usable; ``gates_or_gate`` reads
+    #: it with the single-gate fallback.
+    gates: frozenset = frozenset()
+    #: The single commit this journal declares, or ``""`` when it declares none or declares two
+    #: different ones. Used to bind the terminal retire's Close evidence to the commit the review
+    #: exemption's path coverage was proven for (Redmine #14539 review j#91577 finding 2).
+    commit: str = ""
+
+    @property
+    def gates_or_gate(self) -> frozenset:
+        """Every recognized gate, falling back to the reduced ``gate`` when unset (pure)."""
+        return self.gates or frozenset({self.gate})
 
 
 #: The recognized gates that constitute an OPEN review round. A round is an explicit request for
@@ -687,7 +713,10 @@ def _review_exempt_now(
     exemption_journal = _int_journal(exemption.journal)
     if exemption_journal is None:
         return False
-    rounds = [r.journal_id for r in recognized if r.gate in _REVIEW_ROUND_GATES]
+    # Every recognized gate of each journal, not the max-precedence reduction: a
+    # ``## Gate: Review Request + Close`` IS an open review round, and reducing it to ``close``
+    # made the round invisible here (review j#91577 finding 1).
+    rounds = [r.journal_id for r in recognized if r.gates_or_gate & _REVIEW_ROUND_GATES]
     if not rounds:
         return True
     return exemption_journal > max(rounds)
@@ -759,7 +788,16 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
             )
         else:
             conclusion, blocker = REVIEW_PENDING, False
-        commit_bearing = bool(gates & _COMMIT_BEARING_GATES) and bool(_COMMIT_FIELD_RE.search(notes or ""))
+        # The commit this gate journal declares, read with the exactly-one rule the exemption
+        # module uses (review j#91577 finding 3): a journal naming two different commits declares
+        # neither, so a safety fence downstream cannot bind to whichever came first.
+        declared_commits = {
+            m.group("value").strip().lower() for m in _COMMIT_FIELD_RE.finditer(notes or "")
+        }
+        # ``commit_bearing`` is unchanged — it asks whether a commit is declared at all, which two
+        # conflicting ones still satisfy. Only the identity used for binding falls back to "".
+        commit = next(iter(declared_commits)) if len(declared_commits) == 1 else ""
+        commit_bearing = bool(gates & _COMMIT_BEARING_GATES) and bool(declared_commits)
         recognized.append(
             _RecognizedJournal(
                 journal_id=jint,
@@ -767,6 +805,8 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
                 review_conclusion=conclusion,
                 commit_bearing=commit_bearing,
                 blocker=blocker,
+                gates=frozenset(gates),
+                commit=commit,
             )
         )
 
@@ -779,8 +819,13 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
     # check needs to know which journals are CHANGE-BEARING gates, and gate recognition lives here,
     # so the ids are computed from the recognized set and passed down rather than re-derived in the
     # exemption module — one gate vocabulary, not two (review j#90289 R3-F1).
+    # Read from EVERY recognized gate of the journal, not the max-precedence reduction: a
+    # ``## Gate: Implementation Done + Close`` announces an implementation result, and reducing it
+    # to ``close`` made it declare nothing — so the PREVIOUS commit's scope stayed authoritative
+    # and the exemption was checked against it (review j#91577 finding 1). The ``close`` boundary
+    # is unchanged: a journal whose ONLY gate is ``close`` still declares nothing.
     change_bearing_journals = [
-        str(r.journal_id) for r in recognized if r.gate in _CHANGE_BEARING_GATES
+        str(r.journal_id) for r in recognized if r.gates_or_gate & _CHANGE_BEARING_GATES
     ]
     review_exemption = fold_review_exemption(
         journals or (), change_bearing_journals=change_bearing_journals
@@ -798,6 +843,7 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         work_unit=work_unit,
         review_exemption=review_exemption,
         review_exempt=_review_exempt_now(review_exemption, recognized),
+        latest_gate_commit=latest.commit,
     )
 
 

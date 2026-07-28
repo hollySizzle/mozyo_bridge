@@ -51,7 +51,6 @@ Boundary: pure. No IO, no Redmine, no git. A total function over ``(journal_id, 
 
 from __future__ import annotations
 
-import fnmatch
 import re
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
@@ -210,6 +209,29 @@ def _field(pattern: "re.Pattern[str]", notes: str) -> str:
     return _clean(match.group("value")) if match else ""
 
 
+def _unique_field(pattern: "re.Pattern[str]", notes: str) -> Tuple[str, bool]:
+    """A governed scalar field's single agreed value, plus whether it CONFLICTS (pure).
+
+    Returns ``(value, conflicted)``. Reading a governed authority field with ``search()`` takes
+    the FIRST occurrence and silently ignores every later one, so a record carrying both
+    ``follow_up_review: false`` and ``follow_up_review: true`` folded to an exemption while the
+    durable text says the owner required a review (Redmine #14539 review j#91577 finding 3).
+
+    The rule, stated because the reviewer left the equal-duplicate case to the implementation:
+
+    - zero occurrences -> ``("", False)`` — absent, judged by the caller's required-field check;
+    - occurrences that all clean to the SAME value -> that value, not a conflict. A duplicated
+      identical line is a transcription artifact, not two different declarations;
+    - occurrences that clean to DIFFERENT values -> ``("", True)``. Such a record is not
+      incomplete, it is not uniquely interpretable, and an authority gate that cannot be read
+      one way must fail closed rather than pick a winner by position.
+    """
+    values = {_clean(m.group("value")) for m in pattern.finditer(notes or "")}
+    if len(values) > 1:
+        return "", True
+    return (values.pop() if values else ""), False
+
+
 def _clean_path(value: object) -> str:
     """Strip decoration and one trailing parenthetical off ONE path entry (pure).
 
@@ -241,9 +263,36 @@ def _path_field(pattern: "re.Pattern[str]", notes: str) -> Tuple[str, ...]:
     Scanning stops at the first line that is not a more-indented list item, so a following
     sibling field or a new section never leaks entries into the list.
     """
-    match = pattern.search(notes or "")
-    if match is None:
-        return ()
+    values = _path_field_values(pattern, notes)
+    return values[0] if values else ()
+
+
+def _path_field_values(
+    pattern: "re.Pattern[str]", notes: str
+) -> list[Tuple[str, ...]]:
+    """Every occurrence of a governed list-valued path field, in order (pure)."""
+    return [_path_entries_at(match, notes or "") for match in pattern.finditer(notes or "")]
+
+
+def _unique_path_field(
+    pattern: "re.Pattern[str]", notes: str
+) -> Tuple[Tuple[str, ...], bool]:
+    """A governed list field's single agreed value, plus whether it CONFLICTS (pure).
+
+    The list-valued counterpart of :func:`_unique_field`, with the same rule and the same
+    reason: a second ``allowed_paths`` label declaring a different set makes the gate's path
+    authority ambiguous, and ``search()`` resolved that ambiguity by position (Redmine #14539
+    review j#91577 finding 3).
+    """
+    values = _path_field_values(pattern, notes)
+    distinct = set(values)
+    if len(distinct) > 1:
+        return (), True
+    return (distinct.pop() if distinct else ()), False
+
+
+def _path_entries_at(match: "re.Match[str]", notes: str) -> Tuple[str, ...]:
+    """The entries of ONE governed list-field occurrence (pure). See :func:`_path_field`."""
     entries: list[str] = []
     inline = _TRAILING_PAREN_RE.sub("", str(match.group("value") or "").strip())
     if inline:
@@ -269,25 +318,68 @@ def _path_field(pattern: "re.Pattern[str]", notes: str) -> Tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
+#: Segments a repository-relative canonical path can never contain. An empty segment is a leading
+#: ``/`` or a ``//``; ``.`` / ``..`` are traversal, not a canonical name.
+_NON_CANONICAL_SEGMENTS: frozenset[str] = frozenset({"", ".", ".."})
+
+
+def is_canonical_relative_path(value: object) -> bool:
+    """Whether ``value`` is a repository-relative canonical POSIX path (pure).
+
+    Redmine #14539 review j#91577 finding 4. The matcher used to *normalize* its inputs — it
+    dropped empty segments — so ``/src/a.py`` (absolute) and ``src//**`` (a double slash) were
+    silently rewritten into the canonical forms and then matched. Coverage of a review exemption
+    must not be granted to an input the record never actually declared in the governed form, so
+    a non-canonical path is now unusable in either role: as a changed path it stays uncovered,
+    and as an ``allowed_paths`` glob it matches nothing. Both directions withhold the exemption,
+    which is the fail-closed side.
+
+    Rejected: an empty string, a leading ``/``, any ``//``, a trailing ``/``, a ``\\`` separator,
+    and any ``.`` / ``..`` segment. Glob metacharacters are NOT paths characters and are judged
+    by :func:`_segment_match`, not here — ``src/**`` is canonical, ``src//**`` is not.
+    """
+    text = str(value or "").strip()
+    if not text or "\\" in text:
+        return False
+    return all(seg not in _NON_CANONICAL_SEGMENTS for seg in text.split("/"))
+
+
 def _segment_match(segment: str, pattern: str) -> bool:
     """Match ONE path segment against one pattern segment (pure).
 
-    ``fnmatchcase`` is safe here precisely because it is applied per segment: its ``*`` would
-    otherwise cross ``/`` and turn ``src/*`` into a recursive glob.
+    The vocabulary is CLOSED and is exactly what :func:`_glob_match` documents: ``*`` matches any
+    run of characters within the segment, ``?`` matches one, and every other character — ``[``
+    and ``]`` included — is a literal.
+
+    This no longer delegates to ``fnmatchcase``. Applying it per segment did keep ``*`` from
+    crossing ``/``, but it also brought fnmatch's ``[...]`` character classes in, so
+    ``allowed_paths: src/[ab].py`` covered ``src/a.py`` — a path authority accepting a grammar
+    its own contract does not declare (Redmine #14539 review j#91577 finding 4).
     """
-    return fnmatch.fnmatchcase(segment, pattern)
+    translated = "".join(
+        "[^/]*" if ch == "*" else "[^/]" if ch == "?" else re.escape(ch) for ch in pattern
+    )
+    return re.fullmatch(translated, segment) is not None
 
 
 def _glob_match(path: str, pattern: str) -> bool:
     """Whether one POSIX-ish path matches one governed ``allowed_paths`` glob (pure).
 
     ``**`` matches zero or more whole segments; ``*`` / ``?`` match within a single segment;
-    anything else is an exact segment. Deliberately a small explicit matcher rather than a
-    ``fnmatch`` of the whole string (whose ``*`` crosses ``/``, so ``src/*`` would match
-    ``src/a/b/c.py`` and over-grant coverage) and rather than ``PurePath.full_match`` (3.13+).
+    anything else is an exact segment — character classes and every other glob dialect are
+    literals, because that is the whole vocabulary this contract declares. Deliberately a small
+    explicit matcher rather than a ``fnmatch`` of the whole string (whose ``*`` crosses ``/``, so
+    ``src/*`` would match ``src/a/b/c.py`` and over-grant coverage) and rather than
+    ``PurePath.full_match`` (3.13+).
+
+    Both sides must be repository-relative canonical paths
+    (:func:`is_canonical_relative_path`); anything else matches nothing rather than being
+    normalized into a form that would.
     """
-    segs = [s for s in str(path or "").strip().split("/") if s]
-    pats = [s for s in str(pattern or "").strip().split("/") if s]
+    if not is_canonical_relative_path(path) or not is_canonical_relative_path(pattern):
+        return False
+    segs = str(path or "").strip().split("/")
+    pats = str(pattern or "").strip().split("/")
     if not segs or not pats:
         return False
 
@@ -355,6 +447,11 @@ class ReviewExemptionFacts:
     ``covered_commit`` is the target commit the coverage check ran against (empty when no change
     scope was declared), and ``uncovered`` names the declared changed paths no ``allowed_paths``
     glob matched. Both are diagnosis for :data:`EXEMPTION_PATH_COVERAGE_UNPROVEN`.
+
+    ``covered_scope_journal`` is the journal that declared that scope. It is what lets a consumer
+    ask whether OTHER evidence about the same lane is newer than the scope it claims to be about
+    (Redmine #14539 review j#91577 finding 2) — a merged disposition recorded before the current
+    target commit was ever declared says nothing about that commit.
     """
 
     state: str = EXEMPTION_NONE
@@ -363,6 +460,7 @@ class ReviewExemptionFacts:
     reason: str = ""
     covered_commit: str = ""
     uncovered: Tuple[str, ...] = ()
+    covered_scope_journal: str = ""
 
     @property
     def recorded(self) -> bool:
@@ -389,6 +487,7 @@ class ReviewExemptionFacts:
             reason=str(self.reason or "").strip(),
             covered_commit=str(self.covered_commit or "").strip(),
             uncovered=tuple(str(p).strip() for p in self.uncovered if str(p).strip()),
+            covered_scope_journal=str(self.covered_scope_journal or "").strip(),
         )
 
     def as_payload(self) -> dict[str, object]:
@@ -400,6 +499,7 @@ class ReviewExemptionFacts:
             "reason": v.reason,
             "covered_commit": v.covered_commit,
             "uncovered": list(v.uncovered),
+            "covered_scope_journal": v.covered_scope_journal,
         }
 
 
@@ -411,6 +511,13 @@ def _journal_exemption(notes: str) -> Optional[ReviewExemptionFacts]:
     A qualifying journal then either satisfies every required field — yielding
     :data:`EXEMPTION_EXEMPT` / :data:`EXEMPTION_REVIEW_REQUIRED` — or folds to
     :data:`EXEMPTION_INVALID`.
+
+    Every governed field is read with the exactly-one rule (:func:`_unique_field`): a record
+    declaring the SAME field twice with DIFFERENT values is not uniquely interpretable and folds
+    to :data:`EXEMPTION_INVALID` before any value is judged. Reading the first occurrence let a
+    gate carrying both ``follow_up_review: false`` and ``follow_up_review: true`` — or a second,
+    narrower ``allowed_paths`` — still fold to an exemption (Redmine #14539 review j#91577
+    finding 3).
     """
     text = notes or ""
     qualifies = _HEADING_RE.search(text) is not None
@@ -425,22 +532,37 @@ def _journal_exemption(notes: str) -> Optional[ReviewExemptionFacts]:
     if not qualifies:
         return None
 
-    allowed_paths = _path_field(_ALLOWED_PATHS_FIELD_RE, text)
-    reason = _field(_REASON_FIELD_RE, text)
+    role, role_conflict = _unique_field(_ROLE_FIELD_RE, text)
+    direct_edit_raw, direct_edit_conflict = _unique_field(_DIRECT_EDIT_FIELD_RE, text)
+    allowed_paths, allowed_paths_conflict = _unique_path_field(_ALLOWED_PATHS_FIELD_RE, text)
+    reason, reason_conflict = _unique_field(_REASON_FIELD_RE, text)
+    follow_up_raw, follow_up_conflict = _unique_field(_FOLLOW_UP_REVIEW_FIELD_RE, text)
+
     invalid = ReviewExemptionFacts(
         state=EXEMPTION_INVALID, allowed_paths=allowed_paths, reason=reason
     )
 
-    # Every required field of `### Codex Direct Edit Gate`, each fail-closed.
-    if _field(_ROLE_FIELD_RE, text) != CANONICAL_DIRECT_EDIT_ROLE:
+    # A field declared twice with conflicting values makes the whole gate ambiguous, so this is
+    # checked BEFORE any single value is judged — otherwise the first-occurrence value decides.
+    if (
+        role_conflict
+        or direct_edit_conflict
+        or allowed_paths_conflict
+        or reason_conflict
+        or follow_up_conflict
+    ):
         return invalid
-    if _boolean(_field(_DIRECT_EDIT_FIELD_RE, text)) is not True:
+
+    # Every required field of `### Codex Direct Edit Gate`, each fail-closed.
+    if role != CANONICAL_DIRECT_EDIT_ROLE:
+        return invalid
+    if _boolean(direct_edit_raw) is not True:
         return invalid
     if not allowed_paths:
         return invalid
     if not reason:
         return invalid
-    follow_up = _boolean(_field(_FOLLOW_UP_REVIEW_FIELD_RE, text))
+    follow_up = _boolean(follow_up_raw)
     if follow_up is None:
         return invalid
 
@@ -516,17 +638,27 @@ def fold_declared_change_scope(
         if jint is None:
             continue
         text = notes or ""
-        commit_match = _COMMIT_FIELD_RE.search(text)
-        commit = commit_match.group("value").strip().lower() if commit_match else ""
+        # Same exactly-one rule the gate's own fields use (review j#91577 finding 3): a journal
+        # naming two different target commits, or declaring two different changed sets, does not
+        # uniquely declare either. It still DECLARES — so it supersedes — but as an unproven
+        # scope, which is the fail-closed resolution of the ambiguity.
+        commits = {m.group("value").strip().lower() for m in _COMMIT_FIELD_RE.finditer(text)}
+        # ``next(iter(...))``, never ``.pop()`` — popping empties the set that the ``declares``
+        # test below still has to read.
+        commit = next(iter(commits)) if len(commits) == 1 else ""
+        # A change-bearing journal naming ANY commit announces a new target, so two conflicting
+        # ones still declare (and shadow) — as an unproven scope, since neither is the identity.
         declares = _CHANGED_PATHS_FIELD_RE.search(text) is not None or (
-            str(jint) in change_bearing and bool(commit)
+            str(jint) in change_bearing and bool(commits)
         )
         if not declares:
             continue  # this journal says nothing about the change scope
         # A declaration IS present, so it supersedes regardless of what it says. A missing /
         # empty path list or a missing commit resolves to an UNPROVEN scope, which shadows an
         # older proven one instead of leaving it standing.
-        paths = _path_field(_CHANGED_PATHS_FIELD_RE, text)
+        paths, paths_conflict = _unique_path_field(_CHANGED_PATHS_FIELD_RE, text)
+        if paths_conflict:
+            paths = ()
         if latest is None or jint > latest[0]:
             latest = (jint, DeclaredChangeScope(commit=commit, paths=paths, journal=str(jint)))
     if latest is None:
@@ -601,6 +733,7 @@ def fold_review_exemption(
             reason=resolved.reason,
             covered_commit=scope.commit,
             uncovered=missing,
+            covered_scope_journal=scope.journal,
         )
     return ReviewExemptionFacts(
         state=EXEMPTION_EXEMPT,
@@ -608,6 +741,7 @@ def fold_review_exemption(
         allowed_paths=resolved.allowed_paths,
         reason=resolved.reason,
         covered_commit=scope.commit,
+        covered_scope_journal=scope.journal,
     )
 
 
@@ -630,6 +764,12 @@ REASON_EXEMPTION_SUPERSEDED = "review_exemption_superseded_by_newer_review_round
 REASON_CLOSE_NOT_RECORDED = "close_not_recorded"
 #: No integration disposition means the work reached the integration branch.
 REASON_INTEGRATION_NOT_COMPLETE = "integration_not_complete"
+#: The Close gate names a DIFFERENT commit than the one the exemption's coverage was proven for
+#: (or names none at all), so the three durable facts are not about the same work.
+REASON_CLOSE_COMMIT_MISMATCH = "close_commit_is_not_the_covered_commit"
+#: The integration disposition predates the change-scope declaration it would have to be about,
+#: so it is evidence for an EARLIER commit than the one being retired.
+REASON_INTEGRATION_EVIDENCE_STALE = "integration_evidence_predates_the_change_scope"
 
 
 def evaluate_exemption_integration_admissible(
@@ -638,6 +778,8 @@ def evaluate_exemption_integration_admissible(
     currently_in_force: bool,
     close_recorded: bool,
     integration_complete: bool,
+    close_commit: str = "",
+    integration_journal: str = "",
 ) -> AdmissionResult:
     """Whether an EXEMPT lane may pass the terminal retire's latest-generation fence (pure).
 
@@ -664,6 +806,25 @@ def evaluate_exemption_integration_admissible(
     F3: reading the bare gate state here let the retire admit a lane whose exemption a NEWER review
     round had already superseded, so the retire and the glance disagreed about the very same
     durable record. One authority, two consumers.
+
+    **The three facts must be about the SAME work** (Redmine #14539 review j#91577 finding 2).
+    Conjoining three booleans only says each fact exists somewhere in the record, not that they
+    share a subject, so a lane could retire on a Close and a merge that both belong to an EARLIER
+    commit while the current target commit was never integrated at all. Two bindings close that:
+
+    - ``close_commit`` — the commit the Close gate declares — must literal-equal
+      :attr:`ReviewExemptionFacts.covered_commit`, the commit the path coverage was proven for.
+      Literal equality is deliberate: an abbreviated hash is not resolved against a full one here,
+      because this is a safety fence and it has no repository to resolve against, so a
+      length-mismatched pair fails closed rather than being guessed equal.
+    - ``integration_journal`` must be no OLDER than
+      :attr:`ReviewExemptionFacts.covered_scope_journal`. A disposition recorded before the
+      current target commit was declared cannot be evidence about it. This is an ordering test,
+      not an identity one, because the governed disposition record carries no commit field —
+      it is the strongest correlation the durable grammar actually supports, and it is the
+      minimum that rules out reusing a previous commit's merge.
+
+    An unparseable / absent journal id on either side of that comparison fails closed.
     """
     facts = exemption.validated()
     if facts.state == EXEMPTION_NONE:
@@ -680,6 +841,15 @@ def evaluate_exemption_integration_admissible(
         return AdmissionResult(False, REASON_CLOSE_NOT_RECORDED)
     if not integration_complete:
         return AdmissionResult(False, REASON_INTEGRATION_NOT_COMPLETE)
+
+    # The three facts above each exist. Now: are they about the same commit?
+    covered = facts.covered_commit.lower()
+    if not covered or str(close_commit or "").strip().lower() != covered:
+        return AdmissionResult(False, REASON_CLOSE_COMMIT_MISMATCH)
+    scope_journal = _int_journal(facts.covered_scope_journal)
+    integration_at = _int_journal(integration_journal)
+    if scope_journal is None or integration_at is None or integration_at < scope_journal:
+        return AdmissionResult(False, REASON_INTEGRATION_EVIDENCE_STALE)
     return AdmissionResult(True, REASON_OK)
 
 
@@ -691,10 +861,12 @@ __all__ = (
     "EXEMPTION_PATH_COVERAGE_UNPROVEN",
     "EXEMPTION_REVIEW_REQUIRED",
     "MARKER_GATE_CODEX_DIRECT_EDIT",
+    "REASON_CLOSE_COMMIT_MISMATCH",
     "REASON_CLOSE_NOT_RECORDED",
     "REASON_EXEMPTION_INVALID",
     "REASON_EXEMPTION_SUPERSEDED",
     "REASON_FOLLOW_UP_REVIEW_REQUIRED",
+    "REASON_INTEGRATION_EVIDENCE_STALE",
     "REASON_INTEGRATION_NOT_COMPLETE",
     "REASON_NO_EXEMPTION_RECORDED",
     "REASON_PATH_COVERAGE_UNPROVEN",
@@ -704,5 +876,6 @@ __all__ = (
     "evaluate_exemption_integration_admissible",
     "fold_declared_change_scope",
     "fold_review_exemption",
+    "is_canonical_relative_path",
     "uncovered_paths",
 )
