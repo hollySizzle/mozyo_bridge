@@ -1095,10 +1095,39 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
 - **gate が発火しても cleanup は完了する。** graceful `server stop` は gate 経由。refuse された場合は
   external request 0 のまま、exact owned process handle への signal に fallback する
   (`graceful_stop_refused=true`)。handle は他 server を指し得ない。
+- **capability は owned child の lifetime に bind する。pid 一致は生存証明ではない** (review j#85841 F2)。
+  owned child が exit した後も pid 記録は一致し続けるため、capability はそのまま「path 宛 actuation」へ
+  退化する。よって authority を 2 つに分割する:
+  - **client-call capability** — owned endpoint への通常 request (`workspace list` / `agent start` 等)。
+    mint した process とその forked worker が保持する。mint process 内では **owned child 生存**も連言する。
+  - **cleanup authority** — `DESTRUCTIVE_SUBCOMMANDS` (`server stop`) の破壊的 control request。
+    **mint した process のみ**が、かつ owned child 生存中のみ保持する。forked worker は無条件に拒否する。
+
+  分割が必要な理由は fork の非対称性である: forked worker は server の直接 parent ではないため、
+  継承した handle への `Popen.poll()` は `waitpid` の `ChildProcessError` 経由で
+  **生存中の child を「終了」と誤読する**。共有 gate に `poll()` を足すと健全な worker call が全て
+  fail-closed する。liveness は答えられる process (mint process) でのみ問い、それ以外は
+  destructive authority 自体を与えない。refusal reason は closed vocabulary へ
+  `owned_child_not_alive` / `cleanup_authority_not_owner` を追加する。
 - **evidence は 2 方向の負証明を持つ。** `operator_endpoint_requests` (実際に dispatch された
   operator endpoint 宛 request 数) と `endpoint_escape_refusals` (dispatch 前に拒否した数) は
   互いに独立で、健全な run では双方 0。binding を落とすと後者が、gate を落とすと前者が動く。
-  どちらも定数では満たせない (#14247 vacuity の教訓)。
+  どちらも定数では満たせない (#14247 vacuity の教訓)。`bound_calls` は `dispatched_calls` と並べて
+  無条件 increment せず、**effective socket が owned capability の socket と一致する場合のみ**加算する。
+  並べて増やすと `bound_calls == dispatched_calls` が恒真になり `endpoint_bound` が定数化する。
+- **負証明の scope は capability を保持した全 process。counter は fork を越えない** (review j#85841 F1)。
+  実 workspace / agent request は forked worker 側で発生するため、親 process の counter だけを読む
+  evidence は cross-process 面について何も証明していない。worker は自身の counter snapshot
+  (`EndpointGateCounters`) を receipt で親へ返し、親は自分の snapshot と併せて
+  `EndpointGateEvidence` へ集約する。**receipt 欠落・不整合は fail-closed**: 欠落した worker を
+  「request 0 の process」として数えず、`endpoint_gate_receipts_complete` /
+  `endpoint_gate_receipts_consistent` が false なら `endpoint_gate_proven_zero_external` は false、
+  run は success にならない。observe できなかったことを「0 だった」と述べない。
+- **失敗分岐でも evidence を出す** (review j#85841 F3)。`--execute` が収束しなかった run こそ
+  failure phase / residue / 負証明が必要になる。CLI は success/failure どちらでも report を
+  render してから **exit code で失敗を伝える**。JSON mode は同一 key 集合の redacted evidence を
+  stdout へ出し、text mode は closed token 要約 (`failure_phases` / `completed_projects` /
+  `endpoint_gate_*`) を返す。evidence を出さずに「JSON を見よ」と案内しない。
 - **guard-removal mutation は live capability を持つ process で行わない。** mutation / negative test は
   module の *copy* に対し、fake inner runner を注入し、ambient `HERDR_SOCKET_PATH` を到達不能な poison path に
   scrub した状態でのみ実行する (`tests/unit/.../test_disposable_herdr_instance.py`)。

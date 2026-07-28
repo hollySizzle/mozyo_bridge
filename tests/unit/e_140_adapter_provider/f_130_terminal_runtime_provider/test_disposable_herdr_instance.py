@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -38,9 +39,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_herdr_instance import (  # noqa: E402,E501
     REFUSAL_CAPABILITY_ABSENT,
     REFUSAL_CAPABILITY_NOT_MINTED,
+    REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER,
     REFUSAL_ENDPOINT_UNBOUND,
+    REFUSAL_OWNED_CHILD_NOT_ALIVE,
     DisposableHerdrInstance,
     EndpointBoundHerdrRunner,
+    EndpointGateCounters,
+    EndpointGateEvidence,
     HERDR_SOCKET_PATH_ENV,
     OwnedEndpointCapability,
     SmokeEndpointEscapeError,
@@ -57,6 +62,7 @@ _GATE_LINES = (
     "        if refusal:\n"
     "            self.escape_refusals += 1\n"
     "            self.last_refusal_reason = refusal\n"
+    "            self.refusal_reasons.add(refusal)\n"
 )
 
 
@@ -285,6 +291,251 @@ class DisposableLifecycleTests(unittest.TestCase):
             self.assertGreaterEqual(instance.runner.escape_refusals, 1)
 
 
+class CleanupAuthoritySplitTests(unittest.TestCase):
+    """Client-call capability vs cleanup authority (review j#85841 F2).
+
+    The pre-fix gate compared the owned pid and nothing else, so a capability outlived
+    the process it described: once the owned child exited, ``herdr server stop`` was
+    still dispatched at a socket path a stranger could have taken over.
+    """
+
+    def _instance(self, tmp: str, dispatched: list, process) -> DisposableHerdrInstance:
+        instance = DisposableHerdrInstance(
+            binary="/bin/true",
+            root=Path(tmp) / "instance",
+            base_env={"HOME": str(Path(tmp) / "operator")},
+            runner=lambda argv, **kwargs: dispatched.append(list(argv))
+            or subprocess.CompletedProcess(argv, 0, "[]", ""),
+            popen_factory=lambda argv, **kwargs: process,
+            sleeper=lambda _seconds: None,
+            ambient_env={},
+        )
+        instance.start()
+        return instance
+
+    def test_dead_owned_child_withdraws_authority_before_any_request(self) -> None:
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            dispatched.clear()
+
+            # The owned child exits.  The handle and its pid are unchanged, which is
+            # precisely why pid equality alone was never proof.
+            process.returncode = 17
+            self.assertFalse(instance.process_alive)
+
+            for command in (["/bin/true", "server", "stop"], ["/bin/true", "workspace", "list"]):
+                with self.assertRaises(SmokeEndpointEscapeError) as caught:
+                    instance.runner(command, capture_output=True)
+                self.assertEqual(caught.exception.reason, REFUSAL_OWNED_CHILD_NOT_ALIVE)
+            self.assertEqual(
+                dispatched, [], "a post-mortem request must make zero external requests"
+            )
+            self.assertEqual(instance.runner.escape_refusals, 2)
+            self.assertEqual(instance.runner.operator_endpoint_requests, 0)
+
+    def test_a_live_child_still_passes_the_same_gate(self) -> None:
+        """Baseline: the fence above must be the dead child, not a blanket refusal."""
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            dispatched.clear()
+            instance.runner(["/bin/true", "workspace", "list"], capture_output=True)
+            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(instance.runner.escape_refusals, 0)
+
+    def test_a_non_minting_process_may_call_but_never_destroy(self) -> None:
+        """A forked worker holds the endpoint, not the right to stop the server."""
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            dispatched.clear()
+
+            # Stand in for "some other process holds this inherited capability" without
+            # forking: the capability records who minted it, so a different pid is
+            # exactly what a worker looks like.
+            with mock.patch.object(live_module.os, "getpid", return_value=os.getpid() + 1):
+                instance.runner(["/bin/true", "workspace", "list"], capture_output=True)
+                self.assertEqual(len(dispatched), 1, "ordinary client calls must survive")
+                with self.assertRaises(SmokeEndpointEscapeError) as caught:
+                    instance.runner(["/bin/true", "server", "stop"], capture_output=True)
+            self.assertEqual(caught.exception.reason, REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER)
+            self.assertEqual(len(dispatched), 1, "the destructive request never left")
+
+    def test_a_real_forked_worker_is_not_locked_out_by_a_false_dead_poll(self) -> None:
+        """The trap the naive fix walks into (review j#85841 F2 caveat).
+
+        A forked worker is not the server's parent, so ``waitpid`` there raises
+        ``ChildProcessError`` and CPython reports a **live** child as exited.  Had the
+        liveness fence been placed on the shared capability provider, every healthy
+        worker call would fail closed.  This test forks for real and asserts the
+        worker still dispatches.
+        """
+        server = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(server.wait)
+        self.addCleanup(server.terminate)
+        context = multiprocessing.get_context("fork")
+        queue = context.Queue()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dispatched: list = []
+            instance = DisposableHerdrInstance(
+                binary="/bin/true",
+                root=Path(tmp) / "instance",
+                base_env={"HOME": str(Path(tmp) / "operator")},
+                runner=lambda argv, **kwargs: dispatched.append(list(argv))
+                or subprocess.CompletedProcess(argv, 0, "[]", ""),
+                popen_factory=lambda argv, **kwargs: server,
+                sleeper=lambda _seconds: None,
+                ambient_env={},
+            )
+            instance.start()
+            self.addCleanup(instance.shutdown)
+
+            worker = context.Process(target=_worker_probe, args=(queue, instance))
+            worker.start()
+            child_poll, dispatched_in_child, refusal = queue.get(timeout=30)
+            worker.join(timeout=30)
+
+            # The premise: the same handle reads as dead in the worker, alive in us.
+            self.assertIsNotNone(child_poll, "premise lost: the worker saw a live poll()")
+            self.assertIsNone(server.poll(), "the stand-in server must still be running")
+            # The property: the worker was NOT refused on that false reading.
+            self.assertEqual(refusal, "", f"worker was locked out: {refusal}")
+            self.assertEqual(dispatched_in_child, 1)
+
+
+def _worker_probe(queue, instance) -> None:
+    """Run one client call in a forked worker; report what it observed."""
+    seen = []
+    instance.runner._inner = lambda argv, *a, **k: seen.append(list(argv)) or (
+        subprocess.CompletedProcess(argv, 0, "[]", "")
+    )
+    refusal = ""
+    try:
+        instance.runner(["/bin/true", "workspace", "list"], capture_output=True)
+    except SmokeEndpointEscapeError as exc:
+        refusal = exc.reason
+    queue.put((instance._process.poll(), len(seen), refusal))
+
+
+class CrossProcessGateEvidenceTests(unittest.TestCase):
+    """The negative proof must span every process that held the capability (F1)."""
+
+    def _counters(self, **overrides) -> EndpointGateCounters:
+        base = dict(
+            dispatched_calls=1,
+            bound_calls=1,
+            escape_refusals=0,
+            operator_endpoint_requests=0,
+            refusal_reasons=(),
+        )
+        base.update(overrides)
+        return EndpointGateCounters(**base)
+
+    def test_every_process_is_folded_in(self) -> None:
+        gate = EndpointGateEvidence.aggregate(
+            parent=self._counters(dispatched_calls=3, bound_calls=3),
+            worker_receipts=[
+                self._counters(dispatched_calls=4, bound_calls=4),
+                self._counters(dispatched_calls=5, bound_calls=5),
+            ],
+        )
+        self.assertEqual(gate.processes, 3)
+        self.assertEqual(gate.dispatched_calls, 12)
+        self.assertTrue(gate.receipts_complete)
+        self.assertTrue(gate.all_calls_bound)
+        self.assertTrue(gate.proven_zero_external)
+
+    def test_a_worker_that_reached_an_operator_endpoint_is_not_hidden(self) -> None:
+        """The regression the parent-only counters could not see at all."""
+        gate = EndpointGateEvidence.aggregate(
+            parent=self._counters(),
+            worker_receipts=[self._counters(operator_endpoint_requests=1)],
+        )
+        self.assertEqual(gate.operator_endpoint_requests, 1)
+        self.assertTrue(gate.operator_endpoint_connected)
+        self.assertFalse(gate.proven_zero_external)
+
+    def test_a_missing_receipt_is_never_a_zero(self) -> None:
+        gate = EndpointGateEvidence.aggregate(
+            parent=self._counters(), worker_receipts=[self._counters(), None]
+        )
+        self.assertEqual(gate.receipts_expected, 2)
+        self.assertEqual(gate.receipts_missing, 1)
+        self.assertFalse(gate.receipts_complete)
+        self.assertFalse(
+            gate.proven_zero_external,
+            "an unobserved process is not a process that made zero requests",
+        )
+        # The readable counters are still reported honestly; it is the CLAIM that fails.
+        self.assertEqual(gate.operator_endpoint_requests, 0)
+
+    def test_an_inconsistent_receipt_is_treated_like_a_missing_one(self) -> None:
+        garbled = self._counters(dispatched_calls=1, bound_calls=9)
+        self.assertFalse(garbled.consistent)
+        gate = EndpointGateEvidence.aggregate(
+            parent=self._counters(), worker_receipts=[garbled]
+        )
+        self.assertFalse(gate.receipts_consistent)
+        self.assertFalse(gate.proven_zero_external)
+
+    def test_a_refusal_count_without_a_reason_is_inconsistent(self) -> None:
+        """The count and the closed vocabulary have to corroborate each other."""
+        self.assertFalse(self._counters(escape_refusals=1, refusal_reasons=()).consistent)
+        self.assertFalse(
+            self._counters(escape_refusals=0, refusal_reasons=("endpoint_unbound",)).consistent
+        )
+        self.assertTrue(
+            self._counters(
+                escape_refusals=1, refusal_reasons=("endpoint_unbound",)
+            ).consistent
+        )
+
+    def test_counters_do_not_cross_a_fork(self) -> None:
+        """The premise of the whole finding, measured rather than assumed."""
+        root = Path("/tmp/owned-fork")
+        capability = _mint(root, pid=os.getpid())
+        runner = EndpointBoundHerdrRunner(
+            lambda argv, *a, **k: subprocess.CompletedProcess(argv, 0, "", ""),
+            capability_provider=lambda: capability,
+            binding_env={HERDR_SOCKET_PATH_ENV: str(root / "herdr.sock")},
+            agent_env={},
+        )
+        runner(["herdr", "workspace", "list"], env={})
+        before = runner.dispatched_calls
+
+        context = multiprocessing.get_context("fork")
+        queue = context.Queue()
+        worker = context.Process(target=_counter_probe, args=(queue, runner))
+        worker.start()
+        child_snapshot = queue.get(timeout=30)
+        worker.join(timeout=30)
+
+        self.assertEqual(child_snapshot.dispatched_calls, before + 1)
+        self.assertEqual(
+            runner.dispatched_calls,
+            before,
+            "the parent's counter must be untouched — which is why receipts exist",
+        )
+        gate = EndpointGateEvidence.aggregate(
+            parent=EndpointGateCounters.snapshot(runner),
+            worker_receipts=[child_snapshot],
+        )
+        self.assertEqual(gate.dispatched_calls, before + before + 1)
+
+
+def _counter_probe(queue, runner) -> None:
+    runner(["herdr", "workspace", "list"], env={})
+    queue.put(EndpointGateCounters.snapshot(runner))
+
+
 class MutationProbeTests(unittest.TestCase):
     """Run guard-removal mutations where the operator endpoint is unreachable.
 
@@ -360,6 +611,8 @@ class MutationProbeTests(unittest.TestCase):
                 self.assertEqual(len(dispatched), 1, "baseline must still work")
                 self.assertEqual(runner.escape_refusals, 0)
                 self.assertEqual(runner.operator_endpoint_requests, 0)
+                self.assertEqual(runner.bound_calls, 1)
+                self.assertTrue(runner.all_calls_bound)
 
                 # Mutation A — the exact incident: the binding stops being applied, so
                 # the call inherits the ambient (operator) socket.  The gate must stop
@@ -382,6 +635,13 @@ class MutationProbeTests(unittest.TestCase):
                 self.assertEqual(len(dispatched), 1)
                 self.assertEqual(dispatched[0]["HERDR_SOCKET_PATH"], poison)
                 self.assertEqual(runner.operator_endpoint_requests, 1)
+                # ``bound_calls`` is derived from the effective socket rather than
+                # incremented next to ``dispatched_calls``, so it can actually move
+                # apart from it.  Were it the old unconditional increment, this
+                # assertion would read 1 and ``all_calls_bound`` would stay True while
+                # the request was landing on the operator's endpoint.
+                self.assertEqual(runner.bound_calls, 0)
+                self.assertFalse(runner.all_calls_bound)
 
             self.assertFalse(
                 Path(poison).exists(),

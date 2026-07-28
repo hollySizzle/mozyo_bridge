@@ -35,6 +35,21 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.shared.errors import die
 
 
+def _failure_phases(report: dict) -> str:
+    """The closed failure-phase tokens the run produced, as a replayable summary.
+
+    ``none`` when nothing failed.  Phases are the whole point of the evidence on the
+    failing branch (issue Acceptance 4), so text mode names them rather than telling
+    the operator to go and read a JSON document that was never printed.
+    """
+    phases = [
+        str(project.get("failure_phase", ""))
+        for project in report.get("projects", [])
+        if str(project.get("failure_phase", "")) not in ("", "none")
+    ]
+    return ",".join(sorted(set(phases))) if phases else "none"
+
+
 def _render_text(report: dict) -> str:
     if report.get("actuated"):
         return (
@@ -42,10 +57,18 @@ def _render_text(report: dict) -> str:
             f"success={report['success']} cross_process={report['cross_process']} "
             f"create_count={report['coordinators_create_count']} "
             f"duplicates={report['duplicate_agents']} "
+            f"completed_projects={report['completed_projects']}"
+            f"/{report['requested_projects']} "
+            f"failure_phases={_failure_phases(report)} "
             f"residue_clear={report['residue_clear']} "
             f"server_stopped={report['server_stopped']} "
             f"operator_endpoint_requests={report['operator_endpoint_requests']} "
-            f"endpoint_escape_refusals={report['endpoint_escape_refusals']}"
+            f"endpoint_escape_refusals={report['endpoint_escape_refusals']} "
+            f"endpoint_gate_processes={report['endpoint_gate_processes']} "
+            "endpoint_gate_receipts_complete="
+            f"{report['endpoint_gate_receipts_complete']} "
+            "endpoint_gate_proven_zero_external="
+            f"{report['endpoint_gate_proven_zero_external']}"
         )
     return (
         "herdr smoke-shared-space preflight: "
@@ -91,16 +114,20 @@ def cmd_herdr_smoke_shared_space(args: argparse.Namespace) -> int:
         # already exists / labels unreadable, or the herdr binary is unresolvable.
         die(f"herdr smoke-shared-space failed: {exc}")
         raise AssertionError("unreachable")
-    if getattr(args, "execute", False) and not report.get("success", False):
-        die(
-            "herdr smoke-shared-space failed: disposable cross-process smoke did not "
-            "converge and clean up; inspect the redacted JSON evidence"
-        )
-        raise AssertionError("unreachable")
+    # Evidence FIRST, verdict second (review j#85841 F3).  A non-converged run is
+    # exactly when the failure phase, the residue counts and the endpoint-gate
+    # negative proof matter, so the report is rendered on both branches and the
+    # failure is signalled by the exit code — never by withholding the evidence.
     if getattr(args, "json", False):
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     else:
         print(_render_text(report))
+    if getattr(args, "execute", False) and not report.get("success", False):
+        die(
+            "herdr smoke-shared-space failed: disposable cross-process smoke did not "
+            "converge and clean up; the redacted evidence above names the phase"
+        )
+        raise AssertionError("unreachable")
     return 0
 
 

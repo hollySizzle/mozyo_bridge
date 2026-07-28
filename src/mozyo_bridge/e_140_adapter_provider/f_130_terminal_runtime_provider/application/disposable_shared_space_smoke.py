@@ -10,6 +10,8 @@ from typing import Mapping, Sequence
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_herdr_instance import (  # noqa: E501
     DisposableHerdrInstance,
+    EndpointGateCounters,
+    EndpointGateEvidence,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_harness import (  # noqa: E501
     SharedSpaceSmokeHarness,
@@ -27,7 +29,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 
 @dataclass(frozen=True)
 class _ProcessReceipt:
-    """Redaction-safe mutation receipts returned by one forked worker."""
+    """Redaction-safe mutation receipts returned by one forked worker.
+
+    ``endpoint_gate`` is the worker's own copy of the endpoint-gate counters.  It is
+    optional at the type level precisely because its absence must stay visible: the
+    parent counts a missing snapshot rather than folding in an implicit zero
+    (review j#85841 F1).
+    """
 
     index: int
     observation: ProjectSmokeObservation
@@ -35,6 +43,7 @@ class _ProcessReceipt:
     created_workspaces: tuple[tuple[str, str], ...] = ()
     agent_start_names: tuple[str, ...] = ()
     coordinators_create_count: int = 0
+    endpoint_gate: "EndpointGateCounters | None" = None
 
 
 def _forked_project_worker(
@@ -43,8 +52,15 @@ def _forked_project_worker(
     output,
     harness: SharedSpaceSmokeHarness,
     spec: _ProjectSpec,
+    gate_runner,
 ) -> None:
-    """One bounded child process; always attempts one typed receipt."""
+    """One bounded child process; always attempts one typed receipt.
+
+    ``gate_runner`` is this child's forked copy of the endpoint-bound runner.  Its
+    counters are process-local, so they are snapshotted into the receipt — that
+    snapshot is the only way the parent can say anything about what THIS process
+    dispatched.
+    """
     try:
         barrier.wait(timeout=15.0)
         observation = harness.run_project(spec)
@@ -65,11 +81,16 @@ def _forked_project_worker(
                 created_workspaces=tuple(harness.recorder.created_workspaces.items()),
                 agent_start_names=tuple(harness.recorder.agent_start_names),
                 coordinators_create_count=harness.recorder.coordinators_create_count,
+                # Snapshotted even when the run failed: a worker that escaped the gate
+                # or reached an operator endpoint before crashing is exactly the
+                # evidence the aggregate must not lose.
+                endpoint_gate=EndpointGateCounters.snapshot(gate_runner),
             )
         )
     except BaseException:
-        # The parent treats a missing receipt as a typed worker failure and still owns
-        # the exact server process/state tree for bounded cleanup.
+        # The parent treats a missing receipt as a typed worker failure AND as a
+        # missing endpoint-gate snapshot, and still owns the exact server
+        # process/state tree for bounded cleanup.
         return
 
 
@@ -78,6 +99,7 @@ def _run_forked_projects(
     harnesses: Sequence[SharedSpaceSmokeHarness],
     specs: Sequence[_ProjectSpec],
     timeout: float,
+    gate_runner,
 ) -> list[_ProcessReceipt]:
     """Release real OS processes together and collect one receipt per project."""
     if not specs:
@@ -93,7 +115,7 @@ def _run_forked_projects(
     processes = [
         context.Process(
             target=_forked_project_worker,
-            args=(index, barrier, output, harnesses[index], spec),
+            args=(index, barrier, output, harnesses[index], spec, gate_runner),
             name=f"mozyo-smoke-{spec.project_key}",
         )
         for index, spec in enumerate(specs)
@@ -181,6 +203,10 @@ def run_disposable_shared_space_smoke(
         **kwargs,
     )
     summary = SharedSpaceSmokeObservation(requested_projects=count)
+    # One slot per project, seeded with the fail-closed value.  A worker that never
+    # reports leaves its ``None`` in place, and the aggregate counts it as missing
+    # rather than as a process that made zero requests (review j#85841 F1).
+    worker_gate_receipts: list = [None] * count
     try:
         with instance:
             with isolated_smoke_home(Path(isolated_home)) as capability:
@@ -209,8 +235,10 @@ def run_disposable_shared_space_smoke(
                     harnesses=harnesses,
                     specs=specs,
                     timeout=process_timeout,
+                    gate_runner=instance.runner,
                 )
                 observations = [receipt.observation for receipt in receipts]
+                worker_gate_receipts = [receipt.endpoint_gate for receipt in receipts]
                 for receipt in receipts:
                     cleanup_harness.recorder.merge_receipts(
                         launched_locators=receipt.launched_locators,
@@ -246,8 +274,14 @@ def run_disposable_shared_space_smoke(
         # ``with instance`` already shuts down.  This idempotent call covers a
         # pre-enter/startup exception without broad process discovery.
         instance.shutdown()
+    # Folded only now, so the parent snapshot also covers cleanup, residue verification
+    # and the shutdown ``server stop`` that ran in the ``finally`` above.
+    gate = EndpointGateEvidence.aggregate(
+        parent=EndpointGateCounters.snapshot(instance.runner),
+        worker_receipts=worker_gate_receipts,
+    )
     evidence = summary.as_evidence()
-    evidence.update(instance.as_evidence())
+    evidence.update(instance.as_evidence(gate=gate))
     evidence["actuated"] = True
     evidence["cross_process"] = True
     evidence["success"] = bool(
@@ -262,9 +296,14 @@ def run_disposable_shared_space_smoke(
         #     operator_endpoint_requests > 0.
         # Neither can be satisfied by a constant, and the first can no longer be
         # discovered *after* the request has already reached the operator's server.
-        and instance.runner.all_calls_bound
-        and instance.runner.escape_refusals == 0
-        and instance.runner.operator_endpoint_requests == 0
+        #
+        # The proof is taken over EVERY process that held the capability, not just this
+        # one: the real workspace/agent traffic happens in the forked workers, whose
+        # counters never cross the fork.  ``proven_zero_external`` additionally requires
+        # every worker receipt to be present and self-consistent, so a lost snapshot
+        # fails the run instead of reading as a silent zero (review j#85841 F1).
+        and gate.proven_zero_external
+        and gate.all_calls_bound
     )
     return evidence
 

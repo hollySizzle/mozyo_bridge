@@ -35,6 +35,36 @@ Four rules follow, and this module implements all four:
    ``tests/unit/.../test_disposable_herdr_instance.py``), never against the live
    :func:`run_disposable_shared_space_smoke` path.
 
+Two authorities, not one (review j#85841 F2)
+--------------------------------------------
+A pid that still *equals* the one we minted for is not proof that the child is still
+running; once it exits, the capability degrades into exactly the socket-path
+addressing rule 1 rejects.  But liveness cannot simply be asked everywhere: the smoke's
+forked workers inherit a *copy* of the owned handle without being the server's parent,
+and :meth:`subprocess.Popen.poll` there reports a **live** child as dead (``waitpid``
+raises ``ChildProcessError``, which CPython maps to "exited").  Bolting ``poll()`` onto
+the shared gate would therefore fail-closed on every healthy worker call.
+
+So the single authority is split in two:
+
+* **client-call capability** — addressing the owned endpoint (``workspace list``,
+  ``agent start``, …).  Held by the minting process and by its forked workers.  In the
+  minting process — the only place the question is answerable — it is additionally
+  fenced on the owned child still being alive.
+* **cleanup authority** — the destructive control requests in
+  :data:`DESTRUCTIVE_SUBCOMMANDS` (``server stop``).  Granted **only** to the minting
+  process, and only while the owned child is alive.  A forked worker is refused
+  outright rather than asked a question it cannot answer.
+
+Cross-process negative proof (review j#85841 F1)
+------------------------------------------------
+The counters live on the runner, so ``fork`` gives every worker its own copy and the
+parent's ``operator_endpoint_requests == 0`` says nothing about the children — which is
+where the real workspace/agent traffic happens.  :class:`EndpointGateCounters` is the
+per-process snapshot a worker returns; :class:`EndpointGateEvidence` aggregates the
+parent's snapshot with one per worker and is **fail-closed on absence**: a missing or
+internally inconsistent worker snapshot is never counted as a zero.
+
 It deliberately does not expose raw ``herdr server`` choreography to callers.  The
 CLI composes this object and reports only closed booleans/counts; socket paths,
 config paths, subprocess output, and environment values never enter evidence.
@@ -79,6 +109,16 @@ REFUSAL_CAPABILITY_NOT_MINTED = "capability_not_minted"
 REFUSAL_ENDPOINT_UNBOUND = "endpoint_unbound"
 REFUSAL_ENDPOINT_OUTSIDE_OWNED_ROOT = "endpoint_outside_owned_root"
 REFUSAL_OPERATOR_ENDPOINT_TARGET = "operator_endpoint_target"
+#: The owned server child is no longer running, so the capability would degrade into
+#: bare socket-path addressing (review j#85841 F2).
+REFUSAL_OWNED_CHILD_NOT_ALIVE = "owned_child_not_alive"
+#: A destructive control request was issued by a process that did not launch the
+#: server (typically a forked smoke worker), which never holds cleanup authority.
+REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER = "cleanup_authority_not_owner"
+
+#: Closed vocabulary of control requests that may destroy the owned server.  Only the
+#: minting process may issue these, and only while its child is alive.
+DESTRUCTIVE_SUBCOMMANDS = (("server", "stop"),)
 
 _ENDPOINT_CAPABILITY_TOKEN = object()
 # Identity registry for minted capabilities.  ``isinstance`` alone is forgeable through
@@ -144,7 +184,15 @@ class OwnedEndpointCapability:
     * it carries ``owner_pid``, the pid of the child we launched, so the gate can
       re-check at actuation time that the process it is cleaning up is still the one
       the capability was minted for — rather than trusting a socket path that any
-      environment may have redirected (design disposition j#85756 item 4).
+      environment may have redirected (design disposition j#85756 item 4);
+    * it carries ``minter_pid``, the pid of the process that launched that child.  A
+      forked smoke worker inherits the capability but not the parent relationship, so
+      this is what separates client-call capability from cleanup authority and tells
+      the gate which process is even *able* to answer the liveness question
+      (review j#85841 F2).
+
+    ``owner_pid`` alone is a stale record once the child exits; liveness is enforced by
+    :class:`DisposableHerdrInstance`, not claimed by this value object.
     """
 
     root: Path
@@ -152,6 +200,7 @@ class OwnedEndpointCapability:
     client_socket_path: Path
     config_path: Path
     owner_pid: int
+    minter_pid: int = 0
     _mint_token: InitVar[object] = None
 
     def __post_init__(self, _mint_token: object) -> None:
@@ -171,10 +220,160 @@ def _mint_owned_endpoint(
         client_socket_path=binding.client_socket_path,
         config_path=binding.config_path,
         owner_pid=int(owner_pid),
+        # Captured here, not passed in: only the process running this mint is the one
+        # that just launched the child, so cleanup authority cannot be handed around.
+        minter_pid=os.getpid(),
         _mint_token=_ENDPOINT_CAPABILITY_TOKEN,
     )
     _MINTED_CAPABILITIES.add(capability)
     return capability
+
+
+@dataclass(frozen=True)
+class EndpointGateCounters:
+    """One process's endpoint-gate counters — the unit of the cross-process proof.
+
+    The counters live on :class:`EndpointBoundHerdrRunner`, so ``fork`` hands every
+    smoke worker its own copy.  A worker returns this snapshot to the parent; absence
+    of one is a fail-closed condition, never an implicit zero (review j#85841 F1).
+    """
+
+    dispatched_calls: int
+    bound_calls: int
+    escape_refusals: int
+    operator_endpoint_requests: int
+    refusal_reasons: tuple[str, ...] = ()
+
+    @classmethod
+    def snapshot(cls, runner: "EndpointBoundHerdrRunner") -> "EndpointGateCounters":
+        return cls(
+            dispatched_calls=int(runner.dispatched_calls),
+            bound_calls=int(runner.bound_calls),
+            escape_refusals=int(runner.escape_refusals),
+            operator_endpoint_requests=int(runner.operator_endpoint_requests),
+            refusal_reasons=tuple(sorted(runner.refusal_reasons)),
+        )
+
+    @property
+    def consistent(self) -> bool:
+        """Whether this snapshot satisfies the invariants the runner maintains.
+
+        A snapshot that was truncated, hand-built or garbled in transit fails here, and
+        an inconsistent snapshot is treated exactly like a missing one — the point of
+        the aggregate is that only a *readable* receipt may lower the residual risk.
+        """
+        counts = (
+            self.dispatched_calls,
+            self.bound_calls,
+            self.escape_refusals,
+            self.operator_endpoint_requests,
+        )
+        if min(counts) < 0:
+            return False
+        if self.bound_calls > self.dispatched_calls:
+            return False
+        if self.operator_endpoint_requests > self.dispatched_calls:
+            return False
+        # A refusal count and a refusal vocabulary must corroborate each other.
+        return (self.escape_refusals > 0) == bool(self.refusal_reasons)
+
+
+@dataclass(frozen=True)
+class EndpointGateEvidence:
+    """The endpoint-gate negative proof over every process that held the capability.
+
+    ``processes`` counts the snapshots that were actually folded in (the parent plus
+    each worker that returned one).  ``receipts_missing`` counts the workers that did
+    not, and any missing or inconsistent receipt makes :attr:`proven_zero_external`
+    false no matter what the readable counters say: a run whose evidence cannot be
+    collected has not proven it made zero external requests, it has merely failed to
+    observe them (review j#85841 F1).
+    """
+
+    processes: int
+    receipts_expected: int
+    receipts_missing: int
+    receipts_consistent: bool
+    dispatched_calls: int
+    bound_calls: int
+    escape_refusals: int
+    operator_endpoint_requests: int
+    refusal_reasons: tuple[str, ...] = ()
+
+    @classmethod
+    def aggregate(
+        cls,
+        *,
+        parent: EndpointGateCounters,
+        worker_receipts: Sequence[Optional[EndpointGateCounters]],
+    ) -> "EndpointGateEvidence":
+        present = [receipt for receipt in worker_receipts if receipt is not None]
+        folded = [parent, *present]
+        reasons: set[str] = set()
+        for snapshot in folded:
+            reasons.update(snapshot.refusal_reasons)
+        return cls(
+            processes=len(folded),
+            receipts_expected=len(worker_receipts),
+            receipts_missing=len(worker_receipts) - len(present),
+            receipts_consistent=all(snapshot.consistent for snapshot in folded),
+            dispatched_calls=sum(s.dispatched_calls for s in folded),
+            bound_calls=sum(s.bound_calls for s in folded),
+            escape_refusals=sum(s.escape_refusals for s in folded),
+            operator_endpoint_requests=sum(s.operator_endpoint_requests for s in folded),
+            refusal_reasons=tuple(sorted(reasons)),
+        )
+
+    @classmethod
+    def for_single_process(
+        cls, runner: "EndpointBoundHerdrRunner"
+    ) -> "EndpointGateEvidence":
+        """The parent-scope view, for a lifecycle that forked no workers."""
+        return cls.aggregate(parent=EndpointGateCounters.snapshot(runner), worker_receipts=())
+
+    @property
+    def receipts_complete(self) -> bool:
+        return self.receipts_missing == 0
+
+    @property
+    def all_calls_bound(self) -> bool:
+        """Every dispatched call across every process carried the owned socket."""
+        return (
+            self.dispatched_calls > 0
+            and self.bound_calls == self.dispatched_calls
+            and self.escape_refusals == 0
+        )
+
+    @property
+    def operator_endpoint_connected(self) -> bool:
+        return self.operator_endpoint_requests > 0
+
+    @property
+    def proven_zero_external(self) -> bool:
+        """Zero operator-endpoint traffic, *proven* rather than merely unobserved."""
+        return (
+            self.receipts_complete
+            and self.receipts_consistent
+            and self.operator_endpoint_requests == 0
+            and self.escape_refusals == 0
+        )
+
+    def as_evidence(self) -> dict[str, object]:
+        return {
+            "endpoint_bound": self.all_calls_bound,
+            "operator_server_connected": self.operator_endpoint_connected,
+            "operator_endpoint_requests": self.operator_endpoint_requests,
+            "endpoint_escape_refusals": self.escape_refusals,
+            "endpoint_gate_dispatched_calls": self.dispatched_calls,
+            "endpoint_gate_bound_calls": self.bound_calls,
+            "endpoint_gate_processes": self.processes,
+            "endpoint_gate_receipts_expected": self.receipts_expected,
+            "endpoint_gate_receipts_missing": self.receipts_missing,
+            "endpoint_gate_receipts_complete": self.receipts_complete,
+            "endpoint_gate_receipts_consistent": self.receipts_consistent,
+            "endpoint_gate_proven_zero_external": self.proven_zero_external,
+            "endpoint_refusal_reasons": list(self.refusal_reasons),
+        }
 
 
 class EndpointBoundHerdrRunner:
@@ -223,6 +422,7 @@ class EndpointBoundHerdrRunner:
         binding_env: Mapping[str, str],
         agent_env: Mapping[str, str],
         operator_socket_paths: Sequence[str] = (),
+        lifecycle_authority: Optional[Callable[[Sequence[str]], str]] = None,
     ) -> None:
         self._inner = inner
         self._capability_provider = capability_provider
@@ -231,12 +431,19 @@ class EndpointBoundHerdrRunner:
         self._operator_sockets = tuple(
             sorted({str(path) for path in operator_socket_paths if str(path or "")})
         )
+        # Consulted per call, AFTER the capability conjunction and still before dispatch.
+        # It answers the questions only the lifecycle can answer — is the owned child
+        # still alive, and may *this* process issue a destructive control request.
+        self._lifecycle_authority = lifecycle_authority or (lambda command: "")
         self.calls = 0
         self.dispatched_calls = 0
         self.bound_calls = 0
         self.operator_endpoint_requests = 0
         self.escape_refusals = 0
         self.last_refusal_reason = ""
+        #: Every closed refusal token this runner produced.  Kept alongside the count
+        #: so a receipt's count and its vocabulary can corroborate each other.
+        self.refusal_reasons: set = set()
 
     def __call__(self, argv, *args, **kwargs):
         command = list(argv)
@@ -248,23 +455,36 @@ class EndpointBoundHerdrRunner:
         kwargs["env"] = merged
         self.calls += 1
         effective = merged.get(HERDR_SOCKET_PATH_ENV, "")
-        refusal = self._refusal_reason(effective)
+        refusal = self._refusal_reason(effective, command)
         if refusal:
             self.escape_refusals += 1
             self.last_refusal_reason = refusal
+            self.refusal_reasons.add(refusal)
             # Nothing has been executed yet: external request count for this call is 0.
             raise SmokeEndpointEscapeError(refusal)
         # Reached only when the gate passed — or when a mutation removed the gate, which
         # is exactly what ``operator_endpoint_requests`` is here to catch.
         self.dispatched_calls += 1
-        self.bound_calls += 1
+        # Derived independently of the gate.  If it were incremented next to
+        # ``dispatched_calls`` unconditionally, ``bound_calls == dispatched_calls`` could
+        # never fail and ``all_calls_bound`` would be the constant-true vacuity that
+        # #14247 warns about: a mutation that removes the gate must move these apart.
+        if self._targets_owned_socket(effective):
+            self.bound_calls += 1
         if effective in self._operator_sockets:
             self.operator_endpoint_requests += 1
         return self._inner(command, *args, **kwargs)
 
     run = __call__
 
-    def _refusal_reason(self, effective: str) -> str:
+    def _targets_owned_socket(self, effective: str) -> bool:
+        """Whether ``effective`` is the socket of a capability this module minted."""
+        capability = self._capability_provider()
+        if capability is None or capability not in _MINTED_CAPABILITIES:
+            return False
+        return bool(effective) and effective == str(capability.socket_path)
+
+    def _refusal_reason(self, effective: str, command: Sequence[str] = ()) -> str:
         capability = self._capability_provider()
         if capability is None:
             return REFUSAL_CAPABILITY_ABSENT
@@ -277,7 +497,7 @@ class EndpointBoundHerdrRunner:
             return REFUSAL_ENDPOINT_OUTSIDE_OWNED_ROOT
         if effective in self._operator_sockets:
             return REFUSAL_OPERATOR_ENDPOINT_TARGET
-        return ""
+        return self._lifecycle_authority(list(command))
 
     @property
     def all_calls_bound(self) -> bool:
@@ -368,6 +588,7 @@ class DisposableHerdrInstance:
             binding_env=self._binding_env(),
             agent_env=self._operator_agent_env(),
             operator_socket_paths=self._operator_sockets,
+            lifecycle_authority=self._lifecycle_authority_refusal,
         )
 
     def _current_capability(self) -> Optional[OwnedEndpointCapability]:
@@ -376,6 +597,12 @@ class DisposableHerdrInstance:
         Before :meth:`start` there is none, so every request fails closed.  After the
         owned handle is released (or replaced), the pid check withdraws it — authority
         follows the owned child identity, not a path that outlived it.
+
+        Liveness is deliberately NOT checked here: this provider is also consulted by
+        forked smoke workers, where ``poll()`` cannot answer the question (see the
+        module docstring).  The liveness and cleanup-authority fences live in
+        :meth:`_lifecycle_authority_refusal`, which the gate consults on the same call,
+        still before dispatch.
         """
         capability = self._capability
         process = self._process
@@ -384,6 +611,35 @@ class DisposableHerdrInstance:
         if getattr(process, "pid", None) != capability.owner_pid:
             return None
         return capability
+
+    def _is_minting_process(self, capability: OwnedEndpointCapability) -> bool:
+        """Whether this process is the one that launched the owned child."""
+        return os.getpid() == capability.minter_pid
+
+    def _lifecycle_authority_refusal(self, command: Sequence[str]) -> str:
+        """Why this call must not be dispatched (``""`` when it may proceed).
+
+        Evaluated before the inner runner, so a refusal still means zero external
+        requests for that call.  Two rules, matching the two authorities:
+
+        * a destructive control request (:data:`DESTRUCTIVE_SUBCOMMANDS`) is refused
+          unless this process minted the capability.  A forked worker holding an
+          inherited copy is not the server's parent and never needs to stop it;
+        * in the minting process — the only one that can answer — the owned child must
+          still be running.  Otherwise the capability has decayed into the bare
+          socket-path addressing the threat model rejects, and a stranger that took
+          over the path would receive the request (review j#85841 F2).
+        """
+        capability = self._current_capability()
+        if capability is None:
+            return REFUSAL_CAPABILITY_ABSENT
+        destructive = tuple(list(command)[1:3]) in DESTRUCTIVE_SUBCOMMANDS
+        if not self._is_minting_process(capability):
+            return REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER if destructive else ""
+        process = self._process
+        if process is None or process.poll() is not None:
+            return REFUSAL_OWNED_CHILD_NOT_ALIVE
+        return ""
 
     @property
     def capability(self) -> Optional[OwnedEndpointCapability]:
@@ -536,7 +792,13 @@ class DisposableHerdrInstance:
         self._process = None
         self._capability = None
 
-    def as_evidence(self) -> dict[str, object]:
+    def gate_evidence(self) -> EndpointGateEvidence:
+        """This process's own endpoint-gate counters, as a single-process aggregate."""
+        return EndpointGateEvidence.for_single_process(self.runner)
+
+    def as_evidence(
+        self, *, gate: Optional[EndpointGateEvidence] = None
+    ) -> dict[str, object]:
         """Closed, path-free lifecycle/negative-proof facts.
 
         ``operator_endpoint_requests`` counts requests that were actually dispatched to
@@ -544,14 +806,19 @@ class DisposableHerdrInstance:
         stopped before dispatch.  A healthy run has both at zero.  A dropped binding
         raises the second; a dropped gate raises the first.  Neither can be satisfied by
         a constant, which the earlier hardcoded negative control could (review #14247).
+
+        ``gate`` names the **scope** of that negative proof.  Omitted, it covers this
+        process only — correct for a lifecycle that forked nothing, and misleading for
+        one that did, because the counters do not cross a ``fork``.  A cross-process
+        driver passes the aggregate it collected from its workers, which also carries
+        whether every worker receipt was actually present and self-consistent
+        (review j#85841 F1).
         """
+        scope = self.gate_evidence() if gate is None else gate
         return {
             "server_started": self.started,
             "server_ready": self.ready,
-            "endpoint_bound": self.runner.all_calls_bound,
-            "operator_server_connected": self.runner.operator_endpoint_connected,
-            "operator_endpoint_requests": self.runner.operator_endpoint_requests,
-            "endpoint_escape_refusals": self.runner.escape_refusals,
+            **scope.as_evidence(),
             "graceful_stop_refused": self.graceful_stop_refused,
             "server_stopped": self.stopped,
             "endpoint_residue": self.endpoint_residue,
@@ -559,9 +826,12 @@ class DisposableHerdrInstance:
 
 
 __all__ = (
+    "DESTRUCTIVE_SUBCOMMANDS",
     "DisposableHerdrBinding",
     "DisposableHerdrInstance",
     "EndpointBoundHerdrRunner",
+    "EndpointGateCounters",
+    "EndpointGateEvidence",
     "OwnedEndpointCapability",
     "SmokeEndpointEscapeError",
     "HERDR_CLIENT_SOCKET_PATH_ENV",
@@ -569,7 +839,9 @@ __all__ = (
     "HERDR_SOCKET_PATH_ENV",
     "REFUSAL_CAPABILITY_ABSENT",
     "REFUSAL_CAPABILITY_NOT_MINTED",
+    "REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER",
     "REFUSAL_ENDPOINT_OUTSIDE_OWNED_ROOT",
     "REFUSAL_ENDPOINT_UNBOUND",
     "REFUSAL_OPERATOR_ENDPOINT_TARGET",
+    "REFUSAL_OWNED_CHILD_NOT_ALIVE",
 )
