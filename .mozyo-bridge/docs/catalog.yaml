@@ -801,6 +801,19 @@ documents:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: logic-herdr-pin-hook-distribution
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/herdr-pin-hook-distribution.md
+    purpose: "herdr backend swap の配布面 operator runbook (Redmine #13249)。supply-chain pin posture の生成/検証 (`herdr pin-posture`、offline / pinned-mirror、欠落スイッチ=herdr既定on=UNPINNED の fail-closed) と、session-resume 用 integration hook の explicit opt-in installer (`herdr integration-install`、既定 read-only PLAN の zero-mutation / 明示 --apply / snapshot-diff-rollback transaction / fail-closed reason 一覧 / credential 非接触 / trusted-env binary) の利用手順・安全境界を固定する。実 home apply・live herdr・download は本 issue gate 外。設計根拠は #13175 PoC E2/E3/E10。"
+    audit_role: herdr_pin_hook_distribution_logic
+    related_document_refs:
+      - spec-herdr-native-identity
+      - logic-plugin-ready-adapter-boundary
+      - logic-herdr-scenario-test-foundation
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-project-scoped-workspace-identity
     type: logic
     status: active
