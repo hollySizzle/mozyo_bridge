@@ -536,6 +536,75 @@ class ReceiptIdentityTests(unittest.TestCase):
                 "w1:p2", tape, "a refused receipt's pane still has to be cleaned up"
             )
 
+    def test_a_bool_index_is_refused_for_both_values(self) -> None:
+        """``bool`` is an ``int`` subclass and ``True`` hashes as ``1``.
+
+        So a ``bool`` index passed the range check and then impersonated project 1 in
+        the collected map — a malformed receipt read as a complete, converged round
+        (review j#91777). Both values are asserted: ``False`` aliases project 0 just as
+        ``True`` aliases project 1.
+        """
+        for value in (True, False):
+            with self.subTest(index=value):
+                with tempfile.TemporaryDirectory() as tmp:
+                    collected, anomalies, tape = self._drive(
+                        Path(tmp),
+                        [self._receipt(value, "w1:p8", project_key="p1" if value else "p0")],
+                    )
+                    self.assertEqual(
+                        collected, {}, "a bool index must never claim a project slot"
+                    )
+                    self.assertEqual(
+                        anomalies, [_driver_module.RECEIPT_ANOMALY_INDEX_NOT_INT]
+                    )
+                    self.assertIn("w1:p8", tape, "its pane still needs cleaning up")
+
+    def test_a_bool_index_leaves_the_round_incomplete_and_failed(self) -> None:
+        """End to end: refusal must reach missing placeholders and a failed round."""
+        with tempfile.TemporaryDirectory() as tmp:
+            specs = self._specs(Path(tmp))
+
+            def _bool_index(*, processes, started, specs, output, collected,
+                            anomalies, locator_tape, timeout):
+                collected[0] = self._receipt(0, "w1:p1")
+                anomalies.append(_driver_module.RECEIPT_ANOMALY_INDEX_NOT_INT)
+                locator_tape.append("w1:p8")
+
+            with mock.patch.object(
+                _driver_module, "_collect_forked_receipts", _bool_index
+            ):
+                forked = _run_forked_projects(
+                    harnesses=[object(), object()], specs=specs,
+                    timeout=5.0, gate_runner=None,
+                )
+            self.assertTrue(forked.round_failed)
+            self.assertEqual(
+                forked.failure_kind, _driver_module.RECEIPT_ANOMALY_INDEX_NOT_INT
+            )
+            self.assertEqual(forked.salvaged_locators, ("w1:p8",))
+            # Project 1 never reported, so it is MISSING rather than silently complete.
+            self.assertIsNone(forked.receipts[1].endpoint_gate)
+            self.assertEqual(forked.receipts[1].observation.outcome, "failed")
+            gate = EndpointGateEvidence.aggregate(
+                parent=EndpointGateCounters(1, 1, 0, 0, ()),
+                worker_receipts=[r.endpoint_gate for r in forked.receipts],
+            )
+            self.assertFalse(
+                gate.proven_zero_external,
+                "a malformed round must not be able to prove zero external requests",
+            )
+
+    def test_plain_integer_indexes_are_still_accepted(self) -> None:
+        """Baseline: strictness about type must not reject the real 0 and 1."""
+        with tempfile.TemporaryDirectory() as tmp:
+            collected, anomalies, tape = self._drive(
+                Path(tmp), [self._receipt(0, "w1:p1"), self._receipt(1, "w1:p2")]
+            )
+            self.assertEqual(sorted(collected), [0, 1])
+            self.assertTrue(all(type(key) is int for key in collected))
+            self.assertEqual(anomalies, [])
+            self.assertEqual(tape, [])
+
     def test_an_out_of_range_index_is_refused_and_its_locator_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             collected, anomalies, tape = self._drive(

@@ -283,6 +283,7 @@ def _run_forked_projects(
 #: Closed vocabulary for why a receipt was refused.
 RECEIPT_ANOMALY_DUPLICATE_INDEX = "receipt_duplicate_index"
 RECEIPT_ANOMALY_INDEX_OUT_OF_RANGE = "receipt_index_out_of_range"
+RECEIPT_ANOMALY_INDEX_NOT_INT = "receipt_index_not_int"
 RECEIPT_ANOMALY_PROJECT_MISMATCH = "receipt_project_mismatch"
 
 
@@ -290,11 +291,20 @@ def _receipt_anomaly(receipt, specs: Sequence[_ProjectSpec], collected: dict) ->
     """Why this receipt cannot be trusted as project ``receipt.index``, or ``""``.
 
     The index is self-reported by the worker, so it is checked rather than believed
-    (review j#91741 F3): it must name a project this round actually launched, must not
-    have been claimed already, and must agree with that project's key.
+    (review j#91741 F3): it must be a strict integer, must name a project this round
+    actually launched, must not have been claimed already, and must agree with that
+    project's key.  Strictness about the *type* matters as much as the range — see the
+    ``bool`` note below.
     """
     index = receipt.index
-    if not isinstance(index, int) or not 0 <= index < len(specs):
+    # ``bool`` is a subclass of ``int`` and ``True == 1`` hashes as ``1``, so a
+    # ``bool`` index used to pass this check and then *impersonate* project 1 in the
+    # ``collected`` map — a malformed receipt read as a complete, converged round
+    # (review j#91777).  A wrong type is a different fault from a wrong number, so it
+    # gets its own token rather than being folded into the range answer.
+    if isinstance(index, bool) or not isinstance(index, int):
+        return RECEIPT_ANOMALY_INDEX_NOT_INT
+    if not 0 <= index < len(specs):
         return RECEIPT_ANOMALY_INDEX_OUT_OF_RANGE
     if index in collected:
         return RECEIPT_ANOMALY_DUPLICATE_INDEX

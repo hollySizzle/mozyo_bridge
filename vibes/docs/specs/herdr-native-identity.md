@@ -1159,6 +1159,14 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     closed token の typed round failure にする。**ただし拒否した receipt が持つ locator も
     cleanup 用に lossless に保持する** — 拒否は「evidence に採らない」であって「その pane を
     放置してよい」ではない。
+  - **index は型についても strict に検証する**。`bool` は `int` の subclass で `True == 1` は
+    `1` と同じ hash を持つため、`isinstance(index, int)` だけでは `bool` index が range 検査を
+    通過し、`collected` map 上で**別 project になりすます**。実測では malformed receipt が
+    anomaly 0 で採用され、`all_projects_completed` / `converged` / `residue_clear` /
+    `proven_zero_external` がすべて green になった (review j#91777)。よって
+    `isinstance(index, bool) or not isinstance(index, int)` を拒否条件に含める
+    (この repo の既存 idiom)。**型不正と範囲外は原因が異なる**ので closed token も分ける
+    (`receipt_index_not_int` / `receipt_index_out_of_range`)。
   - **root release は lifecycle の state であり、call 引数ではない**。引数にすると渡した call site しか
     縛れず、`with instance:` の暗黙 `__exit__` が既定値で先に解放してしまう (review j#91687 F1 実測)。
     `withhold_root_release(reason)` / `permit_root_release()` で instance に policy を持たせ、
