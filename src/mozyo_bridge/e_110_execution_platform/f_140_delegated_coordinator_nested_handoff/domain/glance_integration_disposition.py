@@ -39,6 +39,7 @@ from typing import Optional, Sequence, Tuple
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     MARKER_CHANNEL_WORKFLOW_EVENT,
+    marker_components_in_note,
     marker_fields_in_note,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
@@ -332,14 +333,26 @@ def fold_work_unit(journals: Sequence[Tuple[object, str]]) -> str:
         jint = _int_journal(journal_id)
         if jint is None:
             continue
-        match = _WORK_UNIT_FIELD_RE.search(notes or "")
-        if match is None:
+        declared = [m.group("value") for m in _WORK_UNIT_FIELD_RE.finditer(notes or "")]
+        if not declared:
             continue  # no declaration here — this journal says nothing about the work unit
         # A declaration IS present, so it supersedes regardless of what it says. An
         # unrecognized value resolves to "" (undeclared), which routes to the same-lane
         # implementation_gateway rather than to a US-level audit.
-        token = _token(match.group("value"))
-        resolved = token if token in WORK_UNIT_GRANULARITIES else ""
+        #
+        # EVERY ``work_unit:`` line in the journal is read, not just the first (Redmine #14539
+        # review j#91797 finding 5). This value routes review AUTHORITY — ``user_story`` sends the
+        # Review Gate to the auditor's US-level audit, ``leaf_issue`` to the same-lane
+        # implementation_gateway — so first-wins meant a journal declaring both owners picked one
+        # by line order. Values that resolve to the SAME token are one declaration; two different
+        # ones are not uniquely interpretable and fold to "" (undeclared), which is the same-lane
+        # side and therefore the fail-closed direction: it never claims US-level audit authority
+        # the record does not unambiguously grant.
+        tokens = {_token(value) for value in declared}
+        resolved = ""
+        if len(tokens) == 1:
+            token = tokens.pop()
+            resolved = token if token in WORK_UNIT_GRANULARITIES else ""
         if latest is None or jint > latest[0]:
             latest = (jint, resolved)
     return latest[1] if latest is not None else ""
@@ -399,6 +412,27 @@ def has_conflicting_disposition_declaration(
         declared.update(canonical_disposition(value) for value in headings)
         if len(declared) > 1:
             return True
+        # …and INSIDE each marker. The shared field scan folds a marker body to a dict, so a
+        # repeated key is erased before any consumer sees it and the marker's meaning depends on
+        # which occurrence came last (Redmine #14539 review j#91797 finding 4). Enumerating the
+        # surfaces was not enough: each surface also has to be checked for internal multiplicity.
+        # A malformed fragment (no ``=``) is refused for the same reason — an authority marker
+        # whose body does not parse cleanly is not a declaration this path may act on.
+        for channel, components in marker_components_in_note(text):
+            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+                continue
+            keyed: dict[str, set[str]] = {}
+            for key, value in components:
+                if not key:
+                    return True  # a fragment carrying no ``key=value`` at all
+                keyed.setdefault(key, set()).add(value)
+            gates = keyed.get("gate") or keyed.get("kind") or set()
+            if MARKER_GATE_INTEGRATION_DISPOSITION not in gates:
+                continue
+            # Any repeated key, ``gate`` included: a marker claiming two gates at once is exactly
+            # as unreadable as one claiming two dispositions.
+            if any(len(values) > 1 for values in keyed.values()):
+                return True
     return False
 
 

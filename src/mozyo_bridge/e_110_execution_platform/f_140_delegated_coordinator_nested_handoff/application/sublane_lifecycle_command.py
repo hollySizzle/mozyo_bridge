@@ -48,6 +48,7 @@ from typing import Any, Optional, Protocol, runtime_checkable
 # gate. Re-exported here so the CLI import site and the #13518 tests are unchanged.
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: F401
     _resolve_latest_generation_admissible,
+    resolve_retire_evidence_target,
     _resolve_review_exemption_admissible,
     _resolve_review_generation_admissible,
 )
@@ -720,7 +721,13 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         # admissibility at action-time via the review-generation fence (unreadable / malformed ->
         # fail-closed). Otherwise fall back to the operator's durable-record assertion. Absent both
         # the fence stays fail-closed (False), so the actual integration never default-admits.
-        latest_generation_admissible=_resolve_latest_generation_admissible(args),
+        # Redmine #14539 review j#91797 finding 2: the exemption route's evidence identity is
+        # MEASURED from the retire target's own lifecycle row, so the resolution has to happen
+        # before the fence runs — the caller's argv is not an independent expectation. An
+        # unresolvable target yields None, and the exemption route then refuses.
+        latest_generation_admissible=_resolve_latest_generation_admissible(
+            args, target=resolve_retire_evidence_target(args, _repo_root(args))
+        ),
     )
     repo_root = _repo_root(args)
     # Redmine #13331 review j#73338: probe the TARGET lane worktree's dirty state (the

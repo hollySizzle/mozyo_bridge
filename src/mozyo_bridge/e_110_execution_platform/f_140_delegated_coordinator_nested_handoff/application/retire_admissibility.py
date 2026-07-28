@@ -25,10 +25,92 @@ evidence — resolves to ``False`` (fail-closed).
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 
-def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
+@dataclass(frozen=True)
+class RetireEvidenceTarget:
+    """The lane identity a retire's integration evidence must name, measured from durable state.
+
+    Redmine #14539 review j#91797 finding 2. The point of this type is WHERE its values come from:
+    the lane lifecycle record of the lane being retired, never the caller's argv and never the
+    observation file. An identity the caller supplies fences nothing — it can simply be pointed at
+    whatever the evidence happens to say — and an identity the observation supplies certifies
+    itself. Only a value read from durable state is an independent expectation.
+
+    ``policy_pointer`` is the committed-config anchor the issuer resolution is basised on
+    (:func:`...hibernate_issuer_policy.config_policy_pointer`); an empty one resolves every issuer
+    to unknown, which is the fail-closed direction.
+
+    Every field is required. A partially-resolved target is not a target: the caller returns
+    ``None`` instead, and the fence refuses.
+    """
+
+    workspace: str
+    lane: str
+    lane_generation: int
+    policy_pointer: str
+
+
+def resolve_retire_evidence_target(
+    args: argparse.Namespace, repo_root: Path
+) -> Optional[RetireEvidenceTarget]:
+    """Measure the retire target's lane identity from durable state, or ``None`` (fail-closed).
+
+    Reads the lane lifecycle record for the lane ``--lane-label`` names, in the workspace the
+    command's own repo root resolves to, and takes the generation from that row rather than from
+    anything the caller said. Any gap — no workspace, no lane label, an unreadable store, no row,
+    a non-positive generation, or an unresolvable committed-config pointer — yields ``None``, and
+    the exemption route then refuses. The retire's other fences are unaffected: this returns an
+    expectation for ONE optional route, it does not gate the command.
+    """
+    lane_label = str(getattr(args, "lane_label", "") or "").strip()
+    if not lane_label:
+        return None
+    try:
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            LaneLifecycleKey,
+            LaneLifecycleStore,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
+            herdr_workspace_segment,
+        )
+
+        workspace = str(herdr_workspace_segment(repo_root) or "").strip()
+        if not workspace:
+            return None
+        record = LaneLifecycleStore().get(LaneLifecycleKey(workspace, lane_label))
+    except Exception:  # noqa: BLE001 - an unresolvable target is a typed zero, not a crash
+        return None
+    if record is None:
+        return None
+    generation = getattr(record, "lane_generation", 0)
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
+        return None
+    pointer = ""
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_lane_topology import (  # noqa: E501
+            committed_config_policy_pointer,
+        )
+
+        pointer = str(committed_config_policy_pointer(repo_root) or "").strip()
+    except Exception:  # noqa: BLE001 - an unresolvable basis is a typed zero, not a crash
+        pointer = ""
+    if not pointer:
+        return None
+    return RetireEvidenceTarget(
+        workspace=workspace,
+        lane=lane_label,
+        lane_generation=generation,
+        policy_pointer=pointer,
+    )
+
+
+def _resolve_review_exemption_admissible(
+    args: argparse.Namespace, *, target: Optional[RetireEvidenceTarget] = None
+) -> bool:
     """Re-verify a review-EXEMPT lane's terminal-retire admissibility at action time (#14539).
 
     ``--review-exemption-json`` supplies the issue's durable journals
@@ -81,9 +163,18 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
             fold_integration_disposition,
             has_conflicting_disposition_declaration,
         )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_integration_disposition import (  # noqa: E501
+            MARKER_GATE_INTEGRATION_DISPOSITION,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+            check_issuer,
+        )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_integration import (  # noqa: E501
             IntegrationEvidenceError,
             resolve_integration_evidence,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_issuer_policy import (  # noqa: E501
+            resolve_journal_issuer,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
             MARKER_CHANNEL_WORKFLOW_EVENT,
@@ -116,13 +207,25 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
         if gate_facts is None:
             # No recognized gate at all -> no Close evidence, no exemption authority.
             return False
-        # j#91696 F3: the lenient fold resolves a journal that declares two DIFFERENT dispositions
-        # by line order, so the same durable record admitted or refused depending on which was
-        # written first. An authority consumer asks the strict question before trusting the fold.
-        if has_conflicting_disposition_declaration(journals):
-            return False
-
         integration = fold_integration_disposition(journals)
+
+        # ONE current declaration, selected once, feeding EVERY question about the integration
+        # (Redmine #14539 review j#91797 finding 3). R7-F2 asked for strict evidence, lenient
+        # disposition, conflict and journal id to share a declaration; the conflict check was the
+        # one left issue-global, so a superseded OLD malformed record blocked forever and a valid
+        # current correction could not repair it — the opposite of latest-wins.
+        current_notes = next(
+            (notes for jid, notes in journals if jid.strip() == integration.journal), ""
+        )
+        current_declaration = (
+            [(integration.journal, current_notes)] if integration.journal else []
+        )
+
+        # j#91696 F3 / j#91797 F4: the lenient fold resolves a journal that declares two DIFFERENT
+        # dispositions by line order — across surfaces AND inside a single marker body. An
+        # authority consumer asks the strict question before trusting the fold.
+        if has_conflicting_disposition_declaration(current_declaration):
+            return False
 
         # j#91696 F2 / j#91747 F2: the STRICT integration evidence (#14219 T2b), read from the
         # CURRENT declaration only. ``fold_integration_disposition`` already decided which journal
@@ -133,9 +236,6 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
         # was satisfied by a journal that carried no evidence at all. A current declaration with no
         # marker (heading-only / legacy) therefore yields no strict evidence — for THIS journal,
         # never a fallback to a stale one.
-        current_notes = next(
-            (notes for jid, notes in journals if jid.strip() == integration.journal), ""
-        )
         marker_fields = [
             fields
             for channel, fields in marker_fields_in_note(current_notes or "")
@@ -145,28 +245,48 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
         if isinstance(evidence, IntegrationEvidenceError):
             source_head = ""
         else:
-            # j#91747 F3: the envelope is the reason this evidence is trustworthy, so it must
-            # actually name THIS retire's lane. Requiring a lane-enveloped marker and then dropping
-            # the envelope is not an identity fence — a marker bound to a foreign workspace / lane /
-            # generation, on an unrelated integration branch, admitted on its source head alone.
+            # j#91747 F3 / j#91797 F2: the envelope is the reason this evidence is trustworthy, so
+            # it must name THE LANE BEING RETIRED — not merely some lane the caller also named.
             #
-            # The expected identity comes from the retire's OWN arguments, never from the
-            # observation file: a value the same untrusted document supplies could not fence it.
-            # ``--lane-label`` is deliberately NOT reused for the envelope's ``lane`` — the lane
-            # registry distinguishes ``lane_id`` from ``lane_label`` and the envelope carries the
-            # former, so equating them would be a category error rather than a fence. Each expected
-            # value must be present; an absent one fails closed rather than skipping its check.
+            # R9 compared the envelope against three dedicated argv flags. That is still a value
+            # the CALLER chooses: pointing all three at the foreign envelope's own tuple admitted
+            # it while ``--lane-label`` still named the real target. The expectation must come from
+            # the retire target RESOLVED FROM DURABLE STATE, which is what ``target`` carries; the
+            # flags are gone. ``target`` is None when the identity could not be resolved, which
+            # fails closed — an unresolvable target cannot fence anything.
+            #
+            # ``integration_branch`` stays an argv comparison because it is the retire's real
+            # policy input (it drives ``SublaneIntegrationPolicy``), not a value invented for this
+            # fence.
             expected = (
-                (str(getattr(args, "evidence_workspace", "") or "").strip(),
-                 evidence.envelope.workspace),
-                (str(getattr(args, "evidence_lane", "") or "").strip(), evidence.envelope.lane),
-                (str(getattr(args, "evidence_lane_generation", "") or "").strip(),
+                (target.workspace if target else "", evidence.envelope.workspace),
+                (target.lane if target else "", evidence.envelope.lane),
+                (str(target.lane_generation) if target else "",
                  str(evidence.envelope.lane_generation)),
                 (str(getattr(args, "integration_branch", "") or "").strip(),
                  evidence.integration_branch),
             )
             bound = all(want and want == got for want, got in expected)
-            source_head = evidence.source_head if bound else ""
+
+            # j#91797 F1: the ISSUER. The central `### Hibernate Evidence Marker Contract` fixes
+            # this gate's writer to the coordinator, and #14219 already owns the resolution — R7-F3
+            # said in as many words that reusing the Hibernate contract as automated evidence must
+            # not drop its issuer condition, and R9 dropped it anyway.
+            #
+            # The role is resolved as POLICY from the note's own gate structure (that resolver takes
+            # no author parameter on purpose), anchored to the committed config blob the caller
+            # resolved. No policy pointer means no basis, which resolves every issuer to unknown and
+            # fails closed. A note claiming two different authority gates proves neither.
+            issuer_refusal = check_issuer(
+                MARKER_GATE_INTEGRATION_DISPOSITION,
+                resolve_journal_issuer(
+                    integration.journal,
+                    current_notes,
+                    policy_pointer=(target.policy_pointer if target else ""),
+                ),
+                envelope=evidence.envelope,
+            )
+            source_head = evidence.source_head if bound and issuer_refusal is None else ""
 
         return bool(
             evaluate_exemption_integration_admissible(
@@ -187,7 +307,9 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
         return False
 
 
-def _resolve_latest_generation_admissible(args: argparse.Namespace) -> bool:
+def _resolve_latest_generation_admissible(
+    args: argparse.Namespace, *, target: Optional[RetireEvidenceTarget] = None
+) -> bool:
     """Resolve the latest-generation integration admissibility for a retire (#13518 R3-F2).
 
     Priority: (1) a coordinator-supplied durable review observation (``--review-generation-json``)
@@ -208,7 +330,7 @@ def _resolve_latest_generation_admissible(args: argparse.Namespace) -> bool:
     path = (getattr(args, "review_generation_json", None) or "").strip()
     if path or exemption_path:
         return _resolve_review_generation_admissible(args) or (
-            _resolve_review_exemption_admissible(args)
+            _resolve_review_exemption_admissible(args, target=target)
         )
     return bool(getattr(args, "latest_generation_admissible", False))
 
@@ -260,6 +382,8 @@ def _resolve_review_generation_admissible(args: argparse.Namespace) -> bool:
 
 
 __all__ = (
+    "RetireEvidenceTarget",
+    "resolve_retire_evidence_target",
     "_resolve_latest_generation_admissible",
     "_resolve_review_exemption_admissible",
     "_resolve_review_generation_admissible",

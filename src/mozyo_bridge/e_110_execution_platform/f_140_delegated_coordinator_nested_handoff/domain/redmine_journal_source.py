@@ -105,7 +105,14 @@ _MARKER_RE = re.compile(r"\[mozyo:(?P<channel>[a-z0-9_-]+):(?P<body>[^\]]*)\]")
 
 
 def _parse_marker_fields(body: str) -> dict[str, str]:
-    """Parse a ``key=value:key=value`` marker body into a dict (pure; last write wins)."""
+    """Parse a ``key=value:key=value`` marker body into a dict (pure; last write wins).
+
+    The collapse is deliberate for the display / routing readers and is left as-is. An AUTHORITY
+    reader must NOT use it — a repeated key is erased here, so a marker declaring
+    ``disposition=explicit_deferral:disposition=merge`` arrives as a single clean ``merge``
+    (Redmine #14539 review j#91797 finding 4). :func:`marker_components_in_note` preserves the
+    multiplicity those readers need.
+    """
     fields: dict[str, str] = {}
     for token in body.split(":"):
         token = token.strip()
@@ -116,6 +123,26 @@ def _parse_marker_fields(body: str) -> dict[str, str]:
             continue
         fields[key.strip()] = value.strip()
     return fields
+
+
+def _parse_marker_components(body: str) -> tuple[tuple[str, str], ...]:
+    """Every ``key=value`` component of a marker body, IN ORDER and uncollapsed (pure).
+
+    A fragment carrying no ``=`` is reported as ``(fragment, None)``-shaped by using an empty key,
+    so a caller checking well-formedness can see it. Nothing is dropped and nothing is merged: this
+    is the raw component list, and every policy decision about repetition belongs to the caller.
+    """
+    components: list[tuple[str, str]] = []
+    for token in body.split(":"):
+        token = token.strip()
+        if not token:
+            continue
+        key, eq, value = token.partition("=")
+        if not eq:
+            components.append(("", token))
+            continue
+        components.append((key.strip(), value.strip()))
+    return tuple(components)
 
 
 def marker_fields_in_note(notes: str) -> tuple[tuple[str, dict[str, str]], ...]:
@@ -134,6 +161,32 @@ def marker_fields_in_note(notes: str) -> tuple[tuple[str, dict[str, str]], ...]:
         if channel not in _RECOGNIZED_CHANNELS:
             continue
         found.append((channel, _parse_marker_fields(match.group("body"))))
+    return tuple(found)
+
+
+def marker_components_in_note(
+    notes: str,
+) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+    """Every marker as ``(channel, components)`` with its field list UNCOLLAPSED (pure).
+
+    The same scan as :func:`marker_fields_in_note`, except each marker keeps its raw ordered
+    ``(key, value)`` components instead of being folded into a dict. Authority readers need this:
+    the dict fold is last-write-wins, so a marker that declares the same key twice with different
+    values reaches every consumer looking perfectly well-formed, and its meaning silently depends
+    on which occurrence came last (Redmine #14539 review j#91797 finding 4). A malformed fragment
+    (one carrying no ``=``) is preserved with an empty key rather than dropped, so "this marker
+    body is not well-formed" is answerable too.
+
+    Still policy-free: it reports what the token says, and the caller decides what to refuse.
+    """
+    if not notes:
+        return ()
+    found: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+    for match in _MARKER_RE.finditer(notes):
+        channel = match.group("channel")
+        if channel not in _RECOGNIZED_CHANNELS:
+            continue
+        found.append((channel, _parse_marker_components(match.group("body"))))
     return tuple(found)
 
 
@@ -655,6 +708,7 @@ __all__ = (
     "MARKER_CHANNEL_WORKFLOW_EVENT",
     "GATE_BEARING_KINDS",
     "RedmineJournalEntry",
+    "marker_components_in_note",
     "marker_fields_in_note",
     "extract_markers_from_note",
     "extract_marker",

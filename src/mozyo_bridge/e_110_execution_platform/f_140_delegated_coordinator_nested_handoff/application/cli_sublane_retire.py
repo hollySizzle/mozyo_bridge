@@ -143,44 +143,11 @@ def register_sublane_retire(
             "opened AFTER the exemption re-owes the review. Fail-closed on an unreadable / "
             "malformed file or on any missing fact. The integration half is proved by the "
             "lane-enveloped strict evidence on the CURRENT disposition journal, whose reviewed "
-            "source head must be the covered commit and whose envelope must match "
-            "--evidence-workspace / --evidence-lane / --evidence-lane-generation and "
-            "--integration-branch; a legacy lane-unbound note is valid for the glance but never "
-            "auto-admits a retire."
-        ),
-    )
-    # Redmine #14539 review j#91747 finding 3: the expected identity of the strict integration
-    # evidence. These are separate from --lane-label on purpose — the lane registry distinguishes
-    # `lane_id` from `lane_label`, and the hibernate evidence envelope carries the former, so the
-    # retire must be told which identity the evidence has to name rather than guessing they are the
-    # same namespace. Each is required (fail-closed) only on the --review-exemption-json route.
-    sublane_retire.add_argument(
-        "--evidence-workspace",
-        dest="evidence_workspace",
-        default=None,
-        help=(
-            "#14539: the workspace id the integration evidence's lane envelope must name. "
-            "Required with --review-exemption-json; absent fails the exemption route closed."
-        ),
-    )
-    sublane_retire.add_argument(
-        "--evidence-lane",
-        dest="evidence_lane",
-        default=None,
-        help=(
-            "#14539: the lane id the integration evidence's lane envelope must name (the "
-            "envelope's `lane`, i.e. the lane_id — NOT the --lane-label). Required with "
-            "--review-exemption-json."
-        ),
-    )
-    sublane_retire.add_argument(
-        "--evidence-lane-generation",
-        dest="evidence_lane_generation",
-        default=None,
-        help=(
-            "#14539: the lane generation the integration evidence's lane envelope must name. "
-            "Required with --review-exemption-json; a mismatch means the evidence belongs to an "
-            "earlier incarnation of the lane."
+            "source head must be the covered commit, whose envelope must match the retire "
+            "TARGET's own lifecycle row (workspace / lane / generation, measured from durable "
+            "state — never from a flag) and --integration-branch, and whose issuer must resolve "
+            "to the coordinator under the Hibernate Evidence Marker Contract; a legacy "
+            "lane-unbound note is valid for the glance but never auto-admits a retire."
         ),
     )
     sublane_retire.add_argument(

@@ -30,12 +30,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (
+    RetireEvidenceTarget,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (
     _resolve_latest_generation_admissible,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_integration_disposition import (
     fold_integration_disposition,
+    fold_work_unit,
     has_conflicting_disposition_declaration,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
+    marker_components_in_note,
+    marker_fields_in_note,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (
     fold_issue_gate_facts,
@@ -158,8 +166,23 @@ INTEGRATION_MERGED = integration_merged()
 
 
 
+#: The committed-config anchor the issuer resolution is basised on. A blank one resolves every
+#: issuer to unknown, which is the fail-closed direction and has its own pin.
+EVIDENCE_POLICY_POINTER = "git:.mozyo-bridge/config.yaml@0123456789abcdef0123456789abcdef01234567"
+
+#: The retire target as ``resolve_retire_evidence_target`` MEASURES it from the lane's lifecycle
+#: row. Tests inject it directly: the point of review j#91797 finding 2 is that this identity is
+#: not something the caller can choose, so there is no flag for it to come from.
+EVIDENCE_TARGET = RetireEvidenceTarget(
+    workspace=EVIDENCE_WORKSPACE,
+    lane=EVIDENCE_LANE,
+    lane_generation=int(EVIDENCE_LANE_GENERATION),
+    policy_pointer=EVIDENCE_POLICY_POINTER,
+)
+
+
 def retire_args(obs_path, *, issue="14539", assertion=False, **over):
-    """The retire namespace for the exemption route, with the evidence identity bound."""
+    """The retire namespace for the exemption route."""
     ns = dict(
         review_generation_json=None,
         review_exemption_json=obs_path,
@@ -167,12 +190,14 @@ def retire_args(obs_path, *, issue="14539", assertion=False, **over):
         issue=issue,
         lane_label="issue_14539_review_exemption_projection",
         integration_branch=INTEGRATION_BRANCH,
-        evidence_workspace=EVIDENCE_WORKSPACE,
-        evidence_lane=EVIDENCE_LANE,
-        evidence_lane_generation=EVIDENCE_LANE_GENERATION,
     )
     ns.update(over)
     return argparse.Namespace(**ns)
+
+
+def resolve_admissible(obs_path, *, target=EVIDENCE_TARGET, **over):
+    """The retire's latest-generation resolution with a MEASURED evidence target."""
+    return _resolve_latest_generation_admissible(retire_args(obs_path, **over), target=target)
 
 
 def state_of(journals, *, issue_open=True):
@@ -295,9 +320,7 @@ class TerminalRetireAdmissionTests(unittest.TestCase):
     def _resolve(self, **over):
         base = dict(review_exemption_json=None)
         base.update(over)
-        return _resolve_latest_generation_admissible(
-            retire_args(base.pop("review_exemption_json"), **base)
-        )
+        return resolve_admissible(base.pop("review_exemption_json"), **base)
 
     def _obs(self, tmp, journals):
         path = Path(tmp) / "exemption.json"
@@ -414,9 +437,7 @@ class ReviewJ90137Tests(unittest.TestCase):
     """The three defects review j#90137 found in R1, each pinned by its own reproduction."""
 
     def _resolve(self, obs_path, *, issue="14539", assertion=False):
-        return _resolve_latest_generation_admissible(
-            retire_args(obs_path, issue=issue, assertion=assertion)
-        )
+        return resolve_admissible(obs_path, issue=issue, assertion=assertion)
 
     def _obs(self, tmp, journals, *, issue="14539", name="o.json"):
         path = Path(tmp) / name
@@ -536,9 +557,7 @@ class ReviewJ90244Tests(unittest.TestCase):
     NEW_EMPTY_SCOPE = f"## Gate: Implementation Done\n- commit: {HEAD}\n- changed_paths:\n"
 
     def _resolve(self, obs_path, *, issue="14539"):
-        return _resolve_latest_generation_admissible(
-            retire_args(obs_path, issue=issue, assertion=False)
-        )
+        return resolve_admissible(obs_path, issue=issue, assertion=False)
 
     def _obs(self, tmp, journals, name="o.json"):
         path = Path(tmp) / name
@@ -634,9 +653,7 @@ class ReviewJ90289Tests(unittest.TestCase):
     )
 
     def _resolve(self, obs_path, *, issue="14539"):
-        return _resolve_latest_generation_admissible(
-            retire_args(obs_path, issue=issue, assertion=False)
-        )
+        return resolve_admissible(obs_path, issue=issue, assertion=False)
 
     def _obs(self, tmp, journals):
         path = Path(tmp) / "o.json"
@@ -737,9 +754,7 @@ class ReviewJ91577CombinedGateTests(unittest.TestCase):
     )
 
     def _resolve(self, obs_path, *, issue="14539"):
-        return _resolve_latest_generation_admissible(
-            retire_args(obs_path, issue=issue, assertion=False)
-        )
+        return resolve_admissible(obs_path, issue=issue, assertion=False)
 
     def _obs(self, tmp, journals):
         path = Path(tmp) / "o.json"
@@ -841,9 +856,7 @@ class ReviewJ91577EvidenceIdentityTests(unittest.TestCase):
         )
 
     def _resolve(self, obs_path, *, issue="14539"):
-        return _resolve_latest_generation_admissible(
-            retire_args(obs_path, issue=issue, assertion=False)
-        )
+        return resolve_admissible(obs_path, issue=issue, assertion=False)
 
     def _obs(self, tmp, journals):
         path = Path(tmp) / "o.json"
@@ -1068,9 +1081,7 @@ class ReviewJ91696IntegrationEvidenceTests(unittest.TestCase):
     """R6-F2/F3: the retire's integration evidence must name the commit and be unambiguous."""
 
     def _resolve(self, obs_path, *, issue="14539"):
-        return _resolve_latest_generation_admissible(
-            retire_args(obs_path, issue=issue, assertion=False)
-        )
+        return resolve_admissible(obs_path, issue=issue, assertion=False)
 
     def _obs(self, tmp, journals):
         path = Path(tmp) / "o.json"
@@ -1172,7 +1183,13 @@ class ReviewJ91696IntegrationEvidenceTests(unittest.TestCase):
             fold_integration_disposition([("1", conflicting)]).disposition, "merge"
         )
 
-    def test_a_conflicting_disposition_elsewhere_in_the_issue_also_blocks(self):
+    def test_a_superseded_conflict_does_not_block_a_valid_current_declaration(self):
+        """j#91797 F3: the conflict question is asked of the CURRENT declaration, not the history.
+
+        Applying it issue-wide meant a malformed OLD record could never be repaired: a valid newer
+        disposition superseded it for every other purpose while the conflict check kept refusing.
+        That is the opposite of latest-wins.
+        """
         journals = [
             ("101", GATE_EXEMPT),
             ("102", IMPLEMENTATION_DONE),
@@ -1182,6 +1199,22 @@ class ReviewJ91696IntegrationEvidenceTests(unittest.TestCase):
                 "- disposition: integration_blocked\n",
             ),
             ("104", integration_merged(HEAD)),
+            ("105", CLOSE),
+        ]
+        with tempfile.TemporaryDirectory() as t:
+            self.assertTrue(self._resolve(self._obs(t, journals)))
+
+    def test_the_conflict_must_be_on_the_current_declaration_to_block(self):
+        """Negative control for the above: the SAME conflict, now current, still blocks."""
+        journals = [
+            ("101", GATE_EXEMPT),
+            ("102", IMPLEMENTATION_DONE),
+            ("103", integration_merged(HEAD)),
+            (
+                "104",
+                "## Integration disposition\n- disposition: merge\n"
+                "- disposition: integration_blocked\n",
+            ),
             ("105", CLOSE),
         ]
         with tempfile.TemporaryDirectory() as t:
@@ -1286,9 +1319,7 @@ class ReviewJ91747EvidenceBindingTests(unittest.TestCase):
 
     def _resolve(self, journals, **over):
         with tempfile.TemporaryDirectory() as t:
-            return _resolve_latest_generation_admissible(
-                retire_args(self._obs(t, journals), **over)
-            )
+            return resolve_admissible(self._obs(t, journals), **over)
 
     def test_a_newer_legacy_note_cannot_borrow_an_older_markers_source_head(self):
         """F2: source head from j100, freshness journal id from j300 — two declarations, one fence.
@@ -1328,27 +1359,57 @@ class ReviewJ91747EvidenceBindingTests(unittest.TestCase):
     def test_the_bound_history_admits(self):
         self.assertTrue(self._resolve(self._bound_history()))
 
-    def test_each_envelope_dimension_must_match_the_retires_own_arguments(self):
-        """F3: requiring a lane-enveloped marker and ignoring the envelope is not a fence."""
-        for label, override in (
-            ("workspace", {"evidence_workspace": "foreign_ws"}),
-            ("lane", {"evidence_lane": "foreign_lane"}),
-            ("generation", {"evidence_lane_generation": "999"}),
-            ("integration_branch", {"integration_branch": "unrelated"}),
-        ):
-            with self.subTest(label):
-                self.assertFalse(self._resolve(self._bound_history(), **override))
+    def test_each_envelope_dimension_must_match_the_measured_target(self):
+        """F3: requiring a lane-enveloped marker and ignoring the envelope is not a fence.
 
-    def test_an_absent_expected_identity_fails_closed(self):
-        """A missing expectation must block, never skip its own check."""
-        for label, override in (
-            ("workspace", {"evidence_workspace": None}),
-            ("lane", {"evidence_lane": ""}),
-            ("generation", {"evidence_lane_generation": None}),
-            ("integration_branch", {"integration_branch": None}),
+        Each dimension is varied on the MEASURED target (review j#91797 finding 2), not on a
+        caller-supplied flag — the flags are gone precisely because pointing them at the evidence
+        was free.
+        """
+        import dataclasses
+
+        for label, field, value in (
+            ("workspace", "workspace", "foreign_ws"),
+            ("lane", "lane", "foreign_lane"),
+            ("generation", "lane_generation", 999),
         ):
             with self.subTest(label):
-                self.assertFalse(self._resolve(self._bound_history(), **override))
+                target = dataclasses.replace(EVIDENCE_TARGET, **{field: value})
+                self.assertFalse(self._resolve(self._bound_history(), target=target))
+        with self.subTest("integration_branch"):
+            self.assertFalse(
+                self._resolve(self._bound_history(), integration_branch="unrelated")
+            )
+
+    def test_an_unresolvable_target_fails_closed(self):
+        """j#91797 F2: no measured identity is not "skip the identity check"."""
+        self.assertFalse(self._resolve(self._bound_history(), target=None))
+
+    def test_an_absent_integration_branch_fails_closed(self):
+        """A missing expectation must block, never skip its own check."""
+        self.assertFalse(self._resolve(self._bound_history(), integration_branch=None))
+
+    def test_a_caller_cannot_point_the_expectation_at_the_evidence(self):
+        """The literal j#91797 F2 defect: the R9 flags were free variables.
+
+        With the flags gone the only way to match a foreign envelope is for the lane's OWN
+        lifecycle row to carry that identity — which is not something the invoking caller chooses.
+        """
+        foreign = [
+            ("101", GATE_EXEMPT),
+            ("102", IMPLEMENTATION_DONE),
+            (
+                "103",
+                "## Integration disposition\n"
+                "- disposition: merged\n"
+                "[mozyo:workflow-event:gate=integration_disposition:workspace=foreign_ws:"
+                f"lane=foreign_lane:lane_generation=999:head={HEAD}:"
+                f"integration_head={INTEGRATION_HEAD}:integration_branch=unrelated:"
+                "disposition=merge]\n",
+            ),
+            ("104", CLOSE),
+        ]
+        self.assertFalse(self._resolve(foreign, integration_branch="unrelated"))
 
     def test_a_foreign_lanes_evidence_does_not_admit(self):
         """The reviewer's reproduction, end to end: only the source head matched."""
@@ -1423,7 +1484,203 @@ class ReviewJ91747InlineHeadingConflictTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            self.assertFalse(_resolve_latest_generation_admissible(retire_args(str(path))))
+            self.assertFalse(resolve_admissible(str(path)))
+
+
+class ReviewJ91797IssuerAuthorityTests(unittest.TestCase):
+    """R9-F1: the Hibernate contract's ISSUER condition, which R7-F3 said not to drop.
+
+    The role is resolved as policy from the note's own gate structure, anchored to the committed
+    config blob — never from an author field the observation could assert, and never from the
+    marker body. So the axes that matter are: can the policy basis be established at all, and does
+    the note claim exactly one authority contract.
+    """
+
+    def _obs(self, tmp, journals):
+        path = Path(tmp) / "o.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "issue": "14539",
+                    "journals": [{"journal_id": j, "notes": n} for j, n in journals],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def _resolve(self, journals, **over):
+        with tempfile.TemporaryDirectory() as t:
+            return resolve_admissible(self._obs(t, journals), **over)
+
+    def _history(self, disposition_note=None):
+        return [
+            ("101", GATE_EXEMPT),
+            ("102", IMPLEMENTATION_DONE),
+            ("103", disposition_note or integration_merged(HEAD)),
+            ("104", CLOSE),
+        ]
+
+    def test_no_policy_basis_resolves_no_issuer_and_blocks(self):
+        """An empty pointer means the binding cannot name its own basis record."""
+        import dataclasses
+
+        target = dataclasses.replace(EVIDENCE_TARGET, policy_pointer="")
+        self.assertFalse(self._resolve(self._history(), target=target))
+
+    def test_a_note_claiming_two_authority_gates_blocks(self):
+        """Two contracts at once prove neither, so the issuer is unresolved."""
+        two_gates = integration_merged(HEAD).rstrip("\n") + (
+            "\n[mozyo:workflow-event:gate=park_declared:workspace="
+            f"{EVIDENCE_WORKSPACE}:lane={EVIDENCE_LANE}:"
+            f"lane_generation={EVIDENCE_LANE_GENERATION}:head={HEAD}]\n"
+        )
+        self.assertFalse(self._resolve(self._history(two_gates)))
+
+    def test_the_single_coordinator_gate_history_admits(self):
+        """Negative control for both: only the issuer resolvability differs."""
+        self.assertTrue(self._resolve(self._history()))
+
+    def test_observation_supplied_author_metadata_is_never_consulted(self):
+        """The observation cannot promote itself: resolution is policy, not self-assertion."""
+        journals = self._history()
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / "o.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "issue": "14539",
+                        "journals": [
+                            {
+                                "journal_id": j,
+                                "notes": n,
+                                "issuer_role": "lane_worker",
+                                "author": "someone-else",
+                                "authority_anchor": "forged",
+                            }
+                            for j, n in journals
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # Unchanged from the control above: the metadata is inert, in both directions.
+            self.assertTrue(resolve_admissible(str(path)))
+
+
+class ReviewJ91797MarkerMultiplicityTests(unittest.TestCase):
+    """R9-F4: exactly-one has to hold INSIDE a surface, not only across surfaces.
+
+    The shared marker scan folds a body to a dict, so a repeated key is erased before any consumer
+    sees it. Enumerating the three surfaces (R7-F4) still left each surface's own contents assumed
+    to be single-valued — the fourth first-wins defect in this issue.
+    """
+
+    def _marker(self, *dispositions, gate="integration_disposition"):
+        body = (
+            f"gate={gate}:workspace={EVIDENCE_WORKSPACE}:lane={EVIDENCE_LANE}:"
+            f"lane_generation={EVIDENCE_LANE_GENERATION}:head={HEAD}:"
+            f"integration_head={INTEGRATION_HEAD}:integration_branch={INTEGRATION_BRANCH}"
+        )
+        for value in dispositions:
+            body += f":disposition={value}"
+        return f"## Integration disposition\n[mozyo:workflow-event:{body}]\n"
+
+    def _resolve(self, note):
+        journals = [
+            ("101", GATE_EXEMPT),
+            ("102", IMPLEMENTATION_DONE),
+            ("103", note),
+            ("104", CLOSE),
+        ]
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / "o.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "issue": "14539",
+                        "journals": [{"journal_id": j, "notes": n} for j, n in journals],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return resolve_admissible(str(path))
+
+    def test_a_repeated_key_with_different_values_is_a_conflict_in_either_order(self):
+        for order in (("explicit_deferral", "merge"), ("merge", "explicit_deferral")):
+            with self.subTest(order=order):
+                note = self._marker(*order)
+                self.assertTrue(has_conflicting_disposition_declaration([("103", note)]))
+                self.assertFalse(self._resolve(note))
+
+    def test_a_repeated_key_with_the_same_value_is_not_a_conflict(self):
+        """Negative control: identical repetition is one declaration, as everywhere else."""
+        note = self._marker("merge", "merge")
+        self.assertFalse(has_conflicting_disposition_declaration([("103", note)]))
+        self.assertTrue(self._resolve(note))
+
+    def test_the_single_valued_marker_admits(self):
+        self.assertTrue(self._resolve(self._marker("merge")))
+
+    def test_a_malformed_fragment_is_a_conflict(self):
+        """A body that does not parse cleanly is not a declaration this path may act on."""
+        note = self._marker("merge").replace(":head=", ":bare_fragment:head=")
+        self.assertTrue(has_conflicting_disposition_declaration([("103", note)]))
+
+    def test_the_raw_scanner_preserves_multiplicity(self):
+        """The grammar half, pinned directly: the dict fold is what loses the duplicate."""
+        note = self._marker("explicit_deferral", "merge")
+        collapsed = [f for ch, f in marker_fields_in_note(note) if ch == "workflow-event"]
+        raw = [c for ch, c in marker_components_in_note(note) if ch == "workflow-event"]
+        self.assertEqual(collapsed[0]["disposition"], "merge")  # last write won
+        self.assertEqual(
+            [v for k, v in raw[0] if k == "disposition"], ["explicit_deferral", "merge"]
+        )
+
+
+class ReviewJ91797WorkUnitTests(unittest.TestCase):
+    """R9-F5: ``fold_work_unit`` routed review AUTHORITY by line order (pre-existing).
+
+    ``user_story`` sends the Review Gate to the auditor's US-level audit and ``leaf_issue`` to the
+    same-lane implementation_gateway, so a journal declaring both picked an owner by which line
+    came first.
+    """
+
+    def test_conflicting_work_unit_declarations_fold_to_undeclared_in_either_order(self):
+        for order in (("user_story", "leaf_issue"), ("leaf_issue", "user_story")):
+            with self.subTest(order=order):
+                note = (
+                    "## Gate: Review Request\n"
+                    f"- work_unit: {order[0]}\n"
+                    f"- work_unit: {order[1]}\n"
+                )
+                self.assertEqual(fold_work_unit([("100", note)]), "")
+
+    def test_an_equal_duplicate_declaration_still_resolves(self):
+        """Negative control: identical repetition is one declaration, not a conflict."""
+        note = (
+            "## Gate: Review Request\n- work_unit: user_story\n- work_unit: user_story\n"
+        )
+        self.assertEqual(fold_work_unit([("100", note)]), "user_story")
+
+    def test_a_single_declaration_is_unchanged(self):
+        for token in ("user_story", "leaf_issue"):
+            with self.subTest(token):
+                note = f"## Gate: Review Request\n- work_unit: {token}\n"
+                self.assertEqual(fold_work_unit([("100", note)]), token)
+
+    def test_the_undeclared_fold_routes_to_the_same_lane_side(self):
+        """Why "" is the fail-closed answer: it never claims US-level audit authority."""
+        conflicting = (
+            "## Gate: Review Request\n- work_unit: user_story\n- work_unit: leaf_issue\n"
+        )
+        self.assertNotEqual(fold_work_unit([("100", conflicting)]), "user_story")
+
+    def test_latest_wins_still_holds_across_journals(self):
+        """The per-journal fix must not disturb the supersession rule between journals."""
+        older = "## Gate: Review Request\n- work_unit: user_story\n"
+        newer = "## Gate: Review Request\n- work_unit: leaf_issue\n"
+        self.assertEqual(fold_work_unit([("100", older), ("200", newer)]), "leaf_issue")
 
 
 if __name__ == "__main__":  # pragma: no cover
