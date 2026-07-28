@@ -121,9 +121,22 @@ config dir の存在 / directory 性 / home 内 realpath は plan gate で一度
 symlink に差し替えたりできるため、installer は同じ問いを **action time に必ず問い直す**:
 
 - preflight (snapshot / backup) の前
-- **各 herdr 呼び出しの直前と直後**
+- **各 herdr 呼び出しの直前**
 - **rollback の書き込み前** (guard は「書く場所」に置く。drift 後の root へ backup を書き戻すと
   operator の bytes を home 外へ押し出すため)
+
+さらに **config dir を「読む」操作はすべて identity で括る** (`with_identity_bracket`: check →
+read → check)。括る対象は preflight の snapshot+backup、**apply 後の read (diff の材料)**、
+**rollback の復元検証 read** の 3 つで、いずれも「読んだ bytes が staged object のものである」ことを
+両側の check で保証する。前後どちらか片側だけでは足りない:
+
+- 先行 check だけ → 読んだ *結果* が何の object のものか言えない。
+- 後続 check だけ → 読み *始め* が正しい object だったと言えない。
+
+これを call site の習慣ではなく **単一 helper** にしてあるのは、習慣が実際に破れたからである
+(preflight の read だけ括り、apply 後の read と rollback 検証 read を素通しにしていたため、同一 path
+への directory 差し替えが **成功扱い**になり、diff は差し替え先の内容を「herdr の変更」として誤報し、
+rollback は **pre-apply と同じ中身に見せかけた別 object** を読んで「復元を証明した」と主張した)。
 
 **identity は path ではなく filesystem object** (`realpath` + `st_dev` + `st_ino`)。同一 path に
 別 directory を作り直す replacement は、containment も realpath 一致もすべて通過するが

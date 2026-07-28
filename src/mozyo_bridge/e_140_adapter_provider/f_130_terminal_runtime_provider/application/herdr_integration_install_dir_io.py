@@ -19,6 +19,12 @@ every downstream set at once and reads as *absent*, which no per-file check can 
 the bytes are written: restoring a backup into a dir that has since been re-pointed
 would push operator content outside home (review j#91762 finding 1).
 
+Every observation of a config dir goes through :func:`with_identity_bracket`, which
+encloses it in an identity check on both sides. That is a function rather than a
+convention because the convention is what failed: bracketing the preflight read while
+leaving the post-apply read and the rollback's verifying read bare let a same-path
+directory replacement read as a successful install (review j#91840).
+
 "The dir it was staged against" means a :class:`DirIdentity` — the filesystem object,
 not the name. A resolved path only says what the target is *called*, and a replacement
 directory created at the same path answers every path-shaped question correctly while
@@ -147,6 +153,35 @@ def config_dir_drift(
             f"refusing to touch a different object",
         )
     return None
+
+
+def with_identity_bracket(
+    root: Path, home: Path, expected: DirIdentity, operation
+) -> "tuple[Optional[object], Optional[tuple[str, str]]]":
+    """Run ``operation()`` between two identity checks; return ``(result, problem)``.
+
+    Every observation of a config dir is only meaningful *about a particular object*,
+    so it has to be enclosed on both sides: the target must be the staged object before
+    the operation starts and still be it when the operation ends. A leading check alone
+    proves nothing about what was actually read, and a trailing check alone cannot say
+    the read began against the right dir.
+
+    This exists as one function rather than as a habit at each call site because the
+    habit is what failed: the preflight read was bracketed while the post-apply read
+    and the rollback's verification read were not, which let a same-path directory
+    replacement be reported as a successful install and let a rollback "prove"
+    restoration by reading a different object (Redmine #13249 review j#91840). Route
+    every config-dir observation through here, and forgetting the bracket stops being
+    possible.
+    """
+    drift = config_dir_drift(root, home, expected=expected)
+    if drift is not None:
+        return None, drift
+    result = operation()
+    drift = config_dir_drift(root, home, expected=expected)
+    if drift is not None:
+        return None, drift
+    return result, None
 
 
 @dataclass(frozen=True)
@@ -404,7 +439,18 @@ def rollback_dir(
     # another sentinel is not byte proof, and a subtree that could not be listed is not
     # evidence of absence, so either gap reports the dir unverified rather than
     # "restored" (Redmine #13249 reviews j#83674 finding 1 / j#91688 finding 2).
-    after = read_dir(root)
+    #
+    # The verifying read is itself bracketed by the identity, because "these bytes match
+    # what was there before" is only a restoration proof when the bytes came from the
+    # dir that was restored. A replacement directory created at the same path — one
+    # seeded to look like the pre-apply state — would otherwise satisfy the comparison
+    # and let this claim a verified rollback of an object it never touched (review
+    # j#91840).
+    after, drift = with_identity_bracket(
+        root, home, expected, lambda: read_dir(root)
+    )
+    if drift is not None or after is None:
+        return False
     if not after.complete or has_unreadable(before):
         return False
     return after.snapshot == before
@@ -423,4 +469,5 @@ __all__ = (
     "read_dir",
     "rollback_dir",
     "scan_dir",
+    "with_identity_bracket",
 )

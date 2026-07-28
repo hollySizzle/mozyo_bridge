@@ -738,6 +738,10 @@ class InstallOpsTest(unittest.TestCase):
         self.assertFalse(report.applied)
         self.assertEqual(fake.calls, [])  # herdr never invoked
         self.assertEqual(report.plans[0].reason, REASON_CONFIG_DIR_MISSING)
+        # …and it is reported as a target that was already gone, not as one that
+        # changed while being read: the preflight validates before it reads, so the
+        # two situations must not collapse into the same diagnostic.
+        self.assertNotIn("while it was being snapshotted", report.plans[0].detail)
 
     def test_apply_refused_when_config_dir_is_repointed_outside_home(self) -> None:
         # Review j#91762 finding 1: swapping the dir for a symlink escaping home after
@@ -799,20 +803,24 @@ class InstallOpsTest(unittest.TestCase):
 
         outside = self.tmp / "outside"
         outside.mkdir()
-        real_drift = install_ops.config_dir_drift
+        real_bracket = install_ops.with_identity_bracket
         state = {"drifted": False}
 
-        def drift_after_read_bracket(config_dir, home, *, expected=None):
-            result = real_drift(config_dir, home, expected=expected)
+        def drift_after_read_bracket(root, home, expected, operation):
+            result = real_bracket(root, home, expected, operation)
             if not state["drifted"]:
-                # this call IS the post-read bracket check; drift right after it
+                # this call IS the preflight read+backup bracket; drift right after it
+                # closes, so only the pre-invocation check stands between the swap and
+                # herdr being handed the dir
                 state["drifted"] = True
                 shutil.rmtree(self.home / ".claude")
                 os.symlink(outside, self.home / ".claude")
             return result
 
         fake = FakeHerdrIntegration()
-        with mock.patch.object(install_ops, "config_dir_drift", drift_after_read_bracket):
+        with mock.patch.object(
+            install_ops, "with_identity_bracket", drift_after_read_bracket
+        ):
             report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
         self.assertFalse(report.ok)
         self.assertFalse(report.applied)
@@ -929,6 +937,68 @@ class InstallOpsTest(unittest.TestCase):
             "operator data",
         )
         self.assertFalse((replacement / "settings.json").exists())
+
+    def test_replacement_before_the_post_apply_read_is_not_a_success(self) -> None:
+        # Review j#91840: the post-invoke identity check is not the last look at the
+        # dir — the post-apply read comes after it, and the diff it produces is only
+        # herdr's change if it came from the staged object. A replacement created in
+        # between (and left in place) must not be reported as a successful install.
+        (self.home / ".claude" / "settings.json").write_text("orig", encoding="utf-8")
+        stash = {}
+        real_read = install_ops.read_dir
+        state = {"n": 0}
+
+        def replace_before_post_read(root):
+            state["n"] += 1
+            if state["n"] == 2:  # 1 = preflight read, 2 = post-apply read
+                stash["dir"] = self._replace_claude_dir_same_path(
+                    seed="replacement-data.txt"
+                )
+            return real_read(root)
+
+        fake = FakeHerdrIntegration()
+        with mock.patch.object(install_ops, "read_dir", replace_before_post_read):
+            report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        outcome = report.outcomes[0]
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.reason, REASON_ROLLBACK_INCOMPLETE)
+        # no diff was published from the stranger's directory
+        self.assertIsNone(outcome.diff)
+        # and the replacement's own file was never touched by the installer
+        self.assertEqual(
+            (self.home / ".claude" / "replacement-data.txt").read_text(encoding="utf-8"),
+            "operator data",
+        )
+
+    def test_rollback_verification_read_is_attributed_to_the_staged_dir(self) -> None:
+        # Review j#91840: "the bytes now match the pre-apply snapshot" only proves a
+        # restoration when the bytes came from the dir that was restored. The
+        # replacement here is seeded to MATCH the pre-apply state exactly, so a
+        # comparison alone would happily call it verified.
+        (self.home / ".claude" / "settings.json").write_text("orig", encoding="utf-8")
+        real_read = dir_io.read_dir
+        state = {"n": 0}
+
+        def replace_before_verification(root):
+            state["n"] += 1
+            if state["n"] == 1:  # rollback_dir's restoration-verification read
+                stashed = self._replace_claude_dir_same_path()
+                # a look-alike: same relative path, same bytes as the pre-apply state
+                (self.home / ".claude" / "settings.json").write_text(
+                    "orig", encoding="utf-8"
+                )
+                state["stashed"] = stashed
+            return real_read(root)
+
+        fake = FakeHerdrIntegration(fail_for=frozenset({AGENT_CLAUDE}))
+        with mock.patch.object(dir_io, "read_dir", replace_before_verification):
+            report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.reason, REASON_ROLLBACK_INCOMPLETE)
+        self.assertFalse(outcome.rolled_back)  # never "verified" against a look-alike
+        self.assertIn("INCOMPLETE", report.detail)
 
     def test_transaction_start_pin_drift_reports_a_closed_reason(self) -> None:
         # Review j#91805 finding 2B: a refusal must arrive as a closed reason, not as

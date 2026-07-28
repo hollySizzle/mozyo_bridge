@@ -96,6 +96,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     observe_config_dir,
     read_dir,
     rollback_dir,
+    with_identity_bracket,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pin_posture_ops import (
     verify_config,
@@ -551,13 +552,18 @@ def _run_apply_transaction(
                 pin_mode=pin_mode,
                 herdr_config_bound=bound_config,
             )
-        before_read = read_dir(config_dir)
-        backup = backup_dir(config_dir)
-        # The snapshot and the backup have to describe ONE object. Re-checking the
-        # identity after them turns "these two reads happened" into "these two reads
-        # are of the dir this transaction staged" (j#91805 finding 1).
-        read_drift = config_dir_drift(config_dir, inputs.home, expected=staged_identity)
-        if read_drift is not None:
+        # The snapshot and the backup have to describe ONE object, so the pair is
+        # enclosed in the identity bracket rather than merely followed by a check
+        # (j#91805 finding 1 / j#91840).
+        reads, read_drift = with_identity_bracket(
+            config_dir,
+            inputs.home,
+            staged_identity,
+            lambda: (read_dir(config_dir), backup_dir(config_dir)),
+        )
+        if read_drift is None:
+            before_read, backup = reads
+        else:
             drift_reason, drift_detail = read_drift
             return InstallReport(
                 applied=False,
@@ -622,20 +628,16 @@ def _run_apply_transaction(
         else:
             ok, detail = _invoke_herdr(runner, binary, agent, env)
             mutated = True  # herdr may have written whatever its exit code says
-            after_drift = config_dir_drift(
-                config_dir, inputs.home, expected=staged_identity
-            )
             # Re-assert the config pin after the run as well: the check before the
             # invocation cannot be atomic with herdr's own read, so a swap inside that
             # window is caught here and rolled back instead of left installed.
             after_pin_drift = _config_pin_drift(inputs, pin, when="while herdr ran")
+            # The dir's identity after the run is asserted by the bracket around the
+            # post-apply read below (success path) and by `rollback_dir`'s own guard
+            # (failure path). A separate check here would duplicate both and could not
+            # be made to fail on its own — the bracket is the single mechanism.
             if not ok:
                 failure = (REASON_HERDR_ERROR, detail)
-            elif after_drift is not None:
-                failure = (
-                    after_drift[0],
-                    f"herdr reported success but {after_drift[1]}",
-                )
             elif after_pin_drift is not None:
                 failure = (
                     REASON_CONFIG_PIN_MISMATCH,
@@ -647,8 +649,23 @@ def _run_apply_transaction(
                 # that cannot be fully read back yields neither an exact diff nor a
                 # final home state, so it is rolled back and reported closed rather
                 # than ok (Redmine #13249 review j#91688 finding 3).
-                after_read = read_dir(config_dir)
-                if not after_read.complete:
+                # …and the read that produces that state is itself bracketed: a diff
+                # computed from a directory that replaced the staged one describes
+                # someone else's contents, and would be reported as the change herdr
+                # made (Redmine #13249 review j#91840).
+                after_read, read_drift = with_identity_bracket(
+                    config_dir,
+                    inputs.home,
+                    staged_identity,
+                    lambda: read_dir(config_dir),
+                )
+                if read_drift is not None:
+                    failure = (
+                        read_drift[0],
+                        f"herdr reported success but the post-apply state could not be "
+                        f"attributed to the staged config dir: {read_drift[1]}",
+                    )
+                elif not after_read.complete:
                     failure = (
                         REASON_CONFIG_DIR_UNREADABLE,
                         f"herdr reported success but {config_dir} could not be fully "
