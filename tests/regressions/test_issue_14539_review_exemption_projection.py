@@ -60,6 +60,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     EXEMPTION_INVALID,
     EXEMPTION_PATH_COVERAGE_UNPROVEN,
     EXEMPTION_REVIEW_REQUIRED,
+    fold_review_exemption,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     classify_lane_state,
@@ -2574,6 +2575,238 @@ class ReviewJ92060ReviewRequestSelectorTests(unittest.TestCase):
         )
 
 
+class ReviewJ92106SameGateSiblingTests(unittest.TestCase):
+    """R21-F3: the shared gate reader kept the readable subset of same-gate siblings.
+
+    R21 gave ``strict_marker_fields_in_note`` whole-note semantics and wrote down exactly why —
+    "a note carrying one clean and one forged marker would read like a clean note" — and then did
+    not apply the same rule to ``strict_gate_markers``, which is the reader most authority
+    consumers actually call.
+    """
+
+    CLEAN = "[mozyo:workflow-event:kind=implementation_request:lane=r1:lane_generation=1]"
+    FORGED = "[mozyo:workflow-event:kind = implementation_request:lane=r1:lane_generation=1]"
+
+    def test_a_forged_sibling_for_the_same_gate_poisons_the_note(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            strict_gate_markers,
+        )
+
+        self.assertEqual(len(strict_gate_markers(self.CLEAN, "implementation_request")), 1)
+        self.assertEqual(
+            strict_gate_markers(self.CLEAN + "\n" + self.FORGED, "implementation_request"), ()
+        )
+
+    def test_a_forged_sibling_for_ANOTHER_gate_is_not_this_gate_s_business(self):
+        """The boundary: whole-note must not mean "any bad marker anywhere kills everything"."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            strict_gate_markers,
+        )
+
+        other = "[mozyo:workflow-event:gate = some_other_gate]"
+        self.assertEqual(
+            len(strict_gate_markers(self.CLEAN + "\n" + other, "implementation_request")), 1
+        )
+
+    def test_the_dispatch_anchor_refuses_the_poisoned_note(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+            dispatch_generations,
+            resolve_dispatch_entry_journal,
+        )
+
+        entries = [
+            RedmineJournalEntry(
+                issue_id="1", journal_id="7", notes=self.CLEAN + "\n" + self.FORGED
+            )
+        ]
+        self.assertEqual(
+            resolve_dispatch_entry_journal(entries, lane="r1", lane_generation=1), ""
+        )
+        self.assertEqual(dispatch_generations(entries, lane="r1"), ())
+
+    def test_the_answered_review_request_refuses_the_poisoned_note(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_basis_producer import (  # noqa: E501
+            _answered_review_request,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+            EvidenceJournal,
+        )
+
+        head = "a" * 40
+        clean = (
+            "[mozyo:workflow-event:gate=review_request:workspace=ws:lane=r1:"
+            f"lane_generation=1:head={head}]"
+        )
+        forged = clean.replace("gate=review_request", "gate = review_request")
+        journal, resolved_head = _answered_review_request(
+            [EvidenceJournal(journal_id="1", notes=clean + "\n" + forged)], result_journal="3"
+        )
+        # The journal still DECLARES the gate, so it is current — it just proves no head.
+        self.assertEqual(journal, "1")
+        self.assertEqual(resolved_head, "")
+
+
+class ReviewJ92106ExemptionQualificationTests(unittest.TestCase):
+    """R21-F1: a marker-qualified exemption journal must carry a RENDERABLE marker.
+
+    The allowlist called this "structural qualification only". On the effect chain it is not:
+    qualifying decides whether the gate's fields are read as authority, and a valid read mints the
+    exemption the glance projection and the terminal retire admission both consume.
+    """
+
+    HEAD = "a" * 40
+    FIELDS = (
+        "\n- role: 実装者\n- direct_edit: true\n- allowed_paths: src/**\n"
+        "- reason: r\n- follow_up_review: false\n"
+    )
+
+    def _scope(self):
+        return (
+            f"## Gate: Implementation Done\n- commit: {self.HEAD}\n"
+            "- changed_paths:\n  - src/a.py\n"
+        )
+
+    def _state(self, marker):
+        return fold_review_exemption(
+            [("101", marker + self.FIELDS), ("102", self._scope())]
+        ).state
+
+    def test_the_canonical_marker_still_mints_the_exemption(self):
+        self.assertEqual(
+            self._state("[mozyo:workflow-event:gate=codex_direct_edit]"), EXEMPTION_EXEMPT
+        )
+
+    def test_a_producer_impossible_marker_mints_nothing(self):
+        for label, marker in (
+            ("whitespace", "[mozyo:workflow-event:gate = codex_direct_edit]"),
+            ("duplicate key",
+             "[mozyo:workflow-event:gate=other:gate=codex_direct_edit]"),
+            ("unknown second alias",
+             "[mozyo:workflow-event:gate=codex_direct_edit:kind=unknown_gate]"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._state(marker), EXEMPTION_INVALID)
+
+    def test_an_unreadable_marker_gate_still_shadows_an_older_valid_one(self):
+        """Refusing to MINT must not become refusing to SEE — the R2-F1 invariant.
+
+        The malformed journal is still the current declaration, so the older valid exemption does
+        not come back; it simply yields ``invalid`` (review owed).
+        """
+        older = "[mozyo:workflow-event:gate=codex_direct_edit]" + self.FIELDS
+        newer = "[mozyo:workflow-event:gate = codex_direct_edit]" + self.FIELDS
+        facts = fold_review_exemption(
+            [("101", older), ("102", self._scope()), ("103", newer)]
+        )
+        self.assertEqual(facts.state, EXEMPTION_INVALID)
+
+    def test_the_heading_form_is_unaffected(self):
+        """A governed heading qualifies on its own; the marker rule must not disturb it."""
+        self.assertEqual(self._state("## Gate: codex_direct_edit"), EXEMPTION_EXEMPT)
+
+
+class ReviewJ92106BespokeParserTests(unittest.TestCase):
+    """R21-F4: the symbol sweep could not see a reader that brings its OWN parser.
+
+    ``dispatch_authorization`` scanned the marker grammar with a private ``_MARKER_RE`` and a
+    verbatim copy of the lenient last-write-wins / whitespace-stripping fold, and its result
+    authorizes an actual worker dispatch. The previous classification pin matched a shared symbol
+    name, so a module that never imports that symbol was invisible to it — which is why "every
+    effect-reaching reader was mechanically enumerated" was not true.
+    """
+
+    def _marker(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authorization import (  # noqa: E501
+            build_dispatch_authorization_marker,
+        )
+
+        return build_dispatch_authorization_marker(
+            action_id="a1",
+            source_gate="review_result",
+            issue="500",
+            workspace_id="ws",
+            lane_id="r1",
+            target_assigned_name="mzb1_ws_claude_r1",
+        )
+
+    def _parse(self, note):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_authorization import (  # noqa: E501
+            parse_dispatch_authorizations,
+        )
+
+        class _E:
+            def __init__(self, notes):
+                self.journal_id = "7"
+                self.notes = notes
+
+        return parse_dispatch_authorizations([_E(note)])
+
+    def test_the_canonical_authorization_is_valid(self):
+        """Control: the producer's own output must keep authorizing."""
+        self.assertEqual([a.valid for a in self._parse(self._marker())], [True])
+
+    def test_producer_impossible_authorizations_authorize_nothing(self):
+        canonical = self._marker()
+        for label, note in (
+            ("whitespace",
+             canonical.replace("action=dispatch_worker", "action = dispatch_worker")),
+            ("duplicate action",
+             canonical.replace("action=dispatch_worker", "action=deny:action=dispatch_worker")),
+            ("duplicate role",
+             canonical.replace(
+                 "authorized_by_role=coordinator",
+                 "authorized_by_role=worker:authorized_by_role=coordinator",
+             )),
+        ):
+            with self.subTest(label):
+                parsed = self._parse(note)
+                # Still EMITTED (a malformed record stays diagnosable) but never valid.
+                self.assertEqual([a.valid for a in parsed], [False])
+
+    def test_no_module_hand_rolls_a_marker_body_parser(self):
+        """The classification pin the symbol sweep could not be: parsers, not imports.
+
+        A module may scan for the ``[mozyo:...]`` token, but splitting a marker BODY into fields
+        itself means it has its own grammar — and a private grammar is exactly what drifted from
+        the contract here. The body parse must come from the shared strict reader.
+        """
+        import pathlib
+        import re
+
+        allowed = {
+            # Owns the grammar: the token regex, the component split, and both strict readers.
+            "redmine_journal_source.py",
+            # A deliberately STRICTER private reader (#14219 j#86569 R8-F2 / j#86675 R18-F3): it
+            # refuses whitespace ANYWHERE in a component, where the shared reader refuses it only
+            # around a key or value. Routing it through the shared reader would LOOSEN it, so it
+            # stays — the rule this pin enforces is "no LENIENT private grammar", and its own
+            # negative cases are pinned by #14219.
+            "hibernate_park_record.py",
+        }
+        root = pathlib.Path(__file__).resolve().parents[2] / "src" / "mozyo_bridge"
+        offenders = set()
+        for path in root.rglob("*.py"):
+            if path.name in allowed:
+                continue
+            text = path.read_text(encoding="utf-8")
+            # Only modules that scan the marker TOKEN itself are in scope — plenty of unrelated
+            # code parses ``KEY=VALUE`` for CLI args or config and has nothing to do with this
+            # grammar. The pair "scans ``[mozyo:`` AND splits a body into fields" is the shape of
+            # a hand-rolled marker parser.
+            if r"\[mozyo:" not in text:
+                continue
+            if re.search(r"body\s*\.\s*split\(", text):
+                offenders.add(path.name)
+        self.assertEqual(
+            offenders,
+            set(),
+            "these modules parse a marker body themselves; route the body through "
+            "`strict_marker_fields(_parse_marker_components(body))` so one grammar decides what "
+            "is renderable",
+        )
+
+
 class ReviewJ92060EffectReachingReaderTests(unittest.TestCase):
     """R19-F2/F3: every reader whose result reaches an EFFECT reads strictly.
 
@@ -2694,15 +2927,14 @@ class ReviewJ92060EffectReachingReaderTests(unittest.TestCase):
             # Display projection only. #14213 deliberately keeps its historical leniency; the
             # authority consumers ask ``has_conflicting_disposition_declaration`` first.
             "glance_integration_disposition.py",
-            # Structural gate QUALIFICATION only (does this note carry the gate heading/marker at
-            # all). Every field it then reads goes through its own exactly-one rule.
-            "review_exemption.py",
-            # Defines the scanner and its strict counterpart.
+            # Defines the scanner and its strict counterparts.
             "redmine_journal_source.py",
-            # Pure approval-shape comparison; the LIVE readers that admit a close were moved to
-            # the strict reader (review j#92012 finding 2).
-            "composer_discard_approval.py",
         }
+        # ``review_exemption.py`` and ``composer_discard_approval.py`` were on this list with
+        # reasons that did not survive the effect chain (review j#92106 findings 1 and 2): the
+        # first MINTS the exemption the retire admits on, the second is called by
+        # ``herdr_session_retire_ops`` against a live Redmine read. Both now read strictly, and
+        # their removal from this list is the durable record of why.
         root = pathlib.Path(__file__).resolve().parents[2] / "src" / "mozyo_bridge"
         offenders = set()
         for path in root.rglob("*.py"):

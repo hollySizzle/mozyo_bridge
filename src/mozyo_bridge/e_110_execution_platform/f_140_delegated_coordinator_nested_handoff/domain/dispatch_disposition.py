@@ -36,6 +36,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+    _parse_marker_components,
+    strict_marker_fields,
+)
 from typing import Mapping, Optional, Sequence
 
 #: The dedicated channel. NOT in the journal source's recognized channels and NOT a gate kind:
@@ -163,14 +167,15 @@ def render_dispatch_disposition_marker(
     return f"[mozyo:{MARKER_CHANNEL_DISPATCH_DISPOSITION}:" + ":".join(fields) + "]"
 
 
-def _parse_fields(body: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for chunk in body.split(":"):
-        key, sep, value = chunk.partition("=")
-        if not sep:
-            continue
-        out[key.strip()] = value.strip()
-    return out
+def _parse_fields(body: str) -> "dict[str, str] | None":
+    """One marker body, or ``None`` when it is not renderable (pure).
+
+    Routed through the shared strict reader (Redmine #14539 review j#92106 finding 4). This used
+    to be another private copy of the lenient fold — last-write-wins on a repeated key, whitespace
+    stripped, ``=``-less chunks dropped — and its result decides whether a disposition WRITE is
+    skipped as already-recorded and whether a dispatch correlates, so it reaches an effect.
+    """
+    return strict_marker_fields(_parse_marker_components(body))
 
 
 def parse_dispatch_dispositions(entry) -> tuple[DispatchDisposition, ...]:
@@ -191,6 +196,8 @@ def parse_dispatch_dispositions(entry) -> tuple[DispatchDisposition, ...]:
         if match.group("channel") != MARKER_CHANNEL_DISPATCH_DISPOSITION:
             continue
         fields = _parse_fields(match.group("body"))
+        if fields is None:
+            continue  # not renderable by the canonical producer: it declares nothing
         if any(not _norm(fields.get(name)) for name in _REQUIRED_FIELDS):
             continue  # incomplete: names no exact round
         found.append(

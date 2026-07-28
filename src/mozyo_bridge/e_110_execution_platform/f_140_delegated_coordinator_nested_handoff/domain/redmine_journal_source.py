@@ -236,6 +236,14 @@ def strict_marker_fields_in_note(notes: str):
     return tuple(found)
 
 
+def _raw_declares_gate(components, gate: str) -> bool:
+    """Whether one marker's RAW components name ``gate`` in either alias (pure)."""
+    return any(
+        key.strip() in MARKER_GATE_ALIASES and value.strip() == gate
+        for key, value in components or ()
+    )
+
+
 def declares_gate(notes: str, gate: str) -> bool:
     """Whether ``notes`` CLAIMS ``gate`` at all, however its marker parses (pure).
 
@@ -252,9 +260,8 @@ def declares_gate(notes: str, gate: str) -> bool:
     for channel, components in marker_components_in_note(notes or ""):
         if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
             continue
-        for key, value in components:
-            if key.strip() in MARKER_GATE_ALIASES and value.strip() == gate:
-                return True
+        if _raw_declares_gate(components, gate):
+            return True
     return False
 
 
@@ -278,7 +285,19 @@ def strict_gate_markers(notes: str, gate: str, *, canonicalize=None) -> tuple:
         if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
             continue
         fields = strict_marker_fields(components, canonicalize=canonicalize)
-        if fields is not None and marker_logical_gates(fields) == {gate}:
+        if fields is None:
+            # An unreadable marker that RAW-DECLARES this gate poisons the whole note (Redmine
+            # #14539 review j#92106 finding 3). Skipping it and returning the readable siblings is
+            # the subset behaviour ``strict_marker_fields_in_note`` already refuses: a note
+            # carrying one clean and one forged marker for the SAME gate would read exactly like a
+            # clean note. The contract says it twice — "fragment を捨てて残りを一致させず marker
+            # 全体を fail-closed とする" and "同一種別の読めない marker を読み飛ばして別の marker を
+            # 採ることもしない". An unreadable marker for some OTHER gate is not this gate's
+            # business and is left alone.
+            if _raw_declares_gate(components, gate):
+                return ()
+            continue
+        if marker_logical_gates(fields) == {gate}:
             found.append(fields)
     return tuple(found)
 

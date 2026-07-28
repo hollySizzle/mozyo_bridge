@@ -56,8 +56,8 @@ from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
-    MARKER_CHANNEL_WORKFLOW_EVENT,
-    marker_fields_in_note,
+    declares_gate,
+    strict_gate_markers,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_generation import (
     REASON_OK,
@@ -65,7 +65,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 #: The marker gate that declares a journal to BE a ``codex_direct_edit`` gate. Read through the
-#: policy-free :func:`marker_fields_in_note` scanner (never by widening
+#: policy-free shared marker scanner (never by widening
 #: ``redmine_journal_source.GATE_BEARING_KINDS``) for the same reason the integration disposition
 #: is: that set is the *callback-required* gate vocabulary, and a direct-edit gate must not become
 #: a callback-bearing gate.
@@ -520,17 +520,24 @@ def _journal_exemption(notes: str) -> Optional[ReviewExemptionFacts]:
     finding 3).
     """
     text = notes or ""
-    qualifies = _HEADING_RE.search(text) is not None
-    if not qualifies:
-        for channel, fields in marker_fields_in_note(text):
-            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
-                continue
-            gate = (fields.get("gate") or fields.get("kind") or "").strip()
-            if gate == MARKER_GATE_CODEX_DIRECT_EDIT:
-                qualifies = True
-                break
+    # DECLARATION is raw: a journal naming this gate qualifies however its marker parses, so a
+    # malformed newer gate still SHADOWS an older valid one (the supersede-by-existing rule this
+    # module has run on since R2-F1). Readability is the separate question below.
+    declared_by_marker = declares_gate(text, MARKER_GATE_CODEX_DIRECT_EDIT)
+    qualifies = _HEADING_RE.search(text) is not None or declared_by_marker
     if not qualifies:
         return None
+
+    # …and a journal that qualifies ONLY through a marker must carry a marker the canonical
+    # producer could actually render (Redmine #14539 review j#92106 finding 1). The allowlist
+    # entry that called this "structural qualification only" was wrong on the effect chain: this
+    # qualification decides whether the fields below are read as authority, and a valid read MINTS
+    # an exemption that reaches the glance projection and the terminal retire admission. So an
+    # unreadable marker qualifies the journal (it shadows) and yields EXEMPTION_INVALID (review
+    # still owed) rather than an exemption.
+    if declared_by_marker and not strict_gate_markers(text, MARKER_GATE_CODEX_DIRECT_EDIT):
+        if _HEADING_RE.search(text) is None:
+            return ReviewExemptionFacts(state=EXEMPTION_INVALID)
 
     role, role_conflict = _unique_field(_ROLE_FIELD_RE, text)
     direct_edit_raw, direct_edit_conflict = _unique_field(_DIRECT_EDIT_FIELD_RE, text)

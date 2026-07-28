@@ -15,7 +15,7 @@ from typing import Sequence
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     MARKER_CHANNEL_WORKFLOW_EVENT,
     RedmineJournalEntry,
-    marker_fields_in_note,
+    strict_gate_markers,
 )
 
 APPROVAL_GATE = "pending_composer_discard_approval"
@@ -136,12 +136,11 @@ def verify_composer_discard_approval(
             "the exact Redmine approval journal does not exist uniquely on the named issue"
         )
     entry = exact[0]
-    candidates = [
-        fields
-        for channel, fields in marker_fields_in_note(entry.notes)
-        if channel == MARKER_CHANNEL_WORKFLOW_EVENT
-        and fields.get("gate") == APPROVAL_GATE
-    ]
+    # This verifier admits a LIVE destructive session retire — ``herdr_session_retire_ops`` reads
+    # Redmine fresh and calls it directly — so the approval is read through the shared strict gate
+    # reader (Redmine #14539 review j#92106 finding 2). Being a pure comparison does not make it
+    # display-only; what matters is where its answer travels.
+    candidates = list(strict_gate_markers(entry.notes, APPROVAL_GATE))
     if len(candidates) != 1:
         raise ComposerDiscardApprovalError(
             "the exact journal does not contain one structured composer-discard owner approval"

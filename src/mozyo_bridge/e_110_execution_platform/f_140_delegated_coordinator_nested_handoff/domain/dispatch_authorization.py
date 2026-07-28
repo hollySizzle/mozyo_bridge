@@ -35,6 +35,11 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+    _parse_marker_components,
+    strict_marker_fields,
+)
+
 # The dedicated authorization marker channel (distinct from ``handoff`` / ``workflow-event``).
 DISPATCH_AUTHORIZATION_CHANNEL = "dispatch-authorization"
 
@@ -69,22 +74,24 @@ SUPERSEDING_GATES = frozenset(
 )
 
 #: ``[mozyo:dispatch-authorization:<key=value:...>]`` — the same grammar the gate-marker
-#: channels use, scanned here for the dedicated authorization channel only.
+#: channels use, scanned here for the dedicated authorization channel only. The BODY is parsed by
+#: the shared strict reader (see :func:`_parse_fields`); only the token scan is local, because this
+#: channel is deliberately outside the gate-marker channel set.
 _MARKER_RE = re.compile(r"\[mozyo:(?P<channel>[a-z0-9_-]+):(?P<body>[^\]]*)\]")
 
 
-def _parse_fields(body: str) -> dict[str, str]:
-    """Parse a ``key=value:key=value`` marker body into a dict (pure; last write wins)."""
-    fields: dict[str, str] = {}
-    for token in body.split(":"):
-        token = token.strip()
-        if not token:
-            continue
-        key, eq, value = token.partition("=")
-        if not eq:
-            continue
-        fields[key.strip()] = value.strip()
-    return fields
+def _parse_fields(body: str) -> "dict[str, str] | None":
+    """Parse a marker body strictly, or ``None`` when it is not renderable (pure).
+
+    This channel's authorization reaches an ACTUAL worker dispatch, so it is read on the same
+    terms as every other authority marker (Redmine #14539 review j#92106 finding 4): the shared
+    strict reader over uncollapsed components. It used to be a verbatim copy of the lenient fold —
+    last-write-wins on a repeated key, whitespace stripped off every key and value — so
+    ``action = dispatch_worker``, ``action=deny:action=dispatch_worker`` and
+    ``authorized_by_role=worker:authorized_by_role=coordinator`` all authorized a dispatch. Having
+    its own parser is precisely why the shared-symbol sweep never saw it.
+    """
+    return strict_marker_fields(_parse_marker_components(body))
 
 
 @dataclass(frozen=True)
@@ -174,6 +181,13 @@ def parse_dispatch_authorizations(
             if match.group("channel") != DISPATCH_AUTHORIZATION_CHANNEL:
                 continue
             fields = _parse_fields(match.group("body"))
+            if fields is None:
+                # A body the canonical producer could not render authorizes nothing. It is still
+                # EMITTED as an invalid authorization so a malformed record is diagnosable rather
+                # than silently vanishing — the same reason this function never dropped partial
+                # markers — but ``valid`` is False, so no dispatch follows from it.
+                out.append(_authorization_from_fields({}, journal))
+                continue
             out.append(_authorization_from_fields(fields, journal))
     return tuple(out)
 
