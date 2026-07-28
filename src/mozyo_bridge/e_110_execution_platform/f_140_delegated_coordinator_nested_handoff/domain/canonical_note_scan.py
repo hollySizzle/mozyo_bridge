@@ -179,6 +179,10 @@ _HIDDEN_CONSTRUCT_START = re.compile(r"<[A-Za-z!?/]")
 #: An AUTOLINK, which is a link and not raw HTML at all (CommonMark 0.31.2 §6.5): an absolute URI or
 #: an email address in angle brackets. Excluding it from the rule above is renderer-faithful
 #: wherever it appears, so it needs no reasoning about surrounding link syntax.
+#: The HTML block openers that OVERLAP the autolink grammar (CommonMark 0.31.2 §4.6): type 2 is
+#: exactly ``<!--``, type 3 is ``<?``, type 4 is ``<!`` and an ASCII letter. Nothing wider — ``<!``
+#: followed by anything else opens no block, and treating it as one erased live gate events.
+_HTML_BLOCK_OPENER = re.compile(r"<!--|<\?|<![A-Za-z]")
 _AUTOLINK = re.compile(
     r"<(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*"
     r"|[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -359,12 +363,21 @@ def _starts_html_block(text: str, offset: int) -> bool:
     """True if ``text[offset:]`` begins an HTML block rather than an inline construct (pure).
 
     An HTML block starts at the head of a line after at most three spaces (CommonMark 0.31.2 §4.6).
-    Only types 2 (``<!--``), 3 (``<?``), 4 and 5 (``<!``) are reachable here: the tag-shaped types
-    cannot satisfy the autolink grammar, which needs a scheme colon or an ``@``.
+    Of the types that can open one, only three overlap the autolink grammar at all: 2 (exactly
+    ``<!--``), 3 (``<?``) and 4 (``<!`` followed by an ASCII letter). Type 5 needs ``<![CDATA[`` and
+    an email local part admits no ``[``; the tag-shaped types need a tag name where the autolink
+    grammar needs a scheme colon or an ``@``.
+
+    Testing ``<!`` alone was too wide, and cost real authority: ``<!@b>``, ``<!1@b>`` and ``<!-@b>``
+    are ordinary email autolinks, and refusing them erased the gate recorded below (#14584 j#91898).
+    This boundary has now been wrong in both directions, so the tests pin real blocks and real
+    autolinks side by side rather than one at a time.
     """
     line_start = text.rfind("\n", 0, offset) + 1
     indent = text[line_start:offset]
-    return indent.strip(" ") == "" and len(indent) <= 3 and text[offset:offset + 2] in ("<!", "<?")
+    if indent.strip(" ") != "" or len(indent) > 3:
+        return False
+    return bool(_HTML_BLOCK_OPENER.match(text, offset))
 
 
 def _blank_from_link_syntax(text: str) -> str:

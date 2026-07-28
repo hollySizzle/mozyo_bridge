@@ -385,6 +385,17 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(self._gates(note), ("review_request",))
 
+    def test_an_email_autolink_at_the_head_of_a_line_does_not_erase_the_gate(self):
+        # #14584 j#91898: `<!` opens an HTML block only before `--` or a letter. Treating every
+        # `<!` as one refused ordinary autolinks and the gate below them disappeared.
+        for label, note in (
+            ("<! then @", "<!@b>\n\n%s" % self.GATE),
+            ("<! then a digit", "<!1@b>\n\n%s" % self.GATE),
+            ("<! then a hyphen", "<!-@b>\n\n%s" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ("review_request",))
+
     def test_a_gate_recorded_above_the_markup_still_counts(self):
         # The bound: refusing from where markup starts must not erase what came before it.
         self.assertEqual(self._gates(self.GATE + "\n\nwe render <div> here"), ("review_request",))

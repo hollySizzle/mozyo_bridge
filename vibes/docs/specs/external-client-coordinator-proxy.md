@@ -223,6 +223,13 @@ authorize したかを照合しなければ scope は未検証のままである
       HTML block type 2/3/4 を開始する**。blank すると opener が Rule E に届かず、描画されない
       raw HTML block 内の marker が gate になった。→ **block を開始し得る match は blank せず E へ残す**。
       同じ bytes でも paragraph 途中なら inline autolink なので従来どおり blank する。
+      ★★★**その「block を開始し得る」条件は実 intersection ちょうどに取る** (#14584 j#91898)。
+      autolink 文法と重なる block opener は **type 2 = exact `<!--` / type 3 = `<?` / type 4 = `<!`+ASCII
+      letter** だけである (type 5 `<![CDATA[` は `[` を email local-part が許さない)。`<!` 全部を条件に
+      したら `<!@b>` / `<!1@b>` / `<!-@b>` という**正規の email autolink**を block と誤認し、
+      **後続の実 gate event / work anchor を消した**。
+      ★★★**この境界は両方向に外した** (R11 で広すぎ→狭すぎ、次で広すぎ)。**片側だけを pin すると、
+      直すたびに反対側へ倒れる。** 実 block 3形と実 autolink 3形を**同じ test に並べて**両側から pin する。
       ★★★**oracle の述語は連言でなければならない** (#14584 j#91863)。R6 で「plain に残る」を
       「text node である」へ**置き換えた**が、raw HTML passthrough は tag 除去後の残骸が text に見える
       ため text-node 判定を通り、plain が空であることを見ていなかった。正しくは

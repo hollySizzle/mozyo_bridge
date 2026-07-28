@@ -577,11 +577,26 @@ class PassOrderTest(unittest.TestCase):
             ("type 2 comment", f"<!--a@b>\n{MARKER}"),
             ("type 3 processing instruction", f"<?a@b>\n{MARKER}"),
             ("type 4 declaration", f"<!A@b> {MARKER}"),
+            ("type 4, lower case letter", f"<!z@b> {MARKER}"),
             ("type 2 closed on its own line", f"<!--a@b>--> {MARKER}"),
             ("three spaces still starts a block", f"   <!--a@b>\n{MARKER}"),
         ):
             with self.subTest(label):
                 self.assertEqual(_gates(note), ())
+
+    def test_only_a_real_block_opener_counts(self):
+        # The other side of the same boundary, and the direction that costs real authority: `<!`
+        # opens a block only before `--` or an ASCII letter. `<!@b>`, `<!1@b>` and `<!-@b>` are
+        # ordinary email autolinks, and refusing them erased the gate recorded below (#14584
+        # j#91898). This boundary has been wrong in BOTH directions now, so real blocks and real
+        # autolinks are pinned together — moving it either way turns one of these red.
+        for label, note in (
+            ("<! then @", f"<!@b>\n\n{MARKER}"),
+            ("<! then a digit", f"<!1@b>\n\n{MARKER}"),
+            ("<! then a hyphen", f"<!-@b>\n\n{MARKER}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ("review_request",))
 
     def test_the_same_bytes_mid_paragraph_are_an_autolink(self):
         # The boundary, both sides. Four columns of indent is an indented code block rather than an

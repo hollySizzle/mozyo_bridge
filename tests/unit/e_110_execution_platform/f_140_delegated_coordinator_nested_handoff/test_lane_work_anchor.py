@@ -227,6 +227,18 @@ class FailClosedTest(unittest.TestCase):
                 anchor = _resolve([_entry("90409", note)])
                 self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
 
+    def test_an_email_autolink_at_the_head_of_a_line_does_not_erase_the_anchor(self):
+        # The same liveness defect at the join (#14584 j#91898).
+        marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
+        for label, note in (
+            ("<! then @", "<!@b>\n\n%s" % marker),
+            ("<! then a digit", "<!1@b>\n\n%s" % marker),
+            ("<! then a hyphen", "<!-@b>\n\n%s" % marker),
+        ):
+            with self.subTest(label):
+                anchor = _resolve([_entry("90409", note)])
+                self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
+
     def test_a_crlf_dispatch_record_still_resolves(self):
         # The paired positive at the join: Redmine writes CRLF, so this is the ordinary case.
         marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
