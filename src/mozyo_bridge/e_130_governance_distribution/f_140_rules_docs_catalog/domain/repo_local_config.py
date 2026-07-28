@@ -634,14 +634,15 @@ class RepoLocalConfig:
                 f"work_unit config is invalid: {exc}"
             ) from exc
         # The lane-class pane-pair placement knob (#13646) declares the herdr split
-        # direction / provider order per lane class. It is parsed by its own
-        # self-contained domain schema (the sibling that also owns the vocabulary); its
-        # LanePlacementError is re-raised as a RepoLocalConfigError so the loader keeps a
-        # single fail-closed boundary. An absent ``lane_placement`` block parses to an empty
-        # declaration (no split / order override recorded) — but NOT to the pre-#13646
-        # launch: `LanePlacementConfig.resolve_effective` resolves every undeclared field to
-        # the #14568 product default, so a repo with no block launches its pairs `split:
-        # down`. The ``pane``-shaped key screen already ran above.
+        # direction / provider order / pair split ratio (#14569) per lane class. It is
+        # parsed by its own self-contained domain schema (the sibling that also owns the
+        # vocabulary); its LanePlacementError is re-raised as a RepoLocalConfigError so the
+        # loader keeps a single fail-closed boundary. An absent ``lane_placement`` block
+        # parses to an empty declaration (no split / order / ratio override recorded) — but
+        # NOT to the pre-#13646 launch: `LanePlacementConfig.resolve_effective` resolves
+        # every undeclared field to the #14568 / #14569 product default, so a repo with no
+        # block launches its pairs `split: down` and divides them evenly. The
+        # ``pane``-shaped key screen already ran above.
         try:
             lane_placement = LanePlacementConfig.from_record(
                 record.get("lane_placement")

@@ -212,8 +212,8 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.age
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (
     AgentProviderProfileError,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import finalize_container_geometry  # noqa: E501
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
-    _close_base_pane,
     _create_tab,
     _create_workspace,
     _invoke,
@@ -540,8 +540,10 @@ def _prepare_session_locked(
     # both lane classes, `order: (codex, claude)` on the default pair), so a workspace that
     # declares no `lane_placement` still lands its pairs vertically with the coordinator on
     # top. `split: right` on the lane class (or on a lane kind) is the rollback.
+    # Redmine #14569 resolves the pair's split RATIO through the same one adapter; it is
+    # consumed after the launches (`agent start` has no `--ratio`), not in the argv.
     lane_class = "default" if result.lane_id == DEFAULT_LANE else "sublane"
-    config_split, config_order = resolve_placement_policy_for_role(
+    config_split, config_order, config_ratio = resolve_placement_policy_for_role(
         lane_placement, lane_class, lane_kind
     )
     providers = resolve_launch_order(providers, config_order)
@@ -904,24 +906,18 @@ def _prepare_session_locked(
                     ),
                 )
 
-    # Reclaim the empty root panes we created — only after EVERY launch succeeded
-    # (a launch failure raised above, so reaching here means all agents are live and
-    # the workspace/tab is safe to keep with just its agent panes). Close only the
-    # exact root pane ids we captured; a close failure is non-fatal cosmetic residue.
-    # The workspace base pane (#13330) and the lane tab root pane (#13411) are
-    # distinct handles — reclaim each independently, never one guessed for the other.
-    if result.base_pane_id:
-        reclaimed, detail = _close_base_pane(
-            binary, result.base_pane_id, runner, timeout, env
-        )
-        result.base_pane_reclaimed = reclaimed
-        result.base_pane_detail = detail
-    if result.tab_pane_id:
-        reclaimed, detail = _close_base_pane(
-            binary, result.tab_pane_id, runner, timeout, env
-        )
-        result.tab_pane_reclaimed = reclaimed
-        result.tab_pane_detail = detail
+    # Finish the container — reclaim the empty root panes we created (#13330 / #13411) and
+    # then divide the pair at the declared ratio (#14569). Both belong to the cohesive
+    # sibling: they run only after EVERY launch succeeded, in that order (closing the root
+    # collapses the split tree the ratio is measured against), and both record onto
+    # `result` rather than raising. The ratio is actuated ONLY on a divider this run just
+    # created — never on a live pair — and is verified by reading `pane layout` back.
+    finalize_container_geometry(
+        result, config_split=config_split, config_order=config_order,
+        config_ratio=config_ratio, launched=len(launch_plans),
+        initial_occupancy=plan_of_container.occupancy, dry_run=dry_run,
+        binary=binary, runner=runner, timeout=timeout, env=env,
+    )
     # Pass 3 — observe what we started (Redmine #13948, Answer j#80989). `agent start`
     # returning a well-formed, correctly-located locator is the LAUNCHER's claim; it says
     # nothing about the process. This bounded read-only probe turns "accepted" into

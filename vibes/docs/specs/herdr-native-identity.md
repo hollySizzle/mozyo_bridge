@@ -465,19 +465,22 @@ fail-closed / safety 不変条件:
 live smoke (cold start bare `mozyo` 後に root pane が残らないこと、adopt 経路が byte-invariant で
 あること) は coordinator の post-review 実機 acceptance で確認する。
 
-## 5.1 lane_placement — pair 配置の設定駆動化 (Redmine #13646)
+## 5.1 lane_placement — pair 配置の設定駆動化 (Redmine #13646 / #14569)
 
-herdr pane pair の **split 方向**と**役割順序** (どちらの provider が先 = 左 / 上に置かれるか) を
-lane class 別に宣言する closed config block。`.mozyo-bridge/config.yaml`:
+herdr pane pair の **split 方向**・**役割順序** (どちらの provider が先 = 左 / 上に置かれるか)・
+**pair 内部の相対 split 比率** (Redmine #14569) を lane class 別に宣言する closed config block。
+`.mozyo-bridge/config.yaml`:
 
 ```yaml
 lane_placement:
   default:                    # coordinator / auditor pair (bare `mozyo`)
     split: down               # right | down
     order: [codex, claude]    # exact permutation
+    ratio: 0.6                # order[0] 側 (down なら上 / right なら左) の占有率
   sublane:                    # lane gateway / worker
     split: right
     order: [codex, claude]
+    ratio: 0.5
 ```
 
 ### Schema (fail-closed)
@@ -487,19 +490,43 @@ lane_placement:
 - `split`: `right` | `down`。herdr 0.7.1 `agent start --split right|down` の語彙 (実 `--help` 照合)。
 - `order`: `[codex, claude]` / `[claude, codex]` の **exact permutation**。欠落 / 重複 / 未知 provider /
   非 list は fail-closed (部分順序が silent に provider を落とさない)。
-- lane class object 自体・`split`・`order` はそれぞれ **個別に optional**。欠落した field は
-  product default を継承する (#14568。空 `{}` は「宣言しない」であって rollback ではない)。
+- `ratio` (#14569): **有限数値**で `0.1 <= ratio <= 0.9`。意味は常に **effective `order[0]` 側**が
+  pair の split 全体に占める割合 (`down` なら上 pane、`right` なら左 pane)。bool / 文字列
+  (`"0.6"`) / list / mapping / `nan` / `±inf` / 範囲外は **config parse 時に fail-closed** し、
+  pane actuation へ到達させない。
+- lane class object 自体・`split`・`order`・`ratio` はそれぞれ **個別に optional**。欠落した field は
+  product default を継承する (#14568 / #14569。空 `{}` は「宣言しない」であって rollback ではない)。
 - unknown class / unknown key / unknown value / unsupported version は fail-closed。
+
+#### `ratio` の値域を herdr の実効 domain へ狭めた理由 (#14569、実測 j#91140)
+
+herdr 0.7.4 の CLI parser は有限 `f32` を広く受理するが、**layout 側が split ratio を
+`0.1..0.9` へ silent clamp** する (実測: ratio 0.5 の split に `pane resize --direction up
+--amount 0.9` を適用すると 0.0 ではなく 0.1 に着地)。schema をこの実効 domain へ狭めない場合、
+`ratio: 0.95` と宣言した workspace の pair は恒久的に 0.9 で描画され、**宣言値と effective layout が
+乖離したまま誰も気づかない**。silent clamp に依存せず parse 時に拒否するのはこのためである
+(Design Answer j#91127「silent clamp を採らない理由」)。
+
+`ratio` は **相対比率のみ**で、固定 pixel 幅 / column 数 / row 数は宣言しない (#14569 Non-goals)。
+herdr は split を ratio として保持し pane rect を container から再導出するため、相対比率は terminal
+resize 後も維持・再現される。固定 extent はそれができない。
 
 ### Product default (Redmine #14568 — #13646 の未設定 byte-invariance を意図的に置換)
 
 未設定時の既定は **`split: down` (default / sublane 両 class)**。`by_lane_kind` > lane class >
 **product default** の 3 層の最下段であり、宣言が無い workspace でも pair は縦分割される。
 
-| lane class | product default `split` | product default `order` | 上段になる provider |
-| --- | --- | --- | --- |
-| `default` | `down` | `[codex, claude]` | codex (coordinator) |
-| `sublane` | `down` | 宣言しない (要求順を維持) | gateway (既定 binding では codex) |
+| lane class | product default `split` | product default `order` | product default `ratio` | 上段になる provider |
+| --- | --- | --- | --- | --- |
+| `default` | `down` | `[codex, claude]` | `0.5` | codex (coordinator) |
+| `sublane` | `down` | 宣言しない (要求順を維持) | `0.5` | gateway (既定 binding では codex) |
+
+`ratio` の product default `0.5` は **#14568 の supersession を拡張しない** (#14569)。herdr が
+fresh split を等分で作るため、`ratio` を宣言しない workspace の landing geometry は本軸の追加前後で
+同一である。`split` の既定変更 (#14568) が意図的な geometry 変更だったのに対し、`ratio` 軸の追加は
+**未宣言 workspace に対して geometry-preserving** である。`order` と違い `ratio` は尊重すべき role
+binding を持たない (provider の選択ではなく split の配分である) ため、`sublane` でも宣言しない理由が無く、
+両 class に同じ `0.5` を置く。
 
 `order` を lane class で非対称にしているのは、**片方だけが尊重すべき role binding を持つ**ため。
 
@@ -530,14 +557,17 @@ lane_placement:
         split: right        # 孫 lane だけ左右へ戻す (lane class より優先)
   ```
 
-- **確認手段は `mozyo-bridge config status`**。`lane_placement.<class>.{split,order}` の leaf row が
+- **確認手段は `mozyo-bridge config status`**。`lane_placement.<class>.{split,order,ratio}` の leaf row が
   effective 値と `declared` / `default` の別を出すので、宣言していない workspace は
-  `lane_placement.default.split = down (default)` として読める。この row は launch chokepoint と
-  **同じ resolver** (`LanePlacementConfig.resolve_effective`) を読むので、status と実 launch は乖離しない。
+  `lane_placement.default.split = down (default)` / `lane_placement.default.ratio = 0.5 (default)` として
+  読める。この row は launch chokepoint と **同じ resolver** (`LanePlacementConfig.resolve_effective`) を
+  読むので、status と実 launch は乖離しない。`ratio` は **実機を測らないと読み取れない唯一の placement
+  field** なので、この row の存在が確認手段そのものである。
 - 設定した field だけが差分を生む。`default` を設定しても `sublane` の launch は不変 (逆も同様)。
 - `by_lane_kind` の **wholesale shadowing は不変** (#13647): 宣言された kind は lane class を丸ごと
   shadow するため、`order` だけ宣言した kind は lane class の `split` を継承せず product default を取る。
-  #14568 はこれを per-field merge に変えていない。
+  #14568 も #14569 もこれを per-field merge に変えていない (`ratio` だけ宣言した kind は lane class の
+  `split` を継承せず、`ratio` を宣言しない kind は lane class の `ratio` ではなく `0.5` を取る)。
 
 ### Launch semantics
 
@@ -571,15 +601,58 @@ lane_placement:
   `order_deferred_until_full_relaunch` を出す (silent に「order 適用済み」と主張しない)。full relaunch で
   configured order が物理的に実現する。
 
+#### ratio actuation (Redmine #14569、実測 j#91140)
+
+herdr 0.7.4 `agent start` は **`--ratio` を持たない** (`pane split` / `pane move` は持つ)。したがって
+`ratio` は launch argv には乗らず、**全 launch 成功 + root pane reclaim の後**に herdr-native
+`pane resize --amount` で 1 度だけ actuate し、`pane layout` で **測って** 判定する。正本実装は
+`herdr_pair_split_ratio.finalize_container_geometry` (reclaim と ratio を 1 つの後処理にまとめた
+cohesive sibling。reclaim が先なのは、root pane を閉じると split tree が畳まれ、その前に測った
+geometry が直後に変わるため)。
+
+- **actuate するのは「この run が今作った divider」だけ**。判定は
+  `launched >= 1 かつ (container の初期 occupancy > 0 または launched >= 2)` — `--split` を出した launch が
+  この run に 1 つ以上あることと同値である。all-adopt / dry-run / 空 container への単発 launch は
+  divider を作らないので **何も触らない**。config を読むだけで live pair が動く経路は存在しない。
+- **対象 split の同定は幾何で行う**。`pane layout` の `splits[]` は child pane id を持たないため、
+  「pair の 2 pane がその split rect を **exact tiling** するか」で同定する。単純な bounding-box 一致は
+  誤判定する (実測: 3 pane の nested layout で、兄弟でない 2 pane の union rect が root split の rect と
+  一致した)。候補が 0 個または 2 個以上なら fail-closed。
+- **shared tab 安全弁 (#14567 との組合せ)**: herdr の `pane resize` は「指定 pane の、direction と軸が
+  一致する最も近い祖先 split」を動かす。したがって actuate 前に「その最近祖先 split が pair 自身の
+  divider か」を照合し、一致しない場合は **resize を発行せず fail-closed** にする。これが無いと、
+  全 sublane を単一 tab へ集約した構成で外側の divider を動かし隣の lane を再配置しうる。
+- **収束と検証**: `--amount` は 1 回あたり 0.5 に clamp される (実測) ため、観測 ratio から毎回 delta を
+  再計算する有界ループ (最大 4 pass、進捗が止まったら中断) で寄せ、最後に `pane layout` を読み直して
+  判定する。判定は 2 本立てで、split ratio が宣言値と `f32` 誤差内 (`1e-3`) であること、かつ first-child
+  pane の extent が `round(extent * ratio)` の ±1 cell 以内であること。**resize が exit 0 で返ったことは
+  根拠にしない** (herdr は amount も ratio も silent clamp するため)。
+- **outcome は独立軸**として `SessionStartResult.ratio_outcome` に出す (`not_applicable` / `matched` /
+  `applied` / `deferred_until_full_relaunch` / `failed`)。`ratio` は 2 pane の **divider** の性質であり
+  どちらの agent の health でもないので、slot health に畳まない。
+- **order-deferred heal**: configured `order[0]` が物理的に 2 番目 (生存 sibling の隣) に着地した場合、
+  そこへ `ratio` を適用すると `order[0]` の取り分が `order[1]` に渡る。live pane の swap / bounce は
+  禁止なので **適用せず `deferred_until_full_relaunch` を明示**する (どちらも主張しない)。full relaunch で
+  order と ratio が同時に実現する。deferral は失敗ではない (pair は使用可能)。
+- **失敗は成功扱いしない**: layout の read / parse 失敗、pair split の同定失敗、`pane resize` の拒否、
+  最終照合の不一致はいずれも `failed` とし、`SessionStartResult.ok` を False にする。ただし
+  `owes_rollback` には入れない — 分割が意図と違うだけの pair は使用可能であり、それを理由に agent を
+  kill / close する方が有害だからである (`ratio` 経路は pane を一切 close しない)。
+
 ### Boundary
 
 - **tab topology とは直交** (#14567 との境界)。`lane_placement` が決めるのは *container の中で pair を
   どう割るか* だけで、*どの container に入るか* (workspace / tab) は #13380 / #13411 の join 軸が決める。
   よって #14567 が全 sublane を単一 tab へ集約しても、その tab の中で各 lane pair は本 block の
-  `split` に従って上下に置ける。両者を組み合わせる時に本 block を変更する必要は無い。
+  `split` / `ratio` に従って置ける。両者を組み合わせる時に本 block を変更する必要は無い。**lane 間の
+  配置比率と pair 内部の比率を混同しない**: 本 block の `ratio` は 1 pair の divider だけを指し、lane
+  同士の列幅は #14604 の scope である。実装上その混同を防いでいるのは上記 shared tab 安全弁で、
+  actuate 対象が pair 自身の divider でないと分かった時点で resize を出さない。
 - `lane_placement` は **future launch policy** であり、live layout / liveness / route authority ではない。
-  config を読むだけで既存 live pair を移動しない (herdr は same-tab re-split を拒否する。live 再配置は
-  operator の CLI 操作のまま)。
+  config を読むだけで既存 live pair を移動 / 再分割しない。`ratio` (#14569) が pane を 1 度 resize するのは
+  **その run 自身が今作った divider** に対してだけで、既存 live pair の divider には触れない
+  (herdr は same-tab re-split を拒否する。live 再配置・live での比率変更は operator の CLI 操作のまま:
+  [[logic-herdr-live-relayout-runbook]])。
 - config key は `pane_placement` では **なく** `lane_placement`。repo-local schema boundary
   (`_FORBIDDEN_KEY_PARTS`) は `pane` を含む key を allowed-key 判定より前に拒否するため、live pane
   addressing に見えない名前へ寄せている (boundary screen は緩めない)。

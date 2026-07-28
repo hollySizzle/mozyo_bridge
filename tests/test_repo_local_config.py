@@ -1042,11 +1042,19 @@ class LanePlacementConfigTest(unittest.TestCase):
         # own LanePlacementError; RepoLocalConfig.from_record re-raises it as a
         # RepoLocalConfigError so the loader keeps one fail-closed boundary (asserted above).
         with self.assertRaises(LanePlacementError):
-            LanePlacementConfig(placements=(("default", "sideways", None),))
+            LanePlacementConfig(placements=(("default", "sideways", None, None),))
         with self.assertRaises(LanePlacementError):
-            LanePlacementConfig(placements=(("nowhere", "down", None),))
+            LanePlacementConfig(placements=(("nowhere", "down", None, None),))
         with self.assertRaises(LanePlacementError):
-            LanePlacementConfig(placements=(("default", None, ("codex",)),))
+            LanePlacementConfig(placements=(("default", None, ("codex",), None),))
+        # Redmine #14569: the ratio axis closes the same back door. Both the range and the
+        # type screen run on direct construction, not only on a parsed record.
+        with self.assertRaises(LanePlacementError):
+            LanePlacementConfig(placements=(("default", None, None, 1.5),))
+        with self.assertRaises(LanePlacementError):
+            LanePlacementConfig(placements=(("default", None, None, "0.5"),))
+        with self.assertRaises(LanePlacementError):
+            LanePlacementConfig(kind_placements=(("implementation", None, None, 0.05),))
 
     def test_config_is_hashable(self) -> None:
         # The placements tuple keeps RepoLocalConfig hashable (the frozen-record rule).

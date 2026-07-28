@@ -188,10 +188,35 @@ class SessionStartResult:
     #: effect (Redmine #13948). Blank for a dry run. It is the ONLY handle an explicit
     #: rollback/replay may act under, so it is surfaced for the operator to pass back.
     action_id: str = ""
+    #: The declared pair-split-ratio axis (Redmine #14569) — one of
+    #: :data:`...herdr_pair_split_ratio.RATIO_OUTCOMES`. Deliberately its own axis rather
+    #: than folded into a slot's ``health``: the ratio is a property of the DIVIDER between
+    #: two panes, not of either agent, and a pair can be perfectly healthy while wrongly
+    #: divided. ``not_applicable`` is the resting value — a run that created no divider of
+    #: its own never claims anything about one.
+    ratio_outcome: str = "not_applicable"
+    #: The measurement (or the refusal) behind :attr:`ratio_outcome`: declared vs observed
+    #: ratio and first-pane extent on a success, the fixed reason on a failure / deferral.
+    ratio_detail: str = ""
+
+    @property
+    def ratio_ok(self) -> bool:
+        """True unless the declared pair split ratio was owed and could not be established.
+
+        ``deferred_until_full_relaunch`` is deliberately NOT a failure: it is the honest,
+        documented outcome of an order-deferred heal, in which applying the ratio would put
+        ``order[0]``'s share on the wrong provider and the alternative — moving a live pane
+        — is forbidden. The run says what it did not do; it did not do the wrong thing.
+        """
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import (  # noqa: E501
+            RATIO_FAILED,
+        )
+
+        return self.ratio_outcome != RATIO_FAILED
 
     @property
     def ok(self) -> bool:
-        """Fully successful iff every requested role was observed healthy (j#80989 Q4).
+        """Fully successful iff every requested role is healthy AND the pair is as declared.
 
         This is the contract the defect violated: success used to mean "``agent start``
         was accepted for every slot", so a pair whose Claude exec'd and exited instantly
@@ -200,12 +225,17 @@ class SessionStartResult:
 
         A read-only surfacing (``stale`` / ``unattested``) is deliberately NOT success:
         the pair is not usable, and saying so is the point of the issue.
+
+        Redmine #14569 adds the second conjunct: a declared pair split ratio that was owed
+        and could not be established is not success either (Design Answer j#91127, "ratio
+        適用失敗を成功扱いしない"). It stays out of :attr:`owes_rollback` on purpose —
+        a mis-divided pair is fully usable, so nothing is owed a teardown for it.
         """
         if self.dry_run:
             # Nothing was started, so no health claim is made or needed: the deliverable
             # of a dry run is the plan itself.
             return True
-        return bool(self.slots) and all(slot.healthy for slot in self.slots)
+        return bool(self.slots) and all(slot.healthy for slot in self.slots) and self.ratio_ok
 
     @property
     def owes_rollback(self) -> bool:
@@ -241,6 +271,8 @@ class SessionStartResult:
             "tab_pane_id": self.tab_pane_id,
             "tab_pane_reclaimed": self.tab_pane_reclaimed,
             "tab_pane_detail": self.tab_pane_detail,
+            "ratio_outcome": self.ratio_outcome,
+            "ratio_detail": self.ratio_detail,
         }
 
 

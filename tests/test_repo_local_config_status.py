@@ -187,7 +187,7 @@ class ClassifyConfigSourcesPureTest(unittest.TestCase):
             )
         }
         for lane_class in ("default", "sublane"):
-            split, order = resolve_placement_policy_for_role(
+            split, order, ratio = resolve_placement_policy_for_role(
                 config.lane_placement, lane_class, None
             )
             self.assertEqual(
@@ -195,6 +195,12 @@ class ClassifyConfigSourcesPureTest(unittest.TestCase):
             )
             self.assertEqual(
                 by_key[f"lane_placement.{lane_class}.order"].effective_value, order
+            )
+            # Redmine #14569: the ratio leaf is held to the SAME rule — it is the field an
+            # operator cannot read off a running pair without measuring it, so a status row
+            # that drifted from the launch resolution would be worse than no row at all.
+            self.assertEqual(
+                by_key[f"lane_placement.{lane_class}.ratio"].effective_value, ratio
             )
 
     def test_effective_value_is_json_safe_frozenset_becomes_sorted_list(self) -> None:

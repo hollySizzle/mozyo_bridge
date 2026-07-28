@@ -18,7 +18,7 @@ live な herdr pane pair (coordinator + auditor / gateway + worker 等) の **�
 
 - **target identity は assigned name 権威**: pane の route authority は herdr assigned name (durable identity) + live inventory であり、pane 位置・tab 配置・pane id は権威ではない ([[spec-herdr-native-identity]])。再配置は表示位置を変えるだけで、assigned name / route / projection を変えない。操作前に必ず対象 pane の assigned name と live 状態を確認し、pane id を durable な target として扱わない。
 - **tab join の権威は `tab_id`**: どの pane が同一 tab に属するかは live inventory の `tab_id` のみが authority で、tab label は cosmetic (#13411)。bounce で「元の tab へ戻す」際は label ではなく元 tab の `tab_id` を指定する。
-- **live pair の即時再配置経路はこの recipe のみ**: herdr は same-tab re-split を拒否するため (下記)、`lane_placement` 設定 (#13646 / #13647) も、その未設定既定 (#14568 の product default `split: down`) も、**既存 live pair の配置を変えない**。設定は次の fresh launch / heal の argv を決めるだけである。live で今すぐ入れ替える唯一の経路が本 recipe である (#13648)。
+- **live pair の即時再配置経路はこの recipe のみ**: herdr は same-tab re-split を拒否するため (下記)、`lane_placement` 設定 (#13646 / #13647 / #14569) も、その未設定既定 (#14568 の product default `split: down`、#14569 の `ratio: 0.5`) も、**既存 live pair の配置を変えない**。設定が決めるのは次の fresh launch / heal の geometry だけである (方向・順序は argv、比率はその launch 自身が作った divider への 1 度の resize)。live で今すぐ入れ替える唯一の経路が本 recipe である (#13648)。
   - #14568 で未設定既定が縦 (`down`) になったため、**既定変更より前に立ち上げた live pair は左右のまま残る**。左右のまま使い続けても不整合ではない (設定と live 配置は別 authority)。今すぐ縦に揃えたい場合は下記 recipe B を使い、pair を再起動できる場面なら fresh launch に任せる方が安全である (live 操作を伴わない)。
 
 ## herdr 0.7.1 の制約 (2026-07-12 実測)
@@ -77,6 +77,44 @@ herdr pane move <moving-pane-id> --tab <original-tab-id> --split right --target-
 
 - 検証: `herdr pane layout` で `direction` が `right` になっていることを実測確認する。
 
+### D. live pair の分割比率を変える (Redmine #14569、2026-07-28 実測 / herdr 0.7.4)
+
+split の **方向**ではなく **配分**を、既に立っている pair に対してその場で変える手順。方向変換 (recipe
+B / C) と違い bounce は不要で、`herdr pane resize` 1 系統で完結する。
+
+```sh
+# 0. 現状確認: 対象 pane の assigned name と live 状態を確認し、現在の ratio を実測する
+herdr pane list [--workspace <workspace_id>]
+herdr pane layout --pane <pane-id>   # splits[].ratio が現在値、splits[].direction が軸
+
+# 1. divider を動かす (direction は「動かしたい向き」であって pane の側ではない)
+herdr pane resize --pane <pane-id> --direction down|up|right|left --amount <0..0.5>
+
+# 2. 検証: 宣言したかった比率になったかを layout で実測する
+herdr pane layout --pane <pane-id>
+```
+
+2026-07-28 の live 実測 (isolated scratch workspace、agent 無し。probe 後 `workspace close` 済み) で
+確定した挙動:
+
+- **`splits[].ratio` は first child の占有率**。`direction: down` なら上 pane、`right` なら左 pane。
+  pane の実 extent は `round(split_extent * ratio)` (extent 75 で ratio 0.5 → 38/37、0.6 → 45/30)。
+- **`--direction` は divider を動かす向き**であり、`--pane` がどちら側かに依らない。`down` / `right` が
+  first child の取り分を増やし、`up` / `left` が減らす。pair のどちらの pane を `--pane` に渡しても
+  同じ divider が同じ向きに動く。
+- **`--pane` は「どの divider か」だけを選ぶ**。herdr は指定 pane の祖先のうち **direction と軸が一致する
+  最も近い split** を動かす。nested layout ではこれが外側の divider になりうるので、**動かす前に
+  `pane layout` の rect を読んで、狙った divider が最近祖先であることを確認する**。確認せずに撃つと
+  隣の pane / lane を再配置する。
+- **`--amount` は 1 回あたり 0.5 に clamp される**。0.1 → 0.9 のような大きな移動は 2 回に分ける
+  (実測: ratio 0.1 に対し `+0.55` / `+0.79` / `+0.8` はいずれも 0.6 で止まる)。**毎回 layout を読み直して
+  残差から次の amount を決める**。exit 0 は「動いた」証拠にならない。
+- **結果 ratio は `0.1..0.9` へ silent clamp される** (0.5 に `up 0.9` を当てると 0.0 ではなく 0.1)。
+  範囲外を狙っても静かに端で止まるので、狙いは必ず layout で照合する。
+- **非有限 / 非数値の `--amount` は `invalid amount: <v>` / exit 2 で拒否**され、layout は変化しない。
+- assigned name / route / projection は不変 (recipe A–C と同じ安全性根拠。divider を動かすだけで
+  pane を move / swap / kill しない)。
+
 ## 安全性の根拠 (実測)
 
 2026-07-12 の live 実測で、上記 recipe が以下を保つことを確認した。
@@ -95,8 +133,10 @@ herdr pane move <moving-pane-id> --tab <original-tab-id> --split right --target-
 
 ## 設定駆動配置との境界
 
-- 恒久的な pair 配置 (どの lane class を左右 / 上下、どちらの provider を先に置くか) を宣言駆動にする作業は別 US: `.mozyo-bridge/config.yaml` への閉集合 `lane_placement` block 追加が #13646、親子孫 3 層別 (lane-role 別) の keying が #13647。config key は `lane_placement` であり `pane_placement` では **ない** — repo-local schema boundary は `pane` を含む key を allowed-key 判定より前に拒否するため、旧名で書いた config は fail-closed で拒否される (正本: [[spec-herdr-native-identity]] §5.1)。
+- 恒久的な pair 配置 (どの lane class を左右 / 上下、どちらの provider を先に置くか、その pair をどんな比率で割るか) を宣言駆動にする作業は別 US: `.mozyo-bridge/config.yaml` への閉集合 `lane_placement` block 追加が #13646、親子孫 3 層別 (lane-role 別) の keying が #13647、pair 内部の相対 split 比率 (`ratio`) が #14569。config key は `lane_placement` であり `pane_placement` では **ない** — repo-local schema boundary は `pane` を含む key を allowed-key 判定より前に拒否するため、旧名で書いた config は fail-closed で拒否される (正本: [[spec-herdr-native-identity]] §5.1)。
 - ただし `lane_placement` 設定は **新規 launch / heal 経路のみ** に効く。herdr が same-tab re-split を拒否するため、既存 live pair の即時再配置は設定変更では起きない。live で今すぐ入れ替える唯一の経路が本書の recipe である (#13646 Non-goals / #13648)。
+- **`ratio` (#14569) も同じ境界**である。`lane_placement.<class>.ratio` を変えても既存 live pair は自動 resize されない。設定が pane を触るのは **その launch 自身が今作った divider に対して 1 度だけ**で、既に立っている pair の divider には届かない。今すぐ live で比率を変えるなら本書 **recipe D** を使い、pair を再起動できる場面なら fresh launch に任せる方が安全である (live 操作を伴わない)。
+- 設定した比率と実機の食い違いを疑ったら、まず `mozyo-bridge config status` の `lane_placement.<class>.ratio` leaf row で **宣言値 (`declared`) か既定 (`default`) か**を読み、次に `herdr pane layout` で **実 ratio** を読む。両者は別 authority なので、片方だけを見て「設定が効いていない」と判断しない (設定は次の fresh launch / heal の geometry を決め、layout は今の geometry を報告する)。
 
 ## 記録の衛生
 

@@ -14,12 +14,17 @@ composing ``LanePlacementConfig`` re-raises it as ``RepoLocalConfigError`` so th
 config-failure boundary stays uniform.
 
 ``lane_placement`` is the config-driven herdr pair placement knob (owner intent 2026-07-12,
-Design Answer j#76564): a ``lane_class -> {split, order}`` table that decides the herdr
-pane pair's split *direction* (``right`` / ``down``) and the provider *order* (which
-provider occupies first / left / top, which one splits beside it) per lane class. It is a
-**future launch policy** only — it constructs the ``agent start`` argv a fresh launch / heal
-uses; it is never a live layout / liveness / route authority, and never reconfigures an
-already-live pair (Non-goal: no live relayout).
+Design Answer j#76564): a ``lane_class -> {split, order, ratio}`` table that decides the
+herdr pane pair's split *direction* (``right`` / ``down``), the provider *order* (which
+provider occupies first / left / top, which one splits beside it), and — since Redmine
+#14569 (owner intent 2026-07-27, Design Answer j#91127) — the *relative share* of that one
+split the first provider takes, per lane class. It is a **future launch policy** only: it
+shapes what a fresh launch / heal builds, and never reconfigures a pair it did not just
+complete (Non-goal: no live relayout).
+
+The ratio axis is deliberately a **relative** share, not a pixel / column / row count
+(issue Non-goals): herdr stores a split as a ratio and re-derives the pane rects from the
+container, so a declared ratio survives a terminal resize while a fixed extent would not.
 
 **Declaration vs effective geometry (Redmine #14568).** Everything in this module that
 *parses* or *reports* the block answers "what did the operator declare", and an absent
@@ -44,6 +49,7 @@ merged (Design Answer j#76564 Q4).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -68,15 +74,27 @@ LANE_PLACEMENT_PROVIDERS: frozenset[str] = frozenset({"claude", "codex"})
 #: is one of these two literals or fails closed.
 LANE_PLACEMENT_SPLIT_DIRECTIONS: frozenset[str] = frozenset({"right", "down"})
 
-#: The closed set of recognized keys inside a lane-class placement object. Both are
-#: individually optional (Design Answer j#76564 Q1 / Q3): a missing field is simply
+#: The closed set of recognized keys inside a lane-class placement object. All three are
+#: individually optional (Design Answer j#76564 Q1 / Q3, j#91127): a missing field is simply
 #: UNDECLARED. An empty ``{}`` object therefore records a lane-class entry that declares
-#: neither field — it is a no-op on the *declaration*, but NOT on the launch: since Redmine
+#: no field — it is a no-op on the *declaration*, but NOT on the launch: since Redmine
 #: #14568 each undeclared field resolves through
 #: :meth:`LanePlacementConfig.resolve_effective` to :func:`product_default_placement`
-#: (``split: down``), so ``{}`` and an absent block land the pair identically — vertically.
-#: Rolling a lane class back takes an explicit ``split: right``, never an empty object.
-LANE_PLACEMENT_CLASS_KEYS: frozenset[str] = frozenset({"split", "order"})
+#: (``split: down``, and since #14569 ``ratio: 0.5``), so ``{}`` and an absent block land
+#: the pair identically — vertically, evenly. Rolling a lane class back takes an explicit
+#: ``split: right``, never an empty object.
+LANE_PLACEMENT_CLASS_KEYS: frozenset[str] = frozenset({"split", "order", "ratio"})
+
+#: The inclusive bounds a declared ``ratio`` must fall in (Redmine #14569, Design Answer
+#: j#91127). Deliberately herdr's OWN effective domain rather than the wider ``0..1`` its
+#: CLI parser accepts: herdr 0.7.4's layout clamps a split ratio into ``0.1..0.9``
+#: (live-measured j#91140 — driving a 0.5 split down by 0.9 lands on 0.1, not 0.0), so a
+#: config value outside it could never be the geometry the pair actually takes. Narrowing
+#: the schema to the effective domain is what keeps a DECLARED value and the EFFECTIVE
+#: layout the same number; accepting ``0.95`` and letting herdr silently clamp it to
+#: ``0.9`` is the drift this rejects (j#91127 "silent clamp を採らない理由").
+LANE_PLACEMENT_RATIO_MIN: float = 0.1
+LANE_PLACEMENT_RATIO_MAX: float = 0.9
 
 #: The closed lane-KIND vocabulary of the ``by_lane_kind`` block (Redmine #13647,
 #: disposition j#85650 P3): the three canonical delegation-geometry tokens
@@ -131,7 +149,9 @@ class ResolvedPlacement:
     :meth:`resolve_by_lane_kind` return what the operator wrote and nothing else, so a
     partial object (``split`` set, ``order`` absent) declares only the split direction
     (Design Answer j#76564 Q3). ``order`` is a full permutation of
-    :data:`LANE_PLACEMENT_PROVIDERS` when set.
+    :data:`LANE_PLACEMENT_PROVIDERS` when set. ``ratio`` (Redmine #14569) is the share of
+    the pair's split that ``order[0]`` — the LEFT pane under ``split: right``, the TOP pane
+    under ``split: down`` — occupies, in ``LANE_PLACEMENT_RATIO_MIN..MAX``.
 
     What an undeclared field falls back to is :func:`product_default_placement`, applied
     once at the end of the precedence chain by :meth:`LanePlacementConfig.resolve_effective`
@@ -142,6 +162,7 @@ class ResolvedPlacement:
 
     split: Optional[str] = None
     order: Optional[tuple[str, ...]] = None
+    ratio: Optional[float] = None
 
 
 #: The PRODUCT-DEFAULT placement per lane class — the bottom of the
@@ -172,10 +193,16 @@ class ResolvedPlacement:
 #:   stays undeclared (keep the requested order), which puts the gateway in the upper pane
 #:   — ``codex`` under the default binding — while a rebound binding still launches ITS
 #:   providers in ITS order.
+#:
+#: ``ratio`` (Redmine #14569) is ``0.5`` on BOTH lane classes, deliberately: an even pair is
+#: the geometry #14568's undeclared default already lands on, so adopting the ratio axis
+#: changes nothing for a workspace that declares no ``ratio``. Unlike ``order``, ``ratio``
+#: carries no role binding to override — it is a share of the split, not a choice of
+#: provider — so there is no reason to leave it undeclared on ``sublane``.
 PRODUCT_DEFAULT_PLACEMENTS: "Mapping[str, ResolvedPlacement]" = MappingProxyType(
     {
-        "default": ResolvedPlacement(split="down", order=("codex", "claude")),
-        "sublane": ResolvedPlacement(split="down"),
+        "default": ResolvedPlacement(split="down", order=("codex", "claude"), ratio=0.5),
+        "sublane": ResolvedPlacement(split="down", ratio=0.5),
     }
 )
 
@@ -251,16 +278,63 @@ def _normalize_split(split: object, *, lane_class: str, source: str) -> Optional
     return split
 
 
+def _normalize_ratio(ratio: object, *, lane_class: str, source: str) -> Optional[float]:
+    """Return a validated pair-split ratio, or ``None`` when the field is absent.
+
+    Redmine #14569 (Design Answer j#91127). The whole point of this validator is that an
+    unusable value must fail at CONFIG PARSE time, before any pane actuation — herdr's own
+    CLI would take a ``0.95`` and its layout would silently clamp the pair to ``0.9``
+    (live-measured j#91140), leaving the declared number and the rendered geometry
+    permanently disagreeing. So the four rejected shapes are, in order:
+
+    - **``bool``** — ``True`` is an ``int`` in Python and would otherwise sail through the
+      numeric check as ``1.0``. A YAML ``ratio: yes`` is a typo, not a ratio.
+    - **non-numeric** — a string (including ``"0.6"``), list, mapping, ``None``-like
+      sentinel: never coerced. ``ratio: "0.6"`` is a quoting mistake and reads as one.
+    - **non-finite** — ``nan`` / ``±inf`` (reachable from YAML as ``.nan`` / ``.inf``).
+      They compare falsely against bounds (``nan`` fails EVERY comparison), so they are
+      rejected by an explicit :func:`math.isfinite` test rather than by the range test.
+    - **out of range** — outside
+      :data:`LANE_PLACEMENT_RATIO_MIN`..:data:`LANE_PLACEMENT_RATIO_MAX`, herdr's own
+      effective domain.
+
+    An ``int`` in range is accepted and widened (there is no in-range integer today, since
+    the bounds exclude ``0`` and ``1``, but the numeric contract does not depend on that).
+    """
+    if ratio is None:
+        return None
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
+        raise LanePlacementError(
+            f"{source} 'lane_placement.{lane_class}.ratio' must be a number in "
+            f"{LANE_PLACEMENT_RATIO_MIN}..{LANE_PLACEMENT_RATIO_MAX}, got "
+            f"{type(ratio).__name__} {ratio!r}"
+        )
+    value = float(ratio)
+    if not math.isfinite(value):
+        raise LanePlacementError(
+            f"{source} 'lane_placement.{lane_class}.ratio' must be a finite number in "
+            f"{LANE_PLACEMENT_RATIO_MIN}..{LANE_PLACEMENT_RATIO_MAX}, got {ratio!r}"
+        )
+    if not (LANE_PLACEMENT_RATIO_MIN <= value <= LANE_PLACEMENT_RATIO_MAX):
+        raise LanePlacementError(
+            f"{source} 'lane_placement.{lane_class}.ratio' must be within "
+            f"{LANE_PLACEMENT_RATIO_MIN}..{LANE_PLACEMENT_RATIO_MAX} (herdr's own "
+            f"effective split domain; a value outside it could never be the geometry the "
+            f"pair takes), got {value!r}"
+        )
+    return value
+
+
 def parse_lane_placement_record(
     record: object, *, source: str
-) -> "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]]], ...]":
-    """Normalize a ``lane_placement`` lane-class mapping into sorted, frozen triples.
+) -> "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]], Optional[float]], ...]":
+    """Normalize a ``lane_placement`` lane-class mapping into sorted, frozen records.
 
-    Shape: ``lane_class -> {split?, order?}`` where ``lane_class`` is a
+    Shape: ``lane_class -> {split?, order?, ratio?}`` where ``lane_class`` is a
     :data:`LANE_PLACEMENT_LANE_CLASSES` value. Returns a sorted tuple of
-    ``(lane_class, split, order)`` triples (hashable, so the composing
-    :class:`RepoLocalConfig` stays hashable), with ``split`` / ``order`` each ``None`` when
-    absent. The ``version`` key is stripped by the composing
+    ``(lane_class, split, order, ratio)`` records (hashable, so the composing
+    :class:`RepoLocalConfig` stays hashable), with ``split`` / ``order`` / ``ratio`` each
+    ``None`` when absent. The ``version`` key is stripped by the composing
     ``LanePlacementConfig.from_record`` before this is called, so every remaining key must
     be a lane class. A non-mapping block, an unknown lane class, an unknown class-object
     key, a non-mapping class object, or an invalid ``split`` / ``order`` value fails closed.
@@ -274,9 +348,9 @@ def parse_lane_placement_record(
     if not isinstance(record, Mapping):
         raise LanePlacementError(
             f"{source} 'lane_placement' must be a mapping of lane_class -> "
-            f"{{split, order}}, got {type(record).__name__}"
+            f"{{split, order, ratio}}, got {type(record).__name__}"
         )
-    triples: list = []
+    records: list = []
     for lane_class, obj in record.items():
         if not isinstance(lane_class, str) or lane_class not in LANE_PLACEMENT_LANE_CLASSES:
             raise LanePlacementError(
@@ -286,7 +360,7 @@ def parse_lane_placement_record(
         if not isinstance(obj, Mapping):
             raise LanePlacementError(
                 f"{source} 'lane_placement.{lane_class}' must be a mapping with optional "
-                f"'split' / 'order' keys, got {type(obj).__name__}"
+                f"'split' / 'order' / 'ratio' keys, got {type(obj).__name__}"
             )
         for key in obj:
             if not isinstance(key, str) or key not in LANE_PLACEMENT_CLASS_KEYS:
@@ -296,25 +370,29 @@ def parse_lane_placement_record(
                 )
         split = _normalize_split(obj.get("split"), lane_class=lane_class, source=source)
         order = _normalize_order(obj.get("order"), lane_class=lane_class, source=source)
-        triples.append((lane_class, split, order))
-    return tuple(sorted(triples))
+        ratio = _normalize_ratio(obj.get("ratio"), lane_class=lane_class, source=source)
+        records.append((lane_class, split, order, ratio))
+    return tuple(sorted(records))
 
 
 def validate_lane_placement(
-    placements: "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]]], ...]",
+    placements: (
+        "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]], Optional[float]], ...]"
+    ),
     *,
     source: str,
 ) -> None:
-    """Fail closed on an invalid ``placements`` tuple (lane_class / split / order).
+    """Fail closed on an invalid ``placements`` tuple (lane_class / split / order / ratio).
 
     Runs the full validation so a directly-constructed
     ``LanePlacementConfig(placements=...)`` is checked as thoroughly as one parsed from a
     record (mirrors :func:`...agent_launch_argv.validate_launch_argv`): every lane class is
-    in vocabulary, no lane class appears twice, every ``split`` is a valid direction, and
-    every ``order`` is a full permutation of :data:`LANE_PLACEMENT_PROVIDERS`.
+    in vocabulary, no lane class appears twice, every ``split`` is a valid direction, every
+    ``order`` is a full permutation of :data:`LANE_PLACEMENT_PROVIDERS`, and every ``ratio``
+    is a finite number inside herdr's effective split domain.
     """
     seen: set = set()
-    for lane_class, split, order in placements:
+    for lane_class, split, order, ratio in placements:
         if lane_class not in LANE_PLACEMENT_LANE_CLASSES:
             raise LanePlacementError(
                 f"{source} 'lane_placement' lane_class must be one of "
@@ -328,32 +406,33 @@ def validate_lane_placement(
         _normalize_split(split, lane_class=lane_class, source=source)
         if order is not None:
             _normalize_order(list(order), lane_class=lane_class, source=source)
+        _normalize_ratio(ratio, lane_class=lane_class, source=source)
 
 
 def parse_lane_kind_placement_record(
     record: object, *, source: str
-) -> "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]]], ...]":
-    """Normalize a ``by_lane_kind`` mapping into sorted, frozen triples (Redmine #13647).
+) -> "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]], Optional[float]], ...]":
+    """Normalize a ``by_lane_kind`` mapping into sorted, frozen records (Redmine #13647).
 
-    Shape: ``lane_kind -> {split?, order?}`` where ``lane_kind`` is a
+    Shape: ``lane_kind -> {split?, order?, ratio?}`` where ``lane_kind`` is a
     :data:`LANE_PLACEMENT_LANE_KINDS` token. Returns a sorted tuple of
-    ``(lane_kind, split, order)`` triples (hashable), reusing the SAME per-field
+    ``(lane_kind, split, order, ratio)`` records (hashable), reusing the SAME per-field
     validators as the lane-class table (:func:`_normalize_split` /
-    :func:`_normalize_order`), so the geometry vocabulary is identical on both
-    axes. A non-mapping block, an unknown lane kind (e.g. a ``parent`` / ``child``
-    alias — there is no such alias), an unknown class-object key, a non-mapping
-    class object, or an invalid ``split`` / ``order`` value fails closed. ``None``
-    yields ``()`` — nothing DECLARED on the lane-kind axis, so every kind falls through
-    to the lane-class layer (and, undeclared there too, to the product default).
+    :func:`_normalize_order` / :func:`_normalize_ratio`), so the geometry vocabulary is
+    identical on both axes. A non-mapping block, an unknown lane kind (e.g. a ``parent`` /
+    ``child`` alias — there is no such alias), an unknown class-object key, a non-mapping
+    class object, or an invalid ``split`` / ``order`` / ``ratio`` value fails closed.
+    ``None`` yields ``()`` — nothing DECLARED on the lane-kind axis, so every kind falls
+    through to the lane-class layer (and, undeclared there too, to the product default).
     """
     if record is None:
         return ()
     if not isinstance(record, Mapping):
         raise LanePlacementError(
             f"{source} 'lane_placement.{LANE_PLACEMENT_BY_LANE_KIND_KEY}' must be a "
-            f"mapping of lane_kind -> {{split, order}}, got {type(record).__name__}"
+            f"mapping of lane_kind -> {{split, order, ratio}}, got {type(record).__name__}"
         )
-    triples: list = []
+    records: list = []
     for lane_kind, obj in record.items():
         if not isinstance(lane_kind, str) or lane_kind not in LANE_PLACEMENT_LANE_KINDS:
             raise LanePlacementError(
@@ -363,7 +442,7 @@ def parse_lane_kind_placement_record(
         if not isinstance(obj, Mapping):
             raise LanePlacementError(
                 f"{source} 'lane_placement.{LANE_PLACEMENT_BY_LANE_KIND_KEY}.{lane_kind}' "
-                f"must be a mapping with optional 'split' / 'order' keys, got "
+                f"must be a mapping with optional 'split' / 'order' / 'ratio' keys, got "
                 f"{type(obj).__name__}"
             )
         for key in obj:
@@ -379,25 +458,29 @@ def parse_lane_kind_placement_record(
         label = f"{LANE_PLACEMENT_BY_LANE_KIND_KEY}.{lane_kind}"
         split = _normalize_split(obj.get("split"), lane_class=label, source=source)
         order = _normalize_order(obj.get("order"), lane_class=label, source=source)
-        triples.append((lane_kind, split, order))
-    return tuple(sorted(triples))
+        ratio = _normalize_ratio(obj.get("ratio"), lane_class=label, source=source)
+        records.append((lane_kind, split, order, ratio))
+    return tuple(sorted(records))
 
 
 def validate_lane_kind_placement(
-    placements: "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]]], ...]",
+    placements: (
+        "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]], Optional[float]], ...]"
+    ),
     *,
     source: str,
 ) -> None:
-    """Fail closed on an invalid ``by_lane_kind`` triple tuple (Redmine #13647).
+    """Fail closed on an invalid ``by_lane_kind`` record tuple (Redmine #13647).
 
     The lane-kind sibling of :func:`validate_lane_placement`, so a directly-built
     ``LanePlacementConfig(kind_placements=...)`` is checked as thoroughly as one
     parsed from a record: every lane kind is in vocabulary, no kind appears twice,
-    every ``split`` is a valid direction, and every ``order`` is a full permutation
-    of :data:`LANE_PLACEMENT_PROVIDERS`.
+    every ``split`` is a valid direction, every ``order`` is a full permutation
+    of :data:`LANE_PLACEMENT_PROVIDERS`, and every ``ratio`` is inside herdr's
+    effective split domain.
     """
     seen: set = set()
-    for lane_kind, split, order in placements:
+    for lane_kind, split, order, ratio in placements:
         if lane_kind not in LANE_PLACEMENT_LANE_KINDS:
             raise LanePlacementError(
                 f"{source} 'lane_placement.{LANE_PLACEMENT_BY_LANE_KIND_KEY}' lane_kind "
@@ -413,6 +496,7 @@ def validate_lane_kind_placement(
         _normalize_split(split, lane_class=label, source=source)
         if order is not None:
             _normalize_order(list(order), lane_class=label, source=source)
+        _normalize_ratio(ratio, lane_class=label, source=source)
 
 
 @dataclass(frozen=True)
@@ -428,40 +512,49 @@ class LanePlacementConfig:
 
     Value field:
 
-    - :attr:`placements` — a frozen, sorted tuple of ``(lane_class, split, order)`` triples
-      parsed from the ``lane_placement: {lane_class: {split, order}}`` mapping. ``split`` is
-      a :data:`LANE_PLACEMENT_SPLIT_DIRECTIONS` value or ``None`` (inherit legacy);
+    - :attr:`placements` — a frozen, sorted tuple of ``(lane_class, split, order, ratio)``
+      records parsed from the ``lane_placement: {lane_class: {split, order, ratio}}``
+      mapping. ``split`` is a :data:`LANE_PLACEMENT_SPLIT_DIRECTIONS` value or ``None``;
       ``order`` is a full permutation of :data:`LANE_PLACEMENT_PROVIDERS` or ``None`` (keep
-      the requested launch order). Both are individually optional per lane class.
+      the requested launch order); ``ratio`` is ``order[0]``'s share of the pair's split, in
+      :data:`LANE_PLACEMENT_RATIO_MIN`..:data:`LANE_PLACEMENT_RATIO_MAX`, or ``None``. All
+      three are individually optional per lane class.
 
     Boundary, kept enforced in code (this is *launch geometry intent*, not authority):
 
-    - **Future launch policy, never live layout.** It constructs the ``agent start`` argv a
-      fresh launch / heal uses; it is never a live layout / liveness / route authority and
-      never reconfigures an already-live pair (Non-goal: no live relayout — herdr rejects
-      same-tab re-split).
-    - **Geometry only.** ``split`` names a herdr split direction and ``order`` names launch
-      providers; the block can never address a live pane / target / route, name an
-      executable, or grant approval / close / send authority.
+    - **Future launch policy, never live layout.** It shapes what a fresh launch / heal
+      builds — the ``agent start`` argv, and (since Redmine #14569) the one post-launch
+      ``pane resize`` that divides the pair this run completed. It is never a live layout /
+      liveness / route authority: loading a config actuates nothing, and no pane this run
+      did not just place is ever moved, swapped, or resized (Non-goal: no live relayout).
+    - **Geometry only.** ``split`` names a herdr split direction, ``order`` names launch
+      providers, and ``ratio`` names a share of one split; the block can never address a
+      live pane / target / route, name an executable, or grant approval / close / send
+      authority.
     - **Declaration-preserving, not default-preserving** (Redmine #14568). An absent block
       still parses to an empty policy — :attr:`placements` and :attr:`kind_placements` are
       both ``()`` — but an undeclared FIELD no longer means "launch exactly as before": it
       resolves through :meth:`resolve_effective` to :func:`product_default_placement`
       (``split: down`` on both lane classes). The #13646 unset byte-invariance is
-      deliberately superseded; ``split: right`` is the per-class / per-kind rollback.
+      deliberately superseded; ``split: right`` is the per-class / per-kind rollback. The
+      ratio axis added in #14569 does NOT extend that supersession: its product default
+      ``0.5`` is the even division an undeclared pair already got, so adding the axis is
+      geometry-preserving for every workspace that declares no ``ratio``.
     """
 
     version: int = LANE_PLACEMENT_CONFIG_VERSION
-    placements: "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]]], ...]" = ()
+    placements: (
+        "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]], Optional[float]], ...]"
+    ) = ()
     #: The lane-KIND placement table parsed from the ``by_lane_kind`` block (Redmine
-    #: #13647). A frozen, sorted tuple of ``(lane_kind, split, order)`` triples,
+    #: #13647). A frozen, sorted tuple of ``(lane_kind, split, order, ratio)`` records,
     #: disjoint from :attr:`placements` (the lane-CLASS table). Empty when the block
     #: is absent, so a repo with no ``by_lane_kind`` block declares nothing on this axis
     #: and resolves exactly as it did pre-#13647 — i.e. through the lane-class layer, whose
-    #: own undeclared fallback is the #14568 product default.
-    kind_placements: "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]]], ...]" = (
-        field(default=())
-    )
+    #: own undeclared fallback is the #14568 / #14569 product default.
+    kind_placements: (
+        "tuple[tuple[str, Optional[str], Optional[tuple[str, ...]], Optional[float]], ...]"
+    ) = field(default=())
 
     def __post_init__(self) -> None:
         # Validate on construction too, so a directly-built LanePlacementConfig(...) is
@@ -473,14 +566,14 @@ class LanePlacementConfig:
         """The DECLARED :class:`ResolvedPlacement` for ``lane_kind`` (the lane-KIND layer).
 
         The lane-KIND lookup consulted at higher precedence than :meth:`resolve` (the
-        lane-CLASS lookup). Returns the configured ``(split, order)`` for a present lane
-        kind, else a fully undeclared :class:`ResolvedPlacement` (both ``None``) so the
-        caller falls through to the lane-class layer. Like :meth:`resolve` it reports the
-        declaration only — :meth:`resolve_effective` is what a launch reads.
+        lane-CLASS lookup). Returns the configured ``(split, order, ratio)`` for a present
+        lane kind, else a fully undeclared :class:`ResolvedPlacement` (every field ``None``)
+        so the caller falls through to the lane-class layer. Like :meth:`resolve` it reports
+        the declaration only — :meth:`resolve_effective` is what a launch reads.
         """
-        for entry_kind, split, order in self.kind_placements:
+        for entry_kind, split, order, ratio in self.kind_placements:
             if entry_kind == lane_kind:
-                return ResolvedPlacement(split=split, order=order)
+                return ResolvedPlacement(split=split, order=order, ratio=ratio)
         return ResolvedPlacement()
 
     def has_lane_kind(self, lane_kind: str) -> bool:
@@ -490,19 +583,20 @@ class LanePlacementConfig:
         explicitly declares that kind, so an undeclared kind falls through to the
         lane-class layer intact, never shadowing it with an empty override.
         """
-        return any(entry_kind == lane_kind for entry_kind, _, _ in self.kind_placements)
+        return any(entry[0] == lane_kind for entry in self.kind_placements)
 
     def resolve(self, lane_class: str) -> ResolvedPlacement:
         """The DECLARED :class:`ResolvedPlacement` for ``lane_class`` (the lane-CLASS layer).
 
-        Returns the configured ``(split, order)`` for a present lane class, else a fully
-        undeclared :class:`ResolvedPlacement` (both ``None``). It reports the operator's
-        declaration only; :meth:`resolve_effective` is what a launch reads, because it also
-        applies the product default to whatever this layer leaves undeclared.
+        Returns the configured ``(split, order, ratio)`` for a present lane class, else a
+        fully undeclared :class:`ResolvedPlacement` (every field ``None``). It reports the
+        operator's declaration only; :meth:`resolve_effective` is what a launch reads,
+        because it also applies the product default to whatever this layer leaves
+        undeclared.
         """
-        for entry_class, split, order in self.placements:
+        for entry_class, split, order, ratio in self.placements:
             if entry_class == lane_class:
-                return ResolvedPlacement(split=split, order=order)
+                return ResolvedPlacement(split=split, order=order, ratio=ratio)
         return ResolvedPlacement()
 
     def resolve_effective(
@@ -518,11 +612,14 @@ class LanePlacementConfig:
            the config explicitly declares that kind (:meth:`has_lane_kind`). A declared kind
            SHADOWS the lane-class entry wholesale, exactly as it did pre-#14568 (Redmine
            #13647, Design Answer j#85645): a kind that declares ``order`` alone does not
-           inherit its lane class's ``split``.
+           inherit its lane class's ``split`` — nor, since Redmine #14569, its ``ratio``.
+           The ratio axis joins the existing wholesale shadowing rather than introducing a
+           per-field merge; a kind that wants its class's ratio restates it (j#91127).
         2. **lane-class layer** — otherwise :meth:`resolve` (``default`` / ``sublane``).
         3. **product default** — every field still undeclared after 1–2 is filled from
            :func:`product_default_placement`, per field. This is the layer #14568 adds; it
-           is what makes an undeclared workspace launch its pairs ``down``.
+           is what makes an undeclared workspace launch its pairs ``down``, and (#14569)
+           divide them evenly.
 
         ``lane_kind is None`` (no durable kind fact — the launch path's fallback) and a
         config with no matching ``by_lane_kind`` entry both fall straight through to step 2,
@@ -537,6 +634,7 @@ class LanePlacementConfig:
         return ResolvedPlacement(
             split=declared.split if declared.split is not None else fallback.split,
             order=declared.order if declared.order is not None else fallback.order,
+            ratio=declared.ratio if declared.ratio is not None else fallback.ratio,
         )
 
     @classmethod
@@ -546,7 +644,8 @@ class LanePlacementConfig:
         "Default" here names the DECLARATION state (nothing declared), not the launch
         geometry. It is deliberately not behavior-preserving since Redmine #14568: a launch
         reading this policy resolves every field through :meth:`resolve_effective` to
-        :func:`product_default_placement`, so an undeclared workspace splits ``down``.
+        :func:`product_default_placement`, so an undeclared workspace splits ``down`` — and
+        (Redmine #14569) divides that split evenly, ``ratio: 0.5``.
         """
         return cls()
 
@@ -560,7 +659,7 @@ class LanePlacementConfig:
         DECLARED; the launch geometry it resolves to is the product default, not the
         pre-#14568 launch). A non-mapping record, an unknown top-level key (an unknown lane
         class), an unsupported version, an unknown class-object key, or an invalid
-        ``split`` / ``order`` value raises
+        ``split`` / ``order`` / ``ratio`` value raises
         :class:`LanePlacementError` (which ``RepoLocalConfig`` re-raises as
         ``RepoLocalConfigError``). The top-level *boundary-token* screen for the
         ``lane_placement`` key itself stays with the repo-local schema, which rejects a
@@ -616,6 +715,8 @@ __all__ = (
     "LANE_PLACEMENT_LANE_KINDS",
     "LANE_PLACEMENT_BY_LANE_KIND_KEY",
     "LANE_PLACEMENT_PROVIDERS",
+    "LANE_PLACEMENT_RATIO_MAX",
+    "LANE_PLACEMENT_RATIO_MIN",
     "LANE_PLACEMENT_SPLIT_DIRECTIONS",
     "LANE_PLACEMENT_CLASS_KEYS",
     "LANE_PLACEMENT_KEYS",

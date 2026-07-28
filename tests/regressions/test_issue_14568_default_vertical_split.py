@@ -169,6 +169,10 @@ class ProductDefaultPolicyTest(unittest.TestCase):
                     (
                         product_default_placement(lane_class).split,
                         product_default_placement(lane_class).order,
+                        # The adapter grew a third field with Redmine #14569; comparing the
+                        # WHOLE tuple against the product default keeps this test a
+                        # statement about the fallback rather than about two chosen fields.
+                        product_default_placement(lane_class).ratio,
                     ),
                 )
 
@@ -217,7 +221,10 @@ class ProductDefaultPolicyTest(unittest.TestCase):
         # same parse: `{}` records a class entry with both FIELDS undeclared, so the
         # distinction that matters is per-field, not per-block. `{}` is not a rollback.
         parsed = LanePlacementConfig.from_record({"sublane": {}, "default": {}})
-        self.assertEqual(parsed.placements, (("default", None, None), ("sublane", None, None)))
+        self.assertEqual(
+            parsed.placements,
+            (("default", None, None, None), ("sublane", None, None, None)),
+        )
         self.assertEqual(parsed.resolve("sublane"), ResolvedPlacement())
         for lane_class in ("default", "sublane"):
             self.assertEqual(

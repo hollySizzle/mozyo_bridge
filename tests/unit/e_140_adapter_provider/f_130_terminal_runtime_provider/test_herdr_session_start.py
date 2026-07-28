@@ -28,7 +28,12 @@ _TESTS_ROOT = Path(__file__).resolve().parents[3]
 if str(_TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_TESTS_ROOT))
 
-from support.herdr_fake import FakeHerdr, attest_capability_epilog
+from support.herdr_fake import (
+    FakeHerdr,
+    apply_resize_amount,
+    attest_capability_epilog,
+    render_pane_layout,
+)
 from support.agent_provider_binaries import (
     DEFAULT_PROVIDER_COMMANDS,
     FakeAgentBinaries,
@@ -265,6 +270,28 @@ class _Herdr:
         # fails closed — used to prove an own-pin heal never depends on it (#14139 F2).
         self.workspace_list_fails = False
         self.workspace_lists: list = []
+        # Redmine #14569 — the pane-geometry half of the fake. Real herdr answers
+        # `pane layout` with the tab's pane rects plus its split ratio, and `pane resize`
+        # MOVES that ratio, so a fake that answered a frozen layout would make every ratio
+        # test pass without the code doing anything. Modelled to the live-measured
+        # semantics (j#91140): a split's `ratio` is the FIRST child's share, `--amount` is
+        # clamped to 0.5 per call, and the resulting ratio is clamped into 0.1..0.9.
+        self.split_ratio = 0.5
+        self.split_direction = ""
+        #: Live pane ids per container ("" -> no tab: keyed by workspace), in placement
+        #: order: the pane that OCCUPIED the container first, then the one that split it.
+        self.tab_panes: dict = {}
+        self.pane_layouts: list = []
+        self.pane_resizes: list = []
+        #: `pane layout` exits non-zero (the unreadable-layout fail-closed path).
+        self.layout_fails = False
+        #: `pane layout` answers a payload the parser must refuse.
+        self.layout_bad_payload = False
+        #: `pane resize` exits non-zero (herdr refused the actuation).
+        self.resize_fails = False
+        #: The extent (cells) the pair's split divides, and its cross-axis size.
+        self.split_extent = 100
+        self.split_cross = 80
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
@@ -394,6 +421,31 @@ class _Herdr:
                 stdout=json.dumps({"result": {"read": {"text": text, "truncated": False}}}),
                 stderr="",
             )
+        if rest[:2] == ["pane", "layout"]:
+            self.pane_layouts.append(rest)
+            if self.layout_fails:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="pane layout refused"
+                )
+            if self.layout_bad_payload:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="{\"result\": {\"type\": \"nope\"}}", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps(self._layout_payload(rest[3])), stderr=""
+            )
+        if rest[:2] == ["pane", "resize"]:
+            self.pane_resizes.append(rest)
+            if self.resize_fails:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="pane resize refused"
+                )
+            direction = rest[rest.index("--direction") + 1]
+            amount = float(rest[rest.index("--amount") + 1])
+            self._apply_resize(direction, amount)
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
+            )
         if rest[:2] == ["pane", "close"]:
             self.pane_closes.append(rest)
             if self.close_fails:
@@ -421,6 +473,7 @@ class _Herdr:
             # Landed tab (Redmine #13411): echo the requested `--tab` unless forced.
             requested_tab = rest[rest.index("--tab") + 1] if "--tab" in rest else ""
             landed_tab = self.start_tab if self.start_tab is not None else requested_tab
+            self._place_pane(rest, pane_id, wid, landed_tab)
             self._settle_launch(rest, pane_id)
             return subprocess.CompletedProcess(
                 argv,
@@ -444,6 +497,59 @@ class _Herdr:
                 stderr="",
             )
         raise AssertionError(f"unexpected herdr call: {argv!r}")
+
+    # -- the container's pane geometry (Redmine #14569) ----------------------------
+
+    def _container_key(self, workspace_id, tab_id):
+        """What a split happens inside: the lane's tab, or the workspace for the default."""
+        return tab_id or workspace_id
+
+    def _place_pane(self, rest, pane_id, workspace_id, tab_id):
+        """Record where this launch landed, exactly as herdr's own tree would.
+
+        A launch WITHOUT ``--split`` occupies the container; one WITH it lands beside the
+        pane already there. When the first pane of the container is not this run's (a heal
+        splitting beside a live sibling), the sibling is seeded from the live inventory —
+        otherwise the fake would report a one-pane layout for a pair that visibly has two,
+        and the ratio rail would look broken for a reason the production code never has.
+        """
+        key = self._container_key(workspace_id, tab_id)
+        panes = self.tab_panes.setdefault(key, [])
+        if not panes:
+            for row in self.existing_rows:
+                locator = str(row.get("pane_id") or "")
+                same_tab = (not tab_id) or str(row.get("tab_id") or "") == tab_id
+                if locator.startswith(f"{workspace_id}:") and same_tab:
+                    panes.append(locator)
+        if "--split" in rest:
+            self.split_direction = rest[rest.index("--split") + 1]
+        if pane_id not in panes:
+            panes.append(pane_id)
+
+    def _layout_payload(self, pane_id):
+        """A `pane layout` payload for the container holding ``pane_id``.
+
+        Rendered by the SHARED producer (``support.herdr_fake.render_pane_layout``) rather
+        than a second hand-written envelope: two fakes that each describe herdr's layout
+        shape drift, and the one that drifts silently stops testing the parser it was
+        written for.
+        """
+        panes = []
+        for group in self.tab_panes.values():
+            if pane_id in group:
+                panes = list(group)
+                break
+        return render_pane_layout(
+            pane_ids=panes,
+            direction=self.split_direction or "down",
+            ratio=self.split_ratio,
+            extent=self.split_extent,
+            cross=self.split_cross,
+        )
+
+    def _apply_resize(self, direction, amount):
+        """herdr's measured resize arithmetic — the shared model (0.5 cap, 0.1..0.9 clamp)."""
+        self.split_ratio = apply_resize_amount(self.split_ratio, direction, amount)
 
     # -- what a real launch leaves behind (Redmine #13948) -------------------------
 

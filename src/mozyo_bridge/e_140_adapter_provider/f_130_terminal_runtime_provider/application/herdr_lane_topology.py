@@ -633,8 +633,8 @@ def initial_container_occupancy(
 
 def resolve_placement_policy_for_role(
     lane_placement: object, lane_class: str, lane_kind: "Optional[str]"
-) -> "tuple[Optional[str], Optional[tuple[str, ...]]]":
-    """This lane's EFFECTIVE ``(split, order)`` — declaration, else product default.
+) -> "tuple[Optional[str], Optional[tuple[str, ...]], Optional[float]]":
+    """This lane's EFFECTIVE ``(split, order, ratio)`` — declaration, else product default.
 
     The one adapter between the repo-local ``lane_placement`` config record (Redmine
     #13646 / #13647) and the pure placement decisions below, so the session-start
@@ -653,12 +653,18 @@ def resolve_placement_policy_for_role(
     A ``None`` config object (a caller with no placement policy at all — no production
     launch path) resolves to the product default too, so the pure-function contract and the
     configured one cannot drift into two different geometries.
+
+    Redmine #14569 adds ``ratio`` to what this returns. It rides on the SAME single call
+    deliberately: the ratio is consumed after the launches (by
+    :mod:`herdr_pair_split_ratio`) rather than in the argv, and resolving it separately
+    there would put the ``None``-config fallback in two places — the exact drift this one
+    adapter exists to prevent.
     """
     if lane_placement is None:
         resolved = product_default_placement(lane_class)
     else:
         resolved = lane_placement.resolve_effective(lane_class, lane_kind)  # type: ignore[attr-defined]
-    return resolved.split, resolved.order
+    return resolved.split, resolved.order, resolved.ratio
 
 
 def resolve_focus_first_launch(

@@ -94,8 +94,8 @@ _UNINTEGRATED_SCHEMA_NOTES: dict[str, str] = {
         "per-provider window/placement schema integration with #13647 is not yet "
         "complete; this block is not a full declaration surface yet. Its undeclared "
         "fields are NOT behavior-preserving (Redmine #14568): see the "
-        "lane_placement.<class>.{split,order} leaf rows for the geometry a fresh launch "
-        "actually takes"
+        "lane_placement.<class>.{split,order,ratio} leaf rows for the geometry a fresh "
+        "launch actually takes"
     ),
 }
 
@@ -113,11 +113,16 @@ _UNINTEGRATED_SCHEMA_NOTES: dict[str, str] = {
 #: ``source`` still follows the one rule every other row follows — ``declared`` iff the
 #: operator's record carries that exact path — so a workspace that rolled a class back with
 #: ``split: right`` reads ``right (declared)``.
-_PLACEMENT_LEAF_KEYS: tuple[tuple[str, str], ...] = (
-    ("default", "split"),
-    ("default", "order"),
-    ("sublane", "split"),
-    ("sublane", "order"),
+#:
+#: ``ratio`` (Redmine #14569) joins on exactly the same terms, and is the leaf that most
+#: needs the row: it is the one placement field an operator cannot infer from looking at a
+#: freshly launched pair without measuring it, so ``lane_placement.default.ratio = 0.5
+#: (default)`` vs ``0.6 (declared)`` is how a workspace states what it asked for. The whole
+#: table is emitted per lane class, so no lane class has a reported field the other lacks.
+_PLACEMENT_LEAF_KEYS: tuple[tuple[str, str], ...] = tuple(
+    (lane_class, field_name)
+    for lane_class in ("default", "sublane")
+    for field_name in ("split", "order", "ratio")
 )
 
 #: The dotted keys :data:`_PLACEMENT_LEAF_KEYS` emits — the public half of that table, so
