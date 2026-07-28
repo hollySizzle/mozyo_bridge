@@ -82,6 +82,7 @@ used to widen an allow.
 from __future__ import annotations
 
 import re
+from types import MappingProxyType
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Optional
@@ -329,7 +330,7 @@ class ReviewedPlugin:
 
 def build_review_registry(
     entries: "Sequence[ReviewedPlugin]",
-) -> "dict[PluginSourceRef, ReviewedPlugin]":
+) -> "MappingProxyType[PluginSourceRef, ReviewedPlugin]":
     """Index reviewed entries by their reference, rejecting an ambiguous registry.
 
     Two failures are programming errors rather than runtime conditions, so both
@@ -352,13 +353,18 @@ def build_review_registry(
                 f"{ref.describe()} is pinned-allowed while its repository is "
                 f"deny-classified; a repository cannot be both"
             )
-    return indexed
+    # Read-only: construction-time checks are worth nothing if the result can be
+    # rewritten afterwards. Self-reported alongside review j#92330 and heavier
+    # than the finding that prompted it — injecting one entry made an arbitrary
+    # plugin `ux_only` and enable-admitted, which is the close condition "admit is
+    # reviewed ux_only x established identity, and nothing else" broken outright.
+    return MappingProxyType(indexed)
 
 
 #: The reviewed herdr plugins. Each entry replays from a durable record; nothing
 #: is classified from a plugin's own self-description, because a manifest cannot
 #: be trusted to declare that it writes into agent input.
-REVIEWED_PLUGINS: "dict[PluginSourceRef, ReviewedPlugin]" = build_review_registry(
+REVIEWED_PLUGINS: "MappingProxyType[PluginSourceRef, ReviewedPlugin]" = build_review_registry(
     (
         ReviewedPlugin(
             ref=PluginSourceRef.pinned(

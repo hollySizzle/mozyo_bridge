@@ -22,6 +22,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from types import MappingProxyType
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -110,6 +111,19 @@ def _leaked(rendered: str, injected: str) -> bool:
         or _ABS_PATH_TOKEN.search(rendered) is not None
         or ops.contains_absolute_path(rendered)
     )
+
+
+def _patched_registry(entries):
+    """Swap the reviewed registry for a test.
+
+    `mock.patch.dict` edits the mapping in place, which a read-only authority
+    refuses (review j#92330). Replacing the module attribute is both what works
+    and what a test should do: it substitutes a registry rather than reaching into
+    the real one.
+    """
+    import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_policy as policy
+
+    return mock.patch.object(policy, "REVIEWED_PLUGINS", MappingProxyType(dict(entries)))
 
 
 def _string_leaf_paths(node: object, prefix: "tuple" = ()) -> "list[tuple]":
@@ -492,12 +506,7 @@ class ClassificationTests(unittest.TestCase):
             plugin_id="p", owner="o", repo="r", commit=OTHER_COMMIT, build=False
         )
         drifted = dict(clean, build=[{"command": ["/bin/sh", "x.sh"]}])
-        with mock.patch.dict(
-            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider"
-            ".domain.herdr_plugin_policy.REVIEWED_PLUGINS",
-            {ref: entry},
-            clear=True,
-        ):
+        with _patched_registry({ref: entry}):
             self.assertTrue(classify_plugin(observe_plugin(clean)).enable.admitted)
             self.assertEqual(
                 classify_plugin(observe_plugin(drifted)).enable.reason,
@@ -699,12 +708,7 @@ class InstallPlanTests(unittest.TestCase):
             review_anchor="#0 j#0",
             rationale="fixture",
         )
-        with mock.patch.dict(
-            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider"
-            ".domain.herdr_plugin_policy.REVIEWED_PLUGINS",
-            {ref: entry},
-            clear=True,
-        ):
+        with _patched_registry({ref: entry}):
             self.assertTrue(plan_install(ref).admitted)
 
     def test_resolve_review_finds_the_repository_deny_for_an_unreviewed_commit(self):
@@ -762,12 +766,7 @@ class InstallPlanTests(unittest.TestCase):
                 rationale="fixture",
             ),
         }
-        with mock.patch.dict(
-            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider"
-            ".domain.herdr_plugin_policy.REVIEWED_PLUGINS",
-            conflicting,
-            clear=True,
-        ):
+        with _patched_registry(conflicting):
             self.assertEqual(
                 resolve_review(pinned_ref).plugin_class, CLASS_AGENT_INPUT_WRITER
             )
@@ -1896,6 +1895,120 @@ class RelationalInvariantTests(unittest.TestCase):
                     f"JSON says ok={payload['ok']} but text says "
                     f"admitted={admitted_in_text}",
                 )
+
+
+class ImmutableAuthorityTests(unittest.TestCase):
+    """A policy authority must be unwritable, not merely single (review j#92330).
+
+    Collecting the planner and the constructor onto one table was the right fix,
+    and it made this worse: a mutable shared table moves *both* readers at once,
+    so a state outside the closed vocabulary becomes justified on both sides
+    simultaneously. "One authority" and "an authority nobody can rewrite" are
+    different properties; the round that delivered the first claimed the second.
+    """
+
+    def test_no_module_level_mapping_authority_is_writable(self):
+        # Mechanical, because three hand-written names is exactly the enumeration
+        # that has been wrong every time. Every public module-level mapping in
+        # this subsystem is checked, so one added later is covered without anyone
+        # remembering.
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.absolute_path_rule as rule
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_identity as identity
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_policy as policy
+
+        writable = []
+        for module in (rule, identity, policy, ops):
+            for name in dir(module):
+                if name.startswith("__"):
+                    continue
+                value = getattr(module, name)
+                if isinstance(value, dict):
+                    writable.append(f"{module.__name__.rsplit('.', 1)[-1]}.{name}")
+        self.assertEqual(
+            writable, [], f"writable module-level mapping authority: {writable}"
+        )
+
+    def _assert_read_only_mapping(self, mapping, sample_key, sample_value):
+        """Assert a mapping refuses writes — WITHOUT risking a successful one.
+
+        The type is checked first and the mutations are attempted only once it is
+        known to be read-only. Written the other way round, this test corrupted
+        module state whenever it failed: the assignment simply succeeded, the
+        `assertRaises` reported a failure, and the injected entry stayed in the
+        registry for every later test in the process (33 unrelated failures,
+        measured). A regression that damages the run when it fails cannot be
+        trusted to report anything.
+        """
+        self.assertIsInstance(mapping, MappingProxyType)
+        with self.assertRaises(TypeError):
+            mapping[sample_key] = sample_value
+        with self.assertRaises(TypeError):
+            del mapping[next(iter(mapping))]
+
+    def test_the_verdictless_table_rejects_every_mutation(self):
+        self._assert_read_only_mapping(
+            ops.VERDICTLESS_ENABLE_STATES, REASON_AGENT_INPUT_WRITER, (True, False)
+        )
+        with self.assertRaises(TypeError):
+            ops.VERDICTLESS_ENABLE_STATES[REASON_TARGET_NOT_INSTALLED] = (False, True)
+
+    def test_the_reviewers_probe_no_longer_admits_a_forbidden_reason(self):
+        # The exact three-step probe from j#92330, as a regression.
+        self.assertIsInstance(ops.VERDICTLESS_ENABLE_STATES, MappingProxyType)
+        with self.assertRaises(TypeError):
+            ops.VERDICTLESS_ENABLE_STATES[REASON_AGENT_INPUT_WRITER] = (True, False)
+        self.assertNotIn(REASON_AGENT_INPUT_WRITER, ops.VERDICTLESS_ENABLE_STATES)
+        with self.assertRaises(HerdrPluginPolicyError):
+            ops.EnablePlan(
+                plugin_id="herdr-file-viewer",
+                found=False,
+                verdict=None,
+                decision=PolicyDecision.deny(REASON_AGENT_INPUT_WRITER, "d"),
+            )
+
+    def test_the_reason_view_can_never_go_stale(self):
+        # It was an import-time snapshot beside a mutable table, so the two could
+        # disagree. Derived from the table, they cannot.
+        self.assertEqual(set(ops.VERDICTLESS_ENABLE_STATES), ops.VERDICTLESS_ENABLE_REASONS)
+
+    def test_the_reviewed_registry_rejects_every_mutation(self):
+        # Self-reported alongside j#92330 and heavier than it: injecting an allow
+        # entry made an arbitrary plugin `ux_only` and enable-admitted, which is
+        # the close condition ("admit is reviewed ux_only x established identity,
+        # and nothing else") broken outright. Construction-time checks on the
+        # registry are worth nothing if it can be rewritten afterwards.
+        forged_ref = PluginSourceRef.pinned(
+            SOURCE_KIND_GITHUB, "attacker", "evil-plugin", FILE_VIEWER_COMMIT
+        )
+        entry = ReviewedPlugin(
+            ref=forged_ref,
+            plugin_id="evil-plugin",
+            plugin_class=CLASS_UX_ONLY,
+            build_provenance=BUILD_NONE,
+            review_anchor="#0 j#0",
+            rationale="injected",
+        )
+        self._assert_read_only_mapping(REVIEWED_PLUGINS, forged_ref, entry)
+        verdict = classify_plugin(
+            observe_plugin(
+                plugin_record(
+                    plugin_id="evil-plugin",
+                    owner="attacker",
+                    repo="evil-plugin",
+                    commit=FILE_VIEWER_COMMIT,
+                    build=False,
+                )
+            )
+        )
+        self.assertEqual(verdict.plugin_class, CLASS_UNKNOWN)
+        self.assertFalse(verdict.enable.admitted)
+
+    def test_the_observation_validator_table_rejects_every_mutation(self):
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_identity as identity
+
+        self._assert_read_only_mapping(
+            identity._OBSERVATION_FIELD_CHECKS, "declares_build", lambda v, n: None
+        )
 
 
 class SinkGuardTests(unittest.TestCase):

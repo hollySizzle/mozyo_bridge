@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+from types import MappingProxyType
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.absolute_path_rule import (
     ABSOLUTE_ROOT_RE,
@@ -365,15 +366,17 @@ def _check_optional_ref(value: object, name: str) -> None:
 #: eight fields were closed, and the five unchecked ones accepted arbitrary text
 #: (a path in ``declares_build`` reached the report) or raised raw ``TypeError``.
 #: The table is still an enumeration — but a *detected* one.
-_OBSERVATION_FIELD_CHECKS = {
-    "plugin_id": _check_plugin_id,
-    "enabled": _check_strict_bool,
-    "source_kind": _check_source_kind,
-    "ref": _check_optional_ref,
-    "declares_build": _check_strict_bool,
-    "declares_panes": _check_strict_bool,
-    "declares_actions": _check_strict_bool,
-}
+_OBSERVATION_FIELD_CHECKS = MappingProxyType(
+    {
+        "plugin_id": _check_plugin_id,
+        "enabled": _check_strict_bool,
+        "source_kind": _check_source_kind,
+        "ref": _check_optional_ref,
+        "declares_build": _check_strict_bool,
+        "declares_panes": _check_strict_bool,
+        "declares_actions": _check_strict_bool,
+    }
+)
 
 
 @dataclass(frozen=True)

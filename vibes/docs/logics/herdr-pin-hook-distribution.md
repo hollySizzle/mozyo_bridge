@@ -440,6 +440,23 @@ positive-proof predicate (`keeps_absolute_root`) も共有する** — 最初は
 `HOME or XDG`、`split / ratio` → `split, ratio`）。**境界に prose を合わせるのが正しい向き**で、
 prose に合わせて境界を緩めるのではない。
 
+### ★authority は「一箇所」であるだけでなく「書き換え不能」であること
+
+policy authority（`REVIEWED_PLUGINS` / `VERDICTLESS_ENABLE_STATES` / observation の
+validator table）は **read-only mapping** で公開する。
+
+**集約と不変性は別の性質であり、集約は不変性を要求する。** planner と constructor に
+同じ表を読ませたのは正しい修正だが、その表が可変だと**両者が一緒に動く**ので、closed
+vocabulary の外の state が両側で同時に正当化される（review j#92330 実測: 禁止 reason を
+表へ注入すると、本来拒否される verdictless plan が受理された）。
+
+**より重い同型が `REVIEWED_PLUGINS` にあった**（自己申告）。任意 pin の allow entry を
+注入すると、その plugin が `ux_only` / enable admitted になる。**構築時に重複・矛盾を
+拒否しても、構築後に書き換えられるなら意味がない。**
+
+派生 view は**表から導出する**。`VERDICTLESS_ENABLE_REASONS` は import 時 snapshot だった
+ため、表が動くと黙って乖離した。
+
 ### ★field の妥当性は組合せの整合性ではない
 
 per-field の型・語彙検査を全 field に課しても、**field 間の関係**は閉じない

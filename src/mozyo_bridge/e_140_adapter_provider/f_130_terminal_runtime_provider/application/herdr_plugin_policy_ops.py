@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from types import MappingProxyType
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,14 +92,23 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 #: rather than restating them, and a regression drives the planner and requires
 #: the set it reaches to equal this table. A hand-written list on the checking
 #: side is what drifts.
-VERDICTLESS_ENABLE_STATES: "dict[str, tuple[bool, bool]]" = {
-    REASON_INVALID_TARGET_ID: (False, False),
-    REASON_INVENTORY_INCOMPLETE: (True, False),
-    REASON_AMBIGUOUS_TARGET: (True, True),
-    REASON_TARGET_NOT_INSTALLED: (True, False),
-}
+#: **Read-only.** Collecting the planner and the constructor onto one table was
+#: right, and it made a mutable table worse: both readers move together, so a
+#: state outside the closed vocabulary gets justified on both sides at once.
+#: Review j#92330 measured it — injecting a per-plugin reason made a forbidden
+#: verdictless plan constructible while the public reason view stayed stale.
+#: "One authority" and "an authority nobody can rewrite" are different properties.
+VERDICTLESS_ENABLE_STATES: "MappingProxyType[str, tuple[bool, bool]]" = MappingProxyType(
+    {
+        REASON_INVALID_TARGET_ID: (False, False),
+        REASON_INVENTORY_INCOMPLETE: (True, False),
+        REASON_AMBIGUOUS_TARGET: (True, True),
+        REASON_TARGET_NOT_INSTALLED: (True, False),
+    }
+)
 
-#: Kept as the set view for callers that only need membership.
+#: The set view, derived from the table rather than snapshotted beside it — the
+#: snapshot could disagree with the table it claimed to summarise.
 VERDICTLESS_ENABLE_REASONS: frozenset[str] = frozenset(VERDICTLESS_ENABLE_STATES)
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
