@@ -336,12 +336,12 @@ class LaneLifecycleStore:
         ``lane_kind`` (v7, Redmine #13647) is the delegation-geometry kind the CREATING
         caller resolved from durable governance (``coordinator`` / ``delegated_coordinator``
         / ``implementation``), written here so a later heal resolves the same lane-role pane
-        placement **offline**. Empty is the pre-#13647 default — no durable kind fact, so the
-        launch path falls back to ``lane_class`` geometry — while a present non-canonical
-        token fails closed (:class:`~mozyo_bridge.core.state.lane_kind.LaneKindError`) rather
-        than storing an off-vocabulary authority value. It is bound to THIS generation: no
-        transition rewrites it, and a governance change re-binds it on a new generation via
-        ``open_next_generation``.
+        placement **offline**. Empty declares no kind, so the launch falls through to
+        ``lane_class`` geometry, whose undeclared landing is #14568's product default
+        (``split: down``), not pre-#13646 — while a present non-canonical token fails closed
+        (:class:`~mozyo_bridge.core.state.lane_kind.LaneKindError`) rather than storing an
+        off-vocabulary authority value. It is bound to THIS generation: no transition rewrites
+        it, and a governance change re-binds it on a new generation via ``open_next_generation``.
 
         Refuses an existing lane (:data:`CAS_ALREADY_DECLARED`) — a re-declare must
         go through an explicit transition, never a silent overwrite (the

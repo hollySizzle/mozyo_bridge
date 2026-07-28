@@ -59,7 +59,10 @@ def validate_session_request(
       the unit, so a cross-slot defect (duplicate workflow role, two entries for one physical
       slot, one slot asked for two profiles, an unknown role / unregistered provider, an
       ambiguous governance anchor) is refused while nothing has been launched. A context with
-      no ``slot_specs`` skips it entirely, so every pre-#13647 caller is byte-invariant.
+      no ``slot_specs`` skips it entirely, so every pre-#13647 caller is byte-invariant **on
+      this axis** — this step can only refuse, never place. It says nothing about the
+      independent geometry axis, where an undeclared lane class lands on the #14568 product
+      default (``split: down``).
     - **Invalid managed permission policy** (review j#73404). The lane chokepoint requests
       (codex, claude), so a validation that only fired inside the claude slot's launch would
       leave the codex gateway already started — a partial lane — when the env override is
@@ -119,7 +122,10 @@ def _validate_slot_plan(
     """
     specs = tuple(getattr(launch_context, "slot_specs", ()) or ())
     if not specs:
-        return  # no role-bearing plan supplied: byte-for-byte the pre-#13647 launch
+        # No role-bearing plan supplied: this gate contributes nothing, byte-for-byte the
+        # pre-#13647 role-plan handling. NOT a pre-#13647 launch — the geometry axis is
+        # resolved elsewhere and defaults to #14568's `split: down` when undeclared.
+        return
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (  # noqa: E501
         WORKFLOW_ROLES,
     )

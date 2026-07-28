@@ -533,9 +533,10 @@ def register_lifecycle(sub, *, snapshot=None) -> None:
     # (親 / 子 / 孫) — a governance fact no probe can infer at create time and which the
     # display cache must never supply. It is stored generation-bound on the lane's
     # lifecycle authority row, so every later heal places the lane's panes by the same
-    # kind, offline. Omitted (the default) records no kind: placement stays lane-class
-    # derived, byte-for-byte pre-#13647. `choices` is the canonical 3-token vocabulary —
-    # deliberately no parent/child/grandchild alias (P3).
+    # kind, offline. Omitted (the default) records no kind: placement stays lane-class derived
+    # — unchanged on the lane-KIND axis, but NOT the pre-#13646 placement, since Redmine
+    # #14568 resolves an undeclared lane class to the product default (`split: down`).
+    # `choices` is the canonical 3-token vocabulary — no parent/child/grandchild alias (P3).
     sublane_create.add_argument(
         "--lane-kind",
         dest="lane_kind",

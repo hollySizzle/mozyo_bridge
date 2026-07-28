@@ -108,8 +108,12 @@ def _insert_active_row(
 
     ``lane_kind`` (Redmine #13647 Tranche 1b) is the resolved delegation-geometry kind the
     creating caller supplied for this generation (``""`` when the caller has no durable kind
-    fact — the pre-#13647 byte-invariant default, so a heal then falls back to ``lane_class``
-    geometry). It is stored generation-bound as the launch path's heal authority.
+    fact — the default on the lane-KIND axis, which then declares nothing and lets a heal
+    fall through to ``lane_class`` geometry). The fall-through itself is unchanged; what it
+    LANDS ON is not: since Redmine #14568 an undeclared lane class resolves to the product
+    default (``split: down``), so an empty kind is byte-invariant on this axis only — never
+    a claim that the launch is the pre-#13647 one. It is stored generation-bound as the
+    launch path's heal authority.
     """
     conn.execute(
         _INSERT_SQL,

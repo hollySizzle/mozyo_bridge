@@ -41,6 +41,7 @@ and is taken AFTER the reclaim.
 from __future__ import annotations
 
 import os
+import re
 import stat
 import tempfile
 import unittest
@@ -55,6 +56,7 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
 )
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (  # noqa: E501
     RepoLocalConfig,
+    RepoLocalConfigError,
 )
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config_status import (  # noqa: E501
     SOURCE_DECLARED,
@@ -416,6 +418,95 @@ class StatusProjectionTest(unittest.TestCase):
         }
         row = statuses["lane_placement.sublane.split"]
         self.assertEqual((row.effective_value, row.source), ("right", SOURCE_DECLARED))
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]  # tests/regressions/<file> -> repo root
+
+#: The docs that tell an operator what to WRITE into ``.mozyo-bridge/config.yaml`` for pane
+#: geometry. Scope is deliberately exactly these two and is NOT widened to every doc that
+#: mentions the block: a doc that narrates the pre-#13646 rename (e.g.
+#: ``vibes/docs/logics/coordinator-autonomy-evaluation.md``, which records that
+#: ``pane_placement`` collided with the hostile-checkout key filter and became
+#: ``lane_placement``) quotes the rejected spelling CORRECTLY, as history. A guard that
+#: forbade the token outright would break accurate records. What this guard does not cover,
+#: it does not claim to cover.
+_CONFIG_GUIDANCE_DOCS = (
+    "vibes/docs/logics/herdr-live-relayout-runbook.md",
+    "vibes/docs/specs/herdr-native-identity.md",
+)
+
+#: An inline-code token shaped like a top-level repo-local config key ending in
+#: ``_placement``. Python identifiers that merely CONTAIN "placement"
+#: (``resolve_placement_policy_for_role``, ``evaluate_mutation_placement_gate``) do not
+#: match, so the guard only ever judges things written in config-key shape.
+_CONFIG_KEY_TOKEN = re.compile(r"`([a-z][a-z0-9]*(?:_[a-z0-9]+)*_placement)`")
+
+
+def _boundary_verdict(token: str) -> str:
+    """Classify ``token`` with the REAL boundary screen, not a copied token list.
+
+    ``accepted`` / ``boundary`` (rejected by ``_FORBIDDEN_KEY_PARTS`` before the allowed-key
+    check) / ``unknown`` (a well-formed name that is simply not a config key). Only
+    ``boundary`` is the failure mode R2-F2 is about: a repo that writes such a key is
+    refused outright, so guidance naming it alone is guidance that cannot be executed.
+    """
+    try:
+        RepoLocalConfig.from_record({token: {}})
+    except RepoLocalConfigError as exc:
+        return "boundary" if "boundary token" in str(exc) else "unknown"
+    return "accepted"
+
+
+class ConfigGuidanceNamesAnExecutableKeyTest(unittest.TestCase):
+    """Operator-facing placement guidance names a key the boundary screen accepts (R2-F2).
+
+    ``herdr-live-relayout-runbook.md`` told operators to add a ``pane_placement`` block. The
+    repo-local schema boundary rejects any key containing ``pane`` BEFORE the allowed-key
+    check, so that config is refused and the permanent placement never applies — the runbook
+    documented a config that cannot exist. The canonical key is ``lane_placement``
+    (``herdr-native-identity.md`` §5.1).
+
+    The rejected spelling may still appear when a line names the accepted one in the same
+    breath ("the key is ``lane_placement``, NOT ``pane_placement``") — you cannot state the
+    contrast without both. What fails is a line that names ONLY a rejected key, which is
+    exactly the shape of all four original occurrences.
+    """
+
+    def test_the_boundary_screen_still_rejects_the_pre_rename_key(self) -> None:
+        # Non-vacuity: the guard is worthless if nothing is boundary-rejected any more.
+        self.assertEqual(_boundary_verdict("pane_placement"), "boundary")
+        self.assertEqual(_boundary_verdict("lane_placement"), "accepted")
+
+    def test_no_guidance_line_names_only_a_rejected_config_key(self) -> None:
+        offenders: list[str] = []
+        rejected_seen = 0
+        for relative in _CONFIG_GUIDANCE_DOCS:
+            doc = _REPO_ROOT / relative
+            self.assertTrue(doc.is_file(), f"{relative} is missing")
+            lines = doc.read_text(encoding="utf-8").splitlines()
+            accepted_in_doc = 0
+            for number, line in enumerate(lines, start=1):
+                verdicts = {
+                    token: _boundary_verdict(token)
+                    for token in _CONFIG_KEY_TOKEN.findall(line)
+                }
+                if not verdicts:
+                    continue
+                accepted = [t for t, v in verdicts.items() if v == "accepted"]
+                rejected = [t for t, v in verdicts.items() if v == "boundary"]
+                accepted_in_doc += len(accepted)
+                rejected_seen += len(rejected)
+                if rejected and not accepted:
+                    offenders.append(f"{relative}:{number} names only {sorted(rejected)}")
+            # Each doc must actually carry the canonical key, or the sweep proves nothing
+            # about that doc (a doc that says nothing cannot say anything wrong).
+            self.assertGreater(
+                accepted_in_doc, 0, f"{relative} names no accepted placement config key"
+            )
+        self.assertEqual(offenders, [])
+        # And the contrast form must really be exercised somewhere, so the rule above is
+        # not passing merely because no rejected spelling survives anywhere.
+        self.assertGreater(rejected_seen, 0)
 
 
 if __name__ == "__main__":  # pragma: no cover

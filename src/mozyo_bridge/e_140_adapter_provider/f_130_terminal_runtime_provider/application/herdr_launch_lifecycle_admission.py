@@ -186,8 +186,10 @@ def admit_launch_against_lifecycle(
     (``open_next_generation(lane_kind=…)``), which is the only sanctioned re-bind.
 
     Otherwise whichever single fact is present wins (they agree when both are), and ``None``
-    — neither authority has a kind — falls through to ``lane_class`` geometry, byte-for-byte
-    the pre-#13647 placement.
+    — neither authority has a kind — falls through to ``lane_class`` geometry. The
+    fall-through is byte-for-byte the pre-#13647 *resolution path*, but not the pre-#13646
+    *placement*: since Redmine #14568 an undeclared lane class lands on the product default
+    (``split: down``).
 
     ``dry_run`` consults NO durable state and returns the caller's context kind alone: a dry
     run is side-effect free *and* store-free by contract (Redmine #13595 / #14242 — it does
