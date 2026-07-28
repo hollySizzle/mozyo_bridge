@@ -1,19 +1,24 @@
-"""``herdr`` distribution surface: pin posture + opt-in hook installer (Redmine #13249).
+"""``herdr`` distribution surface: pin posture, hook installer, plugin policy.
 
-One registration point for the two public commands this US ships — mirroring the
-``cli_herdr_recovery`` precedent so the near-ceiling ``cli_core`` composition root gains
-only a single import + call:
+One registration point for the public commands the distribution / supply-chain
+surface ships — mirroring the ``cli_herdr_recovery`` precedent so the
+near-ceiling ``cli_core`` composition root gains only a single import + call:
 
-- ``herdr pin-posture`` — generate the herdr supply-chain pin config, or verify an
-  existing herdr config is pinned (read-only; ``--verify <path>``). This is the config
-  half of the US: it never mutates operator state.
-- ``herdr integration-install`` — the **opt-in** Claude / Codex session-hook installer.
-  Read-only plan by default (mutates nothing); ``--apply`` is the explicit opt-in that
-  runs ``herdr integration install`` bracketed by a snapshot / diff / rollback
-  transaction. It refuses to touch home unless herdr's posture is pinned and every gate
-  passes.
+- ``herdr pin-posture`` (Redmine #13249) — generate the herdr supply-chain pin
+  config, or verify an existing herdr config is pinned (read-only;
+  ``--verify <path>``). This is the config half of that US: it never mutates
+  operator state.
+- ``herdr integration-install`` (Redmine #13249) — the **opt-in** Claude / Codex
+  session-hook installer. Read-only plan by default (mutates nothing);
+  ``--apply`` is the explicit opt-in that runs ``herdr integration install``
+  bracketed by a snapshot / diff / rollback transaction. It refuses to touch home
+  unless herdr's posture is pinned and every gate passes.
+- ``herdr plugin-policy`` (Redmine #14619) — the managed-lane community-plugin
+  policy: classify the installed plugins, or plan an enable / install. Read-only
+  throughout; it has no apply mode at all, because enabling a herdr plugin is a
+  *user-global* change and this surface never makes one.
 
-The parser is deliberately narrow: an operator names agents by their known token
+The parsers are deliberately narrow: an operator names agents by their known token
 (``--agent claude`` / ``--agent codex``), a home by ``--home`` (defaults to ``$HOME``),
 and the herdr config that must be pinned by ``--herdr-config``. There is no ``--force``
 and no way to name an arbitrary directory or executable — the config dirs are derived
@@ -49,6 +54,22 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     format_report_text,
     report_payload,
     run_install,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_plugin_policy_ops import (
+    InventoryReadError,
+    RenderGuardError,
+    guard_rendered_payload,
+    guard_rendered_text,
+    classify_inventory,
+    format_enable_plan_text,
+    format_install_plan_text,
+    format_read_error_text,
+    format_status_text,
+    parse_inventory,
+    plan_candidate_install,
+    plan_enable,
+    query_inventory,
+    read_inventory_document,
 )
 
 
@@ -208,8 +229,146 @@ def register_herdr_integration_install_parser(herdr_sub) -> None:
     parser.set_defaults(func=cmd_herdr_integration_install)
 
 
+# --- plugin-policy -----------------------------------------------------------
+
+
+def _emit(payload: dict, text: str, *, as_json: bool) -> int:
+    """The single output point for this command — and its disclosure sink guard.
+
+    Every mode renders through here, so this is the one place a check covers a
+    surface nobody remembered to enumerate. Four review rounds on this issue each
+    closed one surface and left its neighbour open, so the guard is deliberately
+    attached to the exit rather than to any field: it asks whether the *finished*
+    artifact carries an absolute path or a control character.
+
+    A violation prints nothing and returns a non-zero code. Emitting a partial or
+    scrubbed report would be worse than emitting none: this text exists to be
+    pasted into a durable record.
+    """
+    try:
+        if as_json:
+            guard_rendered_payload(payload)
+            rendered = json.dumps(payload, indent=2, sort_keys=True)
+        else:
+            rendered = guard_rendered_text(text)
+    except RenderGuardError as exc:
+        print(f"error [render_guard]: {exc}")
+        return 1
+    print(rendered)
+    return 0
+
+
+def cmd_herdr_plugin_policy(args: argparse.Namespace) -> int:
+    """Classify the installed plugins, or plan an enable / install. Read-only.
+
+    ``--plan-install`` is answered without reading the inventory at all: a candidate
+    install is about a plugin that does not exist locally yet, so consulting the
+    local inventory would only introduce a dependency on an unrelated surface.
+    """
+    as_json = bool(getattr(args, "json", False))
+    if getattr(args, "plan_install", None):
+        install_plan = plan_candidate_install(
+            args.plan_install, getattr(args, "ref", None)
+        )
+        blocked = _emit(
+            install_plan.as_payload(),
+            format_install_plan_text(install_plan),
+            as_json=as_json,
+        )
+        return blocked or (0 if install_plan.ok else 1)
+    try:
+        if getattr(args, "from_json", None):
+            document = read_inventory_document(Path(args.from_json))
+        else:
+            document = query_inventory(os.environ)
+        status = classify_inventory(parse_inventory(document))
+    except InventoryReadError as exc:
+        _emit(
+            {"ok": False, "reason": exc.reason, "detail": exc.detail},
+            format_read_error_text(exc),
+            as_json=as_json,
+        )
+        return 1
+    if getattr(args, "plan_enable", None):
+        enable_plan = plan_enable(status, args.plan_enable)
+        blocked = _emit(
+            enable_plan.as_payload(),
+            format_enable_plan_text(enable_plan),
+            as_json=as_json,
+        )
+        return blocked or (0 if enable_plan.ok else 1)
+    blocked = _emit(status.as_payload(), format_status_text(status), as_json=as_json)
+    return blocked or (0 if status.ok else 1)
+
+
+def register_herdr_plugin_policy_parser(herdr_sub) -> None:
+    """Register ``herdr plugin-policy`` on the ``herdr`` subparser group."""
+    parser = herdr_sub.add_parser(
+        "plugin-policy",
+        help=(
+            "Classify installed herdr plugins against the managed-lane policy, or "
+            "plan an enable / install (read-only; never changes plugin state)."
+        ),
+        description=(
+            "Decide what a herdr community plugin may be in a managed lane. Two "
+            "independent answers per plugin: whether it may be ENABLED (the "
+            "lane-authority axis — a plugin that writes into agent input bypasses the "
+            "exact-once handoff rail and the durable anchor), and whether its INSTALL "
+            "may be run (the supply-chain axis — a [[build]] that fetches a remote "
+            "artifact verified only from the same origin is an unpinned remote "
+            "execution). An allow is pinned to an exact commit; a plugin observed at "
+            "any unreviewed identity is unknown and denied. Reports state plainly that "
+            "a herdr enable is USER-GLOBAL, never workspace-local, and carry no "
+            "filesystem path. This command has no apply mode: it plans and reports, "
+            "and installs / enables / disables nothing."
+        ),
+    )
+    parser.add_argument(
+        "--from-json",
+        dest="from_json",
+        metavar="INVENTORY_PATH",
+        default=None,
+        help=(
+            "Classify a captured `herdr plugin list --json` document instead of "
+            "querying the trusted-environment herdr binary."
+        ),
+    )
+    parser.add_argument(
+        "--plan-enable",
+        dest="plan_enable",
+        metavar="PLUGIN_ID",
+        default=None,
+        help=(
+            "Answer whether this installed plugin may be enabled. Exits non-zero when "
+            "it may not. Enables nothing."
+        ),
+    )
+    parser.add_argument(
+        "--plan-install",
+        dest="plan_install",
+        metavar="OWNER/REPO",
+        default=None,
+        help=(
+            "Answer whether `herdr plugin install OWNER/REPO --ref COMMIT` may be run "
+            "(needs --ref). Installs nothing."
+        ),
+    )
+    parser.add_argument(
+        "--ref",
+        dest="ref",
+        metavar="COMMIT",
+        default=None,
+        help=(
+            "The exact full 40-hex commit a --plan-install candidate would be pinned "
+            "to. Without it the candidate is unpinned and denied."
+        ),
+    )
+    parser.add_argument("--json", action="store_true", help="Emit as JSON.")
+    parser.set_defaults(func=cmd_herdr_plugin_policy)
+
+
 def register_herdr_distribution_surfaces(herdr_sub, *, add_repo_option=None) -> None:
-    """Register the pin-posture + opt-in hook installer surfaces (Redmine #13249).
+    """Register the distribution / supply-chain surfaces (Redmine #13249 / #14619).
 
     ``add_repo_option`` is accepted for signature parity with the sibling registrars
     but unused: these commands take an explicit ``--home`` / ``--herdr-config`` rather
@@ -217,12 +376,15 @@ def register_herdr_distribution_surfaces(herdr_sub, *, add_repo_option=None) -> 
     """
     register_herdr_pin_posture_parser(herdr_sub)
     register_herdr_integration_install_parser(herdr_sub)
+    register_herdr_plugin_policy_parser(herdr_sub)
 
 
 __all__ = (
     "cmd_herdr_integration_install",
     "cmd_herdr_pin_posture",
+    "cmd_herdr_plugin_policy",
     "register_herdr_distribution_surfaces",
     "register_herdr_integration_install_parser",
     "register_herdr_pin_posture_parser",
+    "register_herdr_plugin_policy_parser",
 )

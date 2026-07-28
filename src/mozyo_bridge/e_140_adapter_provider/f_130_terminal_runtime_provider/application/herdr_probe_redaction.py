@@ -6,7 +6,12 @@ condition — no private absolute path in public evidence — has to be enforced
 arbitrary third-party output, rather than assumed from any format.
 
 Carved out of ``herdr_pane_lifecycle`` (module-health leaf extraction, not an allowlist bump).
-It depends only on ``re`` and ``Path``, which is what makes it a leaf.
+Beyond ``os``, ``re`` and ``Path`` it imports exactly one thing: the repository's
+absolute-path rule (``domain.absolute_path_rule``) — the root patterns and the
+positive-proof predicate. That module belongs to neither consumer, so this surface and
+the managed-lane plugin policy (Redmine #14619) cannot disagree about what an absolute
+path is. The quoted-run and URL-collapse transformations below are NOT shared: they are
+redaction behaviour, not part of the rule.
 """
 
 from __future__ import annotations
@@ -14,6 +19,12 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.absolute_path_rule import (
+    ABSOLUTE_ROOT_RE as _canonical_abs_root_re,
+    RELATIVE_CONTINUATION_RE as _canonical_relative_continuation_re,
+    keeps_absolute_root as _canonical_keeps_absolute_root,
+)
 
 #: What a redacted filesystem path is rendered as in a public verdict detail.
 REDACTED_PROBE_PATH = "<target config>"
@@ -39,7 +50,12 @@ REDACTED_PROBE_PATH = "<target config>"
 #: so ``s:/`` inside ``https://`` is not one. That is a rule about the SHAPE of the root, not
 #: a safety allowlist — and it costs nothing, because the ``/`` alternative still finds that
 #: position and the URL proof is what preserves it.
-_ABS_ROOT_RE = re.compile(r"\\\\|(?<![A-Za-z0-9_.\-])[A-Za-z]:[\\/]|/")
+#: Imported rather than restated: the canonical rule lives in ``absolute_path_rule``,
+#: a module owned by neither consumer. Redmine #14619 review j#92194 F1 measured what
+#: two copies cost — the second copy silently read ``/etc`` and ``/`` as safe — and
+#: j#92241 F3 that sharing only the patterns leaves the predicate duplicated. The
+#: patterns are unchanged from the #14258 version this module hardened.
+_ABS_ROOT_RE = _canonical_abs_root_re
 
 #: A quoted run, escape-aware: the closing quote is the first UNescaped one. The naive
 #: same-quote rule closed at the first escaped quote and left the rest of the path behind
@@ -69,7 +85,7 @@ _URL_OCCURRENCE_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://")
 #: i.e. the preceding character continues a word. ``:`` deliberately does not qualify —
 #: ``config:/Users/…`` is a labelled absolute path, and treating the label as proof of
 #: relativity is exactly the fail-open the allowlist had.
-_RELATIVE_CONTINUATION_RE = re.compile(r"[A-Za-z0-9_.\-]$")
+_RELATIVE_CONTINUATION_RE = _canonical_relative_continuation_re
 
 
 def _collapse_url_tokens(line: str) -> str:
@@ -92,29 +108,12 @@ def _collapse_url_tokens(line: str) -> str:
     return line[: match.start()] + EXTERNAL_URL_PLACEHOLDER
 
 
-def _keeps_absolute_root(line: str, start: int, root: str) -> bool:
-    """True iff this root occurrence is provably NOT a private absolute path (#14258 R20/R21).
-
-    The predicate is deliberately inverted from the original design. That one asked "does a
-    known-safe character precede the root?" and, for anything it had not enumerated, concluded
-    "not a path" — so a colon label, a backtick, a brace or a pipe let a full private path
-    through untouched (measured). The candidate launcher's stderr format is not ours to
-    control, so an allowlist of shapes can never be the safe side.
-
-    Exactly one thing is proven safe: a ``/`` that continues a word, and is therefore inside a
-    relative token (``relative/path.yaml``, ``down/right``). ``:`` deliberately does not
-    qualify — ``config:/Users/…`` is a labelled absolute path. A drive or UNC root is never
-    exempt; neither can occur inside a relative path.
-
-    The proof is judged per OCCURRENCE and covers nothing beyond itself (review j#87831 R21).
-    An earlier version let a proof exempt the rest of the surrounding token, which silently
-    exempted every later root in it — a tab, a non-breaking space or a ``?file=`` inside the
-    same token carried a full private path through. URLs are handled before this runs, by
-    replacement rather than by proof, so no case here needs to look forward at all.
-    """
-    if root != "/":
-        return False
-    return bool(_RELATIVE_CONTINUATION_RE.search(line[:start]))
+#: The positive-proof predicate is the canonical one, not a second implementation.
+#: Review j#92241 F3: sharing only the regex OBJECTS left this rule written twice,
+#: which is exactly the drift that produced the original path-detector defect. The
+#: rule (and its long review history, Redmine #14258 j#87831 R21 included) now
+#: lives in one place and both consumers call it.
+_keeps_absolute_root = _canonical_keeps_absolute_root
 
 
 def _redact_probe_paths(detail: str, *scratch: Path) -> str:
