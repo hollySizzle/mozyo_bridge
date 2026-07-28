@@ -1308,8 +1308,11 @@ class PathDetectorOracleTests(unittest.TestCase):
                 self.assertTrue(ops.contains_absolute_path(f"a line\n{value} tail"))
 
     def test_the_detector_is_the_repository_wide_rule(self):
-        # One rule, one place: the redactor hardened over #14258's review rounds
-        # and this boundary must not be able to disagree.
+        # Review j#92241 F3: the previous version asserted only that the two
+        # modules shared the regex OBJECTS — which the claim "one rule, one place"
+        # survives while the *positive-proof predicate* is implemented twice. A
+        # test that cannot falsify the claim it guards is not guarding it. Both
+        # halves of the rule are now pinned by function identity.
         import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_probe_redaction as redaction
         import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_identity as identity
 
@@ -1317,9 +1320,24 @@ class PathDetectorOracleTests(unittest.TestCase):
         self.assertIs(
             redaction._RELATIVE_CONTINUATION_RE, identity._RELATIVE_CONTINUATION_RE
         )
+        self.assertIs(redaction._keeps_absolute_root, identity.keeps_absolute_root)
         for value in SPEC_ABSOLUTE_PATHS:
             with self.subTest(value=value):
                 self.assertNotEqual(redaction.redact_probe_paths(value), value)
+
+    def test_both_consumers_agree_on_the_whole_corpus(self):
+        # Behavioural half of the same claim: sharing the callables is the
+        # mechanism, agreeing on every input is the property.
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_probe_redaction as redaction
+
+        for value in SPEC_ABSOLUTE_PATHS:
+            with self.subTest(value=value, expected="path"):
+                self.assertTrue(ops.contains_absolute_path(value))
+                self.assertNotEqual(redaction.redact_probe_paths(value), value)
+        for value in SPEC_NON_PATHS:
+            with self.subTest(value=value, expected="not a path"):
+                self.assertFalse(ops.contains_absolute_path(value))
+                self.assertEqual(redaction.redact_probe_paths(value), value)
 
 
 class EdgeMatrixTests(unittest.TestCase):
@@ -1582,19 +1600,138 @@ class RelationalInvariantTests(unittest.TestCase):
                     )
 
     def test_a_denied_plan_may_carry_no_reference(self):
-        # The precondition applies to admission only; a denial legitimately has
-        # nothing behind it, and refusing that would break every deny path.
-        ops.InstallPlan(
-            spec=None,
-            ref=None,
-            decision=PolicyDecision.deny(REASON_UNPINNED_SOURCE, "no identity"),
-        )
+        # A denial legitimately has nothing behind it, and refusing that would
+        # break every deny path. What it may NOT do is disagree with the policy —
+        # see the recomputation tests below.
+        ops.InstallPlan(spec=None, ref=None, decision=plan_install(None))
         ops.EnablePlan(
             plugin_id=None,
             found=False,
             verdict=None,
             decision=PolicyDecision.deny(REASON_INVALID_TARGET_ID, "not an id"),
         )
+
+    def test_an_install_plan_cannot_invert_the_policy(self):
+        # Review j#92241 F1: the admitted precondition asked only for a pinned
+        # ref, so a reference the policy DENIES (`unpinned_remote_build`) could be
+        # handed an invented admit and rendered `ok=true`. `PluginVerdict` already
+        # recomputed; the plans got a weaker rule for the same question.
+        reviewed = PluginSourceRef.pinned(
+            SOURCE_KIND_GITHUB, "smarzban", "herdr-file-viewer", FILE_VIEWER_COMMIT
+        )
+        self.assertFalse(plan_install(reviewed).admitted)
+        with self.assertRaises(HerdrPluginPolicyError):
+            ops.InstallPlan(
+                spec="smarzban/herdr-file-viewer",
+                ref=reviewed,
+                decision=PolicyDecision.admit("invented"),
+            )
+        # A *denial* that is not the policy's denial is equally inconsistent.
+        with self.assertRaises(HerdrPluginPolicyError):
+            ops.InstallPlan(
+                spec="smarzban/herdr-file-viewer",
+                ref=reviewed,
+                decision=PolicyDecision.deny(REASON_AGENT_INPUT_WRITER, "invented"),
+            )
+
+    def test_an_install_plan_spec_must_name_its_reference(self):
+        reviewed = PluginSourceRef.pinned(
+            SOURCE_KIND_GITHUB, "smarzban", "herdr-file-viewer", FILE_VIEWER_COMMIT
+        )
+        with self.assertRaises(HerdrPluginPolicyError):
+            ops.InstallPlan(
+                spec="someone/else",
+                ref=reviewed,
+                decision=plan_install(reviewed),
+            )
+
+    def test_the_real_install_plan_still_constructs(self):
+        for spec, ref in (
+            ("smarzban/herdr-file-viewer", FILE_VIEWER_COMMIT),
+            ("persiyanov/herdr-reviewr", OTHER_COMMIT),
+            ("someone/unreviewed", OTHER_COMMIT),
+        ):
+            with self.subTest(spec=spec):
+                plan = ops.plan_candidate_install(spec, ref)
+                self.assertFalse(plan.ok)
+
+    def test_an_enable_plan_cannot_disagree_with_its_verdict(self):
+        # Review j#92241 F2: the deny path was left unconstrained, so a plan could
+        # carry an enable-admitted verdict while its own decision denied — and the
+        # two renderers then answered the same question oppositely.
+        status = self._status()
+        real = ops.plan_enable(status, "herdr-file-viewer")
+        for divergence in (
+            dict(found=False),
+            dict(decision=PolicyDecision.deny(REASON_TARGET_NOT_INSTALLED, "x")),
+            dict(decision=PolicyDecision.admit("different detail")),
+            dict(plugin_id="another-plugin"),
+        ):
+            with self.subTest(divergence=sorted(divergence)):
+                with self.assertRaises(HerdrPluginPolicyError):
+                    dataclasses.replace(real, **divergence)
+
+    def test_a_verdictless_enable_plan_needs_a_reason_that_admits_no_verdict(self):
+        allowed = (
+            REASON_INVALID_TARGET_ID,
+            REASON_INVENTORY_INCOMPLETE,
+            REASON_AMBIGUOUS_TARGET,
+            REASON_TARGET_NOT_INSTALLED,
+        )
+        for reason in allowed:
+            with self.subTest(reason=reason):
+                ops.EnablePlan(
+                    plugin_id="herdr-file-viewer",
+                    found=False,
+                    verdict=None,
+                    decision=PolicyDecision.deny(reason, "d"),
+                )
+        # A per-plugin reason cannot be reached without the plugin it judged.
+        for reason in (REASON_AGENT_INPUT_WRITER, REASON_UNPINNED_SOURCE):
+            with self.subTest(reason=reason):
+                with self.assertRaises(HerdrPluginPolicyError):
+                    ops.EnablePlan(
+                        plugin_id="herdr-file-viewer",
+                        found=False,
+                        verdict=None,
+                        decision=PolicyDecision.deny(reason, "d"),
+                    )
+
+    def test_the_two_renderings_never_disagree_about_admission(self):
+        # The property the inconsistency actually broke: a machine-readable and a
+        # human-readable artifact answering the same question oppositely.
+        status = self._status()
+        plans = [
+            ops.plan_enable(status, "herdr-file-viewer"),
+            ops.plan_enable(status, "not-installed"),
+            ops.plan_enable(status, LEAK_MARKER),
+            ops.plan_enable(
+                ops.PolicyStatus(
+                    verdicts=(),
+                    malformed=(ops.MalformedEntry(index=0, detail="unreadable"),),
+                ),
+                "herdr-file-viewer",
+            ),
+        ]
+        for plan in plans:
+            with self.subTest(plugin_id=plan.plugin_id):
+                payload = plan.as_payload()
+                text = ops.format_enable_plan_text(plan)
+                # Read the plan's OWN answer line. Scanning the whole block for
+                # "ADMITTED"/"DENIED" was imprecise: the verdict context
+                # legitimately reports a denied *install* beside an admitted
+                # enable, so a whole-text scan measured the wrong thing.
+                answer = [
+                    line for line in text.splitlines() if line.startswith("enable ")
+                ]
+                self.assertEqual(len(answer), 1, f"expected one answer line: {answer}")
+                admitted_in_text = "ADMITTED" in answer[0]
+                self.assertEqual(
+                    payload["ok"],
+                    admitted_in_text,
+                    f"JSON says ok={payload['ok']} but text says "
+                    f"admitted={admitted_in_text}",
+                )
 
 
 class SinkGuardTests(unittest.TestCase):

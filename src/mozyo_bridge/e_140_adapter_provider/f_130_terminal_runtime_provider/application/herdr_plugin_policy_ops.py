@@ -79,6 +79,18 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     source_ref_from_parts,
 )
 
+#: The only enable denials reachable without a verdict: they are decided before —
+#: or instead of — judging any particular plugin. Every other reason names a
+#: judgement about a plugin, so it cannot exist without that plugin's verdict.
+VERDICTLESS_ENABLE_REASONS: frozenset[str] = frozenset(
+    {
+        REASON_INVALID_TARGET_ID,
+        REASON_INVENTORY_INCOMPLETE,
+        REASON_AMBIGUOUS_TARGET,
+        REASON_TARGET_NOT_INSTALLED,
+    }
+)
+
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 #: Same set minus the newline, which is what structures the text report.
 _CONTROL_CHARS_EXCEPT_NEWLINE = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
@@ -426,20 +438,34 @@ class EnablePlan:
             raise HerdrPluginPolicyError("decision must be a PolicyDecision")
         if self.verdict is not None and not isinstance(self.verdict, PluginVerdict):
             raise HerdrPluginPolicyError("verdict must be a PluginVerdict or None")
-        # Relational invariant (review j#92194 F2): an admitted enable plan must
-        # rest on something. Without this, `EnablePlan(plugin_id=None, found=False,
-        # verdict=None, decision=admit)` was constructible and rendered
-        # `ok=true / plugin=null` — an admission with nothing behind it.
-        if self.decision.admitted and (
-            not self.found
-            or self.verdict is None
-            or self.plugin_id is None
-            or not self.verdict.enable.admitted
-            or self.verdict.observation.plugin_id != self.plugin_id
+        # Relational invariant. The first version (review j#92194 F2) constrained
+        # only the admitted case, on the reasoning that "a denial needs nothing
+        # behind it". That reasoning is right about *preconditions* and wrong about
+        # *consistency*: j#92241 F2 measured a plan carrying an enable-admitted
+        # verdict while its own decision denied, and the two renderers then
+        # answered the same question oppositely.
+        #
+        # So a plan with a verdict is checked the way `PluginVerdict` is checked —
+        # against what produced it — rather than against a weaker hand-written
+        # rule. The strong technique was already in this module for verdicts; using
+        # it here too is the point.
+        if self.verdict is not None:
+            if (
+                not self.found
+                or self.plugin_id != self.verdict.observation.plugin_id
+                or self.decision != self.verdict.enable
+            ):
+                raise HerdrPluginPolicyError(
+                    "an enable plan carrying a verdict must report that verdict's "
+                    "plugin, decision and found state"
+                )
+        elif self.decision.admitted or self.decision.reason not in (
+            VERDICTLESS_ENABLE_REASONS
         ):
             raise HerdrPluginPolicyError(
-                "an admitted enable plan requires the named plugin to have been "
-                "found and to have carried an admitting verdict"
+                f"without a verdict an enable plan may only deny for one of "
+                f"{sorted(VERDICTLESS_ENABLE_REASONS)}; a per-plugin reason cannot "
+                f"be reached without the plugin it judged"
             )
 
     @property
@@ -550,13 +576,21 @@ class InstallPlan:
             raise HerdrPluginPolicyError("ref must be a PluginSourceRef or None")
         if not isinstance(self.decision, PolicyDecision):
             raise HerdrPluginPolicyError("decision must be a PolicyDecision")
-        # Relational invariant (review j#92194 F2): an install may only be admitted
-        # against an exactly pinned reference. `InstallPlan(ref=None,
-        # decision=admit)` reported ok=true for a candidate with no identity at all.
-        if self.decision.admitted and (self.ref is None or not self.ref.is_pinned):
+        # Recomputed, not merely preconditioned (review j#92241 F1). Requiring only
+        # "admitted implies a pinned ref" let a reference the policy DENIES
+        # (`unpinned_remote_build`) be handed an invented admit and rendered
+        # `ok=true` — a supply-chain preflight inverting its own answer. The
+        # decision must be the policy's decision for this reference.
+        if self.decision != plan_install(self.ref):
             raise HerdrPluginPolicyError(
-                "an admitted install plan requires an exactly pinned reference"
+                "install plan decision disagrees with the policy for this reference"
             )
+        if self.spec is not None and self.ref is not None:
+            if self.spec != f"{self.ref.owner}/{self.ref.repo}":
+                raise HerdrPluginPolicyError(
+                    "install plan spec must name the repository its reference "
+                    "resolves to"
+                )
 
     @property
     def ok(self) -> bool:
@@ -626,7 +660,16 @@ def _format_decision(label: str, decision: PolicyDecision) -> str:
     return f"{line}\n      {decision.detail}" if decision.detail else line
 
 
-def _format_verdict(verdict: PluginVerdict) -> "list[str]":
+def _format_verdict(
+    verdict: PluginVerdict, *, include_enable: bool = True
+) -> "list[str]":
+    """Render one plugin's block. ``include_enable=False`` omits the enable line.
+
+    The enable plan suppresses it because the plan's own ``decision`` is the answer
+    there, and printing a second enable line beside it puts two authorities on one
+    question — which is how the JSON and the text came to disagree (review j#92241
+    F2). The install line stays: it is context the plan does not answer.
+    """
     observation = verdict.observation
     state = "enabled" if observation.enabled else "disabled"
     lines = [
@@ -636,7 +679,8 @@ def _format_verdict(verdict: PluginVerdict) -> "list[str]":
     ]
     if verdict.review_anchor:
         lines.append(f"  reviewed: {verdict.review_anchor}")
-    lines.append(_format_decision("enable ", verdict.enable))
+    if include_enable:
+        lines.append(_format_decision("enable ", verdict.enable))
     lines.append(_format_decision("install", verdict.install))
     if verdict.breach:
         lines.append(
@@ -677,10 +721,12 @@ def format_enable_plan_text(plan: EnablePlan) -> str:
     ]
     lines.extend(_format_scope())
     lines.append("")
-    if plan.verdict is None:
-        lines.append(_format_decision("enable ", plan.decision).lstrip())
-        return "\n".join(lines)
-    lines.extend(_format_verdict(plan.verdict))
+    # The plan's own decision is the single answer, whether or not a verdict
+    # supplied it. The verdict block below is context, with its enable line
+    # suppressed so this stays the only place the question is answered.
+    lines.append(_format_decision("enable ", plan.decision).lstrip())
+    if plan.verdict is not None:
+        lines.extend(_format_verdict(plan.verdict, include_enable=False))
     return "\n".join(lines)
 
 
@@ -784,6 +830,7 @@ __all__ = (
     "guard_rendered_payload",
     "guard_rendered_text",
     "sanitize_renderable",
+    "VERDICTLESS_ENABLE_REASONS",
     "classify_inventory",
     "normalize_operand",
     "format_enable_plan_text",

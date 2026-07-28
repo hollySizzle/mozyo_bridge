@@ -18,6 +18,7 @@ from pathlib import Path
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_identity import (
     _ABS_ROOT_RE as _canonical_abs_root_re,
     _RELATIVE_CONTINUATION_RE as _canonical_relative_continuation_re,
+    keeps_absolute_root as _canonical_keeps_absolute_root,
 )
 
 #: What a redacted filesystem path is rendered as in a public verdict detail.
@@ -102,29 +103,12 @@ def _collapse_url_tokens(line: str) -> str:
     return line[: match.start()] + EXTERNAL_URL_PLACEHOLDER
 
 
-def _keeps_absolute_root(line: str, start: int, root: str) -> bool:
-    """True iff this root occurrence is provably NOT a private absolute path (#14258 R20/R21).
-
-    The predicate is deliberately inverted from the original design. That one asked "does a
-    known-safe character precede the root?" and, for anything it had not enumerated, concluded
-    "not a path" — so a colon label, a backtick, a brace or a pipe let a full private path
-    through untouched (measured). The candidate launcher's stderr format is not ours to
-    control, so an allowlist of shapes can never be the safe side.
-
-    Exactly one thing is proven safe: a ``/`` that continues a word, and is therefore inside a
-    relative token (``relative/path.yaml``, ``down/right``). ``:`` deliberately does not
-    qualify — ``config:/Users/…`` is a labelled absolute path. A drive or UNC root is never
-    exempt; neither can occur inside a relative path.
-
-    The proof is judged per OCCURRENCE and covers nothing beyond itself (review j#87831 R21).
-    An earlier version let a proof exempt the rest of the surrounding token, which silently
-    exempted every later root in it — a tab, a non-breaking space or a ``?file=`` inside the
-    same token carried a full private path through. URLs are handled before this runs, by
-    replacement rather than by proof, so no case here needs to look forward at all.
-    """
-    if root != "/":
-        return False
-    return bool(_RELATIVE_CONTINUATION_RE.search(line[:start]))
+#: The positive-proof predicate is the canonical one, not a second implementation.
+#: Review j#92241 F3: sharing only the regex OBJECTS left this rule written twice,
+#: which is exactly the drift that produced the original path-detector defect. The
+#: rule (and its long review history, Redmine #14258 j#87831 R21 included) now
+#: lives in one place and both consumers call it.
+_keeps_absolute_root = _canonical_keeps_absolute_root
 
 
 def _redact_probe_paths(detail: str, *scratch: Path) -> str:

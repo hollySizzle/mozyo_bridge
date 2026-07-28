@@ -417,7 +417,11 @@ observed 側に無かった。**同じ概念を 2 箇所で書くと、片方だ
 ### ★path 判定は repository 単一 authority を使う
 
 絶対 path の判定規則は **`herdr_plugin_identity` の 1 箇所**にあり、`herdr_probe_redaction`
-(#14258) がそれを import する。以前は本 boundary が独自に「`/` + segment + `/`」という第三の
+(#14258) がそれを import する。**root pattern と relative-continuation pattern だけでなく、
+positive-proof predicate (`keeps_absolute_root`) も共有する** — 最初は regex object しか
+共有せず、同じ規則が 2 実装のまま残っていた（review j#92241 F3）。しかも当時の test は
+**regex の identity しか検査しておらず、「単一 authority」という主張を falsify できなかった**。
+現在は関数 identity と、両 consumer が corpus 全件で一致することの両方を pin している。以前は本 boundary が独自に「`/` + segment + `/`」という第三の
 規則を書いており、**`/etc` / `/` / `/秘密` / `/tmp-☃/secret` をすべて安全と読んだ**
 （review j#92194 F1）。同じ問いに対する硬化済み実装が repo 内に既にあったのに再利用せず、
 **最も新しい面に最も弱い写しを置いていた**。
@@ -440,10 +444,24 @@ per-field の型・語彙検査を全 field に課しても、**field 間の関�
 なった。
 
 - `PluginObservation`: `ref` を持つなら `source_kind` は `github` でなければならない。
-- `PluginVerdict`: **policy から再計算した値と一致すること**。個別の pairwise 規則を並べるより
-  強く、しかも policy の変更に置いていかれない。
-- `EnablePlan` / `InstallPlan`: **admit にだけ**前提を課す（found + verdict + 一致する id /
-  exactly pinned ref）。deny は前提を持たなくてよい。
+- **computed result はすべて「policy から再計算した値と一致すること」で閉じる。**
+  `PluginVerdict` は `resolve_reference` / `decide_enable` / `decide_install` の結果と、
+  `InstallPlan` は `plan_install(ref)` と一致すること。`EnablePlan` は verdict を持つなら
+  その verdict の `enable` / `plugin_id` / `found` と一致し、verdict を持たないなら
+  **verdict 無しで到達しうる deny reason の閉じた集合**（`inventory_incomplete` /
+  `ambiguous_target` / `target_not_installed` / `invalid_target_id`）に限る。
+
+  **同じ問いには同じ強さの解を当てる。** 最初は `PluginVerdict` にだけ再計算を入れ、
+  plan には「admit にだけ最小前提を課す」という弱い形を選んだ。結果、policy が
+  `unpinned_remote_build` で deny する reference に invented admit を渡すと
+  **supply-chain preflight が自分の答えを反転できた**（review j#92241 F1）。
+  さらに deny 経路を無制約にしたため、**enable-admitted な verdict を抱えたまま deny する
+  plan** が作れ、JSON と text が同じ問いに反対の答えを返した（同 F2）。
+  「deny には *前提* が要らない」は正しいが、「deny の *整合性* を検査しなくてよい」ではない。
+
+- **1 つの問いには 1 つの authority。** enable plan の text は `plan.decision` だけが答え、
+  verdict block は enable 行を伏せた context として出す。両方が enable を語ると、
+  どちらが答えか決まらない。
 
 ### regression の形
 
