@@ -171,12 +171,26 @@ def build_ir_handoff_argv(anchor: str, route: DispatchRoute, *, issue: str) -> "
     Mirrors the live sublane actuator's dispatch argv (``sublane_actuator_ops.dispatch_implementation_request``):
     the #12918-route-gated ``handoff send`` with the mandatory ``--target-repo`` identity gate, the
     anchor ``--journal``, and the role-profile fields (``lane``) the receiver contract needs (R7-F4).
+
+    ``route.lane`` has TWO consumers and both must be written (Redmine #14659, verdict j#92207):
+
+    - ``--profile-field lane=`` is the role profile's placeholder **content** — what the receiving
+      agent's contract text says its lane is;
+    - ``--target-lane`` is the **route authority** — the tier-1 explicit lane
+      ``derive_target_lane`` resolves the receiver slot with.
+
+    Writing only the first left ``target_lane=None`` on the parsed handoff, so the route derived the
+    workspace default lane instead of the dispatch's own. With an explicit ``--target`` naming the
+    same-lane worker that disagreement is refused by :class:`HerdrExplicitTargetMismatchError`
+    (``invalid_args``, zero-send, #13884) — the guard held, but no same-lane IR could ever be
+    delivered. The lane is one value; it is not "the profile's lane" and separately "the route's".
     """
     return [
         "handoff", "send",
         "--to", str(route.to),
         "--target", str(route.target),
         "--target-repo", str(route.target_repo),
+        "--target-lane", str(route.lane),
         "--source", str(route.source),
         "--issue", str(issue),
         "--journal", str(anchor),

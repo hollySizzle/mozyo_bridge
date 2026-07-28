@@ -282,6 +282,22 @@ documents:
       - rule-project-agent-workflow
       - skill-workflow-reference
 
+  - id: spec-external-client-coordinator-proxy
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/external-client-coordinator-proxy.md
+    purpose: "attested lane agent ではない external coordinator client (operator shell / API caller) が、既に durable に確定した high-level action を live attested default coordinator へ一回だけ委譲する public rail の contract (Redmine #14546 / #14500)。workflow step の herdr_sender_identity_unresolved と sublane create --execute の missing_identity+sender_attestation はどちらも正しい停止だが第三の道が無く、残る前進手段が MOZYO_* 手動 export (identity 偽造) と raw pane 入力 (audit boundary 迂回) だけになっていた問題を解く。gate を緩めず、caller が主張できないものだけから action-time に authority を再導出する: workspace=repo checkout の registry anchor、role=repo-local durable role authority、provider=provider_binding、target=agent 自身の mzb1 assigned name decode、anchor=source-of-truth Redmine の structured gate marker (superseded は zero-send)、delivery=dedicated exactly-once fence。caller env を authority にせず fallback にもせず、cross-workspace を構造的に不可能にし、duplicate identity を ambiguity として zero-send する。fence は completed 後も同一 (issue, journal) の再委譲を duplicate として拒否し、journal 比較は数値で行う。委譲するのは decision であって実行 authority ではない。"
+    audit_role: external_client_coordinator_proxy_spec
+    related_document_refs:
+      - spec-herdr-default-lane-workflow-role-authority
+      - spec-herdr-native-identity
+      - logic-workflow-step-command-design
+      - logic-managed-state-model
+      - logic-project-scoped-workspace-identity
+      - logic-tmux-send-safety-contract
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
   - id: spec-conversational-onboarding-tool-contract
     type: spec
     status: active
@@ -1629,27 +1645,56 @@ file_conventions:
     name: herdr default-lane durable workflow-role authority source
     patterns:
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_role_authority.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/lane_work_anchor.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/workflow_role_authority_source.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_step_herdr.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_workflow_step.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_forward_route.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_forward_send.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_role_authority.py
       - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/delivery_outcome_gate.py
       - src/mozyo_bridge/core/state/forward_outbox_fence.py
       - .mozyo-bridge/workflow-role-bindings.json
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_lane_work_anchor.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority_source.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_step_herdr.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_workflow_step_adapter.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_forward_route.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_forward_send.py
       - tests/unit/core/state/test_forward_outbox_fence.py
+      - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_cli_workflow_role_authority.py
+      - tests/regressions/test_issue_14500_default_coordinator_authority.py
     severity: block
     document_refs:
       - spec-herdr-default-lane-workflow-role-authority
       - logic-workflow-step-command-design
       - logic-ticketless-project-gateway-runtime-ux
       - spec-herdr-native-identity
+      - logic-managed-state-model
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
+  - id: fc-external-client-coordinator-proxy
+    name: external-client coordinator proxy delegation rail
+    patterns:
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/coordinator_proxy.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/canonical_note_scan.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/coordinator_proxy_send.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_proxy.py
+      - src/mozyo_bridge/core/state/coordinator_proxy_fence.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_coordinator_proxy.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_canonical_note_scan.py
+      - tests/unit/core/state/test_coordinator_proxy_fence.py
+      - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_coordinator_proxy_send.py
+      - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_cli_workflow_step_forward_leg.py
+      - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_proxy_ack_authority.py
+    severity: block
+    document_refs:
+      - spec-external-client-coordinator-proxy
+      - spec-herdr-default-lane-workflow-role-authority
+      - spec-herdr-native-identity
+      - logic-workflow-step-command-design
       - logic-managed-state-model
       - rule-project-agent-workflow
       - skill-workflow-reference

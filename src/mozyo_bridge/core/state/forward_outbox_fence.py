@@ -52,10 +52,11 @@ FORWARD_RESERVED = "reserved"  # minted + write-locked before the send; the send
 FORWARD_DELIVERED = "delivered"  # the forward send was positively confirmed; awaiting the callback
 FORWARD_UNCERTAIN = "uncertain"  # the send outcome is unknown (crash / timeout) -> operator reconcile
 FORWARD_COMPLETED = "completed"  # the correlated callback returned -> the next step may re-mint
+FORWARD_ABANDONED = "abandoned"  # an operator proved the send never left; the route may re-mint
 FORWARD_ABSENT = "absent"  # sentinel: no row existed for the route (not persisted)
 
 FORWARD_STATES = frozenset(
-    {FORWARD_RESERVED, FORWARD_DELIVERED, FORWARD_UNCERTAIN, FORWARD_COMPLETED}
+    {FORWARD_RESERVED, FORWARD_DELIVERED, FORWARD_UNCERTAIN, FORWARD_COMPLETED, FORWARD_ABANDONED}
 )
 #: The states that hold the active generation (a repeat is a duplicate zero-send).
 _ACTIVE_STATES = frozenset({FORWARD_RESERVED, FORWARD_DELIVERED, FORWARD_UNCERTAIN})
@@ -325,7 +326,7 @@ class ForwardOutboxFence:
                     current_state=FORWARD_RESERVED, detail="minted the first generation for this route",
                 )
             prior_action, prior = str(row[0]), str(row[1])
-            if prior == FORWARD_COMPLETED:
+            if prior in (FORWARD_COMPLETED, FORWARD_ABANDONED):
                 action_id = mint_forward_action_id()
                 conn.execute(
                     "UPDATE forward_generation SET forward_action_id=?, state=?, detail=?, "
@@ -335,8 +336,9 @@ class ForwardOutboxFence:
                 )
                 conn.execute("COMMIT")
                 return ReserveResult(
-                    won=True, action_id=action_id, prior_state=FORWARD_COMPLETED,
-                    current_state=FORWARD_RESERVED, detail="minted a new generation after completion",
+                    won=True, action_id=action_id, prior_state=prior,
+                    current_state=FORWARD_RESERVED,
+                    detail=f"minted a new generation after {prior}",
                 )
             if prior == FORWARD_RESERVED:
                 conn.execute(
@@ -418,6 +420,31 @@ class ForwardOutboxFence:
         return self._guarded_set(
             route, action_id, (FORWARD_RESERVED,), FORWARD_UNCERTAIN,
             detail or "forward outcome uncertain", now=now,
+        )
+
+    def confirm_delivered(
+        self, route: ForwardRouteKey, action_id: str, *, detail: str, now: Optional[str] = None
+    ) -> bool:
+        """Resolve an ``uncertain`` generation to ``delivered`` on proven evidence (j#90329 c4).
+
+        The forward's correlated-callback completion contract is unchanged: this returns the
+        generation to ``delivered``, where it waits for the callback that completes it. It does NOT
+        complete anything — only a correlated callback (or equivalent exact evidence) does.
+        """
+        return self._guarded_set(
+            route, action_id, (FORWARD_UNCERTAIN,), FORWARD_DELIVERED, detail, now=now,
+        )
+
+    def mark_abandoned(
+        self, route: ForwardRouteKey, action_id: str, *, detail: str, now: Optional[str] = None
+    ) -> bool:
+        """Record that an operator PROVED the forward never left — a retryable terminal (j#90329 c4).
+
+        Re-opens the route for a new generation, so it is the strongest assertion the reconcile can
+        make and advances only from :data:`FORWARD_UNCERTAIN`.
+        """
+        return self._guarded_set(
+            route, action_id, (FORWARD_UNCERTAIN,), FORWARD_ABANDONED, detail, now=now,
         )
 
     def complete(self, route: ForwardRouteKey, action_id: str, *, detail: str = "", now: Optional[str] = None) -> bool:
@@ -569,6 +596,7 @@ __all__ = (
     "FORWARD_DELIVERED",
     "FORWARD_UNCERTAIN",
     "FORWARD_COMPLETED",
+    "FORWARD_ABANDONED",
     "FORWARD_ABSENT",
     "FORWARD_STATES",
     "ForwardOutboxFenceError",

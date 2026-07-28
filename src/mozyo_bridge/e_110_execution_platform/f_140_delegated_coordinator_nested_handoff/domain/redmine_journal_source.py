@@ -39,10 +39,14 @@ implemented and tested here rather than reimplementing it.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import ClassVar, Iterable, Mapping, Protocol, Sequence
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.canonical_note_scan import (  # noqa: E501
+    MARKER_CHANNEL_HANDOFF,
+    MARKER_CHANNEL_WORKFLOW_EVENT,
+    canonical_marker_fields,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
     LaneEvidenceEnvelope,
     render_lane_envelope,
@@ -60,22 +64,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 # ---------------------------------------------------------------------------
-# Structured marker schema (machine token, never prose). The watcher recognizes the
-# existing handoff marker channel and a dedicated workflow-event channel; both are
-# ``[mozyo:<channel>:key=value:key=value:...]`` with ':'-separated key=value fields.
+# Structured marker schema (machine token, never prose). The token grammar, the recognized
+# channels, and the QUOTE-AWARE canonical scan all live in one shared authority
+# (:mod:`...domain.canonical_note_scan`) that this reader and the proxy rail's reader both
+# call — two readers of the same grammar with two notions of "quoted" is a drift generator,
+# and the drift is exactly what let a quoted marker become gate authority (#14585).
+#
+# :data:`MARKER_CHANNEL_HANDOFF` / :data:`MARKER_CHANNEL_WORKFLOW_EVENT` are re-exported here
+# because this module's ``__all__`` is the import site the rest of the package already uses.
 # ---------------------------------------------------------------------------
-
-#: The handoff marker channel (:func:`...domain.handoff.build_marker`). Its ``kind`` field
-#: carries the gate; the source anchor is ``issue`` / ``journal``.
-MARKER_CHANNEL_HANDOFF = "handoff"
-#: A dedicated watcher channel a gate journal can embed to carry the full structured event
-#: (gate + conclusion / callback / commit / integrated / open / blocker). Its gate field is
-#: ``gate`` (``kind`` is also accepted as an alias).
-MARKER_CHANNEL_WORKFLOW_EVENT = "workflow-event"
-
-_RECOGNIZED_CHANNELS = frozenset(
-    {MARKER_CHANNEL_HANDOFF, MARKER_CHANNEL_WORKFLOW_EVENT}
-)
 
 #: The **callback-required** gate kinds a marker may name — the states that must wake the
 #: coordinator (``skills/mozyo-bridge-agent/references/workflow.md`` ``### coordinator callback
@@ -100,41 +97,21 @@ GATE_BEARING_KINDS: frozenset[str] = frozenset(
     }
 )
 
-#: ``[mozyo:<channel>:<body>]`` — the body is the ':'-separated key=value field list.
-_MARKER_RE = re.compile(r"\[mozyo:(?P<channel>[a-z0-9_-]+):(?P<body>[^\]]*)\]")
-
-
-def _parse_marker_fields(body: str) -> dict[str, str]:
-    """Parse a ``key=value:key=value`` marker body into a dict (pure; last write wins)."""
-    fields: dict[str, str] = {}
-    for token in body.split(":"):
-        token = token.strip()
-        if not token:
-            continue
-        key, eq, value = token.partition("=")
-        if not eq:
-            continue
-        fields[key.strip()] = value.strip()
-    return fields
-
-
 def marker_fields_in_note(notes: str) -> tuple[tuple[str, dict[str, str]], ...]:
-    """Every ``[mozyo:<channel>:...]`` marker in a note as ``(channel, fields)``, in note order (pure).
+    """Every CANONICAL ``[mozyo:<channel>:...]`` marker as ``(channel, fields)``, in note order (pure).
 
-    The shared structured-token scan the marker readers are built on: it recognizes the token
-    grammar and parses the field list, but applies **no** vocabulary policy — each reader decides
-    which channel / kind it accepts. Unrecognized channels are dropped here so a reader never has
-    to know the channel set. Prose is never inspected; a note with no token yields ``()``.
+    A thin name over the shared quote-aware scan (:func:`canonical_marker_fields`): it recognizes
+    the token grammar and parses the field list, but applies **no** vocabulary policy — each reader
+    decides which channel / kind it accepts.
+
+    "Canonical" is the load-bearing word (Redmine #14585). A marker that appears only inside a
+    fenced block, a blockquote, an indented code block, or a backtick span is someone **quoting**
+    the grammar — a review discussing the contract, a callback record echoing the landing marker it
+    observed — not this agent recording a decision. Such a marker is not returned at all, so it is
+    neither authority nor an ambiguity poison. Prose is never inspected; a note with no canonical
+    token yields ``()``.
     """
-    if not notes:
-        return ()
-    found: list[tuple[str, dict[str, str]]] = []
-    for match in _MARKER_RE.finditer(notes):
-        channel = match.group("channel")
-        if channel not in _RECOGNIZED_CHANNELS:
-            continue
-        found.append((channel, _parse_marker_fields(match.group("body"))))
-    return tuple(found)
+    return canonical_marker_fields(notes)
 
 
 @dataclass(frozen=True)
@@ -223,12 +200,13 @@ def extract_markers_from_note(
     *,
     channels: "frozenset[str] | set[str] | None" = None,
 ) -> tuple[JournalMarker, ...]:
-    """Extract every structured gate marker from one journal note (pure; never prose).
+    """Extract every CANONICAL structured gate marker from one journal note (pure; never prose).
 
-    Scans ``notes`` for ``[mozyo:<channel>:...]`` tokens on a recognized channel, parses each
-    into a :class:`JournalMarker` when it names a gate-bearing kind, and returns them in
-    note order. A note with no recognized marker token yields ``()`` — the watcher reads the
-    structured token, never the surrounding narrative.
+    Scans ``notes`` through the shared quote-aware scan (:func:`canonical_marker_fields`), parses
+    each canonical marker into a :class:`JournalMarker` when it names a gate-bearing kind, and
+    returns them in note order. A note with no canonical marker token yields ``()`` — the watcher
+    reads the structured token, never the surrounding narrative, and never a **quotation** of the
+    token (Redmine #14585: a journal that echoes a marker while discussing it is not a gate).
 
     ``channels`` optionally restricts extraction to a SUBSET of the recognized channels — the
     channel provenance a caller needs to keep the two channels apart (Redmine #13952 R6 review
@@ -244,13 +222,7 @@ def extract_markers_from_note(
         notes=notes,
     )
     markers: list[JournalMarker] = []
-    for match in _MARKER_RE.finditer(notes):
-        channel = match.group("channel")
-        if channel not in _RECOGNIZED_CHANNELS:
-            continue
-        if channels is not None and channel not in channels:
-            continue
-        fields = _parse_marker_fields(match.group("body"))
+    for channel, fields in canonical_marker_fields(notes, channels=channels):
         marker = _gate_marker_from_fields(entry, channel, fields)
         if marker is not None:
             markers.append(marker)
@@ -489,6 +461,31 @@ def dispatch_generations(entries: "Iterable[RedmineJournalEntry]", *, lane: str)
     return tuple(sorted(found))
 
 
+def dispatch_lanes(entries: "Iterable[RedmineJournalEntry]") -> "tuple[str, ...]":
+    """Every lane this issue carries a canonical dispatch marker for (pure, sorted).
+
+    The lane-free counterpart of :func:`dispatch_entry_journals`, which fixes a lane and can
+    therefore never tell "this issue has no dispatch at all" from "this issue's dispatches belong to
+    somebody else". A caller resolving its own work anchor needs that distinction to say so: a lane
+    reading an issue whose dispatches all name OTHER lanes is a cross-lane read, and reporting it as
+    a plain absence sends the operator looking for a missing record that is not missing.
+
+    Both cases are equally fail-closed — this only names which one happened. A blank lane field is
+    skipped (never guessed).
+    """
+    found: set[str] = set()
+    for entry in entries or ():
+        for channel, fields in marker_fields_in_note(getattr(entry, "notes", "") or ""):
+            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+                continue
+            if str(fields.get("kind", "")).strip() != DISPATCH_KIND_IMPLEMENTATION_REQUEST:
+                continue
+            lane = str(fields.get("lane", "")).strip()
+            if lane:
+                found.add(lane)
+    return tuple(sorted(found))
+
+
 def resolve_dispatch_entry_journal(
     entries: "Iterable[RedmineJournalEntry]",
     *,
@@ -669,6 +666,7 @@ __all__ = (
     "render_dispatch_note",
     "dispatch_entry_journals",
     "dispatch_generations",
+    "dispatch_lanes",
     "resolve_dispatch_entry_journal",
     "dispatch_entry_journal_from_source",
 )

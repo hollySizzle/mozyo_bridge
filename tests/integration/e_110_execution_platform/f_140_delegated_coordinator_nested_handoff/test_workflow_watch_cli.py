@@ -238,6 +238,65 @@ class RedmineSourceTest(_StoreCase):
         self.assertEqual(rc, 0)
         self.assertIn("accepted: 0 suppressed: 1", out)
 
+    def _write_quoted_issue_json(self) -> str:
+        marker = (
+            "[mozyo:handoff:source=redmine:issue=12672:journal=68989:"
+            "kind=review_request:to=codex]"
+        )
+        payload = {
+            "issue": {"id": "12672"},
+            "journals": [
+                # A review journal DISCUSSING the marker grammar, in each shape Markdown quotes
+                # with. None of these is somebody recording a review_request (Redmine #14585).
+                {"id": "68990", "notes": "the producer must emit `%s`" % marker},
+                {"id": "68991", "notes": "> %s" % marker},
+                {"id": "68992", "notes": "```\n%s\n```" % marker},
+                {"id": "68993", "notes": "- observed:\n    %s" % marker},
+            ],
+        }
+        path = Path(self._tmp.name) / "quoted_issue.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def test_quoted_marker_never_becomes_a_pending_action(self):
+        # Redmine #14585 at the consumer that motivates the whole read boundary. `workflow watch`
+        # turns a recorded gate into a PENDING ACTION the coordinator is woken for — so a journal
+        # that merely quotes the grammar must produce no action at all, in any quoting shape.
+        rc, out = _run(
+            [
+                "workflow", "watch",
+                "--redmine-json", self._write_quoted_issue_json(),
+                "--store-path", self.store_path,
+            ]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("accepted: 0", out)
+        for journal in ("68990", "68991", "68992", "68993"):
+            self.assertNotIn(f"redmine:12672:{journal}", out)
+        self.assertEqual(WorkflowRuntimeStore(path=Path(self.store_path)).read_events(), ())
+
+    def test_quotation_does_not_shadow_a_real_marker_in_the_same_issue(self):
+        # The other direction: quote-safety must not cost the issue its real gate. A note that
+        # records a gate AND quotes the token for reference still ingests exactly one action.
+        marker = (
+            "[mozyo:handoff:source=redmine:issue=12672:journal=68989:"
+            "kind=review_request:to=codex]"
+        )
+        payload = {
+            "issue": {"id": "12672"},
+            "journals": [
+                {"id": "68989", "notes": "%s\n\nfor reference: `%s`" % (marker, marker)},
+            ],
+        }
+        path = Path(self._tmp.name) / "mixed_issue.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        rc, out = _run(
+            ["workflow", "watch", "--redmine-json", str(path), "--store-path", self.store_path]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("redmine:12672:68989 review_request -> accepted", out)
+        self.assertIn("accepted: 1", out)
+
     def test_nested_redmine_rest_shape_is_read(self):
         # The standard /issues/<id>.json?include=journals shape nests journals under the
         # issue (review j#69006): it must not silently drop them.

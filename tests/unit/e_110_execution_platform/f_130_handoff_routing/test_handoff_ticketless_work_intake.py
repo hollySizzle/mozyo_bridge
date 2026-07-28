@@ -21,6 +21,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
     CALLBACK_METHODS,
     CALLBACK_TO_ROLES,
     READ_CONTRACT_TOKENS,
+    ROLE_COORDINATOR,
     ROLE_DELEGATED_COORDINATOR,
     WORK_SHAPE_DOMAIN_DESIGN,
     WORK_SHAPE_IMPLEMENTATION,
@@ -46,10 +47,33 @@ def _intake(**overrides) -> TicketlessWorkIntake:
 
 class WorkIntakeConstructionTest(unittest.TestCase):
     def test_fixed_token_contract(self):
-        # The child returns to the parent gateway; the read contract is the child's.
-        self.assertEqual(CALLBACK_TO_ROLES, (ROLE_PROJECT_GATEWAY,))
+        # The child returns to whichever parent forwarded the work-intake — the project gateway,
+        # or (Redmine #14546) the single-workspace default coordinator, which is the forwarding
+        # actor in a bare `mozyo` workspace that has no separate project-gateway lane. The read
+        # contract and the anchor-decision owner are unchanged: the child still owns the anchor.
+        self.assertEqual(CALLBACK_TO_ROLES, (ROLE_PROJECT_GATEWAY, ROLE_COORDINATOR))
         self.assertEqual(READ_CONTRACT_TOKENS, (ROLE_DELEGATED_COORDINATOR,))
         self.assertEqual(ANCHOR_DECISION_OWNER, ROLE_DELEGATED_COORDINATOR)
+
+    def test_default_coordinator_is_an_accepted_callback_target(self):
+        # A work-intake forwarded BY the default coordinator returns to it (#14546).
+        wi = _intake(callback_to_role=ROLE_COORDINATOR)
+        self.assertEqual(wi.callback_to_role, ROLE_COORDINATOR)
+        self.assertEqual(wi.read_contract, ROLE_DELEGATED_COORDINATOR)
+
+    def test_coordinator_token_matches_the_canonical_runtime_role(self):
+        # The token is declared literally in this bounded context (the dependency runs
+        # f_140 -> f_130, never back), so pin it to the canonical runtime declaration.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (  # noqa: E501
+            ROLE_COORDINATOR as RUNTIME_ROLE_COORDINATOR,
+        )
+
+        self.assertEqual(ROLE_COORDINATOR, RUNTIME_ROLE_COORDINATOR)
+
+    def test_unbound_role_is_still_rejected(self):
+        # Widening by one named role must not open the vocabulary.
+        with self.assertRaises(TicketlessWorkIntakeError):
+            _intake(callback_to_role="implementation_worker")
 
     def test_invariants_are_fixed_true(self):
         wi = _intake()

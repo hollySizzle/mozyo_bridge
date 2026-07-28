@@ -36,6 +36,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     build_live_vocabulary,
     dispatch_implementation_request,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+    AUTO_TARGET_REPO,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     render_dispatch_note,
 )
@@ -55,12 +58,33 @@ def _dispatch_body(args: argparse.Namespace) -> str:
     return ""
 
 
+def _canonical_target_repo(raw: str) -> str:
+    """The ``--target-repo`` identity as the admission gate will read it: absolute, or a sentinel.
+
+    The gate compares ``Path(--target-repo).expanduser().resolve()`` against the target's resolved
+    workspace root, and — once ``--target-lane`` is explicit — the herdr route ALSO derives the
+    target ``cwd`` from this same value. A relative ``.`` therefore means "wherever the coordinator's
+    process happened to be", so the same command names a different repo depending on the sender's
+    cwd (Redmine #14659 verdict j#92207 / authorization j#92210). Resolve it here, at the boundary
+    where operator input becomes route identity, so the emitted argv already carries what the gate
+    compares — the gate itself is untouched and is never string-matched into agreement.
+
+    ``auto`` is the handoff's infer-the-root sentinel, not a path: it is passed through verbatim.
+    Empty stays empty so :meth:`DispatchRoute.missing` still fails the dispatch closed before any
+    write, rather than resolving "" into the process cwd.
+    """
+    value = str(raw or "").strip()
+    if not value or value == AUTO_TARGET_REPO:
+        return value
+    return str(Path(value).expanduser().resolve())
+
+
 def _route_from_args(args: argparse.Namespace, lane: str) -> DispatchRoute:
     """Build the handoff route identity from args (validated against the vocabulary in the use case)."""
     return DispatchRoute(
         to=str(getattr(args, "to", None) or "claude"),
         target=str(getattr(args, "target", "") or ""),
-        target_repo=str(getattr(args, "target_repo", "") or ""),
+        target_repo=_canonical_target_repo(getattr(args, "target_repo", "") or ""),
         lane=lane,
         gateway_callback_target=str(getattr(args, "gateway_callback_target", "") or ""),
         role_profile=str(getattr(args, "role_profile", None) or DISPATCH_ROLE_PROFILE),
