@@ -1,5 +1,6 @@
-"""Identity-stability oracle for ``_hash_untracked`` (Redmine #14655).
+"""Identity-stability oracle for ``sublane_hibernate_boundary._hash_untracked``.
 
+The contract under test (Redmine #13843 review j#83853 / j#83889, unchanged by this module):
 ``_hash_untracked`` must fail closed whenever the object it *classified* is not the object
 it *hashed* — an inode swap, a symlink retarget, or a mid-read rewrite. It proves that by
 re-observing the object at three points and comparing selected ``stat`` fields:
@@ -13,20 +14,7 @@ observation      taken at                              compared against
 ``settled``      ``fstat`` after the last ``read``     ``opened`` (the read window)
 ===============  ====================================  ==========================================
 
-**Why this module exists.** The previous oracle (``HashUntrackedIdentityStabilityTest`` in
-``test_sublane_hibernate.py``) produced the drift by asking the *real* filesystem for it, so
-two of its cases silently inherited filesystem-specific behaviour and were not CI-hermetic
-(reproduced on Linux overlayfs/tmpfs in #14580 review j#91949):
-
-- the same-size, mtime-restored mid-read rewrite left ``st_ctime_ns`` as the ONLY
-  discriminator, so it needed sub-second ``ctime`` granularity. On a filesystem that stores
-  second-granular ``ctime`` (ext4 with 128-byte inodes, and overlayfs over it) a rewrite that
-  completes inside one second drifts nothing and production legitimately returns a digest;
-- the symlink swap removed and recreated the link, so it needed the recreated symlink to get
-  a *different* inode number. Linux reuses just-freed inode numbers, and with a coarse
-  ``ctime`` the recreated link is indistinguishable from the original.
-
-The fix separates the two concerns the acceptance calls out:
+The oracle is built in three layers:
 
 1. :class:`UntrackedIdentityFieldOracle` — **hermetic, always runs.** It injects the drift
    into the observation itself (one ``stat`` field, one observation, one delta) instead of
@@ -37,18 +25,27 @@ The fix separates the two concerns the acceptance calls out:
 2. :class:`UntrackedIdentityRealFilesystemTest` — **real filesystem.** Only this layer can
    pin *when* production takes its observations (a synthetic drift is delivered to whichever
    call site exists, so it cannot tell "re-stat after the read" from "re-stat before it").
-   Three of its four races are made deterministic by keeping both objects alive across the
-   swap, so a distinct inode is guaranteed rather than hoped for. The fourth genuinely needs
-   filesystem support and is gated on a typed, measured capability probe.
+   Every race here is deterministic on any POSIX filesystem: the drift is either a size
+   change, or an inode change produced by keeping BOTH objects alive across the swap.
 3. :class:`UntrackedIdentityCoverageTest` — a differential oracle over the production source:
    the per-field table below is compared against the fields production actually reads, so a
    newly compared field cannot land without a test.
 
-A capability that is absent produces a typed skip, never a silent pass — and never a coverage
-hole either, because layer 1 covers the same field unconditionally.
+**Background — why the oracle is shaped this way (Redmine #14655).** Its predecessor
+(``HashUntrackedIdentityStabilityTest`` in ``test_sublane_hibernate.py``) produced the drift by
+asking the *real* filesystem for it, so two cases silently inherited filesystem behaviour and
+were not CI-hermetic (reproduced on Linux overlayfs/tmpfs in #14580 review j#91949): a
+same-size, mtime-restored rewrite left ``st_ctime_ns`` as the only discriminator and so needed
+sub-second ``ctime`` granularity, and a symlink swap that removed and recreated the link needed
+the new link to get a different inode number, which Linux does not guarantee — it hands
+just-freed numbers straight back out. Both are properties of the host, not of the contract, so
+neither belongs in the assertion path. No test here depends on either one: `ctime` is exercised
+only through an injected observation, and every real swap keeps both objects alive so POSIX
+guarantees the distinct inode.
 
-Refs: Redmine #14655 filesystem hermeticity; #14580 review j#91949; #13843 review j#83853 /
-j#83889 (the fail-closed contract itself, which this module does not change).
+Refs: Redmine #13843 review j#83853 / j#83889 (the contract, unchanged here); #14655 filesystem
+hermeticity, review j#92295 F1 (the ctime capability probe this module no longer has);
+#14580 review j#91949.
 """
 
 from __future__ import annotations
@@ -262,13 +259,16 @@ class UntrackedIdentityFieldOracle(unittest.TestCase):
 class FsCapability(enum.Enum):
     """A filesystem behaviour a real-filesystem race needs in order to mean anything."""
 
-    #: A same-size, in-place rewrite with ``mtime`` restored still drifts ``st_ctime_ns``.
-    #: Absent wherever ``ctime`` is second-granular (ext4 with 128-byte inodes, overlayfs
-    #: over it) and the rewrite completes inside one tick.
-    CTIME_DRIFT_ON_SAME_SIZE_INPLACE_REWRITE = "ctime_drift_on_same_size_inplace_rewrite"
-
     #: Two paths that exist at the same time on the same device have different inode numbers.
-    #: Required by every race that swaps one live object over another.
+    #: Required by every race that swaps one live object over another. POSIX guarantees it, so
+    #: this probe is a fail-closed check on that guarantee rather than a real expected variance.
+    #:
+    #: A capability admitted here must be a stable PROPERTY of the filesystem. Timestamp
+    #: granularity is deliberately NOT one: whether a given operation drifts a coarse ``ctime``
+    #: depends on whether it happened to straddle a tick, so sampling it returns different
+    #: answers on the same filesystem run to run (measured: 146 present / 154 absent over 300
+    #: runs at one tick size). Anything whose answer moves with timing belongs in the synthetic
+    #: layer, not behind a capability gate (review j#92295 F1, verdict j#92300).
     DISTINCT_INODE_FOR_COEXISTING_PATHS = "distinct_inode_for_coexisting_paths"
 
 
@@ -290,54 +290,6 @@ class CapabilityVerdict:
         """
         if not self.present:
             raise unittest.SkipTest(f"capability_absent:{self.capability.value}: {self.detail}")
-
-
-def _identity(observed: os.stat_result) -> dict[str, int]:
-    return {
-        "dev": observed.st_dev,
-        "ino": observed.st_ino,
-        "size": observed.st_size,
-        "mtime_ns": observed.st_mtime_ns,
-        "ctime_ns": observed.st_ctime_ns,
-    }
-
-
-def _drifted_fields(before: os.stat_result, after: os.stat_result) -> tuple[str, ...]:
-    lhs, rhs = _identity(before), _identity(after)
-    return tuple(sorted(key for key in lhs if lhs[key] != rhs[key]))
-
-
-def probe_ctime_drift(directory: Path, samples: int = 5) -> CapabilityVerdict:
-    """Measure whether a same-size, mtime-restored rewrite drifts ``ctime`` on THIS filesystem.
-
-    Repeated ``samples`` times and required to hold EVERY time: on a second-granular
-    filesystem a single rewrite occasionally straddles a tick boundary and drifts by luck, and
-    a probe that accepted one lucky sample would re-admit the flake it exists to prevent. The
-    probe writes a small file, so it is strictly faster than the race it gates — a filesystem
-    that always drifts for the probe always drifts for the (longer) real test.
-    """
-    capability = FsCapability.CTIME_DRIFT_ON_SAME_SIZE_INPLACE_REWRITE
-    payload = 4096
-    for attempt in range(samples):
-        target = directory / f"probe-{attempt}"
-        target.write_bytes(b"A" * payload)
-        before = os.stat(target)
-        with open(target, "r+b") as handle:
-            handle.seek(0)
-            handle.write(b"B" * payload)
-        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
-        observed = _drifted_fields(before, os.stat(target))
-        os.remove(target)
-        if observed != ("ctime_ns",):
-            return CapabilityVerdict(
-                capability,
-                False,
-                f"sample {attempt + 1}/{samples} drifted {observed or '()'}, expected "
-                "('ctime_ns',) — this filesystem cannot isolate a ctime-only drift",
-            )
-    return CapabilityVerdict(
-        capability, True, f"{samples}/{samples} samples drifted ctime_ns and nothing else"
-    )
 
 
 def probe_distinct_inode(directory: Path) -> CapabilityVerdict:
@@ -362,17 +314,27 @@ def probe_distinct_inode(directory: Path) -> CapabilityVerdict:
 
 
 class UntrackedIdentityRealFilesystemTest(unittest.TestCase):
-    """Real races against a real filesystem, made deterministic where that is possible.
+    """Real races against a real filesystem. Every one of them is deterministic.
 
     A synthetic drift proves the comparison rejects a drifted observation, but it is delivered
     to whichever call site exists — it cannot distinguish "re-observe after the read" from
     "re-observe before it". These races can: the mutation happens between production's own
     observations, so an observation taken at the wrong moment sees nothing and the test fails.
+    That temporal placement is the ONLY thing this layer is here to prove; every compared field
+    is covered unconditionally by :class:`UntrackedIdentityFieldOracle`.
 
-    The three swap races avoid the two filesystem behaviours that made the previous oracle
-    non-hermetic (inode-number reuse and ``ctime`` granularity) by keeping BOTH objects alive
-    across the swap: two paths that coexist must have different inode numbers, so the drift is
-    guaranteed by POSIX rather than by the filesystem's timestamp resolution.
+    The drift each race relies on is guaranteed by POSIX, never by a host property:
+
+    - an append changes ``st_size``;
+    - a swap changes ``st_ino``, because BOTH objects are kept alive across it and two
+      coexisting paths on one device cannot share an inode number.
+
+    Nothing here observes a timestamp. A race whose only discriminator was ``st_ctime_ns``
+    lived here until review j#92295 F1: it needed sub-second ``ctime`` granularity, which is a
+    property of the host and — worse — one whose observation moves with timing rather than
+    with the filesystem. Measurement showed it contributed no mutation coverage at all (the
+    ``st_ctime_ns`` comparison is killed by the synthetic layer, and the read-window placement
+    by the append race below), so it was removed rather than gated. See verdict j#92300.
     """
 
     def _hash(self, root: Path, name: str) -> Optional[bytes]:
@@ -471,46 +433,6 @@ class UntrackedIdentityRealFilesystemTest(unittest.TestCase):
             with mock.patch.object(B.os, "read", side_effect=racing_read):
                 result = self._hash(root, "r")
             self.assertEqual(fired["n"], 1, "the append never fired; the race did not happen")
-            self.assertIsNone(result)
-
-    def test_same_size_mtime_restored_rewrite_fails_closed(self) -> None:
-        # The ctime-only case: same inode, same size, ``mtime`` restored with ``utime``, so
-        # ``st_ctime_ns`` is the sole discriminator. It is the one race no fixture can make
-        # deterministic — a filesystem that does not resolve the rewrite in ``ctime`` simply
-        # has nothing to observe — so it is gated on a measured capability. The field itself
-        # stays covered by ``UntrackedIdentityFieldOracle.test_read_window_ctime_...``.
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            probe_ctime_drift(root).require(self)
-            payload = 200000
-            target = root / "r"
-            target.write_bytes(b"A" * payload)
-            self._assert_quiescent_baseline(root, "r")
-            baseline = os.stat(target)
-
-            real_read = os.read
-            fired = {"n": 0}
-
-            def racing_read(fd, size):
-                chunk = real_read(fd, size)
-                if chunk and fired["n"] == 0:
-                    fired["n"] = 1
-                    with open(target, "r+b") as handle:
-                        handle.seek(0)
-                        handle.write(b"B" * payload)
-                    os.utime(target, ns=(baseline.st_atime_ns, baseline.st_mtime_ns))
-                return chunk
-
-            with mock.patch.object(B.os, "read", side_effect=racing_read):
-                result = self._hash(root, "r")
-            self.assertEqual(fired["n"], 1, "the rewrite never fired; the race did not happen")
-            settled = os.stat(target)
-            self.assertEqual(
-                _drifted_fields(baseline, settled),
-                ("ctime_ns",),
-                "the race must leave ctime as the ONLY discriminator, else it proves nothing "
-                "about the ctime check",
-            )
             self.assertIsNone(result)
 
     def test_stable_regular_file_hashes(self) -> None:
