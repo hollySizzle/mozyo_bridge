@@ -207,6 +207,35 @@ def strict_marker_fields(
     return fields
 
 
+def strict_marker_fields_in_note(notes: str):
+    """Every marker as ``(channel, fields)``, or ``None`` if ANY of them is unreadable (pure).
+
+    The drop-in strict counterpart of :func:`marker_fields_in_note` for readers whose result
+    reaches an EFFECT — a send, an actuation, an admission (Redmine #14539 review j#92060).
+    Those readers cannot use the lenient fold: it collapses a repeated key by last-write-wins and
+    normalizes whitespace, so a body the canonical producer could not render arrives looking clean
+    and becomes a dispatch anchor, a recovery key, or a work anchor.
+
+    ``None`` rather than "the readable subset" is deliberate, and is the contract's own wording:
+    "fragment を捨てて残りを一致させず marker 全体を fail-closed とする". Dropping the unreadable
+    marker and matching on the rest would let a note carrying one clean marker plus one forged one
+    read exactly like a clean note — which is how an exact-anchor check gets weakened by a change
+    meant to tighten it.
+    """
+    if not notes:
+        return ()
+    found = []
+    for match in _MARKER_RE.finditer(notes):
+        channel = match.group("channel")
+        if channel not in _RECOGNIZED_CHANNELS:
+            continue
+        fields = strict_marker_fields(_parse_marker_components(match.group("body")))
+        if fields is None:
+            return None
+        found.append((channel, fields))
+    return tuple(found)
+
+
 def declares_gate(notes: str, gate: str) -> bool:
     """Whether ``notes`` CLAIMS ``gate`` at all, however its marker parses (pure).
 
@@ -625,11 +654,14 @@ def dispatch_entry_journals(
         entry_journal = str(getattr(entry, "journal_id", "") or "").strip()
         if not entry_journal:
             continue
-        for channel, fields in marker_fields_in_note(getattr(entry, "notes", "") or ""):
-            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
-                continue
-            if str(fields.get("kind", "")).strip() != DISPATCH_KIND_IMPLEMENTATION_REQUEST:
-                continue
+        # Effect-reaching: the anchor this resolves drives the callback sweep's send decision, so
+        # the note is read strictly and an unreadable marker refuses the whole entry.
+        # ``strict_gate_markers`` carries all three requirements at once: the workflow-event
+        # channel, a renderable body, and a logical gate set of exactly this kind — so a note
+        # naming a second gate in the other alias proves neither and matches nothing.
+        for fields in strict_gate_markers(
+            getattr(entry, "notes", "") or "", DISPATCH_KIND_IMPLEMENTATION_REQUEST
+        ):
             if str(fields.get("lane", "")).strip() != lane_s:
                 continue
             if str(fields.get("lane_generation", "")).strip() != gen_s:
@@ -653,11 +685,9 @@ def dispatch_generations(entries: "Iterable[RedmineJournalEntry]", *, lane: str)
         return ()
     found: set[int] = set()
     for entry in entries or ():
-        for channel, fields in marker_fields_in_note(getattr(entry, "notes", "") or ""):
-            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
-                continue
-            if str(fields.get("kind", "")).strip() != DISPATCH_KIND_IMPLEMENTATION_REQUEST:
-                continue
+        for fields in strict_gate_markers(
+            getattr(entry, "notes", "") or "", DISPATCH_KIND_IMPLEMENTATION_REQUEST
+        ):
             if str(fields.get("lane", "")).strip() != lane_s:
                 continue
             raw = str(fields.get("lane_generation", "")).strip()
@@ -840,6 +870,7 @@ __all__ = (
     "marker_logical_gates",
     "declares_gate",
     "strict_gate_markers",
+    "strict_marker_fields_in_note",
     "strict_marker_fields",
     "extract_markers_from_note",
     "extract_marker",

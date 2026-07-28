@@ -41,7 +41,7 @@ from typing import Iterable, Optional
 
 from .redmine_journal_source import (
     MARKER_CHANNEL_WORKFLOW_EVENT,
-    marker_fields_in_note,
+    strict_gate_markers,
 )
 
 #: The key schema version. It participates in the digest, so a future field set can never be
@@ -428,9 +428,11 @@ def resolve_recovery_action_key(
         )
     markers = [
         fields
-        for channel, fields in marker_fields_in_note(str(getattr(matched[0], "notes", "") or ""))
-        if channel == MARKER_CHANNEL_WORKFLOW_EVENT
-        and str(fields.get("kind", "")).strip() == RECOVERY_ACTION_MARKER_KIND
+        # Effect-reaching: this key admits the first state-changing recovery action, so the note
+        # is read through the shared strict gate reader (review j#92060 finding 3).
+        for fields in strict_gate_markers(
+            str(getattr(matched[0], "notes", "") or ""), RECOVERY_ACTION_MARKER_KIND
+        )
     ]
     if not markers:
         return RecoveryActionLookup(

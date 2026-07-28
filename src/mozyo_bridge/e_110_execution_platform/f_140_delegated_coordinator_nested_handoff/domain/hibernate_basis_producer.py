@@ -404,11 +404,13 @@ def _answered_review_request(
         jint = _journal_int(journal.journal_id)
         if jint is None or jint >= result_id:
             continue
-        markers = _markers_of(journal.notes, MARKER_GATE_REVIEW_REQUEST)
-        if not markers:
+        # Selection by DECLARATION, exactly as ``_latest_gate_declaration`` (review j#92060
+        # finding 1): keying on the strict markers meant a malformed newer request did not shadow
+        # an older valid one, so the older request came back as the answered round.
+        if not declares_gate(journal.notes, MARKER_GATE_REVIEW_REQUEST):
             continue
         if best is None or jint > best[0]:
-            best = (jint, markers)
+            best = (jint, _markers_of(journal.notes, MARKER_GATE_REVIEW_REQUEST))
     if best is None:
         return "", ""
     heads = {str(fields.get(FIELD_HEAD, "") or "").strip() for fields in best[1]}
@@ -429,10 +431,12 @@ def _review_request_after(
     result_id = _journal_int(result_journal)
     if result_id is None:
         return False
+    # A re-review request REOPENS by existing. An unreadable one still reopens — refusing to see
+    # it would let an approval outlive a round the record says was reopened (review j#92060 F1).
     return any(
         _journal_int(journal.journal_id) is not None
         and _journal_int(journal.journal_id) > result_id
-        and _markers_of(journal.notes, MARKER_GATE_REVIEW_REQUEST)
+        and declares_gate(journal.notes, MARKER_GATE_REVIEW_REQUEST)
         for journal in journals or ()
     )
 
@@ -660,7 +664,7 @@ def produce_basis_conjuncts(
             # (1) is the canonical correlation rule; (2) is what keeps an approval from outliving
             # its round. A later request cannot retroactively validate an earlier approval (it is
             # not the answered request), and it also invalidates the round that approval closed.
-            if _markers_of(declaration.notes, MARKER_GATE_REVIEW_REQUEST):
+            if declares_gate(declaration.notes, MARKER_GATE_REVIEW_REQUEST):
                 # Contradictory in ONE record: answering an earlier round while opening a new one.
                 # Neither the strictly-before correlation (which looks before this journal) nor the
                 # supersession check (which looks after it) can see a request filed in the result's

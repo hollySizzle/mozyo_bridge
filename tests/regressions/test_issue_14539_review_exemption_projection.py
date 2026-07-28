@@ -2488,5 +2488,241 @@ class ReviewJ92012CanonicalizerParityTests(unittest.TestCase):
         )
 
 
+class ReviewJ92060ReviewRequestSelectorTests(unittest.TestCase):
+    """R19-F1: the review_request-specific selectors kept the old existence/readability conflation.
+
+    R17 moved ``_latest_gate_declaration`` to declaration-based selection but left the two
+    review_request selectors in the SAME module keying on the strict markers, so a malformed newer
+    request neither shadowed the older one nor reopened a closed round.
+    """
+
+    HEAD = "a" * 40
+
+    def _request(self, gate_field="gate=review_request"):
+        return (
+            f"[mozyo:workflow-event:{gate_field}:workspace=ws:lane=r1:"
+            f"lane_generation=1:head={self.HEAD}]"
+        )
+
+    def _journals(self, pairs):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+            EvidenceJournal,
+        )
+
+        return [EvidenceJournal(journal_id=j, notes=n) for j, n in pairs]
+
+    def test_the_sole_valid_request_is_the_answered_one(self):
+        """Control: without it the shadow assertion could be a broken fixture."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_basis_producer import (  # noqa: E501
+            _answered_review_request,
+        )
+
+        journal, head = _answered_review_request(
+            self._journals([("1", self._request())]), result_journal="3"
+        )
+        self.assertEqual((journal, head), ("1", self.HEAD))
+
+    def test_a_malformed_newer_request_shadows_the_older_valid_one(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_basis_producer import (  # noqa: E501
+            _answered_review_request,
+        )
+
+        for label, gate_field in (
+            ("whitespace", "gate = review_request"),
+            ("unknown second alias", "gate=review_request:kind=unknown_gate"),
+        ):
+            with self.subTest(label):
+                journal, head = _answered_review_request(
+                    self._journals(
+                        [("1", self._request()), ("2", self._request(gate_field=gate_field))]
+                    ),
+                    result_journal="3",
+                )
+                # The NEWER journal is the answered round, and it names no head — so no approval
+                # can correlate to it, which is the fail-closed direction.
+                self.assertEqual(journal, "2")
+                self.assertEqual(head, "")
+
+    def test_a_malformed_request_after_a_result_still_reopens_the_round(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_basis_producer import (  # noqa: E501
+            _review_request_after,
+        )
+
+        for label, gate_field in (
+            ("valid", "gate=review_request"),
+            ("whitespace", "gate = review_request"),
+            ("unknown second alias", "gate=review_request:kind=unknown_gate"),
+        ):
+            with self.subTest(label):
+                self.assertTrue(
+                    _review_request_after(
+                        self._journals([("4", self._request(gate_field=gate_field))]),
+                        result_journal="3",
+                    )
+                )
+
+    def test_no_request_after_the_result_does_not_reopen(self):
+        """Negative control: reopening must still require a declaration to exist."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_basis_producer import (  # noqa: E501
+            _review_request_after,
+        )
+
+        self.assertFalse(
+            _review_request_after(
+                self._journals([("2", self._request())]), result_journal="3"
+            )
+        )
+
+
+class ReviewJ92060EffectReachingReaderTests(unittest.TestCase):
+    """R19-F2/F3: every reader whose result reaches an EFFECT reads strictly.
+
+    Three rounds running, a reader was left on the lenient fold because it was classified by its
+    name rather than by where its result travels. These pin the behaviour at each effect boundary
+    the review named, and the last test pins the CLASSIFICATION itself so a new lenient authority
+    reader cannot be added silently.
+    """
+
+    def _dispatch_note(self, kind_field="kind=implementation_request"):
+        return f"[mozyo:workflow-event:{kind_field}:lane=r1:lane_generation=1]"
+
+    def _entries(self, note):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+        )
+
+        return [RedmineJournalEntry(issue_id="1", journal_id="7", notes=note)]
+
+    def test_the_dispatch_anchor_and_generation_refuse_unrenderable_bodies(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            dispatch_generations,
+            resolve_dispatch_entry_journal,
+        )
+
+        clean = self._entries(self._dispatch_note())
+        self.assertEqual(
+            resolve_dispatch_entry_journal(clean, lane="r1", lane_generation=1), "7"
+        )
+        self.assertEqual(dispatch_generations(clean, lane="r1"), (1,))
+        for label, note in (
+            ("whitespace", self._dispatch_note("kind = implementation_request")),
+            ("duplicate key",
+             self._dispatch_note().replace("lane=r1", "lane=other:lane=r1")),
+            ("unknown second alias",
+             self._dispatch_note("kind=implementation_request:gate=unknown_gate")),
+        ):
+            with self.subTest(label):
+                entries = self._entries(note)
+                # Fail-closed to "" is this resolver's own zero-send contract.
+                self.assertEqual(
+                    resolve_dispatch_entry_journal(entries, lane="r1", lane_generation=1), ""
+                )
+                self.assertEqual(dispatch_generations(entries, lane="r1"), ())
+
+    def test_an_unreadable_marker_leaves_the_entry_unclassified(self):
+        """``stall_unprovable`` exists for opaque entries; a forged body must not look understood."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_sweep_watermark import (  # noqa: E501
+            _entry_is_classified,
+        )
+
+        class _E:
+            def __init__(self, notes):
+                self.notes = notes
+
+        self.assertTrue(_entry_is_classified(_E(self._dispatch_note())))
+        self.assertFalse(
+            _entry_is_classified(_E(self._dispatch_note("kind = implementation_request")))
+        )
+
+    def test_the_exact_work_anchor_refuses_unrenderable_bodies(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovered_worker_delivery import (  # noqa: E501
+            is_exact_implementation_request_anchor,
+        )
+
+        class _E:
+            def __init__(self, notes):
+                self.issue_id = "500"
+                self.journal_id = "9"
+                self.notes = notes
+
+        kwargs = dict(issue="500", journal="9", lane="r1", lane_generation="1")
+        self.assertTrue(
+            is_exact_implementation_request_anchor(_E(self._dispatch_note()), **kwargs)
+        )
+        for label, note in (
+            ("whitespace", self._dispatch_note("kind = implementation_request")),
+            ("duplicate key",
+             self._dispatch_note("kind=other:kind=implementation_request")),
+        ):
+            with self.subTest(label):
+                self.assertFalse(
+                    is_exact_implementation_request_anchor(_E(note), **kwargs)
+                )
+
+    def test_a_clean_marker_beside_a_forged_one_does_not_read_as_clean(self):
+        """The reason the strict scan refuses the NOTE, not just the bad marker."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovered_worker_delivery import (  # noqa: E501
+            is_exact_implementation_request_anchor,
+        )
+
+        class _E:
+            def __init__(self, notes):
+                self.issue_id = "500"
+                self.journal_id = "9"
+                self.notes = notes
+
+        mixed = self._dispatch_note() + "\n[mozyo:workflow-event:gate = forged]"
+        self.assertFalse(
+            is_exact_implementation_request_anchor(
+                _E(mixed), issue="500", journal="9", lane="r1", lane_generation="1"
+            )
+        )
+
+    def test_only_the_declared_display_readers_still_use_the_lenient_fold(self):
+        """The classification itself, pinned — this is what kept regressing.
+
+        Three consecutive rounds found a reader left lenient because it was judged by its name.
+        The rule is now mechanical: a module may call ``marker_fields_in_note`` only if it is on
+        this list, and each entry says why its result never reaches a send / actuation / admission.
+        Adding a new lenient reader to an authority module fails HERE rather than in the next
+        audit.
+        """
+        import pathlib
+        import re
+
+        allowed = {
+            # Display projection only. #14213 deliberately keeps its historical leniency; the
+            # authority consumers ask ``has_conflicting_disposition_declaration`` first.
+            "glance_integration_disposition.py",
+            # Structural gate QUALIFICATION only (does this note carry the gate heading/marker at
+            # all). Every field it then reads goes through its own exactly-one rule.
+            "review_exemption.py",
+            # Defines the scanner and its strict counterpart.
+            "redmine_journal_source.py",
+            # Pure approval-shape comparison; the LIVE readers that admit a close were moved to
+            # the strict reader (review j#92012 finding 2).
+            "composer_discard_approval.py",
+        }
+        root = pathlib.Path(__file__).resolve().parents[2] / "src" / "mozyo_bridge"
+        offenders = set()
+        for path in root.rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            # Match the NAME anywhere — call, plain import, or aliased import.
+            # Matching only call sites let ``import marker_fields_in_note as _x``
+            # walk straight past the guard, which a probe against THIS test found.
+            # The strict helper's name contains the lenient one, so the lookbehind
+            # keeps the pattern from matching itself.
+            if re.search(r"(?<!strict_)\bmarker_fields_in_note\b", text):
+                if path.name not in allowed:
+                    offenders.add(path.name)
+        self.assertEqual(
+            offenders,
+            set(),
+            "these modules call the LENIENT marker fold; if the result reaches a send / "
+            "actuation / admission it must use the strict reader, and if it genuinely does not, "
+            "add it to the allowlist above WITH the reason",
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
