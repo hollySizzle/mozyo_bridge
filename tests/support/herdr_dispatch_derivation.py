@@ -81,6 +81,21 @@ sweep gate that analysed a function only when a *local* was tainted, which had b
 because the over-broad rule happened to create such a local.  Two errors had been
 cancelling; the pair is worth remembering when a change here makes the numbers move.
 
+One more assumption was hiding underneath all of that: the walk read assignment *targets*
+without reading **scope declarations** (review j#92266 F4).  ``global X; X = self.runner``
+therefore looked like an ordinary local binding while actually publishing the runner to
+module state for any other function to dispatch through — silent in all three channels,
+the original defect's exact shape.  ``global`` / ``nonlocal`` names are now excluded from
+local binding and an assignment of a tainted value to one is reported.  ``nonlocal`` had
+appeared to work, but only because :func:`ast.walk` descends into nested definitions and
+picked the inner assignment up as an outer local: the same scope blindness, surfacing as
+an accidental catch instead of a miss.
+
+:data:`_MODELLED_ATTRIBUTE_READS` is likewise checked against use rather than trusted:
+:attr:`Derivation.used_read_exceptions` records which keys a run actually consumed, and a
+test requires the two sets to match exactly.  Without that, a stale or mistyped key sat in
+the guard pre-authorising a read nobody performs (review j#92266 F5).
+
 It is analysis-only: nothing here imports the modules it reads, executes production
 code, or touches a Herdr endpoint.
 """
@@ -155,6 +170,9 @@ class Derivation:
     seed_flows: tuple = ()
     #: Tainted values the walk could not follow (fail-closed findings, not pairs).
     unresolved_flows: tuple = ()
+    #: Which :data:`_MODELLED_ATTRIBUTE_READS` keys this run actually consumed.  Compared
+    #: against the table so an entry nobody uses cannot linger (review j#92266 F5).
+    used_read_exceptions: frozenset = frozenset()
 
     @property
     def pairs(self) -> frozenset:
@@ -413,6 +431,10 @@ class _Walker:
         #: ``RecordingHerdrRunner``, and without carrying that across the call the
         #: wrapper's own forwarding site has no argv anyone can resolve.
         self.param_classes: dict = {}
+        #: Exception keys from :data:`_MODELLED_ATTRIBUTE_READS` this run actually
+        #: consumed.  Without it a stale or mistyped entry sits in the table forever,
+        #: pre-authorising a read nobody performs (review j#92266 F5).
+        self.used_read_exceptions: set = set()
         self.dispatch_calls: list = []  # (module, qualname, Call node, func expr)
         self.unresolved_flows: list = []
 
@@ -472,6 +494,26 @@ class _Walker:
 
     # -- per-function analysis ----------------------------------------------
 
+    def _rebound_scope_names(self, function: ast.AST) -> set:
+        """Names this body rebinds in an OUTER scope via ``global`` / ``nonlocal``.
+
+        The walk tracks locals.  Assigning to one of these names does not create a local
+        at all — it writes module state, or an enclosing function's state, where another
+        function can pick it up and dispatch.  Reading only the assignment target's node
+        type made that look like an ordinary local binding, and the runner escaped
+        through it in complete silence (review j#92266 F4).
+
+        Collected across nested definitions too.  That over-collects — a name declared
+        ``global`` only inside an inner function is excluded here as well — and that is
+        the fail-closed direction: reporting a binding the walk might have handled is
+        recoverable, missing one is what this module exists to prevent.
+        """
+        names: set = set()
+        for node in ast.walk(function):
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                names.update(node.names)
+        return names
+
     def _local_taint(self, module: str, qualname: str, function: ast.AST) -> tuple:
         """``(tainted names, kwargs maps)`` bound to a tainted value in one body.
 
@@ -482,6 +524,7 @@ class _Walker:
         have reported "no dispatch sites" for the entire session-start path.
         """
         owner = _enclosing_class(qualname)
+        rebound = self._rebound_scope_names(function)
         local = {
             name
             for name in _parameter_names(function)
@@ -515,7 +558,11 @@ class _Walker:
                 if not self._is_tainted(module, owner, local, value):
                     continue
                 for target in targets:
-                    if isinstance(target, ast.Name) and target.id not in local:
+                    if (
+                        isinstance(target, ast.Name)
+                        and target.id not in local
+                        and target.id not in rebound
+                    ):
                         local.add(target.id)
                         changed = True
         return local, kwargs_maps
@@ -727,6 +774,7 @@ class _Walker:
     def _sweep(self) -> None:
         self.dispatch_calls = []
         self.unresolved_flows = []
+        self.used_read_exceptions = set()
         for module_name, module in self.index.items():
             for qualname, function in module.functions.items():
                 local, kwargs_maps = self._local_taint(module_name, qualname, function)
@@ -898,6 +946,7 @@ class _Walker:
     def _check_escapes(
         self, module: str, qualname: str, owner: str, local: set, function: ast.AST
     ) -> None:
+        rebound = self._rebound_scope_names(function)
         parents: dict = {}
         for node in ast.walk(function):
             for child in ast.iter_child_nodes(node):
@@ -933,7 +982,7 @@ class _Walker:
                     f"not follow"
                 )
                 continue
-            if self._is_modelled_parent(node, parent):
+            if self._is_modelled_parent(node, parent, rebound):
                 continue
             self.unresolved_flows.append(
                 f"{module}:{qualname}:{getattr(node, 'lineno', 0)}: a runner-carrying "
@@ -1092,9 +1141,14 @@ class _Walker:
         module, class_name = class_ref
         if (module, class_name, attr) in self.tainted_attrs:
             return True
-        return (class_name, attr) in _MODELLED_ATTRIBUTE_READS
+        if (class_name, attr) in _MODELLED_ATTRIBUTE_READS:
+            self.used_read_exceptions.add((class_name, attr))
+            return True
+        return False
 
-    def _is_modelled_parent(self, node: ast.AST, parent: ast.AST) -> bool:
+    def _is_modelled_parent(
+        self, node: ast.AST, parent: ast.AST, rebound: set = frozenset()
+    ) -> bool:
         """Whether ``parent`` is a context the walk actually follows for ``node``.
 
         Two shapes look modelled but are not, so they are excluded by position rather
@@ -1109,7 +1163,7 @@ class _Walker:
             if parent.value is not node:
                 return True  # the runner IS the target being rebound; taint follows it
             return all(
-                isinstance(target, ast.Name)
+                (isinstance(target, ast.Name) and target.id not in rebound)
                 or (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
@@ -1767,6 +1821,7 @@ def derive_dispatch_surface(source_root: Optional[Path] = None) -> Derivation:
         ),
         seed_flows=derive_seed_flows(index),
         unresolved_flows=tuple(sorted(set(walker.unresolved_flows))),
+        used_read_exceptions=frozenset(walker.used_read_exceptions),
     )
 
 

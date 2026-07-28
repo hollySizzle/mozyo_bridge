@@ -115,6 +115,23 @@ EDGES = [
      '    def _p(self):\n        return [r for r in [self.runner]]\n\n', True),
     ("escape: yield", None, None,
      '    def _p(self):\n        yield self.runner\n\n', True),
+    # -- module / enclosing-scope carriers (review j#92266 F4) ---------------------------
+    ("carrier: global module state", None,
+     "\n\n_PROBE_GLOBAL_RUNNER = None\n\n\ndef _probe_global_dispatch():\n    return _PROBE_GLOBAL_RUNNER([\"bin\", \"probe\", \"global-carrier\"])\n",
+     '    def _p(self):\n        global _PROBE_GLOBAL_RUNNER\n        _PROBE_GLOBAL_RUNNER = self.runner\n        return _probe_global_dispatch()\n\n', True),
+    ("carrier: nonlocal rebinding", None, None,
+     '    def _p(self):\n        holder = None\n\n        def _set():\n            nonlocal holder\n            holder = self.runner\n\n        _set()\n        return holder([self.binary, "probe", "nonlocal-carrier"])\n\n', True),
+    # -- Process boundary (escalation j#92214 required_surface) ---------------------------
+    # An INDEPENDENT mutant, not "the live tree happens to exercise it" — that substitute
+    # is exactly what review j#92266 rejected.  Both directions are pinned: a worker that
+    # dispatches must be found, and a worker whose argv cannot be resolved must be
+    # reported rather than dropped at the fork boundary.
+    ("process: worker dispatches through the forked runner", None,
+     "\n\ndef _probe_worker(index, gate_runner):\n    return gate_runner([\"bin\", \"probe\", \"process-worker\"])\n",
+     '    def _p(self):\n        import multiprocessing\n        ctx = multiprocessing.get_context("fork")\n        proc = ctx.Process(target=_probe_worker, args=(0, self.runner))\n        proc.start()\n        return proc\n\n', True),
+    ("process: worker argv unresolvable", None,
+     "\n\ndef _probe_worker_opaque(index, gate_runner, chosen):\n    return gate_runner(chosen)\n",
+     '    def _p(self, chosen):\n        import multiprocessing\n        ctx = multiprocessing.get_context("fork")\n        proc = ctx.Process(target=_probe_worker_opaque, args=(0, self.runner, chosen))\n        proc.start()\n        return proc\n\n', True),
     # -- argv resolution ----------------------------------------------------------------
     ("argv: unresolvable argv", None, None,
      '    def _p(self, chosen):\n        return self.runner(chosen)\n\n', True),
@@ -150,7 +167,13 @@ def run_edge(init_inj, tail_inj, owner_inj):
         d = derive_dispatch_surface(tmp)
         pairs = [p for p in d.pairs if p[0] == "probe"]
         sites = [x for x in d.unresolved_sites if "_p" == x.function.split(".")[-1] or "_Probe" in x.function]
-        flows = [f for f in d.unresolved_flows if ":_p:" in f or "._p:" in f or "_Probe" in f]
+        flows = [
+            f for f in d.unresolved_flows
+            if ":_p:" in f or "._p:" in f or "_Probe" in f or "_probe_" in f
+        ]
+        sites = sites + [
+            x for x in d.unresolved_sites if "_probe_" in x.function
+        ]
         return bool(pairs or sites or flows), pairs
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -172,7 +195,7 @@ class DerivationEdgeSweepTests(unittest.TestCase):
             if got != expect:
                 mismatches.append(f"{label}: expected reported={expect}, got {got}")
         self.assertEqual(mismatches, [], "\n".join(mismatches))
-        self.assertGreaterEqual(len(rows), 20, "the sweep lost edges")
+        self.assertGreaterEqual(len(rows), 24, "the sweep lost edges")
 
 
 if __name__ == "__main__":  # pragma: no cover

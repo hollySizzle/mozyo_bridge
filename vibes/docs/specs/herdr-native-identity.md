@@ -1197,6 +1197,18 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     - **`with` の免除は撤去**した。「束縛されない」と「実行されない」は別である。
     - **callability と method 解決は base class を辿る**。解決できない base は callable 側
       (= taint を流す側) に倒す。
+    - **scope 宣言を読む** (review j#92266 F4)。assignment の *target* だけを見て
+      `ast.Global` / `ast.Nonlocal` を読まないと、`global X; X = runner` が「local へ入れた
+      だけ」に見え、**runner が module state へ出て別 function から dispatch できるのに
+      3 channel すべてが沈黙する** — 元障害と同型である。`global` / `nonlocal` 宣言名は
+      local binding として扱わず、そこへの tainted 代入は報告する。なお `nonlocal` は
+      修正前も「通って」いたが、それは `ast.walk` が nested definition へ降りて内側の代入を
+      外側 local として拾っていただけで、**同じ scope 無視が漏れ側と偶然の検出側に現れて
+      いた**にすぎない。
+    - **例外表は「使われたか」で検証する** (review j#92266 F5)。key の形だけを検査しても、
+      read が消えて entry だけ残る / typo key が将来の同名 read を事前許可する drift は
+      green のままになる。derivation が実際に消費した key を収集し (`used_read_exceptions`)、
+      **table key 集合と双方向一致**することと、各 key が実在 member を指すことを test で固定する。
     - wrapper 規則は **callable な class に限定**する。runner を保持するだけの container
       (smoke harness) を runner 扱いすると、その全属性が runner-carrying に見えてしまう。
     許可側を狭めたことが「全部報告する」に化けていないことは、benign な counter 読み取りを
@@ -1210,6 +1222,10 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     導出が何かを言うことを実測する。**control 2 件 (benign read / probe 無し) が沈黙する**
     ことも同時に固定し、「全部報告する」で全 mutant を通す退化を検出する。実行時間の都合で
     `MOZYO_DERIVATION_EDGE_SWEEP=1` の opt-in とし、個別 regression は unit 側で常時実行する。
+    **`Process` 境界は「live tree が現在通るから」で代替しない** (review j#92266)。propagation が
+    効くことと、worker の argv が解決できないときに fail-closed で報告されることを、
+    **独立 mutant 2 件**で固定する。module state (`global`) / enclosing scope (`nonlocal`) の
+    carrier も edge として明示する。
   - 静的導出を **実行でも裏取りする**。`tests/integration/.../test_shared_space_smoke_harness.py`
     が production 経路を fake 上で実走させ、実際に dispatch された pair が導出集合と
     allowlist の双方に含まれることを確認する。ただしこの fixture は launcher を解決しないため

@@ -259,6 +259,49 @@ class ModelledReadTableTests(unittest.TestCase):
                 )
                 self.assertTrue(reason.strip(), "every admitted read must record why")
 
+    def test_every_entry_is_actually_consumed_by_the_live_run(self) -> None:
+        """Review j#92266 F5, verdict j#92272.
+
+        The table's own tests checked that keys look well-formed, never that anything
+        uses them.  A stale key — a read that was removed, or a typo — therefore sat in
+        the guard pre-authorising a read nobody performs, which is the opposite of "a new
+        read stays red until a person adds it".
+        """
+        from support import herdr_dispatch_derivation as derivation
+
+        surface = _surface()
+        table = set(derivation._MODELLED_ATTRIBUTE_READS)
+        used = set(surface.used_read_exceptions)
+        self.assertEqual(
+            sorted(table - used),
+            [],
+            "these modelled-read exceptions are never consumed by the derivation; a "
+            "stale entry pre-authorises a read that no longer happens",
+        )
+        self.assertEqual(
+            sorted(used - table),
+            [],
+            "the run consumed an exception key that is not in the table",
+        )
+
+    def test_every_entry_names_an_attribute_the_class_really_has(self) -> None:
+        """A typo key would otherwise wait in the table for a matching future read."""
+        from support import herdr_dispatch_derivation as derivation
+
+        index = derivation._index_package(derivation.default_source_root())
+        walker = derivation._Walker(index)
+        for class_name, attribute in derivation._MODELLED_ATTRIBUTE_READS:
+            with self.subTest(cls=class_name, attr=attribute):
+                owner = [
+                    module for module, indexed in index.items()
+                    if class_name in indexed.classes
+                ][0]
+                self.assertNotEqual(
+                    walker._attribute_kind((owner, class_name), attribute),
+                    "unknown",
+                    f"{class_name}.{attribute} is not a member of that class",
+                )
+
     def test_the_table_stays_small(self) -> None:
         """A drifting exception table is how a fail-closed guard becomes fail-open."""
         from support import herdr_dispatch_derivation as derivation
@@ -596,6 +639,55 @@ class DerivationLivenessTests(unittest.TestCase):
             ("probe", "inherited-wrapper"),
             surface.pairs,
             "a wrapper inheriting __call__ was not recognised as a dispatcher",
+        )
+
+    def test_a_runner_stored_in_module_state_via_global_is_reported(self) -> None:
+        """Review j#92266 F4, verdict j#92272.
+
+        ``global X; X = self.runner`` looked like an ordinary local binding because the
+        walk read the assignment target's node type and never read the scope declaration.
+        The runner reached module state, another function dispatched through it, and all
+        three channels stayed empty — the same shape as the original defect.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_global_carrier(self):\n"
+            "        global _PROBE_GLOBAL_RUNNER\n"
+            "        _PROBE_GLOBAL_RUNNER = self.runner\n"
+            "        return _probe_global_dispatch()\n\n",
+            tail_addition=(
+                "\n\n_PROBE_GLOBAL_RUNNER = None\n\n\n"
+                "def _probe_global_dispatch():\n"
+                '    return _PROBE_GLOBAL_RUNNER(["bin", "probe", "global-carrier"])\n'
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            self._probe_reports(surface, "_probe_global_carrier"),
+            "a runner escaping into module state through `global` was silently omitted",
+        )
+
+    def test_a_runner_rebound_through_nonlocal_is_reported(self) -> None:
+        """The other half of the same root cause.
+
+        ``nonlocal`` previously "passed" only because the walk descends into nested
+        function bodies and picked the assignment up as an outer local — scope blindness
+        producing an accidental catch rather than a modelled one.  It is now reported
+        explicitly, because rebinding an enclosing scope is not something this walk
+        follows.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_nonlocal_carrier(self):\n"
+            "        holder = None\n\n"
+            "        def _inner_set():\n"
+            "            nonlocal holder\n"
+            "            holder = self.runner\n\n"
+            "        _inner_set()\n"
+            '        return holder([self.binary, "probe", "nonlocal-carrier"])\n\n'
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            self._probe_reports(surface, "_probe_nonlocal_carrier"),
+            "a runner rebound through `nonlocal` was silently omitted",
         )
 
     def test_the_probe_does_not_touch_the_live_source(self) -> None:
