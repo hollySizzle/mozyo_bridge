@@ -341,6 +341,7 @@ class DerivationLivenessTests(unittest.TestCase):
         runner_addition: str = "",
         init_addition: str = "",
         tail_addition: str = "",
+        recorder_addition: str = "",
     ) -> Path:
         tmp = Path(tempfile.mkdtemp(prefix="mozyo-derivation-probe-"))
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -375,6 +376,15 @@ class DerivationLivenessTests(unittest.TestCase):
             self.assertIn(tail_marker, source, "the module tail injection point moved")
             source = source.replace(tail_marker, tail_marker + tail_addition, 1)
         seed.write_text(source.replace(marker, addition + marker, 1), encoding="utf-8")
+        if recorder_addition:
+            recorder = seed.parent / "shared_space_smoke_observation.py"
+            body = recorder.read_text(encoding="utf-8")
+            recorder_marker = "    run = __call__"
+            self.assertIn(recorder_marker, body, "the recorder injection point moved")
+            recorder.write_text(
+                body.replace(recorder_marker, recorder_marker + recorder_addition, 1),
+                encoding="utf-8",
+            )
         return tmp
 
     def test_a_new_dispatch_site_appears_in_the_derivation(self) -> None:
@@ -689,6 +699,89 @@ class DerivationLivenessTests(unittest.TestCase):
             self._probe_reports(surface, "_probe_nonlocal_carrier"),
             "a runner rebound through `nonlocal` was silently omitted",
         )
+
+    def test_a_truth_test_on_the_runner_is_analysed(self) -> None:
+        """Review j#92326 F6-1, verdict j#92333.
+
+        ``runner = runner or subprocess.run`` already exists in production
+        (``herdr_session_start.py``).  ``BoolOp`` was on the modelled-parent list, so the
+        position was waved through — yet ``or`` *runs* ``__bool__`` on the operand.  No
+        call site has to change for that to dispatch; only the class does.
+
+        The dunder is injected on ``RecordingHerdrRunner`` because that is the class the
+        walk resolves at that site.  Using a class that does not flow there would pass for
+        the wrong reason.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_addition=(
+                "\n\n    def __bool__(self):\n"
+                '        self(["bin", "probe", "boolop-truth-test"])\n'
+                "        return True\n"
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertIn(
+            ("probe", "boolop-truth-test"),
+            surface.pairs,
+            "a dispatching __bool__ at the existing production BoolOp was not analysed",
+        )
+
+    def test_the_runner_used_directly_as_a_context_manager_is_analysed(self) -> None:
+        """Review j#92326 F6-2, verdict j#92333.
+
+        R4 closed ``with runner._ctx:`` — a context held on an *attribute*.  The tainted
+        value used directly as the context expression went through ``ast.withitem`` on the
+        modelled-parent list instead, so ``__enter__`` ran unexamined.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_direct_with(self):\n"
+            "        with self.runner:\n"
+            "            return None\n\n",
+            runner_addition=(
+                "    run = __call__\n\n"
+                "    def __enter__(self):\n"
+                '        return self(["bin", "probe", "direct-with"])\n\n'
+                "    def __exit__(self, *exc):\n"
+                "        return False\n"
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertIn(("probe", "direct-with"), surface.pairs)
+
+    def test_a_conditional_expression_test_on_the_runner_is_analysed(self) -> None:
+        """The third protocol position, closed by contract rather than by literal."""
+        tree = self._mutated_tree(
+            "    def _probe_ifexp(self):\n"
+            "        return 1 if self.runner else 0\n\n",
+            runner_addition=(
+                "    run = __call__\n\n"
+                "    def __bool__(self):\n"
+                '        self(["bin", "probe", "ifexp-test"])\n'
+                "        return True\n"
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertIn(("probe", "ifexp-test"), surface.pairs)
+
+    def test_a_protocol_position_without_the_dunder_stays_modelled(self) -> None:
+        """Control, taken from production rather than invented.
+
+        ``herdr_session_start`` really does contain ``runner = runner or
+        subprocess.run``, and the class at that site defines no ``__bool__``.  The live
+        derivation must therefore stay silent — otherwise the protocol contract has
+        degenerated into reporting every carrier position.
+        """
+        production = (
+            ROOT / "src" / "mozyo_bridge" / "e_140_adapter_provider"
+            / "f_130_terminal_runtime_provider" / "application" / "herdr_session_start.py"
+        )
+        self.assertIn(
+            "runner = runner or subprocess.run",
+            production.read_text(encoding="utf-8"),
+            "the production BoolOp this control depends on has moved",
+        )
+        self.assertEqual(_surface().unresolved_flows, ())
 
     def test_the_probe_does_not_touch_the_live_source(self) -> None:
         """Probe hygiene: mutating the copy must leave the real tree byte-identical.

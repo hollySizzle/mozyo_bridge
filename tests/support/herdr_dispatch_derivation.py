@@ -91,6 +91,20 @@ appeared to work, but only because :func:`ast.walk` descends into nested definit
 picked the inner assignment up as an outer local: the same scope blindness, surfacing as
 an accidental catch instead of a miss.
 
+One question remained conflated after all of that, and it was the same one (review
+j#92326 F6).  ``_MODELLED_PARENTS`` answers *where the value may travel*; it was also
+being used to answer *what the syntax executes on the value*.  Those are different, and
+three of its entries run a protocol: ``with <value>:`` runs ``__enter__`` / ``__exit__``,
+and a ``BoolOp`` operand or an ``IfExp`` test runs ``__bool__``.  ``runner = runner or
+subprocess.run`` already exists in production, so a ``__bool__`` appearing on the class at
+that site would have dispatched with no call site changing at all.
+:data:`_Walker._PROTOCOL_POSITIONS` now answers the second question separately, keyed by
+``(parent node type, child field)``, and a protocol position is modelled only when the
+receiver is bound into the dunder and analysed — the same rule as a declared method call.
+The three positions were established by auditing every modelled parent by child position;
+every other implicit-effect position in the language has no modelled parent and so already
+reports.
+
 :data:`_MODELLED_ATTRIBUTE_READS` is likewise checked against use rather than trusted:
 :attr:`Derivation.used_read_exceptions` records which keys a run actually consumed, and a
 test requires the two sets to match exactly.  Without that, a stale or mistyped key sat in
@@ -547,14 +561,20 @@ class _Walker:
                     value = node.context_expr
                 if value is None:
                     continue
-                carried = self._carried_keywords(module, owner, local, value)
+                carried = self._carried_keywords(
+                    module, owner, local, value, qualname
+                )
                 if carried:
                     for target in targets:
                         if isinstance(target, ast.Name):
-                            merged = kwargs_maps.setdefault(target.id, set())
-                            if not carried <= merged:
-                                merged |= carried
-                                changed = True
+                            merged = kwargs_maps.setdefault(target.id, {})
+                            for name, classes in carried.items():
+                                known = merged.setdefault(name, set())
+                                if not classes <= known:
+                                    known |= classes
+                                    changed = True
+                                elif name not in merged:
+                                    changed = True
                 if not self._is_tainted(module, owner, local, value):
                     continue
                 for target in targets:
@@ -587,21 +607,30 @@ class _Walker:
         return (resolved, list(arguments.elts))
 
     def _carried_keywords(
-        self, module: str, owner: str, local: set, expr: ast.AST
-    ) -> set:
-        """Keyword names under which ``dict(...)`` carries a tainted value."""
+        self, module: str, owner: str, local: set, expr: ast.AST, qualname: str = ""
+    ) -> dict:
+        """``{keyword: classes}`` under which ``dict(...)`` carries a tainted value.
+
+        The classes travel with the name so a value forwarded through ``**kwargs`` still
+        has a resolvable type at the far end; without that, protocol positions there can
+        only fail closed (review j#92326).
+        """
         if not (
             isinstance(expr, ast.Call)
             and isinstance(expr.func, ast.Name)
             and expr.func.id == "dict"
         ):
-            return set()
-        return {
-            keyword.arg
-            for keyword in expr.keywords
-            if keyword.arg
-            and self._is_tainted(module, owner, local, keyword.value)
-        }
+            return {}
+        carried: dict = {}
+        for keyword in expr.keywords:
+            if not keyword.arg:
+                continue
+            if not self._is_tainted(module, owner, local, keyword.value):
+                continue
+            carried[keyword.arg] = self._value_classes(
+                module, qualname, owner, local, keyword.value
+            )
+        return carried
 
     def _is_tainted(
         self, module: str, owner: str, local: set, expr: ast.AST
@@ -844,7 +873,7 @@ class _Walker:
                             self.attr_classes[(module, owner, target.attr)] = wrapper
             if not isinstance(node, ast.Call):
                 continue
-            if self._carried_keywords(module, owner, local, node):
+            if self._carried_keywords(module, owner, local, node, qualname):
                 continue
             if self._is_dispatch(module, owner, local, node):
                 self.dispatch_calls.append((module, qualname, node))
@@ -940,6 +969,26 @@ class _Walker:
         ast.IfExp,
     )
 
+    #: Where a syntactic position does not merely CARRY the value but runs a protocol on
+    #: it — keyed by ``(parent node type, child field)`` (review j#92326 F6).
+    #:
+    #: ``_MODELLED_PARENTS`` answers "where may the value travel".  That is a different
+    #: question from "what does this syntax execute on the value", and deciding both with
+    #: one node-type allowlist is what let ``with self.runner:`` and ``runner or
+    #: subprocess.run`` dispatch in silence.  The second question is answered here, and
+    #: the two are combined rather than conflated.
+    #:
+    #: Audited exhaustively against the modelled parents: these three positions run a
+    #: protocol, and no others do.  Every other implicit-effect position in Python
+    #: (``Compare`` ``__eq__``, ``Subscript`` ``__getitem__``, ``For`` ``__iter__``,
+    #: ``not`` / ``if`` / ``while`` / ``assert`` ``__bool__``, f-string ``__format__``)
+    #: has no modelled parent at all, so it already reports.
+    _PROTOCOL_POSITIONS: dict = {
+        (ast.withitem, "context_expr"): ("__enter__", "__exit__"),
+        (ast.BoolOp, "values"): ("__bool__",),
+        (ast.IfExp, "test"): ("__bool__",),
+    }
+
     #: Attribute spellings that ARE the dispatch entry point (see :meth:`_is_dispatch`).
     _DISPATCH_ATTRS = frozenset({"run", "__call__"})
 
@@ -980,6 +1029,18 @@ class _Walker:
                     f"value is reached through attribute {parent.attr!r} "
                     f"({'called' if called else 'read as a value'}), which this walk does "
                     f"not follow"
+                )
+                continue
+            protocol = self._protocol_for_position(node, parent)
+            if protocol is not None:
+                if self._protocol_receiver_is_analysed(
+                    module, qualname, owner, local, node, protocol
+                ):
+                    continue
+                self.unresolved_flows.append(
+                    f"{module}:{qualname}:{getattr(node, 'lineno', 0)}: a runner-carrying "
+                    f"value sits where {' / '.join(protocol)} runs on it, and this walk "
+                    f"cannot analyse that"
                 )
                 continue
             if self._is_modelled_parent(node, parent, rebound):
@@ -1146,6 +1207,49 @@ class _Walker:
             return True
         return False
 
+    def _protocol_for_position(self, node: ast.AST, parent: ast.AST) -> Optional[tuple]:
+        """The dunders this position runs on ``node``, or ``None`` if it only carries it."""
+        for (parent_type, field), dunders in self._PROTOCOL_POSITIONS.items():
+            if not isinstance(parent, parent_type):
+                continue
+            value = getattr(parent, field, None)
+            if value is node or (
+                isinstance(value, list) and any(item is node for item in value)
+            ):
+                return dunders
+        return None
+
+    def _protocol_receiver_is_analysed(
+        self, module: str, qualname: str, owner: str, local: set, node: ast.AST,
+        dunders: tuple,
+    ) -> bool:
+        """Bind the value into the dunders this position runs, and say whether that held.
+
+        Same treatment as a declared method call: the position is modelled only when the
+        receiver taint is actually bound into the body, so a dispatching ``__bool__``
+        resolves as a real pair instead of being waved through.  A class the walk cannot
+        resolve, or a dunder defined outside the first-party source, is reported — the
+        walk cannot analyse what it cannot read.
+        """
+        classes = self._value_classes(module, qualname, owner, local, node)
+        if not classes:
+            return False
+        for class_ref in classes:
+            for dunder in dunders:
+                found = self._lookup_member(class_ref, dunder)
+                if found is None:
+                    continue  # the class does not implement it: no effect to follow
+                found_module, found_qualname = found
+                function = self.index[found_module].functions[found_qualname]
+                names = _parameter_names(function)
+                if not names:
+                    return False
+                self.tainted_params.add((found_module, found_qualname, names[0]))
+                self.param_classes.setdefault(
+                    (found_module, found_qualname, names[0]), set()
+                ).add(class_ref)
+        return True
+
     def _is_modelled_parent(
         self, node: ast.AST, parent: ast.AST, rebound: set = frozenset()
     ) -> bool:
@@ -1213,10 +1317,11 @@ class _Walker:
         kwargs_maps: dict,
         call: ast.Call,
     ) -> None:
-        forwarded: set = set()
+        forwarded: dict = {}
         for keyword in call.keywords:
             if keyword.arg is None and isinstance(keyword.value, ast.Name):
-                forwarded |= kwargs_maps.get(keyword.value.id, set())
+                for name, classes in kwargs_maps.get(keyword.value.id, {}).items():
+                    forwarded.setdefault(name, set()).update(classes)
         tainted_arguments = [
             argument
             for argument in [
@@ -1325,9 +1430,13 @@ class _Walker:
                     self.param_classes.setdefault(
                         (callee_module, callee_name, parameter), set()
                     ).update(classes)
-        for parameter in forwarded & set(_parameter_names(function)):
+        for parameter in set(forwarded) & set(_parameter_names(function)):
             self.tainted_params.add((callee_module, callee_name, parameter))
             marked = True
+            if forwarded[parameter]:
+                self.param_classes.setdefault(
+                    (callee_module, callee_name, parameter), set()
+                ).update(forwarded[parameter])
         if not marked:
             self.unresolved_flows.append(
                 f"{module}:{qualname}:{call.lineno}: a runner-carrying value could not "

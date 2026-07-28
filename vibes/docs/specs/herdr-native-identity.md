@@ -1205,6 +1205,18 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
       修正前も「通って」いたが、それは `ast.walk` が nested definition へ降りて内側の代入を
       外側 local として拾っていただけで、**同じ scope 無視が漏れ側と偶然の検出側に現れて
       いた**にすぎない。
+    - **「値がどこへ運ばれるか」と「その構文が値に何を実行するか」を分ける** (review j#92326 F6)。
+      modelled parent の一覧は前者の答えであり、後者の答えではない。実際 3 つの位置は値に
+      protocol を**実行する**: `with <value>:` は `__enter__`/`__exit__`、`BoolOp` の operand と
+      `IfExp` の test は `__bool__`。production には既に `runner = runner or subprocess.run` が
+      あり、**call site を一切変えずに class 側へ `__bool__` が生えるだけ**で dispatch が成立する。
+      よって protocol 実行位置を `(parent node 種別, child field)` の明示 map として分離し、
+      **receiver を該当 dunder へ bind して解析できたときのみ modelled** とする (declared method
+      call と同じ規則)。class 未解決 / dunder が first-party 外なら報告する。3 位置は modelled
+      parent を child position 単位で全件監査して確定した。他の implicit-effect 位置
+      (`Compare` / `Subscript` / `For` / `not` / `if` / `while` / `assert` / f-string) は
+      modelled parent を持たないため既に報告側に落ちる。descriptor `__set__` は first-party に
+      定義 class が存在しないことを機械確認済み。
     - **例外表は「使われたか」で検証する** (review j#92266 F5)。key の形だけを検査しても、
       read が消えて entry だけ残る / typo key が将来の同名 read を事前許可する drift は
       green のままになる。derivation が実際に消費した key を収集し (`used_read_exceptions`)、

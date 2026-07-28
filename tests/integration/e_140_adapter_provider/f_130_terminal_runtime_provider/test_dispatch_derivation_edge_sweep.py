@@ -115,6 +115,21 @@ EDGES = [
      '    def _p(self):\n        return [r for r in [self.runner]]\n\n', True),
     ("escape: yield", None, None,
      '    def _p(self):\n        yield self.runner\n\n', True),
+    # -- implicit protocol positions (review j#92326 F6) ---------------------------------
+    # These positions do not merely carry the value, they RUN a protocol on it.  Kept
+    # distinct from the carrier edges above: "where the value goes" and "what the syntax
+    # executes on it" are different questions, and answering both with one node-type
+    # allowlist is what F3-2 and F6 both came from.
+    # The dunder is injected INSIDE the runner class (the injection must start with the
+    # `run = __call__` marker, or it dedents mid-class and the module stops parsing).
+    ("protocol: direct `with <runner>` (__enter__)", None,
+     TAIL + '\n\n    def __enter__(self):\n        return self(["bin", "probe", "direct-with"])\n\n    def __exit__(self, *exc):\n        return False\n',
+     '    def _p(self):\n        with self.runner:\n            return None\n\n', True),
+    ("protocol: IfExp test (__bool__)", None,
+     TAIL + '\n\n    def __bool__(self):\n        self(["bin", "probe", "ifexp-test"])\n        return True\n',
+     '    def _p(self):\n        return 1 if self.runner else 0\n\n', True),
+    ("protocol: carrier position without the dunder stays silent", None, None,
+     '    def _p(self):\n        chosen = self.runner if self.binary else self.runner\n        return chosen([self.binary, "probe", "ifexp-branch"])\n\n', True),
     # -- module / enclosing-scope carriers (review j#92266 F4) ---------------------------
     ("carrier: global module state", None,
      "\n\n_PROBE_GLOBAL_RUNNER = None\n\n\ndef _probe_global_dispatch():\n    return _PROBE_GLOBAL_RUNNER([\"bin\", \"probe\", \"global-carrier\"])\n",
@@ -195,7 +210,7 @@ class DerivationEdgeSweepTests(unittest.TestCase):
             if got != expect:
                 mismatches.append(f"{label}: expected reported={expect}, got {got}")
         self.assertEqual(mismatches, [], "\n".join(mismatches))
-        self.assertGreaterEqual(len(rows), 24, "the sweep lost edges")
+        self.assertGreaterEqual(len(rows), 27, "the sweep lost edges")
 
 
 if __name__ == "__main__":  # pragma: no cover
