@@ -183,11 +183,9 @@ _HIDDEN_CONSTRUCT_START = re.compile(r"<[A-Za-z!?/]")
 #: exactly ``<!--``, type 3 is ``<?``, type 4 is ``<!`` and an ASCII letter. Nothing wider — ``<!``
 #: followed by anything else opens no block, and treating it as one erased live gate events.
 _HTML_BLOCK_OPENER = re.compile(r"<!--|<\?|<![A-Za-z]")
-#: Everything that can stand between the start of a line and the column where a block may begin:
-#: indentation, and the list markers of any containers the line is inside (CommonMark §3.2 / §5.2).
-#: A list marker is a container prefix, not prose, so ``- <!--a@b>`` opens a block just as
-#: ``<!--a@b>`` does — treating "block start" as "physical line head" hid one (#14584 j#91918).
-_CONTAINER_PREFIX = re.compile(r"^ {0,3}(?:(?:[-+*]|\d{1,9}[.)])[ \t]+ {0,3})*$")
+#: A list marker, which opens a container (CommonMark §5.2). What may follow it is decided in
+#: COLUMNS by :func:`_is_block_start_column`, not by counting characters.
+_LIST_MARKER = re.compile(r"[-+*]|\d{1,9}[.)]")
 _AUTOLINK = re.compile(
     r"<(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\x00-\x20]*"
     r"|[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -384,9 +382,41 @@ def _starts_html_block(text: str, offset: int) -> bool:
     opener as an autolink and a marker inside an unrendered block became a gate (#14584 j#91918).
     """
     line_start = text.rfind("\n", 0, offset) + 1
-    if not _CONTAINER_PREFIX.match(text[line_start:offset]):
+    if not _is_block_start_column(text[line_start:offset]):
         return False
     return bool(_HTML_BLOCK_OPENER.match(text, offset))
+
+
+def _is_block_start_column(prefix: str) -> bool:
+    """True if ``prefix`` is only indentation and list markers, so a block may begin after it (pure).
+
+    Measured in COLUMNS, like every other indentation decision in this module. A list marker admits
+    one to four columns of whitespace after it (§5.2 rule 1); at five the content is no longer at the
+    item's column but an indented code block inside it (§5.2 rule 2 with §4.4), and code is not a
+    place where a raw-HTML block opens. Accepting whitespace by the character instead refused
+    ``-     <!--a@b>`` — visible code in the rendering — and erased the gate below it (#14584
+    j#91938). Four leading columns do the same thing at the top level, which is why the indent
+    allowance is three.
+    """
+    index = column = 0
+    while index < len(prefix) and prefix[index] in " \t" and column < 3:
+        column += 1 if prefix[index] == " " else _TAB_STOP - (column % _TAB_STOP)
+        index += 1
+    while index < len(prefix):
+        marker = _LIST_MARKER.match(prefix, index)
+        if marker is None:
+            return False
+        column += marker.end() - marker.start()
+        index = marker.end()
+        width = 0
+        while index < len(prefix) and prefix[index] in " \t":
+            step = 1 if prefix[index] == " " else _TAB_STOP - (column % _TAB_STOP)
+            width += step
+            column += step
+            index += 1
+        if not 1 <= width <= 4:
+            return False
+    return True
 
 
 def _blank_from_link_syntax(text: str) -> str:

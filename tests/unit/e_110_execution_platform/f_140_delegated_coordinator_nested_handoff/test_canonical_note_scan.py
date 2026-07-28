@@ -613,6 +613,34 @@ class PassOrderTest(unittest.TestCase):
         # ...and the paired positive: nesting does not make an ordinary autolink into a block.
         self.assertEqual(_gates(f"- - <!@b>\n\n{MARKER}"), ("review_request",))
 
+    def test_the_indent_after_a_list_marker_is_measured_in_columns(self):
+        # A list marker admits one to four COLUMNS after it (§5.2 rule 1). At five the content is an
+        # indented code block inside the item (§5.2 rule 2 with §4.4) — visible code, not a block
+        # start — and refusing it erased the gate below (#14584 j#91938). Both sides of 4/5, and
+        # tabs, which is where counting characters instead of columns goes wrong.
+        for label, note in (
+            ("one space opens a block", f"- <!--a@b>\n\n{MARKER}"),
+            ("four spaces still open one", f"-    <!--a@b>\n\n{MARKER}"),
+            ("one tab is four columns", f"-\t<!--a@b>\n\n{MARKER}"),
+            ("space plus tab is four columns", f"- \t<!--a@b>\n\n{MARKER}"),
+            ("ordered marker, four spaces", f"1.    <!--a@b>\n\n{MARKER}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ())
+        for label, note in (
+            ("five spaces is indented code", f"-     <!--a@b>\n\n{MARKER}"),
+            ("six spaces is indented code", f"-      <!--a@b>\n\n{MARKER}"),
+            ("two tabs is indented code", f"-\t\t<!--a@b>\n\n{MARKER}"),
+            ("ordered marker, five spaces", f"1.     <!--a@b>\n\n{MARKER}"),
+            # A marker with NO whitespace after it is not a marker at all, so what follows is prose
+            # rather than an item's content column. (Without this the "zero columns is fine"
+            # mutation goes undetected.)
+            ("no whitespace after the marker", f"-<!--a@b>\n\n{MARKER}"),
+            ("ordered, no whitespace", f"1.<!--a@b>\n\n{MARKER}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ("review_request",))
+
     def test_a_list_does_not_cost_the_gate_below_it(self):
         # The paired positive, in the direction that has already been lost twice: inside a list the
         # opener test is the same one, so an ordinary autolink is still just an autolink, and prose

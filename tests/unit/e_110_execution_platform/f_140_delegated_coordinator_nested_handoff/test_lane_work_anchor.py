@@ -202,6 +202,7 @@ class FailClosedTest(unittest.TestCase):
             # at the item content column too.
             ("html block inside a list item", "- <!--a@b>\n  %s" % marker),
             ("html block inside an ordered item", "1. <?a@b>\n   %s" % marker),
+            ("four columns after the marker", "-    <!--a@b>\n\n%s" % marker),
             ("definition title on the next line", '[foo]: /url\n  "%s"' % marker),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % marker),
             ("image alt text", "![a %s b](img.png)" % marker),
@@ -238,6 +239,17 @@ class FailClosedTest(unittest.TestCase):
             ("<! then @", "<!@b>\n\n%s" % marker),
             ("<! then a digit", "<!1@b>\n\n%s" % marker),
             ("<! then a hyphen", "<!-@b>\n\n%s" % marker),
+        ):
+            with self.subTest(label):
+                anchor = _resolve([_entry("90409", note)])
+                self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
+
+    def test_indented_code_inside_a_list_does_not_erase_the_anchor(self):
+        # The same liveness case at the join (#14584 j#91938).
+        marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
+        for label, note in (
+            ("five spaces", "-     <!--a@b>\n\n%s" % marker),
+            ("two tabs", "-\t\t<!--a@b>\n\n%s" % marker),
         ):
             with self.subTest(label):
                 anchor = _resolve([_entry("90409", note)])

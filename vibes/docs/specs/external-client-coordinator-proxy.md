@@ -234,8 +234,15 @@ authorize したかを照合しなければ scope は未検証のままである
       intersection を正しく取っても、**block start position を物理行頭と同一視**していたため、
       `- <!--a@b>` (list item の content column に開く同じ block) を autolink として blank し、
       不可視 marker が authority になった。**list marker は container prefix であって prose ではない**
-      (§3.2 / §5.2)。→ 判定は **`0–3 spaces` + `(list marker + 空白 + 0–3 spaces)*` を剥いだ column** で行う。
-      opener 判定自体は変えないので、**list 内の正規 autolink は従来どおり blank され後続 gate を消さない**。
+      (§3.2 / §5.2)。→ 判定は **container prefix を剥いだ column** で行う。opener 判定自体は変えないので、
+      **list 内の正規 autolink は従来どおり blank され後続 gate を消さない**。
+      ★★★**その prefix は「文字数」ではなく「column 規則」で確定する** (#14584 j#91938)。
+      list marker の後に許される indent は **1–4 columns** で、**5 columns 以上は container prefix ではなく
+      indented code** である (§5.2 rule 2 + §4.4)。tab は 4-column tab stop (§2.2)。
+      `[ \t]+` のように文字数で受理すると `-     <!--a@b>` (marker 後 5 spaces、renderer では**可視な
+      code**) を block opener と誤認し、**後続の実 gate event を消した**。
+      **同 module に既に `_indent_columns` があるのに prefix だけ文字数で書いた** — 既存の正しい実装を
+      再利用しないと、そこだけ規則が古くなる。**doc に宣言した境界を code が実装しているか毎回確かめる。**
       ★★★**oracle の述語は連言でなければならない** (#14584 j#91863)。R6 で「plain に残る」を
       「text node である」へ**置き換えた**が、raw HTML passthrough は tag 除去後の残骸が text に見える
       ため text-node 判定を通り、plain が空であることを見ていなかった。正しくは
