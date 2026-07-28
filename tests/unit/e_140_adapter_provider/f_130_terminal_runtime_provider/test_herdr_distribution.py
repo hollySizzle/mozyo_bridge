@@ -56,6 +56,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     is_safe_config_dir,
     normalize_agents,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E402
+    herdr_integration_install_dir_io as dir_io,
+    herdr_integration_install_ops as install_ops,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_integration_install_ops import (  # noqa: E402
     HERDR_CONFIG_PATH_ENV,
     InstallInputs,
@@ -702,6 +706,194 @@ class InstallOpsTest(unittest.TestCase):
         self.assertTrue(outcome.rolled_back)
         # …and the unobservable write was reverted: home is as it was found
         self.assertEqual(before, self._dir_state())
+
+    # -- action-time drift (review j#91762) --
+
+    def _drift_at_apply(self, action):
+        """Run ``action`` when apply re-resolves the binary — after the plan gate ran."""
+        real = install_ops._resolve_binary
+        state = {"n": 0}
+
+        def wrapper(inputs):
+            state["n"] += 1
+            result = real(inputs)
+            if state["n"] == 2:  # 1 = inside plan_install, 2 = apply's own resolution
+                action()
+            return result
+
+        patcher = mock.patch.object(install_ops, "_resolve_binary", wrapper)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_apply_refused_when_config_dir_is_removed_after_the_plan_gate(self) -> None:
+        # Review j#91762 finding 1: the plan gate's "the dir is there" is a statement
+        # about the past. If the dir goes away before the mutation, the apply must not
+        # run herdr and report success against a dir that no longer exists.
+        import shutil
+
+        fake = FakeHerdrIntegration()
+        self._drift_at_apply(lambda: shutil.rmtree(self.home / ".claude"))
+        report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertFalse(report.applied)
+        self.assertEqual(fake.calls, [])  # herdr never invoked
+        self.assertEqual(report.plans[0].reason, REASON_CONFIG_DIR_MISSING)
+
+    def test_apply_refused_when_config_dir_is_repointed_outside_home(self) -> None:
+        # Review j#91762 finding 1: swapping the dir for a symlink escaping home after
+        # the gate must not let herdr write outside home — the whole point of the
+        # path-safety gate.
+        import shutil
+
+        outside = self.tmp / "outside"
+        outside.mkdir()
+
+        def repoint():
+            shutil.rmtree(self.home / ".claude")
+            os.symlink(outside, self.home / ".claude")
+
+        fake = FakeHerdrIntegration()
+        self._drift_at_apply(repoint)
+        report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertFalse(report.applied)
+        self.assertEqual(fake.calls, [])  # herdr never invoked
+        self.assertEqual(report.plans[0].reason, REASON_UNSAFE_CONFIG_PATH)
+        # nothing at all was written into the escaped location
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_apply_refused_when_dir_is_repointed_after_preflight(self) -> None:
+        # Review j#91762 finding 1 requires the dir to be re-validated before EACH
+        # runner call, not only once before the preflight. Drift injected after the
+        # backup is past the preflight check, so only the per-invocation check can
+        # catch it.
+        import shutil
+
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        real_backup = install_ops.backup_dir
+
+        def repoint_after_backup(root):
+            result = real_backup(root)
+            shutil.rmtree(self.home / ".claude")
+            os.symlink(outside, self.home / ".claude")
+            return result
+
+        fake = FakeHerdrIntegration()
+        with mock.patch.object(install_ops, "backup_dir", repoint_after_backup):
+            report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertFalse(report.applied)
+        self.assertEqual(fake.calls, [])  # herdr never invoked
+        self.assertEqual(report.outcomes[0].reason, REASON_UNSAFE_CONFIG_PATH)
+        self.assertEqual(list(outside.iterdir()), [])  # nothing written outside home
+
+    def test_dir_repointed_while_herdr_runs_is_not_reported_ok(self) -> None:
+        # The dir can also drift *during* the invocation, so it is re-validated after
+        # the run too: the result is neither ok nor restorable (restoring would write
+        # into the escaped location), so it must report rollback_incomplete.
+        import shutil
+
+        outside = self.tmp / "outside"
+        outside.mkdir()
+
+        class RepointingFake(FakeHerdrIntegration):
+            def run(inner, argv, **kw):  # noqa: N805 - mirrors the runner signature
+                result = FakeHerdrIntegration.run(inner, argv, **kw)
+                shutil.rmtree(self.home / ".claude")
+                os.symlink(outside, self.home / ".claude")
+                return result
+
+        fake = RepointingFake()
+        report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertEqual(len(fake.calls), 1)  # herdr did run
+        self.assertEqual(report.outcomes[0].reason, REASON_ROLLBACK_INCOMPLETE)
+        self.assertFalse(report.outcomes[0].rolled_back)
+        self.assertEqual(list(outside.iterdir()), [])  # no restore write escaped home
+
+    def test_apply_refused_when_verified_config_changes_before_the_runner(self) -> None:
+        # Review j#91762 finding 2: pinning the config PATH is not pinning the pin —
+        # the bytes at that path can be swapped for an unpinned config after the
+        # posture verified, and herdr would read those.
+        real_backup = install_ops.backup_dir
+
+        def swap_after_backup(root):
+            result = real_backup(root)
+            self.herdr_config.write_text(
+                "[update]\nversion_check = true\nmanifest_check = true\n",
+                encoding="utf-8",
+            )
+            return result
+
+        before = self._dir_state()
+        fake = FakeHerdrIntegration()
+        with mock.patch.object(install_ops, "backup_dir", swap_after_backup):
+            report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertFalse(report.applied)
+        self.assertEqual(fake.calls, [])  # herdr never ran against the swapped config
+        self.assertEqual(report.outcomes[0].reason, REASON_CONFIG_PIN_MISMATCH)
+        self.assertEqual(before, self._dir_state())
+
+    def test_config_swapped_while_herdr_runs_is_caught_and_rolled_back(self) -> None:
+        # The check before the invocation cannot be atomic with herdr's own read, so
+        # the pin is re-asserted AFTER the run too: a swap inside that window is
+        # detected and reverted instead of leaving the hook installed.
+        class SwappingFake(FakeHerdrIntegration):
+            def run(inner, argv, **kw):  # noqa: N805 - mirrors the runner signature
+                result = FakeHerdrIntegration.run(inner, argv, **kw)
+                self.herdr_config.write_text(
+                    "[update]\nversion_check = true\nmanifest_check = true\n",
+                    encoding="utf-8",
+                )
+                return result
+
+        before = self._dir_state()
+        fake = SwappingFake()
+        report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertEqual(len(fake.calls), 1)  # herdr did run
+        outcome = report.outcomes[0]
+        self.assertEqual(outcome.reason, REASON_CONFIG_PIN_MISMATCH)
+        self.assertTrue(outcome.rolled_back)
+        self.assertEqual(before, self._dir_state())  # hook reverted
+
+    def test_reading_a_missing_root_is_incomplete_not_an_empty_dir(self) -> None:
+        # Review j#91762 finding 1: "could not look" must not read as "nothing there".
+        # This is the root-level twin of the subtree case from j#91688 finding 2.
+        missing = self.home / ".claude" / "gone"
+        read = dir_io.read_dir(missing)
+        self.assertFalse(read.complete)
+        self.assertEqual(dir_io.backup_dir(missing).complete, False)
+        # …while a genuinely empty, present dir IS complete (the distinction is real)
+        empty = self.home / ".claude" / "empty"
+        empty.mkdir()
+        self.assertTrue(dir_io.read_dir(empty).complete)
+
+    def test_rollback_refuses_to_write_into_a_drifted_root(self) -> None:
+        # The write guard lives with the write: restoring a backup into a root that now
+        # resolves outside home would push operator bytes out of home.
+        import shutil
+
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        config_dir = self.home / ".claude"
+        (config_dir / "settings.json").write_text("orig", encoding="utf-8")
+        before_read = dir_io.read_dir(config_dir)
+        backup = dir_io.backup_dir(config_dir)
+        staged_real = os.path.realpath(config_dir)
+        shutil.rmtree(config_dir)
+        os.symlink(outside, config_dir)
+        restored = dir_io.rollback_dir(
+            config_dir,
+            backup.files,
+            before_read.snapshot,
+            home=self.home,
+            expected_real=staged_real,
+        )
+        self.assertFalse(restored)
+        self.assertEqual(list(outside.iterdir()), [])  # nothing written outside home
 
     def _restore_perms(self) -> None:
         import stat as _stat

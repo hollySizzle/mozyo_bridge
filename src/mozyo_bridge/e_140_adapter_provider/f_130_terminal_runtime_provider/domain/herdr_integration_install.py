@@ -64,11 +64,18 @@ AGENT_CONFIG_DIRNAME: "dict[str, str]" = {
 REASON_UNKNOWN_AGENT = "unknown_agent"
 #: The agent's config dir does not exist. herdr itself refuses this (E2); the
 #: installer refuses it *first* so it never asks herdr to touch a dir that is not
-#: there, and never silently creates one.
+#: there, and never silently creates one. Also reported when the dir was present at
+#: the plan gate but has gone by the time the apply would act on it — the gate's
+#: answer describes the past, so it is re-asked at each action time (Redmine #13249
+#: review j#91762 finding 1).
 REASON_CONFIG_DIR_MISSING = "config_dir_missing"
 #: The resolved config path is not a real directory safely under home — a symlink
 #: escaping home, a traversal (``..``) component, or a non-directory. The install
-#: is refused before any snapshot / mutation.
+#: is refused before any snapshot / mutation, and the same check is re-run before each
+#: herdr invocation and before any rollback write, so a dir re-pointed after the gate
+#: cannot carry a mutation outside home. A path that still resolves safely but to a
+#: *different* dir than the one this operation was staged against is refused too:
+#: containment is not identity (Redmine #13249 review j#91762 finding 1).
 REASON_UNSAFE_CONFIG_PATH = "unsafe_config_path"
 #: The herdr supply-chain posture is not pinned (see :mod:`...domain.herdr_pin_posture`).
 #: Installing a hook onto an unpinned herdr would leave unattended egress enabled,
@@ -97,12 +104,14 @@ REASON_ROLLBACK_INCOMPLETE = "rollback_incomplete"
 #: completeness check). The same reason covers a **post-apply** dir that cannot be
 #: fully read back, because success then cannot be observed either (j#91688 finding 3).
 REASON_CONFIG_DIR_UNREADABLE = "config_dir_unreadable"
-#: The pin posture was verified against one config file, but herdr would read another
-#: (the environment names a different ``HERDR_CONFIG_PATH``). A pin proven on a file
-#: herdr never reads is no pin at all — an unrelated pinned file could otherwise be
-#: used as a decoy to pass the ``unpinned_remote`` gate — so the installer refuses
-#: until the verified config and herdr's effective config are the same file (Redmine
-#: #13249 review j#91688 finding 1).
+#: The config herdr would read is not the config whose posture was verified. That
+#: covers a *different file* — the environment names another ``HERDR_CONFIG_PATH``, so
+#: an unrelated pinned file could be used as a decoy to pass the ``unpinned_remote``
+#: gate (Redmine #13249 review j#91688 finding 1) — and equally *the same path holding
+#: different bytes*: a pin is a claim about content, so a file swapped or edited after
+#: it verified is no longer the thing that was approved (review j#91762 finding 2). The
+#: installer refuses until the verified config and herdr's effective config are the
+#: same file with the same content.
 REASON_CONFIG_PIN_MISMATCH = "config_pin_mismatch"
 #: Apply was requested for several agents and at least one failed after another had
 #: already been mutated — the whole operation is reported failed and rolled back.

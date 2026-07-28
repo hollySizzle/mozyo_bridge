@@ -92,13 +92,40 @@ herdr が実際に読む file が別々でよいなら、無関係な pinned fil
   勝手に決めない)。同一 file を指す symlink 等は realpath 同一性で同一とみなす。
 - plan / apply の report は `herdr_config_bound` として bind 先を表示する。
 
+**path を固定しても pin は固定されない。** pin が主張しているのは path ではなく **content の
+性質** (`[update]` の switch) なので、同じ path の bytes を検証後に差し替えれば herdr は unpinned
+config を読む。したがって installer は posture 検証時に config の **content digest と file identity
+(`st_dev`/`st_ino`)** を捕捉し、**各 herdr 呼び出しの直前と直後**に「今も pinned か」「同じ bytes か」
+「同じ file か」を再検証する。いずれかが崩れていれば `config_pin_mismatch` で fail-closed
+(直前検出なら herdr 未実行、直後検出なら verified rollback して非成功)。
+
+**残存 window (実装保証の限界)**: 直前の再検証と herdr 自身の read は atomic ではないため、その
+極小区間での差し替えは検出できない。直後の再検証はこの区間の差し替えを **事後に検出して rollback
+する**ことで「気付かれないまま hook が残る」経路を塞ぐが、区間そのものを無くすものではない。config
+file への write 権限を持つ主体を排除するのは operator 側の責務であり、本 installer の保証範囲外。
+
+### plan gate は過去の観測、mutation は現在の行為 (action-time 再検証)
+
+config dir の存在 / directory 性 / home 内 realpath は plan gate で一度確認するが、それは
+**「見たときはそうだった」**という過去の陳述にすぎない。plan 後に dir を削除したり home 外への
+symlink に差し替えたりできるため、installer は同じ問いを **action time に必ず問い直す**:
+
+- preflight (snapshot / backup) の前
+- **各 herdr 呼び出しの直前と直後**
+- **rollback の書き込み前** (guard は「書く場所」に置く。drift 後の root へ backup を書き戻すと
+  operator の bytes を home 外へ押し出すため)
+
+staged 時点の realpath と一致しない場合も drift として扱う (「home 内のどこか安全な場所」ではなく
+**同一 identity** を要求する)。drift は `config_dir_missing` / `unsafe_config_path` で fail-closed。
+
 ### 「完全に読めた」ことが rollback 開始の前提 (列挙失敗も含む)
 
 rollback は snapshot と backup が対象 dir を **完全に読めた時だけ**開始する。ここでの「完全」は
 file の read 成否だけでなく **列挙 (`os.walk` / `lstat`) の成否**を含む。列挙に失敗した subtree は
 snapshot からも backup からも同時に消えるため、file 単位の unreadable 検査では「読めなかった」では
 なく「存在しない」に化ける。列挙失敗・read 失敗はいずれも `config_dir_unreadable` で mutation 前に
-拒否する。
+拒否する。**root 自体の不在 / 非 directory も「完全に読めた空 dir」ではなく列挙失敗として扱う**
+(subtree で閉じた同型欠陥が root に残っていた)。
 
 同じ理由で、herdr が exit 0 を返しても **apply 後の dir を完全に読み戻せない場合は成功にしない**。
 exact diff も最終 home state も観測できていないためで、この場合は backup から verified rollback を
@@ -109,11 +136,11 @@ exact diff も最終 home state も観測できていないためで、この場
 | reason | 意味 |
 |---|---|
 | `unknown_agent` | claude / codex 以外の agent |
-| `config_dir_missing` | 対象 `~/.claude` / `~/.codex` が存在しない (先に作成すること) |
-| `unsafe_config_path` | config dir が symlink / traversal で home 外へ解決 |
+| `config_dir_missing` | 対象 `~/.claude` / `~/.codex` が存在しない (先に作成すること)。plan 後に消えた場合も action-time 再検証で同じ reason |
+| `unsafe_config_path` | config dir が symlink / traversal で home 外へ解決、または staged 時点と identity が変わった |
 | `unpinned_remote` | herdr posture が pinned でない (§1 を先に満たすこと) |
-| `config_pin_mismatch` | 検証した config と、環境 (`HERDR_CONFIG_PATH`) が herdr に読ませる config が別 file |
-| `config_dir_unreadable` | config dir を完全に読めない (file read 失敗 / subtree 列挙失敗)、または apply 後に読み戻せない |
+| `config_pin_mismatch` | 検証した config と herdr が読む effective config が一致しない — 環境 (`HERDR_CONFIG_PATH`) が別 file を名指す、または検証後に同一 path の bytes / file identity が変わった |
+| `config_dir_unreadable` | config dir を完全に読めない (file read 失敗 / 列挙失敗 / root 不在・非 directory)、または apply 後に読み戻せない |
 | `herdr_unresolved` | trusted-env から herdr binary を解決できない (plan も gate される) |
 | `herdr_error` | herdr が非ゼロ終了 / 起動失敗 |
 | `rollback_incomplete` | rollback が復元を証明できず residue が残る (home 未復元) |
