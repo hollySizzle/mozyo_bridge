@@ -498,7 +498,8 @@ class _Herdr:
                 )
             direction = rest[rest.index("--direction") + 1]
             amount = float(rest[rest.index("--amount") + 1])
-            self._apply_resize(direction, amount)
+            addressed = rest[rest.index("--pane") + 1] if "--pane" in rest else ""
+            self._apply_resize(direction, amount, pane=addressed)
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
             )
@@ -523,7 +524,7 @@ class _Herdr:
                 pane_id = self.start_locator
             elif wid:
                 # Land in the requested workspace with a distinct pane per launch.
-                pane_id = f"{wid}:p{len(self.start_argvs) + 1}"
+                pane_id = self._mint_pane_id(wid)
             else:
                 pane_id = "w1:pNEW"
             # Landed tab (Redmine #13411): echo the requested `--tab` unless forced.
@@ -554,6 +555,17 @@ class _Herdr:
         raise AssertionError(f"unexpected herdr call: {argv!r}")
 
     # -- the container's pane geometry (Redmine #14569) ----------------------------
+
+    def _mint_pane_id(self, workspace_id):
+        """The locator this launch lands on — one per launch, in launch order.
+
+        Overridable because the numbering is only unique among THIS fake's own launches:
+        a test that also seeds pre-existing panes has to place them somewhere this can
+        never mint, or the "existing" pane and the freshly launched one silently become the
+        same object (review j#92057 F1). Subclasses that model a populated container
+        namespace their ids instead of racing this counter.
+        """
+        return f"{workspace_id}:p{len(self.start_argvs) + 1}"
 
     def _container_key(self, workspace_id, tab_id):
         """What a split happens inside: the lane's tab, or the workspace for the default."""
@@ -602,8 +614,13 @@ class _Herdr:
             cross=self.split_cross,
         )
 
-    def _apply_resize(self, direction, amount):
-        """herdr's measured resize arithmetic — the shared model (0.5 cap, 0.1..0.9 clamp)."""
+    def _apply_resize(self, direction, amount, pane=""):
+        """herdr's measured resize arithmetic — the shared model (0.5 cap, 0.1..0.9 clamp).
+
+        ``pane`` is the divider's ADDRESS. This flat model has one divider per fake, so it
+        is unused here; a container holding several lanes has one per lane and must scope
+        the move to the addressed pane's own (see ``_SharedTabHerdr``, Redmine #14567).
+        """
         self.split_ratio = apply_resize_amount(self.split_ratio, direction, amount)
 
     # -- what a real launch leaves behind (Redmine #13948) -------------------------

@@ -1109,6 +1109,118 @@ def render_pane_layout(
     return {"result": {"type": "pane_layout", "layout": layout}}
 
 
+def render_shared_tab_layout(
+    *,
+    columns,
+    pair_ratios,
+    tab_id: str = "t1",
+    workspace_id: str = "w1",
+    width: int = HERDR_SPLIT_EXTENT,
+    height: int = HERDR_SPLIT_CROSS,
+) -> dict:
+    """A ``pane layout`` payload for a tab holding SEVERAL lanes (Redmine #14567).
+
+    :func:`render_pane_layout` models one container as at most one divider, which is all a
+    per-lane tab ever has. A shared tab is a tree: lanes are columns split on the
+    inter-lane axis (``right``), and each lane's own pair divides its column on the pair
+    axis (``down``). Rendering that as "N panes and no splits" — what the flat producer
+    does for anything other than exactly two panes — makes every divider unidentifiable,
+    so a test written on it cannot tell a fixture gap from a production one (review j#92057
+    F1). This producer renders the real shape:
+
+    - ``columns`` is one list of pane ids per lane, in the order the lanes arrived. The
+      first is the leftmost column;
+    - ``pair_ratios[i]`` is column ``i``'s own pair split ratio (ignored for a 1-pane
+      column, which has no divider of its own);
+    - the inter-lane splits are a chain: split ``i`` divides column ``i`` from everything
+      to its right, so each one's rect is the region it actually governs. That is what
+      makes ``governing_split`` resolve a pane's *nearest* same-axis ancestor rather than
+      the whole tab;
+    - every rect tiles its split exactly, so a consumer identifying dividers geometrically
+      (which is all the real payload allows — herdr emits no child pane ids) finds exactly
+      one candidate per divider.
+
+    The consequence the #14567 composition turns on: a ``down``-axis question asked about a
+    pane resolves to that pane's OWN column, never to a neighbouring lane's divider.
+    """
+    cols = [list(c) for c in columns]
+    layout = {
+        "tab_id": tab_id,
+        "workspace_id": workspace_id,
+        "area": {"x": 0, "y": 0, "width": width, "height": height},
+        "focused_pane_id": cols[0][0] if cols and cols[0] else "",
+        "zoomed": False,
+        "panes": [],
+        "splits": [],
+    }
+    if not cols:
+        return {"result": {"type": "pane_layout", "layout": layout}}
+
+    # Column x-bounds that tile the width exactly (the last absorbs the remainder).
+    ncols = len(cols)
+    edges = [round(width * i / ncols) for i in range(ncols)] + [width]
+
+    for index, panes in enumerate(cols):
+        x0, x1 = edges[index], edges[index + 1]
+        col_width = x1 - x0
+        # The inter-lane divider between this column and everything right of it.
+        if index < ncols - 1:
+            region = width - x0
+            layout["splits"].append(
+                {
+                    "id": f"split_lane_{index}",
+                    "direction": "right",
+                    "ratio": col_width / region if region else 0.0,
+                    "rect": {"x": x0, "y": 0, "width": region, "height": height},
+                }
+            )
+        if len(panes) == 2:
+            ratio = pair_ratios[index] if index < len(pair_ratios) else 0.5
+            first = round(height * ratio)
+            layout["panes"].append(
+                {
+                    "pane_id": panes[0],
+                    "rect": {"x": x0, "y": 0, "width": col_width, "height": first},
+                    "focused": index == 0,
+                }
+            )
+            layout["panes"].append(
+                {
+                    "pane_id": panes[1],
+                    "rect": {
+                        "x": x0,
+                        "y": first,
+                        "width": col_width,
+                        "height": height - first,
+                    },
+                    "focused": False,
+                }
+            )
+            layout["splits"].append(
+                {
+                    "id": f"split_pair_{index}",
+                    "direction": "down",
+                    "ratio": ratio,
+                    "rect": {"x": x0, "y": 0, "width": col_width, "height": height},
+                }
+            )
+        else:
+            for pane in panes:
+                layout["panes"].append(
+                    {
+                        "pane_id": pane,
+                        "rect": {
+                            "x": x0,
+                            "y": 0,
+                            "width": col_width,
+                            "height": height,
+                        },
+                        "focused": False,
+                    }
+                )
+    return {"result": {"type": "pane_layout", "layout": layout}}
+
+
 def _ok(argv, payload) -> "subprocess.CompletedProcess[str]":
     return subprocess.CompletedProcess(
         list(argv), 0, stdout=json.dumps(payload), stderr=""

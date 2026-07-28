@@ -38,17 +38,28 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mozyo_bridge.core.state.sublane_tab_fence import (
+# The shared herdr fakes live under `tests/support`; make them importable the same way the
+# sibling regression suites do rather than relying on another test module's import order.
+_TESTS_ROOT = Path(__file__).resolve().parents[1]
+if str(_TESTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TESTS_ROOT))
+
+from mozyo_bridge.core.state.sublane_tab_fence import (  # noqa: E402
     SUBLANE_TAB_CREATE_LOCK_PREFIX,
     SublaneTabCreateLockUnavailable,
     SublaneTabCreateReleaseError,
     sublane_tab_create_lock,
     sublane_tab_create_lock_path,
+)
+from support.herdr_fake import (  # noqa: E402
+    apply_resize_amount,
+    render_shared_tab_layout,
 )
 from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (  # noqa: E501
@@ -97,7 +108,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     resolve_shared_tab_target,
     verify_shared_tab_consistency,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_health import (  # noqa: E501
+    StartupProbe,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    decode_assigned_name,
     encode_assigned_name,
 )
 
@@ -105,6 +120,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 # Importing them keeps this file a pin on the behaviour instead of a second, subtly
 # different simulation of herdr.
 from tests.unit.e_140_adapter_provider.f_130_terminal_runtime_provider.test_herdr_session_start import (  # noqa: E501
+    PROVIDER_BINS,
     _Herdr,
     _LayoutHerdr,
     _launch_env,
@@ -116,6 +132,42 @@ SHARED = SublaneTabTopologyConfig(mode=SHARED_TAB)
 PER_LANE = SublaneTabTopologyConfig(mode=PER_LANE_TAB)
 
 
+_FAST_PROBE = StartupProbe(polls=3, interval=0.0, sleeper=lambda _seconds: None)
+
+
+def _wrapping_launch_env(tmp, binpath):
+    """A launch env whose PATH carries a resolvable ``mozyo-bridge`` (the #13637 wrapper).
+
+    Without it the launcher cannot wrap, every launched slot comes back
+    ``attestation_unavailable``, and ``SessionStartResult.ok`` is False for a reason that
+    has nothing to do with the axis under test.
+
+    That is not a cosmetic detail here. Review j#92057 F1: the first cut of the ratio pins
+    below hit that False ``result.ok``, and instead of asking why, the assertion was
+    narrowed to ``ratio_ok`` — discarding the one aggregate signal that would have shown
+    the fixture was measuring a single two-pane container while claiming two lanes. Making
+    a genuinely healthy run reachable is what lets those pins assert ``result.ok`` honestly,
+    with the attestation written by the fake wrapper and read back through the real rail
+    (rather than an injected reader that would vouch for anything).
+
+    The PATH replaces the default one, so it must also carry the #13441 provider stubs or
+    argv[0] would not resolve. Both components are absolute; only this dir holds
+    ``mozyo-bridge`` and only the shared dir holds the providers, so neither lookup is
+    ambiguous.
+    """
+    bindir = Path(tmp) / "bin"
+    bindir.mkdir(exist_ok=True)
+    launcher = bindir / "mozyo-bridge"
+    if not launcher.exists():
+        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        launcher.chmod(
+            launcher.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+        )
+    env = _launch_env(binpath)
+    env["PATH"] = os.pathsep.join([str(bindir), str(PROVIDER_BINS.bin_dir)])
+    return env
+
+
 def _prepare(
     tmp,
     *,
@@ -124,14 +176,21 @@ def _prepare(
     lane,
     sublane_tab_topology=None,
     lane_placement=None,
+    pair_order=None,
     rows=None,
     repo_name="repo",
+    attested=False,
 ):
     """Run the real ``prepare_session`` against a fake herdr in an isolated home.
 
     Returns ``(result, workspace_id, {provider: pane_locator})`` — the pane map is what the
     layout assertions key on, since a pane id is the only handle
     ``_LayoutHerdr.direction_between`` understands.
+
+    ``attested`` wraps the launch (:func:`_wrapping_launch_env`) and points the fake
+    wrapper's attestation write at the home the launcher resolves, so the run can actually
+    come up healthy — what a case asserting ``result.ok`` needs. It defaults to False so
+    every pre-existing case keeps its exact previous behaviour.
     """
     repo = Path(tmp) / repo_name
     repo.mkdir(exist_ok=True)
@@ -146,14 +205,25 @@ def _prepare(
         workspace_id = read_anchor(repo)["workspace_id"]
         if rows is not None:
             herdr.existing_rows = rows(workspace_id)
+        env = _launch_env(binpath)
+        extra: dict = {}
+        if attested:
+            env = _wrapping_launch_env(tmp, binpath)
+            # Point the fake wrapper's attestation write at the SAME home the launcher
+            # resolves, so a wrapped launch in a test attests where the real one does.
+            herdr.attest_home = home
+            extra["probe"] = _FAST_PROBE
+        if pair_order is not None:
+            extra["pair_order"] = pair_order
         result = prepare_session(
             repo_root=repo,
             providers=providers,
             lane_id=lane,
-            env=_launch_env(binpath),
+            env=env,
             runner=herdr.run,
             lane_placement=lane_placement,
             sublane_tab_topology=sublane_tab_topology,
+            **extra,
         )
     return result, workspace_id, {s.provider: s.locator for s in result.slots}
 
@@ -1034,15 +1104,23 @@ class SharedTabLaunchTest(unittest.TestCase):
     def test_heal_rejoins_the_shared_tab_on_the_pair_axis(self) -> None:
         # A single-provider heal beside a live sibling splits on the PAIR axis, not the
         # inter-lane one: it is placed next to its own gateway, not next to another lane.
+        #
+        # Runs on `_SharedTabHerdr` because the flat fake could not represent this tab
+        # (review j#92057 F1): it mints `wZ:p2`/`wZ:p3` for launches, so the seeded lane-a
+        # sibling and the healed slot collapsed into one pane, and its layout renders any
+        # container that is not exactly two panes with NO splits. The run therefore came
+        # back `ratio_outcome=failed` while this test — asserting only the argv — passed,
+        # which is precisely the state in which a fixture gap and a production gap are
+        # indistinguishable. The ratio axis is asserted below so that can no longer hide.
         with tempfile.TemporaryDirectory() as tmp:
-            herdr = _Herdr(created_workspace="wZ")
+            herdr = _SharedTabHerdr(created_workspace="wZ")
             herdr.tab_labels["wZ:t1"] = SHARED_SUBLANE_TAB_LABEL
 
             def rows(ws):
                 return [
-                    _row(ws, "codex", "lane-a", "wZ:p2", "wZ:t1"),
-                    _row(ws, "codex", "lane-b", "wZ:p4", "wZ:t1"),
-                    _row(ws, "claude", "lane-b", "wZ:p5", "wZ:t1"),
+                    _row(ws, "codex", "lane-a", "wZ:p90", "wZ:t1"),
+                    _row(ws, "codex", "lane-b", "wZ:p94", "wZ:t1"),
+                    _row(ws, "claude", "lane-b", "wZ:p95", "wZ:t1"),
                 ]
 
             result, _ws, _panes = _prepare(
@@ -1051,14 +1129,23 @@ class SharedTabLaunchTest(unittest.TestCase):
                 providers=["claude"],
                 lane="lane-a",
                 sublane_tab_topology=SHARED,
+                pair_order=("codex", "claude"),
                 rows=rows,
+                attested=True,
             )
+            herdr.assert_no_locator_collision(self, result)
             self.assertEqual(result.herdr_tab_id, "wZ:t1")
             self.assertEqual(len(herdr.tab_creates), 0, "an existing tab is adopted")
             self.assertEqual(_split_of(herdr.start_argvs[0]), "down")
             self.assertNotIn(
                 "--focus", herdr.start_argvs[0], "a heal never focuses / moves a pane"
             )
+            self.assertTrue(
+                result.ratio_ok,
+                f"a heal that rejoined its own pair must not leave the ratio axis "
+                f"unresolved: {result.ratio_outcome} / {result.ratio_detail}",
+            )
+            self.assertTrue(result.ok, result.ratio_detail)
 
     def test_unreadable_tab_labels_create_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1242,6 +1329,172 @@ class SharedTabLayoutTest(unittest.TestCase):
             )
 
 
+class _SharedTabHerdr(_Herdr):
+    """A herdr fake whose tab holds SEVERAL lanes, each as its own column.
+
+    ``_Herdr`` models a container as at most one divider, which is everything a per-lane
+    tab has. Review j#92057 F1 showed that is not enough to state the #14567 x #14569
+    composition as behaviour, in two independent ways:
+
+    1. **locator collision.** ``_Herdr`` mints ``<ws>:p2``, ``<ws>:p3``, ... in launch
+       order, so a test seeding an "existing" lane at those ids gets the freshly launched
+       pane and the pre-existing one as the SAME pane. A ratio then measured "successfully"
+       against a two-pane tab that was supposed to hold four. This fake namespaces its
+       launches (``:pL<n>``) so a seeded pane and a launched one can never coincide, and
+       :meth:`assert_no_locator_collision` states that as an assertion rather than a
+       convention.
+    2. **flat layout.** ``render_pane_layout`` renders anything other than exactly two
+       panes with NO splits, so every divider in a populated shared tab is unidentifiable
+       and the rail reports ``failed`` for fixture reasons. This fake tracks per-lane
+       columns and renders the real tree through
+       :func:`support.herdr_fake.render_shared_tab_layout`.
+
+    Columns are recovered the way production does it — from the lane segment of each live
+    slot's durable name — so the fake never needs to be told which lane a seeded pane
+    belongs to.
+    """
+
+    #: Locator namespace for panes THIS fake launches. Disjoint from any `:p<n>` a test
+    #: seeds, which is the whole point (see the class docstring).
+    LAUNCH_PREFIX = "pL"
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        #: ``{container key: [[pane, ...] per lane column, in arrival order]}``
+        self.columns: dict = {}
+        #: ``{container key: [lane id per column]}`` — which column belongs to which lane.
+        self.column_lanes: dict = {}
+        #: ``{container key: [pair ratio per column]}``
+        self.column_ratios: dict = {}
+        #: Columns whose divider a ``pane resize`` actually moved, in call order.
+        self.resized_columns: list = []
+        self._launch_seq = 0
+
+    # -- identity ------------------------------------------------------------------
+
+    def _mint_pane_id(self, workspace_id):
+        self._launch_seq += 1
+        return f"{workspace_id}:{self.LAUNCH_PREFIX}{self._launch_seq}"
+
+    def assert_no_locator_collision(self, case, result) -> None:
+        """Fail loudly if a launched slot reused a seeded pane's locator.
+
+        The defect this class exists for was invisible precisely because it looked like a
+        pass. Asserting the disjointness makes a future change to either numbering scheme
+        break here, where the reason is written down, instead of in a ratio assertion whose
+        message would blame the production code.
+        """
+        seeded = {str(row.get("pane_id") or "") for row in self.existing_rows}
+        launched = {slot.locator for slot in result.slots if slot.locator}
+        case.assertEqual(
+            seeded & launched,
+            set(),
+            "a launched slot reused a seeded pane's locator; the fixture is measuring "
+            "one pane while claiming two",
+        )
+
+    # -- geometry ------------------------------------------------------------------
+
+    @staticmethod
+    def _lane_of(name: str) -> str:
+        decoded = decode_assigned_name(name)
+        if not decoded.ok or decoded.identity is None:
+            return ""
+        return decoded.identity.lane_id
+
+    def _seed_columns(self, key, workspace_id, tab_id):
+        """Recover the pre-existing lanes' columns from the live inventory, in row order."""
+        order: list = []
+        grouped: dict = {}
+        for row in self.existing_rows:
+            locator = str(row.get("pane_id") or "")
+            same_tab = (not tab_id) or str(row.get("tab_id") or "") == tab_id
+            if not locator.startswith(f"{workspace_id}:") or not same_tab:
+                continue
+            lane = self._lane_of(str(row.get("name") or ""))
+            if lane not in grouped:
+                grouped[lane] = []
+                order.append(lane)
+            grouped[lane].append(locator)
+        self.columns[key] = [grouped[lane] for lane in order]
+        self.column_lanes[key] = list(order)
+        self.column_ratios[key] = [0.5 for _ in order]
+
+    def _place_pane(self, rest, pane_id, workspace_id, tab_id):
+        """Place the launch in ITS OWN lane's column — a new one if the lane has none yet.
+
+        Keyed on the lane decoded from the launch's assigned name, never on position. An
+        earlier cut of this fake appended a pair-axis launch to the LAST column, which is
+        the launching lane's only when that lane happens to be the rightmost; with the
+        neighbour seeded after it, a heal silently joined the neighbour's column and the
+        pair became unidentifiable. That is the same class of defect review j#92057 F1
+        found in the fixture it replaced, so it is decided from identity here.
+        """
+        key = self._container_key(workspace_id, tab_id)
+        if key not in self.columns:
+            self._seed_columns(key, workspace_id, tab_id)
+        columns = self.columns[key]
+        lanes = self.column_lanes[key]
+        ratios = self.column_ratios[key]
+        split = rest[rest.index("--split") + 1] if "--split" in rest else ""
+        if split:
+            self.split_direction = split
+        lane = self._lane_of(rest[2]) if len(rest) > 2 else ""
+        if lane in lanes:
+            # Splitting beside this lane's own sibling: the pair axis, inside its column.
+            index = lanes.index(lane)
+            if pane_id not in columns[index]:
+                columns[index].append(pane_id)
+            return
+        # This lane has no column yet: opening one (or occupying an empty tab).
+        columns.append([pane_id])
+        lanes.append(lane)
+        ratios.append(0.5)
+
+    def column_of_lane(self, lane, key="wZ:t1"):
+        """The panes of ``lane``'s column — so a test can name the column it means."""
+        lanes = self.column_lanes.get(key, [])
+        return list(self.columns[key][lanes.index(lane)]) if lane in lanes else []
+
+    def _column_of(self, pane_id):
+        for key, columns in self.columns.items():
+            for index, panes in enumerate(columns):
+                if pane_id in panes:
+                    return key, index
+        return "", -1
+
+    def _layout_payload(self, pane_id):
+        key, _index = self._column_of(pane_id)
+        if not key:
+            return render_shared_tab_layout(columns=[], pair_ratios=[])
+        return render_shared_tab_layout(
+            columns=self.columns[key],
+            pair_ratios=self.column_ratios[key],
+            width=self.split_extent,
+            height=self.split_cross,
+        )
+
+    def _apply_resize(self, direction, amount, pane=""):
+        """Move ONLY the addressed pane's own column divider.
+
+        This is the property the composition turns on: a lane resizing its pair must not
+        move the inter-lane divider or a neighbouring lane's pair. Scoping it here is what
+        lets a test assert that as an observation rather than trusting the argv.
+        """
+        key, index = self._column_of(pane)
+        if index < 0:
+            return
+        self.column_ratios[key][index] = apply_resize_amount(
+            self.column_ratios[key][index], direction, amount
+        )
+        self.resized_columns.append(index)
+
+    def pair_ratio_of(self, pane_id) -> float:
+        """The live ratio of the column holding ``pane_id`` — herdr's state, not the ask."""
+        key, index = self._column_of(pane_id)
+        return self.column_ratios[key][index] if index >= 0 else -1.0
+
+
 class SharedTabPairRatioCompositionTest(unittest.TestCase):
     """The #14569 x #14567 seam: which occupancy decides that a PAIR divider was created.
 
@@ -1250,9 +1503,17 @@ class SharedTabPairRatioCompositionTest(unittest.TestCase):
     #14567 breaks that identity: in a shared tab a lane's first slot splits beside ANOTHER
     LANE on :data:`INTER_LANE_SPLIT_DIRECTION`, so the container is occupied while this
     pair still has no divider. The predicate is therefore scoped to the LANE's occupancy
-    (``_created_pair_split``). Both directions are pinned below, because scoping it wrongly
-    fails in one direction and disabling it fails in the other.
+    (``_created_pair_split``).
+
+    Every case runs on :class:`_SharedTabHerdr`, which models the populated tab as columns
+    with their own dividers. The first cut of these pins ran on the flat fake and was a
+    false positive (review j#92057 F1): the "existing" lane and the launched pair were the
+    same two panes, so ``applied`` proved nothing about a lane sharing a tab with another.
     """
+
+    #: The neighbouring lane already in the shared tab, seeded where the fake's own
+    #: launch numbering cannot reach.
+    FOREIGN = ("wZ:p90", "wZ:p91")
 
     @staticmethod
     def _resizes(herdr):
@@ -1261,27 +1522,32 @@ class SharedTabPairRatioCompositionTest(unittest.TestCase):
     @staticmethod
     def _placement():
         # A declared ratio, so `config_ratio` is not None and the rail is genuinely armed;
-        # a test with no ratio would reach `not_applicable` for the wrong reason.
+        # a test reaching `not_applicable` with no ratio would prove it for the wrong reason.
         return LanePlacementConfig.from_record(
             {"sublane": {"split": "down", "ratio": 0.7}}
         )
+
+    def _foreign_lane_rows(self):
+        def rows(ws):
+            return [
+                _row(ws, "codex", "lane-b", self.FOREIGN[0], "wZ:t1"),
+                _row(ws, "claude", "lane-b", self.FOREIGN[1], "wZ:t1"),
+            ]
+
+        return rows
+
+    def _shared_herdr(self):
+        herdr = _SharedTabHerdr(created_workspace="wZ")
+        herdr.tab_labels["wZ:t1"] = SHARED_SUBLANE_TAB_LABEL
+        return herdr
 
     def test_a_lane_opening_its_column_owes_no_pair_ratio(self) -> None:
         # lane-a has no live slot; lane-b already holds the shared tab. lane-a's single
         # launch opens its own column — a divider, but the INTER-LANE one (#14604's axis).
         # Reading the container's occupancy here claims a pair divider that does not exist,
-        # then cannot find it in `config_split`'s direction and reports RATIO_FAILED,
-        # dropping `result.ok` for a healthy launch.
+        # then cannot find it in `config_split`'s direction and reports RATIO_FAILED.
         with tempfile.TemporaryDirectory() as tmp:
-            herdr = _Herdr(created_workspace="wZ")
-            herdr.tab_labels["wZ:t1"] = SHARED_SUBLANE_TAB_LABEL
-
-            def rows(ws):
-                return [
-                    _row(ws, "codex", "lane-b", "wZ:p2", "wZ:t1"),
-                    _row(ws, "claude", "lane-b", "wZ:p3", "wZ:t1"),
-                ]
-
+            herdr = self._shared_herdr()
             result, _ws, _panes = _prepare(
                 tmp,
                 herdr=herdr,
@@ -1289,8 +1555,10 @@ class SharedTabPairRatioCompositionTest(unittest.TestCase):
                 lane="lane-a",
                 sublane_tab_topology=SHARED,
                 lane_placement=self._placement(),
-                rows=rows,
+                rows=self._foreign_lane_rows(),
+                attested=True,
             )
+            herdr.assert_no_locator_collision(self, result)
             # It really did open a column — otherwise this pins nothing.
             self.assertEqual(
                 _split_of(herdr.start_argvs[0]), INTER_LANE_SPLIT_DIRECTION
@@ -1303,31 +1571,37 @@ class SharedTabPairRatioCompositionTest(unittest.TestCase):
                 [],
                 "no divider is resized when this run created no pair divider of its own",
             )
-            self.assertTrue(result.ratio_ok, result.ratio_detail)
+            self.assertTrue(result.ok, result.ratio_detail)
 
-    def test_a_pair_launched_into_an_occupied_shared_tab_still_gets_its_ratio(self) -> None:
+    def test_a_pair_launched_into_an_occupied_shared_tab_gets_only_its_own_ratio(self) -> None:
         # The other direction of the same predicate, so the fix cannot be "switch the ratio
-        # rail off under shared_tab". This lane launches BOTH slots into a tab another lane
-        # occupies: the first opens the column, the SECOND creates this pair's own divider —
-        # which is owed the declared ratio and must actually be resized.
+        # rail off under shared_tab" — and, unlike the first cut of this pin, with a real
+        # neighbouring lane present. The first slot opens the column, the SECOND creates
+        # this pair's own divider, which is owed the declared ratio.
         with tempfile.TemporaryDirectory() as tmp:
-            herdr = _Herdr(created_workspace="wZ")
-            herdr.tab_labels["wZ:t1"] = SHARED_SUBLANE_TAB_LABEL
-
-            def rows(ws):
-                return [
-                    _row(ws, "codex", "lane-b", "wZ:p2", "wZ:t1"),
-                    _row(ws, "claude", "lane-b", "wZ:p3", "wZ:t1"),
-                ]
-
-            result, _ws, _panes = _prepare(
+            herdr = self._shared_herdr()
+            result, _ws, panes = _prepare(
                 tmp,
                 herdr=herdr,
                 providers=["codex", "claude"],
                 lane="lane-a",
                 sublane_tab_topology=SHARED,
                 lane_placement=self._placement(),
-                rows=rows,
+                rows=self._foreign_lane_rows(),
+                attested=True,
+            )
+            herdr.assert_no_locator_collision(self, result)
+            # Four panes really are live in the one tab: the neighbour's two and ours —
+            # named by LANE, because a column identified by position passes even when a
+            # launch joined the wrong lane's column.
+            self.assertEqual(
+                herdr.column_of_lane("lane-b"), list(self.FOREIGN),
+                "the neighbouring lane's column must be untouched by this run",
+            )
+            self.assertEqual(
+                sorted(herdr.column_of_lane("lane-a")),
+                sorted(slot.locator for slot in result.slots),
+                "this run's slots must form this lane's own column",
             )
             self.assertEqual(
                 _split_of(herdr.start_argvs[0]), INTER_LANE_SPLIT_DIRECTION
@@ -1338,7 +1612,57 @@ class SharedTabPairRatioCompositionTest(unittest.TestCase):
                 (RATIO_APPLIED, RATIO_MATCHED),
                 result.ratio_detail,
             )
-            self.assertTrue(result.ratio_ok, result.ratio_detail)
+            self.assertTrue(result.ok, result.ratio_detail)
+            # The claim is about herdr's state: OUR column moved to the declared ratio...
+            self.assertAlmostEqual(herdr.pair_ratio_of(panes["codex"]), 0.7, places=6)
+            # ...and the neighbour's did not move at all.
+            self.assertAlmostEqual(herdr.pair_ratio_of(self.FOREIGN[0]), 0.5, places=6)
+            self.assertEqual(
+                set(herdr.resized_columns),
+                {herdr.column_lanes["wZ:t1"].index("lane-a")},
+                "only this lane's own column divider may be resized",
+            )
+
+    def test_a_shared_tab_heal_beside_its_own_sibling_is_owed_the_ratio(self) -> None:
+        # Decision 4's heal shape, stated as a ratio disposition rather than only as argv.
+        # lane-a already holds one slot in the shared tab, so its second launch splits on
+        # the PAIR axis beside its own sibling and therefore DOES create the pair divider —
+        # `not_applicable` here would mean a shared-tab lane silently never gets its ratio.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = self._shared_herdr()
+
+            def rows(ws):
+                return [
+                    _row(ws, "codex", "lane-b", self.FOREIGN[0], "wZ:t1"),
+                    _row(ws, "claude", "lane-b", self.FOREIGN[1], "wZ:t1"),
+                    _row(ws, "codex", "lane-a", "wZ:p92", "wZ:t1"),
+                ]
+
+            result, _ws, _panes = _prepare(
+                tmp,
+                herdr=herdr,
+                providers=["claude"],
+                lane="lane-a",
+                sublane_tab_topology=SHARED,
+                lane_placement=self._placement(),
+                pair_order=("codex", "claude"),
+                rows=rows,
+                attested=True,
+            )
+            herdr.assert_no_locator_collision(self, result)
+            self.assertEqual(
+                _split_of(herdr.start_argvs[0]),
+                "down",
+                "a heal rejoins its own pair, not the inter-lane axis",
+            )
+            self.assertIn(
+                result.ratio_outcome,
+                (RATIO_APPLIED, RATIO_MATCHED),
+                result.ratio_detail,
+            )
+            self.assertTrue(result.ok, result.ratio_detail)
+            self.assertAlmostEqual(herdr.pair_ratio_of("wZ:p92"), 0.7, places=6)
+            self.assertAlmostEqual(herdr.pair_ratio_of(self.FOREIGN[0]), 0.5, places=6)
 
     def test_per_lane_tab_keeps_the_pre_14567_predicate(self) -> None:
         # Under `per_lane_tab` the lane occupancy IS the container occupancy, so a
@@ -1348,7 +1672,7 @@ class SharedTabPairRatioCompositionTest(unittest.TestCase):
             herdr = _Herdr(created_workspace="wZ")
 
             def rows(ws):
-                return [_row(ws, "codex", "lane-a", "wZ:p2", "wZ:t1")]
+                return [_row(ws, "codex", "lane-a", "wZ:p90", "wZ:t1")]
 
             result, _ws, _panes = _prepare(
                 tmp,
@@ -1358,6 +1682,7 @@ class SharedTabPairRatioCompositionTest(unittest.TestCase):
                 sublane_tab_topology=PER_LANE,
                 lane_placement=self._placement(),
                 rows=rows,
+                attested=True,
             )
             self.assertEqual(_split_of(herdr.start_argvs[0]), "down")
             self.assertNotEqual(

@@ -571,20 +571,35 @@ binding を持たない (provider の選択ではなく split の配分である
 
 ### Launch semantics
 
+- **container と 2 つの occupancy (#14567)**: container は default = project workspace、sublane =
+  `sublane_tab_topology` が決める tab である — `per_lane_tab` では lane 専用 tab、`shared_tab` では
+  **project の全 lane が同居する 1 枚の tab**。したがって配置判定は **2 つの counter** を持つ
+  (`ContainerPlan.occupancy` / `.lane_occupancy`): 前者は「そもそも split するか」、後者は「**どちらの軸で**
+  split するか」を決める。`per_lane_tab` では両者はつねに等しく、以下の記述は #14567 以前と一致する。
 - **fresh pair**: `prepare_session` が `order` で requested providers を並べ替える。1st slot が container
-  (default = project workspace / sublane = lane tab) を占有し (`--split` 無し)、2nd slot が
-  `--split <dir>` で隣に置かれる。`--split` は `--tab` と独立に出せる (herdr 0.7.1 は両者を独立 optional
-  flag として受理) ため、tab を持たない default pair も縦分割できる。
+  を占有し (`--split` 無し)、2nd slot が `--split <dir>` で隣に置かれる。`--split` は `--tab` と独立に
+  出せる (herdr 0.7.1 は両者を独立 optional flag として受理) ため、tab を持たない default pair も
+  縦分割できる。
+  **shared tab で container が既に埋まっている場合** (先行 lane が居る)、1st slot は container を占有
+  できないので `--split right` (`INTER_LANE_SPLIT_DIRECTION`) で **自 lane の列を開き** `--focus` を取る。
+  2nd slot はその列の中で `--split <dir>` する。つまり fresh pair は shared tab では
+  `(inter-lane, pair)` の 2 軸を順に使う。この場合も pair divider を作るのは **2nd slot** であり、
+  ratio actuation の対象はその divider だけである (lane 間の列幅は #14604 の scope)。
 - **active-target と first-launch `--focus` (Redmine #13646 R1-F1、実機実測)**: herdr の split は
   **container の active pane** を割る。`agent start` に pane-target flag は無い。全 launch を
   `--no-focus` にすると container の空 root pane が active のままなので、2nd slot の `--split <dir>` は
   **1st agent ではなく root pane** を割り、その root を reclaim した時点で nested split が畳まれ、1st agent
   の暗黙 split が作った外側の既定 `right` だけが残る = **設定方向が無言で効かない**。
-  → **fresh container では 1st launch を `--focus`** にして split target を 1st agent へ固定し、2nd 以降は
+  → **その lane がまだ pane を持たないときは 1st launch を `--focus`** にして split target を 1st agent
+  へ固定し (fresh container、および shared tab で新しく開く列の両方)、2nd 以降は
   `--split <dir> --no-focus` とする。root pane reclaim は従来どおり **全 launch 成功後**
   (partial-launch safety を壊さない)。
-  発火条件は: container occupancy = 0 かつ launch 対象 2 件以上かつ **effective split 方向が非空**。
-  **single-provider / heal / mixed adopt では発火しない**。
+  発火条件は: **lane occupancy = 0** かつ launch 対象 2 件以上かつ **effective split 方向が非空**
+  (`resolve_focus_first_launch`)。**single-provider / heal / mixed adopt では発火しない**。
+  **#14567 の変更点**: 第 1 項は container ではなく **自 lane** の occupancy である。shared tab で先行
+  lane が居る場合、新 lane の 1 本目は container occupancy が非零のまま `--split right` で列を開くが、
+  その pane こそ 2 本目の split target なので **`--focus` は必要**である。container 側で判定すると
+  この 1 本目が focus を失い、pair が隣 lane の pane を割って裂ける。
   なお `--split right` literal (#13411) も同じ理由で本来効いておらず、観測される `right` は herdr 既定
   split の偶然の一致だった。
   **#14568 の変更点**: 発火条件の第 3 項は「`split`/`order` が **explicit**」から「**effective** split 方向が
@@ -594,7 +609,15 @@ binding を持たない (provider の選択ではなく split の配分である
 - **single-provider request**: `order` は **未要求の peer を暗黙 launch しない**。heal は欠けた provider
   だけを launch する。
 - **heal**: 生存 sibling の隣へ configured `--split <dir>` で launch する。既存 pane は swap / move /
-  bounce / focus しない (container の唯一の pane = 生存 sibling が既に split target なので `--focus` 不要)。
+  bounce / focus しない (**自 lane の occupancy が非零**、すなわち生存 sibling が既に split target なので
+  `--focus` 不要)。`per_lane_tab` ではこれは「container の唯一の pane = 生存 sibling」と同義だが、
+  **shared tab では container に他 lane の pane が居るためその言い換えは成立しない** — 判断根拠は
+  container の pane 数ではなく **自 lane の occupancy** である。
+  heal は自 pair の divider を作るので **ratio actuation の対象である**。ただし `providers` を縮小した
+  caller が lane の stable な `pair_order` を渡さなかった場合、effective order を決められないので
+  `deferred_until_full_relaunch` へ倒す (上記 order best-effort と同じ根拠。`deferred` は成功語彙の一員で
+  あり `failed` ではない)。**自 lane に生存 slot が 1 つも無い状態での single-provider launch は heal では
+  なく「列を開く」ケース**であり、pair divider を作らないので ratio は `not_applicable` になる。
 - **order best-effort**: herdr `agent start` に pane-target flag は存在しない (実 `--help` 照合) ため、
   役割順序は **launch 順としてのみ**実現できる。configured primary (`order[0]`) が後から復旧し、生存
   sibling の隣へ split するしかない場合は物理順序を満たせないので、その slot の `detail` に
@@ -610,10 +633,16 @@ herdr 0.7.4 `agent start` は **`--ratio` を持たない** (`pane split` / `pan
 cohesive sibling。reclaim が先なのは、root pane を閉じると split tree が畳まれ、その前に測った
 geometry が直後に変わるため)。
 
-- **actuate するのは「この run が今作った divider」だけ**。判定は
-  `launched >= 1 かつ (container の初期 occupancy > 0 または launched >= 2)` — `--split` を出した launch が
-  この run に 1 つ以上あることと同値である。all-adopt / dry-run / 空 container への単発 launch は
+- **actuate するのは「この run が今作った *pair* divider」だけ**。判定は
+  `launched >= 1 かつ (lane の初期 occupancy > 0 または launched >= 2)` — **pair 軸**に `--split` を出した
+  launch がこの run に 1 つ以上あることと同値である。all-adopt / dry-run / 空 container への単発 launch は
   divider を作らないので **何も触らない**。config を読むだけで live pair が動く経路は存在しない。
+  **scope は container ではなく lane である** (#14567 との合成、`_created_pair_split`)。shared tab では
+  lane の 1 本目の slot が *隣の lane* の横へ inter-lane 軸で割って入るため、**container は既に埋まって
+  いるのに当該 pair の divider はまだ存在しない**。ここで container 側の occupancy を読むと「pair divider
+  を作った」と誤主張し、`split` 方向にそれを探して見つけられず、健全な single-slot launch を `failed` と
+  報告してしまう。`per_lane_tab` と default lane では 2 つの occupancy は構造上つねに等しい
+  (`resolve_container_plan`) ため、非 shared 経路の判定は #14567 以前と同一である。
   **この述語が「測定するか」も決める**: これを通過した run は測定を負っているので、以降の拒否はすべて
   `failed` であり `not_applicable` ではない。`not_applicable` になるのは **layout を 1 度も読む前に**
   決まる場合 (dry-run / divider 未作成 / ratio・direction 未解決) だけである。
