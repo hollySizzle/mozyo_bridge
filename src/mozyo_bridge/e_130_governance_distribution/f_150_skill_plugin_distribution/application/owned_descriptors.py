@@ -256,26 +256,40 @@ class _Retention:
                 if first is None:
                     first = interrupt
                 unadmitted.append(_Occurrence(interrupt))
-        self._admit_before_leaving(unadmitted)
-        return first
+        return self._admit_before_leaving(unadmitted, first)
 
-    def _admit_before_leaving(self, unadmitted: list[_Occurrence]) -> None:
+    def _admit_before_leaving(
+        self, unadmitted: list[_Occurrence], first: BaseException | None
+    ) -> BaseException | None:
         """Get the leftovers into the queue, so a later retention can see them.
 
         Whatever is still unadmitted when this call gives up would otherwise
-        exist only in a local that is about to go out of scope. Bounded, and
-        the last unavoidable point: a signal can land on the instruction that
-        appends to the queue, and Python has no way to make that atomic. The
-        window is one instruction wide, retried, and no wider than this.
+        exist only in a local that is about to go out of scope.
+
+        This runs on the same two rails as everything else, which it did not
+        when it was first written: it swallowed control flow with a ``continue``
+        under the comment "priority is already decided". That is false whenever
+        the main loop left on an *ordinary* failure — ``first`` is still
+        ``None`` then, so an interrupt here was neither raised by the caller nor
+        recorded, even though the very next attempt admitted successfully
+        (j#90779 R21-F1). An interrupt is a first-class occurrence at the exit
+        too, and it is an addition, never a replacement.
+
+        The last unavoidable point is one instruction wide: a signal can land on
+        the append itself, which Python cannot make atomic. It is retried, and
+        it is no wider than that.
         """
         for _ in range(_RETENTION_ATTEMPTS):
             try:
                 self._admit(unadmitted)
-                return
+                return first
             except Exception:  # noqa: BLE001 - the queue is a plain list; retry
                 continue
-            except BaseException:  # noqa: BLE001 - priority is already decided
-                continue
+            except BaseException as interrupt:  # noqa: BLE001 - routed, not raised
+                if first is None:
+                    first = interrupt
+                unadmitted.append(_Occurrence(interrupt))
+        return first
 
     def _admit(self, unadmitted: list[_Occurrence]) -> None:
         """Queue every arrival that is not queued yet."""

@@ -2513,6 +2513,62 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
                 else:
                     self.assertIsNone(first, "an ordinary failure is not control flow")
 
+    def test_an_interrupt_during_the_final_admission_still_counts(self) -> None:
+        """j#90779 R21-F1. The exit rail added for R20-F1 swallowed control flow
+        with a `continue`, under a comment claiming priority was already
+        decided. It is not: when the main loop leaves on an *ordinary* failure
+        nothing has been chosen yet, so an interrupt during the final admission
+        was neither raised by the caller nor recorded — while the very next
+        attempt admitted successfully, so this is not the never-recovers
+        boundary either.
+
+        The schedule is the point: an ordinary failure first, so the exit rail
+        is reached with no control flow chosen, then the interrupt on it, then
+        recovery. Neither earlier regression composes those.
+        """
+        real_enqueue = owned_descriptors._Retention._enqueue
+        interrupt = KeyboardInterrupt("the final admission was interrupted")
+        calls: list[int] = []
+
+        def scheduled(retention, occurrence):  # type: ignore[no-untyped-def]
+            calls.append(1)
+            if len(calls) == 1:
+                raise MemoryError("the main admission failed")
+            if len(calls) == 2:
+                raise interrupt
+            return real_enqueue(retention, occurrence)
+
+        ran: list[str] = []
+
+        def failing() -> bool:
+            ran.append("failing")
+            return False
+
+        def quiet() -> None:
+            ran.append("quiet")
+
+        primary = Exception("write failed")
+        with unittest.mock.patch.object(
+            owned_descriptors._Retention, "_enqueue", scheduled
+        ):
+            control = owned_descriptors._teardown_during(primary, failing, quiet)
+
+        self.assertGreaterEqual(len(calls), 3, "the schedule never reached recovery")
+        self.assertEqual(["failing", "quiet"], ran)
+        self.assertIs(control, interrupt, "the interrupt did not reach the caller")
+
+        ledger = owned_descriptors.teardown_failures(primary)
+        self.assertEqual(
+            1,
+            sum(1 for entry in ledger if entry is False),
+            "the returned failure was lost",
+        )
+        self.assertEqual(
+            1,
+            sum(1 for entry in ledger if entry is interrupt),
+            "the interrupt was not retained exactly once",
+        )
+
     def test_an_exhausted_retry_still_reaches_the_queue(self) -> None:
         """j#90620 R20-F1, the far end of the same defect. The last interrupt of
         an exhausted retry sat in the local that was about to go out of scope,
