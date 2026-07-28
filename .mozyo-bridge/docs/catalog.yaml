@@ -1381,6 +1381,22 @@ documents:
       - spec-project-map
       - skill-workflow-reference
 
+  - id: logic-legacy-mirror-failure-state-characterization
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/legacy-mirror-failure-state-characterization.md
+    purpose: "legacy project skill partial-mirror の同期障害を #14592 の状態ベース設計へ分離する前に、現行の観測可能な挙動を read-only に固定した characterization 正本 (Redmine #14660、親 #14592)。audit 機械 (rule A-F/P/W の評価順序・suppression・recovery precedence)、write 機械 (`_replace_one` の遷移表と staging cleanup ownership)、retention 機械 (`owned_descriptors` の 3 outcome channel と ledger occurrence 保存則) を実測から表で定義し、retry admissibility の収束/非収束を分ける。test 側は AST 導出 inventory で pure / real-file / boundary-injection / subprocess を分割し、#14592 の 6 invariant を pure unit / real-file integration / boundary injection / regression の各層へ一意に対応づける。source 行番号依存 3 件と private call order 依存 1 件の残置理由 (廃止不能な最小境界)、Hypothesis 非採用の根拠 (依存追加コスト・欠陥形状と生成器形状の不一致・網羅証明の喪失) と再開条件、behavior-preserving move と behavior change を分ける実装 Task 分割と changed-path ownership を持つ。"
+    audit_role: legacy_mirror_failure_state_characterization_logic
+    related_document_refs:
+      - logic-tests-placement-discovery-policy
+      - logic-refactor-split-strategy
+      - logic-module-health-gate
+      - logic-skill-distribution
+      - logic-object-oriented-architecture-policy
+      - spec-bounded-context-map
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
   - id: logic-herdr-scenario-test-foundation
     type: logic
     status: active
@@ -1532,6 +1548,21 @@ file_conventions:
       - rule-project-agent-workflow
       - logic-object-oriented-architecture-policy
       - skill-workflow-reference
+
+  - id: fc-legacy-mirror-sync
+    name: legacy project skill partial-mirror sync source and tests
+    patterns:
+      - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/legacy_mirror_sync.py
+      - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/owned_descriptors.py
+      - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/platform_capabilities.py
+      - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/domain/legacy_mirror_contract.py
+      - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_*.py
+      - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_*.py
+    severity: warn
+    document_refs:
+      - logic-legacy-mirror-failure-state-characterization
+      - logic-tests-placement-discovery-policy
+      - logic-skill-distribution
 
   - id: fc-workflow-contract-config
     name: ticketless/delegated workflow-contract bundle config source of truth
