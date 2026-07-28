@@ -38,6 +38,7 @@ now, so there is nothing to cross-check and nothing to drift.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import inspect
@@ -2514,49 +2515,73 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
                     self.assertIsNone(first, "an ordinary failure is not control flow")
 
     @staticmethod
-    def _guarded_body_lines() -> list[int]:
-        """Every line of `_took_the_interrupt`'s guarded body.
+    def _helper_lines() -> dict[str, object]:
+        """Classify every executable line of `_took_the_interrupt`.
 
-        Enumerated rather than named, so the injection covers whatever the body
-        happens to contain. Naming the lines is how the last gap got through:
-        both targets sat after the priority assignment, so nothing exercised
-        the decision itself (j#90839 R23-F1). A statement added here is covered
-        the moment it exists.
+        Enumerated from the code object rather than named, because naming is
+        how the last two gaps got through: the injections sat after the
+        priority assignment (j#90839 R23-F1), and then the enumeration started
+        *after* the `try:` header and so skipped the two lines that were
+        actually unprotected (j#90882 R24-F1). Everything the function can
+        execute is classified here, and the residual is asserted rather than
+        assumed.
         """
-        lines, start = inspect.getsourcelines(owned_descriptors._took_the_interrupt)
-        found: list[int] = []
-        inside = False
-        for offset, line in enumerate(lines):
-            stripped = line.strip()
-            if not inside:
-                inside = stripped == "try:"
-                continue
-            if stripped.startswith("except BaseException as nested"):
-                break
-            if stripped:
-                found.append(start + offset)
-        if not found:
-            raise AssertionError("no guarded body found in _took_the_interrupt")
-        return found
-
-    def _interrupt_while_taking_an_interrupt(self, line: int):
-        """Raise once inside `_took_the_interrupt`, at `line`."""
+        source, start = inspect.getsourcelines(owned_descriptors._took_the_interrupt)
         code = owned_descriptors._took_the_interrupt.__code__
-        nested = GeneratorExit("a second interrupt while recording the first")
-        fired: list[bool] = []
+        executable = sorted({line for _, _, line in code.co_lines() if line})
+
+        def text(line: int) -> str:
+            return source[line - start].strip()
+
+        entry = next(line for line in executable if text(line) == "try:")
+        handler = next(
+            line
+            for line in executable
+            if text(line).startswith("except BaseException as nested")
+        )
+        exit_line = next(line for line in executable if text(line).startswith("return "))
+
+        body = [line for line in executable if entry < line < handler]
+        inner = [line for line in executable if handler <= line < exit_line]
+        if not body or not inner:
+            raise AssertionError("the helper no longer has the shape this probe assumes")
+
+        def transitional(line: int) -> bool:
+            """Region boundaries: no arrangement of Python puts these inside a guard."""
+            body_text = text(line)
+            return (
+                body_text == "try:"
+                or body_text.startswith("except ")
+                or body_text.startswith("return ")
+            )
+
+        return {
+            "executable": executable,
+            "entry": entry,
+            "exit": exit_line,
+            "body": body,
+            "inner": inner,
+            "transitions": [line for line in executable if transitional(line)],
+            "statements": [line for line in executable if not transitional(line)],
+        }
+
+    def _interrupt_while_taking_an_interrupt(self, steps):  # type: ignore[no-untyped-def]
+        """Raise each `(line, exception)` in `steps`, in order, once each."""
+        code = owned_descriptors._took_the_interrupt.__code__
+        pending = list(steps)
 
         def local(frame, event, arg):  # type: ignore[no-untyped-def]
-            if event == "line" and frame.f_lineno == line and not fired:
-                fired.append(True)
-                raise nested
+            if event == "line" and pending and frame.f_lineno == pending[0][0]:
+                _, failure = pending.pop(0)
+                raise failure
             return local
 
         def tracer(frame, event, arg):  # type: ignore[no-untyped-def]
             return local if frame.f_code is code else None
 
-        return tracer, fired, nested
+        return tracer, pending
 
-    def _interrupt_the_main_rail(self):
+    def _interrupt_the_main_rail(self, reached: list[bool] | None = None):
         """Interrupt the carrier once, so the main retention rail handles it."""
         real_ledger = owned_descriptors._ledger
         fired: list[bool] = []
@@ -2565,6 +2590,8 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         def interrupts_once(primary):  # type: ignore[no-untyped-def]
             if not fired:
                 fired.append(True)
+                if reached is not None:
+                    reached.append(True)
                 raise interrupt
             return real_ledger(primary)
 
@@ -2573,7 +2600,7 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             interrupt,
         )
 
-    def _interrupt_the_final_rail(self):
+    def _interrupt_the_final_rail(self, reached: list[bool] | None = None):
         """Fail the main admission, then interrupt the exit rail."""
         real_enqueue = owned_descriptors._Retention._enqueue
         calls: list[int] = []
@@ -2584,6 +2611,8 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             if len(calls) == 1:
                 raise MemoryError("the main admission failed")
             if len(calls) == 2:
+                if reached is not None:
+                    reached.append(True)
                 raise interrupt
             return real_enqueue(retention, occurrence)
 
@@ -2594,6 +2623,30 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             interrupt,
         )
 
+    @staticmethod
+    def _enter_the_handler_once(reached: list[bool]):
+        """Make the helper's first occurrence raise, once the rail has fired.
+
+        The handler cannot be reached by a traced injection: raising from a
+        trace function turns tracing off for that frame, so a second injection
+        inside the handler would never fire — the kind of probe that reports
+        green having done nothing. Failing the construction instead leaves the
+        tracer armed for the line actually under test.
+        """
+        real = owned_descriptors._Occurrence
+        entered: list[bool] = []
+        trigger = GeneratorExit("the interrupt that enters the handler")
+
+        def raising_once(failure):  # type: ignore[no-untyped-def]
+            if reached and not entered:
+                entered.append(True)
+                raise trigger
+            return real(failure)
+
+        return unittest.mock.patch.object(
+            owned_descriptors, "_Occurrence", raising_once
+        ), entered
+
     def test_a_nested_interrupt_never_skips_a_remaining_action(self) -> None:
         """j#90807 R22-F1. Catching a control-flow exception is not the same as
         handling it: the `except` body is ordinary code outside the `try` that
@@ -2603,20 +2656,38 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         `GeneratorExit` escaping `_teardown_during`, an empty ledger, and the
         first interrupt's priority lost as well.
 
-        Both rails and every line of the conversion, because the last rounds
-        each fixed one rail or one line and left its twin shaped the same way.
-        Priority now comes from the arguments in the return expression, so no
-        line of the body can change it (j#90839 R23-F1) — which is why every
+        Both rails and every executable line of the helper, because each of the
+        last rounds fixed one rail or one line and left its twin the same
+        shape. Priority comes from the arguments in the return expression, so
+        no line of the body can change it (j#90839 R23-F1) — which is why every
         line can assert the same thing.
+
+        The residual is *measured*, not assumed. **No statement may escape.**
+        What can is the region boundaries — a `try` header, an `except`
+        header, the `return` — which sit between protected ranges by
+        construction; wrapping them in another guard only moves which boundary
+        is exposed, it does not remove one. Asserting the difference is the
+        point: assuming it is how the last two rounds shipped a residual wider
+        than the docs claimed (j#90839 R23-F1, j#90882 R24-F1).
         """
+        shape = self._helper_lines()
+        escaped: set[int] = set()
+
         for rail, drive in (
             ("main", self._interrupt_the_main_rail),
             ("final", self._interrupt_the_final_rail),
         ):
-            for line in self._guarded_body_lines():
+            for line in shape["executable"]:  # type: ignore[union-attr]
                 with self.subTest(rail=rail, line=line):
-                    patch, interrupt = drive()
-                    tracer, fired, nested = self._interrupt_while_taking_an_interrupt(line)
+                    reached: list[bool] = []
+                    patch, interrupt = drive(reached)
+                    nested = GeneratorExit("a second interrupt while recording")
+                    tracer, pending = self._interrupt_while_taking_an_interrupt(
+                        [(line, nested)]
+                    )
+
+                    inner = line in shape["inner"]  # type: ignore[operator]
+                    enter, entered = self._enter_the_handler_once(reached)
 
                     ran: list[str] = []
 
@@ -2628,32 +2699,59 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
                         ran.append("quiet")
 
                     primary = Exception("write failed")
-                    with patch:
+                    left = None
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(patch)
+                        if inner:
+                            stack.enter_context(enter)
                         sys.settrace(tracer)
                         try:
                             control = owned_descriptors._teardown_during(
                                 primary, failing, quiet
                             )
+                        except BaseException as out:  # noqa: BLE001 - the point of the test
+                            control, left = None, out
                         finally:
                             sys.settrace(None)
 
-                    self.assertTrue(fired, "the nested injection never fired")
+                    if inner:
+                        self.assertTrue(entered, f"line {line}: the handler was never entered")
+                    if pending:
+                        continue  # this line never ran under this schedule
+                    if left is not None:
+                        escaped.add(line)
+                        continue
+
                     self.assertEqual(
                         ["failing", "quiet"], ran, "a remaining action was skipped"
                     )
                     self.assertIs(control, interrupt, "the first interrupt lost priority")
 
-                    ledger = owned_descriptors.teardown_failures(primary)
-                    self.assertEqual(
-                        1,
-                        sum(1 for entry in ledger if entry is nested),
-                        "the nested interrupt was not retained",
-                    )
-                    self.assertEqual(
-                        1,
-                        sum(1 for entry in ledger if entry is interrupt),
-                        "the interrupt being recorded was lost",
-                    )
+                    if line in shape["body"]:  # type: ignore[operator]
+                        ledger = owned_descriptors.teardown_failures(primary)
+                        self.assertEqual(
+                            1,
+                            sum(1 for entry in ledger if entry is nested),
+                            "the nested interrupt was not retained",
+                        )
+                        self.assertEqual(
+                            1,
+                            sum(1 for entry in ledger if entry is interrupt),
+                            "the interrupt being recorded was lost",
+                        )
+
+        self.assertEqual(
+            set(),
+            escaped.intersection(shape["statements"]),  # type: ignore[arg-type]
+            "a statement of the helper escaped it, skipping the remaining teardown",
+        )
+        self.assertTrue(
+            escaped, "nothing escaped at all — the probe is not reaching the helper"
+        )
+        self.assertTrue(
+            escaped.issubset(shape["transitions"]),  # type: ignore[arg-type]
+            "something outside the region boundaries escaped",
+        )
 
     def test_an_interrupt_during_the_final_admission_still_counts(self) -> None:
         """j#90779 R21-F1. The exit rail added for R20-F1 swallowed control flow

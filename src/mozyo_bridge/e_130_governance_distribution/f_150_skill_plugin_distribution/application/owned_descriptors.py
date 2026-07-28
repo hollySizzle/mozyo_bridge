@@ -207,21 +207,36 @@ def _took_the_interrupt(
     teardown actions, and those outrank a second interrupt whose arrival is
     already represented by the first.
 
-    What is left is the call and the return: one instruction at each edge, the
-    same residue as the queue append, and no wider.
+    Nothing runs before the ``try``. Initialising a local first looked
+    harmless and was not: that line, like the ``try`` header itself, is outside
+    the protected range, so an arrival on it left the helper — taking the
+    remaining cleanup and both occurrences with it (j#90882 R24-F1). Whether
+    the occurrence exists is asked of the binding instead, from inside the
+    guard.
+
+    What is left is the region boundaries themselves — a ``try`` header, an
+    ``except`` header, the ``return`` — which sit between protected ranges by
+    construction. Wrapping them in another guard only moves which boundary is
+    exposed. No *statement* escapes, and the regression injects into every
+    executable line of this function to keep that measured rather than assumed;
+    claiming a narrower residual than the code has is the mistake this
+    paragraph replaces.
     """
-    occurrence: _Occurrence | None = None
     try:
         occurrence = _Occurrence(interrupt)
         unadmitted.append(occurrence)
     except BaseException as nested:  # noqa: BLE001 - absorbed, never raised
         try:
-            if occurrence is None:
-                occurrence = _Occurrence(interrupt)
+            try:
+                held = occurrence
+            except UnboundLocalError:
+                # Interrupted before the occurrence existed; the argument is
+                # bound at call time and cannot have been lost.
+                held = _Occurrence(interrupt)
             # Identity, so a nested arrival *after* the append does not queue
             # the same occurrence twice — the commit-boundary lesson again.
-            if not any(queued is occurrence for queued in unadmitted):
-                unadmitted.append(occurrence)
+            if not any(queued is held for queued in unadmitted):
+                unadmitted.append(held)
             unadmitted.append(_Occurrence(nested))
         except BaseException:  # noqa: BLE001 - the regress ends here, by design
             pass
