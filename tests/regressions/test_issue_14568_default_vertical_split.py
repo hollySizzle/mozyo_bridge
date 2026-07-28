@@ -63,7 +63,7 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     SOURCE_DEFAULT,
     classify_config_sources,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_geometry import (  # noqa: E501
     resolve_placement_policy_for_role,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501

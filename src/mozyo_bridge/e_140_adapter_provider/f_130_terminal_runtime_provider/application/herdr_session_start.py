@@ -110,6 +110,9 @@ if TYPE_CHECKING:
         AgentLaunchConfig,
         LanePlacementConfig,
     )
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.sublane_tab_topology import (  # noqa: E501
+        SublaneTabTopologyConfig,
+    )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501
         LaneLaunchContext,
     )
@@ -215,27 +218,27 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
     _close_base_pane,
     _create_tab,
-    _create_workspace,
     _invoke,
     _list_rows,
-    _list_workspace_labels,
+    _list_tab_labels,
     preflight_launcher_compatibility,
     HerdrLauncherIncompatibleError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
     HerdrSessionStartError,
-    SHARED_COORDINATOR_WORKSPACE_LABEL,
-    _host_workspace_label,
-    _lane_live_slot_tabs,
-    _launch_target_for_lane,
     _parse_started_agent,
     _parse_tab_created,
     _parse_workspace_created,
-    _shared_coordinator_own_target,
-    _shared_coordinator_target,
-    _tab_target_for_lane,
     _workspace_prefix,
     herdr_workspace_segment,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_host_workspace import (  # noqa: E501
+    resolve_host_workspace,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_shared_tab import (  # noqa: E501
+    resolve_lane_tab,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_geometry import (  # noqa: E501
     resolve_container_plan,
     resolve_launch_order,
     resolve_placement_policy_for_role,
@@ -244,12 +247,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
     COORDINATOR_PLACEMENT_MODES,
     DEFAULT_COORDINATOR_PLACEMENT_MODE,
-    SHARED_SPACE,
-)
-from mozyo_bridge.core.state.coordinator_placement_fence import (
-    CoordinatorSharedCreateLockUnavailable,
-    CoordinatorSharedCreateReleaseError,
-    coordinator_shared_create_lock,
 )
 from mozyo_bridge.shared.errors import die
 
@@ -282,6 +279,7 @@ def prepare_session(
     claude_permission_mode_default: Optional[str] = None,
     agent_launch: "Optional[AgentLaunchConfig]" = None,
     lane_placement: "Optional[LanePlacementConfig]" = None,
+    sublane_tab_topology: "Optional[SublaneTabTopologyConfig]" = None,
     launch_context: "Optional[LaneLaunchContext]" = None,
     coordinator_placement_mode: str = DEFAULT_COORDINATOR_PLACEMENT_MODE,
     attestation_reader: "Optional[Callable[[str], Optional[IdentityAttestationRecord]]]" = None,
@@ -326,6 +324,7 @@ def prepare_session(
         claude_permission_mode_default=claude_permission_mode_default,
         agent_launch=agent_launch,
         lane_placement=lane_placement,
+        sublane_tab_topology=sublane_tab_topology,
         launch_context=launch_context,
         coordinator_placement_mode=coordinator_placement_mode,
         attestation_reader=attestation_reader,
@@ -367,6 +366,7 @@ def _prepare_session_locked(
     claude_permission_mode_default: Optional[str] = None,
     agent_launch: "Optional[AgentLaunchConfig]" = None,
     lane_placement: "Optional[LanePlacementConfig]" = None,
+    sublane_tab_topology: "Optional[SublaneTabTopologyConfig]" = None,
     launch_context: "Optional[LaneLaunchContext]" = None,
     coordinator_placement_mode: str = DEFAULT_COORDINATOR_PLACEMENT_MODE,
     attestation_reader: "Optional[Callable[[str], Optional[IdentityAttestationRecord]]]" = None,
@@ -541,6 +541,17 @@ def _prepare_session_locked(
     # declares no `lane_placement` still lands its pairs vertically with the coordinator on
     # top. `split: right` on the lane class (or on a lane kind) is the rollback.
     lane_class = "default" if result.lane_id == DEFAULT_LANE else "sublane"
+    # The lane-BETWEEN axis (Redmine #14567), disjoint from the pair geometry above: does
+    # this project put every lane in its own tab, or all of them in one shared tab? Only a
+    # non-default lane has a tab at all, so the coordinator pair is unaffected by the mode
+    # and the flag is pinned False there rather than left to the tab code to re-check. A
+    # `None` config (a caller with no repo config — no production launch path) is the
+    # product default, `per_lane_tab`.
+    shared_tab = bool(
+        result.lane_id != DEFAULT_LANE
+        and sublane_tab_topology is not None
+        and sublane_tab_topology.shared_tab
+    )
     config_split, config_order = resolve_placement_policy_for_role(
         lane_placement, lane_class, lane_kind
     )
@@ -678,166 +689,61 @@ def _prepare_session_locked(
     )
     result.action_id = transaction.action_id if transaction else ""
 
-    # Resolve the launch-target workspace (Redmine #13330 / #13377 / #13380). Nothing
-    # to launch (all adopt / dry-run) means no workspace create and no reclaim —
-    # byte-invariant. Placement is lane-aware (#13380 dedicated sublane host): a
-    # lane's own live/adopted slots pin the target first (a heal never splits a
-    # pair); otherwise a lane slot joins the sublane host workspace the other lane
-    # slots occupy (never the coordinator's), and the default lane joins only its
-    # own pins — one mozyo workspace thus occupies a constant "project 1 + host 1"
-    # herdr workspaces. When nothing pins a target the workspace is created
-    # explicitly (labelled for a lane slot) so its empty root pane is a known
-    # handle to reclaim, not one we scan for.
-    #
-    # Operator placement mode (Redmine #14139): in `shared_space` mode the DEFAULT
-    # lane (coordinator pair) instead joins one stable shared coordinators
-    # workspace across projects (`_shared_coordinator_target`), created with the
-    # stable `SHARED_COORDINATOR_WORKSPACE_LABEL`. Only the default lane in shared
-    # mode diverges; `per_project_space` (the default) and every sublane path stay
-    # byte-for-byte the pre-#14139 resolution — the shared branch is never taken
-    # for a lane slot, so the #13380/#13411 sublane axes are untouched.
+    # Resolve the launch-target workspace — the outer container axis (#13330 / #13377 /
+    # #13380 / #14139 operator placement mode). The whole resolution, its fail-closed
+    # messages, and the shared-space single-flight fence live in
+    # `herdr_host_workspace.resolve_host_workspace`; nothing to launch resolves to no
+    # workspace and no reclaim.
     launch_plans = [p for p in plans if p.kind == "launch"]
-    target_workspace = ""
+    target_workspace, workspace_base_pane_id = resolve_host_workspace(
+        rows,
+        workspace_id,
+        result.lane_id,
+        launching=bool(launch_plans),
+        adopt_locators=[p.locator for p in plans if p.kind == "adopt"],
+        coordinator_placement_mode=coordinator_placement_mode,
+        repo_root=repo_root,
+        resolved_root=resolved_root,
+        binary=binary,
+        runner=runner,
+        timeout=timeout,
+        env=env,
+    )
     if launch_plans:
-        shared_coordinator_space = (
-            coordinator_placement_mode == SHARED_SPACE
-            and result.lane_id == DEFAULT_LANE
-        )
-        adopt_locators = [p.locator for p in plans if p.kind == "adopt"]
-        if shared_coordinator_space:
-            # The shared coordinators space is identified by its stable LABEL, the
-            # backend-readable authority (Redmine #14139 review j#83383 F1 / Design
-            # Answer j#83385 Decision 1) — never a locator-prefix guess that would
-            # adopt a per-project coordinator window on a mode transition.
-            #
-            # Resolve this project's OWN pin FIRST (R4 review j#83473 F2): an own-pin
-            # heal rejoins its own live space by identity and must NOT depend on the
-            # `workspace list` command succeeding, so the label read is skipped when
-            # an own pin exists. Only a fresh / mode-transition launch with no own pin
-            # reads the labels — and per_project / sublane launches never reach here,
-            # so they issue no extra `workspace list` (byte-invariant).
-            target_workspace = _shared_coordinator_own_target(
-                rows, workspace_id, adopt_locators
-            )
-            if not target_workspace:
-                # No own pin -> the shared space must be adopted or created. Run the
-                # whole list->resolve->create under a home-scoped single-flight fence
-                # (R5 review j#83516 F1) so concurrent clean-slate launches converge to
-                # ONE workspace: the first creates it under the lock; the rest wait,
-                # re-read the labels under the lock and ADOPT it (double-checked). A
-                # partial-failure husk is adopted the same way (resolver F1). Own-pin
-                # heal above never takes the lock (it creates nothing). Unreadable
-                # labels / ambiguity / mode-transition all fail closed in the resolver.
-                #
-                # The fence's ACQUISITION runs before any herdr command, so an
-                # acquisition failure is zero-actuation; its RELEASE runs AFTER the
-                # body, so on the clean-slate path the shared `workspace create` has
-                # already happened. Both convert into the launch's typed error boundary
-                # (no raw traceback at the CLI, R6 review j#83569 F2), but the message
-                # must be phase-accurate: an acquisition failure created nothing, while
-                # a release failure may have left a labelled `coordinators` workspace a
-                # re-run adopts idempotently (R8 review j#83633 F1).
-                try:
-                    with coordinator_shared_create_lock(mozyo_bridge_home()):
-                        workspace_labels = _list_workspace_labels(binary, runner, timeout)
-                        target_workspace = _shared_coordinator_target(
-                            rows,
-                            workspace_id,
-                            adopt_locators,
-                            workspace_labels,
-                            SHARED_COORDINATOR_WORKSPACE_LABEL,
-                        )
-                        if not target_workspace:
-                            target_workspace, base_pane_id = _create_workspace(
-                                binary,
-                                repo_root,
-                                runner,
-                                timeout,
-                                env,
-                                label=SHARED_COORDINATOR_WORKSPACE_LABEL,
-                            )
-                            result.base_pane_id = base_pane_id
-                except CoordinatorSharedCreateReleaseError as exc:
-                    # Release runs AFTER the body: the shared workspace was already
-                    # resolved (created on a clean slate, or adopted), and the
-                    # coordinator agents were NOT started. A labelled `coordinators`
-                    # workspace may exist as an empty husk; a re-run adopts it
-                    # idempotently (no duplicate is created).
-                    raise HerdrSessionStartError(
-                        "managed-launch admission resolved the shared coordinators "
-                        f"workspace but could not release the single-flight lock ({exc}); "
-                        "the coordinator agents were NOT started. A labelled "
-                        "'coordinators' workspace may have been created and remain as an "
-                        "empty husk — re-run to adopt it idempotently (no duplicate is "
-                        "created)."
-                    ) from exc
-                except CoordinatorSharedCreateLockUnavailable as exc:
-                    raise HerdrSessionStartError(
-                        "managed-launch admission could not acquire the shared "
-                        f"coordinators single-flight lock ({exc}); no workspace / tab / "
-                        "agent was created. Re-run once the home lock is reachable."
-                    ) from exc
-        else:
-            target_workspace = _launch_target_for_lane(
-                rows,
-                workspace_id,
-                result.lane_id,
-                adopt_locators,
-            )
-            if not target_workspace:
-                create_label = (
-                    _host_workspace_label(resolved_root)
-                    if result.lane_id != DEFAULT_LANE
-                    else ""
-                )
-                target_workspace, base_pane_id = _create_workspace(
-                    binary,
-                    repo_root,
-                    runner,
-                    timeout,
-                    env,
-                    label=create_label,
-                )
-                result.base_pane_id = base_pane_id
+        result.base_pane_id = workspace_base_pane_id
         result.herdr_workspace_id = target_workspace
 
-    # Resolve the launch-target tab within the host workspace (Redmine #13411,
-    # lane=tab). Only a non-default lane subdivides: its gateway + worker live in
-    # ONE dedicated tab, so a host with N lanes shows N tabs instead of 2N loose
-    # panes. The lane's own live/adopted slots pin their tab (a heal rejoins the
-    # SAME tab). When nothing pins a tab, mint one explicitly ONLY for a FRESH lane
-    # (no own live/adopted slots) — labelled with the lane key (cosmetic) so its
-    # empty root pane is a known handle to reclaim. A heal of a legacy pre-#13411
-    # lane whose live slots are LOOSE panes (own slots present, no tab pinned)
-    # launches loose too, keeping the pair together (it migrates to a tab on a full
-    # relaunch, the #13380 cohabiting precedent). The default lane never uses a tab,
-    # so the coordinator path stays byte-invariant.
-    #
-    # The fresh-vs-loose decision keys on the lane's WHOLE live inventory in the
-    # target workspace (`_lane_live_slot_tabs`), NOT this run's requested `plans`
-    # (review j#74433 finding 1): a single-provider heal requests only one provider,
-    # so the lane's OTHER live slot is in the inventory but never in `plans` —
-    # counting requested adopts alone would mint a fresh tab for a live loose sibling
-    # (splitting the pair).
+    # Resolve the launch-target tab within the host workspace. Only a non-default lane
+    # subdivides the host — the coordinator path stays byte-invariant — and which tab it
+    # gets is the `sublane_tab_topology` axis: one tab per lane (#13411) or one tab shared
+    # by every lane of the project (#14567). Both branches, and the whole fail-closed
+    # contract of each, live in `herdr_shared_tab.resolve_lane_tab`.
     target_tab = ""
-    lane_slot_tabs: list = []
+    lane_slot_tabs: tuple = ()
+    host_slot_tabs: tuple = ()
     if launch_plans and result.lane_id != DEFAULT_LANE:
-        lane_slot_tabs = _lane_live_slot_tabs(
-            rows, workspace_id, target_workspace, result.lane_id
+        tab_placement = resolve_lane_tab(
+            rows,
+            workspace_id,
+            target_workspace,
+            result.lane_id,
+            shared_tab=shared_tab,
+            list_tabs=lambda ws: _list_tab_labels(binary, ws, runner, timeout),
+            create_tab=lambda ws, label: _create_tab(
+                binary, ws, runner, timeout, env, label=label
+            ),
         )
-        target_tab = _tab_target_for_lane(
-            rows, workspace_id, target_workspace, result.lane_id
-        )
-        if not target_tab and not lane_slot_tabs:
-            target_tab, tab_pane_id = _create_tab(
-                binary, target_workspace, runner, timeout, env, label=result.lane_id
-            )
-            result.tab_pane_id = tab_pane_id
+        target_tab = tab_placement.tab_id
+        lane_slot_tabs = tab_placement.lane_slot_tabs
+        host_slot_tabs = tab_placement.host_slot_tabs
+        result.tab_pane_id = tab_placement.created_pane_id
         result.herdr_tab_id = target_tab
 
-    # Split placement (#13411 tab axis + #13646 direction / #13646-R1-F1 focus). The first
-    # slot occupies the container; later launching slots split beside it. Pure decisions —
-    # see `herdr_lane_topology.resolve_container_plan` for the full contract.
+    # Split placement (#13411 tab axis + #13646 direction / #13646-R1-F1 focus + #14567
+    # inter-lane axis). The first slot into an empty container occupies it; later launching
+    # slots split beside what is there — on the inter-lane axis for a lane's first slot in a
+    # shared tab, on the `lane_placement` axis beside its own sibling. Pure decisions — see
+    # `herdr_lane_geometry.resolve_container_plan` for the full contract.
     plan_of_container = resolve_container_plan(
         rows,
         workspace_id,
@@ -848,8 +754,14 @@ def _prepare_session_locked(
         lane_slot_tabs=lane_slot_tabs,
         config_split=config_split,
         launch_count=len(launch_plans),
+        shared_tab=shared_tab,
+        host_slot_tabs=host_slot_tabs,
     )
-    occupancy = plan_of_container.occupancy  # grows per launch (first occupies, rest split)
+    # Both counters grow per launch: `occupancy` decides whether a slot splits at all,
+    # `lane_occupancy` which axis it splits on. Under `per_lane_tab` they are equal and stay
+    # equal, so the pre-#14567 single-counter behaviour is reproduced exactly.
+    occupancy = plan_of_container.occupancy
+    lane_occupancy = plan_of_container.lane_occupancy
 
     # Pass 2 — execute each slot's decision (adopt row, dry-run plan, or launch into the
     # resolved target workspace/tab). A launch failure raises here, before reclaim.
@@ -867,7 +779,9 @@ def _prepare_session_locked(
             plan.kind,
             plan.provider,
             split_direction=plan_of_container.split_direction,
+            inter_lane_split=plan_of_container.inter_lane_split,
             occupancy=occupancy,
+            lane_occupancy=lane_occupancy,
             config_order=config_order,
             focus_first=plan_of_container.focus_first,
         )
@@ -896,6 +810,7 @@ def _prepare_session_locked(
         )
         if plan.kind == "launch":
             occupancy += 1
+            lane_occupancy += 1
             if transaction is not None:
                 transaction.record_launch(
                     result.slots[-1],

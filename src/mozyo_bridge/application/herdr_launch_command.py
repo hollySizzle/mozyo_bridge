@@ -302,6 +302,7 @@ class LiveHerdrLaunchOps:
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
             agent_launch=repo_config.agent_launch,
             lane_placement=repo_config.lane_placement,
+            sublane_tab_topology=repo_config.sublane_tab_topology,
             coordinator_placement_mode=coordinator_placement_mode,
         )
 

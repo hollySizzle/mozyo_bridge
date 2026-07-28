@@ -98,6 +98,7 @@ def prepare_actuator_lane_session(
         runner=runner,
         timeout=timeout,
         lane_placement=repo_config.lane_placement,
+        sublane_tab_topology=repo_config.sublane_tab_topology,
         claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
         agent_launch=repo_config.agent_launch,
         replacement_action_id=replacement_action_id,

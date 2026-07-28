@@ -168,6 +168,7 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
             agent_launch=agent_launch,
             lane_placement=lane_placement,
+            sublane_tab_topology=repo_config.sublane_tab_topology,
             coordinator_placement_mode=coordinator_placement_mode,
         )
     except HerdrSessionStartError as exc:

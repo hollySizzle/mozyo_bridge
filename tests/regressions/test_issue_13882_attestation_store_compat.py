@@ -1790,13 +1790,29 @@ class ZeroSideEffectTest(unittest.TestCase):
             herdr_pane_lifecycle,
         )
 
+        # Redmine #14567 moved the workspace resolution (and with it the `_create_workspace`
+        # call) into the `herdr_host_workspace` leaf, so the body now names the RESOLVER
+        # where it used to name the write. The guard follows the same chain-of-source shape
+        # it already used for the store join rather than being weakened: the conjunction
+        # must precede the resolver call in the body, AND the resolver must be the thing
+        # that performs the workspace write. Dropping either link fails this test.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_host_workspace,
+        )
+
         src = inspect.getsource(herdr_session_start._prepare_session_locked)
         self.assertIn("preflight_launcher_compatibility", src)
         self.assertLess(
             src.index("preflight_launcher_compatibility"),
-            src.index("_create_workspace"),
+            src.index("resolve_host_workspace"),
             "the launcher compatibility conjunction must precede the first herdr "
             "workspace write",
+        )
+        self.assertIn(
+            "_create_workspace",
+            inspect.getsource(herdr_host_workspace.resolve_host_workspace),
+            "the workspace resolver must be the site that performs the workspace write, "
+            "so ordering against it is ordering against the write",
         )
         self.assertIn(
             "preflight_attest_store_schema",

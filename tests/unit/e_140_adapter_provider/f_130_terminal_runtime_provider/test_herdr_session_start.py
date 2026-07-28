@@ -265,6 +265,19 @@ class _Herdr:
         # fails closed — used to prove an own-pin heal never depends on it (#14139 F2).
         self.workspace_list_fails = False
         self.workspace_lists: list = []
+        # Redmine #14567: the shared-sublane-tab label authority (`tab list`).
+        # `{tab_id: label}`; a `tab create --label` records the created tab's label here
+        # so a later `tab list` reflects it, exactly as the workspace pair above does.
+        # `tab_list_unreadable` forces an unparseable payload (labels-unreadable path);
+        # `tab_list_fails` makes the command exit non-zero (mechanical failure).
+        self.tab_labels: dict = {}
+        self.tab_list_unreadable = False
+        self.tab_list_fails = False
+        self.tab_lists: list = []
+        # Monotonic tab counter, so a run that mints TWO tabs (two lanes under
+        # `per_lane_tab`) gets two distinct ids instead of one id twice. The first
+        # minted tab is still `<ws>:t1`, so every single-tab test is unchanged.
+        self.tab_seq = 0
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **kw):
         rest = list(argv[1:])
@@ -357,6 +370,34 @@ class _Herdr:
                 ),
                 stderr="",
             )
+        if rest[:2] == ["tab", "list"]:
+            self.tab_lists.append(rest)
+            wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else ""
+            if self.tab_list_fails:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="tab list refused"
+                )
+            if self.tab_list_unreadable:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="not json", stderr=""
+                )
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "result": {
+                            "type": "tab_list",
+                            "tabs": [
+                                {"tab_id": tab_id, "label": label}
+                                for tab_id, label in sorted(self.tab_labels.items())
+                                if tab_id.startswith(f"{wid}:")
+                            ],
+                        }
+                    }
+                ),
+                stderr="",
+            )
         if rest[:2] == ["tab", "create"]:
             self.tab_creates.append(rest)
             wid = rest[rest.index("--workspace") + 1]
@@ -364,7 +405,13 @@ class _Herdr:
                 return subprocess.CompletedProcess(
                     argv, 0, stdout=json.dumps({"result": {"type": "nope"}}), stderr=""
                 )
-            tab_id = self.created_tab or f"{wid}:t1"
+            if self.created_tab is not None:
+                tab_id = self.created_tab
+            else:
+                self.tab_seq += 1
+                tab_id = f"{wid}:t{self.tab_seq}"
+            if "--label" in rest:
+                self.tab_labels[tab_id] = rest[rest.index("--label") + 1]
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -419,8 +466,7 @@ class _Herdr:
             else:
                 pane_id = "w1:pNEW"
             # Landed tab (Redmine #13411): echo the requested `--tab` unless forced.
-            requested_tab = rest[rest.index("--tab") + 1] if "--tab" in rest else ""
-            landed_tab = self.start_tab if self.start_tab is not None else requested_tab
+            landed_tab = self._landed_tab(rest)
             self._settle_launch(rest, pane_id)
             return subprocess.CompletedProcess(
                 argv,
@@ -457,6 +503,11 @@ class _Herdr:
                 out[key] = value
         return out
 
+    def _landed_tab(self, rest):
+        """The tab an ``agent start`` actually landed in (echoes ``--tab`` unless forced)."""
+        requested = rest[rest.index("--tab") + 1] if "--tab" in rest else ""
+        return self.start_tab if self.start_tab is not None else requested
+
     def _settle_launch(self, rest, pane_id):
         """Model the two after-effects of a real ``agent start``.
 
@@ -472,7 +523,16 @@ class _Herdr:
         role = env.get("MOZYO_AGENT_ROLE", "")
         if role in self.exit_after_start:
             return  # started, then left: no row at all
-        row = {"name": name, "pane_id": pane_id, "agent_status": "idle"}
+        # Real 0.7.1 rows carry the landed `tab_id` alongside the locator (#13411), and
+        # the tab-axis resolvers read exactly that field. A fake that omitted it modelled a
+        # world where every launched slot is loose, which silently defeats any test whose
+        # SECOND run has to see the first run's tab (#14567 shared tab, #13411 heal).
+        row = {
+            "name": name,
+            "pane_id": pane_id,
+            "agent_status": "idle",
+            "tab_id": self._landed_tab(rest),
+        }
         if role in self.residue_after_start:
             # Positive shell residue: the name is there, the agent field is present and
             # blank — the exact signal `classify_named_slot` calls SLOT_STALE (#13518).
@@ -1765,7 +1825,11 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
     def test_launch_target_for_lane_placement_rules(self) -> None:
         # Redmine #13380 dedicated sublane host workspace: own pins first, then the
         # sibling-lane host EXCLUDING the coordinator's workspace, else create ("").
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
+        # Imported from the module that owns the rule. It used to be re-exported by
+        # `herdr_session_start`, which called it directly; Redmine #14567 moved that call
+        # into the `herdr_host_workspace` resolver, so the orchestrator no longer imports
+        # it and the pure rule is read from its home, `herdr_lane_topology`.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
             _launch_target_for_lane,
         )
 
@@ -2072,7 +2136,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         herdr = _Herdr(created_workspace="wS")
         lock_path = (
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_session_start.coordinator_shared_create_lock"
+            "application.herdr_host_workspace.coordinator_shared_create_lock"
         )
         with tempfile.TemporaryDirectory() as tmp:
             with patch(lock_path, _unavailable):
@@ -2106,7 +2170,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         herdr = _Herdr(created_workspace="wS")
         lock_path = (
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_session_start.coordinator_shared_create_lock"
+            "application.herdr_host_workspace.coordinator_shared_create_lock"
         )
         with tempfile.TemporaryDirectory() as tmp:
             with patch(lock_path, _release_boom):
@@ -2160,7 +2224,7 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
 
         lock_path = (
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_session_start.coordinator_shared_create_lock"
+            "application.herdr_host_workspace.coordinator_shared_create_lock"
         )
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
