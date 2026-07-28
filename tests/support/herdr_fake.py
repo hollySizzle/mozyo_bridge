@@ -46,6 +46,10 @@ Contract faithfulness (design §1.1, modelled faces A–F)
   backend-readable adopt authority the shared ``coordinators`` space keys on, so a
   create carrying ``--label coordinators`` is visible to a later project's adopt, and
   a vanished workspace is absent (residue verification, Redmine #14187).
+- **I ``tab list --workspace <id>``** (Redmine #14567) — the live tab LABEL authority
+  the shared sublane tab is adopted on. Reports ``{tab_id, label}`` per live tab of that
+  workspace in the ``tab_list`` envelope, verbatim label, vanished tabs absent.
+
 - **G ``tab create`` / ``agent start --tab [--split right]``** (Redmine #13411) —
   ``tab create --workspace <id>`` mints a fresh ``<id>:t<n>`` tab born with one
   empty ``root_pane`` (the tab analogue of D), returned in a ``tab_created``
@@ -153,6 +157,11 @@ class _Workspace:
     pane_seq: int = 0  # monotonic per-workspace pane counter (never reused)
     pane_tab: dict = field(default_factory=dict)  # pane_id -> tab_id ("" = default)
     tab_seq: int = 0  # monotonic per-workspace tab counter (never reused)
+    #: The verbatim `--label` each tab was created with (Redmine #14567 shared sublane
+    #: tab). Keyed by tab id. `tab list` (face I) reports it so the shared-tab label
+    #: authority can be exercised end-to-end. A tab with no remaining panes has
+    #: auto-vanished, so its entry is dropped with the last pane and never listed.
+    tab_labels: dict = field(default_factory=dict)  # tab_id -> label ("" = unlabelled)
     #: The stable operator-readable label set at ``workspace create --label`` (Redmine
     #: #13380 sublane host / #14139 shared ``coordinators`` space). Verbatim; ``""``
     #: when unlabelled. ``workspace list`` (face H) reports it so the #14139 shared
@@ -360,6 +369,8 @@ class FakeHerdr:
             return self._cmd_workspace_list(argv)
         if head == ["tab", "create"]:
             return self._cmd_tab_create(argv, rest)
+        if head == ["tab", "list"]:
+            return self._cmd_tab_list(argv, rest)
         if head == ["agent", "start"]:
             return self._cmd_agent_start(argv, rest)
         if head == ["agent", "list"]:
@@ -451,6 +462,9 @@ class FakeHerdr:
         tab_id = f"{wid}:t{ws.tab_seq}"
         root_pane = self._mint_pane(ws)
         ws.pane_tab[root_pane] = tab_id
+        # Record the verbatim `--label` (Redmine #14567): the shared sublane tab is
+        # adopted on an EXACT label match, so the fake must round-trip it unmodified.
+        ws.tab_labels[tab_id] = _flag_value(rest, "--label") or ""
         return _ok(
             argv,
             {
@@ -458,6 +472,31 @@ class FakeHerdr:
                     "type": "tab_created",
                     "tab": {"tab_id": tab_id},
                     "root_pane": {"pane_id": root_pane},
+                }
+            },
+        )
+
+    def _cmd_tab_list(self, argv, rest):
+        # I (Redmine #14567): the live tab label authority, scoped to one workspace.
+        # Each live tab contributes `{tab_id, label}` in the `tab_list` envelope, so the
+        # shared-sublane-tab resolver can be exercised end-to-end (a create carrying
+        # `--label sublanes` is visible to a later lane's adopt). A vanished tab (its
+        # last pane closed) is absent — residue verification. An unknown workspace fails
+        # closed rather than reporting an empty, adoptable-looking list.
+        wid = _flag_value(rest, "--workspace")
+        ws = self._workspaces.get(wid)
+        if ws is None:
+            return _err(argv, f"unknown workspace: {wid}")
+        live_tabs = [tab for tab in dict.fromkeys(ws.pane_tab.values()) if tab]
+        return _ok(
+            argv,
+            {
+                "result": {
+                    "type": "tab_list",
+                    "tabs": [
+                        {"tab_id": tab, "label": ws.tab_labels.get(tab, "")}
+                        for tab in live_tabs
+                    ],
                 }
             },
         )
@@ -676,7 +715,11 @@ class FakeHerdr:
         # E (tab axis, #13411): the pane leaves its tab; the tab lives on only while
         # another pane still references it. `pane_tab` is the sole tab registry, so a
         # tab with no remaining panes simply stops being referenced (auto-vanish).
-        ws.pane_tab.pop(pane_id, None)
+        vacated_tab = ws.pane_tab.pop(pane_id, None)
+        if vacated_tab and vacated_tab not in set(ws.pane_tab.values()):
+            # The tab lost its last pane, so it auto-vanished: drop its label with it,
+            # or `tab list` would keep advertising a tab nothing can join (#14567).
+            ws.tab_labels.pop(vacated_tab, None)
         self._agents.pop(pane_id, None)
         # E: the last pane closing auto-vanishes the workspace (no husk, #13380).
         if not ws.panes:

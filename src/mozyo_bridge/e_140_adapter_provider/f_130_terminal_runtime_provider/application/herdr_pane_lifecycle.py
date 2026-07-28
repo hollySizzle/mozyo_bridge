@@ -44,6 +44,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _parse_workspace_created,
     _parse_workspace_list,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_shared_tab import (  # noqa: E501
+    _parse_tab_list,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_argv import (
     CONFIG_PARSE_REJECTED_EXIT,
     MOZYO_BRIDGE_LAUNCHER_ENV,
@@ -804,6 +807,24 @@ def _list_workspace_labels(
     return _parse_workspace_list(completed.stdout)
 
 
+def _list_tab_labels(
+    binary: str, workspace_id: str, runner: Runner, timeout: float
+) -> Optional[Mapping[str, str]]:
+    """Run herdr ``tab list --workspace <id>`` and return ``{tab_id: label}`` (or ``None``).
+
+    The backend-readable label authority for the shared sublane tab (Redmine #14567,
+    Design Answer j#91144 Decision 3). Called ONLY on the ``shared_tab`` sublane path, so
+    ``per_lane_tab`` repos and every default-lane launch never issue this extra command and
+    stay byte-for-byte the pre-#14567 choreography. Returns ``None`` — "labels
+    unreadable" — when the payload is not a recognisable ``tab list`` shape, which the
+    resolver treats as fail-closed (never a guessed shared tab).
+    """
+    completed = _invoke(
+        binary, ["tab", "list", "--workspace", workspace_id], runner, timeout, env=None
+    )
+    return _parse_tab_list(completed.stdout)
+
+
 def _create_workspace(
     binary: str,
     repo_root: Path,
@@ -909,6 +930,7 @@ __all__ = (
     "_create_workspace",
     "_invoke",
     "_list_rows",
+    "_list_tab_labels",
     "CONFIG_TEXT_ABSENT",
     "CONFIG_TEXT_PRESENT",
     "CONFIG_TEXT_NOT_REGULAR",

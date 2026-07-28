@@ -3,6 +3,8 @@ work_unit:
   granularity: user_story
 sublane_integration:
   integration_branch: main-next
+sublane_tab_topology:
+  mode: shared_tab
 agents:
   profiles:
     implementation:

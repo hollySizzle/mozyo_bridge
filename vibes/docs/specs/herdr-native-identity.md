@@ -697,12 +697,23 @@ geometry が直後に変わるため)。
 ### Boundary
 
 - **tab topology とは直交** (#14567 との境界)。`lane_placement` が決めるのは *container の中で pair を
-  どう割るか* だけで、*どの container に入るか* (workspace / tab) は #13380 / #13411 の join 軸が決める。
-  よって #14567 が全 sublane を単一 tab へ集約しても、その tab の中で各 lane pair は本 block の
-  `split` / `ratio` に従って置ける。両者を組み合わせる時に本 block を変更する必要は無い。**lane 間の
-  配置比率と pair 内部の比率を混同しない**: 本 block の `ratio` は 1 pair の divider だけを指し、lane
-  同士の列幅は #14604 の scope である。実装上その混同を防いでいるのは上記 shared tab 安全弁で、
-  actuate 対象が pair 自身の divider でないと分かった時点で resize を出さない。
+  どう割るか* だけで、*どの container に入るか* (workspace / tab) は #13380 / #13411 / #14567 の join 軸が
+  決める。実際 #14567 が全 sublane を単一 tab へ集約しても、その tab の中で各 lane pair は本 block の
+  `split` / `ratio` に従って置ける (実装済み、§5.1.2)。ただし #14567 は **lane 間の split 方向という
+  第 2 の軸**を足したため、`ContainerPlan` は pair 内方向 (`split_direction`) と lane 間方向
+  (`inter_lane_split`) を別 field で持つ。本 block が供給するのは前者だけである。
+- **lane 間の配置比率と pair 内部の比率を混同しない**: 本 block の `ratio` は 1 pair の divider だけを
+  指し、lane 同士の列幅は #14604 の scope である。実装上その混同を防ぐ guard は **2 つあり、効く時点が
+  違う**。
+  - *actuate 時*: 上記 shared tab 安全弁 (`governing_split`)。addressed pane の最近祖先 split が pair
+    自身の divider でないと分かった時点で resize を出さない。
+  - *測定に入る前*: 「この run が divider を作ったか」の述語を **container ではなく lane の occupancy**
+    で採る (`_created_pair_split`)。shared tab では lane の 1 本目の slot は *隣の lane* の横へ
+    `inter_lane_split` で割って入るので、container は既に埋まっているのに pair の divider はまだ無い。
+    container 側の occupancy で採ると「pair divider を作った」と誤主張し、`config_split` 方向に
+    それを探して見つけられず、健全な single-slot heal を `failed` と報告してしまう (この経路は
+    #14569 と #14567 の合成時に顕在化した)。`per_lane_tab` と coordinator lane では 2 つの
+    occupancy は構造上つねに等しいため、非 shared 経路の挙動は #14567 以前と同一である。
 - `lane_placement` は **future launch policy** であり、live layout / liveness / route authority ではない。
   config を読むだけで既存 live pair を移動 / 再分割しない。`ratio` (#14569) が pane を 1 度 resize するのは
   **その run 自身が今作った divider** に対してだけで、既存 live pair の divider には触れない
@@ -1230,6 +1241,68 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
   `MOZYO_SMOKE_LIVE_HERDR=1` が無ければ skip する。同 test は operator 役の stand-in disposable server を
   先に起動して その socket を ambient に植え、smoke 後に stand-in が生存し応答し続けること
   (operator process / state 不変) と `operator_endpoint_requests == 0` を assert する。
+
+## 5.1.2 sublane_tab_topology — lane 間 tab 集約 (Redmine #14567)
+
+§5 の #13411「lane = tab」は sublane host workspace を lane ごとの tab へ細分化する。owner intent
+2026-07-27 は「全 lane を 1 tab に並べて切替なしで見渡したい」だが、lane ごとの tab を好む利用者も
+いるため **repo-local config の選択肢**とする (Design Answer j#91144)。
+
+```yaml
+sublane_tab_topology:
+  version: 1
+  mode: per_lane_tab | shared_tab
+```
+
+- **軸の所有**: 本 block が決めるのは *どの tab に lane を置くか* だけである。*その container の中で
+  pair をどう割るか* は §5.1 `lane_placement` の軸であり、両者は交わらない (§5.1 Boundary と対)。
+  block 名を `lane_topology` ではなく `sublane_tab_topology` にしたのは、広い名前が lane lifecycle /
+  routing まで所有すると誤読されるため (`lane_placement` が `pane_placement` を避けたのと同じ理由)。
+- **product default は `per_lane_tab`** = #13411 の現行配置。未宣言 repo は byte-for-byte 従来どおり
+  launch する。§5.1 の `lane_placement` が「未宣言でも product default が効く」のと **対照的**で、
+  本 block は未宣言時 behavior-preserving である (owner intent は dogfood の明示選択のみを要求し、
+  未宣言 adopter の既定変更を求めていない)。unknown key / value / version は fail-closed。
+- **shared tab の authority は stable label `sublanes`** であり、live inventory ではない。
+  `herdr tab list --workspace <host>` を読み、**exact / verbatim** な label 一致がちょうど 1 件なら
+  adopt、0 件なら create、複数件・unreadable は fail-closed。**解釈できない row が 1 件でもあれば
+  payload 全体を unreadable にする** (review j#91241 F1): 空 `{}` は「tab が 0 件」という積極的な主張で
+  create 判断に使われるため、「読めなかった」と同一視すると本物の shared tab の隣に重複を mint する。
+  実 payload は herdr 0.7.4 で read-only 実測済み — envelope は
+  `{"result":{"type":"tab_list","tabs":[{"tab_id":"wN:tM","label":...,...}]}}` で、row には
+  `agent_status` / `focused` / `number` / `pane_count` / `workspace_id` が併記される (parser は無視する)。
+  `--label` 無しで作った tab は **番号が label になる** (実測 `"1"`) ため、未 label は空文字ではない。
+  inventory だけでは決められない:
+  `tab create` 済みで最初の `agent start` が未着地の tab は `agent list` に 1 行も出ないため、
+  clean-slate で同時起動した 2 lane が互いを見落として別 tab を mint する。
+- **workspace-scoped single-flight**: `tab list -> resolve -> create` を
+  `sublane_tab_fence.sublane_tab_create_lock(<mozyo workspace id>)` で囲み、**lock 取得後に label を
+  読み直す** (double-checked)。critical section は tab の create/adopt のみで、`agent start` や split
+  は直列化しない (owner clarification「layout のためだけの global serialization を導入しない」)。
+  lock file は project ごとに分かれるため、別 project の lane 起動と競合しない。
+- **live inventory は authority ではなく整合検証**: shared mode では host workspace 内の全 non-default
+  live slot が authority tab に居ることを要求する。loose pane (pre-#13411) / 別 tab / 複数 tab は
+  per-lane topology からの移行中を意味するので、**pane を作る前に** fail-closed する。既存 live lane を
+  暗黙に move / adopt / rename しない (Non-goal)。移行手順は「当該 workspace の全 lane を retire し、
+  `shared_tab` で再 launch」。live pane への明示適用は #14605 の責務。
+- **2 つの split 軸**: shared tab では lane の **1 本目の slot** が `--split right --focus` で自 lane の
+  列を開き、**2 本目**が `lane_placement` の軸 (product default `down`) でその pane を割る。
+  `--focus` が要るのは、focus しないと 2 本目が「たまたま active だった他 lane の pane」を割り、
+  pair が他 lane を挟んで組まれてしまうため。lane 間方向は `right` 固定で config 化しない
+  (列順・相対幅は #14604 の軸であり schema を先取りしない)。default lane は tab を持たないため
+  本 mode の影響を受けず、plan 生成側でも lane class と AND を取って構造的に無効化する。
+- **best-effort 境界 (owner clarification 2026-07-28)**: `agent start` に pane-target flag は無く、
+  任意 pane を絶対指定で active にする command も無い (herdr 0.7.4 実測)。新 lane は既存の **1 pane** しか
+  割れないため、その列は先着 lane の片側の中に入れ子で入る。**厳密な隣接・均等幅・右端追加順は close
+  条件にしない**。保証するのは (a) 全 lane が同一 tab に着地する、(b) 各 pair が自分自身を基準に置かれる
+  (到着 lane の 2 pane が連続する) の 2 点である。決定論的な列生成には `pane move --target-pane` の
+  2 段 bounce (§#13648 runbook) が要るが、live pane move を伴うため本 US では採らない。
+- **mixed installed/source runtime**: 本 block 固有の capability token は作らない。#14258 の
+  `config check-parse --file <target config>` preflight が launcher 自身の parser を実 config に当てる
+  ため、本 block を知らない launcher は unknown top-level key として reject し、workspace / tab / agent の
+  write 0 で fail-closed する。session-start と pre-worktree `sublane create` の両境界で成立する。
+- **retire は tab を見ない**: retirement unit は `(workspace_id, lane_id, slot_digest)` であり、close は
+  自 lane の pin-matched pane のみ。したがって 1 lane の retire は他 lane の pane を閉じず、最終 pane が
+  閉じた時点で herdr が tab / workspace を auto-vanish させる (#13380 と対称)。
 
 ## 5.2 mutating-heal runtime fence + `pair_split` projection (Redmine #13705)
 

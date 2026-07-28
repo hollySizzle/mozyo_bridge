@@ -171,7 +171,7 @@ class ClassifyConfigSourcesPureTest(unittest.TestCase):
         # Guards the drift this surface exists to prevent: `config status` must not
         # re-implement the precedence. Compare the reported value against the launch
         # chokepoint's own resolution for the same config.
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_geometry import (  # noqa: E501
             resolve_placement_policy_for_role,
         )
 

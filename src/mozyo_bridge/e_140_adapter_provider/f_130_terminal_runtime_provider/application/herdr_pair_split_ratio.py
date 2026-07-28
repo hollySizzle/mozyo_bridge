@@ -16,11 +16,14 @@ and no geometry logic of its own:
 
 Boundary — this never becomes a live-relayout rail (issue Non-goals, Design Answer j#91127)
 -------------------------------------------------------------------------------------------
-The only divider this module ever moves is **one this run just created**. Concretely
-:func:`_created_pair_split` demands that a launch in this run split an already-occupied
-container; an all-adopt run, a dry run, and a first-launch-only run all create no divider
-and actuate nothing. Loading a config actuates nothing at all — there is no path from
-``config.yaml`` to a live pane except through a launch that completes a pair. No pane is
+The only divider this module ever moves is **one this run just created, inside its own
+lane**. Concretely :func:`_created_pair_split` demands that a launch in this run split an
+already-occupied *lane*; an all-adopt run, a dry run, and a first-launch-only run all create
+no divider and actuate nothing. Neither does a lane opening its column in a shared tab
+(Redmine #14567): that run does create a divider, but an INTER-LANE one, which belongs to
+Redmine #14604's axis and is not this pair's. Loading a config actuates nothing at all —
+there is no path from ``config.yaml`` to a live pane except through a launch that completes
+a pair. No pane is
 ever closed, moved, swapped, focused or killed here beyond the root reclaim this run's own
 ``workspace create`` / ``tab create`` incurred.
 
@@ -67,9 +70,11 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
 )
 
 #: No pair split ratio was actuated, and none was owed: the run created no divider of its
-#: own (dry run / nothing launched / a first launch that only occupied the container), or no
-#: ratio and direction resolved at all. Every one of those is decided BEFORE any layout is
-#: read — once a run is known to have created a divider it owes a measurement, and any later
+#: own (dry run / nothing launched / a first launch that only occupied the lane, whether it
+#: occupied an empty container or opened this lane's column in a shared tab — Redmine
+#: #14567), or no ratio and direction resolved at all. Every one of those is decided BEFORE
+#: any layout is read — once a run is known to have created a divider it owes a
+#: measurement, and any later
 #: refusal is a :data:`RATIO_FAILED`. Review j#91217 R1-F1 is why that boundary is stated
 #: this sharply: a "cannot identify the pair" case had been parked here, so a target-only
 #: heal that really did create a divider dropped its declared ratio and reported success.
@@ -400,16 +405,27 @@ def ratio_verdict(
     return (ratio_ok and extent_ok), detail
 
 
-def _created_pair_split(*, launched: int, initial_occupancy: int) -> bool:
-    """True iff a launch in THIS run split an already-occupied container.
+def _created_pair_split(*, launched: int, initial_lane_occupancy: int) -> bool:
+    """True iff a launch in THIS run split an already-occupied LANE.
 
-    The launches enter the container at occupancies ``o, o+1, ... o+n-1``; a slot emits
-    ``--split`` exactly when its occupancy is non-zero (``herdr_lane_topology.slot_placement``),
-    so at least one divider is this run's iff the container was already occupied or this run
-    launched a second slot into it. This predicate — not "a pair exists" — is what keeps the
-    module off live pairs: an all-adopt run launches nothing and therefore owns no divider.
+    The launches enter the lane at occupancies ``o, o+1, ... o+n-1``; a slot splits on the
+    PAIR's axis exactly when its lane occupancy is non-zero
+    (:func:`herdr_lane_geometry.slot_placement`), so at least one pair divider is this run's
+    iff the lane was already occupied or this run launched a second slot into it. This
+    predicate — not "a pair exists" — is what keeps the module off live pairs: an all-adopt
+    run launches nothing and therefore owns no divider.
+
+    The scope is the LANE, not the container, because Redmine #14567 separated the two: in a
+    shared tab a lane's first slot splits beside ANOTHER LANE on
+    :data:`herdr_lane_geometry.INTER_LANE_SPLIT_DIRECTION`, so the container is occupied
+    while this pair has no divider yet. Keying on the container occupancy there would claim a
+    pair divider that does not exist and then fail to find it in ``config_split``'s direction
+    — reporting :data:`RATIO_FAILED` for a healthy single-slot heal. Under ``per_lane_tab``
+    (and for the coordinator lane, which has no tab at all) the two occupancies are equal by
+    construction (:func:`herdr_lane_geometry.resolve_container_plan`), so this is the
+    pre-#14567 predicate unchanged on every non-shared path.
     """
-    return launched >= 1 and (initial_occupancy > 0 or launched >= 2)
+    return launched >= 1 and (initial_lane_occupancy > 0 or launched >= 2)
 
 
 @dataclass(frozen=True)
@@ -741,7 +757,7 @@ def _pair_geometry(
     requested: "Optional[Sequence[str]]",
     config_ratio: Optional[float],
     launched: int,
-    initial_occupancy: int,
+    initial_lane_occupancy: int,
     dry_run: bool,
     binary: str,
     runner: Runner,
@@ -760,10 +776,11 @@ def _pair_geometry(
     """
     if dry_run:
         return RATIO_NOT_APPLICABLE, "dry run: nothing was launched, so nothing was divided"
-    if not _created_pair_split(launched=launched, initial_occupancy=initial_occupancy):
+    if not _created_pair_split(launched=launched, initial_lane_occupancy=initial_lane_occupancy):
         return RATIO_NOT_APPLICABLE, (
             "this run created no pair divider (nothing launched, or the only launch "
-            "occupied an empty container); no live pair is resized"
+            "occupied this lane — an empty container, or this lane's own column in a "
+            "shared tab); no live pair is resized"
         )
     if config_ratio is None or not config_split:
         return RATIO_NOT_APPLICABLE, "no effective pair split ratio / direction resolved"
@@ -828,7 +845,7 @@ def finalize_container_geometry(
     requested: "Optional[Sequence[str]]",
     config_ratio: Optional[float],
     launched: int,
-    initial_occupancy: int,
+    initial_lane_occupancy: int,
     dry_run: bool,
     binary: str,
     runner: Runner,
@@ -855,7 +872,7 @@ def finalize_container_geometry(
         requested=requested,
         config_ratio=config_ratio,
         launched=launched,
-        initial_occupancy=initial_occupancy,
+        initial_lane_occupancy=initial_lane_occupancy,
         dry_run=dry_run,
         binary=binary,
         runner=runner,

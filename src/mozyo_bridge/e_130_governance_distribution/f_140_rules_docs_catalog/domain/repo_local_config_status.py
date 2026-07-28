@@ -81,6 +81,7 @@ CONFIG_BLOCK_KEYS: tuple[str, ...] = (
     "providers",
     "delegation",
     "lane_placement",
+    "sublane_tab_topology",
 )
 
 #: Blocks whose SCHEMA is not yet cross-integrated with a sibling US (#14148 role-canonical
@@ -177,6 +178,12 @@ CONFIG_LEAF_KEYS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
             ("presentation", "grouping", "delegation_window_policy"),
         ),
     ),
+    # Redmine #14567. A LEAF row (not only the block row) because the block is a single
+    # knob whose default is what a fresh launch actually takes: an operator must be able
+    # to read `sublane_tab_topology.mode = per_lane_tab (default)` without inferring it
+    # from an empty block. Unlike the lane_placement leaves this IS a plain attribute
+    # walk — the mode has no per-lane-class precedence to resolve.
+    ("sublane_tab_topology.mode", (("sublane_tab_topology", "mode"),)),
 )
 
 

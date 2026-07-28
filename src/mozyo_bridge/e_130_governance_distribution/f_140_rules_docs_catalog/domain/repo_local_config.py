@@ -103,6 +103,11 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     AgentsTopologyConfig,
     AgentsTopologyError,
 )
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.sublane_tab_topology import (  # noqa: E501
+    SUBLANE_TAB_TOPOLOGY_KEY,
+    SublaneTabTopologyConfig,
+    SublaneTabTopologyError,
+)
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (
     LanePlacementConfig,
     LanePlacementError,
@@ -194,6 +199,7 @@ REPO_LOCAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "work_unit",
         "agent_launch",
         "lane_placement",
+        "sublane_tab_topology",
         "provider_binding",
         "terminal_transport",
         "agents",
@@ -491,6 +497,13 @@ class RepoLocalConfig:
     lane_placement: LanePlacementConfig = field(
         default_factory=LanePlacementConfig.default
     )
+    #: Which herdr tab a non-default lane's pair lands in (Redmine #14567): one tab per
+    #: lane (the #13411 default) or one tab shared by every lane of the project. Disjoint
+    #: from :attr:`lane_placement`, which decides only how the pair is split once it is
+    #: inside that container. Behavior-preserving when undeclared.
+    sublane_tab_topology: SublaneTabTopologyConfig = field(
+        default_factory=SublaneTabTopologyConfig.default
+    )
     provider_binding: RoleProviderBindingConfig = field(
         default_factory=RoleProviderBindingConfig.default
     )
@@ -651,6 +664,21 @@ class RepoLocalConfig:
             raise RepoLocalConfigError(
                 f"lane_placement config is invalid: {exc}"
             ) from exc
+        # Which herdr TAB a non-default lane's pair lands in (#14567) — the axis disjoint
+        # from ``lane_placement`` above, which only decides how the pair is split once it
+        # is inside its container. Parsed by its own self-contained domain schema; its
+        # SublaneTabTopologyError is re-raised as a RepoLocalConfigError so the loader keeps
+        # a single fail-closed boundary. Unlike ``lane_placement``, an absent block IS
+        # behavior-preserving: it resolves to ``per_lane_tab``, the #13411 placement
+        # (Design Answer j#91144 Decision 2).
+        try:
+            sublane_tab_topology = SublaneTabTopologyConfig.from_record(
+                record.get(SUBLANE_TAB_TOPOLOGY_KEY)
+            )
+        except SublaneTabTopologyError as exc:
+            raise RepoLocalConfigError(
+                f"sublane_tab_topology config is invalid: {exc}"
+            ) from exc
         # The role -> provider binding (#13157) and per-role launch argv (#13155/#13425)
         # are version-gated (Redmine #14148):
         #  - v1 parses the provider-keyed legacy ``provider_binding`` / ``agent_launch``
@@ -719,6 +747,7 @@ class RepoLocalConfig:
             work_unit=work_unit,
             agent_launch=agent_launch,
             lane_placement=lane_placement,
+            sublane_tab_topology=sublane_tab_topology,
             provider_binding=provider_binding,
             terminal_transport=terminal_transport,
             agents=agents,
