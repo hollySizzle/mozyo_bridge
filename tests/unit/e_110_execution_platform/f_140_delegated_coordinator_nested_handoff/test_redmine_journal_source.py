@@ -359,6 +359,11 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             # more a declaration than one inside [text](URL).
             ("marker inside a URI autolink", "<https://example.test/%s>" % self.GATE),
             ("marker inside a mailto autolink", "<mailto:a@x.test?s=%s>" % self.GATE),
+            # #14584 j#91863: the same bytes start an HTML block at the head of a line,
+            # and the block phase wins — so they must reach the raw-HTML rule.
+            ("html block type 2", "<!--a@b>\n%s" % self.GATE),
+            ("html block type 3", "<?a@b>\n%s" % self.GATE),
+            ("html block type 4", "<!A@b> %s" % self.GATE),
             ("definition title on the next line", '[foo]: /url\n  "%s"' % self.GATE),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % self.GATE),
             ("image alt text", "![a %s b](img.png)" % self.GATE),

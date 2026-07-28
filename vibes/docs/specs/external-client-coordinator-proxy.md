@@ -217,6 +217,17 @@ authorize したかを照合しなければ scope は未検証のままである
       `[text](URL)` 内の marker を拒否するのと同じ理由で拒否されなければならない。blank が安全なのは
       **span が exact match** で、その内部が定義上 `<` / `>` / 空白を含まない (= 実 tag を隠しようがない)
       からであり、R8 の lexical mask とは前提が異なる。
+      ★★★**ただし文法に exact 一致することと、その文法として解釈されることは別である** (#14584 j#91863)。
+      CommonMark §3 は block を inline より先に決め、email local-part は `!` / `?` / `-` を許すため、
+      `<!--a@b>` / `<?a@b>` / `<!A@b>` は **autolink 文法に exact 一致しつつ、行頭 (0–3 spaces) では
+      HTML block type 2/3/4 を開始する**。blank すると opener が Rule E に届かず、描画されない
+      raw HTML block 内の marker が gate になった。→ **block を開始し得る match は blank せず E へ残す**。
+      同じ bytes でも paragraph 途中なら inline autolink なので従来どおり blank する。
+      ★★★**oracle の述語は連言でなければならない** (#14584 j#91863)。R6 で「plain に残る」を
+      「text node である」へ**置き換えた**が、raw HTML passthrough は tag 除去後の残骸が text に見える
+      ため text-node 判定を通り、plain が空であることを見ていなかった。正しくは
+      **`plain に残る` かつ `text node` かつ `quotation element の外`**。
+      **片方ずつ入れ替えるのではなく、なぜ各連言項が要るのかを書く。**
       ★★★**oracle はこの finding を検出できない。** autolink は URL が label を兼ねるので marker は
       **可視 text node** として描画される。**「可視か」は測れるが「散文か」は測れない** — 契約
       (Rule F、「marker は coordinator の可視な*散文*上の自己宣言」) が裁定する。

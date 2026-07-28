@@ -567,6 +567,35 @@ class PassOrderTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(_gates(note), ())
 
+    def test_bytes_that_start_an_html_block_are_not_treated_as_an_autolink(self):
+        # CommonMark settles block structure before inlines (§3), and an email local part may hold
+        # `!`, `?` and `-` — so <!--a@b>, <?a@b> and <!A@b> satisfy the autolink grammar AND start
+        # HTML blocks of type 2/3/4 at the head of a line. The block wins, and blanking them as
+        # autolinks hid the opener from rule E (#14584 j#91863). Matching a grammar is not being
+        # parsed by it.
+        for label, note in (
+            ("type 2 comment", f"<!--a@b>\n{MARKER}"),
+            ("type 3 processing instruction", f"<?a@b>\n{MARKER}"),
+            ("type 4 declaration", f"<!A@b> {MARKER}"),
+            ("type 2 closed on its own line", f"<!--a@b>--> {MARKER}"),
+            ("three spaces still starts a block", f"   <!--a@b>\n{MARKER}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ())
+
+    def test_the_same_bytes_mid_paragraph_are_an_autolink(self):
+        # The boundary, both sides. Four columns of indent is an indented code block rather than an
+        # HTML block, and anywhere but the head of a line these bytes really are an email autolink.
+        self.assertEqual(_gates(f"x <!--a@b>\n\n{MARKER}"), ("review_request",))
+        self.assertEqual(_gates(f"    <!--a@b>\n\n{MARKER}"), ("review_request",))
+        # The 0-3 column limit itself, exercised where the indent is NOT already a code block:
+        # inside an open paragraph a fourth column is hanging indent, so these bytes stay inline.
+        # (A block-start test at four spaces proves nothing — rule C blanks that line first.)
+        self.assertEqual(_gates(f"prose\n    <!--a@b>\n\n{MARKER}"), ("review_request",))
+        self.assertEqual(_gates(f"prose\n   <!--a@b>\n\n{MARKER}"), ())
+        self.assertEqual(_gates(f"<https://example.test/>\n\n{MARKER}"), ("review_request",))
+        self.assertEqual(_gates(f"<a@example.test>\n\n{MARKER}"), ("review_request",))
+
     def test_an_autolink_costs_nothing_to_what_follows_it(self):
         # Both controls the refusal has to keep: a marker recorded after an autolink is still the
         # writer's own voice, and a real tag after one still refuses the rest of the note.

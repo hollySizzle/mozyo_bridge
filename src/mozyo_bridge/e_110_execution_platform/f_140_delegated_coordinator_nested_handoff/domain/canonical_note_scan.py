@@ -93,8 +93,12 @@ to be a subset of.
   refuses. Excluding them from E while leaving them visible to the marker scan let
   ``<https://example.test/[mozyo:…]>`` become a gate and an exact work anchor (#14584 j#91839) —
   "not markup" and "not authority" are two decisions, and fixing the first said nothing about the
-  second. Blanking is safe here in the way the link mask was not: the span is EXACT-matched and
-  cannot contain ``<``, ``>`` or a space, so it can never hide a real tag.
+  second. **Matching the grammar exactly is still not enough**: CommonMark settles blocks before
+  inlines (§3), an email local part may hold ``!``, ``?`` and ``-``, and so ``<!--a@b>`` satisfies
+  the autolink grammar *and* opens an HTML block when it starts a line — where the block wins.
+  Blanking one hid the opener from E and a marker in an unrendered raw-HTML block became a gate
+  (#14584 j#91863). A match that could start a block is therefore left for E; the same bytes
+  mid-paragraph really are an autolink. **Matching a grammar is not being parsed by it.**
 
 What remains is an over-blank this module accepts on purpose: a tag-shaped **title**
 (``[text](url "<code>")``) still starts a refusal. The renderer hides it, but nothing short of
@@ -329,17 +333,38 @@ def _blank_autolinks(text: str) -> str:
       leaving it visible to the marker scan let ``<https://example.test/[mozyo:…]>`` become a gate
       and an exact work anchor (#14584 j#91839).
 
-    Blanking the span is safe in the way the earlier link mask was not: the region is EXACT-matched,
-    and an autolink cannot contain ``<``, ``>`` or a space, so this can never hide a real tag.
+    Matching the autolink grammar exactly is NOT enough on its own, because CommonMark settles block
+    structure before inlines (§3). An email local part may contain ``!``, ``?`` and ``-``, so
+    ``<!--a@b>``, ``<?a@b>`` and ``<!A@b>`` satisfy this grammar *and* start HTML blocks of type
+    2/3/4 when they begin a line — and the block wins. Blanking one hid the opener from rule E and
+    a marker inside an unrendered raw-HTML block became a gate (#14584 j#91863). Matching a grammar
+    is not the same as being parsed by it.
+
+    So a match that could START an html block is left alone; the same bytes mid-paragraph really are
+    an autolink and are still blanked.
     """
     chars = list(text)
     for match in _AUTOLINK.finditer(text):
         if _is_escaped(text, match.start()):
             continue
+        if _starts_html_block(text, match.start()):
+            continue
         for index in range(match.start(), match.end()):
             if chars[index] != "\n":
                 chars[index] = " "
     return "".join(chars)
+
+
+def _starts_html_block(text: str, offset: int) -> bool:
+    """True if ``text[offset:]`` begins an HTML block rather than an inline construct (pure).
+
+    An HTML block starts at the head of a line after at most three spaces (CommonMark 0.31.2 §4.6).
+    Only types 2 (``<!--``), 3 (``<?``), 4 and 5 (``<!``) are reachable here: the tag-shaped types
+    cannot satisfy the autolink grammar, which needs a scheme colon or an ``@``.
+    """
+    line_start = text.rfind("\n", 0, offset) + 1
+    indent = text[line_start:offset]
+    return indent.strip(" ") == "" and len(indent) <= 3 and text[offset:offset + 2] in ("<!", "<?")
 
 
 def _blank_from_link_syntax(text: str) -> str:
