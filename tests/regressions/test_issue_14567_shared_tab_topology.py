@@ -401,6 +401,64 @@ class TabListParserTest(unittest.TestCase):
                     "an unreadable row must not be reported as 'there are no tabs'",
                 )
 
+    def test_the_real_herdr_074_payload_parses(self) -> None:
+        # The shape this parser was written against was UNMEASURED through R2 (j#91144 /
+        # j#91266 both carried that caveat). These two payloads are verbatim `herdr tab
+        # list --workspace <id>` output from herdr 0.7.4, captured read-only, so the
+        # envelope, the field names, and the extra keys herdr sends are pinned as fact
+        # rather than assumed. If a future herdr renames `tab_id` or moves the container,
+        # this fails instead of quietly reporting "there are no tabs".
+        single_tab = (
+            '{"id":"cli:tab:list","result":{"tabs":[{"agent_status":"idle",'
+            '"focused":true,"label":"1","number":1,"pane_count":2,"tab_id":"w45:t1",'
+            '"workspace_id":"w45"}],"type":"tab_list"}}'
+        )
+        self.assertEqual(_parse_tab_list(single_tab), {"w45:t1": "1"})
+
+        # A real sublane host running the per-lane topology: several labelled tabs.
+        sublane_host = (
+            '{"id":"cli:tab:list","result":{"tabs":['
+            '{"agent_status":"done","focused":false,"label":"issue_14567_shared_tab_topology",'
+            '"number":2,"pane_count":2,"tab_id":"w4B:t2","workspace_id":"w4B"},'
+            '{"agent_status":"idle","focused":false,"label":"issue_14584_quote_safe_work_anchor",'
+            '"number":4,"pane_count":2,"tab_id":"w4B:t4","workspace_id":"w4B"}'
+            '],"type":"tab_list"}}'
+        )
+        self.assertEqual(
+            _parse_tab_list(sublane_host),
+            {
+                "w4B:t2": "issue_14567_shared_tab_topology",
+                "w4B:t4": "issue_14584_quote_safe_work_anchor",
+            },
+        )
+        # Neither host carries the shared label, so both resolve to "create one" — and the
+        # per-lane host is then stopped by the mid-transition guard, not by this parser.
+        for payload, workspace in ((single_tab, "w45"), (sublane_host, "w4B")):
+            self.assertEqual(
+                resolve_shared_tab_from_labels(
+                    _parse_tab_list(payload),
+                    SHARED_SUBLANE_TAB_LABEL,
+                    target_workspace=workspace,
+                ),
+                "",
+            )
+
+    def test_herdr_auto_labels_an_unlabelled_tab_with_its_number(self) -> None:
+        # Measured on herdr 0.7.4: a tab created without `--label` comes back labelled
+        # "1" (its number), NOT "". So "unlabelled" is not an empty-string case in
+        # practice, and the exact-match authority is what keeps such a tab from ever
+        # reading as the shared one.
+        payload = '{"result":{"type":"tab_list","tabs":[{"tab_id":"w45:t1","label":"1"}]}}'
+        self.assertEqual(_parse_tab_list(payload), {"w45:t1": "1"})
+        self.assertEqual(
+            resolve_shared_tab_from_labels(
+                _parse_tab_list(payload),
+                SHARED_SUBLANE_TAB_LABEL,
+                target_workspace="w45",
+            ),
+            "",
+        )
+
     def test_empty_list_is_readable_and_means_no_tabs(self) -> None:
         # The one case that legitimately yields `{}`: a readable container that really is
         # empty. This is what keeps the create path reachable at all.

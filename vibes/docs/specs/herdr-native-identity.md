@@ -957,7 +957,14 @@ sublane_tab_topology:
   未宣言 adopter の既定変更を求めていない)。unknown key / value / version は fail-closed。
 - **shared tab の authority は stable label `sublanes`** であり、live inventory ではない。
   `herdr tab list --workspace <host>` を読み、**exact / verbatim** な label 一致がちょうど 1 件なら
-  adopt、0 件なら create、複数件・unreadable は fail-closed。inventory だけでは決められない:
+  adopt、0 件なら create、複数件・unreadable は fail-closed。**解釈できない row が 1 件でもあれば
+  payload 全体を unreadable にする** (review j#91241 F1): 空 `{}` は「tab が 0 件」という積極的な主張で
+  create 判断に使われるため、「読めなかった」と同一視すると本物の shared tab の隣に重複を mint する。
+  実 payload は herdr 0.7.4 で read-only 実測済み — envelope は
+  `{"result":{"type":"tab_list","tabs":[{"tab_id":"wN:tM","label":...,...}]}}` で、row には
+  `agent_status` / `focused` / `number` / `pane_count` / `workspace_id` が併記される (parser は無視する)。
+  `--label` 無しで作った tab は **番号が label になる** (実測 `"1"`) ため、未 label は空文字ではない。
+  inventory だけでは決められない:
   `tab create` 済みで最初の `agent start` が未着地の tab は `agent list` に 1 行も出ないため、
   clean-slate で同時起動した 2 lane が互いを見落として別 tab を mint する。
 - **workspace-scoped single-flight**: `tab list -> resolve -> create` を

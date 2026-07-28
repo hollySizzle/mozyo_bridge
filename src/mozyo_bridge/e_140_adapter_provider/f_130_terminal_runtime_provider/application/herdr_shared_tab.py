@@ -88,16 +88,22 @@ def _parse_tab_list(stdout: object) -> Optional[dict]:
 
     and the tolerant variants a bare list of tab objects / an object carrying the list
     under ``tabs`` — mirroring :func:`herdr_lane_topology._parse_workspace_list`, whose
-    tolerance was measured against the real ``workspace list``. The live ``tab list``
-    payload has NOT been measured yet (this lane may not drive herdr), so the parser is
-    deliberately strict about what it accepts and returns ``None`` for everything else;
-    the isolated live acceptance is what confirms the real shape.
+    tolerance was measured against the real ``workspace list``.
+
+    The live shape IS now measured (herdr 0.7.4, read-only capture, pinned by
+    ``test_the_real_herdr_074_payload_parses``): the envelope above is exactly what herdr
+    sends, and each row carries additional keys (``agent_status`` / ``focused`` /
+    ``number`` / ``pane_count`` / ``workspace_id``) that this parser ignores. Rows are
+    therefore accepted on the two fields the authority needs and rejected — as a whole
+    payload — on anything it cannot read.
 
     The label is kept **raw / verbatim** (NOT trimmed or case-folded): the adopt authority
     is an EXACT label match, so a padded ``" sublanes "`` or a case-variant ``"Sublanes"``
-    is a DIFFERENT label and must not be normalised into the authority label. A missing /
-    non-string label is the empty string (present but unlabelled, so it never matches). An
-    EMPTY list is a valid readable result — there really are no tabs — and yields ``{}``.
+    is a DIFFERENT label and must not be normalised into the authority label. herdr
+    auto-labels a tab created without ``--label`` with its NUMBER (measured: ``"1"``), so
+    "unlabelled" is not an empty-string case in practice; a non-string label still maps to
+    ``""`` defensively, and neither can ever equal the shared label. An EMPTY list is a
+    valid readable result — there really are no tabs — and yields ``{}``.
 
     Returns ``None`` — "labels unreadable", which the resolver treats as fail-closed —
     when the payload is not JSON, exposes no recognisable tab container, **repeats a
