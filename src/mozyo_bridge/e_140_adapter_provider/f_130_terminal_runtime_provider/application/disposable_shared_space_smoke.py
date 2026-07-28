@@ -225,54 +225,63 @@ def _run_forked_projects(
         for index, spec in enumerate(specs)
     ]
     started: list = []
+    # Owned by THIS function so a later failure cannot take the receipts that already
+    # arrived with it.  Losing them meant losing the exact pane locators cleanup needs
+    # and the gate counters a worker had already proven (review j#91687 F3).
+    collected: dict = {}
     orphaned = 0
     round_failed = False
     failure_kind = ""
-    receipts: list = []
     try:
-        receipts = _collect_forked_receipts(
-            processes=processes,
-            started=started,
-            specs=specs,
-            output=output,
-            timeout=bounded,
-        )
-    except Exception as exc:  # noqa: BLE001 - the round's verdict must survive it
-        # Partial start, a queue-collection failure, ``output.close()`` — whatever it
-        # was, the caller still needs the containment answer and a renderable report.
-        # ``BaseException`` (KeyboardInterrupt/SystemExit) is deliberately NOT caught;
-        # the ``finally`` below still reaps before it propagates.
-        round_failed = True
-        failure_kind = type(exc).__name__
-        receipts = _unreported_receipts(specs)
+        try:
+            _collect_forked_receipts(
+                processes=processes,
+                started=started,
+                specs=specs,
+                output=output,
+                collected=collected,
+                timeout=bounded,
+            )
+        except Exception as exc:  # noqa: BLE001 - the round's verdict must survive it
+            # Partial start, a queue-collection failure, ``output.close()`` — whatever
+            # it was, the caller still needs the containment answer and a renderable
+            # report.  ``BaseException`` (KeyboardInterrupt/SystemExit) is deliberately
+            # NOT caught; the ``finally`` still reaps before it propagates.
+            round_failed = True
+            failure_kind = type(exc).__name__
     finally:
         # Runs even if ``start()`` itself failed halfway through the fleet: only the
         # handles that actually started are in ``started``.
         orphaned = _reap_exact_workers(started)
     return _ForkedRun(
-        receipts=tuple(receipts),
+        receipts=tuple(_fill_unreported(specs, collected)),
         orphaned_workers=orphaned,
         round_failed=round_failed,
         failure_kind=failure_kind,
     )
 
 
-def _unreported_receipts(specs: Sequence[_ProjectSpec]) -> list:
-    """One typed ``failed`` receipt per project, with no endpoint-gate snapshot.
+def _fill_unreported(specs: Sequence[_ProjectSpec], collected: "dict") -> list:
+    """Everything that arrived, plus a typed ``failed`` placeholder for what did not.
 
-    Used when the round died before collection: every project is unreported, so the
-    aggregate counts each as a *missing* gate receipt rather than as a process that
-    proved it made zero external requests.
+    Only the indexes that never reported are replaced.  Wiping the whole set on a late
+    failure threw away exact pane locators cleanup still needs, and gate counters a
+    worker had already proven — a placeholder is fail-closed, but it is not free
+    (review j#91687 F3).  A placeholder carries no endpoint-gate snapshot, so the
+    aggregate counts it as *missing* rather than as a proven zero.
     """
     return [
-        _ProcessReceipt(
-            index=index,
-            observation=ProjectSmokeObservation(
-                project_key=spec.project_key,
-                workspace_id="",
-                outcome="failed",
-                coordinators_workspace_id="",
-                failure_phase=PHASE_WORKER_ERROR,
+        collected.get(
+            index,
+            _ProcessReceipt(
+                index=index,
+                observation=ProjectSmokeObservation(
+                    project_key=spec.project_key,
+                    workspace_id="",
+                    outcome="failed",
+                    coordinators_workspace_id="",
+                    failure_phase=PHASE_WORKER_ERROR,
+                ),
             ),
         )
         for index, spec in enumerate(specs)
@@ -285,12 +294,16 @@ def _collect_forked_receipts(
     started: list,
     specs: Sequence[_ProjectSpec],
     output,
+    collected: dict,
     timeout: float,
-) -> list[_ProcessReceipt]:
-    """Start the fleet, join it under the bound, and collect one receipt per project.
+) -> None:
+    """Start the fleet, join it under the bound, and publish each receipt as it lands.
 
     ``started`` is appended to as each process starts so the caller's ``finally`` can
     reap exactly what exists, including when this function raises partway through.
+    ``collected`` is the caller's map and is written **as receipts arrive**, for the
+    same reason: a failure in the tail of this function must not take the receipts that
+    already made it (review j#91687 F3).
     """
     for process in processes:
         process.start()
@@ -304,29 +317,16 @@ def _collect_forked_receipts(
             if process.is_alive():
                 process.kill()
                 process.join(timeout=5.0)
-    receipts: dict[int, _ProcessReceipt] = {}
     for _ in processes:
         try:
             receipt = output.get(timeout=1.0)
         except queue.Empty:
             break
         if isinstance(receipt, _ProcessReceipt):
-            receipts[receipt.index] = receipt
+            collected[receipt.index] = receipt
     output.close()
     output.join_thread()
-    for index, spec in enumerate(specs):
-        if index not in receipts:
-            receipts[index] = _ProcessReceipt(
-                index=index,
-                observation=ProjectSmokeObservation(
-                    project_key=spec.project_key,
-                    workspace_id="",
-                    outcome="failed",
-                    coordinators_workspace_id="",
-                    failure_phase=PHASE_WORKER_ERROR,
-                ),
-            )
-    return [receipts[index] for index in range(len(specs))]
+
 
 
 def run_disposable_shared_space_smoke(
@@ -386,9 +386,9 @@ def run_disposable_shared_space_smoke(
     # Seeded to the fail-closed values: only a completed fork round may lower them.
     orphaned_workers = -1
     round_failure_kind = ""
-    # Containment starts satisfied only because no worker exists yet; the moment the
-    # fork round runs, its verdict replaces this.
-    workers_contained = True
+    # Only a completed round may claim containment.  The lifecycle policy below is the
+    # authority; this mirrors it for the evidence dict.
+    workers_contained = False
     try:
         with instance:
             with isolated_smoke_home(Path(isolated_home)) as capability:
@@ -413,6 +413,11 @@ def run_disposable_shared_space_smoke(
                     providers=providers,
                 )
                 cleanup_harness.preflight_clean_slate()
+                # From here a worker can exist, and an interrupt can unwind past every
+                # assignment below.  Withhold the path release on the LIFECYCLE first,
+                # so both the context manager's ``__exit__`` and the outer ``finally``
+                # inherit it no matter how we leave (review j#91687 F1/F2).
+                instance.withhold_root_release("workers_unverified")
                 forked = _run_forked_projects(
                     harnesses=harnesses,
                     specs=specs,
@@ -427,6 +432,11 @@ def run_disposable_shared_space_smoke(
                 # client-call capability could address whatever binds it next.
                 workers_contained = forked.workers_contained
                 round_failure_kind = forked.failure_kind
+                if workers_contained:
+                    # The only positive verdict: every started worker is provably gone.
+                    instance.permit_root_release()
+                else:
+                    instance.withhold_root_release("workers_not_contained")
                 observations = [receipt.observation for receipt in receipts]
                 worker_gate_receipts = [receipt.endpoint_gate for receipt in receipts]
                 for receipt in receipts:
@@ -461,11 +471,10 @@ def run_disposable_shared_space_smoke(
                     cleanup_attempted=True,
                 )
     finally:
-        # ``with instance`` already shuts down.  This idempotent call covers a
-        # pre-enter/startup exception without broad process discovery.  ``release_root``
-        # carries the containment verdict computed above, so the decision reaches the
-        # teardown instead of being scored after it (review j#91638 F1).
-        instance.shutdown(release_root=workers_contained)
+        # ``with instance`` already shut down, obeying the same lifecycle policy this
+        # call obeys.  Idempotent, and it also covers a pre-enter/startup exception
+        # without broad process discovery.
+        instance.shutdown()
     # Folded only now, so the parent snapshot also covers cleanup, residue verification
     # and the shutdown ``server stop`` that ran in the ``finally`` above.
     gate = EndpointGateEvidence.aggregate(
@@ -509,8 +518,8 @@ def run_disposable_shared_space_smoke(
         and workers_contained
         and orphaned_workers == 0
         and not round_failure_kind
-        # Withheld root release means the owned tree is deliberately still there.
-        and evidence.get("owned_root_released", False)
+        # Observed after teardown, not inferred: the owned tree is actually gone.
+        and not evidence.get("owned_root_present", True)
     )
     return evidence
 

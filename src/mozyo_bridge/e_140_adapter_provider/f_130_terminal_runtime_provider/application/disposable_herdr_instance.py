@@ -616,9 +616,16 @@ class DisposableHerdrInstance:
         self.stopped = False
         self.graceful_stop_refused = False
         self.endpoint_residue = -1
-        #: True when a caller withheld root release for containment (an owned worker
-        #: outlived its kill, so the socket path must not be freed for anyone to bind).
-        self.root_release_withheld = False
+        # Root-release policy lives on the lifecycle, not on a call argument, so that
+        # EVERY teardown path obeys the same single decision — including the implicit
+        # ``__exit__`` of ``with instance:``, which used to release the tree with the
+        # default before a containment verdict could reach the explicit shutdown
+        # (review j#91687 F1).  It starts permitted only because no worker exists yet.
+        self._root_release_permitted = True
+        self._root_withhold_reason = ""
+        #: Observed AFTER teardown, never inferred from a flag: the two used to
+        #: disagree in both directions (review j#91687 F4).
+        self.owned_root_present = True
         # Operator endpoints the gate must never target.  BOTH sources are captured:
         # the caller's declared env, and the true process ambient — the incident's
         # unbound call inherited ``os.environ``, not ``base_env`` (j#85754).
@@ -816,23 +823,65 @@ class DisposableHerdrInstance:
             "disposable Herdr server did not become ready within the bounded startup window"
         )
 
-    def shutdown(self, *, release_root: bool = True) -> None:
-        """Stop the owned child and, unless withheld, remove its exact state tree.
+    def withhold_root_release(self, reason: str) -> None:
+        """Bind a containment verdict to the lifecycle: do not free the owned path.
 
-        ``release_root=False`` is the **containment** case (review j#91638 F1): the
-        caller has established that an owned worker outlived even its ``kill``, and a
-        worker holds client-call capability bound to *this* socket path.  Removing the
-        root would free that path for anything else to bind, which is the takeover the
-        threat model exists to prevent — so the tree stays, the residue is reported,
-        and the run cannot claim success.
+        Called when an owned worker outlived even its ``kill``, or when the count could
+        not be established at all.  A worker holds client-call capability bound to
+        *this* socket path, so removing the tree would free that path for anything else
+        to bind — the takeover the threat model exists to prevent.  The tree therefore
+        stays, its presence is reported, and the run cannot claim success.
 
-        The server is stopped either way: killing our own endpoint makes a survivor's
-        calls fail to connect, which strengthens containment rather than weakening it.
-        What is withheld is only the *release of the path*.
+        Deliberately **not** a shutdown argument.  As an argument it only constrained
+        the call site that passed it, and the context manager's own ``__exit__`` had
+        already released the tree with the default (review j#91687 F1).
+        """
+        self._root_release_permitted = False
+        self._root_withhold_reason = str(reason)
+
+    def permit_root_release(self) -> None:
+        """Record that containment was positively established, so the tree may go."""
+        self._root_release_permitted = True
+        self._root_withhold_reason = ""
+
+    @property
+    def root_release_withheld(self) -> bool:
+        return not self._root_release_permitted
+
+    @property
+    def root_withhold_reason(self) -> str:
+        return self._root_withhold_reason
+
+    def _observe_root(self) -> None:
+        """Record what is actually on disk, rather than what we intended."""
+        try:
+            self.owned_root_present = self.root.exists()
+        except OSError:
+            # Unreadable is not absent: keep the fail-closed reading.
+            self.owned_root_present = True
+
+    def _release_root_if_permitted(self) -> None:
+        """Remove exactly the owned tree when the lifecycle policy allows it.
+
+        Runs on every shutdown path, including the one where the server never started
+        (a failed ``Popen`` still left a written ``config.toml`` behind, which the old
+        early return skipped — review j#91687 F4).
+        """
+        if self._root_release_permitted and self.root.exists():
+            shutil.rmtree(self.root)
+        self._observe_root()
+
+    def shutdown(self) -> None:
+        """Stop the owned child and, unless containment withholds it, remove its tree.
+
+        The server is stopped whether or not the path is released: killing our own
+        endpoint makes a survivor's calls fail to connect, which strengthens
+        containment rather than weakening it.  What containment withholds is only the
+        *release of the path*.
         """
         process = self._process
         if process is None:
-            self.root_release_withheld = not release_root
+            self._release_root_if_permitted()
             return
         if process.poll() is None:
             try:
@@ -866,10 +915,12 @@ class DisposableHerdrInstance:
         )
         # Only this exact, caller-provided instance root is removed.  The lifecycle
         # never scans for or kills another process and never removes a parent tree.
-        self.root_release_withheld = not release_root
-        if release_root and self.stopped and self.root.exists():
-            shutil.rmtree(self.root)
-            self.endpoint_residue = 0
+        if self.stopped:
+            self._release_root_if_permitted()
+            if not self.owned_root_present:
+                self.endpoint_residue = 0
+        else:
+            self._observe_root()
         self._process = None
         self._capability = None
 
@@ -903,7 +954,12 @@ class DisposableHerdrInstance:
             "graceful_stop_refused": self.graceful_stop_refused,
             "server_stopped": self.stopped,
             "endpoint_residue": self.endpoint_residue,
-            "owned_root_released": not self.root_release_withheld,
+            # Observed state, not the policy flag: the two disagreed in both directions
+            # before (root gone but reported withheld; root present but reported
+            # released) — review j#91687 F4.
+            "owned_root_present": self.owned_root_present,
+            "owned_root_released": not self.owned_root_present,
+            "root_withhold_reason": self._root_withhold_reason,
         }
 
 

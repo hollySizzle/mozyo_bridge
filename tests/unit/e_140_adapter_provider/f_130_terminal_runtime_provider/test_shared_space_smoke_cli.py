@@ -91,6 +91,12 @@ def _report(*, success: bool) -> dict:
         # -1 on the failing branch: the fork round never completed, so worker residue
         # was never established (distinct from "there were none").
         "worker_processes_orphaned": 0 if success else -1,
+        "workers_contained": success,
+        "fork_round_failure": "" if success else "RuntimeError",
+        # Observed after teardown; withheld release leaves the tree in place.
+        "owned_root_present": not success,
+        "owned_root_released": success,
+        "root_withhold_reason": "" if success else "workers_not_contained",
     }
 
 
@@ -168,6 +174,8 @@ class ExecuteTextEvidenceTests(unittest.TestCase):
         self.assertIn("endpoint_gate_proven_zero_external=False", run.stdout)
         # "we never established worker residue" must be visible, not implied.
         self.assertIn("orphaned_workers=-1", run.stdout)
+        self.assertIn("workers_contained=False", run.stdout)
+        self.assertIn("owned_root_present=True", run.stdout)
 
     def test_text_mode_reports_no_phase_when_nothing_failed(self) -> None:
         run = _run(_report(success=True), json_mode=False)

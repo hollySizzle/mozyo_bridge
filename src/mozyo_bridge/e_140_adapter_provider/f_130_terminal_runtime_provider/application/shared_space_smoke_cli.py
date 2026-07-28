@@ -79,6 +79,8 @@ def _render_text(report: dict) -> str:
             f"failure_phases={_failure_phases(report)} "
             f"residue_clear={report['residue_clear']} "
             f"orphaned_workers={report['worker_processes_orphaned']} "
+            f"workers_contained={report['workers_contained']} "
+            f"owned_root_present={report['owned_root_present']} "
             f"server_stopped={report['server_stopped']} "
             f"operator_endpoint_requests={report['operator_endpoint_requests']} "
             f"endpoint_escape_refusals={report['endpoint_escape_refusals']} "

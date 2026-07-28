@@ -257,6 +257,132 @@ class ForkedGateReceiptTests(unittest.TestCase):
         )
 
 
+class PartialReceiptRetentionTests(unittest.TestCase):
+    """A late collection failure must not take the receipts that already landed.
+
+    Wiping the whole set threw away exact pane locators cleanup still needs and gate
+    counters a worker had already proven (review j#91687 F3).
+    """
+
+    def _specs(self, tmp: Path, count: int = 2):
+        specs = []
+        for index in range(count):
+            repo = tmp / f"p{index}"
+            repo.mkdir(parents=True, exist_ok=True)
+            specs.append(_ProjectSpec(f"p{index}", repo))
+        return specs
+
+    def _receipt(self, index: int) -> object:
+        return _driver_module._ProcessReceipt(
+            index=index,
+            observation=ProjectSmokeObservation(
+                project_key=f"p{index}", workspace_id="w1", outcome="created",
+                coordinators_workspace_id="w1",
+            ),
+            launched_locators=(f"w1:p{index + 3}",),
+            endpoint_gate=EndpointGateCounters(2, 2, 0, 0, ()),
+        )
+
+    class _Queue:
+        """Hands back the given receipts, then fails in the tail of collection."""
+
+        def __init__(self, items, fail_on_close=True):
+            self._items = list(items)
+            self._fail_on_close = fail_on_close
+
+        def get(self, timeout=None):
+            if self._items:
+                return self._items.pop(0)
+            import queue as _q
+
+            raise _q.Empty
+
+        def close(self):
+            if self._fail_on_close:
+                raise OSError("injected close failure")
+
+        def join_thread(self):
+            pass
+
+    class _InertProcess:
+        """Enough of the Process surface for the drain loop; starts nothing."""
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout=None) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return False
+
+        def terminate(self) -> None:
+            pass
+
+        def kill(self) -> None:
+            pass
+
+    def test_collected_receipts_survive_a_late_collection_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs = self._specs(Path(tmp))
+            collected: dict = {}
+            processes = [self._InertProcess(f"mozyo-smoke-p{i}") for i in range(2)]
+            with self.assertRaises(OSError):
+                _driver_module._collect_forked_receipts(
+                    processes=processes, started=[], specs=specs,
+                    output=self._Queue([self._receipt(0)]),
+                    collected=collected, timeout=5.0,
+                )
+            self.assertIn(0, collected, "the received receipt was thrown away")
+            self.assertEqual(collected[0].launched_locators, ("w1:p3",))
+            self.assertIsNotNone(collected[0].endpoint_gate)
+
+    def test_only_the_unreported_indexes_become_missing_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            specs = self._specs(Path(tmp))
+            filled = _driver_module._fill_unreported(specs, {0: self._receipt(0)})
+
+            self.assertEqual(len(filled), 2)
+            # Kept: the exact locator cleanup needs, and the proven gate snapshot.
+            self.assertEqual(filled[0].launched_locators, ("w1:p3",))
+            self.assertIsNotNone(filled[0].endpoint_gate)
+            self.assertEqual(filled[0].observation.outcome, "created")
+            # Filled: never reported, so it counts as MISSING, not as a proven zero.
+            self.assertEqual(filled[1].launched_locators, ())
+            self.assertIsNone(filled[1].endpoint_gate)
+            self.assertEqual(filled[1].observation.outcome, "failed")
+
+    def test_the_round_result_carries_the_partial_receipts(self) -> None:
+        """End to end through ``_run_forked_projects``: the fix's actual contract."""
+        real = _driver_module._collect_forked_receipts
+
+        def _partial(*, processes, started, specs, output, collected, timeout):
+            collected[0] = self._receipt(0)
+            raise OSError("injected after one receipt landed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            specs = self._specs(Path(tmp))
+            with mock.patch.object(
+                _driver_module, "_collect_forked_receipts", _partial
+            ):
+                forked = _run_forked_projects(
+                    harnesses=[object(), object()], specs=specs,
+                    timeout=5.0, gate_runner=None,
+                )
+            self.assertTrue(forked.round_failed)
+            self.assertEqual(forked.failure_kind, "OSError")
+            self.assertEqual(
+                forked.receipts[0].launched_locators, ("w1:p3",),
+                "a failed round must still carry what it had already received",
+            )
+            self.assertIsNotNone(forked.receipts[0].endpoint_gate)
+            self.assertIsNone(forked.receipts[1].endpoint_gate)
+        del real
+
+
 class WorkerTimeoutAndCleanupTests(unittest.TestCase):
     """A caller must not be able to strand owned workers (review j#91604 F2).
 
@@ -321,7 +447,7 @@ class WorkerTimeoutAndCleanupTests(unittest.TestCase):
         """The property the missing ``finally`` cost: cleanup on the exception path."""
         started_names = []
 
-        def _boom(*, processes, started, specs, output, timeout):
+        def _boom(*, processes, started, specs, output, collected, timeout):
             for process in processes:
                 process.start()
                 started.append(process)
@@ -359,41 +485,139 @@ class WorkerTimeoutAndCleanupTests(unittest.TestCase):
             )
 
     def test_an_uncontained_survivor_withholds_the_owned_root(self) -> None:
-        """The fence itself: teardown consults the verdict instead of scoring it.
+        """Through the PRODUCTION driver, not a hand-made shutdown call.
 
-        A ``_ForkedRun`` that reports a survivor must leave the socket path in place,
-        because a worker still holding client-call capability could address whatever
-        binds it next.
+        The previous version drove the instance directly and so never met the context
+        manager's own ``__exit__``, which released the tree with the default before any
+        containment verdict could reach the explicit shutdown (review j#91687 F1).
+        Here the real ``run_disposable_shared_space_smoke`` runs end to end and the
+        assertion is the *filesystem*, not a flag.
         """
-        for orphans, expect_released in ((1, False), (-1, False), (0, True)):
+        for orphans, expect_removed in ((1, False), (-1, False), (0, True)):
             with self.subTest(orphans=orphans):
-                run = _driver_module._ForkedRun(receipts=(), orphaned_workers=orphans)
-                self.assertEqual(run.workers_contained, expect_released)
+                report, root = _drive_production_smoke(
+                    self, forked=_driver_module._ForkedRun(
+                        receipts=(), orphaned_workers=orphans
+                    )
+                )
+                self.assertEqual(
+                    root.exists(), not expect_removed,
+                    "root removal must follow the containment verdict",
+                )
+                # Evidence is the observed state, and it agrees with the disk.
+                self.assertEqual(report["owned_root_present"], root.exists())
+                self.assertEqual(report["owned_root_released"], not root.exists())
+                self.assertEqual(report["workers_contained"], expect_removed)
+                self.assertFalse(
+                    report["success"] if not expect_removed else False,
+                    "an uncontained run can never be a success",
+                )
 
-                with tempfile.TemporaryDirectory() as tmp:
-                    process = _FakeOwnedProcess()
-                    instance = DisposableHerdrInstance(
-                        binary="/bin/true",
-                        root=Path(tmp) / "instance",
-                        base_env={"HOME": str(Path(tmp) / "operator")},
-                        runner=lambda argv, **k: subprocess.CompletedProcess(
-                            argv, 0, "[]", ""
-                        ),
-                        popen_factory=lambda argv, **k: process,
-                        sleeper=lambda _s: None,
-                        ambient_env={},
-                    )
-                    instance.start()
-                    root = instance.root
-                    instance.shutdown(release_root=run.workers_contained)
-                    self.assertEqual(
-                        root.exists(),
-                        not expect_released,
-                        "root removal must follow the containment verdict",
-                    )
-                    self.assertEqual(
-                        instance.as_evidence()["owned_root_released"], expect_released
-                    )
+    def test_an_interrupt_mid_round_never_releases_the_owned_root(self) -> None:
+        """``KeyboardInterrupt`` is not caught, so the policy must already be set.
+
+        Every teardown used to ask for release with the verdict still unknown
+        (measured: ``release_root`` args ``[True, True]``) — review j#91687 F2.
+        """
+        for injected in (KeyboardInterrupt, SystemExit):
+            with self.subTest(injected=injected.__name__):
+                def _interrupt(**kwargs):
+                    raise injected("injected mid-round")
+
+                report, root = _drive_production_smoke(
+                    self, fork_impl=_interrupt, expect_raises=injected
+                )
+                self.assertIsNone(report, "the interrupt must still propagate")
+                self.assertTrue(
+                    root.exists(),
+                    "an unknown containment verdict must not free the owned path",
+                )
+
+    def test_a_contained_round_still_releases_the_tree(self) -> None:
+        """Baseline: containment must not become a permanent residue leak."""
+        report, root = _drive_production_smoke(
+            self, forked=_driver_module._ForkedRun(receipts=(), orphaned_workers=0)
+        )
+        self.assertFalse(root.exists())
+        self.assertTrue(report["owned_root_released"])
+        self.assertFalse(report["owned_root_present"])
+
+
+def _drive_production_smoke(case, *, forked=None, fork_impl=None, expect_raises=None):
+    """Run the real driver with fakes, and hand back its report and the owned root.
+
+    Only the fork round is substituted; the isolation home, the harness, the endpoint
+    gate, the context manager and both teardown paths are the production ones.
+    """
+    tmp = Path(tempfile.mkdtemp(dir="/tmp", prefix="smoke-driver-"))
+    case.addCleanup(shutil.rmtree, tmp, True)
+    bindir = tmp / "bin"
+    bindir.mkdir()
+    for name in ("herdr-stub", "claude", "codex"):
+        script = bindir / name
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+
+    holder = {}
+
+    class _Popen:
+        def __init__(self):
+            self.pid = 919191
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+    def _popen(argv, **kwargs):
+        return _Popen()
+
+    def _runner(argv, *a, **k):
+        return subprocess.CompletedProcess(argv, 0, "[]", "")
+
+    real_init = _lifecycle_module.DisposableHerdrInstance.__init__
+
+    def _capture(self, **kwargs):
+        real_init(self, **kwargs)
+        holder.setdefault("root", self.root)
+
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure import (
+        herdr_transport,
+    )
+
+    report = None
+    with mock.patch.object(
+        herdr_transport, "resolve_herdr_binary",
+        lambda env: type("R", (), {"path": str(bindir / "herdr-stub")})(),
+    ), mock.patch.object(
+        _lifecycle_module.DisposableHerdrInstance, "__init__", _capture
+    ), mock.patch.object(
+        _driver_module, "_run_forked_projects",
+        fork_impl if fork_impl is not None else (lambda **kwargs: forked),
+    ):
+        env = {"HOME": str(tmp / "home"), "PATH": f"{bindir}:/usr/bin:/bin"}
+        if expect_raises is not None:
+            with case.assertRaises(expect_raises):
+                run_disposable_shared_space_smoke(
+                    tmp / "smoke-home", env=env, projects=2, process_timeout=5.0,
+                    runner=_runner, popen_factory=_popen,
+                )
+        else:
+            report = run_disposable_shared_space_smoke(
+                tmp / "smoke-home", env=env, projects=2, process_timeout=5.0,
+                runner=_runner, popen_factory=_popen,
+            )
+    return report, holder["root"]
 
 
 class _FakeOwnedProcess:

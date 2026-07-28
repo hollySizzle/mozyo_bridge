@@ -1149,10 +1149,29 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     失敗した場合の closed token)。例外で結果を捨てると、reap で確定した containment の答えも
     失敗分岐の evidence も同時に失われる。`KeyboardInterrupt` / `SystemExit` は捕捉せず伝播させるが、
     その場合も exact-handle reap は `finally` で通る。
-  - teardown は containment verdict を**引数として受け取る**。survivor が残る、または確定できない
-    (`-1`) 場合は **owned root / socket path を解放しない**。生存 worker が再 actuate しうる path を
-    先に手放さないことを containment の定義とし、`owned_root_released` を evidence に出す。
-    未解放は `endpoint_residue > 0` として既存 success 連言でも落ちる。
+  - **受領済み receipt は caller 所有の container へ逐次公開する**。collection 関数の local に
+    溜めると、`output.close()` 等 tail の失敗が **既に届いた receipt ごと巻き戻す**。exact pane
+    locator を失うと receipt-tape 駆動の cleanup が実行できず、観測済み gate counter も失う
+    (review j#91687 F3)。例外時に missing placeholder で埋めるのは **未受領 index のみ**とする。
+  - **root release は lifecycle の state であり、call 引数ではない**。引数にすると渡した call site しか
+    縛れず、`with instance:` の暗黙 `__exit__` が既定値で先に解放してしまう (review j#91687 F1 実測)。
+    `withhold_root_release(reason)` / `permit_root_release()` で instance に policy を持たせ、
+    `shutdown()` は**あらゆる経路がその唯一の decision を読む**。
+  - policy は **worker が存在しうる領域へ入る直前に withhold へ倒す** (`workers_unverified`)。
+    round が containment を positive に返したときだけ permit する。こうすると
+    `KeyboardInterrupt` / `SystemExit` で巻き戻っても policy は withhold のままで、
+    両 teardown が path を解放しない (review j#91687 F2: 修正前は `release_root` 引数が
+    `[True, True]` になっていた)。
+  - **evidence は action 後の実状態を観測して作る**。`owned_root_present` は teardown 後の
+    `root.exists()` を観測した値で、`owned_root_released` はその否定である。flag の反転で作ると
+    「root は消えたのに withheld」「root は残っているのに released」の両方向に実状態と乖離する
+    (review j#91687 F4 実測)。success は `owned_root_present == False` を連言する。
+    `endpoint_residue` は socket 2 path のみを数える field なので、**root/config だけが残る状態を
+    表さない**。root の残存は `owned_root_present` で表し、residue field に代弁させない。
+  - **process が生成されなかった startup failure でも owned tree は解放する**。`start()` は `Popen`
+    前に `config.toml` を書くため、`_process is None` で早期 return すると owned tree が残る。
+  - containment 後の反復 shutdown は withhold を**弱めない** (policy は instance state なので
+    既定引数で上書きされない)。
   - `server stop` 自体は containment を**強める**方向 (自 socket を死なせる) なので停止は行う。
     withhold するのは path の解放のみ。cleanup (`pane close` 等) も fence しない — 実行した方が
     residue が減り、かつ path 解放を伴わないため。

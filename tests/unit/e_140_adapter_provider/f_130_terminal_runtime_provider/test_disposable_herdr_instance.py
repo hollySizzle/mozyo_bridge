@@ -50,6 +50,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     OwnedEndpointCapability,
     SmokeEndpointEscapeError,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_observation import (  # noqa: E402,E501
+    SharedSpaceSmokeError,
+)
 
 _MODULE_PATH = Path(live_module.__file__)
 
@@ -619,7 +622,8 @@ class RootReleaseContainmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             instance = self._instance(tmp, _Process())
             root = instance.root
-            instance.shutdown(release_root=False)
+            instance.withhold_root_release("workers_not_contained")
+            instance.shutdown()
 
             self.assertTrue(
                 root.exists(),
@@ -628,9 +632,14 @@ class RootReleaseContainmentTests(unittest.TestCase):
             self.assertTrue(instance.stopped, "the server itself is still stopped")
             evidence = instance.as_evidence()
             self.assertFalse(evidence["owned_root_released"])
-            self.assertGreater(
-                evidence["endpoint_residue"], -1, "residue must be reported, not hidden"
-            )
+            self.assertTrue(evidence["owned_root_present"], "observed, not inferred")
+            self.assertEqual(evidence["root_withhold_reason"], "workers_not_contained")
+
+            # A later idempotent shutdown must NOT weaken the containment decision.
+            instance.shutdown()
+            self.assertTrue(root.exists())
+            self.assertTrue(instance.as_evidence()["owned_root_present"])
+            self.assertFalse(instance.as_evidence()["owned_root_released"])
 
     def test_releasing_is_still_the_default_and_removes_exactly_the_owned_tree(self) -> None:
         """Baseline: containment must not turn into a permanent residue leak."""
@@ -644,7 +653,33 @@ class RootReleaseContainmentTests(unittest.TestCase):
             self.assertFalse(root.exists())
             self.assertTrue(sibling.exists(), "only the owned root may be removed")
             self.assertTrue(instance.as_evidence()["owned_root_released"])
+            self.assertFalse(instance.as_evidence()["owned_root_present"])
             self.assertEqual(instance.as_evidence()["endpoint_residue"], 0)
+
+    def test_a_startup_failure_before_any_process_still_releases_the_tree(self) -> None:
+        """``start()`` writes config.toml before Popen; a failure must not leave it."""
+        def failing_popen(argv, **kwargs):
+            raise OSError("injected popen failure")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = DisposableHerdrInstance(
+                binary="/bin/true",
+                root=Path(tmp) / "instance",
+                base_env={"HOME": str(Path(tmp) / "operator")},
+                runner=lambda argv, **k: subprocess.CompletedProcess(argv, 0, "[]", ""),
+                popen_factory=failing_popen,
+                sleeper=lambda _s: None,
+                ambient_env={},
+            )
+            with self.assertRaises(SharedSpaceSmokeError):
+                instance.start()
+            self.assertTrue(instance.root.exists(), "premise: the tree was written")
+            instance.shutdown()
+            self.assertFalse(
+                instance.root.exists(),
+                "a pre-process startup failure must not leave the owned tree behind",
+            )
+            self.assertTrue(instance.as_evidence()["owned_root_released"])
 
 
 class CrossProcessGateEvidenceTests(unittest.TestCase):
