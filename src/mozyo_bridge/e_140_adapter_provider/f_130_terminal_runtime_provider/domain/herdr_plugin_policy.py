@@ -92,6 +92,23 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.provider
 from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import (
     CORE_OWNED_AUTHORITIES,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_identity import (
+    OBSERVED_SOURCE_KINDS,
+    SOURCE_KIND_ABSENT,
+    SOURCE_KIND_GITHUB,
+    SOURCE_KIND_LINK,
+    SOURCE_KIND_UNRECOGNIZED,
+    VERSION_UNRECOGNIZED,
+    HerdrPluginPolicyError,
+    PluginObservation,
+    PluginSourceRef,
+    require_segment,
+    normalize_source_kind,
+    normalize_version,
+    observe_plugin,
+    read_source_ref,
+    source_ref_from_parts,
+)
 
 # --- authority boundary (core-owned, reused verbatim) ------------------------
 #: Authorities a herdr plugin is never granted. The two existing core-owned sets
@@ -181,6 +198,15 @@ REASON_UNPINNED_REMOTE_BUILD = "unpinned_remote_build"
 REASON_UNREVIEWED_BUILD = "unreviewed_build"
 #: The record could not be read as a plugin at all.
 REASON_MALFORMED_RECORD = "malformed_record"
+#: The inventory carries at least one record that could not be read, so it has not
+#: been fully classified and no admission answer drawn from it is trustworthy.
+REASON_INVENTORY_INCOMPLETE = "inventory_incomplete"
+#: More than one installed plugin answers to the named id, so "which plugin" has no
+#: single answer. Picking one silently is how the wrong plugin gets admitted.
+REASON_AMBIGUOUS_TARGET = "ambiguous_target"
+#: The named plugin is not installed, so there is nothing whose identity could be
+#: established.
+REASON_TARGET_NOT_INSTALLED = "target_not_installed"
 
 DENY_REASONS: frozenset[str] = frozenset(
     {
@@ -193,6 +219,9 @@ DENY_REASONS: frozenset[str] = frozenset(
         REASON_UNPINNED_REMOTE_BUILD,
         REASON_UNREVIEWED_BUILD,
         REASON_MALFORMED_RECORD,
+        REASON_INVENTORY_INCOMPLETE,
+        REASON_AMBIGUOUS_TARGET,
+        REASON_TARGET_NOT_INSTALLED,
     }
 )
 
@@ -220,130 +249,6 @@ SCOPE_ISOLATION_MECHANISM = (
     "a separate HOME / XDG_CONFIG_HOME config root; splitting herdr sessions does not "
     "isolate plugin state"
 )
-
-#: The one source kind herdr resolves to an immutable commit. ``link`` (a local
-#: directory) carries no upstream identity at all.
-SOURCE_KIND_GITHUB = "github"
-
-_COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
-_SEGMENT_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
-
-
-class HerdrPluginPolicyError(ValueError):
-    """A plugin record, review entry, or registry is unreadable / self-contradictory.
-
-    Inherits :class:`ValueError` for fail-closed semantics, matching the sibling
-    adapter-boundary errors (``HerdrPinPostureError`` / ``ProviderRegistryError``).
-    """
-
-
-def _require_segment(value: object, field: str) -> str:
-    """Return ``value`` as a path-free identifier segment, or fail closed.
-
-    Type is checked before shape: ``isinstance(value, str)`` first, so a non-string
-    can never reach a regex that would coerce it. The character class excludes ``/``
-    and whitespace, so an owner / repo segment can never smuggle a path or a second
-    path component into an identity.
-    """
-    if not isinstance(value, str):
-        raise HerdrPluginPolicyError(
-            f"{field} must be a string, got {type(value).__name__}"
-        )
-    if not _SEGMENT_RE.match(value):
-        raise HerdrPluginPolicyError(
-            f"{field} {value!r} is not a bare identifier segment "
-            f"(letters, digits, '.', '_', '-')"
-        )
-    return value
-
-
-@dataclass(frozen=True)
-class PluginSourceRef:
-    """Where a plugin's code came from: a repository, optionally at an exact commit.
-
-    ``commit`` is ``None`` for a *repository-scoped* reference — the shape a
-    deny-classification uses, and the shape an allow may never use (see the module
-    docstring). When present it must be a full 40-character lowercase hex commit:
-    an abbreviated commit is not an identity, because a prefix can match more than
-    one object and cannot be compared for equality against a full one.
-    """
-
-    kind: str
-    owner: str
-    repo: str
-    commit: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        if self.kind != SOURCE_KIND_GITHUB:
-            raise HerdrPluginPolicyError(
-                f"source kind {self.kind!r} is not a pinnable upstream identity; "
-                f"only {SOURCE_KIND_GITHUB!r} resolves to an immutable commit"
-            )
-        _require_segment(self.owner, "source owner")
-        _require_segment(self.repo, "source repo")
-        if self.commit is not None:
-            if not isinstance(self.commit, str):
-                raise HerdrPluginPolicyError(
-                    f"source commit must be a string, got {type(self.commit).__name__}"
-                )
-            if not _COMMIT_RE.match(self.commit):
-                raise HerdrPluginPolicyError(
-                    "source commit must be a full 40-character lowercase hex commit; "
-                    "an abbreviated commit is not an identity"
-                )
-
-    @classmethod
-    def repository(cls, kind: str, owner: str, repo: str) -> "PluginSourceRef":
-        """A repository-scoped reference (no commit) — deny-classifications only."""
-        return cls(kind=kind, owner=owner, repo=repo)
-
-    @classmethod
-    def pinned(cls, kind: str, owner: str, repo: str, commit: str) -> "PluginSourceRef":
-        """A reference pinned to an exact immutable commit."""
-        return cls(kind=kind, owner=owner, repo=repo, commit=commit)
-
-    @property
-    def repo_key(self) -> "PluginSourceRef":
-        """This reference with the commit dropped — the repository-scoped key."""
-        if self.commit is None:
-            return self
-        return PluginSourceRef(kind=self.kind, owner=self.owner, repo=self.repo)
-
-    @property
-    def is_pinned(self) -> bool:
-        return self.commit is not None
-
-    def describe(self) -> str:
-        """A short, path-free description (``github:owner/repo@commit``)."""
-        base = f"{self.kind}:{self.owner}/{self.repo}"
-        return f"{base}@{self.commit}" if self.commit else base
-
-
-def read_source_ref(source: object) -> Optional[PluginSourceRef]:
-    """Read a pinned :class:`PluginSourceRef` out of a herdr ``source`` record.
-
-    Returns ``None`` — never a partial or guessed identity — whenever the record
-    does not carry a complete, exactly-pinned upstream identity: a missing or
-    non-mapping ``source``, a source kind other than ``github`` (a linked local
-    directory has no upstream identity), a missing / malformed owner or repo, or a
-    ``resolved_commit`` that is not a full lowercase hex commit. The caller turns
-    ``None`` into :data:`REASON_UNPINNED_SOURCE`; it is a denial, not an error,
-    because an unpinnable source is a legitimate thing to observe and report.
-    """
-    if not isinstance(source, Mapping):
-        return None
-    if source.get("kind") != SOURCE_KIND_GITHUB:
-        return None
-    try:
-        return PluginSourceRef.pinned(
-            kind=SOURCE_KIND_GITHUB,
-            owner=source.get("owner"),
-            repo=source.get("repo"),
-            commit=source.get("resolved_commit"),
-        )
-    except HerdrPluginPolicyError:
-        return None
-
 
 @dataclass(frozen=True)
 class ReviewedPlugin:
@@ -377,7 +282,7 @@ class ReviewedPlugin:
                 f"build provenance {self.build_provenance!r} is not one of "
                 f"{sorted(BUILD_PROVENANCES)}"
             )
-        _require_segment(self.plugin_id, "reviewed plugin_id")
+        require_segment(self.plugin_id, "reviewed plugin_id")
         if not self.review_anchor.strip():
             raise HerdrPluginPolicyError(
                 f"reviewed plugin {self.plugin_id!r} needs a durable review anchor"
@@ -526,97 +431,6 @@ def resolve_review(ref: Optional[PluginSourceRef]) -> Optional[ReviewedPlugin]:
 
 
 @dataclass(frozen=True)
-class PluginObservation:
-    """A herdr plugin as observed, normalized to path-free facts.
-
-    Deliberately holds no ``manifest_path`` / ``plugin_root`` / ``managed_path``:
-    the three absolute operator-home paths in herdr's payload have nowhere to go,
-    so no formatter can leak one. ``declares_build`` / ``declares_panes`` /
-    ``declares_actions`` record only *whether* the local manifest declares each
-    surface — never the commands, which are third-party strings that can embed a
-    private path.
-    """
-
-    plugin_id: str
-    version: str
-    enabled: bool
-    source_kind: str
-    ref: Optional[PluginSourceRef]
-    declares_build: bool
-    declares_panes: bool
-    declares_actions: bool
-
-
-def _require_bool(record: "Mapping[object, object]", key: str) -> bool:
-    """Read a strict boolean, refusing ``bool``-adjacent values.
-
-    ``bool`` is a subclass of ``int``, so an ``isinstance(value, int)`` check would
-    accept ``1`` here and, worse, treat it as ``True``. The enabled flag decides
-    whether a denied plugin is a live breach, so it is type-checked exactly.
-    """
-    value = record.get(key)
-    if not isinstance(value, bool):
-        raise HerdrPluginPolicyError(
-            f"plugin record field {key!r} must be a boolean, got "
-            f"{type(value).__name__}"
-        )
-    return value
-
-
-def _declares(record: "Mapping[object, object]", key: str) -> bool:
-    """Whether the manifest declares a non-empty list under ``key`` (fail-closed).
-
-    An absent key is "does not declare". A present key that is not a list is a
-    malformed record rather than an absence — refusing to read it is not the same
-    as reading it as empty.
-    """
-    if key not in record:
-        return False
-    value = record[key]
-    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise HerdrPluginPolicyError(
-            f"plugin record field {key!r} must be a list, got {type(value).__name__}"
-        )
-    return len(value) > 0
-
-
-def observe_plugin(record: object) -> PluginObservation:
-    """Normalize one ``herdr plugin list --json`` plugin record (fail-closed).
-
-    Raises :class:`HerdrPluginPolicyError` when the record cannot be read as a
-    plugin at all. A record that reads fine but carries no pinned source is *not*
-    an error: it yields ``ref=None`` and is denied downstream as
-    :data:`REASON_UNPINNED_SOURCE`.
-    """
-    if not isinstance(record, Mapping):
-        raise HerdrPluginPolicyError(
-            f"plugin record must be a mapping, got {type(record).__name__}"
-        )
-    plugin_id = _require_segment(record.get("plugin_id"), "plugin_id")
-    version = record.get("version", "")
-    if not isinstance(version, str):
-        raise HerdrPluginPolicyError(
-            f"plugin record field 'version' must be a string, got "
-            f"{type(version).__name__}"
-        )
-    source = record.get("source")
-    source_kind = ""
-    if isinstance(source, Mapping):
-        raw_kind = source.get("kind")
-        source_kind = raw_kind if isinstance(raw_kind, str) else ""
-    return PluginObservation(
-        plugin_id=plugin_id,
-        version=version,
-        enabled=_require_bool(record, "enabled"),
-        source_kind=source_kind,
-        ref=read_source_ref(source),
-        declares_build=_declares(record, "build"),
-        declares_panes=_declares(record, "panes"),
-        declares_actions=_declares(record, "actions"),
-    )
-
-
-@dataclass(frozen=True)
 class PolicyDecision:
     """One admissibility decision, with a reason from the closed vocabulary.
 
@@ -650,25 +464,64 @@ class PolicyDecision:
         return cls(admitted=False, reason=reason, detail=detail)
 
 
+def resolve_reference(
+    ref: Optional[PluginSourceRef],
+) -> "tuple[Optional[ReviewedPlugin], Optional[PolicyDecision]]":
+    """Resolve a reference to ``(review, denial)`` — exactly one of which is set.
+
+    The single ordering both entry points share (the observed inventory and an
+    operator-named candidate), so they cannot drift apart on what "unknown" means:
+
+    1. no usable repository identity -> ``unpinned_source``;
+    2. a resolved review answers, **even when the reference carries no commit** —
+       a repository-scoped entry is a deny by construction, so this cannot admit
+       anything unpinned, and it is what keeps a deny-classified project reporting
+       its real reason instead of "you did not name a commit" (review j#92053 F3);
+    3. no review and no commit -> ``unpinned_source``;
+    4. no review, commit present -> ``unreviewed_pin``.
+
+    Step 2's safety rests on ``ReviewedPlugin`` rejecting a repository-scoped
+    allow. The class is re-checked here rather than trusted from another module's
+    constructor, so an unpinned reference can never reach an admit.
+    """
+    if ref is None:
+        return None, PolicyDecision.deny(
+            REASON_UNPINNED_SOURCE,
+            "the source carries no usable upstream repository identity, so what "
+            "this code is cannot be established",
+        )
+    review = resolve_review(ref)
+    if review is not None and (ref.is_pinned or review.plugin_class in DENY_CLASSES):
+        return review, None
+    if not ref.is_pinned:
+        return None, PolicyDecision.deny(
+            REASON_UNPINNED_SOURCE,
+            f"{ref.describe()} names no exact commit, so what this code is cannot "
+            f"be established",
+        )
+    return None, PolicyDecision.deny(
+        REASON_UNREVIEWED_PIN, f"{ref.describe()} has no reviewed classification"
+    )
+
+
 def _identity_decision(
     observation: PluginObservation, review: Optional[ReviewedPlugin]
 ) -> Optional[PolicyDecision]:
     """The denial shared by both axes, or ``None`` when identity is settled.
 
-    Both the enable and the install question are unanswerable for the same three
-    identity failures, so they are decided once here rather than duplicated — a
-    second copy is where the two axes would drift apart on what "unknown" means.
+    Both the enable and the install question are unanswerable for the same identity
+    failures, so they are decided once here rather than duplicated — a second copy
+    is where the two axes would drift apart on what "unknown" means.
     """
-    if observation.ref is None:
-        return PolicyDecision.deny(
-            REASON_UNPINNED_SOURCE,
-            f"source kind {observation.source_kind or '(absent)'!r} carries no exact "
-            f"upstream commit, so what this code is cannot be established",
-        )
+    _, denial = resolve_reference(observation.ref)
+    if denial is not None:
+        return denial
     if review is None:
+        # Unreachable through classify_plugin (which resolves the same reference),
+        # but a direct caller could pass a mismatched pair; refuse rather than
+        # dereference.
         return PolicyDecision.deny(
-            REASON_UNREVIEWED_PIN,
-            f"{observation.ref.describe()} has no reviewed classification",
+            REASON_UNREVIEWED_PIN, "no reviewed classification was resolved"
         )
     if observation.plugin_id != review.plugin_id:
         return PolicyDecision.deny(
@@ -772,34 +625,16 @@ def plan_install(ref: Optional[PluginSourceRef]) -> PolicyDecision:
 
     Identity here is only the reference the operator names, so the two observation
     checks (``identity_mismatch`` / ``manifest_drift``) have nothing to compare
-    against and are not applied — there is no local manifest yet.
-
-    A resolved review is answered **before** the missing-commit check, so a
-    deny-classified project reports why the *project* is inadmissible rather than
-    "you did not name a commit" — a reason that would invite the operator to
-    supply one and be denied again. That ordering is only safe because a
-    repository-scoped entry can never carry an allow (:class:`ReviewedPlugin`
-    rejects one at construction); the class is re-checked here so the guarantee
-    does not live solely in another module's constructor.
+    against and are not applied — there is no local manifest yet. The reference
+    itself is resolved through the same :func:`resolve_reference` the observed path
+    uses, so a candidate and an installed plugin can never be classified by
+    different rules.
     """
-    if ref is None:
-        return PolicyDecision.deny(
-            REASON_UNPINNED_SOURCE,
-            "no exact upstream commit was named, so what would be executed cannot be "
-            "established",
-        )
-    review = resolve_review(ref)
-    if review is not None and (ref.is_pinned or review.plugin_class in DENY_CLASSES):
-        return _decide_install_from_review(review)
-    if not ref.is_pinned:
-        return PolicyDecision.deny(
-            REASON_UNPINNED_SOURCE,
-            f"{ref.describe()} names no commit; an install must name the exact commit "
-            f"it executes",
-        )
-    return PolicyDecision.deny(
-        REASON_UNREVIEWED_PIN, f"{ref.describe()} has no reviewed classification"
-    )
+    review, denial = resolve_reference(ref)
+    if denial is not None:
+        return denial
+    assert review is not None  # resolve_reference sets exactly one
+    return _decide_install_from_review(review)
 
 
 @dataclass(frozen=True)
@@ -825,7 +660,7 @@ class PluginVerdict:
 
 def classify_plugin(observation: PluginObservation) -> PluginVerdict:
     """Decide both axes for one observed plugin (pure; fail-closed on both)."""
-    review = resolve_review(observation.ref)
+    review, _ = resolve_reference(observation.ref)
     return PluginVerdict(
         observation=observation,
         plugin_class=review.plugin_class if review else CLASS_UNKNOWN,
@@ -838,6 +673,18 @@ def classify_plugin(observation: PluginObservation) -> PluginVerdict:
 
 __all__ = (
     "ADMISSIBLE_BUILD_PROVENANCES",
+    "OBSERVED_SOURCE_KINDS",
+    "REASON_AMBIGUOUS_TARGET",
+    "REASON_INVENTORY_INCOMPLETE",
+    "REASON_TARGET_NOT_INSTALLED",
+    "SOURCE_KIND_ABSENT",
+    "SOURCE_KIND_LINK",
+    "SOURCE_KIND_UNRECOGNIZED",
+    "VERSION_UNRECOGNIZED",
+    "normalize_source_kind",
+    "normalize_version",
+    "resolve_reference",
+    "source_ref_from_parts",
     "BUILD_NONE",
     "BUILD_PROVENANCES",
     "BUILD_REMOTE_ARTIFACT",

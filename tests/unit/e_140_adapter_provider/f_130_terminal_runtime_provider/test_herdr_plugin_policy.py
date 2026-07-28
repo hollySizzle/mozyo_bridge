@@ -15,6 +15,7 @@ Every path literal below is an abstract placeholder, never an operator path.
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import json
 import re
@@ -45,9 +46,16 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     REASON_UNPINNED_REMOTE_BUILD,
     REASON_UNPINNED_SOURCE,
     REASON_UNREVIEWED_BUILD,
+    REASON_AMBIGUOUS_TARGET,
+    REASON_INVENTORY_INCOMPLETE,
+    REASON_TARGET_NOT_INSTALLED,
     REASON_UNREVIEWED_PIN,
     REVIEWED_PLUGINS,
+    SOURCE_KIND_ABSENT,
     SOURCE_KIND_GITHUB,
+    SOURCE_KIND_LINK,
+    SOURCE_KIND_UNRECOGNIZED,
+    VERSION_UNRECOGNIZED,
     HerdrPluginPolicyError,
     PluginObservation,
     PluginSourceRef,
@@ -81,6 +89,45 @@ PLACEHOLDER_MANIFEST = f"{PLACEHOLDER_ROOT}/herdr-plugin.toml"
 #: A POSIX absolute-path token: a slash immediately followed by a path segment.
 #: ``HOME / XDG_CONFIG_HOME`` in prose does not match (the slash stands alone).
 _ABS_PATH_TOKEN = re.compile(r"/[A-Za-z0-9._-]+/")
+
+#: The value the whole-surface leak oracle injects. Path-shaped so it trips the
+#: absolute-path scan too, and distinctive enough to find in any rendering.
+LEAK_MARKER = "/opt/private-probe/leaked-secret/value.txt"
+
+
+def _string_leaf_paths(node: object, prefix: "tuple" = ()) -> "list[tuple]":
+    """Every path to a string leaf inside a nested record (for the leak oracle)."""
+    if isinstance(node, str):
+        return [prefix]
+    if isinstance(node, dict):
+        found: "list[tuple]" = []
+        for key, value in node.items():
+            found.extend(_string_leaf_paths(value, prefix + (key,)))
+        return found
+    if isinstance(node, list):
+        found = []
+        for index, value in enumerate(node):
+            found.extend(_string_leaf_paths(value, prefix + (index,)))
+        return found
+    return []
+
+
+def _with_leaf(node: object, path: "tuple", value: str) -> object:
+    """A deep copy of ``node`` with the leaf at ``path`` replaced by ``value``."""
+    if not path:
+        return value
+    head, rest = path[0], path[1:]
+    if isinstance(node, dict):
+        return {
+            key: _with_leaf(item, rest, value) if key == head else copy.deepcopy(item)
+            for key, item in node.items()
+        }
+    if isinstance(node, list):
+        return [
+            _with_leaf(item, rest, value) if index == head else copy.deepcopy(item)
+            for index, item in enumerate(node)
+        ]
+    return copy.deepcopy(node)
 
 
 def plugin_record(
@@ -340,6 +387,58 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(verdict.plugin_class, CLASS_UNKNOWN)
         self.assertFalse(verdict.enable.admitted)
         self.assertFalse(verdict.install.admitted)
+
+    def test_an_abbreviated_pin_keeps_the_repository_deny_classification(self):
+        # Review j#92053 finding 3: a malformed commit used to discard owner/repo
+        # too, so reviewr classified as `unknown` / `unpinned_source`. The deny
+        # survived but its class and reason were both untrue — defeating the very
+        # property the repository-scoped deny exists to provide.
+        for commit in ("6c304925", "6C304925BDD2727EC88C38F8C8806F97B7CA0EA0", "", 7):
+            with self.subTest(commit=commit):
+                verdict = classify_plugin(
+                    observe_plugin(
+                        plugin_record(
+                            plugin_id="herdr-reviewr",
+                            owner="persiyanov",
+                            repo="herdr-reviewr",
+                            commit=commit,
+                        )
+                    )
+                )
+                self.assertEqual(verdict.plugin_class, CLASS_AGENT_INPUT_WRITER)
+                self.assertEqual(verdict.enable.reason, REASON_AGENT_INPUT_WRITER)
+
+    def test_an_abbreviated_pin_keeps_the_spreader_classification(self):
+        verdict = classify_plugin(
+            observe_plugin(
+                plugin_record(
+                    plugin_id="herdr-spreader",
+                    owner="yuk1ty",
+                    repo="herdr-spreader",
+                    commit="5f76bc9e",
+                    build=False,
+                )
+            )
+        )
+        self.assertEqual(verdict.plugin_class, CLASS_TEST_ORACLE)
+        self.assertEqual(verdict.enable.reason, REASON_NO_LANE_AUTHORITY)
+
+    def test_an_abbreviated_pin_never_upgrades_an_allow(self):
+        # The other direction of the same fix: keeping the repository identity must
+        # not let a pinned-allow project in at an unpinned identity.
+        verdict = classify_plugin(observe_plugin(plugin_record(commit="96fcc0a2")))
+        self.assertEqual(verdict.plugin_class, CLASS_UNKNOWN)
+        self.assertFalse(verdict.enable.admitted)
+        self.assertEqual(verdict.enable.reason, REASON_UNPINNED_SOURCE)
+
+    def test_a_malformed_owner_or_repo_still_yields_no_identity(self):
+        verdict = classify_plugin(
+            observe_plugin(
+                plugin_record(source={"kind": "github", "owner": "a/b", "repo": "r"})
+            )
+        )
+        self.assertIsNone(verdict.observation.ref)
+        self.assertEqual(verdict.enable.reason, REASON_UNPINNED_SOURCE)
 
     def test_a_locally_linked_plugin_has_no_identity_and_is_denied(self):
         verdict = classify_plugin(
@@ -764,6 +863,70 @@ class StatusReportTests(unittest.TestCase):
         self.assertNotIn(PLACEHOLDER_MANIFEST, rendered)
         self.assertIsNone(_ABS_PATH_TOKEN.search(rendered))
 
+    def test_no_string_field_anywhere_in_the_payload_can_reach_the_report(self):
+        # Review j#92053 finding 1: the previous version of this class enumerated
+        # the fields it thought could carry a path, and the enumeration was wrong —
+        # `version` and `source_kind` were free text and went straight through, so
+        # a clean `ok=true` report carried a private path.
+        #
+        # The enumeration is therefore replaced by an oracle over the whole input
+        # surface: inject the marker into EVERY string leaf of a real-shaped
+        # payload, one leaf at a time, and require it never to surface. A field
+        # added later is covered without anyone remembering to list it.
+        leaks = []
+        for path in _string_leaf_paths(plugin_record()):
+            record = _with_leaf(plugin_record(), path, LEAK_MARKER)
+            status = self._status(record)
+            rendered = json.dumps(status.as_payload()) + ops.format_status_text(status)
+            if LEAK_MARKER in rendered or _ABS_PATH_TOKEN.search(rendered):
+                leaks.append(".".join(str(part) for part in path))
+        self.assertEqual(leaks, [], f"payload leaf(s) reached the report: {leaks}")
+
+    def test_the_oracle_would_catch_a_leak(self):
+        # The oracle above proves nothing unless it can fail. Feed the same marker
+        # through a formatter that does echo it, and require detection — otherwise
+        # a future change that made `_status` return nothing would read as "green".
+        rendered = f"version: {LEAK_MARKER}"
+        self.assertTrue(
+            LEAK_MARKER in rendered or _ABS_PATH_TOKEN.search(rendered) is not None
+        )
+        self.assertTrue(_string_leaf_paths(plugin_record()))
+
+    def test_a_path_shaped_version_is_replaced_by_a_closed_token(self):
+        status = self._status(plugin_record(version=LEAK_MARKER))
+        verdict = status.verdicts[0]
+        self.assertEqual(verdict.observation.version, VERSION_UNRECOGNIZED)
+        rendered = json.dumps(status.as_payload()) + ops.format_status_text(status)
+        self.assertNotIn(LEAK_MARKER, rendered)
+
+    def test_an_ordinary_version_is_still_echoed(self):
+        # The closed token must not swallow the normal case: a report that called
+        # every version "unrecognized" would satisfy the leak oracle and be useless.
+        for version in ("1.14.0", "0.26.1", "2.0.0-rc.1", "1.0.0+build_7"):
+            with self.subTest(version=version):
+                status = self._status(plugin_record(version=version))
+                self.assertEqual(status.verdicts[0].observation.version, version)
+
+    def test_an_unrecognized_source_kind_is_projected_not_echoed(self):
+        status = self._status(
+            plugin_record(source={"kind": LEAK_MARKER, "owner": "o", "repo": "r"})
+        )
+        verdict = status.verdicts[0]
+        self.assertEqual(verdict.observation.source_kind, SOURCE_KIND_UNRECOGNIZED)
+        rendered = json.dumps(status.as_payload()) + ops.format_status_text(status)
+        self.assertNotIn(LEAK_MARKER, rendered)
+
+    def test_the_known_source_kinds_are_still_distinguished(self):
+        cases = (
+            (..., SOURCE_KIND_GITHUB),
+            ({"kind": "link"}, SOURCE_KIND_LINK),
+            (None, SOURCE_KIND_ABSENT),
+        )
+        for source, expected in cases:
+            with self.subTest(expected=expected):
+                status = self._status(plugin_record(source=source))
+                self.assertEqual(status.verdicts[0].observation.source_kind, expected)
+
     def test_a_malformed_record_does_not_carry_its_path_into_the_report(self):
         # The parse message quotes the offending value, and that value is
         # third-party data that can hold a path.
@@ -778,10 +941,60 @@ class StatusReportTests(unittest.TestCase):
         plan = ops.plan_enable(self._status(plugin_record()), "not-installed")
         self.assertFalse(plan.found)
         self.assertFalse(plan.ok)
+        self.assertEqual(plan.decision.reason, REASON_TARGET_NOT_INSTALLED)
 
     def test_plan_enable_admits_the_reviewed_ux_only_plugin(self):
         plan = ops.plan_enable(self._status(plugin_record()), "herdr-file-viewer")
         self.assertTrue(plan.ok)
+
+    def test_plan_enable_refuses_an_inventory_that_did_not_fully_read(self):
+        # Review j#92053 finding 2: status.ok already said "not fully classified",
+        # but the enable answer — the one that gates an operator action — was drawn
+        # from the readable remainder and came back admitted.
+        broken = plugin_record(plugin_id="herdr-file-viewer")
+        broken["enabled"] = "yes"
+        status = self._status(plugin_record(), broken)
+        self.assertFalse(status.fully_read)
+        plan = ops.plan_enable(status, "herdr-file-viewer")
+        self.assertFalse(plan.ok)
+        self.assertEqual(plan.decision.reason, REASON_INVENTORY_INCOMPLETE)
+
+    def test_an_unreadable_record_blocks_even_an_unrelated_plugin_id(self):
+        # The unreadable record may BE the plugin asked about, or a second claimant
+        # to its id — neither is knowable, so the id asked about cannot narrow it.
+        broken = plugin_record(plugin_id="something-else")
+        broken["enabled"] = 1
+        status = self._status(plugin_record(), broken)
+        plan = ops.plan_enable(status, "herdr-file-viewer")
+        self.assertFalse(plan.ok)
+        self.assertEqual(plan.decision.reason, REASON_INVENTORY_INCOMPLETE)
+
+    def test_a_duplicate_plugin_id_is_ambiguous_not_first_match(self):
+        # Same id, two different sources — one of them deny-classified. Answering
+        # from the first match answers about a different plugin than the one an
+        # `herdr plugin enable <id>` would affect.
+        impostor = plugin_record(
+            plugin_id="herdr-file-viewer",
+            owner="persiyanov",
+            repo="herdr-reviewr",
+            commit=OTHER_COMMIT,
+        )
+        status = self._status(plugin_record(), impostor)
+        self.assertTrue(status.fully_read)
+        plan = ops.plan_enable(status, "herdr-file-viewer")
+        self.assertFalse(plan.ok)
+        self.assertEqual(plan.decision.reason, REASON_AMBIGUOUS_TARGET)
+        self.assertIsNone(plan.verdict)
+
+    def test_the_enable_plan_payload_always_carries_its_decision(self):
+        for plugin_id in ("herdr-file-viewer", "not-installed"):
+            with self.subTest(plugin_id=plugin_id):
+                plan = ops.plan_enable(self._status(plugin_record()), plugin_id)
+                payload = plan.as_payload()
+                self.assertEqual(payload["ok"], plan.decision.admitted)
+                self.assertEqual(
+                    payload["decision"]["reason"], plan.decision.reason
+                )
 
 
 class CliTests(unittest.TestCase):

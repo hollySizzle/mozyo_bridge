@@ -45,7 +45,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     CLASS_UNKNOWN,
     ENABLE_SCOPE,
     ENABLE_SCOPE_STATEMENT,
+    REASON_AMBIGUOUS_TARGET,
+    REASON_INVENTORY_INCOMPLETE,
     REASON_MALFORMED_RECORD,
+    REASON_TARGET_NOT_INSTALLED,
     SCOPE_ISOLATION_MECHANISM,
     SCOPE_ROOT_DETERMINANTS,
     SOURCE_KIND_GITHUB,
@@ -57,6 +60,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     observe_plugin,
     plan_install,
     resolve_review,
+    source_ref_from_parts,
 )
 
 #: The **only** herdr invocation this surface makes: a read-only inventory query.
@@ -258,14 +262,27 @@ class PolicyStatus:
         return tuple(verdict for verdict in self.verdicts if verdict.breach)
 
     @property
+    def fully_read(self) -> bool:
+        """Whether every record in the inventory was readable.
+
+        The single predicate every consumer of this inventory asks, rather than a
+        condition each one re-derives. Review j#92053 finding 2 measured the cost of
+        having only ``ok`` express it: the reasoning ("an inventory with an
+        unreadable entry has not been fully classified") was written into ``ok``
+        and *not* applied to :func:`plan_enable`, so the reporting side failed
+        closed while the admission side — the one that actually gates an
+        operator's action — failed open.
+        """
+        return not self.malformed
+
+    @property
     def ok(self) -> bool:
         """Clean iff every record read and no enabled plugin is inadmissible.
 
         A *denied* plugin that is not enabled is the policy working, so it does not
-        fail the report. A record that could not be read does, because an inventory
-        with an unreadable entry has not been fully classified.
+        fail the report. A record that could not be read does.
         """
-        return not self.malformed and not self.breaches
+        return self.fully_read and not self.breaches
 
     def as_payload(self) -> dict:
         return {
@@ -293,16 +310,23 @@ def classify_inventory(records: "Sequence[object]") -> PolicyStatus:
 
 @dataclass(frozen=True)
 class EnablePlan:
-    """The answer to "may I enable this plugin?" — a decision, never an action."""
+    """The answer to "may I enable this plugin?" — a decision, never an action.
+
+    Carries an explicit :class:`PolicyDecision` rather than deriving admissibility
+    from whether a verdict happened to be found. The derived form (review j#92053
+    finding 2) could only say "admitted" or "not found", so every *other* way the
+    question can be unanswerable — an inventory that did not fully read, an
+    ambiguous id — had nowhere to be represented and silently became "admitted".
+    """
 
     plugin_id: str
     found: bool
     verdict: Optional[PluginVerdict]
+    decision: PolicyDecision
 
     @property
     def ok(self) -> bool:
-        """A plugin that is not installed is not admissible to enable either."""
-        return bool(self.verdict and self.verdict.enable.admitted)
+        return self.decision.admitted
 
     def as_payload(self) -> dict:
         return {
@@ -310,6 +334,7 @@ class EnablePlan:
             "plugin_id": self.plugin_id,
             "found": self.found,
             "enable_scope": _scope_payload(),
+            "decision": _decision_payload(self.decision),
             "plugin": _verdict_payload(self.verdict) if self.verdict else None,
         }
 
@@ -317,13 +342,60 @@ class EnablePlan:
 def plan_enable(status: PolicyStatus, plugin_id: str) -> EnablePlan:
     """Decide whether ``plugin_id`` may be enabled. Enables nothing.
 
-    A plugin id that is absent from the inventory is reported as not found and is
-    not admissible — there is nothing whose identity could have been established.
+    Fails closed on every way the question can lack a single trustworthy answer,
+    checked before the plugin's own verdict is consulted:
+
+    - **the inventory did not fully read** — a record we could not classify may be
+      the very plugin being asked about, or a second claimant to its id, so no
+      answer drawn from the remainder is trustworthy;
+    - **more than one installed plugin answers to the id** — herdr's id is what an
+      operator would type at ``herdr plugin enable``, and picking the first match
+      silently answers about a different plugin than the one that would be enabled;
+    - **nothing answers to the id** — there is no identity to establish.
     """
-    for verdict in status.verdicts:
-        if verdict.observation.plugin_id == plugin_id:
-            return EnablePlan(plugin_id=plugin_id, found=True, verdict=verdict)
-    return EnablePlan(plugin_id=plugin_id, found=False, verdict=None)
+    if not status.fully_read:
+        return EnablePlan(
+            plugin_id=plugin_id,
+            found=False,
+            verdict=None,
+            decision=PolicyDecision.deny(
+                REASON_INVENTORY_INCOMPLETE,
+                f"{len(status.malformed)} inventory record(s) could not be read, so "
+                f"the inventory has not been fully classified; no enable answer "
+                f"drawn from it is trustworthy",
+            ),
+        )
+    matches = [
+        verdict
+        for verdict in status.verdicts
+        if verdict.observation.plugin_id == plugin_id
+    ]
+    if len(matches) > 1:
+        return EnablePlan(
+            plugin_id=plugin_id,
+            found=True,
+            verdict=None,
+            decision=PolicyDecision.deny(
+                REASON_AMBIGUOUS_TARGET,
+                f"{len(matches)} installed plugins answer to this id; which one an "
+                f"enable would affect has no single answer",
+            ),
+        )
+    if not matches:
+        return EnablePlan(
+            plugin_id=plugin_id,
+            found=False,
+            verdict=None,
+            decision=PolicyDecision.deny(
+                REASON_TARGET_NOT_INSTALLED,
+                "no installed plugin answers to this id, so there is nothing whose "
+                "identity could be established",
+            ),
+        )
+    verdict = matches[0]
+    return EnablePlan(
+        plugin_id=plugin_id, found=True, verdict=verdict, decision=verdict.enable
+    )
 
 
 @dataclass(frozen=True)
@@ -356,27 +428,20 @@ def plan_candidate_install(spec: str, ref: Optional[str]) -> InstallPlan:
 
     ``spec`` mirrors herdr's own ``<owner>/<repo>`` argument. A spec or ref that
     cannot be read as an exact pinned identity is not an error here: it resolves to
-    ``ref=None`` and is denied as ``unpinned_source``, which is the same answer an
-    unpinnable installed plugin gets.
+    the strongest reference the parts support (possibly repository-scoped, possibly
+    ``None``) and is denied accordingly — the same answer an installed plugin with
+    the same parts gets, because both go through ``source_ref_from_parts``. That
+    sharing is the point: the pinned-then-repository fallback used to live only
+    here, which is how the observed path lost a repository identity to a malformed
+    commit (review j#92053 finding 3).
     """
-    source_ref: Optional[PluginSourceRef] = None
     owner, separator, repo = spec.partition("/")
-    if separator and owner and repo and ref:
-        try:
-            source_ref = PluginSourceRef.pinned(SOURCE_KIND_GITHUB, owner, repo, ref)
-        except HerdrPluginPolicyError:
-            source_ref = None
-    if source_ref is None and separator and owner and repo:
-        # A well-formed repository with no usable commit still resolves to a
-        # repository-scoped deny entry when one exists, so a known-inadmissible
-        # project is named as such instead of as a generic unpinned source.
-        try:
-            source_ref = PluginSourceRef.repository(SOURCE_KIND_GITHUB, owner, repo)
-        except HerdrPluginPolicyError:
-            source_ref = None
-    return InstallPlan(
-        spec=spec, ref=source_ref, decision=plan_install(source_ref)
+    source_ref: Optional[PluginSourceRef] = (
+        source_ref_from_parts(SOURCE_KIND_GITHUB, owner, repo, ref)
+        if separator
+        else None
     )
+    return InstallPlan(spec=spec, ref=source_ref, decision=plan_install(source_ref))
 
 
 # --- text rendering ----------------------------------------------------------
@@ -450,10 +515,7 @@ def format_enable_plan_text(plan: EnablePlan) -> str:
     lines.extend(_format_scope())
     lines.append("")
     if plan.verdict is None:
-        lines.append(
-            f"- {plan.plugin_id}: NOT INSTALLED — nothing to establish an identity "
-            f"from, so the enable is not admissible."
-        )
+        lines.append(_format_decision("enable ", plan.decision).lstrip())
         return "\n".join(lines)
     lines.extend(_format_verdict(plan.verdict))
     return "\n".join(lines)

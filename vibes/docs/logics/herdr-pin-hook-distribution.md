@@ -9,8 +9,11 @@ allow / deny 境界を durable に固定する。設計根拠は #13175 PoC
 
 この runbook は **利用手順の正本**であり、CLI `--help` を replay 可能な形にしたもの。実装は
 `e_140_adapter_provider/f_130_terminal_runtime_provider` の `herdr_pin_posture` /
-`herdr_integration_install` / `herdr_plugin_policy`(domain)と `*_ops`(application)、CLI は
-`cli_herdr_distribution`。owner 別に:
+`herdr_integration_install` / `herdr_plugin_identity` + `herdr_plugin_policy`(domain)と
+`*_ops`(application)、CLI は `cli_herdr_distribution`。plugin policy の domain は
+「**plugin が何であるか**」(`herdr_plugin_identity`: source identity と正規化済み observation)
+と「**何が許可されるか**」(`herdr_plugin_policy`: review registry と admission 判定) で
+分かれており、依存は前者→後者の一方向のみ。owner 別に:
 
 | 節 | 対象 | Redmine |
 |---|---|---|
@@ -307,7 +310,7 @@ breach ではない** (policy が機能している状態)。enable 済み か�
 
 | reason | 意味 |
 |---|---|
-| `unpinned_source` | exact な upstream commit が無い (`plugin link` の local、非 `github` kind、欠落 / 不正な commit)。**abbreviated commit は identity ではない**ので拒否する |
+| `unpinned_source` | exact な upstream commit が無い (`plugin link` の local、非 `github` kind、欠落 / 不正な commit、malformed な owner/repo)。**abbreviated commit は identity ではない**ので pin としては拒否する |
 | `unreviewed_pin` | source は pin されているが、**その identity** を review した記録が無い |
 | `identity_mismatch` | pin は review 済みだが、local manifest が別の `plugin_id` を名乗る |
 | `manifest_drift` | local manifest の `[[build]]` の有無が review 記録と食い違う。**commit pin が固定するのは upstream が publish した内容であって、install 後に operator の plugin directory に置かれた bytes ではない** |
@@ -316,6 +319,39 @@ breach ではない** (policy が機能している状態)。enable 済み か�
 | `unpinned_remote_build` | `[[build]]` が remote artifact を download し、その整合性証明が同一 origin からしか得られない |
 | `unreviewed_build` | `[[build]]` が何を実行するかを review が確立していない |
 | `malformed_record` | plugin record として読めない。**読み飛ばさず**報告し、report を fail させる |
+| `inventory_incomplete` | inventory に読めない record が 1 件以上ある。**enable plan は残りから答えを作らない** |
+| `ambiguous_target` | 同一 `plugin_id` に複数の installed plugin が該当する。先頭一致で黙って解決しない |
+| `target_not_installed` | 該当 `plugin_id` の plugin が無い |
+
+### ★abbreviated commit は pin を壊すが repository identity は壊さない
+
+`(kind, owner, repo)` が valid なら、commit が不正でも **repository-scoped reference は保持する**。
+これが無いと、abbreviated commit を与えられた `reviewr` が `agent_input_writer` ではなく
+`unknown` に落ち、**deny は残るのに class も reason も真でなくなる** — repository-scoped deny を
+置いた目的そのものが失われる。deny の理由が間違っている deny は、自分を説明しなくなった deny
+である。逆向きも同じ規則で閉じる: repository identity を保持しても、**pinned allow は
+unpinned identity では成立しない**（file-viewer に abbreviated commit を与えると
+`unpinned_source` で deny）。
+
+reference の構築は `source_ref_from_parts` **1 つ**で、observed inventory と operator が
+名指した候補の両方が通る。以前は候補側にだけ「pinned 失敗 → repository へ fallback」があり、
+observed 側に無かった。**同じ概念を 2 箇所で書くと、片方だけが古くなる。**
+
+### enable plan は「答えが一意に定まらない」全経路で fail-closed
+
+`plan_enable` は plugin 自身の verdict を見る**前**に次を拒否する。
+
+1. **inventory が完全に読めていない** — 読めなかった record が、まさに問い合わせ対象の plugin か、
+   その id を名乗る第二の record かもしれない。どちらも知り得ないので、残りから作った答えは
+   信用できない。**問い合わせた id では絞り込めない**（id 自体が読めなかった側にあり得る）。
+2. **同一 id に複数該当** — herdr の id は operator が `herdr plugin enable` に打つ値そのもの。
+   先頭一致で答えると、**実際に enable される plugin とは別の plugin について**答えることになる。
+3. **該当なし** — identity を確立する対象が無い。
+
+`PolicyStatus.ok` と `plan_enable` は「完全に読めたか」の述語 (`fully_read`) を**共有する**。
+以前は同じ論拠が `ok` の docstring にだけ書かれ、`plan_enable` に適用されていなかった —
+**報告側が fail-closed で、実際に operator の行為を gate する admission 側が fail-open** という
+向きの誤りだった。
 
 ### 保証と、その保証の範囲外
 
@@ -323,11 +359,23 @@ breach ではない** (policy が機能している状態)。enable 済み か�
   `INVENTORY_ARGV = ("plugin","list","--json")` **ただ一つ**で、install / enable / disable /
   uninstall へ至る code path は存在しない。全 mode について「subprocess を呼ばない、または
   この argv でだけ呼ぶ」ことを test が pin している。
-- **値非表示も構造的である。** herdr の payload は絶対 path を 3 つ (`manifest_path` /
-  `plugin_root` / `source.managed_path`) 運ぶが、正規化後の `PluginObservation` には
-  それを**格納する field が無い**。したがって formatter が redact を忘れても漏れない。
-  自分で書いていない text (subprocess の stderr、malformed record の parse message) だけは
-  `redact_probe_paths` を通す。
+- **値非表示は「closed representation」で担保する。** herdr の payload は絶対 path を 3 つ
+  (`manifest_path` / `plugin_root` / `source.managed_path`) 運ぶが、正規化後の
+  `PluginObservation` はそれを格納しない。加えて **plugin が自由に書ける text field を
+  そのまま保持しない**: `source.kind` は closed vocabulary へ**投影**し（未知の値は
+  `unrecognized` であって生値ではない）、`version` は version 形の bounded token だけを
+  echo して、それ以外は `unrecognized` に落とす。`PluginObservation.__post_init__` が
+  この不変条件を**構築時に検査**する。自分で書いていない text (subprocess の stderr、
+  malformed record の parse message) だけは `redact_probe_paths` を通す。
+
+  **訂正 (本節の以前の版):** 以前ここには「record に path を格納する field が無いので
+  formatter が redact を忘れても漏れない」と書いてあった。これは誤りだった。正しくは
+  「**path を意図した field が無い**」だけで、`version` と `source_kind` は任意 text を
+  保持でき、実際に text / JSON 双方へ無加工で出ていた（`version` 経由では
+  **`ok=true` の clean な report が private path を運んだ**）。regression は field 名を
+  列挙せず、**real-shaped payload の全 string leaf へ 1 つずつ marker を注入して
+  report に現れないことを要求する** oracle にしてある — 列挙が漏れたことが原因なので、
+  列挙をやめた。
 - **authority は core 所有のまま。** `FORBIDDEN_PLUGIN_AUTHORITIES` は既存の
   `FORBIDDEN_PROVIDER_AUTHORITIES` (#12035) と `CORE_OWNED_AUTHORITIES` (#12155) を
   **そのまま再利用**した上で lane 固有 (`delivery_authority` / `durable_anchor_authority` /
