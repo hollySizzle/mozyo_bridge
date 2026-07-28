@@ -2392,28 +2392,84 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
 
 
 class SessionStartCliTest(_SessionStartHarness, unittest.TestCase):
-    def test_repeated_agent_flag_dies_fail_closed(self) -> None:
+    #: The exact refusal the duplicate-slot guard renders. Shared by the scenario below
+    #: and by its isolation pin, so the boundary both of them claim is one literal.
+    DUPLICATE_AGENT_STDERR = (
+        "error: herdr session-start failed: duplicate requested slot for "
+        "provider 'claude' in lane 'default'; each (provider, lane) may be "
+        "prepared once — remove the duplicate `--agent` argument\n"
+    )
+
+    def _run_duplicate_agent_cli(self):
+        """Return ``(exit_code, stderr)`` from the real CLI for a duplicated ``--agent``.
+
+        Everything ``cmd_herdr_session_start`` reads BEFORE the guard under test is
+        pinned to this temp tree, because those reads are inputs to the assertion. There
+        are three, and the last one was missed (Redmine #14645):
+
+        - ``repo_root_from_args`` -> the temp repo passed on ``args``;
+        - ``load_repo_local_config(repo_root)`` -> the same temp repo, which has no config;
+        - ``resolve_coordinator_placement_mode()`` -> the **operator-scoped home**, read
+          from ambient ``MOZYO_BRIDGE_HOME``. Left unpinned, an operator or CI whose home
+          holds a malformed ``coordinator-placement.yaml`` — or who points the variable at
+          a non-directory such as ``/dev/null`` — dies on THAT read, with a placement
+          diagnostic, before the duplicate guard ever runs. Measured before this fix: this
+          scenario failed under both shapes, and it was the single failure in the whole
+          enclosing suite under ``/dev/null`` (``Ran 894``, ``FAILED (failures=1)``) —
+          same subject and same code as the green run against an empty home.
+
+        The subject here is the guard and its refusal text; the operator's environment is
+        not part of what the assertions describe.
+        """
         from mozyo_bridge.application.cli import build_parser
 
         stderr = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
             args = build_parser().parse_args(
                 ["herdr", "session-start", "--agent", "claude", "--agent", "claude"]
             )
             args.repo = str(repo)
-            with contextlib.redirect_stderr(stderr):
-                with self.assertRaises(SystemExit) as ctx:
-                    args.func(args)
-            # Non-zero fail-closed exit (die), not a silent success.
-            self.assertEqual(ctx.exception.code, 2)
-        self.assertEqual(
-            stderr.getvalue(),
-            "error: herdr session-start failed: duplicate requested slot for "
-            "provider 'claude' in lane 'default'; each (provider, lane) may be "
-            "prepared once — remove the duplicate `--agent` argument\n",
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as ctx:
+                        args.func(args)
+        return ctx.exception.code, stderr.getvalue()
+
+    def test_repeated_agent_flag_dies_fail_closed(self) -> None:
+        code, stderr = self._run_duplicate_agent_cli()
+        # Non-zero fail-closed exit (die), not a silent success.
+        self.assertEqual(code, 2)
+        self.assertEqual(stderr, self.DUPLICATE_AGENT_STDERR)
+
+    def test_duplicate_guard_is_unaffected_by_a_hostile_operator_home(self) -> None:
+        """Redmine #14645: pin the ISOLATION, not just today's clean operator home.
+
+        ``cmd_herdr_session_start`` reads ``$MOZYO_BRIDGE_HOME/coordinator-placement.yaml``
+        before the duplicate guard, so an ambient home that fails that read pre-empts the
+        boundary above with a placement diagnostic — the scenario would then be asserting
+        on the environment. Point the ambient home at each shape that actually broke it
+        and require the same exit code and the same refusal text anyway, because
+        ``_run_duplicate_agent_cli`` overrides the variable. Dropping that override reds
+        this test.
+        """
+        malformed = Path(tempfile.mkdtemp(prefix="mzb14645-hostile-home-"))
+        self.addCleanup(shutil.rmtree, malformed, True)
+        (malformed / "coordinator-placement.yaml").write_text(
+            "mode: [not, a, string]\n", encoding="utf-8"
         )
+        # `/dev/null` is the shape #14569 R8 hit: not a directory, so resolving the
+        # placement file under it raises `NotADirectoryError`, not `FileNotFoundError`,
+        # and therefore does NOT take the missing-file default.
+        for hostile in (str(malformed), "/dev/null"):
+            with self.subTest(hostile_home=hostile):
+                with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": hostile}, clear=False):
+                    code, stderr = self._run_duplicate_agent_cli()
+                self.assertEqual(code, 2)
+                self.assertEqual(stderr, self.DUPLICATE_AGENT_STDERR)
 
     def test_default_both_providers_still_valid(self) -> None:
         # The default invocation (no --agent) resolves to both providers with no
