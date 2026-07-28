@@ -66,6 +66,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     apply_install,
     plan_install,
 )
+from tests.support.private_path_fixtures import linux_home_path  # noqa: E402
 
 
 # --- pin posture: domain -----------------------------------------------------
@@ -254,10 +255,18 @@ class InstallDomainTest(unittest.TestCase):
             DirSnapshot(entries=(("a", "1"), ("a", "2")))
 
     def test_safe_config_dir(self) -> None:
-        self.assertTrue(is_safe_config_dir(resolved="/home/u/.claude", home_resolved="/home/u"))
-        self.assertTrue(is_safe_config_dir(resolved="/home/u", home_resolved="/home/u"))
-        self.assertFalse(is_safe_config_dir(resolved="/etc/passwd", home_resolved="/home/u"))
-        self.assertFalse(is_safe_config_dir(resolved="/home/user2/.claude", home_resolved="/home/u"))
+        # Home-shaped paths composed at runtime: the predicate is about personal
+        # home containment, so the values it sees must carry that exact shape
+        # while the tracked source carries no such literal (Redmine #14656).
+        home = linux_home_path("u")
+        self.assertTrue(is_safe_config_dir(resolved=home + "/.claude", home_resolved=home))
+        self.assertTrue(is_safe_config_dir(resolved=home, home_resolved=home))
+        self.assertFalse(is_safe_config_dir(resolved="/etc/passwd", home_resolved=home))
+        self.assertFalse(
+            is_safe_config_dir(
+                resolved=linux_home_path("user2", ".claude"), home_resolved=home
+            )
+        )
 
     def test_credential_shaped(self) -> None:
         self.assertTrue(is_credential_shaped(".credentials.json"))

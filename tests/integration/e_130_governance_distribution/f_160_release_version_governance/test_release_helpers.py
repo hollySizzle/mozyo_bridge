@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge import __version__
 from mozyo_bridge.application.cli import build_parser
+from tests.support.private_path_fixtures import linux_home_path, macos_home_path
 
 class ReleaseHelperParserTest(unittest.TestCase):
     """The contract-admitted release helper subcommands must round-trip
@@ -186,6 +187,36 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             self.assertEqual(release_mod.EXIT_BLOCKER, rc)
             self.assertIn(personal_path, out.getvalue())
             self.assertIn("result: blocker", out.getvalue())
+
+    def test_shared_home_path_fixtures_are_what_this_gate_blocks(self) -> None:
+        """The suite's private-path negative controls compose their home-shaped
+        values with `tests.support.private_path_fixtures` instead of writing the
+        literal, so that the tracked bytes carry nothing this gate blocks while
+        the code under test still receives exactly such a path (Redmine #14656).
+
+        That indirection is only a negative control while the composed value is
+        still blocker-shaped: a helper quietly degraded to a neutral path would
+        leave every call site green and testing nothing. Pin it against the real
+        command, not against a second copy of the pattern.
+        """
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        for fixture, composed in (
+            ("macos_home_path", macos_home_path("someone", "secret", "path")),
+            ("linux_home_path", linux_home_path("someone", ".claude")),
+        ):
+            with self.subTest(fixture=fixture):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self._init_repo(root)
+                    self._commit_file(
+                        root, "AGENTS.md", f"see {composed} for context\n"
+                    )
+                    args = argparse.Namespace(repo=str(root))
+                    with contextlib.redirect_stdout(io.StringIO()) as out:
+                        rc = release_mod.cmd_release_check_tree(args)
+                    self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+                    self.assertIn(composed, out.getvalue())
 
     def test_secret_value_shape_in_tracked_file_is_blocker(self) -> None:
         from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
