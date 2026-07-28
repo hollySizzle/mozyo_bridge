@@ -2513,9 +2513,34 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
                 else:
                     self.assertIsNone(first, "an ordinary failure is not control flow")
 
-    def _interrupt_while_taking_an_interrupt(self, match: str):
-        """Raise once inside `_took_the_interrupt`, on the line holding `match`."""
-        line = self._source_line(owned_descriptors._took_the_interrupt, match)
+    @staticmethod
+    def _guarded_body_lines() -> list[int]:
+        """Every line of `_took_the_interrupt`'s guarded body.
+
+        Enumerated rather than named, so the injection covers whatever the body
+        happens to contain. Naming the lines is how the last gap got through:
+        both targets sat after the priority assignment, so nothing exercised
+        the decision itself (j#90839 R23-F1). A statement added here is covered
+        the moment it exists.
+        """
+        lines, start = inspect.getsourcelines(owned_descriptors._took_the_interrupt)
+        found: list[int] = []
+        inside = False
+        for offset, line in enumerate(lines):
+            stripped = line.strip()
+            if not inside:
+                inside = stripped == "try:"
+                continue
+            if stripped.startswith("except BaseException as nested"):
+                break
+            if stripped:
+                found.append(start + offset)
+        if not found:
+            raise AssertionError("no guarded body found in _took_the_interrupt")
+        return found
+
+    def _interrupt_while_taking_an_interrupt(self, line: int):
+        """Raise once inside `_took_the_interrupt`, at `line`."""
         code = owned_descriptors._took_the_interrupt.__code__
         nested = GeneratorExit("a second interrupt while recording the first")
         fired: list[bool] = []
@@ -2578,20 +2603,20 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         `GeneratorExit` escaping `_teardown_during`, an empty ledger, and the
         first interrupt's priority lost as well.
 
-        Both rails and both boundaries inside the conversion, because the last
-        three rounds each fixed one rail and left the other shaped the same way.
+        Both rails and every line of the conversion, because the last rounds
+        each fixed one rail or one line and left its twin shaped the same way.
+        Priority now comes from the arguments in the return expression, so no
+        line of the body can change it (j#90839 R23-F1) — which is why every
+        line can assert the same thing.
         """
         for rail, drive in (
             ("main", self._interrupt_the_main_rail),
             ("final", self._interrupt_the_final_rail),
         ):
-            for boundary, match in (
-                ("after the occurrence exists", "unadmitted.append(occurrence)"),
-                ("before it exists", "occurrence = _Occurrence(interrupt)"),
-            ):
-                with self.subTest(rail=rail, boundary=boundary):
+            for line in self._guarded_body_lines():
+                with self.subTest(rail=rail, line=line):
                     patch, interrupt = drive()
-                    tracer, fired, nested = self._interrupt_while_taking_an_interrupt(match)
+                    tracer, fired, nested = self._interrupt_while_taking_an_interrupt(line)
 
                     ran: list[str] = []
 
@@ -2624,13 +2649,11 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
                         sum(1 for entry in ledger if entry is nested),
                         "the nested interrupt was not retained",
                     )
-                    if match == "unadmitted.append(occurrence)":
-                        # Its occurrence already existed, so both are keepable.
-                        self.assertEqual(
-                            1,
-                            sum(1 for entry in ledger if entry is interrupt),
-                            "the interrupt being recorded was lost",
-                        )
+                    self.assertEqual(
+                        1,
+                        sum(1 for entry in ledger if entry is interrupt),
+                        "the interrupt being recorded was lost",
+                    )
 
     def test_an_interrupt_during_the_final_admission_still_counts(self) -> None:
         """j#90779 R21-F1. The exit rail added for R20-F1 swallowed control flow

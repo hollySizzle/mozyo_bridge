@@ -194,30 +194,38 @@ def _took_the_interrupt(
     not run yet (j#90807 R22-F1). Both retention rails route their handler
     through here, so the rule is decided once rather than per call site.
 
-    A nested interrupt gets one attempt at retaining *both* — the interrupt it
-    landed on and itself — and is then absorbed. Surfacing it would cost the
-    remaining teardown actions, and those outrank a second interrupt whose
-    arrival is already represented by the first.
+    Priority is decided **only** in the return expression, from the arguments.
+    Deciding it inside the guard meant a nested interrupt arriving on the
+    ``if first is None`` line left the parameter untouched, so the first
+    control-flow exception vanished from both the return rail and the ledger —
+    while ``interrupt`` sat right there as an argument (j#90839 R23-F1). Nothing
+    the body does can change the answer now, whatever it is interrupted at.
 
-    What is left is the call instruction itself — the same one-instruction
-    residue as the queue append, and no wider.
+    A nested interrupt gets one attempt at retaining *both* — the interrupt it
+    landed on, rebuilt from the argument if its occurrence does not exist yet,
+    and itself — and is then absorbed. Surfacing it would cost the remaining
+    teardown actions, and those outrank a second interrupt whose arrival is
+    already represented by the first.
+
+    What is left is the call and the return: one instruction at each edge, the
+    same residue as the queue append, and no wider.
     """
     occurrence: _Occurrence | None = None
     try:
-        if first is None:
-            first = interrupt
         occurrence = _Occurrence(interrupt)
         unadmitted.append(occurrence)
     except BaseException as nested:  # noqa: BLE001 - absorbed, never raised
         try:
+            if occurrence is None:
+                occurrence = _Occurrence(interrupt)
             # Identity, so a nested arrival *after* the append does not queue
             # the same occurrence twice — the commit-boundary lesson again.
-            if occurrence is not None and not any(queued is occurrence for queued in unadmitted):
+            if not any(queued is occurrence for queued in unadmitted):
                 unadmitted.append(occurrence)
             unadmitted.append(_Occurrence(nested))
         except BaseException:  # noqa: BLE001 - the regress ends here, by design
             pass
-    return first
+    return interrupt if first is None else first
 
 
 class _Retention:
