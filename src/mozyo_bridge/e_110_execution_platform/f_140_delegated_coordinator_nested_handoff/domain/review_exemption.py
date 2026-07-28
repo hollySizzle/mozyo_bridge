@@ -770,6 +770,12 @@ REASON_CLOSE_COMMIT_MISMATCH = "close_commit_is_not_the_covered_commit"
 #: The integration disposition predates the change-scope declaration it would have to be about,
 #: so it is evidence for an EARLIER commit than the one being retired.
 REASON_INTEGRATION_EVIDENCE_STALE = "integration_evidence_predates_the_change_scope"
+#: The durable record carries no STRICT (lane-enveloped, head-bearing) integration evidence, or the
+#: evidence it carries is malformed / conflicting. The lenient display fold is not authority.
+REASON_INTEGRATION_EVIDENCE_NOT_STRICT = "no_strict_integration_evidence"
+#: Strict integration evidence exists, but its reviewed SOURCE head is not the commit the
+#: exemption's coverage was proven for — it proves the integration of different work.
+REASON_INTEGRATION_HEAD_MISMATCH = "integration_source_head_is_not_the_covered_commit"
 
 
 def evaluate_exemption_integration_admissible(
@@ -780,6 +786,7 @@ def evaluate_exemption_integration_admissible(
     integration_complete: bool,
     close_commit: str = "",
     integration_journal: str = "",
+    integration_source_head: str = "",
 ) -> AdmissionResult:
     """Whether an EXEMPT lane may pass the terminal retire's latest-generation fence (pure).
 
@@ -819,12 +826,26 @@ def evaluate_exemption_integration_admissible(
       length-mismatched pair fails closed rather than being guessed equal.
     - ``integration_journal`` must be no OLDER than
       :attr:`ReviewExemptionFacts.covered_scope_journal`. A disposition recorded before the
-      current target commit was declared cannot be evidence about it. This is an ordering test,
-      not an identity one, because the governed disposition record carries no commit field —
-      it is the strongest correlation the durable grammar actually supports, and it is the
-      minimum that rules out reusing a previous commit's merge.
+      current target commit was declared cannot be evidence about it.
 
     An unparseable / absent journal id on either side of that comparison fails closed.
+
+    **The integration evidence must NAME the commit, not merely follow it** (review j#91696
+    finding 2). The ordering test above was justified in R5 as "the strongest correlation the
+    durable grammar supports, because the governed disposition record carries no commit field".
+    That premise was wrong: the same bounded context already ships a STRICT integration-evidence
+    grammar (:mod:`...domain.hibernate_evidence_integration`, #14219 T2b) whose lane-enveloped
+    marker separates ``head`` — the reviewed SOURCE head — from ``integration_head``, the commit
+    that proved integration on the branch. Journal ordering is not a substitute for identity: a
+    marker naming a different source head, recorded after the scope, passed the ordering test
+    while proving the integration of entirely different work.
+
+    ``integration_source_head`` is therefore the strict evidence's reviewed head, and it must
+    literal-equal ``covered_commit`` on the same terms as ``close_commit``. It is ``""`` when the
+    caller found no strict evidence, or found it malformed / lane-unbound / conflicting — all of
+    which fail closed here, because the lenient display fold is not authority. The ordering test
+    is KEPT alongside it: it costs nothing and independently rules out a disposition recorded
+    before the work it claims to integrate existed.
     """
     facts = exemption.validated()
     if facts.state == EXEMPTION_NONE:
@@ -850,6 +871,13 @@ def evaluate_exemption_integration_admissible(
     integration_at = _int_journal(integration_journal)
     if scope_journal is None or integration_at is None or integration_at < scope_journal:
         return AdmissionResult(False, REASON_INTEGRATION_EVIDENCE_STALE)
+
+    # …and does the integration evidence NAME that commit? Ordering is not identity.
+    source_head = str(integration_source_head or "").strip().lower()
+    if not source_head:
+        return AdmissionResult(False, REASON_INTEGRATION_EVIDENCE_NOT_STRICT)
+    if source_head != covered:
+        return AdmissionResult(False, REASON_INTEGRATION_HEAD_MISMATCH)
     return AdmissionResult(True, REASON_OK)
 
 
@@ -866,7 +894,9 @@ __all__ = (
     "REASON_EXEMPTION_INVALID",
     "REASON_EXEMPTION_SUPERSEDED",
     "REASON_FOLLOW_UP_REVIEW_REQUIRED",
+    "REASON_INTEGRATION_EVIDENCE_NOT_STRICT",
     "REASON_INTEGRATION_EVIDENCE_STALE",
+    "REASON_INTEGRATION_HEAD_MISMATCH",
     "REASON_INTEGRATION_NOT_COMPLETE",
     "REASON_NO_EXEMPTION_RECORDED",
     "REASON_PATH_COVERAGE_UNPROVEN",

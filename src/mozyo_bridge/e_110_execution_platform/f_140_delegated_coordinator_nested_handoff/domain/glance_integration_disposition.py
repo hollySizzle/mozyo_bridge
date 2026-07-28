@@ -345,10 +345,58 @@ def fold_work_unit(journals: Sequence[Tuple[object, str]]) -> str:
     return latest[1] if latest is not None else ""
 
 
+def has_conflicting_disposition_declaration(
+    journals: Sequence[Tuple[object, str]],
+) -> bool:
+    """Whether any ONE journal declares two DIFFERENT integration dispositions (pure).
+
+    :func:`fold_integration_disposition` deliberately keeps its historical leniency: it takes the
+    first marker value, else the first ``disposition:`` field line, else the heading's inline
+    value. For a DISPLAY projection that is acceptable. For an AUTHORITY consumer it is not — a
+    journal carrying both ``disposition: merge`` and ``disposition: explicit_deferral`` folded to
+    whichever was written first, so the terminal retire admitted or refused the very same durable
+    record depending on line order (Redmine #14539 review j#91696 finding 3).
+
+    This is the separate, strict question an authority consumer asks BEFORE trusting the lenient
+    fold — the parser/consumer split the review names, so the glance keeps rendering what it always
+    rendered. Same rule as the exemption gate's fields (review j#91577 finding 3): values that
+    canonicalize to the SAME token are one declaration; two different tokens are not uniquely
+    interpretable and the caller must fail closed.
+
+    Only structurally qualifying journals are examined, on the same terms as
+    :func:`_journal_disposition`, so a stray ``disposition:`` line elsewhere is never a conflict.
+    """
+    for _, notes in journals or ():
+        text = notes or ""
+        heading = _HEADING_RE.search(text)
+        marker_value = _marker_disposition_value(text)
+        if heading is None and marker_value is None:
+            continue
+        declared = {
+            canonical_disposition(m.group("value"))
+            for m in _DISPOSITION_FIELD_RE.finditer(text)
+        }
+        for channel, fields in marker_fields_in_note(text):
+            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+                continue
+            gate = (fields.get("gate") or fields.get("kind") or "").strip()
+            if gate != MARKER_GATE_INTEGRATION_DISPOSITION:
+                continue
+            raw = (fields.get("disposition") or "").strip()
+            if raw:
+                declared.add(canonical_disposition(raw))
+        if heading is not None and heading.group("value"):
+            declared.add(canonical_disposition(heading.group("value")))
+        if len(declared) > 1:
+            return True
+    return False
+
+
 __all__ = (
     "MARKER_GATE_INTEGRATION_DISPOSITION",
     "IntegrationDispositionFacts",
     "canonical_disposition",
     "fold_integration_disposition",
     "fold_work_unit",
+    "has_conflicting_disposition_declaration",
 )

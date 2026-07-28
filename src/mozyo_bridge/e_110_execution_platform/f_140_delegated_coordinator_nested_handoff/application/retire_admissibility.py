@@ -58,6 +58,15 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
     declaration of that commit's change scope. Conjoining three booleans admitted a lane whose
     Close and merge both belonged to an earlier commit while the current one was never integrated.
 
+    **The integration half of that fence reads the STRICT evidence** (review j#91696 findings 2
+    and 3). The lenient :func:`fold_integration_disposition` is a display projection: it resolves
+    a journal declaring two different dispositions by line order, and it cannot see which commit
+    the disposition is about. This route therefore (a) refuses any record carrying a conflicting
+    disposition declaration, and (b) requires lane-enveloped evidence from
+    :mod:`...domain.hibernate_evidence_integration` whose reviewed ``head`` is the covered commit.
+    A legacy, lane-unbound ``## Integration disposition`` note remains perfectly valid for the
+    glance and is simply not sufficient to auto-admit a terminal retire.
+
     Every other failure mode — unreadable file, malformed journals, invalid gate, unproven path
     coverage, ``follow_up_review: true``, missing Close, incomplete integration — is likewise
     fail-closed to ``False``.
@@ -70,6 +79,15 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
 
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_integration_disposition import (  # noqa: E501
             fold_integration_disposition,
+            has_conflicting_disposition_declaration,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_integration import (  # noqa: E501
+            IntegrationEvidenceError,
+            resolve_integration_evidence,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            MARKER_CHANNEL_WORKFLOW_EVENT,
+            marker_fields_in_note,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (  # noqa: E501
             fold_issue_gate_facts,
@@ -98,7 +116,30 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
         if gate_facts is None:
             # No recognized gate at all -> no Close evidence, no exemption authority.
             return False
+        # j#91696 F3: the lenient fold resolves a journal that declares two DIFFERENT dispositions
+        # by line order, so the same durable record admitted or refused depending on which was
+        # written first. An authority consumer asks the strict question before trusting the fold.
+        if has_conflicting_disposition_declaration(journals):
+            return False
+
         integration = fold_integration_disposition(journals)
+
+        # j#91696 F2: the STRICT integration evidence (#14219 T2b), which binds the disposition to
+        # a lane and separates the reviewed source head from the integration head. Absent /
+        # malformed / lane-unbound / conflicting evidence yields "", which fails closed in the
+        # fence. The lenient fold above stays as an independent conjunct: a NEWER legacy deferral
+        # must still block, which strict-only would miss (that module's own docstring names this).
+        marker_fields = [
+            fields
+            for _, notes in journals
+            for channel, fields in marker_fields_in_note(notes or "")
+            if channel == MARKER_CHANNEL_WORKFLOW_EVENT
+        ]
+        evidence = resolve_integration_evidence(marker_fields)
+        source_head = (
+            "" if isinstance(evidence, IntegrationEvidenceError) else evidence.source_head
+        )
+
         return bool(
             evaluate_exemption_integration_admissible(
                 gate_facts.review_exemption,
@@ -111,6 +152,7 @@ def _resolve_review_exemption_admissible(args: argparse.Namespace) -> bool:
                 # "the LATEST gate is Close", so the two read the same journal.
                 close_commit=gate_facts.latest_gate_commit,
                 integration_journal=integration.journal,
+                integration_source_head=source_head,
             ).admissible
         )
     except Exception:  # noqa: BLE001 - unreadable / malformed durable observation -> fail closed

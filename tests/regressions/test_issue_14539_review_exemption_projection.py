@@ -33,6 +33,10 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (
     _resolve_latest_generation_admissible,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_integration_disposition import (
+    fold_integration_disposition,
+    has_conflicting_disposition_declaration,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (
     fold_issue_gate_facts,
     lane_signal_from_gate_facts,
@@ -113,7 +117,34 @@ def close(commit: str = HEAD) -> str:
 
 
 CLOSE = close()
-INTEGRATION_MERGED = "## Integration disposition\n- disposition: merged\n"
+
+#: The commit that proved integration on the branch — deliberately NOT the reviewed source head,
+#: because under patch_equivalent they differ and the fence must bind to the SOURCE head.
+INTEGRATION_HEAD = "7c1d2e3f4a5b60718293a4b5c6d7e8f90a1b2c3d"
+
+#: A legacy, lane-unbound disposition note. Valid for the glance projection forever; NOT automated
+#: terminal-retire evidence (review j#91696 finding 2), which is its own pin below.
+INTEGRATION_MERGED_LEGACY = "## Integration disposition\n- disposition: merged\n"
+
+
+def integration_merged(source_head: str = HEAD) -> str:
+    """A governed integration disposition carrying STRICT lane-enveloped evidence.
+
+    Parameterized by the reviewed SOURCE head, because that is what the retire binds to the
+    exemption's covered commit. The previous fixture was the legacy lane-unbound note, which
+    names no commit at all — so every "this history admits" test asserted admission on evidence
+    that could not say which work it integrated.
+    """
+    return (
+        "## Integration disposition\n"
+        "- disposition: merged\n"
+        "[mozyo:workflow-event:gate=integration_disposition:workspace=ws:lane=r1:"
+        f"lane_generation=1:head={source_head}:integration_head={INTEGRATION_HEAD}:"
+        "integration_branch=main-next:disposition=merge]\n"
+    )
+
+
+INTEGRATION_MERGED = integration_merged()
 
 
 def state_of(journals, *, issue_open=True):
@@ -615,7 +646,7 @@ class ReviewJ90289Tests(unittest.TestCase):
 
     def _retire_history(self, newest, *, close_commit=NEW_COMMIT):
         return self._open_history(newest) + [
-            ("203", INTEGRATION_MERGED),
+            ("203", integration_merged(close_commit)),
             ("204", close(close_commit)),
         ]
 
@@ -747,7 +778,7 @@ class ReviewJ91577CombinedGateTests(unittest.TestCase):
                     ("100", self.OLD_SCOPE),
                     ("101", GATE_EXEMPT),
                     ("200", combined),
-                    ("203", INTEGRATION_MERGED),
+                    ("203", integration_merged(self.NEW_COMMIT)),
                 ]
                 with tempfile.TemporaryDirectory() as t:
                     self.assertFalse(self._resolve(self._obs(t, journals)))
@@ -768,7 +799,7 @@ class ReviewJ91577CombinedGateTests(unittest.TestCase):
             ("100", self.OLD_SCOPE),
             ("101", GATE_EXEMPT),
             ("200", combined),
-            ("203", INTEGRATION_MERGED),
+            ("203", integration_merged(self.NEW_COMMIT)),
         ]
         facts, _ = state_of(journals, issue_open=False)
         self.assertEqual(facts.review_exemption.state, EXEMPTION_EXEMPT)
@@ -832,7 +863,7 @@ class ReviewJ91577EvidenceIdentityTests(unittest.TestCase):
         journals = [
             ("100", self._scope(self.OLD_COMMIT, "vibes/docs/rules/agent-workflow.md")),
             ("101", GATE_EXEMPT),
-            ("102", INTEGRATION_MERGED),
+            ("102", integration_merged(self.OLD_COMMIT)),
         ]
         if second_scope:
             journals.append(
@@ -875,7 +906,7 @@ class ReviewJ91577EvidenceIdentityTests(unittest.TestCase):
                     "vibes/docs/logics/coordinator-sublane-development-flow.md",
                 ),
             ),
-            ("104", INTEGRATION_MERGED),
+            ("104", integration_merged(self.NEW_COMMIT)),
             ("105", close(self.NEW_COMMIT)),
         ]
         with tempfile.TemporaryDirectory() as t:
@@ -953,6 +984,213 @@ class ReviewJ91577AmbiguousGateTests(unittest.TestCase):
         self.assertEqual(
             facts.review_exemption.uncovered, ("/vibes/docs/rules/agent-workflow.md",)
         )
+
+
+class ReviewJ91696LaneStateTests(unittest.TestCase):
+    """R6-F1: a combined heading's OPEN review round must block close/retire progression.
+
+    The grammar's F10 invariant — an open review round suppresses a conflicting ``close`` /
+    ``owner_close`` heading so the lane cannot advance past it — was stated unconditionally in the
+    module contract but enforced only inside the structured-marker branch. A heading-only
+    ``## Gate: Review Request + Close`` therefore reduced to ``close`` and projected
+    ``retire_ready``: the lane retired past its own open review round.
+
+    This is the THIRD consumer of the max-precedence reduction in this issue (R4-F1 fixed the
+    change-bearing and review-round sets; this is lane state).
+    """
+
+    NEW_COMMIT = "2222222222222222222222222222222222222222"
+    OLD_SCOPE = (
+        f"## Gate: Implementation Done\n"
+        f"- commit: {'1' * 40}\n"
+        "- changed_paths:\n"
+        "  - `vibes/docs/rules/agent-workflow.md`\n"
+    )
+
+    def _history(self, newest):
+        return [
+            ("100", self.OLD_SCOPE),
+            ("101", GATE_EXEMPT),
+            ("200", newest),
+            ("203", integration_merged(self.NEW_COMMIT)),
+        ]
+
+    def test_a_combined_review_request_close_does_not_project_retire_ready(self):
+        newest = f"## Gate: Review Request + Close\n- commit: {self.NEW_COMMIT}\n"
+        facts, state = state_of(self._history(newest))
+        self.assertNotEqual(state, LANE_STATE_RETIRE_READY)
+        self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
+        self.assertEqual(facts.latest_gate, "review_request")
+
+    def test_a_combined_changes_requested_review_close_does_not_project_retire_ready(self):
+        newest = f"## Gate: Review + Close\n- commit: {self.NEW_COMMIT}\n- 結論: 要修正\n"
+        _, state = state_of(self._history(newest))
+        self.assertNotEqual(state, LANE_STATE_RETIRE_READY)
+
+    def test_the_combined_forms_agree_with_their_single_gate_controls(self):
+        """The defect's signature: the state changed only because Close shared the heading."""
+        for label, combined, single in (
+            (
+                "review_request",
+                f"## Gate: Review Request + Close\n- commit: {self.NEW_COMMIT}\n",
+                f"## Gate: Review Request\n- commit: {self.NEW_COMMIT}\n",
+            ),
+            (
+                "review_changes_requested",
+                f"## Gate: Review + Close\n- commit: {self.NEW_COMMIT}\n- 結論: 要修正\n",
+                f"## Gate: Review\n- commit: {self.NEW_COMMIT}\n- 結論: 要修正\n",
+            ),
+        ):
+            with self.subTest(label):
+                _, combined_state = state_of(self._history(combined))
+                _, single_state = state_of(self._history(single))
+                self.assertEqual(combined_state, single_state)
+
+    def test_an_approved_review_combined_with_close_still_advances(self):
+        """The boundary: an APPROVED review is not an open round, so this must NOT be suppressed.
+
+        Without this control the fix could be "any review gate blocks close", which would break
+        the governed combination a coordinator legitimately writes at close time.
+        """
+        newest = (
+            f"## Gate: Review + Close\n"
+            f"- commit: {self.NEW_COMMIT}\n"
+            "- 結論: 承認\n"
+            "- changed_paths:\n"
+            "  - `vibes/docs/logics/coordinator-sublane-development-flow.md`\n"
+        )
+        facts, state = state_of(self._history(newest), issue_open=False)
+        self.assertEqual(facts.latest_gate, "close")
+        self.assertEqual(state, LANE_STATE_RETIRE_READY)
+
+
+class ReviewJ91696IntegrationEvidenceTests(unittest.TestCase):
+    """R6-F2/F3: the retire's integration evidence must name the commit and be unambiguous."""
+
+    def _resolve(self, obs_path, *, issue="14539"):
+        return _resolve_latest_generation_admissible(
+            argparse.Namespace(
+                review_generation_json=None,
+                review_exemption_json=obs_path,
+                latest_generation_admissible=False,
+                issue=issue,
+            )
+        )
+
+    def _obs(self, tmp, journals):
+        path = Path(tmp) / "o.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "issue": "14539",
+                    "journals": [{"journal_id": j, "notes": n} for j, n in journals],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def _history(self, disposition_note):
+        return [
+            ("101", GATE_EXEMPT),
+            ("102", IMPLEMENTATION_DONE),
+            ("103", disposition_note),
+            ("104", CLOSE),
+        ]
+
+    def test_a_legacy_lane_unbound_disposition_is_not_retire_evidence(self):
+        """F2: valid for the glance forever, but it cannot say WHICH work it integrated."""
+        with tempfile.TemporaryDirectory() as t:
+            self.assertFalse(
+                self._resolve(self._obs(t, self._history(INTEGRATION_MERGED_LEGACY)))
+            )
+
+    def test_strict_evidence_for_a_different_source_head_does_not_admit(self):
+        """F2's literal reproduction: the marker proves the integration of other work."""
+        with tempfile.TemporaryDirectory() as t:
+            self.assertFalse(
+                self._resolve(self._obs(t, self._history(integration_merged("9" * 40))))
+            )
+
+    def test_strict_evidence_naming_the_covered_commit_admits(self):
+        """Negative control for both: only the marker's source head differs."""
+        with tempfile.TemporaryDirectory() as t:
+            self.assertTrue(self._resolve(self._obs(t, self._history(integration_merged(HEAD)))))
+
+    def test_the_glance_still_reads_the_legacy_note(self):
+        """The parser/consumer split: tightening the retire must not change the display fold."""
+        facts, _ = state_of(self._history(INTEGRATION_MERGED_LEGACY), issue_open=False)
+        self.assertTrue(facts.integration_recorded)
+        self.assertEqual(facts.integration.disposition, "merge")
+
+    def test_a_journal_declaring_two_dispositions_never_admits_in_either_order(self):
+        """F3: the same durable record admitted or refused depending on line order."""
+        for order in (
+            ("merge", "explicit_deferral"),
+            ("explicit_deferral", "merge"),
+        ):
+            with self.subTest(order=order):
+                note = (
+                    "## Integration disposition\n"
+                    + "".join(f"- disposition: {d}\n" for d in order)
+                    + "[mozyo:workflow-event:gate=integration_disposition:workspace=ws:lane=r1:"
+                    f"lane_generation=1:head={HEAD}:integration_head={INTEGRATION_HEAD}:"
+                    "integration_branch=main-next:disposition=merge]\n"
+                )
+                with tempfile.TemporaryDirectory() as t:
+                    self.assertFalse(self._resolve(self._obs(t, self._history(note))))
+
+    def test_an_equal_duplicate_disposition_is_not_a_conflict(self):
+        """Same rule as the gate fields: the same value twice is one declaration."""
+        note = (
+            "## Integration disposition\n"
+            "- disposition: merged\n"
+            "- disposition: merge\n"
+            "[mozyo:workflow-event:gate=integration_disposition:workspace=ws:lane=r1:"
+            f"lane_generation=1:head={HEAD}:integration_head={INTEGRATION_HEAD}:"
+            "integration_branch=main-next:disposition=merge]\n"
+        )
+        with tempfile.TemporaryDirectory() as t:
+            self.assertTrue(self._resolve(self._obs(t, self._history(note))))
+
+    def test_the_conflict_detector_itself(self):
+        """The pure helper, pinned directly rather than only through the retire."""
+        conflicting = "## Integration disposition\n- disposition: merge\n- disposition: explicit_deferral\n"
+        agreeing = "## Integration disposition\n- disposition: merged\n- disposition: merge\n"
+        single = INTEGRATION_MERGED_LEGACY
+        unqualified = "## Progress Log\n- disposition: merge\n- disposition: explicit_deferral\n"
+        self.assertTrue(has_conflicting_disposition_declaration([("1", conflicting)]))
+        self.assertFalse(has_conflicting_disposition_declaration([("1", agreeing)]))
+        self.assertFalse(has_conflicting_disposition_declaration([("1", single)]))
+        # A journal that does not structurally qualify is never a conflict — the fold could not
+        # have read it in the first place.
+        self.assertFalse(has_conflicting_disposition_declaration([("1", unqualified)]))
+
+    def test_the_display_fold_keeps_its_documented_leniency(self):
+        """The parser/consumer split, stated as a pin: the glance is deliberately NOT tightened.
+
+        Its first-wins behaviour is historical and regression-tested by #14213; this issue adds a
+        strict question for the AUTHORITY consumer instead of changing what the display renders.
+        """
+        conflicting = "## Integration disposition\n- disposition: merge\n- disposition: explicit_deferral\n"
+        self.assertEqual(
+            fold_integration_disposition([("1", conflicting)]).disposition, "merge"
+        )
+
+    def test_a_conflicting_disposition_elsewhere_in_the_issue_also_blocks(self):
+        journals = [
+            ("101", GATE_EXEMPT),
+            ("102", IMPLEMENTATION_DONE),
+            (
+                "103",
+                "## Integration disposition\n- disposition: merge\n"
+                "- disposition: integration_blocked\n",
+            ),
+            ("104", integration_merged(HEAD)),
+            ("105", CLOSE),
+        ]
+        with tempfile.TemporaryDirectory() as t:
+            self.assertFalse(self._resolve(self._obs(t, journals)))
 
 
 if __name__ == "__main__":  # pragma: no cover

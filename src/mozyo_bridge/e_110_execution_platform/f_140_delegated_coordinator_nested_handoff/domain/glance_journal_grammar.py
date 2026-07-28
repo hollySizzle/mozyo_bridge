@@ -690,6 +690,19 @@ _CHANGE_BEARING_GATES: frozenset[str] = frozenset(
 )
 
 
+def _is_open_review_round(gates: "frozenset | set", conclusion: str) -> bool:
+    """Whether this journal's gates constitute an OPEN review round (pure).
+
+    A ``review_request`` is always open — it asks for a review that has not answered yet. A
+    ``review`` is open unless it CONCLUDED approved; ``pending`` (an unreadable / absent 結論) and
+    ``changes_requested`` both leave the round owed, and ``pending`` in particular must count as
+    open because it is the fail-closed read of a review whose conclusion could not be established.
+    """
+    if GATE_REVIEW_REQUEST in gates:
+        return True
+    return GATE_REVIEW in gates and conclusion != REVIEW_APPROVED
+
+
 def _review_exempt_now(
     exemption: ReviewExemptionFacts, recognized: Sequence["_RecognizedJournal"]
 ) -> bool:
@@ -781,13 +794,22 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         )
         if not gates:
             continue
-        top_gate = max(gates, key=lambda g: _GATE_PRECEDENCE.get(g, 0))
         if GATE_REVIEW in gates:
             conclusion, blocker = _review_outcome(
                 notes, review_qualifier, marker_disposition, marker_conclusion, marker_blocker
             )
         else:
             conclusion, blocker = REVIEW_PENDING, False
+        # F10 applies to the HEADING path too (Redmine #14539 review j#91696 finding 1). The
+        # invariant above is stated unconditionally — an open review round may not be advanced past
+        # by a conflicting close / owner-close — but it was only ever enforced inside the marker
+        # branch. A heading-only ``## Gate: Review Request + Close`` therefore reduced to ``close``
+        # and projected ``retire_ready``, i.e. the lane retired past its own open review round. An
+        # APPROVED review is not an open round, so ``## Gate: Review + Close`` with ``結論: 承認``
+        # keeps advancing — that is the governed combination this must not break.
+        if _is_open_review_round(gates, conclusion):
+            gates -= _REVIEW_SUPERSEDES_PROGRESSION
+        top_gate = max(gates, key=lambda g: _GATE_PRECEDENCE.get(g, 0))
         # The commit this gate journal declares, read with the exactly-one rule the exemption
         # module uses (review j#91577 finding 3): a journal naming two different commits declares
         # neither, so a safety fence downstream cannot bind to whichever came first.

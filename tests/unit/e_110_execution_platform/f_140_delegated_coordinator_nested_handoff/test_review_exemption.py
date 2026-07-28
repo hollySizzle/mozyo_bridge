@@ -36,7 +36,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_EXEMPTION_INVALID,
     REASON_EXEMPTION_SUPERSEDED,
     REASON_FOLLOW_UP_REVIEW_REQUIRED,
+    REASON_INTEGRATION_EVIDENCE_NOT_STRICT,
     REASON_INTEGRATION_EVIDENCE_STALE,
+    REASON_INTEGRATION_HEAD_MISMATCH,
     REASON_INTEGRATION_NOT_COMPLETE,
     REASON_NO_EXEMPTION_RECORDED,
     REASON_PATH_COVERAGE_UNPROVEN,
@@ -508,6 +510,7 @@ class ExemptionIntegrationAdmissibilityTests(unittest.TestCase):
             integration_complete=True,
             close_commit=HEAD,
             integration_journal="103",
+            integration_source_head=HEAD,
         )
         kwargs.update(over)
         return evaluate_exemption_integration_admissible(
@@ -600,6 +603,24 @@ class ExemptionIntegrationAdmissibilityTests(unittest.TestCase):
                 )
             ).reason,
             REASON_INTEGRATION_EVIDENCE_STALE,
+        )
+
+    def test_absent_strict_integration_evidence_blocks(self):
+        """j#91696 F2: the lenient display fold is not automated retire evidence."""
+        result = self._evaluate(integration_source_head="")
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, REASON_INTEGRATION_EVIDENCE_NOT_STRICT)
+
+    def test_strict_evidence_for_another_source_head_blocks(self):
+        """It proves the integration of different work, however recent it is."""
+        result = self._evaluate(integration_source_head="9" * 40)
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, REASON_INTEGRATION_HEAD_MISMATCH)
+
+    def test_the_source_head_comparison_ignores_case_and_space(self):
+        """Negative control for the two above: the SAME source head still admits."""
+        self.assertTrue(
+            self._evaluate(integration_source_head=f"  {HEAD.upper()}  ").admissible
         )
 
     def test_a_superseded_exemption_blocks(self):
