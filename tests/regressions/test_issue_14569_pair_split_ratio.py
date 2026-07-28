@@ -892,6 +892,80 @@ class LaunchRatioTest(unittest.TestCase):
                 # was never asked to create, launch, resize or close anything.
                 self.assertEqual(herdr.calls, [], f"{bad!r} reached herdr")
 
+    def test_a_malformed_pair_order_costs_no_filesystem_side_effect(self) -> None:
+        """Review j#91331 R4-F1: refused BEFORE the first side effect, not merely early.
+
+        The public entry takes the attestation-store lock before delegating, and taking it
+        creates the mozyo home directory and a lock file. Validating inside the locked
+        callee therefore refused the argument only *after* touching the filesystem — the
+        exact "side effect ahead of validation" this entry point's signature is spelled out
+        to prevent. Asserting ``herdr.calls == []`` did not see it, because the residue is
+        not a herdr call.
+        """
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        herdr = FakeHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"  # deliberately NOT created
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            env = {
+                HERDR_ENV: str(binpath),
+                "PATH": str(PROVIDER_BINS.bin_dir),
+                **neutralized_overrides(),
+            }
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with self.assertRaises(HerdrSessionStartError):
+                    prepare_session(
+                        repo_root=repo, providers=["codex"], lane_id="lane-1", env=env,
+                        runner=herdr.run, lane_placement=config,
+                        pair_order=("unknown", "codex"), probe=_FAST_PROBE,
+                    )
+            self.assertEqual(herdr.calls, [])
+            # Neither the home directory nor the lock file inside it may exist: the argument
+            # was rejected before anything was created.
+            self.assertFalse(home.exists(), sorted(p.name for p in home.rglob("*")))
+
+    def test_a_malformed_pair_order_is_refused_before_lock_contention_matters(self) -> None:
+        # Ordering, not just absence: a malformed argument must lose to nothing — including
+        # a busy store. If validation ran after acquisition, a contended lock would decide
+        # the error instead, and the caller would be told to retry a call that can never work.
+        from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+            AttestationStoreLockBusy,
+        )
+
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        herdr = FakeHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            env = {
+                HERDR_ENV: str(binpath),
+                "PATH": str(PROVIDER_BINS.bin_dir),
+                **neutralized_overrides(),
+            }
+
+            def busy(*_args, **_kwargs):
+                raise AttestationStoreLockBusy("probe: the store is held exclusively")
+
+            module = "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with patch(
+                    module + "application.herdr_session_start.attestation_store_lock", busy
+                ):
+                    with self.assertRaises(HerdrSessionStartError):
+                        prepare_session(
+                            repo_root=repo, providers=["codex"], lane_id="lane-1", env=env,
+                            runner=herdr.run, lane_placement=config,
+                            pair_order=("unknown", "codex"), probe=_FAST_PROBE,
+                        )
+
     def test_a_pair_order_that_excludes_the_requested_provider_is_refused(self) -> None:
         # A caller naming a stable order that does not contain what it is launching has
         # contradicted itself; the side the ratio would pick from that is meaningless.
@@ -1095,13 +1169,19 @@ class TargetOnlyProductionSeamTest(unittest.TestCase):
         )
         self.assertAlmostEqual(live_ratio, 0.5, places=6)
 
-    def _drive_target_only_heal(self, tmp, *, healed_provider, spy):
+    def _drive_target_only_heal(self, tmp, *, healed_provider, spy, results):
         """Run the REAL actuator -> heal_lane_column -> prepare_session chain, target-only.
 
-        Returns ``(fake, healed pane id, resize count delta)``. The lane declares a
-        NON-default ``ratio`` and no ``order`` — the product default that exists precisely to
-        respect the binding's ``(gateway, worker)`` order — so nothing here can pass by
-        coinciding with the even default.
+        Returns ``(fake, healed pane id, resize count delta)`` and fills ``spy`` with the
+        ``pair_order`` that crossed the last hop and ``results`` with the
+        :class:`SessionStartResult` that hop RETURNED. Both are needed: geometry says the
+        pair ended up right, the result says the run knows it did. Review j#91331 R4-F2 —
+        keeping only the geometry left the seam green when the production path was forced to
+        answer ``not_applicable`` (gateway) or to mislabel a real resize as ``failed``.
+
+        The lane declares a NON-default ``ratio`` and no ``order`` — the product default that
+        exists precisely to respect the binding's ``(gateway, worker)`` order — so nothing
+        here can pass by coinciding with the even default.
         """
         from tests.regressions.test_issue_13933_bound_stale_pair_convergence import (
             _append_v1_lane,
@@ -1144,7 +1224,9 @@ class TargetOnlyProductionSeamTest(unittest.TestCase):
         def watch(inner):
             def watched(**kwargs):
                 spy.append(kwargs.get("pair_order"))
-                return inner(**kwargs)
+                result = inner(**kwargs)
+                results.append(result)
+                return result
 
             return watched
 
@@ -1171,9 +1253,10 @@ class TargetOnlyProductionSeamTest(unittest.TestCase):
         merely in a detail string.
         """
         spy: list = []
+        results: list = []
         with tempfile.TemporaryDirectory() as tmp:
             fake, pane, resized = self._drive_target_only_heal(
-                tmp, healed_provider="claude", spy=spy
+                tmp, healed_provider="claude", spy=spy, results=results
             )
             live_ratio = fake.split_ratio_of(pane)
             starts = [c for c in fake.calls if c[:2] == ["agent", "start"]]
@@ -1185,21 +1268,34 @@ class TargetOnlyProductionSeamTest(unittest.TestCase):
         self.assertEqual([list(o or ()) for o in spy[-1:]], [["codex", "claude"]])
         self.assertGreater(resized, 0)
         self.assertAlmostEqual(live_ratio, 0.8, places=6)
+        # ...and the run REPORTS what it did. Geometry alone left this green when the
+        # production path mislabelled a completed resize as `failed` (j#91331 R4-F2).
+        self.assertEqual(results[-1].ratio_outcome, RATIO_APPLIED, results[-1].ratio_detail)
+        self.assertTrue(results[-1].ratio_ok)
 
     def test_the_production_seam_defers_a_gateway_target_only_heal(self) -> None:
         """The case j#91284 names: the gateway can only be placed second, so nothing is
         divided — and the stable order still has to arrive for that verdict to be the
         *attributed* one rather than the unattributable fallback."""
         spy: list = []
+        results: list = []
         with tempfile.TemporaryDirectory() as tmp:
             fake, pane, resized = self._drive_target_only_heal(
-                tmp, healed_provider="codex", spy=spy
+                tmp, healed_provider="codex", spy=spy, results=results
             )
             live_ratio = fake.split_ratio_of(pane)
         self.assertEqual([list(o or ()) for o in spy[-1:]], [["codex", "claude"]])
         self.assertEqual(resized, 0)
         # herdr's fresh divider, untouched: the run neither applied 0.8 nor claimed to.
         self.assertAlmostEqual(live_ratio, 0.5, places=6)
+        # The typed verdict, which "0 resizes" alone does not distinguish from a run that
+        # decided nothing at all — forcing `not_applicable` used to leave this green.
+        outcome = results[-1]
+        self.assertEqual(outcome.ratio_outcome, RATIO_DEFERRED, outcome.ratio_detail)
+        # ...and it is the ATTRIBUTED deferral (the stable order arrived and named the
+        # gateway), not the unattributable fallback a missing forwarding would produce.
+        self.assertIn("codex", outcome.ratio_detail)
+        self.assertNotIn("unattributable", outcome.ratio_detail)
 
 
 class RunSuccessAxisTest(unittest.TestCase):

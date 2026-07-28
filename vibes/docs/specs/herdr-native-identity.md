@@ -649,7 +649,8 @@ geometry が直後に変わるため)。
   `slot_placement` が `order` 軸に対して既に使っている規則と **同一**である (ratio 専用の第二の
   「primary」定義を作らない)。sibling の provider は判定に不要である。
 
-  **effective order の解決 (Redmine #14569 review j#91263 R2-F1)**。3 層で解決する。
+  **effective order の解決 (Redmine #14569 review j#91263 R2-F1)**。**3 つの authority 層 + 終端 fallback**
+  で解決する (層は 1〜3、4. は「どの層も答えられなかった」という終端であって 4 番目の authority ではない)。
 
   各層は **canonical provider の exact permutation として受理できる場合のみ**採用し、答えられない層は
   半端に答えず読み飛ばす (値域は宣言 `order` と同一 = `lane_placement._normalize_order`)。
@@ -662,11 +663,14 @@ geometry が直後に変わるため)。
   3. 無ければ **その run 自身の要求 providers**。要求が full pair である限りそれが pair 順そのもので
      あるため、通常経路は caller からの供給を必要としない。**縮小された要求は permutation にならないので
      何も寄与しない** — 縮小 list の中ではその 1 provider が自明に「先頭」になり、それが誤帰属だからである。
-  4. どれも答えられなければ空 — 帰属できない (`unattributable`) → deferral。
+  4. (終端) どの層も答えられなければ空 — 帰属できない (`unattributable`) → deferral。
 
-  **`pair_order` は副作用より前に argument boundary で検証する** (`validate_pair_order`、
-  review j#91284 R3-F1)。未知 provider / 重複 / 欠落 / 非 string 要素 / 非 sequence、および
-  **要求 providers を含まない order** は zero-side-effect で拒否する。検証していない値を authority として
+  **`pair_order` は最初の副作用より前に検証する** (`validate_pair_order`、review j#91284 R3-F1 /
+  j#91331 R4-F1)。未知 provider / 重複 / 欠落 / 非 string 要素 / 非 sequence、および
+  **要求 providers を含まない order** は zero-side-effect で拒否する。
+  **「boundary に置く」だけでは足りない**: public `prepare_session` は attestation store lock を先に取得し、
+  その取得が mozyo home directory と lock file を作る。したがって検証は **lock 取得より前**に走らせる
+  (caller-held lock 経路の `_prepare_session_locked` 側でも重ねて検証し、どちらの入口も拒否する)。検証していない値を authority として
   受理すると実害が出る: `pair_order=("unknown","codex")` は `codex` を primary でなくするため、gateway の
   target-only heal が pair を resize して **gateway の宣言 share を生存 worker へ渡したまま `applied` と
   報告**した (実測 j#91299)。resolver 側も `str()` coercion をやめ、認識できない入力は空 = deferral に倒す
