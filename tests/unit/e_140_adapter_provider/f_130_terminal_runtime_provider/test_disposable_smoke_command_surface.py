@@ -252,7 +252,7 @@ class DerivationLivenessTests(unittest.TestCase):
             + [str(p) for p in surface.pairs if p[0] == "probe"]
         )
 
-    def _mutated_tree(self, addition: str) -> Path:
+    def _mutated_tree(self, addition: str, runner_addition: str = "") -> Path:
         tmp = Path(tempfile.mkdtemp(prefix="mozyo-derivation-probe-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         destination = tmp / "mozyo_bridge"
@@ -271,6 +271,10 @@ class DerivationLivenessTests(unittest.TestCase):
         source = seed.read_text(encoding="utf-8")
         marker = "    def _binding_env(self) -> dict[str, str]:"
         self.assertIn(marker, source, "the probe's injection point moved")
+        if runner_addition:
+            runner_marker = "    run = __call__"
+            self.assertIn(runner_marker, source, "the runner injection point moved")
+            source = source.replace(runner_marker, runner_addition, 1)
         seed.write_text(source.replace(marker, addition + marker, 1), encoding="utf-8")
         return tmp
 
@@ -402,6 +406,69 @@ class DerivationLivenessTests(unittest.TestCase):
         )
         # And the real tree, which performs five such reads, stays fully readable.
         self.assertEqual(_surface().unresolved_flows, ())
+
+    def test_a_declared_method_on_the_runner_is_analysed_not_assumed(self) -> None:
+        """Review j#92165 F2(A), verdict j#92168.
+
+        Admitting ``runner.execute(argv)`` because "the class declares that method and the
+        walk analyses it" was a claim the walk did not honour: propagation only followed
+        tainted *arguments*, so a call whose only tainted value was the receiver never
+        bound anything and the body was never read.  The receiver is now bound to the
+        callee's ``self``, which makes the claim true — so the injected method resolves as
+        a real dispatch pair rather than merely being reported.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_declared(self):\n"
+            '        return self.runner.execute([self.binary, "probe", "declared-method"])\n\n',
+            runner_addition=(
+                "    run = __call__\n\n"
+                "    def execute(self, argv):\n"
+                "        return self(argv)\n"
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertIn(
+            ("probe", "declared-method"),
+            surface.pairs,
+            "a declared method that dispatches through the receiver was not analysed",
+        )
+
+    def test_a_callable_data_attribute_of_the_runner_is_reported(self) -> None:
+        """Review j#92165 F2(B), verdict j#92168.
+
+        ``_inner`` is a plain instance attribute AND the ungated inner runner.  Reading it
+        out and calling it bypasses the endpoint gate itself, so "it is a data member" was
+        never evidence that the value cannot dispatch — three of this runner's data
+        attributes hold callables.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_callable_data(self):\n"
+            "        forward = self.runner._inner\n"
+            '        return forward([self.binary, "probe", "callable-data"])\n\n'
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            self._probe_reports(surface, "_probe_callable_data"),
+            "reading the ungated inner runner out of the gate was silently omitted",
+        )
+
+    def test_a_with_binding_of_a_callable_attribute_is_still_reported(self) -> None:
+        """The boundary of the one structural exemption.
+
+        ``with self._lock:`` is modelled because the value is consumed and bound to
+        nothing.  Adding an ``as`` target binds it, so the same shape must be reported —
+        otherwise the exemption would be a hole shaped like a keyword.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_withas(self):\n"
+            "        with self.runner._inner as forward:\n"
+            '            return forward([self.binary, "probe", "with-as"])\n\n'
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            self._probe_reports(surface, "_probe_withas"),
+            "an ``as`` binding escaped through the with-consumption exemption",
+        )
 
     def test_the_probe_does_not_touch_the_live_source(self) -> None:
         """Probe hygiene: mutating the copy must leave the real tree byte-identical.

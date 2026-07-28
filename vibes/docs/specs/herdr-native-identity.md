@@ -1173,12 +1173,25 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     現れずに oracle が green のままになる。**列挙漏れを塞ぐ guard の許可リスト自体が
     列挙漏れしていた**形であり、同型の再発である。よって attribute 経由の到達は
     **class が何を宣言しているかから個別に判定する**:
-    - **呼び出し**: dispatch 綴り (`run` / `__call__`) か、walk が実際に解析する method か。
-      それ以外は報告する。
-    - **値としての読み取り**: instance data 属性か `@property` のみ modelled。method /
-      class-level callable alias (`run = __call__` — 両 runner が実際にこう書いている) は
-      **報告する** (後で呼ばれ得る callable を渡しているため)。
+    ただしこの訂正は **2 回必要だった** (review j#92165 F2 / verdict j#92168)。1 回目は
+    node 種別という proxy を `data` / `property` という **member 種別の proxy** に置き換えた
+    だけで、「dispatch し得ない」という性質そのものを確立していなかった。実測すると
+    `EndpointBoundHerdrRunner` の instance data 属性のうち **3 つが callable** で、うち
+    `_inner` は **gate の内側の runner そのもの**である。これを値として読み出して呼べば
+    endpoint gate を**丸ごと迂回**でき、command pair の取りこぼしより重い。さらに
+    「class が method を宣言しているから walk が解析する」という許可根拠も、伝播が
+    tainted argument のみを追っていたため **receiver だけが tainted な call では成立して
+    いなかった**。よって proxy をやめ、性質そのものを問う:
+    - **呼び出し**: receiver taint が callee の `self` へ実際に束縛されたときのみ modelled
+      (束縛して初めて body が解析される)。dispatch 綴り (`run` / `__call__`) はそのまま。
+    - **値としての読み取り**: その属性への**全代入**が literal または非 callable builtin で
+      あり、値が dispatcher になり得ないと示せる場合のみ modelled。walk が既に追跡している
+      tainted attribute は「実際に追う」ので modelled。それ以外は報告する。
     - **class が解決できない tainted 値の属性**は報告する (名前を言えない属性は追えない)。
+    - 構造的例外は `with <attr>:` (`as` なし) のみ。値が文に消費され何にも束縛されないため
+      逃げようがない。`as` で束縛する形は**報告する**。
+    - wrapper 規則は **callable な class に限定**する。runner を保持するだけの container
+      (smoke harness) を runner 扱いすると、その全属性が runner-carrying に見えてしまう。
     許可側を狭めたことが「全部報告する」に化けていないことは、benign な counter 読み取りを
     control として probe し modelled のままであることを実測して固定する。
   - 静的導出を **実行でも裏取りする**。`tests/integration/.../test_shared_space_smoke_harness.py`

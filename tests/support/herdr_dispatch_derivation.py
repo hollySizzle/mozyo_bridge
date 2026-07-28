@@ -43,13 +43,31 @@ j#92132).  The escape check listed ``ast.Attribute`` as a modelled parent *whole
 while :meth:`_Walker._is_dispatch` recognised only ``run`` / ``__call__``.  Between those
 two, ``runner.execute(argv)`` and ``forward = runner.run`` were neither a dispatch nor an
 escape — they appeared nowhere.  A guard against enumeration gaps had an enumeration gap
-in its own allow-list.  Attribute access is therefore no longer judged by node type but
-by what the class declares (:meth:`_Walker._attribute_kind`): a call must be the dispatch
-spelling or a method the walk analyses; a *read* is modelled only for a data member or a
-``@property``, because a method or a class-level callable alias (``run = __call__`` — how
-both runners actually spell it) hands out something that can dispatch later.  An attribute
-on a value whose class cannot be resolved is reported: an attribute the walk cannot name
-is one it cannot follow.
+in its own allow-list.  The correction was then made twice, because the first
+attempt replaced one proxy with another (review j#92165 F2, verdict j#92168): judging the
+access by *member kind* — "a data member or a property is safe to read" — is no more a
+proof than judging it by node type was.  Three of ``EndpointBoundHerdrRunner``'s own data
+attributes hold callables, and one of them, ``_inner``, is the **ungated inner runner**:
+reading it out and calling it bypasses the endpoint gate entirely.  And admitting a call
+because "the class declares that method and the walk analyses it" was a claim the walk did
+not honour, since propagation followed tainted arguments only and a receiver-only call
+bound nothing.
+
+So the question asked is now the property itself, not a stand-in for it:
+
+* a **call** is modelled only when the receiver taint is actually bound into the callee's
+  ``self`` (:meth:`_Walker._propagate`), which is what makes the body genuinely analysed;
+* a **read** is modelled only when the value provably cannot be a dispatcher — every
+  assignment to it is a literal or a non-callable builtin — or when it is an attribute the
+  walk already tracks and therefore really does follow;
+* an attribute on a value whose class cannot be resolved is reported: an attribute the
+  walk cannot name is one it cannot follow;
+* the single structural exemption is ``with <attr>:`` with no ``as`` target, where the
+  value is consumed by the statement and bound to nothing.  An ``as`` binding is reported.
+
+Narrowing the wrapper rule to *callable* classes was needed alongside this: a container
+that merely holds the runner (the smoke harness) is not the runner, and treating it as one
+made every one of its attributes look runner-carrying.
 
 It is analysis-only: nothing here imports the modules it reads, executes production
 code, or touches a Herdr endpoint.
@@ -292,6 +310,40 @@ def _enclosing_class(qualname: str) -> str:
     return parts[-2] if len(parts) >= 2 else ""
 
 
+#: Builtins whose result is a plain container / scalar, never a dispatcher.
+_NON_CALLABLE_BUILTINS = frozenset(
+    {"dict", "list", "set", "tuple", "str", "int", "float", "bool", "frozenset", "sorted"}
+)
+
+
+def _is_non_callable_expr(node: ast.AST) -> bool:
+    """Whether ``node`` provably evaluates to something that cannot be called.
+
+    Deliberately small and fail-closed: an expression this does not recognise is NOT
+    assumed safe.  Recognising "a parameter" or "another attribute" as non-callable is
+    exactly the assumption review j#92165 F2 struck down.
+    """
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(
+        node,
+        (
+            ast.List,
+            ast.Dict,
+            ast.Set,
+            ast.Tuple,
+            ast.ListComp,
+            ast.DictComp,
+            ast.SetComp,
+            ast.JoinedStr,
+        ),
+    ):
+        return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        return node.func.id in _NON_CALLABLE_BUILTINS
+    return False
+
+
 class _Walker:
     """Follow the gated runner through the first-party source (fail-closed)."""
 
@@ -493,7 +545,34 @@ class _Walker:
                 ]
             ):
                 return False
-            return self._is_constructor(module, expr)
+            # ...and only a CALLABLE class.  ``RecordingHerdrRunner`` wraps the runner and
+            # dispatches through it; ``SharedSpaceSmokeHarness`` merely *holds* one on an
+            # attribute the walk tracks separately.  Treating a container as the runner
+            # itself makes every one of its attributes look runner-carrying, which is a
+            # different error from the one the wrapper rule exists to catch.
+            constructed = self._constructed_class(module, "", expr)
+            return constructed is not None and self._class_is_callable(constructed)
+        return False
+
+    def _class_is_callable(self, class_ref: tuple) -> bool:
+        """Whether instances of ``class_ref`` can be called (define a dispatch entry)."""
+        module, class_name = class_ref
+        indexed = self.index.get(module)
+        if indexed is None:
+            return False
+        if any(
+            f"{class_name}.{spelling}" in indexed.functions
+            for spelling in self._DISPATCH_ATTRS
+        ):
+            return True
+        class_def = indexed.classes.get(class_name)
+        if class_def is None:
+            return False
+        # ``run = __call__`` — a class-level alias of a dispatch entry.
+        for node in class_def.body:
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+                if node.value.id in self._DISPATCH_ATTRS:
+                    return True
         return False
 
     def _is_constructor(self, module: str, call: ast.Call) -> bool:
@@ -569,9 +648,28 @@ class _Walker:
                     not local
                     and not kwargs_maps
                     and not self._class_has_taint(module_name, qualname)
+                    and not self._mentions_tainted_attribute(function)
                 ):
                     continue
                 self._analyse(module_name, qualname, function, local, kwargs_maps)
+
+    def _mentions_tainted_attribute(self, function: ast.AST) -> bool:
+        """Whether the body reads an attribute name the walk currently tracks.
+
+        A function can hold a tainted EXPRESSION without holding a tainted local — the
+        smoke driver's ``SharedSpaceSmokeHarness(runner=instance.runner, ...)`` is exactly
+        that.  Gating analysis on locals alone therefore skipped the function that hands
+        the runner to the harness; it was reached only because an over-broad wrapper rule
+        happened to make ``cleanup_harness`` a tainted local as well.  Narrowing that rule
+        exposed the gap, so the gate now asks the question directly.
+        """
+        tracked = {attribute for _, _, attribute in self.tainted_attrs}
+        if not tracked:
+            return False
+        for node in ast.walk(function):
+            if isinstance(node, ast.Attribute) and node.attr in tracked:
+                return True
+        return False
 
     def _class_has_taint(self, module: str, qualname: str) -> bool:
         owner = _enclosing_class(qualname)
@@ -733,6 +831,16 @@ class _Walker:
                 called = (
                     isinstance(grandparent, ast.Call) and grandparent.func is parent
                 )
+                # ``with self._lock:`` — the value is consumed by the statement and bound
+                # to no name, so it cannot be called or handed on.  This is a structural
+                # reason, not an allow-list of "safe-looking" types: an ``as`` target
+                # would bind it and is deliberately NOT exempt.
+                if (
+                    isinstance(grandparent, ast.withitem)
+                    and grandparent.context_expr is parent
+                    and grandparent.optional_vars is None
+                ):
+                    continue
                 if self._attribute_access_is_modelled(
                     module, qualname, owner, local, node, parent, called
                 ):
@@ -751,6 +859,18 @@ class _Walker:
                 f"value appears under {type(parent).__name__}, which this walk does not "
                 f"follow"
             )
+
+    def _method_on_receiver(
+        self, module: str, qualname: str, owner: str, local: set, receiver, attr: str
+    ) -> Optional[tuple]:
+        """The method ``attr`` names on the receiver's class, as ``(module, qualname)``."""
+        for holder_module, holder_class in self._value_classes(
+            module, qualname, owner, local, receiver
+        ):
+            candidate = f"{holder_class}.{attr}"
+            if candidate in self.index[holder_module].functions:
+                return (holder_module, candidate)
+        return None
 
     def _attribute_kind(self, class_ref: tuple, attr: str) -> str:
         """What ``attr`` is on ``class_ref``: method / property / alias / data / unknown.
@@ -825,19 +945,86 @@ class _Walker:
         if called:
             if attribute.attr in self._DISPATCH_ATTRS:
                 return True  # the dispatch spelling; _is_dispatch already recorded it
-            # A method on a class the walk analyses (the smoke harness's own methods) is
-            # followed through its own body, so calling it is modelled.
-            return bool(classes) and all(
-                self._attribute_kind(ref, attribute.attr) == "method" for ref in classes
-            )
+            # A method on a class the walk analyses is modelled ONLY IF the receiver
+            # taint was actually bound into it (``_propagate`` above).  Checking the
+            # binding rather than the declaration is the point: F2(A) was precisely a
+            # declaration that no propagation backed.
+            if not classes:
+                return False
+            for holder_module, holder_class in classes:
+                candidate = f"{holder_class}.{attribute.attr}"
+                if candidate not in self.index[holder_module].functions:
+                    return False
+                bound = self.index[holder_module].functions[candidate]
+                names = _parameter_names(bound)
+                if not names or (holder_module, candidate, names[0]) not in (
+                    self.tainted_params
+                ):
+                    return False
+            return True
         # Not called: reading the attribute yields a value.  Only a value that cannot BE
         # a dispatcher is modelled.
+        #
+        # Review j#92165 F2(B): "it is a data member or a property" was the second proxy
+        # in a row standing in for that property, and it is not one.  Three of
+        # ``EndpointBoundHerdrRunner``'s own data attributes hold callables, and one of
+        # them — ``_inner`` — is the UNGATED inner runner: reading it out and calling it
+        # bypasses the endpoint gate entirely, which is worse than a missing pair.  So the
+        # question asked is now the property itself.
         if attribute.attr in self._DISPATCH_ATTRS:
             return False
         return bool(classes) and all(
-            self._attribute_kind(ref, attribute.attr) in {"data", "property"}
-            for ref in classes
+            self._read_yields_no_dispatcher(ref, attribute.attr) for ref in classes
         )
+
+    def _read_yields_no_dispatcher(self, class_ref: tuple, attr: str) -> bool:
+        """Whether reading ``class_ref.attr`` provably cannot hand out a dispatcher."""
+        module, class_name = class_ref
+        # An attribute the walk itself tracks is followed, so reading it is modelled for a
+        # real reason rather than an assumed one.
+        if (module, class_name, attr) in self.tainted_attrs:
+            return True
+        indexed = self.index.get(module)
+        if indexed is None:
+            return False
+        function = indexed.functions.get(f"{class_name}.{attr}")
+        if function is not None:
+            decorators = {
+                d.id for d in function.decorator_list if isinstance(d, ast.Name)
+            }
+            if "property" not in decorators:
+                return False  # a method: reading it hands out a callable
+            returns = [
+                node.value
+                for node in ast.walk(function)
+                if isinstance(node, ast.Return) and node.value is not None
+            ]
+            return bool(returns) and all(_is_non_callable_expr(r) for r in returns)
+        class_def = indexed.classes.get(class_name)
+        if class_def is None:
+            return False
+        assigned: list = []
+        for node in ast.walk(class_def):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+                # ``attr = <member>`` — a class-level callable alias.
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == attr:
+                        return False
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr == attr
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                    and node.value is not None
+                ):
+                    assigned.append(node.value)
+        # Every assignment must be provably non-callable.  No assignment at all means the
+        # walk cannot say anything about it, which is not the same as "safe".
+        return bool(assigned) and all(_is_non_callable_expr(v) for v in assigned)
 
     def _is_modelled_parent(self, node: ast.AST, parent: ast.AST) -> bool:
         """Whether ``parent`` is a context the walk actually follows for ``node``.
@@ -916,6 +1103,39 @@ class _Walker:
             ]
             if self._is_tainted(module, owner, local, argument)
         ]
+        # Review j#92165 F2(A): a call whose RECEIVER is tainted was dropped here, because
+        # only tainted arguments and forwarded keywords propagated.  The attribute check
+        # meanwhile admitted such a call on the grounds that "the walk analyses that
+        # method" — a property the walk did not actually have.  Bind the receiver to the
+        # callee's ``self`` so the body really is analysed, and the claim becomes true.
+        receiver = call.func.value if isinstance(call.func, ast.Attribute) else None
+        if receiver is not None and self._is_tainted(module, owner, local, receiver):
+            # Resolve through the RECEIVER'S CLASS, the same way
+            # :meth:`_attribute_access_is_modelled` does.  ``_callee`` only understands a
+            # plain-name receiver, so ``self.runner.execute(...)`` resolved for the
+            # attribute check and not for propagation — the two decisions disagreed, and
+            # that disagreement is F2(A).  One resolver now backs both.
+            resolved_method = self._method_on_receiver(
+                module, qualname, owner, local, receiver, call.func.attr
+            )
+            if resolved_method is not None:
+                callee_module, callee_name = resolved_method
+                function = self.index[callee_module].functions.get(callee_name)
+                names = _parameter_names(function) if function is not None else []
+                if names and names[0] in {"self", "cls"}:
+                    self.tainted_params.add((callee_module, callee_name, names[0]))
+                    classes = self._value_classes(
+                        module, qualname, owner, local, receiver
+                    )
+                    if classes:
+                        self.param_classes.setdefault(
+                            (callee_module, callee_name, names[0]), set()
+                        ).update(classes)
+                    edge = self.taint_edges.setdefault(
+                        (callee_module, callee_name), []
+                    )
+                    if not any(existing[2] is call for existing in edge):
+                        edge.append((module, qualname, call))
         process_target = self._process_target(module, qualname, call)
         if process_target:
             (callee_module, callee_name), arguments = process_target
