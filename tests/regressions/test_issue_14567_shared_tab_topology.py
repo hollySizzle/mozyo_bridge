@@ -1366,8 +1366,16 @@ class _SharedTabHerdr(_Herdr):
         self.column_lanes: dict = {}
         #: ``{container key: [pair ratio per column]}``
         self.column_ratios: dict = {}
-        #: Columns whose divider a ``pane resize`` actually moved, in call order.
+        #: ``{container key: [pair split axis per column]}`` — the direction the lane's own
+        #: `--split` used. Recorded per column rather than assumed, because
+        #: `lane_placement: {split: right}` makes the pair axis the SAME as the inter-lane
+        #: one and the rail then has to pick the nearer divider of two same-axis splits.
+        self.column_directions: dict = {}
+        #: Columns whose PAIR divider a ``pane resize`` actually moved, in call order.
         self.resized_columns: list = []
+        #: Inter-lane dividers a ``pane resize`` would have moved — the outcome that
+        #: re-lays-out a neighbouring lane. Must stay empty on every path.
+        self.inter_lane_resizes: list = []
         self._launch_seq = 0
 
     # -- identity ------------------------------------------------------------------
@@ -1419,6 +1427,7 @@ class _SharedTabHerdr(_Herdr):
         self.columns[key] = [grouped[lane] for lane in order]
         self.column_lanes[key] = list(order)
         self.column_ratios[key] = [0.5 for _ in order]
+        self.column_directions[key] = ["down" for _ in order]
 
     def _place_pane(self, rest, pane_id, workspace_id, tab_id):
         """Place the launch in ITS OWN lane's column — a new one if the lane has none yet.
@@ -1436,20 +1445,25 @@ class _SharedTabHerdr(_Herdr):
         columns = self.columns[key]
         lanes = self.column_lanes[key]
         ratios = self.column_ratios[key]
+        directions = self.column_directions[key]
         split = rest[rest.index("--split") + 1] if "--split" in rest else ""
         if split:
             self.split_direction = split
         lane = self._lane_of(rest[2]) if len(rest) > 2 else ""
         if lane in lanes:
             # Splitting beside this lane's own sibling: the pair axis, inside its column.
+            # The axis is whatever this launch actually asked for, not an assumption.
             index = lanes.index(lane)
             if pane_id not in columns[index]:
                 columns[index].append(pane_id)
+                if split:
+                    directions[index] = split
             return
         # This lane has no column yet: opening one (or occupying an empty tab).
         columns.append([pane_id])
         lanes.append(lane)
         ratios.append(0.5)
+        directions.append("down")
 
     def column_of_lane(self, lane, key="wZ:t1"):
         """The panes of ``lane``'s column — so a test can name the column it means."""
@@ -1470,24 +1484,64 @@ class _SharedTabHerdr(_Herdr):
         return render_shared_tab_layout(
             columns=self.columns[key],
             pair_ratios=self.column_ratios[key],
+            pair_directions=self.column_directions[key],
             width=self.split_extent,
             height=self.split_cross,
         )
 
     def _apply_resize(self, direction, amount, pane=""):
-        """Move ONLY the addressed pane's own column divider.
+        """Resolve the resize the way herdr does: the NEAREST same-axis ancestor split.
 
-        This is the property the composition turns on: a lane resizing its pair must not
-        move the inter-lane divider or a neighbouring lane's pair. Scoping it here is what
-        lets a test assert that as an observation rather than trusting the argv.
+        Deliberately not "the addressed pane's own column divider". Assuming that would
+        make the fake grant the very property `governing_split` exists to guarantee — the
+        production rail refuses precisely when the divider herdr would move is NOT the
+        pair's, so a fake that always moved the pair's could never show that failure, and
+        the guard's pin would be vacuous.
+
+        Modelled as the smallest same-direction split whose rect contains the pane, read off
+        the rendered layout so the fake and the code agree on one geometry. Whether the
+        winner was the lane's own pair divider or the INTER-LANE one is recorded separately:
+        the latter is the outcome that re-lays-out a neighbouring lane, and a test asserts it
+        never happens rather than trusting the argv.
         """
         key, index = self._column_of(pane)
         if index < 0:
             return
-        self.column_ratios[key][index] = apply_resize_amount(
-            self.column_ratios[key][index], direction, amount
+        layout = self._layout_payload(pane)["result"]["layout"]
+        rect = next(
+            (p["rect"] for p in layout["panes"] if p["pane_id"] == pane), None
         )
-        self.resized_columns.append(index)
+        if rect is None:
+            return
+
+        def contains(outer, inner):
+            return (
+                outer["x"] <= inner["x"]
+                and outer["y"] <= inner["y"]
+                and outer["x"] + outer["width"] >= inner["x"] + inner["width"]
+                and outer["y"] + outer["height"] >= inner["y"] + inner["height"]
+            )
+
+        candidates = [
+            split
+            for split in layout["splits"]
+            if split["direction"] == direction and contains(split["rect"], rect)
+        ]
+        if not candidates:
+            return
+        nearest = min(
+            candidates, key=lambda s: s["rect"]["width"] * s["rect"]["height"]
+        )
+        if nearest["id"].startswith("split_lane_"):
+            # herdr would move the divider BETWEEN lanes. Record it; do not pretend the
+            # pair moved.
+            self.inter_lane_resizes.append(int(nearest["id"].rsplit("_", 1)[1]))
+            return
+        moved = int(nearest["id"].rsplit("_", 1)[1])
+        self.column_ratios[key][moved] = apply_resize_amount(
+            self.column_ratios[key][moved], direction, amount
+        )
+        self.resized_columns.append(moved)
 
     def pair_ratio_of(self, pane_id) -> float:
         """The live ratio of the column holding ``pane_id`` — herdr's state, not the ask."""
@@ -1622,6 +1676,11 @@ class SharedTabPairRatioCompositionTest(unittest.TestCase):
                 {herdr.column_lanes["wZ:t1"].index("lane-a")},
                 "only this lane's own column divider may be resized",
             )
+            self.assertEqual(
+                herdr.inter_lane_resizes,
+                [],
+                "no resize may resolve to the divider BETWEEN lanes",
+            )
 
     def test_a_shared_tab_heal_beside_its_own_sibling_is_owed_the_ratio(self) -> None:
         # Decision 4's heal shape, stated as a ratio disposition rather than only as argv.
@@ -1663,6 +1722,61 @@ class SharedTabPairRatioCompositionTest(unittest.TestCase):
             self.assertTrue(result.ok, result.ratio_detail)
             self.assertAlmostEqual(herdr.pair_ratio_of("wZ:p92"), 0.7, places=6)
             self.assertAlmostEqual(herdr.pair_ratio_of(self.FOREIGN[0]), 0.5, places=6)
+
+    def test_a_right_pair_axis_resizes_its_own_divider_not_the_inter_lane_one(self) -> None:
+        # The adversarial edge of this whole composition, surfaced by the full-surface sweep
+        # the escalation gate (j#92090) put this round into.
+        #
+        # `INTER_LANE_SPLIT_DIRECTION` is `right`, and `lane_placement` may declare the PAIR
+        # axis as `right` too (the #14568 rollback). Then the tab holds TWO same-axis splits
+        # containing this lane's panes — the inter-lane one and the pair's — and
+        # `pane resize --direction right` moves whichever herdr resolves as nearest. If the
+        # rail addressed the outer one it would re-lay-out the neighbouring lane, which is
+        # exactly what `governing_split` exists to refuse. Nothing else in this file drives
+        # that collision: the other cases leave the pair on `down`, where the two axes differ
+        # and the ambiguity cannot arise.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = self._shared_herdr()
+            result, _ws, panes = _prepare(
+                tmp,
+                herdr=herdr,
+                providers=["codex", "claude"],
+                lane="lane-a",
+                sublane_tab_topology=SHARED,
+                lane_placement=LanePlacementConfig.from_record(
+                    {"sublane": {"split": "right", "ratio": 0.7}}
+                ),
+                rows=self._foreign_lane_rows(),
+                attested=True,
+            )
+            herdr.assert_no_locator_collision(self, result)
+            # Both axes really are `right` here — otherwise the collision is not exercised.
+            self.assertEqual(
+                _split_of(herdr.start_argvs[0]), INTER_LANE_SPLIT_DIRECTION
+            )
+            self.assertEqual(_split_of(herdr.start_argvs[1]), "right")
+            self.assertEqual(
+                herdr.column_directions["wZ:t1"][
+                    herdr.column_lanes["wZ:t1"].index("lane-a")
+                ],
+                INTER_LANE_SPLIT_DIRECTION,
+                "the fixture must model the pair on the SAME axis as the inter-lane split",
+            )
+            self.assertTrue(result.ratio_ok, result.ratio_detail)
+            self.assertTrue(result.ok, result.ratio_detail)
+            # The decisive observation: our column moved, the neighbour's did not.
+            self.assertAlmostEqual(herdr.pair_ratio_of(panes["codex"]), 0.7, places=6)
+            self.assertAlmostEqual(herdr.pair_ratio_of(self.FOREIGN[0]), 0.5, places=6)
+            self.assertEqual(
+                set(herdr.resized_columns),
+                {herdr.column_lanes["wZ:t1"].index("lane-a")},
+                "a `right` pair must resize its own divider, never the inter-lane one",
+            )
+            self.assertEqual(
+                herdr.inter_lane_resizes,
+                [],
+                "no resize may resolve to the divider BETWEEN lanes",
+            )
 
     def test_per_lane_tab_keeps_the_pre_14567_predicate(self) -> None:
         # Under `per_lane_tab` the lane occupancy IS the container occupancy, so a

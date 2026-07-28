@@ -420,7 +420,10 @@ def _created_pair_split(*, launched: int, initial_lane_occupancy: int) -> bool:
     :data:`herdr_lane_geometry.INTER_LANE_SPLIT_DIRECTION`, so the container is occupied
     while this pair has no divider yet. Keying on the container occupancy there would claim a
     pair divider that does not exist and then fail to find it in ``config_split``'s direction
-    — reporting :data:`RATIO_FAILED` for a healthy single-slot heal. Under ``per_lane_tab``
+    — reporting :data:`RATIO_FAILED` for a healthy launch. That launch is NOT a heal, which is
+    the distinction the predicate turns on: a heal joins a live sibling (lane occupancy > 0)
+    and does own its pair divider, whereas a lane whose occupancy is zero is opening its own
+    column and owns only the inter-lane one. Under ``per_lane_tab``
     (and for the coordinator lane, which has no tab at all) the two occupancies are equal by
     construction (:func:`herdr_lane_geometry.resolve_container_plan`), so this is the
     pre-#14567 predicate unchanged on every non-shared path.

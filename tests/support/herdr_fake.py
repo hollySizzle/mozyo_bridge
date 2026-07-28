@@ -1113,6 +1113,7 @@ def render_shared_tab_layout(
     *,
     columns,
     pair_ratios,
+    pair_directions=(),
     tab_id: str = "t1",
     workspace_id: str = "w1",
     width: int = HERDR_SPLIT_EXTENT,
@@ -1132,6 +1133,11 @@ def render_shared_tab_layout(
       first is the leftmost column;
     - ``pair_ratios[i]`` is column ``i``'s own pair split ratio (ignored for a 1-pane
       column, which has no divider of its own);
+    - ``pair_directions[i]`` is the axis column ``i``'s pair divides on, defaulting to
+      ``down``. It is a parameter rather than a constant because ``lane_placement`` may
+      declare ``split: right`` — the SAME axis the inter-lane divider uses — and that
+      collision is the one case where "the divider herdr would move for this pane" is not
+      obviously the pair's. A fake that hardcoded ``down`` could not express it;
     - the inter-lane splits are a chain: split ``i`` divides column ``i`` from everything
       to its right, so each one's rect is the region it actually governs. That is what
       makes ``governing_split`` resolve a pane's *nearest* same-axis ancestor rather than
@@ -1176,30 +1182,38 @@ def render_shared_tab_layout(
             )
         if len(panes) == 2:
             ratio = pair_ratios[index] if index < len(pair_ratios) else 0.5
-            first = round(height * ratio)
+            axis = (
+                pair_directions[index]
+                if index < len(pair_directions) and pair_directions[index]
+                else "down"
+            )
+            if axis == "down":
+                first = round(height * ratio)
+                rects = [
+                    {"x": x0, "y": 0, "width": col_width, "height": first},
+                    {"x": x0, "y": first, "width": col_width, "height": height - first},
+                ]
+            else:
+                first = round(col_width * ratio)
+                rects = [
+                    {"x": x0, "y": 0, "width": first, "height": height},
+                    {
+                        "x": x0 + first,
+                        "y": 0,
+                        "width": col_width - first,
+                        "height": height,
+                    },
+                ]
             layout["panes"].append(
-                {
-                    "pane_id": panes[0],
-                    "rect": {"x": x0, "y": 0, "width": col_width, "height": first},
-                    "focused": index == 0,
-                }
+                {"pane_id": panes[0], "rect": rects[0], "focused": index == 0}
             )
             layout["panes"].append(
-                {
-                    "pane_id": panes[1],
-                    "rect": {
-                        "x": x0,
-                        "y": first,
-                        "width": col_width,
-                        "height": height - first,
-                    },
-                    "focused": False,
-                }
+                {"pane_id": panes[1], "rect": rects[1], "focused": False}
             )
             layout["splits"].append(
                 {
                     "id": f"split_pair_{index}",
-                    "direction": "down",
+                    "direction": axis,
                     "ratio": ratio,
                     "rect": {"x": x0, "y": 0, "width": col_width, "height": height},
                 }

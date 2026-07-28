@@ -740,8 +740,9 @@ geometry が直後に変わるため)。
     で採る (`_created_pair_split`)。shared tab では lane の 1 本目の slot は *隣の lane* の横へ
     `inter_lane_split` で割って入るので、container は既に埋まっているのに pair の divider はまだ無い。
     container 側の occupancy で採ると「pair divider を作った」と誤主張し、`config_split` 方向に
-    それを探して見つけられず、健全な single-slot heal を `failed` と報告してしまう (この経路は
-    #14569 と #14567 の合成時に顕在化した)。`per_lane_tab` と coordinator lane では 2 つの
+    それを探して見つけられず、**自 lane の列を開く single-provider launch** (lane occupancy = 0 の
+    非-heal 経路。上記 Launch semantics の heal 定義を参照) を `failed` と報告してしまう。この経路は
+    #14569 と #14567 の合成時に顕在化した。`per_lane_tab` と coordinator lane では 2 つの
     occupancy は構造上つねに等しいため、非 shared 経路の挙動は #14567 以前と同一である。
 - `lane_placement` は **future launch policy** であり、live layout / liveness / route authority ではない。
   config を読むだけで既存 live pair を移動 / 再分割しない。`ratio` (#14569) が pane を 1 度 resize するのは
