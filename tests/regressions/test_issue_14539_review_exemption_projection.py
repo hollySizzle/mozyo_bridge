@@ -3403,5 +3403,80 @@ class ReviewJ92227DispatchAuthorityTests(unittest.TestCase):
         self.assertEqual(writes, [])  # zero-write on both paths
 
 
+class ReviewJ92227ChannelScannerInventoryTests(unittest.TestCase):
+    """The mechanical guard the two channel findings were missing.
+
+    The R23 pin inventories modules that hand-roll a marker BODY parser. Neither dispatch
+    module did — both route the body through the shared strict reader — and both still shipped
+    a readable-subset hole, because owning a CHANNEL SCAN is a separate capability from owning
+    a body grammar: the scan decides what happens to the OTHER markers in the note.
+
+    So this is the second inventory. Every module that scans the marker token and walks more
+    than one match per note must have a stated whole-note discipline; a new channel scanner
+    fails this gate until someone writes down which one it has.
+    """
+
+    #: module -> how it refuses to act on the readable subset of a poisoned note.
+    DISCIPLINES = {
+        # Owns the grammar. ``strict_gate_markers`` returns () for the whole note when a marker
+        # names the gate and cannot be counted as its evidence (j#92106 F3 / j#92174 F1).
+        "redmine_journal_source.py": "same-gate poison returns () for the note",
+        # Poisons the note for its channel; the siblings keep their identity and carry
+        # ``ambiguity``, so they are selected and reported rather than silently dropped.
+        "dispatch_authorization.py": "note-scoped ambiguity flag makes every sibling invalid",
+        # Same shape; the correlator reads ``note_ambiguous`` as AMBIGUOUS rather than OWED.
+        "dispatch_disposition.py": "note-scoped note_ambiguous flag refuses the discharge",
+        # Refuses unless the note carries EXACTLY ONE marker of its channel, so a forged
+        # sibling makes the whole note unreadable before any field is compared.
+        "recovery_anchor_delivery.py": "exactly-one-marker rule",
+        "recovered_pair_pin_reconciliation.py": "exactly-one-marker rule",
+        # Reads one marker per record; there is no sibling to skip.
+        "hibernate_park_record.py": "single-marker reader",
+    }
+
+    def test_every_marker_channel_scanner_has_a_declared_whole_note_discipline(self):
+        import pathlib
+        import re
+
+        root = pathlib.Path(__file__).resolve().parents[2] / "src" / "mozyo_bridge"
+        scanners = set()
+        for path in root.rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            # Scans the marker token AND walks every match in a note: the pair that means this
+            # module decides what a note's OTHER markers do. A module that reads one marker, or
+            # that never scans the token, is not making that decision.
+            if r"\[mozyo:" not in text:
+                continue
+            if not re.search(r"\bfinditer\b", text):
+                continue
+            scanners.add(path.name)
+        self.assertEqual(
+            scanners,
+            set(self.DISCIPLINES),
+            "a module scans the mozyo marker token across every match in a note without a "
+            "declared whole-note discipline; decide what it does with an unrenderable sibling "
+            "(poison the note, or require exactly one) and record it in DISCIPLINES",
+        )
+
+    def test_the_two_dispatch_channels_would_not_have_been_caught_by_the_body_parser_pin(self):
+        """Why this second inventory exists: the first one is blind to this capability."""
+        import pathlib
+        import re
+
+        root = pathlib.Path(__file__).resolve().parents[2] / "src" / "mozyo_bridge"
+        for name in ("dispatch_authorization.py", "dispatch_disposition.py"):
+            path = next(root.rglob(name))
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(r"\[mozyo:", text)
+            # No private body grammar — they use the shared reader, so the R23 pin passes them.
+            self.assertIsNone(
+                re.search(
+                    r"\.\s*split\(\s*[\"']:[\"']\s*\)|\.\s*partition\(\s*[\"']=[\"']\s*\)", text
+                ),
+                f"{name} grew a private body parser; the R23 pin now covers it and this "
+                "test's premise needs revisiting",
+            )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
