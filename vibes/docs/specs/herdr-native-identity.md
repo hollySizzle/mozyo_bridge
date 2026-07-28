@@ -1165,6 +1165,22 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     **その時点で unresolved flow として報告する** (escape check)。fork 境界
     (`Process(target=..., args=(..., gate_runner))`) は例外扱いではなく **模型に入れる**:
     そこは worker process 側であり、実 herdr traffic が起きる側だからである。
+  - **escape check の「許可側」を node 種別で一括にしない** (review j#92123 F1 / verdict
+    j#92132)。初版は `ast.Attribute` を無条件に modelled とし、dispatch と認めるのは
+    `run` / `__call__` だけだった。この 2 つが噛み合うと
+    `runner.execute(argv)` (未知属性の呼び出し) と `forward = runner.run` (bound method を
+    値として取り出す) が **dispatch でも escape でもない**穴に落ち、pair にも unresolved にも
+    現れずに oracle が green のままになる。**列挙漏れを塞ぐ guard の許可リスト自体が
+    列挙漏れしていた**形であり、同型の再発である。よって attribute 経由の到達は
+    **class が何を宣言しているかから個別に判定する**:
+    - **呼び出し**: dispatch 綴り (`run` / `__call__`) か、walk が実際に解析する method か。
+      それ以外は報告する。
+    - **値としての読み取り**: instance data 属性か `@property` のみ modelled。method /
+      class-level callable alias (`run = __call__` — 両 runner が実際にこう書いている) は
+      **報告する** (後で呼ばれ得る callable を渡しているため)。
+    - **class が解決できない tainted 値の属性**は報告する (名前を言えない属性は追えない)。
+    許可側を狭めたことが「全部報告する」に化けていないことは、benign な counter 読み取りを
+    control として probe し modelled のままであることを実測して固定する。
   - 静的導出を **実行でも裏取りする**。`tests/integration/.../test_shared_space_smoke_harness.py`
     が production 経路を fake 上で実走させ、実際に dispatch された pair が導出集合と
     allowlist の双方に含まれることを確認する。ただしこの fixture は launcher を解決しないため

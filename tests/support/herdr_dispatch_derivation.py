@@ -37,6 +37,20 @@ an unreadable site must never read as "no site there".  The walk deliberately kn
 the shapes this code base actually uses; a refactor into an unrecognised shape turns the
 oracle red instead of quietly narrowing it.
 
+That claim was once overstated in one specific place, and the correction is worth stating
+because it is the same defect this module exists to remove (review j#92123 F1, verdict
+j#92132).  The escape check listed ``ast.Attribute`` as a modelled parent *wholesale*
+while :meth:`_Walker._is_dispatch` recognised only ``run`` / ``__call__``.  Between those
+two, ``runner.execute(argv)`` and ``forward = runner.run`` were neither a dispatch nor an
+escape — they appeared nowhere.  A guard against enumeration gaps had an enumeration gap
+in its own allow-list.  Attribute access is therefore no longer judged by node type but
+by what the class declares (:meth:`_Walker._attribute_kind`): a call must be the dispatch
+spelling or a method the walk analyses; a *read* is modelled only for a data member or a
+``@property``, because a method or a class-level callable alias (``run = __call__`` — how
+both runners actually spell it) hands out something that can dispatch later.  An attribute
+on a value whose class cannot be resolved is reported: an attribute the walk cannot name
+is one it cannot follow.
+
 It is analysis-only: nothing here imports the modules it reads, executes production
 code, or touches a Herdr endpoint.
 """
@@ -578,14 +592,21 @@ class _Walker:
         for node in ast.walk(function):
             if isinstance(node, ast.Assign):
                 for target in node.targets:
-                    if (
+                    if not (
                         isinstance(target, ast.Attribute)
                         and isinstance(target.value, ast.Name)
                         and target.value.id == "self"
                         and owner
-                        and self._is_tainted(module, owner, local, node.value)
                     ):
+                        continue
+                    if self._is_tainted(module, owner, local, node.value):
                         self.tainted_attrs.add((module, owner, target.attr))
+                    # Record the class for ANY tainted attribute, not only one that
+                    # became tainted through this assignment.  The seed attribute
+                    # (``DisposableHerdrInstance.runner``) is tainted directly, so keying
+                    # this off the assigned value left the one attribute the whole walk
+                    # starts from with no known class.
+                    if (module, owner, target.attr) in self.tainted_attrs:
                         wrapper = self._constructed_class(module, qualname, node.value)
                         if wrapper is not None:
                             self.attr_classes[(module, owner, target.attr)] = wrapper
@@ -618,13 +639,24 @@ class _Walker:
         if isinstance(expr, ast.Call):
             constructed = self._constructed_class(module, qualname, expr)
             return {constructed} if constructed is not None else set()
-        if (
-            isinstance(expr, ast.Attribute)
-            and isinstance(expr.value, ast.Name)
-            and expr.value.id == "self"
-        ):
-            known = self.attr_classes.get((module, owner, expr.attr))
-            return {known} if known is not None else set()
+        if isinstance(expr, ast.Attribute):
+            if isinstance(expr.value, ast.Name) and expr.value.id == "self":
+                known = self.attr_classes.get((module, owner, expr.attr))
+                return {known} if known is not None else set()
+            # ``<instance>.<attr>`` — resolve the instance's class first, then the class
+            # that attribute was assigned.  Without this the smoke driver's
+            # ``instance.runner`` and ``harness.recorder`` have no known class, and the
+            # attribute check below can only fail closed on values it should model.
+            found: set = set()
+            for holder_module, holder_class in self._value_classes(
+                module, qualname, owner, local, expr.value
+            ):
+                known = self.attr_classes.get(
+                    (holder_module, holder_class, expr.attr)
+                )
+                if known is not None:
+                    found.add(known)
+            return found
         if isinstance(expr, ast.Name):
             carried = self.param_classes.get((module, qualname, expr.id))
             if carried:
@@ -672,10 +704,12 @@ class _Walker:
         ast.Assign,
         ast.AnnAssign,
         ast.withitem,
-        ast.Attribute,
         ast.BoolOp,
         ast.IfExp,
     )
+
+    #: Attribute spellings that ARE the dispatch entry point (see :meth:`_is_dispatch`).
+    _DISPATCH_ATTRS = frozenset({"run", "__call__"})
 
     def _check_escapes(
         self, module: str, qualname: str, owner: str, local: set, function: ast.AST
@@ -694,6 +728,22 @@ class _Walker:
                 continue
             if self._is_process_args_tuple(module, qualname, parents, parent):
                 continue
+            if isinstance(parent, ast.Attribute):
+                grandparent = parents.get(id(parent))
+                called = (
+                    isinstance(grandparent, ast.Call) and grandparent.func is parent
+                )
+                if self._attribute_access_is_modelled(
+                    module, qualname, owner, local, node, parent, called
+                ):
+                    continue
+                self.unresolved_flows.append(
+                    f"{module}:{qualname}:{getattr(node, 'lineno', 0)}: a runner-carrying "
+                    f"value is reached through attribute {parent.attr!r} "
+                    f"({'called' if called else 'read as a value'}), which this walk does "
+                    f"not follow"
+                )
+                continue
             if self._is_modelled_parent(node, parent):
                 continue
             self.unresolved_flows.append(
@@ -701,6 +751,93 @@ class _Walker:
                 f"value appears under {type(parent).__name__}, which this walk does not "
                 f"follow"
             )
+
+    def _attribute_kind(self, class_ref: tuple, attr: str) -> str:
+        """What ``attr`` is on ``class_ref``: method / property / alias / data / unknown.
+
+        The distinction decides whether reading it hands someone a **callable**.  A data
+        member or a property yields a value the walk does not need to follow; a method or
+        a class-level callable alias (``run = __call__``, which is exactly how both
+        runners spell it) yields something that can dispatch later.
+        """
+        module, class_name = class_ref
+        indexed = self.index.get(module)
+        if indexed is None:
+            return "unknown"
+        function = indexed.functions.get(f"{class_name}.{attr}")
+        if function is not None:
+            decorators = {
+                d.id for d in function.decorator_list if isinstance(d, ast.Name)
+            }
+            return "property" if "property" in decorators else "method"
+        class_def = indexed.classes.get(class_name)
+        if class_def is None:
+            return "unknown"
+        for node in class_def.body:
+            # A class-level ``attr = <other member>`` alias.
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == attr:
+                        inner = f"{class_name}.{node.value.id}"
+                        if inner in indexed.functions:
+                            return "callable_alias"
+        for node in ast.walk(class_def):
+            # ``self.attr = ...`` anywhere in the class body: an instance data member.
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr == attr
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                ):
+                    return "data"
+        return "unknown"
+
+    def _attribute_access_is_modelled(
+        self,
+        module: str,
+        qualname: str,
+        owner: str,
+        local: set,
+        node: ast.AST,
+        attribute: ast.Attribute,
+        called: bool,
+    ) -> bool:
+        """Whether a tainted value reached through ``attribute`` stays inside the model.
+
+        Review j#92123 F1.  Two shapes were escaping silently:
+
+        * ``runner.execute(argv)`` — an attribute CALL that is not the dispatch spelling.
+          It was neither a dispatch (only ``run`` / ``__call__`` are) nor an escape (any
+          ``Attribute`` parent was "modelled"), so it appeared nowhere at all.
+        * ``forward = runner.run`` — the bound method taken as a VALUE.  The taint does
+          not survive the attribute read, so the later ``forward(argv)`` is not a
+          dispatch either.
+
+        The rule is now decided from what the class declares.  Anything the walk cannot
+        classify — including a tainted value whose class it does not know — is reported,
+        because an attribute it cannot name is an attribute it cannot follow.
+        """
+        classes = self._value_classes(module, qualname, owner, local, node)
+        if called:
+            if attribute.attr in self._DISPATCH_ATTRS:
+                return True  # the dispatch spelling; _is_dispatch already recorded it
+            # A method on a class the walk analyses (the smoke harness's own methods) is
+            # followed through its own body, so calling it is modelled.
+            return bool(classes) and all(
+                self._attribute_kind(ref, attribute.attr) == "method" for ref in classes
+            )
+        # Not called: reading the attribute yields a value.  Only a value that cannot BE
+        # a dispatcher is modelled.
+        if attribute.attr in self._DISPATCH_ATTRS:
+            return False
+        return bool(classes) and all(
+            self._attribute_kind(ref, attribute.attr) in {"data", "property"}
+            for ref in classes
+        )
 
     def _is_modelled_parent(self, node: ast.AST, parent: ast.AST) -> bool:
         """Whether ``parent`` is a context the walk actually follows for ``node``.

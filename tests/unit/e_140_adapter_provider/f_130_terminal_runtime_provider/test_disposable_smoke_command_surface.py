@@ -240,6 +240,18 @@ class DerivationLivenessTests(unittest.TestCase):
     *copy* of the tree — never the live source — and require the mutation to show up.
     """
 
+    def _probe_reports(self, surface, function_marker: str) -> list:
+        """Everything the derivation said about an injected probe, in any channel.
+
+        A shape may legitimately surface as a resolved pair, an unresolved site, or an
+        unresolved flow; what must never happen is all three being empty.
+        """
+        return (
+            [f for f in surface.unresolved_flows if function_marker in f]
+            + [s.anchor for s in surface.unresolved_sites if function_marker in s.function]
+            + [str(p) for p in surface.pairs if p[0] == "probe"]
+        )
+
     def _mutated_tree(self, addition: str) -> Path:
         tmp = Path(tempfile.mkdtemp(prefix="mozyo-derivation-probe-"))
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -333,6 +345,63 @@ class DerivationLivenessTests(unittest.TestCase):
                     f"would lose it and still call the surface complete",
                 )
                 self.assertIn(expected, flows[0])
+
+    def test_an_unknown_runner_attribute_call_is_reported(self) -> None:
+        """Review j#92123 F1(a), verdict j#92132.
+
+        ``runner.execute(argv)`` was neither a dispatch (only ``run`` / ``__call__``
+        count) nor an escape (any ``Attribute`` parent was treated as modelled), so it
+        appeared in no output at all — the silent omission this whole check exists to
+        prevent, sitting inside the check itself.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_attr(self):\n"
+            '        return self.runner.execute([self.binary, "probe", "attribute-call"])\n\n'
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            self._probe_reports(surface, "_probe_attr"),
+            "an unknown attribute call on the gated runner was silently omitted",
+        )
+
+    def test_a_bound_method_alias_of_the_runner_is_reported(self) -> None:
+        """Review j#92123 F1(b), verdict j#92132.
+
+        Taking ``runner.run`` as a *value* drops the taint, so the later call through the
+        alias was not recognised as a dispatch either.  ``run = __call__`` is exactly how
+        both runners spell it, so this is the shape a refactor would actually produce.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_attr(self):\n"
+            "        forward = self.runner.run\n"
+            '        return forward([self.binary, "probe", "bound-alias"])\n\n'
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            self._probe_reports(surface, "_probe_attr"),
+            "a bound-method alias of the gated runner was silently omitted",
+        )
+
+    def test_a_benign_attribute_read_stays_modelled(self) -> None:
+        """Control: the F1 fix must NARROW the model, not blanket-report every attribute.
+
+        Without this, "report everything under an ``Attribute``" would pass both tests
+        above while making the derivation useless — the counter reads that
+        ``EndpointGateCounters.snapshot`` performs on the live tree are exactly the reads
+        it must keep modelling.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_read(self):\n"
+            "        return int(self.runner.escape_refusals)\n\n"
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertEqual(
+            self._probe_reports(surface, "_probe_read"),
+            [],
+            "a plain data-attribute read was reported; the model narrowed too far",
+        )
+        # And the real tree, which performs five such reads, stays fully readable.
+        self.assertEqual(_surface().unresolved_flows, ())
 
     def test_the_probe_does_not_touch_the_live_source(self) -> None:
         """Probe hygiene: mutating the copy must leave the real tree byte-identical.
