@@ -60,6 +60,7 @@ def dispatch_retire_intent(
     *,
     may_retire: bool,
     worktree: Optional[str],
+    evidence_target=None,
 ) -> RetireIntentResults:
     """Run the one selected retire intent, or none (preflight-only). Never raises for a
     non-selected intent: an unset flag simply does not enter its branch.
@@ -251,7 +252,9 @@ def dispatch_retire_intent(
             run_guarded_retire_close,
         )
 
-        close_result = run_guarded_retire_close(args, repo_root)
+        close_result = run_guarded_retire_close(
+            args, repo_root, evidence_target=evidence_target
+        )
 
     return RetireIntentResults(
         close_result=close_result,

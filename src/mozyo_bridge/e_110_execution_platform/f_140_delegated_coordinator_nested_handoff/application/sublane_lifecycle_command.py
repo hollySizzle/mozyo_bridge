@@ -711,6 +711,10 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    # Resolved ONCE, before the decision, and carried to the commit point: the same lane row the
+    # retire is admitted against must still be the row the destructive close acts on
+    # (Redmine #14539 review j#91847 finding 2).
+    evidence_target = resolve_retire_evidence_target(args, _repo_root(args))
     assertions = RetireAssertions(
         issue_closed=bool(getattr(args, "issue_closed", False)),
         callbacks_drained=bool(getattr(args, "callbacks_drained", False)),
@@ -726,7 +730,7 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         # before the fence runs — the caller's argv is not an independent expectation. An
         # unresolvable target yields None, and the exemption route then refuses.
         latest_generation_admissible=_resolve_latest_generation_admissible(
-            args, target=resolve_retire_evidence_target(args, _repo_root(args))
+            args, target=evidence_target
         ),
     )
     repo_root = _repo_root(args)
@@ -797,6 +801,7 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         repo_root,
         may_retire=outcome.preflight.may_retire,
         worktree=worktree,
+        evidence_target=evidence_target,
     )
     close_result = intents.close_result
     migration_result = intents.migration_result

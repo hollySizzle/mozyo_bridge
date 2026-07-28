@@ -41,6 +41,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     fold_work_unit,
     has_conflicting_disposition_declaration,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_issuer_policy import (
+    resolve_journal_issuer,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     marker_components_in_note,
     marker_fields_in_note,
@@ -1541,8 +1544,21 @@ class ReviewJ91797IssuerAuthorityTests(unittest.TestCase):
         """Negative control for both: only the issuer resolvability differs."""
         self.assertTrue(self._resolve(self._history()))
 
-    def test_observation_supplied_author_metadata_is_never_consulted(self):
-        """The observation cannot promote itself: resolution is policy, not self-assertion."""
+    def test_author_metadata_is_deliberately_not_an_authority_input(self):
+        """Author metadata is NOT authority here, and that is an owner ruling — not an oversight.
+
+        #14219 j#86718 (Fork A) decided: "canonical gate structure → writer role の対応を採用する
+        … ただしこれは issuer identity の認証ではない。単一 Redmine user workspace では role を
+        個人identityから識別不能であり、「その gate kind を書く契約上の role」を表す policy binding
+        に限定する。author一致だけで authority を満たしたと扱わず、exact lane/generation/head、
+        request相関、actor-specific grammar、corroborationを引き続き必須とする."
+
+        So this test does NOT assert "forged metadata is fine". It asserts that the observation
+        cannot promote OR demote itself by asserting an author — the resolution ignores the claim
+        in both directions — and the defences that actually reject a forgery are the layered ones
+        the ruling keeps mandatory: the measured lane envelope, the covered-commit binding, the
+        current-declaration selection and the conflict checks, each pinned separately above.
+        """
         journals = self._history()
         with tempfile.TemporaryDirectory() as t:
             path = Path(t) / "o.json"
@@ -1636,6 +1652,150 @@ class ReviewJ91797MarkerMultiplicityTests(unittest.TestCase):
         self.assertEqual(
             [v for k, v in raw[0] if k == "disposition"], ["explicit_deferral", "merge"]
         )
+
+
+class ReviewJ91847AliasAndComponentTests(unittest.TestCase):
+    """R11-F3/F4: one logical field spelled two ways, and a component grammar that dropped input.
+
+    Both are defects in the conflict detector R11 introduced. ``gate`` and ``kind`` are aliases,
+    so reading the first non-empty one let a second, DIFFERENT authority gate hide in the other
+    spelling; and the raw component scanner promised "nothing is dropped" while skipping empty
+    components, so a body no canonical producer can render read as well-formed.
+    """
+
+    def _marker(self, body_extra: str = "", *, gate_field: str = "gate=integration_disposition",
+                disposition: str = "merge") -> str:
+        return (
+            "## Integration disposition\n"
+            f"[mozyo:workflow-event:{gate_field}:workspace={EVIDENCE_WORKSPACE}:"
+            f"lane={EVIDENCE_LANE}:lane_generation={EVIDENCE_LANE_GENERATION}{body_extra}:"
+            f"head={HEAD}:integration_head={INTEGRATION_HEAD}:"
+            f"integration_branch={INTEGRATION_BRANCH}:disposition={disposition}]\n"
+        )
+
+    def _resolve(self, note):
+        journals = [
+            ("101", GATE_EXEMPT),
+            ("102", IMPLEMENTATION_DONE),
+            ("103", note),
+            ("104", CLOSE),
+        ]
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / "o.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "issue": "14539",
+                        "journals": [{"journal_id": j, "notes": n} for j, n in journals],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return resolve_admissible(str(path))
+
+    def test_a_conflicting_kind_alias_is_a_conflict(self):
+        """F3: a second authority gate spelled as ``kind`` must not hide behind ``gate``."""
+        note = self._marker(gate_field="gate=integration_disposition:kind=park_declared")
+        self.assertTrue(has_conflicting_disposition_declaration([("103", note)]))
+        self.assertFalse(self._resolve(note))
+
+    def test_the_conflicting_alias_also_unresolves_the_issuer(self):
+        """The shared resolver reads BOTH spellings, so two contracts prove neither."""
+        note = self._marker(gate_field="gate=integration_disposition:kind=park_declared")
+        issuer = resolve_journal_issuer("103", note, policy_pointer=EVIDENCE_POLICY_POINTER)
+        self.assertEqual(issuer.role, "unknown")
+
+    def test_the_alias_alone_still_resolves(self):
+        """Negative control: ``kind`` is a spelling of the same field, not a second claim."""
+        note = self._marker(gate_field="kind=integration_disposition")
+        self.assertFalse(has_conflicting_disposition_declaration([("103", note)]))
+        issuer = resolve_journal_issuer("103", note, policy_pointer=EVIDENCE_POLICY_POINTER)
+        self.assertEqual(issuer.role, "coordinator")
+
+    def test_an_empty_component_is_preserved_and_refuses_the_marker(self):
+        """F4a: the scanner's own docstring promised this and the code dropped it."""
+        note = self._marker(body_extra=":")
+        raw = [c for ch, c in marker_components_in_note(note) if ch == "workflow-event"]
+        self.assertIn(("", ""), raw[0])
+        self.assertTrue(has_conflicting_disposition_declaration([("103", note)]))
+        self.assertFalse(self._resolve(note))
+
+    def test_a_canonical_equivalent_duplicate_is_not_a_conflict(self):
+        """F4b: ``merged`` and ``merge`` are one declaration written twice."""
+        note = self._marker(disposition="merged").replace(
+            "disposition=merged]", "disposition=merged:disposition=merge]"
+        )
+        self.assertFalse(has_conflicting_disposition_declaration([("103", note)]))
+        self.assertTrue(self._resolve(note))
+
+    def test_a_genuinely_different_disposition_is_still_a_conflict(self):
+        """The boundary: canonicalizing must not collapse two DIFFERENT dispositions."""
+        note = self._marker(disposition="merge").replace(
+            "disposition=merge]", "disposition=merge:disposition=explicit_deferral]"
+        )
+        self.assertTrue(has_conflicting_disposition_declaration([("103", note)]))
+
+    def test_a_repeated_non_governed_key_is_still_a_conflict(self):
+        """A key with no canonical form compares literally, which is the fail-closed reading."""
+        note = self._marker().replace(f"head={HEAD}", f"head={HEAD}:head={'9' * 40}")
+        self.assertTrue(has_conflicting_disposition_declaration([("103", note)]))
+
+    def test_the_well_formed_marker_still_admits(self):
+        self.assertTrue(self._resolve(self._marker()))
+
+
+class ReviewJ91847CommitPointFenceTests(unittest.TestCase):
+    """R11-F2: the generic guarded close had no commit-point CAS.
+
+    The hibernated-bound and active-live-zero intents already pass ``expected_revision`` to a
+    bounded CAS (``CAS_STALE_REVISION``); the generic ``--execute`` close just closes panes, so a
+    lane that advanced a generation between the admissibility decision and the close would have
+    had the NEW lane's slots closed on the OLD lane's evidence.
+    """
+
+    def test_the_attestation_takes_the_expectation_it_was_admitted_against(self):
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E501
+            attest_retire_target,
+        )
+
+        params = inspect.signature(attest_retire_target).parameters
+        self.assertIn("expected_generation", params)
+        self.assertIn("expected_revision", params)
+        # Both default to None so an intent with no expectation is unchanged, never loosened.
+        self.assertIsNone(params["expected_generation"].default)
+        self.assertIsNone(params["expected_revision"].default)
+
+    def test_the_measured_target_carries_the_revision(self):
+        """The expectation has to exist before it can be carried."""
+        self.assertEqual(EVIDENCE_TARGET.lane_generation, int(EVIDENCE_LANE_GENERATION))
+        target = RetireEvidenceTarget(
+            workspace="ws", lane="r1", lane_generation=3, policy_pointer="", revision=7
+        )
+        self.assertEqual(target.revision, 7)
+
+    def test_the_guarded_close_forwards_the_expectation(self):
+        import inspect
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_retire_actuation,
+        )
+
+        source = inspect.getsource(sublane_retire_actuation.run_guarded_retire_close)
+        self.assertIn("expected_generation=", source)
+        self.assertIn("expected_revision=", source)
+
+    def test_an_unresolvable_issuer_basis_does_not_disable_the_expectation(self):
+        """The two questions are separate: an unreadable config must not drop the CAS axis.
+
+        ``policy_pointer`` empty fails the exemption route closed on its own (pinned above); it
+        must not also blank the generation / revision the destructive close re-reads.
+        """
+        target = RetireEvidenceTarget(
+            workspace="ws", lane="r1", lane_generation=2, policy_pointer="", revision=5
+        )
+        self.assertEqual((target.lane_generation, target.revision), (2, 5))
 
 
 class ReviewJ91797WorkUnitTests(unittest.TestCase):

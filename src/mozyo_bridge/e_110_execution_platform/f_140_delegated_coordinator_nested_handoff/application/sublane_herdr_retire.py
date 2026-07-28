@@ -92,6 +92,13 @@ REASON_ZERO_CLOSE_UNPROVEN = "zero_close_unproven"
 REASON_ISSUE_LANE_MISMATCH = "issue_lane_mismatch"
 REASON_LANE_OWNER_UNVERIFIED = "lane_owner_unverified"
 REASON_LIFECYCLE_UNREADABLE = "lifecycle_unreadable"
+#: Lifecycle-generation attestation (Redmine #14539 review j#91847 finding 2). The evidence a
+#: retire was admitted on is about ONE generation / revision of the lane row. Between the
+#: admissibility decision and the destructive close the row can advance (a new generation) or be
+#: recreated, and the earlier decision — by then a bare boolean — would close the NEW lane's
+#: slots. The exact ``(lane_generation, revision)`` the decision was made against is therefore
+#: re-read immediately before the close, and any drift is zero-actuation.
+REASON_LANE_GENERATION_DRIFT = "lane_generation_drift"
 #: Worktree-binding attestation (Redmine #13754 R2-F1, design j#78572, A+C). The lane's
 #: durable lifecycle records a canonical worktree binding; the caller's ``--worktree``
 #: must resolve to that exact token before any close, or a sibling lane's worktree could

@@ -52,6 +52,9 @@ class RetireEvidenceTarget:
     lane: str
     lane_generation: int
     policy_pointer: str
+    #: The row's CAS revision at resolution time. Carried so the destructive close can re-read the
+    #: row at the commit point and refuse if it advanced (Redmine #14539 review j#91847 finding 2).
+    revision: int = 0
 
 
 def resolve_retire_evidence_target(
@@ -89,6 +92,13 @@ def resolve_retire_evidence_target(
     generation = getattr(record, "lane_generation", 0)
     if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
         return None
+    revision = getattr(record, "revision", 0)
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0:
+        return None
+    # The issuer basis is resolved separately and is allowed to be EMPTY here. An unreadable
+    # committed config must not silently disable the generation / revision expectation the
+    # destructive close depends on (review j#91847 finding 2) — those are different questions with
+    # different consequences. The exemption route's own issuer check refuses an empty pointer.
     pointer = ""
     try:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_lane_topology import (  # noqa: E501
@@ -98,13 +108,12 @@ def resolve_retire_evidence_target(
         pointer = str(committed_config_policy_pointer(repo_root) or "").strip()
     except Exception:  # noqa: BLE001 - an unresolvable basis is a typed zero, not a crash
         pointer = ""
-    if not pointer:
-        return None
     return RetireEvidenceTarget(
         workspace=workspace,
         lane=lane_label,
         lane_generation=generation,
         policy_pointer=pointer,
+        revision=revision,
     )
 
 

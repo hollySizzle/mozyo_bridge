@@ -68,13 +68,21 @@ def resolve_journal_issuer(
 
     gates: dict[str, list[dict]] = {}
     for _channel, fields in marker_fields_in_note(notes or ""):
-        gate = str(fields.get("gate", "") or "").strip()
-        if not gate:
-            continue
-        role = contract_writer_role(gate)
-        if role == ISSUER_UNKNOWN:
-            continue
-        gates.setdefault(gate, []).append(fields)
+        # ``gate`` and ``kind`` are two spellings of ONE logical field, so BOTH are read
+        # (Redmine #14539 review j#91847 finding 3). Reading ``gate`` alone let a marker spell a
+        # second, different authority gate as ``kind`` and have it ignored — so
+        # ``gate=integration_disposition:kind=park_declared`` resolved cleanly to the coordinator,
+        # which is exactly the "two authority gates prove neither" edge this function documents.
+        declared = {
+            str(fields.get(alias, "") or "").strip() for alias in ("gate", "kind")
+        }
+        for gate in declared:
+            if not gate:
+                continue
+            role = contract_writer_role(gate)
+            if role == ISSUER_UNKNOWN:
+                continue
+            gates.setdefault(gate, []).append(fields)
 
     if len(gates) != 1:
         # Zero authority-bearing gates -> unknown; two DIFFERENT authority gates in one note

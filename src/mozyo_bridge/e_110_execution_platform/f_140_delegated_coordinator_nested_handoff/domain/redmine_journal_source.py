@@ -128,18 +128,28 @@ def _parse_marker_fields(body: str) -> dict[str, str]:
 def _parse_marker_components(body: str) -> tuple[tuple[str, str], ...]:
     """Every ``key=value`` component of a marker body, IN ORDER and uncollapsed (pure).
 
-    A fragment carrying no ``=`` is reported as ``(fragment, None)``-shaped by using an empty key,
-    so a caller checking well-formedness can see it. Nothing is dropped and nothing is merged: this
-    is the raw component list, and every policy decision about repetition belongs to the caller.
+    A fragment carrying no ``=`` is reported with an empty key so a caller checking
+    well-formedness can see it, and an EMPTY component is reported the same way rather than being
+    skipped. Nothing is dropped and nothing is merged: this is the raw component list, and every
+    policy decision about repetition belongs to the caller.
+
+    Redmine #14539 review j#91847 finding 4: the first version of this function said exactly that
+    and then dropped empty components, so ``…:lane_generation=1::head=…`` — a body no canonical
+    producer can render — read as perfectly well-formed. The central `### Hibernate Evidence Marker
+    Contract` requires the opposite: "空 component・``=`` を欠く fragment・空 key・whitespace 混入は
+    canonical producer が描画し得ない marker であり fragment を捨てて残りを一致させず marker 全体を
+    fail-closed とする".
     """
     components: list[tuple[str, str]] = []
     for token in body.split(":"):
-        token = token.strip()
-        if not token:
+        stripped = token.strip()
+        if not stripped:
+            # An empty component IS a component — reporting it is the whole point.
+            components.append(("", ""))
             continue
-        key, eq, value = token.partition("=")
+        key, eq, value = stripped.partition("=")
         if not eq:
-            components.append(("", token))
+            components.append(("", stripped))
             continue
         components.append((key.strip(), value.strip()))
     return tuple(components)
