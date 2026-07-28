@@ -231,6 +231,46 @@ class SeedFlowTests(unittest.TestCase):
         )
 
 
+class ModelledReadTableTests(unittest.TestCase):
+    """The guard's exception table is small, justified, and unambiguous.
+
+    Reads are admitted from an explicit table rather than from a syntactic test, because
+    three successive syntactic tests were each wrong in a new way (j#92123 / j#92165 /
+    j#92213).  A hand-written exception set is only defensible while it stays checkable:
+    every key must name a real, unique class, and every entry must say why.
+    """
+
+    def test_every_entry_names_exactly_one_real_class(self) -> None:
+        from support import herdr_dispatch_derivation as derivation
+
+        index = derivation._index_package(derivation.default_source_root())
+        for (class_name, attribute), reason in (
+            derivation._MODELLED_ATTRIBUTE_READS.items()
+        ):
+            with self.subTest(cls=class_name, attr=attribute):
+                owners = [
+                    module for module, indexed in index.items()
+                    if class_name in indexed.classes
+                ]
+                self.assertEqual(
+                    len(owners), 1,
+                    f"{class_name!r} resolves to {len(owners)} classes; the key would be "
+                    f"ambiguous",
+                )
+                self.assertTrue(reason.strip(), "every admitted read must record why")
+
+    def test_the_table_stays_small(self) -> None:
+        """A drifting exception table is how a fail-closed guard becomes fail-open."""
+        from support import herdr_dispatch_derivation as derivation
+
+        self.assertLessEqual(
+            len(derivation._MODELLED_ATTRIBUTE_READS),
+            15,
+            "the modelled-read exceptions are growing; each one is a place the walk stops "
+            "asking questions, so a larger set needs a deliberate decision, not drift",
+        )
+
+
 class DerivationLivenessTests(unittest.TestCase):
     """The oracle must be falsifiable: prove it re-reads the source it is given.
 
@@ -252,7 +292,13 @@ class DerivationLivenessTests(unittest.TestCase):
             + [str(p) for p in surface.pairs if p[0] == "probe"]
         )
 
-    def _mutated_tree(self, addition: str, runner_addition: str = "") -> Path:
+    def _mutated_tree(
+        self,
+        addition: str,
+        runner_addition: str = "",
+        init_addition: str = "",
+        tail_addition: str = "",
+    ) -> Path:
         tmp = Path(tempfile.mkdtemp(prefix="mozyo-derivation-probe-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         destination = tmp / "mozyo_bridge"
@@ -275,6 +321,16 @@ class DerivationLivenessTests(unittest.TestCase):
             runner_marker = "    run = __call__"
             self.assertIn(runner_marker, source, "the runner injection point moved")
             source = source.replace(runner_marker, runner_addition, 1)
+        if init_addition:
+            init_marker = "        self.refusal_reasons: set = set()"
+            self.assertIn(init_marker, source, "the runner __init__ injection point moved")
+            source = source.replace(
+                init_marker, init_marker + "\n" + init_addition, 1
+            )
+        if tail_addition:
+            tail_marker = "    run = __call__"
+            self.assertIn(tail_marker, source, "the module tail injection point moved")
+            source = source.replace(tail_marker, tail_marker + tail_addition, 1)
         seed.write_text(source.replace(marker, addition + marker, 1), encoding="utf-8")
         return tmp
 
@@ -468,6 +524,78 @@ class DerivationLivenessTests(unittest.TestCase):
         self.assertTrue(
             self._probe_reports(surface, "_probe_withas"),
             "an ``as`` binding escaped through the with-consumption exemption",
+        )
+
+    def test_a_callable_carried_inside_a_container_is_reported(self) -> None:
+        """Review j#92213 F3-1, verdict j#92219.
+
+        A list is not callable; a list *holding* the inner runner still hands one out via
+        a subscript.  "The outer node is not callable" was never a statement about the
+        contents.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_container(self):\n"
+            "        forward = self.runner._forwarders[0]\n"
+            '        return forward([self.binary, "probe", "container-element"])\n\n',
+            init_addition="        self._forwarders = [inner]",
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            self._probe_reports(surface, "_probe_container"),
+            "a dispatcher extracted from a container attribute was silently omitted",
+        )
+
+    def test_a_context_manager_on_a_runner_attribute_is_reported(self) -> None:
+        """Review j#92213 F3-2, verdict j#92219.
+
+        ``with <attr>:`` was exempted because the value is bound to nothing.  But ``with``
+        *runs* ``__enter__`` / ``__exit__`` — not escaping and not executing are different
+        claims, and only the first one was true.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_ctx(self):\n"
+            "        with self.runner._ctx:\n"
+            "            return None\n\n",
+            init_addition="        self._ctx = _ProbeCtx(inner)",
+            tail_addition=(
+                "\n\nclass _ProbeCtx:\n"
+                "    def __init__(self, inner):\n"
+                "        self._inner = inner\n\n"
+                "    def __enter__(self):\n"
+                '        return self._inner(["bin", "probe", "with-enter"])\n\n'
+                "    def __exit__(self, *exc):\n"
+                "        return False\n"
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            self._probe_reports(surface, "_probe_ctx"),
+            "a context manager held on the runner was silently omitted",
+        )
+
+    def test_a_subclass_inheriting_call_is_treated_as_callable(self) -> None:
+        """Review j#92213 F3-3, verdict j#92219.
+
+        The subclass defines its own ``__init__`` deliberately: a subclass without one
+        trips a *different* branch and would pass this test for the wrong reason.  What is
+        under test is only whether callability follows base classes.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_inherit(self):\n"
+            "        sub = _ProbeSub(self.runner, capability_provider=self._current_capability,\n"
+            "                        binding_env={}, agent_env={})\n"
+            '        return sub([self.binary, "probe", "inherited-wrapper"])\n\n',
+            tail_addition=(
+                "\n\nclass _ProbeSub(EndpointBoundHerdrRunner):\n"
+                "    def __init__(self, inner, **kwargs):\n"
+                "        super().__init__(inner, **kwargs)\n"
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertIn(
+            ("probe", "inherited-wrapper"),
+            surface.pairs,
+            "a wrapper inheriting __call__ was not recognised as a dispatcher",
         )
 
     def test_the_probe_does_not_touch_the_live_source(self) -> None:

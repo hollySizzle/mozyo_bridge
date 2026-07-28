@@ -53,21 +53,33 @@ because "the class declares that method and the walk analyses it" was a claim th
 not honour, since propagation followed tainted arguments only and a receiver-only call
 bound nothing.
 
-So the question asked is now the property itself, not a stand-in for it:
+That correction was itself wrong in three further ways (review j#92213): a container is
+not callable but *holds* callables and gives them up to a subscript; ``with <attr>:`` binds
+nothing but *executes* ``__enter__``; and a subclass that inherits ``__call__`` is callable
+while its own body says nothing.  Three rounds, three syntactic tests for "this value
+cannot dispatch", three fail-open guards.
+
+The conclusion drawn — and it is the important part of this module's history — is that a
+local syntactic check cannot establish that semantic property, and that continuing to try
+was the actual defect.  So the read side no longer tries:
 
 * a **call** is modelled only when the receiver taint is actually bound into the callee's
-  ``self`` (:meth:`_Walker._propagate`), which is what makes the body genuinely analysed;
-* a **read** is modelled only when the value provably cannot be a dispatcher — every
-  assignment to it is a literal or a non-callable builtin — or when it is an attribute the
-  walk already tracks and therefore really does follow;
-* an attribute on a value whose class cannot be resolved is reported: an attribute the
-  walk cannot name is one it cannot follow;
-* the single structural exemption is ``with <attr>:`` with no ``as`` target, where the
-  value is consumed by the statement and bound to nothing.  An ``as`` binding is reported.
+  ``self`` (:meth:`_Walker._propagate`), which is what makes the body genuinely analysed.
+  Method lookup and callability both follow base classes; an unresolvable base is treated
+  as callable, the direction that keeps taint flowing rather than dropping it;
+* a **read** is modelled only when the attribute is one the walk already tracks, or when
+  the ``(class, attribute)`` pair appears in :data:`_MODELLED_ATTRIBUTE_READS` with a
+  written justification.  There is no third reason, and in particular no inference from
+  the shape of the assigned value;
+* everything else — unknown attributes, containers, context managers, unresolvable
+  classes — is reported.
 
 Narrowing the wrapper rule to *callable* classes was needed alongside this: a container
 that merely holds the runner (the smoke harness) is not the runner, and treating it as one
-made every one of its attributes look runner-carrying.
+made every one of its attributes look runner-carrying.  That narrowing then exposed a
+sweep gate that analysed a function only when a *local* was tainted, which had been masked
+because the over-broad rule happened to create such a local.  Two errors had been
+cancelling; the pair is worth remembering when a change here makes the numbers move.
 
 It is analysis-only: nothing here imports the modules it reads, executes production
 code, or touches a Herdr endpoint.
@@ -309,6 +321,45 @@ def _enclosing_class(qualname: str) -> str:
     parts = qualname.split(".")
     return parts[-2] if len(parts) >= 2 else ""
 
+
+#: The ONLY attribute reads on a tainted value the walk models, each with the reason it
+#: is admitted.  Everything else is reported.
+#:
+#: This is a hand-written set, deliberately, after three rounds in which a *syntactic*
+#: test for "this value cannot dispatch" was wrong in a new way each time (review j#92123
+#: node type, j#92165 member kind, j#92213 container contents / context protocol /
+#: inheritance).  A local syntax check cannot establish a semantic property, and pretending
+#: otherwise produced three fail-open guards in a row.  What it CAN do is fail closed on
+#: everything it was not told about, which is what this table does: it is small, each entry
+#: carries its justification, it covers only the reads this smoke actually performs, and a
+#: new read — including a legitimate one — turns the oracle red until a person adds it.
+#:
+#: Keyed by ``(class name, attribute)``.  A test asserts every class named here resolves to
+#: exactly one class in the index, so the key cannot quietly match the wrong type.
+_MODELLED_ATTRIBUTE_READS: dict = {
+    ("EndpointBoundHerdrRunner", "dispatched_calls"): "gate counter (int) read into evidence",
+    ("EndpointBoundHerdrRunner", "bound_calls"): "gate counter (int) read into evidence",
+    ("EndpointBoundHerdrRunner", "escape_refusals"): "gate counter (int) read into evidence",
+    ("EndpointBoundHerdrRunner", "operator_endpoint_requests"): (
+        "gate counter (int) read into evidence"
+    ),
+    ("EndpointBoundHerdrRunner", "refusal_reasons"): "closed refusal tokens (set of str)",
+    ("RecordingHerdrRunner", "launched_locators"): "actuation-receipt tape (list of str)",
+    ("RecordingHerdrRunner", "agent_start_names"): "actuation-receipt tape (list of str)",
+    ("RecordingHerdrRunner", "created_workspaces"): (
+        "actuation-receipt tape (dict of workspace id -> label)"
+    ),
+    ("RecordingHerdrRunner", "workspace_create_labels"): (
+        "actuation-receipt tape (list of str labels)"
+    ),
+    ("RecordingHerdrRunner", "created_coordinators_workspaces"): (
+        "property deriving a list of workspace ids from the receipt tape"
+    ),
+    ("RecordingHerdrRunner", "_lock"): (
+        "threading.Lock used only as a context manager for the tape.  NOT first-party, so "
+        "its __enter__ cannot be analysed; admitted on this recorded justification alone"
+    ),
+}
 
 #: Builtins whose result is a plain container / scalar, never a dispatcher.
 _NON_CALLABLE_BUILTINS = frozenset(
@@ -554,12 +605,42 @@ class _Walker:
             return constructed is not None and self._class_is_callable(constructed)
         return False
 
-    def _class_is_callable(self, class_ref: tuple) -> bool:
-        """Whether instances of ``class_ref`` can be called (define a dispatch entry)."""
+    def _base_classes(self, class_ref: tuple) -> tuple:
+        """``(resolved bases, saw_unresolved)`` for ``class_ref``."""
+        module, class_name = class_ref
+        indexed = self.index.get(module)
+        class_def = indexed.classes.get(class_name) if indexed else None
+        if class_def is None:
+            return ((), True)
+        resolved: list = []
+        unresolved = False
+        for base in class_def.bases:
+            if not isinstance(base, ast.Name):
+                unresolved = True
+                continue
+            found = self._resolve_name(module, base.id)
+            if found is None or found[1] not in self.index[found[0]].classes:
+                # ``object`` and stdlib bases land here; so would a base the walk cannot
+                # read.  It cannot tell those apart, so it says so.
+                unresolved = True
+                continue
+            resolved.append(found)
+        return (tuple(resolved), unresolved)
+
+    def _class_is_callable(self, class_ref: tuple, _seen: tuple = ()) -> bool:
+        """Whether instances of ``class_ref`` can be called (define a dispatch entry).
+
+        Follows base classes (review j#92213 F3-3): a subclass that inherits ``__call__``
+        is callable, and reading only its own body reported a real dispatcher as inert.
+        An unresolvable base makes the answer **callable**, because that is the direction
+        that keeps taint flowing rather than dropping it.
+        """
+        if class_ref in _seen:
+            return False
         module, class_name = class_ref
         indexed = self.index.get(module)
         if indexed is None:
-            return False
+            return True
         if any(
             f"{class_name}.{spelling}" in indexed.functions
             for spelling in self._DISPATCH_ATTRS
@@ -567,13 +648,18 @@ class _Walker:
             return True
         class_def = indexed.classes.get(class_name)
         if class_def is None:
-            return False
+            return True
         # ``run = __call__`` — a class-level alias of a dispatch entry.
         for node in class_def.body:
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
                 if node.value.id in self._DISPATCH_ATTRS:
                     return True
-        return False
+        bases, unresolved = self._base_classes(class_ref)
+        if any(
+            self._class_is_callable(base, _seen + (class_ref,)) for base in bases
+        ):
+            return True
+        return unresolved and bool(class_def.bases)
 
     def _is_constructor(self, module: str, call: ast.Call) -> bool:
         func = call.func
@@ -831,16 +917,11 @@ class _Walker:
                 called = (
                     isinstance(grandparent, ast.Call) and grandparent.func is parent
                 )
-                # ``with self._lock:`` — the value is consumed by the statement and bound
-                # to no name, so it cannot be called or handed on.  This is a structural
-                # reason, not an allow-list of "safe-looking" types: an ``as`` target
-                # would bind it and is deliberately NOT exempt.
-                if (
-                    isinstance(grandparent, ast.withitem)
-                    and grandparent.context_expr is parent
-                    and grandparent.optional_vars is None
-                ):
-                    continue
+                # No ``with`` exemption.  The previous round admitted ``with <attr>:``
+                # because the value is bound to nothing — but ``with`` *executes*
+                # ``__enter__`` / ``__exit__``, so "does not escape" was again standing in
+                # for "does not dispatch" (j#92213).  A context manager on a tainted value
+                # goes through the same read rule as everything else.
                 if self._attribute_access_is_modelled(
                     module, qualname, owner, local, node, parent, called
                 ):
@@ -860,16 +941,32 @@ class _Walker:
                 f"follow"
             )
 
+    def _lookup_member(self, class_ref: tuple, attr: str, _seen: tuple = ()) -> Optional[tuple]:
+        """``(module, qualname)`` of ``attr`` on ``class_ref`` or a base, else ``None``."""
+        if class_ref in _seen:
+            return None
+        module, class_name = class_ref
+        indexed = self.index.get(module)
+        if indexed is None:
+            return None
+        candidate = f"{class_name}.{attr}"
+        if candidate in indexed.functions:
+            return (module, candidate)
+        bases, _ = self._base_classes(class_ref)
+        for base in bases:
+            found = self._lookup_member(base, attr, _seen + (class_ref,))
+            if found is not None:
+                return found
+        return None
+
     def _method_on_receiver(
         self, module: str, qualname: str, owner: str, local: set, receiver, attr: str
     ) -> Optional[tuple]:
         """The method ``attr`` names on the receiver's class, as ``(module, qualname)``."""
-        for holder_module, holder_class in self._value_classes(
-            module, qualname, owner, local, receiver
-        ):
-            candidate = f"{holder_class}.{attr}"
-            if candidate in self.index[holder_module].functions:
-                return (holder_module, candidate)
+        for class_ref in self._value_classes(module, qualname, owner, local, receiver):
+            found = self._lookup_member(class_ref, attr)
+            if found is not None:
+                return found
         return None
 
     def _attribute_kind(self, class_ref: tuple, attr: str) -> str:
@@ -951,13 +1048,14 @@ class _Walker:
             # declaration that no propagation backed.
             if not classes:
                 return False
-            for holder_module, holder_class in classes:
-                candidate = f"{holder_class}.{attribute.attr}"
-                if candidate not in self.index[holder_module].functions:
+            for class_ref in classes:
+                found = self._lookup_member(class_ref, attribute.attr)
+                if found is None:
                     return False
-                bound = self.index[holder_module].functions[candidate]
+                found_module, found_qualname = found
+                bound = self.index[found_module].functions[found_qualname]
                 names = _parameter_names(bound)
-                if not names or (holder_module, candidate, names[0]) not in (
+                if not names or (found_module, found_qualname, names[0]) not in (
                     self.tainted_params
                 ):
                     return False
@@ -978,53 +1076,23 @@ class _Walker:
         )
 
     def _read_yields_no_dispatcher(self, class_ref: tuple, attr: str) -> bool:
-        """Whether reading ``class_ref.attr`` provably cannot hand out a dispatcher."""
+        """Whether reading ``class_ref.attr`` is a read the walk models.
+
+        Two admissible reasons, and no third:
+
+        * the attribute is one the walk itself **tracks**, so it genuinely follows it;
+        * the ``(class, attribute)`` pair is in :data:`_MODELLED_ATTRIBUTE_READS` with a
+          recorded justification.
+
+        Note what is deliberately NOT here: any attempt to decide from the shape of the
+        assigned value.  A container holds callables, a property returns them, and a
+        ``@property`` that looks like a list read can be anything — each of those was a
+        separate silent omission (j#92213).
+        """
         module, class_name = class_ref
-        # An attribute the walk itself tracks is followed, so reading it is modelled for a
-        # real reason rather than an assumed one.
         if (module, class_name, attr) in self.tainted_attrs:
             return True
-        indexed = self.index.get(module)
-        if indexed is None:
-            return False
-        function = indexed.functions.get(f"{class_name}.{attr}")
-        if function is not None:
-            decorators = {
-                d.id for d in function.decorator_list if isinstance(d, ast.Name)
-            }
-            if "property" not in decorators:
-                return False  # a method: reading it hands out a callable
-            returns = [
-                node.value
-                for node in ast.walk(function)
-                if isinstance(node, ast.Return) and node.value is not None
-            ]
-            return bool(returns) and all(_is_non_callable_expr(r) for r in returns)
-        class_def = indexed.classes.get(class_name)
-        if class_def is None:
-            return False
-        assigned: list = []
-        for node in ast.walk(class_def):
-            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
-                # ``attr = <member>`` — a class-level callable alias.
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == attr:
-                        return False
-            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-                continue
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                if (
-                    isinstance(target, ast.Attribute)
-                    and target.attr == attr
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id == "self"
-                    and node.value is not None
-                ):
-                    assigned.append(node.value)
-        # Every assignment must be provably non-callable.  No assignment at all means the
-        # walk cannot say anything about it, which is not the same as "safe".
-        return bool(assigned) and all(_is_non_callable_expr(v) for v in assigned)
+        return (class_name, attr) in _MODELLED_ATTRIBUTE_READS
 
     def _is_modelled_parent(self, node: ast.AST, parent: ast.AST) -> bool:
         """Whether ``parent`` is a context the walk actually follows for ``node``.

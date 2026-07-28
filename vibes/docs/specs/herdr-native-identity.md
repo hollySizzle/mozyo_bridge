@@ -1184,16 +1184,32 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     いなかった**。よって proxy をやめ、性質そのものを問う:
     - **呼び出し**: receiver taint が callee の `self` へ実際に束縛されたときのみ modelled
       (束縛して初めて body が解析される)。dispatch 綴り (`run` / `__call__`) はそのまま。
-    - **値としての読み取り**: その属性への**全代入**が literal または非 callable builtin で
-      あり、値が dispatcher になり得ないと示せる場合のみ modelled。walk が既に追跡している
-      tainted attribute は「実際に追う」ので modelled。それ以外は報告する。
+    - **値としての読み取り**: **構文からの証明を行わない**。R1 (node 種別) / R2 (member 種別) /
+      R3 (中身・束縛・自己宣言) と 3 度続けて「dispatch し得ない」を局所的な構文条件で
+      代用し、3 度とも別の抜け道が残った (container は callable を保持し subscript で渡す /
+      `with` は束縛しないが `__enter__` を**実行する** / 継承した `__call__` は自 class body に
+      現れない)。**局所構文では意味的性質を確立できない**というのが結論である。よって read が
+      modelled になるのは **(a) walk が実際に追跡している attribute**、または
+      **(b) 明示的な例外表に理由付きで載っている `(class, attribute)`** のみとし、
+      **第三の理由を持たない**。例外表は小さく保ち、各 entry が理由を持ち、未知の read は
+      red に倒れる (test で個数上限と一意解決性を固定)。
     - **class が解決できない tainted 値の属性**は報告する (名前を言えない属性は追えない)。
-    - 構造的例外は `with <attr>:` (`as` なし) のみ。値が文に消費され何にも束縛されないため
-      逃げようがない。`as` で束縛する形は**報告する**。
+    - **`with` の免除は撤去**した。「束縛されない」と「実行されない」は別である。
+    - **callability と method 解決は base class を辿る**。解決できない base は callable 側
+      (= taint を流す側) に倒す。
     - wrapper 規則は **callable な class に限定**する。runner を保持するだけの container
       (smoke harness) を runner 扱いすると、その全属性が runner-carrying に見えてしまう。
     許可側を狭めたことが「全部報告する」に化けていないことは、benign な counter 読み取りを
     control として probe し modelled のままであることを実測して固定する。
+  - **full-surface adversarial edge sweep** (escalation j#92214)。同 subsystem で blocking
+    finding が 2 round 連続したため、review は `full_surface_adversarial` へ昇格した。その
+    実行形が `tests/integration/.../test_dispatch_derivation_edge_sweep.py` であり、
+    `required_surface` の各 edge (seed / local・parameter・attribute 伝播 / `**kwargs` 転送 /
+    wrapper 構築 / 継承 / attribute call・read / container carrier / context protocol /
+    escape 各形 / argv 未解決 / Process 境界) に **1 mutant ずつ**を copy tree へ単独注入し、
+    導出が何かを言うことを実測する。**control 2 件 (benign read / probe 無し) が沈黙する**
+    ことも同時に固定し、「全部報告する」で全 mutant を通す退化を検出する。実行時間の都合で
+    `MOZYO_DERIVATION_EDGE_SWEEP=1` の opt-in とし、個別 regression は unit 側で常時実行する。
   - 静的導出を **実行でも裏取りする**。`tests/integration/.../test_shared_space_smoke_harness.py`
     が production 経路を fake 上で実走させ、実際に dispatch された pair が導出集合と
     allowlist の双方に含まれることを確認する。ただしこの fixture は launcher を解決しないため
