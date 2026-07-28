@@ -199,6 +199,15 @@ authorize したかを照合しなければ scope は未検証のままである
     → 順序を **「renderer が隠すものを隠す (A-C と *閉じた* code span)」→ 「E を読む」→ 「renderer より
     多く隠す (tail 系・hanging indent)」→ 「E を適用」** に固定する。
     **pass を足すたびに順序を考えるのではなく、広い拒否の観測を先に固定する。**
+    ★★★**ただし E は link 自身の `<…>` を markup と読んではならない** (#14584 j#91761)。早く読むと
+    destination / title がまだ text 上にあるため、`[docs](<https://example.com>)` だけで note 全体が
+    拒否され、**実在する gate event と work anchor が消えた**。よって E は **各 link の「あり得る最小の
+    hidden 領域」を mask した写しを読む**。
+    ★★★**この近似が許されるのは、それが「E が*追加で拒否するか*」しか決めないから**である。
+    j#91682 で link の parse を禁じたのは、その parse が **何を release するか**を決めていたからで、
+    向きが逆である。**領域を小さく見積もれば over-blank (復旧可能)、大きく見積もれば under-blank
+    (復旧不能)** なので、閉じ記号が見つからないときは **mask を空**にする。
+    **同じ「近似」でも、release を決めるのか refusal を決めるのかで安全性の向きが反転する。**
   - **scan は行単位で行う。** marker body の grammar は `[^\]]*` で改行を跨ぐため、blank 化した note
     を 1 文字列として scan すると、canonical 行の閉じていない `[mozyo:` が引用行を越えて後続の `]`
     で閉じ、**どの 1 行にも存在しない marker** が成立しうる。

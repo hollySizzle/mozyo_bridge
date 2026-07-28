@@ -200,6 +200,19 @@ class FailClosedTest(unittest.TestCase):
         anchor = _resolve([_entry("90409", marker + "\n\nwe render <div> here")])
         self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
 
+    def test_a_link_in_the_body_does_not_erase_the_work_anchor(self):
+        # The same regression at the join: a dispatch record whose body merely contains a Markdown
+        # link with an angle destination stopped resolving at all (#14584 j#91761).
+        marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
+        for label, note in (
+            ("angle destination", "see [docs](<https://example.com>)\n\n%s" % marker),
+            ("tag-shaped title", '[text](http://x "<code>")\n\n%s' % marker),
+            ("reference definition", "[ref]: <https://example.com>\n\n%s" % marker),
+        ):
+            with self.subTest(label):
+                anchor = _resolve([_entry("90409", note)])
+                self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
+
     def test_a_crlf_dispatch_record_still_resolves(self):
         # The paired positive at the join: Redmine writes CRLF, so this is the ordinary case.
         marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()

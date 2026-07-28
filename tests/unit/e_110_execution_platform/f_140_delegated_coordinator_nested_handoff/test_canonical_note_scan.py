@@ -512,6 +512,34 @@ class PassOrderTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(_gates(note), ())
 
+    def test_a_link_of_its_own_does_not_look_like_markup_to_it(self):
+        # The other direction of the same invariant, and the regression reading E early created:
+        # an angle destination or a tag-shaped title is markup the RENDERER hides, so E must not
+        # read it and refuse the rest of the note. This erased live gate events (#14584 j#91761).
+        for label, note in (
+            ("angle destination", f"see [docs](<https://example.com>)\n\n{MARKER}"),
+            ("tag-shaped title", f'[text](http://x "<code>")\n\n{MARKER}'),
+            ("reference definition", f"[ref]: <https://example.com>\n\n{MARKER}"),
+            ("image angle destination", f"![a](<https://x/i.png>)\n\n{MARKER}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ("review_request",))
+
+    def test_markup_outside_the_link_region_still_refuses_the_note(self):
+        # And the mask must stay SMALL enough: a tag past the link, or past a definition's
+        # destination, is real raw HTML. `[r]: /u <code>` is not even a definition — a title has to
+        # be quoted — so masking the whole line there would have hidden real markup.
+        self.assertEqual(_gates(f"see [docs](/u) <code>\nq\n\n{MARKER}"), ())
+        self.assertEqual(_gates(f"[r]: /u <code>\nmore\n\n{MARKER}"), ())
+
+    def test_an_unterminated_opener_masks_nothing_at_all(self):
+        # With no closing token there is no region to approximate, and the smallest approximation
+        # is the empty one — so E still sees the tag and still refuses. Masking to the paragraph
+        # end here would hide real markup, which is the direction that cannot be recovered.
+        # (Without this case the "unterminated masks to the paragraph end" mutation is invisible.)
+        self.assertEqual(_gates(f"see [docs](/u <code>\nq\n\n{MARKER}"), ())
+        self.assertEqual(_gates(f"see ![a](/i <code>\nq\n\n{MARKER}"), ())
+
     def test_a_closed_span_may_still_hide_markup_from_it(self):
         # The other side: a CLOSED span hides exactly what the renderer hides, so reading E after it
         # is correct and a backticked tag still costs nothing. Collapsing the two span passes into

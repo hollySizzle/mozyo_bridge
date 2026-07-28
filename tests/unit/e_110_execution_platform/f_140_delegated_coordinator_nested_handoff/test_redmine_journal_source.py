@@ -360,6 +360,17 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(self._gates(note), ())
 
+    def test_a_link_in_the_body_does_not_erase_the_gate(self):
+        # #14584 j#91761: reading rule E before the link pass made an angle destination or a
+        # tag-shaped title look like raw HTML, and the gate below it disappeared note-wide.
+        for label, note in (
+            ("angle destination", "see [docs](<https://example.com>)\n\n%s" % self.GATE),
+            ("tag-shaped title", '[text](http://x "<code>")\n\n%s' % self.GATE),
+            ("reference definition", "[ref]: <https://example.com>\n\n%s" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ("review_request",))
+
     def test_a_gate_recorded_above_the_markup_still_counts(self):
         # The bound: refusing from where markup starts must not erase what came before it.
         self.assertEqual(self._gates(self.GATE + "\n\nwe render <div> here"), ("review_request",))

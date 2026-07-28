@@ -78,6 +78,14 @@ that E would have refused the rest of the note for — reported for the link tai
 the other three (#14584 j#91735). So the order is: hide what the renderer hides (A–C, and CLOSED
 code spans), **read E**, then hide what this module hides beyond the renderer, then apply E.
 
+**But E must not read a link's own angle brackets as markup either.** Reading it early means the
+destinations and titles are still there, and ``[docs](<https://example.com>)`` refused the rest of
+the note and erased live gate events (#14584 j#91761). E therefore reads a copy with each link's
+*smallest possible* hidden region masked (:func:`_mask_link_regions_for_html`). That approximation
+is allowed here and was not allowed in F for one reason: **it decides only whether E refuses MORE,
+never what anything releases.** Too small a region costs an over-blank; too large a one would hide
+real markup, so where the region is unclear the mask is empty.
+
 Three properties of the scan are load-bearing rather than incidental:
 
 - **Quoted regions are blanked, not deleted.** The line structure survives, so a marker can never be
@@ -358,6 +366,50 @@ def _blank_closed_code_spans(text: str) -> str:
     return "".join(chars)
 
 
+#: The closing token of each link-syntax opener, for the SMALLEST region it could hide. ``]:`` has
+#: none: a definition's destination is one token, and taking the line instead would hide real markup
+#: after it (``[r]: /u <code>`` is not a definition at all — a title must be quoted).
+_LINK_REGION_CLOSERS = {"](": ")", "![": ")", "][": "]"}
+#: The destination token of a link reference definition: the whitespace run, then one bare token.
+_DEFINITION_DESTINATION = re.compile(r"[ \t]*[^ \t\n]+")
+
+
+def _mask_link_regions_for_html(text: str) -> str:
+    """``text`` with the SMALLEST region each link opener could hide blanked (pure).
+
+    Used only to decide what rule E observes, never what anything releases. That distinction is the
+    whole reason this may approximate at all: #14584 j#91682 refused to parse link syntax because
+    the parse decided what got RELEASED, and every shortcut released a marker. Here a wrong
+    approximation can only make E refuse more —
+
+    - too SMALL a region → E sees a ``<`` the renderer hides → over-blank, recoverable;
+    - too LARGE a region → E misses real raw HTML → under-blank, not recoverable.
+
+    So the region is deliberately the smallest one possible: to the FIRST closing token, and nothing
+    at all when there is none. Reading E before the tail pass without this mask made a plain
+    ``[docs](<https://example.com>)`` refuse the rest of the note and erased live gate events
+    (#14584 j#91761); reading it after the tail pass hid real markup from E (j#91735).
+    """
+    chars = list(text)
+    for match in _LINK_HIDDEN_PART.finditer(text):
+        if _is_escaped(text, match.start()):
+            continue
+        if match.group() == "]:":
+            destination = _DEFINITION_DESTINATION.match(text, match.end())
+            if destination is None:
+                continue
+            end = destination.end()
+        else:
+            closer = text.find(_LINK_REGION_CLOSERS[match.group()], match.end())
+            if closer < 0:
+                continue  # unterminated: mask nothing, so E sees everything and refuses more
+            end = closer + 1
+        for index in range(match.start(), end):
+            if chars[index] != "\n":
+                chars[index] = " "
+    return "".join(chars)
+
+
 def _blank_paragraph_tail(text: str) -> str:
     """``text`` blanked from the first construct that refuses the rest of the paragraph (pure).
 
@@ -413,9 +465,14 @@ def canonical_note_lines(notes: str) -> tuple[str, ...]:
     paragraphs = _paragraph_runs(classified)
     for start, end in paragraphs:  # renderer-faithful: a closed span hides what the renderer hides
         lines[start:end] = _blank_closed_code_spans("\n".join(lines[start:end])).split("\n")
-    # E is READ here, before anything that hides more than the renderer does.
+    # E is READ here, before anything that hides more than the renderer does — but on a copy with
+    # each link's smallest hidden region masked out, so it does not read a destination or a title as
+    # raw HTML. The mask only ever makes E refuse MORE; nothing is released on its judgement.
+    observed = [line for line in lines]
+    for start, end in paragraphs:
+        observed[start:end] = _mask_link_regions_for_html("\n".join(observed[start:end])).split("\n")
     cutoff = next(
-        (index for index, line in enumerate(lines) if _first_hidden_construct(line) >= 0), None
+        (index for index, line in enumerate(observed) if _first_hidden_construct(line) >= 0), None
     )
     for start, end in paragraphs:  # refuses more than the renderer: tails
         lines[start:end] = _blank_paragraph_tail("\n".join(lines[start:end])).split("\n")
