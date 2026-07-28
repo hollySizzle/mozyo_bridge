@@ -537,6 +537,47 @@ class ControlSurfaceAllowlistTests(unittest.TestCase):
             )
             self.assertEqual(len(dispatched), 1)
 
+    def test_a_leading_global_flag_shifts_the_pair_out_of_the_allowlist(self) -> None:
+        """Argv-grammar drift anchor (review j#91638 hypothesis).
+
+        The check reads exactly ``command[1:3]``, so what it closes is the
+        ``(group, subcommand)`` pair. On Herdr v0.7.4 a leading ``--session`` /
+        ``--remote`` pushes the real command right and lands outside the allowlist,
+        which is why the smoke's argv shape is safe today. If Herdr's parser ever
+        changes so that a flagged form maps back onto an allowlisted pair, this test is
+        where that assumption stops holding quietly.
+        """
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            dispatched.clear()
+            for prefix in (["--session", "default"], ["--remote", "user@host"]):
+                argv = ["/bin/true", *prefix, "server", "stop"]
+                with self.assertRaises(SmokeEndpointEscapeError, msg=argv) as caught:
+                    instance.runner(argv, capture_output=True)
+                self.assertEqual(
+                    caught.exception.reason,
+                    live_module.REFUSAL_COMMAND_NOT_ALLOWLISTED,
+                )
+            self.assertEqual(dispatched, [])
+
+    def test_the_agent_env_injection_does_not_move_the_matched_pair(self) -> None:
+        """``agent start`` gains ``--env`` flags before ``--``; the pair must survive."""
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            dispatched.clear()
+            instance.runner(
+                ["/bin/true", "agent", "start", "mzb1_x", "--", "claude"],
+                capture_output=True,
+            )
+            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(dispatched[0][1:3], ["agent", "start"])
+
     def test_allowlisted_client_calls_survive_for_both_processes(self) -> None:
         """Baseline: the fence must not turn into a blanket refusal."""
         process = _Process()
@@ -556,6 +597,54 @@ class ControlSurfaceAllowlistTests(unittest.TestCase):
                 for group, verb in sorted(live_module.CLIENT_CALL_SUBCOMMANDS):
                     instance.runner(["/bin/true", group, verb], capture_output=True)
             self.assertEqual(len(dispatched), minter_calls * 2)
+
+
+class RootReleaseContainmentTests(unittest.TestCase):
+    """Teardown must obey the worker verdict, not be scored after it (j#91638 F1)."""
+
+    def _instance(self, tmp: str, process) -> DisposableHerdrInstance:
+        instance = DisposableHerdrInstance(
+            binary="/bin/true",
+            root=Path(tmp) / "instance",
+            base_env={"HOME": str(Path(tmp) / "operator")},
+            runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "[]", ""),
+            popen_factory=lambda argv, **kwargs: process,
+            sleeper=lambda _seconds: None,
+            ambient_env={},
+        )
+        instance.start()
+        return instance
+
+    def test_withholding_release_keeps_the_owned_path_out_of_circulation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, _Process())
+            root = instance.root
+            instance.shutdown(release_root=False)
+
+            self.assertTrue(
+                root.exists(),
+                "a surviving worker could bind whatever takes this path next",
+            )
+            self.assertTrue(instance.stopped, "the server itself is still stopped")
+            evidence = instance.as_evidence()
+            self.assertFalse(evidence["owned_root_released"])
+            self.assertGreater(
+                evidence["endpoint_residue"], -1, "residue must be reported, not hidden"
+            )
+
+    def test_releasing_is_still_the_default_and_removes_exactly_the_owned_tree(self) -> None:
+        """Baseline: containment must not turn into a permanent residue leak."""
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, _Process())
+            root = instance.root
+            sibling = Path(tmp) / "not-ours"
+            sibling.mkdir()
+            instance.shutdown()
+
+            self.assertFalse(root.exists())
+            self.assertTrue(sibling.exists(), "only the owned root may be removed")
+            self.assertTrue(instance.as_evidence()["owned_root_released"])
+            self.assertEqual(instance.as_evidence()["endpoint_residue"], 0)
 
 
 class CrossProcessGateEvidenceTests(unittest.TestCase):

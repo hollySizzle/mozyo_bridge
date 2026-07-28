@@ -36,6 +36,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_observation import (  # noqa: E402,E501
     PHASE_WORKER_ERROR,
+    SharedSpaceSmokeError,
 )
 
 
@@ -213,6 +214,33 @@ class ProcessTimeoutDomainTests(unittest.TestCase):
         for value, expected in (("45", 45.0), ("0.5", 0.5), ("3600", 3600.0)):
             with self.subTest(value=value):
                 self.assertEqual(self._parse(value).process_timeout, expected)
+
+    def test_a_huge_int_is_a_typed_domain_error_not_a_raw_overflow(self) -> None:
+        """``float(10**10000)`` raises OverflowError, which is not a ValueError.
+
+        Leaving it out of the except clause let a direct ``Namespace`` caller reach a
+        raw traceback with zero evidence (review j#91638 F2).
+        """
+        for value in (10 ** 10000, -(10 ** 10000), "1" + "0" * 5000):
+            with self.subTest(value=type(value).__name__):
+                with self.assertRaises(SharedSpaceSmokeError):
+                    bounded_process_timeout(value)
+
+    def test_the_cli_delegates_the_domain_to_the_driver(self) -> None:
+        """No second, weaker conversion may sit in front of the driver authority."""
+        args = Namespace(
+            isolated_home="/tmp/iso", projects=2, execute=True,
+            process_timeout=10 ** 10000, json=True,
+        )
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                cli.cmd_herdr_smoke_shared_space(args)
+            except SystemExit as exc:
+                code = exc.code
+        self.assertEqual(code, 2, "a huge int must be a typed, rendered refusal")
+        self.assertIn("herdr smoke-shared-space failed", err.getvalue())
 
     def test_the_default_is_inside_the_accepted_domain(self) -> None:
         args = self._parser().parse_args(

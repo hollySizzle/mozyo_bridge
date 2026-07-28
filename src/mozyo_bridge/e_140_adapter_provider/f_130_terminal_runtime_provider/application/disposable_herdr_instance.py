@@ -58,8 +58,15 @@ So the single authority is split in two:
 Both are scoped by an allowlist, not a denylist (review j#91604 F1).  Only
 :data:`CLIENT_CALL_SUBCOMMANDS` may be dispatched at all; every other Herdr control —
 ``session stop``/``session delete`` (whose help names ``default`` as a target),
-``server reload-config``, ``update``, and whatever the next release adds — is refused
-by default rather than needing to be predicted.
+``server reload-config``, ``update`` — is refused because it was never named.
+
+The guarantee is scoped to ``(group, subcommand)`` **pairs** and claims nothing more
+(review j#91638): matching happens on those two argv tokens, so a brand-new command
+pair is denied by default, while an option added to an *already allowlisted* pair is
+not something this check closes.  On Herdr v0.7.4 a leading global flag
+(``--session <name>`` / ``--remote <target>``) shifts the pair out of the allowlist and
+is refused with zero dispatch; that argv-grammar boundary is pinned by a drift test so a
+parser change on Herdr's side surfaces rather than silently widening the surface.
 
 Cross-process negative proof (review j#85841 F1)
 ------------------------------------------------
@@ -609,6 +616,9 @@ class DisposableHerdrInstance:
         self.stopped = False
         self.graceful_stop_refused = False
         self.endpoint_residue = -1
+        #: True when a caller withheld root release for containment (an owned worker
+        #: outlived its kill, so the socket path must not be freed for anyone to bind).
+        self.root_release_withheld = False
         # Operator endpoints the gate must never target.  BOTH sources are captured:
         # the caller's declared env, and the true process ambient — the incident's
         # unbound call inherited ``os.environ``, not ``base_env`` (j#85754).
@@ -806,9 +816,23 @@ class DisposableHerdrInstance:
             "disposable Herdr server did not become ready within the bounded startup window"
         )
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, release_root: bool = True) -> None:
+        """Stop the owned child and, unless withheld, remove its exact state tree.
+
+        ``release_root=False`` is the **containment** case (review j#91638 F1): the
+        caller has established that an owned worker outlived even its ``kill``, and a
+        worker holds client-call capability bound to *this* socket path.  Removing the
+        root would free that path for anything else to bind, which is the takeover the
+        threat model exists to prevent — so the tree stays, the residue is reported,
+        and the run cannot claim success.
+
+        The server is stopped either way: killing our own endpoint makes a survivor's
+        calls fail to connect, which strengthens containment rather than weakening it.
+        What is withheld is only the *release of the path*.
+        """
         process = self._process
         if process is None:
+            self.root_release_withheld = not release_root
             return
         if process.poll() is None:
             try:
@@ -842,7 +866,8 @@ class DisposableHerdrInstance:
         )
         # Only this exact, caller-provided instance root is removed.  The lifecycle
         # never scans for or kills another process and never removes a parent tree.
-        if self.stopped and self.root.exists():
+        self.root_release_withheld = not release_root
+        if release_root and self.stopped and self.root.exists():
             shutil.rmtree(self.root)
             self.endpoint_residue = 0
         self._process = None
@@ -878,6 +903,7 @@ class DisposableHerdrInstance:
             "graceful_stop_refused": self.graceful_stop_refused,
             "server_stopped": self.stopped,
             "endpoint_residue": self.endpoint_residue,
+            "owned_root_released": not self.root_release_withheld,
         }
 
 

@@ -1100,8 +1100,9 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
   退化する。よって authority を 2 つに分割する:
   - **client-call capability** — owned endpoint への通常 request (`workspace list` / `agent start` 等)。
     mint した process とその forked worker が保持する。mint process 内では **owned child 生存**も連言する。
-  - **cleanup authority** — `DESTRUCTIVE_SUBCOMMANDS` (`server stop`) の破壊的 control request。
-    **mint した process のみ**が、かつ owned child 生存中のみ保持する。forked worker は無条件に拒否する。
+  - **cleanup authority** — `MINTER_ONLY_SUBCOMMANDS` (= 自分が起動した server への graceful
+    `server stop`)。**mint した process のみ**が、かつ owned child 生存中のみ保持する。
+    forked worker は無条件に拒否する。許可される command 集合そのものは下記 allowlist が定義する。
 
   分割が必要な理由は fork の非対称性である: forked worker は server の直接 parent ではないため、
   継承した handle への `Popen.poll()` は `waitpid` の `ChildProcessError` 経由で
@@ -1116,10 +1117,18 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
   `server reload-config` 等を forked worker が dispatch できた。よって **smoke が必要とする
   client call を `CLIENT_CALL_SUBCOMMANDS` として閉じた集合で定義し、それ以外は全 process で拒否する**
   (`command_not_allowlisted`)。mint process のみ `MINTER_ONLY_SUBCOMMANDS` (= 自分が起動した
-  server への graceful `server stop`) を追加で持つ。この形は Herdr の将来の CLI 追加に対しても
-  既定拒否であり、「次に何が来るか」を予測する必要がない。allowlist に control 動詞
+  server への graceful `server stop`) を追加で持つ。allowlist に control 動詞
   (`stop` / `delete` / `attach` / `reload-config` / `reset-keys` / `set`) が紛れ込まないことを
   drift test で固定する。
+
+  **保証範囲は `(group, subcommand)` pair に限る** (review j#91638 finding_3 / 仮説)。
+  判定は argv の当該 2 token に対して行うので、この allowlist が既定拒否にできるのは
+  **新しい command pair** である。既に allowlist 済みの pair へ将来追加される option
+  (例: 既存 pair に endpoint selector が生える形) は閉じていない。「Herdr の将来の追加を
+  すべて拒否する」とは書かない — 実装が保証していない強さの主張はしない。現行 v0.7.4 では
+  先行 global flag (`--session <name>` / `--remote <target>`) は `command[1:3]` を
+  allowlist 外へずらすため zero-dispatch で拒否される。この argv grammar 上の境界を
+  drift test で固定し、Herdr 側の parser 変更で前提が崩れたら検出できるようにする。
 - **worker timeout は process 起動前に domain 検証し、cleanup は例外経路でも通す** (review j#91604 F2)。
   `--process-timeout` を無制約 `float` で受けると `inf` / `nan` / 0 / 負値が
   `Process.join()` まで到達し、**全 worker を起動した後**に `OverflowError` で driver を巻き戻す。
@@ -1132,6 +1141,23 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     最終 kill 後に `is_alive()` を再確認する。generic kill / name scan は行わない。
   - 生存した worker 数を `worker_processes_orphaned` として evidence に出し、`success` へ `== 0` を
     連言する。fork round が完了しなかった場合は `-1` (「残留 0 だった」ではなく「確定できなかった」)。
+- **worker containment は teardown の前段 fence であり、事後 boolean ではない** (review j#91638 F1)。
+  survivor 数を `success` に連言するだけでは、危険な teardown が起きたことを事後に採点するに過ぎない。
+  worker は non-minter なので owned child liveness を照合できず、**socket / owned root を解放した後も
+  生存 worker は同 path へ actuate しうる**。よって:
+  - fork round は例外経路を含め **必ず構造化結果を返す** (receipts / missing / orphan count /
+    失敗した場合の closed token)。例外で結果を捨てると、reap で確定した containment の答えも
+    失敗分岐の evidence も同時に失われる。`KeyboardInterrupt` / `SystemExit` は捕捉せず伝播させるが、
+    その場合も exact-handle reap は `finally` で通る。
+  - teardown は containment verdict を**引数として受け取る**。survivor が残る、または確定できない
+    (`-1`) 場合は **owned root / socket path を解放しない**。生存 worker が再 actuate しうる path を
+    先に手放さないことを containment の定義とし、`owned_root_released` を evidence に出す。
+    未解放は `endpoint_residue > 0` として既存 success 連言でも落ちる。
+  - `server stop` 自体は containment を**強める**方向 (自 socket を死なせる) なので停止は行う。
+    withhold するのは path の解放のみ。cleanup (`pane close` 等) も fence しない — 実行した方が
+    residue が減り、かつ path 解放を伴わないため。
+  - load-bearing test は「正常 return の survivor」と「partial-start / queue-close / join-thread
+    例外」の双方で **root removal 0** を要求する。
 - **evidence は 2 方向の負証明を持つ。** `operator_endpoint_requests` (実際に dispatch された
   operator endpoint 宛 request 数) と `endpoint_escape_refusals` (dispatch 前に拒否した数) は
   互いに独立で、健全な run では双方 0。binding を落とすと後者が、gate を落とすと前者が動く。

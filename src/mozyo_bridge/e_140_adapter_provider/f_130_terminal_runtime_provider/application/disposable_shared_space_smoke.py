@@ -46,7 +46,10 @@ def bounded_process_timeout(timeout: object) -> float:
     """
     try:
         value = float(timeout)  # type: ignore[arg-type]
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
+        # ``OverflowError`` is the huge-int case (``float(10**10000)``).  It is an
+        # ``ArithmeticError``, so leaving it out let a direct caller reach a raw
+        # traceback instead of a typed, renderable refusal (review j#91638 F2).
         raise SharedSpaceSmokeError(
             "smoke worker timeout must be a number of seconds"
         ) from exc
@@ -91,10 +94,30 @@ def _reap_exact_workers(started: Sequence) -> int:
 
 @dataclass(frozen=True)
 class _ForkedRun:
-    """What one bounded fork round produced, including its own cleanup verdict."""
+    """What one bounded fork round produced, including its own cleanup verdict.
+
+    Returned on **every** path, including the one where the round raised (review
+    j#91638 F1): the reaping in the ``finally`` already established how many owned
+    workers survived, and letting the exception discard that answer is exactly how the
+    caller ended up tearing the endpoint down with no idea whether anything was still
+    running — and with no evidence to render either.
+    """
 
     receipts: tuple
     orphaned_workers: int
+    round_failed: bool = False
+    #: Exception class name only.  A type name is a closed-enough token for evidence;
+    #: the message could carry a path and never enters the report.
+    failure_kind: str = ""
+
+    @property
+    def workers_contained(self) -> bool:
+        """Whether every owned worker is provably gone.
+
+        The teardown fence reads this *before* releasing anything, so an indeterminate
+        count is not containment: ``-1`` fails here exactly like a live survivor.
+        """
+        return self.orphaned_workers == 0
 
 
 @dataclass(frozen=True)
@@ -203,6 +226,9 @@ def _run_forked_projects(
     ]
     started: list = []
     orphaned = 0
+    round_failed = False
+    failure_kind = ""
+    receipts: list = []
     try:
         receipts = _collect_forked_receipts(
             processes=processes,
@@ -211,11 +237,46 @@ def _run_forked_projects(
             output=output,
             timeout=bounded,
         )
+    except Exception as exc:  # noqa: BLE001 - the round's verdict must survive it
+        # Partial start, a queue-collection failure, ``output.close()`` — whatever it
+        # was, the caller still needs the containment answer and a renderable report.
+        # ``BaseException`` (KeyboardInterrupt/SystemExit) is deliberately NOT caught;
+        # the ``finally`` below still reaps before it propagates.
+        round_failed = True
+        failure_kind = type(exc).__name__
+        receipts = _unreported_receipts(specs)
     finally:
         # Runs even if ``start()`` itself failed halfway through the fleet: only the
         # handles that actually started are in ``started``.
         orphaned = _reap_exact_workers(started)
-    return _ForkedRun(receipts=tuple(receipts), orphaned_workers=orphaned)
+    return _ForkedRun(
+        receipts=tuple(receipts),
+        orphaned_workers=orphaned,
+        round_failed=round_failed,
+        failure_kind=failure_kind,
+    )
+
+
+def _unreported_receipts(specs: Sequence[_ProjectSpec]) -> list:
+    """One typed ``failed`` receipt per project, with no endpoint-gate snapshot.
+
+    Used when the round died before collection: every project is unreported, so the
+    aggregate counts each as a *missing* gate receipt rather than as a process that
+    proved it made zero external requests.
+    """
+    return [
+        _ProcessReceipt(
+            index=index,
+            observation=ProjectSmokeObservation(
+                project_key=spec.project_key,
+                workspace_id="",
+                outcome="failed",
+                coordinators_workspace_id="",
+                failure_phase=PHASE_WORKER_ERROR,
+            ),
+        )
+        for index, spec in enumerate(specs)
+    ]
 
 
 def _collect_forked_receipts(
@@ -322,8 +383,12 @@ def run_disposable_shared_space_smoke(
     # reports leaves its ``None`` in place, and the aggregate counts it as missing
     # rather than as a process that made zero requests (review j#85841 F1).
     worker_gate_receipts: list = [None] * count
-    # Seeded to the fail-closed value: only a completed fork round may lower it.
+    # Seeded to the fail-closed values: only a completed fork round may lower them.
     orphaned_workers = -1
+    round_failure_kind = ""
+    # Containment starts satisfied only because no worker exists yet; the moment the
+    # fork round runs, its verdict replaces this.
+    workers_contained = True
     try:
         with instance:
             with isolated_smoke_home(Path(isolated_home)) as capability:
@@ -356,6 +421,12 @@ def run_disposable_shared_space_smoke(
                 )
                 receipts = forked.receipts
                 orphaned_workers = forked.orphaned_workers
+                # The containment fence, established BEFORE anything is torn down.
+                # A survivor (or an indeterminate count) means the socket path this
+                # run owns must not be handed back, because a worker still holding
+                # client-call capability could address whatever binds it next.
+                workers_contained = forked.workers_contained
+                round_failure_kind = forked.failure_kind
                 observations = [receipt.observation for receipt in receipts]
                 worker_gate_receipts = [receipt.endpoint_gate for receipt in receipts]
                 for receipt in receipts:
@@ -391,8 +462,10 @@ def run_disposable_shared_space_smoke(
                 )
     finally:
         # ``with instance`` already shuts down.  This idempotent call covers a
-        # pre-enter/startup exception without broad process discovery.
-        instance.shutdown()
+        # pre-enter/startup exception without broad process discovery.  ``release_root``
+        # carries the containment verdict computed above, so the decision reaches the
+        # teardown instead of being scored after it (review j#91638 F1).
+        instance.shutdown(release_root=workers_contained)
     # Folded only now, so the parent snapshot also covers cleanup, residue verification
     # and the shutdown ``server stop`` that ran in the ``finally`` above.
     gate = EndpointGateEvidence.aggregate(
@@ -407,6 +480,9 @@ def run_disposable_shared_space_smoke(
     #: Reported rather than folded into a bool, because "we could not tell" and "there
     #: were none" are different facts (review j#91604 F2).
     evidence["worker_processes_orphaned"] = orphaned_workers
+    evidence["workers_contained"] = workers_contained
+    #: Closed token: the exception class that ended the fork round, or "".
+    evidence["fork_round_failure"] = round_failure_kind
     evidence["success"] = bool(
         summary.converged
         and summary.residue_clear
@@ -430,7 +506,11 @@ def run_disposable_shared_space_smoke(
         # A worker that outlived even the kill may still be actuating Herdr while the
         # server and the owned root are being torn down, so the run has not converged
         # and cleaned up no matter how good the rest of the evidence looks.
+        and workers_contained
         and orphaned_workers == 0
+        and not round_failure_kind
+        # Withheld root release means the owned tree is deliberately still there.
+        and evidence.get("owned_root_released", False)
     )
     return evidence
 

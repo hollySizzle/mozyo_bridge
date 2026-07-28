@@ -333,16 +333,87 @@ class WorkerTimeoutAndCleanupTests(unittest.TestCase):
             with mock.patch.object(
                 _driver_module, "_collect_forked_receipts", _boom
             ):
-                with self.assertRaises(RuntimeError):
-                    _run_forked_projects(
-                        harnesses=harnesses, specs=specs,
-                        timeout=20.0, gate_runner=gate_runner,
-                    )
+                forked = _run_forked_projects(
+                    harnesses=harnesses, specs=specs,
+                    timeout=20.0, gate_runner=gate_runner,
+                )
             self.assertEqual(len(started_names), 2, "premise lost: no workers started")
             self.assertEqual(
                 self._live_smoke_workers(), [],
                 "owned workers outlived the driver's exception path",
             )
+            # The verdict the exception used to discard (review j#91638 F1).
+            self.assertTrue(forked.round_failed)
+            self.assertEqual(forked.failure_kind, "RuntimeError")
+            self.assertEqual(forked.orphaned_workers, 0)
+            self.assertTrue(forked.workers_contained)
+            self.assertEqual(
+                len(forked.receipts), 2, "every project must still carry a receipt"
+            )
+            self.assertTrue(
+                all(r.endpoint_gate is None for r in forked.receipts),
+                "an unreported round must count as MISSING gate snapshots, not zeros",
+            )
+            self.assertTrue(
+                all(r.observation.outcome == "failed" for r in forked.receipts)
+            )
+
+    def test_an_uncontained_survivor_withholds_the_owned_root(self) -> None:
+        """The fence itself: teardown consults the verdict instead of scoring it.
+
+        A ``_ForkedRun`` that reports a survivor must leave the socket path in place,
+        because a worker still holding client-call capability could address whatever
+        binds it next.
+        """
+        for orphans, expect_released in ((1, False), (-1, False), (0, True)):
+            with self.subTest(orphans=orphans):
+                run = _driver_module._ForkedRun(receipts=(), orphaned_workers=orphans)
+                self.assertEqual(run.workers_contained, expect_released)
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    process = _FakeOwnedProcess()
+                    instance = DisposableHerdrInstance(
+                        binary="/bin/true",
+                        root=Path(tmp) / "instance",
+                        base_env={"HOME": str(Path(tmp) / "operator")},
+                        runner=lambda argv, **k: subprocess.CompletedProcess(
+                            argv, 0, "[]", ""
+                        ),
+                        popen_factory=lambda argv, **k: process,
+                        sleeper=lambda _s: None,
+                        ambient_env={},
+                    )
+                    instance.start()
+                    root = instance.root
+                    instance.shutdown(release_root=run.workers_contained)
+                    self.assertEqual(
+                        root.exists(),
+                        not expect_released,
+                        "root removal must follow the containment verdict",
+                    )
+                    self.assertEqual(
+                        instance.as_evidence()["owned_root_released"], expect_released
+                    )
+
+
+class _FakeOwnedProcess:
+    def __init__(self) -> None:
+        self.pid = 717171
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.returncode = -9
 
 
 def _gate_runner_for(root: Path) -> EndpointBoundHerdrRunner:

@@ -118,7 +118,11 @@ def cmd_herdr_smoke_shared_space(args: argparse.Namespace) -> int:
                 Path(isolated_home),
                 env=os.environ,
                 projects=projects,
-                process_timeout=float(getattr(args, "process_timeout", 45.0)),
+                # Passed through unconverted: the driver's own
+                # ``bounded_process_timeout`` is the single domain authority.  A bare
+                # ``float()`` here was a second, weaker check in front of it, and it
+                # raised untyped for a huge int (review j#91638 F2).
+                process_timeout=getattr(args, "process_timeout", 45.0),
             )
         else:
             report = smoke_shared_space_preflight(
