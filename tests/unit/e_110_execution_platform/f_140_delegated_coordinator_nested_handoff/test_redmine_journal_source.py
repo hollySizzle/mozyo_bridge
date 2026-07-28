@@ -355,6 +355,10 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             ("][ trigger, not a link", "prose ][ <script> ]\n\n%s\n</script>" % self.GATE),
             ("]: trigger, not a link", "prose ]: <script>\n\n%s\n</script>" % self.GATE),
             ("![ trigger, not a link", "prose ![ <script> ]\n\n%s\n</script>" % self.GATE),
+            # #14584 j#91839: a URL is not prose, so a marker inside an autolink is no
+            # more a declaration than one inside [text](URL).
+            ("marker inside a URI autolink", "<https://example.test/%s>" % self.GATE),
+            ("marker inside a mailto autolink", "<mailto:a@x.test?s=%s>" % self.GATE),
             ("definition title on the next line", '[foo]: /url\n  "%s"' % self.GATE),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % self.GATE),
             ("image alt text", "![a %s b](img.png)" % self.GATE),

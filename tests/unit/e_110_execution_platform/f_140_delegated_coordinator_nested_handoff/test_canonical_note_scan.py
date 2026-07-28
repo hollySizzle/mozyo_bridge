@@ -554,6 +554,25 @@ class PassOrderTest(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(_gates(note), ("review_request",))
 
+    def test_a_marker_inside_an_autolink_is_not_a_declaration(self):
+        # "Not markup" and "not authority" are two decisions. Excluding autolinks from rule E and
+        # leaving them visible to the marker scan let a marker written into the URL become a gate
+        # (#14584 j#91839) — while rule F refuses the very same marker in [text](URL). The renderer
+        # cannot arbitrate this one: an autolink's URL is also its label, so the marker IS visible
+        # text. What settles it is that a URL is not prose.
+        for label, note in (
+            ("URI autolink", "<https://example.test/%s>" % MARKER),
+            ("mailto autolink", "<mailto:a@x.test?s=%s>" % MARKER),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ())
+
+    def test_an_autolink_costs_nothing_to_what_follows_it(self):
+        # Both controls the refusal has to keep: a marker recorded after an autolink is still the
+        # writer's own voice, and a real tag after one still refuses the rest of the note.
+        self.assertEqual(_gates(f"see <https://example.test/> here\n\n{MARKER}"), ("review_request",))
+        self.assertEqual(_gates(f"see <https://example.test/> <code>\nq\n\n{MARKER}"), ())
+
     def test_markup_outside_the_link_region_still_refuses_the_note(self):
         # And the mask must stay SMALL enough: a tag past the link, or past a definition's
         # destination, is real raw HTML. `[r]: /u <code>` is not even a definition — a title has to

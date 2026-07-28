@@ -87,8 +87,14 @@ real ``<script>`` opener (#14584 j#91792). "A smaller approximation only costs a
 only while the approximation is a SUBSET of the real region, and a false trigger has no real region
 to be a subset of.
 
-What is safe is fixing E's own vocabulary: ``<scheme:…>`` and ``<user@host>`` are **autolinks, not
-raw HTML** (§6.5), wherever they appear. E skips them, which needs no claim about links at all.
+- **G. autolink** — ``<scheme:…>`` and ``<user@host>``, blanked in full. These are **links, not raw
+  HTML** (§6.5), so E must not refuse a note for one; and their content is **a URL, not prose**, so a
+  marker inside one is no more a declaration than a marker in ``[text](URL)``, which F already
+  refuses. Excluding them from E while leaving them visible to the marker scan let
+  ``<https://example.test/[mozyo:…]>`` become a gate and an exact work anchor (#14584 j#91839) —
+  "not markup" and "not authority" are two decisions, and fixing the first said nothing about the
+  second. Blanking is safe here in the way the link mask was not: the span is EXACT-matched and
+  cannot contain ``<``, ``>`` or a space, so it can never hide a real tag.
 
 What remains is an over-blank this module accepts on purpose: a tag-shaped **title**
 (``[text](url "<code>")``) still starts a refusal. The renderer hides it, but nothing short of
@@ -299,17 +305,41 @@ def _first_hidden_construct(line: str) -> int:
     Markdown's link syntax hides content too, and is refused the same way — see
     :func:`_blank_from_link_syntax`. The only difference is how far the refusal runs.
 
-    An autolink is skipped because it is a LINK, not raw HTML (§6.5) — true wherever it appears, so
-    unlike masking "what looks like a link region" it cannot be defeated by a lexical trigger that
-    is not a link at all (#14584 j#91792).
+    Autolinks never reach this: :func:`_blank_autolinks` has already removed them, because they are
+    links rather than raw HTML (§6.5) AND their URL is not prose. Stating that once, as a blank,
+    rather than twice — a skip here and a blank there — is deliberate; this module has been bitten
+    repeatedly by one rule living in two places.
     """
     for match in _HIDDEN_CONSTRUCT_START.finditer(line):
-        if _is_escaped(line, match.start()):
-            continue
-        if _AUTOLINK.match(line, match.start()):
-            continue
-        return match.start()
+        if not _is_escaped(line, match.start()):
+            return match.start()
     return -1
+
+
+def _blank_autolinks(text: str) -> str:
+    """``text`` with every autolink blanked, preserving character positions (pure).
+
+    An autolink is a link whose URI is both destination and label (§6.5). Two things follow, and
+    both were learned the hard way:
+
+    - it is **not raw HTML**, so rule E must not refuse the rest of the note for it — reading
+      ``[docs](<https://example.com>)`` as markup erased live gate events (#14584 j#91761);
+    - its content is **a URL, not prose**, so a marker written inside it is no more a declaration
+      than one written in ``[text](URL)``, which rule F already refuses. Excluding it from E while
+      leaving it visible to the marker scan let ``<https://example.test/[mozyo:…]>`` become a gate
+      and an exact work anchor (#14584 j#91839).
+
+    Blanking the span is safe in the way the earlier link mask was not: the region is EXACT-matched,
+    and an autolink cannot contain ``<``, ``>`` or a space, so this can never hide a real tag.
+    """
+    chars = list(text)
+    for match in _AUTOLINK.finditer(text):
+        if _is_escaped(text, match.start()):
+            continue
+        for index in range(match.start(), match.end()):
+            if chars[index] != "\n":
+                chars[index] = " "
+    return "".join(chars)
 
 
 def _blank_from_link_syntax(text: str) -> str:
@@ -442,8 +472,9 @@ def canonical_note_lines(notes: str) -> tuple[str, ...]:
     classified = _classify_block_structure(lines_in)
     lines = [text for text, _paragraph, _blanked in classified]
     paragraphs = _paragraph_runs(classified)
-    for start, end in paragraphs:  # renderer-faithful: a closed span hides what the renderer hides
-        lines[start:end] = _blank_closed_code_spans("\n".join(lines[start:end])).split("\n")
+    for start, end in paragraphs:  # renderer-faithful: these hide exactly what the renderer hides
+        joined = _blank_closed_code_spans("\n".join(lines[start:end]))
+        lines[start:end] = _blank_autolinks(joined).split("\n")
     # E is READ here, before anything that hides more than the renderer does.
     cutoff = next(
         (index for index, line in enumerate(lines) if _first_hidden_construct(line) >= 0), None

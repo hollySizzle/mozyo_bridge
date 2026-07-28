@@ -189,6 +189,10 @@ class FailClosedTest(unittest.TestCase):
             ("][ trigger, not a link", "prose ][ <script> ]\n\n%s\n</script>" % marker),
             ("]: trigger, not a link", "prose ]: <script>\n\n%s\n</script>" % marker),
             ("![ trigger, not a link", "prose ![ <script> ]\n\n%s\n</script>" % marker),
+            # #14584 j#91839: a URL is not prose, so a marker inside an autolink is no
+            # more a declaration than one inside [text](URL).
+            ("marker inside a URI autolink", "<https://example.test/%s>" % marker),
+            ("marker inside a mailto autolink", "<mailto:a@x.test?s=%s>" % marker),
             ("definition title on the next line", '[foo]: /url\n  "%s"' % marker),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % marker),
             ("image alt text", "![a %s b](img.png)" % marker),

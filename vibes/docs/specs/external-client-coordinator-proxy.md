@@ -210,6 +210,17 @@ authorize したかを照合しなければ scope は未検証のままである
     → 正しい対処は **E の語彙を renderer 忠実に直すこと**: `<scheme:…>` / `<user@host>` は §6.5 の
     **autolink であって raw HTML ではない**。これは出現位置に依らず真なので、link 文脈についての
     主張を一切必要としない。
+    - **G. autolink** — exact match した span を**丸ごと blank する**。
+      ★★★**「markup ではない」と「authority ではない」は別の判断である** (#14584 j#91839)。E から
+      除外しただけで marker scan から除外しなかったため、`<https://example.test/[marker]>` が
+      gate / work anchor として通った。**autolink の内容は URL であって散文ではなく**、Rule F が
+      `[text](URL)` 内の marker を拒否するのと同じ理由で拒否されなければならない。blank が安全なのは
+      **span が exact match** で、その内部が定義上 `<` / `>` / 空白を含まない (= 実 tag を隠しようがない)
+      からであり、R8 の lexical mask とは前提が異なる。
+      ★★★**oracle はこの finding を検出できない。** autolink は URL が label を兼ねるので marker は
+      **可視 text node** として描画される。**「可視か」は測れるが「散文か」は測れない** — 契約
+      (Rule F、「marker は coordinator の可視な*散文*上の自己宣言」) が裁定する。
+      **differential oracle が緑でも、契約整合は別に確かめる。**
     - 残る **意図的 over-blank**: tag 形の **title** (`[text](url "<code>")`) は autolink 形ではないので
       E が発火する。renderer は隠すが、**隠れていることを link を parse せずに証明できない**。
       復旧可能な向きなので拒否側に倒す。
