@@ -47,7 +47,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
-from mozyo_bridge.core.state.sublane_tab_fence import sublane_tab_create_lock
+from mozyo_bridge.core.state.sublane_tab_fence import (
+    SublaneTabCreateLockUnavailable,
+    SublaneTabCreateReleaseError,
+    sublane_tab_create_lock,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
     AGENT_KEY_TAB,
     HerdrSessionStartError,
@@ -93,14 +97,24 @@ def _parse_tab_list(stdout: object) -> Optional[dict]:
     is an EXACT label match, so a padded ``" sublanes "`` or a case-variant ``"Sublanes"``
     is a DIFFERENT label and must not be normalised into the authority label. A missing /
     non-string label is the empty string (present but unlabelled, so it never matches). An
-    entry with no ``tab_id`` is skipped. An EMPTY list is a valid readable result (no tabs)
-    and yields ``{}``.
+    EMPTY list is a valid readable result — there really are no tabs — and yields ``{}``.
 
     Returns ``None`` — "labels unreadable", which the resolver treats as fail-closed —
-    when the payload is not JSON, exposes no recognisable tab container, **or repeats a
+    when the payload is not JSON, exposes no recognisable tab container, **repeats a
     ``tab_id``** (a herdr identity that appears twice in one snapshot is an identity
     conflict: keeping the last-seen label would make the whole label authority
-    order-dependent). Never a guess; never raises.
+    order-dependent), **or contains any row this parser cannot read** — a non-mapping
+    element, or one whose ``tab_id`` is missing / blank / non-string.
+
+    That last rule is why ``{}`` means something precise (review j#91241 F1). ``{}`` is
+    the positive claim "this workspace has no tabs", and the resolver acts on it by
+    CREATING one. Skipping unreadable rows would let a container that is plainly non-empty
+    produce that same ``{}``, so a payload whose rows key the id differently (say ``id``
+    instead of ``tab_id``) would read as "no shared tab exists" and mint a duplicate beside
+    the real one. The live ``tab list`` shape has not been measured yet, which is exactly
+    the condition under which "I could not read this" must never be reported as "there is
+    nothing there". When the real payload is confirmed, widen the accepted shape here
+    deliberately — never by resuming the skip. Never a guess; never raises.
     """
     payload = stdout
     if isinstance(stdout, str):
@@ -114,10 +128,16 @@ def _parse_tab_list(stdout: object) -> Optional[dict]:
     labels: dict = {}
     for entry in container:
         if not isinstance(entry, Mapping):
-            continue
-        tab_id = _norm(entry.get("tab_id"))
+            return None
+        raw_tab_id = entry.get("tab_id")
+        # The ``isinstance`` check is load-bearing: ``_norm`` stringifies anything, so a
+        # numeric / structured ``tab_id`` would otherwise become a plausible-looking token
+        # ("7") that no herdr tab can ever match — a misread payload dressed as data.
+        if not isinstance(raw_tab_id, str):
+            return None
+        tab_id = _norm(raw_tab_id)
         if not tab_id:
-            continue
+            return None
         if tab_id in labels:
             # A duplicate herdr tab identity in one snapshot: the label authority must not
             # depend on which row we saw last. Fail closed on the whole payload.
@@ -292,27 +312,60 @@ def resolve_shared_tab_target(
 
     ``list_tabs`` / ``create_tab`` are injected (the herdr command pair), keeping this
     function free of subprocess knowledge and directly testable.
+
+    Every fence failure is converted to :class:`HerdrSessionStartError` (review j#91241 F2),
+    because that is the only type the launch front doors catch — a raw lock error would
+    escape ``herdr session-start`` / the bare ``mozyo`` launch as an unformatted traceback
+    instead of the fail-closed message they render. The two phases are converted separately
+    because they are true of different things, and the wording states only what THIS rail
+    can vouch for:
+
+    - **acquisition** runs before any herdr command here, so no tab and no agent exist.
+      It deliberately does NOT claim "no workspace was created": the host workspace is
+      resolved by ``herdr_host_workspace.resolve_host_workspace`` EARLIER in the same run,
+      so a fresh sublane host may well have been minted already. Copying the coordinator
+      fence's wider "no workspace / tab / agent" sentence would make this message false.
+    - **release** runs after the body, so the shared tab was already resolved — adopted, or
+      created on a clean slate — and no agent has started yet. A labelled, slot-less tab may
+      remain; a re-run adopts it idempotently rather than minting a second one.
     """
     if not target_workspace:
         raise HerdrSessionStartError(
             "shared sublane tab resolution requires a resolved host workspace; refuse to "
             "list or create a tab without one"
         )
-    with sublane_tab_create_lock(workspace_id, home=home):
-        # Read the labels UNDER the lock: a peer that created the shared tab between our
-        # decision to launch and this point must be observed, not duplicated.
-        target_tab = resolve_shared_tab_from_labels(
-            list_tabs(target_workspace), shared_label, target_workspace=target_workspace
-        )
-        verify_shared_tab_consistency(
-            host_lane_slot_tabs(rows, workspace_id, target_workspace),
-            authority_tab=target_tab,
-            target_workspace=target_workspace,
-            shared_label=shared_label,
-        )
-        if target_tab:
-            return target_tab, ""
-        return create_tab(target_workspace, shared_label)
+    try:
+        with sublane_tab_create_lock(workspace_id, home=home):
+            # Read the labels UNDER the lock: a peer that created the shared tab between
+            # our decision to launch and this point must be observed, not duplicated.
+            target_tab = resolve_shared_tab_from_labels(
+                list_tabs(target_workspace),
+                shared_label,
+                target_workspace=target_workspace,
+            )
+            verify_shared_tab_consistency(
+                host_lane_slot_tabs(rows, workspace_id, target_workspace),
+                authority_tab=target_tab,
+                target_workspace=target_workspace,
+                shared_label=shared_label,
+            )
+            if target_tab:
+                return target_tab, ""
+            return create_tab(target_workspace, shared_label)
+    except SublaneTabCreateReleaseError as exc:
+        raise HerdrSessionStartError(
+            "the shared sublane tab was resolved for workspace "
+            f"{target_workspace!r} but the single-flight lock could not be released "
+            f"({exc}); no agent was started. A tab labelled {shared_label!r} may remain "
+            "with no slots in it — re-run to adopt it idempotently (no duplicate is "
+            "created)."
+        ) from exc
+    except SublaneTabCreateLockUnavailable as exc:
+        raise HerdrSessionStartError(
+            "could not acquire the shared sublane tab single-flight lock for workspace "
+            f"{target_workspace!r} ({exc}); no tab and no agent were created. Re-run once "
+            "the home lock is reachable."
+        ) from exc
 
 
 @dataclass(frozen=True)

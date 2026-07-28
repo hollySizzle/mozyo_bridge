@@ -46,6 +46,7 @@ from unittest.mock import patch
 from mozyo_bridge.core.state.sublane_tab_fence import (
     SUBLANE_TAB_CREATE_LOCK_PREFIX,
     SublaneTabCreateLockUnavailable,
+    SublaneTabCreateReleaseError,
     sublane_tab_create_lock,
     sublane_tab_create_lock_path,
 )
@@ -88,6 +89,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _parse_tab_list,
     host_lane_slot_tabs,
     resolve_shared_tab_from_labels,
+    resolve_shared_tab_target,
     verify_shared_tab_consistency,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
@@ -370,7 +372,38 @@ class TabListParserTest(unittest.TestCase):
             with self.subTest(payload=str(payload)[:32]):
                 self.assertIsNone(_parse_tab_list(payload))
 
+    def test_a_row_this_parser_cannot_read_makes_the_payload_unreadable(self) -> None:
+        # Review j#91241 F1. Skipping unreadable rows let a plainly NON-EMPTY container
+        # produce `{}`, which is the positive claim "this workspace has no tabs" — and the
+        # resolver acts on that by creating one. Since the live payload shape is still
+        # unmeasured, a rows-key-it-differently payload is exactly the realistic case, and
+        # it would have minted a duplicate beside the real shared tab.
+        for payload in (
+            json.dumps({"tabs": [{"id": "w1:t1", "label": SHARED_SUBLANE_TAB_LABEL}]}),
+            json.dumps({"tabs": ["not-a-tab-row"]}),
+            json.dumps({"tabs": [{"tab_id": "", "label": SHARED_SUBLANE_TAB_LABEL}]}),
+            json.dumps({"tabs": [{"tab_id": None}]}),
+            json.dumps({"tabs": [{"tab_id": 7}]}),
+            json.dumps({"tabs": [{"tab_id": "   "}]}),
+            # One good row does not license skipping the bad one beside it.
+            json.dumps(
+                {
+                    "tabs": [
+                        {"tab_id": "w1:t1", "label": SHARED_SUBLANE_TAB_LABEL},
+                        {"id": "w1:t2", "label": ""},
+                    ]
+                }
+            ),
+        ):
+            with self.subTest(payload=payload[:44]):
+                self.assertIsNone(
+                    _parse_tab_list(payload),
+                    "an unreadable row must not be reported as 'there are no tabs'",
+                )
+
     def test_empty_list_is_readable_and_means_no_tabs(self) -> None:
+        # The one case that legitimately yields `{}`: a readable container that really is
+        # empty. This is what keeps the create path reachable at all.
         self.assertEqual(_parse_tab_list(json.dumps({"tabs": []})), {})
 
 
@@ -517,6 +550,120 @@ class FenceTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 with sublane_tab_create_lock("wsA", home=Path(tmp)):
                     raise ValueError("body fault")
+
+
+class LockFailureReachesTheLaunchBoundaryTest(unittest.TestCase):
+    """Review j#91241 F2: a fence failure must arrive as the launch's own typed error.
+
+    The launch front doors (`herdr session-start`, the bare `mozyo` launch) catch exactly
+    :class:`HerdrSessionStartError`. A raw lock error would escape them as an unformatted
+    traceback instead of the fail-closed message they render — the fence would still be
+    safe, but the operator would not be told what happened or what to do.
+    """
+
+    def _resolve(self, workspace_id, *, home=None):
+        calls: list = []
+        with self.assertRaises(HerdrSessionStartError) as ctx:
+            resolve_shared_tab_target(
+                [],
+                workspace_id,
+                "w1",
+                list_tabs=lambda ws: calls.append(("list", ws)),
+                create_tab=lambda ws, label: calls.append(("create", ws, label)),
+                home=home,
+            )
+        return ctx.exception, calls
+
+    def test_acquire_failure_is_typed_and_creates_nothing(self) -> None:
+        exc, calls = self._resolve("bad/workspace id")
+        self.assertEqual(calls, [], "zero herdr commands before the lock is held")
+        self.assertIn("could not acquire", str(exc))
+
+    def test_the_acquire_message_does_not_claim_the_workspace_was_untouched(self) -> None:
+        # The coordinator fence says "no workspace / tab / agent was created" because it
+        # guards the FIRST side effect of the run. This rail does not: the host workspace
+        # is resolved earlier in the same run, so a fresh sublane host may already exist.
+        # Copying that wider sentence here would make the message false.
+        exc, _calls = self._resolve("bad/workspace id")
+        message = str(exc)
+        self.assertIn("no tab and no agent were created", message)
+        self.assertNotIn("no workspace", message)
+
+    def test_release_failure_says_the_tab_may_survive(self) -> None:
+        # Release runs AFTER the body, so a tab may have been created. The message must
+        # not read like the acquire case, or an operator would look for residue that the
+        # acquire path never leaves — and miss the residue this path does.
+        import contextlib
+
+        @contextlib.contextmanager
+        def _release_boom(workspace_id, *, home=None):
+            yield
+            raise SublaneTabCreateReleaseError("unlock refused")
+
+        target = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_shared_tab.sublane_tab_create_lock"
+        )
+        with patch(target, _release_boom):
+            with self.assertRaises(HerdrSessionStartError) as ctx:
+                resolve_shared_tab_target(
+                    [],
+                    "wsA",
+                    "w1",
+                    list_tabs=lambda ws: {},
+                    create_tab=lambda ws, label: ("w1:t1", "w1:t1-root"),
+                )
+        message = str(ctx.exception)
+        self.assertIn("could not be released", message)
+        self.assertIn("may remain", message)
+        self.assertIn("adopt it idempotently", message)
+        self.assertNotIn("no tab and no agent were created", message)
+
+    def test_the_launch_front_door_renders_it_instead_of_raising_raw(self) -> None:
+        # GUARD BITE at the real boundary: `prepare_session` must let the CLI's
+        # `except HerdrSessionStartError` catch this, so the command exits with the
+        # formatted message rather than a traceback.
+        import contextlib
+
+        @contextlib.contextmanager
+        def _unavailable(workspace_id, *, home=None):
+            raise SublaneTabCreateLockUnavailable("flock unavailable")
+            yield  # pragma: no cover
+
+        target = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_shared_tab.sublane_tab_create_lock"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ")
+            with patch(target, _unavailable):
+                with self.assertRaises(HerdrSessionStartError):
+                    _prepare(
+                        tmp,
+                        herdr=herdr,
+                        providers=["codex", "claude"],
+                        lane="lane-a",
+                        sublane_tab_topology=SHARED,
+                    )
+            self.assertEqual(herdr.tab_creates, [])
+            self.assertEqual(herdr.start_argvs, [])
+
+    def test_a_body_failure_is_not_relabelled_as_a_lock_failure(self) -> None:
+        # The fence propagates a body exception unchanged; the conversion above must not
+        # swallow it into "could not acquire / release the lock".
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError) as ctx:
+                resolve_shared_tab_target(
+                    [],
+                    "wsA",
+                    "w1",
+                    list_tabs=lambda ws: None,  # unreadable labels
+                    create_tab=lambda ws, label: ("w1:t1", "root"),
+                    home=Path(tmp),
+                )
+            message = str(ctx.exception)
+            self.assertIn("unreadable", message)
+            self.assertNotIn("single-flight lock", message)
 
 
 class GeometryDecisionTest(unittest.TestCase):
@@ -854,6 +1001,23 @@ class SharedTabLaunchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             herdr = _Herdr(created_workspace="wZ")
             herdr.tab_list_unreadable = True
+            with self.assertRaises(HerdrSessionStartError):
+                _prepare(
+                    tmp,
+                    herdr=herdr,
+                    providers=["codex", "claude"],
+                    lane="lane-a",
+                    sublane_tab_topology=SHARED,
+                )
+            self.assertEqual(herdr.tab_creates, [])
+            self.assertEqual(herdr.start_argvs, [])
+
+    def test_a_malformed_tab_row_creates_nothing(self) -> None:
+        # Review j#91241 F1, end to end: the whole launch must refuse rather than mint a
+        # second shared tab beside one it failed to recognise.
+        with tempfile.TemporaryDirectory() as tmp:
+            herdr = _Herdr(created_workspace="wZ")
+            herdr.tab_list_rows = [{"id": "wZ:t1", "label": SHARED_SUBLANE_TAB_LABEL}]
             with self.assertRaises(HerdrSessionStartError):
                 _prepare(
                     tmp,

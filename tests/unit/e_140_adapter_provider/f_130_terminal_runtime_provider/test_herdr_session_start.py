@@ -271,6 +271,11 @@ class _Herdr:
         # `tab_list_unreadable` forces an unparseable payload (labels-unreadable path);
         # `tab_list_fails` makes the command exit non-zero (mechanical failure).
         self.tab_labels: dict = {}
+        # Raw `tab list` rows to emit INSTEAD of rendering them from `tab_labels`. Lets a
+        # test drive a payload whose rows this build cannot read (review j#91241 F1) while
+        # the command itself still succeeds — the case a skip-the-row parser turned into
+        # "there are no tabs".
+        self.tab_list_rows = None
         self.tab_list_unreadable = False
         self.tab_list_fails = False
         self.tab_lists: list = []
@@ -388,11 +393,15 @@ class _Herdr:
                     {
                         "result": {
                             "type": "tab_list",
-                            "tabs": [
-                                {"tab_id": tab_id, "label": label}
-                                for tab_id, label in sorted(self.tab_labels.items())
-                                if tab_id.startswith(f"{wid}:")
-                            ],
+                            "tabs": (
+                                self.tab_list_rows
+                                if self.tab_list_rows is not None
+                                else [
+                                    {"tab_id": tab_id, "label": label}
+                                    for tab_id, label in sorted(self.tab_labels.items())
+                                    if tab_id.startswith(f"{wid}:")
+                                ]
+                            ),
                         }
                     }
                 ),
