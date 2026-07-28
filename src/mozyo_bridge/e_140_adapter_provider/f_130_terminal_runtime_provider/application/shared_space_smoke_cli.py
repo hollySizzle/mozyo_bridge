@@ -30,9 +30,26 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     smoke_shared_space_preflight,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_shared_space_smoke import (  # noqa: E501
+    MAX_PROCESS_TIMEOUT_SECONDS,
+    bounded_process_timeout,
     run_disposable_shared_space_smoke,
 )
 from mozyo_bridge.shared.errors import die
+
+
+def _process_timeout(raw: str) -> float:
+    """Parse ``--process-timeout``, refusing a bound the driver cannot honour.
+
+    ``argparse``'s bare ``float`` happily accepted ``inf`` / ``nan`` / ``0`` / negatives,
+    which only failed much later inside ``Process.join`` — after every worker had been
+    started (review j#91604 F2).  The domain check belongs at the entry point, where
+    refusing costs nothing; :func:`bounded_process_timeout` is the same authority the
+    driver applies to direct callers.
+    """
+    try:
+        return bounded_process_timeout(raw)
+    except Exception as exc:  # noqa: BLE001 - re-typed for argparse's own error path
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _failure_phases(report: dict) -> str:
@@ -61,6 +78,7 @@ def _render_text(report: dict) -> str:
             f"/{report['requested_projects']} "
             f"failure_phases={_failure_phases(report)} "
             f"residue_clear={report['residue_clear']} "
+            f"orphaned_workers={report['worker_processes_orphaned']} "
             f"server_stopped={report['server_stopped']} "
             f"operator_endpoint_requests={report['operator_endpoint_requests']} "
             f"endpoint_escape_refusals={report['endpoint_escape_refusals']} "
@@ -172,9 +190,12 @@ def register_herdr_smoke_shared_space_parser(sub) -> None:
     )
     parser.add_argument(
         "--process-timeout",
-        type=float,
+        type=_process_timeout,
         default=45.0,
-        help="bounded seconds allowed for each smoke worker process (default: 45)",
+        help=(
+            "bounded seconds allowed for each smoke worker process (default: 45; "
+            f"must be finite and within (0, {MAX_PROCESS_TIMEOUT_SECONDS:g}])"
+        ),
     )
     parser.add_argument(
         "--json", action="store_true", help="emit the redacted report as JSON"

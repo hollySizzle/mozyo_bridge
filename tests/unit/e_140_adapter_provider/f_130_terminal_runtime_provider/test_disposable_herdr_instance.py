@@ -425,6 +425,139 @@ def _worker_probe(queue, instance) -> None:
     queue.put((instance._process.poll(), len(seen), refusal))
 
 
+#: Herdr control commands that are NOT client calls, measured read-only from the
+#: installed CLI's own help (``herdr --help`` / ``herdr session --help``, v0.7.4; the
+#: same surface review j#91604 cites from v0.7.1 ``src/cli.rs``).  ``session stop`` /
+#: ``session delete`` accept ``default`` by name — the help says so explicitly — which
+#: is why a denylist of one entry was fail-open.  This fixture is the drift anchor: if
+#: Herdr grows another control, the allowlist still refuses it by construction, and this
+#: list only has to grow for the *assertion* to keep naming real commands.
+HERDR_LIFECYCLE_CONTROLS = (
+    ("session", "stop"),
+    ("session", "delete"),
+    ("session", "attach"),
+    ("session", "list"),
+    ("server", "reload-config"),
+    ("config", "reset-keys"),
+    ("channel", "set"),
+    ("update", "--handoff"),
+    ("worktree", "add"),
+    ("integration", "install"),
+)
+
+
+class ControlSurfaceAllowlistTests(unittest.TestCase):
+    """Only what the smoke needs may be dispatched at all (review j#91604 F1).
+
+    The previous version denylisted ``("server","stop")`` and permitted everything
+    else, so a forked worker could stop or delete the operator's *default* Herdr
+    session. An allowlist inverts the default: an unforeseen control is refused
+    because it was never named, not because someone predicted it.
+    """
+
+    def _instance(self, tmp: str, dispatched: list, process) -> DisposableHerdrInstance:
+        instance = DisposableHerdrInstance(
+            binary="/bin/true",
+            root=Path(tmp) / "instance",
+            base_env={"HOME": str(Path(tmp) / "operator")},
+            runner=lambda argv, **kwargs: dispatched.append(list(argv))
+            or subprocess.CompletedProcess(argv, 0, "[]", ""),
+            popen_factory=lambda argv, **kwargs: process,
+            sleeper=lambda _seconds: None,
+            ambient_env={},
+        )
+        instance.start()
+        return instance
+
+    def test_the_allowlist_names_no_lifecycle_control(self) -> None:
+        """Drift guard: nothing control-shaped may be added to the client allowlist."""
+        overlap = set(HERDR_LIFECYCLE_CONTROLS) & set(live_module.CLIENT_CALL_SUBCOMMANDS)
+        self.assertEqual(overlap, set(), f"lifecycle control(s) in the allowlist: {overlap}")
+        control_verbs = {"stop", "delete", "attach", "reload-config", "reset-keys", "set"}
+        offenders = {
+            pair
+            for pair in live_module.CLIENT_CALL_SUBCOMMANDS
+            if pair[1] in control_verbs
+        }
+        self.assertEqual(offenders, set(), f"control-shaped verbs allowlisted: {offenders}")
+        self.assertEqual(
+            set(live_module.MINTER_ONLY_SUBCOMMANDS),
+            {("server", "stop")},
+            "the minter's extra authority must stay exactly its own graceful stop",
+        )
+
+    def test_every_lifecycle_control_is_refused_with_zero_dispatch(self) -> None:
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            dispatched.clear()
+
+            for group, verb in HERDR_LIFECYCLE_CONTROLS:
+                argv = ["/bin/true", group, verb, "default"]
+                # As the minter (the strongest position anyone holds here).
+                with self.assertRaises(SmokeEndpointEscapeError, msg=argv) as caught:
+                    instance.runner(argv, capture_output=True)
+                self.assertEqual(
+                    caught.exception.reason,
+                    live_module.REFUSAL_COMMAND_NOT_ALLOWLISTED,
+                    f"{group} {verb} was refused for the wrong reason",
+                )
+                # And as a forked worker.
+                with mock.patch.object(
+                    live_module.os, "getpid", return_value=os.getpid() + 1
+                ):
+                    with self.assertRaises(SmokeEndpointEscapeError, msg=argv):
+                        instance.runner(argv, capture_output=True)
+            self.assertEqual(
+                dispatched, [], "a refused control must make zero external requests"
+            )
+
+    def test_the_minters_own_graceful_stop_is_still_allowed(self) -> None:
+        """Baseline: the allowlist must not break the one control cleanup needs."""
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            dispatched.clear()
+            instance.runner(["/bin/true", "server", "stop"], capture_output=True)
+            self.assertEqual(len(dispatched), 1)
+
+            # ...and is still denied to a worker, with the authority reason rather than
+            # the allowlist one: it IS a sanctioned command, just not for that process.
+            with mock.patch.object(
+                live_module.os, "getpid", return_value=os.getpid() + 1
+            ):
+                with self.assertRaises(SmokeEndpointEscapeError) as caught:
+                    instance.runner(["/bin/true", "server", "stop"], capture_output=True)
+            self.assertEqual(
+                caught.exception.reason, REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER
+            )
+            self.assertEqual(len(dispatched), 1)
+
+    def test_allowlisted_client_calls_survive_for_both_processes(self) -> None:
+        """Baseline: the fence must not turn into a blanket refusal."""
+        process = _Process()
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self._instance(tmp, dispatched, process)
+            self.addCleanup(instance.shutdown)
+            dispatched.clear()
+            for group, verb in sorted(live_module.CLIENT_CALL_SUBCOMMANDS):
+                instance.runner(["/bin/true", group, verb], capture_output=True)
+            minter_calls = len(dispatched)
+            self.assertEqual(minter_calls, len(live_module.CLIENT_CALL_SUBCOMMANDS))
+
+            with mock.patch.object(
+                live_module.os, "getpid", return_value=os.getpid() + 1
+            ):
+                for group, verb in sorted(live_module.CLIENT_CALL_SUBCOMMANDS):
+                    instance.runner(["/bin/true", group, verb], capture_output=True)
+            self.assertEqual(len(dispatched), minter_calls * 2)
+
+
 class CrossProcessGateEvidenceTests(unittest.TestCase):
     """The negative proof must span every process that held the capability (F1)."""
 

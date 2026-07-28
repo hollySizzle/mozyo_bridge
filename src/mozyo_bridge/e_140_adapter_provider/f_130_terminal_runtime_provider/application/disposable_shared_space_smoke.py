@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import multiprocessing
 import queue
 from dataclasses import dataclass
@@ -25,6 +26,75 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     SharedSpaceSmokeError,
     SharedSpaceSmokeObservation,
 )
+
+
+#: Upper bound on the per-worker wall clock a caller may ask for.  The smoke is a
+#: bounded diagnostic, so "wait longer than an hour" is a misuse, not a preference.
+MAX_PROCESS_TIMEOUT_SECONDS = 3600.0
+
+
+def bounded_process_timeout(timeout: object) -> float:
+    """Validate the per-worker bound, or refuse **before** any process exists.
+
+    A caller must not be able to express a timeout the driver cannot honour (review
+    j#91604 F2).  ``float('inf')`` used to reach :meth:`multiprocessing.Process.join`,
+    where it raises ``OverflowError`` *after* every worker had already been started —
+    unwinding the driver with owned processes still running and no typed error for the
+    CLI to render evidence from.  ``nan`` and non-positive values are the same class of
+    misuse.  Refusing here, before ``start()``, is the only place where the answer costs
+    nothing.
+    """
+    try:
+        value = float(timeout)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise SharedSpaceSmokeError(
+            "smoke worker timeout must be a number of seconds"
+        ) from exc
+    if not math.isfinite(value) or value <= 0.0 or value > MAX_PROCESS_TIMEOUT_SECONDS:
+        raise SharedSpaceSmokeError(
+            "smoke worker timeout must be a finite number of seconds in "
+            f"(0, {MAX_PROCESS_TIMEOUT_SECONDS:g}]"
+        )
+    return value
+
+
+def _reap_exact_workers(started: Sequence) -> int:
+    """Terminate/kill exactly the workers WE started; return how many survived.
+
+    Only the handles this driver created are ever touched — never a name scan, never a
+    generic kill.  Idempotent, so it is safe as a ``finally`` on both the normal path
+    and an exception path.  The return value is evidence, not decoration: a surviving
+    worker means the run may still be actuating Herdr while the parent tears the server
+    and the owned root down, so the caller must fail closed on it.
+    """
+    for process in started:
+        try:
+            if not process.is_alive():
+                continue
+            process.terminate()
+            process.join(timeout=5.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5.0)
+        except (OSError, ValueError, AssertionError):
+            # A handle we cannot signal is still counted below rather than assumed dead.
+            continue
+    survivors = 0
+    for process in started:
+        try:
+            if process.is_alive():
+                survivors += 1
+        except (OSError, ValueError, AssertionError):
+            survivors += 1
+    return survivors
+
+
+@dataclass(frozen=True)
+class _ForkedRun:
+    """What one bounded fork round produced, including its own cleanup verdict."""
+
+    receipts: tuple
+    orphaned_workers: int
 
 
 @dataclass(frozen=True)
@@ -100,10 +170,21 @@ def _run_forked_projects(
     specs: Sequence[_ProjectSpec],
     timeout: float,
     gate_runner,
-) -> list[_ProcessReceipt]:
-    """Release real OS processes together and collect one receipt per project."""
+) -> _ForkedRun:
+    """Release real OS processes together and collect one receipt per project.
+
+    Every worker this function starts is reaped through its exact handle in a
+    ``finally``, on the normal path and on any exception alike, and the count that
+    survived even a ``kill`` is returned rather than assumed to be zero (review j#91604
+    F2).  Without that, an exception anywhere after ``start()`` unwound the driver with
+    owned workers still actuating Herdr while the caller went on to shut the server and
+    its state tree down.
+    """
     if not specs:
-        return []
+        return _ForkedRun(receipts=(), orphaned_workers=0)
+    # Refused before a single process exists: an unusable bound must never be
+    # discovered by the join that already has children waiting on it.
+    bounded = bounded_process_timeout(timeout)
     try:
         context = multiprocessing.get_context("fork")
     except ValueError as exc:
@@ -120,8 +201,39 @@ def _run_forked_projects(
         )
         for index, spec in enumerate(specs)
     ]
+    started: list = []
+    orphaned = 0
+    try:
+        receipts = _collect_forked_receipts(
+            processes=processes,
+            started=started,
+            specs=specs,
+            output=output,
+            timeout=bounded,
+        )
+    finally:
+        # Runs even if ``start()`` itself failed halfway through the fleet: only the
+        # handles that actually started are in ``started``.
+        orphaned = _reap_exact_workers(started)
+    return _ForkedRun(receipts=tuple(receipts), orphaned_workers=orphaned)
+
+
+def _collect_forked_receipts(
+    *,
+    processes: Sequence,
+    started: list,
+    specs: Sequence[_ProjectSpec],
+    output,
+    timeout: float,
+) -> list[_ProcessReceipt]:
+    """Start the fleet, join it under the bound, and collect one receipt per project.
+
+    ``started`` is appended to as each process starts so the caller's ``finally`` can
+    reap exactly what exists, including when this function raises partway through.
+    """
     for process in processes:
         process.start()
+        started.append(process)
     for process in processes:
         process.join(timeout=max(1.0, timeout))
         if process.is_alive():
@@ -184,6 +296,9 @@ def run_disposable_shared_space_smoke(
     )
 
     count = max(2, int(projects))
+    # Before the binary, the server, the isolated home — before anything exists that
+    # would have to be cleaned up if this turned out to be unusable (review j#91604 F2).
+    bounded_timeout = bounded_process_timeout(process_timeout)
     try:
         resolution = resolve_herdr_binary(env)
     except Exception as exc:
@@ -207,6 +322,8 @@ def run_disposable_shared_space_smoke(
     # reports leaves its ``None`` in place, and the aggregate counts it as missing
     # rather than as a process that made zero requests (review j#85841 F1).
     worker_gate_receipts: list = [None] * count
+    # Seeded to the fail-closed value: only a completed fork round may lower it.
+    orphaned_workers = -1
     try:
         with instance:
             with isolated_smoke_home(Path(isolated_home)) as capability:
@@ -231,12 +348,14 @@ def run_disposable_shared_space_smoke(
                     providers=providers,
                 )
                 cleanup_harness.preflight_clean_slate()
-                receipts = _run_forked_projects(
+                forked = _run_forked_projects(
                     harnesses=harnesses,
                     specs=specs,
-                    timeout=process_timeout,
+                    timeout=bounded_timeout,
                     gate_runner=instance.runner,
                 )
+                receipts = forked.receipts
+                orphaned_workers = forked.orphaned_workers
                 observations = [receipt.observation for receipt in receipts]
                 worker_gate_receipts = [receipt.endpoint_gate for receipt in receipts]
                 for receipt in receipts:
@@ -284,6 +403,10 @@ def run_disposable_shared_space_smoke(
     evidence.update(instance.as_evidence(gate=gate))
     evidence["actuated"] = True
     evidence["cross_process"] = True
+    #: ``-1`` = the fork round never completed, so worker residue was never established.
+    #: Reported rather than folded into a bool, because "we could not tell" and "there
+    #: were none" are different facts (review j#91604 F2).
+    evidence["worker_processes_orphaned"] = orphaned_workers
     evidence["success"] = bool(
         summary.converged
         and summary.residue_clear
@@ -304,6 +427,10 @@ def run_disposable_shared_space_smoke(
         # fails the run instead of reading as a silent zero (review j#85841 F1).
         and gate.proven_zero_external
         and gate.all_calls_bound
+        # A worker that outlived even the kill may still be actuating Herdr while the
+        # server and the owned root are being torn down, so the run has not converged
+        # and cleaned up no matter how good the rest of the evidence looks.
+        and orphaned_workers == 0
     )
     return evidence
 

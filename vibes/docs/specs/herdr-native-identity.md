@@ -1109,6 +1109,29 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
   fail-closed する。liveness は答えられる process (mint process) でのみ問い、それ以外は
   destructive authority 自体を与えない。refusal reason は closed vocabulary へ
   `owned_child_not_alive` / `cleanup_authority_not_owner` を追加する。
+- **command 面は allowlist で閉じる。denylist は構造的に fail-open** (review j#91604 F1)。
+  「破壊的 control を列挙して拒否する」形は、列挙し損ねた control をすべて許可する。実測では
+  `("server","stop")` のみを denylist した結果、Herdr 0.7.x が公開する
+  `session stop <name>` / `session delete <name>` (help が `default` を名指しする) /
+  `server reload-config` 等を forked worker が dispatch できた。よって **smoke が必要とする
+  client call を `CLIENT_CALL_SUBCOMMANDS` として閉じた集合で定義し、それ以外は全 process で拒否する**
+  (`command_not_allowlisted`)。mint process のみ `MINTER_ONLY_SUBCOMMANDS` (= 自分が起動した
+  server への graceful `server stop`) を追加で持つ。この形は Herdr の将来の CLI 追加に対しても
+  既定拒否であり、「次に何が来るか」を予測する必要がない。allowlist に control 動詞
+  (`stop` / `delete` / `attach` / `reload-config` / `reset-keys` / `set`) が紛れ込まないことを
+  drift test で固定する。
+- **worker timeout は process 起動前に domain 検証し、cleanup は例外経路でも通す** (review j#91604 F2)。
+  `--process-timeout` を無制約 `float` で受けると `inf` / `nan` / 0 / 負値が
+  `Process.join()` まで到達し、**全 worker を起動した後**に `OverflowError` で driver を巻き戻す。
+  結果として owned worker が生存したまま親が server と owned root を shutdown でき、bounded cleanup /
+  全 process evidence / owned-root lifetime bind が同時に破れる。かつ typed error でないため
+  失敗分岐の evidence 契約 (上記) も raw traceback に落ちる。よって:
+  - `bounded_process_timeout` が **finite かつ `(0, MAX_PROCESS_TIMEOUT_SECONDS]`** を CLI 入口と
+    driver の双方で強制し、**何も起動していない時点で** `SharedSpaceSmokeError` として拒否する。
+  - worker 起動以降は `finally` で **起動した exact handle のみ** terminate → join → kill し、
+    最終 kill 後に `is_alive()` を再確認する。generic kill / name scan は行わない。
+  - 生存した worker 数を `worker_processes_orphaned` として evidence に出し、`success` へ `== 0` を
+    連言する。fork round が完了しなかった場合は `-1` (「残留 0 だった」ではなく「確定できなかった」)。
 - **evidence は 2 方向の負証明を持つ。** `operator_endpoint_requests` (実際に dispatch された
   operator endpoint 宛 request 数) と `endpoint_escape_refusals` (dispatch 前に拒否した数) は
   互いに独立で、健全な run では双方 0。binding を落とすと後者が、gate を落とすと前者が動く。

@@ -51,10 +51,15 @@ So the single authority is split in two:
   ``agent start``, …).  Held by the minting process and by its forked workers.  In the
   minting process — the only place the question is answerable — it is additionally
   fenced on the owned child still being alive.
-* **cleanup authority** — the destructive control requests in
-  :data:`DESTRUCTIVE_SUBCOMMANDS` (``server stop``).  Granted **only** to the minting
-  process, and only while the owned child is alive.  A forked worker is refused
-  outright rather than asked a question it cannot answer.
+* **cleanup authority** — :data:`MINTER_ONLY_SUBCOMMANDS` (``server stop``).  Granted
+  **only** to the minting process, and only while the owned child is alive.  A forked
+  worker is refused outright rather than asked a question it cannot answer.
+
+Both are scoped by an allowlist, not a denylist (review j#91604 F1).  Only
+:data:`CLIENT_CALL_SUBCOMMANDS` may be dispatched at all; every other Herdr control —
+``session stop``/``session delete`` (whose help names ``default`` as a target),
+``server reload-config``, ``update``, and whatever the next release adds — is refused
+by default rather than needing to be predicted.
 
 Cross-process negative proof (review j#85841 F1)
 ------------------------------------------------
@@ -115,10 +120,48 @@ REFUSAL_OWNED_CHILD_NOT_ALIVE = "owned_child_not_alive"
 #: A destructive control request was issued by a process that did not launch the
 #: server (typically a forked smoke worker), which never holds cleanup authority.
 REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER = "cleanup_authority_not_owner"
+#: The request is not one of the client calls the smoke is allowed to make at all.
+#: An *allowlist* miss, so a Herdr control the smoke never needed — including one added
+#: after this code was written — is refused rather than silently permitted.
+REFUSAL_COMMAND_NOT_ALLOWLISTED = "command_not_allowlisted"
 
-#: Closed vocabulary of control requests that may destroy the owned server.  Only the
-#: minting process may issue these, and only while its child is alive.
-DESTRUCTIVE_SUBCOMMANDS = (("server", "stop"),)
+#: The closed set of endpoint-bound client calls the shared-space smoke needs, as
+#: ``(group, subcommand)`` pairs measured from what the harness and the production
+#: session-start path actually issue.
+#:
+#: This is an **allowlist, and that is the point** (review j#91604 F1).  The previous
+#: version denylisted a single control (``server stop``) and was therefore fail-open by
+#: construction: Herdr 0.7.x also publishes ``session stop <name>`` / ``session delete
+#: <name>`` — whose own help names ``default`` as a target — plus ``server
+#: reload-config``, ``update``, ``channel set`` and ``config reset-keys``, none of which
+#: the denylist caught.  A forked worker could dispatch every one of them.  Enumerating
+#: what the smoke *needs* fails closed on the whole rest of the CLI, today and after the
+#: next Herdr release, and a miss surfaces as a precise
+#: :data:`REFUSAL_COMMAND_NOT_ALLOWLISTED` rather than as an unnoticed capability.
+CLIENT_CALL_SUBCOMMANDS: frozenset = frozenset(
+    {
+        ("workspace", "list"),
+        ("workspace", "create"),
+        ("agent", "start"),
+        ("agent", "list"),
+        ("agent", "get"),
+        ("agent", "read"),
+        ("agent", "pane"),
+        ("agent", "target"),
+        ("pane", "close"),
+        ("pane", "layout"),
+        ("pane", "resize"),
+        ("pane", "location"),
+        ("tab", "create"),
+        ("wait", "agent-status"),
+        ("config", "check-parse"),
+    }
+)
+
+#: The only control beyond the client calls, and only for the process that launched the
+#: child: the graceful stop of *its own* server.  Deliberately not reachable from a
+#: forked worker, which is refused with :data:`REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER`.
+MINTER_ONLY_SUBCOMMANDS: frozenset = frozenset({("server", "stop")})
 
 _ENDPOINT_CAPABILITY_TOKEN = object()
 # Identity registry for minted capabilities.  ``isinstance`` alone is forgeable through
@@ -622,7 +665,11 @@ class DisposableHerdrInstance:
         Evaluated before the inner runner, so a refusal still means zero external
         requests for that call.  Two rules, matching the two authorities:
 
-        * a destructive control request (:data:`DESTRUCTIVE_SUBCOMMANDS`) is refused
+        * a request outside :data:`CLIENT_CALL_SUBCOMMANDS` is refused for everyone
+          unless it is the minter's own :data:`MINTER_ONLY_SUBCOMMANDS` graceful stop —
+          an allowlist, so an unforeseen Herdr control is denied by default rather than
+          having to be predicted (review j#91604 F1);
+        * that graceful stop is refused
           unless this process minted the capability.  A forked worker holding an
           inherited copy is not the server's parent and never needs to stop it;
         * in the minting process — the only one that can answer — the owned child must
@@ -633,9 +680,18 @@ class DisposableHerdrInstance:
         capability = self._current_capability()
         if capability is None:
             return REFUSAL_CAPABILITY_ABSENT
-        destructive = tuple(list(command)[1:3]) in DESTRUCTIVE_SUBCOMMANDS
-        if not self._is_minting_process(capability):
-            return REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER if destructive else ""
+        subcommand = tuple(list(command)[1:3])
+        minting = self._is_minting_process(capability)
+        if subcommand not in CLIENT_CALL_SUBCOMMANDS:
+            # Not a client call.  Either it is the one control the minter may issue, or
+            # it is outside the sanctioned surface entirely — a Herdr lifecycle control
+            # the smoke never needed, which nobody here may send.
+            if subcommand not in MINTER_ONLY_SUBCOMMANDS:
+                return REFUSAL_COMMAND_NOT_ALLOWLISTED
+            if not minting:
+                return REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER
+        if not minting:
+            return ""
         process = self._process
         if process is None or process.poll() is not None:
             return REFUSAL_OWNED_CHILD_NOT_ALIVE
@@ -826,7 +882,8 @@ class DisposableHerdrInstance:
 
 
 __all__ = (
-    "DESTRUCTIVE_SUBCOMMANDS",
+    "CLIENT_CALL_SUBCOMMANDS",
+    "MINTER_ONLY_SUBCOMMANDS",
     "DisposableHerdrBinding",
     "DisposableHerdrInstance",
     "EndpointBoundHerdrRunner",
@@ -840,6 +897,7 @@ __all__ = (
     "REFUSAL_CAPABILITY_ABSENT",
     "REFUSAL_CAPABILITY_NOT_MINTED",
     "REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER",
+    "REFUSAL_COMMAND_NOT_ALLOWLISTED",
     "REFUSAL_ENDPOINT_OUTSIDE_OWNED_ROOT",
     "REFUSAL_ENDPOINT_UNBOUND",
     "REFUSAL_OPERATOR_ENDPOINT_TARGET",

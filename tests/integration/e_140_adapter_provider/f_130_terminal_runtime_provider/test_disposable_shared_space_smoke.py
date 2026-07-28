@@ -22,6 +22,7 @@ rather than as a process that made zero requests.
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import shutil
 import stat
@@ -30,6 +31,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT / "src") not in sys.path:
@@ -47,13 +49,18 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E402,E501
     disposable_herdr_instance as _lifecycle_module,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E402,E501
+    disposable_shared_space_smoke as _driver_module,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_shared_space_smoke import (  # noqa: E402,E501
     _ProjectSpec,
     _run_forked_projects,
+    bounded_process_timeout,
     run_disposable_shared_space_smoke,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_observation import (  # noqa: E402,E501
     ProjectSmokeObservation,
+    SharedSpaceSmokeError,
 )
 
 
@@ -211,20 +218,21 @@ class ForkedGateReceiptTests(unittest.TestCase):
             ]
             for spec in specs:
                 spec.repo_root.mkdir(parents=True, exist_ok=True)
-            receipts = _run_forked_projects(
+            forked = _run_forked_projects(
                 harnesses=harnesses, specs=specs, timeout=20.0, gate_runner=gate_runner
             )
             gate = EndpointGateEvidence.aggregate(
                 parent=EndpointGateCounters.snapshot(gate_runner),
-                worker_receipts=[receipt.endpoint_gate for receipt in receipts],
+                worker_receipts=[r.endpoint_gate for r in forked.receipts],
             )
-            return receipts, gate, gate_runner
+            return forked, gate, gate_runner
 
     def test_worker_counters_reach_the_parent_through_the_receipt(self) -> None:
-        receipts, gate, gate_runner = self._drive([{"calls": 2}, {"calls": 3}])
+        forked, gate, gate_runner = self._drive([{"calls": 2}, {"calls": 3}])
 
         self.assertEqual(gate_runner.dispatched_calls, 0, "the parent dispatched nothing")
-        self.assertTrue(all(r.endpoint_gate is not None for r in receipts))
+        self.assertEqual(forked.orphaned_workers, 0, "a clean round leaves no worker")
+        self.assertTrue(all(r.endpoint_gate is not None for r in forked.receipts))
         self.assertEqual(gate.receipts_missing, 0)
         self.assertTrue(gate.receipts_complete)
         self.assertEqual(
@@ -236,16 +244,136 @@ class ForkedGateReceiptTests(unittest.TestCase):
         self.assertTrue(gate.all_calls_bound)
 
     def test_a_worker_that_dies_without_reporting_is_counted_as_missing(self) -> None:
-        receipts, gate, _runner = self._drive([{"calls": 1}, {"calls": 1, "die": True}])
+        forked, gate, _runner = self._drive([{"calls": 1}, {"calls": 1, "die": True}])
 
-        self.assertIsNone(receipts[1].endpoint_gate)
-        self.assertEqual(receipts[1].observation.outcome, "failed")
+        self.assertIsNone(forked.receipts[1].endpoint_gate)
+        self.assertEqual(forked.receipts[1].observation.outcome, "failed")
         self.assertEqual(gate.receipts_expected, 2)
         self.assertEqual(gate.receipts_missing, 1)
         self.assertFalse(gate.receipts_complete)
         self.assertFalse(
             gate.proven_zero_external,
             "a lost snapshot must not read as a proven-zero process",
+        )
+
+
+class WorkerTimeoutAndCleanupTests(unittest.TestCase):
+    """A caller must not be able to strand owned workers (review j#91604 F2).
+
+    ``float('inf')`` reached ``Process.join``, raised ``OverflowError`` *after* the
+    whole fleet had started, and unwound the driver with the workers still running —
+    while the caller went on to shut the server and the owned root down.
+    """
+
+    def _live_smoke_workers(self) -> list:
+        return [
+            child
+            for child in multiprocessing.active_children()
+            if child.name.startswith("mozyo-smoke-")
+        ]
+
+    def setUp(self) -> None:
+        self.addCleanup(self._reap_leftovers)
+
+    def _reap_leftovers(self) -> None:
+        """Safety net so a failing assertion never leaks a process into the suite."""
+        for child in self._live_smoke_workers():
+            child.terminate()
+            child.join(timeout=10)
+
+    def _fleet(self, tmp: Path, count: int = 2):
+        gate_runner = _gate_runner_for(tmp / "owned")
+        harnesses = [_SleepHarness() for _ in range(count)]
+        specs = []
+        for index in range(count):
+            repo = tmp / "projects" / f"p{index}"
+            repo.mkdir(parents=True, exist_ok=True)
+            specs.append(_ProjectSpec(f"p{index}", repo))
+        return gate_runner, harnesses, specs
+
+    def test_an_unusable_timeout_is_refused_before_any_process_exists(self) -> None:
+        for value in (float("inf"), float("-inf"), float("nan"), 0.0, -1.0, 10_000.0):
+            with tempfile.TemporaryDirectory() as tmp:
+                gate_runner, harnesses, specs = self._fleet(Path(tmp))
+                with self.assertRaises(SharedSpaceSmokeError, msg=repr(value)):
+                    _run_forked_projects(
+                        harnesses=harnesses, specs=specs,
+                        timeout=value, gate_runner=gate_runner,
+                    )
+                self.assertEqual(
+                    self._live_smoke_workers(), [],
+                    f"{value!r} must be refused before a worker is ever started",
+                )
+
+    def test_a_usable_timeout_still_runs(self) -> None:
+        """Baseline: the domain check must not reject the values the smoke uses."""
+        self.assertEqual(bounded_process_timeout(45.0), 45.0)
+        self.assertEqual(bounded_process_timeout("20"), 20.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            gate_runner, harnesses, specs = self._fleet(Path(tmp), count=1)
+            forked = _run_forked_projects(
+                harnesses=harnesses, specs=specs, timeout=1.0, gate_runner=gate_runner
+            )
+            self.assertEqual(forked.orphaned_workers, 0)
+            self.assertEqual(self._live_smoke_workers(), [])
+
+    def test_a_failure_after_start_still_reaps_every_owned_worker(self) -> None:
+        """The property the missing ``finally`` cost: cleanup on the exception path."""
+        started_names = []
+
+        def _boom(*, processes, started, specs, output, timeout):
+            for process in processes:
+                process.start()
+                started.append(process)
+                started_names.append(process.name)
+            raise RuntimeError("injected failure after the fleet started")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            gate_runner, harnesses, specs = self._fleet(Path(tmp))
+            with mock.patch.object(
+                _driver_module, "_collect_forked_receipts", _boom
+            ):
+                with self.assertRaises(RuntimeError):
+                    _run_forked_projects(
+                        harnesses=harnesses, specs=specs,
+                        timeout=20.0, gate_runner=gate_runner,
+                    )
+            self.assertEqual(len(started_names), 2, "premise lost: no workers started")
+            self.assertEqual(
+                self._live_smoke_workers(), [],
+                "owned workers outlived the driver's exception path",
+            )
+
+
+def _gate_runner_for(root: Path) -> EndpointBoundHerdrRunner:
+    binding = _lifecycle_module.DisposableHerdrBinding(
+        root=root,
+        socket_path=root / "herdr.sock",
+        client_socket_path=root / "herdr-client.sock",
+        config_path=root / "config.toml",
+    )
+    capability = _lifecycle_module._mint_owned_endpoint(binding, os.getpid())
+    return EndpointBoundHerdrRunner(
+        lambda argv, *a, **k: subprocess.CompletedProcess(argv, 0, "", ""),
+        capability_provider=lambda: capability,
+        binding_env={HERDR_SOCKET_PATH_ENV: str(root / "herdr.sock")},
+        agent_env={},
+    )
+
+
+class _SleepHarness:
+    """A worker that stays alive well past any bounded join."""
+
+    def __init__(self) -> None:
+        self.recorder = _StubRecorder()
+
+    def run_project(self, spec) -> ProjectSmokeObservation:
+        import time
+
+        time.sleep(30)
+        return ProjectSmokeObservation(
+            project_key=spec.project_key, workspace_id="w1",
+            outcome="created", coordinators_workspace_id="w1",
         )
 
 

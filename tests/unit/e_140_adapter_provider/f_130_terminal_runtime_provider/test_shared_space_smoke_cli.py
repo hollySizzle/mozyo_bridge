@@ -14,6 +14,7 @@ network: the actuation function is substituted with an injected report.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -29,6 +30,9 @@ if str(ROOT / "src") not in sys.path:
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E402,E501
     shared_space_smoke_cli as cli,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_shared_space_smoke import (  # noqa: E402,E501
+    bounded_process_timeout,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_observation import (  # noqa: E402,E501
     PHASE_WORKER_ERROR,
@@ -83,6 +87,9 @@ def _report(*, success: bool) -> dict:
         "graceful_stop_refused": False,
         "server_stopped": True,
         "endpoint_residue": 0,
+        # -1 on the failing branch: the fork round never completed, so worker residue
+        # was never established (distinct from "there were none").
+        "worker_processes_orphaned": 0 if success else -1,
     }
 
 
@@ -158,6 +165,8 @@ class ExecuteTextEvidenceTests(unittest.TestCase):
         self.assertIn("completed_projects=1/2", run.stdout)
         self.assertIn("endpoint_gate_receipts_complete=False", run.stdout)
         self.assertIn("endpoint_gate_proven_zero_external=False", run.stdout)
+        # "we never established worker residue" must be visible, not implied.
+        self.assertIn("orphaned_workers=-1", run.stdout)
 
     def test_text_mode_reports_no_phase_when_nothing_failed(self) -> None:
         run = _run(_report(success=True), json_mode=False)
@@ -169,6 +178,49 @@ class ExecuteTextEvidenceTests(unittest.TestCase):
     def test_no_home_path_reaches_the_text_summary(self) -> None:
         run = _run(_report(success=False), json_mode=False)
         self.assertNotIn("/tmp/does-not-need-to-exist", run.stdout)
+
+
+class ProcessTimeoutDomainTests(unittest.TestCase):
+    """The entry point must refuse a bound the driver cannot honour (j#91604 F2).
+
+    A bare ``type=float`` accepted ``inf`` / ``nan`` / ``0`` / negatives, which only
+    failed inside ``Process.join`` — after the whole worker fleet had started, with an
+    ``OverflowError`` that no ``except`` in this module catches, so the run lost its
+    workers *and* the redacted evidence at the same time.
+    """
+
+    def _parser(self) -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser()
+        cli.register_herdr_smoke_shared_space_parser(parser.add_subparsers())
+        return parser
+
+    def _parse(self, value: str):
+        # ``=`` form: a bare "-inf" would be read as a flag and mask the real behaviour.
+        return self._parser().parse_args(
+            ["smoke-shared-space", "--isolated-home", "/tmp/iso",
+             f"--process-timeout={value}"]
+        )
+
+    def test_unusable_timeouts_are_rejected_at_the_entry_point(self) -> None:
+        for value in ("inf", "-inf", "nan", "0", "-1", "1e9", "later"):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit) as caught:
+                    self._parse(value)
+                self.assertEqual(caught.exception.code, 2)
+
+    def test_usable_timeouts_are_accepted(self) -> None:
+        """Baseline: the guard must not reject the values the smoke actually uses."""
+        for value, expected in (("45", 45.0), ("0.5", 0.5), ("3600", 3600.0)):
+            with self.subTest(value=value):
+                self.assertEqual(self._parse(value).process_timeout, expected)
+
+    def test_the_default_is_inside_the_accepted_domain(self) -> None:
+        args = self._parser().parse_args(
+            ["smoke-shared-space", "--isolated-home", "/tmp/iso"]
+        )
+        self.assertEqual(
+            bounded_process_timeout(args.process_timeout), args.process_timeout
+        )
 
 
 class PreflightBranchTests(unittest.TestCase):
