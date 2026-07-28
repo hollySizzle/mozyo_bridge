@@ -269,8 +269,22 @@ authorize したかを照合しなければ scope は未検証のままである
       入ったときに落ちる回帰証跡**である。それを「3 層で確認・回復」と記録したので、記録が
       committed test より広い主張になっていた。**remedy が層を数えているなら、その層数を test の側で
       数え直す。** subTest は `Ran` を増やさないので、件数は担保の指標にならない — **担保は
-      「その case を落とす mutation があるか」で示す** (ここでは class を `\d` へ戻すと当該 2 層の
-      Devanagari case だけが赤化する)。
+      「その case を落とす mutation があるか」で示す**。
+      ★★★**mutation は「どの記号を壊したか」までが証拠であり、shared symbol の mutation は層別感度を
+      証明しない** (#14584 j#92124)。上の担保を `_LIST_MARKER` を `\d` へ戻して示したが、これは
+      **shared domain authority の記号**なので、実測は **3 形 × 3 層の 9 case すべてが赤化**する
+      (`FAILED (failures=9)`)。これが示すのは**3 層が同じ 1 実装を共有している**ことだけで、
+      「downstream 層だけに将来入る変更を捕まえるか」には答えない。層別感度は**その層でだけ欠陥を
+      再現する mutation** で別に測る:
+      reader-local (`extract_markers_from_note` で Devanagari ordered marker から切り捨てる) →
+      **gate reader の該当 case のみ 1 件赤化**、
+      anchor-local (`resolve_lane_work_anchor` の入力 row に同じ切り捨てを入れる) →
+      **work-anchor の該当 case のみ 1 件赤化**。両者とも他層は green で、**3 層は test 上も独立**。
+      ★★★**filter した出力を実測として書かない** (同 j#92124)。上の「だけ」という誤記は、
+      mutation の出力を `grep -E "Devanagari|^Ran|FAILED"` で絞って読んだために生じた。
+      **同じ画面の `FAILED (failures=6)` が既に反証だった**のに照合しなかった。
+      **mutation の verdict は「どの case 名が見えたか」ではなく `failure 件数と case 集合の全体`
+      で採る。**
       ★★★**oracle の述語は連言でなければならない** (#14584 j#91863)。R6 で「plain に残る」を
       「text node である」へ**置き換えた**が、raw HTML passthrough は tag 除去後の残骸が text に見える
       ため text-node 判定を通り、plain が空であることを見ていなかった。正しくは
