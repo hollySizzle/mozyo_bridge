@@ -169,7 +169,10 @@ _TAB_STOP = 4
 _INTERRUPTS_PARAGRAPH = (
     re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)"),  # ATX heading
     re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$"),  # thematic break
-    re.compile(r"^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)"),  # list item
+    # A list item interrupts a paragraph, but an ORDERED one only when it starts at 1
+    # (CommonMark 0.31.2 §5.2). Accepting any number made `prose\n2. …` a new block and cost
+    # the gate below it (#14584 j#91954 F2).
+    re.compile(r"^ {0,3}(?:[-+*]|1[.)])(?:[ \t]|$)"),  # list item
 )
 
 #: Anything that starts raw HTML: a tag, a closing tag, a comment / declaration / CDATA (``<!``) or
@@ -354,7 +357,7 @@ def _blank_autolinks(text: str) -> str:
     for match in _AUTOLINK.finditer(text):
         if _is_escaped(text, match.start()):
             continue
-        if _starts_html_block(text, match.start()):
+        if _starts_html_block(text, match.start(), first_line_only=True):
             continue
         for index in range(match.start(), match.end()):
             if chars[index] != "\n":
@@ -362,7 +365,7 @@ def _blank_autolinks(text: str) -> str:
     return "".join(chars)
 
 
-def _starts_html_block(text: str, offset: int) -> bool:
+def _starts_html_block(text: str, offset: int, *, first_line_only: bool = False) -> bool:
     """True if ``text[offset:]`` begins an HTML block rather than an inline construct (pure).
 
     An HTML block starts at the head of a line after at most three spaces (CommonMark 0.31.2 §4.6).
@@ -382,7 +385,14 @@ def _starts_html_block(text: str, offset: int) -> bool:
     opener as an autolink and a marker inside an unrendered block became a gate (#14584 j#91918).
     """
     line_start = text.rfind("\n", 0, offset) + 1
-    if not _is_block_start_column(text[line_start:offset]):
+    prefix = text[line_start:offset]
+    if not _is_block_start_column(prefix):
+        return False
+    if first_line_only and line_start != 0 and _LIST_MARKER.search(prefix):
+        # An HTML block CAN interrupt a paragraph, so a later line is still a block start when its
+        # prefix is only indentation. A list marker there is different: had that list been able to
+        # interrupt, the line would already have begun a paragraph of its own. It did not, so the
+        # marker is prose — `prose\n2. <!--a@b>` is exactly that case (#14584 j#91954 F2).
         return False
     return bool(_HTML_BLOCK_OPENER.match(text, offset))
 
@@ -399,8 +409,13 @@ def _is_block_start_column(prefix: str) -> bool:
     allowance is three.
     """
     index = column = 0
-    while index < len(prefix) and prefix[index] in " \t" and column < 3:
-        column += 1 if prefix[index] == " " else _TAB_STOP - (column % _TAB_STOP)
+    while index < len(prefix) and prefix[index] in " \t":
+        # The boundary holds after the step, not before it: a tab at column 0, 1 or 2 lands on
+        # column 4, and checking beforehand consumed it as indentation anyway (#14584 j#91954 F1).
+        step = 1 if prefix[index] == " " else _TAB_STOP - (column % _TAB_STOP)
+        if column + step > 3:
+            break
+        column += step
         index += 1
     while index < len(prefix):
         marker = _LIST_MARKER.match(prefix, index)

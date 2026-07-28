@@ -369,6 +369,7 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             ("html block inside a list item", "- <!--a@b>\n  %s" % self.GATE),
             ("html block inside an ordered item", "1. <?a@b>\n   %s" % self.GATE),
             ("four columns after the marker", "-    <!--a@b>\n\n%s" % self.GATE),
+            ("ordered list at one interrupts", "prose\n1. <!--a@b>\n\n%s" % self.GATE),
             ("definition title on the next line", '[foo]: /url\n  "%s"' % self.GATE),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % self.GATE),
             ("image alt text", "![a %s b](img.png)" % self.GATE),
@@ -397,6 +398,16 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             ("<! then @", "<!@b>\n\n%s" % self.GATE),
             ("<! then a digit", "<!1@b>\n\n%s" % self.GATE),
             ("<! then a hyphen", "<!-@b>\n\n%s" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ("review_request",))
+
+    def test_paragraph_continuations_do_not_erase_the_gate(self):
+        # #14584 j#91954: a tab of hanging indent, and an ordered marker that cannot interrupt a
+        # paragraph, are both prose — neither opens a block.
+        for label, note in (
+            ("tab hanging indent", "prose\n\t<!--a@b>\n\n%s" % self.GATE),
+            ("ordered marker at two", "prose\n2. <!--a@b>\n\n%s" % self.GATE),
         ):
             with self.subTest(label):
                 self.assertEqual(self._gates(note), ("review_request",))

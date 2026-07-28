@@ -243,6 +243,16 @@ authorize したかを照合しなければ scope は未検証のままである
       code**) を block opener と誤認し、**後続の実 gate event を消した**。
       **同 module に既に `_indent_columns` があるのに prefix だけ文字数で書いた** — 既存の正しい実装を
       再利用しないと、そこだけ規則が古くなる。**doc に宣言した境界を code が実装しているか毎回確かめる。**
+      ★★★**境界は「step を適用した後の column」で判定する** (#14584 j#91954 F1)。適用前に `column < 3` を
+      見ると、column 0/1/2 の **tab が column 4 へ進んでも consume** され、open paragraph 中の hanging
+      indent が block opener に化けて**実 gate を消した**。space 形だけの test と probe では踏めない。
+      ★★★**container prefix は「字面」ではなく「その位置で本当に container が開くか」で決まる**
+      (#14584 j#91954 F2)。CommonMark §5.2 では **ordered list が paragraph を interrupt できるのは
+      start number が 1 のときだけ**なので、`prose` の次行の `2. ` は prose であって container prefix では
+      ない。よって (a) interrupter 判定を `1` に狭め、(b) **paragraph 継続行の marker 付き prefix は
+      block start にしない**。**ただし indent だけの prefix は継続行でも block start たり得る** —
+      HTML block は paragraph を interrupt できるからで、ここを一律に禁じると逆に実 gate を消す
+      (probe PHASEWIDE で赤化)。
       ★★★**oracle の述語は連言でなければならない** (#14584 j#91863)。R6 で「plain に残る」を
       「text node である」へ**置き換えた**が、raw HTML passthrough は tag 除去後の残骸が text に見える
       ため text-node 判定を通り、plain が空であることを見ていなかった。正しくは

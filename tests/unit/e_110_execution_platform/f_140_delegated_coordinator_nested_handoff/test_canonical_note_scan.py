@@ -613,6 +613,30 @@ class PassOrderTest(unittest.TestCase):
         # ...and the paired positive: nesting does not make an ordinary autolink into a block.
         self.assertEqual(_gates(f"- - <!@b>\n\n{MARKER}"), ("review_request",))
 
+    def test_leading_indent_is_bounded_after_each_step_not_before(self):
+        # A tab at column 0, 1 or 2 lands on column 4. Checking the bound before applying the step
+        # consumed it as indentation, so hanging indent inside an open paragraph turned an inline
+        # autolink into a block opener and the gate below it was erased (#14584 j#91954 F1).
+        for label, note in (
+            ("tab", f"prose\n\t<!--a@b>\n\n{MARKER}"),
+            ("space then tab", f"prose\n \t<!--a@b>\n\n{MARKER}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ("review_request",))
+        # ...and three columns still is a block start, since an HTML block may interrupt a paragraph.
+        self.assertEqual(_gates(f"prose\n   <!--a@b>\n\n{MARKER}"), ())
+
+    def test_an_ordered_marker_interrupts_a_paragraph_only_at_one(self):
+        # CommonMark §5.2: an ordered list interrupts a paragraph only when it starts at 1. A `2.`
+        # inside a paragraph is prose, so its "container prefix" is not one, and treating it as a
+        # block start erased the gate below (#14584 j#91954 F2). Both sides, and the same marker at
+        # the top of a note where it really does open a list.
+        self.assertEqual(_gates(f"prose\n2. <!--a@b>\n\n{MARKER}"), ("review_request",))
+        self.assertEqual(_gates(f"prose\n2) <!--a@b>\n\n{MARKER}"), ("review_request",))
+        self.assertEqual(_gates(f"prose\n1. <!--a@b>\n\n{MARKER}"), ())
+        self.assertEqual(_gates(f"prose\n- <!--a@b>\n\n{MARKER}"), ())
+        self.assertEqual(_gates(f"2. <!--a@b>\n\n{MARKER}"), ())
+
     def test_the_indent_after_a_list_marker_is_measured_in_columns(self):
         # A list marker admits one to four COLUMNS after it (§5.2 rule 1). At five the content is an
         # indented code block inside the item (§5.2 rule 2 with §4.4) — visible code, not a block

@@ -203,6 +203,7 @@ class FailClosedTest(unittest.TestCase):
             ("html block inside a list item", "- <!--a@b>\n  %s" % marker),
             ("html block inside an ordered item", "1. <?a@b>\n   %s" % marker),
             ("four columns after the marker", "-    <!--a@b>\n\n%s" % marker),
+            ("ordered list at one interrupts", "prose\n1. <!--a@b>\n\n%s" % marker),
             ("definition title on the next line", '[foo]: /url\n  "%s"' % marker),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % marker),
             ("image alt text", "![a %s b](img.png)" % marker),
@@ -239,6 +240,17 @@ class FailClosedTest(unittest.TestCase):
             ("<! then @", "<!@b>\n\n%s" % marker),
             ("<! then a digit", "<!1@b>\n\n%s" % marker),
             ("<! then a hyphen", "<!-@b>\n\n%s" % marker),
+        ):
+            with self.subTest(label):
+                anchor = _resolve([_entry("90409", note)])
+                self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
+
+    def test_paragraph_continuations_do_not_erase_the_anchor(self):
+        # The same liveness cases at the join (#14584 j#91954).
+        marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
+        for label, note in (
+            ("tab hanging indent", "prose\n\t<!--a@b>\n\n%s" % marker),
+            ("ordered marker at two", "prose\n2. <!--a@b>\n\n%s" % marker),
         ):
             with self.subTest(label):
                 anchor = _resolve([_entry("90409", note)])
