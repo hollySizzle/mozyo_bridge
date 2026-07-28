@@ -2546,13 +2546,30 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         if not body or not inner:
             raise AssertionError("the helper no longer has the shape this probe assumes")
 
-        def transitional(line: int) -> bool:
-            """Region boundaries: no arrangement of Python puts these inside a guard."""
-            body_text = text(line)
-            return (
-                body_text == "try:"
-                or body_text.startswith("except ")
-                or body_text.startswith("return ")
+        # The residual, spelled out. Classifying by how a line is *spelled* —
+        # anything that looked like a `try:`/`except`/`return` — meant every
+        # region added to the helper silently widened the escape surface it
+        # approved, and two nested headers rode in that way (j#90918 R25-F1).
+        # This is the sequence the helper is allowed to have, in order; if it
+        # gains a region, or loses one, resolution fails here rather than
+        # quietly permitting more.
+        expected_roles = (
+            "try:",
+            "except BaseException as nested:",
+            "try:",
+            "except BaseException:",
+            "pass",
+            "return interrupt if first is None else first",
+        )
+        residual: list[int] = []
+        remaining = list(expected_roles)
+        for line in executable:
+            if remaining and text(line).startswith(remaining[0]):
+                remaining.pop(0)
+                residual.append(line)
+        if remaining:
+            raise AssertionError(
+                f"the helper no longer has the pinned residual shape; unmatched: {remaining}"
             )
 
         return {
@@ -2561,8 +2578,7 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             "exit": exit_line,
             "body": body,
             "inner": inner,
-            "transitions": [line for line in executable if transitional(line)],
-            "statements": [line for line in executable if not transitional(line)],
+            "residual": set(residual),
         }
 
     def _interrupt_while_taking_an_interrupt(self, steps):  # type: ignore[no-untyped-def]
@@ -2624,133 +2640,137 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         )
 
     @staticmethod
-    def _enter_the_handler_once(reached: list[bool]):
-        """Make the helper's first occurrence raise, once the rail has fired.
+    def _fail_occurrences(reached: list[bool], count: int):
+        """Fail the helper's first `count` occurrence constructions.
 
         The handler cannot be reached by a traced injection: raising from a
         trace function turns tracing off for that frame, so a second injection
         inside the handler would never fire — the kind of probe that reports
         green having done nothing. Failing the construction instead leaves the
-        tracer armed for the line actually under test.
+        tracer armed for the line actually under test. One failure reaches the
+        handler; two reach the handler's own absorbing branch.
         """
         real = owned_descriptors._Occurrence
-        entered: list[bool] = []
-        trigger = GeneratorExit("the interrupt that enters the handler")
+        seen: list[int] = []
 
-        def raising_once(failure):  # type: ignore[no-untyped-def]
-            if reached and not entered:
-                entered.append(True)
-                raise trigger
+        def raising(failure):  # type: ignore[no-untyped-def]
+            if reached and len(seen) < count:
+                seen.append(1)
+                raise GeneratorExit(f"occurrence construction {len(seen)}")
             return real(failure)
 
         return unittest.mock.patch.object(
-            owned_descriptors, "_Occurrence", raising_once
-        ), entered
+            owned_descriptors, "_Occurrence", raising
+        ), seen
 
     def test_a_nested_interrupt_never_skips_a_remaining_action(self) -> None:
-        """j#90807 R22-F1. Catching a control-flow exception is not the same as
-        handling it: the `except` body is ordinary code outside the `try` that
-        caught it, so a second interrupt arriving while the first was being
-        turned into an occurrence escaped the retention and skipped a cleanup.
-        Measured before the fix on the main rail: `actions=['failing']`, the
-        `GeneratorExit` escaping `_teardown_during`, an empty ledger, and the
-        first interrupt's priority lost as well.
+        """j#90807 R22-F1, and what the two rounds after it turned up.
 
-        Both rails and every executable line of the helper, because each of the
-        last rounds fixed one rail or one line and left its twin the same
-        shape. Priority comes from the arguments in the return expression, so
-        no line of the body can change it (j#90839 R23-F1) — which is why every
-        line can assert the same thing.
+        Catching a control-flow exception is not the same as handling it: the
+        `except` body is ordinary code outside the `try` that caught it, so a
+        second interrupt arriving while the first was being turned into an
+        occurrence escaped the retention and skipped a cleanup.
 
-        The residual is *measured*, not assumed. **No statement may escape.**
-        What can is the region boundaries — a `try` header, an `except`
-        header, the `return` — which sit between protected ranges by
-        construction; wrapping them in another guard only moves which boundary
-        is exposed, it does not remove one. Asserting the difference is the
-        point: assuming it is how the last two rounds shipped a residual wider
-        than the docs claimed (j#90839 R23-F1, j#90882 R24-F1).
+        Every executable line of the helper, on both rails, under three
+        schedules — because each round fixed one rail or one line and left its
+        twin the same shape, and because lines the schedule never reached were
+        silently skipped rather than measured (j#90918 R25-F1).
+
+        Two things are asserted, and the second is the one that kept slipping:
+
+        - wherever the helper does not escape, every action runs and the first
+          control flow is the one returned;
+        - the set of lines that *do* escape is exactly the pinned residual —
+          the two guards' headers, the absorbing handler and its body, and the
+          return. Approving whatever looked like a `try:` let two avoidable
+          headers in, so the shape is spelled out in `_helper_lines` and a new
+          region fails there instead.
         """
         shape = self._helper_lines()
         escaped: set[int] = set()
+        exercised: set[int] = set()
 
         for rail, drive in (
             ("main", self._interrupt_the_main_rail),
             ("final", self._interrupt_the_final_rail),
         ):
-            for line in shape["executable"]:  # type: ignore[union-attr]
-                with self.subTest(rail=rail, line=line):
-                    reached: list[bool] = []
-                    patch, interrupt = drive(reached)
-                    nested = GeneratorExit("a second interrupt while recording")
-                    tracer, pending = self._interrupt_while_taking_an_interrupt(
-                        [(line, nested)]
-                    )
+            for schedule, failures in (("plain", 0), ("handler", 1), ("absorb", 2)):
+                for line in shape["executable"]:  # type: ignore[union-attr]
+                    with self.subTest(rail=rail, schedule=schedule, line=line):
+                        reached: list[bool] = []
+                        patch, interrupt = drive(reached)
+                        occurrences, _ = self._fail_occurrences(reached, failures)
+                        injected = GeneratorExit("a second interrupt while recording")
+                        tracer, pending = self._interrupt_while_taking_an_interrupt(
+                            [(line, injected)]
+                        )
 
-                    inner = line in shape["inner"]  # type: ignore[operator]
-                    enter, entered = self._enter_the_handler_once(reached)
+                        ran: list[str] = []
 
-                    ran: list[str] = []
+                        def failing() -> None:
+                            ran.append("failing")
+                            raise RuntimeError("teardown failure")
 
-                    def failing() -> None:
-                        ran.append("failing")
-                        raise RuntimeError("teardown failure")
+                        def quiet() -> None:
+                            ran.append("quiet")
 
-                    def quiet() -> None:
-                        ran.append("quiet")
+                        primary = Exception("write failed")
+                        left = None
+                        with contextlib.ExitStack() as stack:
+                            stack.enter_context(patch)
+                            stack.enter_context(occurrences)
+                            sys.settrace(tracer)
+                            try:
+                                control = owned_descriptors._teardown_during(
+                                    primary, failing, quiet
+                                )
+                            except BaseException as out:  # noqa: BLE001 - the point
+                                control, left = None, out
+                            finally:
+                                sys.settrace(None)
 
-                    primary = Exception("write failed")
-                    left = None
-                    with contextlib.ExitStack() as stack:
-                        stack.enter_context(patch)
-                        if inner:
-                            stack.enter_context(enter)
-                        sys.settrace(tracer)
-                        try:
-                            control = owned_descriptors._teardown_during(
-                                primary, failing, quiet
+                        if pending:
+                            continue  # this schedule does not reach that line
+                        exercised.add(line)
+                        if left is not None:
+                            escaped.add(line)
+                            continue
+
+                        self.assertEqual(
+                            ["failing", "quiet"], ran, "a remaining action was skipped"
+                        )
+                        self.assertIs(
+                            control, interrupt, "the first interrupt lost priority"
+                        )
+
+                        if schedule == "plain" and line in shape["body"]:  # type: ignore[operator]
+                            # The recoverable case: the handler is reached by the
+                            # injection alone, so both occurrences are keepable.
+                            # Inside the handler nothing more is attempted — the
+                            # regress ends there by design — which is stated here
+                            # rather than left as an untested gap.
+                            ledger = owned_descriptors.teardown_failures(primary)
+                            self.assertEqual(
+                                1,
+                                sum(1 for entry in ledger if entry is interrupt),
+                                "the interrupt being recorded was lost",
                             )
-                        except BaseException as out:  # noqa: BLE001 - the point of the test
-                            control, left = None, out
-                        finally:
-                            sys.settrace(None)
+                            self.assertEqual(
+                                1,
+                                sum(1 for entry in ledger if entry is injected),
+                                "the nested interrupt was not retained",
+                            )
 
-                    if inner:
-                        self.assertTrue(entered, f"line {line}: the handler was never entered")
-                    if pending:
-                        continue  # this line never ran under this schedule
-                    if left is not None:
-                        escaped.add(line)
-                        continue
-
-                    self.assertEqual(
-                        ["failing", "quiet"], ran, "a remaining action was skipped"
-                    )
-                    self.assertIs(control, interrupt, "the first interrupt lost priority")
-
-                    if line in shape["body"]:  # type: ignore[operator]
-                        ledger = owned_descriptors.teardown_failures(primary)
-                        self.assertEqual(
-                            1,
-                            sum(1 for entry in ledger if entry is nested),
-                            "the nested interrupt was not retained",
-                        )
-                        self.assertEqual(
-                            1,
-                            sum(1 for entry in ledger if entry is interrupt),
-                            "the interrupt being recorded was lost",
-                        )
-
+        unreached = set(shape["executable"]) - exercised - {shape["executable"][0]}  # type: ignore[index]
         self.assertEqual(
             set(),
-            escaped.intersection(shape["statements"]),  # type: ignore[arg-type]
-            "a statement of the helper escaped it, skipping the remaining teardown",
+            unreached,
+            "a line of the helper was never executed by any schedule, so nothing measured it",
         )
-        self.assertTrue(
-            escaped, "nothing escaped at all — the probe is not reaching the helper"
-        )
-        self.assertTrue(
-            escaped.issubset(shape["transitions"]),  # type: ignore[arg-type]
-            "something outside the region boundaries escaped",
+        self.assertEqual(
+            shape["residual"],
+            escaped,
+            "the lines that escape the helper are not the pinned residual",
         )
 
     def test_an_interrupt_during_the_final_admission_still_counts(self) -> None:
