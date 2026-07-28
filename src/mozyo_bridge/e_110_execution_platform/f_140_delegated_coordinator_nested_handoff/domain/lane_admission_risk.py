@@ -33,6 +33,10 @@ The *invalid* non-reasons are an equally closed vocabulary
 (:data:`INVALID_SERIALIZATION_NONREASONS`). They are **recorded** on the outcome — so a
 coordinator who was tempted to serialize for convenience sees them named and rejected — but
 they never move the decision off :data:`ADMIT_ALLOW_DISPATCH` on their own.
+:data:`NONREASON_GOAL_COUNT` is the multi-goal form of the same correction (Redmine #14636):
+"the owner handed me *many* goals at once" is a statement about the size of the request, not
+about any concrete engineering risk between two of them, so it belongs in this vocabulary
+rather than in a second one owned by the multi-goal planner.
 
 Scope boundaries (carried over from #12855 / #12856), the policy **must not** cross:
 
@@ -132,7 +136,11 @@ _RISK_DECISION: dict[str, str] = {
 # credential/destructive/unresolved-design gates rank first (spine `### Drain Order` step
 # 1-2: production/release/credential/destructive + owner decision drain before all else),
 # then a concrete blocked dependency, then a serialize-able overlap / queue.
-_DECISION_SEVERITY: tuple[str, ...] = (
+#
+# Public because it is the *single* ordering over this vocabulary: a downstream planner that
+# has to combine an admission decision with a hold of its own (e.g. #14636's typed intake
+# defect) must rank them here rather than invent a second, drifting order.
+ADMISSION_DECISION_SEVERITY: tuple[str, ...] = (
     ADMIT_NEEDS_OWNER_DECISION,
     ADMIT_BLOCKED,
     ADMIT_SERIALIZE,
@@ -150,12 +158,17 @@ NONREASON_CALLBACK_MISS_RISK = "callback_miss_risk"
 NONREASON_COORDINATOR_MANAGEMENT_LOAD = "coordinator_management_load"
 # 「broad bucket だから」 — the bucket / version is broad, with no concrete overlap.
 NONREASON_BROAD_BUCKET = "broad_bucket"
+# 「目標が多いから」 — the *number* of goals / candidates in one request (Redmine #14636).
+# A count is not a relation: it says nothing about whether any two of them share a file, an
+# invariant, a merge order, or a dependency.
+NONREASON_GOAL_COUNT = "goal_count"
 
 INVALID_SERIALIZATION_NONREASONS = frozenset(
     {
         NONREASON_CALLBACK_MISS_RISK,
         NONREASON_COORDINATOR_MANAGEMENT_LOAD,
         NONREASON_BROAD_BUCKET,
+        NONREASON_GOAL_COUNT,
     }
 )
 
@@ -212,9 +225,12 @@ class LaneAdmissionInputs:
     ``unresolved_design_decision`` / ``release_publish_gate_active`` /
     ``credential_destructive_external_gate_active`` are owner-territory gates.
 
-    ``callback_miss_concern`` / ``coordinator_management_load`` / ``broad_bucket_only``
-    are the rejected coordinator-convenience signals: they are recorded on the outcome
-    but never move the decision off :data:`ADMIT_ALLOW_DISPATCH` on their own.
+    ``callback_miss_concern`` / ``coordinator_management_load`` / ``broad_bucket_only`` /
+    ``goal_count_only`` are the rejected coordinator-convenience signals: they are
+    recorded on the outcome but never move the decision off
+    :data:`ADMIT_ALLOW_DISPATCH` on their own. ``goal_count_only`` is the multi-goal form
+    (#14636): the caller wanted to hold this candidate only because the request carried
+    many goals.
     """
 
     candidate_issue: str
@@ -229,6 +245,7 @@ class LaneAdmissionInputs:
     callback_miss_concern: bool = False
     coordinator_management_load: bool = False
     broad_bucket_only: bool = False
+    goal_count_only: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -405,10 +422,12 @@ def evaluate_lane_admission(inputs: LaneAdmissionInputs) -> LaneAdmissionOutcome
         rejected.append(NONREASON_COORDINATOR_MANAGEMENT_LOAD)
     if inputs.broad_bucket_only:
         rejected.append(NONREASON_BROAD_BUCKET)
+    if inputs.goal_count_only:
+        rejected.append(NONREASON_GOAL_COUNT)
 
     fired_decisions = {risk.decision for risk in risks}
     decision = ADMIT_ALLOW_DISPATCH
-    for candidate_decision in _DECISION_SEVERITY:
+    for candidate_decision in ADMISSION_DECISION_SEVERITY:
         if candidate_decision == ADMIT_ALLOW_DISPATCH or candidate_decision in fired_decisions:
             decision = candidate_decision
             break
@@ -469,6 +488,7 @@ __all__ = (
     "ADMIT_BLOCKED",
     "ADMIT_NEEDS_OWNER_DECISION",
     "ADMISSION_DECISIONS",
+    "ADMISSION_DECISION_SEVERITY",
     "RISK_FILE_OVERLAP",
     "RISK_INVARIANT_OVERLAP",
     "RISK_MERGE_ORDER_CONFLICT",
@@ -481,6 +501,7 @@ __all__ = (
     "NONREASON_CALLBACK_MISS_RISK",
     "NONREASON_COORDINATOR_MANAGEMENT_LOAD",
     "NONREASON_BROAD_BUCKET",
+    "NONREASON_GOAL_COUNT",
     "INVALID_SERIALIZATION_NONREASONS",
     "LaneAdmissionInputs",
     "AdmissionRisk",

@@ -38,6 +38,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     NONREASON_BROAD_BUCKET,
     NONREASON_CALLBACK_MISS_RISK,
     NONREASON_COORDINATOR_MANAGEMENT_LOAD,
+    NONREASON_GOAL_COUNT,
     RISK_BLOCKED_OR_CALLBACK_FAILURE,
     RISK_COORDINATOR_OWNED_QUEUE,
     RISK_CREDENTIAL_DESTRUCTIVE_EXTERNAL_GATE,
@@ -140,12 +141,23 @@ class CoordinatorConvenienceRejectedTest(unittest.TestCase):
                 callback_miss_concern=True,
                 coordinator_management_load=True,
                 broad_bucket_only=True,
+                goal_count_only=True,
             )
         )
         self.assertEqual(out.decision, ADMIT_ALLOW_DISPATCH)
         self.assertEqual(
             set(out.rejected_nonreasons), set(INVALID_SERIALIZATION_NONREASONS)
         )
+
+    def test_goal_count_alone_is_recorded_and_never_decisive(self):
+        # Redmine #14636: "the request carried many goals" is a statement about the size of
+        # the request, not a concrete risk between any two of them.
+        out = evaluate_lane_admission(
+            LaneAdmissionInputs(candidate_issue="14636", goal_count_only=True)
+        )
+        self.assertEqual(out.decision, ADMIT_ALLOW_DISPATCH)
+        self.assertEqual(out.rejected_nonreasons, (NONREASON_GOAL_COUNT,))
+        self.assertEqual(out.risk_reasons, ())
 
     def test_nonreason_does_not_suppress_a_real_risk(self):
         out = evaluate_lane_admission(
