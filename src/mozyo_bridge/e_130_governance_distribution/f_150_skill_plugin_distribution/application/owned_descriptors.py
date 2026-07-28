@@ -228,12 +228,25 @@ def _took_the_interrupt(
     ``UnboundLocalError`` — worked, and cost two more escapable headers for no
     reason (j#90918 R25-F1). It is never passed by a caller.
 
-    What is left is four region boundaries: this ``try``, its ``except``, the
-    inner ``try``, and the ``return``. They sit between protected ranges by
-    construction, so they cannot be brought inside one — but that is an
-    argument for keeping them few, not for adding more. No *statement*
-    escapes, and the regression injects into every executable line to keep the
-    set measured and pinned rather than approved by how a line is spelled.
+    What is left is six lines, and they are the ones the regression pins:
+
+    1. this ``try`` header,
+    2. its ``except`` header,
+    3. the inner ``try`` header,
+    4. the absorbing ``except`` header,
+    5. that handler's ``pass``,
+    6. the ``return``.
+
+    Five are region boundaries, which sit between protected ranges by
+    construction. The ``pass`` is a statement, and it escapes too — a handler
+    body has to contain something, and nothing encloses it. Saying "no
+    statement escapes" was therefore wrong, as was counting four boundaries
+    (j#90948 R26-F1); a residual described more narrowly than the code has is
+    how two earlier defects stayed hidden here. That they cannot be brought
+    inside a guard is an argument for keeping them few, not for adding more.
+    The regression injects into every executable line of this function on both
+    rails, so the set stays measured rather than approved by how a line is
+    spelled.
     """
     try:
         occurrence = _Occurrence(interrupt)

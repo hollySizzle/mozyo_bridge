@@ -2687,13 +2687,19 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
           region fails there instead.
         """
         shape = self._helper_lines()
-        escaped: set[int] = set()
-        exercised: set[int] = set()
+        # Keyed by rail. Sharing one line-number set across rails meant a rail
+        # that never reached the helper at all was covered by the other one —
+        # measured: replacing the final rail with a no-op left this test green
+        # (j#90948 R26-F2). Each rail now has to stand on its own.
+        escaped: dict[str, set[int]] = {}
+        exercised: dict[str, set[int]] = {}
 
         for rail, drive in (
             ("main", self._interrupt_the_main_rail),
             ("final", self._interrupt_the_final_rail),
         ):
+            escaped.setdefault(rail, set())
+            exercised.setdefault(rail, set())
             for schedule, failures in (("plain", 0), ("handler", 1), ("absorb", 2)):
                 for line in shape["executable"]:  # type: ignore[union-attr]
                     with self.subTest(rail=rail, schedule=schedule, line=line):
@@ -2731,9 +2737,9 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
 
                         if pending:
                             continue  # this schedule does not reach that line
-                        exercised.add(line)
+                        exercised[rail].add(line)
                         if left is not None:
-                            escaped.add(line)
+                            escaped[rail].add(line)
                             continue
 
                         self.assertEqual(
@@ -2761,17 +2767,19 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
                                 "the nested interrupt was not retained",
                             )
 
-        unreached = set(shape["executable"]) - exercised - {shape["executable"][0]}  # type: ignore[index]
-        self.assertEqual(
-            set(),
-            unreached,
-            "a line of the helper was never executed by any schedule, so nothing measured it",
-        )
-        self.assertEqual(
-            shape["residual"],
-            escaped,
-            "the lines that escape the helper are not the pinned residual",
-        )
+        required = set(shape["executable"]) - {shape["executable"][0]}  # type: ignore[index]
+        self.assertEqual({"main", "final"}, set(exercised), "a rail did not run at all")
+        for rail in ("main", "final"):
+            self.assertEqual(
+                set(),
+                required - exercised[rail],
+                f"{rail}: a line of the helper was never executed, so nothing measured it",
+            )
+            self.assertEqual(
+                shape["residual"],
+                escaped[rail],
+                f"{rail}: the lines that escape the helper are not the pinned residual",
+            )
 
     def test_an_interrupt_during_the_final_admission_still_counts(self) -> None:
         """j#90779 R21-F1. The exit rail added for R20-F1 swallowed control flow
