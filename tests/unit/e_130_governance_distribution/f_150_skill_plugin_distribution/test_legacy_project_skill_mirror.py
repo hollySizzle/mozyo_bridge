@@ -2431,18 +2431,125 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         )
 
     @staticmethod
-    def _drain_line(match: str) -> int:
-        """The line in `_Retention._drain` containing `match`.
+    def _source_line(function, match: str) -> int:
+        """The line in `function` containing `match`.
 
         Found by source text, not written down: a literal line number would go
         stale the moment the module is edited, and an injection that quietly
         stops firing is exactly the kind of test that reports green for nothing.
         """
-        lines, start = inspect.getsourcelines(owned_descriptors._Retention._drain)
+        lines, start = inspect.getsourcelines(function)
         for offset, line in enumerate(lines):
             if match in line:
                 return start + offset
-        raise AssertionError(f"no line matching {match!r} in _drain; the probe is stale")
+        raise AssertionError(
+            f"no line matching {match!r} in {function.__name__}; the probe is stale"
+        )
+
+    @classmethod
+    def _drain_line(cls, match: str) -> int:
+        return cls._source_line(owned_descriptors._Retention._drain, match)
+
+    def _interrupt_the_queue_append(self, failure: BaseException):
+        """Raise `failure` once, on the instruction that admits to the queue."""
+        line = self._source_line(
+            owned_descriptors._Retention._enqueue, "self._queued.append("
+        )
+        code = owned_descriptors._Retention._enqueue.__code__
+        fired: list[bool] = []
+
+        def local(frame, event, arg):  # type: ignore[no-untyped-def]
+            if event == "line" and frame.f_lineno == line and not fired:
+                fired.append(True)
+                raise failure
+            return local
+
+        def tracer(frame, event, arg):  # type: ignore[no-untyped-def]
+            return local if frame.f_code is code else None
+
+        return tracer, fired
+
+    def test_an_arrival_survives_a_failure_before_it_reaches_the_queue(self) -> None:
+        """j#90620 R20-F1. Making ledger membership the commit authority fixed
+        the far end of the machine and left the entrance lossy: an arrival lived
+        in a single local until it was queued, so an ordinary exception dropped
+        it and an interrupt *replaced* it with the interrupt's own occurrence.
+
+        Measured before the fix, injecting at the queue append: `MemoryError`
+        left an empty ledger, and `KeyboardInterrupt` left a ledger holding the
+        interrupt and not the failure it arrived with.
+        """
+        for label, injected in (
+            ("ordinary", MemoryError("no room to queue it")),
+            ("control flow", KeyboardInterrupt("interrupt while queueing")),
+        ):
+            with self.subTest(failure=label):
+                primary = Exception("write failed")
+                retention = owned_descriptors._Retention(primary)
+                original = RuntimeError("the original teardown failure")
+
+                tracer, fired = self._interrupt_the_queue_append(injected)
+                sys.settrace(tracer)
+                try:
+                    first = retention.remember(original)
+                finally:
+                    sys.settrace(None)
+                retention.flush()
+
+                self.assertTrue(fired, f"{label}: the injection never fired")
+                ledger = owned_descriptors.teardown_failures(primary)
+                self.assertEqual(
+                    1,
+                    sum(1 for entry in ledger if entry is original),
+                    f"{label}: the arrival was lost before it reached the queue",
+                )
+                if label == "control flow":
+                    self.assertIs(first, injected, "the interrupt did not take priority")
+                    self.assertEqual(
+                        1,
+                        sum(1 for entry in ledger if entry is injected),
+                        "the interrupt was not retained exactly once",
+                    )
+                else:
+                    self.assertIsNone(first, "an ordinary failure is not control flow")
+
+    def test_an_exhausted_retry_still_reaches_the_queue(self) -> None:
+        """j#90620 R20-F1, the far end of the same defect. The last interrupt of
+        an exhausted retry sat in the local that was about to go out of scope,
+        so it was never queued — and this is not the documented never-recovers
+        boundary, because the carrier works again on the very next call."""
+        real_ledger = owned_descriptors._ledger
+        attempts = owned_descriptors._RETENTION_ATTEMPTS
+        raised: list[BaseException] = []
+
+        def interrupts_then_recovers(primary):  # type: ignore[no-untyped-def]
+            if len(raised) < attempts:
+                interrupt = KeyboardInterrupt(f"interrupt-{len(raised) + 1}")
+                raised.append(interrupt)
+                raise interrupt
+            return real_ledger(primary)
+
+        primary = Exception("write failed")
+        retention = owned_descriptors._Retention(primary)
+        original = RuntimeError("the original teardown failure")
+
+        with unittest.mock.patch.object(
+            owned_descriptors, "_ledger", interrupts_then_recovers
+        ):
+            first = retention.remember(original)
+        retention.flush()
+
+        self.assertEqual(attempts, len(raised), "the schedule did not exhaust the retries")
+        self.assertIs(first, raised[0], "the first interrupt did not take priority")
+
+        ledger = owned_descriptors.teardown_failures(primary)
+        self.assertEqual(1, sum(1 for entry in ledger if entry is original))
+        for index, interrupt in enumerate(raised, start=1):
+            self.assertEqual(
+                1,
+                sum(1 for entry in ledger if entry is interrupt),
+                f"interrupt-{index} was not retained exactly once",
+            )
 
     def _interrupt_after_a_commit(self, primary, line: int):
         """Trace `_drain` and interrupt once at `line`, after an append landed.

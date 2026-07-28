@@ -233,22 +233,54 @@ class _Retention:
         interrupt is an occurrence in its own right, so it joins the queue and
         the loop tries again — bounded, because a carrier that keeps
         interrupting must not spin.
+
+        Arrivals wait in a list, not a slot. Holding the incoming occurrence in
+        a single local made the queue's *entrance* the lossy part of an
+        otherwise lossless machine: an ordinary exception dropped it, an
+        interrupt overwrote it with the interrupt's own occurrence, and the last
+        interrupt of an exhausted retry was never queued at all — even when the
+        carrier recovered on the very next call (j#90620 R20-F1). Admission is
+        idempotent, so re-admitting the whole list costs nothing and an arrival
+        can only be added, never replaced.
         """
+        unadmitted: list[_Occurrence] = [] if arriving is None else [arriving]
         first: BaseException | None = None
         for _ in range(_RETENTION_ATTEMPTS):
             try:
-                if arriving is not None:
-                    self._enqueue(arriving)
-                    arriving = None
+                self._admit(unadmitted)
                 self._drain()
                 return first
-            except Exception:  # noqa: BLE001 - nothing to route; still queued
-                return first
+            except Exception:  # noqa: BLE001 - nothing to route; admitted below
+                break
             except BaseException as interrupt:  # noqa: BLE001 - routed, not raised
                 if first is None:
                     first = interrupt
-                arriving = _Occurrence(interrupt)
+                unadmitted.append(_Occurrence(interrupt))
+        self._admit_before_leaving(unadmitted)
         return first
+
+    def _admit_before_leaving(self, unadmitted: list[_Occurrence]) -> None:
+        """Get the leftovers into the queue, so a later retention can see them.
+
+        Whatever is still unadmitted when this call gives up would otherwise
+        exist only in a local that is about to go out of scope. Bounded, and
+        the last unavoidable point: a signal can land on the instruction that
+        appends to the queue, and Python has no way to make that atomic. The
+        window is one instruction wide, retried, and no wider than this.
+        """
+        for _ in range(_RETENTION_ATTEMPTS):
+            try:
+                self._admit(unadmitted)
+                return
+            except Exception:  # noqa: BLE001 - the queue is a plain list; retry
+                continue
+            except BaseException:  # noqa: BLE001 - priority is already decided
+                continue
+
+    def _admit(self, unadmitted: list[_Occurrence]) -> None:
+        """Queue every arrival that is not queued yet."""
+        for occurrence in unadmitted:
+            self._enqueue(occurrence)
 
     def _enqueue(self, occurrence: _Occurrence) -> None:
         """Queue an occurrence unless it is already there. Idempotent."""
