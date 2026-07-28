@@ -36,7 +36,11 @@ Consequences worth stating, because they are easy to undo by accident:
 
 Where the host cannot provide these primitives the service fails closed
 (:data:`~..domain.legacy_mirror_contract.PLATFORM_UNSUPPORTED`) rather than
-degrading to path-based I/O.
+degrading to path-based I/O. Deciding whether it can is
+:mod:`.platform_capabilities`, which probes the call forms below rather than
+reading ``os.supports_dir_fd`` — that set is an advertisement, and on Linux
+CPython 3.12 it omits ``os.lstat`` and refused a host that supports everything
+here (Redmine #14651).
 
 Unreadable state is a typed violation, not an exception: a mode-000 canonical
 file used to escape the audit as a traceback, which left `release check drift`
@@ -62,6 +66,7 @@ from .owned_descriptors import (
     _OwnedDescriptor,
     _teardown_during,
 )
+from .platform_capabilities import missing_platform_capabilities
 from ..domain.legacy_mirror_contract import (
     CLEANUP_FAILED,
     CONTENT_DRIFT,
@@ -110,38 +115,6 @@ _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLL
 #: swapped in after the type audit from blocking the open itself; the `fstat`
 #: on the returned fd then rejects it (j#90450 R7-F2).
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-
-
-#: Every platform-dependent primitive this module actually calls, paired with
-#: the capability probe for it. Review j#90450 R7-F4: the manifest listed
-#: `os.stat`, which nothing here calls, and omitted `os.lstat(dir_fd=)`, which
-#: every type decision goes through — so a host without it passed the preflight
-#: and then raised `NotImplementedError` straight past the fail-closed path. The
-#: manifest is the call surface, not a plausible-looking sample of it.
-_REQUIRED_DIR_FD_CALLS: tuple[tuple[str, object], ...] = (
-    ("open(dir_fd=)", os.open),
-    ("lstat(dir_fd=)", os.lstat),
-    ("unlink(dir_fd=)", os.unlink),
-    ("mkdir(dir_fd=)", os.mkdir),
-    # `os.replace` shares `os.rename`'s implementation; the capability set is
-    # keyed on `os.rename` even though both accept the arguments (measured).
-    ("rename(src_dir_fd=, dst_dir_fd=)", os.rename),
-)
-
-
-def missing_platform_capabilities() -> tuple[str, ...]:
-    """Primitives this service refuses to run without."""
-    missing: list[str] = []
-    for flag in ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK"):
-        if not hasattr(os, flag):
-            missing.append(flag)
-    for label, function in _REQUIRED_DIR_FD_CALLS:
-        if function not in os.supports_dir_fd:
-            missing.append(label)
-    if os.scandir not in os.supports_fd:
-        missing.append("scandir(fd)")
-    return tuple(missing)
-
 
 
 class LegacyProjectSkillMirrorSync:

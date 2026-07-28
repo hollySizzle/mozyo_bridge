@@ -38,6 +38,7 @@ now, so there is nothing to cross-check and nothing to drift.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import errno
 import hashlib
@@ -53,6 +54,7 @@ import tempfile
 import threading
 import unittest
 import unittest.mock
+from collections.abc import Iterator
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -61,6 +63,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.application import (  # noqa: E402
     legacy_mirror_sync,
     owned_descriptors,
+    platform_capabilities,
 )
 from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.application.legacy_mirror_sync import (  # noqa: E402
     HOOK_TEMP_CREATED,
@@ -229,6 +232,23 @@ class _MirrorTreeFixture(unittest.TestCase):
     @staticmethod
     def _service(repo: Path, **kwargs: object) -> LegacyProjectSkillMirrorSync:
         return LegacyProjectSkillMirrorSync(repo, **kwargs)  # type: ignore[arg-type]
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _preflight_already_answered() -> Iterator[None]:
+        """Run the service with the host capability probe answered in advance.
+
+        The probe calls the same primitives the service does — that is what
+        makes it a probe rather than an advertisement (#14651) — so an
+        injection that fires on the *n*-th call to a global `os.unlink` or
+        `os.close` would land on the probe before it ever reached the subject.
+        Injections keyed on a descriptor, a name or a flag pick out their own
+        call and do not need this.
+        """
+        with unittest.mock.patch.object(
+            legacy_mirror_sync, "missing_platform_capabilities", return_value=()
+        ):
+            yield
 
     def assertBlocksWrite(self, repo: Path, expected_kind: str) -> None:
         """Both modes refuse, nothing is written, and the class is named."""
@@ -1210,11 +1230,12 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
             raise OSError(errno.ENOSPC, "injected")
 
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", failing_write):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "unlink", transient_unlink
-            ):
-                code, _out, err = self._service(repo).sync()
+        with self._preflight_already_answered():
+            with unittest.mock.patch.object(legacy_mirror_sync.os, "write", failing_write):
+                with unittest.mock.patch.object(
+                    legacy_mirror_sync.os, "unlink", transient_unlink
+                ):
+                    code, _out, err = self._service(repo).sync()
 
         self.assertEqual(1, code)
         self.assertEqual(1, len(calls), "cleanup ran more than once for one staging file")
@@ -1759,9 +1780,10 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             if len(order) == 2:
                 raise CurrentClose("second")
 
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "close", failing_close):
-            with self.assertRaises(PreviousClose) as caught:
-                self._service(repo).audit()
+        with self._preflight_already_answered():
+            with unittest.mock.patch.object(legacy_mirror_sync.os, "close", failing_close):
+                with self.assertRaises(PreviousClose) as caught:
+                    self._service(repo).audit()
 
         notes = getattr(caught.exception, "__notes__", [])
         self.assertTrue(
@@ -3115,61 +3137,224 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         self.assertEqual(1, code)
         self.assertIn("no longer a regular file", "\n".join(err))
 
-    # --- R7-F4: the capability manifest is the call surface -------------------
+    # --- R7-F4 / #14651: the capability probe measures the call surface -------
+
+    @staticmethod
+    def _call_surface_sources() -> list[Path]:
+        """Every module of the package except the prober itself.
+
+        Naming the files here is what went wrong before: the primitives were
+        split across two modules when the service crossed the module-health
+        threshold, and a fence that reads only one of them goes blind to the
+        other (j#90458 R8-F4). The prober is excluded because its own probe
+        calls would otherwise satisfy the fence with themselves.
+        """
+        package = Path(legacy_mirror_sync.__file__).parent
+        prober = Path(platform_capabilities.__file__)
+        return sorted(path for path in package.glob("*.py") if path != prober)
+
+    @staticmethod
+    def _os_calls_taking_a_dir_fd(sources: list[Path]) -> set[str]:
+        """Read the call surface out of the source instead of listing it.
+
+        Two review rounds found the manifest listing a primitive nothing calls
+        and omitting one every call goes through. A hand-written list of call
+        sites in the test reproduces that failure mode one level up, so the
+        oracle is the AST: any ``os.<name>(...)`` passing ``dir_fd`` /
+        ``src_dir_fd`` / ``dst_dir_fd``.
+        """
+        found: set[str] = set()
+        for path in sources:
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if not isinstance(node, ast.Call):
+                    continue
+                function = node.func
+                if not (
+                    isinstance(function, ast.Attribute)
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id == "os"
+                ):
+                    continue
+                if any(
+                    keyword.arg in ("dir_fd", "src_dir_fd", "dst_dir_fd")
+                    for keyword in node.keywords
+                ):
+                    found.add(function.attr)
+        return found
+
+    def test_capability_manifest_is_exactly_the_primitives_the_module_calls(self) -> None:
+        """Guard the manifest against the module drifting away from it —
+        in both directions. `os.stat` was listed and never called; `os.lstat`
+        was called and never listed (j#90450 R7-F4)."""
+        sources = self._call_surface_sources()
+        self.assertIn(Path(legacy_mirror_sync.__file__), sources)
+        self.assertIn(Path(owned_descriptors.__file__), sources)
+
+        called = self._os_calls_taking_a_dir_fd(sources)
+        body = "\n".join(path.read_text(encoding="utf-8") for path in sources)
+        if "os.scandir(" in body:
+            # `scandir` takes its descriptor positionally, so the AST cannot
+            # tell it from a path argument; it is named here instead.
+            called.add("scandir")
+        listed = {name for name, _label, _probe in platform_capabilities._REQUIRED_DIR_FD_CALLS}
+        self.assertEqual(
+            called,
+            listed,
+            "the manifest and the call surface disagree",
+        )
+        # The two the advertisement gets wrong, spelled out so a regression
+        # names them rather than printing a set difference.
+        self.assertIn("lstat", listed, "lstat(dir_fd=) is not in the manifest")
+        self.assertIn("replace", listed, "replace is what the swap calls, not rename")
 
     def test_each_required_capability_individually_fails_closed(self) -> None:
-        """j#90450 R7-F4. The manifest probed `os.stat`, which nothing calls,
-        and omitted `os.lstat(dir_fd=)`, which every type decision uses — so a
-        host missing it passed the preflight and then raised
-        `NotImplementedError` past the fail-closed path.
-        """
+        """A host that cannot provide one primitive must refuse, whichever
+        way it says so: `NotImplementedError` is what CPython raises for an
+        unavailable `dir_fd`, and a primitive that never took the keyword
+        raises `TypeError`."""
         repo = self._stage()
-        required = [function for _label, function in legacy_mirror_sync._REQUIRED_DIR_FD_CALLS]
-        self.assertIn(os.lstat, required, "lstat(dir_fd=) is not in the manifest")
 
-        for function in required:
-            with self.subTest(capability=getattr(function, "__name__", function)):
-                reduced = frozenset(os.supports_dir_fd) - {function}
-                with unittest.mock.patch.object(os, "supports_dir_fd", reduced):
-                    self.assertIn(
-                        getattr(function, "__name__", ""),
-                        " ".join(legacy_mirror_sync.missing_platform_capabilities()),
-                    )
+        def unavailable(*_args: object, **_kwargs: object) -> None:
+            raise NotImplementedError("dir_fd unavailable on this platform")
+
+        def without_the_keyword(*_args: object) -> None:
+            """Accepts the positional arguments and nothing else."""
+
+        for name, label, _probe in platform_capabilities._REQUIRED_DIR_FD_CALLS:
+            for host, stub in (
+                ("NotImplementedError", unavailable),
+                ("TypeError", without_the_keyword),
+            ):
+                with self.subTest(capability=label, host=host):
                     service = self._service(repo)
-                    audit = service.audit()
+                    with unittest.mock.patch.object(os, name, stub):
+                        missing = platform_capabilities.missing_platform_capabilities()
+                        audit = service.audit()
+                        code, out, _err = service.sync()
+                    self.assertIn(label, missing)
                     self.assertIn(PLATFORM_UNSUPPORTED, audit.kinds())
                     self.assertTrue(audit.blocks_write)
-                    code, out, _ = service.sync()
                     self.assertEqual(1, code)
                     self.assertEqual((), out)
 
-    def test_capability_manifest_covers_the_primitives_the_module_calls(self) -> None:
-        """Guard the manifest against the module drifting away from it."""
-        # Both modules: the primitives were split across two files when the
-        # service crossed the module-health threshold, and a fence that reads
-        # only one of them would go blind to the other.
-        source = "\n".join(
-            Path(module.__file__).read_text(encoding="utf-8")
-            for module in (legacy_mirror_sync, owned_descriptors)
-        )
-        # Scan the WHOLE module: restricting it to the class body meant a call
-        # moved to a module-level helper escaped the fence while still being a
-        # platform-dependent primitive (j#90458 R8-F4).
-        body = source
-        listed = {
-            getattr(function, "__name__", "")
-            for _label, function in legacy_mirror_sync._REQUIRED_DIR_FD_CALLS
-        }
-        for call, name in (
-            ("os.lstat(", "lstat"),
-            ("os.open(", "open"),
-            ("os.unlink(", "unlink"),
-            ("os.mkdir(", "mkdir"),
-        ):
-            if call in body:
-                self.assertIn(name, listed, f"{name} is called but not in the manifest")
-        if "os.replace(" in body:
-            self.assertIn("rename", listed, "replace is called; rename must be probed")
+    def test_a_scandir_whose_failure_is_deferred_still_fails_closed(self) -> None:
+        """`os.scandir` hands back an iterator before it has opened anything —
+        CPython leaves the `fdopendir` to the first step. A probe that only
+        constructed the iterator would read a host that cannot open a directory
+        by descriptor at all as capable, so the probe steps it."""
+        repo = self._stage()
+
+        class DeferredFailure:
+            def __iter__(self) -> object:
+                return self
+
+            def __next__(self) -> object:
+                raise NotImplementedError("fd support unavailable")
+
+            def close(self) -> None:
+                """Constructing and closing it says nothing about the host."""
+
+        service = self._service(repo)
+        with unittest.mock.patch.object(os, "scandir", lambda _fd: DeferredFailure()):
+            missing = platform_capabilities.missing_platform_capabilities()
+            audit = service.audit()
+        self.assertIn("scandir(fd)", missing)
+        self.assertIn(PLATFORM_UNSUPPORTED, audit.kinds())
+        self.assertTrue(audit.blocks_write)
+
+    def test_an_interrupt_during_the_probe_is_not_a_missing_capability(self) -> None:
+        """Unknown exceptions fail closed, but `BaseException` is not unknown —
+        swallowing an interrupt would report the host as unsupported and let
+        the run continue as if it had measured something."""
+
+        def interrupted(*_args: object, **_kwargs: object) -> None:
+            raise KeyboardInterrupt
+
+        with unittest.mock.patch.object(os, "lstat", interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                platform_capabilities.missing_platform_capabilities()
+
+    def test_a_supported_host_is_not_refused_by_a_stale_advertisement(self) -> None:
+        """#14651. `os.supports_dir_fd` is a hand-maintained list in `os.py`,
+        not a fact about the interpreter: CPython 3.12 on Linux omits
+        `os.lstat` although `os.lstat(name, dir_fd=)` works there (measured on
+        `python:3.12-slim`; 3.13 added the entry), and no version has ever
+        listed `os.replace`. Reading it refused the whole Linux CI runner —
+        every legacy mirror path collapsed into `platform_unsupported`, 91
+        failures on a host that supports everything (Actions run 30383304588).
+
+        The advertisement is emptied entirely rather than trimmed by one
+        entry, so the test states the property — the probe does not consult it
+        — rather than re-encoding whichever entry CPython happens to omit.
+        """
+        repo = self._stage()
+        with unittest.mock.patch.object(os, "supports_dir_fd", frozenset()):
+            with unittest.mock.patch.object(os, "supports_fd", frozenset()):
+                self.assertEqual((), platform_capabilities.missing_platform_capabilities())
+                code, out, err = self._service(repo).check()
+        self.assertEqual(0, code, "\n".join(err))
+        self.assertIn("up to date", "\n".join(out))
+
+    def test_the_exact_linux_312_advertisement_is_accepted(self) -> None:
+        """The CI condition itself: `lstat` missing from the set, everything
+        else present. Kept alongside the emptied-set case because that one
+        would still pass if the probe fell back to membership whenever the set
+        looked implausible."""
+        as_linux_312 = frozenset(os.supports_dir_fd) - {os.lstat}
+        with unittest.mock.patch.object(os, "supports_dir_fd", as_linux_312):
+            self.assertEqual((), platform_capabilities.missing_platform_capabilities())
+
+    def test_the_probe_writes_nothing_and_leaks_no_descriptor(self) -> None:
+        """The anchor is not a directory, so every `*at()` call is rejected
+        before the relative name is resolved. That is what makes the probe
+        side-effect-free; measure it rather than trust the docstring."""
+        scratch = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        origin = os.getcwd()
+        os.chdir(scratch)
+        self.addCleanup(os.chdir, origin)
+
+        before = self._open_descriptors()
+        for _ in range(32):
+            self.assertEqual((), platform_capabilities.missing_platform_capabilities())
+        self.assertEqual([], sorted(scratch.rglob("*")), "the probe left residue behind")
+        self.assertEqual(before, self._open_descriptors(), "the probe leaked a descriptor")
+
+    def test_the_probe_anchor_is_not_a_directory(self) -> None:
+        """Why the above holds. If the anchor ever became a real directory the
+        probes would start acting on it, and `mkdir` / `replace` / `unlink`
+        would resolve their names instead of being rejected."""
+        with platform_capabilities._probe_anchor() as anchor:
+            self.assertIsNotNone(anchor)
+            self.assertFalse(stat.S_ISDIR(os.fstat(anchor).st_mode))
+
+    def test_a_probe_that_cannot_be_set_up_fails_closed(self) -> None:
+        """Not being able to measure the host is not the same as the host
+        being capable. It refuses for the same reason a missing primitive
+        does, and says which of the two happened."""
+        repo = self._stage()
+        exhausted = unittest.mock.Mock(side_effect=OSError(errno.EMFILE, "too many open files"))
+        with unittest.mock.patch.object(os, "pipe", exhausted):
+            service = self._service(repo)
+            missing = platform_capabilities.missing_platform_capabilities()
+            audit = service.audit()
+            code, out, _err = service.sync()
+        self.assertEqual((platform_capabilities.PROBE_UNAVAILABLE,), missing)
+        self.assertIn(PLATFORM_UNSUPPORTED, audit.kinds())
+        self.assertTrue(audit.blocks_write)
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+
+    @staticmethod
+    def _open_descriptors() -> list[int]:
+        live: list[int] = []
+        for fd in range(1024):
+            try:
+                os.fstat(fd)
+            except OSError:
+                continue
+            live.append(fd)
+        return live
 
     # --- R6-F3: unreadable state is typed, not an exception ------------------
 
