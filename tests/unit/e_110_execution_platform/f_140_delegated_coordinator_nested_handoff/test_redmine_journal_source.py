@@ -437,6 +437,7 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
         for label, note in (
             ("Arabic-Indic one", "\u0661. <!--a@b>\n\n%s" % self.GATE),
             ("fullwidth one", "\uff11. <!--a@b>\n\n%s" % self.GATE),
+            ("Devanagari one", "\u0967. <!--a@b>\n\n%s" % self.GATE),
         ):
             with self.subTest(label):
                 self.assertEqual(self._gates(note), ("review_request",))

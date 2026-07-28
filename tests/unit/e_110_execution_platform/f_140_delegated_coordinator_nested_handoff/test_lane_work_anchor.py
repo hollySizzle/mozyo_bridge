@@ -281,6 +281,7 @@ class FailClosedTest(unittest.TestCase):
         for label, note in (
             ("Arabic-Indic one", "\u0661. <!--a@b>\n\n%s" % marker),
             ("fullwidth one", "\uff11. <!--a@b>\n\n%s" % marker),
+            ("Devanagari one", "\u0967. <!--a@b>\n\n%s" % marker),
         ):
             with self.subTest(label):
                 anchor = _resolve([_entry("90409", note)])
