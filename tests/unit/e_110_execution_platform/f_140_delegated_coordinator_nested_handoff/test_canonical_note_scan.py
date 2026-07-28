@@ -636,6 +636,32 @@ class PassOrderTest(unittest.TestCase):
         self.assertEqual(_gates(f"prose\n1. <!--a@b>\n\n{MARKER}"), ())
         self.assertEqual(_gates(f"prose\n- <!--a@b>\n\n{MARKER}"), ())
         self.assertEqual(_gates(f"2. <!--a@b>\n\n{MARKER}"), ())
+        # The condition is the start NUMBER, not the digit. Every spelling of one interrupts, and
+        # matching the literal "1" read `01.` as prose and let an unrendered block through
+        # (#14584 j#91997) — so both sides are pinned by value rather than by text.
+        for label, note in (
+            ("leading zero", f"prose\n01. <!--a@b>\n\n{MARKER}"),
+            ("nine digits", f"prose\n000000001. <!--a@b>\n\n{MARKER}"),
+            ("paren delimiter", f"prose\n01) <!--a@b>\n\n{MARKER}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ())
+        for label, note in (
+            ("padded two", f"prose\n000000002. <!--a@b>\n\n{MARKER}"),
+            ("ten", f"prose\n10. <!--a@b>\n\n{MARKER}"),
+            ("ten digits is not a marker at all", f"prose\n0000000001. <!--a@b>\n\n{MARKER}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ("review_request",))
+
+    def test_the_ninth_digit_is_the_last_one_a_marker_may_have(self):
+        # The tenth-digit edge of the same rule. It does not show through the block-start test —
+        # the container prefix caps at nine digits too, so both spellings fail it — but it does
+        # show through paragraph GROUPING: nine digits interrupt, so the unmatched backtick above
+        # stops refusing there; ten digits do not, so the refusal carries on.
+        # (Declared over-blank on the second line: the tail rule refuses more than the renderer.)
+        self.assertEqual(_gates(f"prose `x\n000000001. y\n{MARKER}"), ("review_request",))
+        self.assertEqual(_gates(f"prose `x\n0000000001. y\n{MARKER}"), ())
 
     def test_the_indent_after_a_list_marker_is_measured_in_columns(self):
         # A list marker admits one to four COLUMNS after it (§5.2 rule 1). At five the content is an

@@ -169,10 +169,12 @@ _TAB_STOP = 4
 _INTERRUPTS_PARAGRAPH = (
     re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)"),  # ATX heading
     re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$"),  # thematic break
-    # A list item interrupts a paragraph, but an ORDERED one only when it starts at 1
+    # A list item interrupts a paragraph, but an ORDERED one only when its START NUMBER is 1
     # (CommonMark 0.31.2 §5.2). Accepting any number made `prose\n2. …` a new block and cost
-    # the gate below it (#14584 j#91954 F2).
-    re.compile(r"^ {0,3}(?:[-+*]|1[.)])(?:[ \t]|$)"),  # list item
+    # the gate below it (#14584 j#91954 F2); matching the literal "1" instead of the value
+    # then read `01.` as prose and let an unrendered block through (#14584 j#91997). The
+    # marker holds one to nine digits, so every spelling of one is 0{0,8}1.
+    re.compile(r"^ {0,3}(?:[-+*]|0{0,8}1[.)])(?:[ \t]|$)"),  # list item
 )
 
 #: Anything that starts raw HTML: a tag, a closing tag, a comment / declaration / CDATA (``<!``) or

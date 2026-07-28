@@ -253,6 +253,10 @@ authorize したかを照合しなければ scope は未検証のままである
       block start にしない**。**ただし indent だけの prefix は継続行でも block start たり得る** —
       HTML block は paragraph を interrupt できるからで、ここを一律に禁じると逆に実 gate を消す
       (probe PHASEWIDE で赤化)。
+      ★★★**規約が「値」を述べているところを「字面」で書かない** (#14584 j#91997)。§5.2 の条件は
+      ordered marker の **start number が 1** であり、`01.` / `000000001.` も 1 である。literal `1` で
+      書いたため leading zero 付きを prose と誤判定し、**描画されない block 内 marker を受理した**。
+      正: `0{0,8}1[.)]` (1–9 桁で値が 1)。**規約の文言をそのまま述語へ写し、写せないなら理由を書く。**
       ★★★**oracle の述語は連言でなければならない** (#14584 j#91863)。R6 で「plain に残る」を
       「text node である」へ**置き換えた**が、raw HTML passthrough は tag 除去後の残骸が text に見える
       ため text-node 判定を通り、plain が空であることを見ていなかった。正しくは

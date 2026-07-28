@@ -204,6 +204,8 @@ class FailClosedTest(unittest.TestCase):
             ("html block inside an ordered item", "1. <?a@b>\n   %s" % marker),
             ("four columns after the marker", "-    <!--a@b>\n\n%s" % marker),
             ("ordered list at one interrupts", "prose\n1. <!--a@b>\n\n%s" % marker),
+            # #14584 j#91997: the condition is the start NUMBER, so 01. interrupts too.
+            ("ordered list at one, padded", "prose\n01. <!--a@b>\n\n%s" % marker),
             ("definition title on the next line", '[foo]: /url\n  "%s"' % marker),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % marker),
             ("image alt text", "![a %s b](img.png)" % marker),
