@@ -455,6 +455,7 @@ def _prepare_session_locked(
         env=env,
         error_type=HerdrSessionStartError,
         launch_context=launch_context,
+        pair_order=pair_order,
     )
     binary = _resolve_binary_or_die(env)
     # The mozyo-bridge launcher the #13637 self-check wraps the provider through
@@ -920,7 +921,7 @@ def _prepare_session_locked(
     # raising. The ratio touches ONLY a divider this run just created, never a live pair.
     finalize_container_geometry(
         result, config_split=config_split, config_order=config_order,
-        pair_order=pair_order or providers, config_ratio=config_ratio,
+        pair_order=pair_order, requested=providers, config_ratio=config_ratio,
         launched=len(launch_plans),
         initial_occupancy=plan_of_container.occupancy, dry_run=dry_run,
         binary=binary, runner=runner, timeout=timeout, env=env,

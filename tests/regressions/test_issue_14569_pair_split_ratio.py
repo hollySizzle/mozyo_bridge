@@ -84,6 +84,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E402,E501
     prepare_session,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E402,E501
+    HerdrSessionStartError,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_health import (  # noqa: E402,E501
     StartupProbe,
 )
@@ -860,6 +863,80 @@ class LaunchRatioTest(unittest.TestCase):
         self.assertEqual(healed.ratio_outcome, RATIO_DEFERRED, healed.ratio_detail)
         self.assertEqual(len(self._resize_calls(herdr)), before)
 
+    def test_a_malformed_pair_order_is_refused_before_any_side_effect(self) -> None:
+        # Review j#91284 R3-F1. `pair_order` is ratio authority, so it is held to the same
+        # domain the declared `order` already is: an exact permutation of the canonical
+        # providers. Coercion was not theoretical — `("unknown", "codex")` made `codex` NOT
+        # the primary, so a gateway heal resized the pair and gave the gateway's declared
+        # share to the surviving worker while reporting `applied` (j#91299).
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        malformed = [
+            ("unknown", "codex"),      # an unknown provider
+            ("codex", "codex"),        # a duplicate
+            ("codex",),                # a partial pair
+            (),                        # empty
+            (None, "codex"),           # a non-string element (used to become "None")
+            ("codex", "claude", "x"),  # a superset
+            "codex",                   # a bare string is not a list of providers
+            7,                         # not a sequence at all
+        ]
+        for bad in malformed:
+            with self.subTest(pair_order=bad):
+                herdr = FakeHerdr()
+                with tempfile.TemporaryDirectory() as tmp:
+                    with self.assertRaises(HerdrSessionStartError):
+                        self._prepare(
+                            tmp, herdr=herdr, lane_placement=config, pair_order=bad
+                        )
+                # Zero side effect: the refusal happens at the argument boundary, so herdr
+                # was never asked to create, launch, resize or close anything.
+                self.assertEqual(herdr.calls, [], f"{bad!r} reached herdr")
+
+    def test_a_pair_order_that_excludes_the_requested_provider_is_refused(self) -> None:
+        # A caller naming a stable order that does not contain what it is launching has
+        # contradicted itself; the side the ratio would pick from that is meaningless.
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        herdr = FakeHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(HerdrSessionStartError):
+                self._prepare(
+                    tmp, herdr=herdr, lane_placement=config,
+                    providers=("codex",), pair_order=("claude", "claude"),
+                )
+        self.assertEqual(herdr.calls, [])
+
+    def test_a_well_formed_pair_order_is_accepted_in_either_direction(self) -> None:
+        # The validator must not be so strict that the real orders stop working: both
+        # permutations are legitimate lane orders (a rebound binding is the second).
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        for order in (("codex", "claude"), ("claude", "codex")):
+            with self.subTest(pair_order=order):
+                herdr = FakeHerdr()
+                with tempfile.TemporaryDirectory() as tmp:
+                    result = self._prepare(
+                        tmp, herdr=herdr, lane_placement=config,
+                        providers=order, pair_order=order,
+                    )
+                self.assertEqual(result.ratio_outcome, RATIO_APPLIED, result.ratio_detail)
+
+    def test_a_shrunk_request_reports_an_unattributable_effective_order(self) -> None:
+        # R3-F1's third part: the spec's layer 3 says a request that is not a full pair
+        # contributes nothing, so the effective order is EMPTY. Previously the singleton
+        # request became a one-element "order" whose deferral was a coincidence, and whose
+        # detail claimed an effective order of `['codex']`.
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        herdr = FakeHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh = self._prepare(tmp, herdr=herdr, lane_placement=config)
+            victim = fresh.slots[0]
+            herdr.run([str(Path(tmp) / "fake-herdr"), "pane", "close", victim.locator])
+            healed = self._prepare(
+                tmp, herdr=herdr, lane_placement=config, providers=(victim.provider,)
+            )
+        self.assertEqual(healed.ratio_outcome, RATIO_DEFERRED)
+        self.assertIn("unattributable", healed.ratio_detail)
+        self.assertNotIn(f"['{victim.provider}']", healed.ratio_detail)
+
     def test_a_full_pair_request_needs_no_caller_supplied_order(self) -> None:
         # The fallback must not make the ordinary path depend on a new argument: an
         # unshrunk request IS the pair order, so a fresh pair still divides with no
@@ -957,6 +1034,26 @@ class TargetOnlyProductionSeamTest(unittest.TestCase):
     LANE = "issue_14569_target_only"
     ISSUE = "14569"
 
+    @staticmethod
+    def _runner_answering_the_launcher_config_probe(inner):
+        """Wrap ``inner`` so the launcher's ``config check-parse`` probe is answered.
+
+        Declaring a ``lane_placement`` at all turns on the #14258 launcher config-parse
+        preflight, and the v1 fixture's fake launcher does not model that subcommand — so
+        without this the seam refuses before it ever launches. The answer comes from the ONE
+        canonical responder the installed-fault harness already uses (which runs this build's
+        real loader), never a second hand-written ``exit 0``: a canned success would report a
+        launcher as config-compatible even for a document this build rejects.
+        """
+        from support.installed_fault_harness import _config_check_parse_result
+
+        def run(argv, *args, **kwargs):
+            if list(argv[1:])[:2] == ["config", "check-parse"]:
+                return _config_check_parse_result(list(argv))
+            return inner(argv, *args, **kwargs)
+
+        return run
+
     def test_a_target_only_replacement_measures_the_divider_it_created(self) -> None:
         from tests.regressions.test_issue_13933_bound_stale_pair_convergence import (
             _append_v1_lane,
@@ -996,6 +1093,112 @@ class TargetOnlyProductionSeamTest(unittest.TestCase):
             layouts_after, layouts_before,
             "the target-only replacement never reached the ratio rail (no pane layout read)",
         )
+        self.assertAlmostEqual(live_ratio, 0.5, places=6)
+
+    def _drive_target_only_heal(self, tmp, *, healed_provider, spy):
+        """Run the REAL actuator -> heal_lane_column -> prepare_session chain, target-only.
+
+        Returns ``(fake, healed pane id, resize count delta)``. The lane declares a
+        NON-default ``ratio`` and no ``order`` — the product default that exists precisely to
+        respect the binding's ``(gateway, worker)`` order — so nothing here can pass by
+        coinciding with the even default.
+        """
+        from tests.regressions.test_issue_13933_bound_stale_pair_convergence import (
+            _append_v1_lane,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
+            HerdrSublaneActuatorOps,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_session_start as _session,
+        )
+
+        home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
+            _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
+        )
+        names = {"codex": (gw_name, gw_old), "claude": (wk_name, wk_old)}
+        assigned_name, old_locator = names[healed_provider]
+        for root in (coord, worktree):
+            (root / ".mozyo-bridge").mkdir(parents=True, exist_ok=True)
+            (root / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 2\nlane_placement:\n  sublane:\n    ratio: 0.8\n",
+                encoding="utf-8",
+            )
+        runner = self._runner_answering_the_launcher_config_probe(fake.run)
+        fake.run([str(Path(tmp) / "fake-herdr"), "pane", "close", old_locator])
+        before = len([c for c in fake.calls if c[:2] == ["pane", "resize"]])
+        ops = HerdrSublaneActuatorOps(
+            repo_root=coord, lane_label=self.LANE, issue=self.ISSUE, journal="91284",
+            env=env, runner=runner,
+            replacement_action_id=f"target-only-{healed_provider}",
+            replacement_assigned_name=assigned_name,
+            replacement_old_locator=old_locator,
+            replacement_target_only=True,
+        )
+        # BOTH entry points, because the v1 replacement path runs under a caller-held
+        # admission lock and therefore composes `_prepare_session_locked`, not the public
+        # wrapper — spying on only one would silently observe nothing.
+        real_public = _session.prepare_session
+        real_locked = _session._prepare_session_locked
+
+        def watch(inner):
+            def watched(**kwargs):
+                spy.append(kwargs.get("pair_order"))
+                return inner(**kwargs)
+
+            return watched
+
+        with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+            with patch.object(_session, "prepare_session", watch(real_public)), \
+                    patch.object(_session, "_prepare_session_locked", watch(real_locked)):
+                ops.heal_lane_column(str(worktree), target_provider=healed_provider)
+        after = len([c for c in fake.calls if c[:2] == ["pane", "resize"]])
+        return fake, fake.agent_named(assigned_name)["pane_id"], after - before
+
+    def test_the_production_seam_carries_the_stable_pair_order_to_a_worker_heal(self) -> None:
+        """Review j#91284 R3-F2: pin the FORWARDING, not just the rail it feeds.
+
+        The R2-F1 fix routes the lane's stable ``(gateway, worker)`` order from
+        ``heal_lane_column``'s ``managed_pair`` through ``_prepare_lane_session`` ->
+        ``prepare_actuator_lane_session`` -> ``prepare_session``. Every test asserting that
+        fix injected ``pair_order`` at the LAST of those hops, so deleting the first left all
+        295 of them green (measured, j#91299).
+
+        A WORKER target-only heal is the geometry discriminator: with the stable order
+        delivered the gateway is the effective primary and holds the first side, so the
+        declared 0.8 is applied; without it the shrunk request is unattributable and the run
+        defers, leaving herdr's even default. The two outcomes differ in the live layout, not
+        merely in a detail string.
+        """
+        spy: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            fake, pane, resized = self._drive_target_only_heal(
+                tmp, healed_provider="claude", spy=spy
+            )
+            live_ratio = fake.split_ratio_of(pane)
+            starts = [c for c in fake.calls if c[:2] == ["agent", "start"]]
+        # The heal really created the divider — otherwise the rail is out of scope and this
+        # would prove nothing about forwarding.
+        self.assertIn("--split", starts[-1])
+        # The exact value that crossed the last hop, so a silently dropped forwarding is
+        # named rather than merely inferred from the geometry.
+        self.assertEqual([list(o or ()) for o in spy[-1:]], [["codex", "claude"]])
+        self.assertGreater(resized, 0)
+        self.assertAlmostEqual(live_ratio, 0.8, places=6)
+
+    def test_the_production_seam_defers_a_gateway_target_only_heal(self) -> None:
+        """The case j#91284 names: the gateway can only be placed second, so nothing is
+        divided — and the stable order still has to arrive for that verdict to be the
+        *attributed* one rather than the unattributable fallback."""
+        spy: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            fake, pane, resized = self._drive_target_only_heal(
+                tmp, healed_provider="codex", spy=spy
+            )
+            live_ratio = fake.split_ratio_of(pane)
+        self.assertEqual([list(o or ()) for o in spy[-1:]], [["codex", "claude"]])
+        self.assertEqual(resized, 0)
+        # herdr's fresh divider, untouched: the run neither applied 0.8 nor claimed to.
         self.assertAlmostEqual(live_ratio, 0.5, places=6)
 
 

@@ -651,12 +651,26 @@ geometry が直後に変わるため)。
 
   **effective order の解決 (Redmine #14569 review j#91263 R2-F1)**。3 層で解決する。
 
+  各層は **canonical provider の exact permutation として受理できる場合のみ**採用し、答えられない層は
+  半端に答えず読み飛ばす (値域は宣言 `order` と同一 = `lane_placement._normalize_order`)。
+
   1. 宣言 (または product default) された `order` — primary を直接名指しする。
   2. 無ければ **その run の lane が持つ stable な managed pair 順**。**`order` 未宣言は「順序主張が
      無い」ではない** — sublane で `order` を宣言しないのは binding が解決した `(gateway, worker)` 順を
      **尊重する**ためであり (§5.1 Product default の非対称性の理由、j#91127)、その順序は本 block の
      上位で解決される。したがって `prepare_session` は caller から `pair_order` として受け取る。
-  3. どちらも無ければ空 — 帰属できない。
+  3. 無ければ **その run 自身の要求 providers**。要求が full pair である限りそれが pair 順そのもので
+     あるため、通常経路は caller からの供給を必要としない。**縮小された要求は permutation にならないので
+     何も寄与しない** — 縮小 list の中ではその 1 provider が自明に「先頭」になり、それが誤帰属だからである。
+  4. どれも答えられなければ空 — 帰属できない (`unattributable`) → deferral。
+
+  **`pair_order` は副作用より前に argument boundary で検証する** (`validate_pair_order`、
+  review j#91284 R3-F1)。未知 provider / 重複 / 欠落 / 非 string 要素 / 非 sequence、および
+  **要求 providers を含まない order** は zero-side-effect で拒否する。検証していない値を authority として
+  受理すると実害が出る: `pair_order=("unknown","codex")` は `codex` を primary でなくするため、gateway の
+  target-only heal が pair を resize して **gateway の宣言 share を生存 worker へ渡したまま `applied` と
+  報告**した (実測 j#91299)。resolver 側も `str()` coercion をやめ、認識できない入力は空 = deferral に倒す
+  (誤った分割より必ず安全側)。
 
   第 2 層が必要なのは、**target-only replacement が要求を 1 provider へ縮小する**ためである
   (`replacement_target_only` → `startup_providers = (provider,)`)。縮小後の要求はもはや pair 順ではないので、

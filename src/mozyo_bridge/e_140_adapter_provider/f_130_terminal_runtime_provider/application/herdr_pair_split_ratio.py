@@ -62,6 +62,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
     Runner,
 )
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (  # noqa: E501
+    LANE_PLACEMENT_PROVIDERS,
+)
 
 #: No pair split ratio was actuated, and none was owed: the run created no divider of its
 #: own (dry run / nothing launched / a first launch that only occupied the container), or no
@@ -453,32 +456,69 @@ def find_sibling_split(
     return matches[0] if len(matches) == 1 else None
 
 
+def exact_pair_permutation(order: object) -> "tuple[str, ...]":
+    """``order`` as a validated provider permutation, or ``()`` — never a coercion.
+
+    The same domain the declared ``order`` already has
+    (``lane_placement._normalize_order``): every canonical provider exactly once, as
+    strings. An unknown provider, a duplicate, a missing one, a non-string element or a
+    non-sequence yields ``()``.
+
+    Review j#91284 R3-F1: the previous version did ``str()`` on whatever it was handed, so
+    ``("unknown", "codex")`` became a live authority in which ``codex`` was NOT the primary —
+    and a gateway target-only heal then resized the pair and gave the gateway's declared
+    share to the surviving worker, reporting ``applied``. ``None`` even became the provider
+    name ``"None"``. Returning ``()`` for anything unrecognised means an unusable order can
+    only ever cause a DEFERRAL (see :func:`order_is_deferred`), never a wrong division.
+    """
+    if isinstance(order, (str, bytes)) or not isinstance(order, (list, tuple)):
+        return ()
+    seen: list = []
+    for element in order:
+        if (
+            not isinstance(element, str)
+            or element not in LANE_PLACEMENT_PROVIDERS
+            or element in seen
+        ):
+            return ()
+        seen.append(element)
+    return tuple(seen) if set(seen) == set(LANE_PLACEMENT_PROVIDERS) else ()
+
+
 def effective_pair_order(
     config_order: "Optional[Sequence[str]]",
     pair_order: "Optional[Sequence[str]]",
+    requested: "Optional[Sequence[str]]" = None,
 ) -> "tuple[str, ...]":
     """Whose side the declared ratio belongs to, as a provider order (Redmine #14569).
 
-    Three layers, in the only order that survives a caller which shrank its request:
+    Three layers, in the only order that survives a caller which shrank its request. Each is
+    accepted only as an :func:`exact_pair_permutation`, so a layer that cannot answer is
+    skipped rather than half-answering:
 
     1. a **declared / product-default** ``order`` names the primary outright;
     2. otherwise the run's **stable managed pair order** — supplied by the caller that knows
        it. An undeclared ``order`` is not "no order": the ``sublane`` product default leaves
        it undeclared precisely so the repo-local role binding's ``(gateway, worker)`` order
        is respected rather than overridden, and that binding is resolved above this layer;
-    3. otherwise empty — nothing can be attributed.
+    3. otherwise the run's **own requested providers**, which ARE the pair order whenever the
+       request is a full pair. A shrunk request is not a permutation, so it contributes
+       nothing — deliberately, since the one provider it holds would otherwise be trivially
+       "first" in its own truncated list (review j#91284 R3-F1: that is the false attribution
+       dressed as an answer, and the deferral it produced was a coincidence, not the rule).
 
-    Review j#91263 R2-F1 is layer 2. The rail previously read the effective order off the
-    slots this run requested, which is correct only while the request IS the pair: a
-    target-only replacement shrinks it to one provider, so healing the GATEWAY made the
-    surviving worker the first side and the declared share went to the wrong role — reported
-    as ``applied``. The shrunk request cannot answer the question, so the caller's stable
-    order does; when even that is absent the answer is empty, and
-    :func:`order_is_deferred` then defers rather than dividing a side it cannot attribute.
+    Empty means unattributable, and :func:`order_is_deferred` then defers rather than
+    dividing a side it cannot attribute. Review j#91263 R2-F1 is layer 2: the rail used to
+    read the effective order off the requested slots, which is correct only while the request
+    IS the pair — a target-only replacement shrinks it to one provider, so healing the
+    GATEWAY made the surviving worker the first side and the declared share went to the wrong
+    role, reported as ``applied``.
     """
-    if config_order:
-        return tuple(str(p) for p in config_order)
-    return tuple(str(p) for p in (pair_order or ()))
+    for candidate in (config_order, pair_order, requested):
+        resolved = exact_pair_permutation(candidate)
+        if resolved:
+            return resolved
+    return ()
 
 
 def order_is_deferred(anchor_provider: str, effective_order: "Sequence[str]") -> bool:
@@ -678,6 +718,7 @@ def _pair_geometry(
     config_split: Optional[str],
     config_order: "Optional[Sequence[str]]",
     pair_order: "Optional[Sequence[str]]",
+    requested: "Optional[Sequence[str]]",
     config_ratio: Optional[float],
     launched: int,
     initial_occupancy: int,
@@ -733,7 +774,7 @@ def _pair_geometry(
             "the slot this run split occupies the first side of its divider, which is not "
             "how herdr places a split; refusing to divide an unrecognised layout"
         )
-    effective_order = effective_pair_order(config_order, pair_order)
+    effective_order = effective_pair_order(config_order, pair_order, requested)
     if order_is_deferred(anchor.provider, effective_order):
         return RATIO_DEFERRED, (
             f"the effective primary {anchor.provider!r} could only be launched as the "
@@ -764,6 +805,7 @@ def finalize_container_geometry(
     config_split: Optional[str],
     config_order: "Optional[Sequence[str]]",
     pair_order: "Optional[Sequence[str]]",
+    requested: "Optional[Sequence[str]]",
     config_ratio: Optional[float],
     launched: int,
     initial_occupancy: int,
@@ -790,6 +832,7 @@ def finalize_container_geometry(
         config_split=config_split,
         config_order=config_order,
         pair_order=pair_order,
+        requested=requested,
         config_ratio=config_ratio,
         launched=launched,
         initial_occupancy=initial_occupancy,
@@ -815,6 +858,7 @@ __all__ = (
     "PairPanes",
     "SplitInfo",
     "effective_pair_order",
+    "exact_pair_permutation",
     "finalize_container_geometry",
     "find_pair_split",
     "find_sibling_split",
