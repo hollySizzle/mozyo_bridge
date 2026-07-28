@@ -614,10 +614,21 @@ geometry が直後に変わるため)。
   `launched >= 1 かつ (container の初期 occupancy > 0 または launched >= 2)` — `--split` を出した launch が
   この run に 1 つ以上あることと同値である。all-adopt / dry-run / 空 container への単発 launch は
   divider を作らないので **何も触らない**。config を読むだけで live pair が動く経路は存在しない。
+  **この述語が「測定するか」も決める**: これを通過した run は測定を負っているので、以降の拒否はすべて
+  `failed` であり `not_applicable` ではない。`not_applicable` になるのは **layout を 1 度も読む前に**
+  決まる場合 (dry-run / divider 未作成 / ratio・direction 未解決) だけである。
+- **pair は「この run が split した slot」を起点に layout から読む**。起点はその run が launch した
+  slot のうち最後の 1 つ (occupancy が最大なので必ず `--split` を出している)。sibling が **この run の
+  slot である必要は無い** — `replacement_target_only` の single-provider heal は 1 slot しか持たないが、
+  生存 sibling の隣へ split して divider を作るのだから測定対象である (review j#91217 R1-F1: 旧実装は
+  「pair の 2 pane が両方この run の slot」を要求したためこの heal を丸ごと素通りさせ、宣言 ratio を
+  適用しないまま成功と報告していた)。
 - **対象 split の同定は幾何で行う**。`pane layout` の `splits[]` は child pane id を持たないため、
-  「pair の 2 pane がその split rect を **exact tiling** するか」で同定する。単純な bounding-box 一致は
-  誤判定する (実測: 3 pane の nested layout で、兄弟でない 2 pane の union rect が root split の rect と
-  一致した)。候補が 0 個または 2 個以上なら fail-closed。
+  「起点 slot と他の 1 pane がその split rect を **exact tiling** するか」で同定する。単純な
+  bounding-box 一致は誤判定する (実測: 3 pane の nested layout で、兄弟でない 2 pane の union rect が
+  root split の rect と一致した)。候補が 0 個または 2 個以上なら fail-closed。
+  herdr は split した pane を **second 側**へ置くため、起点 slot が first 側に居る layout は
+  予測しない形として fail-closed とする。
 - **shared tab 安全弁 (#14567 との組合せ)**: herdr の `pane resize` は「指定 pane の、direction と軸が
   一致する最も近い祖先 split」を動かす。したがって actuate 前に「その最近祖先 split が pair 自身の
   divider か」を照合し、一致しない場合は **resize を発行せず fail-closed** にする。これが無いと、
@@ -634,6 +645,10 @@ geometry が直後に変わるため)。
   そこへ `ratio` を適用すると `order[0]` の取り分が `order[1]` に渡る。live pane の swap / bounce は
   禁止なので **適用せず `deferred_until_full_relaunch` を明示**する (どちらも主張しない)。full relaunch で
   order と ratio が同時に実現する。deferral は失敗ではない (pair は使用可能)。
+  判定は **`order` が宣言されており、かつ split した slot の provider が `order[0]` である**ときに限る —
+  これは `slot_placement` が `order` 軸に対して既に使っている規則と **同一**である (ratio 専用の第二の
+  「primary」定義を作らない)。`order` 未宣言なら破るべき順序の主張が無いので deferral は起きず、
+  first 側の pane へ適用する。sibling の provider は判定に不要である。
 - **失敗は成功扱いしない**: layout の read / parse 失敗、pair split の同定失敗、`pane resize` の拒否、
   最終照合の不一致はいずれも `failed` とし、`SessionStartResult.ok` を False にする。ただし
   `owes_rollback` には入れない — 分割が意図と違うだけの pair は使用可能であり、それを理由に agent を

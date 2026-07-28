@@ -702,6 +702,68 @@ class LaunchRatioTest(unittest.TestCase):
         # A deferral is an honest outcome, not a failure: the pair is usable.
         self.assertTrue(healed.ratio_ok, healed.ratio_detail)
 
+    def test_a_target_only_secondary_heal_divides_the_divider_it_just_created(self) -> None:
+        # Review j#91217 R1-F1. The production `replacement_target_only` path calls
+        # `prepare_session(providers=(one,))`, so the run's ONLY slot is the replacement and
+        # the surviving sibling belongs to an earlier run. That run still emits `--split`
+        # and therefore creates the pair's divider — the earlier cut skipped it as
+        # `not_applicable`, dropping the declared ratio while reporting success.
+        herdr = FakeHerdr()
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self._prepare(tmp, herdr=herdr, lane_placement=config)
+            self.assertEqual(first.ratio_outcome, RATIO_APPLIED, first.ratio_detail)
+            secondary = first.slots[-1]
+            herdr.run([str(Path(tmp) / "fake-herdr"), "pane", "close", secondary.locator])
+            before = len(self._resize_calls(herdr))
+            healed = self._prepare(
+                tmp, herdr=herdr, lane_placement=config, providers=(secondary.provider,)
+            )
+        self.assertEqual([s.provider for s in healed.slots], [secondary.provider])
+        self.assertEqual(healed.ratio_outcome, RATIO_APPLIED, healed.ratio_detail)
+        self.assertGreater(len(self._resize_calls(herdr)), before)
+        self.assertAlmostEqual(
+            herdr.split_ratio_of(healed.slots[0].locator), 0.8, places=6
+        )
+
+    def test_a_target_only_primary_heal_defers_instead_of_dividing_the_wrong_side(self) -> None:
+        # The other half of R1-F1's required behaviour: when the single provider being
+        # healed IS the configured `order[0]`, it lands on the second side, so applying the
+        # declared share there would give it to the other provider. Deferred, not applied,
+        # and not silently skipped either.
+        herdr = FakeHerdr()
+        config = LanePlacementConfig.from_record(
+            {"sublane": {"ratio": 0.8, "order": ["codex", "claude"]}}
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self._prepare(tmp, herdr=herdr, lane_placement=config)
+            primary = next(s for s in first.slots if s.provider == "codex")
+            herdr.run([str(Path(tmp) / "fake-herdr"), "pane", "close", primary.locator])
+            before = len(self._resize_calls(herdr))
+            healed = self._prepare(
+                tmp, herdr=herdr, lane_placement=config, providers=("codex",)
+            )
+        self.assertEqual(healed.ratio_outcome, RATIO_DEFERRED, healed.ratio_detail)
+        self.assertIn("codex", healed.ratio_detail)
+        self.assertEqual(len(self._resize_calls(herdr)), before)
+        self.assertTrue(healed.ratio_ok)
+
+    def test_a_target_only_run_into_an_empty_container_stays_not_applicable(self) -> None:
+        # The boundary the R1-F1 fix must NOT cross: a single launch that only OCCUPIES a
+        # container creates no divider, so it still measures and resizes nothing. Otherwise
+        # "measure whenever one slot launched" would reach panes this run never split.
+        herdr = FakeHerdr()
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._prepare(
+                tmp, herdr=herdr, lane_placement=config, providers=("codex",)
+            )
+        self.assertEqual(result.ratio_outcome, RATIO_NOT_APPLICABLE, result.ratio_detail)
+        self.assertEqual(
+            [c for c in herdr.calls if c[:2] in (["pane", "resize"], ["pane", "layout"])],
+            [],
+        )
+
     def test_an_unreadable_layout_is_a_failure_not_a_silent_success(self) -> None:
         # Close condition 7: a ratio that could not be established is never reported as
         # applied, and it costs the run its exit-code success — while closing no agent.
@@ -750,6 +812,67 @@ class LaunchRatioTest(unittest.TestCase):
         # round number, `round(extent * ratio)` would carry rounding error and the geometry
         # assertions above would start being about arithmetic instead of about the rail.
         self.assertEqual(HERDR_SPLIT_EXTENT % 10, 0)
+
+
+class TargetOnlyProductionSeamTest(unittest.TestCase):
+    """Review j#91217 R1-F1 at the seam that actually reaches production.
+
+    ``sublane_hibernated_pair_recovery_live`` heals a single leg with
+    ``replacement_target_only=True``; that flag is what collapses ``prepare_session``'s
+    providers to one (``herdr_session_start_v1_replacement_binding``:
+    ``startup_providers = (provider,) if target_only else managed_pair``). The class above
+    pins the behaviour at ``prepare_session``; this one drives the REAL actuator ->
+    ``heal_lane_column`` -> ``prepare_session`` chain so the two cannot agree while the wiring
+    between them says something else.
+
+    The heavy v1 lane fixture is reused from the #13933 convergence regression rather than
+    re-created here: it already stands up a registered lane, a self-attesting launcher and a
+    live v1-bound pair over the shared FakeHerdr, and a second copy of it would drift.
+    """
+
+    LANE = "issue_14569_target_only"
+    ISSUE = "14569"
+
+    def test_a_target_only_replacement_measures_the_divider_it_created(self) -> None:
+        from tests.regressions.test_issue_13933_bound_stale_pair_convergence import (
+            _append_v1_lane,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
+            HerdrSublaneActuatorOps,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home, coord, worktree, env, fake, ws, gw_name, wk_name, gw_old, wk_old = (
+                _append_v1_lane(tmp, lane=self.LANE, issue=self.ISSUE)
+            )
+            # Close the worker leg, then heal ONLY it — the exact production shape.
+            fake.run([str(Path(tmp) / "fake-herdr"), "pane", "close", wk_old])
+            layouts_before = len([c for c in fake.calls if c[:2] == ["pane", "layout"]])
+            ops = HerdrSublaneActuatorOps(
+                repo_root=coord, lane_label=self.LANE, issue=self.ISSUE, journal="91217",
+                env=env, runner=fake.run,
+                replacement_action_id="target-only-ratio-1",
+                replacement_assigned_name=wk_name,
+                replacement_old_locator=wk_old,
+                replacement_target_only=True,
+            )
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                ops.heal_lane_column(str(worktree), target_provider="claude")
+            layouts_after = len([c for c in fake.calls if c[:2] == ["pane", "layout"]])
+            live_ratio = fake.split_ratio_of(fake.agent_named(wk_name)["pane_id"])
+
+        # The discriminator is the LAYOUT READ, deliberately, and not a resize: this fixture
+        # declares no `lane_placement`, so the effective ratio is the product default and a
+        # freshly split pair already matches it — a correct run issues no resize here. Under
+        # the defect the rail bailed BEFORE reading anything, so zero layout reads is exactly
+        # the failure being pinned. (What a declared, non-default ratio does to a
+        # single-provider run is pinned at the `prepare_session` level above, where the
+        # launcher config-parse preflight this fixture cannot answer is out of the way.)
+        self.assertGreater(
+            layouts_after, layouts_before,
+            "the target-only replacement never reached the ratio rail (no pane layout read)",
+        )
+        self.assertAlmostEqual(live_ratio, 0.5, places=6)
 
 
 class RunSuccessAxisTest(unittest.TestCase):

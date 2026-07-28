@@ -24,15 +24,26 @@ and actuate nothing. Loading a config actuates nothing at all — there is no pa
 ever closed, moved, swapped, focused or killed here beyond the root reclaim this run's own
 ``workspace create`` / ``tab create`` incurred.
 
+That predicate — and nothing narrower — also decides what gets MEASURED. Everything the
+rail needs is found from the one slot this run launched as a split
+(:func:`splitting_slot`): the pair comes off the layout around it
+(:func:`find_sibling_split`), and the order question is asked only about that slot
+(:func:`order_is_deferred`). The sibling may belong to an earlier run, which is exactly the
+target-only single-provider heal: it splits beside a live sibling and therefore owns the
+divider. An earlier cut required BOTH panes to be this run's slots and so skipped that heal
+entirely — divider created, declared ratio unapplied, run still reported successful (review
+j#91217 R1-F1).
+
 Fail-closed — a ratio that was not applied is never reported as applied
 ----------------------------------------------------------------------
-Every step that could quietly produce the wrong geometry ends in :data:`RATIO_FAILED` with
-a fixed reason token rather than an optimistic default: an unparseable layout, a pair whose
-governing split cannot be uniquely identified, a split whose direction is not the one that
-was declared, a ``pane resize`` that herdr rejected, and — last — a final measurement that
-disagrees with the declared ratio. herdr silently clamps both the per-call ``--amount``
-(to 0.5) and the resulting ratio (to ``0.1..0.9``), so *issuing* a resize proves nothing;
-only the closing :func:`pane layout` read does.
+Once past the created-divider guard the run OWES a measurement, so every step that could
+quietly produce the wrong geometry ends in :data:`RATIO_FAILED` with a fixed reason token
+rather than an optimistic default: an unparseable layout, a divider that is not uniquely
+identifiable, a splitting slot found on the side herdr does not place it, a divider that is
+not the one herdr would move for that pane, a ``pane resize`` that herdr rejected, and —
+last — a final measurement that disagrees with the declared ratio. herdr silently clamps
+both the per-call ``--amount`` (to 0.5) and the resulting ratio (to ``0.1..0.9``), so
+*issuing* a resize proves nothing; only the closing :func:`pane layout` read does.
 """
 
 from __future__ import annotations
@@ -46,18 +57,19 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _invoke,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E501
-    SLOT_ADOPTED,
     SLOT_LAUNCHED,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
     Runner,
 )
 
-#: No pair split ratio was actuated, and none was owed. The run created no divider of its
-#: own (dry run / nothing launched / a first launch that only occupied the container), or
-#: the pair's two panes are not both this run's slots — see the accompanying detail. This
-#: is the ONLY non-failure outcome that skips the measurement, and it never means "a
-#: declared ratio was quietly dropped on a pair this run did divide".
+#: No pair split ratio was actuated, and none was owed: the run created no divider of its
+#: own (dry run / nothing launched / a first launch that only occupied the container), or no
+#: ratio and direction resolved at all. Every one of those is decided BEFORE any layout is
+#: read — once a run is known to have created a divider it owes a measurement, and any later
+#: refusal is a :data:`RATIO_FAILED`. Review j#91217 R1-F1 is why that boundary is stated
+#: this sharply: a "cannot identify the pair" case had been parked here, so a target-only
+#: heal that really did create a divider dropped its declared ratio and reported success.
 RATIO_NOT_APPLICABLE = "not_applicable"
 #: The pair's split already sat at the declared ratio; measured read-only, no resize
 #: issued. A no-op is a success (Design Answer j#91127) — the common case for the product
@@ -379,46 +391,85 @@ def _created_pair_split(*, launched: int, initial_occupancy: int) -> bool:
 
 @dataclass(frozen=True)
 class PairPanes:
-    """The two panes of the pair this run completed, already ordered first-then-second."""
+    """The two panes of the divider this run created, ordered first-then-second.
+
+    Only pane IDS. Redmine #14569 review j#91217 R1-F1: an earlier cut also demanded both
+    providers, which forced the pair to consist of two slots THIS run resolved — and a
+    target-only single-provider heal has exactly one. That run splits beside a live sibling
+    and therefore creates the divider, so refusing it left the declared ratio unapplied
+    while the run still reported success. The sibling's ROLE was never needed: the ratio
+    goes to whichever pane holds the first side, and the only order question
+    (:func:`order_is_deferred`) is about the slot this run launched, whose provider it knows.
+    """
 
     first_pane: str
     second_pane: str
-    first_provider: str
-    second_provider: str
 
 
-def _pair_slots(slots: Sequence[object]) -> "Optional[tuple[object, object]]":
-    """This run's two live pair slots, in launch order, or ``None``.
+def splitting_slot(slots: Sequence[object]) -> "Optional[object]":
+    """The slot this run launched AS A SPLIT — the anchor everything else is found from.
 
-    Both must be slots this run actually resolved to a live pane (``launched`` /
-    ``adopted``) with distinct locators. A ``stale`` / ``unattested`` surfacing is a
-    read-only report about somebody else's pane, never a pair member.
+    Launches enter the container at rising occupancies, so when this run created a divider
+    (:func:`_created_pair_split`) the LAST launched slot is necessarily the one that carried
+    ``--split``: its occupancy is the highest of the run, hence non-zero. Adopted / planned /
+    stale / unattested slots launched nothing and are never the anchor.
+
+    Anchoring on this run's own launch — rather than on "the pair's two slots" — is what
+    makes the rail work for a target-only heal, whose sibling belongs to an earlier run
+    (review j#91217 R1-F1).
     """
-    live = [
+    launched = [
         slot
         for slot in slots
-        if getattr(slot, "outcome", "") in (SLOT_LAUNCHED, SLOT_ADOPTED)
-        and getattr(slot, "locator", "")
+        if getattr(slot, "outcome", "") == SLOT_LAUNCHED and getattr(slot, "locator", "")
     ]
-    if len(live) != 2 or live[0].locator == live[1].locator:  # type: ignore[attr-defined]
-        return None
-    return live[0], live[1]
+    return launched[-1] if launched else None
 
 
-def intended_primary(
-    slots: Sequence[object], config_order: "Optional[Sequence[str]]"
-) -> str:
-    """Which provider the declared ratio's share belongs to (the effective ``order[0]``).
+def find_sibling_split(
+    layout: LayoutSnapshot, anchor: str, direction: str
+) -> "Optional[tuple[str, SplitInfo]]":
+    """``(sibling pane id, the divider)`` the anchor shares, or ``None`` if not unique.
 
-    A declared ``order`` names it outright. With no declared order — the product default for
-    the ``sublane`` class, which deliberately leaves ``order`` undeclared so the repo-local
-    role binding is respected rather than overridden — the effective first provider is the
-    one this run put first, i.e. the first requested slot. Either way the answer is a
-    provider, so the geometry check below compares roles and not pane ids.
+    The pair is read off the LAYOUT rather than off this run's slot list, so a sibling
+    launched by an earlier run counts exactly as much as one launched by this one. Both
+    orderings are tried because the anchor's side is not assumed here — :func:`order_pair`
+    decides it — and any ambiguity (no candidate, or more than one) is a refusal.
     """
-    if config_order:
-        return str(config_order[0])
-    return str(getattr(slots[0], "provider", "")) if slots else ""
+    anchor_rect = layout.panes.get(anchor)
+    if anchor_rect is None:
+        return None
+    matches: list = []
+    for pane_id, rect in layout.panes.items():
+        if pane_id == anchor:
+            continue
+        first, second = (
+            (anchor_rect, rect) if order_pair(anchor_rect, rect, direction)
+            else (rect, anchor_rect)
+        )
+        split = find_pair_split(layout, first, second, direction)
+        if split is not None:
+            matches.append((pane_id, split))
+    return matches[0] if len(matches) == 1 else None
+
+
+def order_is_deferred(
+    anchor_provider: str, config_order: "Optional[Sequence[str]]"
+) -> bool:
+    """True iff the configured primary is the very slot this run had to place SECOND.
+
+    Deliberately the SAME rule ``herdr_lane_topology.slot_placement`` already applies to the
+    ``order`` axis: a splitting slot lands on the second side, so when it carries the
+    configured ``order[0]`` the physical order cannot be satisfied. Applying the ratio there
+    would hand ``order[0]``'s declared share to ``order[1]``, and moving a live pane is
+    forbidden — hence :data:`RATIO_DEFERRED`.
+
+    With **no** declared ``order`` there is no order claim to violate (the ``sublane``
+    product default leaves ``order`` undeclared precisely so the repo-local role binding
+    decides), so nothing is deferred and the ratio applies to whichever pane holds the first
+    side. One rule for both axes; a second, ratio-only notion of "primary" would drift.
+    """
+    return bool(config_order) and anchor_provider == str(config_order[0])
 
 
 def _reclaim_root_panes(
@@ -606,7 +657,16 @@ def _pair_geometry(
     timeout: float,
     env,
 ) -> "tuple[str, str]":
-    """Decide and (when owed) actuate this run's pair split ratio — ``(outcome, detail)``."""
+    """Decide and (when owed) actuate this run's pair split ratio — ``(outcome, detail)``.
+
+    Everything downstream hangs off ONE fact: the slot this run launched as a split
+    (:func:`splitting_slot`). The pair is then read out of the layout around it, so a
+    target-only single-provider heal — whose sibling belongs to an earlier run — is measured
+    exactly like a fresh pair (review j#91217 R1-F1). Once past the created-divider guard
+    this run OWES a measurement, so every remaining refusal is a typed failure rather than
+    ``not_applicable``: the only outcomes that skip the ratio are the ones decided before
+    that guard.
+    """
     if dry_run:
         return RATIO_NOT_APPLICABLE, "dry run: nothing was launched, so nothing was divided"
     if not _created_pair_split(launched=launched, initial_occupancy=initial_occupancy):
@@ -616,43 +676,40 @@ def _pair_geometry(
         )
     if config_ratio is None or not config_split:
         return RATIO_NOT_APPLICABLE, "no effective pair split ratio / direction resolved"
-    slots = list(result.slots)
-    pair_slots = _pair_slots(slots)
-    if pair_slots is None:
-        return RATIO_NOT_APPLICABLE, (
-            "the pair's two panes are not both slots of this run, so the ratio's "
-            "order-relative side cannot be identified; no pane is resized"
+    anchor = splitting_slot(list(result.slots))
+    if anchor is None:
+        return RATIO_FAILED, (
+            "this run created a pair divider but reports no launched slot to locate it from"
         )
-    launch_first, launch_second = pair_slots
-    primary = intended_primary(slots, config_order)
     layout = _read_layout(
-        launch_first.locator, binary=binary, runner=runner, timeout=timeout, env=env
+        anchor.locator, binary=binary, runner=runner, timeout=timeout, env=env
     )
     if layout is None:
         return RATIO_FAILED, "pane layout could not be read or parsed"
-    rect_first = layout.panes.get(launch_first.locator)
-    rect_second = layout.panes.get(launch_second.locator)
-    if rect_first is None or rect_second is None:
-        return RATIO_FAILED, "the pair's panes are not both present in the tab layout"
-    # Which pane PHYSICALLY holds the first (left / top) side decides whose share the
-    # declared ratio is. herdr places the splitting slot second, so on a heal the surviving
-    # sibling is first even when the configured primary is the one being launched.
-    if order_pair(rect_first, rect_second, config_split):
-        first_slot, second_slot = launch_first, launch_second
-    else:
-        first_slot, second_slot = launch_second, launch_first
-    if primary and first_slot.provider != primary:
-        return RATIO_DEFERRED, (
-            f"the configured primary {primary!r} landed on the second side of the split "
-            f"(its sibling was already live), so the declared ratio {config_ratio:g} would "
-            f"go to {first_slot.provider!r}; no live pane is swapped or resized"
+    found = find_sibling_split(layout, anchor.locator, config_split)
+    if found is None:
+        return RATIO_FAILED, (
+            "no single pane shares an exactly-tiled divider with the slot this run split, "
+            "so the pair's divider is ambiguous"
         )
-    pair = PairPanes(
-        first_pane=first_slot.locator,
-        second_pane=second_slot.locator,
-        first_provider=first_slot.provider,
-        second_provider=second_slot.provider,
-    )
+    sibling, _split = found
+    anchor_rect = layout.panes[anchor.locator]
+    sibling_rect = layout.panes[sibling]
+    # herdr places a splitting slot on the SECOND side, so the anchor is expected there and
+    # the sibling holds the first. An anchor found on the first side is a layout this module
+    # did not predict — fail closed rather than divide by a guess.
+    if order_pair(anchor_rect, sibling_rect, config_split):
+        return RATIO_FAILED, (
+            "the slot this run split occupies the first side of its divider, which is not "
+            "how herdr places a split; refusing to divide an unrecognised layout"
+        )
+    if order_is_deferred(anchor.provider, config_order):
+        return RATIO_DEFERRED, (
+            f"the configured primary {anchor.provider!r} could only be launched as the "
+            f"split beside a live sibling, so the declared ratio {config_ratio:g} would go "
+            f"to the other side; no live pane is swapped or resized"
+        )
+    pair = PairPanes(first_pane=sibling, second_pane=anchor.locator)
     split, first, reason = _measure_pair(layout, pair, config_split)
     if split is None or first is None:
         return RATIO_FAILED, reason
@@ -725,12 +782,14 @@ __all__ = (
     "SplitInfo",
     "finalize_container_geometry",
     "find_pair_split",
+    "find_sibling_split",
     "governing_split",
-    "intended_primary",
+    "order_is_deferred",
     "order_pair",
     "pane_extent",
     "parse_pane_layout",
     "ratio_verdict",
     "resize_step",
     "split_extent",
+    "splitting_slot",
 )

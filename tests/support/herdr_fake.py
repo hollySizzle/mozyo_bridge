@@ -663,7 +663,16 @@ class FakeHerdr:
         ws = self._workspace_of_pane(pane_id)
         if ws is None:
             return _err(argv, f"no such pane: {pane_id}")
+        _ws, tab, panes = self._container_of(pane_id)
         ws.panes.remove(pane_id)
+        if len(panes) <= 2:
+            # G (#14569): a divider exists only while two panes share it. Closing one
+            # collapses the split, so the stored ratio must go with it — a later
+            # `agent start --split` builds a FRESH divider at herdr's even default rather
+            # than inheriting the dead one's share. Keeping it would let a heal report
+            # `matched` without ever having divided anything.
+            self._split_ratio.pop((ws.workspace_id, tab), None)
+            self._split_direction.pop((ws.workspace_id, tab), None)
         # E (tab axis, #13411): the pane leaves its tab; the tab lives on only while
         # another pane still references it. `pane_tab` is the sole tab registry, so a
         # tab with no remaining panes simply stops being referenced (auto-vanish).
