@@ -41,6 +41,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import os
+import pickle
 import shutil
 import socket
 import stat
@@ -2155,6 +2156,151 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         kinds = {type(entry) for entry in owned_descriptors.teardown_failures(primary)}
         self.assertIn(SystemExit, kinds, "the later control-flow failure was dropped")
         self.assertIn(GeneratorExit, kinds, "the interrupt that broke the recording was dropped")
+
+    def _assert_ledger_holds_the_failure(self, primary, actions, label: str) -> None:
+        """Run the actions and require: nothing escapes, everything runs, it is
+        recorded. One helper because the carrier has to hold under every hostile
+        primary, not just the one that was fashionable that round."""
+        ran: list[str] = []
+
+        def tracked(index: int, action):  # type: ignore[no-untyped-def]
+            def run() -> None:
+                ran.append(f"a{index}")
+                action()
+
+            return run
+
+        wrapped = [tracked(i, action) for i, action in enumerate(actions, start=1)]
+        owned_descriptors._teardown_during(primary, *wrapped)
+
+        self.assertEqual(
+            [f"a{i}" for i in range(1, len(actions) + 1)],
+            ran,
+            f"{label}: the carrier skipped an action that had not run",
+        )
+        self.assertTrue(
+            any(
+                isinstance(entry, RuntimeError)
+                for entry in owned_descriptors.teardown_failures(primary)
+            ),
+            f"{label}: the failure was not retained",
+        )
+
+    def test_the_ledger_survives_a_hostile_dict_descriptor(self) -> None:
+        """j#90508 R16-F1. `object.__getattribute__(exc, "__dict__")` still runs
+        a `__dict__` data descriptor defined by a subclass — bypassing
+        `__setattr__` is not the same as bypassing the type.
+
+        Measured before the fix: the property raising an ordinary exception lost
+        the retention silently, and the property raising `KeyboardInterrupt`
+        escaped the rail so the second action never ran.
+        """
+
+        class DictRaises(Exception):
+            @property
+            def __dict__(self):  # type: ignore[override]
+                raise RuntimeError("this exception has no usable instance dict")
+
+        class DictInterrupts(Exception):
+            @property
+            def __dict__(self):  # type: ignore[override]
+                raise KeyboardInterrupt("interrupt from the carrier itself")
+
+        def failing() -> None:
+            raise RuntimeError("teardown failure")
+
+        def quiet() -> None:
+            return None
+
+        for label, primary in (
+            ("ordinary", DictRaises("write failed")),
+            ("control flow", DictInterrupts("write failed")),
+        ):
+            with self.subTest(descriptor=label):
+                self._assert_ledger_holds_the_failure(primary, (failing, quiet), label)
+
+    def test_a_value_at_the_carrier_key_is_never_adopted(self) -> None:
+        """j#90508 R16-F2. The ledger was any `list` found at a public key, so a
+        caller's own list was mutated and a `list` subclass with a hostile
+        `__iter__` escaped the rail from inside the identity dedupe."""
+
+        class Plain(Exception):
+            pass
+
+        class HostileList(list):
+            def __iter__(self):  # type: ignore[override]
+                raise KeyboardInterrupt("iterating this is not safe")
+
+        def failing() -> None:
+            raise RuntimeError("teardown failure")
+
+        def quiet() -> None:
+            return None
+
+        callers_own = ["caller data"]
+        for label, value in (("plain list", callers_own), ("list subclass", HostileList())):
+            with self.subTest(value=label):
+                primary = Plain("write failed")
+                state = object.__getattribute__(primary, "__dict__")
+                state[owned_descriptors._LEDGER_KEY] = value
+                self._assert_ledger_holds_the_failure(primary, (failing, quiet), label)
+
+        self.assertEqual(["caller data"], callers_own, "the caller's own list was mutated")
+
+    def test_a_carrier_failure_never_skips_a_remaining_action(self) -> None:
+        """j#90508 R16-F1, second condition: acquiring or writing the record is
+        on the same channel as everything else.
+
+        Pinned at the seam deliberately. Three carriers in a row were escaped
+        by a hostile primary, and each fix made the previous hostile input
+        unreachable — so asserting through an input would only pin whichever
+        attack happened to still work. `_remember` not propagating is the
+        property; this asserts that directly.
+        """
+        ran: list[str] = []
+
+        def failing() -> None:
+            ran.append("a1")
+            raise RuntimeError("teardown failure")
+
+        def quiet() -> None:
+            ran.append("a2")
+
+        def interrupting_ledger(_primary):  # type: ignore[no-untyped-def]
+            raise KeyboardInterrupt("interrupt from inside the carrier")
+
+        primary = Exception("write failed")
+        with unittest.mock.patch.object(
+            owned_descriptors, "_ledger", interrupting_ledger
+        ):
+            control = owned_descriptors._teardown_during(primary, failing, quiet)
+
+        self.assertEqual(["a1", "a2"], ran, "a carrier failure skipped a remaining action")
+        self.assertIsInstance(control, KeyboardInterrupt)
+
+    def test_an_exception_carrying_a_ledger_still_pickles(self) -> None:
+        """An identity key was written for the carrier first and measured: a
+        non-string key makes `pickle.loads` fail on the instance dictionary, so
+        the exception serialises and cannot be restored. The ledger is scoped to
+        one unwind, so it pickles as empty — which also keeps an entry that was
+        never picklable from making its exception unpicklable."""
+
+        class Unpicklable(Exception):
+            def __reduce__(self):  # type: ignore[override]
+                raise TypeError("this failure cannot be pickled")
+
+        def failing() -> None:
+            raise Unpicklable("teardown failure")
+
+        # A module-level type, because a class defined in a test body is not
+        # picklable for reasons that have nothing to do with the ledger.
+        primary = RuntimeError("write failed")
+        owned_descriptors._teardown_during(primary, failing)
+        self.assertNotEqual((), owned_descriptors.teardown_failures(primary))
+
+        restored = pickle.loads(pickle.dumps(primary))
+        self.assertIsInstance(restored, RuntimeError)
+        self.assertEqual((), owned_descriptors.teardown_failures(restored))
 
     def test_the_ledger_survives_a_primary_that_refuses_attributes(self) -> None:
         """The carrier has to be the instance dictionary, not `setattr`.
