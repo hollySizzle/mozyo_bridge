@@ -106,10 +106,17 @@ authorize したかを照合しなければ scope は未検証のままである
       なお **marker が comment / 属性値の中にある場合、描画結果に一切現れない** (`pandoc -t plain`
       で消える)。「引用」ですらなく**不可視の文字列**が gate authority になっていた。
     - **F. link 構文** — destination と title `](…)`、reference label `][…]`、reference definition の
-      末尾 `]: …`。marker をここに書くと URL / attribute / **何も描画されない**ものになる。
-      E と違い**この領域は有界なので blank にとどめる**: `][` 以降を note 末尾まで拒否する版を live
-      journal で実測したところ **実 gate event を 7 件落とした** (`[P1][documented_rule …]` は
-      review 散文として普通に現れる)。**「拒否が高すぎる」ことは live 実測でしか分からない。**
+      末尾 `]: …`、image の alt text `![…]` の起動位置から **paragraph 末尾まで**。marker をここに
+      書くと URL / attribute になり、**散文としては描画されない**。
+      ★★★**E と同様 tokenize しない。** 一度 tokenize する版を書いたが、reference definition を
+      **物理行末**で閉じ、`(` / `)` を1つの depth に数え、**quoted title と angle destination を
+      知らなかった** — この3つの近道が**それぞれ別に** marker を解放した (#14584 j#91682 F1)。
+      §4.7 は destination / title が**次行から始まる**ことを許し title は複数行に渡るので、
+      行単位の規則は原理的に正しくなり得ない。
+      ★★★**拒否の scope と実装方式は独立である。** paragraph 止まりにしたのは、note 末尾までの
+      拒否を live journal で実測して **実 gate event を7件落とした**からであって (`[P1][documented_rule …]`
+      は review 散文)、有界にしたいことは **parse を始めてよい理由にならなかった**。paragraph 境界は
+      既に block 構造として決まっており、tokenizer を必要としない。
     - **§2.4 backslash escape** — escape された delimiter は literal であり delimiter ではない。
       escaped backtick を run に数えると、その run が後続の**本物の opener と対になり**、実際に span を
       形成していた 2 delimiter の間が blank されなくなる (j#91593 F1)。`\<` も同様に markup を起動しない。
@@ -157,9 +164,13 @@ authorize したかを照合しなければ scope は未検証のままである
     ★★★**oracle の述語を間違えると、corpus をいくら回しても差分は出ない** (#14584 j#91593 F2)。
     「`<code>`/`<pre>`/`<blockquote>` の内側でないこと」を canonical の定義にしていたため、comment や
     属性値の中の marker は「引用されていない」と判定され、651 shape を通しても検出できなかった。
-    正しい述語は **「marker が可視の散文テキストとして描画されること」** である: HTML 出力上の位置が
-    verbatim / quotation element の内側でないことに加え、**plain text 出力にその文字列が残ること**を
-    要求する (comment / 属性 / `script` / `style` / `textarea` の中身はここで消える)。
+    正しい述語は **「marker が可視の散文テキストとして描画されること」** である。可視性は **HTML の
+    text node** で判定する — tag と comment を除去した残りに marker が現れること、かつ位置が
+    verbatim / quotation element の内側でないこと。
+    ★★★**「plain text 出力に残るか」は proxy であり、それも誤りだった** (#14584 j#91682 F2)。pandoc は
+    image の `alt` を本文へ昇格するため、属性の中の marker が「可視」と判定された。**text node かを
+    問えば `title` / `alt` / `href` を個別に列挙する必要がない** — 属性は定義上 text node ではない。
+    **proxy で述語を書くと、proxy が壊れる形を別途列挙する羽目になる。**
     ★★★**述語は 1 箇所にしか置かない。** corpus harness が旧述語のコピーを持ったままだったため、
     oracle を直した後も corpus は旧規則で採点し続けていた (#14584 R5 自己検出)。**scanner に対して
     「同じ grammar の定義が 2 つあるのは drift 生成器」と書いたのと同じ誤りを、検証側で犯した。**

@@ -349,6 +349,9 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             ("escaped backtick", "\\` x `%s`" % self.GATE),
             ("link destination", "[text](%s)" % self.GATE),
             ("link title", '[text](http://example.com "%s")' % self.GATE),
+            ("definition title on the next line", '[foo]: /url\n  "%s"' % self.GATE),
+            ("paren inside a quoted title", '[text](url "a ) %s b")' % self.GATE),
+            ("image alt text", "![a %s b](img.png)" % self.GATE),
         ):
             with self.subTest(label):
                 self.assertEqual(self._gates(note), ())

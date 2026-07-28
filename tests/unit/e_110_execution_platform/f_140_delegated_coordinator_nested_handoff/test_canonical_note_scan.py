@@ -398,15 +398,18 @@ class RawHtmlTest(unittest.TestCase):
 
 
 class LinkSyntaxTest(unittest.TestCase):
-    """A link's destination, title and reference label are not shown to the reader.
+    """A link's destination, title, reference label and an image's alt text are not shown as prose.
 
-    Same class as the HTML findings — an INVISIBLE marker becoming a durable gate event — but found
-    by the corpus rather than by a review, once the oracle stopped calling "renders as nothing"
-    a non-verdict and started calling it "not the writer's prose" (#14584 R5).
+    Same class as the raw-HTML findings — an INVISIBLE marker becoming a durable gate event. The
+    first two shapes came out of the generated corpus rather than a review; the rest came from
+    #14584 j#91682, after a version of this rule that DID tokenize closed a reference definition at
+    the physical line end, counted every parenthesis into one depth, and knew nothing of quoted
+    titles or angle-bracket destinations.
 
-    These regions are blanked rather than refused-to-end-of-note, unlike raw HTML: refusing from
-    ``][`` onward was measured against live journals and lost seven real gate events, because
-    ``[P1][documented_rule …]`` is ordinary review prose.
+    So this refuses to the end of the paragraph and asks nothing about where the link ends. The
+    paragraph bound is not a design preference either: refusing to the end of the NOTE was measured
+    against live journals and lost seven real gate events, because ``[P1][documented_rule …]`` is
+    ordinary review prose.
     """
 
     def test_a_marker_as_a_link_destination_is_not_canonical(self):
@@ -415,37 +418,51 @@ class LinkSyntaxTest(unittest.TestCase):
     def test_a_marker_as_a_link_title_is_not_canonical(self):
         self.assertEqual(_gates(f'[text](http://example.com "{MARKER}")'), ())
 
-    # These two are deliberate over-blank: with the reference UNDEFINED the renderer falls back to
-    # showing the brackets literally, so the oracle calls them visible. Refused anyway — whether a
-    # label resolves depends on definitions elsewhere in the note, which is not a question this scan
-    # answers, and the recoverable direction is refusal.
     def test_a_marker_as_a_reference_label_is_not_canonical(self):
         self.assertEqual(_gates(f"[text][{MARKER}]"), ())
 
     def test_a_marker_in_a_reference_definition_is_not_canonical(self):
         self.assertEqual(_gates(f"[ref]: http://example.com {MARKER}"), ())
 
+    def test_a_definition_hides_text_on_the_lines_below_it(self):
+        # CommonMark 0.31.2 §4.7: the destination may start on the NEXT line and the title may span
+        # several. Any rule that closes the region at the physical line end releases these.
+        self.assertEqual(_gates(f'[foo]: /url\n  "{MARKER}"'), ())
+        self.assertEqual(_gates(f"[foo]:\n/url/{MARKER}"), ())
+
+    def test_parentheses_inside_a_title_or_an_angle_destination_do_not_end_it(self):
+        # The two shapes a parenthesis-counting version released: a ")" inside a quoted title, and
+        # one inside an angle-bracket destination.
+        self.assertEqual(_gates(f'[text](url "before ) {MARKER} after")'), ())
+        self.assertEqual(_gates(f'[text](<https://x/)> "{MARKER}")'), ())
+
+    def test_a_marker_in_image_alt_text_is_not_canonical(self):
+        # Alt text renders into an attribute, not into the document text — the same class as
+        # `<span title="...">`, which this module already refused (#14584 j#91682 F2).
+        self.assertEqual(_gates(f"![prefix {MARKER} suffix](image.png)"), ())
+
     def test_a_marker_as_link_TEXT_is_canonical(self):
         # The paired positive: link text is exactly what the reader sees.
         self.assertEqual(_gates(f"[{MARKER}](http://example.com)"), ("review_request",))
 
-    def test_a_destination_holds_its_nested_parentheses(self):
-        # A destination may contain balanced parens, so the region does not end at the first ")".
-        # Both directions of that: the marker still inside is refused, the one past the real end is
-        # not. (Without the second case the "stop tracking depth" mutation goes undetected.)
-        self.assertEqual(_gates(f"[text](http://ex.com/a(b){MARKER})"), ())
-        self.assertEqual(_gates(f"[text](http://ex.com/a(b)c) {MARKER}"), ("review_request",))
-
-    def test_a_marker_after_a_link_is_canonical(self):
-        # The bound: blanking a destination must not swallow the rest of the paragraph.
-        self.assertEqual(_gates(f"see [docs](http://example.com) and {MARKER}"), ("review_request",))
-
-    def test_bracket_pairs_in_prose_do_not_swallow_the_note(self):
-        # The shape that made the refuse-to-end-of-note version cost live gate events.
+    def test_the_refusal_ends_with_the_paragraph(self):
+        # The bound. A marker in the NEXT paragraph is the writer's own voice again — without this
+        # the rule would quietly become "any note containing a link records nothing".
         self.assertEqual(
-            _gates(f"1. **[P1][documented_rule + code_fact]** finding\n\n{MARKER}"),
-            ("review_request",),
+            _gates(f"see [docs](http://example.com)\n\n{MARKER}"), ("review_request",)
         )
+
+    def test_a_marker_above_a_link_is_canonical(self):
+        self.assertEqual(_gates(f"{MARKER}\n\nsee [docs](http://example.com)"), ("review_request",))
+
+    def test_escaped_brackets_are_not_link_syntax(self):
+        # `\\[` and `\\]` are literals (§2.4), so this renders as visible text and starts nothing.
+        # (Without this case the "a backslash no longer shields the opener" mutation is invisible.)
+        self.assertEqual(_gates(f"see \\[docs\\](http://x) and {MARKER}"), ("review_request",))
+
+    def test_link_syntax_inside_a_quotation_costs_nothing(self):
+        # Decided on what the earlier rules left standing, so a link inside a code span is gone.
+        self.assertEqual(_gates(f"see `[docs](http://x)` here\n\n{MARKER}"), ("review_request",))
 
 
 class BackslashEscapeTest(unittest.TestCase):

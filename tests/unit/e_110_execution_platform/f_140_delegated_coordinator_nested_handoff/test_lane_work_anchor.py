@@ -183,6 +183,9 @@ class FailClosedTest(unittest.TestCase):
             ("escaped backtick", "\\` x `%s`" % marker),
             ("link destination", "[text](%s)" % marker),
             ("link title", '[text](http://example.com "%s")' % marker),
+            ("definition title on the next line", '[foo]: /url\n  "%s"' % marker),
+            ("paren inside a quoted title", '[text](url "a ) %s b")' % marker),
+            ("image alt text", "![a %s b](img.png)" % marker),
         ):
             with self.subTest(label):
                 self.assertEqual(_resolve([_entry("90409", note)]).status, WORK_ANCHOR_MISSING)

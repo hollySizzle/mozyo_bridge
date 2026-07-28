@@ -29,11 +29,17 @@ stated once, and both readers call it:
   deciding authority IS the defect, so this asks only whether markup begins, never where it ends.
   A marker inside a comment or an attribute is not even a quotation: it renders as **nothing**, and
   an invisible string was becoming a durable gate event.
-- **F. link syntax** — a destination and title ``](…)``, a reference label ``][…]`` and a reference
-  definition's tail ``]: …``. A marker written in one of them renders as a URL, an attribute, or
-  nothing at all. Unlike E these regions are BOUNDED and only they are blanked: refusing to the end
-  of the note from ``][`` was measured against live journals and lost seven real gate events,
-  because ``[P1][documented_rule …]`` is ordinary review prose.
+- **F. link syntax** — from a destination and title ``](…)``, a reference label ``][…]``, a
+  reference definition's tail ``]: …`` or an image's alt text ``![…]``, everything to the end of the
+  PARAGRAPH. A marker written in one of them renders as a URL or an attribute, never as prose. Like
+  E this does not tokenize: the version that tried closed a definition at the physical line end,
+  counted every parenthesis into one depth, and knew nothing of quoted titles or angle-bracket
+  destinations — three shortcuts, three separate escapes (#14584 j#91682 F1). §4.7 lets a
+  definition's destination and title begin on the NEXT line, so no line-scoped rule can be right.
+  The refusal stops at the paragraph rather than the note only because refusing further was
+  measured against live journals and cost seven real gate events (``[P1][documented_rule …]`` is
+  ordinary review prose). **The scope of a refusal and the way it is implemented are independent —
+  wanting a bounded one is not a reason to start parsing.**
 - **Backslash escapes (§2.4)** — an escaped delimiter is a literal. Counting an escaped backtick as
   a run pairs it with the REAL opener after it, so the span those two delimiters actually formed
   stops being blanked; ``\\<`` starts no markup.
@@ -137,12 +143,10 @@ _INTERRUPTS_PARAGRAPH = (
 #: a processing instruction (``<?``). This module does NOT tokenize what follows — it refuses from
 #: here to the end of the note (see :func:`_first_hidden_construct`).
 _HIDDEN_CONSTRUCT_START = re.compile(r"<[A-Za-z!?/]")
-#: The parts of Markdown's link syntax the renderer does not show as prose: a destination and title
-#: ``](…)``, a reference label ``][…]``, and a link reference definition's tail ``]: …``. A marker
-#: written in one of them renders as a URL, an attribute, or nothing. Unlike raw HTML these are
-#: BOUNDED — refusing to the end of the note instead costs real markers, measured on live journals:
-#: ``[P1][documented_rule …]`` is ordinary review prose, and seven live gate events were lost.
-_LINK_HIDDEN_PART = re.compile(r"\]\(|\]\[|\]:")
+#: Where Markdown's link syntax starts hiding text: a destination and title ``](…)``, a reference
+#: label ``][…]``, a reference definition's tail ``]: …``, and an image's alt text ``![…]``. A marker
+#: written in any of them renders as a URL or an attribute — never as prose.
+_LINK_HIDDEN_PART = re.compile(r"\]\(|\]\[|\]:|!\[")
 
 
 def _indent_columns(line: str) -> int:
@@ -261,9 +265,8 @@ def _first_hidden_construct(line: str) -> int:
     partial parser deciding authority is the defect, so this asks only "does one start here" and the
     caller refuses everything from here to the end of the note.
 
-    Markdown's link syntax hides content too, but is handled by :func:`_blank_link_hidden_parts`
-    instead: its regions are bounded, and refusing to the end of the note for them costs real
-    markers rather than hypothetical ones.
+    Markdown's link syntax hides content too, and is refused the same way — see
+    :func:`_blank_from_link_syntax`. The only difference is how far the refusal runs.
     """
     for match in _HIDDEN_CONSTRUCT_START.finditer(line):
         if not _is_escaped(line, match.start()):
@@ -271,50 +274,33 @@ def _first_hidden_construct(line: str) -> int:
     return -1
 
 
-def _blank_link_hidden_parts(text: str) -> str:
-    """``text`` with every link destination, title and reference label blanked (pure).
+def _blank_from_link_syntax(text: str) -> str:
+    """``text`` blanked from where link syntax starts hiding text, to the end of the paragraph (pure).
 
-    A marker written as ``[text](THIS)`` renders as a URL, as ``[text][THIS]`` as a lookup that
-    resolves to nothing, and as ``[label]: THIS`` as a definition the reader never sees — three more
-    ways an INVISIBLE string was becoming a durable gate event (#14584 j#91593 F2's class).
+    A marker written as ``[text](THIS)``, ``[text][THIS]``, ``[label]: THIS`` or ``![THIS](img)``
+    renders as a URL or an attribute — never as prose.
 
-    Each region is bounded: to the matching ``)``, the closing ``]``, or the end of the line. An
-    unterminated one refuses the rest of the paragraph, like an unmatched backtick string.
+    This does not ask where the region ends, for the same reason :func:`_first_hidden_construct`
+    does not. The previous version tried: it closed a reference definition at the physical line end,
+    counted every parenthesis into one depth, and knew nothing of quoted titles or angle-bracket
+    destinations — and each of those three shortcuts released a marker on its own (#14584 j#91682
+    F1). CommonMark 0.31.2 §4.7 lets a definition's destination and title start on the NEXT line and
+    the title span several, so no line-scoped rule can be right here.
+
+    The refusal stops at the paragraph rather than the note because refusing further was measured
+    against live journals and cost seven real gate events: ``[P1][documented_rule …]`` is ordinary
+    review prose. Bounding by paragraph needs no tokenizer — it is the block structure already
+    decided above.
     """
-    chars = list(text)
-    position = 0
-    while True:
-        opening = _LINK_HIDDEN_PART.search(text, position)
-        if opening is None:
-            return "".join(chars)
-        start = opening.start()
-        if _is_escaped(text, start):
-            position = opening.end()
+    for match in _LINK_HIDDEN_PART.finditer(text):
+        if _is_escaped(text, match.start()):
             continue
-        end = _link_region_end(text, opening.group(), opening.end())
-        for index in range(start, end):
+        chars = list(text)
+        for index in range(match.start(), len(text)):
             if chars[index] != "\n":
                 chars[index] = " "
-        position = end
-
-
-def _link_region_end(text: str, opener: str, start: int) -> int:
-    """Where the link region opened by ``opener`` ends (pure); the paragraph end if it never does."""
-    if opener == "]:":  # a reference definition's destination and title run to the line end
-        newline = text.find("\n", start)
-        return len(text) if newline < 0 else newline
-    if opener == "][":
-        closing = text.find("]", start)
-        return len(text) if closing < 0 else closing + 1
-    depth = 1  # "](" — destinations may contain balanced parentheses
-    for index in range(start, len(text)):
-        if text[index] == "(" and not _is_escaped(text, index):
-            depth += 1
-        elif text[index] == ")" and not _is_escaped(text, index):
-            depth -= 1
-            if depth == 0:
-                return index + 1
-    return len(text)
+        return "".join(chars)
+    return text
 
 
 def _blank_code_spans(text: str) -> str:
@@ -387,7 +373,7 @@ def canonical_note_lines(notes: str) -> tuple[str, ...]:
         while end < len(classified) and classified[end][1] == paragraph:
             end += 1
         joined = _blank_code_spans("\n".join(lines[start:end]))
-        lines[start:end] = _blank_link_hidden_parts(joined).split("\n")
+        lines[start:end] = _blank_from_link_syntax(joined).split("\n")
         start = end
     lines = ["" if blanked else line for line, (_t, _p, blanked) in zip(lines, classified)]
     # Hidden constructs are decided last, on what the rules above left standing — so a `<tag>` or
