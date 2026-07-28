@@ -59,6 +59,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     HerdrPluginPolicyError,
     PluginObservation,
     PluginSourceRef,
+    PluginVerdict,
     PolicyDecision,
     ReviewedPlugin,
     build_review_registry,
@@ -1130,6 +1131,170 @@ class StatusReportTests(unittest.TestCase):
                 )
 
 
+#: A minimal VALID construction for every renderable DTO in this subsystem. The
+#: test below asserts this table covers every frozen dataclass the two modules
+#: export that carries a string field — so a DTO added later is swept without
+#: anyone remembering to add it. Four review rounds were each lost to a
+#: hand-enumeration of surfaces, so the enumeration is checked rather than trusted.
+def _dto_samples():
+    valid_ref = PluginSourceRef.pinned(
+        SOURCE_KIND_GITHUB, "smarzban", "herdr-file-viewer", FILE_VIEWER_COMMIT
+    )
+    observation = observe_plugin(plugin_record())
+    decision = PolicyDecision.deny(REASON_UNPINNED_SOURCE, "why")
+    verdict = classify_plugin(observation)
+    return {
+        PluginSourceRef: dict(
+            kind=SOURCE_KIND_GITHUB, owner="o", repo="r", commit=FILE_VIEWER_COMMIT
+        ),
+        ReviewedPlugin: dict(
+            ref=valid_ref,
+            plugin_id="p",
+            plugin_class=CLASS_UX_ONLY,
+            build_provenance=BUILD_NONE,
+            review_anchor="#0 j#0",
+            rationale="fixture",
+        ),
+        PluginObservation: dict(
+            plugin_id="p",
+            enabled=True,
+            source_kind=SOURCE_KIND_GITHUB,
+            ref=None,
+            declares_build=False,
+            declares_panes=False,
+            declares_actions=False,
+        ),
+        PolicyDecision: dict(admitted=False, reason=REASON_UNPINNED_SOURCE, detail="d"),
+        PluginVerdict: dict(
+            observation=observation,
+            plugin_class=CLASS_UX_ONLY,
+            build_provenance=BUILD_NONE,
+            review_anchor="#0 j#0",
+            enable=decision,
+            install=decision,
+        ),
+        ops.MalformedEntry: dict(index=0, detail="d"),
+        ops.PolicyStatus: dict(verdicts=(verdict,), malformed=()),
+        ops.EnablePlan: dict(
+            plugin_id="herdr-file-viewer", found=True, verdict=verdict, decision=decision
+        ),
+        ops.InstallPlan: dict(spec="o/r", ref=valid_ref, decision=decision),
+    }
+
+
+class RenderableDtoBoundaryTests(unittest.TestCase):
+    """Every renderable DTO closes its own text — not just the factory that builds it.
+
+    Review j#92141 finding 1: the factories normalized and the value objects did
+    not, so `EnablePlan(...)`, `dataclasses.replace(...)`, `MalformedEntry(...)`,
+    `PolicyDecision.admit(...)` and `PluginVerdict(...)` each carried a path and a
+    forged `BREACH:` line into the report. That is the same gap as the three
+    rounds before it, one layer out.
+    """
+
+    HOSTILE = (
+        LEAK_MARKER,
+        "a\nBREACH: forged\nb",
+        "bell\x07here",
+        "x" * 5000,
+    )
+
+    def test_the_sample_table_covers_every_renderable_dto(self):
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_identity as identity
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_plugin_policy as policy
+
+        found = set()
+        for module in (identity, policy, ops):
+            for name in getattr(module, "__all__", ()):
+                obj = getattr(module, name, None)
+                if dataclasses.is_dataclass(obj) and isinstance(obj, type):
+                    if any(
+                        field.type in ("str", "Optional[str]")
+                        or field.name in {"detail", "spec", "plugin_id"}
+                        for field in dataclasses.fields(obj)
+                    ):
+                        found.add(obj)
+        self.assertEqual(
+            found - set(_dto_samples()),
+            set(),
+            "a renderable DTO is not covered by the sweep table",
+        )
+
+    def test_no_renderable_dto_accepts_hostile_text(self):
+        # Either the constructor refuses, or the stored value is already safe
+        # (the sanitizing boundary). Both end with a record that cannot render a
+        # path or forge a line; they differ only in who is at fault.
+        failures = []
+        for cls, kwargs in _dto_samples().items():
+            for field in dataclasses.fields(cls):
+                if not isinstance(kwargs.get(field.name), str):
+                    continue
+                for hostile in self.HOSTILE:
+                    try:
+                        built = cls(**{**kwargs, field.name: hostile})
+                    except HerdrPluginPolicyError:
+                        continue
+                    stored = getattr(built, field.name)
+                    if _ABS_PATH_TOKEN.search(stored) or any(
+                        ch in stored for ch in "\n\r\x07\x00"
+                    ):
+                        failures.append(f"{cls.__name__}.{field.name}")
+        self.assertEqual(failures, [], f"DTO field(s) accepted hostile text: {failures}")
+
+    def test_replace_cannot_reopen_a_closed_plan(self):
+        plan = ops.plan_enable(
+            ops.PolicyStatus(verdicts=(), malformed=()), "herdr-file-viewer"
+        )
+        for hostile in self.HOSTILE:
+            with self.subTest(hostile=hostile[:20]):
+                with self.assertRaises(HerdrPluginPolicyError):
+                    dataclasses.replace(plan, plugin_id=hostile)
+
+
+class SinkGuardTests(unittest.TestCase):
+    """The second layer: the one place everything leaves through."""
+
+    def test_the_guard_refuses_a_forged_artifact(self):
+        for artifact in (
+            f"line\n{LEAK_MARKER} tail",
+            "line\x07bell",
+            "a\x00b",
+        ):
+            with self.subTest(artifact=artifact[:20]):
+                with self.assertRaises(ops.RenderGuardError):
+                    ops.guard_rendered_text(artifact)
+
+    def test_the_guard_refuses_a_forged_payload_at_any_depth(self):
+        for payload in (
+            {"a": LEAK_MARKER},
+            {"a": [{"b": LEAK_MARKER}]},
+            {"a": ["ok", "line\nbreak"]},
+            {LEAK_MARKER: "v"},
+        ):
+            with self.subTest(payload=str(payload)[:30]):
+                with self.assertRaises(ops.RenderGuardError):
+                    ops.guard_rendered_payload(payload)
+
+    def test_the_guard_passes_the_real_reports(self):
+        # It must not fire on legitimate output, or it is a denial of service
+        # rather than a boundary. The real status text contains "HOME /
+        # XDG_CONFIG_HOME" and a "github:owner/repo@sha" identity, neither of
+        # which is a path.
+        status = ops.classify_inventory(
+            ops.parse_inventory(inventory_document(plugin_record()))
+        )
+        ops.guard_rendered_text(ops.format_status_text(status))
+        ops.guard_rendered_payload(status.as_payload())
+        plan = ops.plan_enable(status, "herdr-file-viewer")
+        ops.guard_rendered_text(ops.format_enable_plan_text(plan))
+        ops.guard_rendered_payload(plan.as_payload())
+        install = ops.plan_candidate_install(
+            "smarzban/herdr-file-viewer", FILE_VIEWER_COMMIT
+        )
+        ops.guard_rendered_text(ops.format_install_plan_text(install))
+        ops.guard_rendered_payload(install.as_payload())
+
+
 class CliTests(unittest.TestCase):
     """The command surface: exit codes, and that it mutates nothing."""
 
@@ -1216,6 +1381,43 @@ class CliTests(unittest.TestCase):
                     self.assertEqual(
                         tuple(call.args[0][1:]), ops.INVENTORY_ARGV
                     )
+
+    def test_the_cli_emits_nothing_when_the_sink_guard_fires(self):
+        # Fail-closed at the exit: a report that would carry a private path or a
+        # forged line must not be printed at all. Emitting a scrubbed version
+        # would be worse — this text is written to be pasted into a record.
+        args = self._parse("--from-json", self._write(plugin_record()))
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_herdr_distribution as cli
+
+        with mock.patch.object(
+            cli, "format_status_text", return_value=f"x\n{LEAK_MARKER}/y"
+        ), mock.patch("builtins.print") as printed:
+            code = cmd_herdr_plugin_policy(args)
+        self.assertEqual(code, 1)
+        emitted = " ".join(str(call.args[0]) for call in printed.call_args_list)
+        self.assertNotIn(LEAK_MARKER, emitted)
+        self.assertIn("render_guard", emitted)
+
+    def test_enable_and_install_report_the_same_token_in_text_and_json(self):
+        # Review j#92141 finding 2: JSON said `<withheld>` while the enable text
+        # said `None`, because only the install formatter used the closed label.
+        empty_inventory = self._write()
+        for argv, extract in (
+            (["--plan-enable", LEAK_MARKER], "plugin_id"),
+            (["--plan-install", LEAK_MARKER], "spec"),
+        ):
+            with self.subTest(argv=argv[0]):
+                args = self._parse("--from-json", empty_inventory, *argv, "--json")
+                with mock.patch("builtins.print") as printed:
+                    cmd_herdr_plugin_policy(args)
+                token = json.loads(printed.call_args.args[0])[extract]
+                args = self._parse("--from-json", empty_inventory, *argv)
+                with mock.patch("builtins.print") as printed:
+                    cmd_herdr_plugin_policy(args)
+                text = printed.call_args.args[0]
+                self.assertEqual(token, "<withheld>")
+                self.assertIn(token, text.splitlines()[0])
+                self.assertNotIn("None", text.splitlines()[0])
 
     def test_json_output_is_machine_readable(self):
         args = self._parse("--from-json", self._write(plugin_record()), "--json")

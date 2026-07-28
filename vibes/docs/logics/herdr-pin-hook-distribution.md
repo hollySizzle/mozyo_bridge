@@ -390,6 +390,33 @@ observed 側に無かった。**同じ概念を 2 箇所で書くと、片方だ
   3. regression の形も 2 度変えた。field 名の列挙 → **payload の全 string leaf へ marker を
      1 つずつ注入する oracle**（列挙が漏れたので列挙をやめた）→ さらに **operand 面へ oracle を
      拡張**（operand は inventory を通らないので、前者の oracle では原理的に見えなかった）。
+  4. **factory を閉じても value object は閉じていなかった**（review j#92141 F1）。
+     `EnablePlan` / `InstallPlan` / `MalformedEntry` / `PolicyDecision` / `PluginVerdict` は
+     直接構築と `dataclasses.replace` で path と偽造行を通した。**描画される当のもの**が
+     開いていた。
+
+### ★2 層で守る: source(各 DTO) と sink(唯一の出口)
+
+**4 round すべてで「閉じた面の隣」が開いていた**。1 面ずつ塞ぐ方式そのものを変える。
+
+1. **source 層** — renderable な text を持つ全 DTO が constructor で自分の値を閉じる。
+   共有述語は 1 つ (`require_renderable_field`: path-free / control-free / bounded)。
+   - **我々が書いた text**（decision detail / review anchor / rationale）は **拒否**する。
+     違反はこちらのバグなので、黙って書き換えず落とすのが正しい。
+   - **第三者由来の text**（parse message / subprocess stderr）は **sanitize** する
+     (`sanitize_renderable`: redact → control 文字を空白へ平坦化 → 長さ制限)。
+     こちらは敵対的入力が想定内なので、値を返せなければ report が作れない。
+   - 両者とも「安全でない値を保持した record が存在しない」点は同じ。違うのは
+     **違反したとき誰の責任か**だけである。
+2. **sink 層** — CLI の**唯一の出口** `_emit` が、**組み上がった artifact** を検査する。
+   面に結びつけないのが要点で、**将来 field / DTO / formatter が増えても、誰も気づかなくても
+   効く**。検査は「絶対 path を含まないか」「(text では改行以外の) control 文字を含まないか」。
+   違反したら **何も出力せず non-zero で終える** — private path や偽造行を含む report を
+   durable record へ貼るくらいなら、出力しない方がよい。
+
+regression も同型に組んである: **両 module が export する frozen dataclass のうち text field を
+持つものを機械列挙**し、sample table が全部を覆っているかを test が検査する（覆っていなければ
+落ちる）。新しい DTO を足したら自動的に掃かれる。
 - **authority は core 所有のまま。** `FORBIDDEN_PLUGIN_AUTHORITIES` は既存の
   `FORBIDDEN_PROVIDER_AUTHORITIES` (#12035) と `CORE_OWNED_AUTHORITIES` (#12155) を
   **そのまま再利用**した上で lane 固有 (`delivery_authority` / `durable_anchor_authority` /

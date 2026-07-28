@@ -80,8 +80,63 @@ REDACTED_TOKEN = "<withheld>"
 #: than suppression.
 MAX_SEGMENT_LENGTH = 64
 
+#: Upper bound on any single rendered text field (a diagnostic sentence, not an
+#: essay). Bounds are part of the boundary: an unbounded field is a channel.
+MAX_RENDERED_FIELD_LENGTH = 2000
+
 _COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _SEGMENT_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+
+#: An absolute filesystem path occurrence: a POSIX root followed by a segment and
+#: another separator, a drive root, or a UNC root. Deliberately requires a second
+#: separator on the POSIX form, so ordinary prose (``HOME / XDG_CONFIG_HOME``) and
+#: a one-slash identity (``github:owner/repo@sha``) are not paths.
+_ABSOLUTE_PATH_RE = re.compile(
+    r"\\\\[^\s\\]|(?<![A-Za-z0-9_.\-])[A-Za-z]:[\\/]|/[A-Za-z0-9._\-]+/"
+)
+
+#: Control characters. ``\n`` matters most: this surface's text is written to be
+#: pasted into a durable record, and a newline inside a *field* lets that field
+#: forge a line of the record (review j#92092 F2 measured a forged ``BREACH:``
+#: line). A field never legitimately contains one; only the assembled artifact does.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def contains_absolute_path(text: str) -> bool:
+    """Whether ``text`` carries an absolute filesystem path occurrence."""
+    return bool(_ABSOLUTE_PATH_RE.search(text))
+
+
+def require_renderable_field(value: object, field: str) -> str:
+    """Return ``value`` if it may be rendered into a report, else fail closed.
+
+    The single predicate every renderable field shares. Used where the content is
+    **ours** — a decision's diagnostic sentence, a review anchor — because a
+    violation there is a bug in text we wrote, and the honest response is to refuse
+    rather than to quietly rewrite it.
+
+    Where the content is derived from a third party (a parser's message about a
+    hostile record, a subprocess's stderr) the boundary *sanitizes* instead; see
+    the ops layer's ``sanitize_renderable``. Both end with a record that cannot
+    hold an unrenderable value; they differ only in who is at fault when one shows
+    up.
+    """
+    if not isinstance(value, str):
+        raise HerdrPluginPolicyError(
+            f"{field} must be a string, got {type(value).__name__}"
+        )
+    if len(value) > MAX_RENDERED_FIELD_LENGTH:
+        raise HerdrPluginPolicyError(
+            f"{field} exceeds {MAX_RENDERED_FIELD_LENGTH} characters"
+        )
+    if _CONTROL_CHAR_RE.search(value):
+        raise HerdrPluginPolicyError(
+            f"{field} carries a control character; a field that can hold one can "
+            f"forge a line of the record it is pasted into"
+        )
+    if contains_absolute_path(value):
+        raise HerdrPluginPolicyError(f"{field} carries an absolute filesystem path")
+    return value
 
 
 def normalize_source_kind(raw: object) -> str:
@@ -421,14 +476,17 @@ __all__ = (
     "SOURCE_KIND_GITHUB",
     "SOURCE_KIND_LINK",
     "SOURCE_KIND_UNRECOGNIZED",
+    "MAX_RENDERED_FIELD_LENGTH",
     "MAX_SEGMENT_LENGTH",
     "REDACTED_TOKEN",
     "HerdrPluginPolicyError",
     "PluginObservation",
     "PluginSourceRef",
+    "contains_absolute_path",
     "normalize_source_kind",
     "observe_plugin",
     "read_source_ref",
+    "require_renderable_field",
     "require_segment",
     "source_ref_from_parts",
 )

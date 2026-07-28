@@ -98,11 +98,14 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     SOURCE_KIND_GITHUB,
     SOURCE_KIND_LINK,
     SOURCE_KIND_UNRECOGNIZED,
+    MAX_RENDERED_FIELD_LENGTH,
     MAX_SEGMENT_LENGTH,
     REDACTED_TOKEN,
     HerdrPluginPolicyError,
     PluginObservation,
     PluginSourceRef,
+    contains_absolute_path,
+    require_renderable_field,
     require_segment,
     normalize_source_kind,
     observe_plugin,
@@ -295,6 +298,12 @@ class ReviewedPlugin:
             raise HerdrPluginPolicyError(
                 f"reviewed plugin {self.plugin_id!r} needs a rationale"
             )
+        # Neither field is rendered today, but both are text this record carries
+        # and either could become rendered. Closing them now costs nothing and
+        # means the boundary does not depend on which fields a future formatter
+        # happens to pick up — the exact assumption that failed in j#92141 F1.
+        require_renderable_field(self.review_anchor, "review anchor")
+        require_renderable_field(self.rationale, "rationale")
         if not self.ref.is_pinned and self.plugin_class not in DENY_CLASSES:
             raise HerdrPluginPolicyError(
                 f"a repository-scoped entry may only carry a deny class "
@@ -458,6 +467,11 @@ class PolicyDecision:
                 f"a denied decision must carry a reason from {sorted(DENY_REASONS)}, "
                 f"got {self.reason!r}"
             )
+        # ``detail`` is rendered verbatim into both the text and the JSON report, so
+        # the record closes it here rather than trusting whoever constructed it
+        # (review j#92141 F1: the factories were closed and the value objects were
+        # not, which is the same gap one layer out).
+        require_renderable_field(self.detail, "decision detail")
 
     @classmethod
     def admit(cls, detail: str = "") -> "PolicyDecision":
@@ -652,6 +666,24 @@ class PluginVerdict:
     enable: PolicyDecision
     install: PolicyDecision
 
+    def __post_init__(self) -> None:
+        if self.plugin_class not in PLUGIN_CLASSES:
+            raise HerdrPluginPolicyError(
+                f"plugin class {self.plugin_class!r} is not one of "
+                f"{sorted(PLUGIN_CLASSES)}"
+            )
+        if self.build_provenance not in BUILD_PROVENANCES:
+            raise HerdrPluginPolicyError(
+                f"build provenance {self.build_provenance!r} is not one of "
+                f"{sorted(BUILD_PROVENANCES)}"
+            )
+        require_renderable_field(self.review_anchor, "review anchor")
+        if not isinstance(self.observation, PluginObservation):
+            raise HerdrPluginPolicyError("observation must be a PluginObservation")
+        for name in ("enable", "install"):
+            if not isinstance(getattr(self, name), PolicyDecision):
+                raise HerdrPluginPolicyError(f"{name} must be a PolicyDecision")
+
     @property
     def breach(self) -> bool:
         """Enabled right now despite not being admissible — an active violation.
@@ -686,7 +718,10 @@ __all__ = (
     "SOURCE_KIND_LINK",
     "SOURCE_KIND_UNRECOGNIZED",
     "MAX_SEGMENT_LENGTH",
+    "MAX_RENDERED_FIELD_LENGTH",
     "REDACTED_TOKEN",
+    "contains_absolute_path",
+    "require_renderable_field",
     "normalize_source_kind",
     "resolve_reference",
     "source_ref_from_parts",

@@ -41,6 +41,7 @@ fine".
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -61,6 +62,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     REASON_TARGET_NOT_INSTALLED,
     SCOPE_ISOLATION_MECHANISM,
     SCOPE_ROOT_DETERMINANTS,
+    MAX_RENDERED_FIELD_LENGTH,
     REDACTED_TOKEN,
     SOURCE_KIND_GITHUB,
     HerdrPluginPolicyError,
@@ -70,10 +72,16 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     classify_plugin,
     observe_plugin,
     plan_install,
+    contains_absolute_path,
+    require_renderable_field,
     require_segment,
     resolve_review,
     source_ref_from_parts,
 )
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+#: Same set minus the newline, which is what structures the text report.
+_CONTROL_CHARS_EXCEPT_NEWLINE = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
 
 #: The **only** herdr invocation this surface makes: a read-only inventory query.
 #: A literal constant rather than something assembled per call, so a test can pin
@@ -112,14 +120,39 @@ class InventoryReadError(Exception):
                 READ_MALFORMED_INVENTORY,
                 f"unknown inventory read reason {reason!r}",
             )
-        super().__init__(detail)
+        safe_detail = sanitize_renderable(detail)
+        super().__init__(safe_detail)
         self.reason = reason
-        self.detail = detail
+        self.detail = safe_detail
 
 
-def _redact(text: object) -> str:
-    """Redact any absolute path out of text this module did not author."""
-    return redact_probe_paths(str(text or ""))
+def sanitize_renderable(text: object) -> str:
+    """Make third-party-derived text safe to render (redact, flatten, bound).
+
+    The *sanitizing* half of the boundary described in
+    ``require_renderable_field``. Applied where the content comes from outside —
+    a subprocess's stderr, a parser's message quoting a hostile record — because
+    there a violation is expected input rather than a bug in our own text, so the
+    boundary must produce a usable value instead of refusing.
+
+    Three transformations, each closing a measured hole: absolute paths are
+    redacted (review j#92053 F1), control characters are flattened to spaces so a
+    field cannot forge a line of the record it is pasted into (j#92092 F2), and the
+    result is bounded (an unbounded field is a channel).
+    """
+    redacted = redact_probe_paths(str(text or ""))
+    flattened = _CONTROL_CHARS.sub(" ", redacted)
+    if len(flattened) > MAX_RENDERED_FIELD_LENGTH:
+        flattened = flattened[: MAX_RENDERED_FIELD_LENGTH - 1] + "…"
+    if contains_absolute_path(flattened):
+        # redact_probe_paths is line-oriented; if anything survives the flattening
+        # we withhold the whole detail rather than emit a partial path.
+        return REDACTED_TOKEN
+    return flattened
+
+
+#: In-module alias kept for the existing call sites.
+_redact = sanitize_renderable
 
 
 def read_inventory_document(path: Path) -> str:
@@ -216,6 +249,13 @@ class MalformedEntry:
     index: int
     detail: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.index, int) or isinstance(self.index, bool):
+            raise HerdrPluginPolicyError("malformed-entry index must be an int")
+        # Third-party derived: sanitize rather than refuse, so a hostile record
+        # still yields a reportable entry (frozen dataclass -> object.__setattr__).
+        object.__setattr__(self, "detail", sanitize_renderable(self.detail))
+
     def as_payload(self) -> dict:
         return {
             "index": self.index,
@@ -267,6 +307,14 @@ class PolicyStatus:
 
     verdicts: "tuple[PluginVerdict, ...]"
     malformed: "tuple[MalformedEntry, ...]"
+
+    def __post_init__(self) -> None:
+        for verdict in self.verdicts:
+            if not isinstance(verdict, PluginVerdict):
+                raise HerdrPluginPolicyError("verdicts must be PluginVerdict values")
+        for entry in self.malformed:
+            if not isinstance(entry, MalformedEntry):
+                raise HerdrPluginPolicyError("malformed must be MalformedEntry values")
 
     @property
     def breaches(self) -> "tuple[PluginVerdict, ...]":
@@ -366,6 +414,19 @@ class EnablePlan:
     verdict: Optional[PluginVerdict]
     decision: PolicyDecision
 
+    def __post_init__(self) -> None:
+        # The factory normalizes; the record *closes*. Review j#92141 F1: closing
+        # only the factory left `EnablePlan(...)` and `dataclasses.replace(...)`
+        # as open paths into the very object that gets rendered.
+        if self.plugin_id is not None:
+            require_segment(self.plugin_id, "enable plan target")
+        if not isinstance(self.found, bool):
+            raise HerdrPluginPolicyError("found must be a boolean")
+        if not isinstance(self.decision, PolicyDecision):
+            raise HerdrPluginPolicyError("decision must be a PolicyDecision")
+        if self.verdict is not None and not isinstance(self.verdict, PluginVerdict):
+            raise HerdrPluginPolicyError("verdict must be a PluginVerdict or None")
+
     @property
     def ok(self) -> bool:
         return self.decision.admitted
@@ -462,6 +523,18 @@ class InstallPlan:
     spec: Optional[str]
     ref: Optional[PluginSourceRef]
     decision: PolicyDecision
+
+    def __post_init__(self) -> None:
+        if self.spec is not None:
+            owner, separator, repo = self.spec.partition("/")
+            if not separator:
+                raise HerdrPluginPolicyError("install plan spec must be owner/repo")
+            require_segment(owner, "install plan spec owner")
+            require_segment(repo, "install plan spec repo")
+        if self.ref is not None and not isinstance(self.ref, PluginSourceRef):
+            raise HerdrPluginPolicyError("ref must be a PluginSourceRef or None")
+        if not isinstance(self.decision, PolicyDecision):
+            raise HerdrPluginPolicyError("decision must be a PolicyDecision")
 
     @property
     def ok(self) -> bool:
@@ -577,7 +650,7 @@ def format_status_text(status: PolicyStatus) -> str:
 def format_enable_plan_text(plan: EnablePlan) -> str:
     """Human-readable enable plan. This never enables anything."""
     lines = [
-        f"herdr plugin policy — enable plan for {plan.plugin_id} "
+        f"herdr plugin policy — enable plan for {_operand_label(plan.plugin_id)} "
         f"(read-only; nothing was enabled)"
     ]
     lines.extend(_format_scope())
@@ -609,6 +682,69 @@ def format_read_error_text(error: InventoryReadError) -> str:
     return f"error [{error.reason}]: {error.detail}"
 
 
+# --- the sink guard ----------------------------------------------------------
+
+
+class RenderGuardError(HerdrPluginPolicyError):
+    """An assembled artifact violated the disclosure boundary at the output sink."""
+
+
+def guard_rendered_text(text: str) -> str:
+    """Verify an assembled text artifact, or refuse to emit it.
+
+    The *second* layer, and the reason it exists is empirical rather than
+    theoretical. Four review rounds each closed a surface and each left the
+    surface next to it open: fields meant to hold a path, then fields not checked
+    at all, then a narrowed alphabet, then the value objects behind the factories.
+    Every one of those was found by someone enumerating surfaces — and the
+    enumeration was wrong every time, mine included.
+
+    So this check is not attached to a surface. It is attached to the **one place
+    everything leaves through**, and it asks about the finished artifact: does it
+    carry an absolute path, or a control character other than the newlines that
+    structure it? A future field, DTO, or formatter is covered without anyone
+    noticing it needs to be.
+
+    Fail-closed by raising: emitting nothing is the correct outcome for a report
+    that would carry a private path or a forged line into a durable record.
+    """
+    if contains_absolute_path(text):
+        raise RenderGuardError(
+            "refusing to emit a report carrying an absolute filesystem path"
+        )
+    if _CONTROL_CHARS_EXCEPT_NEWLINE.search(text):
+        raise RenderGuardError(
+            "refusing to emit a report carrying a control character"
+        )
+    return text
+
+
+def guard_rendered_payload(payload: object) -> object:
+    """Verify every string in an assembled JSON payload, or refuse to emit it.
+
+    The payload counterpart of :func:`guard_rendered_text`. A payload string is a
+    *field*, never an assembled artifact, so a newline is not structural here and
+    is refused along with every other control character.
+    """
+    if isinstance(payload, str):
+        if contains_absolute_path(payload):
+            raise RenderGuardError(
+                "refusing to emit a payload carrying an absolute filesystem path"
+            )
+        if _CONTROL_CHARS.search(payload):
+            raise RenderGuardError(
+                "refusing to emit a payload carrying a control character"
+            )
+    elif isinstance(payload, Mapping):
+        for key, value in payload.items():
+            guard_rendered_payload(key)
+            guard_rendered_payload(value)
+    elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+        for item in payload:
+            guard_rendered_payload(item)
+    return payload
+
+
 __all__ = (
     "INVENTORY_ARGV",
     "INVENTORY_TIMEOUT_SECONDS",
@@ -622,6 +758,10 @@ __all__ = (
     "InventoryReadError",
     "MalformedEntry",
     "PolicyStatus",
+    "RenderGuardError",
+    "guard_rendered_payload",
+    "guard_rendered_text",
+    "sanitize_renderable",
     "classify_inventory",
     "normalize_operand",
     "format_enable_plan_text",

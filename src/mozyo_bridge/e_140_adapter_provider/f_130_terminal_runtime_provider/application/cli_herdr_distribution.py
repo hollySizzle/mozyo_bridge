@@ -57,6 +57,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_plugin_policy_ops import (
     InventoryReadError,
+    RenderGuardError,
+    guard_rendered_payload,
+    guard_rendered_text,
     classify_inventory,
     format_enable_plan_text,
     format_install_plan_text,
@@ -229,11 +232,30 @@ def register_herdr_integration_install_parser(herdr_sub) -> None:
 # --- plugin-policy -----------------------------------------------------------
 
 
-def _emit(payload: dict, text: str, *, as_json: bool) -> None:
-    if as_json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
-        print(text)
+def _emit(payload: dict, text: str, *, as_json: bool) -> int:
+    """The single output point for this command — and its disclosure sink guard.
+
+    Every mode renders through here, so this is the one place a check covers a
+    surface nobody remembered to enumerate. Four review rounds on this issue each
+    closed one surface and left its neighbour open, so the guard is deliberately
+    attached to the exit rather than to any field: it asks whether the *finished*
+    artifact carries an absolute path or a control character.
+
+    A violation prints nothing and returns a non-zero code. Emitting a partial or
+    scrubbed report would be worse than emitting none: this text exists to be
+    pasted into a durable record.
+    """
+    try:
+        if as_json:
+            guard_rendered_payload(payload)
+            rendered = json.dumps(payload, indent=2, sort_keys=True)
+        else:
+            rendered = guard_rendered_text(text)
+    except RenderGuardError as exc:
+        print(f"error [render_guard]: {exc}")
+        return 1
+    print(rendered)
+    return 0
 
 
 def cmd_herdr_plugin_policy(args: argparse.Namespace) -> int:
@@ -248,12 +270,12 @@ def cmd_herdr_plugin_policy(args: argparse.Namespace) -> int:
         install_plan = plan_candidate_install(
             args.plan_install, getattr(args, "ref", None)
         )
-        _emit(
+        blocked = _emit(
             install_plan.as_payload(),
             format_install_plan_text(install_plan),
             as_json=as_json,
         )
-        return 0 if install_plan.ok else 1
+        return blocked or (0 if install_plan.ok else 1)
     try:
         if getattr(args, "from_json", None):
             document = read_inventory_document(Path(args.from_json))
@@ -269,14 +291,14 @@ def cmd_herdr_plugin_policy(args: argparse.Namespace) -> int:
         return 1
     if getattr(args, "plan_enable", None):
         enable_plan = plan_enable(status, args.plan_enable)
-        _emit(
+        blocked = _emit(
             enable_plan.as_payload(),
             format_enable_plan_text(enable_plan),
             as_json=as_json,
         )
-        return 0 if enable_plan.ok else 1
-    _emit(status.as_payload(), format_status_text(status), as_json=as_json)
-    return 0 if status.ok else 1
+        return blocked or (0 if enable_plan.ok else 1)
+    blocked = _emit(status.as_payload(), format_status_text(status), as_json=as_json)
+    return blocked or (0 if status.ok else 1)
 
 
 def register_herdr_plugin_policy_parser(herdr_sub) -> None:
