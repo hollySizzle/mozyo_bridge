@@ -38,6 +38,7 @@ now, so there is nothing to cross-check and nothing to drift.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import errno
 import hashlib
@@ -53,6 +54,7 @@ import tempfile
 import threading
 import unittest
 import unittest.mock
+from collections.abc import Iterator
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -61,6 +63,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.application import (  # noqa: E402
     legacy_mirror_sync,
     owned_descriptors,
+    platform_capabilities,
 )
 from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.application.legacy_mirror_sync import (  # noqa: E402
     HOOK_TEMP_CREATED,
@@ -229,6 +232,23 @@ class _MirrorTreeFixture(unittest.TestCase):
     @staticmethod
     def _service(repo: Path, **kwargs: object) -> LegacyProjectSkillMirrorSync:
         return LegacyProjectSkillMirrorSync(repo, **kwargs)  # type: ignore[arg-type]
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _preflight_already_answered() -> Iterator[None]:
+        """Run the service with the host capability probe answered in advance.
+
+        The probe calls the same primitives the service does — that is what
+        makes it a probe rather than an advertisement (#14651) — so an
+        injection that fires on the *n*-th call to a global `os.unlink` or
+        `os.close` would land on the probe before it ever reached the subject.
+        Injections keyed on a descriptor, a name or a flag pick out their own
+        call and do not need this.
+        """
+        with unittest.mock.patch.object(
+            legacy_mirror_sync, "missing_platform_capabilities", return_value=()
+        ):
+            yield
 
     def assertBlocksWrite(self, repo: Path, expected_kind: str) -> None:
         """Both modes refuse, nothing is written, and the class is named."""
@@ -730,12 +750,19 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
     def test_staging_entry_rebound_to_a_regular_file_is_not_swapped_into_place(
         self,
     ) -> None:
-        """The inode identity check, isolated from the no-follow open.
+        """The inode identity check, isolated from the no-follow type check.
 
-        Re-binding the staging name to a *symlink* is already refused when the
-        verification open uses `O_NOFOLLOW`. Re-binding it to an ordinary file
-        opens fine, so only comparing the inode catches it — a mutation probe
-        that removed the comparison stayed green until this case existed.
+        Re-binding the staging name to a *symlink* is already refused by the
+        type of the entry. Re-binding it to an ordinary file is not, so only
+        comparing the inode catches it — a mutation probe that removed the
+        comparison stayed green until this case existed.
+
+        This is also the case that measured the comparison being unsound on its
+        own: on a filesystem that recycles inode numbers the impostor inherited
+        the number and was installed, and this test failed 3 runs out of 3 on
+        Linux overlayfs while passing on tmpfs and APFS (Redmine #14652). It is
+        the outcome-level half of that fix; the property-level half is below,
+        and does not depend on the host recycling anything.
         """
         repo = self._stage()
         canonical = self._source(repo) / "workflow.md"
@@ -760,6 +787,137 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
                 (self._mirror(repo) / name).read_text(encoding="utf-8"),
                 "a substituted staging file was installed as a pinned reference",
             )
+
+    # --- #14652: an inode number is an identity only while it is pinned ------
+
+    def test_ownership_refuses_to_answer_once_the_descriptor_is_closed(self) -> None:
+        """Why the staging descriptor is the last thing closed.
+
+        The name here still refers to the very file that was created — nothing
+        was substituted — so comparing `(st_dev, st_ino)` would answer "ours",
+        and would keep answering "ours" for whatever file inherited the number
+        next. It is refused instead. Fail-closed is not "usually right": an
+        unpinned comparison is not a weaker proof of ownership, it is not one.
+
+        Host-independent by construction. The outcome this prevents needs a
+        filesystem that recycles inode numbers; this asks the question the
+        recycling makes unanswerable, and that question has the same answer
+        everywhere.
+        """
+        repo = self._stage()
+        mirror_fd = os.open(self._mirror(repo), os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, mirror_fd)
+        name = ".mozyo-legacy-mirror.pin-probe.tmp"
+        descriptor = owned_descriptors._OwnedDescriptor(
+            os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=mirror_fd)
+        )
+        self.addCleanup(os.unlink, name, dir_fd=mirror_fd)
+        ownership = owned_descriptors._StagingOwnership(descriptor)
+        ownership.prove()
+
+        self.assertEqual(
+            owned_descriptors._OWNERSHIP_CONFIRMED,
+            ownership.resolve(mirror_fd, name),
+            "the pinned entry was not recognised as ours",
+        )
+        descriptor.close()
+        self.assertEqual(
+            owned_descriptors._OWNERSHIP_UNPROVEN,
+            ownership.resolve(mirror_fd, name),
+            "an unpinned inode number was accepted as an identity",
+        )
+
+    def test_the_staging_descriptor_still_pins_the_inode_at_every_ownership_question(
+        self,
+    ) -> None:
+        """The pin has to be live where the question is asked, in production.
+
+        Measured rather than read off a flag: at each point the sync asks who
+        owns the staging name, `fstat` on the staging descriptor must still
+        succeed — it raises `EBADF` once the descriptor is gone — and must still
+        report the inode the proof was taken from.
+
+        Both callers are covered, which needs both paths: the clean write asks
+        before the swap, and the failed write asks again in the release.
+        """
+        real_resolve = owned_descriptors._StagingOwnership.resolve
+
+        for label, break_the_write in (("clean write", False), ("failed write", True)):
+            with self.subTest(label):
+                repo = self._stage()
+                canonical = self._source(repo) / "workflow.md"
+                canonical.write_text(
+                    canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8"
+                )
+                pinned: list[bool] = []
+
+                def observing_resolve(self, dir_fd, name):  # type: ignore[no-untyped-def]
+                    identity = self._identity
+                    try:
+                        live = os.fstat(self._descriptor.fileno)
+                    except OSError:
+                        pinned.append(False)  # the descriptor is already gone
+                    else:
+                        pinned.append(
+                            identity is not None
+                            and (live.st_dev, live.st_ino) == (identity.st_dev, identity.st_ino)
+                        )
+                    return real_resolve(self, dir_fd, name)
+
+                def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+                    raise OSError(errno.ENOSPC, "injected")
+
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        unittest.mock.patch.object(
+                            owned_descriptors._StagingOwnership, "resolve", observing_resolve
+                        )
+                    )
+                    if break_the_write:
+                        stack.enter_context(
+                            unittest.mock.patch.object(
+                                legacy_mirror_sync.os, "write", failing_write
+                            )
+                        )
+                    self._service(repo).sync()
+
+                self.assertTrue(pinned, "ownership was never asked")
+                self.assertTrue(
+                    all(pinned), "ownership was asked while the inode was not pinned"
+                )
+
+    def test_a_deferred_write_error_is_reported_before_anything_is_installed(self) -> None:
+        """#14652. The close used to be in position to catch a write error the
+        host had deferred, because it ran before the swap. It now runs after —
+        so the flush is what has to catch one, while the file is still staging.
+
+        A flush that fails must therefore leave the mirror entry exactly as it
+        was, and must not be folded into a success (j#90467 R9-F1).
+        """
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+        entry = self._mirror(repo) / "workflow.md"
+        before = entry.read_text(encoding="utf-8")
+        fired: list[int] = []
+
+        def failing_fsync(fd: int) -> None:
+            fired.append(fd)
+            raise OSError(errno.EIO, "injected deferred write error")
+
+        with unittest.mock.patch.object(legacy_mirror_sync.os, "fsync", failing_fsync):
+            code, out, err = self._service(repo).sync()
+
+        self.assertTrue(fired, "the staging flush was never reached")
+        self.assertEqual(1, code)
+        self.assertEqual((), out, "a failed flush still printed the banner")
+        self.assertIn("could not be flushed to disk", "\n".join(err))
+        self.assertEqual(
+            before,
+            entry.read_text(encoding="utf-8"),
+            "a flush that failed still installed the entry",
+        )
+        self.assertEqual([], self._staging_names(repo), "the failed flush left residue")
 
     def test_source_becoming_unreadable_after_the_walk_is_typed(self) -> None:
         """The observation branch inside the bound source directory.
@@ -1210,11 +1368,12 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
             raise OSError(errno.ENOSPC, "injected")
 
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", failing_write):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "unlink", transient_unlink
-            ):
-                code, _out, err = self._service(repo).sync()
+        with self._preflight_already_answered():
+            with unittest.mock.patch.object(legacy_mirror_sync.os, "write", failing_write):
+                with unittest.mock.patch.object(
+                    legacy_mirror_sync.os, "unlink", transient_unlink
+                ):
+                    code, _out, err = self._service(repo).sync()
 
         self.assertEqual(1, code)
         self.assertEqual(1, len(calls), "cleanup ran more than once for one staging file")
@@ -1314,67 +1473,112 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         self.assertTrue(foreign.exists(), "the unwind deleted an entry that was not ours")
         self.assertEqual("FOREIGN\n", foreign.read_text(encoding="utf-8"))
 
-    def test_verify_open_failure_releases_the_staging(self) -> None:
-        """j#90472 R10-F2. Failing to observe the entry is not evidence that it
-        is foreign; skipping cleanup guaranteed residue instead."""
+    def test_an_unreadable_staging_name_at_swap_time_releases_the_staging(self) -> None:
+        """j#90472 R10-F2, on the observation #14652 replaced the verify open
+        with. Failing to observe the entry is not evidence that it is foreign;
+        skipping cleanup guaranteed residue instead.
+
+        Only the first observation fails, so the release's own observation still
+        answers — a permanently failing `lstat` would test the *unreadable
+        cleanup* branch instead, which is the next test's job.
+        """
         repo = self._stage()
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        real_open = os.open
+        real_lstat = os.lstat
+        fired: list[str] = []
 
-        def failing_verify_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        def failing_staging_lstat(path, *args, **kwargs):  # type: ignore[no-untyped-def]
             if (
                 isinstance(path, str)
                 and path.startswith(".mozyo-legacy-mirror.")
-                and not flags & os.O_CREAT
+                and not fired
             ):
-                raise OSError(errno.EMFILE, "injected")
-            return real_open(path, flags, *args, **kwargs)
+                fired.append(path)
+                raise OSError(errno.EIO, "injected")
+            return real_lstat(path, *args, **kwargs)
 
         with unittest.mock.patch.object(
-            legacy_mirror_sync.os, "open", failing_verify_open
+            owned_descriptors.os, "lstat", failing_staging_lstat
         ):
-            code, out, _err = self._service(repo).sync()
+            code, out, err = self._service(repo).sync()
 
+        self.assertTrue(fired, "the staging observation was never reached")
         self.assertEqual(1, code)
         self.assertEqual((), out)
-        self.assertEqual([], self._staging_names(repo), "verify failure left residue")
+        self.assertIn("could not be re-validated", "\n".join(err))
+        self.assertEqual([], self._staging_names(repo), "the failed observation left residue")
 
-    def test_verify_fstat_failure_releases_the_staging(self) -> None:
-        """The sibling branch of the same window."""
+    def test_a_staging_entry_gone_before_the_swap_is_reported_without_residue(self) -> None:
+        """The sibling branch: the name resolves to nothing at all.
+
+        There is nothing to install and nothing to clean up, so the run reports
+        the aborted swap and claims no surviving residue — claiming residue that
+        is not there was its own defect (j#90467 R9-F3).
+        """
+        repo = self._stage()
+        canonical = self._source(repo) / "workflow.md"
+        canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+        removed: list[str] = []
+
+        def hook(event: str) -> None:
+            if event == HOOK_TEMP_CREATED:
+                for path in self._mirror(repo).iterdir():
+                    if path.name.startswith(".mozyo-legacy-mirror."):
+                        path.unlink()
+                        removed.append(path.name)
+                        break
+
+        code, out, err = self._service(repo, progress_hook=hook).sync()
+
+        self.assertTrue(removed, "the staging entry was never observed to remove")
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+        report = "\n".join(err)
+        self.assertIn("was gone before it could be installed", report)
+        self.assertNotIn("still present", report)
+        self.assertEqual([], self._staging_names(repo))
+
+    def test_an_unprovable_staging_identity_never_unlinks(self) -> None:
+        """#14652. Without the identity there is no ownership proof, so the
+        entry is reported and left rather than removed on a guess.
+
+        The identity is read from the pinned descriptor, so the way to lose it
+        is for that read to fail. What must not happen is the cleanup treating
+        "no proof" as "not ours" and saying so, or as "ours" and unlinking.
+        """
         repo = self._stage()
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
         real_open, real_fstat = os.open, os.fstat
-        verify_fds: set[int] = set()
+        staging_fds: set[int] = set()
 
         def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
             fd = real_open(path, flags, *args, **kwargs)
-            if (
-                isinstance(path, str)
-                and path.startswith(".mozyo-legacy-mirror.")
-                and not flags & os.O_CREAT
-            ):
-                verify_fds.add(fd)
+            if flags & os.O_CREAT:
+                staging_fds.add(fd)
             return fd
 
-        def failing_verify_fstat(fd: int):  # type: ignore[no-untyped-def]
-            if fd in verify_fds:
+        def failing_identity_fstat(fd: int):  # type: ignore[no-untyped-def]
+            if fd in staging_fds:
                 raise OSError(errno.EIO, "injected")
             return real_fstat(fd)
 
         with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
             with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "fstat", failing_verify_fstat
+                owned_descriptors.os, "fstat", failing_identity_fstat
             ):
-                code, out, _err = self._service(repo).sync()
+                code, out, err = self._service(repo).sync()
 
-        self.assertTrue(verify_fds, "the verify open was never reached")
+        self.assertTrue(staging_fds, "the staging create was never reached")
         self.assertEqual(1, code)
         self.assertEqual((), out)
-        self.assertEqual([], self._staging_names(repo), "verify failure left residue")
+        self.assertIn("ownership could not be proved", "\n".join(err))
+        self.assertEqual(
+            1, len(self._staging_names(repo)), "an unprovable entry was unlinked anyway"
+        )
 
     def test_a_close_that_unwinds_still_releases_the_staging(self) -> None:
         """j#90477 R11-F1. `_close_quietly` re-raises anything that is not an
@@ -1698,15 +1902,21 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
 
         return tracking_open, failing_close, state
 
-    def test_a_close_primary_survives_a_raising_release(self) -> None:
-        """j#90487 R13-F1. When the close is itself the primary, the release ran
-        bare — a raising release replaced it and left residue. Both must be
-        independent, with the first ordinary primary surviving."""
+    def test_a_raising_release_does_not_take_the_close_with_it(self) -> None:
+        """j#90487 R13-F1, at the position #14652 moved it to.
 
-        class PrimaryClose(Exception):
+        The rule is unchanged — the close and the release are independent, the
+        first primary survives, and neither failure is dropped. What changed is
+        which of the two runs first. The release now goes first because it needs
+        the descriptor the close is about to give up, so the roles are reversed
+        from R13-F1: the release is the primary and the close is the action that
+        must still run and still be recorded.
+        """
+
+        class PrimaryCleanup(Exception):
             pass
 
-        class SecondaryCleanup(Exception):
+        class SecondaryClose(Exception):
             pass
 
         repo = self._stage()
@@ -1715,27 +1925,117 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
 
         service = self._service(repo)
 
-        def exploding_release(mirror_fd: int, temp_name: str, identity):  # type: ignore[no-untyped-def]
-            raise SecondaryCleanup("injected cleanup failure")
+        def exploding_release(mirror_fd: int, temp_name: str, ownership):  # type: ignore[no-untyped-def]
+            raise PrimaryCleanup("injected cleanup failure")
 
         service._release_staging = exploding_release  # type: ignore[method-assign]
         tracking_open, failing_close, state = self._fail_staging_close_with(
-            PrimaryClose("injected close primary")
+            SecondaryClose("injected close failure")
         )
+
+        def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+            raise OSError(errno.ENOSPC, "injected")
 
         with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
             with unittest.mock.patch.object(
                 legacy_mirror_sync.os, "close", failing_close
             ):
-                with self.assertRaises(PrimaryClose) as caught:
-                    service.sync()
+                with unittest.mock.patch.object(
+                    legacy_mirror_sync.os, "write", failing_write
+                ):
+                    with self.assertRaises(PrimaryCleanup) as caught:
+                        service.sync()
 
-        self.assertTrue(state["fired"], "the staging close injection never fired")
+        self.assertTrue(state["fired"], "the staging close never ran after the release raised")
         notes = getattr(caught.exception, "__notes__", [])
         self.assertTrue(
-            any("SecondaryCleanup" in note for note in notes),
-            "the cleanup failure was dropped",
+            any("SecondaryClose" in note for note in notes),
+            "the close failure was dropped",
         )
+
+    def _staging_lifetime_events(self, repo: Path):  # type: ignore[no-untyped-def]
+        """A service whose staging release and staging close announce themselves.
+
+        Returns ``(service, events, open_patch, close_patch)``. The close is
+        observed through the real `os.close` call, so what lands in ``events``
+        is the syscall happening, not a flag the implementation set.
+        """
+        service = self._service(repo)
+        events: list[str] = []
+        real_release = service._release_staging
+        real_open, real_close = os.open, os.close
+        staging_fds: set[int] = set()
+
+        def watching_release(mirror_fd: int, temp_name: str, ownership):  # type: ignore[no-untyped-def]
+            events.append("release")
+            return real_release(mirror_fd, temp_name, ownership)
+
+        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_CREAT:
+                staging_fds.add(fd)
+            return fd
+
+        def watching_close(fd: int) -> None:
+            if fd in staging_fds:
+                staging_fds.discard(fd)
+                events.append("close")
+            real_close(fd)
+
+        service._release_staging = watching_release  # type: ignore[method-assign]
+        return service, events, tracking_open, watching_close
+
+    def test_the_staging_release_always_precedes_the_staging_close(self) -> None:
+        """#14652. The release consults the ownership proof, and that proof is
+        only sound while the staging descriptor still pins the inode — so the
+        release has to happen before the close on every path that has one.
+
+        Two paths, because one alone would be vacuous: the write-failure path
+        releases and then closes, and the success path has the rename consume
+        the entry so the close is the only event. What must never appear is a
+        release after a close.
+        """
+        for label, break_the_write in (("failed write", True), ("clean write", False)):
+            with self.subTest(label):
+                repo = self._stage()
+                canonical = self._source(repo) / "workflow.md"
+                canonical.write_text(
+                    canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8"
+                )
+                service, events, tracking_open, watching_close = self._staging_lifetime_events(
+                    repo
+                )
+
+                def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
+                    raise OSError(errno.ENOSPC, "injected")
+
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open)
+                    )
+                    stack.enter_context(
+                        unittest.mock.patch.object(legacy_mirror_sync.os, "close", watching_close)
+                    )
+                    if break_the_write:
+                        stack.enter_context(
+                            unittest.mock.patch.object(
+                                legacy_mirror_sync.os, "write", failing_write
+                            )
+                        )
+                    service.sync()
+
+                self.assertIn("close", events, "the staging close was never observed")
+                self.assertEqual(
+                    break_the_write,
+                    "release" in events,
+                    "the release did not run exactly on the path that needs it",
+                )
+                if break_the_write:
+                    self.assertLess(
+                        events.index("release"),
+                        events.index("close"),
+                        "the release consulted the ownership proof after the pin was gone",
+                    )
 
     def test_the_walk_keeps_the_first_close_failure(self) -> None:
         """j#90487 R13-F1. In the walk, a previous-close primary was overwritten
@@ -1759,9 +2059,10 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             if len(order) == 2:
                 raise CurrentClose("second")
 
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "close", failing_close):
-            with self.assertRaises(PreviousClose) as caught:
-                self._service(repo).audit()
+        with self._preflight_already_answered():
+            with unittest.mock.patch.object(legacy_mirror_sync.os, "close", failing_close):
+                with self.assertRaises(PreviousClose) as caught:
+                    self._service(repo).audit()
 
         notes = getattr(caught.exception, "__notes__", [])
         self.assertTrue(
@@ -1916,7 +2217,12 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
     def test_a_later_control_flow_failure_is_recorded_not_dropped(self) -> None:
         """j#90492 R14-F2. Only the first control-flow exception was kept; a
         second one left no trace in notes or context, while the returned and
-        ordinary channels both record every failure."""
+        ordinary channels both record every failure.
+
+        "First" is by arrival, so the injections follow the teardown order: the
+        release runs before the close (#14652), and it is the release's
+        interrupt that has to surface.
+        """
 
         class PrimaryWrite(Exception):
             pass
@@ -1927,12 +2233,12 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
 
         service = self._service(repo)
 
-        def exiting_release(mirror_fd: int, temp_name: str, identity):  # type: ignore[no-untyped-def]
-            raise SystemExit("injected second control flow")
+        def interrupting_release(mirror_fd: int, temp_name: str, ownership):  # type: ignore[no-untyped-def]
+            raise KeyboardInterrupt("injected first control flow")
 
-        service._release_staging = exiting_release  # type: ignore[method-assign]
+        service._release_staging = interrupting_release  # type: ignore[method-assign]
         tracking_open, failing_close, state = self._fail_staging_close_with(
-            KeyboardInterrupt("injected first control flow")
+            SystemExit("injected second control flow")
         )
 
         def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
@@ -3115,61 +3421,224 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         self.assertEqual(1, code)
         self.assertIn("no longer a regular file", "\n".join(err))
 
-    # --- R7-F4: the capability manifest is the call surface -------------------
+    # --- R7-F4 / #14651: the capability probe measures the call surface -------
+
+    @staticmethod
+    def _call_surface_sources() -> list[Path]:
+        """Every module of the package except the prober itself.
+
+        Naming the files here is what went wrong before: the primitives were
+        split across two modules when the service crossed the module-health
+        threshold, and a fence that reads only one of them goes blind to the
+        other (j#90458 R8-F4). The prober is excluded because its own probe
+        calls would otherwise satisfy the fence with themselves.
+        """
+        package = Path(legacy_mirror_sync.__file__).parent
+        prober = Path(platform_capabilities.__file__)
+        return sorted(path for path in package.glob("*.py") if path != prober)
+
+    @staticmethod
+    def _os_calls_taking_a_dir_fd(sources: list[Path]) -> set[str]:
+        """Read the call surface out of the source instead of listing it.
+
+        Two review rounds found the manifest listing a primitive nothing calls
+        and omitting one every call goes through. A hand-written list of call
+        sites in the test reproduces that failure mode one level up, so the
+        oracle is the AST: any ``os.<name>(...)`` passing ``dir_fd`` /
+        ``src_dir_fd`` / ``dst_dir_fd``.
+        """
+        found: set[str] = set()
+        for path in sources:
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if not isinstance(node, ast.Call):
+                    continue
+                function = node.func
+                if not (
+                    isinstance(function, ast.Attribute)
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id == "os"
+                ):
+                    continue
+                if any(
+                    keyword.arg in ("dir_fd", "src_dir_fd", "dst_dir_fd")
+                    for keyword in node.keywords
+                ):
+                    found.add(function.attr)
+        return found
+
+    def test_capability_manifest_is_exactly_the_primitives_the_module_calls(self) -> None:
+        """Guard the manifest against the module drifting away from it —
+        in both directions. `os.stat` was listed and never called; `os.lstat`
+        was called and never listed (j#90450 R7-F4)."""
+        sources = self._call_surface_sources()
+        self.assertIn(Path(legacy_mirror_sync.__file__), sources)
+        self.assertIn(Path(owned_descriptors.__file__), sources)
+
+        called = self._os_calls_taking_a_dir_fd(sources)
+        body = "\n".join(path.read_text(encoding="utf-8") for path in sources)
+        if "os.scandir(" in body:
+            # `scandir` takes its descriptor positionally, so the AST cannot
+            # tell it from a path argument; it is named here instead.
+            called.add("scandir")
+        listed = {name for name, _label, _probe in platform_capabilities._REQUIRED_DIR_FD_CALLS}
+        self.assertEqual(
+            called,
+            listed,
+            "the manifest and the call surface disagree",
+        )
+        # The two the advertisement gets wrong, spelled out so a regression
+        # names them rather than printing a set difference.
+        self.assertIn("lstat", listed, "lstat(dir_fd=) is not in the manifest")
+        self.assertIn("replace", listed, "replace is what the swap calls, not rename")
 
     def test_each_required_capability_individually_fails_closed(self) -> None:
-        """j#90450 R7-F4. The manifest probed `os.stat`, which nothing calls,
-        and omitted `os.lstat(dir_fd=)`, which every type decision uses — so a
-        host missing it passed the preflight and then raised
-        `NotImplementedError` past the fail-closed path.
-        """
+        """A host that cannot provide one primitive must refuse, whichever
+        way it says so: `NotImplementedError` is what CPython raises for an
+        unavailable `dir_fd`, and a primitive that never took the keyword
+        raises `TypeError`."""
         repo = self._stage()
-        required = [function for _label, function in legacy_mirror_sync._REQUIRED_DIR_FD_CALLS]
-        self.assertIn(os.lstat, required, "lstat(dir_fd=) is not in the manifest")
 
-        for function in required:
-            with self.subTest(capability=getattr(function, "__name__", function)):
-                reduced = frozenset(os.supports_dir_fd) - {function}
-                with unittest.mock.patch.object(os, "supports_dir_fd", reduced):
-                    self.assertIn(
-                        getattr(function, "__name__", ""),
-                        " ".join(legacy_mirror_sync.missing_platform_capabilities()),
-                    )
+        def unavailable(*_args: object, **_kwargs: object) -> None:
+            raise NotImplementedError("dir_fd unavailable on this platform")
+
+        def without_the_keyword(*_args: object) -> None:
+            """Accepts the positional arguments and nothing else."""
+
+        for name, label, _probe in platform_capabilities._REQUIRED_DIR_FD_CALLS:
+            for host, stub in (
+                ("NotImplementedError", unavailable),
+                ("TypeError", without_the_keyword),
+            ):
+                with self.subTest(capability=label, host=host):
                     service = self._service(repo)
-                    audit = service.audit()
+                    with unittest.mock.patch.object(os, name, stub):
+                        missing = platform_capabilities.missing_platform_capabilities()
+                        audit = service.audit()
+                        code, out, _err = service.sync()
+                    self.assertIn(label, missing)
                     self.assertIn(PLATFORM_UNSUPPORTED, audit.kinds())
                     self.assertTrue(audit.blocks_write)
-                    code, out, _ = service.sync()
                     self.assertEqual(1, code)
                     self.assertEqual((), out)
 
-    def test_capability_manifest_covers_the_primitives_the_module_calls(self) -> None:
-        """Guard the manifest against the module drifting away from it."""
-        # Both modules: the primitives were split across two files when the
-        # service crossed the module-health threshold, and a fence that reads
-        # only one of them would go blind to the other.
-        source = "\n".join(
-            Path(module.__file__).read_text(encoding="utf-8")
-            for module in (legacy_mirror_sync, owned_descriptors)
-        )
-        # Scan the WHOLE module: restricting it to the class body meant a call
-        # moved to a module-level helper escaped the fence while still being a
-        # platform-dependent primitive (j#90458 R8-F4).
-        body = source
-        listed = {
-            getattr(function, "__name__", "")
-            for _label, function in legacy_mirror_sync._REQUIRED_DIR_FD_CALLS
-        }
-        for call, name in (
-            ("os.lstat(", "lstat"),
-            ("os.open(", "open"),
-            ("os.unlink(", "unlink"),
-            ("os.mkdir(", "mkdir"),
-        ):
-            if call in body:
-                self.assertIn(name, listed, f"{name} is called but not in the manifest")
-        if "os.replace(" in body:
-            self.assertIn("rename", listed, "replace is called; rename must be probed")
+    def test_a_scandir_whose_failure_is_deferred_still_fails_closed(self) -> None:
+        """`os.scandir` hands back an iterator before it has opened anything —
+        CPython leaves the `fdopendir` to the first step. A probe that only
+        constructed the iterator would read a host that cannot open a directory
+        by descriptor at all as capable, so the probe steps it."""
+        repo = self._stage()
+
+        class DeferredFailure:
+            def __iter__(self) -> object:
+                return self
+
+            def __next__(self) -> object:
+                raise NotImplementedError("fd support unavailable")
+
+            def close(self) -> None:
+                """Constructing and closing it says nothing about the host."""
+
+        service = self._service(repo)
+        with unittest.mock.patch.object(os, "scandir", lambda _fd: DeferredFailure()):
+            missing = platform_capabilities.missing_platform_capabilities()
+            audit = service.audit()
+        self.assertIn("scandir(fd)", missing)
+        self.assertIn(PLATFORM_UNSUPPORTED, audit.kinds())
+        self.assertTrue(audit.blocks_write)
+
+    def test_an_interrupt_during_the_probe_is_not_a_missing_capability(self) -> None:
+        """Unknown exceptions fail closed, but `BaseException` is not unknown —
+        swallowing an interrupt would report the host as unsupported and let
+        the run continue as if it had measured something."""
+
+        def interrupted(*_args: object, **_kwargs: object) -> None:
+            raise KeyboardInterrupt
+
+        with unittest.mock.patch.object(os, "lstat", interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                platform_capabilities.missing_platform_capabilities()
+
+    def test_a_supported_host_is_not_refused_by_a_stale_advertisement(self) -> None:
+        """#14651. `os.supports_dir_fd` is a hand-maintained list in `os.py`,
+        not a fact about the interpreter: CPython 3.12 on Linux omits
+        `os.lstat` although `os.lstat(name, dir_fd=)` works there (measured on
+        `python:3.12-slim`; 3.13 added the entry), and no version has ever
+        listed `os.replace`. Reading it refused the whole Linux CI runner —
+        every legacy mirror path collapsed into `platform_unsupported`, 91
+        failures on a host that supports everything (Actions run 30383304588).
+
+        The advertisement is emptied entirely rather than trimmed by one
+        entry, so the test states the property — the probe does not consult it
+        — rather than re-encoding whichever entry CPython happens to omit.
+        """
+        repo = self._stage()
+        with unittest.mock.patch.object(os, "supports_dir_fd", frozenset()):
+            with unittest.mock.patch.object(os, "supports_fd", frozenset()):
+                self.assertEqual((), platform_capabilities.missing_platform_capabilities())
+                code, out, err = self._service(repo).check()
+        self.assertEqual(0, code, "\n".join(err))
+        self.assertIn("up to date", "\n".join(out))
+
+    def test_the_exact_linux_312_advertisement_is_accepted(self) -> None:
+        """The CI condition itself: `lstat` missing from the set, everything
+        else present. Kept alongside the emptied-set case because that one
+        would still pass if the probe fell back to membership whenever the set
+        looked implausible."""
+        as_linux_312 = frozenset(os.supports_dir_fd) - {os.lstat}
+        with unittest.mock.patch.object(os, "supports_dir_fd", as_linux_312):
+            self.assertEqual((), platform_capabilities.missing_platform_capabilities())
+
+    def test_the_probe_writes_nothing_and_leaks_no_descriptor(self) -> None:
+        """The anchor is not a directory, so every `*at()` call is rejected
+        before the relative name is resolved. That is what makes the probe
+        side-effect-free; measure it rather than trust the docstring."""
+        scratch = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        origin = os.getcwd()
+        os.chdir(scratch)
+        self.addCleanup(os.chdir, origin)
+
+        before = self._open_descriptors()
+        for _ in range(32):
+            self.assertEqual((), platform_capabilities.missing_platform_capabilities())
+        self.assertEqual([], sorted(scratch.rglob("*")), "the probe left residue behind")
+        self.assertEqual(before, self._open_descriptors(), "the probe leaked a descriptor")
+
+    def test_the_probe_anchor_is_not_a_directory(self) -> None:
+        """Why the above holds. If the anchor ever became a real directory the
+        probes would start acting on it, and `mkdir` / `replace` / `unlink`
+        would resolve their names instead of being rejected."""
+        with platform_capabilities._probe_anchor() as anchor:
+            self.assertIsNotNone(anchor)
+            self.assertFalse(stat.S_ISDIR(os.fstat(anchor).st_mode))
+
+    def test_a_probe_that_cannot_be_set_up_fails_closed(self) -> None:
+        """Not being able to measure the host is not the same as the host
+        being capable. It refuses for the same reason a missing primitive
+        does, and says which of the two happened."""
+        repo = self._stage()
+        exhausted = unittest.mock.Mock(side_effect=OSError(errno.EMFILE, "too many open files"))
+        with unittest.mock.patch.object(os, "pipe", exhausted):
+            service = self._service(repo)
+            missing = platform_capabilities.missing_platform_capabilities()
+            audit = service.audit()
+            code, out, _err = service.sync()
+        self.assertEqual((platform_capabilities.PROBE_UNAVAILABLE,), missing)
+        self.assertIn(PLATFORM_UNSUPPORTED, audit.kinds())
+        self.assertTrue(audit.blocks_write)
+        self.assertEqual(1, code)
+        self.assertEqual((), out)
+
+    @staticmethod
+    def _open_descriptors() -> list[int]:
+        live: list[int] = []
+        for fd in range(1024):
+            try:
+                os.fstat(fd)
+            except OSError:
+                continue
+            live.append(fd)
+        return live
 
     # --- R6-F3: unreadable state is typed, not an exception ------------------
 
