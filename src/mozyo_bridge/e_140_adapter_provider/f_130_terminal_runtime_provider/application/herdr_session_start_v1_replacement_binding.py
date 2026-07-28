@@ -75,7 +75,10 @@ def prepare_actuator_lane_session(
     only AFTER this launch returns: at a lane's FIRST launch there is no stored kind to heal
     from, so without the caller's context the very launch that creates the panes would place
     them by ``lane_class`` and only later relaunches would honour the configured lane-role
-    geometry. ``None`` (every pre-#13647 caller) is byte-for-byte the previous composition.
+    geometry. ``None`` (every pre-#13647 caller) contributes no kind, so this composition is
+    byte-for-byte the previous one **on the lane-kind axis**: the launch then places by
+    ``lane_class``. What that resolves to is not pre-#13646 — since Redmine #14568 an
+    undeclared lane class lands on the product default (``split: down``).
     """
     from mozyo_bridge.application.repo_local_config_loader import (
         load_repo_local_config,

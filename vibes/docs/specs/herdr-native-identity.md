@@ -263,8 +263,8 @@ flow:
    (byte-invariant)。launch は `agent start --workspace <host> --tab <tab_id>` で行い、tab 内 2
    slot 目 (fresh pair の第 2、または heal で生存 slot の隣) は `--split <dir>` を付ける。方向と
    provider 順序は `lane_placement` config で lane class 別に宣言できる (Redmine #13646、下記
-   §lane_placement)。未設定時は従来どおり sublane が `--split right`、default lane は `--split`
-   を出さず herdr server 既定へ委任する (byte-invariant)。tab root pane は
+   §lane_placement)。**未設定時は product default `--split down` を出す (Redmine #14568)**。
+   default lane は `--tab` を出さないままだが `--split` は出す (両者は独立 flag)。tab root pane は
    #13330 の workspace base pane と同型で全 launch 成功後に reclaim し、tab 内最終 pane close で
    herdr が tab を自動消滅させる (workspace 自動消滅と対称)。**
 3. mint durable name: `encode_assigned_name(workspace_segment, role, lane)` で mzb1 名を作る。
@@ -487,15 +487,57 @@ lane_placement:
 - `split`: `right` | `down`。herdr 0.7.1 `agent start --split right|down` の語彙 (実 `--help` 照合)。
 - `order`: `[codex, claude]` / `[claude, codex]` の **exact permutation**。欠落 / 重複 / 未知 provider /
   非 list は fail-closed (部分順序が silent に provider を落とさない)。
-- lane class object 自体・`split`・`order` はそれぞれ **個別に optional**。欠落した field だけが
-  legacy 規律を継承する (空 `{}` は no-op)。
+- lane class object 自体・`split`・`order` はそれぞれ **個別に optional**。欠落した field は
+  product default を継承する (#14568。空 `{}` は「宣言しない」であって rollback ではない)。
 - unknown class / unknown key / unknown value / unsupported version は fail-closed。
 
-### Compatibility (byte-invariance)
+### Product default (Redmine #14568 — #13646 の未設定 byte-invariance を意図的に置換)
 
-- **未設定は現行 launch argv と byte 一致**: `sublane` は従来どおり 1st slot が tab を占有し 2nd slot が
-  `--split right`、`default` は `--tab` も `--split` も出さず herdr server 既定へ委任する。
+未設定時の既定は **`split: down` (default / sublane 両 class)**。`by_lane_kind` > lane class >
+**product default** の 3 層の最下段であり、宣言が無い workspace でも pair は縦分割される。
+
+| lane class | product default `split` | product default `order` | 上段になる provider |
+| --- | --- | --- | --- |
+| `default` | `down` | `[codex, claude]` | codex (coordinator) |
+| `sublane` | `down` | 宣言しない (要求順を維持) | gateway (既定 binding では codex) |
+
+`order` を lane class で非対称にしているのは、**片方だけが尊重すべき role binding を持つ**ため。
+
+- `default` = bare `mozyo` の coordinator pair は固定 topology
+  (`default_agent_topology.DEFAULT_EXPECTED_AGENTS`) を launch し、その launch 順は `claude` 先である。
+  縦分割すると implementer が上段になるので、product default で `[codex, claude]` に pin する。別 binding
+  の workspace は `lane_placement.default.order` を明示宣言する。
+- `sublane` は既に role binding から解決した `(gateway, worker)` 順で launch する
+  (`sublane_actuator_herdr_ops._launch_providers`)。ここに product default `order` を置くと binding を
+  **尊重ではなく上書き**してしまうため、宣言しない。結果として gateway が上段になり、rebound binding は
+  その binding 順のまま launch される。
+
+#### 互換性と rollback (adopter 向け)
+
+- **既存 live pair は暗黙再配置しない**。product default は fresh launch / heal の argv を決めるだけで、
+  live pane を move / swap / kill しない。既に左右で立っている pair は次の fresh launch まで左右のまま。
+  live で今すぐ変えるなら [[logic-herdr-live-relayout-runbook]] の手順を使う (境界は不変)。
+- **rollback は `split: right` の明示宣言**。粒度は 3 つあり、いずれも従来どおりの優先順で効く。
+
+  ```yaml
+  lane_placement:
+    default:
+      split: right          # coordinator pair だけ左右へ戻す
+    sublane:
+      split: right          # 全 sublane pair を左右へ戻す
+    by_lane_kind:
+      implementation:
+        split: right        # 孫 lane だけ左右へ戻す (lane class より優先)
+  ```
+
+- **確認手段は `mozyo-bridge config status`**。`lane_placement.<class>.{split,order}` の leaf row が
+  effective 値と `declared` / `default` の別を出すので、宣言していない workspace は
+  `lane_placement.default.split = down (default)` として読める。この row は launch chokepoint と
+  **同じ resolver** (`LanePlacementConfig.resolve_effective`) を読むので、status と実 launch は乖離しない。
 - 設定した field だけが差分を生む。`default` を設定しても `sublane` の launch は不変 (逆も同様)。
+- `by_lane_kind` の **wholesale shadowing は不変** (#13647): 宣言された kind は lane class を丸ごと
+  shadow するため、`order` だけ宣言した kind は lane class の `split` を継承せず product default を取る。
+  #14568 はこれを per-field merge に変えていない。
 
 ### Launch semantics
 
@@ -508,13 +550,17 @@ lane_placement:
   `--no-focus` にすると container の空 root pane が active のままなので、2nd slot の `--split <dir>` は
   **1st agent ではなく root pane** を割り、その root を reclaim した時点で nested split が畳まれ、1st agent
   の暗黙 split が作った外側の既定 `right` だけが残る = **設定方向が無言で効かない**。
-  → **fresh container で explicit placement を実現する時だけ、1st launch を `--focus`** にして split target
-  を 1st agent へ固定し、2nd 以降は `--split <dir> --no-focus` とする。root pane reclaim は従来どおり
-  **全 launch 成功後** (partial-launch safety を壊さない)。
-  発火条件は狭く限定する: container occupancy = 0 かつ launch 対象 2 件以上かつ `split`/`order` が
-  explicit。**unset / single-provider / heal / mixed adopt では発火しない** (byte/layout invariant)。
+  → **fresh container では 1st launch を `--focus`** にして split target を 1st agent へ固定し、2nd 以降は
+  `--split <dir> --no-focus` とする。root pane reclaim は従来どおり **全 launch 成功後**
+  (partial-launch safety を壊さない)。
+  発火条件は: container occupancy = 0 かつ launch 対象 2 件以上かつ **effective split 方向が非空**。
+  **single-provider / heal / mixed adopt では発火しない**。
   なお `--split right` literal (#13411) も同じ理由で本来効いておらず、観測される `right` は herdr 既定
-  split の偶然の一致だった。unset lane class はその挙動をそのまま維持する。
+  split の偶然の一致だった。
+  **#14568 の変更点**: 発火条件の第 3 項は「`split`/`order` が **explicit**」から「**effective** split 方向が
+  非空」へ移った。product default で全 lane class が `down` を持つ以上、「operator が宣言したか」を
+  問うと未宣言 workspace だけが focus を得られず、argv には `--split down` が出るのに実機は
+  reclaim で `right` へ畳まれる — 本 fix が防ぐはずの症状そのものになる。
 - **single-provider request**: `order` は **未要求の peer を暗黙 launch しない**。heal は欠けた provider
   だけを launch する。
 - **heal**: 生存 sibling の隣へ configured `--split <dir>` で launch する。既存 pane は swap / move /
@@ -527,6 +573,10 @@ lane_placement:
 
 ### Boundary
 
+- **tab topology とは直交** (#14567 との境界)。`lane_placement` が決めるのは *container の中で pair を
+  どう割るか* だけで、*どの container に入るか* (workspace / tab) は #13380 / #13411 の join 軸が決める。
+  よって #14567 が全 sublane を単一 tab へ集約しても、その tab の中で各 lane pair は本 block の
+  `split` に従って上下に置ける。両者を組み合わせる時に本 block を変更する必要は無い。
 - `lane_placement` は **future launch policy** であり、live layout / liveness / route authority ではない。
   config を読むだけで既存 live pair を移動しない (herdr は same-tab re-split を拒否する。live 再配置は
   operator の CLI 操作のまま)。
@@ -565,10 +615,17 @@ lane_placement:
 
 ### Precedence
 
-`by_lane_kind[kind]` > `lane_class` > legacy 既定。kind 層が参照されるのは **durable な lane_kind が
-解決でき、かつ config がその kind を明示宣言している時だけ**。未解決 kind / 未宣言 kind / block 不在は
-すべて §5.1 の lane-class 解決へ **byte 一致で** fall-through する (`resolve_container_plan` 幾何
-engine は無改修)。
+`by_lane_kind[kind]` > `lane_class` > **product default** (#14568。#13647 時点の表記は「legacy 既定」)。
+kind 層が参照されるのは **durable な lane_kind が解決でき、かつ config がその kind を明示宣言している
+時だけ**。未解決 kind / 未宣言 kind / block 不在はすべて §5.1 の lane-class 解決へ fall-through する。
+
+3 層の合成は `LanePlacementConfig.resolve_effective` が単独で持ち、launch 経路
+(`resolve_placement_policy_for_role`) と `config status` の双方がそれを読む。どちらかが層を再実装すると
+「status の表示」と「実 launch の幾何」が乖離しうるため、resolver は 1 つに保つ。
+
+宣言された kind は lane class を **丸ごと** shadow する (per-field merge ではない)。したがって
+`order` だけ宣言した kind の `split` は lane class ではなく product default を取る。この shadowing 規律は
+#14568 でも変えていない。
 
 ### lane_kind の 2 authority (Redmine #13647 Tranche 1a / 1b)
 

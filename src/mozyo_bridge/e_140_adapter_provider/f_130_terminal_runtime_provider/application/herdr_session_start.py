@@ -401,13 +401,15 @@ def _prepare_session_locked(
 
     ``lane_placement`` (Redmine #13646, Design Answer j#76564) is the repo-local herdr
     pane-pair placement policy the launch site resolved from ``.mozyo-bridge/config.yaml``.
-    It reorders the requested ``providers`` (the configured provider launches first and
+    It reorders the requested ``providers`` (the resolved primary launches first and
     occupies; the rest split beside it) and supplies each splitting launch's ``--split
-    <dir>`` — including the tab-less ``default`` pair, previously left to the herdr server
-    default. ``order`` never adds an unrequested peer; a configured primary that can only
+    <dir>`` — including the tab-less ``default`` pair, which before #13646 was left to the
+    herdr server default. ``order`` never adds an unrequested peer; a configured primary that can only
     split beside a live sibling is reported ``order_deferred_until_full_relaunch`` rather
-    than silently claimed (no swap / bounce — Non-goal: no live relayout). ``None`` keeps
-    the requested order and the legacy split discipline (byte-for-byte pre-#13646).
+    than silently claimed (no swap / bounce — Non-goal: no live relayout). ``None`` — and
+    an undeclared lane class — resolve to the PRODUCT default (Redmine #14568): both pairs
+    split ``down``, and the coordinator pair launches ``(codex, claude)`` so the coordinator
+    takes the upper pane. A workspace rolls a class back with ``split: right``.
 
     ``coordinator_placement_mode`` (Redmine #14139) is the *operator-scoped* placement
     knob the launch site resolved from the mozyo-bridge home (never a repo-committed
@@ -523,18 +525,21 @@ def _prepare_session_locked(
     )
 
     # Config-driven pane placement (Redmine #13646, Design Answer j#76564): resolve the
-    # lane class's `(split, order)` ONCE, then reorder the requested providers so the
+    # lane's EFFECTIVE `(split, order)` ONCE, then reorder the requested providers so the
     # first-launched slot occupies the container. `lane_class` is the same axis
-    # `agent_launch` keys on, resolved independently (no merge). An unset config yields
-    # `(None, None)`, so every downstream decision stays byte-for-byte pre-#13646. The
-    # decisions are pure (`herdr_lane_topology`).
+    # `agent_launch` keys on, resolved independently (no merge). The decisions are pure
+    # (`herdr_lane_topology`).
     # Lane-role aware placement precedence (Redmine #13647, disposition j#85650): the
     # caller-supplied `launch_context` carries the durable `lane_kind` (親/子/孫) resolved from
     # governance at the create / heal boundary — never inferred from provider / pane / display
-    # cache here. Precedence is `by_lane_kind[kind] > lane_class > default`
+    # cache here. Precedence is `by_lane_kind[kind] > lane_class > product default`
     # (`resolve_placement_policy_for_role`); a `None` context / unresolved kind / a config with
-    # no matching `by_lane_kind` entry all fall through to the pre-#13646 lane-class resolution
-    # (byte-invariant). Fresh launch = that context, heal = the stored kind (reconciled above).
+    # no matching `by_lane_kind` entry all fall through to the lane-class resolution.
+    # Fresh launch = that context, heal = the stored kind (reconciled above).
+    # Redmine #14568: the bottom of that chain is now the PRODUCT default (`split: down` on
+    # both lane classes, `order: (codex, claude)` on the default pair), so a workspace that
+    # declares no `lane_placement` still lands its pairs vertically with the coordinator on
+    # top. `split: right` on the lane class (or on a lane kind) is the rollback.
     lane_class = "default" if result.lane_id == DEFAULT_LANE else "sublane"
     config_split, config_order = resolve_placement_policy_for_role(
         lane_placement, lane_class, lane_kind
@@ -842,7 +847,6 @@ def _prepare_session_locked(
         target_tab=target_tab,
         lane_slot_tabs=lane_slot_tabs,
         config_split=config_split,
-        config_order=config_order,
         launch_count=len(launch_plans),
     )
     occupancy = plan_of_container.occupancy  # grows per launch (first occupies, rest split)

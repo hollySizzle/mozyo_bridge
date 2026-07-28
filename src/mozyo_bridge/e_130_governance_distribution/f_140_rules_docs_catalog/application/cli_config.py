@@ -219,7 +219,7 @@ def cmd_config_check_parse(args) -> int:
     path = Path(getattr(args, "config_file", "") or "")
     try:
         if not path.is_file():
-            # The loader treats a MISSING file as the behavior-preserving default, which is
+            # The loader treats a MISSING file as the empty default record, which is
             # right for "load this repo's config" and wrong here: the caller asked whether a
             # specific document parses, and answering "yes" for a document that is not there
             # would let the preflight credit a launcher it never actually exercised.
@@ -244,7 +244,7 @@ def cmd_config_status(args) -> int:
     Loads the repo-local config through the same fail-closed loader every command uses and
     surfaces its schema version, any actionable deprecation warning (Redmine #14148 review
     j#84516 finding 2), and — Redmine #14222/#14223 — the per-key effective value + source
-    (``declared`` vs the silent behavior-preserving ``default``) for every top-level config
+    (``declared`` vs the silent ``default``) for every top-level config
     block, via :func:`~...domain.repo_local_config_status.classify_config_sources`. This
     stays the ONE status command (#14223 close condition: no second ``status`` surface);
     nothing here writes, and nothing prints credential-shaped data (the schema forbids such
@@ -265,7 +265,7 @@ def cmd_config_status(args) -> int:
 
     warnings = list(config.deprecation_warnings())
     # Redmine #14222/#14223: per-key effective value + source (declared vs the silent
-    # behavior-preserving default), reusing THIS surface rather than a second status
+    # default), reusing THIS surface rather than a second status
     # command. `_load_raw_record` already exists for `config migrate`'s dry-run plan; a
     # parse failure here cannot happen (the loader above already proved the file parses),
     # so any raise would be a genuine bug, not a reachable user-facing path.

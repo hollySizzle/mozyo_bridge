@@ -1,15 +1,19 @@
 """Pure per-key effective-value / source classification for `config status` (Redmine #14223).
 
-`.mozyo-bridge/config.yaml` composes several behavior-preserving-by-default blocks
+`.mozyo-bridge/config.yaml` composes several blocks that an operator may leave undeclared
 (:data:`CONFIG_BLOCK_KEYS`, mirroring :data:`repo_local_config.REPO_LOCAL_CONFIG_KEYS` minus
-the meta ``version`` key). Before this module, the only public surface (`config status`,
-Redmine #14148 review j#84516) reported the schema version and a v1-deprecation warning —
-never *which* blocks the operator actually declared versus which are silently running on
-their default. That silence is #14222's whole subject: operator intent and runtime
-resolution read identically from every existing surface.
+the meta ``version`` key). Most are behavior-preserving when undeclared; ``lane_placement``
+deliberately is not (Redmine #14568 — its undeclared split resolves to ``down``), which is
+exactly why its effective value is worth reporting rather than assuming.
+
+Before this module, the only public surface (`config status`, Redmine #14148 review
+j#84516) reported the schema version and a v1-deprecation warning — never *which* blocks
+the operator actually declared versus which are silently running on their default. That
+silence is #14222's whole subject: operator intent and runtime resolution read identically
+from every existing surface.
 
 This module is pure (no IO): it takes the already-parsed raw YAML mapping (``None`` for a
-missing / empty file — the loader's own behavior-preserving-default input) and the already-
+missing / empty file — the loader's own empty-declaration input) and the already-
 loaded typed :class:`~.repo_local_config.RepoLocalConfig`, and classifies each top-level
 block AND each curated operator-relevant leaf path (:data:`CONFIG_LEAF_KEYS`, Redmine
 #14222 review j#85125 F3) as :data:`SOURCE_DECLARED` (the raw record carries this key,
@@ -35,10 +39,12 @@ import dataclasses
 from typing import Any, Mapping, Optional
 
 #: The key was found in the parsed record — the operator declared it, whether or not
-#: the declared value happens to equal the behavior-preserving default.
+#: the declared value happens to equal what it would have defaulted to.
 SOURCE_DECLARED = "declared"
-#: The key is absent from the parsed record; the effective value is the silent,
-#: behavior-preserving default (Redmine #14222's subject).
+#: The key is absent from the parsed record; the effective value is the silent default
+#: (Redmine #14222's subject). The token classifies the SOURCE of the value, not its
+#: compatibility: a ``default`` row may carry a product default that changes behavior
+#: relative to an older build (the ``lane_placement.<class>.split`` rows do — #14568).
 SOURCE_DEFAULT = "default"
 #: The effective value is produced by a LEGACY-compatibility translation (Redmine
 #: #14222 review j#85125 F3): the operator declared the pre-#14148 v1 shape
@@ -86,10 +92,42 @@ CONFIG_BLOCK_KEYS: tuple[str, ...] = (
 _UNINTEGRATED_SCHEMA_NOTES: dict[str, str] = {
     "lane_placement": (
         "per-provider window/placement schema integration with #13647 is not yet "
-        "complete; this block's effective value is behavior-preserving but not a full "
-        "declaration surface yet"
+        "complete; this block is not a full declaration surface yet. Its undeclared "
+        "fields are NOT behavior-preserving (Redmine #14568): see the "
+        "lane_placement.<class>.{split,order} leaf rows for the geometry a fresh launch "
+        "actually takes"
     ),
 }
+
+#: The lane-CLASS placement leaves (Redmine #14568). Kept apart from
+#: :data:`CONFIG_LEAF_KEYS` because their effective value is NOT an attribute walk: the
+#: geometry a launch takes is the resolution of ``by_lane_kind > lane_class > product
+#: default``, and ``LanePlacementConfig.default`` is a constructor, not the ``default``
+#: lane class — an attribute walk would silently report a bound classmethod. Each entry is
+#: ``(lane_class, field)``; the reported key is ``lane_placement.<lane_class>.<field>`` and
+#: the raw declaring path is the same triple.
+#:
+#: These rows are what make the product default AUDITABLE: with no block at all the
+#: operator sees ``lane_placement.default.split = down (default)`` rather than having to
+#: infer it from an empty ``lane_placement`` block whose own row reads ``default`` too.
+#: ``source`` still follows the one rule every other row follows — ``declared`` iff the
+#: operator's record carries that exact path — so a workspace that rolled a class back with
+#: ``split: right`` reads ``right (declared)``.
+_PLACEMENT_LEAF_KEYS: tuple[tuple[str, str], ...] = (
+    ("default", "split"),
+    ("default", "order"),
+    ("sublane", "split"),
+    ("sublane", "order"),
+)
+
+#: The dotted keys :data:`_PLACEMENT_LEAF_KEYS` emits — the public half of that table, so
+#: the closed key vocabulary of this surface is stateable as
+#: ``CONFIG_BLOCK_KEYS | CONFIG_LEAF_KEYS | PLACEMENT_LEAF_KEYS`` without a consumer
+#: re-deriving the dotted spelling.
+PLACEMENT_LEAF_KEYS: tuple[str, ...] = tuple(
+    f"lane_placement.{lane_class}.{field_name}"
+    for lane_class, field_name in _PLACEMENT_LEAF_KEYS
+)
 
 #: Operator-relevant LEAF key paths (Redmine #14222 review j#85125 F3): the nested
 #: settings the parent issue's close condition 1 / #14223's scope enumerate, classified
@@ -272,6 +310,37 @@ def _classify_leaves(
                 effective_value=_effective_leaf(config, dotted),
             )
         )
+    rows.extend(_classify_placement_leaves(raw_record=raw_record, config=config))
+    return rows
+
+
+def _classify_placement_leaves(
+    *, raw_record: Optional[Mapping[str, object]], config: Any
+) -> list[ConfigKeyStatus]:
+    """Per-lane-class placement rows for :data:`_PLACEMENT_LEAF_KEYS` (Redmine #14568).
+
+    The effective value comes from the SAME resolver the launch chokepoint reads
+    (``LanePlacementConfig.resolve_effective``), so ``config status`` can never report a
+    geometry a fresh launch would not take. ``lane_kind`` is deliberately not passed: a
+    lane KIND override is a per-lane runtime fact (the durable lifecycle row), not a
+    property of the config file this surface classifies, so these rows report the lane-CLASS
+    resolution and the ``by_lane_kind`` block stays visible in its own block row.
+    """
+    placement = config.lane_placement
+    rows: list[ConfigKeyStatus] = []
+    for (lane_class, field_name), dotted in zip(_PLACEMENT_LEAF_KEYS, PLACEMENT_LEAF_KEYS):
+        declared = _raw_path_present(
+            raw_record, ("lane_placement", lane_class, field_name)
+        )
+        rows.append(
+            ConfigKeyStatus(
+                key=dotted,
+                source=SOURCE_DECLARED if declared else SOURCE_DEFAULT,
+                effective_value=getattr(
+                    placement.resolve_effective(lane_class), field_name
+                ),
+            )
+        )
     return rows
 
 
@@ -281,6 +350,7 @@ __all__ = (
     "ACTIONS",
     "CONFIG_BLOCK_KEYS",
     "CONFIG_LEAF_KEYS",
+    "PLACEMENT_LEAF_KEYS",
     "SOURCE_COMPATIBILITY",
     "SOURCE_DECLARED",
     "SOURCE_DEFAULT",

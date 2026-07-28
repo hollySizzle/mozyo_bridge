@@ -50,6 +50,9 @@ from mozyo_bridge.core.state.workspace_registry import (
     load_workspace_by_path,
     read_anchor,
 )
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (  # noqa: E501
+    product_default_placement,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
     DEFAULT_LANE,
@@ -587,20 +590,6 @@ def resolve_launch_order(
     return sorted(providers, key=lambda provider: rank.get(provider, len(rank)))
 
 
-def resolve_split_direction(lane_class: str, config_split: Optional[str]) -> str:
-    """The ``--split`` direction a splitting slot of ``lane_class`` uses (``""`` = none).
-
-    Config-driven placement (Redmine #13646, Design Answer j#76564 Q3): a configured
-    ``split`` wins; otherwise the legacy discipline applies — ``right`` for a ``sublane``
-    slot (byte-for-byte the pre-#13646 literal) and NO split for the ``default``
-    (coordinator) pair, which delegates to the herdr server default unless explicitly
-    configured. ``""`` means the caller emits no ``--split`` flag at all.
-    """
-    if config_split is not None:
-        return config_split
-    return "right" if lane_class == "sublane" else ""
-
-
 def initial_container_occupancy(
     rows: Sequence[Mapping[str, object]],
     workspace_id: str,
@@ -627,8 +616,10 @@ def initial_container_occupancy(
     - the ``default`` lane has no tab, so its container is the project WORKSPACE itself:
       the coordinator pair's own live slots in ``target_workspace``. This is what makes a
       fresh pair's 2nd slot split beside the 1st and a heal split beside the live sibling.
-      ``count_default_lane`` is False when nothing launches or no split is configured, so
-      an unset default lane never reads it and stays byte-for-byte the pre-#13646 launch.
+      ``count_default_lane`` is False when nothing launches, when there is no resolved
+      target workspace, or when the run resolved no split direction at all — the last of
+      which no longer includes "the operator declared nothing", because Redmine #14568
+      gives the default lane a product-default direction.
 
     Live slots count regardless of how this run classified them (adopt / unattested /
     stale): they occupy a pane either way, and a launch must split beside a live pane.
@@ -640,59 +631,39 @@ def initial_container_occupancy(
     return len(_lane_live_slot_tabs(rows, workspace_id, target_workspace, lane_id))
 
 
-def resolve_placement_policy(
-    lane_placement: object, lane_class: str
-) -> "tuple[Optional[str], Optional[tuple[str, ...]]]":
-    """The lane class's configured ``(split, order)``, or ``(None, None)`` when unset.
-
-    The one adapter between the repo-local ``lane_placement`` config record (Redmine
-    #13646) and the pure placement decisions below, so the session-start composition root
-    holds no config-shape knowledge and this module keeps no config import (it only calls
-    ``.resolve(lane_class)``). ``None`` config — or a lane class the config omits — yields
-    ``(None, None)``: inherit the legacy launch discipline everywhere (byte-invariant).
-    """
-    if lane_placement is None:
-        return None, None
-    resolved = lane_placement.resolve(lane_class)  # type: ignore[attr-defined]
-    return resolved.split, resolved.order
-
-
 def resolve_placement_policy_for_role(
     lane_placement: object, lane_class: str, lane_kind: "Optional[str]"
 ) -> "tuple[Optional[str], Optional[tuple[str, ...]]]":
-    """The lane's configured ``(split, order)`` under the ``role > lane_class > default`` precedence.
+    """This lane's EFFECTIVE ``(split, order)`` — declaration, else product default.
 
-    Redmine #13647 (Design Answer j#85645, disposition j#85650). The precedence is a
-    typed fall-through over the SAME :class:`ResolvedPlacement` the lane-class layer
-    already returns, so it is a strict superset of :func:`resolve_placement_policy`:
+    The one adapter between the repo-local ``lane_placement`` config record (Redmine
+    #13646 / #13647) and the pure placement decisions below, so the session-start
+    composition root holds no config-shape knowledge and this module holds no placement
+    fallback of its own: the whole ``by_lane_kind > lane_class > product default``
+    precedence lives on the config type (``resolve_effective``), and this returns what it
+    decided as the plain pair the decisions below consume.
 
-    1. **lane-kind layer** — consulted ONLY when a durable ``lane_kind`` is supplied
-       AND the config's ``by_lane_kind`` block explicitly declares that kind
-       (:meth:`LanePlacementConfig.has_lane_kind`). This is the only path that can
-       diverge from the pre-#13647 result.
-    2. **lane-class layer** — otherwise the existing ``default`` / ``sublane``
-       resolution (:func:`resolve_placement_policy`), byte-for-byte.
-    3. **legacy default** — no config yields ``(None, None)``.
+    Redmine #14568 moved the bottom of that chain from "inherit the legacy launch
+    discipline" to :func:`product_default_placement` (``split: down`` on both lane
+    classes), so an undeclared workspace now gets a real, non-``None`` split here. That is
+    what turns on the first-launch focus and the default-lane occupancy read below — both
+    of which used to key on "did the operator declare anything", a question no longer worth
+    asking now that the product always has an opinion.
 
-    Byte-invariance: ``lane_kind is None`` (no durable kind fact — the launch path's
-    fallback) OR a config with no matching ``by_lane_kind`` entry both fall straight
-    through to step 2, so every existing repo and every kind-unresolved launch keeps
-    today's exact ``(split, order)``. An unknown ``by_lane_kind`` key is rejected at
-    config parse time, not here; runtime "kind simply unresolved" is a fall-through,
-    never an error (the issue's close condition).
+    A ``None`` config object (a caller with no placement policy at all — no production
+    launch path) resolves to the product default too, so the pure-function contract and the
+    configured one cannot drift into two different geometries.
     """
     if lane_placement is None:
-        return None, None
-    if lane_kind is not None and lane_placement.has_lane_kind(lane_kind):  # type: ignore[attr-defined]
-        resolved = lane_placement.resolve_by_lane_kind(lane_kind)  # type: ignore[attr-defined]
-        return resolved.split, resolved.order
-    return resolve_placement_policy(lane_placement, lane_class)
+        resolved = product_default_placement(lane_class)
+    else:
+        resolved = lane_placement.resolve_effective(lane_class, lane_kind)  # type: ignore[attr-defined]
+    return resolved.split, resolved.order
 
 
 def resolve_focus_first_launch(
     *,
-    config_split: Optional[str],
-    config_order: Optional[Sequence[str]],
+    split_direction: str,
     launch_count: int,
     container_occupancy: int,
 ) -> bool:
@@ -703,32 +674,30 @@ def resolve_focus_first_launch(
     ``--no-focus`` the container's empty ROOT pane stays active: the second slot's
     ``--split <dir>`` splits the root rather than the first agent, and reclaiming the root
     (after all launches, #13330) collapses that split away — leaving only the outer default
-    ``right`` split the first agent implicitly created. The configured direction silently
+    ``right`` split the first agent implicitly created. The intended direction silently
     never applies (live-measured on BOTH the tab-less default pair and the lane tab: the
     pre-#13646 ``--split right`` literal only *looked* correct because it coincides with
     herdr's default direction, j#76622). Focusing the first launch pins the container's
     split target to that agent, so the second slot splits the AGENT and the direction
     survives the reclaim.
 
-    Deliberately narrow (j#76616), so nothing else changes shape:
+    The three conditions:
 
+    - ``split_direction`` non-empty — this run will actually ask for a direction, so it has
+      one to lose. Redmine #14568 keys this on the EFFECTIVE direction rather than on the
+      pre-#14568 "did the operator declare a placement" predicate: with a product default
+      of ``down`` on both lane classes, an undeclared workspace is exactly the case that
+      needs the focus, and asking whether the operator wrote a block would silently hand it
+      the collapsed ``right`` layout the fix exists to prevent.
     - ``container_occupancy == 0`` — a FRESH container. A heal / mixed adopt joins a
       container whose only pane is the live sibling, which is therefore already the split
       target; a live pane is never focused / moved / swapped.
     - ``launch_count >= 2`` — a full pair. A single-provider request has no second slot to
       place, so the focus policy never fires.
-    - explicit placement (``config_split`` or ``config_order`` set) — an UNSET lane class
-      keeps ``--no-focus`` on every launch and stays byte-for-byte the pre-#13646 argv.
-      (An unset sublane therefore keeps its historical — coincidentally correct — ``right``
-      layout; only an explicitly configured lane class opts into the corrected placement.)
-
-    Note this keys on the CONFIG being explicit, not on the effective split direction: an
-    unset ``sublane`` still resolves ``split_direction == "right"`` by legacy default, and
-    must NOT gain a ``--focus`` it never had.
     """
     if container_occupancy != 0 or launch_count < 2:
         return False
-    return config_split is not None or config_order is not None
+    return bool(split_direction)
 
 
 @dataclass(frozen=True)
@@ -757,21 +726,24 @@ def resolve_container_plan(
     target_tab: str,
     lane_slot_tabs: Sequence[str],
     config_split: Optional[str],
-    config_order: Optional[Sequence[str]],
     launch_count: int,
 ) -> ContainerPlan:
     """The whole container placement plan for this run (pure; the single entry point).
 
-    Composes the three decisions the session-start composition root needs — the effective
-    split direction (:func:`resolve_split_direction`), the container's initial occupancy
+    Composes the three decisions the session-start composition root needs — the split
+    direction to render, the container's initial occupancy
     (:func:`initial_container_occupancy`), and whether the first launch must own the split
     target (:func:`resolve_focus_first_launch`) — so the orchestrator makes ONE call and
     holds no placement logic of its own.
 
-    The default-lane occupancy is only counted when a split direction is configured, so an
-    unset default lane never reads the inventory and stays byte-for-byte the pre-#13646 launch.
+    ``config_split`` arrives already resolved through the full precedence
+    (:func:`resolve_placement_policy_for_role`), so the direction is just rendered here:
+    ``""`` (emit no ``--split``) is reachable only for a caller that resolved no policy at
+    all. Redmine #14568 gives every lane class a product default, so the default lane now
+    reads its occupancy on every launching run — that read is what makes the pair's 2nd
+    slot split beside the 1st instead of landing on herdr's own default geometry.
     """
-    split_direction = resolve_split_direction(lane_class, config_split)
+    split_direction = config_split or ""
     occupancy = initial_container_occupancy(
         rows,
         workspace_id,
@@ -780,13 +752,10 @@ def resolve_container_plan(
         lane_class=lane_class,
         target_tab=target_tab,
         lane_slot_tabs=lane_slot_tabs,
-        count_default_lane=bool(
-            launch_count and target_workspace and config_split is not None
-        ),
+        count_default_lane=bool(launch_count and target_workspace and split_direction),
     )
     focus_first = resolve_focus_first_launch(
-        config_split=config_split,
-        config_order=config_order,
+        split_direction=split_direction,
         launch_count=launch_count,
         container_occupancy=occupancy,
     )
@@ -984,8 +953,7 @@ __all__ = (
     "resolve_container_plan",
     "resolve_focus_first_launch",
     "resolve_launch_order",
-    "resolve_placement_policy",
-    "resolve_split_direction",
+    "resolve_placement_policy_for_role",
     "slot_placement",
     "_parse_started_agent",
     "_parse_tab_created",

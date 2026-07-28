@@ -2,7 +2,7 @@
 
 live な herdr pane pair (coordinator + auditor / gateway + worker 等) の **位置交換 (swap)** と **split 方向変換 (左右 ⇔ 上下)** を、実機で検証済みの手順として replay 可能な形で固定する。2026-07-12 の live 実測 (herdr 0.7.1) で確立した recipe と、その安全境界・herdr 側 gap を記録する (Redmine #13648 / #13664)。
 
-対象は **手動 CLI での live 再配置** のみ。設定駆動の恒久配置 (`pane_placement`) は本書の非 scope で、境界は下記「設定駆動配置との境界」を読む。設計正本は [[spec-herdr-native-identity]] (target authority = herdr assigned name)、lane 運用手順の正本は [[task-herdr-lane-operations]]、pane identity / marker の意味構造は [[logic-pane-centric-cockpit-semantics]]。本書は手順のみを扱い規約本文を複製しない。
+対象は **手動 CLI での live 再配置** のみ。設定駆動の恒久配置 (`lane_placement`) は本書の非 scope で、境界は下記「設定駆動配置との境界」を読む。設計正本は [[spec-herdr-native-identity]] (target authority = herdr assigned name)、lane 運用手順の正本は [[task-herdr-lane-operations]]、pane identity / marker の意味構造は [[logic-pane-centric-cockpit-semantics]]。本書は手順のみを扱い規約本文を複製しない。
 
 ## 適用範囲と非 scope
 
@@ -10,7 +10,7 @@ live な herdr pane pair (coordinator + auditor / gateway + worker 等) の **�
 - **非 scope**:
   - source / runtime 変更 (mozyo-bridge への wrapper command 追加は #13646 系の別 US)。
   - herdr 本体の改修 (same-tab re-split / rotate action の追加)。
-  - 設定駆動の恒久配置 (`.mozyo-bridge/config.yaml` の `pane_placement`。#13646 / #13647)。
+  - 設定駆動の恒久配置 (`.mozyo-bridge/config.yaml` の `lane_placement`。#13646 / #13647)。
   - live pane actuation の自動化、外部送信、release、origin/main への push。
 - herdr の pane 操作は外部 binary (`herdr`) の CLI であり mozyo-bridge の command ではない。argv の細部は実行時に `herdr pane --help` / 各 subcommand の `--help` を正本にする (本書は 2026-07-12 実測の verified 形のみ literal に固定し、未記録の signature は推測で埋めない)。
 
@@ -18,7 +18,8 @@ live な herdr pane pair (coordinator + auditor / gateway + worker 等) の **�
 
 - **target identity は assigned name 権威**: pane の route authority は herdr assigned name (durable identity) + live inventory であり、pane 位置・tab 配置・pane id は権威ではない ([[spec-herdr-native-identity]])。再配置は表示位置を変えるだけで、assigned name / route / projection を変えない。操作前に必ず対象 pane の assigned name と live 状態を確認し、pane id を durable な target として扱わない。
 - **tab join の権威は `tab_id`**: どの pane が同一 tab に属するかは live inventory の `tab_id` のみが authority で、tab label は cosmetic (#13411)。bounce で「元の tab へ戻す」際は label ではなく元 tab の `tab_id` を指定する。
-- **live pair の即時再配置経路はこの recipe のみ**: herdr は same-tab re-split を拒否するため (下記)、`pane_placement` 設定を将来足しても既存 live pair の配置は変わらない。live で今すぐ入れ替える唯一の経路が本 recipe である (#13648)。
+- **live pair の即時再配置経路はこの recipe のみ**: herdr は same-tab re-split を拒否するため (下記)、`lane_placement` 設定 (#13646 / #13647) も、その未設定既定 (#14568 の product default `split: down`) も、**既存 live pair の配置を変えない**。設定は次の fresh launch / heal の argv を決めるだけである。live で今すぐ入れ替える唯一の経路が本 recipe である (#13648)。
+  - #14568 で未設定既定が縦 (`down`) になったため、**既定変更より前に立ち上げた live pair は左右のまま残る**。左右のまま使い続けても不整合ではない (設定と live 配置は別 authority)。今すぐ縦に揃えたい場合は下記 recipe B を使い、pair を再起動できる場面なら fresh launch に任せる方が安全である (live 操作を伴わない)。
 
 ## herdr 0.7.1 の制約 (2026-07-12 実測)
 
@@ -94,8 +95,8 @@ herdr pane move <moving-pane-id> --tab <original-tab-id> --split right --target-
 
 ## 設定駆動配置との境界
 
-- 恒久的な pair 配置 (どの lane class を左右 / 上下、どちらの provider を先に置くか) を宣言駆動にする作業は別 US: `.mozyo-bridge/config.yaml` への閉集合 `pane_placement` block 追加が #13646、親子孫 3 層別 (lane-role 別) の keying が #13647。
-- ただし `pane_placement` 設定は **新規 launch / heal 経路のみ** に効く。herdr が same-tab re-split を拒否するため、既存 live pair の即時再配置は設定変更では起きない。live で今すぐ入れ替える唯一の経路が本書の recipe である (#13646 Non-goals / #13648)。
+- 恒久的な pair 配置 (どの lane class を左右 / 上下、どちらの provider を先に置くか) を宣言駆動にする作業は別 US: `.mozyo-bridge/config.yaml` への閉集合 `lane_placement` block 追加が #13646、親子孫 3 層別 (lane-role 別) の keying が #13647。config key は `lane_placement` であり `pane_placement` では **ない** — repo-local schema boundary は `pane` を含む key を allowed-key 判定より前に拒否するため、旧名で書いた config は fail-closed で拒否される (正本: [[spec-herdr-native-identity]] §5.1)。
+- ただし `lane_placement` 設定は **新規 launch / heal 経路のみ** に効く。herdr が same-tab re-split を拒否するため、既存 live pair の即時再配置は設定変更では起きない。live で今すぐ入れ替える唯一の経路が本書の recipe である (#13646 Non-goals / #13648)。
 
 ## 記録の衛生
 
