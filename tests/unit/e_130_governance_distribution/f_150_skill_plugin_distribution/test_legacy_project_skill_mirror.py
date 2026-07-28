@@ -2157,10 +2157,12 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         self.assertIn(SystemExit, kinds, "the later control-flow failure was dropped")
         self.assertIn(GeneratorExit, kinds, "the interrupt that broke the recording was dropped")
 
-    def _assert_ledger_holds_the_failure(self, primary, actions, label: str) -> None:
-        """Run the actions and require: nothing escapes, everything runs, it is
-        recorded. One helper because the carrier has to hold under every hostile
-        primary, not just the one that was fashionable that round."""
+    def _run_teardown_actions(self, primary, actions, label: str) -> None:
+        """Run the actions and require that every one of them ran.
+
+        One helper because the carrier has to hold under every hostile primary,
+        not just the one that was fashionable that round.
+        """
         ran: list[str] = []
 
         def tracked(index: int, action):  # type: ignore[no-untyped-def]
@@ -2178,6 +2180,10 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             ran,
             f"{label}: the carrier skipped an action that had not run",
         )
+
+    def _assert_ledger_holds_the_failure(self, primary, actions, label: str) -> None:
+        """As above, and the failure is on the ledger afterwards."""
+        self._run_teardown_actions(primary, actions, label)
         self.assertTrue(
             any(
                 isinstance(entry, RuntimeError)
@@ -2219,10 +2225,51 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             with self.subTest(descriptor=label):
                 self._assert_ledger_holds_the_failure(primary, (failing, quiet), label)
 
-    def test_a_value_at_the_carrier_key_is_never_adopted(self) -> None:
-        """j#90508 R16-F2. The ledger was any `list` found at a public key, so a
-        caller's own list was mutated and a `list` subclass with a hostile
-        `__iter__` escaped the rail from inside the identity dedupe."""
+    def test_the_carrier_key_is_not_an_attribute_name(self) -> None:
+        """j#90517 R17-F1. An obscure string key is still an attribute name:
+        `setattr`/`getattr` work on any string however it is spelled, so a
+        caller's binding could be replaced. I claimed such a key was "outside
+        the caller's namespace"; it was not. An identity key removes the
+        collision instead of making it unlikely.
+
+        The cost is real and stated rather than hidden: an instance dictionary
+        is restored by attribute name, so an exception carrying a ledger raises
+        on `pickle.loads`.
+        """
+
+        def failing() -> None:
+            raise RuntimeError("teardown failure")
+
+        self.assertNotIsInstance(
+            owned_descriptors._LEDGER_KEY, str, "a string key is in the attribute namespace"
+        )
+
+        primary = RuntimeError("write failed")
+        owned_descriptors._teardown_during(primary, failing)
+        self.assertNotEqual((), owned_descriptors.teardown_failures(primary))
+        self.assertEqual(
+            ["__notes__"],
+            [
+                key
+                for key in object.__getattribute__(primary, "__dict__")
+                if isinstance(key, str)
+            ],
+            "the carrier took a name in the caller's namespace",
+        )
+        with self.assertRaises(TypeError):
+            pickle.loads(pickle.dumps(primary))
+
+    def test_a_value_at_the_carrier_key_is_never_replaced(self) -> None:
+        """j#90508 R16-F2 and j#90517 R17-F1. The ledger was any `list` found at
+        a public key, so a caller's own list was adopted and mutated and a
+        `list` subclass with a hostile `__iter__` escaped the rail. Checking the
+        value's type stopped the adoption but still *replaced* the binding, and
+        the regression only looked at the foreign list's contents — so it went
+        green without showing the binding was preserved.
+
+        Refusing to retain is the right answer here: the record is worth less
+        than someone else's data.
+        """
 
         class Plain(Exception):
             pass
@@ -2243,9 +2290,64 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
                 primary = Plain("write failed")
                 state = object.__getattribute__(primary, "__dict__")
                 state[owned_descriptors._LEDGER_KEY] = value
-                self._assert_ledger_holds_the_failure(primary, (failing, quiet), label)
+
+                # (a) the read accessor alone must not touch the binding.
+                self.assertEqual((), owned_descriptors.teardown_failures(primary))
+                self.assertIs(
+                    value, state[owned_descriptors._LEDGER_KEY], f"{label}: a read replaced it"
+                )
+
+                # (b) nor may a full teardown.
+                self._run_teardown_actions(primary, (failing, quiet), label)
+                self.assertIs(
+                    value,
+                    state[owned_descriptors._LEDGER_KEY],
+                    f"{label}: the teardown replaced the binding",
+                )
 
         self.assertEqual(["caller data"], callers_own, "the caller's own list was mutated")
+
+    def test_reading_the_ledger_does_not_create_one(self) -> None:
+        """j#90517 R17-F1. `teardown_failures` looked like a read accessor and
+        was not: it went through the creating path, so asking an exception what
+        went wrong wrote to that exception even when nothing had failed."""
+
+        primary = RuntimeError("write failed")
+        state = object.__getattribute__(primary, "__dict__")
+        before = dict(state)
+
+        self.assertEqual((), owned_descriptors.teardown_failures(primary))
+        self.assertEqual(before, dict(state), "reading the ledger modified the exception")
+
+    def test_each_occurrence_is_one_ledger_entry(self) -> None:
+        """j#90517 R17-F2. The ledger de-duplicated by object identity, so two
+        independent actions returning the same singleton `False` — the whole
+        returned-failure channel — collapsed into one entry while the notes
+        correctly showed two. Occurrences are what the ledger counts."""
+
+        def returns_false() -> bool:
+            return False
+
+        shared = RuntimeError("the same instance, raised twice")
+
+        def raises_shared() -> None:
+            raise shared
+
+        for label, action in (("returned False", returns_false), ("raised", raises_shared)):
+            with self.subTest(channel=label):
+                primary = Exception("write failed")
+                owned_descriptors._teardown_during(primary, action, action)
+
+                self.assertEqual(
+                    2,
+                    len(owned_descriptors.teardown_failures(primary)),
+                    f"{label}: two occurrences collapsed into one ledger entry",
+                )
+                self.assertEqual(
+                    2,
+                    len(getattr(primary, "__notes__", [])),
+                    f"{label}: the notes and the ledger disagree",
+                )
 
     def test_a_carrier_failure_never_skips_a_remaining_action(self) -> None:
         """j#90508 R16-F1, second condition: acquiring or writing the record is
@@ -2277,30 +2379,6 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
 
         self.assertEqual(["a1", "a2"], ran, "a carrier failure skipped a remaining action")
         self.assertIsInstance(control, KeyboardInterrupt)
-
-    def test_an_exception_carrying_a_ledger_still_pickles(self) -> None:
-        """An identity key was written for the carrier first and measured: a
-        non-string key makes `pickle.loads` fail on the instance dictionary, so
-        the exception serialises and cannot be restored. The ledger is scoped to
-        one unwind, so it pickles as empty — which also keeps an entry that was
-        never picklable from making its exception unpicklable."""
-
-        class Unpicklable(Exception):
-            def __reduce__(self):  # type: ignore[override]
-                raise TypeError("this failure cannot be pickled")
-
-        def failing() -> None:
-            raise Unpicklable("teardown failure")
-
-        # A module-level type, because a class defined in a test body is not
-        # picklable for reasons that have nothing to do with the ledger.
-        primary = RuntimeError("write failed")
-        owned_descriptors._teardown_during(primary, failing)
-        self.assertNotEqual((), owned_descriptors.teardown_failures(primary))
-
-        restored = pickle.loads(pickle.dumps(primary))
-        self.assertIsInstance(restored, RuntimeError)
-        self.assertEqual((), owned_descriptors.teardown_failures(restored))
 
     def test_the_ledger_survives_a_primary_that_refuses_attributes(self) -> None:
         """The carrier has to be the instance dictionary, not `setattr`.

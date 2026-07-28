@@ -45,23 +45,24 @@ def _close_quietly(fd: int) -> bool:
 
 
 
-_LEDGER_KEY = "mozyo-bridge teardown ledger"
+_LEDGER_KEY = object()
 """Key for the ledger inside a primary's instance dictionary.
 
-Not an attribute name: the spaces and the hyphen mean no attribute syntax can
-produce it, so it is outside the caller's namespace in practice. A public,
-identifier-shaped key was worse than it looked — a value already sitting at it
-was adopted as the ledger, which mutated the caller's own list and let a
-``list`` subclass with a hostile ``__iter__`` escape the teardown rail (j#90508
-R16-F2).
+An identity no caller can name. A string key — however obscure — is still in
+the attribute namespace: ``setattr(exc, key, value)`` and ``getattr`` both work
+on it whatever it is spelled like, so a caller's binding could be replaced
+(j#90517 R17-F1). An identity key removes the collision rather than making it
+unlikely.
 
-An identity key (``object()``) was written first and measured: it makes the
-exception unpicklable, because restoring an instance dictionary requires string
-keys, so ``pickle.dumps`` succeeds and ``pickle.loads`` raises. Trading a
-namespace that attribute syntax cannot reach for an exception that cannot come
-back from a pickle is a bad trade; ownership is enforced by the value's type
-instead, which is what actually stopped the adoption.
+The cost, stated because it is real: an instance dictionary is restored by
+attribute name, so an exception carrying a ledger raises on ``pickle.loads``
+(``pickle.dumps`` still succeeds). A string key was chosen once for exactly
+that reason and it was the wrong trade — the ledger has never survived a pickle
+anyway, and not overwriting a caller's binding is the requirement.
 """
+
+_ABSENT = object()
+"""Distinguishes "no ledger yet" from "something else is bound at the key"."""
 
 _instance_state = BaseException.__dict__["__dict__"].__get__
 """Reach a primary's real instance dictionary, ignoring its class.
@@ -88,17 +89,6 @@ class _Ledger:
     def __init__(self) -> None:
         self.entries: list[object] = []
 
-    def __reduce__(self):
-        """Pickle as an empty ledger.
-
-        The record lives and dies with the unwind it describes, and an entry
-        that cannot be pickled must not be the reason the exception carrying it
-        cannot be. Dropping the entries keeps pickling an exception total —
-        including for entries that were never picklable, which the previous
-        plain-list carrier would have failed on.
-        """
-        return (_Ledger, ())
-
 
 def teardown_failures(primary: BaseException) -> tuple[object, ...]:
     """Every failure seen while tearing down ``primary``, as objects.
@@ -106,9 +96,23 @@ def teardown_failures(primary: BaseException) -> tuple[object, ...]:
     This is the machine-readable half of the record. Notes are for humans and
     are best effort; this is what a caller — or a test — reads to find out that
     a cleanup returned ``CLEANUP_FAILED`` and residue is on disk.
+
+    A read, and only a read. Routing it through the creating path meant asking
+    an exception what went wrong *wrote to that exception* — replacing whatever
+    was bound at the carrier key even when nothing had failed at all (j#90517
+    R17-F1).
     """
-    ledger = _ledger(primary)
+    ledger = _existing_ledger(primary)
     return tuple(ledger.entries) if ledger is not None else ()
+
+
+def _existing_ledger(primary: BaseException) -> _Ledger | None:
+    """The ledger already on ``primary``, or ``None``. Never writes."""
+    state = _instance_state(primary)
+    if type(state) is not dict:
+        return None
+    ledger = state.get(_LEDGER_KEY)
+    return ledger if type(ledger) is _Ledger else None
 
 
 def _ledger(primary: BaseException) -> _Ledger | None:
@@ -122,51 +126,54 @@ def _ledger(primary: BaseException) -> _Ledger | None:
     (j#90503 R15-F1) — and a secondary whose ``__str__`` raised vanished
     outright (R15-F2).
 
-    Three earlier carriers were each written, measured, and discarded, which is
+    Four earlier carriers were each written, measured, and discarded, which is
     why this one is so deliberate: ``setattr`` and ``__context__`` assignment
-    both route through a type's ``__setattr__`` (j#90503), and
+    both route through a type's ``__setattr__`` (j#90503),
     ``object.__getattribute__`` still dispatches to a subclass ``__dict__``
-    descriptor (j#90508 R16-F1). What is left — a descriptor bound from
-    ``BaseException``, a private identity key, and a private container type — is
-    reachable only through this module.
+    descriptor (j#90508 R16-F1), and an obscure string key is still an
+    attribute name a caller can bind (j#90517 R17-F1). What is left — a
+    descriptor bound from ``BaseException``, an identity key, and a private
+    container type — is reachable only through this module.
 
-    Returns ``None`` when there is no instance dictionary to use, which for a
-    real ``BaseException`` does not happen; the caller treats that as "not
-    retained" rather than as a reason to raise mid-unwind.
+    Returns ``None`` rather than writing when there is no instance dictionary,
+    or when something that is not ours already occupies the key: refusing to
+    retain is always better than overwriting a binding that belongs to someone
+    else.
     """
     state = _instance_state(primary)
     if type(state) is not dict:
         return None
-    ledger = state.get(_LEDGER_KEY)
+    ledger = state.get(_LEDGER_KEY, _ABSENT)
     if type(ledger) is _Ledger:
         return ledger
+    if ledger is not _ABSENT:
+        return None
     ledger = _Ledger()
     state[_LEDGER_KEY] = ledger
     return ledger
 
 
 def _remember(primary: BaseException, failure: object) -> BaseException | None:
-    """Retain a teardown failure; return control flow raised while retaining.
+    """Retain one occurrence of a teardown failure.
 
-    Returning rather than raising is the rule the carrier itself broke twice:
-    retention must never be the reason an action that has not run yet is
-    skipped (j#90508 R16-F1/F2). Nothing below can raise for a real exception —
-    binding a base descriptor, a dict lookup on an identity key, and a
-    ``list`` append — but the guard is what makes that a property of the code
-    rather than of an argument about it.
+    Returns control flow raised while retaining, rather than raising it: the
+    carrier itself broke the "remaining actions always run" rule twice by
+    unwinding out of the loop (j#90508 R16-F1/F2). Nothing below can raise for
+    a real exception — binding a base descriptor, a dict lookup on an identity
+    key, and a ``list`` append — but the guard makes that a property of the
+    code rather than of an argument about it.
 
-    Idempotent by identity, so a call site may retain defensively without
-    having to know whether an earlier step already did. Equality is not
-    consulted — a failure object may define a hostile ``__eq__`` just as
-    readily as a hostile ``__str__``.
+    One call, one entry. There is deliberately no de-duplication: identity
+    de-duplication collapsed two independent actions that returned the same
+    ``False`` — the returned-failure channel, where ``False`` is a singleton
+    and so *always* collapsed — into a single ledger entry, while the notes
+    correctly showed two (j#90517 R17-F2). Each occurrence is retained at
+    exactly one place instead, so defensive re-retention is unnecessary.
     """
     try:
         ledger = _ledger(primary)
         if ledger is None:
             return None
-        for entry in ledger.entries:
-            if entry is failure:
-                return None
         ledger.entries.append(failure)
     except Exception:  # noqa: BLE001 - nothing to route; the failure is simply not retained
         return None
@@ -215,25 +222,36 @@ def _describe_failure(failure: object) -> str:
         return f"{name}: <unprintable>"
 
 
+def _present(primary: BaseException, failure: object) -> BaseException | None:
+    """Render an already-retained failure as a note; never raise.
+
+    :func:`_attach_secondary` deliberately lets a control-flow exception out —
+    an interrupt outranks a note (R13-F3) — but it must not leave the loop that
+    called it, because the actions after this one would never run (j#90492
+    R14-F1). That interrupt is a teardown failure in its own right, so this is
+    where its single retention happens.
+    """
+    try:
+        _attach_secondary(primary, failure)
+    except Exception:  # noqa: BLE001 - `_attach_secondary` already absorbs these
+        return None
+    except BaseException as interrupt:  # noqa: BLE001 - routed, not raised here
+        _remember(primary, interrupt)
+        return interrupt
+    return None
+
+
 def _record_secondary(primary: BaseException, secondary: object) -> BaseException | None:
     """Retain ``secondary``, then present it; return control-flow raised doing so.
 
     The order is the fix: retention first and unconditionally, presentation
-    second and best effort. :func:`_attach_secondary` deliberately lets a
-    control-flow exception out — an interrupt outranks a note (R13-F3) — but it
-    must not leave the loop that called it, because the actions after this one
-    would never run (j#90492 R14-F1). Returning it puts it on the same channel
-    as an interrupt from the action itself, so exactly one rule decides what
-    happens next, and the failure is on the ledger either way.
+    second and best effort. Every occurrence passing through here is retained
+    exactly once, which is what lets :func:`_remember` drop de-duplication
+    (j#90517 R17-F2).
     """
     retaining = _remember(primary, secondary)
-    try:
-        _attach_secondary(primary, secondary)
-    except Exception:  # noqa: BLE001 - `_attach_secondary` already absorbs these
-        return retaining
-    except BaseException as interrupt:  # noqa: BLE001 - routed, not raised here
-        return retaining if retaining is not None else interrupt
-    return retaining
+    presenting = _present(primary, secondary)
+    return retaining if retaining is not None else presenting
 
 
 def _run_teardown_action(primary: BaseException, action) -> BaseException | None:
@@ -300,6 +318,10 @@ def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
     properties twice by raising out of the loop instead (j#90508 R16-F1/F2), so
     :func:`_remember` returns control flow rather than raising it, and no step
     of the record can cost an action that has not run.
+
+    Each occurrence is retained at exactly one place — where it arises — so the
+    ledger counts occurrences rather than distinct objects. Two actions that
+    each return the same singleton ``False`` are two entries (j#90517 R17-F2).
     """
     control_flow: BaseException | None = None
     for action in actions:
@@ -308,14 +330,12 @@ def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
             continue
         if control_flow is None:
             control_flow = arrived
-            _remember(primary, arrived)
         else:
-            # Already retained; this adds the human-readable note. An interrupt
-            # raised by the note itself is retained too — only its *priority*
-            # is bounded, because the regress has no natural end.
-            interrupt = _record_secondary(primary, arrived)
-            if interrupt is not None:
-                _remember(primary, interrupt)
+            # Retained already, wherever it arose; this only adds the note. An
+            # interrupt raised by the note itself is retained by `_present` —
+            # only its *priority* is bounded, because the regress has no
+            # natural end.
+            _present(primary, arrived)
     return control_flow
 
 
