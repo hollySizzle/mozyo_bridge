@@ -286,6 +286,27 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
     def test_indented_code_marker_is_not_a_gate(self):
         self.assertEqual(self._gates("    " + self.GATE), ())
 
+    def test_mismatched_delimiters_are_not_a_gate_either(self):
+        # #14584 j#91152 F1 reaching THIS reader: the shapes a boolean fence toggle and a
+        # one-backtick span let through are verbatim to every renderer, so they must be as
+        # invisible here as the four shapes above. Wiring, not grammar — the matrix is in
+        # ``test_canonical_note_scan.DelimiterIdentityTest``.
+        for label, note in (
+            ("two-backtick span", "``%s``" % self.GATE),
+            ("shorter run inside a longer fence", "````\n```\n%s\n````" % self.GATE),
+            ("tilde run inside a backtick fence", "```\n~~~\n%s\n```" % self.GATE),
+            ("backtick run inside a tilde fence", "~~~\n```\n%s\n~~~" % self.GATE),
+            ("run bearing an info string", "```\n```python\n%s\n```" % self.GATE),
+            ("backtick in the opener info string", "```a`b\n```\n%s\n```" % self.GATE),
+            ("unmatched backtick string", "``%s`" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ())
+
+    def test_a_matching_delimiter_still_releases_the_writers_own_voice(self):
+        # The paired positive: >= opener length closes, so this marker is NOT quoted.
+        self.assertEqual(self._gates("```\nquoted\n````\n" + self.GATE), ("review_request",))
+
     def test_quotation_is_not_an_ambiguity_poison_either(self):
         # The other half of the contract: a quoted marker must not merely be *refused*, it must be
         # invisible. If it still counted as a second marker it would make the journal unusable —

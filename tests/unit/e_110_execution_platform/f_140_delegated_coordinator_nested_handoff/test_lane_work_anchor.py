@@ -127,9 +127,25 @@ class FailClosedTest(unittest.TestCase):
             ("blockquote", "> " + marker),
             ("fenced", "```\n" + marker + "\n```"),
             ("indented code", "    " + marker),
+            # #14584 j#91152 F1: the same echo written with delimiters that do not match. Every
+            # one of these is verbatim in the rendered journal, so none of them dispatched work.
+            ("two-backtick span", "``%s``" % marker),
+            ("shorter run inside a longer fence", "````\n```\n%s\n````" % marker),
+            ("tilde run inside a backtick fence", "```\n~~~\n%s\n```" % marker),
+            ("backtick run inside a tilde fence", "~~~\n```\n%s\n~~~" % marker),
+            ("run bearing an info string", "```\n```python\n%s\n```" % marker),
+            ("backtick in the opener info string", "```a`b\n```\n%s\n```" % marker),
+            ("unmatched backtick string", "``%s`" % marker),
         ):
             with self.subTest(label):
                 self.assertEqual(_resolve([_entry("90409", note)]).status, WORK_ANCHOR_MISSING)
+
+    def test_a_real_dispatch_after_a_closed_fence_still_resolves(self):
+        # The paired positive at the join: refusing mismatched delimiters must not start refusing
+        # dispatches that merely follow a quotation. A run at least as long as the opener closes it.
+        marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
+        anchor = _resolve([_entry("90409", "```\nquoted\n````\n" + marker)])
+        self.assertEqual((anchor.status, anchor.journal), (WORK_ANCHOR_RESOLVED, "90409"))
 
     def test_two_distinct_entries_are_ambiguous(self):
         anchor = _resolve([_dispatch("90409"), _dispatch("90410")])

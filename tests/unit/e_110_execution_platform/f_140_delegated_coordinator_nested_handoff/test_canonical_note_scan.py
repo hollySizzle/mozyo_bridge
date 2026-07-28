@@ -122,6 +122,63 @@ class QuotedMarkerTest(unittest.TestCase):
         self.assertEqual(_gates(note), ())
 
 
+class DelimiterIdentityTest(unittest.TestCase):
+    """A delimiter only delimits when it MATCHES (#14584 j#91152 F1, CommonMark 0.31.2 §4.5/§6.1).
+
+    The shapes above are the quotations a reader recognizes on sight. These are the ones a reader
+    also recognizes on sight but a *boolean* fence toggle and an "any two backticks" span do not:
+    the block is verbatim in every renderer, and the scan used to hand it back as canonical.
+
+    Refusing three reported shapes would have left four more standing (this class was written from
+    the delimiter rules, not from the report — the escalation this US recorded). Each refusal is
+    paired with the positive it must not swallow, because a scan that recognizes nothing is
+    trivially quote-safe and completely useless.
+    """
+
+    def test_two_backtick_inline_span_is_quoted(self):
+        # A one-backtick regex reads ``…`` as two EMPTY spans and leaves the middle canonical.
+        self.assertEqual(_gates(f"the grammar is ``{MARKER}``"), ())
+
+    def test_span_delimiters_must_be_the_same_length(self):
+        # The run of 1 inside cannot close the run of 2 that opened the span.
+        self.assertEqual(_gates(f"``a`b {MARKER}``"), ())
+
+    def test_unmatched_backtick_string_refuses_the_rest_of_the_line(self):
+        # No run of 2 ever closes this span. CommonMark renders it literally, but a line whose
+        # quoting is unbalanced is the line whose authorship the scan cannot establish.
+        self.assertEqual(_gates(f"``{MARKER}`"), ())
+
+    def test_shorter_fence_run_inside_a_longer_fence_is_content(self):
+        # ``` inside a ```` block does not close it, so the marker below is still inside.
+        self.assertEqual(_gates(f"````\n```\n{MARKER}\n````"), ())
+
+    def test_tilde_run_does_not_close_a_backtick_fence(self):
+        self.assertEqual(_gates(f"```\n~~~\n{MARKER}\n```"), ())
+
+    def test_backtick_run_does_not_close_a_tilde_fence(self):
+        self.assertEqual(_gates(f"~~~\n```\n{MARKER}\n~~~"), ())
+
+    def test_run_bearing_an_info_string_does_not_close_a_fence(self):
+        # A closing fence may carry only whitespace; ```python is content.
+        self.assertEqual(_gates(f"```\n```python\n{MARKER}\n```"), ())
+
+    def test_backtick_in_an_info_string_means_the_line_never_opened_a_fence(self):
+        # Without this rule ```a`b opens, and the REAL opener below reads as its closer — which
+        # would release the fenced marker as canonical text.
+        self.assertEqual(_gates(f"```a`b\n```\n{MARKER}\n```"), ())
+
+    def test_longer_run_may_close_a_shorter_fence(self):
+        # The other side of the length rule: >= opener length still closes, so the marker after it
+        # is the writer's own voice and must be read.
+        self.assertEqual(_gates(f"```\nquoted\n````\n{MARKER}"), ("review_request",))
+
+    def test_marker_between_two_closed_spans_is_canonical(self):
+        self.assertEqual(_gates(f"`a` {MARKER} ``b``"), ("review_request",))
+
+    def test_marker_after_a_closed_two_backtick_span_is_canonical(self):
+        self.assertEqual(_gates(f"``code`` {MARKER}"), ("review_request",))
+
+
 class ScanIsPerLineTest(unittest.TestCase):
     """Blanking must not let a marker be spliced together across a quotation."""
 

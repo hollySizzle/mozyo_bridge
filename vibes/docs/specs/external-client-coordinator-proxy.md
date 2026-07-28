@@ -88,6 +88,20 @@ authorize したかを照合しなければ scope は未検証のままである
     - **B. blockquote** — 先頭の非空白文字が `>`。nest (`> >`) と leading whitespace を含む。
     - **C. indented code** — 4 space 以上 (または tab) の indent。
     - **D. inline code** — canonical 行内の backtick span。
+    ★★★**A と D は delimiter の規則であり、delimiter は「一致したときだけ」delimiter である**
+    (#14584 j#91152 F1)。fence を単一 boolean で toggle し、span を「任意の backtick 2 個の間」と
+    読む実装は、renderer が逐語として描画した region を canonical text として返す。CommonMark
+    0.31.2 §4.5 / §6.1 に従い delimiter identity を保持する:
+    - fence の closer は opener と**同じ文字**かつ**opener 以上の長さ**で、後続は空白のみ。info
+      string を持つ行は closer ではなく content である (` ``` ` 行は ` ```` ` block を閉じない)。
+    - backtick fence の opener の info string は backtick を**含めない**。この規則が無いと
+      ` ```a`b ` が opener として読まれ、後続の**本物の opener が closer として作用**して、
+      fence 内の marker が canonical text として解放される。
+    - code span は backtick string から**ちょうど同じ長さ**の次の backtick string までであり、
+      間にある別長の run は span の content である。
+    - **対応しない backtick string は無視せず、その行の残りを拒否する。** CommonMark は逐語
+      text として描画するが、引用が閉じていない行はこの scan が著者性を確定できない行であり、
+      拒否は復旧可能な向きである (下記「代償」と同じ)。
     ★**A と D だけを覆った初版は live acceptance で破れた** (#14577 j#90392)。journal に `>` で
     grammar を引用しただけの note が `links.anchor=verified` を返し、zero-send になったのは後段の
     別 link がたまたま壊れていたからにすぎない。**引用の形は 1 つではないので、報告された形だけを
@@ -98,9 +112,12 @@ authorize したかを照合しなければ scope は未検証のままである
     引用 marker が durable gate authority になった。**同じ grammar に対して「引用とは何か」の定義が
     2 つあるのは drift 生成器である。** 規則は共有 authority に 1 箇所だけ置き、reader は policy
     (どの channel / gate を受理するか) だけを各自が持つ。
+    この形の finding は **B/C (#14577 j#90392) に続いて 2 度目**であり、`review-escalation`
+    projection が同一 subsystem の反復として `full_surface_adversarial` を返した (#14584 j#91158)。
+    以後この規則面は「報告された形」ではなく **delimiter 規則の側から全 edge を掃く**。
   - 代償として **decision は top-level に書く**必要がある (list bullet の下に 4 space indent した
-    marker は拒否される)。この向きの失敗は coordinator が column 0 に書き直せば済む。逆向きの失敗
-    (引用に authority を渡す) は復旧できない。
+    marker、対応しない backtick run を含む行の marker は拒否される)。この向きの失敗は coordinator が
+    column 0 に書き直せば済む。逆向きの失敗 (引用に authority を渡す) は復旧できない。
   - **scan は行単位で行う。** marker body の grammar は `[^\]]*` で改行を跨ぐため、blank 化した note
     を 1 文字列として scan すると、canonical 行の閉じていない `[mozyo:` が引用行を越えて後続の `]`
     で閉じ、**どの 1 行にも存在しない marker** が成立しうる。
