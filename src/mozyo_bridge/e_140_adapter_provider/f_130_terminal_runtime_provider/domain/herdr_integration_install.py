@@ -86,12 +86,24 @@ REASON_HERDR_UNRESOLVED = "herdr_unresolved"
 #: remains). The installer must never claim ``home left as found`` / ``rolled_back``
 #: when restoration could not be *proven* (Redmine #13249 review j#83613 finding 1).
 REASON_ROLLBACK_INCOMPLETE = "rollback_incomplete"
-#: A target config dir holds a non-credential file the installer cannot read, so a
-#: rollback of that dir could never be byte-verified. The apply is refused *before*
-#: any mutation — an un-provable rollback must never be started, and a pair of
-#: unreadable files must never read as "restored" (Redmine #13249 review j#83674
-#: finding 1: `unreadable == unreadable` is not restoration proof).
+#: A target config dir could not be *completely* read: a non-credential file whose
+#: bytes are unreadable, **or a subtree / entry the installer could not even
+#: enumerate**. Either way a rollback of that dir could never be byte-verified. The
+#: apply is refused *before* any mutation — an un-provable rollback must never be
+#: started, a pair of unreadable files must never read as "restored" (Redmine #13249
+#: review j#83674 finding 1: `unreadable == unreadable` is not restoration proof), and
+#: an un-enumerable subtree must never read as "absent" (review j#91688 finding 2: a
+#: file that fell out of *both* the snapshot and the backup passes every per-file
+#: completeness check). The same reason covers a **post-apply** dir that cannot be
+#: fully read back, because success then cannot be observed either (j#91688 finding 3).
 REASON_CONFIG_DIR_UNREADABLE = "config_dir_unreadable"
+#: The pin posture was verified against one config file, but herdr would read another
+#: (the environment names a different ``HERDR_CONFIG_PATH``). A pin proven on a file
+#: herdr never reads is no pin at all — an unrelated pinned file could otherwise be
+#: used as a decoy to pass the ``unpinned_remote`` gate — so the installer refuses
+#: until the verified config and herdr's effective config are the same file (Redmine
+#: #13249 review j#91688 finding 1).
+REASON_CONFIG_PIN_MISMATCH = "config_pin_mismatch"
 #: Apply was requested for several agents and at least one failed after another had
 #: already been mutated — the whole operation is reported failed and rolled back.
 REASON_PARTIAL_FAILURE = "partial_failure"
@@ -105,6 +117,7 @@ INSTALL_FAILURE_REASONS: frozenset[str] = frozenset(
         REASON_UNKNOWN_AGENT,
         REASON_CONFIG_DIR_MISSING,
         REASON_CONFIG_DIR_UNREADABLE,
+        REASON_CONFIG_PIN_MISMATCH,
         REASON_UNSAFE_CONFIG_PATH,
         REASON_UNPINNED_REMOTE,
         REASON_HERDR_ERROR,
@@ -341,6 +354,11 @@ class InstallReport:
     every agent outcome is ``ok`` (and nothing was rolled back). A single failing
     agent makes the whole report not-``ok`` — partial success is never reported as
     success (issue #13249: "部分失敗は成功扱いしない").
+
+    ``herdr_config_bound`` is the resolved config file the pin posture was verified
+    against **and** that an apply binds herdr to, so the report shows *which* config
+    the pin verdict actually governs rather than leaving it implicit (Redmine #13249
+    review j#91688 finding 1).
     """
 
     applied: bool
@@ -349,6 +367,7 @@ class InstallReport:
     outcomes: "tuple[AgentInstallOutcome, ...]" = ()
     detail: str = ""
     pin_mode: Optional[str] = None
+    herdr_config_bound: Optional[str] = None
 
 
 __all__ = (
@@ -360,6 +379,7 @@ __all__ = (
     "INTEGRATION_AGENTS",
     "REASON_CONFIG_DIR_MISSING",
     "REASON_CONFIG_DIR_UNREADABLE",
+    "REASON_CONFIG_PIN_MISMATCH",
     "REASON_HERDR_ERROR",
     "REASON_HERDR_UNRESOLVED",
     "REASON_NOT_OPTED_IN",

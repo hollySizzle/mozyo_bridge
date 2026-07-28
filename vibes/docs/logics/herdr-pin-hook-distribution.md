@@ -78,6 +78,32 @@ mozyo-bridge herdr integration-install --apply \
 post-snapshot → diff。いずれかの agent が失敗したら**全 agent を rollback** し、復元を
 **検証**してから結果を出す (home を発見時の状態へ戻す)。
 
+### `--herdr-config` は「検証対象」であると同時に「実行時の effective config」
+
+`--herdr-config` に渡した file は §1 の pin 検証対象であるだけでなく、apply が
+`HERDR_CONFIG_PATH` に **固定**して herdr へ渡す config でもある。pin を証明した file と
+herdr が実際に読む file が別々でよいなら、無関係な pinned file を decoy にして
+`unpinned_remote` gate を通過できてしまう (PoC 実測: herdr は `HERDR_CONFIG_PATH` で config を
+差し替え可能、`logic-herdr-poc-13175-experiment-log`)。したがって:
+
+- apply は検証済み config の realpath を `HERDR_CONFIG_PATH` に設定して herdr を起動する。
+- 呼び出し側の環境が **別の** config を `HERDR_CONFIG_PATH` で名指している場合、installer は
+  黙って上書きせず `config_pin_mismatch` で **zero-mutation 拒否**する (どちらが正かを installer が
+  勝手に決めない)。同一 file を指す symlink 等は realpath 同一性で同一とみなす。
+- plan / apply の report は `herdr_config_bound` として bind 先を表示する。
+
+### 「完全に読めた」ことが rollback 開始の前提 (列挙失敗も含む)
+
+rollback は snapshot と backup が対象 dir を **完全に読めた時だけ**開始する。ここでの「完全」は
+file の read 成否だけでなく **列挙 (`os.walk` / `lstat`) の成否**を含む。列挙に失敗した subtree は
+snapshot からも backup からも同時に消えるため、file 単位の unreadable 検査では「読めなかった」では
+なく「存在しない」に化ける。列挙失敗・read 失敗はいずれも `config_dir_unreadable` で mutation 前に
+拒否する。
+
+同じ理由で、herdr が exit 0 を返しても **apply 後の dir を完全に読み戻せない場合は成功にしない**。
+exact diff も最終 home state も観測できていないためで、この場合は backup から verified rollback を
+行い `config_dir_unreadable` で closed 扱いとする。
+
 ### Fail-closed (成功扱いしないケース)
 
 | reason | 意味 |
@@ -86,6 +112,8 @@ post-snapshot → diff。いずれかの agent が失敗したら**全 agent を
 | `config_dir_missing` | 対象 `~/.claude` / `~/.codex` が存在しない (先に作成すること) |
 | `unsafe_config_path` | config dir が symlink / traversal で home 外へ解決 |
 | `unpinned_remote` | herdr posture が pinned でない (§1 を先に満たすこと) |
+| `config_pin_mismatch` | 検証した config と、環境 (`HERDR_CONFIG_PATH`) が herdr に読ませる config が別 file |
+| `config_dir_unreadable` | config dir を完全に読めない (file read 失敗 / subtree 列挙失敗)、または apply 後に読み戻せない |
 | `herdr_unresolved` | trusted-env から herdr binary を解決できない (plan も gate される) |
 | `herdr_error` | herdr が非ゼロ終了 / 起動失敗 |
 | `rollback_incomplete` | rollback が復元を証明できず residue が残る (home 未復元) |

@@ -31,14 +31,25 @@ Boundaries kept enforced here:
   repo-local value can never point it at an arbitrary executable.
 - **Path safety.** A config dir whose realpath escapes home (a symlink or ``..``
   traversal) is refused before any snapshot or mutation.
+- **The verified config is the config herdr reads.** The pin posture is proven against
+  a specific file, and an apply binds herdr to *that* file via
+  :data:`HERDR_CONFIG_PATH_ENV`; an environment naming a different config is refused
+  rather than overridden, so a pinned file can never be a decoy for an unpinned run.
+- **Completeness is part of the data, not a later check.** Every read of a config dir
+  returns its snapshot / backup together with the listing and read failures that
+  produced it (:class:`_DirRead`, :class:`_DirBackup`), because a subtree that could
+  not be enumerated disappears from every set at once and would otherwise read as
+  *absent*. An apply starts only from a fully-read dir and reports success only when
+  the post-apply dir can be fully read back.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import stat
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
@@ -46,6 +57,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_CONFIG_DIRNAME,
     REASON_CONFIG_DIR_MISSING,
     REASON_CONFIG_DIR_UNREADABLE,
+    REASON_CONFIG_PIN_MISMATCH,
     REASON_HERDR_ERROR,
     REASON_HERDR_UNRESOLVED,
     REASON_PARTIAL_FAILURE,
@@ -71,6 +83,14 @@ Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 #: as a herdr error. Kept short so an unresponsive herdr fails closed quickly.
 COMMAND_TIMEOUT_SECONDS = 30
 
+#: The environment variable herdr reads its config from. PoC #13175 measured that
+#: ``HERDR_CONFIG_PATH`` overrides herdr's XDG config resolution
+#: (``vibes/docs/logics/herdr-poc-13175-experiment-log.md``), which is exactly why the
+#: pin gate cannot stop at "some file is pinned": an apply binds herdr to the *verified*
+#: config through this variable, so the file whose posture was proven is the file herdr
+#: actually reads (Redmine #13249 review j#91688 finding 1).
+HERDR_CONFIG_PATH_ENV = "HERDR_CONFIG_PATH"
+
 
 @dataclass(frozen=True)
 class InstallInputs:
@@ -78,11 +98,12 @@ class InstallInputs:
 
     ``home`` is the operator home the agent config dirs sit under (the CLI defaults
     it to ``$HOME`` but a test injects a temp dir). ``herdr_config`` is the herdr
-    config whose pin posture gates the install; ``manifest_catalog_url`` is the
-    observed pinned-mirror env value (or ``None``). ``env`` is the trusted
-    environment used to resolve the herdr binary and passed to the runner so herdr
-    resolves the agent dirs under the same ``home``. ``runner`` is injected (a fake
-    in tests).
+    config whose pin posture gates the install **and** which an apply binds herdr to
+    (:data:`HERDR_CONFIG_PATH_ENV`), so the verified file is the effective one;
+    ``manifest_catalog_url`` is the observed pinned-mirror env value (or ``None``).
+    ``env`` is the trusted environment used to resolve the herdr binary and passed to
+    the runner so herdr resolves the agent dirs under the same ``home``. ``runner`` is
+    injected (a fake in tests).
     """
 
     home: Path
@@ -96,28 +117,79 @@ class InstallInputs:
 # --- snapshot / backup / rollback IO -----------------------------------------
 
 
-def _iter_files(root: Path):
-    """Yield ``(relpath, abspath)`` for every non-credential regular file under ``root``.
+@dataclass(frozen=True)
+class _DirScan:
+    """The non-credential files under a dir **plus the proof the listing was complete**.
 
-    Credential-shaped files (by any path component) are skipped entirely so they are
+    ``files`` are the ``(relpath, abspath)`` pairs that were successfully enumerated;
+    ``unenumerable`` names every subtree / entry whose ``scandir`` or ``lstat`` failed.
+    The two travel together on purpose: an enumeration error makes a file vanish from
+    *every* downstream set at once (snapshot and backup alike), so a per-file
+    "unreadable" check can never see it — it reads as *absent*, and every completeness
+    comparison built from those sets silently agrees (Redmine #13249 review j#91688
+    finding 2). Only :attr:`complete` licenses treating the file list as exhaustive.
+    """
+
+    files: "tuple[tuple[str, Path], ...]" = ()
+    unenumerable: "tuple[str, ...]" = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.unenumerable
+
+
+def _scan_dir(root: Path) -> _DirScan:
+    """Enumerate ``root``'s non-credential regular files, recording listing failures.
+
+    Credential-shaped files and dirs (by any path component) are pruned so they are
     never read. Symlinked files are skipped too — the installer only tracks real hook
     files, and following a symlink out of the dir would read arbitrary content.
+
+    Every way the listing can come up short is captured rather than swallowed:
+    ``os.walk``'s ``onerror`` collects a subtree whose ``scandir`` failed (without it
+    ``os.walk`` drops the subtree *silently*), and the entry type is taken from an
+    explicit :func:`os.lstat` instead of :meth:`Path.is_file`, which answers ``False``
+    for a stat error and would make an un-stattable entry indistinguishable from a
+    directory.
     """
-    if not root.is_dir():
-        return
-    for dirpath, dirnames, filenames in os.walk(root):
+    files: "list[tuple[str, Path]]" = []
+    failed: "list[str]" = []
+
+    def _relative(target: object) -> str:
+        if not isinstance(target, (str, os.PathLike)):
+            return "."
+        try:
+            return os.path.relpath(os.fspath(target), root)
+        except (OSError, ValueError):
+            return str(target)
+
+    def _onerror(exc: OSError) -> None:
+        failed.append(_relative(getattr(exc, "filename", None) or root))
+
+    try:
+        if not root.is_dir():
+            return _DirScan()
+    except OSError:
+        return _DirScan(unenumerable=(".",))
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_onerror):
         # Prune credential-shaped subdirs so we never descend into them.
         dirnames[:] = [d for d in dirnames if not is_credential_shaped(d)]
         for name in filenames:
             if is_credential_shaped(name):
                 continue
             abspath = Path(dirpath) / name
-            if abspath.is_symlink() or not abspath.is_file():
-                continue
             rel = os.path.relpath(abspath, root)
             if any(is_credential_shaped(part) for part in Path(rel).parts):
                 continue
-            yield rel, abspath
+            try:
+                mode = os.lstat(abspath).st_mode
+            except OSError:
+                failed.append(rel)
+                continue
+            if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+                continue
+            files.append((rel, abspath))
+    return _DirScan(files=tuple(files), unenumerable=tuple(sorted(set(failed))))
 
 
 #: The snapshot digest for a file that could not be read. It is intentionally NOT a
@@ -128,21 +200,61 @@ def _iter_files(root: Path):
 _UNREADABLE_SENTINEL = "\x00unreadable\x00"
 
 
-def _snapshot_dir(root: Path) -> DirSnapshot:
+@dataclass(frozen=True)
+class _DirRead:
+    """A dir snapshot **inseparable from the proof that the whole dir was read**.
+
+    A bare :class:`DirSnapshot` cannot answer "did I see everything?", so every
+    producer here returns this instead — the completeness verdict is part of the type
+    rather than something a caller must remember to re-derive afterwards (a post-hoc
+    check is exactly what the success path forgot in Redmine #13249 review j#91688
+    finding 3). ``unreadable`` names files whose bytes could not be read;
+    ``unenumerable`` names subtrees / entries the listing itself could not cover.
+    """
+
+    snapshot: DirSnapshot = field(default_factory=DirSnapshot)
+    unreadable: "tuple[str, ...]" = ()
+    unenumerable: "tuple[str, ...]" = ()
+
+    @property
+    def complete(self) -> bool:
+        return not (self.unreadable or self.unenumerable)
+
+    @property
+    def gap_detail(self) -> str:
+        """Bounded, operator-readable description of what could not be read."""
+        parts = []
+        if self.unenumerable:
+            parts.append(f"un-enumerable: {', '.join(self.unenumerable[:5])}")
+        if self.unreadable:
+            parts.append(f"unreadable: {', '.join(self.unreadable[:5])}")
+        return "; ".join(parts) or "none"
+
+
+def _read_dir(root: Path) -> _DirRead:
     """Content manifest (relpath -> sha256) of ``root``'s non-credential files.
 
     An unreadable file is recorded with :data:`_UNREADABLE_SENTINEL` (never a real
     hash) so its presence is still detected, but its bytes never enter the snapshot —
     and a snapshot carrying the sentinel can never be used as restoration *proof*.
+    The returned :class:`_DirRead` also carries the listing failures from
+    :func:`_scan_dir`, so a caller cannot obtain a snapshot without its completeness.
     """
+    scan = _scan_dir(root)
     manifest: "dict[str, str]" = {}
-    for rel, abspath in _iter_files(root):
+    unreadable: "list[str]" = []
+    for rel, abspath in scan.files:
         try:
             digest = hashlib.sha256(abspath.read_bytes()).hexdigest()
         except OSError:
             digest = _UNREADABLE_SENTINEL
+            unreadable.append(rel)
         manifest[rel] = digest
-    return DirSnapshot.of(manifest)
+    return _DirRead(
+        snapshot=DirSnapshot.of(manifest),
+        unreadable=tuple(sorted(unreadable)),
+        unenumerable=scan.unenumerable,
+    )
 
 
 def _has_unreadable(snapshot: DirSnapshot) -> bool:
@@ -155,25 +267,52 @@ def _has_unreadable(snapshot: DirSnapshot) -> bool:
     return any(digest == _UNREADABLE_SENTINEL for _rel, digest in snapshot.entries)
 
 
-def _backup_dir(root: Path) -> "tuple[dict[str, bytes], list[str]]":
-    """Capture the bytes of ``root``'s non-credential files for rollback.
+@dataclass(frozen=True)
+class _DirBackup:
+    """The bytes captured for a rollback, **with the proof the capture was complete**.
 
-    Returns ``(backup, unreadable)``: ``backup`` maps each successfully-read
-    non-credential file to its bytes, and ``unreadable`` lists the files whose read
-    failed. A backup read can fail even when the snapshot read succeeded (a transient
-    error, or a file that turned unreadable between the two passes), and an incomplete
-    backup means a rollback of that dir could never be restored — so the caller MUST
-    refuse the apply before mutating rather than silently proceeding with a partial
-    backup (Redmine #13249 review j#83737 finding 1).
+    ``files`` maps each successfully-read non-credential file to its bytes;
+    ``unreadable`` lists files whose read failed and ``unenumerable`` the subtrees the
+    listing could not cover. A backup read can fail even when the snapshot read
+    succeeded (a transient error, or a file that turned unreadable between the two
+    passes), and an incomplete backup means a rollback of that dir could never be
+    restored — so the caller MUST refuse the apply before mutating rather than silently
+    proceeding with a partial backup (Redmine #13249 review j#83737 finding 1).
     """
-    backup: "dict[str, bytes]" = {}
+
+    files: "dict[str, bytes]" = field(default_factory=dict)
+    unreadable: "tuple[str, ...]" = ()
+    unenumerable: "tuple[str, ...]" = ()
+
+    @property
+    def complete(self) -> bool:
+        return not (self.unreadable or self.unenumerable)
+
+    @property
+    def gap_detail(self) -> str:
+        parts = []
+        if self.unenumerable:
+            parts.append(f"un-enumerable: {', '.join(self.unenumerable[:5])}")
+        if self.unreadable:
+            parts.append(f"unreadable: {', '.join(self.unreadable[:5])}")
+        return "; ".join(parts) or "none"
+
+
+def _backup_dir(root: Path) -> _DirBackup:
+    """Capture the bytes of ``root``'s non-credential files for rollback."""
+    scan = _scan_dir(root)
+    files: "dict[str, bytes]" = {}
     unreadable: "list[str]" = []
-    for rel, abspath in _iter_files(root):
+    for rel, abspath in scan.files:
         try:
-            backup[rel] = abspath.read_bytes()
+            files[rel] = abspath.read_bytes()
         except OSError:
             unreadable.append(rel)
-    return backup, unreadable
+    return _DirBackup(
+        files=files,
+        unreadable=tuple(sorted(unreadable)),
+        unenumerable=scan.unenumerable,
+    )
 
 
 def _rollback_dir(root: Path, backup: "dict[str, bytes]", before: DirSnapshot) -> bool:
@@ -183,7 +322,7 @@ def _rollback_dir(root: Path, backup: "dict[str, bytes]", before: DirSnapshot) -
     then rewrites every backed-up file's original bytes (restoring changed / removed
     files). Credential files are never touched (they are absent from both the backup
     and the snapshot). Best-effort per file: a rollback IO error on one file does not
-    abort the rest — but the restoration is then **re-snapshotted and compared to the
+    abort the rest — but the restoration is then **re-read and compared to the
     pre-apply snapshot**, and the boolean it returns is ``True`` only when the dir's
     non-credential content is byte-identical to how it was found. A swallowed
     remove/restore error (a read-only file, a permission loss) that leaves residue
@@ -191,7 +330,7 @@ def _rollback_dir(root: Path, backup: "dict[str, bytes]", before: DirSnapshot) -
     so a caller can never claim ``home left as found`` on an unproven rollback.
     """
     before_paths = before.paths
-    for rel, abspath in list(_iter_files(root)):
+    for rel, abspath in _scan_dir(root).files:
         if rel not in before_paths:
             try:
                 abspath.unlink()
@@ -204,14 +343,15 @@ def _rollback_dir(root: Path, backup: "dict[str, bytes]", before: DirSnapshot) -
             target.write_bytes(data)
         except OSError:
             pass
-    # Prove the restoration: the post-rollback snapshot must match the pre-apply one
-    # AND carry no unreadable file — a sentinel that only *equals* another sentinel is
-    # not byte proof, so a dir that became unreadable is reported unverified, never
-    # "restored" (Redmine #13249 review j#83674 finding 1).
-    after = _snapshot_dir(root)
-    if _has_unreadable(after) or _has_unreadable(before):
+    # Prove the restoration: the post-rollback read must match the pre-apply snapshot,
+    # cover the whole dir, AND carry no unreadable file — a sentinel that only *equals*
+    # another sentinel is not byte proof, and a subtree that could not be listed is not
+    # evidence of absence, so either gap reports the dir unverified rather than
+    # "restored" (Redmine #13249 reviews j#83674 finding 1 / j#91688 finding 2).
+    after = _read_dir(root)
+    if not after.complete or _has_unreadable(before):
         return False
-    return after == before
+    return after.snapshot == before
 
 
 # --- gating (read-only) ------------------------------------------------------
@@ -227,6 +367,7 @@ def _gate_agent(
     *,
     pinned: bool,
     pin_detail: str,
+    bind_conflict: Optional[str],
     binary: Optional[str],
     binary_detail: str,
 ) -> AgentInstallPlan:
@@ -236,9 +377,14 @@ def _gate_agent(
     binary must resolve for the plan to be ready — an unresolvable binary gates the
     plan closed (``herdr_unresolved``) rather than being demoted to a cosmetic
     ``detail`` while the plan still reports ``ok`` (Redmine #13249 review j#83613
-    finding 2). The security / filesystem gates (pinned posture, dir present, safe
-    path) are reported first so their more actionable reason surfaces; the binary
-    gate is the last precondition before ``ready``.
+    finding 2). The security / filesystem gates (pinned posture, config identity, dir
+    present, safe path) are reported first so their more actionable reason surfaces;
+    the binary gate is the last precondition before ``ready``.
+
+    The posture gate is two questions, not one: *is a config pinned* and *is that the
+    config herdr will read*. ``bind_conflict`` carries the second — an environment that
+    names a different config makes the verified pin unrelated to the run, so the plan
+    is gated ``config_pin_mismatch`` (Redmine #13249 review j#91688 finding 1).
     """
     config_dir = _config_dir(home, agent)
     display = str(config_dir)
@@ -249,6 +395,14 @@ def _gate_agent(
             ready=False,
             reason=REASON_UNPINNED_REMOTE,
             detail=f"herdr posture not pinned: {pin_detail}",
+        )
+    if bind_conflict:
+        return AgentInstallPlan(
+            agent=agent,
+            config_dir=display,
+            ready=False,
+            reason=REASON_CONFIG_PIN_MISMATCH,
+            detail=bind_conflict,
         )
     if not config_dir.exists():
         return AgentInstallPlan(
@@ -323,6 +477,35 @@ def _pin_state(inputs: InstallInputs) -> "tuple[bool, Optional[str], str]":
     return False, None, f"[{verdict.reason}] {verdict.detail}"
 
 
+def _config_binding(inputs: InstallInputs) -> "tuple[Optional[str], Optional[str]]":
+    """Return ``(bound_config, conflict_detail)`` for the config herdr will read.
+
+    ``bound_config`` is the resolved (realpath) config whose posture :func:`_pin_state`
+    verified — the value an apply pins into :data:`HERDR_CONFIG_PATH_ENV` so herdr reads
+    *that* file and not whatever it would have resolved on its own.
+
+    ``conflict_detail`` is set when the caller's environment already names a different
+    config. Silently overriding it would be the wrong kind of fix: two authorities then
+    disagree about which config governs the run and the installer just picks one. The
+    fail-closed answer is to refuse, which is also what makes the decoy visible — an
+    unrelated pinned file offered as ``--herdr-config`` while the environment points
+    herdr at an unpinned one (Redmine #13249 review j#91688 finding 1).
+    """
+    if inputs.herdr_config is None:
+        return None, None  # the posture gate already refuses a missing config
+    bound = os.path.realpath(inputs.herdr_config)
+    env = inputs.env if inputs.env is not None else os.environ
+    declared = env.get(HERDR_CONFIG_PATH_ENV)
+    if declared and os.path.realpath(declared) != bound:
+        return bound, (
+            f"the environment sets {HERDR_CONFIG_PATH_ENV}={declared} but the pin "
+            f"posture was verified against {bound}; herdr would read a config whose "
+            f"posture was never proven, so the install is refused (supply the same "
+            f"config to both, or unset {HERDR_CONFIG_PATH_ENV})"
+        )
+    return bound, None
+
+
 def _herdr_argv(binary: str, agent: str) -> "tuple[str, ...]":
     return (binary, "integration", "install", agent)
 
@@ -331,9 +514,12 @@ def plan_install(inputs: InstallInputs) -> InstallReport:
     """Read-only plan: gate every agent, mutate nothing (byte-invariant)."""
     agents = inputs.agents
     pinned, pin_mode, pin_detail = _pin_state(inputs)
+    # The verified config must also be the config herdr reads — a pin proven on a file
+    # herdr never opens is not a pin (j#91688 finding 1).
+    bound_config, bind_conflict = _config_binding(inputs)
     # The trusted herdr binary is a plan precondition: an unresolvable binary gates
-    # every agent closed (finding 2), so a plan never reports ok for a target no
-    # apply could touch.
+    # every agent closed (j#83613 finding 2), so a plan never reports ok for a target
+    # no apply could touch.
     binary, binary_detail = _resolve_binary(inputs)
     plans: "list[AgentInstallPlan]" = []
     for agent in agents:
@@ -342,6 +528,7 @@ def plan_install(inputs: InstallInputs) -> InstallReport:
             inputs.home,
             pinned=pinned,
             pin_detail=pin_detail,
+            bind_conflict=bind_conflict,
             binary=binary,
             binary_detail=binary_detail,
         )
@@ -354,6 +541,7 @@ def plan_install(inputs: InstallInputs) -> InstallReport:
         plans=tuple(plans),
         detail=detail,
         pin_mode=pin_mode if pinned else None,
+        herdr_config_bound=bound_config if pinned and not bind_conflict else None,
     )
 
 
@@ -375,6 +563,7 @@ def apply_install(inputs: InstallInputs) -> InstallReport:
             detail="apply refused: at least one agent is gated (see plan); nothing "
             "was mutated",
             pin_mode=plan_report.pin_mode,
+            herdr_config_bound=plan_report.herdr_config_bound,
         )
     binary, binary_detail = _resolve_binary(inputs)
     if binary is None:
@@ -385,31 +574,53 @@ def apply_install(inputs: InstallInputs) -> InstallReport:
             detail=f"apply refused: herdr binary unresolved ({binary_detail})",
             pin_mode=plan_report.pin_mode,
         )
-    return _run_apply_transaction(inputs, binary, plan_report.pin_mode)
+    bound_config = plan_report.herdr_config_bound
+    if bound_config is None:
+        # Defence in depth: an ok plan always carries the bound config, so reaching
+        # here would mean the posture gate and the binding disagree — refuse rather
+        # than run herdr against a config whose posture is unproven (j#91688 F1).
+        return InstallReport(
+            applied=False,
+            ok=False,
+            plans=plan_report.plans,
+            detail="apply refused: the verified herdr config could not be bound to "
+            "the run; nothing was mutated",
+            pin_mode=plan_report.pin_mode,
+        )
+    return _run_apply_transaction(inputs, binary, plan_report.pin_mode, bound_config)
 
 
 def _run_apply_transaction(
-    inputs: InstallInputs, binary: str, pin_mode: Optional[str]
+    inputs: InstallInputs, binary: str, pin_mode: Optional[str], bound_config: str
 ) -> InstallReport:
     runner = inputs.runner if inputs.runner is not None else subprocess.run
     env = dict(inputs.env) if inputs.env is not None else dict(os.environ)
     # herdr resolves the agent config dirs from HOME; pin it to the resolved home so
     # a managed apply and the gate look at the same dirs.
     env["HOME"] = str(inputs.home)
+    # …and pin the config too, so the file whose pin posture was verified is exactly
+    # the file herdr reads. Without this the gate proves a property of one file while
+    # herdr obeys another (Redmine #13249 review j#91688 finding 1).
+    env[HERDR_CONFIG_PATH_ENV] = bound_config
     # Preflight, BEFORE any mutation: snapshot + back up every agent's dir. A rollback
     # of a dir is only provable when every non-credential file could be both
-    # snapshotted AND backed up. So the whole transaction is refused with zero mutation
-    # (Redmine #13249 reviews j#83674 / j#83737) when either pass cannot fully read the
-    # dir: the snapshot carries an unreadable sentinel, OR the backup had a read error /
-    # does not cover every snapshot path (a file readable at snapshot time can fail the
-    # separate backup read). Snapshots are captured here (pre-mutation) and reused.
+    # snapshotted AND backed up — and when the *listing itself* was complete, since a
+    # subtree that could not be enumerated drops out of the snapshot and the backup
+    # together and would otherwise satisfy every per-file check (Redmine #13249 reviews
+    # j#83674 / j#83737 / j#91688 finding 2). So the whole transaction is refused with
+    # zero mutation when either pass is incomplete, or when the backup does not cover
+    # every snapshot path (a file readable at snapshot time can fail the separate
+    # backup read). Snapshots are captured here (pre-mutation) and reused.
     staged: "list[tuple[str, Path, DirSnapshot, dict]]" = []
     for agent in inputs.agents:
         config_dir = _config_dir(inputs.home, agent)
-        before = _snapshot_dir(config_dir)
-        backup, backup_unreadable = _backup_dir(config_dir)
-        missing_from_backup = before.paths - set(backup)
-        if _has_unreadable(before) or backup_unreadable or missing_from_backup:
+        before_read = _read_dir(config_dir)
+        backup = _backup_dir(config_dir)
+        missing_from_backup = before_read.snapshot.paths - set(backup.files)
+        if not before_read.complete or not backup.complete or missing_from_backup:
+            gaps = f"snapshot [{before_read.gap_detail}], backup [{backup.gap_detail}]"
+            if missing_from_backup:
+                gaps += f", not backed up: {', '.join(sorted(missing_from_backup)[:5])}"
             return InstallReport(
                 applied=False,
                 ok=False,
@@ -419,31 +630,53 @@ def _run_apply_transaction(
                         config_dir=str(config_dir),
                         ready=False,
                         reason=REASON_CONFIG_DIR_UNREADABLE,
-                        detail=f"config dir {config_dir} holds a non-credential file "
-                        f"that could not be fully snapshotted and backed up; a "
-                        f"rollback could not be proven so nothing was mutated",
+                        detail=f"config dir {config_dir} could not be fully "
+                        f"snapshotted and backed up ({gaps}); a rollback could not be "
+                        f"proven so nothing was mutated",
                     ),
                 ),
                 detail="apply refused: an un-provable rollback would be required; "
                 "nothing was mutated",
                 pin_mode=pin_mode,
+                herdr_config_bound=bound_config,
             )
-        staged.append((agent, config_dir, before, backup))
+        staged.append((agent, config_dir, before_read.snapshot, backup.files))
     applied: "list[tuple[str, Path, dict, DirSnapshot]]" = []
     outcomes: "list[AgentInstallOutcome]" = []
     for agent, config_dir, before, backup in staged:
         ok, detail = _invoke_herdr(runner, binary, agent, env)
+        failure: "Optional[tuple[str, str]]" = None
+        after: Optional[DirSnapshot] = None
         if not ok:
-            # Roll back this agent's partial write (verified), then every prior agent.
+            failure = (REASON_HERDR_ERROR, detail)
+        else:
+            # herdr reporting success is not the same as the apply having succeeded:
+            # the resulting state has to be observable. A post-apply dir that cannot be
+            # fully read back yields neither an exact diff nor a final home state, so
+            # it is rolled back and reported closed rather than ok (Redmine #13249
+            # review j#91688 finding 3).
+            after_read = _read_dir(config_dir)
+            if not after_read.complete:
+                failure = (
+                    REASON_CONFIG_DIR_UNREADABLE,
+                    f"herdr reported success but {config_dir} could not be fully read "
+                    f"back ({after_read.gap_detail}); the resulting state and diff are "
+                    f"unobservable",
+                )
+            else:
+                after = after_read.snapshot
+        if failure is not None:
+            failed_reason, failure_detail = failure
+            # Roll back this agent's write (verified), then every prior agent.
             restored = _rollback_dir(config_dir, backup, before)
             if restored:
-                failed_reason, failed_detail, rolled = REASON_HERDR_ERROR, detail, True
+                failed_detail, rolled = failure_detail, True
             else:
-                failed_reason = REASON_ROLLBACK_INCOMPLETE
                 failed_detail = (
-                    f"herdr install failed ({detail}) AND rollback left residue in "
+                    f"apply failed ({failure_detail}) AND rollback left residue in "
                     f"{config_dir}; home NOT restored"
                 )
+                failed_reason = REASON_ROLLBACK_INCOMPLETE
                 rolled = False
             outcomes.append(
                 AgentInstallOutcome(
@@ -460,13 +693,13 @@ def _run_apply_transaction(
             reverted_desc = ", ".join(reverted) if reverted else "its partial write"
             if all_restored:
                 note = (
-                    f"herdr install failed for {agent}; rolled back {reverted_desc} — "
-                    f"home left as found"
+                    f"apply failed for {agent} ({failure[0]}); rolled back "
+                    f"{reverted_desc} — home left as found"
                 )
             else:
                 note = (
-                    f"herdr install failed for {agent}; rollback INCOMPLETE — residue "
-                    f"remains, home NOT fully restored (verify the config dirs)"
+                    f"apply failed for {agent} ({failure[0]}); rollback INCOMPLETE — "
+                    f"residue remains, home NOT fully restored (verify the config dirs)"
                 )
             return InstallReport(
                 applied=True,
@@ -474,8 +707,8 @@ def _run_apply_transaction(
                 outcomes=tuple(outcomes),
                 detail=note,
                 pin_mode=pin_mode,
+                herdr_config_bound=bound_config,
             )
-        after = _snapshot_dir(config_dir)
         applied.append((agent, config_dir, backup, before))
         outcomes.append(
             AgentInstallOutcome(
@@ -491,6 +724,7 @@ def _run_apply_transaction(
         outcomes=tuple(outcomes),
         detail="hook installed for every requested agent",
         pin_mode=pin_mode,
+        herdr_config_bound=bound_config,
     )
 
 
@@ -588,6 +822,7 @@ def report_payload(report: InstallReport) -> dict:
         "applied": report.applied,
         "ok": report.ok,
         "pin_mode": report.pin_mode,
+        "herdr_config_bound": report.herdr_config_bound,
         "detail": report.detail,
         "plans": [
             {
@@ -622,6 +857,11 @@ def format_report_text(report: InstallReport) -> str:
     lines = [f"herdr integration-install {head}: {status}"]
     if report.pin_mode:
         lines.append(f"  herdr posture: pinned ({report.pin_mode})")
+    if report.herdr_config_bound:
+        lines.append(
+            f"  herdr config: {report.herdr_config_bound} "
+            f"(bound via {HERDR_CONFIG_PATH_ENV})"
+        )
     if report.detail:
         lines.append(f"  {report.detail}")
     for p in report.plans:
@@ -655,6 +895,7 @@ def run_install(inputs: InstallInputs, *, apply: bool) -> InstallReport:
 
 __all__ = (
     "COMMAND_TIMEOUT_SECONDS",
+    "HERDR_CONFIG_PATH_ENV",
     "InstallInputs",
     "apply_install",
     "format_report_text",

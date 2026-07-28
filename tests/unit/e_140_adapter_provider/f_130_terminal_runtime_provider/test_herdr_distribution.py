@@ -42,6 +42,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_CODEX,
     REASON_CONFIG_DIR_MISSING,
     REASON_CONFIG_DIR_UNREADABLE,
+    REASON_CONFIG_PIN_MISMATCH,
     REASON_HERDR_ERROR,
     REASON_HERDR_UNRESOLVED,
     REASON_PARTIAL_FAILURE,
@@ -56,6 +57,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     normalize_agents,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_integration_install_ops import (  # noqa: E402
+    HERDR_CONFIG_PATH_ENV,
     InstallInputs,
     apply_install,
     plan_install,
@@ -278,9 +280,11 @@ class FakeHerdrIntegration:
     def __init__(self, *, fail_for: "frozenset[str]" = frozenset()):
         self.fail_for = fail_for
         self.calls: "list[list[str]]" = []
+        self.envs: "list[dict[str, str]]" = []
 
     def run(self, argv, capture_output=None, text=None, timeout=None, env=None, **_):
         self.calls.append(list(argv))
+        self.envs.append(dict(env or {}))
         # argv == [binary, "integration", "install", <agent>]
         agent = argv[3]
         home = Path((env or {}).get("HOME", ""))
@@ -577,6 +581,127 @@ class InstallOpsTest(unittest.TestCase):
         self.assertEqual(fake.calls, [])  # herdr never invoked → zero mutation
         self.assertEqual(report.plans[0].reason, REASON_CONFIG_DIR_UNREADABLE)
         self.assertEqual(settings.read_text(encoding="utf-8"), "orig")
+
+    def test_apply_binds_the_verified_config_into_the_herdr_env(self) -> None:
+        # Review j#91688 finding 1: the pin posture is proven against a specific file,
+        # so the apply must make THAT file the one herdr reads — otherwise the gate
+        # verifies one config while herdr obeys another.
+        fake = FakeHerdrIntegration()
+        report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertTrue(report.ok)
+        expected = os.path.realpath(self.herdr_config)
+        self.assertEqual(fake.envs[0][HERDR_CONFIG_PATH_ENV], expected)
+        self.assertEqual(report.herdr_config_bound, expected)
+
+    def test_plan_gated_when_env_names_a_different_config(self) -> None:
+        # Review j#91688 finding 1: an unrelated pinned file must not be usable as a
+        # decoy while the environment points herdr at an unpinned config.
+        decoy_unpinned = self.tmp / "decoy.toml"
+        decoy_unpinned.write_text(
+            "[update]\nversion_check = true\nmanifest_check = true\n", encoding="utf-8"
+        )
+        env = dict(self.env)
+        env[HERDR_CONFIG_PATH_ENV] = str(decoy_unpinned)
+        inputs = InstallInputs(
+            home=self.home,
+            agents=(AGENT_CLAUDE,),
+            herdr_config=self.herdr_config,  # pinned, but NOT what herdr would read
+            env=env,
+        )
+        plan = plan_install(inputs)
+        self.assertFalse(plan.ok)
+        self.assertEqual(plan.plans[0].reason, REASON_CONFIG_PIN_MISMATCH)
+        self.assertIsNone(plan.herdr_config_bound)
+
+    def test_apply_refused_when_env_names_a_different_config(self) -> None:
+        decoy_unpinned = self.tmp / "decoy.toml"
+        decoy_unpinned.write_text(
+            "[update]\nversion_check = true\nmanifest_check = true\n", encoding="utf-8"
+        )
+        env = dict(self.env)
+        env[HERDR_CONFIG_PATH_ENV] = str(decoy_unpinned)
+        before = self._dir_state()
+        fake = FakeHerdrIntegration()
+        report = apply_install(
+            InstallInputs(
+                home=self.home,
+                agents=(AGENT_CLAUDE,),
+                herdr_config=self.herdr_config,
+                env=env,
+                runner=fake.run,
+            )
+        )
+        self.assertFalse(report.ok)
+        self.assertFalse(report.applied)
+        self.assertEqual(fake.calls, [])  # herdr never invoked → zero mutation
+        self.assertEqual(before, self._dir_state())
+
+    def test_env_naming_the_same_config_by_another_path_is_not_a_conflict(self) -> None:
+        # A symlink to the very same file is the same effective config; the gate must
+        # compare identity (realpath), not the literal string, or it would refuse a
+        # legitimate operator setup.
+        link = self.tmp / "herdr-link.toml"
+        os.symlink(self.herdr_config, link)
+        env = dict(self.env)
+        env[HERDR_CONFIG_PATH_ENV] = str(link)
+        fake = FakeHerdrIntegration()
+        report = apply_install(
+            InstallInputs(
+                home=self.home,
+                agents=(AGENT_CLAUDE,),
+                herdr_config=self.herdr_config,
+                env=env,
+                runner=fake.run,
+            )
+        )
+        self.assertTrue(report.ok)
+        self.assertEqual(
+            fake.envs[0][HERDR_CONFIG_PATH_ENV], os.path.realpath(self.herdr_config)
+        )
+
+    def test_apply_refused_when_a_subdir_cannot_be_enumerated(self) -> None:
+        # Review j#91688 finding 2: a subtree whose listing fails drops out of the
+        # snapshot AND the backup together, so every per-file completeness check
+        # agrees while a real file went unseen. The listing failure itself must gate.
+        self.addCleanup(self._restore_perms)
+        sub = self.home / ".claude" / "sub"
+        sub.mkdir()
+        (sub / "settings.json").write_text("orig", encoding="utf-8")
+        sub.chmod(0o000)  # scandir(sub) fails → os.walk would drop it silently
+        fake = FakeHerdrIntegration()
+        report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertFalse(report.applied)
+        self.assertEqual(fake.calls, [])  # herdr never invoked → zero mutation
+        self.assertEqual(report.plans[0].reason, REASON_CONFIG_DIR_UNREADABLE)
+        # the file inside the un-listable subtree is untouched
+        sub.chmod(0o700)
+        self.assertEqual((sub / "settings.json").read_text(encoding="utf-8"), "orig")
+
+    def test_apply_not_ok_when_post_apply_dir_cannot_be_read_back(self) -> None:
+        # Review j#91688 finding 3: herdr exiting 0 is not the apply having succeeded.
+        # If the post-apply dir cannot be fully read, neither the exact diff nor the
+        # final home state is observable, so the outcome is rolled back and closed.
+        fake = FakeHerdrIntegration()
+        orig_read = Path.read_bytes
+
+        def flaky_read(path_self):
+            # the hook only exists after herdr ran → its first read is the post-snapshot
+            if str(path_self).endswith("mozyo-session.sh"):
+                raise OSError("injected post-snapshot read failure")
+            return orig_read(path_self)
+
+        before = self._dir_state()
+        with mock.patch.object(Path, "read_bytes", flaky_read):
+            report = apply_install(self._inputs(agents=(AGENT_CLAUDE,), runner=fake.run))
+        self.assertFalse(report.ok)
+        self.assertEqual(len(fake.calls), 1)  # herdr really did run and report success
+        outcome = report.outcomes[0]
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.reason, REASON_CONFIG_DIR_UNREADABLE)
+        self.assertTrue(outcome.rolled_back)
+        # …and the unobservable write was reverted: home is as it was found
+        self.assertEqual(before, self._dir_state())
 
     def _restore_perms(self) -> None:
         import stat as _stat
