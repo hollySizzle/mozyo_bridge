@@ -1,0 +1,480 @@
+"""The smoke's dispatch allowlist is pinned to a derivation, not to a memory (#14658).
+
+#14185 R3 measured what hand enumeration costs (evidence j#91992).  The production
+session-start path runs a launcher preflight probe — ``<launcher> herdr agent-attest
+--help`` — whose ``(group, subcommand)`` pair was never in
+:data:`CLIENT_CALL_SUBCOMMANDS`, so the endpoint gate refused it *before dispatch*,
+twice, and the live smoke never reached acceptance 2/3.  The same hand pass had put five
+pairs into the set that no call site can emit.  Three of those five occur
+elsewhere in the tree as JSON key / alias tuples rather than as commands:
+``("agent","pane")`` is ``herdr_state._GET_OBJECT_KEYS`` and ``("pane","location")`` is
+``support.herdr_fake.LOCATOR_ALIASES`` exactly, while ``("agent","target")`` is an
+adjacent pair inside ``herdr_state._HANDLE_KEYS`` — which is what a text search for a
+tuple, rather than a walk of the call graph, will find.  The other two are real herdr
+commands that this runner simply never carries: ``agent get`` is issued by
+``HerdrCliAgentStateReader`` (retire / turn-start / hibernate paths), and
+``wait agent-status`` goes out through ``popen``, not through the gated runner at all.
+
+So the fix is not the missing literal.  It is that the set now has an external authority:
+``support.herdr_dispatch_derivation`` follows the gated runner through the first-party
+source and reports every site that can dispatch through it.  These tests pin the set
+against that derivation in **both** directions, and every fail-closed property the
+derivation relies on is probed rather than assumed:
+
+* an unreadable site must be *reported*, never dropped — otherwise "no findings" and
+  "could not look" become the same answer;
+* the derivation must actually re-read the source — the mutation probes add a dispatch
+  site to a copy of the tree and require the new pair to appear, so a walk that had
+  quietly stopped resolving anything could not stay green.
+
+The live-path reproduction at the bottom drives the real production preflight through the
+real gate.  With the pre-#14658 allowlist it raises exactly the refusal #14185 hit; that
+contrast is what makes it a regression test rather than a smoke test.
+"""
+
+from __future__ import annotations
+
+import functools
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[4]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+if str(ROOT / "tests") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tests"))
+
+from support.herdr_dispatch_derivation import (  # noqa: E402
+    derive_dispatch_surface,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E402,E501
+    disposable_herdr_instance as live_module,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_herdr_instance import (  # noqa: E402,E501
+    CLIENT_CALL_SUBCOMMANDS,
+    DisposableHerdrInstance,
+    LAUNCHER_PREFLIGHT_SUBCOMMANDS,
+    MINTER_ONLY_SUBCOMMANDS,
+    REFUSAL_COMMAND_NOT_ALLOWLISTED,
+    SmokeEndpointEscapeError,
+)
+
+#: The pair the #14185 R3 live run was refused on, and the sibling probe that was already
+#: admitted.  Named here so a change to either one has to come through this file.
+ATTEST_PROBE_PAIR = ("herdr", "agent-attest")
+CONFIG_PARSE_PROBE_PAIR = ("config", "check-parse")
+
+#: Herdr controls that must never become dispatchable.  ``session stop``/``session
+#: delete`` name ``default`` as a target in their own help, so on a shared server they
+#: reach the operator's session; the rest reconfigure or replace the server.
+FORBIDDEN_CONTROLS = (
+    ("session", "stop"),
+    ("session", "delete"),
+    ("session", "attach"),
+    ("server", "reload-config"),
+    ("config", "reset-keys"),
+    ("channel", "set"),
+    ("update", "--handoff"),
+    ("pane", "send-text"),
+    ("pane", "send-keys"),
+)
+
+#: Where the gated runner is allowed to leave its owner.  This is deliberately a small
+#: hand-written boundary: it is not the command surface (that is derived), it is the
+#: **seed** the derivation starts from, so a new consumer must be looked at by a person
+#: before the derivation silently starts covering — or missing — it.
+EXPECTED_SEED_FLOWS = {
+    ("SharedSpaceSmokeHarness", "runner"),
+    ("_run_forked_projects", "gate_runner"),
+    ("snapshot", "#0"),
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _surface():
+    """The derivation over the live tree.
+
+    Cached because it parses the whole first-party package (~3 s) and is pure
+    read-only analysis: every test in this file asks the same question of the same
+    unchanged source.  The mutation probes deliberately call
+    :func:`derive_dispatch_surface` directly on their own copied tree, so they never
+    read through this cache.
+    """
+    return derive_dispatch_surface()
+
+
+class DerivationReadabilityTests(unittest.TestCase):
+    """The derivation may not report a surface it could not fully read."""
+
+    def test_no_dispatch_site_is_left_unresolved(self) -> None:
+        surface = _surface()
+        unresolved = [
+            f"{site.anchor}: {site.unresolved_reason}"
+            for site in surface.unresolved_sites
+        ]
+        self.assertEqual(
+            unresolved,
+            [],
+            "a dispatch site whose argv could not be resolved is an unknown, not an "
+            "absence: the allowlist below cannot be called complete while one exists",
+        )
+
+    def test_no_runner_flow_is_left_unfollowed(self) -> None:
+        surface = _surface()
+        self.assertEqual(
+            list(surface.unresolved_flows),
+            [],
+            "the gated runner reaches a callee the walk cannot follow, so there may be "
+            "dispatch sites beyond the ones reported",
+        )
+
+    def test_the_surface_is_not_empty(self) -> None:
+        """Baseline: a walk that resolved nothing would satisfy every ⊆ assertion."""
+        surface = _surface()
+        self.assertGreaterEqual(len(surface.sites), 10, surface.sites)
+        self.assertGreaterEqual(len(surface.pairs), 10, sorted(surface.pairs))
+
+
+class AllowlistMatchesTheDerivationTests(unittest.TestCase):
+    """Both directions.  Either one alone is how #14658 happened."""
+
+    def test_every_dispatchable_pair_is_admitted(self) -> None:
+        """The direction #14185 R3 failed on: a real call site the gate refuses."""
+        surface = _surface()
+        admitted = set(CLIENT_CALL_SUBCOMMANDS) | set(MINTER_ONLY_SUBCOMMANDS)
+        missing = sorted(surface.pairs - admitted)
+        detail = {
+            pair: [site.anchor for site in surface.sites_for(pair)] for pair in missing
+        }
+        self.assertEqual(
+            missing,
+            [],
+            f"production can dispatch these pairs and the gate would refuse them, "
+            f"with zero dispatch, at the call sites shown: {detail}",
+        )
+
+    def test_every_admitted_pair_has_a_call_site(self) -> None:
+        """The other direction: privilege granted to a command nobody issues."""
+        surface = _surface()
+        admitted = set(CLIENT_CALL_SUBCOMMANDS) | set(MINTER_ONLY_SUBCOMMANDS)
+        undeliverable = sorted(admitted - surface.pairs)
+        self.assertEqual(
+            undeliverable,
+            [],
+            "these pairs are allowlisted but no call site reachable from the gated "
+            "runner emits them, so they are privilege with no purpose — remove them, or "
+            "add the call site that justifies them",
+        )
+
+    def test_the_launcher_preflight_probe_is_on_the_surface(self) -> None:
+        """The exact #14185 R3 regression, anchored to the site that emits it."""
+        surface = _surface()
+        anchors = [site.anchor for site in surface.sites_for(ATTEST_PROBE_PAIR)]
+        self.assertTrue(
+            anchors,
+            f"{ATTEST_PROBE_PAIR} is no longer derived from any call site; if the "
+            f"production launcher preflight really was removed, remove it from "
+            f"LAUNCHER_PREFLIGHT_SUBCOMMANDS in the same change",
+        )
+        self.assertTrue(
+            any("preflight_attest_launcher_capability" in anchor for anchor in anchors),
+            f"expected the launcher capability preflight to be the emitter: {anchors}",
+        )
+        self.assertIn(ATTEST_PROBE_PAIR, CLIENT_CALL_SUBCOMMANDS)
+
+    def test_the_two_launcher_probes_are_named_apart_from_the_server_calls(self) -> None:
+        """``argv[0]`` is the launcher for these two, so the record must say so."""
+        self.assertEqual(
+            set(LAUNCHER_PREFLIGHT_SUBCOMMANDS),
+            {ATTEST_PROBE_PAIR, CONFIG_PARSE_PROBE_PAIR},
+        )
+        self.assertEqual(
+            set(live_module.HERDR_SERVER_CLIENT_SUBCOMMANDS)
+            & set(LAUNCHER_PREFLIGHT_SUBCOMMANDS),
+            set(),
+            "a pair cannot be both a Herdr server call and a launcher probe",
+        )
+
+    def test_no_lifecycle_control_is_dispatchable_or_admitted(self) -> None:
+        """Negative control, on the derivation as well as on the allowlist."""
+        surface = _surface()
+        admitted = set(CLIENT_CALL_SUBCOMMANDS) | set(MINTER_ONLY_SUBCOMMANDS)
+        for pair in FORBIDDEN_CONTROLS:
+            self.assertNotIn(pair, surface.pairs, f"{pair} is reachable from the smoke")
+            self.assertNotIn(pair, admitted, f"{pair} is allowlisted")
+
+    def test_the_minters_extra_authority_is_still_only_its_own_stop(self) -> None:
+        self.assertEqual(set(MINTER_ONLY_SUBCOMMANDS), {("server", "stop")})
+        self.assertNotIn(("server", "stop"), CLIENT_CALL_SUBCOMMANDS)
+
+
+class SeedFlowTests(unittest.TestCase):
+    """Where the gated runner leaves its owner is a reviewed boundary, not a discovery."""
+
+    def test_the_seed_flows_are_the_reviewed_ones(self) -> None:
+        surface = _surface()
+        observed = {(flow.callee, flow.parameter) for flow in surface.seed_flows}
+        self.assertEqual(
+            observed,
+            EXPECTED_SEED_FLOWS,
+            "the disposable smoke hands its gated runner somewhere new (or no longer "
+            "hands it somewhere it used to). The derivation starts from this boundary, "
+            "so a change here has to be read by a person before the derived command "
+            "surface can be trusted again",
+        )
+
+
+class DerivationLivenessTests(unittest.TestCase):
+    """The oracle must be falsifiable: prove it re-reads the source it is given.
+
+    Every assertion above is of the form "the derived set matches the allowlist".  A
+    walk that had stopped resolving anything would satisfy the ⊆ direction trivially, and
+    a walk that returned a frozen constant would satisfy both.  These probes mutate a
+    *copy* of the tree — never the live source — and require the mutation to show up.
+    """
+
+    def _mutated_tree(self, addition: str) -> Path:
+        tmp = Path(tempfile.mkdtemp(prefix="mozyo-derivation-probe-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        destination = tmp / "mozyo_bridge"
+        shutil.copytree(
+            ROOT / "src" / "mozyo_bridge",
+            destination,
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+        seed = (
+            destination
+            / "e_140_adapter_provider"
+            / "f_130_terminal_runtime_provider"
+            / "application"
+            / "disposable_herdr_instance.py"
+        )
+        source = seed.read_text(encoding="utf-8")
+        marker = "    def _binding_env(self) -> dict[str, str]:"
+        self.assertIn(marker, source, "the probe's injection point moved")
+        seed.write_text(source.replace(marker, addition + marker, 1), encoding="utf-8")
+        return tmp
+
+    def test_a_new_dispatch_site_appears_in_the_derivation(self) -> None:
+        baseline = _surface()
+        self.assertNotIn(("probe", "liveness"), baseline.pairs)
+        tree = self._mutated_tree(
+            "    def _probe_liveness(self):\n"
+            '        return self.runner([self.binary, "probe", "liveness"])\n\n'
+        )
+        mutated = derive_dispatch_surface(tree)
+        self.assertIn(
+            ("probe", "liveness"),
+            mutated.pairs,
+            "the derivation did not notice a dispatch site added to the seed class, so "
+            "it cannot be relied on to notice one added to production",
+        )
+        self.assertEqual(mutated.unresolved_sites, ())
+
+    def test_an_unresolvable_argv_is_reported_rather_than_dropped(self) -> None:
+        """The fail-closed property the ⊆ assertions rest on."""
+        tree = self._mutated_tree(
+            "    def _probe_unreadable(self, chosen):\n"
+            "        return self.runner(chosen)\n\n"
+        )
+        mutated = derive_dispatch_surface(tree)
+        # Anchored to the injected site: a bare "something was unresolved" would also
+        # pass if an unrelated site had gone unreadable, which is the opposite of what
+        # this probe claims to show.
+        reported = [
+            site
+            for site in mutated.unresolved_sites
+            if "_probe_unreadable" in site.function
+        ]
+        self.assertEqual(
+            len(reported),
+            1,
+            f"a dispatch whose argv cannot be resolved was silently omitted; an "
+            f"unreadable site must never read as no site. All unresolved: "
+            f"{[s.anchor for s in mutated.unresolved_sites]}",
+        )
+        self.assertTrue(reported[0].unresolved_reason)
+        self.assertIsNone(reported[0].pair)
+
+    def test_a_runner_escaping_into_a_container_is_reported(self) -> None:
+        """The other half of fail-closed: taint the walk cannot follow must be named.
+
+        A dispatch site the walk resolves wrongly is loud; a runner that leaves through
+        a container or a return value is silent, and silence is indistinguishable from
+        "there was nothing there".  Each shape below is injected on its own so one of
+        them cannot cover for the others.
+        """
+        shapes = {
+            "List": "    def _stash(self):\n        return [self.runner]\n\n",
+            "Assign": (
+                "    def _stash(self):\n        d = {}\n"
+                "        d['r'] = self.runner\n        return d\n\n"
+            ),
+            "Return": "    def _stash(self):\n        return self.runner\n\n",
+        }
+        for expected, injection in shapes.items():
+            with self.subTest(shape=expected):
+                tree = self._mutated_tree(injection)
+                flows = [
+                    flow
+                    for flow in derive_dispatch_surface(tree).unresolved_flows
+                    if "_stash" in flow
+                ]
+                self.assertTrue(
+                    flows,
+                    f"a runner leaving through {expected} was not reported; the walk "
+                    f"would lose it and still call the surface complete",
+                )
+                self.assertIn(expected, flows[0])
+
+    def test_the_probe_does_not_touch_the_live_source(self) -> None:
+        """Probe hygiene: mutating the copy must leave the real tree byte-identical.
+
+        Asserted on the bytes of the live seed module, before and after, because that is
+        the actual claim.  Checking that the injected pair is absent from the live
+        derivation would pass even if the probe HAD written to ``src`` — it would only
+        catch the one mutation that happens to emit that pair.
+        """
+        live = (
+            ROOT
+            / "src"
+            / "mozyo_bridge"
+            / "e_140_adapter_provider"
+            / "f_130_terminal_runtime_provider"
+            / "application"
+            / "disposable_herdr_instance.py"
+        )
+        before = live.read_bytes()
+        self._mutated_tree(
+            '    def _probe_hygiene(self):\n'
+            '        return self.runner([self.binary, "probe", "hygiene"])\n\n'
+        )
+        self.assertEqual(live.read_bytes(), before, "the probe wrote to the live source")
+        self.assertNotIn(("probe", "hygiene"), _surface().pairs)
+
+
+def _executable(path: Path) -> Path:
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+class _Process:
+    """The owned server child handle: alive until the lifecycle stops it."""
+
+    def __init__(self) -> None:
+        self.pid = os.getpid()
+        self._returncode = None
+
+    def poll(self):
+        return self._returncode
+
+    def wait(self, timeout=None):
+        self._returncode = 0
+        return 0
+
+    def terminate(self) -> None:
+        self._returncode = 0
+
+    def kill(self) -> None:
+        self._returncode = -9
+
+
+class LauncherPreflightReachesTheRunnerTests(unittest.TestCase):
+    """Drive the REAL production preflight through the REAL gate (#14185 R3 repro).
+
+    No Herdr, no launcher process: the inner runner is a fake, and the "launcher" is an
+    executable stub that only has to exist for ``resolve_attest_launcher``.  What is real
+    is the call site — ``preflight_attest_launcher_capability`` builds the probe argv the
+    way production does and hands it to the gate.
+    """
+
+    def _instance(self, tmp: Path, dispatched: list) -> DisposableHerdrInstance:
+        instance = DisposableHerdrInstance(
+            binary="/bin/true",
+            root=tmp / "instance",
+            base_env={"HOME": str(tmp / "operator")},
+            runner=lambda argv, **kwargs: dispatched.append(list(argv))
+            or subprocess.CompletedProcess(list(argv), 0, "[]", ""),
+            popen_factory=lambda argv, **kwargs: _Process(),
+            sleeper=lambda _seconds: None,
+            ambient_env={},
+        )
+        instance.start()
+        self.addCleanup(instance.shutdown)
+        dispatched.clear()
+        return instance
+
+    def _run_preflight(self, instance, launcher: Path, tmp: Path):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            preflight_attest_launcher_capability,
+        )
+
+        return preflight_attest_launcher_capability(
+            str(launcher),
+            instance.runner,
+            5.0,
+            {"PATH": "/usr/bin:/bin"},
+            repo_root=tmp,
+        )
+
+    def test_the_probe_reaches_the_inner_runner(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            HerdrLauncherIncompatibleError,
+        )
+
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            instance = self._instance(tmp, dispatched)
+            launcher = _executable(tmp / "fake-mozyo-bridge")
+            # The capability verdict is decided elsewhere and this stub launcher cannot
+            # satisfy it, so the preflight must end in the CAPABILITY verdict — not in a
+            # gate refusal.  Asserting the specific type is the point: a bare
+            # ``assertRaises(Exception)`` would also pass on the refusal this test exists
+            # to rule out.
+            with self.assertRaises(HerdrLauncherIncompatibleError):
+                self._run_preflight(instance, launcher, tmp)
+            self.assertEqual(
+                [argv[1:3] for argv in dispatched],
+                [["herdr", "agent-attest"]],
+                "the production launcher preflight probe was not dispatched",
+            )
+            self.assertEqual(instance.runner.escape_refusals, 0)
+            self.assertEqual(instance.runner.operator_endpoint_requests, 0)
+
+    def test_the_pre_14658_allowlist_reproduces_the_live_refusal(self) -> None:
+        """Mutation probe: without the pair, the same call is refused with 0 dispatch."""
+        dispatched: list = []
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            instance = self._instance(tmp, dispatched)
+            launcher = _executable(tmp / "fake-mozyo-bridge")
+            without_the_pair = frozenset(
+                set(CLIENT_CALL_SUBCOMMANDS) - {ATTEST_PROBE_PAIR}
+            )
+            with mock.patch.object(
+                live_module, "CLIENT_CALL_SUBCOMMANDS", without_the_pair
+            ):
+                with self.assertRaises(SmokeEndpointEscapeError) as caught:
+                    self._run_preflight(instance, launcher, tmp)
+            self.assertEqual(
+                caught.exception.reason,
+                REFUSAL_COMMAND_NOT_ALLOWLISTED,
+                "this is the refusal #14185 R3 recorded in j#91992",
+            )
+            self.assertEqual(
+                dispatched, [], "a refused probe must make zero external requests"
+            )
+            self.assertEqual(instance.runner.escape_refusals, 1)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

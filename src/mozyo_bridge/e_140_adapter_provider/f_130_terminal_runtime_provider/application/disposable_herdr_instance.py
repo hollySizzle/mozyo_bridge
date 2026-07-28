@@ -60,6 +60,13 @@ Both are scoped by an allowlist, not a denylist (review j#91604 F1).  Only
 ``session stop``/``session delete`` (whose help names ``default`` as a target),
 ``server reload-config``, ``update`` — is refused because it was never named.
 
+That allowlist is **derived from the source, not enumerated by hand** (Redmine #14658).
+Hand enumeration was measured to fail in both directions at once: the #14185 R3 live run
+was refused because the production launcher preflight probe was missing from the set
+(j#91992), while five pairs that no call site can emit were widening it.  The derivation
+lives in ``tests/support/herdr_dispatch_derivation.py`` and is pinned bidirectionally by
+``test_disposable_smoke_command_surface.py``.
+
 The guarantee is scoped to ``(group, subcommand)`` **pairs** and claims nothing more
 (review j#91638): matching happens on those two argv tokens, so a brand-new command
 pair is denied by default, while an option added to an *already allowlisted* pair is
@@ -136,9 +143,7 @@ REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER = "cleanup_authority_not_owner"
 #: after this code was written — is refused rather than silently permitted.
 REFUSAL_COMMAND_NOT_ALLOWLISTED = "command_not_allowlisted"
 
-#: The closed set of endpoint-bound client calls the shared-space smoke needs, as
-#: ``(group, subcommand)`` pairs measured from what the harness and the production
-#: session-start path actually issue.
+#: Calls addressed to the **owned Herdr server**, as ``(group, subcommand)`` pairs.
 #:
 #: This is an **allowlist, and that is the point** (review j#91604 F1).  The previous
 #: version denylisted a single control (``server stop``) and was therefore fail-open by
@@ -149,24 +154,67 @@ REFUSAL_COMMAND_NOT_ALLOWLISTED = "command_not_allowlisted"
 #: what the smoke *needs* fails closed on the whole rest of the CLI, today and after the
 #: next Herdr release, and a miss surfaces as a precise
 #: :data:`REFUSAL_COMMAND_NOT_ALLOWLISTED` rather than as an unnoticed capability.
-CLIENT_CALL_SUBCOMMANDS: frozenset = frozenset(
+HERDR_SERVER_CLIENT_SUBCOMMANDS: frozenset = frozenset(
     {
         ("workspace", "list"),
         ("workspace", "create"),
+        ("tab", "create"),
         ("agent", "start"),
         ("agent", "list"),
-        ("agent", "get"),
         ("agent", "read"),
-        ("agent", "pane"),
-        ("agent", "target"),
         ("pane", "close"),
         ("pane", "layout"),
         ("pane", "resize"),
-        ("pane", "location"),
-        ("tab", "create"),
-        ("wait", "agent-status"),
+    }
+)
+
+#: Calls addressed to the **mozyo-bridge launcher**, not to Herdr at all (Redmine
+#: #14658).  Both are actuation-free preflight probes the production session-start path
+#: runs before its first herdr write: ``<launcher> herdr agent-attest --help`` asks
+#: whether the launcher still carries the #13637 wrapper subcommand, and ``<launcher>
+#: config check-parse --file <path>`` makes it parse a config with its own grammar.
+#:
+#: They are named apart from the server calls because they share only the *shape* of a
+#: herdr command.  ``argv[0]`` is the launcher, so ``("herdr", "agent-attest")`` is a
+#: mozyo-bridge command group and not a Herdr one — folding it in with the server calls
+#: would read as though Herdr had grown a ``herdr`` group.  The gate itself matches on
+#: the pair alone, exactly as before; the split is what the *record* says, not a second
+#: matching rule.
+LAUNCHER_PREFLIGHT_SUBCOMMANDS: frozenset = frozenset(
+    {
+        ("herdr", "agent-attest"),
         ("config", "check-parse"),
     }
+)
+
+#: The closed set of calls the shared-space smoke may dispatch at all.
+#:
+#: **Derived, not enumerated** (Redmine #14658).  The first version of this set was
+#: assembled by reading the code, and the #14185 R3 live run measured what that costs
+#: (evidence j#91992): the launcher preflight probe above was missing, so production
+#: ``prepare_session`` was refused with :data:`REFUSAL_COMMAND_NOT_ALLOWLISTED` twice
+#: before a single workspace existed — while five pairs that no call site can emit
+#: (``agent get`` / ``agent pane`` / ``agent target`` / ``pane location`` /
+#: ``wait agent-status``) sat in the set widening it.  Three of those five are not
+#: commands at all — the same sequence occurs elsewhere in the tree as a JSON key / alias
+#: tuple, which is what a text search for a tuple finds and a walk of the call graph does
+#: not.  A hand pass that misses a live call and admits five dead ones is not a method, so
+#: adding the missing literal would have fixed the run and left the method in place.
+#:
+#: The authority is now ``tests/support/herdr_dispatch_derivation.py``: it follows the
+#: gated runner from this class through the first-party source and reports every call
+#: site that can dispatch through it.  ``test_disposable_smoke_command_surface.py`` pins
+#: this set against that derivation in **both** directions — a call site whose pair is
+#: unlisted fails, and a listed pair no call site emits fails — so neither kind of drift
+#: can reach a live run again.
+#:
+#: What that does NOT claim (unchanged from review j#91638): the guarantee is scoped to
+#: ``(group, subcommand)`` pairs.  An option added to an already-listed pair is not
+#: something this check closes, so an allowlisted pair that is an exec trampoline
+#: (``agent start``, and now ``herdr agent-attest``) is bounded by the ownership and
+#: endpoint fences above it, not by this set.
+CLIENT_CALL_SUBCOMMANDS: frozenset = (
+    HERDR_SERVER_CLIENT_SUBCOMMANDS | LAUNCHER_PREFLIGHT_SUBCOMMANDS
 )
 
 #: Closed vocabulary of reasons the owned path may be withheld.  Evidence carries this
@@ -878,6 +926,8 @@ class DisposableHerdrInstance:
 
 __all__ = (
     "CLIENT_CALL_SUBCOMMANDS",
+    "HERDR_SERVER_CLIENT_SUBCOMMANDS",
+    "LAUNCHER_PREFLIGHT_SUBCOMMANDS",
     "ROOT_OBSERVATION_ABSENT",
     "ROOT_OBSERVATION_PRESENT",
     "ROOT_OBSERVATION_UNKNOWN",

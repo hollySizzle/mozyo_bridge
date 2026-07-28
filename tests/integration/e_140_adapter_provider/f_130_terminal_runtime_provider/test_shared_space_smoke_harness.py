@@ -425,5 +425,52 @@ class PreflightSurfaceTests(unittest.TestCase):
                     )
 
 
+class DerivedCommandSurfaceCorroborationTests(unittest.TestCase):
+    """What the smoke actually dispatches, measured by running it (Redmine #14658).
+
+    ``support.herdr_dispatch_derivation`` derives the dispatchable command surface
+    *statically*, and ``CLIENT_CALL_SUBCOMMANDS`` is pinned to that derivation.  A static
+    walk can only under-approximate by losing a flow, and a lost flow looks like no flow —
+    so this test measures the same question a second way, by executing the production path
+    and reading back every pair the fake was actually asked for.
+
+    Scope, stated rather than implied: this fixture resolves no launcher (``PATH`` holds
+    only the stub binaries), so the run is the unwrapped #13637 fallback and does NOT
+    exercise the two launcher preflight probes — which is precisely why the #14185 R3
+    refusal was invisible to the fake-driven suite in the first place.  Those two are
+    covered at their own call site in
+    ``tests/unit/.../test_disposable_smoke_command_surface.py``.
+    """
+
+    def test_every_executed_pair_is_derived_and_admitted(self) -> None:
+        from support.herdr_dispatch_derivation import derive_dispatch_surface
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_herdr_instance import (  # noqa: E501
+            CLIENT_CALL_SUBCOMMANDS,
+            MINTER_ONLY_SUBCOMMANDS,
+        )
+
+        with _HarnessFixture() as fx:
+            harness = fx.harness()
+            harness.smoke(fx.specs(2))
+            executed = {
+                tuple(call[:2]) for call in fx.fake.calls if len(call) >= 2
+            }
+
+        self.assertTrue(executed, "the run dispatched nothing; nothing was measured")
+        derived = derive_dispatch_surface().pairs
+        admitted = set(CLIENT_CALL_SUBCOMMANDS) | set(MINTER_ONLY_SUBCOMMANDS)
+        self.assertEqual(
+            sorted(executed - derived),
+            [],
+            "the production path dispatched a pair the static derivation does not "
+            "report, so the walk lost a flow",
+        )
+        self.assertEqual(
+            sorted(executed - admitted),
+            [],
+            "the production path dispatched a pair the endpoint gate would refuse",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

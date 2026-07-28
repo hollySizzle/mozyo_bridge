@@ -1129,6 +1129,67 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
   先行 global flag (`--session <name>` / `--remote <target>`) は `command[1:3]` を
   allowlist 外へずらすため zero-dispatch で拒否される。この argv grammar 上の境界を
   drift test で固定し、Herdr 側の parser 変更で前提が崩れたら検出できるようにする。
+
+  **allowlist の中身は手で列挙せず source から導出する** (Redmine #14658)。上の設計は
+  「何を拒否するか」を正しく決めたが、「何を許可するか」の決め方を決めていなかった。
+  初版は code を読んで集合を書き下ろしており、#14185 R3 の live 実測 (evidence j#91992) が
+  その手法の代償を **両方向同時に** 計測した:
+
+  - **不足**: production `prepare_session` の launcher preflight probe
+    `<launcher> herdr agent-attest --help` (`build_attest_capability_probe_argv`) の pair が
+    集合に無く、workspace が 1 つも出来ない段階で `command_not_allowlisted` により 2 回
+    fail-closed した。live acceptance 2/3 へ到達できない。
+  - **過剰**: どの call site も発行し得ない 5 pair (`agent get` / `agent pane` /
+    `agent target` / `pane location` / `wait agent-status`) が集合を広げていた。うち 3 件は
+    command ではなく、tree 内の **JSON key / alias 定数として同じ並びが存在する**:
+    `("agent","pane")` は `herdr_state._GET_OBJECT_KEYS` そのもの、`("pane","location")` は
+    `support.herdr_fake.LOCATOR_ALIASES` そのもの、`("agent","target")` は
+    `herdr_state._HANDLE_KEYS` 内の隣接 2 要素である。call graph を辿らず tuple を
+    text 検索すると出てくるのがちょうどこの形である。残る 2 件は実在する herdr command だが
+    **この runner を通らない**: `agent get` は `HerdrCliAgentStateReader`
+    (retire / turn-start / hibernate 経路) が発行し、`wait agent-status` は `popen` 経路である。
+
+  不足 1 件を literal 追加するだけでは、その run は通っても **決め方は初版のまま**である。
+  よって正本を集合そのものから **導出器**へ移す:
+
+  - 導出器は `tests/support/herdr_dispatch_derivation.py`。`DisposableHerdrInstance` が持つ
+    gated runner を seed とし、first-party source 上で parameter / local 束縛 / `with` 束縛 /
+    wrapper constructor (`RecordingHerdrRunner`) / instance attribute / `dict(...)` 経由の
+    `**kwargs` 転送を辿る **inter-procedural な taint walk** を行い、tainted な値の call を
+    dispatch site として列挙し、その argv を `(group, subcommand)` へ解決する。
+  - **読めなかったものは落とさず報告する**。argv を解決できない site、追跡できない runner flow は
+    typed な unresolved として返し、oracle 側で red にする。「見つからなかった」と
+    「見られなかった」を同じ答えにしない。静的 walk が過小評価する唯一の形は
+    **flow を見失うこと**であり、見失った flow は「flow が無い」と同じ見た目になる。よって
+    tainted な値が walk の模型に無い文脈 (`Return` / container / subscript 等) に現れたら
+    **その時点で unresolved flow として報告する** (escape check)。fork 境界
+    (`Process(target=..., args=(..., gate_runner))`) は例外扱いではなく **模型に入れる**:
+    そこは worker process 側であり、実 herdr traffic が起きる側だからである。
+  - 静的導出を **実行でも裏取りする**。`tests/integration/.../test_shared_space_smoke_harness.py`
+    が production 経路を fake 上で実走させ、実際に dispatch された pair が導出集合と
+    allowlist の双方に含まれることを確認する。ただしこの fixture は launcher を解決しないため
+    **2 つの launcher preflight probe は実走しない** (これが #14185 R3 の欠陥が fake 駆動 suite に
+    見えなかった理由そのものである)。その 2 つは call site 単位の unit test で覆う。射程を
+    doc と test docstring の双方に明示し、「実走した = 全部覆った」と読ませない。
+  - `tests/unit/.../test_disposable_smoke_command_surface.py` が allowlist を導出結果に対して
+    **双方向**で固定する: 導出された pair が allowlist に無ければ落ち (= #14185 の不足方向)、
+    allowlist の pair を発行する call site が無ければ落ちる (= 過剰方向)。
+  - oracle 自身の liveness を probe する。tree の **copy** に dispatch site を注入して新 pair が
+    現れることと、解決不能な argv が unresolved として報告されることを実測する。導出が黙って
+    何も解決しなくなった walk は ⊆ 方向の assertion を素通りするため、これが無いと oracle は
+    反証不能になる。
+  - seed の出口 (gated runner が owner から渡される先) だけは人が読む境界として test に literal で
+    置く。ここは command 面ではなく **導出の起点**なので、増えたら人が見てから導出を信じ直す。
+
+  **launcher probe は Herdr の command ではない**。`("herdr","agent-attest")` /
+  `("config","check-parse")` は `argv[0]` が mozyo-bridge launcher であり、Herdr server 宛ての
+  client call と形が同じだけである。source では `LAUNCHER_PREFLIGHT_SUBCOMMANDS` /
+  `HERDR_SERVER_CLIENT_SUBCOMMANDS` として別名で保持し、union を `CLIENT_CALL_SUBCOMMANDS` とする。
+  gate の照合規則は従来どおり pair 単独であり、この分割が加えるのは **記録の正確さ**であって
+  第二の照合規則ではない (Herdr が `herdr` group を生やしたかのように読ませない)。
+  なお `("herdr","agent-attest")` は wrapper 経由で任意 provider を exec し得る trampoline だが、
+  これは既に allowlist 済みの `("agent","start")` と同じ class であり、その境界を与えるのは
+  上位の ownership / endpoint fence であって本 allowlist ではない (保証範囲は pair のまま)。
 - **worker timeout は process 起動前に domain 検証し、cleanup は例外経路でも通す** (review j#91604 F2)。
   `--process-timeout` を無制約 `float` で受けると `inf` / `nan` / 0 / 負値が
   `Process.join()` まで到達し、**全 worker を起動した後**に `OverflowError` で driver を巻き戻す。
