@@ -3403,80 +3403,415 @@ class ReviewJ92227DispatchAuthorityTests(unittest.TestCase):
         self.assertEqual(writes, [])  # zero-write on both paths
 
 
-class ReviewJ92227ChannelScannerInventoryTests(unittest.TestCase):
-    """The mechanical guard the two channel findings were missing.
+class ReviewJ92327ClosedVocabularyTests(ReviewJ92227DispatchAuthorityTests):
+    """R25-F1/F2: the closed-vocabulary reader and the writer's first-match-wins loop.
 
-    The R23 pin inventories modules that hand-roll a marker BODY parser. Neither dispatch
-    module did — both route the body through the shared strict reader — and both still shipped
-    a readable-subset hole, because owning a CHANNEL SCAN is a separate capability from owning
-    a body grammar: the scan decides what happens to the OTHER markers in the note.
+    R24 built ``strict_marker_body_fields`` precisely so a channel with a fixed field set could
+    refuse an extra field, a same-value repeated key and a blank value — and R25 edited both
+    dispatch modules without routing them through it. Every one of those bodies reached
+    ``authorize`` / ``discharged``. Separately the writer returned on the FIRST causal prior, so
+    an identical clean record followed by a conflicting one reported ``already_recorded`` while
+    the correlator, on the same entries, said ``ambiguous``.
 
-    So this is the second inventory. Every module that scans the marker token and walks more
-    than one match per note must have a stated whole-note discipline; a new channel scanner
-    fails this gate until someone writes down which one it has.
+    Inherits the R24 harness (real effect entries through their injection seams).
     """
 
-    #: module -> how it refuses to act on the readable subset of a poisoned note.
+    def _extra_field(self, marker):
+        return marker[:-1] + ":unexpected=1]"
+
+    def _duplicate_key(self, marker):
+        return marker.replace("lane_id=r1", "lane_id=r1:lane_id=r1", 1)
+
+    def _blank_value(self, marker):
+        return marker.replace("lane_id=r1", "lane_id=", 1)
+
+    # -- finding 1: authorization ------------------------------------------------------
+
+    def test_a_producer_impossible_authorization_body_never_authorizes(self):
+        clean = self._auth("a1")
+        self.assertEqual(self._decide([self._entry(7, clean)]).decision, "authorize")  # control
+        for label, note in (
+            ("extra field", self._extra_field(clean)),
+            ("same-value duplicate key", self._duplicate_key(clean)),
+            ("blank value", self._blank_value(clean)),
+        ):
+            with self.subTest(label):
+                self.assertNotEqual(self._decide([self._entry(7, note)]).decision, "authorize")
+
+    def test_an_incomplete_same_channel_sibling_blocks_the_clean_one(self):
+        """It used to be SKIPPED by the required-field check, walking past the note poison."""
+        clean = self._auth("a1")
+        incomplete = "[mozyo:dispatch-authorization:action_id=a9:issue=14539]"
+        self.assertEqual(
+            self._decide([self._entry(7, clean + "\n" + incomplete)]).decision, "blocked"
+        )
+
+    # -- finding 1: disposition --------------------------------------------------------
+
+    def _discharge(self, note):
+        entries = self._disposition_history(note)
+        index = self._valid_index([self._entry(7, self._auth("a1"))])
+        return self._correlate(entries, index, review_requests=["9"]).state
+
+    def test_a_producer_impossible_disposition_body_never_discharges(self):
+        clean = self._disposition()
+        self.assertEqual(self._discharge(clean), "discharged")  # control
+        for label, note in (
+            ("extra field", self._extra_field(clean)),
+            ("same-value duplicate key", self._duplicate_key(clean)),
+            ("blank value", self._blank_value(clean)),
+        ):
+            with self.subTest(label):
+                self.assertNotEqual(self._discharge(note), "discharged")
+
+    def test_an_incomplete_disposition_sibling_refuses_the_discharge(self):
+        clean = self._disposition()
+        incomplete = "[mozyo:dispatch-disposition:action_id=a9:lane_id=r1]"
+        self.assertEqual(self._discharge(clean + "\n" + incomplete), "ambiguous")
+
+    # -- finding 2: the writer reads every causal prior ---------------------------------
+
+    def _write(self, entries):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.dispatch_disposition_writer import (  # noqa: E501
+            record_dispatch_disposition,
+        )
+
+        writes = []
+        result = record_dispatch_disposition(
+            issue=self.ISSUE,
+            dispatch_journal="7",
+            terminal_journal="9",
+            workspace_id=self.WS,
+            lane_id=self.LANE,
+            target_assigned_name=self.TGT,
+            action_id="a1",
+            source=type("_S", (), {"read_entries": lambda _s, _i: entries})(),
+            append_note=lambda issue, text: writes.append((issue, text)),
+        )
+        return result.state, writes
+
+    def _history(self, *later):
+        clean = self._auth("a1")
+        entries = [
+            self._entry(7, clean),
+            self._entry(9, "[mozyo:workflow-event:gate=review_request]"),
+            self._entry(11, self._disposition()),
+        ]
+        entries.extend(self._entry(13 + i, note) for i, note in enumerate(later))
+        return entries
+
+    def test_a_later_conflicting_prior_beats_idempotent_success(self):
+        state, writes = self._write(self._history())  # control: clean only
+        self.assertEqual(state, "already_recorded")
+        conflicting = self._disposition_with_terminal("99")
+        state, writes2 = self._write(self._history(conflicting))
+        self.assertEqual(state, "refused")
+        self.assertEqual(writes + writes2, [])  # zero-write on both paths
+
+    def test_a_later_poisoned_prior_beats_idempotent_success(self):
+        clean = self._disposition()
+        poisoned = clean + "\n" + clean.replace("action_id=a1", "action_id = a1", 1)
+        state, writes = self._write(self._history(poisoned))
+        self.assertEqual(state, "refused")
+        self.assertEqual(writes, [])
+
+    def test_the_writer_and_the_correlator_agree_on_the_same_entries(self):
+        """The parity this finding is about, asserted on one shared input per shape."""
+        index = self._valid_index([self._entry(7, self._auth("a1"))])
+        clean = self._disposition()
+        for label, later, writer_state, correlator_state in (
+            ("clean only", None, "already_recorded", "discharged"),
+            ("clean -> conflicting", self._disposition_with_terminal("99"), "refused", "ambiguous"),
+            (
+                "clean -> poisoned",
+                clean + "\n" + clean.replace("action_id=a1", "action_id = a1", 1),
+                "refused",
+                "ambiguous",
+            ),
+        ):
+            with self.subTest(label):
+                entries = self._history(later) if later else self._history()
+                self.assertEqual(self._write(entries)[0], writer_state)
+                self.assertEqual(
+                    self._correlate(entries, index, review_requests=["9", "99"]).state,
+                    correlator_state,
+                )
+
+    def _disposition_with_terminal(self, terminal):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.dispatch_disposition import (  # noqa: E501
+            render_dispatch_disposition_marker,
+        )
+
+        return render_dispatch_disposition_marker(
+            action_id="a1",
+            dispatch_journal="7",
+            workspace_id=self.WS,
+            lane_id=self.LANE,
+            target_assigned_name=self.TGT,
+            terminal_journal=terminal,
+        )
+
+
+class ReviewJ92327ClosedVocabularyHelperTests(unittest.TestCase):
+    """The shared helper's own closed-vocabulary rules, including the one R24 dropped."""
+
+    def _read(self, body, expected=("a", "b")):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            strict_marker_body_fields,
+        )
+
+        return strict_marker_body_fields(body, expected=frozenset(expected))
+
+    def test_the_canonical_body_reads(self):
+        self.assertEqual(self._read("a=1:b=2"), {"a": "1", "b": "2"})
+
+    def test_a_blank_value_is_refused(self):
+        """R24 routed the recovery channels here and DROPPED their ``not value`` refusal.
+
+        That conversion was described as a tightening; on this one axis it was a loosening, and
+        nothing pinned it. Found while fixing review j#92327 finding 1.
+        """
+        self.assertIsNone(self._read("a=1:b="))
+
+    def test_an_extra_field_is_refused(self):
+        self.assertIsNone(self._read("a=1:b=2:c=3"))
+
+    def test_a_missing_field_is_refused(self):
+        self.assertIsNone(self._read("a=1"))
+
+    def test_a_repeated_key_is_refused_even_with_an_identical_value(self):
+        self.assertIsNone(self._read("a=1:a=1:b=2"))
+
+
+def _marker_pattern_holders(root):
+    """Every module holding a compiled mozyo-marker pattern -> (repo-relative path, names).
+
+    Read from the AST, never from the file's text (Redmine #14539 review j#92327 finding 3).
+    The R25 version of this inventory searched for the literal ``\\[mozyo:`` and the word
+    ``finditer`` anywhere in the source, which made it depend on spelling in both directions: a
+    module scanning through an IMPORTED pattern carried no literal and was invisible, one using
+    ``findall`` was invisible, and — measured while probing this very finding — a module whose
+    DOCSTRING happened to contain the word ``finditer`` was flagged. Provenance is therefore
+    "a name bound to ``re.compile(...)`` over a pattern containing the marker token", which a
+    comment cannot fake, and possession is resolved one level through ``from X import N``.
+    """
+    import ast
+
+    def literal_parts(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            yield node.value
+        elif isinstance(node, ast.JoinedStr):  # rf"...{re.escape(CHANNEL)}..."
+            for value in node.values:
+                yield from literal_parts(value)
+
+    def compiled_marker_names(tree):
+        names = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            call = node.value
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "compile"
+                and call.args
+            ):
+                continue
+            if not any("[mozyo:" in part for part in literal_parts(call.args[0])):
+                continue
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        return names
+
+    trees = {}
+    for path in sorted(root.rglob("*.py")):
+        try:
+            trees[path] = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:  # pragma: no cover - src must parse
+            continue
+    owners = {}
+    for path, tree in trees.items():
+        owned = compiled_marker_names(tree)
+        if owned:
+            owners[path.stem] = owned
+
+    holders = {}
+    for path, tree in trees.items():
+        held = set(compiled_marker_names(tree))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                owned = owners.get(node.module.rsplit(".", 1)[-1], set())
+                held.update(
+                    alias.asname or alias.name
+                    for alias in node.names
+                    if alias.name in owned
+                )
+        if not held:
+            continue
+        # Held AND used. A module that imports the name without touching it decides nothing.
+        if not any(
+            isinstance(node, ast.Name) and node.id in held for node in ast.walk(tree)
+        ):
+            continue
+        holders[str(path.relative_to(root.parent.parent))] = sorted(held)
+    return holders
+
+
+class ReviewJ92327ScannerInventoryTests(unittest.TestCase):
+    """R25-F3: the scanner inventory was evadable by basename and by spelling.
+
+    The inventory exists because owning a channel SCAN is a different capability from owning a
+    body grammar — the scan decides what a note's other markers do. But R25 implemented it with
+    ``path.name`` identity and a textual search for ``\\[mozyo:`` + ``finditer``, so three
+    different undeclared scanners passed it: one reusing an allowlisted basename in another
+    package, one scanning through an imported pattern, one spelling iteration ``findall``.
+
+    The rule is now possession, not iteration: a module that HOLDS a mozyo marker pattern and
+    uses it must declare what it does when a note carries more than one marker.
+    """
+
+    #: repo-relative module -> how it refuses to act on the readable subset of a poisoned note.
     DISCIPLINES = {
         # Owns the grammar. ``strict_gate_markers`` returns () for the whole note when a marker
         # names the gate and cannot be counted as its evidence (j#92106 F3 / j#92174 F1).
-        "redmine_journal_source.py": "same-gate poison returns () for the note",
-        # Poisons the note for its channel; the siblings keep their identity and carry
-        # ``ambiguity``, so they are selected and reported rather than silently dropped.
-        "dispatch_authorization.py": "note-scoped ambiguity flag makes every sibling invalid",
+        "src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff"
+        "/domain/redmine_journal_source.py": "same-gate poison returns () for the note",
+        # Poisons the note for its channel; siblings keep their identity and carry ``ambiguity``,
+        # so they are selected and reported rather than silently dropped.
+        "src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff"
+        "/domain/dispatch_authorization.py": "note-scoped ambiguity flag invalidates every sibling",
         # Same shape; the correlator reads ``note_ambiguous`` as AMBIGUOUS rather than OWED.
-        "dispatch_disposition.py": "note-scoped note_ambiguous flag refuses the discharge",
-        # Refuses unless the note carries EXACTLY ONE marker of its channel, so a forged
-        # sibling makes the whole note unreadable before any field is compared.
-        "recovery_anchor_delivery.py": "exactly-one-marker rule",
-        "recovered_pair_pin_reconciliation.py": "exactly-one-marker rule",
+        "src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff"
+        "/domain/dispatch_disposition.py": "note-scoped note_ambiguous flag refuses the discharge",
+        # Refuse unless the note carries EXACTLY ONE marker of their channel, so a second marker
+        # of any kind makes the note unreadable before a field is compared.
+        "src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff"
+        "/domain/recovery_anchor_delivery.py": "exactly-one-marker rule",
+        "src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff"
+        "/domain/recovered_pair_pin_reconciliation.py": "exactly-one-marker rule",
         # Reads one marker per record; there is no sibling to skip.
-        "hibernate_park_record.py": "single-marker reader",
+        "src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff"
+        "/domain/hibernate_park_record.py": "single-marker reader",
+        # NOT an authority reader at all: it observes a tmux composer TAIL (untrusted display
+        # text, not a durable note) for un-sent ``handoff`` markers, and the handoff channel is a
+        # delivery notification that never carries gate authority. Multiplicity is the point —
+        # it de-duplicates and reports every marker it sees. Found only by this AST inventory:
+        # it scans with ``findall``, so the R25 spelling-based pin never saw it.
+        "src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff"
+        "/application/sublane_quarantine.py": "pane observation, handoff channel, never authority",
     }
 
-    def test_every_marker_channel_scanner_has_a_declared_whole_note_discipline(self):
+    def _root(self):
         import pathlib
-        import re
 
-        root = pathlib.Path(__file__).resolve().parents[2] / "src" / "mozyo_bridge"
-        scanners = set()
-        for path in root.rglob("*.py"):
-            text = path.read_text(encoding="utf-8")
-            # Scans the marker token AND walks every match in a note: the pair that means this
-            # module decides what a note's OTHER markers do. A module that reads one marker, or
-            # that never scans the token, is not making that decision.
-            if r"\[mozyo:" not in text:
-                continue
-            if not re.search(r"\bfinditer\b", text):
-                continue
-            scanners.add(path.name)
+        return pathlib.Path(__file__).resolve().parents[2] / "src" / "mozyo_bridge"
+
+    def test_every_marker_pattern_holder_has_a_declared_discipline(self):
         self.assertEqual(
-            scanners,
+            set(_marker_pattern_holders(self._root())),
             set(self.DISCIPLINES),
-            "a module scans the mozyo marker token across every match in a note without a "
-            "declared whole-note discipline; decide what it does with an unrenderable sibling "
-            "(poison the note, or require exactly one) and record it in DISCIPLINES",
+            "a module holds a mozyo marker pattern without a declared whole-note discipline; "
+            "decide what it does when a note carries more than one marker (poison the note, "
+            "require exactly one, or state that it is not an authority reader) and record it "
+            "in DISCIPLINES against its REPO-RELATIVE path",
         )
 
-    def test_the_two_dispatch_channels_would_not_have_been_caught_by_the_body_parser_pin(self):
-        """Why this second inventory exists: the first one is blind to this capability."""
-        import pathlib
-        import re
-
-        root = pathlib.Path(__file__).resolve().parents[2] / "src" / "mozyo_bridge"
-        for name in ("dispatch_authorization.py", "dispatch_disposition.py"):
-            path = next(root.rglob(name))
-            text = path.read_text(encoding="utf-8")
-            self.assertIn(r"\[mozyo:", text)
-            # No private body grammar — they use the shared reader, so the R23 pin passes them.
-            self.assertIsNone(
-                re.search(
-                    r"\.\s*split\(\s*[\"']:[\"']\s*\)|\.\s*partition\(\s*[\"']=[\"']\s*\)", text
-                ),
-                f"{name} grew a private body parser; the R23 pin now covers it and this "
-                "test's premise needs revisiting",
+    def test_the_declared_identities_are_paths_not_basenames(self):
+        """Evasion A closed at the key level; the behaviour is pinned in the detector tests."""
+        for declared in self.DISCIPLINES:
+            self.assertTrue(
+                declared.startswith("src/mozyo_bridge/") and declared.endswith(".py"),
+                f"{declared!r} is not a repo-relative module path; a basename key lets an "
+                "undeclared scanner inherit an allowlisted name from another package",
             )
 
+
+class ReviewJ92327ScannerDetectionTests(unittest.TestCase):
+    """The detector itself, driven over synthetic modules — the three R25 evasions plus prose.
+
+    These run the real :func:`_marker_pattern_holders` over a temporary tree, so they pin the
+    DETECTION rule rather than the current contents of ``src``. Each evasion is the mutation the
+    finding named; the prose case is the false POSITIVE the R25 spelling rule produced.
+    """
+
+    OWNER = (
+        "import re\n"
+        '_MARKER_RE = re.compile(r"\\[mozyo:(?P<channel>[a-z-]+):(?P<body>[^\\]]*)\\]")\n'
+        'def read(n): return [m.group("body") for m in _MARKER_RE.finditer(n or "")]\n'
+    )
+
+    def _holders(self, modules):
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "repo" / "src" / "mozyo_bridge"
+            (root / "pkg").mkdir(parents=True)
+            (root / "owner.py").write_text(self.OWNER, encoding="utf-8")
+            for name, text in modules.items():
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            return set(_marker_pattern_holders(root))
+
+    def test_the_owner_itself_is_always_detected(self):
+        """Control: without this every "detected" below would prove nothing."""
+        self.assertEqual(self._holders({}), {"src/mozyo_bridge/owner.py"})
+
+    def test_a_reused_basename_in_another_package_is_a_separate_identity(self):
+        """Evasion A: basename collision."""
+        holders = self._holders({"pkg/owner.py": self.OWNER})
+        self.assertEqual(
+            holders, {"src/mozyo_bridge/owner.py", "src/mozyo_bridge/pkg/owner.py"}
+        )
+
+    def test_a_scanner_using_an_IMPORTED_pattern_is_detected(self):
+        """Evasion B: the marker literal never appears in the offending file."""
+        module = (
+            "from mozyo_bridge.owner import _MARKER_RE\n"
+            'def read(n): return [m.group("body") for m in _MARKER_RE.finditer(n or "")]\n'
+        )
+        self.assertIn("src/mozyo_bridge/pkg/imported.py", self._holders({"pkg/imported.py": module}))
+
+    def test_a_scanner_spelling_iteration_findall_is_detected(self):
+        """Evasion C: the other iteration spelling."""
+        module = (
+            "import re\n"
+            '_RE = re.compile(r"\\[mozyo:probe:([^\\]]*)\\]")\n'
+            'def read(n): return _RE.findall(n or "")\n'
+        )
+        self.assertIn("src/mozyo_bridge/pkg/findall.py", self._holders({"pkg/findall.py": module}))
+
+    def test_a_scanner_walking_matches_by_hand_is_detected(self):
+        """Evasion D: no iteration helper at all — a manual ``search`` loop."""
+        module = (
+            "import re\n"
+            '_RE = re.compile(r"\\[mozyo:probe:([^\\]]*)\\]")\n'
+            "def read(n):\n"
+            "    out, pos = [], 0\n"
+            "    while True:\n"
+            "        m = _RE.search(n or '', pos)\n"
+            "        if not m: return out\n"
+            "        out.append(m.group(1)); pos = m.end()\n"
+        )
+        self.assertIn("src/mozyo_bridge/pkg/manual.py", self._holders({"pkg/manual.py": module}))
+
+    def test_prose_mentioning_the_token_or_finditer_is_not_a_scanner(self):
+        """The false POSITIVE the spelling rule produced: a docstring is not a capability."""
+        module = (
+            '"""Explains the [mozyo:...] grammar and why finditer is used elsewhere."""\n'
+            "# [mozyo:workflow-event:gate=review_request] is documented here too\n"
+            "VALUE = 1\n"
+        )
+        self.assertEqual(
+            self._holders({"pkg/prose.py": module}), {"src/mozyo_bridge/owner.py"}
+        )
+
+    def test_holding_a_pattern_without_using_it_is_not_a_scanner(self):
+        """The boundary: an unused import decides nothing about any note."""
+        module = "from mozyo_bridge.owner import _MARKER_RE  # noqa: F401\nVALUE = 1\n"
+        self.assertEqual(
+            self._holders({"pkg/unused.py": module}), {"src/mozyo_bridge/owner.py"}
+        )
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

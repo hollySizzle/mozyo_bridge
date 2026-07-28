@@ -36,8 +36,7 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
-    _parse_marker_components,
-    strict_marker_fields,
+    strict_marker_body_fields,
 )
 
 # The dedicated authorization marker channel (distinct from ``handoff`` / ``workflow-event``).
@@ -104,8 +103,17 @@ def _parse_fields(body: str) -> "dict[str, str] | None":
     ``action = dispatch_worker``, ``action=deny:action=dispatch_worker`` and
     ``authorized_by_role=worker:authorized_by_role=coordinator`` all authorized a dispatch. Having
     its own parser is precisely why the shared-symbol sweep never saw it.
+
+    This channel has a CLOSED vocabulary, so it reads through the closed-vocabulary helper
+    (Redmine #14539 review j#92327 finding 1). ``strict_marker_fields`` alone answers "could a
+    producer render this body", which is the right question for an open-ended gate marker and
+    too weak here: an extra field, a key repeated with the same value, and a blank value are all
+    bodies THIS producer cannot render, and every one of them reached ``authorize``. R24 added
+    ``strict_marker_body_fields`` for exactly this and R25 edited this module without routing it
+    here. A refusal makes the marker unreadable, which the note-poison below then propagates —
+    so an incomplete sibling stops being something to skip past.
     """
-    return strict_marker_fields(_parse_marker_components(body))
+    return strict_marker_body_fields(body, expected=frozenset(_REQUIRED_FIELDS))
 
 
 @dataclass(frozen=True)

@@ -184,31 +184,48 @@ def record_dispatch_disposition(
         _norm(dispatch_journal),
         _norm(action_id),
     )
-    for entry in entries:
-        for prior in parse_dispatch_dispositions(entry):
-            if prior.causal_key != causal:
-                continue
-            if (
-                prior.terminal_journal == _norm(terminal_journal)
-                and prior.recorded_by_role == RECORDED_BY_IMPLEMENTATION_GATEWAY
-                and prior.fixed_fields_valid
-                # A prior claim from a note poisoned by an unrenderable sibling is not proof
-                # that THIS disposition is already recorded (review j#92227 finding 3); it falls
-                # through to the conflicting-record refusal, which is still zero-write but tells
-                # the operator the durable record needs a human look.
-                and not prior.note_ambiguous
-            ):
-                return DispositionWriteResult(
-                    state=WRITE_ALREADY_RECORDED,
-                    detail=f"an identical disposition is already recorded at j#{prior.journal}",
-                    marker=marker,
-                )
-            return _refused(
-                REASON_CONFLICTING_RECORD,
-                f"a different disposition for this action already exists at j#{prior.journal} "
-                f"(terminal {prior.terminal_journal!r}); refusing to record a second, "
-                "conflicting claim",
-            )
+    # EVERY causal prior is evaluated, and any reason to doubt beats idempotent success (Redmine
+    # #14539 review j#92327 finding 2). Returning on the FIRST match made the answer depend on
+    # note order: an identical clean record followed by a conflicting or poisoned one reported
+    # ``already_recorded`` — which the gateway treats as success — while the terminal correlator,
+    # reading the SAME entries, said ``ambiguous``. The two must not disagree about one durable
+    # record, and "I found one that matches" is not a statement about the record as a whole.
+    priors = [
+        prior
+        for entry in entries
+        for prior in parse_dispatch_dispositions(entry)
+        if prior.causal_key == causal
+    ]
+    poisoned = [prior for prior in priors if prior.note_ambiguous]
+    if poisoned:
+        return _refused(
+            REASON_CONFLICTING_RECORD,
+            f"j#{poisoned[0].journal} carries a dispatch-disposition marker the canonical "
+            "producer could not render alongside a claim for this action; refusing to treat "
+            "the durable record as settled",
+        )
+    conflicting = [
+        prior
+        for prior in priors
+        if not (
+            prior.terminal_journal == _norm(terminal_journal)
+            and prior.recorded_by_role == RECORDED_BY_IMPLEMENTATION_GATEWAY
+            and prior.fixed_fields_valid
+        )
+    ]
+    if conflicting:
+        return _refused(
+            REASON_CONFLICTING_RECORD,
+            f"a different disposition for this action already exists at j#{conflicting[0].journal} "
+            f"(terminal {conflicting[0].terminal_journal!r}); refusing to record a second, "
+            "conflicting claim",
+        )
+    if priors:
+        return DispositionWriteResult(
+            state=WRITE_ALREADY_RECORDED,
+            detail=f"an identical disposition is already recorded at j#{priors[0].journal}",
+            marker=marker,
+        )
 
     append_note(_norm(issue), marker)
     return DispositionWriteResult(state=WRITE_RECORDED, marker=marker)

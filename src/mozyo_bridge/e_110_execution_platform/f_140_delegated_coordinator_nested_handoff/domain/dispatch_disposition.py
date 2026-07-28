@@ -37,8 +37,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
-    _parse_marker_components,
-    strict_marker_fields,
+    strict_marker_body_fields,
 )
 from typing import Mapping, Optional, Sequence
 
@@ -174,12 +173,19 @@ def render_dispatch_disposition_marker(
 def _parse_fields(body: str) -> "dict[str, str] | None":
     """One marker body, or ``None`` when it is not renderable (pure).
 
-    Routed through the shared strict reader (Redmine #14539 review j#92106 finding 4). This used
-    to be another private copy of the lenient fold — last-write-wins on a repeated key, whitespace
+    Routed through the shared reader (Redmine #14539 review j#92106 finding 4). This used to be
+    another private copy of the lenient fold — last-write-wins on a repeated key, whitespace
     stripped, ``=``-less chunks dropped — and its result decides whether a disposition WRITE is
     skipped as already-recorded and whether a dispatch correlates, so it reaches an effect.
+
+    Specifically the CLOSED-vocabulary reader (review j#92327 finding 1): this channel's fields
+    are fixed, so an extra field, a same-value repeated key and a blank value are all bodies
+    :func:`render_dispatch_disposition_marker` cannot produce — and all three reached
+    ``discharged``. A refusal makes the marker unreadable, which the note-poison in
+    :func:`parse_dispatch_dispositions` then propagates, so an incomplete sibling stops being
+    something to skip past and becomes something that fails the note closed.
     """
-    return strict_marker_fields(_parse_marker_components(body))
+    return strict_marker_body_fields(body, expected=frozenset(_REQUIRED_FIELDS))
 
 
 def parse_dispatch_dispositions(entry) -> tuple[DispatchDisposition, ...]:

@@ -221,12 +221,18 @@ def strict_marker_body_fields(
     "happened to be" is the problem: the pin that is supposed to inventory hand-rolled parsers
     could not see them, so a later loosening would have reached an effect with the gate green.
 
-    Stricter than :func:`strict_marker_fields` on the two axes a closed vocabulary allows:
+    Stricter than :func:`strict_marker_fields` on the three axes a closed vocabulary allows:
 
     - a key repeated AT ALL is refused, not just one repeated with a different value — a closed
       field set is rendered once per key, so a second occurrence is already not producer output;
     - with ``expected``, the field set must be EXACTLY that set, so a missing or extra key is
-      refused rather than being caught field-by-field downstream.
+      refused rather than being caught field-by-field downstream;
+    - an EMPTY value is refused. The shared reader allows one (the central contract's list of
+      producer-impossible bodies does not include it), but every closed-vocabulary producer here
+      raises on a blank field, so ``lane_id=`` is not something any of them can render. Review
+      j#92327 finding 1 is what surfaced this: routing the recovery channels here in R24 dropped
+      their own ``not value`` refusal, which was a LOOSENING carried by a change whose commit
+      message called it a tightening.
 
     Everything the shared reader refuses it refuses too, which is why routing the private parsers
     here TIGHTENS them: they stripped each component before judging it, so ``issue = 14539`` — a
@@ -237,6 +243,8 @@ def strict_marker_body_fields(
     if fields is None:
         return None
     if len(fields) != len(components):
+        return None
+    if any(not value for value in fields.values()):
         return None
     if expected is not None and frozenset(fields) != frozenset(expected):
         return None
