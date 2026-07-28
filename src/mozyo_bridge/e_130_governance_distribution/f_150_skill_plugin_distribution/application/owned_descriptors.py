@@ -55,10 +55,13 @@ on it whatever it is spelled like, so a caller's binding could be replaced
 unlikely.
 
 The cost, stated because it is real: an instance dictionary is restored by
-attribute name, so an exception carrying a ledger raises on ``pickle.loads``
-(``pickle.dumps`` still succeeds). A string key was chosen once for exactly
-that reason and it was the wrong trade — the ledger has never survived a pickle
-anyway, and not overwriting a caller's binding is the requirement.
+attribute name, so an exception carrying a ledger raises ``TypeError`` on
+``pickle.loads``. ``pickle.dumps`` gets that far only when the retained entries
+are themselves picklable — a failure object whose ``__reduce__`` raises fails
+the dump, since the ledger holds the objects rather than a rendering of them
+(j#90529 R18-F2). A string key was chosen once to keep the exception
+unpicklable-free and it was the wrong trade: the ledger has never survived a
+pickle anyway, and not overwriting a caller's binding is the requirement.
 """
 
 _ABSENT = object()
@@ -153,33 +156,61 @@ def _ledger(primary: BaseException) -> _Ledger | None:
     return ledger
 
 
-def _remember(primary: BaseException, failure: object) -> BaseException | None:
-    """Retain one occurrence of a teardown failure.
+class _Retention:
+    """One unwind's retention, with the occurrences the carrier has not taken.
 
-    Returns control flow raised while retaining, rather than raising it: the
-    carrier itself broke the "remaining actions always run" rule twice by
-    unwinding out of the loop (j#90508 R16-F1/F2). Nothing below can raise for
-    a real exception — binding a base descriptor, a dict lookup on an identity
-    key, and a ``list`` append — but the guard makes that a property of the
-    code rather than of an argument about it.
+    ``_remember`` used to return the control flow it hit and nothing else, so
+    the caller could not tell an append that *happened* from one that did not.
+    A carrier that interrupted once and then recovered lost both the failure it
+    was recording and the interrupt itself — the notes still showed the failure,
+    but the ledger was empty (j#90529 R18-F1). Notes are a rendering; losing the
+    objects is losing the record.
 
-    One call, one entry. There is deliberately no de-duplication: identity
-    de-duplication collapsed two independent actions that returned the same
-    ``False`` — the returned-failure channel, where ``False`` is a singleton
-    and so *always* collapsed — into a single ledger entry, while the notes
-    correctly showed two (j#90517 R17-F2). Each occurrence is retained at
-    exactly one place instead, so defensive re-retention is unnecessary.
+    So an occurrence the carrier refused stays queued and is retried at the next
+    retention, and once more when the teardown ends. Queue order is arrival
+    order, and an entry leaves the queue only after its append returns, so a
+    retry cannot duplicate what already landed.
+
+    If the carrier never recovers the record is unreachable — the same boundary
+    as refusing to overwrite a foreign binding (j#90517 R17-F1), and stated for
+    the same reason: this is not a case this code can create.
     """
-    try:
-        ledger = _ledger(primary)
-        if ledger is None:
-            return None
-        ledger.entries.append(failure)
-    except Exception:  # noqa: BLE001 - nothing to route; the failure is simply not retained
+
+    __slots__ = ("primary", "_queued")
+
+    def __init__(self, primary: BaseException) -> None:
+        self.primary = primary
+        self._queued: list[object] = []
+
+    def remember(self, failure: object) -> BaseException | None:
+        """Retain one occurrence, and anything still queued before it."""
+        self._queued.append(failure)
+        return self.flush()
+
+    def flush(self) -> BaseException | None:
+        """Append what is queued; return control flow raised while trying.
+
+        Returning rather than raising is the rule the carrier itself broke
+        twice by unwinding out of the loop (j#90508 R16-F1/F2). Nothing here
+        can raise for a real exception — binding a base descriptor, a dict
+        lookup on an identity key, and a ``list`` append — but the guard makes
+        that a property of the code rather than of an argument about it.
+        """
+        while self._queued:
+            try:
+                ledger = _ledger(self.primary)
+                if ledger is None:
+                    return None  # no carrier; leave the queue for a later try
+                ledger.entries.append(self._queued[0])
+            except Exception:  # noqa: BLE001 - nothing to route; still queued
+                return None
+            except BaseException as interrupt:  # noqa: BLE001 - routed, not raised
+                # The interrupt is itself an occurrence, and it queues *behind*
+                # the one it interrupted so arrival order survives the retry.
+                self._queued.append(interrupt)
+                return interrupt
+            self._queued.pop(0)
         return None
-    except BaseException as interrupt:  # noqa: BLE001 - routed, not raised here
-        return interrupt
-    return None
 
 
 def _is_reported_failure(outcome: object) -> bool:
@@ -222,7 +253,7 @@ def _describe_failure(failure: object) -> str:
         return f"{name}: <unprintable>"
 
 
-def _present(primary: BaseException, failure: object) -> BaseException | None:
+def _present(retention: _Retention, failure: object) -> BaseException | None:
     """Render an already-retained failure as a note; never raise.
 
     :func:`_attach_secondary` deliberately lets a control-flow exception out —
@@ -232,29 +263,29 @@ def _present(primary: BaseException, failure: object) -> BaseException | None:
     where its single retention happens.
     """
     try:
-        _attach_secondary(primary, failure)
+        _attach_secondary(retention.primary, failure)
     except Exception:  # noqa: BLE001 - `_attach_secondary` already absorbs these
         return None
     except BaseException as interrupt:  # noqa: BLE001 - routed, not raised here
-        _remember(primary, interrupt)
+        retention.remember(interrupt)
         return interrupt
     return None
 
 
-def _record_secondary(primary: BaseException, secondary: object) -> BaseException | None:
+def _record_secondary(retention: _Retention, secondary: object) -> BaseException | None:
     """Retain ``secondary``, then present it; return control-flow raised doing so.
 
     The order is the fix: retention first and unconditionally, presentation
     second and best effort. Every occurrence passing through here is retained
-    exactly once, which is what lets :func:`_remember` drop de-duplication
+    exactly once, which is what lets :class:`_Retention` drop de-duplication
     (j#90517 R17-F2).
     """
-    retaining = _remember(primary, secondary)
-    presenting = _present(primary, secondary)
+    retaining = retention.remember(secondary)
+    presenting = _present(retention, secondary)
     return retaining if retaining is not None else presenting
 
 
-def _run_teardown_action(primary: BaseException, action) -> BaseException | None:
+def _run_teardown_action(retention: _Retention, action) -> BaseException | None:
     """Run one action, record what it reports, and never raise.
 
     Every way this can go wrong — the action raising, the action *returning* a
@@ -265,16 +296,16 @@ def _run_teardown_action(primary: BaseException, action) -> BaseException | None
     try:
         outcome = action()
     except Exception as failure:  # noqa: BLE001 - recorded, not raised
-        return _record_secondary(primary, failure)
+        return _record_secondary(retention, failure)
     except BaseException as interrupt:  # noqa: BLE001 - routed, not raised here
         # Retained here rather than by the caller: whether it goes on to be
-        # raised or merely noted, it is already on the ledger. The action's own
+        # raised or merely noted, it belongs on the ledger. The action's own
         # interrupt keeps precedence over anything the retention hit.
-        _remember(primary, interrupt)
+        retention.remember(interrupt)
         return interrupt
     else:
         if _is_reported_failure(outcome):
-            return _record_secondary(primary, outcome)
+            return _record_secondary(retention, outcome)
         return None
 
 
@@ -316,16 +347,19 @@ def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
 
     Retention is on the same channel as everything else. The carrier broke both
     properties twice by raising out of the loop instead (j#90508 R16-F1/F2), so
-    :func:`_remember` returns control flow rather than raising it, and no step
-    of the record can cost an action that has not run.
+    :meth:`_Retention.flush` returns control flow rather than raising it, and no
+    step of the record can cost an action that has not run. A carrier that
+    refuses an occurrence does not lose it either: it stays queued and is
+    retried, including once after the last action (j#90529 R18-F1).
 
     Each occurrence is retained at exactly one place — where it arises — so the
     ledger counts occurrences rather than distinct objects. Two actions that
     each return the same singleton ``False`` are two entries (j#90517 R17-F2).
     """
+    retention = _Retention(primary)
     control_flow: BaseException | None = None
     for action in actions:
-        arrived = _run_teardown_action(primary, action)
+        arrived = _run_teardown_action(retention, action)
         if arrived is None:
             continue
         if control_flow is None:
@@ -335,7 +369,10 @@ def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
             # interrupt raised by the note itself is retained by `_present` —
             # only its *priority* is bounded, because the regress has no
             # natural end.
-            _present(primary, arrived)
+            _present(retention, arrived)
+    # A carrier that recovered after refusing an occurrence still gets to keep
+    # it, even if no later retention came along to carry the retry.
+    retention.flush()
     return control_flow
 
 

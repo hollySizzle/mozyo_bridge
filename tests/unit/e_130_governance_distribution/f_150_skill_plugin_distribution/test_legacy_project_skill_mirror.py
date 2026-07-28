@@ -2232,9 +2232,8 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         the caller's namespace"; it was not. An identity key removes the
         collision instead of making it unlikely.
 
-        The cost is real and stated rather than hidden: an instance dictionary
-        is restored by attribute name, so an exception carrying a ledger raises
-        on `pickle.loads`.
+        The pickle cost is stated rather than hidden, and
+        `test_the_pickle_boundary_depends_on_the_entries` says where it lands.
         """
 
         def failing() -> None:
@@ -2256,8 +2255,36 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             ],
             "the carrier took a name in the caller's namespace",
         )
+
+    def test_the_pickle_boundary_depends_on_the_entries(self) -> None:
+        """j#90529 R18-F2. I wrote the limitation down as "`dumps` succeeds,
+        `loads` fails" — which is only true when what the ledger holds can be
+        pickled. The ledger holds the failure objects rather than a rendering of
+        them, so one whose `__reduce__` raises fails the dump. Stating a
+        limitation is not the same as stating it accurately.
+        """
+
+        class Unpicklable(Exception):
+            def __reduce__(self):  # type: ignore[override]
+                raise TypeError("this failure cannot be pickled")
+
+        def ordinary_failure() -> None:
+            raise RuntimeError("teardown failure")
+
+        def unpicklable_failure() -> None:
+            raise Unpicklable("teardown failure")
+
+        # A module-level primary type: a class defined in a test body is not
+        # picklable for reasons that have nothing to do with the ledger.
+        picklable_entries = RuntimeError("write failed")
+        owned_descriptors._teardown_during(picklable_entries, ordinary_failure)
         with self.assertRaises(TypeError):
-            pickle.loads(pickle.dumps(primary))
+            pickle.loads(pickle.dumps(picklable_entries))
+
+        unpicklable_entries = RuntimeError("write failed")
+        owned_descriptors._teardown_during(unpicklable_entries, unpicklable_failure)
+        with self.assertRaises(TypeError):
+            pickle.dumps(unpicklable_entries)
 
     def test_a_value_at_the_carrier_key_is_never_replaced(self) -> None:
         """j#90508 R16-F2 and j#90517 R17-F1. The ledger was any `list` found at
@@ -2356,9 +2383,56 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         Pinned at the seam deliberately. Three carriers in a row were escaped
         by a hostile primary, and each fix made the previous hostile input
         unreachable — so asserting through an input would only pin whichever
-        attack happened to still work. `_remember` not propagating is the
+        attack happened to still work. Retention not propagating is the
         property; this asserts that directly.
+
+        It asserts what survives too, which the first version of this test did
+        not: it checked the actions and the return value only, so it stayed
+        green while a carrier that interrupted once and then recovered dropped
+        both the failure it was recording and the interrupt (j#90529 R18-F1).
         """
+        ran: list[str] = []
+        failure = RuntimeError("teardown failure")
+
+        def failing() -> None:
+            ran.append("a1")
+            raise failure
+
+        def quiet() -> None:
+            ran.append("a2")
+
+        real_ledger = owned_descriptors._ledger
+        fired: list[bool] = []
+
+        def interrupts_once(primary):  # type: ignore[no-untyped-def]
+            if not fired:
+                fired.append(True)
+                raise KeyboardInterrupt("interrupt from inside the carrier")
+            return real_ledger(primary)
+
+        primary = Exception("write failed")
+        with unittest.mock.patch.object(owned_descriptors, "_ledger", interrupts_once):
+            control = owned_descriptors._teardown_during(primary, failing, quiet)
+
+        self.assertEqual(["a1", "a2"], ran, "a carrier failure skipped a remaining action")
+        self.assertIsInstance(control, KeyboardInterrupt)
+
+        ledger = owned_descriptors.teardown_failures(primary)
+        self.assertEqual(
+            1,
+            sum(1 for entry in ledger if entry is failure),
+            "the failure the carrier refused was not retained exactly once on recovery",
+        )
+        self.assertEqual(
+            1,
+            sum(1 for entry in ledger if entry is control),
+            "the carrier's own interrupt was not retained exactly once",
+        )
+
+    def test_a_carrier_that_never_recovers_gives_up_the_record_only(self) -> None:
+        """The stated boundary, held to: if the carrier never takes anything,
+        the record is unreachable — but the actions still all run, the first
+        control flow still surfaces, and nothing is duplicated or escapes."""
         ran: list[str] = []
 
         def failing() -> None:
@@ -2368,17 +2442,16 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
         def quiet() -> None:
             ran.append("a2")
 
-        def interrupting_ledger(_primary):  # type: ignore[no-untyped-def]
-            raise KeyboardInterrupt("interrupt from inside the carrier")
+        def never_recovers(_primary):  # type: ignore[no-untyped-def]
+            raise KeyboardInterrupt("the carrier is gone for good")
 
         primary = Exception("write failed")
-        with unittest.mock.patch.object(
-            owned_descriptors, "_ledger", interrupting_ledger
-        ):
+        with unittest.mock.patch.object(owned_descriptors, "_ledger", never_recovers):
             control = owned_descriptors._teardown_during(primary, failing, quiet)
 
-        self.assertEqual(["a1", "a2"], ran, "a carrier failure skipped a remaining action")
+        self.assertEqual(["a1", "a2"], ran)
         self.assertIsInstance(control, KeyboardInterrupt)
+        self.assertEqual((), owned_descriptors.teardown_failures(primary))
 
     def test_the_ledger_survives_a_primary_that_refuses_attributes(self) -> None:
         """The carrier has to be the instance dictionary, not `setattr`.
