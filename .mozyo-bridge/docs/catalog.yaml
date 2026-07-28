@@ -558,6 +558,7 @@ documents:
     purpose: external plugin API 公開前に、ticket / presentation / terminal runtime / catalog / telemetry / release helper の built-in adapter 境界と v0.8 最初の候補を分類する設計正本。
     audit_role: plugin_ready_adapter_boundary_logic
     related_document_refs:
+      - logic-herdr-plugin-presentation-consumer-boundary
       - logic-ticket-system-neutral-orchestrator
       - logic-managed-state-model
       - logic-workspace-registry
@@ -570,6 +571,26 @@ documents:
       - logic-skill-distribution
       - logic-release-helper-contract
       - logic-fallback-retirement-ledger
+      - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-herdr-plugin-presentation-consumer-boundary
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/herdr-plugin-presentation-consumer-boundary.md
+    purpose: Herdr 0.7.5 pluginをmozyo-bridgeのexternal providerではなくpresentation consumerとして扱い、sublane UX intent、state ownership、safe customization、user-global plugin境界、engine-first実装順序を固定する設計正本。
+    audit_role: herdr_plugin_presentation_consumer_boundary_logic
+    related_document_refs:
+      - logic-plugin-ready-adapter-boundary
+      - logic-modular-config-driven-refactor
+      - logic-unit-target-model
+      - logic-unit-presentation-state-db
+      - logic-iterm-webviewer-presentation-boundary
+      - logic-pane-centric-cockpit-semantics
+      - logic-delegated-coordinator-cockpit-display
+      - logic-cockpit-attention-state
+      - logic-event-timeline-source
+      - spec-herdr-native-identity
       - rule-public-private-boundary
       - spec-project-map
 
@@ -931,6 +952,7 @@ documents:
     purpose: Unit / Target projection の desired / presentation state を tracked static file ではなく DB current table で扱う To-Be schema 境界。registry / inventory / managed-events / live tmux / Redmine の責務分担を固定する。
     audit_role: unit_presentation_state_db_logic
     related_document_refs:
+      - logic-herdr-plugin-presentation-consumer-boundary
       - logic-unit-target-model
       - logic-managed-state-model
       - logic-session-inventory
@@ -1087,6 +1109,7 @@ documents:
     purpose: iTerm Toolbelt / WebViewer / private cockpit UI を mozyo-bridge の event・target・attention contract を読む presentation consumer として扱う責務分界。UI を正本にせず、private policy を OSS default に混入させない設計正本。
     audit_role: iterm_webviewer_presentation_boundary_logic
     related_document_refs:
+      - logic-herdr-plugin-presentation-consumer-boundary
       - logic-cockpit-web-ui
       - logic-event-timeline-source
       - logic-unit-target-model
@@ -1282,6 +1305,7 @@ documents:
     purpose: v0.9 line の modular / configuration-aware built-in composition 方針。module / provider / feature selection を設定駆動に寄せつつ、workflow authority / safety / credential 境界を設定で弱めないための設計正本。
     audit_role: modular_config_driven_refactor_logic
     related_document_refs:
+      - logic-herdr-plugin-presentation-consumer-boundary
       - logic-plugin-ready-adapter-boundary
       - logic-workspace-defaults-renderer
       - rule-project-agent-workflow

@@ -8,6 +8,12 @@ external plugin API を公開する前に built-in adapter / provider 境界を�
 third-party extension contract、互換性保証を公開しない。目的は、core に残すべき
 最小 contract と、将来 adapter 化しやすい責務を分けることである。
 
+Herdr 0.7.5 が host 側で load する plugin は、mozyo-bridge の external provider
+plugin とは別である。Herdr plugin を Unit / Target / attention 等の presentation
+consumer として利用する境界、sublane UX intent、engine-first の順序は
+`herdr-plugin-presentation-consumer-boundary.md` を正本とする。Herdr-hosted plugin
+の存在を、本書が禁止する arbitrary code provider loading の解禁と読まない。
+
 ## Decision
 
 v0.8 の方針は **plugin system first** ではなく **built-in adapter boundary first**。
