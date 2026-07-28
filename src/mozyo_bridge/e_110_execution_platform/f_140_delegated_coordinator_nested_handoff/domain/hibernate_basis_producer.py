@@ -59,6 +59,7 @@ from typing import Mapping, Optional, Sequence, Tuple
 
 from .glance_integration_disposition import (
     MARKER_GATE_INTEGRATION_DISPOSITION,
+    canonical_marker_value,
     fold_integration_disposition,
 )
 from .hibernate_evidence_authority import (
@@ -116,6 +117,7 @@ from .hibernate_evidence_marker import (
 )
 from .redmine_journal_source import (
     MARKER_CHANNEL_WORKFLOW_EVENT,
+    declares_gate,
     strict_gate_markers,
 )
 from .sublane_admission import REVIEW_APPROVED
@@ -291,7 +293,9 @@ def _markers_of(notes: str, gate: str) -> tuple:
     yields nothing, and ``gate`` / ``kind`` are unioned so a second claim cannot hide in the other
     spelling (a marker naming two gates matches neither).
     """
-    return strict_gate_markers(notes, gate)
+    # The governed canonicalizer travels with the gate: two spellings of one disposition token are
+    # one declaration, exactly as the terminal consumers read them (review j#92012 finding 3).
+    return strict_gate_markers(notes, gate, canonicalize=canonical_marker_value)
 
 
 def _latest_gate_declaration(
@@ -309,13 +313,18 @@ def _latest_gate_declaration(
         jint = _journal_int(journal.journal_id)
         if jint is None:
             continue
-        found = _markers_of(journal.notes, gate)
-        if not found:
+        # Selection is by DECLARATION, parsing is separate (review j#92012 finding 1). Keying the
+        # scan on the STRICT markers collapsed the two: a newer malformed declaration produced no
+        # markers, so the journal was skipped and an OLDER valid one came back as current — the
+        # exact supersede-by-existence defect this docstring warns about. A journal that names the
+        # gate is current whatever its marker turns out to be; if that marker does not parse the
+        # declaration simply carries no evidence.
+        if not declares_gate(journal.notes, gate):
             continue
         if latest is None or jint > latest[0]:
             latest = (jint, _Declaration(
                 journal=str(jint),
-                markers=found,
+                markers=_markers_of(journal.notes, gate),
                 issuer=journal.issuer,
                 notes=journal.notes or "",
             ))

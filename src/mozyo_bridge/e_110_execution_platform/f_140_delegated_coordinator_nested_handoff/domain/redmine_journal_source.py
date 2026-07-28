@@ -207,7 +207,29 @@ def strict_marker_fields(
     return fields
 
 
-def strict_gate_markers(notes: str, gate: str) -> tuple:
+def declares_gate(notes: str, gate: str) -> bool:
+    """Whether ``notes`` CLAIMS ``gate`` at all, however its marker parses (pure).
+
+    The existence half of latest-wins (Redmine #14539 review j#92012 finding 1). A declaration
+    supersedes by EXISTING, not by being readable: a newer journal whose marker is malformed must
+    still shadow an older valid one, or strict parsing silently resurrects stale authority. So this
+    reads the RAW components and asks only "is this gate named here", where
+    :func:`strict_gate_markers` asks the separate question "and does its evidence parse".
+
+    Both aliases count and the workflow-event channel is the only authority channel, matching the
+    strict reader — the two must agree about WHICH journal is current even when they disagree about
+    whether its evidence is usable.
+    """
+    for channel, components in marker_components_in_note(notes or ""):
+        if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+            continue
+        for key, value in components:
+            if key.strip() in MARKER_GATE_ALIASES and value.strip() == gate:
+                return True
+    return False
+
+
+def strict_gate_markers(notes: str, gate: str, *, canonicalize=None) -> tuple:
     """Every STRICTLY readable workflow-event marker in ``notes`` declaring exactly ``gate`` (pure).
 
     The one call every Hibernate / terminal authority consumer makes (Redmine #14539 review
@@ -215,12 +237,18 @@ def strict_gate_markers(notes: str, gate: str) -> tuple:
     the workflow-event channel only (the handoff channel is a delivery notification), a body the
     canonical producer could render, and a logical gate set that is exactly ``{gate}`` — a marker
     naming two gates proves neither, so it matches nothing.
+
+    ``canonicalize`` is forwarded to :func:`strict_marker_fields` and MUST be the same hook the
+    other consumers of that gate pass (review j#92012 finding 3). Dropping it here reintroduced
+    the very inconsistency R15 fixed: ``disposition=merged:disposition=merge`` is one declaration
+    written twice for the terminal reader and an unreadable body for this one, so a contract-valid
+    integration evidence vanished on the Hibernate side alone.
     """
     found = []
     for channel, components in marker_components_in_note(notes or ""):
         if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
             continue
-        fields = strict_marker_fields(components)
+        fields = strict_marker_fields(components, canonicalize=canonicalize)
         if fields is not None and marker_logical_gates(fields) == {gate}:
             found.append(fields)
     return tuple(found)
@@ -810,6 +838,7 @@ __all__ = (
     "marker_components_in_note",
     "marker_fields_in_note",
     "marker_logical_gates",
+    "declares_gate",
     "strict_gate_markers",
     "strict_marker_fields",
     "extract_markers_from_note",

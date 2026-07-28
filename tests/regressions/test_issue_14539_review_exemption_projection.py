@@ -2239,5 +2239,254 @@ class ReviewJ91943HibernateAuthorityReaderTests(unittest.TestCase):
                 self.assertEqual(_markers_of(marker, "integration_disposition"), ())
 
 
+class ReviewJ92012SupersessionTests(unittest.TestCase):
+    """R17-F1: strict parsing must not resurrect a superseded declaration.
+
+    ``_latest_gate_declaration`` documents "latest-wins by existence … however its marker turns
+    out to parse". Keying the scan on the STRICT markers collapsed existence into readability, so
+    a newer malformed declaration produced no markers, its journal was skipped, and an OLDER valid
+    declaration came back as current — with its external read and its evidence.
+    """
+
+    HEAD = "a" * 40
+
+    class _Selected:
+        repo_workspace_id = "ws"
+        lane_id = "r1"
+        lane_generation = 1
+
+    def _delegation(self, gate_field="gate=dogfood_delegated"):
+        return (
+            f"[mozyo:workflow-event:{gate_field}:workspace=ws:lane=r1:lane_generation=1:"
+            f"head={self.HEAD}:release_issue=900:acceptance=j%23123]"
+        )
+
+    def _run(self, journals):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            read_dogfood_receipts,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+            EvidenceJournal,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+        )
+
+        reads: list = []
+
+        def _entries(issue):
+            reads.append(issue)
+            return [
+                RedmineJournalEntry(
+                    issue_id="900",
+                    journal_id="9",
+                    notes=(
+                        "[mozyo:workflow-event:gate=dogfood_receipt:source_issue=500:"
+                        f"head={self.HEAD}]"
+                    ),
+                )
+            ]
+
+        got = read_dogfood_receipts(
+            [EvidenceJournal(journal_id=j, notes=n) for j, n in journals],
+            self._Selected(),
+            _entries,
+        )
+        return reads, got
+
+    def test_the_sole_valid_declaration_is_current(self):
+        """The control: without it the shadow assertions could be a broken fixture."""
+        reads, got = self._run([("1", self._delegation())])
+        self.assertEqual(reads, ["900"])
+        self.assertEqual(set(got), {"900"})
+
+    def test_a_newer_malformed_declaration_shadows_the_older_valid_one(self):
+        """The literal defect: j2 is unreadable, so j1 must NOT come back as current."""
+        reads, got = self._run(
+            [
+                ("1", self._delegation()),
+                ("2", self._delegation(gate_field="gate = dogfood_delegated")),
+            ]
+        )
+        self.assertEqual(reads, [])
+        self.assertEqual(got, {})
+
+    def test_the_shadow_holds_for_every_malformation(self):
+        for label, gate_field in (
+            ("whitespace", "gate = dogfood_delegated"),
+            ("unknown second alias", "gate=dogfood_delegated:kind=unknown_gate"),
+        ):
+            with self.subTest(label):
+                reads, got = self._run(
+                    [("1", self._delegation()), ("2", self._delegation(gate_field=gate_field))]
+                )
+                self.assertEqual(reads, [])
+                self.assertEqual(got, {})
+
+    def test_a_newer_VALID_declaration_supersedes_normally(self):
+        """Negative control: the shadow rule must not make every newer journal unusable."""
+        reads, got = self._run([("1", self._delegation()), ("2", self._delegation())])
+        self.assertEqual(reads, ["900"])
+        self.assertEqual(set(got), {"900"})
+
+    def test_the_declaration_scan_sees_a_gate_however_it_parses(self):
+        """The grammar half: existence and readability are separate questions."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            declares_gate,
+            strict_gate_markers,
+        )
+
+        malformed = self._delegation(gate_field="gate = dogfood_delegated")
+        self.assertTrue(declares_gate(malformed, "dogfood_delegated"))
+        self.assertEqual(strict_gate_markers(malformed, "dogfood_delegated"), ())
+
+    def test_the_shadow_rule_covers_the_other_gates_sharing_the_selector(self):
+        """``_latest_gate_declaration`` is shared, so the invariant must hold for every gate."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_basis_producer import (  # noqa: E501
+            _latest_gate_declaration,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+            EvidenceJournal,
+        )
+
+        for gate in ("review_result", "required_ci_green", "park_declared"):
+            with self.subTest(gate):
+                clean = f"[mozyo:workflow-event:gate={gate}:workspace=ws:lane=r1]"
+                malformed = f"[mozyo:workflow-event:gate = {gate}:workspace=ws:lane=r1]"
+                decl = _latest_gate_declaration(
+                    [
+                        EvidenceJournal(journal_id="1", notes=clean),
+                        EvidenceJournal(journal_id="2", notes=malformed),
+                    ],
+                    gate=gate,
+                )
+                # The NEWER journal is current, and it carries no usable evidence.
+                self.assertEqual(decl.journal, "2")
+                self.assertEqual(decl.markers, ())
+
+
+class ReviewJ92012OwnerApprovalTests(unittest.TestCase):
+    """R17-F2: the bound-pair owner approval readers are destructive authority.
+
+    An exact approval match admits the replacement transaction / guarded close, so the lenient
+    fold accepted three bodies the canonical producer cannot emit as genuine owner approvals.
+    """
+
+    def _modules(self):
+        import importlib
+
+        base = (
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+        )
+        return (
+            importlib.import_module(base + "sublane_hibernated_bound_pair_convergence_live"),
+            importlib.import_module(
+                base + "sublane_hibernated_bound_pair_composer_discard_live"
+            ),
+        )
+
+    def test_the_genuine_owner_approval_is_read(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            strict_gate_markers,
+        )
+
+        for module in self._modules():
+            with self.subTest(module.__name__.rsplit(".", 1)[-1]):
+                gate = module.APPROVAL_GATE
+                clean = f"[mozyo:workflow-event:gate={gate}:issue=500:lane=r1]"
+                self.assertEqual(len(strict_gate_markers(clean, gate)), 1)
+
+    def test_producer_impossible_owner_approvals_are_refused(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            strict_gate_markers,
+        )
+
+        for module in self._modules():
+            gate = module.APPROVAL_GATE
+            clean = f"[mozyo:workflow-event:gate={gate}:issue=500:lane=r1]"
+            for label, marker in (
+                ("whitespace", clean.replace(f"gate={gate}", f"gate = {gate}")),
+                ("duplicate key", clean.replace("issue=500", "issue=999:issue=500")),
+                ("unknown second alias",
+                 clean.replace(f"gate={gate}", f"gate={gate}:kind=unknown_gate")),
+                ("handoff channel",
+                 clean.replace("[mozyo:workflow-event:", "[mozyo:handoff:")),
+            ):
+                with self.subTest(f"{module.__name__.rsplit('.', 1)[-1]}/{label}"):
+                    self.assertEqual(strict_gate_markers(marker, gate), ())
+
+    def test_both_readers_go_through_the_shared_strict_reader(self):
+        """Neither may keep a private lenient scan — that is how this drifted in the first place."""
+        import inspect
+
+        for module in self._modules():
+            with self.subTest(module.__name__.rsplit(".", 1)[-1]):
+                source = inspect.getsource(module)
+                self.assertIn("strict_gate_markers(entry.notes, APPROVAL_GATE)", source)
+                self.assertNotIn("marker_fields_in_note", source)
+
+
+class ReviewJ92012CanonicalizerParityTests(unittest.TestCase):
+    """R17-F3: the shared gate reader dropped the governed canonicalizer.
+
+    R15 fixed "the consumers disagree about the same marker" by giving them one canonicalizer;
+    R17's new shared helper called the strict reader without it, so a canonical duplicate was one
+    declaration for the terminal consumers and an unreadable body for the Hibernate basis.
+    """
+
+    HEAD = "a" * 40
+
+    def _duplicate_note(self):
+        return (
+            "[mozyo:workflow-event:gate=integration_disposition:"
+            f"head={self.HEAD}:disposition=merged:disposition=merge]"
+        )
+
+    def test_every_integration_disposition_consumer_returns_the_same_verdict(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_basis_producer import (  # noqa: E501
+            _markers_of,
+        )
+
+        note = self._duplicate_note()
+        components = [
+            c
+            for ch, c in marker_components_in_note(note)
+            if ch == "workflow-event"
+        ][0]
+
+        # terminal strict read, Hibernate basis read, and the conflict detector must agree that
+        # ``merged`` + ``merge`` is ONE declaration written twice.
+        self.assertIsNotNone(
+            strict_marker_fields(components, canonicalize=canonical_marker_value)
+        )
+        self.assertEqual(len(_markers_of(note, "integration_disposition")), 1)
+        self.assertFalse(
+            has_conflicting_disposition_declaration(
+                [("1", "## Integration disposition\n" + note)]
+            )
+        )
+
+    def test_a_genuinely_different_duplicate_is_refused_everywhere(self):
+        """The boundary: parity must not mean "accept everything"."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_basis_producer import (  # noqa: E501
+            _markers_of,
+        )
+
+        note = self._duplicate_note().replace("disposition=merge]", "disposition=explicit_deferral]")
+        components = [
+            c for ch, c in marker_components_in_note(note) if ch == "workflow-event"
+        ][0]
+        self.assertIsNone(
+            strict_marker_fields(components, canonicalize=canonical_marker_value)
+        )
+        self.assertEqual(_markers_of(note, "integration_disposition"), ())
+        self.assertTrue(
+            has_conflicting_disposition_declaration(
+                [("1", "## Integration disposition\n" + note)]
+            )
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
