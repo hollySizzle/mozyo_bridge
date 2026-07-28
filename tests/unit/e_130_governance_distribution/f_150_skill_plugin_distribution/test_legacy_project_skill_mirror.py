@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import inspect
 import os
 import pickle
 import shutil
@@ -2428,6 +2429,136 @@ class LegacyMirrorSyncServiceTest(_MirrorTreeFixture):
             sum(1 for entry in ledger if entry is control),
             "the carrier's own interrupt was not retained exactly once",
         )
+
+    @staticmethod
+    def _drain_line(match: str) -> int:
+        """The line in `_Retention._drain` containing `match`.
+
+        Found by source text, not written down: a literal line number would go
+        stale the moment the module is edited, and an injection that quietly
+        stops firing is exactly the kind of test that reports green for nothing.
+        """
+        lines, start = inspect.getsourcelines(owned_descriptors._Retention._drain)
+        for offset, line in enumerate(lines):
+            if match in line:
+                return start + offset
+        raise AssertionError(f"no line matching {match!r} in _drain; the probe is stale")
+
+    def _interrupt_after_a_commit(self, primary, line: int):
+        """Trace `_drain` and interrupt once at `line`, after an append landed.
+
+        "After the append returned" is an ordering, not a commit
+        acknowledgement — control flow arrives between bytecodes. Conditioning
+        on the ledger being non-empty is what makes this the post-commit
+        boundary rather than some earlier one.
+        """
+        code = owned_descriptors._Retention._drain.__code__
+        fired: list[bool] = []
+
+        def local(frame, event, arg):  # type: ignore[no-untyped-def]
+            if (
+                event == "line"
+                and frame.f_lineno == line
+                and not fired
+                and owned_descriptors.teardown_failures(primary)
+            ):
+                fired.append(True)
+                raise KeyboardInterrupt("interrupt at an instruction boundary")
+            return local
+
+        def tracer(frame, event, arg):  # type: ignore[no-untyped-def]
+            return local if frame.f_code is code else None
+
+        return tracer, fired
+
+    def test_retention_survives_an_interrupt_at_a_commit_boundary(self) -> None:
+        """j#90561 R19-F1. The queue popped an entry once its append returned,
+        which is an ordering and not an acknowledgement: an interrupt between
+        the append and the pop left the occurrence queued *and* recorded, so a
+        retry duplicated it, and the pop sat outside the guard, so an interrupt
+        there escaped the rail and skipped a cleanup that had not run.
+
+        Measured before the fix at two boundaries: `actions=['failing']` with
+        the `KeyboardInterrupt` escaping `_teardown_during`, and a ledger
+        holding the same failure twice.
+        """
+        for label, match in (
+            ("loop head", "while True:"),
+            ("the unrecorded scan", "_unrecorded("),
+        ):
+            with self.subTest(boundary=label):
+                ran: list[str] = []
+                failure = RuntimeError("the teardown failure")
+
+                def failing() -> None:
+                    ran.append("failing")
+                    raise failure
+
+                def quiet() -> None:
+                    ran.append("quiet")
+
+                primary = Exception("write failed")
+                tracer, fired = self._interrupt_after_a_commit(
+                    primary, self._drain_line(match)
+                )
+                sys.settrace(tracer)
+                try:
+                    control = owned_descriptors._teardown_during(primary, failing, quiet)
+                finally:
+                    sys.settrace(None)
+
+                self.assertTrue(fired, f"{label}: the injection never fired")
+                self.assertEqual(["failing", "quiet"], ran, f"{label}: an action was skipped")
+                self.assertIsInstance(control, KeyboardInterrupt)
+
+                ledger = owned_descriptors.teardown_failures(primary)
+                self.assertEqual(
+                    1,
+                    sum(1 for entry in ledger if entry is failure),
+                    f"{label}: the failure was recorded more than once",
+                )
+                self.assertEqual(
+                    1,
+                    sum(1 for entry in ledger if entry is control),
+                    f"{label}: the interrupt was not recorded exactly once",
+                )
+
+    def test_the_final_flush_surfaces_the_control_flow_it_hits(self) -> None:
+        """j#90561 R19-F2. The flush after the last action returned control flow
+        that was thrown away, so an interrupt there vanished entirely — worse
+        than the demotion to a note R13-F3 was about, and not the documented
+        never-recovers boundary either, since the carrier recovers next call."""
+        ran: list[str] = []
+        failure = RuntimeError("teardown failure")
+
+        def failing() -> None:
+            ran.append("failing")
+            raise failure
+
+        def quiet() -> None:
+            ran.append("quiet")
+
+        real_ledger = owned_descriptors._ledger
+        schedule = ["ordinary", "interrupt"]
+
+        def scheduled(primary):  # type: ignore[no-untyped-def]
+            if schedule:
+                if schedule.pop(0) == "ordinary":
+                    raise MemoryError("the carrier failed, leaving the queue")
+                raise KeyboardInterrupt("the carrier interrupted the final flush")
+            return real_ledger(primary)
+
+        primary = Exception("write failed")
+        with unittest.mock.patch.object(owned_descriptors, "_ledger", scheduled):
+            control = owned_descriptors._teardown_during(primary, failing, quiet)
+
+        self.assertEqual([], schedule, "the schedule never reached the final flush")
+        self.assertEqual(["failing", "quiet"], ran)
+        self.assertIsInstance(control, KeyboardInterrupt)
+
+        ledger = owned_descriptors.teardown_failures(primary)
+        self.assertEqual(1, sum(1 for entry in ledger if entry is failure))
+        self.assertEqual(1, sum(1 for entry in ledger if entry is control))
 
     def test_a_carrier_that_never_recovers_gives_up_the_record_only(self) -> None:
         """The stated boundary, held to: if the carrier never takes anything,

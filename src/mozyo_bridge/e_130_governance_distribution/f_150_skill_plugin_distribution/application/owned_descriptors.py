@@ -106,7 +106,9 @@ def teardown_failures(primary: BaseException) -> tuple[object, ...]:
     R17-F1).
     """
     ledger = _existing_ledger(primary)
-    return tuple(ledger.entries) if ledger is not None else ()
+    if ledger is None:
+        return ()
+    return tuple(entry.failure for entry in ledger.entries)
 
 
 def _existing_ledger(primary: BaseException) -> _Ledger | None:
@@ -156,6 +158,30 @@ def _ledger(primary: BaseException) -> _Ledger | None:
     return ledger
 
 
+class _Occurrence:
+    """One arrival of one failure, distinct from every other arrival.
+
+    The ledger holds these rather than the failures themselves, because
+    "already recorded" has to be answerable independently of the failure
+    object: two actions may report the same object — ``False`` is a singleton —
+    and those are two occurrences (j#90517 R17-F2), while a retry of *this*
+    occurrence is not a second one (j#90561 R19-F1).
+    """
+
+    __slots__ = ("failure",)
+
+    def __init__(self, failure: object) -> None:
+        self.failure = failure
+
+
+_RETENTION_ATTEMPTS = 4
+"""How many times one retention retries a carrier that keeps interrupting.
+
+Bounded so a carrier that never recovers still terminates; the queue survives
+the call anyway and later retentions try again.
+"""
+
+
 class _Retention:
     """One unwind's retention, with the occurrences the carrier has not taken.
 
@@ -166,10 +192,18 @@ class _Retention:
     but the ledger was empty (j#90529 R18-F1). Notes are a rendering; losing the
     objects is losing the record.
 
-    So an occurrence the carrier refused stays queued and is retried at the next
-    retention, and once more when the teardown ends. Queue order is arrival
-    order, and an entry leaves the queue only after its append returns, so a
-    retry cannot duplicate what already landed.
+    The fix for that kept a queue and popped an entry once its append returned.
+    "After the append returned" is an ordering, not an acknowledgement: control
+    flow arrives at bytecode boundaries, so an interrupt between the append and
+    the pop left the occurrence queued *and* recorded — a retry duplicated it —
+    and the pop itself sat outside the guard, so an interrupt there escaped the
+    rail and skipped a cleanup that had not run (j#90561 R19-F1).
+
+    There is no commit step now. Nothing is ever removed from the queue; the
+    ledger *is* the record of what has been taken, and the next pass simply
+    skips occurrences already in it. Every instruction that touches either lives
+    inside the guard, so an interrupt anywhere leaves a state the next pass
+    reads correctly.
 
     If the carrier never recovers the record is unreachable — the same boundary
     as refusing to overwrite a foreign binding (j#90517 R17-F1), and stated for
@@ -180,36 +214,68 @@ class _Retention:
 
     def __init__(self, primary: BaseException) -> None:
         self.primary = primary
-        self._queued: list[object] = []
+        self._queued: list[_Occurrence] = []
 
     def remember(self, failure: object) -> BaseException | None:
         """Retain one occurrence, and anything still queued before it."""
-        self._queued.append(failure)
-        return self.flush()
+        return self._retain(_Occurrence(failure))
 
     def flush(self) -> BaseException | None:
-        """Append what is queued; return control flow raised while trying.
+        """Retain whatever earlier attempts could not."""
+        return self._retain(None)
 
-        Returning rather than raising is the rule the carrier itself broke
-        twice by unwinding out of the loop (j#90508 R16-F1/F2). Nothing here
-        can raise for a real exception — binding a base descriptor, a dict
-        lookup on an identity key, and a ``list`` append — but the guard makes
-        that a property of the code rather than of an argument about it.
+    def _retain(self, arriving: _Occurrence | None) -> BaseException | None:
+        """Queue ``arriving`` if given, then take everything the carrier will.
+
+        Returns the first control flow raised while trying, rather than raising
+        it: the carrier itself broke the "remaining actions always run" rule by
+        unwinding out of the loop (j#90508 R16-F1/F2, j#90561 R19-F1). Each
+        interrupt is an occurrence in its own right, so it joins the queue and
+        the loop tries again — bounded, because a carrier that keeps
+        interrupting must not spin.
         """
-        while self._queued:
+        first: BaseException | None = None
+        for _ in range(_RETENTION_ATTEMPTS):
             try:
-                ledger = _ledger(self.primary)
-                if ledger is None:
-                    return None  # no carrier; leave the queue for a later try
-                ledger.entries.append(self._queued[0])
+                if arriving is not None:
+                    self._enqueue(arriving)
+                    arriving = None
+                self._drain()
+                return first
             except Exception:  # noqa: BLE001 - nothing to route; still queued
-                return None
+                return first
             except BaseException as interrupt:  # noqa: BLE001 - routed, not raised
-                # The interrupt is itself an occurrence, and it queues *behind*
-                # the one it interrupted so arrival order survives the retry.
-                self._queued.append(interrupt)
-                return interrupt
-            self._queued.pop(0)
+                if first is None:
+                    first = interrupt
+                arriving = _Occurrence(interrupt)
+        return first
+
+    def _enqueue(self, occurrence: _Occurrence) -> None:
+        """Queue an occurrence unless it is already there. Idempotent."""
+        for queued in self._queued:
+            if queued is occurrence:
+                return
+        self._queued.append(occurrence)
+
+    def _drain(self) -> None:
+        """Append every queued occurrence the ledger does not already hold."""
+        while True:
+            ledger = _ledger(self.primary)
+            if ledger is None:
+                return  # no carrier; the queue waits for a later attempt
+            occurrence = self._unrecorded(ledger)
+            if occurrence is None:
+                return
+            ledger.entries.append(occurrence)
+
+    def _unrecorded(self, ledger: _Ledger) -> _Occurrence | None:
+        """The first queued occurrence the ledger has not taken, in order."""
+        for occurrence in self._queued:
+            for entry in ledger.entries:
+                if entry is occurrence:
+                    break
+            else:
+                return occurrence
         return None
 
 
@@ -371,8 +437,13 @@ def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
             # natural end.
             _present(retention, arrived)
     # A carrier that recovered after refusing an occurrence still gets to keep
-    # it, even if no later retention came along to carry the retry.
-    retention.flush()
+    # it, even if no later retention came along to carry the retry. The flush is
+    # part of the retention channel, so its control flow goes on the same rail:
+    # discarding it made an interrupt vanish outright — worse than the demotion
+    # to a note that R13-F3 was about (j#90561 R19-F2).
+    late = retention.flush()
+    if control_flow is None:
+        control_flow = late
     return control_flow
 
 
