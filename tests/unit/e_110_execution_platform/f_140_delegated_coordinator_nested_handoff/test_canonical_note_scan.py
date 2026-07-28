@@ -518,9 +518,38 @@ class PassOrderTest(unittest.TestCase):
         # read it and refuse the rest of the note. This erased live gate events (#14584 j#91761).
         for label, note in (
             ("angle destination", f"see [docs](<https://example.com>)\n\n{MARKER}"),
-            ("tag-shaped title", f'[text](http://x "<code>")\n\n{MARKER}'),
             ("reference definition", f"[ref]: <https://example.com>\n\n{MARKER}"),
             ("image angle destination", f"![a](<https://x/i.png>)\n\n{MARKER}"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ("review_request",))
+
+    def test_a_tag_shaped_title_is_a_declared_over_blank(self):
+        # The renderer hides this one too, but nothing short of parsing the link proves it, and the
+        # attempt to approximate the region masked real <script> openers behind lexical triggers
+        # that were not links at all (#14584 j#91792). Refusing is the direction that can be undone.
+        self.assertEqual(_gates(f'[text](http://x "<code>")\n\n{MARKER}'), ())
+
+    def test_a_lexical_link_trigger_never_hides_real_markup(self):
+        # The four triggers, none of them an actual link. The true hidden region is empty, so any
+        # mask at all was too large — and a marker between <script> tags came back as a gate.
+        for label, note in (
+            ("]( trigger", f"prose ]( <script> )\n\n{MARKER}\n</script>"),
+            ("![ trigger", f"prose ![ <script> ]\n\n{MARKER}\n</script>"),
+            ("][ trigger", f"prose ][ <script> ]\n\n{MARKER}\n</script>"),
+            ("]: trigger", f"prose ]: <script>\n\n{MARKER}\n</script>"),
+            ("link shape that is not a link", f"[docs]( invalid <script> )\n\n{MARKER}\n</script>"),
+        ):
+            with self.subTest(label):
+                self.assertEqual(_gates(note), ())
+
+    def test_an_autolink_is_a_link_and_not_markup(self):
+        # What actually makes the angle-destination cases above work, and it holds wherever an
+        # autolink appears — no claim about surrounding link syntax is needed (CommonMark §6.5).
+        for label, note in (
+            ("scheme autolink in prose", f"see <https://example.com> here\n\n{MARKER}"),
+            ("email autolink in prose", f"mail <a@example.com> here\n\n{MARKER}"),
+            ("mailto autolink", f"see <mailto:a@example.com> here\n\n{MARKER}"),
         ):
             with self.subTest(label):
                 self.assertEqual(_gates(note), ("review_request",))

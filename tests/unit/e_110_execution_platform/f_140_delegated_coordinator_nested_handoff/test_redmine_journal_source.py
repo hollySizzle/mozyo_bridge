@@ -349,6 +349,12 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
             ("escaped backtick", "\\` x `%s`" % self.GATE),
             ("link destination", "[text](%s)" % self.GATE),
             ("link title", '[text](http://example.com "%s")' % self.GATE),
+            # #14584 j#91792: lexical triggers that are not links at all — a mask here
+            # hid a real <script> opener and the marker inside it became a gate.
+            ("]( trigger, not a link", "prose ]( <script> )\n\n%s\n</script>" % self.GATE),
+            ("][ trigger, not a link", "prose ][ <script> ]\n\n%s\n</script>" % self.GATE),
+            ("]: trigger, not a link", "prose ]: <script>\n\n%s\n</script>" % self.GATE),
+            ("![ trigger, not a link", "prose ![ <script> ]\n\n%s\n</script>" % self.GATE),
             ("definition title on the next line", '[foo]: /url\n  "%s"' % self.GATE),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % self.GATE),
             ("image alt text", "![a %s b](img.png)" % self.GATE),
@@ -365,7 +371,6 @@ class QuotedMarkerIsNotAGateTest(unittest.TestCase):
         # tag-shaped title look like raw HTML, and the gate below it disappeared note-wide.
         for label, note in (
             ("angle destination", "see [docs](<https://example.com>)\n\n%s" % self.GATE),
-            ("tag-shaped title", '[text](http://x "<code>")\n\n%s' % self.GATE),
             ("reference definition", "[ref]: <https://example.com>\n\n%s" % self.GATE),
         ):
             with self.subTest(label):

@@ -183,6 +183,12 @@ class FailClosedTest(unittest.TestCase):
             ("escaped backtick", "\\` x `%s`" % marker),
             ("link destination", "[text](%s)" % marker),
             ("link title", '[text](http://example.com "%s")' % marker),
+            # #14584 j#91792: lexical triggers that are not links at all — a mask here
+            # hid a real <script> opener and the marker inside it became a gate.
+            ("]( trigger, not a link", "prose ]( <script> )\n\n%s\n</script>" % marker),
+            ("][ trigger, not a link", "prose ][ <script> ]\n\n%s\n</script>" % marker),
+            ("]: trigger, not a link", "prose ]: <script>\n\n%s\n</script>" % marker),
+            ("![ trigger, not a link", "prose ![ <script> ]\n\n%s\n</script>" % marker),
             ("definition title on the next line", '[foo]: /url\n  "%s"' % marker),
             ("paren inside a quoted title", '[text](url "a ) %s b")' % marker),
             ("image alt text", "![a %s b](img.png)" % marker),
@@ -206,7 +212,6 @@ class FailClosedTest(unittest.TestCase):
         marker = render_dispatch_note("", lane=LANE, lane_generation=1).strip()
         for label, note in (
             ("angle destination", "see [docs](<https://example.com>)\n\n%s" % marker),
-            ("tag-shaped title", '[text](http://x "<code>")\n\n%s' % marker),
             ("reference definition", "[ref]: <https://example.com>\n\n%s" % marker),
         ):
             with self.subTest(label):
