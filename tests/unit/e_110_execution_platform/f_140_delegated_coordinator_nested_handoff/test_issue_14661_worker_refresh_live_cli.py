@@ -1062,6 +1062,61 @@ class RealIssuerResolutionTests(unittest.TestCase):
         self.assertTrue(pointer.startswith("git:.mozyo-bridge/config.yaml@"), pointer)
         self.assertGreater(len(pointer.split("@")[-1]), 0, "an anchor needs a real blob")
 
+    def test_the_anchor_cites_the_ruling_that_actually_decided_this_gate(self):
+        # Review j#92715: the anchor used to carry a repo-wide pointer at #14219 j#85530 Q3 — a
+        # ruling that says nothing about this gate — so ``is_anchored`` passed while pointing at
+        # a record that could not have decided the binding. Checking only "non-empty" cannot see
+        # that; the anchor has to name the ruling that actually decided it.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_issuer_policy import (  # noqa: E501
+            config_policy_pointer,
+            resolve_journal_issuer,
+        )
+
+        issuer = resolve_journal_issuer(
+            notes=self.marker, journal_id=self.APPROVAL_JOURNAL,
+            policy_pointer=config_policy_pointer("deadbeef"),
+        )
+        self.assertEqual(issuer.role, "coordinator")
+        self.assertTrue(issuer.is_anchored)
+        self.assertIn("redmine:#14661:j#92641", issuer.authority_anchor)
+        self.assertNotIn("#14219", issuer.authority_anchor)
+
+    def test_the_pre_existing_gates_keep_their_own_ruling_anchor(self):
+        # The fix must not retroactively re-attribute the hibernate-evidence gates.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_issuer_policy import (  # noqa: E501
+            config_policy_pointer,
+            resolve_journal_issuer,
+        )
+
+        issuer = resolve_journal_issuer(
+            notes="[mozyo:workflow-event:gate=park_declared:workspace=ws:lane=l:lane_generation=2]",
+            journal_id="1", policy_pointer=config_policy_pointer("deadbeef"),
+        )
+        self.assertEqual(issuer.role, "lane_worker")
+        self.assertIn("redmine:#14219:j#85530:Q3", issuer.authority_anchor)
+        self.assertNotIn("j#92641", issuer.authority_anchor)
+
+    def test_every_gate_with_a_role_also_names_the_ruling_that_gave_it(self):
+        # The runtime "unruled gate" guard is unreachable on its own (a gate with no role is
+        # filtered before it), so the property it protects is pinned here instead: the two maps
+        # must describe the SAME gates. Adding a gate to one alone is the drift that produced
+        # this finding — a role with no ruling of its own, silently anchored to someone else's.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (  # noqa: E501
+            hibernate_evidence_authority as auth,
+        )
+
+        self.assertEqual(
+            set(auth._KIND_ISSUER), set(auth._KIND_RULING),
+            "every gate with a canonical writer must name the ruling that decided it",
+        )
+
+    def test_a_gate_no_ruling_claims_is_unanchored(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+            contract_ruling_pointer,
+        )
+
+        self.assertEqual(contract_ruling_pointer("some_unruled_gate"), "")
+
     def test_a_coordinator_written_approval_verifies_through_the_real_resolver(self):
         # No issuer_resolver override: the gate->role policy and the committed anchor do the work.
         self.assertTrue(self._verify(f"## Gate: owner approval\n\n{self.marker}\n"))
