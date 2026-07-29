@@ -30,6 +30,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     CANONICAL_REVIEW_CONCLUSION_TOKENS,
     CANONICAL_REVIEW_HEADING,
     REVIEW_OUTCOME_BLOCKER,
+    canonical_gate_heading,
     fold_issue_gate_facts,
     lane_signal_from_gate_facts,
 )
@@ -73,10 +74,12 @@ class ProducerTemplateMandatesTheConsumerContract(unittest.TestCase):
 
     def test_worker_template_pins_canonical_gate_tokens_not_reworded(self) -> None:
         # #13910 j#81068: a worker who reworded the gate token (``Review Request (R3)``) lost
-        # the anchor. The template fixes the canonical literals.
+        # the anchor. The template fixes the canonical literals. Redmine #14665: those literals
+        # are DERIVED from the grammar's canonical token map, never spelled a second time here
+        # — a hand-copied literal beside the contract is how the preset and the skill drifted.
         body = self.templates[_WORKER_ROLE]
-        self.assertIn("## Gate: Implementation Done", body)
-        self.assertIn("## Gate: Review Request", body)
+        for token in ("implementation_done", "review_request"):
+            self.assertIn(canonical_gate_heading(token), body)
 
 
 class TemplateMandatedJournalsFoldThroughTheGrammar(unittest.TestCase):
