@@ -1,13 +1,20 @@
 """Shared `os` fault schedule for the legacy mirror family (Redmine #14684).
 
-The five modules the #14660 characterization marks with a non-zero `os_patch`
+Four modules inject `os` primitives against a real mirror tree, and each of the
+four had re-written the same three fakes: an `os.open` that remembers which
+descriptor the staging create handed back, an `os.close` that closes for real
+and then fails exactly that descriptor once, and a primitive that raises instead
+of running. This module owns those three shapes, so a fix to one of them lands
+once instead of four times.
+
+Four, not the five the #14660 characterization marks with a non-zero `os_patch`
 (`vibes/docs/logics/legacy-mirror-failure-state-characterization.md`
-§5.5 移設先 module の確定) inject `os` primitives against a real mirror tree,
-and each of them had re-written the same three fakes: an `os.open` that
-remembers which descriptor the staging create handed back, an `os.close` that
-closes for real and then fails exactly that descriptor once, and a primitive
-that raises instead of running. This module owns those three shapes, so a fix
-to one of them lands once instead of five times.
+§5.5 移設先 module の確定). The fifth,
+`tests/regressions/test_issue_14651_capability_advertisement.py`, does not import
+this and has none of the three shapes: its two `os_patch` replace
+`os.supports_dir_fd` / `os.supports_fd` with a `frozenset`, which substitutes an
+*advertisement the probe must refuse to read* (#14651) rather than making a
+primitive fail. Routing it through a fault schedule would be reuse in name only.
 
 It deliberately does not own a fault whose payload *is* the property under
 test — the short write, the ordinary file substituted at the staging name
@@ -27,10 +34,22 @@ Two notes on what the schedule patches:
   as a reach it does not have.
 * A fault keyed on nothing but a call count lands on the host capability probe
   before it reaches the subject, because the probe calls the same primitives
-  (#14651). ``only_first`` therefore belongs with
-  `_MirrorTreeFixture._preflight_already_answered`, exactly as the hand-written
-  fake it replaces did. Faults keyed on a descriptor pick out their own call and
-  do not need it.
+  (#14651). Such a fault therefore belongs with
+  `_MirrorTreeFixture._preflight_already_answered`. Faults keyed on a descriptor
+  pick out their own call and do not need it.
+
+Two limits to know before adding a consumer:
+
+* **There is no "fail only the first call" knob**, and adding one back needs an
+  oracle first — see `raise_on` (Redmine #14684, review j#93050 F2).
+* **Three invariants here are not observed by any current consumer**: the close
+  fault firing at most once, an exception *instance* being re-raised as the same
+  object rather than rebuilt, and `walk_root` being the *first* descriptor opened
+  without a `dir_fd` rather than the latest. Each was measured by mutating it and
+  watching all 40 consumer tests stay green (j#93064). They reproduce the
+  hand-written fakes this module replaced, so nothing regressed — but do not
+  build a new consumer on one of them without adding a case that would notice if
+  it broke.
 """
 
 from __future__ import annotations
@@ -120,19 +139,22 @@ class FaultSchedule:
 
         return self._schedule("open", build)
 
-    def raise_on(self, primitive: str, error, *, only_first: bool = False) -> FaultSchedule:  # type: ignore[no-untyped-def]
-        """``os.<primitive>`` raises `error` instead of running.
+    def raise_on(self, primitive: str, error) -> FaultSchedule:  # type: ignore[no-untyped-def]
+        """``os.<primitive>`` raises `error` instead of running — on every call.
 
-        ``only_first`` lets the real primitive run from the second call on, for
-        the cases about a failure that does not persist.
+        There is deliberately no "only the first call" variant. One case needs a
+        failure that does not persist, and it writes that fake itself: a fault
+        that stops after n calls has a *schedule* which is the property under
+        test, so it belongs with the case that asserts it. Offering the knob here
+        would put a promise on the shared surface that no consumer observes —
+        measured: disabling it killed none of the 40 tests — and a later caller
+        could then rely on behaviour nothing checks (review j#93050 F2).
         """
         make = _exception_factory(error)
 
-        def build(real):  # type: ignore[no-untyped-def]
+        def build(_real):  # type: ignore[no-untyped-def]
             def failing(*args, **kwargs):  # type: ignore[no-untyped-def]
                 self.calls[primitive] += 1
-                if only_first and self.calls[primitive] > 1:
-                    return real(*args, **kwargs)
                 raise make()
 
             return failing

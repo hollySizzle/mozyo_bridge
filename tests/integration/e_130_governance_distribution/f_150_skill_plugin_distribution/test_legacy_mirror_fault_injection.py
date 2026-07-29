@@ -299,22 +299,35 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        schedule = FaultSchedule()
-        schedule.raise_on("write", OSError(errno.ENOSPC, "injected"))
-        schedule.raise_on(
-            "unlink", PermissionError(errno.EACCES, "injected"), only_first=True
-        )
+        real_unlink = os.unlink
+        calls: list[int] = []
+
+        def transient_unlink(*args, **kwargs):  # type: ignore[no-untyped-def]
+            """The cleanup failure does not persist: a second attempt succeeds.
+
+            Written here rather than taken from the schedule. The *schedule* of
+            this fault — fail, then stop failing — is what the case is about, and
+            it is the only one that needs it; a shared knob for it would promise
+            something no test observes (review j#93050 F2).
+            """
+            calls.append(1)
+            if len(calls) == 1:
+                raise PermissionError(errno.EACCES, "injected")
+            return real_unlink(*args, **kwargs)
+
+        schedule = FaultSchedule().raise_on("write", OSError(errno.ENOSPC, "injected"))
 
         # The unlink fault is keyed on nothing but a call count, so the probe
         # has to be answered in advance or it absorbs the first one.
         with self._preflight_already_answered():
             with schedule:
-                code, _out, err = self._service(repo).sync()
+                with unittest.mock.patch.object(
+                    legacy_mirror_sync.os, "unlink", transient_unlink
+                ):
+                    code, _out, err = self._service(repo).sync()
 
         self.assertEqual(1, code)
-        self.assertEqual(
-            1, schedule.calls["unlink"], "cleanup ran more than once for one staging file"
-        )
+        self.assertEqual(1, len(calls), "cleanup ran more than once for one staging file")
         residue = [
             p.name
             for p in self._mirror(repo).iterdir()

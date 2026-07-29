@@ -912,12 +912,31 @@ T6 (共有 fault schedule fake の新規作成) が触る consumer は**この�
 - `tests/support/legacy_mirror_tree_fixture.py` は `_MirrorTreeFixture` の逐語移動で
   あり test を含まないので、この表の 127 には入らない。
 - `tests/support/legacy_mirror_fault_schedule.py` (T6 / Redmine #14684 が新規作成)
-  も同様に test を含まないので 127 に入らない。所有するのは `os_patch` 列が非 0 の
-  5 module が重複して書いていた 3 形 — staging descriptor を記録する `os.open`、
-  その descriptor を実際に閉じてから 1 度だけ失敗する `os.close`、実行せず raise する
-  primitive — に限る。**fault の payload 自体が検証対象である場合 (short write /
-  staging 名へ差し替えられた entry / 遅延失敗する `scandir` / staging 名で keying した
-  `lstat` / walk の序数 close) は共有側へ移さず call site に残す。**
+  も同様に test を含まないので 127 に入らない。所有するのは下記 4 consumer が重複して
+  書いていた 3 形 — staging descriptor を記録する `os.open`、その descriptor を実際に
+  閉じてから 1 度だけ失敗する `os.close`、実行せず raise する primitive — に限る。
+  **fault の payload 自体が検証対象である場合 (short write / staging 名へ差し替えられた
+  entry / 遅延失敗する `scandir` / staging 名で keying した `lstat` / walk の序数 close /
+  失敗が持続しない transient cleanup) は共有側へ移さず call site に残す。**
+
+#### `os_patch` と consumer の関係 [T6 が実測]
+
+`os_patch` 非 0 は **5 module** だが、共有 fault schedule の consumer は **4 module** である。
+両者は一致しない。
+
+| module | `os_patch` | consumer | `os_patch` の中身 |
+| --- | ---: | :---: | --- |
+| `test_legacy_mirror_fault_injection.py` | 29 | ○ | primitive の注入 |
+| `test_platform_capability_probe_io.py` | 2 | ○ | 〃 |
+| `test_issue_14580_reused_descriptor_number_close.py` | 2 | ○ | 〃 |
+| `test_platform_capability_probe.py` | 1 | ○ | 〃 |
+| `test_issue_14651_capability_advertisement.py` | 2 | **×** | `os.supports_dir_fd` / `os.supports_fd` の `frozenset` 置換 |
+
+**`os_patch` は「`os` 属性を patch する test の数」であって「fault を注入する test の数」ではない。**
+#14651 が置換するのは *probe が読んではならない広告* (#14651 の regression 主題そのもの) であり、
+primitive を失敗させてはいない。したがって同 module は共有 fake を import せず、3 形のいずれも
+持たない [実測: `grep -rl legacy_mirror_fault_schedule tests/` = 4 件]。
+広告置換を fault schedule 経由にすると名ばかりの再利用になるため、T6 は同 module を変更していない。
 
 #### 共有 helper の所有 [導出]
 
@@ -958,8 +977,17 @@ AST 導出した結果、**cross-module helper は 7 件**ある:
 `test_owned_descriptor_teardown.py` の 1 つである。同 module の `os_patch` は **0** —
 retention 機械の 19 件は `owned_descriptors._ledger` / `_Occurrence` /
 `_Retention._enqueue` を差し替えるのであって `os` primitive を注入しないためである
-[実測: A.2 の surface 分類]。したがって T6 の consumer 集合 (`os_patch` 非 0 の
-5 module) に `test_owned_descriptor_teardown.py` は**含まれない**。
+[実測: A.2 の surface 分類]。したがって T6 の consumer 集合に
+`test_owned_descriptor_teardown.py` は**含まれない**。
+
+> **母数の訂正 [Redmine #14684 T6 が実測]。** 本節は R8 まで T6 の consumer 集合を
+> 「`os_patch` 非 0 の **5 module**」と括弧書きしていた。T6 が実装した結果、実際の
+> consumer は **4 module** である — `test_issue_14651_capability_advertisement.py` の
+> `os_patch = 2` は `os.supports_dir_fd` / `os.supports_fd` を `frozenset` へ差し替える
+> **広告 (advertisement) の置換**であって primitive の注入ではなく、共有 fake を import
+> しない (実測: `grep -rl legacy_mirror_fault_schedule tests/` = 4 件)。
+> **交差しないという結論は 4 ⊂ 5 なので変わらない**が、括弧内の母数だけが stale に
+> なったので実測値へ差し替えた。詳細は §5.5「`os_patch` と consumer の関係」。
 
 > R6 まで §7 は「T6 は T2 / T3 とは触る file が交わらないので並行可能」と
 > **根拠なしに断定**していた。consumer を特定していない以上それは導出できない。
@@ -1119,7 +1147,8 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
 - T4 は T3 と**同じ file** に触る可能性があるため、**T3 の後**に直列化する。
 - T6 は T1 の後。**T3 / T4 とは交差しない** — T3 / T4 が触る test module は
   `test_owned_descriptor_teardown.py` の 1 つで、その `os_patch` は **0** なので
-  T6 の consumer 集合に含まれない (§5.5 の表で判定できる)。したがって並行可能。
+  T6 の consumer 集合 (実測 4 module。§5.5「`os_patch` と consumer の関係」) に
+  含まれない。したがって並行可能。
   T2 とは `src/**` と `tests/**` で面が分かれる。
 - **T5 は撤去した** (T1 に統合)。以降の Task 番号は R5 までの記載と互換のため詰めない。
 
@@ -1142,8 +1171,10 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
 
 T1 は 10 module + `legacy_mirror_tree_fixture.py` を、T6 (Redmine #14684) は
 `tests/support/legacy_mirror_fault_schedule.py` を `fc-legacy-mirror-sync` の
-`patterns` へ追加した。T6 の consumer は §5.5 の `os_patch` 非 0 の 5 module のみで、
-`os_patch = 0` の module は触れていない (`src/**` diff は byte 0)。
+`patterns` へ追加した。T6 が変更したのは §5.5「`os_patch` と consumer の関係」の
+**4 consumer のみ**で、`os_patch = 0` の module にも、`os_patch` 非 0 だが consumer で
+ない `test_issue_14651_capability_advertisement.py` にも触れていない
+(`src/**` diff は byte 0)。
 
 **T2 への申し送り [未確認]:** §5.4 のとおり `legacy_mirror_sync.py` は 899 行で
 `max_module_lines: 1000` まで 101 行しかない。状態機械を同 module に足すと gate に
