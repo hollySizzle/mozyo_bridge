@@ -27,6 +27,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTION_SCOPES,
     ANCHOR_ACTION_MISMATCH,
     ANCHOR_DECISION_AMBIGUOUS,
+    ANCHOR_DECISION_UNREADABLE,
     DECISION_REFUSAL_STATUS,
     ANCHOR_DECISION_INCOMPLETE,
     ANCHOR_GENERATION_STALE,
@@ -50,6 +51,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_ACTION_UNKNOWN,
     REASON_ANCHOR_ACTION_MISMATCH,
     REASON_ANCHOR_DECISION_AMBIGUOUS,
+    REASON_ANCHOR_DECISION_UNREADABLE,
     REASON_ANCHOR_DECISION_INCOMPLETE,
     REASON_ANCHOR_GENERATION_STALE,
     REASON_ANCHOR_LANE_UNRESOLVED,
@@ -163,6 +165,7 @@ class TheOnlyDeliverPathTest(unittest.TestCase):
             (dict(anchor=ANCHOR_LANE_UNRESOLVED), REASON_ANCHOR_LANE_UNRESOLVED),
             (dict(anchor=ANCHOR_SCOPE_MISMATCH), REASON_ANCHOR_SCOPE_MISMATCH),
             (dict(anchor=ANCHOR_DECISION_AMBIGUOUS), REASON_ANCHOR_DECISION_AMBIGUOUS),
+            (dict(anchor=ANCHOR_DECISION_UNREADABLE), REASON_ANCHOR_DECISION_UNREADABLE),
             (dict(fence=FENCE_DUPLICATE), REASON_DUPLICATE),
             (dict(fence=FENCE_STALE), REASON_STALE),
             (dict(fence=FENCE_RECONCILE), REASON_FENCE_RECONCILE),
@@ -268,6 +271,10 @@ class AnchorStatusTest(unittest.TestCase):
             {
                 "no_canonical_decision": ANCHOR_UNVERIFIED,
                 "duplicate_canonical_decision": ANCHOR_DECISION_AMBIGUOUS,
+                # A same-kind claim in a body the canonical producer could not have rendered
+                # (Redmine #14667). Its own status, because its remedy is its own: the journal
+                # carries a decision, and it has to be re-recorded rather than added to.
+                "unreadable_canonical_decision": ANCHOR_DECISION_UNREADABLE,
                 "action_not_declared": ANCHOR_ACTION_MISMATCH,
             },
         )
