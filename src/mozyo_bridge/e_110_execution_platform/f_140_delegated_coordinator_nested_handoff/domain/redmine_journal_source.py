@@ -43,6 +43,11 @@ import re
 from dataclasses import dataclass
 from typing import ClassVar, Iterable, Mapping, Protocol, Sequence
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+    MARKER_VALUE_FORBIDDEN_CHARS,
+    MarkerValueError,
+    validate_marker_field_value,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
     LaneEvidenceEnvelope,
     render_lane_envelope,
@@ -205,6 +210,8 @@ def strict_marker_fields(
         seen[key] = canonical
         fields[key] = value
     return fields
+
+
 
 
 def strict_marker_body_fields(
@@ -929,6 +936,9 @@ def render_gate_note(gate: str, *, body: str = "", **marker_fields: object) -> s
 
 
 __all__ = (
+    "MARKER_VALUE_FORBIDDEN_CHARS",
+    "MarkerValueError",
+    "validate_marker_field_value",
     "MARKER_CHANNEL_HANDOFF",
     "MARKER_CHANNEL_WORKFLOW_EVENT",
     "GATE_BEARING_KINDS",

@@ -38,6 +38,7 @@ import re
 from dataclasses import dataclass
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     strict_marker_body_fields,
+    validate_marker_field_value,
 )
 from typing import Mapping, Optional, Sequence
 
@@ -142,30 +143,25 @@ def render_dispatch_disposition_marker(
     The fixed fields are emitted literally — a caller cannot choose a different terminal gate,
     conclusion or recording role, because those are the contract, not parameters. The issue is
     deliberately NOT a field: it comes from the entry that owns the marker.
+
+    Every value goes through the shared producer-side validator (Redmine #14539 review j#92374
+    finding 2). Checking only non-emptiness let ``lane_id='r1:unexpected=1'`` render a marker that
+    :func:`parse_dispatch_dispositions` then read as ZERO records — the canonical producer writing
+    a record its own reader refuses.
     """
-    for name, value in (
-        ("action_id", action_id),
-        ("dispatch_journal", dispatch_journal),
-        ("workspace_id", workspace_id),
-        ("lane_id", lane_id),
-        ("target_assigned_name", target_assigned_name),
-        ("terminal_journal", terminal_journal),
-    ):
-        if not _norm(value):
-            raise ValueError(
-                f"a dispatch disposition requires a non-empty {name}; a blank identity could "
-                "never name one exact dispatch round"
-            )
     fields = [
-        f"action_id={_norm(action_id)}",
-        f"dispatch_journal={_norm(dispatch_journal)}",
-        f"workspace_id={_norm(workspace_id)}",
-        f"lane_id={_norm(lane_id)}",
-        f"target_assigned_name={_norm(target_assigned_name)}",
-        f"terminal_gate={TERMINAL_GATE_REVIEW_REQUEST}",
-        f"terminal_journal={_norm(terminal_journal)}",
-        f"conclusion={CONCLUSION_DISCHARGED}",
-        f"recorded_by_role={RECORDED_BY_IMPLEMENTATION_GATEWAY}",
+        f"{name}={validate_marker_field_value(name, value, what='dispatch disposition')}"
+        for name, value in (
+            ("action_id", action_id),
+            ("dispatch_journal", dispatch_journal),
+            ("workspace_id", workspace_id),
+            ("lane_id", lane_id),
+            ("target_assigned_name", target_assigned_name),
+            ("terminal_gate", TERMINAL_GATE_REVIEW_REQUEST),
+            ("terminal_journal", terminal_journal),
+            ("conclusion", CONCLUSION_DISCHARGED),
+            ("recorded_by_role", RECORDED_BY_IMPLEMENTATION_GATEWAY),
+        )
     ]
     return f"[mozyo:{MARKER_CHANNEL_DISPATCH_DISPOSITION}:" + ":".join(fields) + "]"
 

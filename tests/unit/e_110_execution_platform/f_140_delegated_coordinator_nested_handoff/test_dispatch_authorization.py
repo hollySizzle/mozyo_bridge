@@ -87,7 +87,12 @@ class ValidityTest(unittest.TestCase):
 
     def test_missing_required_field_is_invalid(self):
         # action_id blanked out -> a required field is missing.
-        self.assertFalse(self._parse(_valid_marker(action_id="")).valid)
+        #
+        # Built as a literal, NOT through the canonical builder: since Redmine #14539 review
+        # j#92374 finding 2 the builder validates every value, so it can no longer emit a body
+        # its own parser refuses. This test is about the READER, and a reader test must be able
+        # to state an input the producer would never write.
+        self.assertFalse(self._parse(_valid_marker().replace("action_id=act-1", "action_id=")).valid)
 
 
 class CorrelationTest(unittest.TestCase):

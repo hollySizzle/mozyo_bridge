@@ -37,6 +37,7 @@ from typing import Iterable, Mapping
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     strict_marker_body_fields,
+    validate_marker_field_value,
 )
 
 # The dedicated authorization marker channel (distinct from ``handoff`` / ``workflow-event``).
@@ -262,18 +263,27 @@ def build_dispatch_authorization_marker(
     The single builder for the token so the coordinator's authorization tooling and the tests
     emit exactly the vocabulary :func:`parse_dispatch_authorizations` reads back. The fixed
     authority fields default to the only values :meth:`DispatchAuthorization.valid` accepts.
+
+    Every value is validated before it is concatenated (Redmine #14539 review j#92374 finding 2).
+    It used to concatenate them unchecked, so ``lane_id='r1:unexpected=1'`` returned a marker this
+    module's OWN parser then refused as unrenderable — a canonical producer able to write a record
+    into a durable authority channel that poisons the note it lands in. "The producer cannot emit
+    this" is the premise the strict reader was given; the producer has to actually hold it.
     """
     fields = [
-        f"action_id={action_id}",
-        f"source_gate={source_gate}",
-        f"issue={issue}",
-        f"workspace_id={workspace_id}",
-        f"lane_id={lane_id}",
-        f"target_role={target_role}",
-        f"target_assigned_name={target_assigned_name}",
-        f"action={action}",
-        f"conclusion={conclusion}",
-        f"authorized_by_role={authorized_by_role}",
+        f"{name}={validate_marker_field_value(name, value, what='dispatch authorization')}"
+        for name, value in (
+            ("action_id", action_id),
+            ("source_gate", source_gate),
+            ("issue", issue),
+            ("workspace_id", workspace_id),
+            ("lane_id", lane_id),
+            ("target_role", target_role),
+            ("target_assigned_name", target_assigned_name),
+            ("action", action),
+            ("conclusion", conclusion),
+            ("authorized_by_role", authorized_by_role),
+        )
     ]
     return "[mozyo:" + DISPATCH_AUTHORIZATION_CHANNEL + ":" + ":".join(fields) + "]"
 
