@@ -69,6 +69,23 @@ ANCHOR_JOURNAL = "92366"
 ANCHOR_GATE = "review_result"
 WORKER_PROVIDER = "claude"
 GATEWAY_PROVIDER = "codex"
+#: Two distinct workspace identities on ONE host — the shape that made a foreign lane of the
+#: same name satisfy the preserved-gateway axis before review j#92443 F3.
+LOCAL_WS = "local_workspace_id_aaaabbbbccccdddd"
+FOREIGN_WS = "foreign_workspace_id_eeeeffff0000"
+
+
+def _gateway_row(workspace: str, pane: str, status: str = "idle") -> dict:
+    """A live same-lane GATEWAY row, encoded through the canonical identity codec."""
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        encode_assigned_name,
+    )
+
+    return {
+        "name": encode_assigned_name(workspace, GATEWAY_PROVIDER, LANE),
+        "pane_id": pane,
+        "status": status,
+    }
 
 
 def _args(**overrides) -> argparse.Namespace:
@@ -218,12 +235,50 @@ class ObservationSeamTests(unittest.TestCase):
         with patch.object(self.ops, "_providers", return_value=("", "")):
             self.assertFalse(self.ops._gateway_distinct_preserved(_request()))
 
+    def _preserved(self, rows, workspace=LOCAL_WS):
+        with patch.object(
+            self.ops, "_providers", return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)
+        ):
+            with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows):
+                with patch.object(
+                    live_mod, "repo_scope_workspace_id", return_value=workspace
+                ):
+                    return self.ops._gateway_distinct_preserved(_request())
+
+    def test_exactly_one_local_live_gateway_is_preserved(self):
+        self.assertTrue(self._preserved([_gateway_row(LOCAL_WS, "w4B:p1Z")]))
+
+    def test_a_foreign_workspace_lane_of_the_same_name_never_satisfies_the_axis(self):
+        # Review j#92443 F3: the herdr inventory is host-global, so lane labels are unique
+        # only WITHIN a workspace. Without the workspace join a foreign workspace running a
+        # same-named lane satisfied "the gateway is preserved" while THIS workspace had no
+        # gateway at all.
+        self.assertFalse(self._preserved([_gateway_row(FOREIGN_WS, "wZZ:p9")]))
+
+    def test_two_ambiguous_live_gateway_rows_never_satisfy_the_axis(self):
+        # Swept with the same fix: an axis that cannot name WHICH slot it preserves has not
+        # established the fact it claims.
+        self.assertFalse(
+            self._preserved(
+                [_gateway_row(LOCAL_WS, "w4B:p1Z"), _gateway_row(LOCAL_WS, "w4B:p1Y")]
+            )
+        )
+
+    def test_a_coexisting_foreign_row_does_not_block_a_real_local_gateway(self):
+        # Discriminating in both directions: the fence must not refuse a legitimate lane just
+        # because some other workspace runs a lane of the same name.
+        self.assertTrue(
+            self._preserved(
+                [_gateway_row(LOCAL_WS, "w4B:p1Z"), _gateway_row(FOREIGN_WS, "wZZ:p9")]
+            )
+        )
+
+    def test_an_unresolvable_workspace_fails_closed(self):
+        self.assertFalse(self._preserved([_gateway_row(LOCAL_WS, "w4B:p1Z")], workspace=""))
+
     def test_the_same_locator_is_never_the_distinct_gateway(self):
         # A row at the CLOSE TARGET's own locator can never be the preserved gateway.
-        rows = [{"name": "mzb1_ws_codex_" + LANE, "pane_id": "w4B:p10", "status": "idle"}]
-        with patch.object(self.ops, "_providers", return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)):
-            with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows):
-                self.assertFalse(self.ops._gateway_distinct_preserved(_request()))
+        self.assertFalse(self._preserved([_gateway_row(LOCAL_WS, "w4B:p10")]))
 
 
 class ParticipantRevisionBindingTests(unittest.TestCase):
@@ -485,6 +540,207 @@ class AnchorDeliveryRecordTests(unittest.TestCase):
 
         self.ops.ledger = _Boom()
         self.assertIsNone(self.ops._anchor_delivery_record(WORKER_PROVIDER))
+
+
+class RealTurnObservationTests(unittest.TestCase):
+    """The live ``observe_turn`` seam end-to-end (review j#92443 F1).
+
+    R1's tests replaced ``observe_turn`` with a fake everywhere, so the generation-authority
+    wiring behind it was never executed — and it was broken: the shared seam read the pin as
+    ``request.gateway_revision`` through a defaulted attribute lookup, which a worker request
+    does not have, so ``turn_started`` was permanently ``False`` and the surface could never
+    reach ``turn_failed_no_durable_gate`` in production. These tests drive the REAL seam.
+    """
+
+    REVISION = "4"
+    TOKEN = "startup-abc123"
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+
+    def _ops(self, request, *, binding_revision=None, landed=False):
+        marker = build_marker(
+            RedmineAnchor(issue=ANCHOR_ISSUE, journal=ANCHOR_JOURNAL),
+            ANCHOR_GATE, WORKER_PROVIDER,
+        )
+        binding = {
+            "assigned_name": "wk", "locator": "w4B:p10",
+            "row_revision": self.REVISION if binding_revision is None else binding_revision,
+            "provider": WORKER_PROVIDER, "startup_action_id": self.TOKEN,
+        }
+        rec = _record(marker)
+        rec.queue_enter_observation = {
+            "event_wait_kind": "changed", "gateway_binding": binding,
+        }
+        notes = (
+            "[mozyo:workflow-event:gate=implementation_done]" if landed else "unrelated prose"
+        )
+        ops = LiveWorkerRefreshOps(
+            repo_root=self.repo, request=request, ledger=_FakeLedger([rec]),
+            journal_reader=lambda issue: [_Entry("92400", notes)],
+            journal_reader_fresh=True,
+        )
+        return ops
+
+    def _rows(self, revision=None, status="done"):
+        return [{
+            "name": "wk", "pane_id": "w4B:p10", "status": status,
+            "revision": self.REVISION if revision is None else revision,
+        }]
+
+    def _observe(self, ops, request, rows=None):
+        with patch.object(
+            ops, "_providers", return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)
+        ):
+            with patch.object(
+                live_mod, "list_herdr_agent_rows", return_value=rows or self._rows()
+            ):
+                with patch.object(
+                    live_mod._gen_authority, "current_request_generation_token",
+                    return_value=self.TOKEN,
+                ):
+                    with patch.object(
+                        ops, "_lane_generation_bound", return_value=True
+                    ):
+                        return ops.observe_turn(request)
+
+    def test_a_real_worker_turn_reaches_turn_failed_no_durable_gate(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_turn_recovery import (  # noqa: E501
+            TURN_CLASS_FAILED,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_turn_recovery import (  # noqa: E501
+            classify_worker_turn,
+        )
+
+        request = _request(worker_revision=self.REVISION)
+        obs = self._observe(self._ops(request), request)
+        self.assertTrue(obs.delivery_confirmed)
+        self.assertTrue(obs.turn_started, "the generation binding must succeed for a worker")
+        self.assertTrue(obs.settled_turn_ended)
+        self.assertTrue(obs.expected_gate_absent)
+        self.assertTrue(obs.durable_source_fresh)
+        self.assertTrue(obs.identity_bound)
+        self.assertEqual(classify_worker_turn(obs), TURN_CLASS_FAILED)
+
+    def test_the_pin_revision_is_this_surfaces_worker_revision(self):
+        # A binding recorded at a DIFFERENT row revision must not bind — proving the pin that
+        # reaches the shared authority is really the worker's, not a constant or an ignored
+        # argument.
+        request = _request(worker_revision=self.REVISION)
+        obs = self._observe(self._ops(request, binding_revision="99"), request)
+        self.assertTrue(obs.delivery_confirmed)
+        self.assertFalse(obs.turn_started)
+
+    def test_an_unpinned_worker_revision_never_binds(self):
+        request = _request(worker_revision="")
+        obs = self._observe(self._ops(request), request)
+        self.assertFalse(obs.turn_started)
+        self.assertFalse(obs.participant_revision_bound)
+
+    def test_a_landed_worker_gate_makes_the_real_turn_productive(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_turn_recovery import (  # noqa: E501
+            TURN_CLASS_PRODUCTIVE,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_turn_recovery import (  # noqa: E501
+            classify_worker_turn,
+        )
+
+        request = _request(worker_revision=self.REVISION)
+        obs = self._observe(self._ops(request, landed=True), request)
+        self.assertTrue(obs.expected_gate_landed)
+        self.assertEqual(classify_worker_turn(obs), TURN_CLASS_PRODUCTIVE)
+
+    def test_the_shared_authority_refuses_a_caller_that_omits_the_pin(self):
+        # The defect class itself: a silent attribute default cannot fail loudly. The seam is
+        # now a required keyword, so a caller that forgets it raises instead of degrading to
+        # a permanently unbound authority.
+        with self.assertRaises(TypeError):
+            live_mod._gen_authority.record_observed_turn_start(
+                object(), request=_request(), repo_root=self.repo, attestation_home=None,
+            )
+
+
+class ApprovalVerificationTests(unittest.TestCase):
+    """The positive owner-approval authority (review j#92443 F2)."""
+
+    APPROVAL_JOURNAL = "92500"
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        self.request = _request(
+            journal=self.APPROVAL_JOURNAL,
+            action_id="refresh-worker:" + LANE + ":claude:claude:wk:w4B:p10:r4",
+            action_generation=3,
+            worker_revision="4",
+        )
+        self.token = self.request.holder
+        self.ops = LiveWorkerRefreshOps(repo_root=self.repo, request=self.request)
+
+    def _with_entries(self, entries):
+        self.ops.journal_reader = lambda issue: entries
+        self.ops.journal_reader_fresh = True
+        return self.ops.approval_verified(self.request)
+
+    def test_an_approval_naming_the_exact_action_and_generation_verifies(self):
+        notes = f"## Gate: owner_close_approval\n- approves: {self.token}\n"
+        self.assertTrue(self._with_entries([_Entry(self.APPROVAL_JOURNAL, notes)]))
+
+    def test_a_journal_that_does_not_name_the_action_is_not_an_approval(self):
+        # The R1 hole verbatim: any well-shaped, existing journal used to authorize a close.
+        self.assertTrue(bool(self.token))
+        self.assertFalse(
+            self._with_entries([_Entry(self.APPROVAL_JOURNAL, "looks good, go ahead")])
+        )
+
+    def test_an_approval_of_a_different_generation_does_not_verify(self):
+        other = self.token.replace(":g3", ":g2")
+        self.assertNotEqual(other, self.token)
+        self.assertFalse(self._with_entries([_Entry(self.APPROVAL_JOURNAL, other)]))
+
+    def test_an_approval_of_a_different_worker_does_not_verify(self):
+        other = self.token.replace(":wk:", ":other_worker:")
+        self.assertNotEqual(other, self.token)
+        self.assertFalse(self._with_entries([_Entry(self.APPROVAL_JOURNAL, other)]))
+
+    def test_the_token_must_live_on_the_PINNED_journal(self):
+        # A correct approval sitting on a different journal never authorizes this pointer.
+        self.assertFalse(self._with_entries([_Entry("99999", self.token)]))
+
+    def test_an_absent_journal_never_verifies(self):
+        self.assertFalse(self._with_entries([]))
+
+    def test_no_reader_or_a_snapshot_reader_never_verifies(self):
+        self.ops.journal_reader = None
+        self.ops.journal_reader_fresh = True
+        self.assertFalse(self.ops.approval_verified(self.request))
+        self.ops.journal_reader = lambda issue: [
+            _Entry(self.APPROVAL_JOURNAL, self.token)
+        ]
+        self.ops.journal_reader_fresh = False
+        self.assertFalse(self.ops.approval_verified(self.request))
+
+    def test_an_unreadable_source_never_verifies(self):
+        def _boom(issue):
+            raise RuntimeError("redmine down")
+
+        self.ops.journal_reader = _boom
+        self.ops.journal_reader_fresh = True
+        self.assertFalse(self.ops.approval_verified(self.request))
+
+    def test_the_read_targets_the_anchor_issue(self):
+        seen: list = []
+        self.ops.journal_reader = lambda issue: seen.append(issue) or []
+        self.ops.journal_reader_fresh = True
+        self.ops.approval_verified(self.request)
+        self.assertEqual(seen, [ANCHOR_ISSUE])
+
+    def test_an_empty_journal_or_action_id_never_verifies(self):
+        self.ops.journal_reader_fresh = True
+        self.ops.journal_reader = lambda issue: [_Entry("", "anything")]
+        self.assertFalse(self.ops.approval_verified(_request(journal="", action_id="x")))
+        self.assertFalse(
+            self.ops.approval_verified(_request(journal="1", action_id=""))
+        )
 
 
 class ResumeRailTests(unittest.TestCase):

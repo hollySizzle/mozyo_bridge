@@ -178,7 +178,13 @@ class WorkerRefreshRequest:
 
     @property
     def holder(self) -> str:
-        """The stable, action-bound lease identity for this refresh (resume-safe)."""
+        """The stable, action-bound lease identity for this refresh (resume-safe).
+
+        It is also the ONE literal a positive owner approval must name (review j#92443 F2):
+        it is the only token that carries the exact action id AND the approved generation
+        together, so an approval quoting it cannot be an approval of a different target or a
+        different round. See :meth:`WorkerRefreshOps.approval_verified`.
+        """
         return f"refresh-worker:{norm(self.action_id)}:g{int(self.action_generation)}"
 
 
@@ -307,6 +313,24 @@ class WorkerRefreshOps(Protocol):
         """
         ...
 
+    def approval_verified(self, request: WorkerRefreshRequest) -> bool:
+        """Is the pinned approval journal a POSITIVE owner approval of THIS exact action?
+
+        (Review j#92443 F2.) Constructing a :class:`DecisionPointer` only proves the pointer
+        is well-shaped — it does not read the durable record, so before this seam existed any
+        non-empty journal id authorized a destructive close. This is the positive fact that
+        closes that: a FRESH durable read of the anchor issue must find the exact pinned
+        journal, and that journal must NAME the exact target it authorizes — the
+        :attr:`WorkerRefreshRequest.holder` token, which carries the action id (and therefore
+        the lane / role / provider / assigned name / locator / row revision it is derived
+        from) together with the approved generation.
+
+        Fail-closed on every axis: no durable reader wired, a non-fresh (snapshot) reader, an
+        unreadable source, an absent journal, or a journal that does not name this exact
+        action + generation. A ``False`` here is a zero-close refusal before any write.
+        """
+        ...
+
     def resume_rail_ready(self, request: WorkerRefreshRequest) -> bool:
         """Can THIS execution context deliver the anchor resume? (read-only, pre-close)
 
@@ -367,6 +391,18 @@ class WorkerRefreshUseCase:
         except Exception:  # noqa: BLE001 - an unreadable authority is never "current"
             return LAUNCH_AUTHORITY_UNKNOWN
         return normalize_launch_authority_reason(raw)
+
+    def _approval_verified(self, request: WorkerRefreshRequest) -> bool:
+        """Is there a positive durable owner approval for THIS exact action? (fail-closed)
+
+        Wraps :meth:`WorkerRefreshOps.approval_verified` so that an ops adapter which raises
+        — or one that predates the seam — refuses rather than authorizing a destructive
+        close. An unreadable authority is never "approved" (review j#92443 F2).
+        """
+        try:
+            return bool(self._ops.approval_verified(request))
+        except Exception:  # noqa: BLE001 - an unverifiable approval is never a positive one
+            return False
 
     def run(self, request: WorkerRefreshRequest, *, execute: bool) -> WorkerRefreshOutcome:
         turn_obs = self._ops.observe_turn(request)
@@ -533,6 +569,17 @@ class WorkerRefreshUseCase:
             return refused(
                 "lane lifecycle revision / generation evidence is required for a "
                 "destructive worker refresh; zero close"
+            )
+        # Review j#92443 F2: the approval must be a POSITIVE durable owner approval of THIS
+        # exact action, not merely a well-shaped pointer. Verified against a FRESH durable
+        # read BEFORE any write / close — every check above this line is about the request's
+        # own self-consistency, and none of them can tell an approval from any other journal.
+        # Ordered ahead of the resume-rail probe because authority to act at all is more
+        # fundamental than the ability to finish.
+        if not self._approval_verified(request):
+            return refused(
+                "the pinned journal is not a positive durable owner approval naming this "
+                f"exact action and generation ({request.holder}); zero close"
             )
         # The resume rail's capability is verified BEFORE any write / close — a context that
         # cannot deliver the anchor resume is refused up front, never discovered as a

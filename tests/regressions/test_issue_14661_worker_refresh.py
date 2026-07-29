@@ -87,6 +87,9 @@ WORKER = dict(
     old_locator="w4B:p10",
 )
 ACTION_ID = "refresh-worker:issue_14661_lane:claude:claude:wk:w4B:p10:r4"
+#: The owner-approval journal — a THIRD authority, distinct from the Start / Implementation
+#: Request (j#92369) and from the resume anchor (j#92366).
+APPROVAL_JOURNAL = "92500"
 
 
 def _turn(**overrides) -> WorkerTurnObservation:
@@ -156,6 +159,7 @@ class FakeWorkerOps:
         lane_authority=True,
         name_free=True,
         rail_ready=True,
+        approval_ok=True,
     ):
         self._turn = turn if turn is not None else _turn()
         self._target = target if target is not None else _target()
@@ -168,6 +172,18 @@ class FakeWorkerOps:
         self._name_free = name_free
         self.name_free_checks: list = []
         self._rail_ready = rail_ready
+        self._approval_ok = approval_ok
+        self.approval_checks: list = []
+
+    def approval_verified(self, request) -> bool:
+        """The positive owner-approval authority (review j#92443 F2).
+
+        Defaults to a verified approval so the existing happy-path cases still describe an
+        AUTHORIZED refresh; the refusal cases below drive it False explicitly. The real
+        adapter proves this against a fresh durable read.
+        """
+        self.approval_checks.append(request)
+        return self._approval_ok
 
     def observe_turn(self, request) -> WorkerTurnObservation:
         return self._turn
@@ -227,7 +243,11 @@ class _RefreshCase(unittest.TestCase):
         base = dict(
             issue="14661", lane=WORKER["lane_id"], role=WORKER["role"],
             provider=WORKER["provider"], assigned_name=WORKER["assigned_name"],
-            locator=WORKER["old_locator"], journal="92369", action_id=ACTION_ID,
+            # Review j#92443 F2: this is an OWNER APPROVAL journal, distinct from both the
+            # dispatch anchor and the Start / Implementation Request. An earlier revision of
+            # this fixture reused the Start journal here, which made the suite assert that
+            # any non-approval journal authorizes a destructive close.
+            locator=WORKER["old_locator"], journal=APPROVAL_JOURNAL, action_id=ACTION_ID,
             action_generation=GEN, worker_revision="4",
             lane_revision="5", lane_generation="2",
             resume_anchor_journal="92366", resume_gate="review_result",
@@ -398,6 +418,41 @@ class ExecuteRefusalTests(_RefreshCase):
             self._request(resume_anchor_journal=""),
             "resume anchor pointer is incomplete",
         )
+
+    def test_an_unverified_owner_approval_refuses_before_any_close(self):
+        # Review j#92443 F2: a well-shaped pointer is NOT an approval. Without a positive
+        # durable approval naming this exact action + generation, nothing is closed.
+        ops = FakeWorkerOps(approval_ok=False)
+        outcome = self._refused(ops, self._request(), "not a positive durable owner approval")
+        self.assertIn(ACTION_ID, outcome.detail)  # the refusal names what must be approved
+
+    def test_an_ops_adapter_that_raises_is_never_treated_as_approved(self):
+        class _Raising(FakeWorkerOps):
+            def approval_verified(self, request):
+                raise RuntimeError("durable source down")
+
+        self._refused(_Raising(), self._request(), "not a positive durable owner approval")
+
+    def test_the_approval_is_verified_before_the_resume_rail_probe(self):
+        # Authority to act at all is more fundamental than the ability to finish: an
+        # unapproved request must not be reported as a rail problem.
+        ops = FakeWorkerOps(approval_ok=False, rail_ready=False)
+        self._refused(ops, self._request(), "not a positive durable owner approval")
+
+    def test_the_approval_seam_is_consulted_on_every_execute(self):
+        ops = FakeWorkerOps()
+        self._use_case(ops).run(self._request(), execute=True)
+        self.assertTrue(ops.approval_checks)
+
+    def test_a_preflight_never_consults_the_approval_seam(self):
+        # A read-only preflight authorizes nothing, so it must not need an approval to run —
+        # otherwise an operator could not produce the evidence the approval is written from.
+        ops = FakeWorkerOps(approval_ok=False)
+        outcome = self._use_case(ops).run(self._request(), execute=False)
+        self.assertEqual(outcome.status, WORKER_REFRESH_STATUS_PREFLIGHT)
+        self.assertEqual(outcome.verdict, WORKER_REFRESH_ACTIONABLE)
+        self.assertEqual(ops.approval_checks, [])
+        self._assert_zero_effect(ops)
 
     def test_an_unready_resume_rail_refuses_before_any_close(self):
         self._refused(

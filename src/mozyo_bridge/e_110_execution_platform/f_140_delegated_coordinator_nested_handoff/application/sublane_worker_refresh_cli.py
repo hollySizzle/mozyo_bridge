@@ -231,7 +231,12 @@ def register_sublane_refresh_worker_parser(sublane_sub: Any) -> None:
     )
     parser.add_argument(
         "--journal", default="",
-        help="Redmine journal id of the positive owner approval (--execute: required)",
+        help=(
+            "Redmine journal id of the positive owner approval (--execute: required). The "
+            "journal must exist at a fresh durable read AND name the exact action it "
+            "authorizes as the literal token refresh-worker:<action id>:g<generation>; "
+            "anything else is refused with zero close"
+        ),
     )
     parser.add_argument(
         "--action-id", dest="action_id", default="",

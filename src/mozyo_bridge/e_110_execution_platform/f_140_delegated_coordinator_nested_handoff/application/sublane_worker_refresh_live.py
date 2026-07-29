@@ -323,15 +323,29 @@ class LiveWorkerRefreshOps:
         The mirror of the gateway refresh's worker-preservation axis: a worker refresh must
         leave the same-lane implementation_gateway running, so an unresolvable gateway binding
         or an indistinguishable pair fails closed.
+
+        Bound to THIS repo's canonical workspace and to EXACTLY ONE candidate (review j#92443
+        F3). The herdr inventory is host-global, so lane labels are only unique *within* a
+        workspace: without the workspace join, a foreign workspace that happens to run a lane
+        of the same name satisfied this axis on its own — the close target's own workspace
+        could have no gateway at all and the worker would still read as "preserved". And
+        without the uniqueness join, two live same-lane gateway rows also passed, though the
+        axis cannot then name WHICH slot it is preserving. The stronger form already existed
+        one function away in the sibling adapter (``_same_lane_worker_locator``'s
+        workspace + ``len(found) == 1`` join); this is that form, not a new invention.
         """
         _worker_provider, gateway_provider = self._providers()
         if not gateway_provider:
             return False
         try:
+            workspace_id = repo_scope_workspace_id(self.repo_root)
             rows = self._rows()
-        except Exception:  # noqa: BLE001 - unreadable inventory fails closed
+        except Exception:  # noqa: BLE001 - unreadable workspace / inventory fails closed
+            return False
+        if not _norm(workspace_id):
             return False
         lane = _norm_lane(request.lane)
+        found = []
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
@@ -340,13 +354,14 @@ class LiveWorkerRefreshOps:
                 continue
             identity = decoded.identity
             if (
-                _norm_lane(identity.lane_id) == lane
+                identity.workspace_id == workspace_id
+                and _norm_lane(identity.lane_id) == lane
                 and identity.role == gateway_provider
                 and _agent_locator(row) != _norm(request.locator)
                 and classify_named_slot(row) == SLOT_LIVE
             ):
-                return True
-        return False
+                found.append(_agent_locator(row))
+        return len(found) == 1
 
     # -- live turn observation -------------------------------------------------
 
@@ -416,10 +431,18 @@ class LiveWorkerRefreshOps:
         return None
 
     def _record_observed_turn_start(self, rec) -> bool:
-        """Delegate to the shared generation-authority leaf (the #14203 module-health split)."""
+        """Delegate to the shared generation-authority leaf (the #14203 module-health split).
+
+        The pinned row revision is passed EXPLICITLY as this surface's ``worker_revision``
+        (review j#92443 F1). The seam previously read ``request.gateway_revision`` through a
+        defaulted attribute lookup, so a worker request — which has no such field — bound to
+        ``""`` and could NEVER observe a turn start: the whole surface was inert in
+        production while every fake-backed test stayed green.
+        """
         return _gen_authority.record_observed_turn_start(
             rec, request=self.request, repo_root=self.repo_root,
             attestation_home=self.attestation_home,
+            pin_revision=self.request.worker_revision,
         )
 
     def _anchor_bound(self, request: WorkerRefreshRequest) -> bool:
@@ -599,6 +622,47 @@ class LiveWorkerRefreshOps:
             timeout=self.timeout,
             attestation_home=self.attestation_home,
         )
+
+    def approval_verified(self, request: WorkerRefreshRequest) -> bool:
+        """A FRESH durable read proving the pinned journal approves THIS exact action.
+
+        (Review j#92443 F2.) Every axis is a positive fact and every failure is fail-closed:
+
+        - a durable reader must be wired AND declare itself FRESH (a snapshot re-read cannot
+          establish an authority for a destructive action — the #13889 discipline);
+        - the read must complete;
+        - the ANCHOR issue must actually contain a journal whose id is exactly the pinned
+          approval journal (a fabricated / mistyped id resolves to nothing);
+        - that journal's notes must name :attr:`WorkerRefreshRequest.holder` — the single
+          token carrying the exact action id AND the approved generation. Because the action
+          id is derived from lane / role / provider / assigned name / locator / row revision,
+          naming it transitively binds the approval to every participant pin, so an approval
+          written for a different worker, a different generation, or a different round can
+          never authorize this close.
+
+        The check deliberately introduces NO new marker grammar: it requires the approval to
+        quote a token this module already derives, rather than inventing an approval
+        vocabulary a leaf task has no standing to define.
+        """
+        reader = self.journal_reader
+        if reader is None or not self.journal_reader_fresh:
+            return False
+        wanted_journal = _norm(request.journal)
+        token = _norm(request.holder)
+        # A holder over an empty action id / generation would be a token that matches loosely;
+        # the caller validates both before reaching here, but this seam refuses independently.
+        if not wanted_journal or not _norm(request.action_id) or not token:
+            return False
+        try:
+            entries = reader(request.effective_anchor_issue)
+        except Exception:  # noqa: BLE001 - unreadable durable source => never approved
+            return False
+        for entry in entries:
+            if _norm(getattr(entry, "journal_id", "")) != wanted_journal:
+                continue
+            notes = str(getattr(entry, "notes", "") or "")
+            return token in notes
+        return False
 
     def resume_rail_ready(self, request: WorkerRefreshRequest) -> bool:
         """Pre-close resume-rail capability. (read-only)
