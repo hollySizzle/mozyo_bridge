@@ -3703,18 +3703,59 @@ def _marker_token_holders(root):
         parts = path.relative_to(root.parent).with_suffix("").parts
         return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
 
-    own, owners = {}, {}
+    def exported_names(tree):
+        """What ``from M import *`` binds, as ``None`` (public names) or an explicit set.
+
+        ``"unknown"`` when ``__all__`` exists but is not a literal — the conservative reading,
+        since an inventory that cannot tell must over-detect rather than under-detect.
+        """
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(
+                isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets
+            ):
+                continue
+            if isinstance(node.value, (ast.List, ast.Tuple)) and all(
+                isinstance(e, ast.Constant) and isinstance(e.value, str)
+                for e in node.value.elts
+            ):
+                return frozenset(e.value for e in node.value.elts)
+            return "unknown"
+        return None
+
+    own, owners, exports = {}, {}, {}
     for path, tree in trees.items():
         held, bound = module_capabilities(tree)
         own[path] = held
         if bound:
             owners[module_path(path)] = bound
+            exports[module_path(path)] = exported_names(tree)
+
+    def wildcard_bindings(module):
+        """The owner's pattern names a ``import *`` would bring into the consumer."""
+        bound = owners.get(module, {})
+        declared = exports.get(module)
+        if declared is None:  # no __all__: everything not underscore-prefixed
+            return {n: caps for n, caps in bound.items() if not n.startswith("_")}
+        if declared == "unknown":  # cannot tell -> assume it all crosses
+            return dict(bound)
+        return {n: caps for n, caps in bound.items() if n in declared}
 
     holders = {}
     for path, tree in trees.items():
         held = list(own[path])
         me = module_path(path)
-        package = me.rsplit(".", 1)[0] if "." in me else me
+        # A package's ``__init__`` IS the package, so ``from .x import y`` inside it resolves
+        # against itself; every other module resolves against its parent (j#92455). Taking the
+        # parent unconditionally shifted every relative import in an ``__init__`` up one level.
+        if path.name == "__init__.py":
+            package = me
+        else:
+            package = me.rsplit(".", 1)[0] if "." in me else me
+        used_names = {
+            other.id for other in ast.walk(tree) if isinstance(other, ast.Name)
+        }
         module_aliases = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
@@ -3726,13 +3767,17 @@ def _marker_token_holders(root):
                 else:
                     full = node.module or ""
                 for alias in node.names:
+                    if alias.name == "*":
+                        # A wildcard is a normal import here — no rule forbids it, so the gate
+                        # may not silently exclude it (j#92455).
+                        for name, capabilities in wildcard_bindings(full).items():
+                            if name in used_names:
+                                held += capabilities
+                        continue
                     local = alias.asname or alias.name
                     owned = owners.get(full, {})
                     if alias.name in owned:
-                        if any(
-                            isinstance(other, ast.Name) and other.id == local
-                            for other in ast.walk(tree)
-                        ):
+                        if local in used_names:
                             held += owned[alias.name]
                     elif f"{full}.{alias.name}" in owners:
                         module_aliases[local] = f"{full}.{alias.name}"
@@ -3996,6 +4041,119 @@ class ReviewJ92374InventoryDetectionTests(unittest.TestCase):
             {"annowner.py": owner, "pkg/consumer.py": consumer}, owner=False
         )
         self.assertEqual(holders.get("src/mozyo_bridge/pkg/consumer.py"), ["chan-b"])
+
+    # -- the one hop, DERIVED rather than remembered (j#92455) ------------------------
+
+    def test_every_one_hop_binding_form_in_the_language_resolves(self):
+        """Generated from the grammar, not from a list of forms I thought of.
+
+        R27 and R28 each claimed "every way of writing the one hop" and each enumerated the
+        forms that came to mind — R28's list missed a package ``__init__``'s relative import and
+        the wildcard, both ordinary Python. Only two statements can bind a name from another
+        module, ``import`` and ``from ... import``, so the cells are their grammar's axes:
+        statement kind x relative level x what is named (symbol / submodule / ``*``) x aliasing x
+        whether the consumer is a package ``__init__``. Every cell is built and asserted; a form
+        the language allows and this matrix omits is a hole in the derivation, not a forgotten
+        line.
+        """
+        owner = (
+            "import re\n"
+            'RE = re.compile(r"\\[mozyo:chan-a:(?P<body>[^\\]]*)\\]")\n'
+        )
+        base_tree = {
+            "__init__.py": "",
+            "pkg/__init__.py": "",
+            "pkg/sub/__init__.py": "",
+            "pkg/owner.py": owner,
+        }
+
+        def cell(consumer_path, statement, use):
+            modules = dict(base_tree)
+            modules[consumer_path] = f"{statement}\ndef read(n): return {use}.findall(n or '')\n"
+            holders = self._holders(modules, owner=False)
+            return holders.get(f"src/mozyo_bridge/{consumer_path}")
+
+        # (consumer, level) -> the dotted prefix that reaches the owner's package
+        sites = [
+            ("consumer.py", 0, "mozyo_bridge.pkg"),          # regular module, absolute
+            ("pkg/consumer.py", 1, "."),                      # regular module, one level up
+            ("pkg/__init__.py", 1, "."),                      # the PACKAGE itself
+            ("pkg/sub/consumer.py", 2, ".."),                 # regular module, two levels
+            ("pkg/sub/__init__.py", 2, ".."),                 # a nested package
+        ]
+        checked = 0
+        for consumer, level, prefix in sites:
+            dots = prefix if level else prefix
+            for label, statement, use in (
+                # ImportFrom naming a SYMBOL, with and without `as`
+                ("symbol", f"from {dots}{'owner' if level else '.owner'} import RE", "RE"),
+                (
+                    "symbol as",
+                    f"from {dots}{'owner' if level else '.owner'} import RE as _p",
+                    "_p",
+                ),
+                # ImportFrom naming a SUBMODULE, then attribute access
+                (
+                    "submodule",
+                    f"from {dots if level else 'mozyo_bridge.pkg'} import owner",
+                    "owner.RE",
+                ),
+                (
+                    "submodule as",
+                    f"from {dots if level else 'mozyo_bridge.pkg'} import owner as _m",
+                    "_m.RE",
+                ),
+                # ImportFrom WILDCARD
+                ("wildcard", f"from {dots}{'owner' if level else '.owner'} import *", "RE"),
+            ):
+                with self.subTest(consumer=consumer, form=label):
+                    self.assertEqual(
+                        cell(consumer, statement, use),
+                        ["chan-a"],
+                        f"{label} from {consumer} did not resolve: {statement}",
+                    )
+                    checked += 1
+
+        # `import ...` cannot be relative, so its axes are dotted-vs-plain and aliasing.
+        for label, statement, use in (
+            ("import dotted", "import mozyo_bridge.pkg.owner", "mozyo_bridge.pkg.owner.RE"),
+            ("import dotted as", "import mozyo_bridge.pkg.owner as _o", "_o.RE"),
+        ):
+            with self.subTest(form=label):
+                self.assertEqual(cell("consumer.py", statement, use), ["chan-a"], statement)
+                checked += 1
+
+        self.assertEqual(checked, 27, "the derived matrix changed size; re-derive it")
+
+    def test_a_wildcard_respects_what_the_owner_actually_exports(self):
+        """Wildcards are expanded by Python's own rule, with the unclear case over-detecting."""
+        private = (
+            "import re\n"
+            '_RE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
+        )
+        consumer = "from mozyo_bridge.owner import *\ndef read(n): return _RE.findall(n or '')\n"
+        # No __all__ and an underscore name: `import *` would not bind it, so neither do we.
+        self.assertIsNone(
+            self._holders({"owner.py": private, "c.py": consumer}, owner=False).get(
+                "src/mozyo_bridge/c.py"
+            )
+        )
+        # An explicit __all__ that names it DOES bind it.
+        listed = private + '__all__ = ["_RE"]\n'
+        self.assertEqual(
+            self._holders({"owner.py": listed, "c.py": consumer}, owner=False).get(
+                "src/mozyo_bridge/c.py"
+            ),
+            ["chan-a"],
+        )
+        # A computed __all__ cannot be read, so the inventory over-detects rather than under.
+        computed = private + "__all__ = sorted(globals())\n"
+        self.assertEqual(
+            self._holders({"owner.py": computed, "c.py": consumer}, owner=False).get(
+                "src/mozyo_bridge/c.py"
+            ),
+            ["chan-a"],
+        )
 
     # -- the import forms j#92420 finding 1 measured ---------------------------------
 
