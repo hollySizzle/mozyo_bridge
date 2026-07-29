@@ -1213,10 +1213,23 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
       よって protocol 実行位置を `(parent node 種別, child field)` の明示 map として分離し、
       **receiver を該当 dunder へ bind して解析できたときのみ modelled** とする (declared method
       call と同じ規則)。class 未解決 / dunder が first-party 外なら報告する。3 位置は modelled
-      parent を child position 単位で全件監査して確定した。他の implicit-effect 位置
+      parent を child position 単位で監査して定めた。他の implicit-effect 位置
       (`Compare` / `Subscript` / `For` / `not` / `if` / `while` / `assert` / f-string) は
-      modelled parent を持たないため既に報告側に落ちる。descriptor `__set__` は first-party に
-      定義 class が存在しないことを機械確認済み。
+      modelled parent を持たないため既に報告側に落ちる。
+    - **どの dunder が走るかの列挙はやめた** (review j#92400)。上の列挙は **2 度反証された**:
+      truth testing は `__bool__` 単独ではなく **`__len__` への fallback chain** であり、`__len__`
+      だけでも既存 production の `or` site で dispatch する。また assignment は **target 側で
+      `__setattr__` を実行し、そこへ値が引数として渡る** — 「値に何が実行されるか」だけを問うた
+      監査はこの向きを見ていなかった (descriptor `__set__` の「現存 class 数 0」確認も future drift
+      を閉じていない)。よって protocol 位置では **解決した class が宣言する dunder を全て bind して
+      解析**する。除くのは construction hook (式が既存 value に対して実行しないもの) と `__call__`
+      (dispatch 自身) のみ。over-analysis は安全側であり (解析は pair か報告を生み、沈黙は生まない)、
+      interpreter がどれを選ぶかを当てる必要が無くなる。`__aenter__` もこの方針で自動的に射程へ入る
+      (実測)。**assignment target は独立した位置**として扱い、owner の `__setattr__` / `__set__` を
+      解析するか報告する。
+    - **「位置の集合が完全である」とは主張しない**。同種の完全性主張は複数 round 連続で次の review に
+      反証されている。設計が提供するのは完全性ではなく、**読めない class / 解決できない chain /
+      owner 不明の位置は報告される**という性質である。
     - **例外表は「使われたか」で検証する** (review j#92266 F5)。key の形だけを検査しても、
       read が消えて entry だけ残る / typo key が将来の同名 read を事前許可する drift は
       green のままになる。derivation が実際に消費した key を収集し (`used_read_exceptions`)、

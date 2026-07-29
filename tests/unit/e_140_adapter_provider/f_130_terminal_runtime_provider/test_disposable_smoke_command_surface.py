@@ -783,6 +783,65 @@ class DerivationLivenessTests(unittest.TestCase):
         )
         self.assertEqual(_surface().unresolved_flows, ())
 
+    def test_a_truth_test_falling_back_to_len_is_analysed(self) -> None:
+        """Review j#92400 F7-1, verdict j#92403.
+
+        Truth testing is a fallback chain, not one dunder: with no ``__bool__``, ``or``
+        and ``if/else`` both call ``__len__``.  The previous round mapped those positions
+        to ``("__bool__",)`` and asserted the mapping was complete.  The walk no longer
+        names which dunder a position invokes — it binds every dunder the class declares —
+        so it does not need to be right about the interpreter's choice.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_addition=(
+                "\n\n    def __len__(self):\n"
+                '        self(["bin", "probe", "len-fallback"])\n'
+                "        return 1\n"
+            ),
+        )
+        self.assertIn(("probe", "len-fallback"), derive_dispatch_surface(tree).pairs)
+
+    def test_an_assignment_target_hook_receiving_the_runner_is_analysed(self) -> None:
+        """Review j#92400 F7-2, verdict j#92403.
+
+        ``self._inner = inner`` runs ``__setattr__`` on the *target*, which receives the
+        runner as an argument.  The R6 audit asked only what runs *on the value* and
+        recorded "nothing" for assignment — true, and beside the point.  Construction
+        alone dispatches here.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_addition=(
+                "\n\n    def __setattr__(self, name, value):\n"
+                '        if name == "_inner" and callable(value):\n'
+                '            value(["bin", "probe", "setattr-target"])\n'
+                "        object.__setattr__(self, name, value)\n"
+            ),
+        )
+        self.assertIn(("probe", "setattr-target"), derive_dispatch_surface(tree).pairs)
+
+    def test_an_async_context_protocol_is_analysed(self) -> None:
+        """A residual the reviewer named but did not push to a mutant (j#92400).
+
+        Probed rather than assumed: binding every declared dunder covers ``__aenter__``
+        without it having to be listed, which is the property that made this approach
+        worth taking.
+        """
+        tree = self._mutated_tree(
+            "    def _probe_async_ctx(self):\n"
+            "        with self.runner:\n"
+            "            return None\n\n",
+            runner_addition=(
+                "    run = __call__\n\n"
+                "    async def __aenter__(self):\n"
+                '        return self(["bin", "probe", "aenter"])\n\n'
+                "    async def __aexit__(self, *exc):\n"
+                "        return False\n"
+            ),
+        )
+        self.assertIn(("probe", "aenter"), derive_dispatch_surface(tree).pairs)
+
     def test_the_probe_does_not_touch_the_live_source(self) -> None:
         """Probe hygiene: mutating the copy must leave the real tree byte-identical.
 

@@ -130,6 +130,21 @@ EDGES = [
      '    def _p(self):\n        return 1 if self.runner else 0\n\n', True),
     ("protocol: carrier position without the dunder stays silent", None, None,
      '    def _p(self):\n        chosen = self.runner if self.binary else self.runner\n        return chosen([self.binary, "probe", "ifexp-branch"])\n\n', True),
+    ("protocol: truth fallback to __len__", None,
+     TAIL + '\n\n    def __len__(self):\n        self(["bin", "probe", "len-fallback"])\n        return 1\n',
+     '    def _p(self):\n        r = self.runner or None\n        return 1 if r else 0\n\n', True),
+    ("protocol: async context (__aenter__)", None,
+     TAIL + '\n\n    async def __aenter__(self):\n        return self(["bin", "probe", "aenter"])\n\n    async def __aexit__(self, *e):\n        return False\n',
+     '    def _p(self):\n        with self.runner:\n            return None\n\n', True),
+    # The hook must live on the class that OWNS the assignment target.  The first version
+    # of this edge put it on the runner class while assigning to the instance, so nothing
+    # was reported — and the sweep caught that, which is the point of running it.
+    ("target hook: __setattr__ receives the runner", None, None,
+     '    def __setattr__(self, name, value):\n'
+     '        if name == "_probe_slot" and callable(value):\n'
+     '            value(["bin", "probe", "setattr-target"])\n'
+     '        object.__setattr__(self, name, value)\n\n'
+     '    def _p(self):\n        self._probe_slot = self.runner\n        return None\n\n', True),
     # -- module / enclosing-scope carriers (review j#92266 F4) ---------------------------
     ("carrier: global module state", None,
      "\n\n_PROBE_GLOBAL_RUNNER = None\n\n\ndef _probe_global_dispatch():\n    return _PROBE_GLOBAL_RUNNER([\"bin\", \"probe\", \"global-carrier\"])\n",
@@ -210,7 +225,7 @@ class DerivationEdgeSweepTests(unittest.TestCase):
             if got != expect:
                 mismatches.append(f"{label}: expected reported={expect}, got {got}")
         self.assertEqual(mismatches, [], "\n".join(mismatches))
-        self.assertGreaterEqual(len(rows), 27, "the sweep lost edges")
+        self.assertGreaterEqual(len(rows), 30, "the sweep lost edges")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -101,9 +101,26 @@ that site would have dispatched with no call site changing at all.
 :data:`_Walker._PROTOCOL_POSITIONS` now answers the second question separately, keyed by
 ``(parent node type, child field)``, and a protocol position is modelled only when the
 receiver is bound into the dunder and analysed — the same rule as a declared method call.
-The three positions were established by auditing every modelled parent by child position;
-every other implicit-effect position in the language has no modelled parent and so already
-reports.
+That mapping was then wrong twice more (review j#92400), in ways worth recording because
+they were both *inside an audit I had called complete*: truth testing is a fallback chain
+(``__bool__`` then ``__len__``, and ``__len__`` alone dispatches at the existing
+production ``or`` site), and assignment runs ``__setattr__`` on the *target*, which
+receives the value — an effect direction the audit never asked about, having asked only
+what runs *on* the value.
+
+So the walk no longer names which dunder a position invokes.  At a protocol position it
+binds **every dunder the resolved class declares**, minus construction hooks (which no
+expression runs on an existing value) and ``__call__`` (which is the dispatch itself).
+Over-analysis is the safe direction: analysing yields a pair or a report, never silence,
+and being wrong about the interpreter's choice stops mattering.  ``__aenter__`` is covered
+without appearing anywhere in this file.  Assignment targets are handled as their own
+position, since the value travels into the owner's hooks rather than having something run
+on itself.
+
+No claim is made here that the set of positions is complete.  Six rounds of such claims
+were each falsified by the next review; what the design offers instead is that an
+unreadable class, an unresolvable chain, or a position with no resolvable owner is
+reported rather than passed.
 
 :data:`_MODELLED_ATTRIBUTE_READS` is likewise checked against use rather than trusted:
 :attr:`Derivation.used_read_exceptions` records which keys a run actually consumed, and a
@@ -140,7 +157,13 @@ DRIVER_MODULE = (
 
 #: Guard against a pathological recursion in a mutually recursive call graph.  Reaching
 #: it is reported as unresolved (fail-closed), never silently truncated.
-_MAX_DEPTH = 12
+#:
+#: Raised from 12 when protocol-position binding (review j#92400) added taint edges and
+#: lengthened the caller chains behind ``_invoke`` / ``RecordingHerdrRunner.__call__``:
+#: the argv still resolved, but only past the old bound, so the walk reported sites it
+#: could in fact read.  The bound exists to stop unbounded recursion, not to cap honest
+#: chains, and hitting it stays a reported unresolved rather than a silent truncation.
+_MAX_DEPTH = 32
 
 
 class DerivationError(RuntimeError):
@@ -637,6 +660,8 @@ class _Walker:
     ) -> bool:
         if isinstance(expr, ast.Name):
             return expr.id in local
+        if isinstance(expr, ast.Name) and expr.id == "self" and owner:
+            return {(module, owner)}
         if isinstance(expr, ast.Attribute):
             if isinstance(expr.value, ast.Name) and expr.value.id == "self":
                 return (module, owner, expr.attr) in self.tainted_attrs
@@ -900,6 +925,8 @@ class _Walker:
         if isinstance(expr, ast.Call):
             constructed = self._constructed_class(module, qualname, expr)
             return {constructed} if constructed is not None else set()
+        if isinstance(expr, ast.Name) and expr.id == "self" and owner:
+            return {(module, owner)}
         if isinstance(expr, ast.Attribute):
             if isinstance(expr.value, ast.Name) and expr.value.id == "self":
                 known = self.attr_classes.get((module, owner, expr.attr))
@@ -984,10 +1011,34 @@ class _Walker:
     #: ``not`` / ``if`` / ``while`` / ``assert`` ``__bool__``, f-string ``__format__``)
     #: has no modelled parent at all, so it already reports.
     _PROTOCOL_POSITIONS: dict = {
-        (ast.withitem, "context_expr"): ("__enter__", "__exit__"),
-        (ast.BoolOp, "values"): ("__bool__",),
-        (ast.IfExp, "test"): ("__bool__",),
+        (ast.withitem, "context_expr"): "context management",
+        (ast.BoolOp, "values"): "truth testing",
+        (ast.IfExp, "test"): "truth testing",
     }
+
+    #: Positions where the tainted value is handed to a hook on the ASSIGNMENT TARGET
+    #: rather than having something run on itself (review j#92400 F7-2).  ``obj.attr =
+    #: value`` calls the owner's ``__setattr__`` with the value as an argument.  The R6
+    #: audit asked only "what runs on the value" and recorded "nothing" for assignment,
+    #: which was true and beside the point: the effect runs on the other side and the
+    #: value travels into it.
+    _TARGET_HOOK_POSITIONS: tuple = ("__setattr__", "__set__")
+
+    #: Dunders that run at CONSTRUCTION, not on an existing value in an expression.
+    #: Binding these from a protocol position would taint ``self`` throughout ``__init__``
+    #: and cascade over every attribute the constructor touches — a false-positive storm
+    #: rather than a safety property.  The distinction "does an expression invoke this on
+    #: an existing object" is far more robust than naming which dunder each position uses,
+    #: which is the enumeration review j#92400 F7-1 falsified.
+    _CONSTRUCTION_DUNDERS: frozenset = frozenset(
+        {"__init__", "__new__", "__init_subclass__", "__set_name__", "__post_init__"}
+    )
+
+    #: Not bound from a protocol position either: a truth test or a ``with`` does not
+    #: CALL the object.  ``__call__`` is the dispatch itself and is already modelled by
+    #: :meth:`_is_dispatch`; binding it here would taint ``self`` through the whole
+    #: dispatch body for reasons no protocol position justifies.
+    _DISPATCH_DUNDERS: frozenset = frozenset({"__call__"})
 
     #: Attribute spellings that ARE the dispatch entry point (see :meth:`_is_dispatch`).
     _DISPATCH_ATTRS = frozenset({"run", "__call__"})
@@ -1039,10 +1090,26 @@ class _Walker:
                     continue
                 self.unresolved_flows.append(
                     f"{module}:{qualname}:{getattr(node, 'lineno', 0)}: a runner-carrying "
-                    f"value sits where {' / '.join(protocol)} runs on it, and this walk "
-                    f"cannot analyse that"
+                    f"value sits where {protocol} runs on it, and this walk cannot "
+                    f"analyse that"
                 )
                 continue
+            # Assignment hands the value to the TARGET's hooks (review j#92400 F7-2).
+            if isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is node:
+                targets = (
+                    parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+                )
+                hooked = [t for t in targets if isinstance(t, ast.Attribute)]
+                if hooked and not all(
+                    self._target_hook_is_analysed(module, qualname, owner, local, t)
+                    for t in hooked
+                ):
+                    self.unresolved_flows.append(
+                        f"{module}:{qualname}:{getattr(node, 'lineno', 0)}: a "
+                        f"runner-carrying value is assigned to an attribute whose owner "
+                        f"hooks this walk cannot analyse"
+                    )
+                    continue
             if self._is_modelled_parent(node, parent, rebound):
                 continue
             self.unresolved_flows.append(
@@ -1221,24 +1288,29 @@ class _Walker:
 
     def _protocol_receiver_is_analysed(
         self, module: str, qualname: str, owner: str, local: set, node: ast.AST,
-        dunders: tuple,
+        _label: str = "",
     ) -> bool:
-        """Bind the value into the dunders this position runs, and say whether that held.
+        """Bind the value into EVERY dunder its class defines, and say whether that held.
 
-        Same treatment as a declared method call: the position is modelled only when the
-        receiver taint is actually bound into the body, so a dispatching ``__bool__``
-        resolves as a real pair instead of being waved through.  A class the walk cannot
-        resolve, or a dunder defined outside the first-party source, is reported — the
-        walk cannot analyse what it cannot read.
+        Deliberately not "the dunders this position invokes".  Naming those was wrong
+        twice: ``with`` runs two of them, and truth testing is a *fallback chain*
+        (``__bool__`` then ``__len__``), which review j#92400 F7-1 caught after the
+        previous round had asserted the mapping was complete.  Binding every dunder the
+        class declares removes the need to know which one the interpreter picks — over-
+        analysis is the safe direction here, because analysing produces a pair or a
+        report, never silence.
+
+        A class the walk cannot resolve is reported: it cannot bind what it cannot read.
         """
         classes = self._value_classes(module, qualname, owner, local, node)
         if not classes:
             return False
         for class_ref in classes:
-            for dunder in dunders:
+            skip = self._CONSTRUCTION_DUNDERS | self._DISPATCH_DUNDERS
+            for dunder in self._declared_dunders(class_ref) - skip:
                 found = self._lookup_member(class_ref, dunder)
                 if found is None:
-                    continue  # the class does not implement it: no effect to follow
+                    continue
                 found_module, found_qualname = found
                 function = self.index[found_module].functions[found_qualname]
                 names = _parameter_names(function)
@@ -1248,6 +1320,55 @@ class _Walker:
                 self.param_classes.setdefault(
                     (found_module, found_qualname, names[0]), set()
                 ).add(class_ref)
+        return True
+
+    def _declared_dunders(self, class_ref: tuple, _seen: tuple = ()) -> set:
+        """Every ``__dunder__`` the class or a base declares."""
+        if class_ref in _seen:
+            return set()
+        module, class_name = class_ref
+        indexed = self.index.get(module)
+        if indexed is None:
+            return set()
+        prefix = f"{class_name}."
+        found = {
+            name[len(prefix):]
+            for name in indexed.functions
+            if name.startswith(prefix)
+            and name[len(prefix):].startswith("__")
+            and name[len(prefix):].endswith("__")
+            and "." not in name[len(prefix):]
+        }
+        for base in self._base_classes(class_ref)[0]:
+            found |= self._declared_dunders(base, _seen + (class_ref,))
+        return found
+
+    def _target_hook_is_analysed(
+        self, module: str, qualname: str, owner: str, local: set, target: ast.Attribute
+    ) -> bool:
+        """Whether the assignment target's own hooks are bound and analysed.
+
+        ``obj.attr = <tainted>`` passes the value to ``__setattr__`` on the owner (and to
+        a data descriptor's ``__set__``).  Counting how many such classes exist today does
+        not close it — the point is future drift — so the owner class is resolved and any
+        hook it declares is analysed, or the assignment is reported.
+        """
+        classes = self._value_classes(module, qualname, owner, local, target.value)
+        if not classes:
+            return False
+        for class_ref in classes:
+            for hook in self._TARGET_HOOK_POSITIONS:
+                found = self._lookup_member(class_ref, hook)
+                if found is None:
+                    continue
+                found_module, found_qualname = found
+                function = self.index[found_module].functions[found_qualname]
+                names = _parameter_names(function)
+                # ``__setattr__(self, name, value)`` — the VALUE is the last parameter,
+                # and that is the one carrying the runner.
+                if len(names) < 3:
+                    return False
+                self.tainted_params.add((found_module, found_qualname, names[-1]))
         return True
 
     def _is_modelled_parent(
@@ -1592,7 +1713,18 @@ class _ArgvResolver:
                     "the dispatch call passes no argv",
                 )
             ]
-        return self._sites_for(module, qualname, call.args[0], call.lineno, 0)
+        found = self._sites_for(module, qualname, call.args[0], call.lineno, 0)
+        if found:
+            return found
+        return [
+            DispatchSite(
+                module,
+                qualname,
+                call.lineno,
+                None,
+                "no resolvable caller chain supplied this dispatch's argv",
+            )
+        ]
 
     def _sites_for(
         self, module: str, qualname: str, expr: ast.AST, lineno: int, depth: int
@@ -1773,7 +1905,18 @@ class _ArgvResolver:
         drop: int,
         lineno: int,
         depth: int,
+        visited: tuple = (),
     ) -> list:
+        # Protocol-position binding (review j#92400) closed a loop in the taint edges:
+        # ``_invoke`` dispatches through the wrapper, whose ``__call__`` forwards back.
+        # Walking that repeatedly only burned the depth bound and reported sites the walk
+        # can in fact resolve through the other branches.  Revisiting an edge yields
+        # nothing; a dispatch that ends up with NO sites at all is still reported below,
+        # so a fully cyclic site cannot become silence.
+        key = (module, qualname, parameter)
+        if key in visited:
+            return []
+        visited = visited + (key,)
         edges = self.walker.taint_edges.get((module, qualname), [])
         if not edges:
             return [
@@ -1846,6 +1989,7 @@ class _ArgvResolver:
                     inner_drop,
                     call.lineno,
                     depth + 1,
+                    visited,
                 )
             )
         return sites
@@ -1915,12 +2059,18 @@ def derive_dispatch_surface(source_root: Optional[Path] = None) -> Derivation:
     sites: list = []
     for module, qualname, call in walker.dispatch_calls:
         sites.extend(resolver.sites(module, qualname, call))
+    # Sorted on a total-order key: ``pair`` is ``None`` for an unresolved site, and
+    # comparing that against a tuple raises.  The key keeps output deterministic without
+    # assuming every site resolved.
     deduplicated = tuple(
         sorted(
             {
                 (site.module, site.function, site.lineno, site.pair, site.unresolved_reason)
                 for site in sites
-            }
+            },
+            key=lambda row: (
+                row[0], row[1], row[2], row[3] is None, row[3] or (), row[4]
+            ),
         )
     )
     return Derivation(
