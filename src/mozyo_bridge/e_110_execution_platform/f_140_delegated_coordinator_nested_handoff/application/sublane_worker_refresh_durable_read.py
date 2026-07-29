@@ -17,6 +17,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     MARKER_CHANNEL_WORKFLOW_EVENT,
+    marker_logical_gates,
     strict_marker_fields_in_note,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_turn_recovery import (  # noqa: E501
@@ -100,6 +101,13 @@ def notes_carry_worker_progress(request: WorkerRefreshRequest, notes: str) -> bo
     worker (:func:`worker_progress_facts`, and the central `### Hibernate Evidence Marker
     Contract`'s "fragment を捨てて残りを一致させず marker 全体を fail-closed とする").
 
+    Structural readability is only half of it. The gate itself is a LOGICAL field with two
+    spellings, resolved through :func:`marker_logical_gates` rather than by reading one of them
+    (review j#93338 R2-F1): a body can parse perfectly and still be judged by a lookup that only
+    knows ``gate``, which is how ``kind=implementation_done`` — the same gate to the intake —
+    read as "no durable gate" here and admitted the close. A marker naming two different gate
+    tokens across the aliases proves neither, so it too is unknown provenance.
+
     A note carrying no marker at all is not unreadable; it simply carries no progress.
     """
     try:
@@ -113,7 +121,22 @@ def notes_carry_worker_progress(request: WorkerRefreshRequest, notes: str) -> bo
     for channel, fields in markers:
         if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
             continue
-        if _norm(fields.get("gate")) not in WORKER_PROGRESS_GATES:
+        # The gate is a LOGICAL field with two spellings (``gate`` / ``kind``), resolved by the
+        # one authority that owns them (Redmine #14687 review j#93338 R2-F1). Reading
+        # ``fields["gate"]`` directly made the ``kind`` spelling invisible here while the intake
+        # read it as the very same gate — ``extract_markers_from_note`` builds an identical
+        # ``JournalMarker(gate='implementation_done')`` from either spelling. One durable note was
+        # therefore a landed gate to the workflow and "no durable gate at all" to the guard on a
+        # destructive close, for all four WORKER_PROGRESS_GATES.
+        gates = marker_logical_gates(fields)
+        if len(gates) > 1:
+            # Two gate tokens across the aliases: by ruling #14219 j#86718 a marker naming two
+            # gates proves NEITHER, so this marker's gate identity is unknown — and unknown
+            # provenance counts as progress. Decided before looking for a progress gate among
+            # them, so the answer cannot depend on WHICH alias the progress gate landed in
+            # (``gate=zzz:kind=implementation_done`` and its mirror must agree).
+            return True
+        if not (gates & WORKER_PROGRESS_GATES):
             continue
         lane = fields.get("lane")
         generation = fields.get("lane_generation")

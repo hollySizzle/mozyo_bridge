@@ -34,6 +34,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     TURN_CLASS_FAILED,
     TURN_CLASS_PRODUCTIVE,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+    MARKER_GATE_ALIASES,
+    extract_markers_from_note,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_turn_recovery import (  # noqa: E501
     WORKER_PROGRESS_GATES,
     WorkerTurnObservation,
@@ -161,6 +165,113 @@ class ProducerImpossibleBodyTests(unittest.TestCase):
             ):
                 with self.subTest(gate=gate, order=label):
                     self.assertNotEqual(_classify(template), TURN_CLASS_FAILED)
+
+
+class GateAliasTests(unittest.TestCase):
+    """R2-F1: the gate is a LOGICAL field with two spellings. (Redmine review j#93338)
+
+    R2 closed the repeated-key axis and left this one open: the semantic lookup read
+    ``fields["gate"]`` directly, so the ``kind`` spelling was invisible to the guard on a
+    destructive close while the intake read it as the very same gate. All four progress gates
+    were affected, and the answer depended on which alias the gate landed in.
+
+    The cases are the PRODUCT of the gate vocabulary and the alias vocabulary, both imported —
+    neither is re-listed here, so a gate or an alias added upstream is pinned automatically. The
+    previous round's "two gate aliases" case looked like it covered this and did not: it put the
+    progress gate in ``gate``, the one position that already worked.
+    """
+
+    def test_the_alias_vocabulary_is_the_one_the_reader_resolves(self):
+        """If the aliases ever change, this file's product must change with them."""
+        self.assertEqual(set(MARKER_GATE_ALIASES), {"gate", "kind"})
+
+    def test_the_intake_reads_both_spellings_as_the_same_gate(self):
+        """The asymmetry that made this a safety bug, pinned at its source.
+
+        The guard and the intake must not disagree about what a note declares. This is what makes
+        an alias-blind reader a destructive-close hole rather than a cosmetic gap.
+
+        Compared spelling-to-spelling rather than against the marker token itself: the intake
+        normalizes the marker-facing name onto the runtime gate (``owner_close_approval_waiting``
+        arrives as ``owner_close_approval``), and that mapping is not this test's subject. What is
+        its subject is that both spellings land on the SAME recognized gate.
+        """
+        for gate in sorted(WORKER_PROGRESS_GATES):
+            declared = {
+                alias: [
+                    marker.gate
+                    for marker in extract_markers_from_note(
+                        "1", "11", f"[mozyo:workflow-event:{alias}={gate}]"
+                    )
+                ]
+                for alias in MARKER_GATE_ALIASES
+            }
+            with self.subTest(gate=gate):
+                self.assertEqual(len(declared["gate"]), 1, "the gate spelling was not recognized")
+                self.assertEqual(declared["kind"], declared["gate"])
+
+    def test_a_progress_gate_in_any_single_alias_never_admits_the_refresh(self):
+        for gate in sorted(WORKER_PROGRESS_GATES):
+            for alias in MARKER_GATE_ALIASES:
+                with self.subTest(gate=gate, alias=alias):
+                    self.assertNotEqual(
+                        _classify(f"[mozyo:workflow-event:{alias}={gate}]"),
+                        TURN_CLASS_FAILED,
+                        f"a worker-progress gate spelled {alias!r} must count as progress",
+                    )
+
+    def test_conflicting_aliases_never_admit_the_refresh_in_either_position(self):
+        """A marker naming two gates proves neither (#14219 j#86718) — unknown provenance."""
+        for gate in sorted(WORKER_PROGRESS_GATES):
+            for alias in MARKER_GATE_ALIASES:
+                other = next(a for a in MARKER_GATE_ALIASES if a != alias)
+                note = f"[mozyo:workflow-event:{alias}={gate}:{other}=zzz]"
+                with self.subTest(gate=gate, progress_in=alias):
+                    self.assertNotEqual(_classify(note), TURN_CLASS_FAILED)
+
+    def test_the_answer_does_not_depend_on_which_alias_holds_the_gate(self):
+        """The R2 defect's signature: the same claim decided differently by position."""
+        for gate in sorted(WORKER_PROGRESS_GATES):
+            classes = {
+                _classify(
+                    f"[mozyo:workflow-event:{alias}={gate}:"
+                    f"{next(a for a in MARKER_GATE_ALIASES if a != alias)}=zzz]"
+                )
+                for alias in MARKER_GATE_ALIASES
+            }
+            with self.subTest(gate=gate):
+                self.assertEqual(len(classes), 1, f"alias-position-dependent: {classes}")
+
+    def test_conflicting_aliases_refuse_even_when_neither_token_is_a_progress_gate(self):
+        """The fail-closed branch's OWN case, which the cases above cannot reach.
+
+        Every conflict case above keeps a progress gate somewhere in the token set, so it refuses
+        whether the conflict is detected or the set merely happens to intersect
+        ``WORKER_PROGRESS_GATES``. A probe that deleted the conflict branch outright passed the
+        whole file — it was pinned by accident, not on purpose. Only a conflicting marker whose
+        tokens are BOTH outside the progress vocabulary can tell the two readers apart: its gate
+        identity is unresolvable (#14219 j#86718), so its provenance is unknown, so it counts as
+        progress.
+        """
+        for alias in MARKER_GATE_ALIASES:
+            other = next(a for a in MARKER_GATE_ALIASES if a != alias)
+            note = f"[mozyo:workflow-event:{alias}=review_result:{other}=zzz]"
+            with self.subTest(non_progress_in=alias):
+                self.assertNotEqual(
+                    _classify(note),
+                    TURN_CLASS_FAILED,
+                    "a marker naming two gates proves neither; an unresolvable gate identity is "
+                    "unknown provenance and must refuse the destructive refresh",
+                )
+
+    def test_a_non_progress_gate_still_admits_in_either_spelling(self):
+        """The alias fix must not turn every workflow-event marker into progress."""
+        for alias in MARKER_GATE_ALIASES:
+            with self.subTest(alias=alias):
+                self.assertEqual(
+                    _classify(f"[mozyo:workflow-event:{alias}=review_result]"),
+                    TURN_CLASS_FAILED,
+                )
 
 
 class SurfaceStillWorksTests(unittest.TestCase):
