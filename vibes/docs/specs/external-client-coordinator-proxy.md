@@ -382,6 +382,20 @@ authorize したかを照合しなければ scope は未検証のままである
     raw 値を検査する。**無効値を正規化して通すのは、producer が caller の依頼と違うものを書く経路**
     である。untrimmed input を持つ caller は、値を「これが意図だ」と主張する前に**自分で明示的に**
     trim する。
+    ★★★**分岐を決める引数の「型」は分岐より先に確定させる。falsy は sentinel ではない**
+    (#14667 R3 review j#93162)。raw で判定する版を `if lane:` と書いたため、`None` / `False` /
+    `0` / `0.0` / 空 container が bootstrap 分岐へ落ち、**有効な bootstrap marker を描画して送信した**。
+    これは既存の型外入力を保持したのではなく、**それ以前の `lane.strip()` が `AttributeError` で
+    marker 生成前に停止していたものを、positive authority send へ変えた regression** である。
+    → producer 境界で **非 str を marker 生成前に拒否**し、bootstrap の sentinel を
+    **exact empty string 1 綴りに固定**する。「falsy なら bootstrap」は sentinel ではなく
+    Python の真偽値表の偶然にすぎない。
+    ★★★**型の前提は「第二の grammar」ではない。** 値が何を*含んで*よいか (禁止文字 / whitespace /
+    空値) は引き続き共有 validator のものだけを使う。producer が持つのは自分の signature に対する
+    型前提だけである。**この前提を共有 validator 側へ移してはならない** — 実測: 共有 validator は
+    `str(value)` で強制するため `False` → `'False'` / `0` → `'0'` を**通し**、逆に共有側へ str 限定を
+    足すと recovery-admission producer が `lane_generation=1` を int で渡しており **22 error** で壊れる。
+    **どの規則をどの層に置くかは、測ってから決める。**
     ★★★**分岐は raw argument で決める。正規化が判断より先に走ると、判断そのものが変わる。**
     同 review の最も深刻な形: 分岐条件が `if lane.strip():` だったため **whitespace-only の lane が
     falsy になり、dispatch を意図した caller に対して `proxy_action=bootstrap_lane` の marker が

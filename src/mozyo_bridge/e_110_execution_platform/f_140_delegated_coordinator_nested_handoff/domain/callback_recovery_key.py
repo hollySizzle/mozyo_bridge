@@ -140,13 +140,20 @@ def _is_digest(value: str) -> bool:
 
 
 def _validate_value(name: str, value: object) -> str:
-    """Return the stripped value, or raise: an unrepresentable field is refused at the boundary.
+    """Return the value as given, or raise: an unrepresentable field is refused at the boundary.
 
     The rules this channel hardened are now the SHARED producer-side check
     (:func:`...redmine_journal_source.validate_marker_field_value`), so the other marker
     producers are held to them too (Redmine #14539 review j#92374 finding 2) — two of them had
     no such check and could emit a record their own parser refused. Only the exception type is
     local, because this channel's callers catch :class:`RecoveryKeyError`.
+
+    "As given" rather than "stripped" since Redmine #14667 review j#93063: the shared check no
+    longer normalizes surrounding whitespace away before judging it, because a rule that says
+    "refuses ANY whitespace" while silently trimming is not the rule it claims to be. This wrapper
+    already forwarded the raw value, so its behaviour did not change — but its description had
+    stopped matching the contract it delegates to (review j#93162 finding 2), and a wrapper that
+    describes the wrong contract is how the next reader learns the wrong rule.
     """
     try:
         return validate_marker_field_value(name, value, what="recovery admission key")

@@ -36,6 +36,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DecisionRecord,
     normalize_action,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+    MarkerValueError,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     marker_components_in_note,
     marker_declares_gate,
@@ -164,6 +167,29 @@ def canonical_decision_in_journal(
     )
 
 
+def _require_str(field: str, value: object) -> None:
+    """Refuse a non-string argument before it can reach a branch or a marker (pure).
+
+    This is a TYPE precondition on this producer's own signature, not a second grammar. Every rule
+    about what a value may CONTAIN — delimiters, whitespace, emptiness — stays with the shared
+    :func:`...redmine_journal_source.validate_marker_field_value`, and nothing here duplicates it.
+
+    It has to live at this boundary rather than in that shared contract, and the reason was
+    measured rather than assumed (review j#93162): the shared validator coerces with ``str(value)``,
+    which turns ``False`` into ``'False'`` and ``0`` into ``'0'`` — so routing a non-string through
+    it produces a clean-looking field instead of a refusal. Adding a string-only rule there instead
+    would break a real caller: the recovery-admission producer passes ``lane_generation=1`` as an
+    int, and that coercion is load-bearing for it (22 errors when probed). A rule that is right for
+    one producer and wrong for another does not belong in the shared contract.
+    """
+    if not isinstance(value, str):
+        raise MarkerValueError(
+            f"marker field {field!r} must be a string, got {type(value).__name__} {value!r}. "
+            "A non-string cannot be judged by the marker value contract without being coerced "
+            "into one, and a coerced value is not the value the caller passed"
+        )
+
+
 def render_bootstrap_decision_marker(lane: str = "", lane_generation: str = "") -> str:
     """The canonical decision marker a coordinator writes to authorize a proxy action (producer).
 
@@ -188,19 +214,23 @@ def render_bootstrap_decision_marker(lane: str = "", lane_generation: str = "") 
     is not.
     """
     marker = f"[mozyo:workflow-event:gate=implementation_request:{DECISION_ACTION_FIELD}="
-    # The branch is decided on the RAW argument, and nothing is normalized before it. Testing
-    # ``lane.strip()`` here made a whitespace-only lane falsy, so a caller asking to authorize a
-    # DISPATCH got a marker authorizing a BOOTSTRAP — the argument did not merely lose its
-    # whitespace, it selected the other action (review j#93063; measured `lane='\t'` reaching a
-    # delivered send). Normalization that runs before a decision is normalization that can change
-    # the decision, so the raw value both picks the branch and is what the validator judges.
-    if lane:
-        lane_value = validate_marker_field_value("lane", lane)
-        generation_value = validate_marker_field_value("lane_generation", lane_generation)
-        return (
-            marker + f"dispatch_next:lane={lane_value}:lane_generation={generation_value}]"
-        )
-    return marker + "bootstrap_lane]"
+    # The type of the argument that DECIDES the branch is settled before the branch. Testing
+    # ``lane`` for truthiness let every falsy non-string — ``None`` / ``False`` / ``0`` — fall into
+    # the bootstrap branch and render a valid marker that delivered (review j#93162). That was not
+    # a pre-existing hole being preserved: ``lane.strip()`` raised ``AttributeError`` on those
+    # values and stopped before any marker existed, so the truthiness test converted a zero-send
+    # into a positive authority send.
+    _require_str("lane", lane)
+    # Exactly one spelling selects a bootstrap: the empty string. "Anything falsy" is not a
+    # sentinel, it is a coincidence of Python's truth table.
+    if lane == "":
+        return marker + "bootstrap_lane]"
+    _require_str("lane_generation", lane_generation)
+    # ...and the VALUE rules stay the shared authority's (review j#93063): the raw value, judged
+    # as given, by the contract every other producer calls.
+    lane_value = validate_marker_field_value("lane", lane)
+    generation_value = validate_marker_field_value("lane_generation", lane_generation)
+    return marker + f"dispatch_next:lane={lane_value}:lane_generation={generation_value}]"
 
 
 def canonical_decision_shapes() -> "frozenset[frozenset[str]]":

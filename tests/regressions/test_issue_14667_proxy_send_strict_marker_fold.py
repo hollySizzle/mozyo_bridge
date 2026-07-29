@@ -513,6 +513,79 @@ class ProducerRefusesUnrenderableValuesTest(unittest.TestCase):
                 # legitimate bootstrap call and must keep working.
                 self.assertIn("bootstrap_lane", render_bootstrap_decision_marker(lane=""))
 
+    def test_a_falsy_non_string_lane_cannot_become_a_BOOTSTRAP_marker(self):
+        """R3 review j#93162: a regression this issue INTRODUCED, and then shipped.
+
+        R2 fixed the branch to read the raw argument — and wrote it as ``if lane:``, so every falsy
+        non-string (``None`` / ``False`` / ``0`` / ``0.0`` / empty containers) fell into the
+        bootstrap branch and rendered a valid marker that delivered. It was not a pre-existing hole
+        preserved: the previous ``lane.strip()`` raised ``AttributeError`` on those values and
+        stopped before any marker existed, so the truthiness test turned a zero-send into a
+        positive authority send.
+
+        The producer refuses them by TYPE, before the branch. Routing them to the shared value
+        contract instead does not work and the reason is measured, not assumed: it coerces with
+        ``str(value)``, so ``False`` becomes the field ``lane=False`` and passes.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+            MarkerValueError,
+        )
+
+        for label, lane in {
+            "None": None,
+            "False": False,
+            "zero int": 0,
+            "zero float": 0.0,
+            "empty list": [],
+            "empty tuple": (),
+            "empty dict": {},
+            # bytes are the case that makes the check's SHAPE load-bearing: they are falsy when
+            # empty and truthy when not, they carry a ``.strip()`` method, and ``str(b'ln')``
+            # renders the field ``lane=b'ln'``. A duck-typed "does it have .strip()" test would
+            # admit them; ``isinstance(value, str)`` is what refuses them.
+            "empty bytes": b"",
+            "non-empty bytes": b"ln",
+            "bytearray": bytearray(b"ln"),
+        }.items():
+            with self.subTest(label):
+                with self.assertRaises(MarkerValueError):
+                    render_bootstrap_decision_marker(lane=lane, lane_generation="2")
+
+    def test_a_non_string_generation_is_refused_on_the_dispatch_path(self):
+        """The same type precondition on the other field, including a TRUTHY non-string.
+
+        ``lane_generation=2`` is the shape a caller most plausibly gets wrong, and it is exactly
+        the one ``str()`` coercion would have waved through as ``lane_generation=2``.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+            MarkerValueError,
+        )
+
+        for label, generation in {"None": None, "False": False, "zero": 0, "truthy int": 2}.items():
+            with self.subTest(label):
+                with self.assertRaises(MarkerValueError):
+                    render_bootstrap_decision_marker(lane="ln", lane_generation=generation)
+
+    def test_the_empty_string_is_the_only_bootstrap_sentinel(self):
+        """The control that gives the two cases above their meaning.
+
+        A producer that refused everything would satisfy them. Exactly one spelling selects a
+        bootstrap — the empty string — and "anything falsy" is not a sentinel but a coincidence of
+        Python's truth table.
+        """
+        for label, kwargs in {
+            "no arguments at all": {},
+            "explicit empty lane": {"lane": ""},
+            "empty lane, generation ignored": {"lane": "", "lane_generation": "2"},
+        }.items():
+            with self.subTest(label):
+                self.assertEqual(
+                    render_bootstrap_decision_marker(**kwargs),
+                    _marker(
+                        f"gate=implementation_request:{DECISION_ACTION_FIELD}=bootstrap_lane"
+                    ),
+                )
+
     def test_the_truncated_body_is_indistinguishable_at_the_reader(self):
         """Why the fix must live in the producer, stated as a measurement rather than a claim.
 
