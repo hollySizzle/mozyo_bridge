@@ -713,7 +713,13 @@ class GateFacts:
     review_waiver_unsupported: bool = False
     #: The NEWEST review round is unresolved and STAYS so past a later Close (#14695 j#93879 F1):
     #: pending review means zero-close / zero-retire, and a Close is not a review resolution.
+    #: ``review_round_gate`` / ``review_round_conclusion`` carry that round's OWN typed identity so
+    #: the classifier can re-apply its ordinary rules to it rather than flattening every unresolved
+    #: outcome into one state (#14695 review j#94005 F2).
     review_round_unresolved: bool = False
+    review_round_gate: str = ""
+    review_round_conclusion: str = ""
+    review_round_blocker: bool = False
 
 
 @dataclass(frozen=True)
@@ -888,7 +894,9 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
     latest = max(recognized, key=lambda r: r.journal_id)
     # Computed ONCE and shared by both derived waiver facts: two calls would be two chances for
     # the round vocabulary to be filtered differently.
-    round_ids, round_unresolved = _review_round_state(recognized)
+    (
+        round_ids, round_unresolved, round_gate, round_conclusion, round_blocker
+    ) = _review_round_state(recognized)
     # Computed once: the derived fact and its negation-for-declared-waivers must agree.
     waived = waived_now(review_waiver, zero_change, round_ids)
     return GateFacts(
@@ -918,6 +926,9 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         review_waiver_unsupported=waiver_declaration_current(review_waiver, round_ids)
         and not waived,
         review_round_unresolved=round_unresolved,
+        review_round_gate=round_gate,
+        review_round_conclusion=round_conclusion,
+        review_round_blocker=round_blocker,
     )
 
 
@@ -958,6 +969,9 @@ def lane_signal_from_gate_facts(
         review_waived=facts.review_waived,
         review_waiver_unsupported=facts.review_waiver_unsupported,
         review_round_unresolved=facts.review_round_unresolved,
+        review_round_gate=facts.review_round_gate,
+        review_round_conclusion=facts.review_round_conclusion,
+        review_round_blocker=facts.review_round_blocker,
     )
 
 

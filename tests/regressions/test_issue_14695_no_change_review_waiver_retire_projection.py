@@ -995,7 +995,49 @@ class CloseFamilyProjectionTest(unittest.TestCase):
                 )
                 self.assertTrue(facts.review_round_unresolved)
                 self.assertNotEqual(state, LANE_STATE_RETIRE_READY)
+                # ``changes_requested`` means the work is back with the implementer, so the lane
+                # is ``implementing`` — the state the LIVE rules already give that round. R8
+                # flattened it to ``review_waiting``, which is coordinator-blocking and stopped
+                # the pipeline on a lane that was merely being reworked (review j#94005 F2).
+                self.assertEqual(state, "implementing")
+
+    def test_an_unresolved_review_outranks_the_integration_precedence(self):
+        """Review j#94005 finding 1: the fence must fire for COMMIT-BEARING lanes too.
+
+        R8 evaluated the integration precedence first, so the correction only ever fired for
+        zero-change records: a commit-bearing lane with an unanswered review_request went to
+        ``integration_waiting``, sending unreviewed work to the integration drain. Integration
+        follows review approval, so review is asked first.
+        """
+        commit_bearing = ("200", "## Gate: implementation done\n- commit_hash: `deadbeef1234567`")
+        for label, extra in (
+            ("unmerged", []),
+            ("explicit_deferral", [("250", "## Integration disposition\n- disposition: explicit_deferral")]),
+            ("integration_blocked", [("250", "## Integration disposition\n- disposition: integration_blocked")]),
+        ):
+            with self.subTest(case=label):
+                journals = [("100", "## Gate: start"), commit_bearing] + extra + [
+                    ("300", "## Gate: review request"),
+                    ("400", "## Gate: close"),
+                ]
+                facts, state = self._state(journals, issue_open=False)
+                self.assertTrue(facts.commit_bearing)
+                self.assertTrue(facts.review_round_unresolved)
                 self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
+
+    def test_integration_precedence_still_applies_once_the_review_resolves(self):
+        # The negative control: with the review APPROVED, commit-bearing unmerged work is still
+        # ``integration_waiting``. Without this, the test above would also pass for a change that
+        # simply disabled the integration precedence.
+        journals = [
+            ("100", "## Gate: start"),
+            ("200", "## Gate: implementation done\n- commit_hash: `deadbeef1234567`"),
+            ("300", "## Gate: review request"),
+            ("400", "## Gate: review\n- 結論: 承認"),
+            ("500", "## Gate: close"),
+        ]
+        _, state = self._state(journals, issue_open=False)
+        self.assertEqual(state, "integration_waiting")
 
     def test_an_unanswered_review_request_is_also_unresolved(self):
         # The other unresolved shape: a request nothing ever answered, then a Close.
@@ -1017,9 +1059,13 @@ class CloseFamilyProjectionTest(unittest.TestCase):
         """
         _, approved = self._state(self._closed_lane("承認", with_waiver=True), issue_open=False)
         _, changes = self._state(self._closed_lane("要修正", with_waiver=True), issue_open=False)
+        _, blocker = self._state(self._closed_lane("blocker", with_waiver=True), issue_open=False)
+        # Each unresolved outcome keeps its OWN state past the Close, which is the point: the live
+        # rules already distinguish them and a Close must not erase that (review j#94005 F2).
         self.assertEqual(approved, LANE_STATE_RETIRE_READY)
-        self.assertEqual(changes, LANE_STATE_REVIEW_WAITING)
-        self.assertNotEqual(approved, changes)
+        self.assertEqual(changes, "implementing")
+        self.assertEqual(blocker, LANE_STATE_BLOCKED)
+        self.assertEqual(len({approved, changes, blocker}), 3)
 
     def test_a_waiver_with_nothing_newer_still_blocks(self):
         """The negative control for both: an UNsuperseded waiver is still refused."""

@@ -225,6 +225,15 @@ class LaneSignal:
     #: pending; recording a Close does not resolve the review. FAIL-CLOSED default False so a
     #: caller that cannot establish it leaves the previous behaviour untouched.
     review_round_unresolved: bool = False
+    #: That round's OWN gate / conclusion, so the classifier re-applies its ordinary rules to it
+    #: instead of flattening every unresolved outcome into one state (#14695 j#94005 F2).
+    review_round_gate: str = ""
+    review_round_conclusion: str = ""
+    #: That round concluded BLOCKER. Carried as the round's own flag rather than inferred from the
+    #: conclusion string: the grammar keeps a blocker in a separate flag and leaves the conclusion
+    #: ``pending``, so comparing conclusions would silently never fire (measured while wiring
+    #: #14695 j#94005 F2).
+    review_round_blocker: bool = False
 
 
 #: The gates whose projection is "the work is done; close it, then retire it". They share the
@@ -361,18 +370,37 @@ def classify_lane_state(signal: LaneSignal) -> str:
     # the operator into a Close the retire would refuse. :data:`_CLOSE_FAMILY_GATES` makes the
     # membership explicit so a gate added to this family cannot silently miss the suppression.
     if gate in _CLOSE_FAMILY_GATES:
+        # An UNRESOLVED review round outranks the close family — INCLUDING its integration
+        # precedence (#14695 reviews j#93879 F1 and j#94005 F1). Evaluating integration first meant
+        # the fence only ever fired for zero-change records: a commit-bearing lane with an
+        # unanswered review_request went to ``integration_waiting``, sending unreviewed work to the
+        # integration drain. Integration follows review approval, so review is asked first.
+        #
+        # The round's own gate and conclusion are re-classified through THIS SAME function, so the
+        # post-Close state is whatever the live rules already say for that round — pending audit ->
+        # review_waiting, changes_requested -> implementing (non-blocking, the implementer has it),
+        # blocker -> blocked. R8 flattened all three into ``review_waiting``, which stopped the
+        # pipeline on a lane that was merely being reworked and weakened an explicit blocker
+        # (j#94005 F2). Re-using the rules rather than writing a second mapping is what keeps the
+        # live and post-Close readings from drifting apart.
+        #
+        # Terminates in one step: a round gate is ``review_request`` / ``review``, never a
+        # close-family gate, so the recursive call cannot re-enter this branch.
+        if signal.review_round_unresolved and signal.review_round_gate:
+            return classify_lane_state(
+                LaneSignal(
+                    issue=signal.issue,
+                    latest_gate=signal.review_round_gate,
+                    review_conclusion=signal.review_round_conclusion,
+                    callback_state=signal.callback_state,
+                    issue_open=signal.issue_open,
+                    blocker_recorded=signal.review_round_blocker,
+                )
+            )
         if _integration_owed(signal) or (
             signal.commit_bearing and not signal.integration_recorded
         ):
             return LANE_STATE_INTEGRATION_WAITING
-        # An UNRESOLVED review round outranks the close family, waiver or not (#14695 review
-        # j#93879 F1 + its design ruling). The Acceptance says pending review means zero-close /
-        # zero-retire, and a Close journal arriving afterwards is not a review resolution — so the
-        # lane reads as the audit it still owes rather than as ready to close or retire. This is
-        # deliberately GENERIC: the ruling holds that keeping normal review-round state after Close
-        # is part of "維持 the normal review-generation fence", not a waiver-specific rule.
-        if signal.review_round_unresolved:
-            return LANE_STATE_REVIEW_WAITING
         # A lane relying on a waiver that establishes nothing must not read as "go close it" or
         # "safe to retire": the terminal retire refuses it, and the issue's Acceptance asks for the
         # same conclusion from the glance, the close and the retire.

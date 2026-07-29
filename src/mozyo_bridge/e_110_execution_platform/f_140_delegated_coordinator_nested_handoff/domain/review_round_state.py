@@ -48,7 +48,7 @@ def is_open_review_round(gates: "frozenset | set", conclusion: str) -> bool:
     return GATE_REVIEW in gates and conclusion != REVIEW_APPROVED
 
 
-def review_round_state(recognized: Sequence[object]) -> Tuple[list, bool]:
+def review_round_state(recognized: Sequence[object]) -> Tuple[list, bool, str, str, bool]:
     """Review-round journal ids, and whether the NEWEST of them is unresolved (pure).
 
     Both answers come from one pass so they cannot disagree about which journals are rounds.
@@ -64,7 +64,25 @@ def review_round_state(recognized: Sequence[object]) -> Tuple[list, bool]:
     unresolved = newest is not None and is_open_review_round(
         newest.gates_or_gate, newest.review_conclusion
     )
-    return [r.journal_id for r in rounds], unresolved
+    # The newest round's OWN gate and conclusion, not a boolean (#14695 review j#94005 F2).
+    # Compressing them lost the distinction the lane state classes are built on: a
+    # ``changes_requested`` round means the implementer is working (non-blocking), a pending audit
+    # means a review is owed, and a blocker means blocked. Collapsing all three into "unresolved"
+    # turned a working lane into a coordinator-blocking one and weakened an explicit blocker.
+    #
+    # The gate is reduced to the round-family member so a combined heading is carried as the round
+    # it opened: ``review`` wins over ``review_request`` because a result answers a request.
+    gate = ""
+    if newest is not None:
+        gates = newest.gates_or_gate
+        gate = GATE_REVIEW if GATE_REVIEW in gates else GATE_REVIEW_REQUEST
+    return (
+        [r.journal_id for r in rounds],
+        unresolved,
+        gate,
+        (newest.review_conclusion if newest is not None else ""),
+        bool(getattr(newest, "blocker", False)) if newest is not None else False,
+    )
 
 
 __all__ = ("REVIEW_ROUND_GATES", "is_open_review_round", "review_round_state")
