@@ -164,6 +164,22 @@ def _clean_field_value(value: object) -> str:
 #: A trailing parenthetical qualifier governed authors append to a heading part.
 _TRAILING_PAREN_RE = re.compile(r"\s*[（(][^）)]*[）)]\s*$")
 
+#: The bounded dash qualifier the canonical Gate heading grammar allows AFTER the gate token
+#: (``## Gate: production_verification — R2``). This is a sanctioned canonical spelling, not a
+#: deviation: the central preset's `### Gate Heading Canonical Literal` says round / 補足 go in a
+#: ``bounded qualifier ( — R3)``, a trailing ``(...)``, or a body field.
+#:
+#: Review j#94110 finding 2 measured the hole: only the trailing parenthetical was stripped here,
+#: so ``## Gate: production_verification — R2`` normalized to a single token
+#: ``production_verification_—_r2``, matched nothing in :data:`HARD_CARVE_OUT_GATE_TOKENS`, and
+#: folded to ``clear=True`` — the parenthetical spelling of the SAME heading was refused
+#: correctly. A qualifier the 正本 invites must not be the thing that opens a fence.
+#:
+#: Spelled out here rather than imported from :mod:`.glance_journal_grammar` for the reason its
+#: sibling regexes already are — that module imports THIS one — and a parity test binds the two
+#: patterns so they cannot drift.
+_BOUNDED_QUALIFIER_RE = re.compile(r"\s+[—–]\s+")
+
 #: The carve-out surface is provably not applicable.
 CARVE_OUT_CLEAR = "hard_carve_out_not_applicable"
 #: A recognized durable fact names a carve-out surface.
@@ -228,10 +244,22 @@ def _structured_gate_tokens(notes: str) -> frozenset[str]:
         match = _GATE_HEADING_LINE_RE.match(line or "")
         if match is None:
             continue
-        for part in _HEADING_PART_SPLIT_RE.split(match.group("body")):
-            token = _normalize_gate_token(_TRAILING_PAREN_RE.sub("", part))
-            if token:
-                tokens.add(token)
+        for raw_part in _HEADING_PART_SPLIT_RE.split(match.group("body")):
+            part = _TRAILING_PAREN_RE.sub("", raw_part)
+            # BOTH the whole part and its bounded-qualifier head are tested. Testing both is the
+            # fail-closed reading for a REFUSAL trigger: adding a candidate can only make this
+            # set larger, so a heading is detected whether the author qualified the gate token or
+            # not. The parenthetical strip is re-applied to the head because the two qualifier
+            # forms compose (``## Gate: release (R2) — 出荷確認``) — the same re-application the
+            # grammar's own splitter performs for the same reason.
+            candidates = [part]
+            head = _BOUNDED_QUALIFIER_RE.split(part, maxsplit=1)[0]
+            if head != part:
+                candidates.append(_TRAILING_PAREN_RE.sub("", head))
+            for candidate in candidates:
+                token = _normalize_gate_token(candidate)
+                if token:
+                    tokens.add(token)
     return frozenset(tokens)
 
 

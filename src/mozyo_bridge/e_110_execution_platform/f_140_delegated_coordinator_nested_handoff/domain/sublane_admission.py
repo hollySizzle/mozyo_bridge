@@ -243,6 +243,28 @@ class LaneSignal:
 _CLOSE_FAMILY_GATES: frozenset = frozenset({GATE_OWNER_CLOSE_APPROVAL, GATE_CLOSE})
 
 
+def is_open_review_round(gates: "frozenset | set", conclusion: str) -> bool:
+    """Whether these round gates constitute an OPEN review round (pure).
+
+    A ``review_request`` is open — it asks for a review that has not answered yet. A ``review``
+    is open unless it CONCLUDED approved; ``pending`` (an unreadable / absent 結論) and
+    ``changes_requested`` both leave the round owed, and ``pending`` in particular must count as
+    open because it is the fail-closed read of a review whose conclusion could not be established.
+
+    It lives HERE, beside the gate / conclusion vocabulary it reads, because it is the ONE
+    definition of "open" that both producer and consumer must share. Review j#94110 finding 1
+    measured what a second, disagreeing rulebook costs: :mod:`.review_round_state` reduced a
+    combined ``review_request + review`` heading to ``review`` while this predicate called the
+    same journal open, so the fold emitted the self-contradictory
+    ``unresolved=True / gate=review / conclusion=approved`` and the close-family branch replayed
+    it as an APPROVED review (``owner_waiting``) — losing the pending-review fence. Both sides now
+    answer "is this round open" with this function, so they cannot disagree again.
+    """
+    if GATE_REVIEW_REQUEST in gates:
+        return True
+    return GATE_REVIEW in gates and conclusion != REVIEW_APPROVED
+
+
 def _no_review_owed(signal: LaneSignal) -> bool:
     """Whether ANY durable authority says no independent review is owed right now (pure).
 
@@ -386,7 +408,20 @@ def classify_lane_state(signal: LaneSignal) -> str:
         #
         # Terminates in one step: a round gate is ``review_request`` / ``review``, never a
         # close-family gate, so the recursive call cannot re-enter this branch.
-        if signal.review_round_unresolved and signal.review_round_gate:
+        #
+        # The carried tuple is VALIDATED against the same openness predicate that produced the
+        # flag, and an unresolved round that does not survive it is blocked rather than fallen
+        # through (j#94110 finding 1). Guarding on ``review_round_gate`` being merely non-empty
+        # was not fail-closed: a caller that set ``review_round_unresolved`` alone — a hand-built
+        # signal, or any future producer that fills the flag before the identity — silently
+        # skipped the whole fence and reached ``retire_ready``, and a contradictory
+        # ``review``/``approved`` tuple replayed an unresolved round as an approved one. Neither
+        # is a state we can classify, so neither may advance past the review fence.
+        if signal.review_round_unresolved:
+            if not is_open_review_round(
+                frozenset({signal.review_round_gate}), signal.review_round_conclusion
+            ):
+                return LANE_STATE_BLOCKED
             return classify_lane_state(
                 LaneSignal(
                     issue=signal.issue,
@@ -621,6 +656,7 @@ __all__ = (
     "SublaneAdmissionInputs",
     "SublaneAdmissionOutcome",
     "classify_lane_state",
+    "is_open_review_round",
     "evaluate_sublane_admission",
     "render_admission_journal",
 )

@@ -339,6 +339,76 @@ class HardCarveOutTest(unittest.TestCase):
         ]
         self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
 
+    def test_a_bounded_qualifier_does_not_hide_a_carve_out_gate(self):
+        """Review j#94110 finding 2: a qualifier the 正本 INVITES must not open the fence.
+
+        Only the trailing parenthetical was stripped, so ``## Gate: production_verification — R2``
+        folded to ``clear=True`` while the parenthetical spelling of the same heading refused
+        correctly. The bounded dash qualifier is canonical — the central preset's
+        `### Gate Heading Canonical Literal` names ``bounded qualifier ( — R3)`` as one of the
+        three places a round / 補足 belongs — so writing the round the way the rules ask was
+        enough to hide a protected gate.
+
+        Every canonical qualifier spelling is pinned, including the two composed, because the
+        defect was that one form was handled and its siblings were not.
+        """
+        for label, heading in sorted(
+            {
+                "em dash": "## Gate: production_verification — R2",
+                "en dash": "## Gate: production_verification – R2",
+                "parenthetical": "## Gate: production_verification (R2)",
+                "composed": "## Gate: production_verification (R2) — 出荷確認",
+                "qualified inside a combined heading": (
+                    "## Gate: implementation_done + release — R2"
+                ),
+                "qualifier carrying prose": "## Gate: release — 0.14.0 を publish した",
+            }.items()
+        ):
+            with self.subTest(case=label):
+                journals = [
+                    ("100", f"## Gate: start\n\n{CARVE_OUT_CLEARED}"),
+                    ("200", heading),
+                    ("300", f"## Gate: close\n{waiver_marker()}"),
+                ]
+                self.assertEqual(fold_hard_carve_out(journals).reason, CARVE_OUT_DECLARED)
+                self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
+
+    def test_a_qualifier_does_not_invent_a_carve_out_that_is_not_there(self):
+        """The negative control: stripping the qualifier must not refuse everything.
+
+        Without this, the test above would also pass for a change that simply refused any
+        qualified heading — turning the canonical round qualifier into a universal blocker.
+        """
+        journals = [
+            ("100", f"## Gate: start\n\n{CARVE_OUT_CLEARED}"),
+            ("200", "## Gate: implementation_done — R2"),
+            ("300", f"## Gate: close\n{waiver_marker()}"),
+        ]
+        self.assertTrue(fold_hard_carve_out(journals).clear)
+
+    def test_the_qualifier_contract_matches_the_canonical_heading_grammar(self):
+        """The drift oracle, taken from the OTHER module rather than restated here.
+
+        This module spells the qualifier pattern out instead of importing it, because
+        ``glance_journal_grammar`` imports THIS one and the cycle cannot be closed. A copied
+        pattern is only safe while something fails when the original moves, so the two are
+        compared directly — and against the preset spelling both of them claim to implement.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (  # noqa: E501
+            _BOUNDED_QUALIFIER_RE as GRAMMAR_RE,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_carve_out import (  # noqa: E501
+            _BOUNDED_QUALIFIER_RE as CARVE_OUT_RE,
+        )
+
+        self.assertEqual(CARVE_OUT_RE.pattern, GRAMMAR_RE.pattern)
+        # And both must actually split the spelling the preset documents, so a pair that drifted
+        # together to something the 正本 does not use still fails here.
+        self.assertEqual(
+            CARVE_OUT_RE.split("production_verification — R3", maxsplit=1)[0],
+            "production_verification",
+        )
+
     def test_the_canonical_marker_producer_cannot_emit_these_gates(self):
         """Why the heading is the real surface, pinned rather than asserted in prose.
 
@@ -1074,6 +1144,176 @@ class CloseFamilyProjectionTest(unittest.TestCase):
         self.assertTrue(facts.review_waiver_unsuperseded)
         self.assertTrue(facts.review_waiver_unsupported)
         self.assertEqual(state, LANE_STATE_BLOCKED)
+
+
+class CombinedReviewRoundTest(unittest.TestCase):
+    """Review j#94110 finding 1: one round, one answer to "is it open".
+
+    The round fold and the openness predicate disagreed about a combined
+    ``## Gate: review request + review`` heading. The predicate called it open (a request is
+    open), the reduction called it a ``review`` (a result answers a request), and the tuple that
+    came out asserted both at once: ``unresolved=True`` with ``gate=review`` and
+    ``conclusion=approved``. The close-family branch replays the carried round through the
+    classifier, so the still-open request was re-read as an APPROVED review and the lane advanced
+    to ``owner_waiting`` — past the pending-review fence this issue exists to hold.
+
+    Measured on the exact head before the correction, end-to-end through
+    ``fold_issue_gate_facts``: 承認 -> ``owner_waiting``, 要修正 -> ``implementing``. Both are
+    states that treat an unanswered request as answered.
+    """
+
+    def _state(self, journals, *, issue_open=False):
+        facts = fold_issue_gate_facts(journals)
+        return facts, classify_lane_state(
+            lane_signal_from_gate_facts(ISSUE, facts, issue_open=issue_open)
+        )
+
+    def _combined(self, conclusion):
+        return [
+            ("100", "## Gate: start"),
+            ("300", f"## Gate: review request + review\n- 結論: {conclusion}"),
+            ("500", "## Gate: close"),
+        ]
+
+    def test_a_combined_round_keeps_the_open_requests_identity(self):
+        """Whatever the review half concluded, the request half is still owed."""
+        for conclusion in ("承認", "要修正"):
+            with self.subTest(conclusion=conclusion):
+                facts, state = self._state(self._combined(conclusion))
+                self.assertTrue(facts.review_round_unresolved)
+                self.assertEqual(facts.review_round_gate, "review_request")
+                # No conclusion is carried: it describes the review half and would contradict
+                # the request half that keeps the round open.
+                self.assertEqual(facts.review_round_conclusion, "")
+                self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
+                self.assertNotEqual(state, LANE_STATE_OWNER_WAITING)
+                self.assertNotEqual(state, LANE_STATE_RETIRE_READY)
+
+    def test_dropping_the_conclusion_does_not_disarm_the_blocker(self):
+        """Carrying no conclusion must not cost the round its most-blocking signal.
+
+        A blocker rides the round's OWN flag, not the conclusion string (j#94005 F2). That is
+        precisely why zeroing the conclusion is safe here — but only as long as it stays true, so
+        it is measured rather than assumed: had the blocker been derived from the conclusion, this
+        correction would have silently disarmed it and a combined heading would have downgraded an
+        explicit blocker to a routine pending review.
+        """
+        journals = [
+            ("100", "## Gate: start"),
+            ("300", "## Gate: review request + review\n- 結論: blocker"),
+            ("500", "## Gate: close"),
+        ]
+        facts, state = self._state(journals)
+        self.assertEqual(facts.review_round_gate, "review_request")
+        self.assertEqual(facts.review_round_conclusion, "")
+        self.assertTrue(facts.review_round_blocker)
+        self.assertEqual(state, LANE_STATE_BLOCKED)
+
+    def test_the_fold_never_emits_a_round_it_calls_open_and_closed_at_once(self):
+        """The general property, derived rather than enumerated.
+
+        Asserting the one combined shape above would leave any OTHER disagreeing shape free to
+        reappear. So every gate subset the round vocabulary can produce, crossed with every
+        conclusion, is folded and the carried tuple is checked against the SAME predicate that
+        set the flag: if the fold says the round is unresolved, the identity it carries must
+        itself read as an open round.
+        """
+        from itertools import combinations
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_round_state import (  # noqa: E501
+            REVIEW_ROUND_GATES,
+            is_open_review_round,
+            review_round_state,
+        )
+
+        class _Round:
+            def __init__(self, gates, conclusion):
+                self.journal_id = 10
+                self.gates_or_gate = frozenset(gates)
+                self.review_conclusion = conclusion
+                self.blocker = False
+
+        subsets = [
+            s
+            for size in (1, 2)
+            for s in combinations(sorted(REVIEW_ROUND_GATES), size)
+        ]
+        self.assertTrue(subsets, "the round vocabulary must not be empty")
+        for gates in subsets:
+            for conclusion in ("approved", "changes_requested", "pending", ""):
+                with self.subTest(gates=gates, conclusion=conclusion):
+                    _, unresolved, gate, carried, _ = review_round_state(
+                        [_Round(gates, conclusion)]
+                    )
+                    self.assertIn(gate, REVIEW_ROUND_GATES)
+                    if unresolved:
+                        self.assertTrue(
+                            is_open_review_round(frozenset({gate}), carried),
+                            f"fold called {gates}/{conclusion!r} unresolved but carried "
+                            f"{gate!r}/{carried!r}, which reads as a CLOSED round",
+                        )
+
+    def test_a_degraded_or_contradictory_round_tuple_is_blocked(self):
+        """The second half of the finding: the classifier validates what it is handed.
+
+        Guarding on ``review_round_gate`` being merely non-empty was not fail-closed. A caller
+        that set the flag without the identity — a hand-built signal, or any future producer that
+        fills one field before the other — fell straight through the fence to ``retire_ready``,
+        which is the exact terminal the Acceptance forbids while a review is owed.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
+            LaneSignal,
+        )
+
+        degraded = {
+            "no identity at all": dict(review_round_gate=""),
+            "an approved review cannot be an open round": dict(
+                review_round_gate="review", review_round_conclusion="approved"
+            ),
+            "a gate outside the round vocabulary": dict(review_round_gate="close"),
+        }
+        for label, fields in sorted(degraded.items()):
+            for gate in ("close", "owner_close_approval"):
+                with self.subTest(case=label, gate=gate):
+                    state = classify_lane_state(
+                        LaneSignal(
+                            issue=ISSUE,
+                            latest_gate=gate,
+                            issue_open=False,
+                            review_round_unresolved=True,
+                            **fields,
+                        )
+                    )
+                    self.assertEqual(state, LANE_STATE_BLOCKED)
+
+    def test_a_well_formed_round_still_reaches_its_own_state(self):
+        """The negative control: the validation must not block what it should replay.
+
+        Without this, the test above would also pass for a change that simply blocked every
+        unresolved round — erasing the typed distinction j#94005 F2 restored.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
+            LaneSignal,
+        )
+
+        expected = {
+            ("review_request", ""): LANE_STATE_REVIEW_WAITING,
+            ("review", "pending"): LANE_STATE_REVIEW_WAITING,
+            ("review", "changes_requested"): "implementing",
+        }
+        for (gate, conclusion), want in sorted(expected.items()):
+            with self.subTest(gate=gate, conclusion=conclusion):
+                state = classify_lane_state(
+                    LaneSignal(
+                        issue=ISSUE,
+                        latest_gate="close",
+                        issue_open=False,
+                        review_round_unresolved=True,
+                        review_round_gate=gate,
+                        review_round_conclusion=conclusion,
+                    )
+                )
+                self.assertEqual(state, want)
 
 
 class OperatorFacingReasonTest(unittest.TestCase):
