@@ -31,6 +31,13 @@ the ledger key is an identity, the ledger container is checked by exact type, an
 the descriptor that reaches a primary's instance dictionary is bound from
 ``BaseException`` itself.
 
+"Public" here means a module binding a caller can reach, not a curated list —
+there is no ``__all__``, so an ``import x`` is as reachable as a ``def``. Imports
+this module needs for itself are therefore bound privately (``Callable as
+_Callable``), which is why a typing helper does not quietly join the API (review
+j#93181 R2-F1). The exceptions are ``os`` and ``Violation``, which predate this
+seam.
+
 :class:`RetentionCarrier` is the one seam that had to be lifted out (Redmine
 #14683): "what happens when the carrier fails" is a property worth pinning, and
 pinning it used to mean monkeypatching :func:`_ledger` over the module — a
@@ -43,7 +50,7 @@ the seam's return type can be named without naming a private one (F2).
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable as _Callable
 
 from ..domain.legacy_mirror_contract import Violation
 
@@ -578,7 +585,7 @@ def _record_secondary(retention: _Retention, secondary: object) -> BaseException
 
 
 def _run_teardown_action(
-    retention: _Retention, action: Callable[[], object]
+    retention: _Retention, action: _Callable[[], object]
 ) -> BaseException | None:
     """Run one action, record what it reports, and never raise.
 
@@ -605,7 +612,7 @@ def _run_teardown_action(
 
 def teardown_during(
     primary: BaseException,
-    *actions: Callable[[], object],
+    *actions: _Callable[[], object],
     carrier: RetentionCarrier | None = None,
 ) -> BaseException | None:
     """Run each teardown action independently, preserving ``primary``.

@@ -69,6 +69,42 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
     """The retention machine (`owned_descriptors`): teardown ordering, the
     failure ledger, and the carrier. No `os` primitive is injected here."""
 
+    def test_the_module_exports_exactly_the_surface_it_documents(self) -> None:
+        """The seam is only narrow if the module's bindings say so.
+
+        There is no `__all__`, so every non-underscore module binding is
+        reachable — an `import x` as much as a `def`. A typing helper imported
+        for the module's own annotations joined the API that way and nobody
+        noticed, because the surface was being read off the `def`s and classes
+        rather than off the namespace (review j#93181 R2-F1).
+
+        So the namespace is the oracle here, and the set is exact rather than a
+        subset: a new import has to be either deliberately listed or bound
+        privately. `os` and `Violation` predate this seam and are named as the
+        exceptions they are, not quietly tolerated.
+        """
+        documented = {
+            # The seam this Task introduced.
+            "teardown_during",
+            "RetentionCarrier",
+            "TeardownRecord",
+            "RETENTION_ATTEMPTS",
+            # The read that was already public.
+            "teardown_failures",
+            # Predating the seam: the `os` module and the violation type.
+            "os",
+            "Violation",
+            # `from __future__ import annotations` binds this.
+            "annotations",
+        }
+        actual = {name for name in vars(owned_descriptors) if not name.startswith("_")}
+
+        self.assertEqual(
+            documented,
+            actual,
+            "the module's public bindings drifted from the surface it documents",
+        )
+
     def test_teardown_continues_when_recording_a_secondary_is_interrupted(self) -> None:
         """The rail's own property, stated directly: whichever step fails — the
         action, or the *recording* of what it reported — every remaining action
