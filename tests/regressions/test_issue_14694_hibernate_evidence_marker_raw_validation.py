@@ -26,7 +26,11 @@ it took — including the three shapes the FIRST fix left open (review j#93646):
 - **``int(lane_generation)`` in front of the renderer** (finding 2), which turned ``1.5`` into
   generation ``1`` — evidence bound to a generation nobody named;
 - **an explicit empty value read as "nothing was supplied"** (finding 3), because the first fix
-  spelled absence as ``""``.
+  spelled absence as ``""``;
+- **the bound that stopped the predicate raising, raising** (review j#94093 blocker 1): the decimal
+  predicate's length bound asked ``sys.get_int_max_str_digits()`` unconditionally — an API new in
+  3.10.7, in a package whose ``requires-python`` is ``>=3.10`` — so on 3.10.0–3.10.6 a CLEAN ``req``
+  and a clean ``--evidence-lane-generation`` raised before either boundary could answer.
 
 Every test in this file detects the recurrence of that symptom. Claims about the producers' public
 contract — the byte shape of a clean marker, the round trip, the unchanged parse side — are the
@@ -38,6 +42,8 @@ other kind of claim and live in
 from __future__ import annotations
 
 import argparse
+import contextlib
+import sys
 import unittest
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.review_gate_marker_fields import (  # noqa: E501
@@ -70,6 +76,29 @@ from tests.support.hibernate_evidence_producer_corpus import (
     envelope,
     envelope_for,
 )
+
+
+@contextlib.contextmanager
+def interpreter_without_the_digit_limit_api():
+    """``sys`` as it is on 3.10.0–3.10.6: no ``get_int_max_str_digits`` to ask.
+
+    The attribute is REMOVED rather than patched to a stand-in, because the defect was the
+    attribute lookup itself, not what the call returned.
+
+    What this cannot simulate: deleting the name does not remove the running interpreter's own cap
+    on ``int``-from-``str``, which lives in the C implementation. So this shape is only asked
+    questions that never convert — an interpreter old enough to lack the API has no cap either, and
+    on it the conversion the CLI does after the predicate succeeds for any length.
+    """
+    missing = object()
+    saved = getattr(sys, "get_int_max_str_digits", missing)
+    if saved is not missing:
+        del sys.get_int_max_str_digits
+    try:
+        yield
+    finally:
+        if saved is not missing:
+            sys.get_int_max_str_digits = saved
 
 
 class ReportedSymptomTests(unittest.TestCase):
@@ -884,6 +913,135 @@ class CanonicalDecimalFieldsTests(unittest.TestCase):
         for value in ("1", "3", "93802", "01", "0", "٣", "", "9" * 4301, None, 3):
             with self.subTest(value=repr(value)[:24]):
                 self.assertEqual(is_journal_id(value), is_canonical_positive_decimal(value))
+
+
+class SupportedInterpreterWithoutTheDigitLimitApiTests(unittest.TestCase):
+    """Review j#94093 blocker 1: the guard that stopped the predicate raising, raised.
+
+    R5 made the decimal predicate lexical so a 4301-digit input would come back as ``False`` rather
+    than as an exception the CLI boundary could not turn into a typed refusal. The upper bound it
+    asked for was the interpreter's own, ``sys.get_int_max_str_digits()`` — an API that is "New in
+    version 3.10.7", called unconditionally, in a package whose ``requires-python`` is ``>=3.10``.
+    So on 3.10.0–3.10.6 a CLEAN ``req`` and a clean ``--evidence-lane-generation`` both raised
+    ``AttributeError`` before any boundary could answer: the same symptom the fix existed to close,
+    reintroduced by the fix, and on the clean path rather than the malformed one.
+
+    The bound is now reached for with ``getattr`` and simply not applied when the interpreter has
+    none — which is not a concession to the older version but the same reasoning: an interpreter
+    without the API has no cap on the conversion either, so there is nothing there for a bound to
+    refuse.
+    """
+
+    _DECIMAL_CORPUS = (
+        "1",
+        "9",
+        "93802",
+        "01",
+        "007",
+        "0",
+        "",
+        " 1",
+        "1 ",
+        "1.0",
+        "-1",
+        "٣",
+        None,
+        1,
+        True,
+        "9" * 4300,
+        "9" * 4301,
+        "1" * 10000,
+    )
+
+    def _predicates(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+            is_canonical_positive_decimal,
+            is_journal_id,
+        )
+
+        return (is_journal_id, is_canonical_positive_decimal)
+
+    def _review_args(self, req):
+        return argparse.Namespace(
+            target_head="d" * 40,
+            review_request_journal=req,
+            review_decision="approval",
+            evidence_workspace=None,
+            evidence_lane=None,
+            evidence_lane_generation=None,
+        )
+
+    def _envelope_args(self, generation):
+        return argparse.Namespace(
+            evidence_workspace="ws", evidence_lane="lane", evidence_lane_generation=generation
+        )
+
+    def test_the_predicates_answer_rather_than_raise_on_both_interpreter_shapes(self):
+        predicates = self._predicates()
+        for label, shape in (
+            ("with the API", contextlib.nullcontext()),
+            ("without the API", interpreter_without_the_digit_limit_api()),
+        ):
+            with shape:
+                for predicate in predicates:
+                    for value in self._DECIMAL_CORPUS:
+                        with self.subTest(shape=label, fn=predicate.__name__, value=repr(value)[:24]):
+                            self.assertIsInstance(predicate(value), bool)
+
+    def test_a_clean_req_and_generation_still_render_without_the_api(self):
+        # The reported symptom: these are the two clean inputs that raised.
+        with interpreter_without_the_digit_limit_api():
+            fields, refusal = review_gate_marker_fields(self._review_args("93802"), "review_result")
+            self.assertIsNone(refusal)
+            self.assertEqual(fields["review_request_journal"], "93802")
+            fields, refusal = lane_envelope_marker_fields(self._envelope_args("3"))
+            self.assertIsNone(refusal)
+            self.assertEqual(fields["evidence_lane_generation"], 3)
+            # Inline over-correction control rather than its own method: dropping the bound on an
+            # interpreter that has none must not drop the SHAPE rule with it, and nothing here may
+            # become a traceback either.
+            for bad in ("01", "007", "0", "-1", "1.5", " 3", "٣", "abc"):
+                with self.subTest(value=bad):
+                    fields, refusal = lane_envelope_marker_fields(self._envelope_args(bad))
+                    self.assertEqual(fields, {})
+                    self.assertEqual(refusal, "evidence_envelope_malformed_generation")
+                    fields, refusal = review_gate_marker_fields(
+                        self._review_args(bad), "review_result"
+                    )
+                    self.assertEqual(fields, {})
+                    self.assertEqual(refusal, "review_marker_malformed_review_request_journal")
+
+    def test_the_bound_is_the_interpreters_own_and_not_a_constant_written_here(self):
+        """Derived from the running interpreter, never from the number 4300 recalled here.
+
+        Asked at the predicate and never through the CLI: see the context manager's docstring for
+        why an oversized token cannot honestly be carried into the without-API shape's conversion.
+        """
+        ask = getattr(sys, "get_int_max_str_digits", None)
+        tell = getattr(sys, "set_int_max_str_digits", None)
+        if ask is None or tell is None:
+            # This suite is itself running on an interpreter with no cap — the shape the blocker
+            # was about. There is no bound to track, and every length converts.
+            for predicate in self._predicates():
+                with self.subTest(fn=predicate.__name__):
+                    self.assertTrue(predicate("9" * 10000))
+            return
+        # Move the interpreter's cap and require the predicate to move with it. A bound hard-coded
+        # here would answer the same on both settings.
+        moved = sys.int_info.str_digits_check_threshold  # the lowest cap the interpreter accepts
+        restore = ask()
+        try:
+            tell(moved)
+            for predicate in self._predicates():
+                with self.subTest(fn=predicate.__name__, cap=moved):
+                    self.assertTrue(predicate("9" * moved))
+                    self.assertFalse(predicate("9" * (moved + 1)))
+                    # ...and with the API taken away, the same token is accepted, because an
+                    # interpreter that cannot be asked for a cap does not have one.
+                    with interpreter_without_the_digit_limit_api():
+                        self.assertTrue(predicate("9" * (moved + 1)))
+        finally:
+            tell(restore)
 
 
 class RendererNeverWritesWhatItWouldNotMeanTests(unittest.TestCase):

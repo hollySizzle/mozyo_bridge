@@ -106,6 +106,23 @@ _ASCII_DIGITS = frozenset("0123456789")
 _ASCII_NONZERO_DIGITS = frozenset("123456789")
 
 
+def _int_conversion_digit_limit() -> int:
+    """The interpreter's own cap on ``int``-from-``str`` conversion; ``0`` when it has none (pure).
+
+    ``sys.get_int_max_str_digits`` is "New in version 3.10.7" and this package supports ``>=3.10``
+    (``pyproject.toml``), so calling it unconditionally made a CLEAN value raise ``AttributeError``
+    on 3.10.0–3.10.6 — before either boundary could answer with the typed refusal it owes its
+    caller, which is the exact failure shape review j#93882 finding 2 was about (Redmine #14694
+    review j#94093 blocker 1). Reaching for the bound with ``getattr`` is not a shrug at the version
+    difference, it IS the difference: an interpreter without the API has no cap on the conversion
+    either, so on it every length converts and there is nothing for this bound to refuse. Raising
+    the package's supported floor to 3.10.7 would answer it the other way, but that is a change to
+    the support contract and not this issue's to make.
+    """
+    interpreter_limit = getattr(sys, "get_int_max_str_digits", None)
+    return interpreter_limit() if interpreter_limit is not None else 0
+
+
 def is_canonical_positive_decimal(value: object) -> bool:
     """Whether ``value`` is a canonical positive decimal token, judged on the RAW value (pure).
 
@@ -123,10 +140,9 @@ def is_canonical_positive_decimal(value: object) -> bool:
     if not set(value) <= _ASCII_DIGITS:
         return False
     # A token no consumer could convert to an integer names nothing. The bound is the interpreter's
-    # own (`sys.get_int_max_str_digits()`, 0 = unlimited) rather than a number chosen here, so this
-    # refuses exactly the input that used to make the predicate RAISE — as a False, which is what a
-    # predicate owes its caller.
-    limit = sys.get_int_max_str_digits()
+    # own (0 = it has none) rather than a number chosen here, so this refuses exactly the input that
+    # used to make the predicate RAISE — as a False, which is what a predicate owes its caller.
+    limit = _int_conversion_digit_limit()
     return not limit or len(value) <= limit
 
 
