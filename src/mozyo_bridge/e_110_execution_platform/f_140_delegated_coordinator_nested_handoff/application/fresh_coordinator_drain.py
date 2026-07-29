@@ -52,6 +52,13 @@ DEFAULT_DRAIN_LEASE_TTL_SECONDS = 300
 #: separately by the durable gate, never assumed from the send).
 DRAIN_SEND_OK = "sent"
 DRAIN_SEND_ERROR = "error"
+#: A rail that can PROVE nothing was transmitted reports this instead of the generic error
+#: (Redmine #14661 j#92601 F5). The distinction is load-bearing for the continuation drain: an
+#: uncertain send must keep its recorded attempt (a re-run may only re-check the confirmation),
+#: while a proven zero-send must un-record it (a re-run may send). Collapsing the two strands a
+#: post-close transaction permanently. A rail that cannot tell them apart keeps returning
+#: ``DRAIN_SEND_ERROR`` — the conservative one.
+DRAIN_SEND_ZERO = "zero_send"
 
 #: Terminal / yield statuses for a drain run (a closed vocabulary).
 DRAIN_COMPLETED = "completed"
