@@ -37,6 +37,7 @@ from mozyo_bridge.core.state.callback_publication_fence import (
     CallbackPublicationFenceError,
     PublicationKey,
 )
+from mozyo_bridge.core.state import callback_sweep_lease as lease_mod
 from mozyo_bridge.core.state.callback_sweep_lease import (
     CallbackSweepLeaseError,
     LEASE_HELD,
@@ -143,6 +144,30 @@ def _bootstrapped_pubfence(home=None):
     f = CallbackPublicationFence(home=home or Path(tempfile.mkdtemp()))
     f.bootstrap()
     return f
+
+
+class _FrozenLeaseClock:
+    """The lease module's clock pinned to one exact instant (#14692).
+
+    ``acquire`` / ``diagnose`` take a ``now``, but ``owns`` reads ``time.time()`` directly, so the
+    only way to observe a deadline being crossed used to be to let real time pass. A 10ms TTL plus
+    a real ``sleep`` made that oracle a race against the scheduler rather than a statement about
+    expiry: measured on the base head, the *first* ``owns`` -- the one asserting the lease is still
+    held -- found as little as -5.065ms of its 10ms TTL left and failed 4 times in 300 runs.
+
+    Only ``time()`` is frozen, and only for this module's binding: everything else the module reads
+    still resolves to the real module, so freezing cannot silently disable something, and no other
+    module's (or thread's) clock is touched.
+    """
+
+    def __init__(self, instant):
+        self._instant = float(instant)
+
+    def time(self):
+        return self._instant
+
+    def __getattr__(self, name):
+        return getattr(time, name)
 
 
 def _bootstrapped_lease(home=None):
@@ -1101,6 +1126,11 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
 
     def key(self):
         return LeaseKey(workspace_id=WS, lane_id=LANE, issue=ISSUE, anchor="79990")
+
+    def _owns_at(self, key, token, instant):
+        """``owns`` evaluated at one exact instant, freezing only this module's clock (#14692)."""
+        with mock.patch.object(lease_mod, "time", _FrozenLeaseClock(instant)):
+            return self.lease.owns(key, token)
 
     def test_an_owner_that_lost_its_expired_lease_publishes_nothing_and_sends_nothing(self):
         # R6-F1. My R6 safety argument -- "a dead owner provably has not sent, because the send is
@@ -2191,10 +2221,24 @@ class LeaseOwnershipFencingTest(unittest.TestCase):
         # fails the identity comparison regardless of whether expiry is honoured -- a probe showed
         # `owns` could ignore the deadline entirely with every test still green. An owner whose
         # lease simply lapsed is not an owner, even with nobody waiting.
-        a = self.lease.acquire(self.key(), ttl_seconds=0.01)
-        self.assertTrue(self.lease.owns(self.key(), a.token))
-        time.sleep(0.05)
-        self.assertFalse(self.lease.owns(self.key(), a.token))
+        #
+        # #14692: the deadline is crossed by moving the CLOCK, not by sleeping past a 10ms TTL.
+        # Sleeping made the "still held" assertion a race the scheduler could win -- and it did,
+        # 4 times in 300 runs on the base head, with as little as -5.065ms of the TTL left by the
+        # time the first `owns` ran. Every instant below is now exact, so the oracle states the
+        # deadline rather than the host's speed.
+        key = self.key()
+        t0, ttl = 1_000_000.0, 30.0
+        a = self.lease.acquire(key, ttl_seconds=ttl, now=t0)
+
+        self.assertTrue(self._owns_at(key, a.token, t0 + ttl - 1))    # inside the lease
+        self.assertFalse(self._owns_at(key, a.token, t0 + ttl))       # ON the deadline: expired
+        self.assertFalse(self._owns_at(key, a.token, t0 + ttl + 1))   # and past it
+
+        # ...and nobody reclaimed it: `release` is owner-conditional but NOT deadline-gated, so a
+        # True here proves the row still names THIS token. The lapse above came from the deadline
+        # alone -- a reclaim would have replaced the token and proved nothing about expiry.
+        self.assertTrue(self.lease.release(key, a.token))
 
     def test_a_lost_store_is_refused_as_a_store_loss_specifically(self):
         # Distinguishes the two store-identity guards. Both fail closed, so an assertRaises alone
