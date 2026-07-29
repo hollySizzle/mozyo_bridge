@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import itertools
 import unittest
+from types import SimpleNamespace
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_turn_recovery import (  # noqa: E501
     GatewayTurnObservation,
@@ -44,6 +45,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     RecoveryObservation,
     decide_recovery,
     stale_worker_recovery_action_id,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_refresh_approval import (  # noqa: E501
+    WorkerRefreshApprovalError,
+    parse_strict_approval_markers,
+    render_worker_refresh_approval_marker,
+    verify_worker_refresh_approval,
+    worker_refresh_approval_digest,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_turn_recovery import (  # noqa: E501
     WORKER_PROGRESS_GATES,
@@ -490,6 +498,130 @@ class ActionIdTests(unittest.TestCase):
         self.assertEqual(len({mine, stale, gateway}), 3)
         self.assertTrue(mine.startswith("refresh-worker:"))
         self.assertFalse(mine.startswith(("recover:", "refresh-gateway:")))
+
+
+class ApprovalDomainContractTests(unittest.TestCase):
+    """The approval verifier's own contract, driven DIRECTLY (Redmine #14661 j#92533 F1/F2).
+
+    Exercised through the pure domain function rather than only through the live adapter: the
+    adapter short-circuits on an unresolvable issuer, so adapter-only tests left the verifier's
+    own presence guards unreachable — and a mutation removing them survived. A public domain
+    contract has to be pinned at the domain.
+    """
+
+    OWNER = "5"
+    JOURNAL = "92500"
+    ISSUE = "14658"
+
+    def _operation(self, **overrides):
+        base = dict(
+            issue="14661", lane="issue_14661_lane",
+            action_id="refresh-worker:issue_14661_lane:claude:claude:wk:w4B:p10:r4",
+            action_generation=3, lane_revision="5", lane_generation="2",
+            anchor_issue=self.ISSUE, resume_anchor_journal="92366",
+            resume_gate="review_result",
+        )
+        base.update(overrides)
+        return base
+
+    def _entry(self, notes, author=OWNER, journal=JOURNAL, issue=ISSUE):
+        return SimpleNamespace(
+            issue_id=issue, journal_id=journal, notes=notes, author_id=author,
+            created_on="",
+        )
+
+    def _verify(self, entries, *, issuer=OWNER, **op):
+        return verify_worker_refresh_approval(
+            entries, journal=self.JOURNAL, expected_issuer_id=issuer,
+            **self._operation(**op)
+        )
+
+    def test_a_canonical_approval_by_the_authority_verifies(self):
+        marker = render_worker_refresh_approval_marker(**self._operation())
+        fields = self._verify([self._entry(marker)])
+        self.assertEqual(fields["decision"], "approved")
+
+    def test_a_missing_author_is_refused_even_when_the_issuer_is_also_missing(self):
+        # ``"" == ""`` would make an equality-only check PASS. Both presence guards exist for
+        # exactly this shape, and the domain function is where they are reachable.
+        marker = render_worker_refresh_approval_marker(**self._operation())
+        with self.assertRaises(WorkerRefreshApprovalError):
+            self._verify([self._entry(marker, author="")], issuer="")
+
+    def test_a_missing_author_alone_is_refused(self):
+        marker = render_worker_refresh_approval_marker(**self._operation())
+        with self.assertRaises(WorkerRefreshApprovalError):
+            self._verify([self._entry(marker, author="")])
+
+    def test_a_missing_issuer_alone_is_refused(self):
+        marker = render_worker_refresh_approval_marker(**self._operation())
+        with self.assertRaises(WorkerRefreshApprovalError):
+            self._verify([self._entry(marker)], issuer="")
+
+    def test_a_foreign_author_is_refused(self):
+        marker = render_worker_refresh_approval_marker(**self._operation())
+        with self.assertRaises(WorkerRefreshApprovalError):
+            self._verify([self._entry(marker, author="9")])
+
+    def test_the_strict_parser_refuses_a_contradictory_record(self):
+        marker = render_worker_refresh_approval_marker(**self._operation())
+        for injected in (
+            marker.replace("decision=approved", "decision=declined:decision=approved"),
+            marker[:-1] + ":bogus=1]",
+            marker[:-1] + ":nonsense]",
+            marker + "\n" + marker,
+        ):
+            with self.subTest(injected=injected[-40:]):
+                with self.assertRaises(WorkerRefreshApprovalError):
+                    self._verify([self._entry(injected)])
+
+    def test_the_strict_parser_is_strict_at_its_own_contract(self):
+        # Driven directly: routed only through the verifier, the exact-field-set check masks
+        # the parser's own well-formedness rules and a mutation removing them survives. A
+        # public parser that promises strictness has to be pinned where it promises it.
+        gate = "gate=worker_refresh_owner_approval"
+        for body in (
+            f"{gate}:nonsense",          # a fragment with no '='
+            f"{gate}:=novalue",          # empty key
+            f"{gate}:empty=",            # empty value
+            f"{gate}::decision=approved",  # an empty component
+            f"{gate}:decision=a:decision=b",  # a contradictory duplicate
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(WorkerRefreshApprovalError):
+                    parse_strict_approval_markers(f"[mozyo:workflow-event:{body}]")
+
+    def test_the_strict_parser_accepts_a_well_formed_marker_and_ignores_foreign_ones(self):
+        marker = render_worker_refresh_approval_marker(**self._operation())
+        self.assertEqual(len(parse_strict_approval_markers(marker)), 1)
+        # A different gate's marker is not this surface's approval and is left alone.
+        self.assertEqual(
+            parse_strict_approval_markers(
+                "[mozyo:workflow-event:gate=implementation_done:head=abc]"
+            ),
+            [],
+        )
+
+    def test_the_digest_covers_the_whole_operation(self):
+        base = worker_refresh_approval_digest(
+            action_id="a", action_generation=1, lane_revision="r", lane_generation="g",
+            anchor_issue="i", resume_anchor_journal="j", resume_gate="review_result",
+        )
+        for field, value in (
+            ("action_id", "b"), ("action_generation", 2), ("lane_revision", "r2"),
+            ("lane_generation", "g2"), ("anchor_issue", "i2"),
+            ("resume_anchor_journal", "j2"), ("resume_gate", "implementation_request"),
+        ):
+            kwargs = dict(
+                action_id="a", action_generation=1, lane_revision="r", lane_generation="g",
+                anchor_issue="i", resume_anchor_journal="j", resume_gate="review_result",
+            )
+            kwargs[field] = value
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    base, worker_refresh_approval_digest(**kwargs),
+                    f"the digest must change when {field} changes",
+                )
 
 
 if __name__ == "__main__":  # pragma: no cover

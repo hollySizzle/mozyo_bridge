@@ -75,6 +75,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_turn_recovery import (  # noqa: E501
     RESUMABLE_GATES,
+    TURN_CLASS_FAILED,
     RESUME_VIA_CALLBACK_RECOVERY,
     normalize_turn_failure_reason,
 )
@@ -103,6 +104,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_turn_recovery import (  # noqa: E501
     WORKER_REFRESH_ACTIONABLE,
     WORKER_REFRESH_BLOCK_LAUNCH_AUTHORITY,
+    WORKER_REFRESH_BLOCK_TURN_NOT_FAILED,
     WORKER_REFRESH_BLOCK_UNKNOWN,
     WorkerRefreshObservation,
     WorkerTurnObservation,
@@ -697,6 +699,28 @@ class WorkerRefreshUseCase:
         #    finished. Those runs close nothing; their remaining legs (launch / attest /
         #    resume) re-join the lane authority action-time inside the actuator and the drain.
         if not post_close:
+            # Review j#92533 F3: re-read the DURABLE PROGRESS authority before the first
+            # close. An earlier revision reused the run's opening turn classification here,
+            # reasoning that a newly-landed gate would be "unrelated" — but this surface's
+            # own progress detector is lane-bound and counts unknown-provenance progress AS
+            # progress, so it has no way to call anything unrelated. Measured: a worker that
+            # landed its gate between the preflight and the close was closed anyway, which
+            # destroys exactly the work the surface exists to preserve. Landed / ambiguous /
+            # unreadable all refuse.
+            fresh_turn = self._ops.observe_turn(request)
+            fresh_turn_class = classify_worker_turn(fresh_turn)
+            if fresh_turn_class != TURN_CLASS_FAILED:
+                return self._outcome(
+                    request, fresh_turn_class, turn_reason,
+                    WORKER_REFRESH_BLOCK_TURN_NOT_FAILED,
+                    status=WORKER_REFRESH_STATUS_REFUSED, executed=True,
+                    turn_observation=fresh_turn, observation=observation,
+                    detail=(
+                        "durable progress authority moved after preflight "
+                        f"({fresh_turn_class}); zero close"
+                    ),
+                    authority_reason=authority_reason,
+                )
             fresh_authority = self._lane_authority_reason(request)
             fresh_observation = self._ops.observe_target(request).with_launch_authority(
                 launch_authority_current(fresh_authority)
@@ -833,8 +857,13 @@ class WorkerRefreshUseCase:
         # is no marker to show.
         try:
             required_marker = render_worker_refresh_approval_marker(
-                issue=request.effective_anchor_issue, lane=request.lane,
+                issue=request.issue, lane=request.lane,
                 action_id=request.action_id, action_generation=request.action_generation,
+                lane_revision=request.lane_revision,
+                lane_generation=request.lane_generation,
+                anchor_issue=request.effective_anchor_issue,
+                resume_anchor_journal=request.resume_anchor_journal,
+                resume_gate=request.resume_gate,
             )
         except WorkerRefreshApprovalError:
             required_marker = ""

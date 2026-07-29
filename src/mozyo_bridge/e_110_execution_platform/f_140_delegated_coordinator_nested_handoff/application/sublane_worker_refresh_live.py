@@ -117,6 +117,15 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     Runner,
 )
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_refresh_close_boundary import (  # noqa: E501
+    SettledCloseBoundaryPort,
+)
+
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_refresh_durable_read import (  # noqa: E501
+    notes_carry_worker_progress,
+    worker_progress_facts,
+)
+
 _STATUS_KEYS = ("agent_status", "status", "state")
 
 #: The transport kind the anchor resume is delivered under (the #14203 j#84223 shape, shared).
@@ -171,82 +180,6 @@ def _row_revision(row: Mapping[str, object]) -> str:
 
 
 @dataclass
-class SettledCloseBoundaryPort:
-    """The shared #13806 actuation port, fenced on a POSITIVELY SETTLED worker (j#92487 F2).
-
-    The shared close boundary reduces the runtime to one boolean —
-    ``running_process = (state == busy)`` — and
-    :func:`...replacement_preservation.assess_worker_recovery_preservation` decides ``may_close``
-    from it. Measured over the whole herdr status vocabulary, that admits a close on every
-    non-``working`` state:
-
-    ============= ================ ==============
-    herdr status  runtime state    may_close
-    ============= ================ ==============
-    ``working``   busy             False (correct)
-    ``done``      turn_ended       True  (correct)
-    ``idle``      awaiting_input   True  (correct)
-    ``blocked``   blocked          **True — a live agent at a permission prompt**
-    (absent)      unknown          **True — an unreadable observation**
-    (novel token) unknown          **True — an unrecognised state**
-    ============= ================ ==============
-
-    The preflight requires ``settled_idle``; this restores that requirement at the boundary
-    that actually closes, and adds the composer re-read the preflight also performs. It is a
-    THIN wrapper: identity, lane lifecycle and row-revision re-verification stay entirely with
-    the shared implementation (no second implementation to drift), and this only ever turns a
-    ``may_close`` into a refusal — never the reverse.
-
-    Scoped to this surface deliberately. The same fail-open exists for ``recover-stale`` and
-    ``recover-gateway``, but those modules are outside this task's changed-path boundary and
-    are not silently retuned here (the coordinator's j#92454 disposition); the gap is reported
-    instead.
-    """
-
-    inner: object
-    ops: "LiveWorkerRefreshOps"
-    request: WorkerRefreshRequest
-
-    #: Forwarded so :func:`...replacement_launch_failure.port_launch_failure_reason` reads the
-    #: INNER port's typed diagnostic rather than seeing an attribute-less wrapper.
-    @property
-    def launch_failure_reason(self) -> str:
-        return getattr(self.inner, "launch_failure_reason", "")
-
-    def observe_old_slot(self, pin):
-        return self.inner.observe_old_slot(pin)
-
-    def observe_preservation(self, pin):
-        observation = self.inner.observe_preservation(pin)
-        if not observation.identity_matches:
-            return observation  # the shared fence already refuses; do not mask its detail
-        state = self.ops.pinned_runtime_state(self.request)
-        if state not in (RUNTIME_TURN_ENDED, RUNTIME_AWAITING_INPUT):
-            # ``running_process`` is the closed reason meaning "closing would destroy live
-            # work". A ``blocked`` slot is a live agent awaiting a permission answer, and an
-            # ``unknown`` / absent / novel state cannot prove it is not one — fail-closed. The
-            # concrete axis travels in ``detail`` so the refusal is diagnosable without adding
-            # a token to a shared closed vocabulary.
-            return replace(
-                observation, running_process=True, detail=f"worker_not_settled:{state}"
-            )
-        if not self.ops._composer_clear(self.request):
-            return replace(
-                observation, running_process=True, detail="pending_composer_input"
-            )
-        return observation
-
-    def close_exact_generation(self, pin):
-        return self.inner.close_exact_generation(pin)
-
-    def launch_action_bound(self, action_id: str, pin):
-        return self.inner.launch_action_bound(action_id, pin)
-
-    def verify_attestation(self, action_id: str, pin):
-        return self.inner.verify_attestation(action_id, pin)
-
-
-@dataclass
 class LiveWorkerRefreshOps:
     """Live observe + exactly-once anchor resume (:class:`WorkerRefreshOps`).
 
@@ -277,6 +210,10 @@ class LiveWorkerRefreshOps:
     #: Marks the ``journal_reader`` as a FRESH (non-snapshot) source (#13889: only a source
     #: declaring freshness may back the absence-of-progress fact).
     journal_reader_fresh: bool = False
+    #: ``issuer_resolver(issue) -> opaque author id`` for the approval authority (#14661
+    #: j#92494). ``None`` = no durable authority is wired here, which refuses every
+    #: ``--execute`` (fail-closed): an approval nobody can be held to is not an approval.
+    issuer_resolver: Optional[object] = None
 
     # -- delegation to the proven #13806 probes --------------------------------
 
@@ -598,76 +535,16 @@ class LiveWorkerRefreshOps:
         )
 
     def _progress_facts(self, request: WorkerRefreshRequest) -> tuple[bool, bool, bool]:
-        """(landed, absent, fresh): the anchored + ordered fresh durable re-read (#13889).
-
-        Worker progress is a structured gate marker of a :data:`WORKER_PROGRESS_GATES` kind on
-        a journal STRICTLY AFTER the anchor (ordered on durable journal ids, never wall-clock),
-        in the anchor issue. No worker gate marker carries a causal back-pointer to the request
-        it answers, so the causal link is ordering + lane binding, resolved in the SAFE
-        direction:
-
-        - a marker carrying the #14219 lane envelope must match BOTH the pinned lane and the
-          pinned lane generation — a different lane's or a superseded generation's gate is not
-          this turn's progress;
-        - a marker WITHOUT an envelope still counts as progress. Unknown provenance classifies
-          ``turn_productive``, which REFUSES the refresh: the only mistake this direction can
-          make is declining to close a worker, while the reverse would close one that had in
-          fact delivered its gate.
-
-        No reader / an unreadable read / a non-fresh (snapshot) reader leaves all facts
-        ``False`` — unobservable, never "absent".
-        """
-        reader = self.journal_reader
-        if reader is None or not self.journal_reader_fresh:
-            return False, False, False
-        try:
-            anchor = int(_norm(request.resume_anchor_journal))
-        except (TypeError, ValueError):
-            return False, False, False
-        try:
-            entries = reader(request.effective_anchor_issue)
-        except Exception:  # noqa: BLE001 - unreadable durable source => unobservable
-            return False, False, False
-        for entry in entries:
-            try:
-                jid = int(_norm(getattr(entry, "journal_id", "")))
-            except (TypeError, ValueError):
-                continue
-            if jid <= anchor:
-                continue
-            notes = str(getattr(entry, "notes", "") or "")
-            if self._notes_carry_worker_progress(request, notes):
-                return True, False, True
-        return False, True, True
+        """(landed, absent, fresh) — delegated to the durable-read leaf (module-health split)."""
+        return worker_progress_facts(
+            request, journal_reader=self.journal_reader,
+            journal_reader_fresh=self.journal_reader_fresh,
+        )
 
     @staticmethod
     def _notes_carry_worker_progress(request: WorkerRefreshRequest, notes: str) -> bool:
-        """Does this journal note carry a worker-progress gate marker for this lane? (pure)"""
-        try:
-            markers = marker_fields_in_note(notes)
-        except Exception:  # noqa: BLE001 - an unparsable note carries no structured marker
-            return False
-        for channel, fields in markers:
-            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
-                continue
-            if _norm(fields.get("gate")) not in WORKER_PROGRESS_GATES:
-                continue
-            lane = fields.get("lane")
-            generation = fields.get("lane_generation")
-            if lane is None or generation is None:
-                # Unenveloped — or only PARTIALLY enveloped, which the canonical producer
-                # cannot emit at all (the lane envelope is all-or-none). Either way the lane
-                # provenance is unreadable, so it counts as progress: the safe direction is
-                # ``turn_productive`` (refuse the refresh). Requiring an exact match here
-                # would silently skip a half-enveloped worker gate and admit a close of the
-                # worker that had in fact delivered it.
-                return True
-            if (
-                _norm_lane(lane) == _norm_lane(request.lane)
-                and _norm(generation) == _norm(request.lane_generation)
-            ):
-                return True
-        return False
+        """Delegated to the durable-read leaf (module-health split)."""
+        return notes_carry_worker_progress(request, notes)
 
     # -- exactly-once anchor resume (the governed rail + the REAL ledger oracle) ---
 
@@ -749,6 +626,12 @@ class LiveWorkerRefreshOps:
         reader = self.journal_reader
         if reader is None or not self.journal_reader_fresh:
             return False
+        # The expected issuer comes from the DURABLE RECORD, never from the caller (#14661
+        # j#92494): the actor asking for a destructive close must not be able to name its own
+        # approver. Unresolvable => not approved.
+        issuer = self._expected_issuer_id(request)
+        if not issuer:
+            return False
         try:
             entries = reader(request.effective_anchor_issue)
         except Exception:  # noqa: BLE001 - unreadable durable source => never approved
@@ -756,17 +639,38 @@ class LiveWorkerRefreshOps:
         try:
             verify_worker_refresh_approval(
                 list(entries),
-                issue=request.effective_anchor_issue,
                 journal=request.journal,
+                expected_issuer_id=issuer,
+                issue=request.issue,
                 lane=request.lane,
                 action_id=request.action_id,
                 action_generation=request.action_generation,
+                lane_revision=request.lane_revision,
+                lane_generation=request.lane_generation,
+                anchor_issue=request.effective_anchor_issue,
+                resume_anchor_journal=request.resume_anchor_journal,
+                resume_gate=request.resume_gate,
             )
         except WorkerRefreshApprovalError:
             return False
         except Exception:  # noqa: BLE001 - a malformed history is never an approval
             return False
         return True
+
+    def _expected_issuer_id(self, request: WorkerRefreshRequest) -> str:
+        """The opaque author id a destructive approval must be attributable to. (fail-closed)
+
+        Resolved from the anchor issue's OWN author on a fresh read — the durable anchor, not
+        a caller-supplied expectation. Returns ``""`` when the source cannot supply one, which
+        refuses the approval (an unattributable authority is not an authority).
+        """
+        resolver = self.issuer_resolver
+        if resolver is None:
+            return ""
+        try:
+            return _norm(resolver(request.effective_anchor_issue))
+        except Exception:  # noqa: BLE001 - an unreadable authority is never an authority
+            return ""
 
     def resume_rail_ready(self, request: WorkerRefreshRequest) -> bool:
         """Pre-close resume-rail capability. (read-only)
@@ -880,13 +784,41 @@ class LiveWorkerRefreshOps:
         # this resume.
         if not self._fresh_slot_action_bound(continuation, locator, worker_provider):
             return DRAIN_SEND_ERROR
-        if self._governed_sender_resolves():
-            try:
-                rc = self._drive_cli(self._resume_argv(continuation, locator))
-            except Exception:  # noqa: BLE001 - a failed drive is a failed send
-                return DRAIN_SEND_ERROR
-            return DRAIN_SEND_OK if rc == 0 else DRAIN_SEND_ERROR
-        return self._oneshot_resume(continuation, locator, worker_provider)
+        # PREFER the action-bound rail (review j#92533 F4). The one-shot delivery service
+        # re-runs its complete preflight AT the irreversible edge — its own docstring says a
+        # prior public preflight is advisory and never reused as authority — and it carries
+        # the target revision and replacement action id all the way into the transport. The
+        # governed CLI rail cannot: its argv is locator + lane only, so between the binding
+        # check and the injection the slot can recycle and the send has nothing left to
+        # detect it with (measured: action_binding_checks=1, send proceeds after a simulated
+        # recycle). Preferring the stronger rail closes that window rather than narrowing it.
+        if self._recovery_delivery_service_ready():
+            return self._oneshot_resume(continuation, locator, worker_provider)
+        # Fallback only: the action-bound service is unavailable in this context. Keep the
+        # governed rail (removing it would strand environments where only it resolves) but
+        # re-join the authority as late as possible — re-resolve the fresh locator and
+        # re-verify the action binding immediately before the drive, and refuse if either
+        # moved. The residual window is the CLI's own internal choreography, which this
+        # surface cannot reach into.
+        if not self._governed_sender_resolves():
+            return DRAIN_SEND_ERROR
+        final_locator = self._fresh_worker_locator()
+        if not final_locator or final_locator != locator:
+            return DRAIN_SEND_ERROR
+        if not self._fresh_slot_action_bound(continuation, final_locator, worker_provider):
+            return DRAIN_SEND_ERROR
+        try:
+            rc = self._drive_cli(self._resume_argv(continuation, final_locator))
+        except Exception:  # noqa: BLE001 - a failed drive is a failed send
+            return DRAIN_SEND_ERROR
+        return DRAIN_SEND_OK if rc == 0 else DRAIN_SEND_ERROR
+
+    def _recovery_delivery_service_ready(self) -> bool:
+        """Can the action-bound one-shot delivery service run here? (read-only, fail-closed)"""
+        try:
+            return bool(self._recovery_delivery_service().ready())
+        except Exception:  # noqa: BLE001 - an unavailable service is not a ready one
+            return False
 
     def _oneshot_resume(
         self, continuation: ContinuationPointer, locator: str, worker_provider: str

@@ -71,15 +71,33 @@ class WorkerRefreshApprovalError(ValueError):
     """The named journal is not a positive structured owner approval of THIS exact action."""
 
 
-def worker_refresh_approval_digest(*, action_id: str, action_generation: object) -> str:
-    """Canonical fingerprint of the exact action + generation the approval authorizes. (pure)
+def worker_refresh_approval_digest(
+    *,
+    action_id: str,
+    action_generation: object,
+    lane_revision: str,
+    lane_generation: str,
+    anchor_issue: str,
+    resume_anchor_journal: str,
+    resume_gate: str,
+) -> str:
+    """Canonical fingerprint of the WHOLE operation the approval authorizes. (pure)
 
-    Digested rather than embedded because the action id contains the marker grammar's ``:``
-    separator (the ``pin_digest`` precedent). The components are newline-separated and neither
-    can contain a newline, so the encoding is unambiguous; a domain tag pins the digest to this
-    surface so a fingerprint can never be replayed from another one.
+    Review j#92533 F2 measured what an earlier digest over ``action_id + action_generation``
+    alone actually authorized: with one unchanged marker, a run could be pointed at a
+    different resume anchor, a different resume gate, a different lane lifecycle revision and
+    a different lane generation — all four verified. The action id pins the participant
+    (lane / role / provider / assigned name / locator / row revision), but the approval must
+    cover what happens AFTER the close too: which durable anchor gets resumed, under which
+    gate, at which lane lifecycle generation. An owner approving "close this worker" is not
+    thereby approving "and resume some other anchor".
+
+    Digested rather than embedded because several components contain the marker grammar's
+    ``:`` separator (the ``pin_digest`` precedent). Components are newline-separated with
+    explicit field tags and none may contain a newline, so the encoding is unambiguous; a
+    domain tag pins the digest to this surface. Every component is REQUIRED — an approval that
+    leaves part of the operation unnamed has not approved that part.
     """
-    action = str(action_id or "").strip()
     try:
         generation = int(action_generation)
     except (TypeError, ValueError):
@@ -90,19 +108,139 @@ def worker_refresh_approval_digest(*, action_id: str, action_generation: object)
         raise WorkerRefreshApprovalError(
             "a worker refresh approval digest requires a positive action generation"
         )
-    if not action:
+    parts = {
+        "action_id": str(action_id or "").strip(),
+        "lane_revision": str(lane_revision or "").strip(),
+        "lane_generation": str(lane_generation or "").strip(),
+        "anchor_issue": str(anchor_issue or "").strip(),
+        "resume_anchor_journal": str(resume_anchor_journal or "").strip(),
+        "resume_gate": str(resume_gate or "").strip(),
+    }
+    missing = sorted(name for name, value in parts.items() if not value)
+    if missing:
         raise WorkerRefreshApprovalError(
-            "a worker refresh approval digest requires a non-empty action id"
+            "a worker refresh approval digest requires a non-empty "
+            f"{' / '.join(missing)}"
+        )
+    if any("\n" in value for value in parts.values()):
+        raise WorkerRefreshApprovalError(
+            "a worker refresh approval digest component may not contain a newline"
         )
     encoded = "\n".join(
-        (f"gate\t{WORKER_REFRESH_APPROVAL_GATE}", f"version\t{APPROVAL_VERSION}",
-         f"action_id\t{action}", f"action_generation\t{generation}")
+        [f"gate\t{WORKER_REFRESH_APPROVAL_GATE}", f"version\t{APPROVAL_VERSION}",
+         f"action_generation\t{generation}"]
+        + [f"{name}\t{parts[name]}" for name in sorted(parts)]
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+#: The COMPLETE field set a valid approval marker may carry — no more, no less. An unknown or
+#: extra field is refused rather than ignored: a marker the canonical producer could not have
+#: rendered is not a canonical marker, and silently tolerating unknown fields is how a future
+#: meaningful field gets ignored by an old verifier (review j#92533 F2).
+APPROVAL_FIELD_ORDER = (
+    "gate", "version", "approval_source", "decision", "effect", "issue", "lane",
+    "action_digest",
+)
+
+
+def parse_strict_approval_markers(notes: str) -> list[dict[str, str]]:
+    """Every canonical approval marker in ``notes``, parsed STRICTLY. (pure)
+
+    The shared :func:`...redmine_journal_source.marker_fields_in_note` is last-write-wins and
+    silently drops malformed fragments — measured in review j#92533 F2, that turned
+    ``decision=declined:decision=approved`` into an approval, and
+    ``approval_source=standing_delegation:approval_source=direct_owner`` into a direct owner
+    one. A record that says two contradictory things has not decided anything, so this parser
+    refuses it instead of picking a winner. It is the governed preset's exactly-one rule for
+    governed fields, applied to the field this surface actually gates on.
+
+    Markers are located with the SHARED scanner first (so code fences and non-canonical text
+    are excluded exactly as everywhere else), then each located marker's body is re-parsed
+    from the note verbatim so duplicates and malformed fragments are visible rather than
+    already collapsed.
+    """
+    located = [
+        raw for raw in _raw_marker_bodies(notes)
+        if _field_pairs_declare_gate(raw)
+    ]
+    parsed: list[dict[str, str]] = []
+    for body in located:
+        fields: dict[str, str] = {}
+        for component in body.split(":"):
+            # ``partition`` makes a missing ``=`` indistinguishable from an empty value
+            # (``"nonsense"`` -> key ``nonsense``, value ``""``), so the emptiness check below
+            # covers both. A separate "not a key=value field" branch was measured to be
+            # unkillable by any input — a guard whose absence provably changes nothing is dead
+            # weight, so it is not kept.
+            key, _, value = component.partition("=")
+            key, value = key.strip(), value.strip()
+            if not key or not value:
+                raise WorkerRefreshApprovalError(
+                    "the approval marker carries a malformed field "
+                    "(not a non-empty key=value pair)"
+                )
+            if key in fields:
+                raise WorkerRefreshApprovalError(
+                    f"the approval marker declares {key!r} more than once; a record that "
+                    "says two things has decided nothing"
+                )
+            fields[key] = value
+        parsed.append(fields)
+    return parsed
+
+
+def _raw_marker_bodies(notes: str) -> list[str]:
+    """The verbatim body of every canonical workflow-event marker the shared scanner sees.
+
+    Uses the shared scanner to decide WHICH spans are markers (one authority for code-fence
+    exclusion and canonical shape), then recovers each body verbatim from the note so this
+    module can apply its own strict field rules to the untouched text.
+    """
+    bodies: list[str] = []
+    prefix = f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:"
+    canonical = marker_fields_in_note(notes)
+    if not canonical:
+        return bodies
+    cursor = 0
+    for _channel, _fields in canonical:
+        start = notes.find(prefix, cursor)
+        if start < 0:
+            break
+        end = notes.find("]", start)
+        if end < 0:
+            break
+        bodies.append(notes[start + len(prefix):end])
+        cursor = end + 1
+    return bodies
+
+
+def _field_pairs_declare_gate(body: str) -> bool:
+    """Does this raw marker body declare THIS surface's approval gate? (pure, tolerant)
+
+    Deliberately tolerant: it only decides whether the strict parser should look at this
+    marker at all. A body that names the gate anywhere is claimed, so a malformed or
+    contradictory approval marker is REFUSED by the strict parse rather than skipped as
+    "not ours" — skipping is how a broken approval would silently become "no approval found"
+    and then, with a second well-formed marker present, an approval.
+    """
+    return any(
+        component.strip() == f"gate={WORKER_REFRESH_APPROVAL_GATE}"
+        for component in body.split(":")
+    )
+
+
 def expected_approval_fields(
-    *, issue: str, lane: str, action_id: str, action_generation: object
+    *,
+    issue: str,
+    lane: str,
+    action_id: str,
+    action_generation: object,
+    lane_revision: str,
+    lane_generation: str,
+    anchor_issue: str,
+    resume_anchor_journal: str,
+    resume_gate: str,
 ) -> dict[str, str]:
     """The complete field map a valid approval marker must match by EXACT equality. (pure)"""
     issue_s = str(issue or "").strip()
@@ -120,98 +258,115 @@ def expected_approval_fields(
         "issue": issue_s,
         "lane": lane_s,
         "action_digest": worker_refresh_approval_digest(
-            action_id=action_id, action_generation=action_generation
+            action_id=action_id, action_generation=action_generation,
+            lane_revision=lane_revision, lane_generation=lane_generation,
+            anchor_issue=anchor_issue, resume_anchor_journal=resume_anchor_journal,
+            resume_gate=resume_gate,
         ),
     }
 
 
-def render_worker_refresh_approval_marker(
-    *, issue: str, lane: str, action_id: str, action_generation: object
-) -> str:
+def render_worker_refresh_approval_marker(**operation: object) -> str:
     """The exact marker a positive owner approval must carry. (pure)
 
     Rendered by the read-only preflight so an operator can see precisely what to record — an
     approval contract nobody can produce is an approval contract nobody will use. Field order
-    is fixed so the rendering is stable across runs.
+    is :data:`APPROVAL_FIELD_ORDER` so the rendering is stable and the strict parser's
+    exact-field-set requirement is satisfied by construction.
     """
-    fields = expected_approval_fields(
-        issue=issue, lane=lane, action_id=action_id, action_generation=action_generation
-    )
-    ordered = (
-        "gate", "version", "approval_source", "decision", "effect", "issue", "lane",
-        "action_digest",
-    )
-    body = ":".join(f"{key}={fields[key]}" for key in ordered)
+    fields = expected_approval_fields(**operation)  # type: ignore[arg-type]
+    body = ":".join(f"{key}={fields[key]}" for key in APPROVAL_FIELD_ORDER)
     return f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:{body}]"
 
 
 def verify_worker_refresh_approval(
     entries: Sequence[RedmineJournalEntry],
     *,
-    issue: str,
     journal: str,
-    lane: str,
-    action_id: str,
-    action_generation: object,
+    expected_issuer_id: str,
+    **operation: object,
 ) -> Mapping[str, str]:
     """Verify ONE exact structured approval from a freshly fetched issue history. (pure)
 
     Returns the matched marker fields, or raises :class:`WorkerRefreshApprovalError`. Every
     refusal path is fail-closed — there is no partial acceptance and no "close enough".
+
+    ``expected_issuer_id`` is the opaque author id the approval must be attributable to,
+    resolved by the caller from the DURABLE RECORD (#14661 j#92494) — never from a flag the
+    actor requesting the destructive action supplies, which would be self-approval. An empty
+    expected issuer, an unattributable journal, or a mismatch all refuse.
     """
     journal_s = str(journal or "").strip()
-    issue_s = str(issue or "").strip()
+    issue_s = str(operation.get("issue") or "").strip()
+    anchor_issue_s = str(operation.get("anchor_issue") or "").strip()
     if not journal_s:
         raise WorkerRefreshApprovalError("no approval journal was pinned")
-    expected = expected_approval_fields(
-        issue=issue_s, lane=lane, action_id=action_id, action_generation=action_generation
-    )
+    expected = expected_approval_fields(**operation)  # type: ignore[arg-type]
     exact = [
         entry
         for entry in entries
-        if str(getattr(entry, "issue_id", "") or "").strip() == issue_s
+        if str(getattr(entry, "issue_id", "") or "").strip() == anchor_issue_s
         and str(getattr(entry, "journal_id", "") or "").strip() == journal_s
     ]
     if len(exact) != 1:
         raise WorkerRefreshApprovalError(
             "the exact Redmine approval journal does not exist uniquely on the named issue"
         )
-    candidates = [
-        fields
-        for channel, fields in marker_fields_in_note(
-            str(getattr(exact[0], "notes", "") or "")
+    entry = exact[0]
+
+    # Issuer authority, BEFORE any field is trusted: a marker that names an approval source
+    # proves nothing about who wrote it (#14661 j#92533 F1). The author must be present and
+    # must be the authority the durable record itself names.
+    author_id = str(getattr(entry, "author_id", "") or "").strip()
+    issuer = str(expected_issuer_id or "").strip()
+    if not issuer:
+        raise WorkerRefreshApprovalError(
+            "the expected approval issuer could not be resolved from the durable record"
         )
-        if channel == MARKER_CHANNEL_WORKFLOW_EVENT
-        and str(fields.get("gate", "")).strip() == WORKER_REFRESH_APPROVAL_GATE
-    ]
+    if not author_id:
+        raise WorkerRefreshApprovalError(
+            "the approval journal is not attributable to any author"
+        )
+    if author_id != issuer:
+        raise WorkerRefreshApprovalError(
+            "the approval journal was not written by the issue's approval authority"
+        )
+
+    candidates = parse_strict_approval_markers(str(getattr(entry, "notes", "") or ""))
     if len(candidates) != 1:
         # Zero: the journal carries no structured approval (a prose mention, a quoted command,
         # or a log line is not a marker). Two or more: a record that declares this gate twice
-        # cannot say which one is authoritative, so it authorizes nothing (the governed
-        # preset's exactly-one rule for governed fields).
+        # cannot say which one is authoritative, so it authorizes nothing.
         raise WorkerRefreshApprovalError(
             "the exact journal does not contain one structured worker-refresh owner approval"
         )
     fields = candidates[0]
-    wrong = [
-        key for key, value in expected.items()
-        if str(fields.get(key, "")).strip() != value
-    ]
+    # EXACT field set — an unknown or missing key is a marker the canonical producer could not
+    # have rendered, so it is refused rather than partially honoured.
+    if set(fields) != set(APPROVAL_FIELD_ORDER):
+        raise WorkerRefreshApprovalError(
+            "the approval marker's field set is not the canonical one"
+        )
+    wrong = [key for key, value in expected.items() if fields.get(key) != value]
     if wrong:
         raise WorkerRefreshApprovalError(
             "the structured owner approval targets another operation, round or lane "
             f"(mismatched fields: {', '.join(sorted(wrong))})"
         )
+    if issue_s and str(fields.get("issue", "")).strip() != issue_s:
+        raise WorkerRefreshApprovalError("the approval marker names another issue")
     return dict(fields)
 
 
 __all__ = (
+    "APPROVAL_FIELD_ORDER",
     "WORKER_REFRESH_APPROVAL_GATE",
     "APPROVAL_VERSION",
     "APPROVAL_DECISION",
     "APPROVAL_EFFECT",
     "APPROVAL_SOURCE",
     "WorkerRefreshApprovalError",
+    "parse_strict_approval_markers",
     "worker_refresh_approval_digest",
     "expected_approval_fields",
     "render_worker_refresh_approval_marker",

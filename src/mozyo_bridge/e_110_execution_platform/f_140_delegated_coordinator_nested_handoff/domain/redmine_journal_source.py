@@ -132,6 +132,34 @@ class RedmineJournalEntry:
     #: start time (the basis decision journal's ``created_on``). Blank when the provider projection
     #: did not carry one; NEVER inferred from the journal id or a local observation.
     created_on: str = ""
+    #: The provider's OPAQUE author identifier for this journal (Redmine #14661 scope resolution
+    #: j#92494). A destructive owner approval must be attributable to an authority, and a marker
+    #: that merely *names* an approval source proves nothing — anyone who can write a note can
+    #: write that field. This carries the author so a verifier can compare it against an issuer
+    #: resolved from the durable record itself.
+    #:
+    #: **Identifier only, never the display name.** j#92494 requires the evidence be carried
+    #: "値非表示" (without exposing the value), and a person's name is personal data that must
+    #: not reach a repo file, a journal, or a log. The provider's numeric user id is an opaque
+    #: comparison key that satisfies the authority check without carrying anything about who the
+    #: person is.
+    #:
+    #: Blank when the provider projection did not carry one — which a fail-closed consumer must
+    #: treat as "not attributable", never as "attributable to anyone".
+    author_id: str = ""
+
+
+def _author_id(actor: object) -> str:
+    """The provider's opaque author id from a ``{"id": ..., "name": ...}`` actor. (pure)
+
+    Reads ONLY the identifier. The display name is deliberately never read, so a personal name
+    cannot reach a DTO, a durable record, or a log through this path (#14661 j#92494's
+    値非表示 requirement and the organisation's personal-data baseline). A missing / malformed
+    actor yields ``""`` — "not attributable", which every consumer must fail closed on.
+    """
+    if not isinstance(actor, Mapping):
+        return ""
+    return str(actor.get("id", "") or "").strip()
 
 
 def _gate_marker_from_fields(
@@ -345,9 +373,23 @@ class MappingRedmineJournalSource:
                 RedmineJournalEntry(
                     issue_id=resolved, journal_id=jid, notes=notes,
                     created_on=str(journal.get("created_on", "") or "").strip(),
+                    author_id=_author_id(journal.get("user")),
                 )
             )
         return entries
+
+    def issue_author_id(self) -> str:
+        """The provider's opaque author id for the ISSUE itself, or ``""``. (pure)
+
+        The durable anchor an approval issuer is resolved against (#14661 j#92494: the expected
+        issuer must come from the record, never from the caller — a caller-supplied expectation
+        would let the actor requesting a destructive action name its own approver). Blank when
+        the projection did not carry one, which fails closed at the consumer.
+        """
+        issue = self.payload.get("issue")
+        if isinstance(issue, Mapping):
+            return _author_id(issue.get("author"))
+        return ""
 
 
 def markers_from_source(

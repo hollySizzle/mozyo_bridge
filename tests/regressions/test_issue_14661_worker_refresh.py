@@ -680,6 +680,81 @@ class ActionTimeDriftTests(_RefreshCase):
         self.assertEqual(len(self.port.closed), closes)  # still zero extra closes
 
 
+class DurableProgressAtCloseTests(_RefreshCase):
+    """Durable progress is re-read before the FIRST close (review j#92533 F3)."""
+
+    class _ProgressLandsOps(FakeWorkerOps):
+        """Actionable at preflight; the worker lands its own gate before the close."""
+
+        def __init__(self, second_turn, **kwargs):
+            super().__init__(**kwargs)
+            self._second = second_turn
+            self.observe_turn_calls = 0
+
+        def observe_turn(self, request):
+            self.observe_turn_calls += 1
+            return self._turn if self.observe_turn_calls == 1 else self._second
+
+    def _refuses(self, second_turn, expected_class):
+        ops = self._ProgressLandsOps(second_turn)
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertGreaterEqual(ops.observe_turn_calls, 2, "progress must be re-read")
+        self.assertEqual(outcome.status, WORKER_REFRESH_STATUS_REFUSED)
+        self.assertEqual(outcome.verdict, WORKER_REFRESH_BLOCK_TURN_NOT_FAILED)
+        self.assertEqual(outcome.turn_class, expected_class)
+        self.assertIn("durable progress authority moved", outcome.detail)
+        self.assertEqual(self.port.closed, [])   # zero close — the whole point
+        self.assertEqual(self.port.launched, [])
+        self.assertEqual(ops.resumes, [])        # zero send
+        return outcome
+
+    def test_progress_landing_before_the_close_is_zero_close(self):
+        # The measured failure: the worker wrote its gate between preflight and close and was
+        # closed anyway, destroying exactly the work this surface exists to preserve.
+        self._refuses(
+            _turn(expected_gate_landed=True, expected_gate_absent=False),
+            TURN_CLASS_PRODUCTIVE,
+        )
+
+    def test_the_worker_waking_up_before_the_close_is_zero_close(self):
+        self._refuses(_turn(settled_turn_ended=False), TURN_CLASS_NOT_SETTLED)
+
+    def test_a_durable_source_that_went_unreadable_is_zero_close(self):
+        self._refuses(
+            _turn(expected_gate_absent=False, durable_source_fresh=False),
+            TURN_CLASS_UNOBSERVABLE,
+        )
+
+    def test_an_identity_binding_that_drifted_is_zero_close(self):
+        self._refuses(_turn(participant_revision_bound=False), TURN_CLASS_UNOBSERVABLE)
+
+    def test_an_unchanged_turn_still_completes(self):
+        # Discriminating in both directions.
+        ops = self._ProgressLandsOps(_turn())
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, WORKER_REFRESH_STATUS_COMPLETED)
+        self.assertEqual(len(self.port.closed), 1)
+
+    def test_the_progress_reread_is_skipped_on_a_post_close_replay(self):
+        identity = (
+            WORKER["lane_id"], WORKER["role"], WORKER["provider"], WORKER["assigned_name"]
+        )
+        self.port.launch_result[identity] = LAUNCH_ERROR
+        self._use_case(FakeWorkerOps()).run(self._request(), execute=True)
+        closes = len(self.port.closed)
+        self.port.launch_result.pop(identity)
+        # After a committed close the anchor's gate may well have landed — the replay exists
+        # to finish the transaction, not to re-litigate it.
+        ops = FakeWorkerOps(
+            target=WorkerRefreshObservation(),
+            turn=_turn(expected_gate_landed=True, expected_gate_absent=False),
+        )
+        replay = self._use_case(ops).run(self._request(), execute=True)
+        self.assertTrue(replay.post_close_resume)
+        self.assertEqual(replay.status, WORKER_REFRESH_STATUS_COMPLETED)
+        self.assertEqual(len(self.port.closed), closes)
+
+
 class AnchorIssueSplitTests(_RefreshCase):
     def test_the_anchor_issue_is_a_separate_authority_from_the_lane_issue(self):
         ops = FakeWorkerOps()

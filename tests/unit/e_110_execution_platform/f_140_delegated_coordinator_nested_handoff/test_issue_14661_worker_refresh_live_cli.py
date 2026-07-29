@@ -64,6 +64,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_AUTHORITY_WORKTREE_MISMATCH,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_refresh_approval import (  # noqa: E501
+    WorkerRefreshApprovalError,
     render_worker_refresh_approval_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_turn_recovery import (  # noqa: E501
@@ -122,10 +123,11 @@ def _request(**overrides) -> WorkerRefreshRequest:
 
 
 class _Entry:
-    def __init__(self, journal_id, notes, issue=ANCHOR_ISSUE):
+    def __init__(self, journal_id, notes, issue=ANCHOR_ISSUE, author="5"):
         self.journal_id = journal_id
         self.notes = notes
         self.issue_id = issue
+        self.author_id = author
 
 
 def _record(marker: str, **overrides):
@@ -713,108 +715,161 @@ class RealTurnObservationTests(unittest.TestCase):
 
 
 class ApprovalVerificationTests(unittest.TestCase):
-    """The structured owner-approval authority (review j#92487 F1).
-
-    The R2 implementation asked whether a token appeared anywhere in the notes. Every case
-    below that ends in "never verifies" was admitted by that check.
-    """
+    """The structured owner-approval authority (reviews j#92487 F1 / j#92533 F1+F2)."""
 
     APPROVAL_JOURNAL = "92500"
     ACTION_ID = "refresh-worker:" + LANE + ":claude:claude:wk:w4B:p10:r4"
+    OWNER = "5"
+    OTHER_AUTHOR = "9"
+
+    def _operation(self, **overrides):
+        base = dict(
+            issue="14661", lane=LANE, action_id=self.ACTION_ID, action_generation=3,
+            lane_revision="5", lane_generation="2", anchor_issue=ANCHOR_ISSUE,
+            resume_anchor_journal=ANCHOR_JOURNAL, resume_gate=ANCHOR_GATE,
+        )
+        base.update(overrides)
+        return base
 
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp())
         self.request = _request(
-            journal=self.APPROVAL_JOURNAL, action_id=self.ACTION_ID,
-            action_generation=3, worker_revision="4",
+            journal=self.APPROVAL_JOURNAL, action_id=self.ACTION_ID, action_generation=3,
+            worker_revision="4", lane_revision="5", lane_generation="2",
         )
-        self.ops = LiveWorkerRefreshOps(repo_root=self.repo, request=self.request)
-        self.marker = render_worker_refresh_approval_marker(
-            issue=ANCHOR_ISSUE, lane=LANE, action_id=self.ACTION_ID, action_generation=3,
+        self.ops = LiveWorkerRefreshOps(
+            repo_root=self.repo, request=self.request,
+            issuer_resolver=lambda issue: self.OWNER,
         )
+        self.marker = render_worker_refresh_approval_marker(**self._operation())
+
+    def _entry(self, notes, journal=None, author=None, issue=ANCHOR_ISSUE):
+        return _Entry(journal or self.APPROVAL_JOURNAL, notes, issue=issue,
+                      author=self.OWNER if author is None else author)
 
     def _verify(self, entries, request=None):
         self.ops.journal_reader = lambda issue: entries
         self.ops.journal_reader_fresh = True
         return self.ops.approval_verified(request or self.request)
 
-    def _entry(self, notes, journal=None):
-        return _Entry(journal or self.APPROVAL_JOURNAL, notes, issue=ANCHOR_ISSUE)
-
     # -- the positive case ---------------------------------------------------
 
-    def test_a_canonical_structured_approval_verifies(self):
-        notes = f"## Gate: owner approval\n\n{self.marker}\n"
-        self.assertTrue(self._verify([self._entry(notes)]))
+    def test_a_canonical_approval_by_the_issue_author_verifies(self):
+        self.assertTrue(self._verify([self._entry(f"## owner approval\n\n{self.marker}\n")]))
 
-    # -- the four holes review j#92487 F1 reproduced -------------------------
+    # -- j#92533 F1: issuer authority ---------------------------------------
 
-    def test_a_negated_prose_mention_never_verifies(self):
-        notes = f"この action は **承認しない**。{self.ACTION_ID} は保留する。"
-        self.assertFalse(self._verify([self._entry(notes)]))
-
-    def test_a_quoted_retry_command_never_verifies(self):
-        notes = (
-            "参考までに retry command:\n```\n"
-            f"mozyo-bridge sublane refresh-worker --action-id {self.ACTION_ID} --execute\n"
-            "```\n(未承認)"
-        )
-        self.assertFalse(self._verify([self._entry(notes)]))
-
-    def test_a_log_line_never_verifies(self):
-        notes = f"[debug] refused action {self.ACTION_ID} (no approval on file)"
-        self.assertFalse(self._verify([self._entry(notes)]))
-
-    def test_a_neighbouring_generation_never_verifies(self):
-        # ``:g30`` used to satisfy ``:g3`` by substring containment. The generation is now a
-        # digest input compared by field equality, so a prefix relation cannot exist.
-        other = render_worker_refresh_approval_marker(
-            issue=ANCHOR_ISSUE, lane=LANE, action_id=self.ACTION_ID, action_generation=30,
-        )
-        self.assertNotEqual(other, self.marker)
-        self.assertFalse(self._verify([self._entry(other)]))
-
-    # -- exact-field / uniqueness / decision fences --------------------------
-
-    def test_an_approval_of_a_different_worker_never_verifies(self):
-        other = render_worker_refresh_approval_marker(
-            issue=ANCHOR_ISSUE, lane=LANE,
-            action_id="refresh-worker:" + LANE + ":claude:claude:other:w4B:p11:r4",
-            action_generation=3,
-        )
-        self.assertFalse(self._verify([self._entry(other)]))
-
-    def test_an_approval_for_a_different_lane_never_verifies(self):
-        other = render_worker_refresh_approval_marker(
-            issue=ANCHOR_ISSUE, lane="issue_99999_other",
-            action_id=self.ACTION_ID, action_generation=3,
-        )
-        self.assertFalse(self._verify([self._entry(other)]))
-
-    def test_a_declined_decision_never_verifies(self):
-        declined = self.marker.replace("decision=approved", "decision=declined")
-        self.assertFalse(self._verify([self._entry(declined)]))
-
-    def test_a_missing_or_unknown_version_never_verifies(self):
+    def test_an_approval_written_by_another_author_never_verifies(self):
+        # The marker says direct_owner; anyone who can write a note can write that field.
         self.assertFalse(
-            self._verify([self._entry(self.marker.replace("version=1", "version=2"))])
+            self._verify([self._entry(self.marker, author=self.OTHER_AUTHOR)])
         )
 
-    def test_a_delegated_approval_source_never_verifies(self):
-        # A guarded worker refresh is a destructive operation — a carve-out from standing
-        # delegation, so only a direct owner approval qualifies.
-        delegated = self.marker.replace(
-            "approval_source=direct_owner", "approval_source=standing_delegation"
+    def test_an_unattributable_journal_never_verifies(self):
+        self.assertFalse(self._verify([self._entry(self.marker, author="")]))
+
+    def test_an_unresolvable_issuer_never_verifies(self):
+        self.ops.issuer_resolver = lambda issue: ""
+        self.assertFalse(self._verify([self._entry(self.marker)]))
+        self.ops.issuer_resolver = None
+        self.assertFalse(self._verify([self._entry(self.marker)]))
+
+    def test_an_unattributable_journal_and_an_unresolvable_issuer_never_agree(self):
+        # The equality check alone would PASS here (`"" == ""`), so the presence guards are
+        # what refuses. Mutation-checked: without them this verifies.
+        self.ops.issuer_resolver = lambda issue: ""
+        self.assertFalse(self._verify([self._entry(self.marker, author="")]))
+
+    def test_an_issuer_resolver_that_raises_never_verifies(self):
+        def _boom(issue):
+            raise RuntimeError("redmine down")
+
+        self.ops.issuer_resolver = _boom
+        self.assertFalse(self._verify([self._entry(self.marker)]))
+
+    def test_the_issuer_is_resolved_from_the_anchor_issue(self):
+        seen: list = []
+        self.ops.issuer_resolver = lambda issue: seen.append(issue) or self.OWNER
+        self._verify([self._entry(self.marker)])
+        self.assertEqual(seen, [ANCHOR_ISSUE])
+
+    # -- j#92533 F2 A: the approval must bind the WHOLE operation ------------
+
+    def test_one_approval_never_authorizes_a_different_operation(self):
+        # Measured before the fix: all four verified under one unchanged marker.
+        for label, kw in (
+            ("resume anchor", dict(resume_anchor_journal="99999")),
+            ("resume gate", dict(resume_gate="implementation_request")),
+            ("lane revision", dict(lane_revision="999")),
+            ("lane generation", dict(lane_generation="999")),
+            ("action generation", dict(action_generation=30)),
+        ):
+            with self.subTest(differs=label):
+                fields = dict(
+                    journal=self.APPROVAL_JOURNAL, action_id=self.ACTION_ID,
+                    action_generation=3, worker_revision="4", lane_revision="5",
+                    lane_generation="2",
+                )
+                fields.update(kw)
+                self.assertFalse(self._verify([self._entry(self.marker)], _request(**fields)))
+
+    def test_the_digest_requires_every_operation_component(self):
+        for missing in ("lane_revision", "lane_generation", "anchor_issue",
+                        "resume_anchor_journal", "resume_gate"):
+            with self.subTest(missing=missing):
+                with self.assertRaises(WorkerRefreshApprovalError):
+                    render_worker_refresh_approval_marker(**self._operation(**{missing: ""}))
+
+    # -- j#92533 F2 B: conflicting / malformed / extra fields ---------------
+
+    def test_a_conflicting_duplicate_field_never_verifies(self):
+        # ``decision=declined:decision=approved`` used to collapse last-write-wins.
+        for original, injected in (
+            ("decision=approved", "decision=declined:decision=approved"),
+            ("decision=approved", "decision=approved:decision=declined"),
+            ("approval_source=direct_owner",
+             "approval_source=standing_delegation:approval_source=direct_owner"),
+        ):
+            with self.subTest(injected=injected):
+                self.assertFalse(
+                    self._verify([self._entry(self.marker.replace(original, injected))])
+                )
+
+    def test_a_malformed_fragment_never_verifies(self):
+        self.assertFalse(self._verify([self._entry(self.marker[:-1] + ":nonsense]")]))
+        self.assertFalse(self._verify([self._entry(self.marker[:-1] + ":=novalue]")]))
+        self.assertFalse(self._verify([self._entry(self.marker[:-1] + ":empty=]")]))
+
+    def test_an_unknown_extra_field_never_verifies(self):
+        self.assertFalse(self._verify([self._entry(self.marker[:-1] + ":bogus=1]")]))
+
+    def test_a_missing_canonical_field_never_verifies(self):
+        stripped = self.marker.replace(":effect=worker_close_relaunch_resume", "")
+        self.assertFalse(self._verify([self._entry(stripped)]))
+
+    # -- the j#92487 F1 holes stay closed ------------------------------------
+
+    def test_prose_quoted_and_log_mentions_never_verify(self):
+        for notes in (
+            f"この action は **承認しない**。{self.ACTION_ID} は保留する。",
+            f"retry:\n```\nmozyo-bridge ... --action-id {self.ACTION_ID}\n```\n(未承認)",
+            f"[debug] refused action {self.ACTION_ID} (no approval on file)",
+        ):
+            with self.subTest(notes=notes[:40]):
+                self.assertFalse(self._verify([self._entry(notes)]))
+
+    def test_a_declined_or_delegated_marker_never_verifies(self):
+        self.assertFalse(
+            self._verify([self._entry(
+                self.marker.replace("decision=approved", "decision=declined"))])
         )
-        self.assertFalse(self._verify([self._entry(delegated)]))
+        self.assertFalse(
+            self._verify([self._entry(self.marker.replace(
+                "approval_source=direct_owner", "approval_source=standing_delegation"))])
+        )
 
     def test_two_approval_markers_on_one_journal_never_verify(self):
-        # A record that declares this gate twice cannot say which is authoritative.
         self.assertFalse(self._verify([self._entry(self.marker + "\n" + self.marker)]))
-
-    def test_a_conflicting_second_marker_never_verifies(self):
-        declined = self.marker.replace("decision=approved", "decision=declined")
-        self.assertFalse(self._verify([self._entry(self.marker + "\n" + declined)]))
 
     # -- pointer / source fences ---------------------------------------------
 
@@ -822,16 +877,13 @@ class ApprovalVerificationTests(unittest.TestCase):
         self.assertFalse(self._verify([self._entry(self.marker, journal="99999")]))
 
     def test_a_duplicated_journal_id_never_verifies(self):
-        self.assertFalse(
-            self._verify([self._entry(self.marker), self._entry(self.marker)])
-        )
+        self.assertFalse(self._verify([self._entry(self.marker), self._entry(self.marker)]))
 
     def test_an_absent_journal_never_verifies(self):
         self.assertFalse(self._verify([]))
 
     def test_a_marker_on_another_issue_never_verifies(self):
-        entry = _Entry(self.APPROVAL_JOURNAL, self.marker, issue="99999")
-        self.assertFalse(self._verify([entry]))
+        self.assertFalse(self._verify([self._entry(self.marker, issue="99999")]))
 
     def test_no_reader_or_a_snapshot_reader_never_verifies(self):
         self.ops.journal_reader = None
@@ -849,18 +901,51 @@ class ApprovalVerificationTests(unittest.TestCase):
         self.ops.journal_reader_fresh = True
         self.assertFalse(self.ops.approval_verified(self.request))
 
-    def test_the_read_targets_the_anchor_issue(self):
-        seen: list = []
-        self.ops.journal_reader = lambda issue: seen.append(issue) or []
-        self.ops.journal_reader_fresh = True
-        self.ops.approval_verified(self.request)
-        self.assertEqual(seen, [ANCHOR_ISSUE])
 
-    def test_an_under_specified_request_never_verifies(self):
-        self.assertFalse(self._verify([self._entry(self.marker)], _request(journal="")))
-        self.assertFalse(
-            self._verify([self._entry(self.marker)], _request(action_id="", journal="1"))
+class JournalAuthorSeamTests(unittest.TestCase):
+    """The shared journal seam extension j#92494 authorized (backward compatible)."""
+
+    def test_the_entry_carries_an_opaque_author_id_and_never_the_name(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            MappingRedmineJournalSource,
         )
+
+        source = MappingRedmineJournalSource({
+            "issue": {"id": "14661", "author": {"id": "5", "name": "PERSONAL NAME"}},
+            "journals": [
+                {"id": "1", "notes": "a", "user": {"id": "5", "name": "PERSONAL NAME"}},
+                {"id": "2", "notes": "b"},                       # no user => unattributable
+                {"id": "3", "notes": "c", "user": "not-a-mapping"},
+            ],
+        })
+        entries = source.read_entries()
+        self.assertEqual([(e.journal_id, e.author_id) for e in entries],
+                         [("1", "5"), ("2", ""), ("3", "")])
+        self.assertEqual(source.issue_author_id(), "5")
+        # The display name is personal data and must not travel anywhere.
+        self.assertNotIn("PERSONAL NAME", repr(entries))
+        self.assertNotIn("PERSONAL NAME", source.issue_author_id())
+
+    def test_the_extension_is_backward_compatible(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+        )
+
+        # Existing consumers construct entries positionally / without the new field.
+        entry = RedmineJournalEntry(issue_id="1", journal_id="2", notes="n")
+        self.assertEqual(entry.author_id, "")
+        self.assertEqual(entry.created_on, "")
+
+    def test_the_cursor_projection_preserves_the_issue_author(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
+            _apply_since,
+        )
+
+        payload = {"issue": {"id": "14661", "author": {"id": "5"},
+                             "journals": [{"id": "9", "notes": "n",
+                                           "created_on": "2026-07-29T00:00:00Z"}]}}
+        projected = _apply_since(payload, "2026-01-01T00:00:00Z")
+        self.assertEqual(projected["issue"].get("author"), {"id": "5"})
 
 
 class CloseBoundarySettledFenceTests(unittest.TestCase):
@@ -1096,10 +1181,79 @@ class ResumeRailTests(unittest.TestCase):
                 )
             )
 
+    def test_the_action_bound_rail_is_preferred_over_the_governed_cli(self):
+        # Review j#92533 F4: the one-shot service re-runs its full preflight AT the
+        # irreversible edge and carries the action id into the transport; the governed CLI
+        # cannot. When both are available the stronger rail must win.
+        rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle", "revision": "9"}]
+        driven: list = []
+        oneshot: list = []
+        with patch.object(self.ops, "_fresh_slot_action_bound", return_value=True), \
+                patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
+                patch.object(self.ops, "_providers",
+                             return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
+                patch.object(self.ops, "_governed_sender_resolves", return_value=True), \
+                patch.object(self.ops, "_recovery_delivery_service_ready", return_value=True), \
+                patch.object(self.ops, "_oneshot_resume",
+                             side_effect=lambda *a: oneshot.append(a) or DRAIN_SEND_OK), \
+                patch.object(self.ops, "_drive_cli",
+                             side_effect=lambda argv: driven.append(argv) or 0):
+            result = self.ops.resume_once(self.continuation)
+        self.assertEqual(result, DRAIN_SEND_OK)
+        self.assertEqual(len(oneshot), 1, "the action-bound rail must be used")
+        self.assertEqual(driven, [], "the governed CLI must not be driven")
+
+    def test_the_governed_fallback_refuses_when_the_locator_moved(self):
+        # A slot that moved between the first resolution and the drive must send nothing even
+        # though the action binding still reports bound — the argv would target the new pane.
+        moving = [
+            [{"name": "wk", "pane_id": "w4B:p22", "status": "idle", "revision": "9"}],
+            [{"name": "wk", "pane_id": "w4B:p33", "status": "idle", "revision": "9"}],
+        ]
+        driven: list = []
+        with patch.object(live_mod, "list_herdr_agent_rows",
+                          side_effect=lambda *_a, **_k: moving.pop(0) if moving else []), \
+                patch.object(self.ops, "_providers",
+                             return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
+                patch.object(self.ops, "_governed_sender_resolves", return_value=True), \
+                patch.object(self.ops, "_recovery_delivery_service_ready", return_value=False), \
+                patch.object(self.ops, "_fresh_slot_action_bound", return_value=True), \
+                patch.object(self.ops, "_drive_cli",
+                             side_effect=lambda argv: driven.append(argv) or 0):
+            result = self.ops.resume_once(self.continuation)
+        self.assertEqual(result, DRAIN_SEND_ERROR)
+        self.assertEqual(driven, [], "a moved locator must receive nothing")
+
+    def test_the_governed_fallback_rejoins_the_binding_immediately_before_the_drive(self):
+        # When the action-bound rail is unavailable the governed CLI is kept (removing it
+        # would strand contexts where only it resolves), but the binding is re-joined as late
+        # as possible: a slot that recycles after the first check sends nothing.
+        rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle", "revision": "9"}]
+        driven: list = []
+        checks = {"n": 0}
+
+        def bound(*_a, **_k):
+            checks["n"] += 1
+            return checks["n"] == 1        # verified once, then the slot recycles
+
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
+                patch.object(self.ops, "_providers",
+                             return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
+                patch.object(self.ops, "_governed_sender_resolves", return_value=True), \
+                patch.object(self.ops, "_recovery_delivery_service_ready", return_value=False), \
+                patch.object(self.ops, "_fresh_slot_action_bound", side_effect=bound), \
+                patch.object(self.ops, "_drive_cli",
+                             side_effect=lambda argv: driven.append(argv) or 0):
+            result = self.ops.resume_once(self.continuation)
+        self.assertEqual(result, DRAIN_SEND_ERROR)
+        self.assertGreaterEqual(checks["n"], 2, "the binding must be re-joined before the drive")
+        self.assertEqual(driven, [], "a recycled slot must receive nothing")
+
     def test_resume_once_drives_the_governed_rail_with_the_existing_anchor(self):
         rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle"}]
         driven: list = []
         with patch.object(self.ops, "_fresh_slot_action_bound", return_value=True), \
+                patch.object(self.ops, "_recovery_delivery_service_ready", return_value=False), \
                 patch.object(live_mod, "list_herdr_agent_rows", return_value=rows):
             with patch.object(
                 self.ops, "_drive_cli", side_effect=lambda argv: driven.append(argv) or 0
