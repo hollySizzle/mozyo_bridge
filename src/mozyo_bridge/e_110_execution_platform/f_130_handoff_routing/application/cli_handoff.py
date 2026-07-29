@@ -265,9 +265,17 @@ def configure_handoff_parser(
             "body and durable delivery record — as a repo-root-relative "
             "pointer when it lives under `--target-repo` (or the pane's "
             "inferred repo root) — so the receiver recovers the execution "
-            "root from the durable record instead of pane scrollback. This "
-            "is record/wording only: it does not change pane selection or "
-            "relax any cross-session / cross-lane gate."
+            "root from the durable record instead of pane scrollback. "
+            "A RELATIVE path resolves against `--target-repo` when that "
+            "flag is passed (Redmine #14249), so the portable `--workdir .` "
+            "means the target repo root, NOT the sender's cwd; with no "
+            "`--target-repo` there is no asserted receiver frame and a "
+            "relative path still resolves against the sender's cwd. When "
+            "`--target-repo` IS asserted, a workdir that resolves outside "
+            "it is a self-contradictory delivery and is refused before any "
+            "injection with `execution_root_outside_target_repo` (zero "
+            "bytes typed). This is record/wording only: it does not change "
+            "pane selection or relax any cross-session / cross-lane gate."
         ),
     )
     parser_.add_argument(

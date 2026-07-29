@@ -37,6 +37,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     RedmineAnchor,
     TicketlessConsultationAnchor,
     TicketlessWorkIntakeAnchor,
+    build_execution_root,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
     RoleProfileResolution,
@@ -117,8 +118,12 @@ class FakeOps:
     def build_execution_root(
         self, workdir_abs: str, *, repo_root_abs: str | None
     ) -> ExecutionRoot:
+        # Delegate to the real (pure, environment-free) derivation — same reason the
+        # transition-role / workflow-contract fakes below do: the planner's #14249
+        # containment fence reads `relative`, so a fake that hard-coded `relative=None`
+        # would make every contained workdir look out-of-tree and pin a false contract.
         self.calls.append(("build_execution_root", workdir_abs, repo_root_abs))
-        return ExecutionRoot(workdir=workdir_abs, repo_root=repo_root_abs)
+        return build_execution_root(workdir_abs, repo_root_abs=repo_root_abs)
 
     def infer_repo_root(self, cwd: str) -> str | None:
         self.calls.append(("infer_repo_root", cwd))
@@ -369,7 +374,7 @@ class PlanDeliveryEnvelopeTest(unittest.TestCase):
     def test_execution_root_uses_explicit_target_repo(self) -> None:
         ops = FakeOps()
         env = self._plan(
-            ops, _inp(workdir="/w"), resolved_target_repo="/target-repo"
+            ops, _inp(workdir="/target-repo/w"), resolved_target_repo="/target-repo"
         )
         self.assertIsInstance(env.execution_root, ExecutionRoot)
         assert env.execution_root is not None
@@ -382,6 +387,92 @@ class PlanDeliveryEnvelopeTest(unittest.TestCase):
         self._plan(ops, _inp(workdir="/w"), resolved_target_repo=None)
         self.assertIn(("infer_repo_root", "/cwd"), ops.calls)
 
+    # --- Redmine #14249: relative-workdir base + containment fence -------------
+
+    def test_relative_workdir_resolves_against_asserted_target_repo(self) -> None:
+        """`--workdir .` means the TARGET repo root, not the sender's cwd (#14249)."""
+        ops = FakeOps()
+        env = self._plan(ops, _inp(workdir="."), resolved_target_repo="/target-repo")
+        assert env.execution_root is not None
+        self.assertEqual(env.execution_root.workdir, "/target-repo")
+        self.assertEqual(env.execution_root.relative, ".")
+        # The portable narrative names the repo root, not a redaction phrase.
+        self.assertTrue(
+            env.execution_root.notification_clause().startswith(
+                "Target execution root: `.` (the target repo root)"
+            ),
+            env.execution_root.notification_clause(),
+        )
+
+    def test_nested_relative_workdir_resolves_against_asserted_target_repo(self) -> None:
+        ops = FakeOps()
+        env = self._plan(
+            ops, _inp(workdir="services/api"), resolved_target_repo="/target-repo"
+        )
+        assert env.execution_root is not None
+        self.assertEqual(env.execution_root.workdir, "/target-repo/services/api")
+        self.assertEqual(env.execution_root.relative, "services/api")
+
+    def test_absolute_workdir_under_target_repo_is_unchanged(self) -> None:
+        """The pre-#14249 absolute-workdir contract is untouched."""
+        ops = FakeOps()
+        env = self._plan(
+            ops,
+            _inp(workdir="/target-repo/services/api"),
+            resolved_target_repo="/target-repo",
+        )
+        assert env.execution_root is not None
+        self.assertEqual(env.execution_root.workdir, "/target-repo/services/api")
+        self.assertEqual(env.execution_root.relative, "services/api")
+
+    def test_out_of_tree_workdir_with_asserted_target_repo_is_zero_send(self) -> None:
+        """An asserted `--target-repo` + an outside workdir refuses BEFORE the rail."""
+        ops = FakeOps()
+        with self.assertRaises(EnvelopePlanError) as ctx:
+            self._plan(
+                ops, _inp(workdir="/elsewhere/root"), resolved_target_repo="/target-repo"
+            )
+        exc = ctx.exception
+        self.assertEqual(exc.reason, "execution_root_outside_target_repo")
+        # The partial execution root is still carried onto the blocked outcome so the
+        # contradiction is auditable from the structured record.
+        self.assertEqual(set(exc.outcome_extra), {"execution_root"})
+        carried = exc.outcome_extra["execution_root"]
+        self.assertEqual(carried.workdir, "/elsewhere/root")
+        self.assertEqual(carried.repo_root, "/target-repo")
+        self.assertIsNone(carried.relative)
+        # Fenced before the body/marker were ever built.
+        self.assertFalse(any(c[0] == "build_notification_body" for c in ops.calls))
+        self.assertFalse(any(c[0] == "build_marker" for c in ops.calls))
+
+    def test_relative_workdir_escaping_target_repo_is_zero_send(self) -> None:
+        """`..` cannot walk out of the asserted repo and still be delivered."""
+        with self.assertRaises(EnvelopePlanError) as ctx:
+            self._plan(
+                FakeOps(),
+                _inp(workdir="../sibling"),
+                resolved_target_repo="/target-repo",
+            )
+        self.assertEqual(ctx.exception.reason, "execution_root_outside_target_repo")
+
+    def test_out_of_tree_workdir_without_target_repo_still_delivers(self) -> None:
+        """No asserted repo -> the #12098 out-of-tree redaction contract is preserved."""
+        ops = FakeOps(inferred_root="/inferred")
+        env = self._plan(ops, _inp(workdir="/elsewhere"), resolved_target_repo=None)
+        assert env.execution_root is not None
+        self.assertIsNone(env.execution_root.relative)
+        self.assertEqual(env.execution_root.repo_root, "/inferred")
+        # Not fenced: the body/marker were still built and the envelope returned.
+        self.assertTrue(any(c[0] == "build_notification_body" for c in ops.calls))
+
+    def test_auto_sentinel_target_repo_keeps_inferred_anchor_contract(self) -> None:
+        """An UNRESOLVED `auto` sentinel is not an assertion: no fence, no re-basing."""
+        ops = FakeOps(inferred_root="/inferred")
+        env = self._plan(ops, _inp(workdir="/elsewhere"), resolved_target_repo="auto")
+        assert env.execution_root is not None
+        self.assertEqual(env.execution_root.repo_root, "/inferred")
+        self.assertIn(("infer_repo_root", "/cwd"), ops.calls)
+
     def test_role_profile_resolved_and_contract_carried(self) -> None:
         env = self._plan(FakeOps(), _inp(role_profile="implementation_worker"))
         self.assertEqual(env.role_profile_contract, "contract::implementation_worker")
@@ -389,7 +480,9 @@ class PlanDeliveryEnvelopeTest(unittest.TestCase):
     def test_role_profile_error_carries_only_execution_root(self) -> None:
         ops = FakeOps(resolve_role_profile_raises=RoleProfileError("bad role"))
         with self.assertRaises(EnvelopePlanError) as ctx:
-            self._plan(ops, _inp(workdir="/w", role_profile="x"), resolved_target_repo="/r")
+            self._plan(
+                ops, _inp(workdir="/r/w", role_profile="x"), resolved_target_repo="/r"
+            )
         exc = ctx.exception
         self.assertEqual(exc.reason, "invalid_args")
         self.assertEqual(set(exc.outcome_extra), {"execution_root"})
