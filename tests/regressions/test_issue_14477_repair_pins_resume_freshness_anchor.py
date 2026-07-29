@@ -25,16 +25,22 @@ with ``hibernated_at`` (schema v8) stamped ONLY at T0. Pinned here:
    never move the boundary;
 4. **acceptance 4** — resume still atomically adopts the exact fresh declared pin snapshot,
    and the provider-binding fence still blocks;
-5. **acceptance 5** — a pre-v8 row (no anchor) stays readable WITHOUT migrating the store and
-   keeps its pre-#14477 ``updated_at`` boundary under an explicitly surfaced compatibility
-   token; an anchor that resolves to nothing at all fails the freshness half CLOSED rather
-   than skipping it;
+5. **acceptance 5** — a pre-v8 row (no anchor) stays readable WITHOUT migrating the store, and
+   gets NO substitute boundary: the freshness half fails CLOSED. Review j#94515 F1 / verdict
+   j#94520 measured the alternative — standing ``updated_at`` in for the boundary admitted a
+   genuine pre-hibernate survivor, because ``updated_at`` is not monotonic (no writer on this
+   component validates its caller-supplied ``now`` against the row's prior stamp). That exact
+   ordering is pinned here, as is the absence of ANY substitute column;
 6. the anchor's own lifecycle: cleared on rehydrate, re-stamped on the next hibernation, and
    its inbound-edge enumeration DERIVED from the public transition policy rather than recalled,
    so a future edge into ``hibernated`` cannot quietly bypass the stamp.
 
 Everything is synthetic: a temp store path, a fake herdr inventory and fake attestation reads.
-No pane / process / route / worktree mutation, and never the shared ``$HOME/.mozyo_bridge``.
+No pane / process / route / worktree mutation. Hermeticity is itself CHECKED rather than
+intended (``OperatorHomeHermeticityTest``, j#94504 item 4): the v8 bump forward-migrated the
+operator's shared ``state.sqlite`` from inside a full-suite run, because a store built without
+an explicit ``path=`` resolves ``MOZYO_BRIDGE_HOME`` / ``~/.mozyo_bridge`` and writing there
+takes the write-MIGRATING gate.
 """
 
 from __future__ import annotations
@@ -59,7 +65,6 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
 from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore  # noqa: E402
 from mozyo_bridge.core.state.lane_hibernation_anchor import (  # noqa: E402
     ANCHOR_HIBERNATE_TRANSITION,
-    ANCHOR_LIFECYCLE_UPDATED_AT,
     ANCHOR_UNAVAILABLE,
     hibernation_anchor_on_transition,
     resume_freshness_anchor,
@@ -84,6 +89,7 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
 )
 from mozyo_bridge.core.state.lane_pin_repair import LanePinRepairStore  # noqa: E402
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair  # noqa: E402
+from mozyo_bridge.core.state.state_store import state_store_path  # noqa: E402
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (  # noqa: E402,E501
     BLOCK_PAIR_ATTESTATION,
     ResumeRequest,
@@ -111,6 +117,10 @@ T_RELEASE = "2026-07-26T20:00:05+00:00"  # still hibernate-side, but a LATER met
 T_FRESH = "2026-07-26T20:10:00+00:00"  # T1 — the relaunched pair self-attests
 T_REPAIR = "2026-07-26T20:20:00+00:00"  # T2 — the metadata-only pin repair
 T_RESUME = "2026-07-26T20:30:00+00:00"
+#: A metadata write whose stamp REGRESSES below the hibernation (review j#94515 F1). No writer
+#: on this component validates ``now`` against the row's prior stamp, so this is reachable from
+#: a backdated programmatic caller or a regressed wall clock — not a contrived value.
+T_BACKDATED = "2026-07-26T19:40:00+00:00"
 
 _GW_LOC = f"{_WS}:p4A"
 _WK_LOC = f"{_WS}:p4B"
@@ -246,7 +256,7 @@ class _Fixture(unittest.TestCase):
     def _rec(self) -> LaneLifecycleRecord:
         return self.store.get(self.key)
 
-    def _repair_pins(self, now: str = T_REPAIR):
+    def _repair_pins(self, *, now: str = T_REPAIR):
         """The metadata-only #13879 declared-pin repair at ``now``."""
         rec = self._rec()
         return LanePinRepairStore(path=self.path).repair_hibernated_bound_pins(
@@ -437,50 +447,72 @@ class PreV8CompatibilityTest(_Fixture):
             conn.close()
         return self.path.read_bytes()
 
-    def test_a_pre_v8_row_reads_without_migrating_and_names_its_authority(self) -> None:
+    def test_a_pre_v8_row_reads_without_migrating_and_has_no_boundary(self) -> None:
         self.assertTrue(self._repair_pins().applied)
         before = self._rewind_to_v7()
 
         rec = self.store.get(self.key)
-        anchor, authority = resume_freshness_anchor(rec)
 
         self.assertEqual(rec.hibernated_at, "")  # the padded additive default, not a guess
-        self.assertEqual(anchor, T_REPAIR)  # its own ``updated_at``, the pre-#14477 boundary
-        self.assertEqual(authority, ANCHOR_LIFECYCLE_UPDATED_AT)
+        # No substitute is invented from any other column on the row — notably NOT its own
+        # ``updated_at``, which is present and non-empty here.
+        self.assertEqual(rec.updated_at, T_REPAIR)
+        self.assertEqual(resume_freshness_anchor(rec), ("", ANCHOR_UNAVAILABLE))
         # The read is non-migrating (#13844): not one byte moved, the version is still 7.
         self.assertEqual(self.path.read_bytes(), before)
 
-    def test_the_pre_v8_fallback_is_stricter_never_weaker(self) -> None:
-        """``updated_at >= hibernated_at`` always, so the legacy threshold can only refuse
-        MORE. The old false-stale outcome is preserved verbatim on an old row — surfaced with
-        its authority token — rather than being repaired by a guessed boundary."""
-        self.assertTrue(self._repair_pins().applied)
-        self._rewind_to_v7()
-        outcome = self._resume()
-        self.assertTrue(outcome.is_blocked)
-        self.assertIn("stale_generation", outcome.preflight.pair_attestation_detail)
-        self.assertIn(
-            f"freshness anchor: {ANCHOR_LIFECYCLE_UPDATED_AT}",
-            outcome.preflight.pair_attestation_detail,
-        )
+    def test_a_regressed_updated_at_cannot_admit_a_pre_hibernate_survivor(self) -> None:
+        """Review j#94515 F1 / verdict j#94520 — the exact measured ordering.
 
-    def test_a_pre_v8_row_with_no_later_metadata_write_still_resumes(self) -> None:
-        """The fallback is a threshold, not a blanket refusal: an untouched legacy row whose
-        ``updated_at`` still predates the fresh attestation resumes exactly as it always did."""
-        self._rewind_to_v7()  # no repair -> updated_at is still the hibernate-side stamp
-        outcome = self._resume()
-        self.assertFalse(
-            outcome.is_blocked,
-            f"blocked: {outcome.preflight.blocked_reasons} "
-            f"({outcome.preflight.pair_attestation_detail})",
-        )
+        ``updated_at`` is NOT monotonic: every CAS on this component takes a caller-supplied
+        ``now`` and no writer validates it against the row's prior stamp, so a backdated caller
+        or a regressed wall clock (NTP step-back, skewed host) leaves it EARLIER than the true
+        hibernation. Substituting it as the boundary therefore produced
+
+            updated_at (19:40)  <  survivor attestation (19:50)  <  true hibernate (20:00)
+
+        and admitted a genuine pre-hibernate survivor, flipping the lane to ``active``. The
+        boundary must be absent-and-refused here, never reconstructed from a mutable column.
+        """
+        self.assertEqual(self._rec().hibernated_at, T_HIBERNATE)  # the TRUE boundary
+        # A public metadata-only repair whose stamp REGRESSES below the hibernation.
+        self.assertTrue(self._repair_pins(now=T_BACKDATED).applied)
+        self._rewind_to_v7()
+
+        rec = self.store.get(self.key)
+        self.assertEqual(rec.updated_at, T_BACKDATED)
+        self.assertLess(rec.updated_at, T_SURVIVOR)  # the ordering that used to admit
+        self.assertLess(T_SURVIVOR, T_HIBERNATE)  # ...a REAL pre-hibernate survivor
+
+        outcome = self._resume(ops=_FakeOps(observed_at=T_SURVIVOR))
+
+        self.assertTrue(outcome.is_blocked)
+        self.assertIn(BLOCK_PAIR_ATTESTATION, outcome.preflight.blocked_reasons)
+        self.assertIn(ANCHOR_UNAVAILABLE, outcome.preflight.pair_attestation_detail)
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertIsNone(outcome.transition)
+
+    def test_a_legacy_row_fails_closed_even_with_a_genuinely_fresh_pair(self) -> None:
+        """The refusal is unconditional on a row with no boundary — the safe direction.
+
+        A legacy lane cannot prove freshness at all, so even a truly fresh pair is refused
+        rather than admitted on the locator pin alone. This is a deliberate, stated functional
+        regression for pre-v8 rows (verdict j#94520): such a lane resumes only after passing
+        through a v8 hibernate transition. The alternative — a substitute threshold — is what
+        the test above measures as unsafe.
+        """
+        self._rewind_to_v7()  # no repair: updated_at is still the hibernate-side stamp
+        outcome = self._resume()  # a genuinely fresh pair, attested after the hibernation
+        self.assertTrue(outcome.is_blocked)
+        self.assertIn(ANCHOR_UNAVAILABLE, outcome.preflight.pair_attestation_detail)
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
 
     def test_an_unresolvable_boundary_fails_the_freshness_half_closed(self) -> None:
         """An absent threshold is not a proof of freshness.
 
         ``evaluate_pair_attestation`` skips the freshness comparison on an empty
-        ``fresh_after``, so a row carrying NEITHER stamp would otherwise be admitted on the
-        locator pin alone — precisely the survivor hole the gate exists to close.
+        ``fresh_after``, so a row with no boundary would otherwise be admitted on the locator
+        pin alone — precisely the survivor hole the gate exists to close.
         """
         conn = sqlite3.connect(self.path)
         try:
@@ -501,6 +533,92 @@ class PreV8CompatibilityTest(_Fixture):
 
     def test_an_absent_row_resolves_to_no_boundary_rather_than_a_guess(self) -> None:
         self.assertEqual(resume_freshness_anchor(None), ("", ANCHOR_UNAVAILABLE))
+
+    def test_no_column_on_the_row_is_ever_used_as_a_substitute_boundary(self) -> None:
+        """Derived, not recalled: NO stored string field may stand in for the anchor.
+
+        Enumerates the record's own text fields rather than naming ``updated_at``, so a future
+        "helpful" fallback to ``created_at`` or any other timestamp-bearing column is caught
+        by this pin instead of shipping as a fresh survivor hole.
+        """
+        self.assertTrue(self._repair_pins().applied)
+        self._rewind_to_v7()
+        rec = self.store.get(self.key)
+        anchor, authority = resume_freshness_anchor(rec)
+        self.assertEqual((anchor, authority), ("", ANCHOR_UNAVAILABLE))
+        candidates = {
+            name: value
+            for name, value in vars(rec).items()
+            if isinstance(value, str) and value and name != "hibernated_at"
+        }
+        self.assertIn("updated_at", candidates)  # the fixture really does offer a temptation
+        self.assertIn("created_at", candidates)
+        for name, value in candidates.items():
+            self.assertNotEqual(
+                anchor, value, f"{name} was used as a substitute freshness boundary"
+            )
+
+
+class OperatorHomeHermeticityTest(_Fixture):
+    """This module never resolves — let alone migrates — the operator's shared home.
+
+    Redmine #14477 j#94504 item 4. The v8 bump forward-migrated the shared operator
+    ``state.sqlite`` at ``2026-07-29T21:46:28Z`` from inside a full-suite run, because a store
+    constructed WITHOUT an explicit ``home=``/``path=`` resolves ``MOZYO_BRIDGE_HOME`` /
+    ``~/.mozyo_bridge`` and any write there takes the write-MIGRATING gate. That is a shared
+    authority store other lanes read with older-schema CLIs, and migrating it read-fail-closes
+    every one of them. These pins make the hermeticity of THIS module a checked property rather
+    than an author's intention.
+    """
+
+    def test_every_store_this_module_touches_is_under_its_temp_dir(self) -> None:
+        tmp = Path(self._tmp.name).resolve()
+        for store in (
+            self.store,
+            LaneDeclarationStore(path=self.path),
+            LanePinRepairStore(path=self.path),
+        ):
+            resolved = Path(store.path).resolve()
+            self.assertTrue(
+                str(resolved).startswith(str(tmp)),
+                f"{type(store).__name__} resolved {resolved}, outside the temp dir {tmp}",
+            )
+
+    def test_the_fixture_path_is_not_the_resolved_default_home_store(self) -> None:
+        """A path comparison only — the operator store is never opened, read, or stat-ed."""
+        default_store = state_store_path(None).resolve()
+        self.assertNotEqual(Path(self.path).resolve(), default_store)
+        self.assertNotEqual(
+            Path(self.path).resolve().parent, default_store.parent
+        )
+
+    def test_no_store_in_this_module_is_constructed_without_an_explicit_path(self) -> None:
+        """Derived from this file's own AST: the defect shape must not reappear here.
+
+        A store built with NO ``home=``/``path=`` resolves the default home — the shape that
+        migrated the operator's shared store. Banned in this module by a check rather than by
+        review attention. Parsed as an AST rather than grepped so the ban survives its own
+        mention in prose (a text search matches this docstring and fails on itself).
+        """
+        import ast
+
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        stores = {"LaneLifecycleStore", "LaneDeclarationStore", "LanePinRepairStore"}
+        offenders = [
+            f"{node.func.id}() at line {node.lineno}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in stores
+            and not node.args
+            and not node.keywords
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "these resolve MOZYO_BRIDGE_HOME / ~/.mozyo_bridge (the operator's shared authority "
+            f"store); always pass an explicit temp path=: {offenders}",
+        )
 
 
 class SchemaVersionTest(unittest.TestCase):

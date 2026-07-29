@@ -357,8 +357,8 @@ Table naming:
       caller-supplied `LaneLaunchContext`、heal は本 field。両方あり **不一致**なら片方が stale なので
       launch は **zero side effect で fail-closed 拒否** (どちらかを黙って採用しない)。
   - **hibernate freshness 境界 (resume の post-hibernate 世代証明の正本)** (schema v8、#14477 /
-    live evidence #14476 j#88614-j#88618)。追加 field `hibernated_at`。semantics / fallback 方向の
-    実装正本は `core/state/lane_hibernation_anchor.py`。
+    live evidence #14476 j#88614-j#88618)。追加 field `hibernated_at`。semantics と「代替境界を
+    与えない」理由の実装正本は `core/state/lane_hibernation_anchor.py`。
     - **何を保存するか**: lane が `hibernated` へ入った **transition の時刻**。resume (#13682) は
       各 slot の startup self-attestation (#13637) が **この時刻より厳密に後** に観測されたことを
       要求して、relaunch された pair と **release を生き残った pane** を区別する (locator は
@@ -376,17 +376,33 @@ Table naming:
       `open_next_generation`) は **空へ clear** する (起きている lane に境界は存在しない)。
       terminal (`superseded` / `retired`) は audit fact として保持する。
     - **clear が fail-closed 方向である理由**: 将来 stamp しない writer が row を `hibernated` へ
-      戻した場合、古い境界が残っていれば threshold が過去に飛び **gate が緩む**。空なら
-      `updated_at` (= その write 自身の stamp) へ fallback するので、緩まない。
-    - **migration / fallback**: pre-v8 row は additive backup-first migration で **空** anchor を
-      得る (`updated_at` から back-fill **しない** — metadata write の stamp を immutable column へ
-      焼き付けると、本 version が除去する false `stale_generation` が恒久化する)。空の場合の
-      reader は当該 row の `updated_at` へ fallback し、`lifecycle_updated_at_pre_v8` として
-      **typed outcome に明示**する。`updated_at >= hibernated_at` は常に成立するので、この
-      fallback は **等しいかより厳しい** threshold であり緩むことはない。
+      戻した場合、古い境界が残っていれば threshold が過去に飛び **gate が緩む**。空なら境界不在
+      として refuse されるので、緩まない。
+    - **anchor が空の row に代替境界を与えない** (#14477 review j#94515 F1 / verdict j#94520)。
+      pre-v8 row は additive backup-first migration で **空** anchor を得る (`updated_at` から
+      back-fill **しない** — metadata write の stamp を immutable column へ焼き付けると、本 version
+      が除去する false `stale_generation` が恒久化する)。**読取側も `updated_at` を代用しない**。
+      - **理由**: `updated_at` は **単調ではない**。本 component の全 CAS は caller 供給の `now` を
+        受け、prior stamp 以上であることを検証する writer は 1 つも存在しない。よって backdated な
+        programmatic caller や wall clock の後退 (NTP step-back / host clock skew) で `updated_at`
+        は真の hibernation より **前** になりうる。実測 (j#94515 F1) では
+        `updated_at(19:40) < survivor attestation(19:50) < true hibernate(20:00)` が成立し、
+        **真の pre-hibernate survivor が admit され lane が active 化した**。
+      - 「`updated_at >= hibernated_at` だから fallback は常により厳しい」という以前の主張は
+        **撤回**する。この不等式が成立するのは **anchor を持つ row** = fallback を使わない row
+        だけであり、anchor が空の row には何も保証しない。
+      - **安全な代替は存在しない**: `created_at` は真の境界より更に前 (より弱い)、release
+        generation に timestamp column は無い、今後 monotonic invariant を強制しても **旧 build が
+        既に書いた row** には遡及できない。選択肢は「refuse」か「推測」であり、世代証明は推測して
+        はならない。
+      - **帰結 (運用上の機能後退として明示)**: pre-v8 build が hibernate した lane は、v8 の
+        hibernate transition を経るまで standard resume rail で resume **できない**。row の
+        **読取**は不変 (`get` / `records` / 非migrating read) であり、失われるのは freshness
+        **証明** のみ — その row について証明は元々存在しなかった。
     - **現在時刻は使わない**: 「最近観測された」pane を通してしまい、世代証明の逆になる。
-      両 stamp を欠く row は `unavailable` として **freshness 半分を fail-closed** にする
-      (threshold 不在を「比較対象が無いので fresh」と読ませない)。
+      anchor を欠く row は `unavailable` として **freshness 半分を fail-closed** にする
+      (threshold 不在を「比較対象が無いので fresh」と読ませない。`evaluate_pair_attestation` は
+      空 threshold で freshness 比較を skip するため、caller 側で明示的に倒す必要がある)。
   - **binding kind / lane generation / typed process pins** (schema v5、#13810 / Design Answer
     j#78386)。project-gateway 用の別 owner component は作らず、同一 `lane_lifecycle_records` row /
     同一 revision CAS を additive 拡張する (別 component にすると owner row と release/replacement
@@ -1466,6 +1482,34 @@ Downgrade は非破壊にする。古い CLI が新しい container `user_versio
 
 Partial migration は component 単位で resumable にする。rerun は complete 済み component を skip してよいが、
 authoritative component を黙って上書きしない。
+
+### test / probe は operator 共有 home を解決しない (#14477 j#94504)
+
+**home scope の authority store は複数 lane が同時に読む共有資源であり、test / probe / 診断が
+それを forward-migrate してはならない。** schema version を上げた branch の未 review WIP source で
+これを起こすと、**他の稼働 lane が全て read-fail-closed する** (`### schema version / migration` の
+downgrade-safe 契約により、古い reader は新しい component version を読めない)。実測: #14477 の
+v7→v8 bump は full suite 実行中に共有 `state.sqlite` を `2026-07-29T21:46:28Z` へ migrate し、
+reviewed v7 facade からの review_result delivery が `reader_upgrade_required` で zero-send になった
+(j#94504 / j#94516)。
+
+規則:
+
+- store は **必ず明示的な `home=` / `path=` を渡して**構築する。**無引数構築
+  (`LaneLifecycleStore()` 等) は `MOZYO_BRIDGE_HOME` / `~/.mozyo_bridge` を解決する**ため test /
+  probe では使わない。write は write-**migrating** gate を通るので、1 回の `declare_active` で
+  共有 component が migrate する。
+- `patch.dict(os.environ, ..., clear=True)` は `MOZYO_BRIDGE_HOME` を消し、解決先を
+  `~/.mozyo_bridge` へ落とす。env を消す test は home を **別途** temp へ固定する。
+- migration 自体を検証する test は temp isolated home 上で行う (backup / version stamp / byte
+  不変を含めて、そこで完結させる)。
+- hermeticity は「意図」ではなく **checked property** にする。store path が temp 配下であること、
+  解決される default home store path と一致しないことを test 自身が pin する
+  (実装例: `tests/regressions/test_issue_14477_repair_pins_resume_freshness_anchor.py`
+  `OperatorHomeHermeticityTest` — 無引数構築の不在は自 module の AST から導出して pin する)。
+- 診断で共有 store を読む必要がある場合は **strict read-only** で開く
+  (`sqlite3.connect("file:...?mode=ro&immutable=1", uri=True)`。`-wal` / `-shm` を作らず write lock
+  も取らない)。downgrade / raw repair / hand edit はしない。
 
 ### corruption quarantine / component repair
 

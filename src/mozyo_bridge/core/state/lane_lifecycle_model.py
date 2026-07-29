@@ -609,8 +609,10 @@ class LaneLifecycleRecord:
     separation is the whole point: a metadata-only write (a revision bump, a decision anchor,
     a declared-pin repair) must not be able to push the boundary past the attestation of the
     pair it just verified (#14476 j#88614-j#88618). Empty on a pre-v8 row / a lane that never
-    hibernated; the reader then falls back to ``updated_at``, an equal-or-later (stricter)
-    threshold. Semantics and fallback direction: :mod:`...lane_hibernation_anchor`.
+    hibernated, and an empty anchor gets NO substitute — the freshness proof reports it
+    unavailable and the caller fails closed, because ``updated_at`` is not monotonic and
+    standing in for the boundary admitted a real survivor (review j#94515 / verdict j#94520).
+    Semantics: :mod:`...lane_hibernation_anchor`.
     """
 
     repo_workspace_id: str

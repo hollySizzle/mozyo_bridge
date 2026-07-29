@@ -24,15 +24,30 @@ as it likes; the boundary the freshness proof compares against does not move wit
 existing fence stays exactly where it was: this module supplies a *threshold*, and decides
 nothing about locators, providers, multiplicity, or attestation validity.
 
-**Every fallback here points fail-closed.** For any row THIS build hibernated,
-``updated_at >= hibernated_at`` always holds — both are stamped by the same write, and only
-``updated_at`` advances afterwards — so falling back to ``updated_at`` yields a threshold
-that is equal or LATER, i.e. a STRICTER gate, never a looser one. That is what makes the
-pre-v8 compatibility disposition safe rather than a guess: a row hibernated by an older
-build carries an empty anchor and keeps precisely its pre-#14477 (over-strict) boundary. The
-current wall clock is never consulted — it would admit any pane merely observed *recently*,
-which is the opposite of a generation proof — and an absent boundary is reported as absent
-so the caller can refuse, never silently skipped.
+**A row with no anchor has NO boundary, and that is reported rather than substituted.** An
+earlier revision of this surface fell back to ``updated_at`` for a pre-v8 row, arguing that
+``updated_at >= hibernated_at`` always holds and so the fallback could only be stricter. That
+argument was wrong, and Redmine #14477 review j#94515 (verdict j#94520) reproduced the
+consequence: the invariant holds only for rows that CARRY an anchor — i.e. exactly the rows
+that never take the fallback — and says nothing about a row whose anchor is empty. Nothing
+enforces it either: every CAS on this component accepts a caller-supplied ``now`` and no
+writer validates it against the row's prior stamp, so a regressing stamp (a backdated
+programmatic caller, an NTP step-back, a skewed host clock) leaves ``updated_at`` EARLIER
+than the true hibernation. The measured result was a threshold below the real boundary, which
+admitted a genuine pre-hibernate survivor and flipped the lane to ``active``.
+
+So a legacy row now resolves to :data:`ANCHOR_UNAVAILABLE` and the caller must fail closed.
+There is no safe substitute to reach for: ``created_at`` predates the hibernation by even
+more, the release generation carries no timestamp, and enforcing monotonicity going forward
+cannot retro-fit rows an older build already wrote. The honest options are "refuse" or
+"guess", and a generation proof may not guess. The current wall clock is likewise never
+consulted — it would admit any pane merely observed *recently*, the exact inverse of a
+generation proof.
+
+The operational cost is stated plainly: a lane hibernated by a pre-v8 build cannot resume
+through the standard rail until it passes through a v8 hibernate transition. Old rows stay
+fully READABLE (``get`` / ``records`` / the non-migrating read path are untouched); what is
+withheld is only the freshness *proof*, which for those rows never actually existed.
 """
 
 from __future__ import annotations
@@ -51,17 +66,14 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
 HIBERNATION_ANCHOR_COLUMN = "hibernated_at"
 
 #: The boundary came from the immutable hibernate-transition stamp — the post-#14477
-#: authority, unmoved by any later metadata write.
+#: authority, unmoved by any later metadata write. The ONLY value that proves freshness.
 ANCHOR_HIBERNATE_TRANSITION = "hibernate_transition"
-#: The row carries no hibernate-transition stamp (a pre-v8 row, or one hibernated by an
-#: older build), so the pre-#14477 generic lifecycle ``updated_at`` is used instead. It is
-#: equal-or-later than the true boundary, so the gate is stricter — never weaker — and this
-#: token makes that compatibility disposition explicit in the typed outcome instead of
-#: leaving the operator to infer which authority answered.
-ANCHOR_LIFECYCLE_UPDATED_AT = "lifecycle_updated_at_pre_v8"
-#: No boundary could be resolved at all (no row, or a row carrying neither stamp). The
-#: freshness half of the proof cannot run, so the caller must fail closed rather than treat
-#: an absent threshold as "nothing to compare, therefore fresh".
+#: No boundary exists to compare against: there is no row, or the row carries no
+#: hibernate-transition stamp (a pre-v8 row, or one hibernated by an older build). The
+#: freshness half of the proof cannot run, so the caller MUST fail closed rather than treat an
+#: absent threshold as "nothing to compare, therefore fresh". Deliberately NOT substituted
+#: with ``updated_at`` — that substitution admitted a real survivor (review j#94515, verdict
+#: j#94520); see this module's docstring for why no safe substitute exists.
 ANCHOR_UNAVAILABLE = "unavailable"
 
 
@@ -91,27 +103,23 @@ def resume_freshness_anchor(
 ) -> tuple[str, str]:
     """``(threshold, authority)`` for the post-hibernate freshness proof of ``record``.
 
-    The immutable hibernate-transition stamp when the row carries one, else the pre-#14477
-    generic ``updated_at`` under the explicit :data:`ANCHOR_LIFECYCLE_UPDATED_AT`
-    compatibility disposition (equal-or-later than the true boundary, so stricter), else
-    :data:`ANCHOR_UNAVAILABLE` with an empty threshold — which the caller must read as "the
-    freshness half cannot be proven", never as "no threshold to fail".
+    The immutable hibernate-transition stamp when the row carries one, else an EMPTY threshold
+    under :data:`ANCHOR_UNAVAILABLE` — which the caller must read as "the freshness half cannot
+    be proven", never as "no threshold to fail". ``updated_at`` is deliberately not consulted:
+    it is not a boundary, and using it as one admitted a real pre-hibernate survivor
+    (review j#94515, verdict j#94520).
     """
     if record is None:
         return "", ANCHOR_UNAVAILABLE
     anchor = norm(record.hibernated_at)
     if anchor:
         return anchor, ANCHOR_HIBERNATE_TRANSITION
-    legacy = norm(record.updated_at)
-    if legacy:
-        return legacy, ANCHOR_LIFECYCLE_UPDATED_AT
     return "", ANCHOR_UNAVAILABLE
 
 
 __all__ = (
     "HIBERNATION_ANCHOR_COLUMN",
     "ANCHOR_HIBERNATE_TRANSITION",
-    "ANCHOR_LIFECYCLE_UPDATED_AT",
     "ANCHOR_UNAVAILABLE",
     "hibernation_anchor_on_transition",
     "resume_freshness_anchor",

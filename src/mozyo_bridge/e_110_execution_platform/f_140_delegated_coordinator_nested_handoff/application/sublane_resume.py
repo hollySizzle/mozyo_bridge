@@ -26,8 +26,10 @@ disposition CAS:
    not the generic lifecycle ``updated_at``: Redmine #14477 measured a metadata-only
    ``repair-pins`` moving the mutable column past the self-attestation of the exact live pair
    it had just verified, which refused that pair ``stale_generation`` until an operator
-   glass-break. See :mod:`mozyo_bridge.core.state.lane_hibernation_anchor` for the authority
-   split and the fail-closed direction of its pre-v8 compatibility fallback.
+   glass-break. A row carrying NO such stamp (a pre-v8 / older-build hibernation) has no
+   boundary at all, and the freshness half then fails CLOSED — no other column stands in for
+   it. See :mod:`mozyo_bridge.core.state.lane_hibernation_anchor` for the authority split and
+   why no safe substitute exists.
 2. **commit point** — :meth:`LaneLifecycleStore.transition_disposition` CAS-moves the lane
    ``hibernated -> active``, clearing the (finished) release generation on rehydrate. The
    substrate refuses the rehydrate while a generation is still in flight (R1-F3) and refuses
@@ -410,7 +412,7 @@ class SublaneResumeUseCase:
         # Redmine #14477: that boundary is the IMMUTABLE hibernate-transition stamp, never the
         # generic lifecycle ``updated_at`` every metadata write moves — reading the mutable
         # column let a pins repair invalidate the exact fresh pair it had just verified
-        # (#14476 j#88614-j#88618). Provenance and fallback direction: the anchor module.
+        # (#14476 j#88614-j#88618).
         hibernation_anchor, anchor_authority = resume_freshness_anchor(rec)
         both_live, attested, attest_detail = evaluate_pair_attestation(
             rows,
@@ -420,12 +422,13 @@ class SublaneResumeUseCase:
             fresh_after=hibernation_anchor,
         )
         if rec is not None and anchor_authority != ANCHOR_HIBERNATE_TRANSITION:
-            # Not the post-#14477 authority: say which one answered instead of leaving the
-            # operator to infer it. An UNAVAILABLE boundary additionally fails the freshness
-            # half closed — ``evaluate_pair_attestation`` skips that half on an empty
-            # threshold, and "nothing to compare against" is not a proof of freshness.
-            if not hibernation_anchor:
-                attested = False
+            # No boundary exists for this row (a pre-v8 / older-build hibernation). FAIL the
+            # freshness half CLOSED and name the reason: ``evaluate_pair_attestation`` skips
+            # that half on an empty threshold, so without this a survivor would be admitted on
+            # the locator pin alone — measured in review j#94515 when ``updated_at`` stood in
+            # for the boundary. Such a lane resumes only after a v8 hibernate transition; it is
+            # never waved through on a substitute timestamp.
+            attested = False
             attest_detail = f"{attest_detail}; freshness anchor: {anchor_authority}"
         fresh_pair_pins: tuple[ProcessGenerationPin, ...] = ()
         if both_live and attested:

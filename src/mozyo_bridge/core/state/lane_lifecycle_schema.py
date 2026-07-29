@@ -78,9 +78,10 @@ LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
 #: exactly one event (the disposition CAS INTO ``hibernated``) and by no metadata write, so a
 #: revision / decision / declared-pin repair can no longer push the boundary past the
 #: attestation of the very pair it just verified (#14476 j#88614-j#88618). A pre-v8 row
-#: migrates with an EMPTY anchor and keeps its pre-#14477 ``updated_at`` boundary, which is
-#: equal-or-later than the true one — a stricter gate, never a weaker one. Semantics,
-#: fallback direction and provenance vocabulary: :mod:`...lane_hibernation_anchor`.
+#: migrates with an EMPTY anchor and is NOT given a substitute boundary: the freshness proof
+#: reports it as unavailable and the caller fails closed (review j#94515 / verdict j#94520
+#: measured a survivor being admitted when ``updated_at`` was substituted). Semantics and the
+#: reason no safe substitute exists: :mod:`...lane_hibernation_anchor`.
 LANE_LIFECYCLE_SCHEMA_VERSION = 8
 #: The component shapes this build can read and write. ``1``–``7`` are migrated
 #: additively to ``8``; anything else — a newer version from a future build, or a foreign
@@ -925,12 +926,12 @@ def ensure_lane_lifecycle_schema(path: Path) -> LifecycleSchemaOutcome:
                     "ADD COLUMN lane_kind TEXT NOT NULL DEFAULT ''"
                 )
             # v8 (Redmine #14477): the immutable hibernate-transition freshness boundary. A
-            # pre-v8 row lands EMPTY — the boundary of a hibernation this build never
-            # observed is not reconstructible, and the resume reader then falls back to that
-            # row's generic ``updated_at`` (equal-or-later than the true boundary, so a
-            # STRICTER gate). Never back-filled from ``updated_at`` at migration time: that
-            # would freeze one metadata write's stamp INTO the immutable column and make the
-            # very false ``stale_generation`` this version exists to remove permanent.
+            # pre-v8 row lands EMPTY — the boundary of a hibernation this build never observed
+            # is not reconstructible — and the resume reader reports it as UNAVAILABLE rather
+            # than substituting another column (review j#94515: substituting ``updated_at``
+            # admitted a real survivor). Never back-filled from ``updated_at`` here either:
+            # that would freeze one metadata write's stamp INTO the immutable column and make
+            # the very false ``stale_generation`` this version exists to remove permanent.
             if "hibernated_at" not in current_columns:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
