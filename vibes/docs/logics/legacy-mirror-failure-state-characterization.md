@@ -915,9 +915,11 @@ ownership conflict を判定できない。
 - `tests/support/legacy_mirror_tree_fixture.py` は `_MirrorTreeFixture` の逐語移動で
   あり test を含まないので、この表の 127 には入らない。
 - `tests/support/legacy_mirror_fault_schedule.py` (T6 / Redmine #14684 が新規作成)
-  も同様に test を含まないので 127 に入らない。所有するのは下記 4 consumer が重複して
-  書いていた 3 形 — staging descriptor を記録する `os.open`、その descriptor を実際に
-  閉じてから 1 度だけ失敗する `os.close`、実行せず raise する primitive — に限る。
+  も同様に test を含まないので 127 に入らない。所有するのは下記 4 consumer が
+  **集合として**使う 3 能力 — staging descriptor を記録する `os.open`、その
+  descriptor が**閉じられるたびに**実 close の後で失敗する `os.close`、実行せず
+  raise する primitive — に限る。**3 能力すべてを使う consumer は 4 件中 2 件**で、
+  残る 2 件 (probe 系) は `raise_on` のみを使う [実測。内訳は下表]。
   **fault の payload 自体が検証対象である場合 (short write / staging 名へ差し替えられた
   entry / 遅延失敗する `scandir` / staging 名で keying した `lstat` / walk の序数 close /
   失敗が持続しない transient cleanup) は共有側へ移さず call site に残す。**
@@ -927,18 +929,23 @@ ownership conflict を判定できない。
 `os_patch` 非 0 は **5 module** だが、共有 fault schedule の consumer は **4 module** である。
 両者は一致しない。
 
-| module | `os_patch` | consumer | `os_patch` の中身 |
-| --- | ---: | :---: | --- |
-| `test_legacy_mirror_fault_injection.py` | 29 | ○ | primitive の注入 |
-| `test_platform_capability_probe_io.py` | 2 | ○ | 〃 |
-| `test_issue_14580_reused_descriptor_number_close.py` | 2 | ○ | 〃 |
-| `test_platform_capability_probe.py` | 1 | ○ | 〃 |
-| `test_issue_14651_capability_advertisement.py` | 2 | **×** | `os.supports_dir_fd` / `os.supports_fd` の `frozenset` 置換 |
+consumer 側も 3 能力を一律に使うわけではない。`track` = `track_descriptors` /
+`close` = `raise_after_closing` / `raise` = `raise_on`。
+
+| module | `os_patch` | consumer | track | close | raise | `os_patch` の中身 |
+| --- | ---: | :---: | :---: | :---: | :---: | --- |
+| `test_legacy_mirror_fault_injection.py` | 29 | ○ | ○ | ○ | ○ | primitive の注入 |
+| `test_issue_14580_reused_descriptor_number_close.py` | 2 | ○ | ○ | ○ | ○ | 〃 |
+| `test_platform_capability_probe_io.py` | 2 | ○ | — | — | ○ | 〃 |
+| `test_platform_capability_probe.py` | 1 | ○ | — | — | ○ | 〃 |
+| `test_issue_14651_capability_advertisement.py` | 2 | **×** | — | — | — | `os.supports_dir_fd` / `os.supports_fd` の `frozenset` 置換 |
 
 **`os_patch` は「`os` 属性を patch する test の数」であって「fault を注入する test の数」ではない。**
 #14651 が置換するのは *probe が読んではならない広告* (#14651 の regression 主題そのもの) であり、
-primitive を失敗させてはいない。したがって同 module は共有 fake を import せず、3 形のいずれも
-持たない [実測: `grep -rl legacy_mirror_fault_schedule tests/` = 4 件]。
+primitive を失敗させてはいない。したがって同 module は共有 fake を import せず、3 能力のいずれも
+使わない [実測: `grep -rl legacy_mirror_fault_schedule tests/` = 4 件]。
+**共有の単位は「各 module が 3 能力すべてを重複して持っていたこと」ではなく、
+「4 module が集合として 3 能力を使い、どの能力も 2 module 以上で使われること」である。**
 広告置換を fault schedule 経由にすると名ばかりの再利用になるため、T6 は同 module を変更していない。
 
 #### 共有 helper の所有 [導出]

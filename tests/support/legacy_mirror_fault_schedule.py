@@ -51,10 +51,26 @@ Two notes on what the schedule patches:
   `_MirrorTreeFixture._preflight_already_answered`. Faults keyed on a descriptor
   pick out their own call and do not need it.
 
-**Every rule here is one a consumer can catch breaking, or is not a rule at all.**
-That is a constraint on what may be added, not a description of how it turned
-out. Four behaviours no case could observe have been removed rather than
-documented (Redmine #14684, reviews j#93050 / j#93155): a "fail only the first
+What the consumers defend, and what they do not, measured rather than asserted
+(Redmine #14684, reviews j#93050 / j#93155 / j#93223):
+
+*Behaviour a consumer catches breaking.* Mutating each of these fails cases, in
+the count shown: the faults firing at all (19 / 12 / 15), `staging` matching only
+an `O_CREAT` open (10), `close_fired` recording that the close fault fired (9),
+the close fault closing for real before it raises (3), `before_raising` running
+(2), and `calls` counting what the fault reached (1).
+
+*Fail-loud boundaries no case exercises.* `_name`'s refusal to bind one name to
+two different descriptors, and the rejection of an `error` that is not an
+exception instance. **Removing either leaves all 40 cases green** — the subject
+never produces two distinct matching descriptors, and every call site passes an
+instance. They are kept as boundaries rather than promises: breaking one cannot
+hand a consumer a wrong answer quietly, only an error. Closing them properly
+would take cases built against this module directly, which is outside the paths
+this task declared; the gateway ruled that acceptable here (j#93223) rather than
+required.
+
+*Behaviour removed because nothing could observe it.* A "fail only the first
 call" knob, the close fault firing at most once, an exception *instance* being
 re-raised as the same object rather than rebuilt, and the rule for choosing
 between two descriptors matching one name — that last one deleted by making the
