@@ -41,7 +41,9 @@ from typing import Iterable, Optional
 
 from .redmine_journal_source import (
     MARKER_CHANNEL_WORKFLOW_EVENT,
-    marker_fields_in_note,
+    MarkerValueError,
+    strict_gate_markers,
+    validate_marker_field_value,
 )
 
 #: The key schema version. It participates in the digest, so a future field set can never be
@@ -113,10 +115,6 @@ _MARKER_FIELD_NAMES = {
     "retry_of": "retry_of",
 }
 
-#: Characters that cannot survive the marker grammar (``[mozyo:<channel>:k=v:k=v]``). A value
-#: carrying one would forge a field boundary and read back as a different well-formed key.
-_FORBIDDEN_VALUE_CHARS = frozenset(":=[]")
-
 #: Lookup reasons. Each names a DISTINCT failure the caller must be able to tell apart — collapsing
 #: them into a bare ``None`` would let "this record has no action" and "this record is ambiguous"
 #: take the same branch, and only one of those is a conflict.
@@ -142,26 +140,18 @@ def _is_digest(value: str) -> bool:
 
 
 def _validate_value(name: str, value: object) -> str:
-    """Return the stripped value, or raise: an unrepresentable field is refused at the boundary."""
-    text = str(value if value is not None else "").strip()
-    if not text:
-        raise RecoveryKeyError(
-            f"recovery admission key field {name!r} is empty: an unkeyed recovery action cannot be "
-            f"admitted, deduplicated, or reconciled"
-        )
-    bad = sorted(set(text) & _FORBIDDEN_VALUE_CHARS)
-    if bad:
-        raise RecoveryKeyError(
-            f"recovery admission key field {name!r}={text!r} contains {bad!r}, which the marker "
-            f"grammar uses as field delimiters: it would read back as a DIFFERENT well-formed key. "
-            f"Refusing to render an identity that cannot round-trip"
-        )
-    if any(ch.isspace() for ch in text):
-        raise RecoveryKeyError(
-            f"recovery admission key field {name!r}={text!r} contains whitespace, which the marker "
-            f"grammar cannot round-trip verbatim"
-        )
-    return text
+    """Return the stripped value, or raise: an unrepresentable field is refused at the boundary.
+
+    The rules this channel hardened are now the SHARED producer-side check
+    (:func:`...redmine_journal_source.validate_marker_field_value`), so the other marker
+    producers are held to them too (Redmine #14539 review j#92374 finding 2) — two of them had
+    no such check and could emit a record their own parser refused. Only the exception type is
+    local, because this channel's callers catch :class:`RecoveryKeyError`.
+    """
+    try:
+        return validate_marker_field_value(name, value, what="recovery admission key")
+    except MarkerValueError as exc:
+        raise RecoveryKeyError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -428,9 +418,11 @@ def resolve_recovery_action_key(
         )
     markers = [
         fields
-        for channel, fields in marker_fields_in_note(str(getattr(matched[0], "notes", "") or ""))
-        if channel == MARKER_CHANNEL_WORKFLOW_EVENT
-        and str(fields.get("kind", "")).strip() == RECOVERY_ACTION_MARKER_KIND
+        # Effect-reaching: this key admits the first state-changing recovery action, so the note
+        # is read through the shared strict gate reader (review j#92060 finding 3).
+        for fields in strict_gate_markers(
+            str(getattr(matched[0], "notes", "") or ""), RECOVERY_ACTION_MARKER_KIND
+        )
     ]
     if not markers:
         return RecoveryActionLookup(

@@ -39,7 +39,10 @@ from typing import Optional, Sequence, Tuple
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     MARKER_CHANNEL_WORKFLOW_EVENT,
+    marker_components_in_note,
     marker_fields_in_note,
+    marker_logical_gates,
+    strict_marker_fields,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
     INTEGRATION_BLOCKED,
@@ -60,6 +63,20 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 #: ``redmine_journal_source.GATE_BEARING_KINDS``: that set is the *callback-required* gate
 #: vocabulary, and an integration disposition must not become a callback-bearing gate.
 MARKER_GATE_INTEGRATION_DISPOSITION = "integration_disposition"
+
+def canonical_marker_value(key: str, value: str) -> str:
+    """The comparison form of one marker field value for the strict reader (pure).
+
+    Only the governed disposition key has a canonical vocabulary; everything else compares
+    literally, so a repeated ``head`` with two different SHAs is still a conflict.
+    """
+    return canonical_disposition(value) if key == FIELD_DISPOSITION_KEY else value
+
+
+#: The marker field key carrying the disposition token. Named because the authority conflict check
+#: canonicalizes THIS key's values before comparing them (``merged`` and ``merge`` are one
+#: declaration) while every other key compares literally.
+FIELD_DISPOSITION_KEY = "disposition"
 
 #: Durable spellings the coordinator actually writes -> the canonical closed token. The
 #: canonical tokens are the acceptance vocabulary (``merge`` / ``patch_equivalent`` /
@@ -332,23 +349,125 @@ def fold_work_unit(journals: Sequence[Tuple[object, str]]) -> str:
         jint = _int_journal(journal_id)
         if jint is None:
             continue
-        match = _WORK_UNIT_FIELD_RE.search(notes or "")
-        if match is None:
+        declared = [m.group("value") for m in _WORK_UNIT_FIELD_RE.finditer(notes or "")]
+        if not declared:
             continue  # no declaration here — this journal says nothing about the work unit
         # A declaration IS present, so it supersedes regardless of what it says. An
         # unrecognized value resolves to "" (undeclared), which routes to the same-lane
         # implementation_gateway rather than to a US-level audit.
-        token = _token(match.group("value"))
-        resolved = token if token in WORK_UNIT_GRANULARITIES else ""
+        #
+        # EVERY ``work_unit:`` line in the journal is read, not just the first (Redmine #14539
+        # review j#91797 finding 5). This value routes review AUTHORITY — ``user_story`` sends the
+        # Review Gate to the auditor's US-level audit, ``leaf_issue`` to the same-lane
+        # implementation_gateway — so first-wins meant a journal declaring both owners picked one
+        # by line order. Values that resolve to the SAME token are one declaration; two different
+        # ones are not uniquely interpretable and fold to "" (undeclared), which is the same-lane
+        # side and therefore the fail-closed direction: it never claims US-level audit authority
+        # the record does not unambiguously grant.
+        tokens = {_token(value) for value in declared}
+        resolved = ""
+        if len(tokens) == 1:
+            token = tokens.pop()
+            resolved = token if token in WORK_UNIT_GRANULARITIES else ""
         if latest is None or jint > latest[0]:
             latest = (jint, resolved)
     return latest[1] if latest is not None else ""
+
+
+def has_conflicting_disposition_declaration(
+    journals: Sequence[Tuple[object, str]],
+) -> bool:
+    """Whether any ONE journal declares two DIFFERENT integration dispositions (pure).
+
+    :func:`fold_integration_disposition` deliberately keeps its historical leniency: it takes the
+    first marker value, else the first ``disposition:`` field line, else the heading's inline
+    value. For a DISPLAY projection that is acceptable. For an AUTHORITY consumer it is not — a
+    journal carrying both ``disposition: merge`` and ``disposition: explicit_deferral`` folded to
+    whichever was written first, so the terminal retire admitted or refused the very same durable
+    record depending on line order (Redmine #14539 review j#91696 finding 3).
+
+    This is the separate, strict question an authority consumer asks BEFORE trusting the lenient
+    fold — the parser/consumer split the review names, so the glance keeps rendering what it always
+    rendered. Same rule as the exemption gate's fields (review j#91577 finding 3): values that
+    canonicalize to the SAME token are one declaration; two different tokens are not uniquely
+    interpretable and the caller must fail closed.
+
+    Only structurally qualifying journals are examined, on the same terms as
+    :func:`_journal_disposition`, so a stray ``disposition:`` line elsewhere is never a conflict.
+
+    ALL THREE governed surfaces are enumerated: ``disposition:`` field lines, workflow-event marker
+    fields, and the heading's own inline ``: <value>`` form — each with ``finditer``, never
+    ``search``. The heading was the one this function first read with ``search``, so a journal
+    carrying ``## Integration disposition: merge`` and
+    ``## Integration disposition: explicit_deferral`` reported no conflict at all (Redmine #14539
+    review j#91747 finding 4). A partial enumeration is not a conflict detector: whichever surface
+    is read singly becomes the bypass.
+    """
+    for _, notes in journals or ():
+        text = notes or ""
+        headings = [
+            m.group("value") for m in _HEADING_RE.finditer(text) if m.group("value")
+        ]
+        qualifies = _HEADING_RE.search(text) is not None
+        marker_value = _marker_disposition_value(text)
+        if not qualifies and marker_value is None:
+            continue
+        declared = {
+            canonical_disposition(m.group("value"))
+            for m in _DISPOSITION_FIELD_RE.finditer(text)
+        }
+        for channel, fields in marker_fields_in_note(text):
+            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+                continue
+            gate = (fields.get("gate") or fields.get("kind") or "").strip()
+            if gate != MARKER_GATE_INTEGRATION_DISPOSITION:
+                continue
+            raw = (fields.get("disposition") or "").strip()
+            if raw:
+                declared.add(canonical_disposition(raw))
+        declared.update(canonical_disposition(value) for value in headings)
+        if len(declared) > 1:
+            return True
+        # …and INSIDE each marker. The shared field scan folds a marker body to a dict, so a
+        # repeated key is erased before any consumer sees it and the marker's meaning depends on
+        # which occurrence came last (Redmine #14539 review j#91797 finding 4). Enumerating the
+        # surfaces was not enough: each surface also has to be checked for internal multiplicity.
+        # A malformed fragment (no ``=``) is refused for the same reason — an authority marker
+        # whose body does not parse cleanly is not a declaration this path may act on.
+        # …and INSIDE each marker, through THE shared strict reader (Redmine #14539 reviews
+        # j#91847 F3/F4 and j#91896 F2/F3). It is the same function the issuer resolver uses, so
+        # "what makes a marker body readable" has one definition: every component must be a
+        # whitespace-clean ``key=value`` with a non-empty key, and a key repeated with a different
+        # (canonical) value refuses the marker. The disposition canonicalizer is passed in, so
+        # ``merged`` and ``merge`` are one declaration written twice while every other key
+        # compares literally — the fail-closed reading for a key with no canonical vocabulary.
+        for channel, components in marker_components_in_note(text):
+            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+                continue
+            fields = strict_marker_fields(
+                components, canonicalize=canonical_marker_value
+            )
+            if fields is None:
+                # Unreadable. A body the canonical producer could not render is refused WHOLE, and
+                # since it cannot be read it cannot even be shown to be about another gate — in a
+                # journal that already qualifies as a disposition declaration that is a conflict.
+                return True
+            # ``gate`` / ``kind`` are two spellings of one logical field: UNIONED, never
+            # first-non-empty, so a second gate cannot hide in the other alias.
+            gates = marker_logical_gates(fields)
+            if MARKER_GATE_INTEGRATION_DISPOSITION not in gates:
+                continue
+            if len(gates) > 1:
+                return True
+    return False
 
 
 __all__ = (
     "MARKER_GATE_INTEGRATION_DISPOSITION",
     "IntegrationDispositionFacts",
     "canonical_disposition",
+    "canonical_marker_value",
     "fold_integration_disposition",
     "fold_work_unit",
+    "has_conflicting_disposition_declaration",
 )

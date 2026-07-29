@@ -121,7 +121,33 @@ def register_sublane_retire(
             "#13518 R2-F7 / R3-F2: assert (from the durable review journals) that the LATEST review "
             "generation is approved AND carries no unresolved blocking finding. Fail-closed when "
             "unset: the actual retire/integration no longer default-admits a stale approval. Ignored "
-            "when --review-generation-json is supplied (that MEASURES it at action-time)."
+            "when --review-generation-json or --review-exemption-json is supplied (those MEASURE "
+            "admissibility at action-time). Do NOT pass it for a review-exempt lane: there is no "
+            "review generation to be approved, so the assert would be false — use "
+            "--review-exemption-json instead (#14539)."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--review-exemption-json",
+        dest="review_exemption_json",
+        default=None,
+        help=(
+            "#14539: path to the issue's durable journals "
+            "{issue, journals:[{journal_id, notes}]}. When supplied, the retire RE-VERIFIES at "
+            "action-time that a `codex_direct_edit` gate with `follow_up_review: false` is in "
+            "force AND the issue records Close AND the integration disposition is complete — the "
+            "three facts that let a review-exempt lane pass the latest-generation fence without a "
+            "false --latest-generation-admissible assert. The observation's `issue` MUST literal "
+            "exact-match --issue (evidence from another issue never unlocks this fence), the gate's "
+            "`allowed_paths` must cover the record's declared changed_paths, and a review round "
+            "opened AFTER the exemption re-owes the review. Fail-closed on an unreadable / "
+            "malformed file or on any missing fact. The integration half is proved by the "
+            "lane-enveloped strict evidence on the CURRENT disposition journal, whose reviewed "
+            "source head must be the covered commit, whose envelope must match the retire "
+            "TARGET's own lifecycle row (workspace / lane / generation, measured from durable "
+            "state — never from a flag) and --integration-branch, and whose issuer must resolve "
+            "to the coordinator under the Hibernate Evidence Marker Contract; a legacy "
+            "lane-unbound note is valid for the glance but never auto-admits a retire."
         ),
     )
     sublane_retire.add_argument(

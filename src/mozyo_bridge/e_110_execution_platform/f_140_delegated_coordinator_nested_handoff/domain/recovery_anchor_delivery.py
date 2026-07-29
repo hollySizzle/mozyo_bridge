@@ -13,6 +13,10 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+    strict_marker_body_fields,
+)
+
 
 KIND_REPLY = "reply"
 KIND_IMPLEMENTATION_REQUEST = "implementation_request"
@@ -247,28 +251,22 @@ def _strict_marker_fields(
     pattern: re.Pattern[str],
     expected: frozenset[str],
 ) -> dict[str, str] | None:
+    """Exactly one marker of ``pattern``, read by the SHARED strict grammar (pure).
+
+    This module owns which channel it reads and how many markers a journal may carry; it does not
+    own what a renderable body looks like (Redmine #14539 review j#92174 finding 3). The body split
+    that used to live here was strict, but privately so, which is how a grammar drifts unobserved.
+
+    Routing it to :func:`strict_marker_body_fields` also tightens it: the old loop stripped each
+    component before judging it, so ``issue = 14539`` passed as a clean ``issue`` field even though
+    no canonical producer renders it. The closed-field-set and repeated-key rules are unchanged.
+    """
     if not isinstance(notes, str):
         return None
     matches = tuple(pattern.finditer(notes))
     if len(matches) != 1:
         return None
-    fields: dict[str, str] = {}
-    for raw_token in matches[0].group("body").split(":"):
-        token = raw_token.strip()
-        key, separator, value = token.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if (
-            not separator
-            or not key
-            or not value
-            or key in fields
-            or key not in expected
-            or any(character.isspace() for character in key)
-        ):
-            return None
-        fields[key] = value
-    return fields if frozenset(fields) == expected else None
+    return strict_marker_body_fields(matches[0].group("body"), expected=expected)
 
 
 def parse_recovery_delivery_authorizations(

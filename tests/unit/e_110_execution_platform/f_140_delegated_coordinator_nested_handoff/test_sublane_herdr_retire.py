@@ -24,6 +24,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     execute_herdr_retire_close,
     plan_herdr_retire_close,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
+    RetireEvidenceTarget,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
@@ -404,7 +407,25 @@ class NonGitRetireCloseTest(unittest.TestCase):
                 ), patch.object(
                     retire_mod, "execute_herdr_retire_close", side_effect=_fake_execute
                 ):
-                    result = actuation.run_guarded_retire_close(args, root)
+                    # Redmine #14539 review j#91896 F1: the destructive generic close now
+                    # REQUIRES the lane's resolved lifecycle target — an unresolvable one is
+                    # zero-actuation — and binds it to the exact (workspace, lane) key. The row
+                    # this test declares above is that target, at its freshly-declared
+                    # generation / revision.
+                    declared = LaneLifecycleStore().get(
+                        LaneLifecycleKey(project_ws, lane_label)
+                    )
+                    result = actuation.run_guarded_retire_close(
+                        args,
+                        root,
+                        evidence_target=RetireEvidenceTarget(
+                            workspace=project_ws,
+                            lane=lane_label,
+                            lane_generation=declared.lane_generation,
+                            policy_pointer="",
+                            revision=declared.revision,
+                        ),
+                    )
                 records = load_lane_records(home=home)
 
         plan = captured["plan"]

@@ -108,6 +108,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     fold_integration_disposition,
     fold_work_unit,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_exemption import (
+    ReviewExemptionFacts,
+    fold_review_exemption,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
     correlated_review_request_journal,
     is_explicit_review_conclusion,
@@ -356,8 +360,13 @@ _MARKER_SHADOW = "shadow"
 
 # An explicit commit-hash field on a gate journal (``commit`` / ``commit_or_diff`` /
 # ``commit_hash`` / ``target_commit`` … : <hex>). Markdown emphasis / list markers tolerated.
+#: The hash is CAPTURED, not merely detected: ``commit_bearing`` only needs "a commit is declared",
+#: but the review-exemption retire fence needs the identity itself (Redmine #14539 j#91577 F2).
+#: The upper bound is 64 (SHA-256) rather than 40 so a longer hash is captured whole instead of
+#: truncated into a value that could never equal the exemption module's — the match set is
+#: unchanged, since a 64-hex run already matched here as its first 40 characters.
 _COMMIT_FIELD_RE = re.compile(
-    r"(?im)^\s*[-*]?\s*\**\s*(?:commit|commit_or_diff|commit_hash|target_commit(?:_or_diff)?)\**\s*[:：]\s*\**`?\s*[0-9a-f]{7,40}"
+    r"(?im)^\s*[-*]?\s*\**\s*(?:commit|commit_or_diff|commit_hash|target_commit(?:_or_diff)?)\**\s*[:：]\s*\**`?\s*(?P<value>[0-9a-f]{7,64})"
 )
 
 
@@ -651,6 +660,13 @@ class GateFacts:
     it False *and* records the pending disposition, which is what keeps an approved-but-
     unmerged lane out of owner-close guidance. ``work_unit`` is the governed granularity the
     durable record declares (``leaf_issue`` / ``user_story``), or ``""`` when undeclared.
+
+    ``review_exemption`` is the LATEST typed ``codex_direct_edit`` exemption (Redmine #14539);
+    ``review_exempt`` is the derived "no independent review is owed *right now*" fact — the
+    exemption is in force AND no newer review round supersedes it. ``latest_gate_commit`` is the
+    commit the LATEST gate journal declares (``""`` when it declares none, or two different ones),
+    which is what lets a consumer check that the latest gate is about the same commit as the rest
+    of the evidence rather than merely existing.
     """
 
     latest_gate: str
@@ -663,6 +679,9 @@ class GateFacts:
         default_factory=IntegrationDispositionFacts
     )
     work_unit: str = ""
+    review_exemption: ReviewExemptionFacts = field(default_factory=ReviewExemptionFacts)
+    review_exempt: bool = False
+    latest_gate_commit: str = ""
 
 
 @dataclass(frozen=True)
@@ -672,6 +691,86 @@ class _RecognizedJournal:
     review_conclusion: str
     commit_bearing: bool
     blocker: bool = False  # an audit review that concluded ``blocker``
+    #: EVERY gate this journal recognized, not just the max-precedence one. A governed journal may
+    #: combine gates in one heading (``## Gate: Review Request + Close``), and ``gate`` keeps only
+    #: the most advanced of them — correct for "what state is the lane in", wrong for any question
+    #: about whether a PARTICULAR gate occurred. Asking the reduced value cost the review-round and
+    #: change-bearing facts of every combined journal (Redmine #14539 review j#91577 finding 1).
+    #: Defaults to empty so a directly-constructed instance stays usable; ``gates_or_gate`` reads
+    #: it with the single-gate fallback.
+    gates: frozenset = frozenset()
+    #: The single commit this journal declares, or ``""`` when it declares none or declares two
+    #: different ones. Used to bind the terminal retire's Close evidence to the commit the review
+    #: exemption's path coverage was proven for (Redmine #14539 review j#91577 finding 2).
+    commit: str = ""
+
+    @property
+    def gates_or_gate(self) -> frozenset:
+        """Every recognized gate, falling back to the reduced ``gate`` when unset (pure)."""
+        return self.gates or frozenset({self.gate})
+
+
+#: The recognized gates that constitute an OPEN review round. A round is an explicit request for
+#: an independent review, so an exemption recorded BEFORE it does not close it (Redmine #14539).
+#: ``implementation_done`` is deliberately absent: it states that implementation finished, not
+#: that a review was requested — whether a review is owed on it is exactly what the exemption
+#: policy decides, so its ordering against the exemption journal is irrelevant.
+_REVIEW_ROUND_GATES: frozenset[str] = frozenset({GATE_REVIEW_REQUEST, GATE_REVIEW})
+
+#: The recognized gates whose journal, when it declares a commit, ANNOUNCES A NEW TARGET COMMIT as
+#: an implementation result — so it declares a change scope even when it omits ``changed_paths``
+#: (Redmine #14539 review j#90289 R3-F1). ``close`` / ``owner_close_approval`` are deliberately
+#: absent: they also carry a commit, but they report on work already scoped, so treating them as
+#: declarations would erase the scope of the very work they close. Passed to
+#: :func:`...review_exemption.fold_declared_change_scope` so the gate vocabulary stays here.
+_CHANGE_BEARING_GATES: frozenset[str] = frozenset(
+    {GATE_IMPLEMENTATION_DONE, GATE_REVIEW_REQUEST}
+)
+
+
+def _is_open_review_round(gates: "frozenset | set", conclusion: str) -> bool:
+    """Whether this journal's gates constitute an OPEN review round (pure).
+
+    A ``review_request`` is always open — it asks for a review that has not answered yet. A
+    ``review`` is open unless it CONCLUDED approved; ``pending`` (an unreadable / absent 結論) and
+    ``changes_requested`` both leave the round owed, and ``pending`` in particular must count as
+    open because it is the fail-closed read of a review whose conclusion could not be established.
+    """
+    if GATE_REVIEW_REQUEST in gates:
+        return True
+    return GATE_REVIEW in gates and conclusion != REVIEW_APPROVED
+
+
+def _review_exempt_now(
+    exemption: ReviewExemptionFacts, recognized: Sequence["_RecognizedJournal"]
+) -> bool:
+    """Whether the durable exemption is in force AND not superseded by a review round (pure).
+
+    An exemption exempts what it precedes in the durable record, not what supersedes it:
+
+    - no review round at all (the common direct-edit lane, whose latest gate is
+      ``implementation_done`` / ``close``) -> the exemption stands;
+    - a review round recorded BEFORE the exemption journal (the "superseded past Review Request"
+      the #14539 acceptance names) -> the exemption supersedes it, so the round is not re-projected
+      as ``review_waiting``;
+    - a review round recorded AFTER the exemption journal -> a review was opened on top of the
+      exemption, so the review is owed again. Fail-closed, and the safe side.
+
+    An unparseable exemption journal id also fails closed (no exemption), because the ordering
+    that makes the exemption safe could not be established.
+    """
+    if not exemption.validated().in_force:
+        return False
+    exemption_journal = _int_journal(exemption.journal)
+    if exemption_journal is None:
+        return False
+    # Every recognized gate of each journal, not the max-precedence reduction: a
+    # ``## Gate: Review Request + Close`` IS an open review round, and reducing it to ``close``
+    # made the round invisible here (review j#91577 finding 1).
+    rounds = [r.journal_id for r in recognized if r.gates_or_gate & _REVIEW_ROUND_GATES]
+    if not rounds:
+        return True
+    return exemption_journal > max(rounds)
 
 
 def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[GateFacts]:
@@ -723,24 +822,49 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         if marker_review_gates:
             # F8: the structured review authority replaces a conflicting heading review gate.
             gates -= _MARKER_ESTABLISHED_GATES
-            # F10: an open review round is current, so a conflicting close / owner-close heading may
-            # not advance the lane past it (blocked stays — a stop is safe-side; impl_done stays —
-            # it is a sticky-fact gate below review).
-            gates -= _REVIEW_SUPERSEDES_PROGRESSION
             gates |= marker_review_gates
+            # F10 used to be applied HERE, unconditionally and before the conclusion was known.
+            # It now runs once below, after the outcome is resolved, for both the marker and the
+            # heading path (Redmine #14539 review j#91747 finding 1) — see there.
         marker_disposition, marker_conclusion, marker_blocker = _review_result_disposition(
             issue_markers, jid_s
         )
         if not gates:
             continue
-        top_gate = max(gates, key=lambda g: _GATE_PRECEDENCE.get(g, 0))
         if GATE_REVIEW in gates:
             conclusion, blocker = _review_outcome(
                 notes, review_qualifier, marker_disposition, marker_conclusion, marker_blocker
             )
         else:
             conclusion, blocker = REVIEW_PENDING, False
-        commit_bearing = bool(gates & _COMMIT_BEARING_GATES) and bool(_COMMIT_FIELD_RE.search(notes or ""))
+        # F10, in ONE place, for BOTH paths, and only once the outcome is known (Redmine #14539
+        # reviews j#91696 finding 1 and j#91747 finding 1). An open review round may not be
+        # advanced past by a conflicting close / owner-close heading.
+        #
+        # It used to be applied twice and wrongly on each side: the marker branch removed the
+        # progression gates unconditionally, BEFORE the conclusion was resolved, so a canonical
+        # ``conclusion=approved`` review lost its Close; the heading path did not apply it at all,
+        # so a heading-only ``Review Request + Close`` kept its Close and projected retire_ready.
+        # The two halves of the same record therefore disagreed depending only on whether a marker
+        # was present. Resolving the outcome first and asking once fixes both directions: an
+        # APPROVED review is not an open round and keeps advancing — the governed close-time
+        # combination — while request / changes_requested / blocker / pending suppress.
+        #
+        # ``gates`` cannot empty out here: the predicate is true only when ``review_request`` or
+        # ``review`` is present, and neither is in :data:`_REVIEW_SUPERSEDES_PROGRESSION`.
+        if _is_open_review_round(gates, conclusion):
+            gates -= _REVIEW_SUPERSEDES_PROGRESSION
+        top_gate = max(gates, key=lambda g: _GATE_PRECEDENCE.get(g, 0))
+        # The commit this gate journal declares, read with the exactly-one rule the exemption
+        # module uses (review j#91577 finding 3): a journal naming two different commits declares
+        # neither, so a safety fence downstream cannot bind to whichever came first.
+        declared_commits = {
+            m.group("value").strip().lower() for m in _COMMIT_FIELD_RE.finditer(notes or "")
+        }
+        # ``commit_bearing`` is unchanged — it asks whether a commit is declared at all, which two
+        # conflicting ones still satisfy. Only the identity used for binding falls back to "".
+        commit = next(iter(declared_commits)) if len(declared_commits) == 1 else ""
+        commit_bearing = bool(gates & _COMMIT_BEARING_GATES) and bool(declared_commits)
         recognized.append(
             _RecognizedJournal(
                 journal_id=jint,
@@ -748,11 +872,31 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
                 review_conclusion=conclusion,
                 commit_bearing=commit_bearing,
                 blocker=blocker,
+                gates=frozenset(gates),
+                commit=commit,
             )
         )
 
     if not recognized:
         return None
+
+    # Redmine #14539: the ``codex_direct_edit`` review exemption is a third issue-wide,
+    # latest-wins authority fact standing in its OWN journal (its heading is deliberately NOT in
+    # ``_HEADING_GATE`` — it is an authority declaration, never a lifecycle gate). Its path-coverage
+    # check needs to know which journals are CHANGE-BEARING gates, and gate recognition lives here,
+    # so the ids are computed from the recognized set and passed down rather than re-derived in the
+    # exemption module — one gate vocabulary, not two (review j#90289 R3-F1).
+    # Read from EVERY recognized gate of the journal, not the max-precedence reduction: a
+    # ``## Gate: Implementation Done + Close`` announces an implementation result, and reducing it
+    # to ``close`` made it declare nothing — so the PREVIOUS commit's scope stayed authoritative
+    # and the exemption was checked against it (review j#91577 finding 1). The ``close`` boundary
+    # is unchanged: a journal whose ONLY gate is ``close`` still declares nothing.
+    change_bearing_journals = [
+        str(r.journal_id) for r in recognized if r.gates_or_gate & _CHANGE_BEARING_GATES
+    ]
+    review_exemption = fold_review_exemption(
+        journals or (), change_bearing_journals=change_bearing_journals
+    )
 
     latest = max(recognized, key=lambda r: r.journal_id)
     return GateFacts(
@@ -764,6 +908,9 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         blocker_recorded=(latest.gate == GATE_BLOCKED or latest.blocker),
         integration=integration,
         work_unit=work_unit,
+        review_exemption=review_exemption,
+        review_exempt=_review_exempt_now(review_exemption, recognized),
+        latest_gate_commit=latest.commit,
     )
 
 
@@ -793,6 +940,10 @@ def lane_signal_from_gate_facts(
         # Redmine #14213: the TYPED disposition is what lets the classifier tell "integrated"
         # from "explicitly deferred / blocked" at the approved-review step.
         integration_disposition=facts.integration.validated().disposition,
+        # Redmine #14539: the derived exemption fact. The ordering authority (is a review round
+        # newer than the exemption?) is resolved in the fold, where the journal ids live, so the
+        # classifier stays a flat function over facts.
+        review_exempt=facts.review_exempt,
     )
 
 

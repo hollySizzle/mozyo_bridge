@@ -59,6 +59,7 @@ from typing import Mapping, Optional, Sequence, Tuple
 
 from .glance_integration_disposition import (
     MARKER_GATE_INTEGRATION_DISPOSITION,
+    canonical_marker_value,
     fold_integration_disposition,
 )
 from .hibernate_evidence_authority import (
@@ -114,7 +115,11 @@ from .hibernate_evidence_marker import (
     HibernateEvidence,
     resolve_hibernate_evidence,
 )
-from .redmine_journal_source import MARKER_CHANNEL_WORKFLOW_EVENT, marker_fields_in_note
+from .redmine_journal_source import (
+    MARKER_CHANNEL_WORKFLOW_EVENT,
+    declares_gate,
+    strict_gate_markers,
+)
 from .sublane_admission import REVIEW_APPROVED
 
 #: The gate whose marker declares the review generation a ``review_result`` must answer.
@@ -279,12 +284,18 @@ class _Declaration:
 
 
 def _markers_of(notes: str, gate: str) -> tuple:
-    return tuple(
-        fields
-        for channel, fields in marker_fields_in_note(notes or "")
-        if channel == MARKER_CHANNEL_WORKFLOW_EVENT
-        and str(fields.get("gate", "") or fields.get("kind", "") or "").strip() == gate
-    )
+    """Every STRICTLY readable ``gate`` marker in a note (pure).
+
+    Reads through the shared strict reader (Redmine #14539 review j#91943 finding 1). The lenient
+    field fold this used to call collapses a repeated key by last-write-wins and normalizes
+    whitespace, so a body no canonical producer can render arrived looking clean — and this is an
+    authority surface: what it returns becomes the hibernate basis. A marker that is not renderable
+    yields nothing, and ``gate`` / ``kind`` are unioned so a second claim cannot hide in the other
+    spelling (a marker naming two gates matches neither).
+    """
+    # The governed canonicalizer travels with the gate: two spellings of one disposition token are
+    # one declaration, exactly as the terminal consumers read them (review j#92012 finding 3).
+    return strict_gate_markers(notes, gate, canonicalize=canonical_marker_value)
 
 
 def _latest_gate_declaration(
@@ -302,13 +313,18 @@ def _latest_gate_declaration(
         jint = _journal_int(journal.journal_id)
         if jint is None:
             continue
-        found = _markers_of(journal.notes, gate)
-        if not found:
+        # Selection is by DECLARATION, parsing is separate (review j#92012 finding 1). Keying the
+        # scan on the STRICT markers collapsed the two: a newer malformed declaration produced no
+        # markers, so the journal was skipped and an OLDER valid one came back as current — the
+        # exact supersede-by-existence defect this docstring warns about. A journal that names the
+        # gate is current whatever its marker turns out to be; if that marker does not parse the
+        # declaration simply carries no evidence.
+        if not declares_gate(journal.notes, gate):
             continue
         if latest is None or jint > latest[0]:
             latest = (jint, _Declaration(
                 journal=str(jint),
-                markers=found,
+                markers=_markers_of(journal.notes, gate),
                 issuer=journal.issuer,
                 notes=journal.notes or "",
             ))
@@ -388,11 +404,13 @@ def _answered_review_request(
         jint = _journal_int(journal.journal_id)
         if jint is None or jint >= result_id:
             continue
-        markers = _markers_of(journal.notes, MARKER_GATE_REVIEW_REQUEST)
-        if not markers:
+        # Selection by DECLARATION, exactly as ``_latest_gate_declaration`` (review j#92060
+        # finding 1): keying on the strict markers meant a malformed newer request did not shadow
+        # an older valid one, so the older request came back as the answered round.
+        if not declares_gate(journal.notes, MARKER_GATE_REVIEW_REQUEST):
             continue
         if best is None or jint > best[0]:
-            best = (jint, markers)
+            best = (jint, _markers_of(journal.notes, MARKER_GATE_REVIEW_REQUEST))
     if best is None:
         return "", ""
     heads = {str(fields.get(FIELD_HEAD, "") or "").strip() for fields in best[1]}
@@ -413,10 +431,12 @@ def _review_request_after(
     result_id = _journal_int(result_journal)
     if result_id is None:
         return False
+    # A re-review request REOPENS by existing. An unreadable one still reopens — refusing to see
+    # it would let an approval outlive a round the record says was reopened (review j#92060 F1).
     return any(
         _journal_int(journal.journal_id) is not None
         and _journal_int(journal.journal_id) > result_id
-        and _markers_of(journal.notes, MARKER_GATE_REVIEW_REQUEST)
+        and declares_gate(journal.notes, MARKER_GATE_REVIEW_REQUEST)
         for journal in journals or ()
     )
 
@@ -644,7 +664,7 @@ def produce_basis_conjuncts(
             # (1) is the canonical correlation rule; (2) is what keeps an approval from outliving
             # its round. A later request cannot retroactively validate an earlier approval (it is
             # not the answered request), and it also invalidates the round that approval closed.
-            if _markers_of(declaration.notes, MARKER_GATE_REVIEW_REQUEST):
+            if declares_gate(declaration.notes, MARKER_GATE_REVIEW_REQUEST):
                 # Contradictory in ONE record: answering an earlier round while opening a new one.
                 # Neither the strictly-before correlation (which looks before this journal) nor the
                 # supersession check (which looks after it) can see a request filed in the result's

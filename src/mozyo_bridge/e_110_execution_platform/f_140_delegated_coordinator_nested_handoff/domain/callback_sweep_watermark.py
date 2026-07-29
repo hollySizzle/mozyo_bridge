@@ -50,7 +50,9 @@ from typing import Any, Iterable
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     GATE_BEARING_KINDS,
     MARKER_CHANNEL_WORKFLOW_EVENT,
-    marker_fields_in_note,
+    marker_logical_gates,
+    strict_gate_markers,
+    strict_marker_fields_in_note,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
@@ -146,10 +148,19 @@ def _entry_progress_kinds(entry: object, *, lane: str, lane_generation: object) 
     lane_s = str(lane or "").strip()
     gen_s = str(lane_generation if lane_generation is not None else "").strip()
     kinds: set[str] = set()
-    for channel, fields in marker_fields_in_note(str(getattr(entry, "notes", "") or "")):
+    # Effect-reaching: this classification decides whether the sweep may send, so an unreadable
+    # marker anywhere in the entry refuses the entry rather than contributing progress
+    # (Redmine #14539 review j#92060 finding 2).
+    for channel, fields in strict_marker_fields_in_note(
+        str(getattr(entry, "notes", "") or "")
+    ) or ():
         if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
             continue
-        named = (fields.get("gate") or fields.get("kind") or "").strip()
+        # Both aliases are ONE logical field: a note naming two tokens proves neither.
+        declared = marker_logical_gates(fields)
+        if len(declared) != 1:
+            continue
+        named = next(iter(declared))
         if named not in QUALIFYING_PROGRESS_KINDS:
             continue
         marker_lane = str(fields.get("lane", "")).strip()
@@ -173,7 +184,10 @@ def _entry_is_classified(entry: object) -> bool:
     counts as progress. An entry with no recognized token is **opaque** — it could be a worker's
     prose gate or coordinator noise, and nothing on it says which.
     """
-    return bool(marker_fields_in_note(str(getattr(entry, "notes", "") or "")))
+    # An entry carrying an UNREADABLE marker is not "understood" — it is opaque, which is exactly
+    # what ``stall_unprovable`` exists to say. Counting it as classified let a producer-impossible
+    # body flip the sweep to ``stall_provable`` (review j#92060 finding 2).
+    return bool(strict_marker_fields_in_note(str(getattr(entry, "notes", "") or "")))
 
 
 def progress_entries_after(
@@ -527,11 +541,9 @@ def sweep_record_journals(
         jid = str(getattr(entry, "journal_id", "") or "").strip()
         if not jid:
             continue
-        for channel, fields in marker_fields_in_note(str(getattr(entry, "notes", "") or "")):
-            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
-                continue
-            if str(fields.get("kind", "")).strip() != SWEEP_RECORD_KIND:
-                continue
+        for fields in strict_gate_markers(
+            str(getattr(entry, "notes", "") or ""), SWEEP_RECORD_KIND
+        ):
             if str(fields.get("lane", "")).strip() != lane_s:
                 continue
             if str(fields.get("lane_generation", "")).strip() != gen_s:

@@ -77,7 +77,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     MARKER_CHANNEL_WORKFLOW_EVENT,
-    marker_fields_in_note,
+    strict_gate_markers,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (
     ACTUATION_RECOVERED,
@@ -648,11 +648,14 @@ class LiveBoundPairPreparationOps(LiveBoundPairConvergenceOps):
         source = LiveRedmineJournalSource.from_environment(environ=self.env)
         entries = source.read_entries(issue)
         exact = [entry for entry in entries if norm(entry.journal_id) == norm(journal)]
+        # The owner approval is DESTRUCTIVE authority: an exact match here admits the replacement
+        # transaction / guarded close. So it is read with the shared strict gate reader, not the
+        # lenient field fold (Redmine #14539 review j#92012 finding 2) — the fold accepted a
+        # whitespace-contaminated gate, a repeated key resolved by last-write-wins, and an unknown
+        # second gate alias, each yielding an approval indistinguishable from the genuine one.
         fields: list[Mapping[str, str]] = []
         for entry in exact:
-            for channel, marker in marker_fields_in_note(entry.notes):
-                if channel == MARKER_CHANNEL_WORKFLOW_EVENT and norm(marker.get("gate")) == APPROVAL_GATE:
-                    fields.append(marker)
+            fields.extend(strict_gate_markers(entry.notes, APPROVAL_GATE))
         return tuple(fields)
 
     @staticmethod
