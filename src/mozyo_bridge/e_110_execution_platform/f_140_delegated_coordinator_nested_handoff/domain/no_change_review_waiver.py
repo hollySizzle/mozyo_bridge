@@ -24,13 +24,18 @@ same downstream question ("is an independent review owed right now?") from diffe
 - this waiver — NO work was produced, so there is nothing to review, nothing to integrate, and
   the carve-out is the mirror image: any declared change at all refuses it.
 
-**Why this is not a relaxation of the review fence.** A waiver admits a lane only when the
-durable record says the lane produced nothing AND the live repository still agrees. A lane that
-produced commits — ordinary development, a guardrail change, a release — can never reach it,
-because a single declared commit, changed path, change-bearing gate or integration disposition
-refuses (:func:`fold_zero_change_record`). The ordinary review-generation fence and the #14539
-exemption route are untouched; this is a third independent route to the SAME single fence, and
-each route can only ever admit, never widen the others.
+**CURRENT STATE: this route admits NOTHING.** See :data:`WRITER_AUTHORITY_RESOLVABLE`. Everything
+below describes a contract that is fully implemented and tested but deliberately inert, because
+the one fact it depends on — who WROTE the waiver — cannot be established in this record system.
+The rest of this docstring therefore describes the PROPOSED contract, not a working admission
+path; nothing here should be read as a defence that currently protects anything.
+
+**Why enabling it would not be a relaxation of the review fence** (proposed, unimplemented). A
+waiver would admit a lane only when the durable record says the lane produced nothing AND the live
+repository still agrees. A lane that produced commits — ordinary development, a guardrail change,
+a release — could never reach it, because a single declared commit, changed path, change-bearing
+gate or integration disposition refuses (:func:`fold_zero_change_record`). The ordinary
+review-generation fence and the #14539 exemption route are untouched either way.
 
 **Structured marker only, closed vocabulary, exact field set.** The gate is declared by a
 canonical ``[mozyo:workflow-event:gate=no_change_review_waiver:...]`` marker, read through the
@@ -47,9 +52,14 @@ by that module's parser. A waiver therefore cannot be reused across lanes or acr
 generation of its own lane, and its ``head`` is what makes post-waiver mutation detectable.
 
 **Two axes, never conflated** (#14661 Design Answer j#92641): ``approval_source=direct_owner`` is
-WHOSE decision the record reports; who was allowed to RECORD it is resolved separately from the
-gate->role policy with a durable anchor (:mod:`.hibernate_evidence_authority`). A marker that
-names an approval source proves nothing about its writer.
+WHOSE decision the record reports; who was allowed to RECORD it is a separate question. A marker
+that names an approval source proves nothing about its writer.
+
+**And the writer axis is UNRESOLVED here.** :mod:`.hibernate_evidence_authority` /
+:mod:`.hibernate_issuer_policy` resolve a gate to its contracted writer ROLE as policy — that
+resolution takes no author input and says so — which identifies a contract, not an actor. Review
+j#93776 finding 1 measured the consequence: a record with no author and no receipt satisfied every
+check. Do not read the issuer resolution as a writer check; it is not one.
 
 Boundary: pure. No IO, no Redmine, no git. The live repository half of the zero-change proof is
 necessarily measured by the application layer and arrives here as parameters — see
@@ -139,13 +149,18 @@ WAIVER_SCOPE = "no_change_investigation"
 #: owner decision qualifies. This is the provenance axis, never the writer axis.
 WAIVER_APPROVAL_SOURCE = "direct_owner"
 #: The only admissible ``carve_out`` value. The marker states the coordinator's carve-out finding
-#: INSIDE the lane envelope, so overwriting it requires forging the exact workspace / lane /
-#: generation / head — not merely appending another note to the issue (review j#93704 finding 1).
+#: INSIDE the lane envelope rather than in a bare field appended anywhere on the issue (review
+#: j#93704 finding 1).
 #:
-#: This does NOT make the marker self-certifying, which j#93412 §3 forbids: the separate governed
-#: ``carve_out_check`` field must independently agree, and a carve-out surface named ANYWHERE in
-#: the record still refuses. The marker binds the determination to a lane; the governed field is
-#: the determination; a recognized fact overrides both.
+#: **This is NOT a writer defence, and an earlier revision wrongly said it was.** It claimed
+#: overwriting the determination "requires forging the exact workspace / lane / generation / head".
+#: Review j#93776 finding 1 refuted that: a lane worker KNOWS all four values for its own lane, so
+#: the envelope is a value it fills in, not a signature it must forge. What binding the field to
+#: the envelope actually buys is narrower — the determination travels with the record it is about,
+#: instead of being a loose field any note on the issue can restate.
+#:
+#: The governed ``carve_out_check`` field must still independently agree, and a carve-out surface
+#: named ANYWHERE in the record still refuses. Neither of those is a writer check either.
 WAIVER_CARVE_OUT_NONE = "none"
 
 #: The COMPLETE, ORDERED field set a canonical waiver marker carries — no more, no less, in this
@@ -739,10 +754,13 @@ def evaluate_no_change_waiver_admissible(
     #
     # Note what the two halves each contribute (review j#93704 finding 1). The marker's
     # ``carve_out=none`` — validated above as part of the closed field set — binds a determination
-    # to THIS lane envelope and head, so changing it requires forging that identity rather than
-    # appending a note. ``carve_out`` here is the INDEPENDENT governed ``carve_out_check`` field
-    # plus the recognized-fact detection. Requiring both is what keeps the marker from certifying
-    # itself while still denying an arbitrary journal the power to write the clear.
+    # to THIS lane envelope and head rather than floating loose on the issue. ``carve_out`` here is
+    # the INDEPENDENT governed ``carve_out_check`` field plus the recognized-fact detection.
+    #
+    # Requiring both keeps the marker from certifying itself. It does NOT establish who wrote
+    # either one — an earlier revision claimed the envelope forced a forgery, which review j#93776
+    # finding 1 refuted (the lane's own worker knows every envelope value). The writer question is
+    # answered by :data:`WRITER_AUTHORITY_RESOLVABLE`, and today it answers "cannot".
     if not carve_out.clear:
         return AdmissionResult(
             False,

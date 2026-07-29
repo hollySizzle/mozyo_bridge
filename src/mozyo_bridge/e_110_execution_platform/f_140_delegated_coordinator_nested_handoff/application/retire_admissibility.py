@@ -11,12 +11,14 @@ kinds of durable evidence measured at action time, plus the operator's fallback 
   covered by a valid ``codex_direct_edit`` gate with ``follow_up_review: false`` has no review
   generation at all, so it is admitted on exemption + Close + complete integration instead of
   on a review that never happened;
-- :func:`_resolve_no_change_waiver_admissible` — the no-change WAIVER fence (#14695): a lane that
-  produced no repository change at all likewise has no review generation, and is admitted on a
-  direct-owner waiver + Close + a zero-change record + live repository facts that still agree.
+- :func:`_resolve_no_change_waiver_admissible` — the no-change WAIVER fence (#14695). **It admits
+  nothing today**: the record system cannot establish who WROTE a waiver, so the route always
+  refuses with a typed reason (see ``no_change_review_waiver.WRITER_AUTHORITY_RESOLVABLE``). Its
+  checks are implemented and tested so that a future writer-authority ruling wires in an authority
+  rather than a re-implementation.
 
-The three are independent routes to ONE fence and each can only admit. Adding a route never
-weakens the others: a lane that fails all three is blocked exactly as before.
+The routes are independent and each can only ever admit; none can weaken another. A lane that
+fails all of them is blocked exactly as it was before any of them existed.
 
 Carved out of :mod:`.sublane_lifecycle_command` (Redmine #14539) when adding the second route
 pushed that module past the oversized-module gate. This is a pure move plus the new route: the
@@ -339,6 +341,35 @@ def _resolve_review_exemption_admissible(
 
 
 @dataclass(frozen=True)
+class GenerationAdmissibility:
+    """The resolved fence answer PLUS the reason a route refused (Redmine #14695 j#93807 F2).
+
+    ``admissible`` is the boolean the retire has always fenced on. ``reason`` is the typed token
+    the deciding route produced, or ``""`` when no route said anything more specific than "not
+    admissible" — in which case the generic ``stale_review_generation`` still stands downstream.
+
+    It exists because collapsing a route's refusal into a bare bool told the operator the wrong
+    thing: the waiver route's ``waiver_writer_authority_unresolvable`` is a PERMANENT, structural
+    refusal, and rendering it as a stale review generation sent them looking for an approval that
+    could never exist. A boolean cannot carry a diagnosis.
+    """
+
+    admissible: bool = False
+    reason: str = ""
+
+    def __bool__(self) -> bool:
+        """The fence answer, so every existing call site reads exactly as it did before.
+
+        This resolver returned a bare ``bool`` until #14695 needed to carry a diagnosis alongside
+        it. Changing the return type outright broke 46 assertions across the #13518 and #14539
+        suites — tests that are correct and about other issues. Truthiness IS admissibility here,
+        so honouring it keeps this change additive: callers that only need the verdict are
+        untouched, and the one caller that needs the reason reads :attr:`reason` explicitly.
+        """
+        return bool(self.admissible)
+
+
+@dataclass(frozen=True)
 class LaneChangeMeasurement:
     """The live repository facts a no-change waiver is re-verified against (Redmine #14695).
 
@@ -461,7 +492,8 @@ def _resolve_no_change_waiver_admissible(
 ) -> bool:
     """Re-verify a NO-CHANGE waived lane's terminal-retire admissibility (Redmine #14695).
 
-    The third measured route to the one ``latest_generation_admissible`` fence. #14613 produced
+    A measured route to the one ``latest_generation_admissible`` fence — **currently always
+    refusing** (see ``no_change_review_waiver.WRITER_AUTHORITY_RESOLVABLE``). #14613 produced
     zero repository change, the owner waived the independent review, and the retire still blocked
     on ``stale_review_generation`` because a lane that changed nothing has no review generation to
     be "latest" (reproduction: #14613 j#93256 / j#93262). Asserting
@@ -490,9 +522,9 @@ def _resolve_no_change_waiver_admissible(
     hard carve-out fact, an unresolved gate inventory, a newer review round, a moved head.
     """
     if not bool(getattr(args, "no_change_review_waiver", False)):
-        return False
+        return GenerationAdmissibility(False, "")
     if target is None or repo_root is None:
-        return False
+        return GenerationAdmissibility(False, REASON_WAIVER_TARGET_UNRESOLVED)
     try:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
             LiveRedmineJournalSource,
@@ -519,7 +551,7 @@ def _resolve_no_change_waiver_admissible(
 
         issue = str(getattr(args, "issue", "") or "").strip()
         if not issue:
-            return False
+            return GenerationAdmissibility(False, REASON_WAIVER_ROUTE_UNREADABLE)
 
         entries = LiveRedmineJournalSource.from_environment().read_entries(issue)
         journals = [
@@ -529,13 +561,13 @@ def _resolve_no_change_waiver_admissible(
         if not journals:
             # An empty history is not "a record that declares no change" — it is a read that
             # produced nothing, and the negative claim above must never be satisfied by silence.
-            return False
+            return GenerationAdmissibility(False, REASON_WAIVER_ROUTE_UNREADABLE)
 
         gate_facts = fold_issue_gate_facts(journals)
         if gate_facts is None:
             # No recognized gate at all: no Close evidence, and the gate inventory the hard
             # carve-out's resolution half requires could not be resolved either.
-            return False
+            return GenerationAdmissibility(False, REASON_WAIVER_ROUTE_UNREADABLE)
 
         waiver = gate_facts.review_waiver
         # The ISSUER, before the marker's own fields are trusted as authority. A marker naming
@@ -553,7 +585,7 @@ def _resolve_no_change_waiver_admissible(
             ),
             envelope=waiver.envelope,
         ) is not None:
-            return False
+            return GenerationAdmissibility(False, REASON_WAIVER_ISSUER_UNRESOLVED)
 
         measured = measure_lane_change(
             repo_root,
@@ -562,7 +594,7 @@ def _resolve_no_change_waiver_admissible(
             worktree=str(getattr(args, "worktree", "") or ""),
         )
 
-        return bool(
+        outcome = (
             evaluate_no_change_waiver_admissible(
                 waiver,
                 # The supersession half ALONE, with zero-change passed beside it as its own
@@ -586,10 +618,13 @@ def _resolve_no_change_waiver_admissible(
                 live_commits_ahead=measured.commits_ahead,
                 worktree_clean=measured.worktree_clean,
                 callbacks_drained=bool(getattr(args, "callbacks_drained", False)),
-            ).admissible
+            )
+        )
+        return GenerationAdmissibility(
+            admissible=bool(outcome.admissible), reason=str(outcome.reason or "")
         )
     except Exception:  # noqa: BLE001 - unreadable durable / live state -> fail closed
-        return False
+        return GenerationAdmissibility(False, REASON_WAIVER_ROUTE_UNREADABLE)
 
 
 def _resolve_latest_generation_admissible(
@@ -623,14 +658,18 @@ def _resolve_latest_generation_admissible(
     # function's docstring for why a caller-supplied file cannot carry a negative claim).
     waiver = bool(getattr(args, "no_change_review_waiver", False))
     if path or exemption_path or waiver:
-        return (
-            _resolve_review_generation_admissible(args)
-            or _resolve_review_exemption_admissible(args, target=target)
-            or _resolve_no_change_waiver_admissible(
-                args, target=target, repo_root=repo_root
-            )
+        if _resolve_review_generation_admissible(args):
+            return GenerationAdmissibility(True, "")
+        if _resolve_review_exemption_admissible(args, target=target):
+            return GenerationAdmissibility(True, "")
+        # The waiver route is the only one that carries a typed reason today; the other two are
+        # historical booleans and keep the generic token when they refuse.
+        return _resolve_no_change_waiver_admissible(
+            args, target=target, repo_root=repo_root
         )
-    return bool(getattr(args, "latest_generation_admissible", False))
+    return GenerationAdmissibility(
+        bool(getattr(args, "latest_generation_admissible", False)), ""
+    )
 
 
 def _resolve_review_generation_admissible(args: argparse.Namespace) -> bool:
@@ -679,8 +718,20 @@ def _resolve_review_generation_admissible(args: argparse.Namespace) -> bool:
     return False
 
 
+#: The waiver route could not even read its own inputs (no target, unreadable Redmine, no
+#: recognized gate). Distinct from a refusal the domain reasoned about.
+REASON_WAIVER_ROUTE_UNREADABLE = "waiver_route_evidence_unreadable"
+#: The retire target's lane identity could not be measured from durable state.
+REASON_WAIVER_TARGET_UNRESOLVED = "waiver_retire_target_unresolved"
+#: The waiver journal's issuer did not resolve to this gate's contracted writer.
+REASON_WAIVER_ISSUER_UNRESOLVED = "waiver_issuer_unresolved"
+
 __all__ = (
+    "GenerationAdmissibility",
     "LaneChangeMeasurement",
+    "REASON_WAIVER_ISSUER_UNRESOLVED",
+    "REASON_WAIVER_ROUTE_UNREADABLE",
+    "REASON_WAIVER_TARGET_UNRESOLVED",
     "RetireEvidenceTarget",
     "measure_lane_change",
     "resolve_retire_evidence_target",

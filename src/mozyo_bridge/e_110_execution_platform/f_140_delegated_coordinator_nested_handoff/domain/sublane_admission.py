@@ -214,6 +214,12 @@ class LaneSignal:
     #: meet at exactly one place, the step-4 predicate below. FAIL-CLOSED default, like its
     #: sibling: any caller that cannot establish the waiver leaves the review path fully armed.
     review_waived: bool = False
+    #: A waiver is DECLARED on this lane but establishes nothing, so the terminal retire refuses
+    #: it (Redmine #14695 review j#93807 finding 1). Blocks the ``retire_ready`` projection so the
+    #: glance and the retire agree about a waiver-bearing record. FAIL-CLOSED default False, and
+    #: deliberately scoped to lanes that CARRY a waiver: a closed no-commit lane with no waiver
+    #: projects ``retire_ready`` today and that is not this issue's to change.
+    review_waiver_unsupported: bool = False
 
 
 def _no_review_owed(signal: LaneSignal) -> bool:
@@ -348,6 +354,12 @@ def classify_lane_state(signal: LaneSignal) -> str:
             signal.commit_bearing and not signal.integration_recorded
         ):
             return LANE_STATE_INTEGRATION_WAITING
+        # #14695 j#93807 F1: a lane that CARRIES a waiver which establishes nothing must not read
+        # as "safe to retire" when the terminal retire will refuse it. Reported as blocked rather
+        # than retire_ready so the refusal is visible BEFORE Close, which is what the issue's
+        # Acceptance ("glance / close / terminal retire project the same conclusion") asks for.
+        if signal.review_waiver_unsupported:
+            return LANE_STATE_BLOCKED
         return LANE_STATE_RETIRE_READY
 
     # 8. no gate — no active durable work.

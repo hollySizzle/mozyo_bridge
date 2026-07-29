@@ -330,6 +330,16 @@ class RetirePreflight:
     #: case, or CLI — that omits it is BLOCKED (``stale_review_generation``), never default-admitted.
     #: Every caller must positively supply the measured / durable-record-asserted admissibility.
     latest_generation_admissible: bool = False
+    #: The TYPED reason the admissibility resolution refused, when a route produced one (Redmine
+    #: #14695 review j#93807 finding 2). Empty means "no route said anything more specific", and
+    #: the generic :data:`INTEGRATION_STALE_REVIEW_GENERATION` stands.
+    #:
+    #: This exists because a boolean cannot carry a diagnosis. The #14695 waiver route refuses with
+    #: ``waiver_writer_authority_unresolvable`` — a permanent, structural refusal that is NOT a
+    #: stale approval — and collapsing it to ``stale_review_generation`` told the operator to go
+    #: look for a review generation that never existed and never could. A route's own reason is
+    #: reported verbatim so the two are never confused; routes that say nothing are unaffected.
+    latest_generation_blocked_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -409,7 +419,15 @@ def decide_retire_integration(
         # #13518 review R2-F7 / R3-F2: the latest review generation is not admissible (a stale
         # approval for an older generation, or an unresolved blocking finding in the latest). The
         # actual integration decision — not only the non-CLI use case — now fences it.
-        blockers.add(INTEGRATION_STALE_REVIEW_GENERATION)
+        #
+        # #14695 review j#93807 finding 2: when the resolution produced a TYPED reason, report it
+        # instead. The waiver route's refusal is structural and permanent, not a stale approval,
+        # and naming it ``stale_review_generation`` sent the operator hunting for a review
+        # generation that cannot exist. A blank reason keeps the generic token exactly as before.
+        blockers.add(
+            str(preflight.latest_generation_blocked_reason or "").strip()
+            or INTEGRATION_STALE_REVIEW_GENERATION
+        )
 
     # Git-specific gates — only in a Git workspace.
     merge_attempted = False
@@ -431,7 +449,19 @@ def decide_retire_integration(
                 blockers.add(BLOCKED_MERGE_CONFLICT)
 
     if blockers:
-        ordered = tuple(r for r in _BLOCKED_REASON_PRECEDENCE if r in blockers)
+        # Known reasons first, in the fixed precedence; then any reason a ROUTE supplied that this
+        # table does not know, sorted for determinism.
+        #
+        # The append half matters (Redmine #14695 review j#93807 finding 2, found while wiring it):
+        # filtering solely by the precedence tuple silently DROPPED an unregistered reason — and,
+        # when it was the only blocker, left ``ordered`` empty so ``ordered[0]`` raised. A typed
+        # reason that a route went to the trouble of producing must not vanish because a generic
+        # table has not heard of it; that silent drop is the same class of defect as collapsing it
+        # into ``stale_review_generation`` in the first place.
+        known = tuple(r for r in _BLOCKED_REASON_PRECEDENCE if r in blockers)
+        ordered = known + tuple(
+            sorted(r for r in blockers if r not in _BLOCKED_REASON_PRECEDENCE)
+        )
         return RetireDecision(
             state=INTEGRATION_BLOCKED,
             blocked_reasons=ordered,

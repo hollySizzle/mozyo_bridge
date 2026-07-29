@@ -113,12 +113,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ZeroChangeFacts,
     fold_no_change_review_waiver,
     fold_zero_change_record,
-    review_round_supersedes,
     waived_now,
     waiver_unsuperseded,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_exemption import (
     ReviewExemptionFacts,
+    exemption_in_force_now,
     fold_review_exemption,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
@@ -700,6 +700,11 @@ class GateFacts:
     zero_change: ZeroChangeFacts = field(default_factory=ZeroChangeFacts)
     review_waived: bool = False
     review_waiver_unsuperseded: bool = False
+    #: A waiver IS declared here but establishes nothing, so the retire refuses it (#14695 review
+    #: j#93807 F1). Keeps a waiver-bearing closed lane out of ``retire_ready``. Scoped to lanes
+    #: that CARRY a waiver: a closed no-commit lane without one projects ``retire_ready`` today
+    #: (measured control) and changing that is a different issue's call.
+    review_waiver_unsupported: bool = False
 
 
 @dataclass(frozen=True)
@@ -757,26 +762,6 @@ def _is_open_review_round(gates: "frozenset | set", conclusion: str) -> bool:
     if GATE_REVIEW_REQUEST in gates:
         return True
     return GATE_REVIEW in gates and conclusion != REVIEW_APPROVED
-
-
-def _review_exempt_now(
-    exemption: ReviewExemptionFacts, round_ids: Sequence[int]
-) -> bool:
-    """Whether the durable exemption is in force AND not superseded by a review round (pure).
-
-    An exemption exempts what it PRECEDES in the durable record, not what supersedes it: no round
-    at all, or a round recorded BEFORE the exemption journal (the "superseded past Review Request"
-    the #14539 acceptance names), leaves it standing; a round recorded AFTER it re-owes the review.
-    An unparseable exemption journal id fails closed, because the ordering that makes the exemption
-    safe could not be established.
-
-    Ordering is delegated to the SHARED predicate (Redmine #14695) — the no-change waiver asks the
-    identical question, and two copies would eventually answer differently for one record. The gate
-    VOCABULARY stays here: which journals constitute a round is this grammar's decision.
-    """
-    return exemption.validated().in_force and not review_round_supersedes(
-        exemption.journal, round_ids
-    )
 
 
 def _review_round_ids(recognized: Sequence["_RecognizedJournal"]) -> list:
@@ -924,6 +909,8 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
     # Computed ONCE and shared by both derived waiver facts: two calls would be two chances for
     # the round vocabulary to be filtered differently.
     round_ids = _review_round_ids(recognized)
+    # Computed once: the derived fact and its negation-for-declared-waivers must agree.
+    waived = waived_now(review_waiver, zero_change, round_ids)
     return GateFacts(
         latest_gate=latest.gate,
         latest_gate_journal=str(latest.journal_id),
@@ -934,12 +921,13 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         integration=integration,
         work_unit=work_unit,
         review_exemption=review_exemption,
-        review_exempt=_review_exempt_now(review_exemption, round_ids),
+        review_exempt=exemption_in_force_now(review_exemption, round_ids),
         latest_gate_commit=latest.commit,
         review_waiver=review_waiver,
         zero_change=zero_change,
-        review_waived=waived_now(review_waiver, zero_change, round_ids),
+        review_waived=waived,
         review_waiver_unsuperseded=waiver_unsuperseded(review_waiver, round_ids),
+        review_waiver_unsupported=review_waiver.recorded and not waived,
     )
 
 
@@ -978,6 +966,7 @@ def lane_signal_from_gate_facts(
         # classifier stays a flat function over facts and cannot reach a different conclusion
         # from the terminal retire about the same record.
         review_waived=facts.review_waived,
+        review_waiver_unsupported=facts.review_waiver_unsupported,
     )
 
 

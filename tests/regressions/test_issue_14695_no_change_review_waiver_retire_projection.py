@@ -184,13 +184,39 @@ class WriterAuthorityTypedRefusalTest(unittest.TestCase):
         self.assertFalse(result.admissible)
         self.assertEqual(result.reason, REASON_WRITER_AUTHORITY_UNRESOLVED)
 
-    def test_the_glance_refuses_on_the_same_gate_so_the_two_agree(self):
-        # One authority, two consumers. A glance that still said "no review owed" while the retire
-        # refused would re-open the #14539 j#90137 F3 disagreement.
-        facts = fold_issue_gate_facts(no_change_journals())
+    def test_the_glance_does_not_call_a_waiver_bearing_closed_lane_retire_ready(self):
+        """Review j#93807 finding 1, and the defect in this suite's own earlier test.
+
+        The previous version built the signal and asserted NOTHING about the lane state, so it
+        claimed the two consumers agreed while the glance said ``retire_ready`` and the retire
+        refused. A test named for an agreement must measure the agreement.
+        """
+        journals = no_change_journals()
+        facts = fold_issue_gate_facts(journals)
         self.assertFalse(facts.review_waived)
-        signal = lane_signal_from_gate_facts(ISSUE, facts, issue_open=False)
+        self.assertTrue(facts.review_waiver_unsupported)
+        state = classify_lane_state(lane_signal_from_gate_facts(ISSUE, facts, issue_open=False))
+        self.assertNotEqual(state, LANE_STATE_RETIRE_READY)
+        self.assertFalse(admit(journals).admissible)
         self.assertNotEqual(facts.review_conclusion, "approved")
+
+    def test_a_lane_with_no_waiver_is_left_exactly_as_it_was(self):
+        """The scope control, measured before the fix and preserved by it.
+
+        A closed no-commit lane projects ``retire_ready`` whether or not a waiver is involved —
+        that is pre-existing general glance behaviour, not something this route introduced. The
+        suppression is therefore scoped to records that CARRY a waiver; widening it would change
+        unrelated lanes (and #14539's route) on this issue's authority.
+        """
+        journals = [
+            ("100", "## Gate: start"),
+            ("200", CARVE_OUT_CLEARED),
+            ("300", "## Gate: close\n- 受け入れ確認: 済"),
+        ]
+        facts = fold_issue_gate_facts(journals)
+        self.assertFalse(facts.review_waiver_unsupported)
+        state = classify_lane_state(lane_signal_from_gate_facts(ISSUE, facts, issue_open=False))
+        self.assertEqual(state, LANE_STATE_RETIRE_READY)
 
     def test_a_waiver_before_close_does_not_reach_owner_waiting(self):
         journals = [
@@ -776,7 +802,7 @@ class ExistingFencesUnchangedTest(unittest.TestCase):
             no_change_review_waiver=False,
             latest_generation_admissible=False,
         )
-        self.assertFalse(_resolve_latest_generation_admissible(args))
+        self.assertFalse(_resolve_latest_generation_admissible(args).admissible)
 
     def test_the_operator_assertion_still_works_when_no_route_is_supplied(self):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
@@ -790,7 +816,7 @@ class ExistingFencesUnchangedTest(unittest.TestCase):
             no_change_review_waiver=False,
             latest_generation_admissible=True,
         )
-        self.assertTrue(_resolve_latest_generation_admissible(args))
+        self.assertTrue(_resolve_latest_generation_admissible(args).admissible)
 
     def test_opting_into_the_waiver_route_never_falls_back_to_the_hand_assert(self):
         # "measured input を渡した場合は operator assertion へ fall back しない" (#14695 j#93412 §4).
@@ -807,7 +833,7 @@ class ExistingFencesUnchangedTest(unittest.TestCase):
             no_change_review_waiver=True,
             latest_generation_admissible=True,
         )
-        self.assertFalse(_resolve_latest_generation_admissible(args))
+        self.assertFalse(_resolve_latest_generation_admissible(args).admissible)
 
     def test_an_exemption_lane_is_unaffected_by_the_waiver_fold(self):
         # A ``codex_direct_edit`` record carries no waiver marker, so the new fold must leave it
@@ -830,6 +856,55 @@ class ExistingFencesUnchangedTest(unittest.TestCase):
         self.assertTrue(facts.review_exempt)
         self.assertFalse(facts.review_waived)
         self.assertEqual(fold_no_change_review_waiver(journals).state, WAIVER_NONE)
+
+
+class OperatorFacingReasonTest(unittest.TestCase):
+    """Review j#93807 finding 2: the typed reason must survive to what the operator sees.
+
+    The domain returned ``waiver_writer_authority_unresolvable`` while the retire decision reported
+    ``stale_review_generation`` — telling the operator to go find a review generation that, for
+    this route, cannot exist. A reason that dies inside a pure function is not a typed refusal.
+    """
+
+    def _decision(self, reason, **overrides):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+            RetirePreflight,
+            SublaneIntegrationPolicy,
+            decide_retire_integration,
+        )
+
+        kwargs = dict(
+            is_git_workspace=True, target_identity_known=True, verification_passed=True,
+            issue_closed=True, callbacks_drained=True, durable_record_recorded=True,
+            latest_generation_admissible=False, latest_generation_blocked_reason=reason,
+        )
+        kwargs.update(overrides)
+        return decide_retire_integration(
+            SublaneIntegrationPolicy(
+                manage_worktree=True, integration_branch="main-next", merge_on_retire=False
+            ),
+            RetirePreflight(**kwargs),
+        )
+
+    def test_the_waiver_reason_reaches_the_blocked_reasons(self):
+        decision = self._decision(REASON_WRITER_AUTHORITY_UNRESOLVED)
+        self.assertIn(REASON_WRITER_AUTHORITY_UNRESOLVED, decision.blocked_reasons)
+        self.assertEqual(decision.primary_reason, REASON_WRITER_AUTHORITY_UNRESOLVED)
+        # …and is NOT confused with the generic token the other routes still use.
+        self.assertNotIn("stale_review_generation", decision.blocked_reasons)
+
+    def test_a_route_that_says_nothing_keeps_the_generic_token(self):
+        # The review-generation and #14539 routes are unchanged: no typed reason, same behaviour
+        # as before this issue existed.
+        decision = self._decision("")
+        self.assertEqual(decision.blocked_reasons, ("stale_review_generation",))
+
+    def test_an_unrelated_blocker_still_outranks_the_waiver_reason(self):
+        # The typed reason is appended after the known precedence, so a dirty worktree is still
+        # the primary diagnosis rather than being displaced by a route-supplied token.
+        decision = self._decision(REASON_WRITER_AUTHORITY_UNRESOLVED, worktree_dirty=True)
+        self.assertEqual(decision.primary_reason, "dirty_worktree")
+        self.assertIn(REASON_WRITER_AUTHORITY_UNRESOLVED, decision.blocked_reasons)
 
 
 class LiveMeasurementTest(unittest.TestCase):

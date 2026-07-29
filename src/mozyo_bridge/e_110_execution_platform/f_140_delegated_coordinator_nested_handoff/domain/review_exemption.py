@@ -64,6 +64,21 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AdmissionResult,
 )
 
+
+def _review_round_supersedes(journal: object, round_ids: Sequence[int]) -> bool:
+    """Lazy indirection to the shared ordering predicate (pure).
+
+    Imported inside the call rather than at module scope because
+    :mod:`.no_change_review_waiver`, which owns that predicate, imports THIS module. A top-level
+    import would be a cycle; the predicate still has exactly one definition.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_review_waiver import (  # noqa: E501
+        review_round_supersedes,
+    )
+
+    return review_round_supersedes(journal, round_ids)
+
+
 #: The marker gate that declares a journal to BE a ``codex_direct_edit`` gate. Read through the
 #: policy-free shared marker scanner (never by widening
 #: ``redmine_journal_source.GATE_BEARING_KINDS``) for the same reason the integration disposition
@@ -912,6 +927,30 @@ def evaluate_exemption_integration_admissible(
     return AdmissionResult(True, REASON_OK)
 
 
+def exemption_in_force_now(
+    exemption: "ReviewExemptionFacts", round_ids: Sequence[int]
+) -> bool:
+    """Whether the durable exemption is in force AND not superseded by a review round (pure).
+
+    An exemption exempts what it PRECEDES in the durable record, not what supersedes it: no round
+    at all, or a round recorded BEFORE the exemption journal (the "superseded past Review Request"
+    the #14539 acceptance names), leaves it standing; a round recorded AFTER it re-owes the review.
+    An unparseable exemption journal id fails closed, because the ordering that makes the exemption
+    safe could not be established.
+
+    Ordering is delegated to the SHARED predicate (Redmine #14695) — the no-change waiver asks the
+    identical question, and two copies would eventually answer differently for one record.
+
+    ``round_ids`` is supplied by the caller that owns gate recognition (the glance grammar), so
+    the gate VOCABULARY stays there and only the derivation lives here, with the exemption it is
+    about. It moved out of the grammar when that module hit the oversized-module gate again;
+    splitting by ownership rather than shaving comments is the gate's own prescribed remedy.
+    """
+    return exemption.validated().in_force and not _review_round_supersedes(
+        exemption.journal, round_ids
+    )
+
+
 __all__ = (
     "CANONICAL_DIRECT_EDIT_ROLE",
     "EXEMPTION_EXEMPT",
@@ -935,6 +974,7 @@ __all__ = (
     "DeclaredChangeScope",
     "ReviewExemptionFacts",
     "declares_any_commit",
+    "exemption_in_force_now",
     "evaluate_exemption_integration_admissible",
     "fold_declared_change_scope",
     "fold_review_exemption",

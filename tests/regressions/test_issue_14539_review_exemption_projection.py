@@ -4256,8 +4256,10 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of recovery_anchor_delivery, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/domain/review_exemption.py": (
-            ['*', '*'],
-            "inherits via a used import of redmine_journal_source; names no marker token itself",
+            ['*', '*', '*'],
+            "inherits via a used import of redmine_journal_source and (Redmine #14695) a lazy "
+            "in-function import of no_change_review_waiver for the shared review-round ordering "
+            "predicate; names no marker token itself",
         ),
         "src/mozyo_bridge/e_140_adapter_provider/f_110_ticket_adapter_common/domain/ticket_adapter.py": (
             ['handoff'],
