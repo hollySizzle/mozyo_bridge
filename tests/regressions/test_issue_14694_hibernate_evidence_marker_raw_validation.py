@@ -52,6 +52,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     render_gate_note,
+    render_workflow_event_marker,
     strict_marker_fields_in_note,
 )
 from tests.support.hibernate_evidence_producer_corpus import (
@@ -393,6 +394,116 @@ class CallSiteTests(unittest.TestCase):
         )
         self.assertEqual(
             review_gate_marker_fields(args(review_request_journal=""), "review_result")[1],
+            "review_marker_missing_review_request_journal",
+        )
+
+
+class ReviewResultProducerTests(unittest.TestCase):
+    """``review_result`` IS one of the evidence kinds, so its own fields are not exempt.
+
+    Review j#93818 finding 1 overruled the R3 disposition that routed this away as "a different
+    contract". The central `### Hibernate Evidence Marker Contract` lists ``review_result`` first
+    among the evidence kinds, and this renderer's own envelope comment already said the rule —
+    "review_result is one of the evidence kinds, so it is not exempt from 'a renderer must refuse
+    what its parser refuses'". The envelope obeyed it; the fields of the SAME marker did not.
+    """
+
+    def test_every_review_evidence_field_is_judged_raw(self):
+        sha = "c" * 40
+        base = dict(conclusion="approved", target_head=sha, review_request_journal="93802")
+
+        def render(**over):
+            kwargs = dict(base)
+            gate = over.pop("gate", "review_result")
+            kwargs.update(over)
+            return render_workflow_event_marker(gate, **kwargs)
+
+        for label, over in (
+            ("gate padded", {"gate": " review_result "}),
+            ("gate non-str", {"gate": 12345}),
+            ("conclusion padded", {"conclusion": " approved "}),
+            ("conclusion outside vocabulary", {"conclusion": "approve"}),
+            ("head padded", {"target_head": f" {sha} "}),
+            ("head newline", {"target_head": f"{sha}\n"}),
+            ("head not full", {"target_head": "deadbeef"}),
+            ("head non-str", {"target_head": 12345}),
+            ("req padded", {"review_request_journal": " 93802 "}),
+            ("req inner space", {"review_request_journal": "938 02"}),
+            ("req non-numeric", {"review_request_journal": "abc"}),
+            ("req shadow value", {"review_request_journal": "93802=shadow"}),
+            ("req non-ascii digit", {"review_request_journal": "٣"}),
+            ("req zero", {"review_request_journal": "0"}),
+            ("req negative", {"review_request_journal": "-5"}),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(ValueError):
+                    render(**over)
+        with self.subTest("callback outside vocabulary"):
+            with self.assertRaises(ValueError):
+                render_workflow_event_marker("blocked", callback="maybe")
+        # Inline controls: the clean markers this producer actually writes are unchanged, byte for
+        # byte, including the bare and head-less legacy forms.
+        self.assertEqual(
+            render(),
+            f"[mozyo:workflow-event:gate=review_result:conclusion=approved:head={sha}:req=93802]",
+        )
+        self.assertEqual(
+            render_workflow_event_marker("review_request", target_head=sha),
+            f"[mozyo:workflow-event:gate=review_request:head={sha}]",
+        )
+        self.assertEqual(
+            render_workflow_event_marker("implementation_done", commit_bearing=True, issue_open=False),
+            "[mozyo:workflow-event:gate=implementation_done:commit=1:open=0]",
+        )
+        self.assertEqual(
+            render_workflow_event_marker("blocked", callback="due"),
+            "[mozyo:workflow-event:gate=blocked:callback=due]",
+        )
+
+    def test_an_unreadable_or_shadowed_req_is_never_written(self):
+        """A rendered ``req`` must read back as the journal it names, or not exist.
+
+        ``req='938 02'`` and ``req='93802=shadow'`` were not merely unreadable — the strict reader
+        extracted them as well-formed fields with a DIFFERENT value than any journal id, so the
+        generation fence would have compared against something nobody wrote.
+        """
+        sha = "c" * 40
+        for bad in ("938 02", "93802=shadow", " 93802 ", "abc"):
+            with self.subTest(req=bad):
+                try:
+                    marker = render_workflow_event_marker(
+                        "review_result", conclusion="approved", target_head=sha,
+                        review_request_journal=bad,
+                    )
+                except ValueError:
+                    continue
+                self.fail(f"raw-invalid req rendered the authority marker {marker!r}")
+
+    def test_the_cli_producer_refuses_a_req_that_is_not_a_journal_id(self):
+        """Review j#93818 finding 2: only whitespace was refused, never the SHAPE."""
+        sha = "c" * 40
+
+        def args(req):
+            return argparse.Namespace(
+                target_head=sha,
+                review_request_journal=req,
+                review_decision="approval",
+                evidence_workspace=None,
+                evidence_lane=None,
+                evidence_lane_generation=None,
+            )
+
+        for bad in ("abc", "93802=shadow", "-5", "0", "1.5", "٣", " 93802 ", "93 802"):
+            with self.subTest(req=bad):
+                fields, refusal = review_gate_marker_fields(args(bad), "review_result")
+                self.assertEqual(fields, {})
+                self.assertEqual(refusal, "review_marker_malformed_review_request_journal")
+        # Inline control: a real journal id still passes, and an absent one still says MISSING.
+        fields, refusal = review_gate_marker_fields(args("93802"), "review_result")
+        self.assertIsNone(refusal)
+        self.assertEqual(fields["review_request_journal"], "93802")
+        self.assertEqual(
+            review_gate_marker_fields(args(""), "review_result")[1],
             "review_marker_missing_review_request_journal",
         )
 

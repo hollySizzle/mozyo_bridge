@@ -12,6 +12,7 @@ import argparse
 from typing import Optional
 
 from ..domain.hibernate_evidence_envelope import contains_marker_separator
+from ..domain.marker_value_contract import is_journal_id
 
 _REVIEW_REQUEST_GATE = "review_request"
 _REVIEW_RESULT_GATE = "review_result"
@@ -55,7 +56,11 @@ def review_gate_marker_fields(args: argparse.Namespace, gate: str) -> "tuple[dic
         req = getattr(args, "review_request_journal", None) or ""
         if not req:
             return {}, "review_marker_missing_review_request_journal"
-        if contains_marker_separator(req):
+        # The contract's `req` is a review_request JOURNAL ID, so the shape is checked, not just
+        # the characters (review j#93818 finding 2): `abc`, `93802=shadow`, `-5`, `0` and `1.5`
+        # all passed the separator check and reached the writer path. The domain producer raises
+        # on the same question; a CLI owes its caller the typed refusal instead.
+        if not is_journal_id(req):
             return {}, "review_marker_malformed_review_request_journal"
         fields["review_request_journal"] = req
         # v2 (`### Gate Schema`): a review_result marker carries its conclusion. The `--review-decision`

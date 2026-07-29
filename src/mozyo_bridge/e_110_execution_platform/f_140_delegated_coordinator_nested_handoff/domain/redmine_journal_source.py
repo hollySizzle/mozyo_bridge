@@ -53,6 +53,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
     MARKER_VALUE_FORBIDDEN_CHARS,
     MarkerValueError,
+    require_journal_id,
+    require_review_head,
+    require_vocabulary,
     validate_marker_field_value,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
@@ -914,17 +917,18 @@ def render_workflow_event_marker(
     contract's authority; the agent-facing producer rule lives in the governed preset's
     ``### Review Generation Marker Contract v2``.
     """
-    gate_s = str(gate).strip()
-    if gate_s not in GATE_BEARING_KINDS:
+    # Every value is judged RAW (#14694 review j#93818 F1): the `str(...).strip()` this used to do
+    # rewrote `conclusion=" approved "` / `head=" <sha> "` / `req=" 93802 "` into clean canonical
+    # authority fields. The envelope's own rule governs this marker's fields too.
+    if not isinstance(gate, str) or gate not in GATE_BEARING_KINDS:
         raise ValueError(
-            f"render_workflow_event_marker gate must be one of {sorted(GATE_BEARING_KINDS)}, "
-            f"got {gate!r}"
+            f"render_workflow_event_marker gate must be one of {sorted(GATE_BEARING_KINDS)}, got {gate!r}"
         )
-    fields = [f"gate={gate_s}"]
+    fields = [f"gate={gate}"]
     if conclusion is not None:
-        fields.append(f"conclusion={str(conclusion).strip()}")
+        fields.append(f"conclusion={require_vocabulary(conclusion, field='conclusion', vocabulary=REVIEW_CONCLUSIONS)}")  # noqa: E501
     if callback is not None:
-        fields.append(f"callback={str(callback).strip()}")
+        fields.append(f"callback={require_vocabulary(callback, field='callback', vocabulary=CALLBACK_STATES)}")  # noqa: E501
     for key, value in (
         ("commit", commit_bearing),
         ("integrated", integration_recorded),
@@ -937,9 +941,9 @@ def render_workflow_event_marker(
     # review_result, the answered review_request journal (``req``). A git SHA is hex and a journal id
     # numeric, so neither collides with the ``:``/``=`` marker grammar. Only emitted when supplied.
     if target_head is not None:
-        fields.append(f"head={str(target_head).strip()}")
+        fields.append(f"head={require_review_head(target_head)}")
     if review_request_journal is not None:
-        fields.append(f"req={str(review_request_journal).strip()}")
+        fields.append(f"req={require_journal_id(review_request_journal)}")
     # Redmine #14219 T2b: the common hibernate-evidence lane envelope
     # (``workspace``/``lane``/``lane_generation``). ADDITIVE and opt-in — a marker without it is
     # unchanged for the review generation fence / glance (which never read these keys), and simply
