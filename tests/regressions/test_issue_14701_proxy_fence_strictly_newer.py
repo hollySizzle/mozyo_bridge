@@ -6,7 +6,7 @@
 canonical decision mints the next one. The comparison shipped as ``want_ordinal < prior_ordinal``
 (cause commit ``c25b1352``, the fence's introduction), which refuses only a SMALLER ordinal. Equal
 was therefore admitted — a fresh ``reserved`` generation and a real delivery for a decision that
-does not supersede the delegated one.
+does not supersede the delegated one. Fixed by ``<=``.
 
 The exact ``(issue, journal)`` repeat is caught earlier as a permanent duplicate, so what the ``<``
 let through was an equal ordinal reached with a *different anchor string*:
@@ -20,11 +20,18 @@ let through was an equal ordinal reached with a *different anchor string*:
 
 Both are pinned here, at the fence and (for the different-issue case) through the public delegation
 path with a counting send port, because the defect's consequence is a **send**: `stale` owes the
-caller zero-write AND zero-send, and only driving the rail can assert the second one. The positive
-controls are part of the same pin — a fix that refused everything, or one that re-admitted a
-different issue on some other ground, would break the rail while passing a refusal-only test — so
-the boundary is asserted as the triple (prior-1 stale / prior stale / prior+1 wins) and the verdict
-PRECEDENCE (duplicate and in-flight refusals still classify before the ordinal) is asserted too.
+caller zero-write AND zero-send, and only driving the rail can assert the second one.
+
+**Every test in this file detects the symptom's return: restore ``<`` and all of them fail.**
+Measured, not asserted — the first version of this file also carried the fix's positive controls
+(strictly newer still mints) and its verdict-precedence claims (duplicate / in-flight still classify
+before the ordinal). Those stayed GREEN under the restored defect because they state the module's
+public contract rather than this symptom's return, which is what
+``tests-placement-discovery-policy.md`` `### regressions` R3-b forbids in a regressions file (review
+j#94494 F1, verdict j#94497). They now live where the decision tree puts them: the fence-level ones
+in ``tests/unit/core/state/test_coordinator_proxy_fence.py`` (branch 4) and the rail-level one in
+``tests/integration/.../test_coordinator_proxy_send.py`` (branch 5). The boundary triple's other two
+arms and the exact-repeat duplicate were already covered there and were not duplicated.
 """
 
 from __future__ import annotations
@@ -41,9 +48,6 @@ from mozyo_bridge.core.state.coordinator_proxy_fence import (  # noqa: E501
     PROXY_ABANDONED,
     PROXY_COMPLETED,
     PROXY_DELIVERED,
-    PROXY_RESERVED,
-    PROXY_UNCERTAIN,
-    RESERVE_DUPLICATE,
     RESERVE_STALE,
     RESERVE_WON,
     CoordinatorProxyFence,
@@ -108,12 +112,12 @@ class StrictlyNewerFenceTestBase(unittest.TestCase):
         self.assertEqual(self.fence.active(ROUTE).state, state)
         return first
 
-    def _refused_without_writing(self, verdict: str, *, issue: str, journal: str):
-        """Reserve ``(issue, journal)``, and assert the refusal changed nothing on the route."""
+    def _stale_without_writing(self, *, issue: str, journal: str):
+        """Reserve ``(issue, journal)``, and assert it was refused as stale, writing nothing."""
         before = self._snapshot()
         result = self.fence.reserve(ROUTE, issue=issue, journal=journal)
         self.assertFalse(result.won, result)
-        self.assertEqual(result.verdict, verdict, result)
+        self.assertEqual(result.verdict, RESERVE_STALE, result)
         self.assertEqual(self._snapshot(), before, "a refusal must write nothing")
         return result
 
@@ -124,9 +128,7 @@ class EqualOrdinalIsNotStrictlyNewerTest(StrictlyNewerFenceTestBase):
     def test_an_equal_ordinal_on_a_different_issue_is_stale(self):
         # Pre-fix this returned `won=True` with a fresh action id and moved the row to `reserved`.
         self._terminal()
-        result = self._refused_without_writing(
-            RESERVE_STALE, issue=OTHER_ISSUE, journal=PRIOR_JOURNAL
-        )
+        result = self._stale_without_writing(issue=OTHER_ISSUE, journal=PRIOR_JOURNAL)
         self.assertEqual(result.prior_state, PROXY_DELIVERED)
         self.assertEqual(result.prior_issue, PRIOR_ISSUE)
         self.assertEqual(result.prior_journal, PRIOR_JOURNAL)
@@ -138,17 +140,13 @@ class EqualOrdinalIsNotStrictlyNewerTest(StrictlyNewerFenceTestBase):
             with self.subTest(prior_state=state):
                 self.setUp()
                 self._terminal(state)
-                self._refused_without_writing(
-                    RESERVE_STALE, issue=OTHER_ISSUE, journal=PRIOR_JOURNAL
-                )
+                self._stale_without_writing(issue=OTHER_ISSUE, journal=PRIOR_JOURNAL)
 
     def test_an_equal_ordinal_spelled_with_leading_zeros_is_stale(self):
         # Same issue, same ordinal, different string: not caught by the exact-anchor duplicate
         # check, so `<` admitted it as a superseding decision.
         self._terminal()
-        self._refused_without_writing(
-            RESERVE_STALE, issue=PRIOR_ISSUE, journal=PADDED_JOURNAL
-        )
+        self._stale_without_writing(issue=PRIOR_ISSUE, journal=PADDED_JOURNAL)
 
     def test_a_padded_stored_journal_is_not_superseded_by_its_bare_spelling(self):
         # The same collision from the other side: the stored value carries the padding.
@@ -159,85 +157,26 @@ class EqualOrdinalIsNotStrictlyNewerTest(StrictlyNewerFenceTestBase):
                 ROUTE, first.action_id, issue=PRIOR_ISSUE, journal=PADDED_JOURNAL
             )
         )
-        self._refused_without_writing(
-            RESERVE_STALE, issue=PRIOR_ISSUE, journal=PRIOR_JOURNAL
-        )
+        self._stale_without_writing(issue=PRIOR_ISSUE, journal=PRIOR_JOURNAL)
 
     def test_the_stale_detail_names_the_decision_that_blocks_this_one(self):
         self._terminal()
         result = self.fence.reserve(ROUTE, issue=OTHER_ISSUE, journal=PRIOR_JOURNAL)
+        self.assertFalse(result.won, result)
         self.assertIn(PRIOR_JOURNAL, result.detail)
         self.assertIn("supersede", result.detail)
 
-
-class AdmissionBoundaryTest(StrictlyNewerFenceTestBase):
-    """The boundary sits exactly at strictly-greater — in BOTH directions."""
-
-    def _reserve_at(self, offset: int, *, issue: str):
-        self.setUp()
+    def test_the_boundary_admits_only_a_greater_ordinal_on_a_different_issue(self):
+        # The equal arm is the symptom; the +1 arm is here because it is what makes the equal arm a
+        # BOUNDARY claim rather than a blanket refusal — the two are one assertion about where the
+        # line sits, and pre-fix the pair could not both hold.
         self._terminal()
-        journal = str(int(PRIOR_JOURNAL) + offset)
-        return self.fence.reserve(ROUTE, issue=issue, journal=journal), journal
-
-    def test_the_triple_around_the_prior_ordinal_on_the_same_issue(self):
-        for offset, expected in ((-1, RESERVE_STALE), (0, RESERVE_DUPLICATE), (1, RESERVE_WON)):
-            with self.subTest(offset=offset):
-                # offset 0 IS the same `(issue, journal)`, so its verdict is duplicate, not stale:
-                # the exact-anchor check must keep classifying before the ordinal comparison.
-                result, _ = self._reserve_at(offset, issue=PRIOR_ISSUE)
-                self.assertEqual(result.verdict, expected, result)
-                self.assertIs(result.won, expected == RESERVE_WON, result)
-
-    def test_the_triple_around_the_prior_ordinal_on_a_different_issue(self):
-        for offset, expected in ((-1, RESERVE_STALE), (0, RESERVE_STALE), (1, RESERVE_WON)):
-            with self.subTest(offset=offset):
-                result, _ = self._reserve_at(offset, issue=OTHER_ISSUE)
-                self.assertEqual(result.verdict, expected, result)
-                self.assertIs(result.won, expected == RESERVE_WON, result)
-
-    def test_a_strictly_newer_decision_on_a_different_issue_still_mints(self):
-        # The positive control the fix must not break: a different issue is not a refusal ground of
-        # its own, so a genuinely newer ordinal proceeds and the row advances to it.
-        first = self._terminal()
-        newer = str(int(PRIOR_JOURNAL) + 1)
-        result = self.fence.reserve(ROUTE, issue=OTHER_ISSUE, journal=newer)
-        self.assertTrue(result.won, result)
-        self.assertNotEqual(result.action_id, first.action_id)
-        row = self.fence.active(ROUTE)
-        self.assertEqual((row.state, row.issue, row.journal), (PROXY_RESERVED, OTHER_ISSUE, newer))
-
-
-class RefusalPrecedenceIsUnchangedTest(StrictlyNewerFenceTestBase):
-    """`<=` must not swallow the refusals that classify BEFORE the ordinal comparison."""
-
-    def test_the_exact_decision_stays_a_permanent_duplicate(self):
-        self._terminal()
-        result = self._refused_without_writing(
-            RESERVE_DUPLICATE, issue=PRIOR_ISSUE, journal=PRIOR_JOURNAL
-        )
-        self.assertIn("delegated once", result.detail)
-
-    def test_an_in_flight_generation_still_refuses_as_duplicate_not_stale(self):
-        # An `uncertain` row is not terminal: an equal ordinal on another issue must be refused for
-        # the stronger reason (a send whose fate is unknown), never reclassified as merely stale.
-        first = self.fence.reserve(ROUTE, issue=PRIOR_ISSUE, journal=PRIOR_JOURNAL)
-        self.assertTrue(
-            self.fence.mark_uncertain(
-                ROUTE, first.action_id, issue=PRIOR_ISSUE, journal=PRIOR_JOURNAL
-            )
-        )
-        self.assertEqual(self.fence.active(ROUTE).state, PROXY_UNCERTAIN)
-        self._refused_without_writing(
-            RESERVE_DUPLICATE, issue=OTHER_ISSUE, journal=PRIOR_JOURNAL
-        )
-
-    def test_a_non_numeric_journal_still_fails_closed_as_stale(self):
-        self._terminal()
-        for token in ("", "j89736", "89736a", "-89736", "89736.0"):
-            with self.subTest(journal=token):
-                self._refused_without_writing(
-                    RESERVE_STALE, issue=OTHER_ISSUE, journal=token
-                )
+        equal = self.fence.reserve(ROUTE, issue=OTHER_ISSUE, journal=PRIOR_JOURNAL)
+        self.assertEqual(equal.verdict, RESERVE_STALE, equal)
+        greater = str(int(PRIOR_JOURNAL) + 1)
+        admitted = self.fence.reserve(ROUTE, issue=OTHER_ISSUE, journal=greater)
+        self.assertEqual(admitted.verdict, RESERVE_WON, admitted)
+        self.assertEqual(self.fence.active(ROUTE).journal, greater)
 
 
 class EqualOrdinalSendsNothingTest(S.ProxySendTestBase):
@@ -254,42 +193,31 @@ class EqualOrdinalSendsNothingTest(S.ProxySendTestBase):
             action=S.ACTION_DISPATCH_NEXT,
         )
 
-    def _deliver_other_issue_at(self, journal: str):
-        """Put a DELIVERED generation for a different issue at ``journal`` on the route."""
-        self.fence.bootstrap()
-        route = self._route()
-        first = self.fence.reserve(route, issue=OTHER_ISSUE, journal=journal)
-        self.assertTrue(first.won, first)
-        self.assertTrue(
-            self.fence.mark_delivered(
-                route, first.action_id, issue=OTHER_ISSUE, journal=journal
-            )
-        )
-        return first
-
     def test_an_equal_ordinal_from_another_issue_delivers_nothing(self):
         # The canonical context's journal (`S.CURRENT_JOURNAL`) equals the delegated ordinal while
         # naming a different issue: every non-fence link verifies, and the fence must still refuse.
-        first = self._deliver_other_issue_at(S.CURRENT_JOURNAL)
+        # Pre-fix `result.sent` was True — a real second delivery, measured on the shipped head.
+        self.fence.bootstrap()
+        route = self._route()
+        first = self.fence.reserve(route, issue=OTHER_ISSUE, journal=S.CURRENT_JOURNAL)
+        self.assertTrue(first.won, first)
+        self.assertTrue(
+            self.fence.mark_delivered(
+                route, first.action_id, issue=OTHER_ISSUE, journal=S.CURRENT_JOURNAL
+            )
+        )
+
         result, port = self._execute(self._context())
         self.assertFalse(result.sent)
         self.assertEqual(result.decision, ZERO_SEND)
         self.assertEqual(result.reason, REASON_STALE)
         self.assertEqual(result.fence_state, FENCE_STALE)
         self.assertEqual(port.calls, [], "a stale delegation must not reach the send port")
-        row = self.fence.active(self._route())
+        row = self.fence.active(route)
         self.assertEqual(
             (row.action_id, row.state, row.issue, row.journal),
             (first.action_id, PROXY_DELIVERED, OTHER_ISSUE, S.CURRENT_JOURNAL),
         )
-
-    def test_a_strictly_newer_ordinal_from_another_issue_still_delivers_once(self):
-        # The rail-level positive control: the fix refuses `equal`, not `different issue`.
-        self._deliver_other_issue_at(S.OLDER_JOURNAL)
-        result, port = self._execute(self._context())
-        self.assertTrue(result.sent, result)
-        self.assertEqual(len(port.calls), 1)
-        self.assertEqual(port.calls[0][1], S.CURRENT_JOURNAL)
 
 
 if __name__ == "__main__":

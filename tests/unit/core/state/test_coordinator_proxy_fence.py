@@ -271,6 +271,50 @@ class ExactlyOnceTest(FenceTestBase):
         self.assertFalse(older_other_issue.won)
         self.assertEqual(older_other_issue.verdict, RESERVE_STALE)
 
+    def test_a_superseding_journal_on_a_different_issue_mints_the_next_generation(self):
+        # The other half of the rule above: a different issue is not a refusal ground of its own.
+        # The route carries decisions, not issues, so a genuinely newer ordinal proceeds whoever
+        # raised it, and the row advances to that decision.
+        fence = self._bootstrapped()
+        first = fence.reserve(ROUTE, issue="14546", journal="89736")
+        fence.mark_delivered(ROUTE, first.action_id, issue="14546", journal="89736")
+
+        newer_other_issue = fence.reserve(ROUTE, issue="14500", journal="89999")
+        self.assertTrue(newer_other_issue.won)
+        self.assertNotEqual(newer_other_issue.action_id, first.action_id)
+        row = fence.active(ROUTE)
+        self.assertEqual((row.state, row.issue, row.journal), (PROXY_RESERVED, "14500", "89999"))
+
+    def test_an_inflight_generation_refuses_whatever_the_candidates_ordinal(self):
+        # The in-flight refusal is classified BEFORE the ordinal comparison, so an `uncertain` row
+        # answers `duplicate` (a send whose fate is unknown) and never the weaker `stale` — for a
+        # newer candidate, and equally for one whose ordinal does not supersede.
+        fence = self._bootstrapped()
+        first = fence.reserve(ROUTE, issue="14546", journal="89736")
+        fence.mark_uncertain(ROUTE, first.action_id, issue="14546", journal="89736")
+
+        for issue, journal in (("14500", "89736"), ("14500", "89626"), ("14546", "89999")):
+            with self.subTest(issue=issue, journal=journal):
+                result = fence.reserve(ROUTE, issue=issue, journal=journal)
+                self.assertFalse(result.won, result)
+                self.assertEqual(result.verdict, RESERVE_DUPLICATE, result)
+                self.assertEqual(result.prior_state, PROXY_UNCERTAIN)
+
+    def test_a_non_numeric_journal_never_wins_against_a_terminal_row_either(self):
+        # `test_a_non_numeric_journal_never_wins` covers the fresh route (no row). The terminal
+        # branch reaches the same fail-closed answer through its own arm of the comparison, so an
+        # unreadable candidate cannot supersede a real delegated decision.
+        fence = self._bootstrapped()
+        first = fence.reserve(ROUTE, issue="14546", journal="89736")
+        fence.mark_delivered(ROUTE, first.action_id, issue="14546", journal="89736")
+
+        for journal in ("", "j89736", "89736a", "-89736", "89736.0"):
+            with self.subTest(journal=journal):
+                result = fence.reserve(ROUTE, issue="14500", journal=journal)
+                self.assertFalse(result.won, result)
+                self.assertEqual(result.verdict, RESERVE_STALE, result)
+                self.assertEqual(fence.active(ROUTE).journal, "89736")
+
 
 class RouteIsolationTest(FenceTestBase):
     def test_distinct_actions_hold_independent_generations(self):
