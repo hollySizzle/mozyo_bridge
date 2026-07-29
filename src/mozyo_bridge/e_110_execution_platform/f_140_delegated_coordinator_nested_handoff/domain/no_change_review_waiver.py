@@ -382,7 +382,7 @@ def fold_no_change_review_waiver(
 
 
 def review_round_supersedes(journal: object, round_journal_ids: Sequence[int]) -> bool:
-    """Whether a review round is recorded AFTER ``journal`` (pure).
+    """Whether a review round is recorded AT OR AFTER ``journal`` (pure).
 
     The supersession half BOTH no-review-owed authorities share — the ``codex_direct_edit``
     exemption (#14539) and this waiver (#14695). One definition rather than two, because two
@@ -396,12 +396,26 @@ def review_round_supersedes(journal: object, round_journal_ids: Sequence[int]) -
     constitute a review round (including that a combined ``## Gate: Review Request + Close`` IS
     one — the max-precedence reduction hid exactly that, #14539 review j#91577 F1), and this
     decides only the ordering.
+
+    The comparison is AT-OR-AFTER, not strictly after (Redmine #14695 review j#94240). A round
+    recorded in the SAME journal as the authority ties on id, and a strict ``>`` read that tie as
+    "the authority is newer" — so a single journal carrying a valid ``codex_direct_edit`` AND a
+    ``## Gate: Review Request`` kept ``review_exempt=True`` beside an unanswered request, and the
+    lane advanced to ``owner_waiting``. Reproduced on the real fold. An authority cannot supersede
+    a round recorded in the same breath as itself: nothing orders them, so the fail-closed reading
+    is that the round stands and a review is owed.
+
+    Strictly OLDER rounds are deliberately untouched. #14539's literal defect was a superseded
+    past Review Request re-projecting as review owed, and it ruled that an exemption recorded
+    after such a request supersedes it; widening this to "any open round wins" reverses that
+    ruling, which is not this issue's to make (measured: it fails
+    ``test_exemption_supersedes_an_earlier_review_request``).
     """
     anchor = _int_journal(journal)
     if anchor is None:
         return True
     rounds = [r for r in (round_journal_ids or ()) if isinstance(r, int)]
-    return bool(rounds) and max(rounds) > anchor
+    return bool(rounds) and max(rounds) >= anchor
 
 
 def waiver_unsuperseded(

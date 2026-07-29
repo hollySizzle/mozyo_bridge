@@ -1352,10 +1352,14 @@ class CombinedReviewRoundTest(unittest.TestCase):
         non-blocking classification j#94005 F2 restored. They are excluded from
         :data:`_ROUND_IDENTITY_GATES` for that reason.
 
-        Measured caveat, recorded so the next reader does not overstate this: the production fold
-        reduces ``latest_gate`` by PRECEDENCE, not recency, so a record containing a review round
-        reports a review-family gate even when a ``progress`` journal is newer. This exclusion is
-        therefore defensive for hand-built signals rather than a path the live fold reaches.
+        CORRECTION (review j#94240): R11 recorded here, and in RR j#94235, that the fold reduces
+        ``latest_gate`` by precedence rather than recency, and that this exclusion was therefore
+        only defensive. Both claims were wrong. Among recognized gates the fold takes the latest
+        JOURNAL — precedence only reduces gates written into one combined journal — so a
+        ``## Gate: start`` recorded after an open round IS the latest gate and this exclusion is
+        live. The observation that misled me was ``## Gate: progress``, which is not a recognized
+        heading token at all and so never becomes the latest gate; I generalized from a heading
+        the grammar ignores. Both halves are asserted below through the real fold.
         """
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
             _ROUND_IDENTITY_GATES,
@@ -1376,55 +1380,114 @@ class CombinedReviewRoundTest(unittest.TestCase):
                 )
                 self.assertEqual(state, "implementing")
 
-    def test_the_fold_never_pairs_an_open_round_with_a_no_review_owed_authority(self):
-        """A fold invariant this correction leans on — so it is pinned, not assumed.
+        # ...and the production fold really does reach it: a start recorded after an open round.
+        facts, state = self._state(
+            [
+                ("100", "## Gate: start"),
+                ("300", "## Gate: review request"),
+                ("400", "## Gate: start"),
+            ],
+            issue_open=True,
+        )
+        self.assertEqual(facts.latest_gate, "start")
+        self.assertTrue(facts.review_round_unresolved)
+        self.assertEqual(state, "implementing")
 
-        Hoisting the round identity means the substituted path now reaches ``_no_review_owed``,
-        where the old close-family REPLAY did not (it rebuilt a bare signal and silently dropped
-        ``review_exempt`` / ``review_waived``). For a hand-built signal that changes
-        close-family + open round + exemption from ``review_waiting`` to ``owner_waiting`` —
-        which is the answer the review-family gates already gave, so the two now agree.
+    #: A VALID ``codex_direct_edit`` exemption, in the shape #14539 requires — the coverage check
+    #: is against a durable change scope, so an exemption without one is never ``review_exempt``.
+    #: R11 measured an "invariant" over a population whose exemption lacked it, so the premise was
+    #: never once true and the invariant held vacuously (review j#94240). Hence
+    #: :meth:`test_the_population_actually_produces_a_valid_exemption` below.
+    EXEMPT_HEAD = "4f2b9c1a3d5e6f708192a3b4c5d6e7f809a1b2c3"
+    GATE_EXEMPT = (
+        "## Gate: codex_direct_edit\n- role: 実装者\n- direct_edit: true\n"
+        "- allowed_paths: vibes/docs/rules/**, vibes/docs/logics/**\n"
+        "- reason: coordinator-owned standalone policy docs\n- follow_up_review: false\n"
+    )
+    CHANGE_SCOPE = (
+        "- changed_paths:\n  - `vibes/docs/rules/agent-workflow.md`\n"
+        "  - `vibes/docs/logics/coordinator-sublane-development-flow.md`\n"
+    )
 
-        It is invisible to production because the fold never emits the pair: an exemption / waiver
-        is superseded by a round, and an open round means one exists. That is the property this
-        test holds. If it ever stops holding, the corner above becomes live and must be decided
-        deliberately rather than inherited from whichever branch happens to run first.
+    def _exempt_pieces(self):
+        impl = (
+            f"## Gate: Implementation Done\n- commit: {self.EXEMPT_HEAD}\n{self.CHANGE_SCOPE}"
+        )
+        request = f"## Gate: Review Request\n- commit: {self.EXEMPT_HEAD}\n{self.CHANGE_SCOPE}"
+        return self.GATE_EXEMPT, impl, request
 
-        The population is DERIVED (orderings of the real gate journals) rather than a list of
-        cases, because the risk is an ordering nobody thought to enumerate.
+    def test_an_authority_does_not_supersede_a_round_in_its_own_journal(self):
+        """Review j#94240: the tie, on both sides of the Close.
+
+        The shared supersession predicate compared STRICTLY newer, so a round recorded in the
+        SAME journal as the authority tied on id and the authority won. One journal carrying a
+        valid ``codex_direct_edit`` AND a ``## Gate: Review Request`` therefore kept
+        ``review_exempt=True`` beside an unanswered request, and the lane read ``owner_waiting``.
+
+        R11 introduced half of this: post-Close the old close-family replay rebuilt a bare signal
+        that dropped the authority fields, so it answered ``review_waiting`` by accident. Hoisting
+        the identity kept the fields and exposed the real ordering bug underneath — measured at
+        13f8f12f (``review_waiting``) vs 5823224d (``owner_waiting``).
         """
-        from itertools import permutations
+        exempt, impl, request = self._exempt_pieces()
+        same_journal = f"{exempt}\n{impl}\n{request}"
+        for closed in (False, True):
+            with self.subTest(closed=closed):
+                journals = [("100", "## Gate: start"), ("300", same_journal)]
+                if closed:
+                    journals.append(("500", f"## Gate: Close\n- commit: {self.EXEMPT_HEAD}\n"))
+                facts, state = self._state(journals)
+                self.assertTrue(facts.review_round_unresolved)
+                self.assertFalse(
+                    facts.review_exempt,
+                    "an authority superseded a round recorded in its own journal",
+                )
+                self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
 
-        pieces = {
-            "exempt": (
-                "## Gate: codex_direct_edit\n- role: 実装者\n- direct_edit: true\n"
-                "- allowed_paths: vibes/docs/rules/**\n- reason: r\n- follow_up_review: false\n"
-            ),
-            "request": "## Gate: review request",
-            "approved": "## Gate: review\n- 結論: 承認",
-            "changes": "## Gate: review\n- 結論: 要修正",
-            "combined": "## Gate: review request + review\n- 結論: 承認",
-            "close": "## Gate: close",
-            "owner_close": CARVE_OUT_CLEARED,
-        }
-        checked = 0
-        for size in (2, 3):
-            for combo in permutations(sorted(pieces), size):
-                journals = [("100", "## Gate: start")] + [
-                    (str(200 + 10 * i), pieces[key]) for i, key in enumerate(combo)
-                ]
-                facts = fold_issue_gate_facts(journals)
-                if facts is None:
-                    continue
-                checked += 1
-                if facts.review_round_unresolved:
-                    with self.subTest(ordering=combo):
-                        self.assertFalse(
-                            facts.review_exempt or facts.review_waived,
-                            "the fold paired an OPEN review round with a no-review-owed "
-                            "authority; the classifier's handling of that pair is now live",
-                        )
-        self.assertGreater(checked, 100, "the derived population collapsed")
+    def test_an_exemption_still_supersedes_a_strictly_earlier_round(self):
+        """The negative control, and a #14539 contract this issue must NOT reverse.
+
+        #14539's literal defect was a superseded past Review Request re-projecting as review
+        owed; it ruled that an exemption recorded AFTER such a request supersedes it. Widening
+        the tie fix to "any open round wins" reverses that ruling — measured, it fails
+        ``test_exemption_supersedes_an_earlier_review_request`` over there. Only the tie moves.
+        """
+        exempt, impl, request = self._exempt_pieces()
+        facts, state = self._state(
+            [("99", impl), ("100", request), ("101", exempt)], issue_open=True
+        )
+        self.assertTrue(facts.review_exempt)
+        self.assertEqual(state, LANE_STATE_OWNER_WAITING)
+
+    def test_the_population_actually_produces_a_valid_exemption(self):
+        """The guard against the way R11's invariant lied (review j#94240).
+
+        That test asserted "the fold never pairs an open round with a no-review-owed authority"
+        over a population whose exemption carried no change scope — so ``review_exempt`` was
+        never True, the premise never held, and the invariant passed without measuring anything.
+        A claim about "whenever X" is worthless until something in the population produces X.
+        """
+        exempt, impl, _ = self._exempt_pieces()
+        facts = fold_issue_gate_facts(
+            [("100", "## Gate: start"), ("200", exempt), ("300", impl)]
+        )
+        self.assertTrue(
+            facts.review_exempt,
+            "the exemption fixture is not valid, so every assertion resting on it is vacuous",
+        )
+
+    def test_the_supersession_predicate_treats_a_tie_as_superseding(self):
+        """The ordering rule itself, at the boundary, independent of any fold fixture."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_review_waiver import (  # noqa: E501
+            review_round_supersedes,
+        )
+
+        self.assertTrue(review_round_supersedes(300, [301]), "a later round must supersede")
+        self.assertTrue(review_round_supersedes(300, [300]), "a same-journal round must supersede")
+        self.assertFalse(
+            review_round_supersedes(300, [299]), "a strictly earlier round must NOT supersede"
+        )
+        self.assertFalse(review_round_supersedes(300, []), "no round supersedes nothing")
 
     def test_a_well_formed_round_still_reaches_its_own_state(self):
         """The negative control: the validation must not block what it should replay.

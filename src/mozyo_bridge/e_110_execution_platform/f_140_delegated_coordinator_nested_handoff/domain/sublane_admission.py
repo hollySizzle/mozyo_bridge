@@ -263,9 +263,13 @@ REVIEW_ROUND_GATES: frozenset = frozenset({GATE_REVIEW_REQUEST, GATE_REVIEW})
 #:
 #: ``start`` / ``progress`` are deliberately EXCLUDED: they are newer positive implementation
 #: activity, and letting a stale open round outrank them would stop a lane that is merely being
-#: reworked — the exact harm j#94005 finding 2 corrected. ``implementation_done`` is excluded
-#: because it reaches the same branch either way, so including it would only add reach without
-#: changing an answer.
+#: reworked — the exact harm j#94005 finding 2 corrected. This is REACHABLE, not merely defensive:
+#: among recognized gates the fold takes the latest JOURNAL (precedence only reduces gates written
+#: in one combined journal), so a ``## Gate: start`` recorded after an open round is the latest
+#: gate and classifies ``implementing``. (Measured — and it corrects what j#94235 claimed; see
+#: the note on that RR. ``## Gate: progress`` is not a recognized heading token at all, so it
+#: never becomes the latest gate.) ``implementation_done`` is excluded because it reaches the same
+#: branch either way, so including it would only add reach without changing an answer.
 _ROUND_IDENTITY_GATES: frozenset = REVIEW_ROUND_GATES | _CLOSE_FAMILY_GATES
 
 
@@ -300,6 +304,12 @@ def _no_review_owed(signal: LaneSignal) -> bool:
     Review Gate approval または自己 review と表現しないこと"; #14695 j#93412 §4 repeats it for
     the waiver). Written as one predicate so a future third authority adds one disjunct here
     instead of a third branch that drifts from the other two.
+
+    Whether an OPEN round defeats an authority is decided by ORDERING, in
+    :func:`.no_change_review_waiver.review_round_supersedes`, not here. #14539 ruled that an
+    exemption recorded after an earlier Review Request supersedes it (its literal defect was that
+    such a request re-projected as review owed), so "an open round always owes a review" is NOT
+    the rule and must not be imposed here.
     """
     return signal.review_exempt or signal.review_waived
 
