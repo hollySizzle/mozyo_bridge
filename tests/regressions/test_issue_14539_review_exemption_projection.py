@@ -3725,29 +3725,59 @@ def _marker_token_holders(root):
         expansion. That was the intent and not the behaviour, so this is also the durable record
         being made true.
         """
-        declarations = []
-        for node in tree.body:  # module level only — a nested __all__ binds nothing here
-            if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets
-            ):
-                declarations.append(node.value)
-            elif (
-                isinstance(node, ast.AnnAssign)
-                and isinstance(node.target, ast.Name)
-                and node.target.id == "__all__"
-            ):
-                declarations.append(node.value)
-            elif (
-                isinstance(node, ast.AugAssign)
-                and isinstance(node.target, ast.Name)
-                and node.target.id == "__all__"
-            ):
-                declarations.append(None)  # ``+=`` never yields an exact set on its own
-        if not declarations:
+        def names_all(node):
+            return isinstance(node, ast.Name) and node.id == "__all__"
+
+        def module_scope_nodes(root):
+            """Every node evaluated in the MODULE's own scope.
+
+            Scope comes from the language, not from tree depth (Redmine #14539 review j#92508).
+            A function / class / lambda body binds in its own scope, so it is skipped — but its
+            decorators, defaults and bases are evaluated out here and are not. Everything else,
+            including the body of an ``if`` / ``try`` / loop / ``with`` / ``match``, runs in
+            module scope, and the two previous versions of this reader missed exactly that: R29
+            took the first node ``ast.walk`` produced, R30 took only ``tree.body``'s direct
+            children. Both substituted a depth in the syntax tree for the scoping rule.
+            """
+            scoped = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+            found = []
+
+            def visit(node):
+                for field, value in ast.iter_fields(node):
+                    if isinstance(node, scoped) and field == "body":
+                        continue
+                    for item in value if isinstance(value, list) else [value]:
+                        if isinstance(item, ast.AST):
+                            found.append(item)
+                            visit(item)
+
+            visit(root)
+            return found
+
+        # Every WRITE to ``__all__`` that module execution can reach, in any statement form.
+        events = []
+        for node in module_scope_nodes(tree):
+            if isinstance(node, ast.Assign) and any(names_all(t) for t in node.targets):
+                events.append(node)
+            elif isinstance(node, ast.AnnAssign) and names_all(node.target) and node.value:
+                events.append(node)
+            elif isinstance(node, ast.AugAssign) and names_all(node.target):
+                events.append(node)
+            elif isinstance(node, ast.NamedExpr) and names_all(node.target):
+                events.append(node)
+            elif isinstance(node, ast.Delete) and any(names_all(t) for t in node.targets):
+                events.append(node)
+        if not events:
             return None
-        if len(declarations) > 1:
+        # Exact only when the module makes ONE unconditional, literal declaration at its top
+        # level. A single write nested in control flow is not unconditional, a ``del`` can undo
+        # one, and ``+=`` / ``:=`` never yield an exact set — all of those fall to full
+        # expansion, which is the direction that cannot lose a consumer.
+        if len(events) > 1 or events[0] not in tree.body:
             return "unknown"
-        value = declarations[0]
+        if not isinstance(events[0], (ast.Assign, ast.AnnAssign)):
+            return "unknown"
+        value = events[0].value
         if (
             isinstance(value, (ast.List, ast.Tuple))
             and value.elts
@@ -4095,15 +4125,37 @@ class ReviewJ92374InventoryDetectionTests(unittest.TestCase):
     _IMPORT_AXES = {"depth": (2, 3, 4), "alias": (True, False), "site": ("module", "init")}
 
     @staticmethod
-    def _admits(level, module_present, target, alias, site):
-        """The grammar's own constraints, stated once."""
+    def _is_a_statement(level, module_present, target, alias, site):
+        """Whether the Python GRAMMAR admits this combination at all."""
+        del site  # the consumer's own kind cannot make a statement ungrammatical
         if level == 0 and not module_present:
             return False  # `from  import x` is not a statement
         if target == "star" and alias:
             return False  # `from m import * as x` is not a statement
-        if level == 1 and site == "init" and not module_present and target in ("symbol", "star"):
-            return False  # the package would be importing from itself, which is not one hop
         return True
+
+    @staticmethod
+    def _is_one_hop(level, module_present, target, alias, site):
+        """Whether a grammatical statement actually crosses ONE module boundary.
+
+        Deliberately separate from :meth:`_is_a_statement` (review j#92508's non-blocking
+        observation, and RR j#92497's own review_focus 2): "the grammar forbids this" and "this
+        is not the relationship the inventory is about" are different claims, and collapsing
+        them into one predicate made the matrix look narrower than the grammar for a reason the
+        reader could not see.
+        """
+        del alias
+        if level == 1 and site == "init" and not module_present and target in ("symbol", "star"):
+            # The package `__init__` would be importing out of its own namespace: zero hops.
+            return False
+        return True
+
+    @classmethod
+    def _admits(cls, level, module_present, target, alias, site):
+        """Grammatical AND one hop — the two questions, asked separately."""
+        return cls._is_a_statement(level, module_present, target, alias, site) and cls._is_one_hop(
+            level, module_present, target, alias, site
+        )
 
     def _derive_one_hop_cells(self):
         import itertools
@@ -4242,13 +4294,36 @@ class ReviewJ92374InventoryDetectionTests(unittest.TestCase):
             with self.subTest(label):
                 self.assertIn(cell, cells)
 
-    def test_the_admissibility_predicate_rejects_only_non_statements(self):
-        """The filter must exclude what the grammar forbids — and nothing else."""
-        self.assertFalse(self._admits(0, False, "symbol", False, "module"))  # `from  import x`
-        self.assertFalse(self._admits(1, True, "star", True, "module"))  # `import * as x`
-        self.assertFalse(self._admits(1, False, "symbol", False, "init"))  # self-import
-        self.assertTrue(self._admits(1, False, "submodule", False, "init"))  # its own subpackage
-        self.assertTrue(self._admits(3, False, "star", False, "init"))
+    def test_the_grammar_filter_rejects_only_non_statements(self):
+        """One question: could Python parse this at all?"""
+        self.assertFalse(self._is_a_statement(0, False, "symbol", False, "module"))
+        self.assertFalse(self._is_a_statement(1, True, "star", True, "module"))
+        # A package importing out of its own namespace IS grammatical — it is just not one hop.
+        self.assertTrue(self._is_a_statement(1, False, "symbol", False, "init"))
+        self.assertTrue(self._is_a_statement(3, False, "star", False, "init"))
+
+    def test_the_one_hop_filter_rejects_only_zero_hop_relationships(self):
+        """The other question: does the statement cross a module boundary?"""
+        self.assertFalse(self._is_one_hop(1, False, "symbol", False, "init"))
+        self.assertFalse(self._is_one_hop(1, False, "star", False, "init"))
+        # Its own SUBpackage is a different module, so that one does cross.
+        self.assertTrue(self._is_one_hop(1, False, "submodule", False, "init"))
+        # The one-hop question says nothing about grammar; ungrammatical cells pass it.
+        self.assertTrue(self._is_one_hop(0, False, "symbol", False, "module"))
+
+    def test_admission_is_the_conjunction_of_the_two_questions(self):
+        for cell in (
+            (0, False, "symbol", False, "module"),
+            (1, True, "star", True, "module"),
+            (1, False, "symbol", False, "init"),
+            (1, False, "submodule", False, "init"),
+            (3, False, "star", False, "init"),
+        ):
+            with self.subTest(cell=cell):
+                self.assertEqual(
+                    self._admits(*cell),
+                    self._is_a_statement(*cell) and self._is_one_hop(*cell),
+                )
 
 
     def test_the_all_reader_matches_what_python_would_export(self):
@@ -4284,6 +4359,106 @@ class ReviewJ92374InventoryDetectionTests(unittest.TestCase):
                     ["chan-a"],
                     f"{label}: Python exports {used!r} here, so the consumer holds it",
                 )
+
+    def test_the_all_reader_takes_scope_from_the_language_not_tree_depth(self):
+        """R30-F1: the reader looked only at ``tree.body``'s direct children.
+
+        Everything below runs in MODULE scope, so Python binds the name for a wildcard importer
+        in every case — an ``if`` / ``try`` body, an assignment expression, and a ``del`` that
+        removes an earlier ``__all__`` and hands the module back to the public-name rule. This
+        was the third miss in a row on "where do declarations live" (R29 took the first node
+        ``ast.walk`` yielded, R30 took only the top level), so the reader now skips exactly what
+        the language scopes away — function, class and lambda BODIES — and nothing else.
+        """
+        public = 'import re\nRE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
+        private = 'import re\n_RE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
+        for label, owner, used in (
+            ("if body", private + 'if True:\n    __all__ = ["_RE"]\n', "_RE"),
+            (
+                "try body",
+                private + 'try:\n    __all__ = ["_RE"]\nexcept Exception:\n    pass\n',
+                "_RE",
+            ),
+            ("for body", private + 'for _ in (1,):\n    __all__ = ["_RE"]\n', "_RE"),
+            ("with body", private + 'import contextlib\nwith contextlib.suppress():\n    __all__ = ["_RE"]\n', "_RE"),
+            ("deleted again", public + '__all__ = []\ndel __all__\n', "RE"),
+            ("assignment expression", private + '(__all__ := ["_RE"])\n', "_RE"),
+        ):
+            with self.subTest(label):
+                consumer = (
+                    "from mozyo_bridge.owner import *\n"
+                    f"def read(n): return {used}.findall(n or '')\n"
+                )
+                self.assertEqual(
+                    self._holders({"owner.py": owner, "c.py": consumer}, owner=False).get(
+                        "src/mozyo_bridge/c.py"
+                    ),
+                    ["chan-a"],
+                    f"{label}: module scope binds {used!r} here, so the consumer holds it",
+                )
+
+    def test_a_function_local_all_is_still_a_different_scope(self):
+        """The boundary the scope rule must keep: a body the language scopes away is not ours."""
+        public = 'import re\nRE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
+        consumer = "from mozyo_bridge.owner import *\ndef read(n): return RE.findall(n or '')\n"
+        for label, owner in (
+            ("function", public + "def f():\n    __all__ = []\n    return __all__\n"),
+            ("class", public + "class C:\n    __all__ = []\n"),
+            ("lambda", public + "g = lambda: (__all__ := [])\n"),
+        ):
+            with self.subTest(label):
+                # None of these declare the MODULE's __all__, so the public-name rule applies
+                # and the public ``RE`` still crosses.
+                self.assertEqual(
+                    self._holders({"owner.py": owner, "c.py": consumer}, owner=False).get(
+                        "src/mozyo_bridge/c.py"
+                    ),
+                    ["chan-a"],
+                )
+
+    def test_a_scoped_body_does_not_turn_an_exact_all_into_full_expansion(self):
+        """The discriminating half of the scope boundary.
+
+        Asserting that a public name still crosses cannot tell "correctly scoped away" from
+        "counted, so the module fell back to full expansion" — over-detection satisfies it too.
+        Here the module makes ONE exact declaration naming only the public pattern, and a
+        function body happens to contain ``__all__`` as a local. Reading that local as a second
+        module declaration would fall to full expansion and let the PRIVATE name cross, which
+        Python never does.
+        """
+        owner = (
+            "import re\n"
+            'RE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
+            '_RE = re.compile(r"\\[mozyo:chan-b:([^\\]]*)\\]")\n'
+            '__all__ = ["RE"]\n'
+            "def f():\n    __all__ = []\n    return __all__\n"
+        )
+        crosses = "from mozyo_bridge.owner import *\ndef read(n): return RE.findall(n or '')\n"
+        blocked = "from mozyo_bridge.owner import *\ndef read(n): return _RE.findall(n or '')\n"
+        holders = self._holders(
+            {"owner.py": owner, "yes.py": crosses, "no.py": blocked}, owner=False
+        )
+        self.assertEqual(holders.get("src/mozyo_bridge/yes.py"), ["chan-a"])
+        self.assertIsNone(
+            holders.get("src/mozyo_bridge/no.py"),
+            "a function-local __all__ was counted as a module declaration",
+        )
+
+    def test_a_decorator_runs_in_module_scope_even_though_the_body_does_not(self):
+        """The other half of the scope rule: only the BODY is scoped away, not the decorators."""
+        private = 'import re\n_RE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
+        owner = private + (
+            "def deco(f):\n    return f\n"
+            "@deco((__all__ := ['_RE']) and deco)\n"
+            "def g():\n    pass\n"
+        )
+        consumer = "from mozyo_bridge.owner import *\ndef read(n): return _RE.findall(n or '')\n"
+        self.assertEqual(
+            self._holders({"owner.py": owner, "c.py": consumer}, owner=False).get(
+                "src/mozyo_bridge/c.py"
+            ),
+            ["chan-a"],
+        )
 
     def test_an_empty_literal_all_exports_nothing(self):
         """The boundary: an exact empty ``__all__`` is exact, not unreadable."""
