@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import os
+import stat
+import subprocess
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .catalog import (
@@ -31,7 +34,10 @@ DEFAULT_COVERAGE_ROOTS = (
     "spec",
 )
 DEFAULT_COVERAGE_SUFFIXES = frozenset({".rb", ".yml", ".yaml"})
-DEFAULT_COVERAGE_IGNORED_PARTS = frozenset({".git", "__pycache__"})
+
+
+class CoverageEnumerationError(RuntimeError):
+    """Raised when Git cannot authoritatively enumerate coverage candidates."""
 
 
 def _has_non_empty_string(document: dict[str, object], field: str) -> bool:
@@ -226,6 +232,76 @@ def resolve_coverage_roots(
     return list(DEFAULT_COVERAGE_ROOTS), "default"
 
 
+def _git_coverage_candidates(repo_root: Path) -> list[PurePosixPath]:
+    """Return tracked and non-ignored untracked paths from Git.
+
+    ``git ls-files`` is the authority for ignore handling: tracked paths
+    remain present even when they match an ignore rule, while ignored
+    untracked paths are omitted according to repository, nested, info,
+    and global excludes.
+    """
+    try:
+        top_level = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError as exc:
+        raise CoverageEnumerationError(f"Git is unavailable: {exc}") from exc
+
+    if top_level.returncode != 0:
+        detail = top_level.stderr.strip() or "not a Git worktree"
+        raise CoverageEnumerationError(f"cannot resolve Git worktree: {detail}")
+
+    reported_root = Path(top_level.stdout.strip()).resolve()
+    if reported_root != repo_root.resolve():
+        raise CoverageEnumerationError(
+            "configured repo root is not the Git worktree root"
+        )
+
+    try:
+        listing = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise CoverageEnumerationError(f"Git is unavailable: {exc}") from exc
+
+    if listing.returncode != 0:
+        detail = os.fsdecode(listing.stderr).strip() or "git ls-files failed"
+        raise CoverageEnumerationError(f"cannot enumerate Git source paths: {detail}")
+
+    candidates: list[PurePosixPath] = []
+    for raw_path in listing.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        relative_path = PurePosixPath(os.fsdecode(raw_path))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise CoverageEnumerationError(
+                f"Git returned a path outside the repository: {relative_path}"
+            )
+        candidates.append(relative_path)
+    return candidates
+
+
+def _path_is_within_root(path: PurePosixPath, root: str) -> bool:
+    normalized_root = PurePosixPath(root)
+    return normalized_root == PurePosixPath(".") or (
+        path == normalized_root or normalized_root in path.parents
+    )
+
+
 def validate_file_coverage(
     context: CatalogContext,
     *,
@@ -242,18 +318,38 @@ def validate_file_coverage(
     notices.append(f"coverage_roots source: {source} ({len(coverage_roots)} root(s))")
     coverage_suffixes = suffixes or set(DEFAULT_COVERAGE_SUFFIXES)
 
+    try:
+        candidates = _git_coverage_candidates(context.repo_root)
+    except CoverageEnumerationError as exc:
+        errors.append(f"file coverage source enumeration failed: {exc}")
+        return errors, notices
+
+    checked_paths: set[PurePosixPath] = set()
     for root in coverage_roots:
         absolute_root = context.repo_abspath(root)
         if not absolute_root.exists():
             notices.append(f"coverage root does not exist (informational): {root}")
             continue
-        for path in absolute_root.rglob("*"):
-            if not path.is_file() or path.suffix not in coverage_suffixes:
+        for relative_path in candidates:
+            if relative_path in checked_paths or not _path_is_within_root(
+                relative_path, root
+            ):
                 continue
-            if set(path.parts) & DEFAULT_COVERAGE_IGNORED_PARTS:
+            path = context.repo_root / Path(relative_path.as_posix())
+            try:
+                path_mode = path.lstat().st_mode
+            except OSError as exc:
+                errors.append(
+                    "file coverage source inspection failed: "
+                    f"{relative_path.as_posix()}: {exc}"
+                )
+                checked_paths.add(relative_path)
                 continue
-            relative_path = path.relative_to(context.repo_root).as_posix()
-            if not matching_file_conventions(catalog, relative_path):
-                errors.append(f"no file_convention matched: {relative_path}")
+            if not stat.S_ISREG(path_mode) or path.suffix not in coverage_suffixes:
+                continue
+            checked_paths.add(relative_path)
+            relative_path_text = relative_path.as_posix()
+            if not matching_file_conventions(catalog, relative_path_text):
+                errors.append(f"no file_convention matched: {relative_path_text}")
 
     return errors, notices
