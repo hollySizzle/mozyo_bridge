@@ -139,28 +139,28 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 #: The widest lifecycle revision a supplied token may be written with. DERIVED, not chosen: the
-#: lifecycle store declares ``revision INTEGER NOT NULL`` (``core.state.lane_lifecycle_schema``)
-#: and SQLite's ``INTEGER`` is a signed 64-bit value, so nothing wider can be a revision this
-#: store holds. A WIDTH bound only — it is what keeps the conversion below from raising; whether
-#: a converted value names a live row stays the CAS's question, not this predicate's.
-#: Deliberately NOT unified with the Redmine-id width used elsewhere in this lane — a revision is
-#: this store's own counter, not a source-system record id, and the authorities differ (#14753).
+#: store declares ``revision INTEGER NOT NULL`` (``core.state.lane_lifecycle_schema``) and
+#: SQLite's ``INTEGER`` is signed 64-bit. A WIDTH bound only — it stops the conversion raising;
+#: whether a converted value names a live row stays the CAS's question. NOT unified with the
+#: Redmine-id width this lane also bounds: a revision is this store's own counter (#14753).
 _MAX_REVISION_DIGITS = len(str(2**63 - 1))
 
 
 def _revision_ordinal(token: str) -> Optional[int]:
     """A supplied lifecycle revision as an int, or ``None`` when it names no revision (pure).
 
-    ``str.isdigit()`` was the guard on this token and it is not "a number ``int()`` can read":
-    measured (Redmine #14753), ``--expected-revision ²`` passed ``isdigit()`` and then raised a
-    raw ``ValueError`` out of the hibernate preflight — a surface whose whole contract is a typed
-    :class:`HibernatePreflight` verdict with a fixed block reason, reached before any CAS.
+    ``str.isdigit()`` was the guard here and is not "a number ``int()`` can read": measured
+    (Redmine #14753), ``--expected-revision ²`` passed it and raised a raw ``ValueError`` out of
+    the hibernate preflight, whose contract is a typed verdict reached before any CAS.
 
-    ``None`` keeps the pre-existing fail-closed direction rather than adding a new one: an
-    unreadable revision never equals ``rec.revision``, so the approval fails closed pre-CAS
-    exactly as a drifted revision already did (``BLOCK_STALE_ACTION_REVISION``), and the
-    issue-lane pin below simply does not engage. Zero is admitted because the store's own
-    counter starts there; the character set is ASCII decimal only.
+    ``None`` means "no revision this store can name". It is ONLY safe because the caller branches
+    on the RAW token and then compares this ordinal — never the other way round. An earlier
+    revision claimed ``None`` was fail-closed by itself ("an unreadable revision never equals
+    ``rec.revision``"); retracted (review j#94379 blocker 1, verdict j#94424) — the property is
+    real but reaches nothing behind an ``is not None`` branch guard, and the issue-lane pin was
+    skipped outright while an unreadable revision hibernated an advanced row.
+
+    Zero is admitted (the store's counter starts there); the character set is ASCII decimal.
     """
     if not token or len(token) > _MAX_REVISION_DIGITS or not token.isascii():
         return None
@@ -695,7 +695,14 @@ class SublaneHibernateUseCase:
         # already-hibernated redrive above does NOT apply this — it resumes the stored release
         # action id / pins (the row's revision has advanced past the approval by the hibernate
         # itself), so re-asserting the approval's revision there would wrongly block resume.
-        expected_revision = _revision_ordinal(_norm(request.expected_revision))
+        # SUPPLIED-ness and READABILITY are two questions; only the first selects the branch
+        # (#14753 review j#94379 blocker 1). Branching on the parsed ordinal conflated "named no
+        # revision" with "named one this store cannot read", so an unreadable token skipped the
+        # pin and kept the permissive default — measured, `expected_revision="²"` hibernated an
+        # advanced row with zero blocked reasons. The fail-closed comparison sat behind the
+        # `elif` instead of inside it, so it never ran.
+        raw_expected_revision = _norm(request.expected_revision)
+        expected_revision = _revision_ordinal(raw_expected_revision)
         cas_expected_revision = rec.revision if rec is not None else 0
         action_revision_current = True
         if project_scope and record_matches_binding(rec, project_scope=project_scope):
@@ -704,7 +711,7 @@ class SublaneHibernateUseCase:
             if action_revision_current:
                 cas_expected_revision = expected_revision
         elif (
-            expected_revision is not None
+            raw_expected_revision
             and rec is not None
             and record_matches_binding(rec, issue_id=issue)
         ):
@@ -714,6 +721,9 @@ class SublaneHibernateUseCase:
             # instead of being silently re-bound to the current revision. A caller that
             # supplies none (the interactive CLI's default) keeps the prior current-revision
             # behavior unchanged.
+            # An unreadable SUPPLIED revision lands here too and fails closed on the same
+            # comparison, which also shuts the hole this branch already had for tokens
+            # `str.isdigit()` rejected (`"abc"` bypassed the pin on the lane base too).
             action_revision_current = expected_revision == rec.revision
             if action_revision_current:
                 cas_expected_revision = expected_revision

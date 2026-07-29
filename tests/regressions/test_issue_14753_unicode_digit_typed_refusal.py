@@ -86,8 +86,26 @@ from mozyo_bridge.e_140_adapter_provider.f_110_ticket_adapter_common.domain.tick
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure import (
     redmine_context,
 )
+from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
+from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+from mozyo_bridge.core.state.lane_lifecycle_model import (
+    DISPOSITION_ACTIVE,
+    LaneLifecycleKey,
+    ProcessGenerationPin,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_preflight import (  # noqa: E501
+    BLOCK_STALE_ACTION_REVISION,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure import (  # noqa: E501
     herdr_transport,
+)
+
+# The public hibernate path needs a live-ish ops double and a declared lane; both already exist
+# as the unit suite's harness, and duplicating them here would let the copy drift from the
+# contract it is standing in for (regressions importing a unit module's harness is established
+# in this tree, e.g. test_issue_13892_r6_forward_edge).
+from tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff import (  # noqa: E501
+    test_sublane_hibernate as H,
 )
 
 
@@ -366,6 +384,81 @@ class SupervisorLaunchdPidTest(unittest.TestCase):
         loaded, pid = supervisor_launchd._is_loaded(self._runner("\tpid = 4321\n"))
         self.assertTrue(loaded)
         self.assertEqual(pid, 4321)
+
+
+class SublaneHibernateSuppliedRevisionFenceTest(unittest.TestCase):
+    """The PUBLIC hibernate path: a supplied-but-unreadable revision must block the CAS.
+
+    Review j#94379 blocker 1, verdict j#94424. The predicate-level test below is not enough and
+    was not enough: `_revision_ordinal` returned `None` correctly, and the issue-lane pin still
+    let `expected_revision="²"` hibernate a lane whose revision had advanced — because the
+    comparison that fails closed sat BEHIND an `is not None` branch guard instead of inside the
+    branch, so "supplied but unreadable" was indistinguishable from "not supplied". A unit test
+    on a predicate cannot see that; only driving the use case can. Measured on the shipped head
+    `9670e1bd`: zero blocked reasons, `transition_applied=True`, final disposition `hibernated`.
+
+    The `"abc"` case is the same hole reached through a token `str.isdigit()` already rejected —
+    it bypassed the pin on the lane base too, so gating on the RAW token closes both.
+    """
+
+    def _run(self, token, *, advance_revision):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=pathlib.Path(tmp))
+            key = LaneLifecycleKey(H.WS, H.LANE)
+            store.declare_active(key, decision=H._decision(), issue_id=H.ISSUE)
+            if advance_revision:
+                bumped = LaneDeclarationStore(home=pathlib.Path(tmp)).backfill_active_binding(
+                    key,
+                    expected_revision=1,
+                    issue_id=H.ISSUE,
+                    worktree_identity="wt_14753",
+                    declared_slots=[
+                        ProcessGenerationPin(
+                            role="implementation", provider="claude",
+                            assigned_name="a1", locator="%1", runtime_revision="r1",
+                        )
+                    ],
+                )
+                self.assertTrue(bumped.applied and bumped.revision == 2, bumped)
+            ops = H._FakeOps(rows=[H._row("codex", H.LANE, f"{H.WS}:p2"),
+                                   H._row("claude", H.LANE, f"{H.WS}:p3")])
+            outcome = H.SublaneHibernateUseCase(ops=ops, store=store).run(
+                H._request(expected_revision=token), execute=True
+            )
+            return outcome, store.get(key)
+
+    def test_an_unreadable_supplied_revision_blocks_the_cas(self):
+        for token in (*UNCONVERTIBLE_DIGITS, *NON_ASCII_CONVERTIBLE_DIGITS, WIDE_ASCII_RUN, "abc"):
+            outcome, record = self._run(token, advance_revision=True)
+            self.assertTrue(outcome.is_blocked, repr(token))
+            self.assertIn(BLOCK_STALE_ACTION_REVISION, outcome.preflight.blocked_reasons, repr(token))
+            self.assertFalse(outcome.transition and outcome.transition.applied, repr(token))
+            self.assertEqual(record.lane_disposition, DISPOSITION_ACTIVE, repr(token))
+
+    def test_an_unreadable_supplied_revision_blocks_even_on_a_current_row(self):
+        # The token authorizes nothing whether or not the row happens to have moved: a caller
+        # that names an unreadable revision has not named this row's revision.
+        outcome, record = self._run(UNCONVERTIBLE_DIGITS[0], advance_revision=False)
+        self.assertTrue(outcome.is_blocked)
+        self.assertIn(BLOCK_STALE_ACTION_REVISION, outcome.preflight.blocked_reasons)
+        self.assertEqual(record.lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_a_stale_readable_revision_still_blocks(self):
+        outcome, record = self._run("1", advance_revision=True)
+        self.assertTrue(outcome.is_blocked)
+        self.assertIn(BLOCK_STALE_ACTION_REVISION, outcome.preflight.blocked_reasons)
+        self.assertEqual(record.lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_a_matching_supplied_revision_still_pins_and_hibernates(self):
+        outcome, _ = self._run("1", advance_revision=False)
+        self.assertFalse(outcome.is_blocked, outcome.preflight.blocked_reasons)
+        self.assertTrue(outcome.transition.applied)
+
+    def test_an_absent_revision_keeps_its_prior_behaviour(self):
+        # The whole point of gating on the RAW token: "not supplied" must NOT become a refusal.
+        outcome, _ = self._run("", advance_revision=True)
+        self.assertFalse(outcome.is_blocked, outcome.preflight.blocked_reasons)
+        self.assertTrue(outcome.transition.applied)
 
 
 class SublaneHibernateRevisionTest(unittest.TestCase):
