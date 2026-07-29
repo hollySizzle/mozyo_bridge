@@ -67,6 +67,9 @@
       - CLI `--coverage-root` が指定されたときは CLI 側が優先される (catalog 値は使わない)。
       - 値は repo-relative の string list でなければならない。空文字列や非 list は validator が error として拒否する。
       - 存在しない root は引き続き `notice:` として印字され exit code には影響しない。既存 root 内の未マッチ file は引き続き exit 1。
+      - coverage 対象の列挙は Git (`ls-files --cached --others --exclude-standard`) を正本とする。tracked file は ignore rule に一致しても対象、untracked nonignored file も対象、gitignored file / directory は対象外とする。
+      - nested `.gitignore`、`.git/info/exclude`、global exclude を含む Git の ignore 判定に従い、dependency 名を validator へ hardcode しない。
+      - symlink は辿らず、repo 外を走査しない。Git が利用不能、repo root を確定不能、または列挙 command が失敗した場合は coverage を fail-closed とする。
 
 tooling:
   注記: |
