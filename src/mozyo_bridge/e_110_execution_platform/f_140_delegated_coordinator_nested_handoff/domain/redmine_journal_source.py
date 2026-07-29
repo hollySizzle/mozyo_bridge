@@ -53,9 +53,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
     MARKER_VALUE_FORBIDDEN_CHARS,
     MarkerValueError,
-    require_journal_id,
-    require_review_head,
-    require_vocabulary,
+    review_anchor_fields,
+    review_marker_fields,
     validate_marker_field_value,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
@@ -925,10 +924,7 @@ def render_workflow_event_marker(
             f"render_workflow_event_marker gate must be one of {sorted(GATE_BEARING_KINDS)}, got {gate!r}"
         )
     fields = [f"gate={gate}"]
-    if conclusion is not None:
-        fields.append(f"conclusion={require_vocabulary(conclusion, field='conclusion', vocabulary=REVIEW_CONCLUSIONS)}")  # noqa: E501
-    if callback is not None:
-        fields.append(f"callback={require_vocabulary(callback, field='callback', vocabulary=CALLBACK_STATES)}")  # noqa: E501
+    fields.extend(review_marker_fields(conclusion=conclusion, callback=callback))
     for key, value in (
         ("commit", commit_bearing),
         ("integrated", integration_recorded),
@@ -937,13 +933,11 @@ def render_workflow_event_marker(
     ):
         if value is not None:
             fields.append(f"{key}={'1' if value else '0'}")
-    # Redmine #13974 additive review-gate contract: the reviewed/requested head (``head``) and, on a
-    # review_result, the answered review_request journal (``req``). A git SHA is hex and a journal id
-    # numeric, so neither collides with the ``:``/``=`` marker grammar. Only emitted when supplied.
-    if target_head is not None:
-        fields.append(f"head={require_review_head(target_head)}")
-    if review_request_journal is not None:
-        fields.append(f"req={require_journal_id(review_request_journal)}")
+    # Redmine #13974 additive review-gate contract: the reviewed/requested head and, on a
+    # review_result, the answered review_request journal. Only emitted when supplied.
+    fields.extend(review_anchor_fields(
+        target_head=target_head, review_request_journal=review_request_journal
+    ))
     # Redmine #14219 T2b: the common hibernate-evidence lane envelope
     # (``workspace``/``lane``/``lane_generation``). ADDITIVE and opt-in — a marker without it is
     # unchanged for the review generation fence / glance (which never read these keys), and simply

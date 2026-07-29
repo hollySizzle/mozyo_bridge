@@ -479,6 +479,114 @@ class ReviewResultProducerTests(unittest.TestCase):
                     continue
                 self.fail(f"raw-invalid req rendered the authority marker {marker!r}")
 
+    def test_membership_cannot_be_impersonated_into_a_different_written_value(self):
+        """Review j#93882 finding 1: the vocabulary check and the written value were two values.
+
+        ``require_vocabulary`` tested membership and then rendered ``str(value)``, so an object
+        whose ``__hash__`` / ``__eq__`` impersonate ``"approved"`` while ``__str__`` says
+        ``"bogus"`` passed the closed vocabulary and wrote ``conclusion=bogus`` — which the strict
+        reader extracted as ``bogus`` and the consumer downgrades to ``pending``. Refusing a plain
+        ``int`` was never a type contract; it was membership happening to fail.
+        """
+
+        class _Spoof:
+            """Hashes and compares equal to ``real`` while stringifying to ``written``."""
+
+            def __init__(self, real, written):
+                self.real, self.written = real, written
+
+            def __hash__(self):
+                return hash(self.real)
+
+            def __eq__(self, other):
+                return other == self.real
+
+            def __str__(self):
+                return self.written
+
+        sha = "c" * 40
+        for label, gate, kwargs in (
+            (
+                "conclusion",
+                "review_result",
+                dict(
+                    conclusion=_Spoof("approved", "bogus"),
+                    target_head=sha,
+                    review_request_journal="93802",
+                ),
+            ),
+            ("callback", "blocked", dict(callback=_Spoof("due", "maybe"))),
+            (
+                "head",
+                "review_result",
+                dict(
+                    conclusion="approved",
+                    target_head=_Spoof(sha, "d" * 40),
+                    review_request_journal="93802",
+                ),
+            ),
+            (
+                "req",
+                "review_result",
+                dict(
+                    conclusion="approved",
+                    target_head=sha,
+                    review_request_journal=_Spoof("93802", "1"),
+                ),
+            ),
+        ):
+            with self.subTest(field=label):
+                try:
+                    marker = render_workflow_event_marker(gate, **kwargs)
+                except ValueError:
+                    continue
+                self.fail(f"an impersonated {label} rendered the authority marker {marker!r}")
+
+    def test_the_journal_id_predicate_is_lexical_and_never_raises(self):
+        """Review j#93882 finding 2: `int()` decided positivity, so it decided too much.
+
+        It accepted ``"01"`` — not the string Redmine owns, so ``req`` cannot exact-match the
+        request it claims to answer — and it RAISED on a 4301-digit input, because CPython caps
+        int-from-str conversion at 4300 digits. A predicate that raises is not a predicate: the CLI
+        boundary that owes a typed refusal got an exception.
+        """
+        # Imported HERE, not at module scope: this predicate does not exist on the base revision,
+        # and a module-level import would turn every method in this file into one ImportError —
+        # a "they all fail on base" that measures nothing.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+            is_journal_id,
+        )
+
+        for bad in ("01", "007", "0", "", " 1", "1 ", "1.0", "-1", "٣", None, 1, True):
+            with self.subTest(value=bad):
+                self.assertFalse(is_journal_id(bad))
+        for good in ("1", "9", "10", "93802", "9" * 4300):
+            with self.subTest(value=f"{len(good)} digits"):
+                self.assertTrue(is_journal_id(good))
+        # Longer than any consumer could convert to an integer: refused as a False, never raised.
+        for oversized in ("9" * 4301, "1" * 10000):
+            with self.subTest(value=f"{len(oversized)} digits"):
+                self.assertFalse(is_journal_id(oversized))
+
+    def test_a_noncanonical_or_oversized_req_is_a_typed_refusal_not_an_exception(self):
+        sha = "c" * 40
+
+        def args(req):
+            return argparse.Namespace(
+                target_head=sha,
+                review_request_journal=req,
+                review_decision="approval",
+                evidence_workspace=None,
+                evidence_lane=None,
+                evidence_lane_generation=None,
+            )
+
+        for bad in ("01", "007", "9" * 4301, "9" * 10000):
+            with self.subTest(value=f"{bad[:6]}… ({len(bad)} chars)"):
+                fields, refusal = review_gate_marker_fields(args(bad), "review_result")
+                self.assertEqual(fields, {})
+                self.assertEqual(refusal, "review_marker_malformed_review_request_journal")
+
     def test_the_cli_producer_refuses_a_req_that_is_not_a_journal_id(self):
         """Review j#93818 finding 2: only whitespace was refused, never the SHAPE."""
         sha = "c" * 40
