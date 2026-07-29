@@ -137,6 +137,8 @@ def _seed_v5(home: Path, *, disposition: str = DISPOSITION_ACTIVE) -> Path:
         # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
         # or the shape is a NEWER table merely re-stamped to an old version.
         conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
+        # v8 (Redmine #14477) added hibernated_at; a faithful pre-v8 rewind drops it too.
+        conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
         conn.execute(
             "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
             (LANE_LIFECYCLE_COMPONENT,),
@@ -969,6 +971,8 @@ class UniversalWriteGateTest(unittest.TestCase):
             # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
             # or the shape is a NEWER table merely re-stamped to an old version.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
+            # v8 (Redmine #14477) added hibernated_at; a faithful pre-v8 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1155,6 +1159,8 @@ class RealCommandMigrationAdvisoryTest(unittest.TestCase):
             # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
             # or the shape is a NEWER table merely re-stamped to an old version.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
+            # v8 (Redmine #14477) added hibernated_at; a faithful pre-v8 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1241,6 +1247,8 @@ class PreMigrationAdvisoryTimingTest(unittest.TestCase):
             # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
             # or the shape is a NEWER table merely re-stamped to an old version.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
+            # v8 (Redmine #14477) added hibernated_at; a faithful pre-v8 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1319,6 +1327,8 @@ class ComposingStoreMigrationSurfaceTest(unittest.TestCase):
             # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
             # or the shape is a NEWER table merely re-stamped to an old version.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
+            # v8 (Redmine #14477) added hibernated_at; a faithful pre-v8 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),

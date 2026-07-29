@@ -160,8 +160,9 @@ class SublaneResumeTest(unittest.TestCase):
     def _hibernated(self, store, *, released=False, declared_slots=()) -> None:
         """Declare active, then hibernate; optionally drive the release to `released`.
 
-        All hibernate-side writes are stamped ``HIBERNATE_AT`` so the row's ``updated_at``
-        is a deterministic freshness anchor (a fresh relaunch attests at ``FRESH_AT``).
+        All hibernate-side writes are stamped ``HIBERNATE_AT``, so the row's immutable
+        ``hibernated_at`` boundary (v8, Redmine #14477) — and its pre-v8 ``updated_at``
+        fallback — are both that deterministic value (a fresh relaunch attests at ``FRESH_AT``).
         """
         key = LaneLifecycleKey(WS, LANE)
         if declared_slots:

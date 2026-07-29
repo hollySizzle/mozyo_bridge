@@ -1423,6 +1423,7 @@ class R3RegressionTest(unittest.TestCase):
                 "declared_slots",
                 "reconcile_phase",
                 "lane_kind",
+                "hibernated_at",
             ):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
@@ -1468,6 +1469,7 @@ class R3RegressionTest(unittest.TestCase):
                 "declared_slots",
                 "reconcile_phase",
                 "lane_kind",
+                "hibernated_at",
             ):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
@@ -1903,6 +1905,7 @@ class BackupFirstMigrationTest(unittest.TestCase):
         "declared_slots",
         "reconcile_phase",
         "lane_kind",
+        "hibernated_at",
     ]
 
     def _v2_store(self) -> Path:

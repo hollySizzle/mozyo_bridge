@@ -342,6 +342,8 @@ class LaneKindSchemaMigrationTest(unittest.TestCase):
         conn = sqlite3.connect(path)
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
+            # v8 (Redmine #14477) added hibernated_at; a faithful pre-v8 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 6 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -369,7 +371,7 @@ class LaneKindSchemaMigrationTest(unittest.TestCase):
         LaneLifecycleStore(home=self.home).ensure_schema()
 
         self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
-        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 7)
+        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 8)  # v8 = #14477 hibernated_at
         # backup-first: the pre-migration snapshot was preserved before the first write
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)

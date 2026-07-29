@@ -73,6 +73,7 @@ def _record(row: Sequence[object]) -> LaneLifecycleRecord:
         declared_slots=str(row[20] or ""),
         reconcile_phase=str(row[21] or ""),
         lane_kind=str(row[22] or ""),
+        hibernated_at=str(row[23] or ""),
     )
 
 
@@ -141,6 +142,9 @@ def _insert_active_row(
             declared_slots,
             "",  # reconcile_phase: a fresh lane is never reconcile-retired (v6, #13842)
             lane_kind,  # v7 (#13647): generation-bound lane-role heal authority
+            # v8 (#14477): a brand-new ACTIVE lane has never hibernated, so it holds no
+            # freshness boundary. Only the disposition CAS into ``hibernated`` writes one.
+            "",
         ),
     )
 

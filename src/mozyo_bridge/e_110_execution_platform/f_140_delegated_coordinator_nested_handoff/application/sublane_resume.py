@@ -21,7 +21,13 @@ disposition CAS:
    pre-hibernate attestation — so the fresh-pair proof also requires the self-attestation's
    ``observed_at`` to post-date the lane's hibernation, which a genuine relaunch satisfies
    and a survivor never does (correcting the design's "the locator IS the generation",
-   Q4 — true only for a *killed-and-relaunched* pane, not a survived one).
+   Q4 — true only for a *killed-and-relaunched* pane, not a survived one). That hibernation
+   timestamp is the **immutable hibernate-transition stamp** (``hibernated_at``, schema v8),
+   not the generic lifecycle ``updated_at``: Redmine #14477 measured a metadata-only
+   ``repair-pins`` moving the mutable column past the self-attestation of the exact live pair
+   it had just verified, which refused that pair ``stale_generation`` until an operator
+   glass-break. See :mod:`mozyo_bridge.core.state.lane_hibernation_anchor` for the authority
+   split and the fail-closed direction of its pre-v8 compatibility fallback.
 2. **commit point** — :meth:`LaneLifecycleStore.transition_disposition` CAS-moves the lane
    ``hibernated -> active``, clearing the (finished) release generation on rehydrate. The
    substrate refuses the rehydrate while a generation is still in flight (R1-F3) and refuses
@@ -46,6 +52,10 @@ from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
+)
+from mozyo_bridge.core.state.lane_hibernation_anchor import (
+    ANCHOR_HIBERNATE_TRANSITION,
+    resume_freshness_anchor,
 )
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
@@ -397,7 +407,11 @@ class SublaneResumeUseCase:
         rows = self.ops.live_rows()
         # The hibernation timestamp anchors the freshness gate: only a pair self-attested
         # AFTER the lane hibernated is a genuine relaunch (a survivor's record predates it).
-        hibernation_anchor = rec.updated_at if rec is not None else ""
+        # Redmine #14477: that boundary is the IMMUTABLE hibernate-transition stamp, never the
+        # generic lifecycle ``updated_at`` every metadata write moves — reading the mutable
+        # column let a pins repair invalidate the exact fresh pair it had just verified
+        # (#14476 j#88614-j#88618). Provenance and fallback direction: the anchor module.
+        hibernation_anchor, anchor_authority = resume_freshness_anchor(rec)
         both_live, attested, attest_detail = evaluate_pair_attestation(
             rows,
             workspace_id,
@@ -405,6 +419,14 @@ class SublaneResumeUseCase:
             self.ops.read_attestation,
             fresh_after=hibernation_anchor,
         )
+        if rec is not None and anchor_authority != ANCHOR_HIBERNATE_TRANSITION:
+            # Not the post-#14477 authority: say which one answered instead of leaving the
+            # operator to infer it. An UNAVAILABLE boundary additionally fails the freshness
+            # half closed — ``evaluate_pair_attestation`` skips that half on an empty
+            # threshold, and "nothing to compare against" is not a proof of freshness.
+            if not hibernation_anchor:
+                attested = False
+            attest_detail = f"{attest_detail}; freshness anchor: {anchor_authority}"
         fresh_pair_pins: tuple[ProcessGenerationPin, ...] = ()
         if both_live and attested:
             try:

@@ -74,6 +74,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
+from mozyo_bridge.core.state.lane_hibernation_anchor import hibernation_anchor_on_transition
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     BINDING_KIND_ISSUE,
     BINDING_KIND_PROJECT_GATEWAY,
@@ -503,25 +504,21 @@ class LaneLifecycleStore:
             release = RELEASE_NOT_REQUESTED if rehydrating else current.process_release
             action = "" if rehydrating else current.release_action_id
             pins = "" if rehydrating else current.release_pins
-            replacement = (
-                REPLACEMENT_NOT_REQUESTED
-                if rehydrating
-                else current.replacement_state
-            )
+            replacement = REPLACEMENT_NOT_REQUESTED if rehydrating else current.replacement_state
             replacement_action = "" if rehydrating else current.replacement_action_id
             replacement_pins = "" if rehydrating else current.replacement_pins
-            declared_slots = (
-                encoded_rehydrated_slots
-                if rehydrating and encoded_rehydrated_slots is not None
-                else current.declared_slots
-            )
+            # v8 (#14477): resume's freshness boundary moves ONLY here (lane_hibernation_anchor).
+            anchor = hibernation_anchor_on_transition(current.hibernated_at, target=target, stamp=stamp)
+            declared_slots = current.declared_slots
+            if rehydrating and encoded_rehydrated_slots is not None:
+                declared_slots = encoded_rehydrated_slots
             revision = current.revision + 1
             try:
                 conn.execute(
                     f"UPDATE {_TABLE} SET lane_disposition = ?, process_release = ?, "
                     "release_action_id = ?, release_pins = ?, replacement_state = ?, "
                     "replacement_action_id = ?, replacement_pins = ?, declared_slots = ?, "
-                    "revision = ?, "
+                    "hibernated_at = ?, revision = ?, "
                     "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                     "updated_at = ? "
                     "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
@@ -534,6 +531,7 @@ class LaneLifecycleStore:
                         replacement_action,
                         replacement_pins,
                         declared_slots,
+                        anchor,
                         revision,
                         decision.source,
                         decision.issue_id,
@@ -702,8 +700,8 @@ class LaneLifecycleStore:
                         f"UPDATE {_TABLE} SET issue_id = ?, lane_disposition = ?, "
                         "process_release = ?, release_action_id = ?, release_pins = ?, "
                         "replacement_state = ?, replacement_action_id = ?, "
-                        "replacement_pins = ?, revision = ?, decision_source = ?, decision_issue_id = ?, "
-                        "decision_journal = ?, "
+                        "replacement_pins = ?, hibernated_at = ?, revision = ?, "
+                        "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                         "updated_at = ? WHERE repo_workspace_id = ? AND lane_id = ? "
                         "AND revision = ?",
                         (
@@ -715,6 +713,7 @@ class LaneLifecycleStore:
                             REPLACEMENT_NOT_REQUESTED,
                             "",
                             "",
+                            "",  # v8 (#14477): a promoted lane is awake -> no boundary
                             revision,
                             decision.source,
                             decision.issue_id,

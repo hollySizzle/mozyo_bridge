@@ -601,6 +601,16 @@ class LaneLifecycleRecord:
     row or a lane created without a durable kind fact (the launch path then falls back to
     ``lane_class`` geometry — the issue's close condition), never a guessed value. It is a
     stored token, NOT folded into ``declared_slots`` (that stays post-launch observation).
+
+    ``hibernated_at`` (v8, Redmine #14477) is the IMMUTABLE hibernate-transition boundary the
+    resume freshness proof (#13682) compares startup self-attestations against. Unlike
+    ``updated_at`` — which every lifecycle write moves — it is stamped by exactly one event,
+    the disposition CAS INTO ``hibernated``, and cleared on the way back to ``active``. That
+    separation is the whole point: a metadata-only write (a revision bump, a decision anchor,
+    a declared-pin repair) must not be able to push the boundary past the attestation of the
+    pair it just verified (#14476 j#88614-j#88618). Empty on a pre-v8 row / a lane that never
+    hibernated; the reader then falls back to ``updated_at``, an equal-or-later (stricter)
+    threshold. Semantics and fallback direction: :mod:`...lane_hibernation_anchor`.
     """
 
     repo_workspace_id: str
@@ -626,6 +636,7 @@ class LaneLifecycleRecord:
     declared_slots: str = ""
     reconcile_phase: str = ""
     lane_kind: str = ""
+    hibernated_at: str = ""
 
     @property
     def key(self) -> LaneLifecycleKey:
@@ -698,6 +709,7 @@ class LaneLifecycleRecord:
             "declared_slots": [p.as_payload() for p in self.declared_pins],
             "reconcile_phase": self.reconcile_phase,
             "lane_kind": self.lane_kind,
+            "hibernated_at": self.hibernated_at,
         }
 
 

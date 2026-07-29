@@ -73,11 +73,19 @@ LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
 #: overwrite. A pre-v7 row migrates with an empty ``lane_kind`` (no durable kind fact → the
 #: launch path falls back to ``lane_class`` geometry, the issue's close condition), never a
 #: guessed value.
-LANE_LIFECYCLE_SCHEMA_VERSION = 7
-#: The component shapes this build can read and write. ``1``–``6`` are migrated
-#: additively to ``7``; anything else — a newer version from a future build, or a foreign
+#: v8 (Redmine #14477) adds ``hibernated_at`` — the IMMUTABLE hibernate-transition boundary
+#: the resume freshness proof (#13682) compares self-attestations against. It is written by
+#: exactly one event (the disposition CAS INTO ``hibernated``) and by no metadata write, so a
+#: revision / decision / declared-pin repair can no longer push the boundary past the
+#: attestation of the very pair it just verified (#14476 j#88614-j#88618). A pre-v8 row
+#: migrates with an EMPTY anchor and keeps its pre-#14477 ``updated_at`` boundary, which is
+#: equal-or-later than the true one — a stricter gate, never a weaker one. Semantics,
+#: fallback direction and provenance vocabulary: :mod:`...lane_hibernation_anchor`.
+LANE_LIFECYCLE_SCHEMA_VERSION = 8
+#: The component shapes this build can read and write. ``1``–``7`` are migrated
+#: additively to ``8``; anything else — a newer version from a future build, or a foreign
 #: value — fails closed and the store is left untouched (R3-F1).
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8})
 #: A coordinator decision that cannot be rebuilt from events; loss requires an
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
@@ -123,6 +131,7 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     declared_slots TEXT NOT NULL DEFAULT '',
     reconcile_phase TEXT NOT NULL DEFAULT '',
     lane_kind TEXT NOT NULL DEFAULT '',
+    hibernated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (repo_workspace_id, lane_id)
 )
 """
@@ -158,7 +167,7 @@ _COLUMNS = (
     "replacement_action_id, replacement_pins, decision_source, "
     "decision_issue_id, decision_journal, created_at, updated_at, worktree_identity, "
     "binding_kind, project_scope, lane_generation, declared_slots, reconcile_phase, "
-    "lane_kind"
+    "lane_kind, hibernated_at"
 )
 
 _V1_COLUMNS = frozenset(
@@ -187,6 +196,7 @@ _V5_ADDS = frozenset(
 )
 _V6_ADDS = frozenset({"reconcile_phase"})  # #13842 reconcile owed-close provenance
 _V7_ADDS = frozenset({"lane_kind"})  # #13647 generation-bound lane-role heal authority
+_V8_ADDS = frozenset({"hibernated_at"})  # #14477 immutable resume-freshness boundary
 
 #: The EXACT allowed column-name signatures per recorded version (Redmine #13754 R6-F1,
 #: j#78803). A recognized store must match one of its version's signatures EXACTLY (set
@@ -203,6 +213,7 @@ _SHAPE_V4 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS
 _SHAPE_V5 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS | _V5_ADDS
 _SHAPE_V6 = _V1_COLUMNS | _V2_ADDS | _V3_ADDS | _V4_ADDS | _V5_ADDS | _V6_ADDS
 _SHAPE_V7 = _SHAPE_V6 | _V7_ADDS
+_SHAPE_V8 = _SHAPE_V7 | _V8_ADDS
 _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     1: (_SHAPE_V1,),
     2: (_SHAPE_V2,),
@@ -211,6 +222,7 @@ _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     5: (_SHAPE_V5,),
     6: (_SHAPE_V6,),
     7: (_SHAPE_V7,),
+    8: (_SHAPE_V8,),
 }
 
 #: The authority-affecting definition each column MUST carry: ``(type, notnull, default,
@@ -242,6 +254,7 @@ _COLUMN_DEFS: dict[str, tuple[str, int, Optional[str], int]] = {
     "declared_slots": ("TEXT", 1, "''", 0),
     "reconcile_phase": ("TEXT", 1, "''", 0),
     "lane_kind": ("TEXT", 1, "''", 0),
+    "hibernated_at": ("TEXT", 1, "''", 0),
 }
 
 
@@ -613,7 +626,7 @@ def readonly_compatible_select(conn: sqlite3.Connection) -> Optional[str]:
     The read half of the read-compatible / write-migrating split (Redmine #13844). Given a
     store whose recorded component version this build recognizes AND whose live table shape
     EXACTLY matches one of that version's known signatures (:func:`_schema_signature_matches`),
-    returns a ``SELECT`` column expression that yields the full current (v6) column vocabulary
+    returns a ``SELECT`` column expression that yields the full current column vocabulary
     in :data:`COLUMNS` order — projecting the columns the store's older shape lacks as their
     **migration-default literal** (``'' AS reconcile_phase`` for a v5 store, and so on). The
     caller then decodes each row exactly as a native current row, WITHOUT altering the DB
@@ -910,6 +923,18 @@ def ensure_lane_lifecycle_schema(path: Path) -> LifecycleSchemaOutcome:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN lane_kind TEXT NOT NULL DEFAULT ''"
+                )
+            # v8 (Redmine #14477): the immutable hibernate-transition freshness boundary. A
+            # pre-v8 row lands EMPTY — the boundary of a hibernation this build never
+            # observed is not reconstructible, and the resume reader then falls back to that
+            # row's generic ``updated_at`` (equal-or-later than the true boundary, so a
+            # STRICTER gate). Never back-filled from ``updated_at`` at migration time: that
+            # would freeze one metadata write's stamp INTO the immutable column and make the
+            # very false ``stale_generation`` this version exists to remove permanent.
+            if "hibernated_at" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN hibernated_at TEXT NOT NULL DEFAULT ''"
                 )
             conn.execute(_OWNER_INDEX_SQL)
             conn.execute(_PROJECT_OWNER_INDEX_SQL)

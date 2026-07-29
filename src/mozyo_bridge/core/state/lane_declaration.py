@@ -547,7 +547,7 @@ class LaneDeclarationStore:
                     "process_release = ?, release_action_id = ?, release_pins = ?, "
                     "replacement_state = ?, replacement_action_id = ?, "
                     "replacement_pins = ?, declared_slots = ?, reconcile_phase = ?, "
-                    "lane_kind = ?, revision = ?, "
+                    "lane_kind = ?, hibernated_at = ?, revision = ?, "
                     "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                     "updated_at = ? "
                     "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
@@ -568,6 +568,11 @@ class LaneDeclarationStore:
                         # v7 (Redmine #13647): carry the geometry kind forward unless the
                         # caller explicitly re-binds it at this generation boundary.
                         current.lane_kind if rebind_kind is None else rebind_kind,
+                        # v8 (Redmine #14477): a re-incarnated generation is a fresh ACTIVE
+                        # lane, so it carries NO hibernate freshness boundary — the previous
+                        # generation's boundary must never gate this one's fresh pair (the
+                        # same reasoning as the ``reconcile_phase`` clear above).
+                        "",
                         revision,
                         decision.source,
                         decision.issue_id,

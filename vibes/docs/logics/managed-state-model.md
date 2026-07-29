@@ -356,6 +356,37 @@ Table naming:
     - **launch 時の 2 authority と矛盾時の扱い** (`herdr-native-identity.md` §5.2): fresh launch は
       caller-supplied `LaneLaunchContext`、heal は本 field。両方あり **不一致**なら片方が stale なので
       launch は **zero side effect で fail-closed 拒否** (どちらかを黙って採用しない)。
+  - **hibernate freshness 境界 (resume の post-hibernate 世代証明の正本)** (schema v8、#14477 /
+    live evidence #14476 j#88614-j#88618)。追加 field `hibernated_at`。semantics / fallback 方向の
+    実装正本は `core/state/lane_hibernation_anchor.py`。
+    - **何を保存するか**: lane が `hibernated` へ入った **transition の時刻**。resume (#13682) は
+      各 slot の startup self-attestation (#13637) が **この時刻より厳密に後** に観測されたことを
+      要求して、relaunch された pair と **release を生き残った pane** を区別する (locator は
+      pane-id なので survivor も自分の pre-hibernate attestation に一致し、locator pin だけでは
+      世代を証明できない)。
+    - **なぜ `updated_at` と分けるか**: `updated_at` は **全ての write が動かす** column である。
+      metadata-only な write が境界を前へ押し、その write 自身が直前に検証した live pair を
+      `stale_generation` に落とす。実測は `repair-pins` (#13879、declared-pin 補填 + revision /
+      decision anchor 更新のみで launch / close / resume / send を一切しない) が、まさに検証した
+      exact pair を resume 不能にし、glass-break しか残らなかった (#14476 j#88617-j#88618)。
+      責務分離が fix であり、gate の緩和ではない。
+    - **write するのは 1 event だけ**: `hibernated` へ入る disposition CAS のみが stamp する。
+      revision bump / decision anchor / declared-pin repair / release・replacement write /
+      reconcile phase は **触らない**。`active` へ戻る側 (resume rehydrate / recovery lane 昇格 /
+      `open_next_generation`) は **空へ clear** する (起きている lane に境界は存在しない)。
+      terminal (`superseded` / `retired`) は audit fact として保持する。
+    - **clear が fail-closed 方向である理由**: 将来 stamp しない writer が row を `hibernated` へ
+      戻した場合、古い境界が残っていれば threshold が過去に飛び **gate が緩む**。空なら
+      `updated_at` (= その write 自身の stamp) へ fallback するので、緩まない。
+    - **migration / fallback**: pre-v8 row は additive backup-first migration で **空** anchor を
+      得る (`updated_at` から back-fill **しない** — metadata write の stamp を immutable column へ
+      焼き付けると、本 version が除去する false `stale_generation` が恒久化する)。空の場合の
+      reader は当該 row の `updated_at` へ fallback し、`lifecycle_updated_at_pre_v8` として
+      **typed outcome に明示**する。`updated_at >= hibernated_at` は常に成立するので、この
+      fallback は **等しいかより厳しい** threshold であり緩むことはない。
+    - **現在時刻は使わない**: 「最近観測された」pane を通してしまい、世代証明の逆になる。
+      両 stamp を欠く row は `unavailable` として **freshness 半分を fail-closed** にする
+      (threshold 不在を「比較対象が無いので fresh」と読ませない)。
   - **binding kind / lane generation / typed process pins** (schema v5、#13810 / Design Answer
     j#78386)。project-gateway 用の別 owner component は作らず、同一 `lane_lifecycle_records` row /
     同一 revision CAS を additive 拡張する (別 component にすると owner row と release/replacement
