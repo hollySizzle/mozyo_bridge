@@ -160,12 +160,19 @@ def _git(*args: str, cwd: Path, capture: bool = False):
 
 #: Config that stops git from leaving a DETACHED background writer inside a synthetic repo.
 #:
-#: Since Git 2.50 a foreground command that ends in a commit (``commit``, ``cherry-pick``,
-#: ``fetch``, ...) finishes by spawning ``git maintenance run --auto --detach``. That process
-#: daemonizes (measured: it reparents to pid 1) and keeps writing INSIDE the repository after the
-#: fixture's ``subprocess.run(..., check=True)`` has already returned — git 2.43 ran the same
-#: maintenance synchronously, which is why this only started biting on the runner (the GitHub
-#: Actions ubuntu-latest image that failed run 30422231848 ships git 2.54.0).
+#: **Git 2.47.0 made auto maintenance detach by default.** A foreground command that ends in a
+#: commit (``commit``, ``cherry-pick``, ``fetch``, ...) finishes by spawning
+#: ``git maintenance run --auto --detach``, and that process daemonizes (measured: it reparents to
+#: pid 1) and keeps writing INSIDE the repository after the fixture's
+#: ``subprocess.run(..., check=True)`` has already returned. Upstream boundary, read directly from
+#: ``run-command.c`` at the release tags: **v2.46.0's ``prepare_auto_maintenance()`` pushes no
+#: ``--detach``; v2.47.0 adds the ``auto_detach`` default** (``maintenance.autoDetach`` falling
+#: back to ``gc.autoDetach``, defaulting to on) **and pushes it**. The GitHub Actions
+#: ubuntu-latest image that failed run 30422231848 ships git 2.54.0.
+#:
+#: An earlier revision of this comment said "Since Git 2.50", interpolating between two measured
+#: points (2.43 = no detach, 2.50.1 / 2.54.0 = detach) instead of checking upstream. That was
+#: wrong and is corrected here (Redmine #14685 review j#94444 F2 / verdict j#94448).
 #:
 #: The teardown then races that writer: ``shutil.rmtree`` lists a directory ONCE, removes the
 #: children it listed, and finally ``os.rmdir``s the directory. The detached maintenance writes
