@@ -32,11 +32,13 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.fresh_coordinator_drain import (  # noqa: E402,E501
     DRAIN_SEND_ERROR,
     DRAIN_SEND_OK,
+    DRAIN_SEND_ZERO,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_continuation_drain import (  # noqa: E402,E501
     CONTINUATION_AUTHORITY_MOVED,
     CONTINUATION_CONFIRMED,
     CONTINUATION_SEND_FAILED,
+    CONTINUATION_ZERO_SEND_REVERTED,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_refresh import (  # noqa: E402,E501
     WORKER_REFRESH_STATUS_COMPLETED,
@@ -753,6 +755,52 @@ class DurableProgressAtCloseTests(_RefreshCase):
         self.assertTrue(replay.post_close_resume)
         self.assertEqual(replay.status, WORKER_REFRESH_STATUS_COMPLETED)
         self.assertEqual(len(self.port.closed), closes)
+
+
+class ZeroSendOutcomeSeparationTests(_RefreshCase):
+    """A proven zero-send is re-sendable AND reported as itself (review j#92656 F4).
+
+    The revert CAS is legitimately shared with the authority-moved path — both mean "reverted,
+    re-sendable" — but they are different facts, and reporting a zero-send as ``authority_moved``
+    produced an outcome asserting ``launch_authority_reason=ok`` and
+    ``resume_status=authority_moved`` at the same time.
+    """
+
+    class _ZeroSendOps(FakeWorkerOps):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.send_calls = 0
+
+        def resume_once(self, continuation):
+            self.send_calls += 1
+            self.resumes.append(continuation)
+            return DRAIN_SEND_ZERO
+
+    def test_a_proven_zero_send_reports_itself_not_an_authority_move(self):
+        ops = self._ZeroSendOps()
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.resume_status, CONTINUATION_ZERO_SEND_REVERTED)
+        self.assertNotEqual(outcome.resume_status, CONTINUATION_AUTHORITY_MOVED)
+        # The authority genuinely held, so the outcome must not claim otherwise.
+        self.assertEqual(outcome.launch_authority_reason, LAUNCH_AUTHORITY_OK)
+        self.assertEqual(ops.send_calls, 1)
+
+    def test_a_reverted_zero_send_is_re_sendable_on_a_rerun(self):
+        ops = self._ZeroSendOps()
+        self._use_case(ops).run(self._request(), execute=True)
+        # The attempt was un-recorded, so a re-run may send again (an uncertain one may not).
+        again = FakeWorkerOps()
+        outcome = self._use_case(again).run(self._request(), execute=True)
+        self.assertEqual(len(again.resumes), 1, "a proven zero-send must be re-sendable")
+        self.assertEqual(outcome.status, WORKER_REFRESH_STATUS_COMPLETED)
+
+    def test_an_uncertain_send_keeps_its_attempt_and_never_blind_resends(self):
+        first = FakeWorkerOps(send_result=DRAIN_SEND_ERROR, confirm_after_send=False)
+        self._use_case(first).run(self._request(), execute=True)
+        self.assertEqual(len(first.resumes), 1)
+        again = FakeWorkerOps(send_result=DRAIN_SEND_ERROR, confirm_after_send=False)
+        self._use_case(again).run(self._request(), execute=True)
+        self.assertEqual(len(again.resumes), 0, "an uncertain send must never blind-resend")
 
 
 class AnchorIssueSplitTests(_RefreshCase):

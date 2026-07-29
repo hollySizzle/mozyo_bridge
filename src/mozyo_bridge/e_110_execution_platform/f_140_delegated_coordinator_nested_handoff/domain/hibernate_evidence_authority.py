@@ -56,6 +56,9 @@ from .hibernate_evidence_marker import (
 
 MARKER_GATE_REVIEW_RESULT = "review_result"
 
+#: Redmine #14661: the guarded live-worker refresh's owner-approval gate (Design Answer j#92641).
+GATE_WORKER_REFRESH_OWNER_APPROVAL = "worker_refresh_owner_approval"
+
 # The closed issuer-role vocabulary (ruling j#85530 Q3).
 ISSUER_COORDINATOR = "coordinator"
 #: The same-lane reviewer / implementation gateway that writes the canonical Review Result.
@@ -79,6 +82,15 @@ _KIND_ISSUER = {
     EVIDENCE_REQUIRED_CI_GREEN: ISSUER_COORDINATOR,
     EVIDENCE_DOGFOOD_DELEGATED: ISSUER_COORDINATOR,
     EVIDENCE_PARK_DECLARED: ISSUER_LANE_WORKER,
+    # Redmine #14661 Design Answer j#92641: the guarded worker refresh's owner-approval gate.
+    # Its canonical writer is the COORDINATOR — the governed preset aggregates owner decisions
+    # at the coordinator role, which records the durable approval journal. The approval's
+    # provenance (that the owner, not the coordinator, decided) is a SEPARATE axis carried by
+    # the marker's ``approval_source=direct_owner``; conflating the two would either invent a
+    # runtime "owner" role this system has no durable resolution for, or let any same-account
+    # writer pass as the owner. Registered HERE rather than in a second map, because this is
+    # the single gate->role authority and a parallel table would drift from it.
+    GATE_WORKER_REFRESH_OWNER_APPROVAL: ISSUER_COORDINATOR,
 }
 
 def contract_writer_role(gate: str) -> str:
@@ -243,6 +255,7 @@ def check_issuer(kind: str, issuer: ResolvedIssuer, *, envelope) -> "str | None"
 
 
 __all__ = [
+    "GATE_WORKER_REFRESH_OWNER_APPROVAL",
     "ISSUER_COORDINATOR",
     "ResolvedIssuer",
     "ISSUER_LANE_WORKER",

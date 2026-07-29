@@ -1027,6 +1027,134 @@ class CloseBoundarySettledFenceTests(unittest.TestCase):
         )
 
 
+class RealIssuerResolutionTests(unittest.TestCase):
+    """The REAL issuer resolution path, with no resolver override (review j#92641 wiring).
+
+    Every other approval test injects an issuer, so the adapter's own resolution — the gate->role
+    policy plus the committed-config anchor — was never executed and a mutation blanking the
+    policy pointer survived. The authority a destructive close rests on has to be driven for
+    real at least once.
+    """
+
+    APPROVAL_JOURNAL = "92500"
+    ACTION_ID = "refresh-worker:" + LANE + ":claude:claude:wk:w4B:p10:r4"
+
+    def setUp(self):
+        self.repo = Path(__file__).resolve().parents[4]   # the real repo: it has the config blob
+        self.request = _request(
+            journal=self.APPROVAL_JOURNAL, action_id=self.ACTION_ID, action_generation=3,
+            worker_revision="4", lane_revision="5", lane_generation="2",
+        )
+        self.ops = LiveWorkerRefreshOps(repo_root=self.repo, request=self.request)
+        self.marker = render_worker_refresh_approval_marker(
+            issue="14661", lane=LANE, action_id=self.ACTION_ID, action_generation=3,
+            lane_revision="5", lane_generation="2", anchor_issue=ANCHOR_ISSUE,
+            resume_anchor_journal=ANCHOR_JOURNAL, resume_gate=ANCHOR_GATE,
+        )
+
+    def _verify(self, notes):
+        self.ops.journal_reader = lambda issue: [_Entry(self.APPROVAL_JOURNAL, notes)]
+        self.ops.journal_reader_fresh = True
+        return self.ops.approval_verified(self.request)
+
+    def test_the_committed_config_anchor_resolves_from_the_tracked_object(self):
+        pointer = self.ops._issuer_policy_pointer()
+        self.assertTrue(pointer.startswith("git:.mozyo-bridge/config.yaml@"), pointer)
+        self.assertGreater(len(pointer.split("@")[-1]), 0, "an anchor needs a real blob")
+
+    def test_a_coordinator_written_approval_verifies_through_the_real_resolver(self):
+        # No issuer_resolver override: the gate->role policy and the committed anchor do the work.
+        self.assertTrue(self._verify(f"## Gate: owner approval\n\n{self.marker}\n"))
+
+    def test_without_a_committed_anchor_nothing_verifies(self):
+        # The mutation that survived before: a blank policy pointer must make every approval
+        # unanchored and therefore refused.
+        with patch.object(self.ops, "_issuer_policy_pointer", return_value=""):
+            self.assertFalse(self._verify(f"## Gate: owner approval\n\n{self.marker}\n"))
+
+    def test_a_delegated_source_is_refused_through_the_real_resolver(self):
+        delegated = self.marker.replace(
+            "approval_source=direct_owner", "approval_source=standing_delegation"
+        )
+        self.assertFalse(self._verify(delegated))
+
+    def test_a_second_authority_gate_in_the_same_journal_refuses(self):
+        # Two authority-bearing gates in one note claim two contracts and prove neither.
+        other = (
+            "[mozyo:workflow-event:gate=park_declared:workspace=ws:lane="
+            + LANE + ":lane_generation=2]"
+        )
+        self.assertFalse(self._verify(f"{self.marker}\n{other}\n"))
+
+
+class CloseEdgeProgressRaceTests(unittest.TestCase):
+    """The progress guard sits at the INNER CLOSE call site (review j#92656 F2).
+
+    The actuator re-authenticates its lease between the preservation decision and the close, so
+    a guard in ``observe_preservation`` is not the last observation. These drive the wrapper
+    directly and land progress in exactly that window.
+    """
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        self.request = _request(worker_revision="4")
+        self.ops = LiveWorkerRefreshOps(repo_root=self.repo, request=self.request)
+        self.inner = _FakeInnerPort()
+
+    def _port(self, guard):
+        return live_mod.SettledCloseBoundaryPort(
+            inner=self.inner, ops=self.ops, request=self.request,
+            progress_still_failed=guard,
+        )
+
+    def test_progress_landing_after_preservation_still_blocks_the_close(self):
+        # The exact measured window: preservation passes, then progress lands, then close.
+        state = {"failed": True}
+        port = self._port(lambda: state["failed"])
+        rows = [{"name": "wk", "pane_id": "w4B:p10", "revision": "4", "status": "done"}]
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
+                patch.object(self.ops, "_composer_clear", return_value=True):
+            observation = port.observe_preservation(_pin())
+        self.assertTrue(assess_worker_recovery_preservation(observation).may_close)
+        state["failed"] = False          # a gate lands during the actuator's lease re-auth
+        self.assertEqual(
+            port.close_exact_generation(_pin()), live_mod.CLOSE_REFUSED_PROGRESS_MOVED
+        )
+        self.assertEqual(self.inner.calls, [], "the inner close must never run")
+
+    def test_an_unreadable_progress_authority_blocks_the_close(self):
+        def _boom():
+            raise RuntimeError("durable source down")
+
+        self.assertEqual(
+            self._port(_boom).close_exact_generation(_pin()),
+            live_mod.CLOSE_REFUSED_PROGRESS_MOVED,
+        )
+        self.assertEqual(self.inner.calls, [])
+
+    def test_a_still_failed_turn_closes(self):
+        # Discriminating in both directions.
+        self.assertEqual(self._port(lambda: True).close_exact_generation(_pin()), "closed")
+        self.assertEqual(self.inner.calls, ["close_exact_generation"])
+
+    def test_a_post_close_replay_passes_no_guard_and_closes(self):
+        # Replay supplies None: the close already committed, and re-litigating it would refuse
+        # the very transactions that exist to be finished.
+        self.assertEqual(self._port(None).close_exact_generation(_pin()), "closed")
+        self.assertEqual(self.inner.calls, ["close_exact_generation"])
+
+    def test_the_guard_runs_on_the_close_leg_not_the_preservation_leg(self):
+        calls: list = []
+        port = self._port(lambda: calls.append("guard") or True)
+        rows = [{"name": "wk", "pane_id": "w4B:p10", "revision": "4", "status": "done"}]
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
+                patch.object(self.ops, "_composer_clear", return_value=True):
+            port.observe_preservation(_pin())
+        self.assertEqual(calls, [], "preservation must not be where progress is judged")
+        port.close_exact_generation(_pin())
+        self.assertEqual(calls, ["guard"])
+
+
 class ResumeRailTests(unittest.TestCase):
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp())

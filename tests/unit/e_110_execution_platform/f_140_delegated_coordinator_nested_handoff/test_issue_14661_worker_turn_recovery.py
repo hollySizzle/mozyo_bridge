@@ -48,9 +48,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
     ResolvedIssuer,
+    contract_writer_role,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_refresh_approval import (  # noqa: E501
     APPROVAL_AUTHORITY_ROLES,
+    WORKER_REFRESH_APPROVAL_GATE,
     WorkerRefreshApprovalError,
     parse_strict_approval_markers,
     render_worker_refresh_approval_marker,
@@ -534,18 +536,43 @@ class ApprovalDomainContractTests(unittest.TestCase):
             created_on="",
         )
 
+    def _coordinator(self):
+        return ResolvedIssuer(role="coordinator", authority_anchor="git:cfg@sha")
+
+    def test_a_canonical_approval_by_the_coordinator_verifies(self):
+        marker = render_worker_refresh_approval_marker(**self._operation())
+        fields = self._verify([self._entry(marker)], issuer=self._coordinator())
+        self.assertEqual(fields["decision"], "approved")
+        self.assertEqual(fields["approval_source"], "direct_owner")
+
     def _verify(self, entries, *, issuer=None, **op):
         return verify_worker_refresh_approval(
             entries, journal=self.JOURNAL, issuer=issuer, **self._operation(**op)
         )
 
-    def test_no_role_currently_holds_owner_approval_authority(self):
-        # Review j#92601 F1: comparing the journal's author to the issue's author was not an
-        # authority check — on a single-account workspace every journal satisfies it. The repo
-        # has no durable role resolution that yields an OWNER, so the set is deliberately empty
-        # and every --execute refuses until that representation is ruled on. Pinning the empty
-        # set makes silently populating it with a nearby role a visible change.
-        self.assertEqual(APPROVAL_AUTHORITY_ROLES, frozenset())
+    def test_the_authority_role_is_the_coordinator_and_only_the_coordinator(self):
+        # Design Answer j#92641: the coordinator is the governed aggregation point that records
+        # the durable approval journal. Pinning the exact set makes widening it a visible
+        # change — and the OWNER-ness of the decision is a separate axis (approval_source),
+        # tested below, never inferred from this role.
+        self.assertEqual(APPROVAL_AUTHORITY_ROLES, frozenset({"coordinator"}))
+
+    def test_the_approval_gate_resolves_to_the_coordinator_in_the_single_role_map(self):
+        # The gate->role binding lives in the ONE shared authority, not a private table here.
+        self.assertEqual(contract_writer_role(WORKER_REFRESH_APPROVAL_GATE), "coordinator")
+
+    def test_a_coordinator_recording_a_delegated_approval_is_still_refused(self):
+        # The two axes are independent: WHO recorded it (coordinator) and WHOSE decision it
+        # reports (direct_owner). A destructive operation is a carve-out from standing
+        # delegation, so a coordinator relaying a delegated approval does not satisfy it.
+        marker = render_worker_refresh_approval_marker(**self._operation()).replace(
+            "approval_source=direct_owner", "approval_source=standing_delegation"
+        )
+        with self.assertRaises(WorkerRefreshApprovalError):
+            self._verify(
+                [self._entry(marker)],
+                issuer=ResolvedIssuer(role="coordinator", authority_anchor="git:cfg@sha"),
+            )
 
     def test_an_unresolved_or_unanchored_issuer_is_refused(self):
         marker = render_worker_refresh_approval_marker(**self._operation())
@@ -562,7 +589,7 @@ class ApprovalDomainContractTests(unittest.TestCase):
     def test_an_anchored_but_non_owner_role_is_refused(self):
         # A coordinator / gateway / worker is anchored but does not hold owner authority.
         marker = render_worker_refresh_approval_marker(**self._operation())
-        for role in ("coordinator", "review_gateway", "lane_worker"):
+        for role in ("review_gateway", "lane_worker"):
             with self.subTest(role=role):
                 with self.assertRaises(WorkerRefreshApprovalError):
                     self._verify(

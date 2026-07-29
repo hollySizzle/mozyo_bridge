@@ -55,6 +55,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     canonical_marker_bodies,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+    ISSUER_COORDINATOR,
     ISSUER_UNKNOWN,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
@@ -81,14 +82,17 @@ APPROVAL_EFFECT = "worker_close_relaunch_resume"
 APPROVAL_SOURCE = "direct_owner"
 
 
-#: The resolved writer roles that may issue a destructive owner approval for this surface.
-#: EMPTY on purpose (#14661 j#92601 F1): the governed preset's approval carve-out requires a
-#: ``direct_owner`` approval for a destructive operation, and this repo has no durable
-#: role-resolution that yields an owner identity today — only coordinator / review-gateway /
-#: lane-worker. Naming one of those here would re-create the defect this finding closed (any
-#: same-account writer passing as the owner). Until the representation of "direct owner" is
-#: settled by a design ruling, every ``--execute`` refuses. The preflight is unaffected.
-APPROVAL_AUTHORITY_ROLES: frozenset[str] = frozenset()
+#: The resolved WRITER roles that may record a destructive owner approval for this surface
+#: (Redmine #14661 Design Answer j#92641). The coordinator is the governed aggregation point for
+#: owner decisions and the actor that writes the durable approval journal.
+#:
+#: This is deliberately NOT "the owner is the coordinator". Two independent axes must both hold:
+#: WHO recorded the journal (this role, resolved from the durable gate->role policy with an
+#: anchor) and WHOSE decision it reports (the marker's ``approval_source``, which must be
+#: ``direct_owner`` — a destructive operation is a carve-out from standing delegation). A
+#: coordinator recording a standing-delegation approval does not satisfy this surface, and a
+#: marker claiming ``direct_owner`` written by a non-coordinator does not either.
+APPROVAL_AUTHORITY_ROLES: frozenset[str] = frozenset({ISSUER_COORDINATOR})
 
 
 class WorkerRefreshApprovalError(ValueError):

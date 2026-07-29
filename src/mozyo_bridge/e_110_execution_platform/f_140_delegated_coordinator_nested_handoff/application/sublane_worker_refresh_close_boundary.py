@@ -19,6 +19,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     RUNTIME_TURN_ENDED,
 )
 
+#: The close-leg refusal this wrapper raises when the durable progress authority moved between
+#: the preservation decision and the effect. It is deliberately NOT one of the actuator's
+#: success tokens, so the actuator stops the recovery and the transaction keeps its replay
+#: fence — a re-run re-reads and, if the worker really did land its gate, keeps refusing.
+CLOSE_REFUSED_PROGRESS_MOVED = "close_refused_durable_progress_moved"
+
 
 @dataclass
 class SettledCloseBoundaryPort:
@@ -92,22 +98,33 @@ class SettledCloseBoundaryPort:
             return replace(
                 observation, running_process=True, detail="pending_composer_input"
             )
+        return observation
+
+    def close_exact_generation(self, pin):
+        """Re-join the durable progress authority, then close. (fail-closed)
+
+        This is the LAST place before the irreversible effect. The guard used to sit in
+        :meth:`observe_preservation`, but the actuator re-authenticates its lease between the
+        preservation read and the close (``_reauth_before_effect``: store get / renew / get),
+        so a gate landing in that window was still closed over — measured in review j#92656 F2
+        (``turn_reads=3``, ``progress_failed_at_end=False``, ``closed_count=1``). "Just before"
+        has to mean the call site of the effect, not the last decision that precedes it.
+
+        ``progress_still_failed`` is ``None`` on a post-close replay, where the close already
+        committed and re-litigating it would refuse the very transactions that exist to be
+        finished; those runs never reach this leg for a second close anyway.
+        """
         guard = self.progress_still_failed
         if guard is not None:
             try:
                 still_failed = bool(guard())
-            except Exception:  # noqa: BLE001 - an unreadable durable authority never permits
+            except Exception:  # noqa: BLE001 - an unreadable authority never permits a close
                 still_failed = False
             if not still_failed:
-                # Landed, ambiguous or unreadable — all three refuse. The worker may have
-                # written its gate moments ago; closing now destroys exactly the work this
-                # surface exists to preserve.
-                return replace(
-                    observation, running_process=True, detail="durable_progress_moved"
-                )
-        return observation
-
-    def close_exact_generation(self, pin):
+                # Landed, ambiguous or unreadable all refuse: the worker may have written its
+                # gate moments ago, and closing now destroys exactly what this surface exists
+                # to preserve.
+                return CLOSE_REFUSED_PROGRESS_MOVED
         return self.inner.close_exact_generation(pin)
 
     def launch_action_bound(self, action_id: str, pin):
@@ -117,4 +134,4 @@ class SettledCloseBoundaryPort:
         return self.inner.verify_attestation(action_id, pin)
 
 
-__all__ = ("SettledCloseBoundaryPort",)
+__all__ = ("CLOSE_REFUSED_PROGRESS_MOVED", "SettledCloseBoundaryPort")

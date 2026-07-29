@@ -58,6 +58,13 @@ CONTINUATION_UNREADABLE = "continuation_unreadable"
 #: is reverted so a later re-run re-attempts exactly once; never a blind send into a lane the
 #: approval no longer governs.
 CONTINUATION_AUTHORITY_MOVED = "authority_moved"
+#: The rail PROVED it transmitted nothing and the attempt was reverted, so a re-run may send
+#: (Redmine #14661 j#92656 F4). Operationally it shares the authority-moved revert path — both
+#: are "reverted, re-sendable" — but they are different facts: one says the lane authority moved
+#: under us, the other says the authority held and the rail declined to transmit. Reporting a
+#: zero-send as ``authority_moved`` produced outcomes asserting ``launch_authority_reason=ok``
+#: and ``resume_status=authority_moved`` at once, which cannot both be true.
+CONTINUATION_ZERO_SEND_REVERTED = "zero_send_reverted"
 #: A PROVEN zero-send attempt's revert CAS could not complete (#13806 R3 j#82782 F1) — a
 #: concrete zero-send CAS-recovery failure, DISTINCT from the send-in-flight ``uncertain``.
 CONTINUATION_RELEASE_REFUSED = "release_refused"
@@ -134,7 +141,10 @@ def drive_continuation_once(
         # acts on, so it takes the same revert — un-record the attempt so a re-run may send.
         # Collapsing it into the failure branch below leaves the attempt recorded forever and a
         # post-close transaction can then never resume its anchor (Redmine #14661 j#92601 F5).
-        return _un_record_attempt(store, clock, key, holder=holder, gen=gen)
+        return _un_record_attempt(
+            store, clock, key, holder=holder, gen=gen,
+            reverted=CONTINUATION_ZERO_SEND_REVERTED,
+        )
     if sent != DRAIN_SEND_OK:
         # Send outcome UNCERTAIN; the state stays attempted. A re-run re-checks the confirmation
         # and only completes if it confirms — never a blind resend.
@@ -144,7 +154,10 @@ def drive_continuation_once(
     return finalize_confirmed(store, clock, key, holder=holder, gen=gen)
 
 
-def _un_record_attempt(store, clock, key, *, holder: str, gen: int) -> str:
+def _un_record_attempt(
+    store, clock, key, *, holder: str, gen: int,
+    reverted: str = CONTINUATION_AUTHORITY_MOVED,
+) -> str:
     """Un-record a PROVEN zero-send attempt, handling the release CAS outcome (j#82768).
 
     Each attempt re-reads the CURRENT row and classifies it into a typed disposition; a
@@ -152,6 +165,10 @@ def _un_record_attempt(store, clock, key, *, holder: str, gen: int) -> str:
     concurrent phase / refusal reason reports :data:`CONTINUATION_RELEASE_REFUSED` (j#82782
     F1) — a distinct zero-send CAS-recovery failure, never the send-in-flight ``uncertain``
     and never a false re-sendable ``authority_moved``.
+
+    ``reverted`` is the token to report once the revert succeeds: the CAS recovery is identical
+    for both callers, but the FACT differs (the authority moved vs the rail proved a zero send),
+    so the outcome must not claim the wrong one (#14661 j#92656 F4).
     """
     for _ in range(_UN_RECORD_RETRY_CAP):
         rec = store.get(key)
@@ -160,7 +177,7 @@ def _un_record_attempt(store, clock, key, *, holder: str, gen: int) -> str:
         if rec.action_generation != gen:
             return CONTINUATION_GENERATION_MISMATCH
         if rec.phase == PHASE_REPLACING_NONSELF:
-            return CONTINUATION_AUTHORITY_MOVED  # re-sendable (reverted / never attempted)
+            return reverted  # re-sendable (reverted / never attempted)
         if rec.phase == PHASE_COMPLETED:
             return CONTINUATION_CONFIRMED  # a concurrent holder dispatched + drained
         if rec.phase != PHASE_DRAINING_CONTINUATION:
@@ -175,7 +192,7 @@ def _un_record_attempt(store, clock, key, *, holder: str, gen: int) -> str:
             holder=holder, now=now,
         )
         if out.applied:
-            return CONTINUATION_AUTHORITY_MOVED  # reverted -> re-sendable
+            return reverted  # reverted -> re-sendable (the caller's own fact)
         if out.reason == CAS_GENERATION_MISMATCH:
             return CONTINUATION_GENERATION_MISMATCH
         if out.reason == CAS_LEASE_NOT_HELD:
@@ -248,6 +265,7 @@ __all__ = (
     "CONTINUATION_NOT_FOUND",
     "CONTINUATION_UNREADABLE",
     "CONTINUATION_AUTHORITY_MOVED",
+    "CONTINUATION_ZERO_SEND_REVERTED",
     "CONTINUATION_RELEASE_REFUSED",
     "drive_continuation_once",
     "finalize_confirmed",

@@ -117,6 +117,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 )
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_refresh_close_boundary import (  # noqa: E501
+    CLOSE_REFUSED_PROGRESS_MOVED,
     SettledCloseBoundaryPort,
 )
 
@@ -668,15 +669,33 @@ class LiveWorkerRefreshOps:
             return ResolvedIssuer()
 
     def _issuer_policy_pointer(self) -> str:
-        """The committed-config basis the issuer resolution is anchored to, or ``""``.
+        """The committed-config blob the issuer resolution is anchored to, or ``""``.
 
-        ``config_policy_pointer`` names the committed provider-binding blob the role policy is
-        read from. Resolving that blob sha for this repo is not wired here yet, so the basis is
-        empty and EVERY resolution is unanchored — which refuses. That is the correct
-        fail-closed state while the owner-authority representation is a pending design ruling
-        (#14661 j#92601 F1): the surface must not close on an authority it cannot establish.
+        ``config_policy_pointer`` names the exact committed blob of the provider-binding config
+        the gate->role contract is bound to, so the resolved role carries a record anyone can
+        re-check (Redmine #14661 Design Answer j#92641). Read from git as a tracked-object
+        lookup — never the working-tree file, whose content an actor requesting a destructive
+        action could edit. An unresolvable blob yields ``""``, which leaves every resolution
+        unanchored and therefore refuses.
         """
-        return ""
+        import subprocess
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_issuer_policy import (  # noqa: E501
+            CONFIG_RELPATH,
+            config_policy_pointer,
+        )
+
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(self.repo_root), "rev-parse", f"HEAD:{CONFIG_RELPATH}"],
+                text=True, capture_output=True,
+            )
+        except OSError:
+            return ""
+        if result.returncode != 0:
+            return ""
+        blob = result.stdout.strip()
+        return config_policy_pointer(blob) if blob else ""
 
     def resume_rail_ready(self, request: WorkerRefreshRequest) -> bool:
         """Can the ACTION-BOUND resume rail deliver from THIS context? (read-only, pre-close)
@@ -896,6 +915,7 @@ class LiveWorkerRefreshOps:
 
 
 __all__ = (
+    "CLOSE_REFUSED_PROGRESS_MOVED",
     "LiveWorkerRefreshOps",
     "SettledCloseBoundaryPort",
     "port_pin_request",
