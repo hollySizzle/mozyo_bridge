@@ -927,7 +927,12 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         zero_change=zero_change,
         review_waived=waived,
         review_waiver_unsuperseded=waiver_unsuperseded(review_waiver, round_ids),
-        review_waiver_unsupported=review_waiver.recorded and not waived,
+        # UNSUPERSEDED, not merely recorded (#14695 review j#93856 finding 2). Keying on "a waiver
+        # exists anywhere in the history" made a lane whose waiver a newer APPROVED review had
+        # already superseded stay blocked forever — the glance poisoning the ordinary review route
+        # with a historical record that no longer governs. The lane is only relying on the waiver
+        # while nothing newer supersedes it.
+        review_waiver_unsupported=waiver_unsuperseded(review_waiver, round_ids) and not waived,
     )
 
 

@@ -222,6 +222,13 @@ class LaneSignal:
     review_waiver_unsupported: bool = False
 
 
+#: The gates whose projection is "the work is done; close it, then retire it". They share the
+#: integration precedence and the unsupported-waiver suppression, so they are enumerated once and
+#: :func:`classify_lane_state` handles them together. A new close-family gate added here inherits
+#: both rules; one added elsewhere is caught by the test that pins this set (#14695 j#93856 F1).
+_CLOSE_FAMILY_GATES: frozenset = frozenset({GATE_OWNER_CLOSE_APPROVAL, GATE_CLOSE})
+
+
 def _no_review_owed(signal: LaneSignal) -> bool:
     """Whether ANY durable authority says no independent review is owed right now (pure).
 
@@ -338,28 +345,28 @@ def classify_lane_state(signal: LaneSignal) -> str:
             return LANE_STATE_INTEGRATION_WAITING
         return LANE_STATE_OWNER_WAITING
 
-    # 6. owner close approval recorded — integration, then close, then retirement.
-    if gate == GATE_OWNER_CLOSE_APPROVAL:
+    # 6-7. the CLOSE FAMILY — owner close approval, then close. Both branches share the same
+    # integration precedence and the same unsupported-waiver suppression, so the suppression is
+    # asked ONCE for the whole family rather than per branch.
+    #
+    # Asking it per branch is exactly what went wrong (Redmine #14695 review j#93856 finding 1):
+    # R6 put the check on the ``close`` branch alone and its comment claimed the refusal was
+    # "visible BEFORE Close" — but the pre-Close gate is ``owner_close_approval``, which never
+    # consulted it, so a record one step from Close still read as ``close_waiting`` and steered
+    # the operator into a Close the retire would refuse. :data:`_CLOSE_FAMILY_GATES` makes the
+    # membership explicit so a gate added to this family cannot silently miss the suppression.
+    if gate in _CLOSE_FAMILY_GATES:
         if _integration_owed(signal) or (
             signal.commit_bearing and not signal.integration_recorded
         ):
             return LANE_STATE_INTEGRATION_WAITING
-        if signal.issue_open:
-            return LANE_STATE_CLOSE_WAITING
-        return LANE_STATE_RETIRE_READY
-
-    # 7. close gate — retire_ready unless commit-bearing work is still unmerged.
-    if gate == GATE_CLOSE:
-        if _integration_owed(signal) or (
-            signal.commit_bearing and not signal.integration_recorded
-        ):
-            return LANE_STATE_INTEGRATION_WAITING
-        # #14695 j#93807 F1: a lane that CARRIES a waiver which establishes nothing must not read
-        # as "safe to retire" when the terminal retire will refuse it. Reported as blocked rather
-        # than retire_ready so the refusal is visible BEFORE Close, which is what the issue's
-        # Acceptance ("glance / close / terminal retire project the same conclusion") asks for.
+        # A lane relying on a waiver that establishes nothing must not read as "go close it" or
+        # "safe to retire": the terminal retire refuses it, and the issue's Acceptance asks for the
+        # same conclusion from the glance, the close and the retire.
         if signal.review_waiver_unsupported:
             return LANE_STATE_BLOCKED
+        if gate == GATE_OWNER_CLOSE_APPROVAL and signal.issue_open:
+            return LANE_STATE_CLOSE_WAITING
         return LANE_STATE_RETIRE_READY
 
     # 8. no gate — no active durable work.

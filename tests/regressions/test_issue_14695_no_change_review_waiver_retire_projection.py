@@ -79,6 +79,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     render_no_change_review_waiver_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
+    LANE_STATE_BLOCKED,
     LANE_STATE_OWNER_WAITING,
     LANE_STATE_RETIRE_READY,
     LANE_STATE_REVIEW_WAITING,
@@ -856,6 +857,96 @@ class ExistingFencesUnchangedTest(unittest.TestCase):
         self.assertTrue(facts.review_exempt)
         self.assertFalse(facts.review_waived)
         self.assertEqual(fold_no_change_review_waiver(journals).state, WAIVER_NONE)
+
+
+class CloseFamilyProjectionTest(unittest.TestCase):
+    """Review j#93856: the refusal must be visible BEFORE Close, and only while it governs."""
+
+    def _state(self, journals, *, issue_open):
+        facts = fold_issue_gate_facts(journals)
+        return facts, classify_lane_state(
+            lane_signal_from_gate_facts(ISSUE, facts, issue_open=issue_open)
+        )
+
+    def _closed_lane(self, conclusion, *, with_waiver):
+        marker = ("\n" + waiver_marker()) if with_waiver else ""
+        return [
+            ("100", "## Gate: start"),
+            ("200", CARVE_OUT_CLEARED + marker),
+            ("300", "## Gate: review request"),
+            ("400", f"## Gate: review\n- 結論: {conclusion}"),
+            ("500", "## Gate: close"),
+        ]
+
+    def test_the_pre_close_gate_blocks_too_not_only_close(self):
+        """Finding 1, in the exact shape it was found.
+
+        R6 put the suppression on the ``close`` branch alone while its comment claimed the refusal
+        was visible BEFORE Close. The gate one step before Close is ``owner_close_approval``, which
+        never consulted it — so a record about to be closed still read as ``close_waiting``.
+        """
+        journals = [
+            ("100", "## Gate: start"),
+            ("200", CARVE_OUT_CLEARED + "\n" + waiver_marker()),
+        ]
+        facts, open_state = self._state(journals, issue_open=True)
+        self.assertEqual(facts.latest_gate, "owner_close_approval")
+        self.assertTrue(facts.review_waiver_unsupported)
+        self.assertEqual(open_state, LANE_STATE_BLOCKED)
+        _, closed_state = self._state(journals, issue_open=False)
+        self.assertEqual(closed_state, LANE_STATE_BLOCKED)
+
+    def test_every_close_family_gate_carries_the_suppression(self):
+        """Derived from the gate set itself, so a gate added to the family cannot miss it."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
+            _CLOSE_FAMILY_GATES,
+            LaneSignal,
+        )
+
+        self.assertEqual(_CLOSE_FAMILY_GATES, frozenset({"owner_close_approval", "close"}))
+        for gate in sorted(_CLOSE_FAMILY_GATES):
+            with self.subTest(gate=gate):
+                signal = LaneSignal(issue=ISSUE, latest_gate=gate, issue_open=True,
+                                    review_waiver_unsupported=True)
+                self.assertEqual(classify_lane_state(signal), LANE_STATE_BLOCKED)
+                # …and the same signal without the unsupported waiver is NOT blocked, so the
+                # assertion above is about the waiver rather than about the gate.
+                clean = LaneSignal(issue=ISSUE, latest_gate=gate, issue_open=True)
+                self.assertNotEqual(classify_lane_state(clean), LANE_STATE_BLOCKED)
+
+    def test_an_approved_review_returns_the_lane_to_the_no_waiver_projection(self):
+        """Finding 2: a superseded waiver must stop influencing the ordinary review route."""
+        with_waiver, state = self._state(
+            self._closed_lane("承認", with_waiver=True), issue_open=False
+        )
+        self.assertFalse(with_waiver.review_waiver_unsuperseded)
+        self.assertFalse(with_waiver.review_waiver_unsupported)
+        _, control = self._state(self._closed_lane("承認", with_waiver=False), issue_open=False)
+        self.assertEqual(state, control)
+        self.assertEqual(state, LANE_STATE_RETIRE_READY)
+
+    def test_a_changes_requested_review_also_matches_its_own_control(self):
+        """The distinguishing case, pinned to what it MEASURES rather than to an expectation.
+
+        A closed lane whose last review requested changes projects ``retire_ready`` — with a
+        waiver and without one alike. That is pre-existing general behaviour (the close gate is
+        latest, and the F10 open-round suppression is per-journal), not something a waiver causes.
+        The property this issue owes is that the waiver does not CHANGE it; making the waiver case
+        differ would reintroduce exactly the poisoning finding 2 objected to.
+        """
+        _, state = self._state(
+            self._closed_lane("要修正", with_waiver=True), issue_open=False
+        )
+        _, control = self._state(self._closed_lane("要修正", with_waiver=False), issue_open=False)
+        self.assertEqual(state, control)
+
+    def test_a_waiver_with_nothing_newer_still_blocks(self):
+        """The negative control for both: an UNsuperseded waiver is still refused."""
+        journals = no_change_journals()
+        facts, state = self._state(journals, issue_open=False)
+        self.assertTrue(facts.review_waiver_unsuperseded)
+        self.assertTrue(facts.review_waiver_unsupported)
+        self.assertEqual(state, LANE_STATE_BLOCKED)
 
 
 class OperatorFacingReasonTest(unittest.TestCase):
