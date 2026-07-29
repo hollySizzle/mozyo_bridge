@@ -259,8 +259,15 @@ def strict_marker_fields_in_note(notes: str):
     return tuple(found)
 
 
-def _raw_declares_gate(components, gate: str) -> bool:
-    """Whether one marker's RAW components name ``gate`` in either alias (pure)."""
+def marker_declares_gate(components, gate: str) -> bool:
+    """Whether one marker's RAW components name ``gate`` in either alias (pure).
+
+    The single answer to "does this marker CLAIM this gate", asked separately from "and is its body
+    readable". Every consumer that poisons a note on an uncountable same-gate sibling must ask it
+    the same way, so it is public rather than private to this module (Redmine #14667): the proxy
+    rail's decision reader asks it too, and a second spelling of "claims this gate" is the drift
+    this module exists to prevent.
+    """
     return any(
         key.strip() in MARKER_GATE_ALIASES and value.strip() == gate
         for key, value in components or ()
@@ -283,7 +290,7 @@ def declares_gate(notes: str, gate: str) -> bool:
     for channel, components in marker_components_in_note(notes or ""):
         if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
             continue
-        if _raw_declares_gate(components, gate):
+        if marker_declares_gate(components, gate):
             return True
     return False
 
@@ -326,7 +333,7 @@ def strict_gate_markers(notes: str, gate: str, *, canonicalize=None) -> tuple:
         # earlier shape here — let ``gate=implementation_request:kind=unknown_gate`` parse, fail
         # the ``== {gate}`` check, and be silently skipped, handing authority to its clean sibling.
         # A marker naming some OTHER gate is not this gate's business and is left alone.
-        if _raw_declares_gate(components, gate):
+        if marker_declares_gate(components, gate):
             return ()
     return tuple(found)
 
@@ -944,6 +951,7 @@ __all__ = (
     "RedmineJournalEntry",
     "MARKER_GATE_ALIASES",
     "marker_components_in_note",
+    "marker_declares_gate",
     "marker_fields_in_note",
     "marker_logical_gates",
     "declares_gate",

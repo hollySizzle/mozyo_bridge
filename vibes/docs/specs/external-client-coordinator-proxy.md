@@ -302,13 +302,59 @@ authorize したかを照合しなければ scope は未検証のままである
     で閉じ、**どの 1 行にも存在しない marker** が成立しうる。
   - canonical 行上の workflow-event marker が**ちょうど 1 件**であること。0 件 / 2 件以上は fixed
     reason で拒否する。
+  - **marker body は uncollapsed component で評価する** (#14667)。canonicality は「引用でない行に
+    ちょうど 1 件ある」だけでは足りない。その body が **canonical producer に描画可能**でなければ
+    ならず、判定は body を dict へ畳む前の `(key, value)` 列に対して行う。
+    ★★★**畳んだ後では「畳めないはずだった」という証拠が消える。** 初版は lenient fold
+    (`marker_fields_in_note`) で読んでいたため、repeated key は last-write-wins で 1 件に化け、
+    key / value 周囲の whitespace は正規化されて消えた。`origin/main-next@4f0d765b` 上で実測した
+    次の 3 body は**いずれも proxy send の decision として成立していた** (#14539 R34 audit
+    j#92652 の独立 probe → routed finding → #14667):
+    ```
+    gate=some_other:gate=implementation_request              (repeated key, LWW)
+    proxy_action=dispatch_next:proxy_action=bootstrap_lane   (同上、action field)
+    gate = implementation_request:proxy_action = …           (whitespace 混入)
+    ```
+    - 規則の**正本はこの rail に無い**。中央 preset `### Hibernate Evidence Marker Contract` が
+      定める producer-impossible body (空 component / `=` を欠く fragment / 空 key / whitespace 混入
+      / 相異なる値での key 重複) の判定は共有 authority
+      `domain/redmine_journal_source.strict_marker_fields` が持ち、どの gate を宣言しているかは
+      `marker_logical_gates` が持つ。**この rail は独自の厳格化軸を足さない** — 足せば sibling
+      consumer との間で「producer に描画可能とは何か」が 2 定義になり、それはこの defect を生んだ
+      drift そのものである。
+    - `gate` / `kind` の 2 alias は**集合として**読む。first-non-empty で読むと、他方の alias に
+      書かれた別 gate が fallback として黙殺される — それは第二の authority 主張であって fallback
+      ではない (#14539 j#91847 F3 / j#91896 F2)。2 gate を名乗る marker は ruling #14219 j#86718 に
+      より**どちらも証明しない**。
+  - **読めない claim を drop しない** (same-note poison)。当該 action の token を**名乗って**いる
+    marker が「ちょうどその token 1 件」として数えられないとき、journal 全体を
+    `decision_unreadable` で拒否する。
+    ★★★**素朴な strict 化 (「strict に parse し、parse できない marker は skip する」) は
+    loosening である。** skip すると exactly-one の cardinality から偽造 marker が消えるので、
+    「偽造 1 件 + clean 1 件」の note が **clean な note と完全に同じに読める** — 本来 ambiguity で
+    拒否されるはずの note が、硬化を意図した変更によって受理へ倒れる。中央 preset の
+    「fragment を捨てて残りを一致させず marker 全体を fail-closed とする」/「同一種別の読めない
+    marker を読み飛ばして別の marker を採ることもしない」と同じ規則である。
+    - 「この marker が当該 gate を**名乗っているか**」は **raw component** に問う
+      (`marker_declares_gate`)。「名乗っているか」と「body が読めるか」は別の問いであり、
+      後者だけを問うと 2 gate を名乗る marker が静かに skip される (#14539 j#92174 F1)。
+    - **引用中の marker はここでも例外**である。引用は marker ではないので authority にも poison に
+      もならない (下記)。引用を poison にすると、grammar を例示した journal が恒久的に使用不能に
+      なる (Design Answer j#90329 契約 5 が廃した失敗)。
   - marker は `proxy_action` field で**どの action を authorize するか**を明示する。欠落は
     `action_not_declared` で拒否。lane-scoped の場合は `lane` / `lane_generation` も持つ。
+    値の読み出しで `.strip()` しない — strict reader が whitespace 混入 body を既に拒否している
+    以上、reader 側で再正規化することは**その保証を隠す**だけである (reader に置いた前提は
+    producer 側で保証する)。
   - journal id は marker を持つ **entry 自身の id** を使う (marker の自己申告は使わない)。
 - 他 journal の引用は **authority にも ambiguity poison にもならない。**
 - 分類:
   - canonical decision が読めない (0 件 / 引用のみ / 読取不能) → `unverified`
   - 2 件以上 → `decision_ambiguous`
+  - 当該 action の token を名乗るが producer 描画可能な body として数えられない → `decision_unreadable`
+    (`unverified` とも `decision_ambiguous` とも別 status にする。前者は「この journal に decision が
+    無い」、後者は「2 件ある」であり、いずれも remedy が異なる。ここでの remedy は
+    **decision を canonical producer の marker で記録し直すこと**であって、marker を足すことではない)
   - `proxy_action` が当該 action でない → `action_mismatch`
   - **lane-scoped**: lane / 数値 generation 必須 (`decision_incomplete`)、live lifecycle facts と
     exact-match (`lane_unresolved` / `scope_mismatch` / `generation_stale`)

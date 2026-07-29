@@ -2946,25 +2946,23 @@ class ReviewJ92060EffectReachingReaderTests(unittest.TestCase):
             # Defines the scanner and its strict counterparts.
             "redmine_journal_source.py",
         }
-        # NOT "this is safe" — a MEASURED, unresolved finding in a module this issue does not own,
-        # recorded here so the gate stays meaningful instead of being quietly widened.
+        # ``coordinator_proxy_send.py`` was carved out here in R34 as a MEASURED, unresolved
+        # finding — its ``canonical_decision_in_journal`` decided a PROXY SEND through the lenient
+        # fold, so three bodies no canonical producer could render each produced a decision. It was
+        # routed rather than patched inside a conflict-resolution task, because the naive strict
+        # fix (drop the unreadable marker) would have LOOSENED that rail's exactly-one-decision
+        # rule by turning a duplicate refusal into an acceptance.
         #
-        # ``coordinator_proxy_send.canonical_decision_in_journal`` arrived on this branch with
-        # ``origin/main-next`` (#14585 / #14546). It decides a PROXY SEND, and it reads the
-        # decision through the lenient fold, so a body no canonical producer could render still
-        # decides. Measured on this head, all three of these produce a decision:
+        # Redmine #14667 closed it: that reader now judges the body from its uncollapsed components
+        # through the shared strict reader, and an unreadable same-kind claim refuses the journal
+        # instead of being dropped. Pinned by (path kept on ONE line so it stays greppable):
+        # tests/regressions/test_issue_14667_proxy_send_strict_marker_fold.py
+        # The carve-out is REMOVED rather than left in place — an allowlist entry for a module that
+        # no longer offends is a standing permission for the next regression, which is the quiet
+        # widening this gate exists to prevent.
         #
-        #     gate=some_other:gate=implementation_request   (repeated key, last-write-wins)
-        #     proxy_action=dispatch_next:proxy_action=…     (same, on the action field)
-        #     gate = implementation_request                 (whitespace-contaminated value)
-        #
-        # Fixing it means changing another issue's hardened authority reader inside a
-        # conflict-resolution task, and the naive fix — a strict parse that DROPS an unreadable
-        # marker — would loosen their exactly-one-decision rule by turning a duplicate refusal
-        # into an acceptance. So it is reported for routing rather than patched here
-        # (Implementation Done / Review Request for #14539 R34).
-        routed_findings = {"coordinator_proxy_send.py"}
-        allowed |= routed_findings
+        # No routed findings are open. When one is, it goes here with its measurement, never with
+        # "this is safe".
         # ``review_exemption.py`` and ``composer_discard_approval.py`` were on this list with
         # reasons that did not survive the effect chain (review j#92106 findings 1 and 2): the
         # first MINTS the exemption the retire admits on, the second is called by
