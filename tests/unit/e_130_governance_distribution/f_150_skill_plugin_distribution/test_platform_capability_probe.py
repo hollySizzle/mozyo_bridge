@@ -42,7 +42,7 @@ class PlatformCapabilityProbeTest(_MirrorTreeFixture):
         swallowing an interrupt would report the host as unsupported and let
         the run continue as if it had measured something."""
 
-        with FaultSchedule().raise_on("lstat", KeyboardInterrupt):
+        with FaultSchedule().raise_on("lstat", KeyboardInterrupt()):
             with self.assertRaises(KeyboardInterrupt):
                 platform_capabilities.missing_platform_capabilities()
 

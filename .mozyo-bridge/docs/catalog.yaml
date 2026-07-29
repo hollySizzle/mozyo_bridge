@@ -1588,8 +1588,11 @@ file_conventions:
       # 3,865-line `test_legacy_project_skill_mirror.py` into the ten modules
       # below plus the shared tree fixture, per #14660 characterisation 5.5;
       # each move task adds its own real paths here as part of finishing.
-      # Redmine #14684 (T6) added the shared fault schedule the five modules
-      # with a non-zero `os_patch` inject through.
+      # Redmine #14684 (T6) added the shared fault schedule. Its consumers are
+      # the four modules that inject a fault, which is not the same set as the
+      # five with a non-zero `os_patch`: that column counts tests patching an
+      # `os` attribute, and the advertisement substitution in
+      # `test_issue_14651_capability_advertisement.py` is not an injected fault.
       - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_contract.py
       - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py
       - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe.py

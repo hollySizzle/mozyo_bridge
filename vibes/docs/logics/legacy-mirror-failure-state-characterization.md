@@ -870,9 +870,12 @@ source 側は `legacy_mirror_sync.py` 899 / `owned_descriptors.py` 725 で
 この表を参照する — 「それを使う module」のような未解決の表現を残すと、dispatch 時に
 ownership conflict を判定できない。
 
-`os_patch` 列は、その module が含む「`os` primitive を注入する test」の数である。
-T6 (共有 fault schedule fake の新規作成) が触る consumer は**この列が非 0 の module
-に限られる**ので、T3 / T4 との交差はこの表から判定できる。
+`os_patch` 列は、その module が含む「**`os` の属性を patch する test**」の数である
+[R8 まで「`os` primitive を注入する test」と定義していたが誤り。訂正の実測は
+下記「`os_patch` と consumer の関係」]。**`os_patch` 非 0 は T6 consumer の
+上界であって consumer 集合そのものではない** — 属性 patch には fault 注入では
+ないもの (広告置換) が含まれるためである。T3 / T4 との交差判定にはこの上界で
+十分だが、consumer を名指すときは下記の表を読む。
 
 | 行き先 | tests | 行 | module | os_patch |
 | --- | ---: | ---: | --- | ---: |
@@ -1104,7 +1107,7 @@ ledger admission の idempotence、occurrence 数の保存則 — に限られ�
 | **T2** | behavior change | `src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/legacy_mirror_sync.py` + `src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/domain/legacy_mirror_contract.py` | — | 状態遷移を filesystem effect から分離。§1.1–1.3 の遷移表が pure に評価できる。T1 の test が無改変で green |
 | **T3** | behavior change | `src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/owned_descriptors.py` + `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py` | — | §3.2(a) の carrier 差し替え seam を公開面へ。private patch を減らす |
 | **T4** | test-only 書き換え | `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py` のみ | — | §3.2(b) を公開 API 経由へ言い換え。`src/**` 不変 |
-| **T6** | behavior change (test 側) | `tests/support/legacy_mirror_fault_schedule.py` (新規) + §5.5 で `os_patch` 非 0 の **5 module のみ**: `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_fault_injection.py` (29) / `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe_io.py` (2) / `tests/regressions/test_issue_14580_reused_descriptor_number_close.py` (2) / `tests/regressions/test_issue_14651_capability_advertisement.py` (2) / `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe.py` (1) | `.mozyo-bridge/docs/catalog.yaml` / `.mozyo-bridge/docs/file_conventions.generated.yaml` / `vibes/docs/logics/legacy-mirror-failure-state-characterization.md` | 共有 fault schedule fake の**新規作成**。個別 mock の重複を縮小。**`os_patch` が 0 の module には触らない** |
+| **T6** | behavior change (test 側) | `tests/support/legacy_mirror_fault_schedule.py` (新規) + §5.5「`os_patch` と consumer の関係」の **consumer 4 module のみ**: `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_fault_injection.py` (29) / `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe_io.py` (2) / `tests/regressions/test_issue_14580_reused_descriptor_number_close.py` (2) / `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe.py` (1) | `.mozyo-bridge/docs/catalog.yaml` / `.mozyo-bridge/docs/file_conventions.generated.yaml` / `vibes/docs/logics/legacy-mirror-failure-state-characterization.md` | 共有 fault schedule fake の**新規作成**。個別 mock の重複を縮小。**`os_patch` が 0 の module にも、`os_patch` 非 0 だが consumer でない `test_issue_14651_capability_advertisement.py` にも触らない** |
 
 **移設を行き先ごとに分割しない [R5-F1 修正]。** R5 まで本 doc は regressions 4 件を
 別 Task (T5) に切り、`T1 → T5` を要求していた。**これは実行不能である** — T1 が元

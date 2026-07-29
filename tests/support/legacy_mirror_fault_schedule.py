@@ -1,11 +1,22 @@
 """Shared `os` fault schedule for the legacy mirror family (Redmine #14684).
 
-Four modules inject `os` primitives against a real mirror tree, and each of the
-four had re-written the same three fakes: an `os.open` that remembers which
-descriptor the staging create handed back, an `os.close` that closes for real
-and then fails exactly that descriptor once, and a primitive that raises instead
-of running. This module owns those three shapes, so a fix to one of them lands
-once instead of four times.
+Four modules inject `os` primitives against a real mirror tree. Between them they
+had re-written the same three fakes — an `os.open` that remembers which
+descriptor the staging create handed back, an `os.close` that closes for real and
+then fails that descriptor, and a primitive that raises instead of running — and
+this module owns the three shapes as a set, so a fix to one of them lands once
+instead of once per module that had it.
+
+As a set, because no module needed all three and none of them is used alone:
+
+===========================================================  ======  =====  =====
+consumer                                                     track   close  raise
+===========================================================  ======  =====  =====
+integration .../test_legacy_mirror_fault_injection.py        yes     yes    yes
+regressions/test_issue_14580_reused_descriptor_number_close  yes     yes    yes
+integration .../test_platform_capability_probe_io.py         --      --     yes
+unit .../test_platform_capability_probe.py                   --      --     yes
+===========================================================  ======  =====  =====
 
 Four, not the five the #14660 characterization marks with a non-zero `os_patch`
 (`vibes/docs/logics/legacy-mirror-failure-state-characterization.md`
@@ -15,6 +26,8 @@ this and has none of the three shapes: its two `os_patch` replace
 `os.supports_dir_fd` / `os.supports_fd` with a `frozenset`, which substitutes an
 *advertisement the probe must refuse to read* (#14651) rather than making a
 primitive fail. Routing it through a fault schedule would be reuse in name only.
+`os_patch` counts tests that patch an `os` *attribute*; the consumer set is the
+tests that inject a *fault*, and §5.5 gives the per-module split of the two.
 
 It deliberately does not own a fault whose payload *is* the property under
 test — the short write, the ordinary file substituted at the staging name
@@ -38,18 +51,16 @@ Two notes on what the schedule patches:
   `_MirrorTreeFixture._preflight_already_answered`. Faults keyed on a descriptor
   pick out their own call and do not need it.
 
-Two limits to know before adding a consumer:
-
-* **There is no "fail only the first call" knob**, and adding one back needs an
-  oracle first — see `raise_on` (Redmine #14684, review j#93050 F2).
-* **Three invariants here are not observed by any current consumer**: the close
-  fault firing at most once, an exception *instance* being re-raised as the same
-  object rather than rebuilt, and `walk_root` being the *first* descriptor opened
-  without a `dir_fd` rather than the latest. Each was measured by mutating it and
-  watching all 40 consumer tests stay green (j#93064). They reproduce the
-  hand-written fakes this module replaced, so nothing regressed — but do not
-  build a new consumer on one of them without adding a case that would notice if
-  it broke.
+**Every rule here is one a consumer can catch breaking, or is not a rule at all.**
+That is a constraint on what may be added, not a description of how it turned
+out. Four behaviours no case could observe have been removed rather than
+documented (Redmine #14684, reviews j#93050 / j#93155): a "fail only the first
+call" knob, the close fault firing at most once, an exception *instance* being
+re-raised as the same object rather than rebuilt, and the rule for choosing
+between two descriptors matching one name — that last one deleted by making the
+ambiguity raise instead. A shared fake that promises what nothing checks lets a
+later consumer build on behaviour no case defends. Anything added back needs the
+case that would notice, in the same change.
 """
 
 from __future__ import annotations
@@ -64,21 +75,6 @@ from types import TracebackType
 #: a descriptor spells one of these rather than a number, because the number is
 #: not known until the subject asks for it.
 DESCRIPTORS = ("staging", "walk_root")
-
-
-def _exception_factory(error):  # type: ignore[no-untyped-def]
-    """Turn an `error` argument into something that yields an exception.
-
-    An instance is re-raised as it is, which is what a fault firing once wants.
-    A callable — an exception class, or a lambda — is called per fire, for a
-    fault that can fire more than once and whose cases must not share a
-    traceback.
-    """
-    if isinstance(error, BaseException):
-        return lambda: error
-    if callable(error):
-        return error
-    raise TypeError(f"expected an exception or a callable returning one, got {error!r}")
 
 
 class FaultSchedule:
@@ -101,12 +97,12 @@ class FaultSchedule:
         #: How many times each patched primitive was reached. A test that has to
         #: prove its injection fired reads this instead of keeping its own list.
         self.calls: Counter[str] = Counter()
-        #: The descriptor of the latest create (`O_CREAT`) — this run's staging
-        #: file — and every one of them, for a fault that must recognise any.
+        #: The descriptor of this run's create (`O_CREAT`) — its staging file —
+        #: and every one of them, for a fault that must recognise any.
         self.staging: int | None = None
         self.staging_descriptors: set[int] = set()
-        #: The first descriptor opened without a `dir_fd`: where the component
-        #: walk starts.
+        #: The descriptor opened without a `dir_fd`: where the component walk
+        #: starts.
         self.walk_root: int | None = None
         #: Whether the descriptor-keyed close fault fired.
         self.close_fired = False
@@ -119,7 +115,24 @@ class FaultSchedule:
     def track_descriptors(self) -> FaultSchedule:
         """Record which descriptor the subject's `os.open` handed back.
 
-        Both names are read from the call the subject actually makes. Naming a
+        A name binds to **the** descriptor matching its predicate — `O_CREAT`
+        for `staging`, no `dir_fd` for `walk_root`. There is no rule for
+        choosing between two of them, because two distinct matches raise
+        (`_name`): a schedule that silently picked one would name the wrong
+        descriptor with nothing to notice.
+
+        The earlier versions did have such a rule — `staging` kept the most
+        recent match and `walk_root` the first — and no case could catch either
+        breaking. `audit()` opens twice without a `dir_fd`, but the first is
+        closed before the second asks, so both calls return the same number
+        (measured: `[3, 3]`) and every choice rule computes the same answer.
+        Removing the choice is what closes that, not documenting it
+        (review j#93155 F2).
+
+        The predicates themselves are observed: recording any open as a create
+        instead of only an `O_CREAT` one fails ten cases.
+
+        Both are read from the call the subject actually makes. Naming a
         descriptor any other way would be guessing at a number, and the numbers
         are reused the moment they are freed.
         """
@@ -129,33 +142,47 @@ class FaultSchedule:
                 fd = real_open(path, flags, *args, **kwargs)
                 self.calls["open"] += 1
                 if flags & os.O_CREAT:
-                    self.staging = fd
+                    self._name("staging", fd)
                     self.staging_descriptors.add(fd)
-                if self.walk_root is None and "dir_fd" not in kwargs:
-                    self.walk_root = fd
+                if "dir_fd" not in kwargs:
+                    self._name("walk_root", fd)
                 return fd
 
             return tracking_open
 
         return self._schedule("open", build)
 
-    def raise_on(self, primitive: str, error) -> FaultSchedule:  # type: ignore[no-untyped-def]
+    def _name(self, descriptor: str, fd: int) -> None:
+        """Bind `descriptor` to `fd`, refusing to choose between two answers."""
+        current = getattr(self, descriptor)
+        if current is not None and current != fd:
+            raise AssertionError(
+                f"two descriptors match {descriptor} in one run ({current} and {fd}); "
+                "the schedule will not pick one for you — key the fault differently"
+            )
+        setattr(self, descriptor, fd)
+
+    def raise_on(self, primitive: str, error: BaseException) -> FaultSchedule:
         """``os.<primitive>`` raises `error` instead of running — on every call.
 
-        There is deliberately no "only the first call" variant. One case needs a
-        failure that does not persist, and it writes that fake itself: a fault
-        that stops after n calls has a *schedule* which is the property under
-        test, so it belongs with the case that asserts it. Offering the knob here
-        would put a promise on the shared surface that no consumer observes —
-        measured: disabling it killed none of the 40 tests — and a later caller
-        could then rely on behaviour nothing checks (review j#93050 F2).
+        `error` is the exception object, raised as it is. There was briefly a
+        second mode taking a callable to build a fresh exception per fire; no
+        case could tell the two apart, so the choice is gone rather than
+        documented (review j#93155 F2).
+
+        There is also deliberately no "only the first call" variant. One case
+        needs a failure that does not persist, and it writes that fake itself: a
+        fault that stops after n calls has a *schedule* which is the property
+        under test, so it belongs with the case that asserts it (review j#93050
+        F2).
         """
-        make = _exception_factory(error)
+        if not isinstance(error, BaseException):
+            raise TypeError(f"expected an exception instance, got {error!r}")
 
         def build(_real):  # type: ignore[no-untyped-def]
             def failing(*args, **kwargs):  # type: ignore[no-untyped-def]
                 self.calls[primitive] += 1
-                raise make()
+                raise error
 
             return failing
 
@@ -164,11 +191,17 @@ class FaultSchedule:
     def raise_after_closing(
         self,
         descriptor: str,
-        error,  # type: ignore[no-untyped-def]
+        error: BaseException,
         *,
         before_raising=None,  # type: ignore[no-untyped-def]
     ) -> FaultSchedule:
-        """`os.close` closes for real, then raises once for `descriptor`.
+        """`os.close` closes for real, then raises — whenever `descriptor` closes.
+
+        Every close of that descriptor raises, the same way `raise_on` fails
+        every call. It used to fire at most once; nothing could catch that guard
+        breaking (measured — removing it leaves all 40 cases green, because no
+        case closes the named descriptor twice), and one rule for both faults
+        beats two rules with one of them undefended (review j#93155 F2).
 
         Closing for real first is the point rather than an implementation
         detail: every defect these cases pin is about what the subject does
@@ -183,17 +216,18 @@ class FaultSchedule:
         """
         if descriptor not in DESCRIPTORS:
             raise ValueError(f"unknown descriptor {descriptor!r}; expected one of {DESCRIPTORS}")
-        make = _exception_factory(error)
+        if not isinstance(error, BaseException):
+            raise TypeError(f"expected an exception instance, got {error!r}")
 
         def build(real_close):  # type: ignore[no-untyped-def]
             def closing_then_failing(fd: int) -> None:
                 self.calls["close"] += 1
                 real_close(fd)
-                if fd == getattr(self, descriptor) and not self.close_fired:
+                if fd == getattr(self, descriptor):
                     self.close_fired = True
                     if before_raising is not None:
                         before_raising()
-                    raise make()
+                    raise error
 
             return closing_then_failing
 
