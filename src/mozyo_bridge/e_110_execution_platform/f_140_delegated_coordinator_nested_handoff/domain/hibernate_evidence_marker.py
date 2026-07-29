@@ -108,10 +108,22 @@ class EvidenceParseError:
     detail: str = ""
 
 
-#: The value every kind-specific producer parameter carries when the caller did not supply it.
-#: Absence is this sentinel and NOTHING else — ``None`` / ``0`` / ``""`` -after-trim are values a
-#: caller passed, and reading them as "absent" is how a wrong type became a missing field.
-_UNSUPPLIED = ""
+class _Unsupplied:
+    """The type of :data:`_UNSUPPLIED` — a value no caller can construct or pass by accident."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostic only
+        return "<unsupplied>"
+
+
+#: What a kind-specific producer parameter holds when the caller did not pass it. It is a dedicated
+#: sentinel, not ``""`` (Redmine #14694 review j#93646 finding 3): spelling absence as the empty
+#: string made "the caller passed nothing" and "the caller passed an empty value" the same input,
+#: so ``park(run="")`` and ``dogfood(workflow="")`` were dropped instead of refused — the very
+#: silent-drop this producer's rule forbids, reintroduced by the rule's own implementation. Only
+#: ``CI(run="")`` happened to be refused, and only because CI requires a run.
+_UNSUPPLIED = _Unsupplied()
 
 #: The kind-specific fields each kind's marker CARRIES, in marker order. A field absent from a
 #: kind's tuple is one that kind's marker cannot express, so supplying it is a producer error
@@ -139,11 +151,11 @@ def render_hibernate_evidence(
     kind: str,
     *,
     envelope: LaneEvidenceEnvelope,
-    run: str = "",
-    workflow: str = "",
-    conclusion: str = "",
-    release_issue: str = "",
-    acceptance: str = "",
+    run: object = _UNSUPPLIED,
+    workflow: object = _UNSUPPLIED,
+    conclusion: object = _UNSUPPLIED,
+    release_issue: object = _UNSUPPLIED,
+    acceptance: object = _UNSUPPLIED,
 ) -> str:
     """Render a ``[mozyo:workflow-event:gate=<kind>:<envelope>:<extra>]`` marker, fail-closed.
 
@@ -164,6 +176,9 @@ def render_hibernate_evidence(
 
     So a field this kind's marker cannot express is refused, and the one field whose value the
     producer states rather than echoes (``conclusion``, always ``success``) may only be restated.
+    "Supplied" is asked as ``is _UNSUPPLIED``, an identity test against a sentinel no caller can
+    pass: an explicit ``run=""`` is a value the caller wrote, and refusing it is the same rule, not
+    an extra one.
     """
     if kind not in HIBERNATE_EVIDENCE_KINDS:
         raise ValueError(f"unknown hibernate evidence kind {kind!r}")
@@ -178,12 +193,12 @@ def render_hibernate_evidence(
         (FIELD_RELEASE_ISSUE, release_issue),
         (FIELD_ACCEPTANCE, acceptance),
     ):
-        if value == _UNSUPPLIED:
+        if value is _UNSUPPLIED:
             continue
         if field not in carried:
             raise ValueError(f"{kind} evidence does not carry a {field}")
         _required(value, kind=kind, field=field)
-    if conclusion != _UNSUPPLIED and conclusion != _CI_CONCLUSION_SUCCESS:
+    if conclusion is not _UNSUPPLIED and conclusion != _CI_CONCLUSION_SUCCESS:
         raise ValueError(
             f"hibernate evidence renders {FIELD_CONCLUSION}={_CI_CONCLUSION_SUCCESS} only, "
             f"got {conclusion!r}"

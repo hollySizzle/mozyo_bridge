@@ -204,25 +204,6 @@ def require_marker_token(value: object, *, field: str, requirement: str) -> str:
     return value
 
 
-def coerce_argv_generation(value: object) -> int:
-    """A CLI-supplied ``lane_generation`` as an ``int``, or a producer error (pure).
-
-    The ONE place an envelope value may legitimately change type: the CLI's generation arrives as
-    an argv string, and the renderer requires an ``int``. It lives here, beside the rule it feeds,
-    so the conversion cannot quietly grow into a normalization of the identities as well.
-
-    A ``bool`` is refused rather than converted (Redmine #14694): ``int(True)`` is ``1``, so a
-    caller-side conversion in front of the renderer defeated the renderer's own ``bool`` refusal —
-    a guard the call site pre-empts is a guard that never runs.
-    """
-    if isinstance(value, bool):
-        raise ValueError(f"lane_generation must be an integer, got {value!r}")
-    try:
-        return int(value)  # type: ignore[call-overload]
-    except (TypeError, ValueError):
-        raise ValueError(f"lane_generation must be an integer, got {value!r}") from None
-
-
 def render_lane_envelope(envelope: LaneEvidenceEnvelope) -> str:
     """Render the envelope to the ``key=value:...`` marker-field form, fail-closed.
 

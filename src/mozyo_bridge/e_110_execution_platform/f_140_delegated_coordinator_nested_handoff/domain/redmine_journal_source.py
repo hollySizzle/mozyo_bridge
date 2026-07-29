@@ -57,7 +57,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
     LaneEvidenceEnvelope,
-    coerce_argv_generation,
     render_lane_envelope,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
@@ -852,11 +851,14 @@ def _render_evidence_envelope(
     marker carrying ``workspace`` but no ``lane`` would read as unenveloped evidence while looking
     enveloped to a human. The values themselves go through the shared strict renderer
     (:func:`render_lane_envelope`), which refuses a non-positive generation, an empty identity, and
-    any value carrying a marker separator — RAW, so a ``str(...).strip()`` here is not a tidy-up
-    but a bypass of the very inputs that renderer exists to refuse (Redmine #14694; operator argv
-    is normalized at the ONE CLI boundary that owes a typed refusal, not in a domain producer).
-    The generation's argv-string conversion belongs to the same authority
-    (:func:`coerce_argv_generation`), for the same reason.
+    any value carrying a marker separator — RAW. Nothing is converted or trimmed on the way in
+    (Redmine #14694 review j#93646 findings 1-2): a ``str(...).strip()`` here bypassed the very
+    inputs that renderer exists to refuse, and an ``int(lane_generation)`` in front of it turned
+    ``1.5`` into generation ``1`` — evidence bound to a generation the caller never named, which is
+    the promotion across generations the whole envelope exists to prevent. There was no argv to
+    convert either: this function's only CLI path
+    (``review_gate_marker_fields.lane_envelope_marker_fields``) resolves the generation to an
+    ``int`` before calling, and ``render_gate_note`` declares it as one.
     """
     supplied = [v for v in (workspace, lane, lane_generation) if v is not None]
     if not supplied:
@@ -867,9 +869,7 @@ def _render_evidence_envelope(
             "workspace, lane and lane_generation must be supplied together"
         )
     return render_lane_envelope(
-        LaneEvidenceEnvelope(
-            workspace=workspace, lane=lane, lane_generation=coerce_argv_generation(lane_generation)
-        )
+        LaneEvidenceEnvelope(workspace=workspace, lane=lane, lane_generation=lane_generation)
     )
 
 

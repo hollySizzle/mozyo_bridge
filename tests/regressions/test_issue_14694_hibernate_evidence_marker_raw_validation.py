@@ -9,30 +9,35 @@ central `### Hibernate Evidence Marker Contract` requires the opposite: a produc
 normalize raw input into a value the caller did not write, and "renderer は parser が拒否する
 ものを書かない".
 
-The same one-line pattern carried five more readings of the same defect, all of them measured on
-the ``render_hibernate_evidence`` entry point rather than recalled:
+One symptom, measured on the producer surface rather than recalled from the report, in every shape
+it took — including the three shapes the FIRST fix left open (review j#93646):
 
 - trimming (``" check "`` → ``check``) — the reported symptom;
 - an INCOMPLETE forbidden set: ``\\n`` / ``\\r`` / ``\\xa0`` were not "空白" to a tuple that
   enumerated space and tab, so they were rendered — and markers are scanned per line, so the
   record never closed on its line and read back as nothing at all;
-- ``str()`` coercion of a non-string (``run=12345`` → ``"12345"``, ``run=True`` → ``"True"``);
-- ``or ""`` falsy coercion, which reported a wrong TYPE (``run=0`` / ``run=None``) as a missing
-  field;
-- ``conclusion`` accepted and discarded: ``conclusion="failure"`` was rendered as
-  ``conclusion=success``, turning a caller's red verdict into green CI evidence;
-- the same trim on the lane envelope's ``workspace`` / ``lane`` / ``head`` and on the
-  ``integration_disposition`` marker's own fields.
+- ``str()`` coercion of a non-string, and ``or ""`` reporting a wrong TYPE as a missing field;
+- ``conclusion`` accepted and discarded, so ``conclusion="failure"`` rendered as
+  ``conclusion=success``;
+- a field the kind's marker cannot carry, accepted and dropped;
+- **the CLI producer trimming the identities before validating them** (finding 1), so the one
+  producer an operator actually calls kept converting ``--evidence-workspace " ws "`` into the
+  canonical authority field ``ws``;
+- **``int(lane_generation)`` in front of the renderer** (finding 2), which turned ``1.5`` into
+  generation ``1`` — evidence bound to a generation nobody named;
+- **an explicit empty value read as "nothing was supplied"** (finding 3), because the first fix
+  spelled absence as ``""``.
 
-Every test here pins the non-recurrence of that symptom on the producer surface. The population of
-producer fields is DERIVED from the signature and the envelope dataclass, not listed: a new
-producer field that skips raw validation must fail these tests rather than quietly join the hole.
+Every test in this file detects the recurrence of that symptom. Claims about the producers' public
+contract — the byte shape of a clean marker, the round trip, the unchanged parse side — are the
+other kind of claim and live in
+``tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_hibernate_evidence_producer_contract.py``
+(``tests-placement-discovery-policy.md`` ``### regressions`` R3-b).
 """
 
 from __future__ import annotations
 
-import dataclasses
-import inspect
+import argparse
 import unittest
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.review_gate_marker_fields import (  # noqa: E501
@@ -44,93 +49,25 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (  # noqa: E501
     hibernate_evidence_marker as ev,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
-    LaneEvidenceEnvelope,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     render_gate_note,
     strict_marker_fields_in_note,
 )
-
-WS = "ws-1"
-LANE = "lane-abc"
-HEAD = "a" * 40
-INTEGRATION_HEAD = "b" * 40
-
-#: Raw values a producer must refuse AS WRITTEN. The whitespace rows are the point: every one of
-#: them is ``strip()``-ed or ``str()``-ed into a perfectly clean token by the old validator.
-INVALID_TOKENS = (
-    " check ",  # the reported symptom (#14667 j#93230)
-    "check ",
-    " check",
-    "che ck",
-    "che\tck",
-    "che\nck",  # a marker scanned per line never closes → unreadable durable evidence
-    "che\rck",
-    "che\xa0ck",  # "空白" is not two characters
-    "che:ck",  # splits into a bogus extra field
-    "che]ck",  # truncates the marker
-    "che[ck",
-    " ",
-    "\n",
+from tests.support.hibernate_evidence_producer_corpus import (
+    CARRIED_BY_KIND,
+    HEAD,
+    INTEGRATION_HEAD,
+    INVALID_TOKENS,
+    INVALID_TYPES,
+    LANE,
+    PRODUCER_FIELDS,
+    VALID_TOKENS,
+    WS,
+    assert_population_is_closed,
+    clean_kwargs,
+    envelope,
+    envelope_for,
 )
-
-#: Values that are not strings at all. ``None`` and ``0`` are the dangerous pair: ``or ""`` turned
-#: both into "the caller supplied nothing", so a type error was reported as a missing field.
-INVALID_TYPES = (None, 0, 1, 12345, True, False, 3.5, b"check", ["check"], {"check": 1})
-
-#: Tokens that merely LOOK unusual and are perfectly renderable — the negative control that kills
-#: an over-correction. A guard that also refuses these has stopped being a marker-grammar rule.
-VALID_TOKENS = (
-    "test.yml",
-    "29860030313",
-    "a-b_c",
-    "#14184",
-    "チェック",
-    "a/b",
-    "a=b",
-    "%2F",
-    "ci(main)",
-    "v1.0.0-rc.1",
-)
-
-
-def _env(**over) -> LaneEvidenceEnvelope:
-    fields = dict(workspace=WS, lane=LANE, lane_generation=3, head=HEAD)
-    fields.update(over)
-    return LaneEvidenceEnvelope(**fields)
-
-
-#: The kind-specific producer parameters, DERIVED from the renderer's own signature, and the
-#: fields each kind requires. A new parameter joins ``_PRODUCER_FIELDS`` automatically; the
-#: coverage test below then fails until this file exercises it.
-_PRODUCER_FIELDS = tuple(
-    name
-    for name in inspect.signature(ev.render_hibernate_evidence).parameters
-    if name not in ("kind", "envelope")
-)
-
-#: What each kind's marker CARRIES. Written out here as the ORACLE rather than read off the
-#: producer's own table: a test that derives its expectation from the implementation cannot catch
-#: the implementation getting it wrong. The closure tests below tie it to the kind vocabulary and
-#: to the renderer's signature, so a new kind or a new field cannot slip past this file either.
-_CARRIED_BY_KIND = {
-    ev.EVIDENCE_REQUIRED_CI_GREEN: (ev.FIELD_WORKFLOW, ev.FIELD_RUN, ev.FIELD_CONCLUSION),
-    ev.EVIDENCE_DOGFOOD_DELEGATED: (ev.FIELD_RELEASE_ISSUE, ev.FIELD_ACCEPTANCE),
-    ev.EVIDENCE_PARK_DECLARED: (),
-}
-
-#: ``conclusion`` is carried by CI but is producer-STATED, not caller-supplied, so it is never
-#: part of a clean call.
-_REQUIRED_BY_KIND = {
-    kind: tuple(f for f in fields if f != ev.FIELD_CONCLUSION)
-    for kind, fields in _CARRIED_BY_KIND.items()
-}
-
-
-def _clean_kwargs(kind: str) -> dict:
-    """The minimal CLEAN call for ``kind`` — every field it requires, nothing else."""
-    return {field: "clean" for field in _REQUIRED_BY_KIND[kind]}
 
 
 class ReportedSymptomTests(unittest.TestCase):
@@ -139,11 +76,11 @@ class ReportedSymptomTests(unittest.TestCase):
     def test_padded_workflow_and_run_are_refused_not_trimmed(self):
         with self.assertRaises(ValueError):
             ev.render_hibernate_evidence(
-                ev.EVIDENCE_REQUIRED_CI_GREEN, envelope=_env(), workflow=" check ", run="run"
+                ev.EVIDENCE_REQUIRED_CI_GREEN, envelope=envelope(), workflow=" check ", run="run"
             )
         with self.assertRaises(ValueError):
             ev.render_hibernate_evidence(
-                ev.EVIDENCE_REQUIRED_CI_GREEN, envelope=_env(), workflow="check", run=" run "
+                ev.EVIDENCE_REQUIRED_CI_GREEN, envelope=envelope(), workflow="check", run=" run "
             )
 
     def test_the_trimmed_authority_marker_is_never_produced(self):
@@ -154,7 +91,7 @@ class ReportedSymptomTests(unittest.TestCase):
         padded input.
         """
         clean = ev.render_hibernate_evidence(
-            ev.EVIDENCE_REQUIRED_CI_GREEN, envelope=_env(), workflow="check", run="run"
+            ev.EVIDENCE_REQUIRED_CI_GREEN, envelope=envelope(), workflow="check", run="run"
         )
         self.assertIn("workflow=check:run=run", clean)
         for workflow, run in ((" check ", " run "), ("check ", "run"), ("check", " run")):
@@ -162,7 +99,7 @@ class ReportedSymptomTests(unittest.TestCase):
                 try:
                     padded = ev.render_hibernate_evidence(
                         ev.EVIDENCE_REQUIRED_CI_GREEN,
-                        envelope=_env(),
+                        envelope=envelope(),
                         workflow=workflow,
                         run=run,
                     )
@@ -172,83 +109,68 @@ class ReportedSymptomTests(unittest.TestCase):
 
 
 class EveryProducerFieldTests(unittest.TestCase):
-    """The sweep over the DERIVED population, not over the two fields the issue named."""
-
-    def test_the_derived_population_is_the_one_this_file_exercises(self):
-        # If the renderer grows a parameter, this file must grow with it: the whole defect was a
-        # validator applied to some producer inputs and not others. Both halves are closed here —
-        # the parameter list against this file's oracle, and the oracle against the kind
-        # vocabulary — so neither a new field nor a new kind can arrive unswept.
-        self.assertEqual(
-            set(_PRODUCER_FIELDS),
-            {
-                ev.FIELD_RUN,
-                ev.FIELD_WORKFLOW,
-                ev.FIELD_CONCLUSION,
-                ev.FIELD_RELEASE_ISSUE,
-                ev.FIELD_ACCEPTANCE,
-            },
-        )
-        self.assertEqual(set(_CARRIED_BY_KIND), set(ev.HIBERNATE_EVIDENCE_KINDS))
-        self.assertEqual(
-            {f for fields in _CARRIED_BY_KIND.values() for f in fields}, set(_PRODUCER_FIELDS)
-        )
-
-    def test_the_oracle_matches_what_a_clean_marker_actually_carries(self):
-        # The oracle is only worth something if it describes the real markers, so read it back off
-        # the rendered output rather than off the producer's table.
-        for kind, carried in sorted(_CARRIED_BY_KIND.items()):
-            with self.subTest(kind=kind):
-                head = HEAD if kind in ev._HEAD_BEARING_EVIDENCE else ""
-                marker = ev.render_hibernate_evidence(
-                    kind, envelope=_env(head=head), **_clean_kwargs(kind)
-                )
-                for field in _PRODUCER_FIELDS:
-                    self.assertEqual(f"{field}=" in marker, field in carried, f"{field} in {marker}")
+    """The sweep over the derived population, not over the two fields the report named."""
 
     def test_every_carried_field_refuses_a_raw_invalid_token(self):
-        for kind, carried in sorted(_CARRIED_BY_KIND.items()):
+        assert_population_is_closed(self)
+        for kind, carried in sorted(CARRIED_BY_KIND.items()):
             for field in carried:
                 for bad in INVALID_TOKENS:
                     with self.subTest(kind=kind, field=field, value=bad):
-                        kwargs = _clean_kwargs(kind)
+                        kwargs = clean_kwargs(kind)
                         kwargs[field] = bad
                         with self.assertRaises(ValueError):
-                            ev.render_hibernate_evidence(kind, envelope=_env(), **kwargs)
+                            ev.render_hibernate_evidence(
+                                kind, envelope=envelope_for(kind), **kwargs
+                            )
 
     def test_every_carried_field_refuses_a_non_string(self):
-        for kind, carried in sorted(_CARRIED_BY_KIND.items()):
+        assert_population_is_closed(self)
+        for kind, carried in sorted(CARRIED_BY_KIND.items()):
             for field in carried:
                 for bad in INVALID_TYPES:
                     with self.subTest(kind=kind, field=field, value=bad):
-                        kwargs = _clean_kwargs(kind)
+                        kwargs = clean_kwargs(kind)
                         kwargs[field] = bad
                         with self.assertRaises(ValueError):
-                            ev.render_hibernate_evidence(kind, envelope=_env(), **kwargs)
+                            ev.render_hibernate_evidence(
+                                kind, envelope=envelope_for(kind), **kwargs
+                            )
 
     def test_a_field_this_kind_cannot_carry_is_refused_even_when_valid(self):
         """The second shape of the same defect: a supplied value that is silently DROPPED.
 
         ``park_declared`` carries neither ``run`` nor ``workflow``, so a caller supplying one was
-        asserting something the durable record would not contain. Validating those fields without
-        refusing them would have left "the marker says what the caller wrote" false for exactly
-        the callers who were wrong about the kind — and the raw-invalid case would then have been
-        the only one anyone noticed.
+        asserting something the durable record would not contain.
         """
-        for kind, carried in sorted(_CARRIED_BY_KIND.items()):
-            for field in _PRODUCER_FIELDS:
+        assert_population_is_closed(self)
+        for kind, carried in sorted(CARRIED_BY_KIND.items()):
+            for field in PRODUCER_FIELDS:
                 if field in carried:
                     continue
                 with self.subTest(kind=kind, field=field):
-                    kwargs = _clean_kwargs(kind)
+                    kwargs = clean_kwargs(kind)
                     # A perfectly VALID value: the refusal is about the field, not its shape.
                     kwargs[field] = "success" if field == ev.FIELD_CONCLUSION else "clean"
                     with self.assertRaises(ValueError):
-                        ev.render_hibernate_evidence(
-                            kind,
-                            envelope=_env(head=HEAD if kind in ev._HEAD_BEARING_EVIDENCE else ""),
-                            **kwargs,
-                        )
+                        ev.render_hibernate_evidence(kind, envelope=envelope_for(kind), **kwargs)
+
+    def test_an_explicitly_empty_value_is_refused_not_read_as_absent(self):
+        """Review j#93646 finding 3: the first fix spelled "unsupplied" as ``""``.
+
+        That made "the caller passed nothing" and "the caller passed an empty value" the same
+        input, so ``park(run="")`` / ``dogfood(workflow="")`` were dropped instead of refused —
+        the silent drop this producer's own rule forbids, reintroduced by the rule's
+        implementation. Only ``CI(run="")`` was refused, and only because CI requires a run.
+        """
+        assert_population_is_closed(self)
+        for kind in sorted(CARRIED_BY_KIND):
+            for field in PRODUCER_FIELDS:
+                with self.subTest(kind=kind, field=field):
+                    kwargs = clean_kwargs(kind)
+                    kwargs[field] = ""
+                    with self.assertRaises(ValueError):
+                        ev.render_hibernate_evidence(kind, envelope=envelope_for(kind), **kwargs)
 
     def test_conclusion_is_refused_rather_than_coerced_to_success(self):
         """``conclusion="failure"`` used to be rendered as ``conclusion=success``."""
@@ -257,7 +179,7 @@ class EveryProducerFieldTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     ev.render_hibernate_evidence(
                         ev.EVIDENCE_REQUIRED_CI_GREEN,
-                        envelope=_env(),
+                        envelope=envelope(),
                         workflow="check",
                         run="run",
                         conclusion=bad,
@@ -267,29 +189,14 @@ class EveryProducerFieldTests(unittest.TestCase):
 class EnvelopeIdentityTests(unittest.TestCase):
     """The envelope reaches the marker through the same producer call and had the same defect."""
 
-    def test_the_derived_envelope_population_is_the_one_this_file_exercises(self):
-        self.assertEqual(
-            tuple(f.name for f in dataclasses.fields(LaneEvidenceEnvelope)),
-            ("workspace", "lane", "lane_generation", "head"),
-        )
-
     def test_string_identities_are_refused_raw(self):
         for field in ("workspace", "lane"):
-            for bad in INVALID_TOKENS:
+            for bad in INVALID_TOKENS + INVALID_TYPES:
                 with self.subTest(field=field, value=bad):
                     with self.assertRaises(ValueError):
                         ev.render_hibernate_evidence(
                             ev.EVIDENCE_REQUIRED_CI_GREEN,
-                            envelope=_env(**{field: bad}),
-                            workflow="check",
-                            run="run",
-                        )
-            for bad in INVALID_TYPES:
-                with self.subTest(field=field, value=bad):
-                    with self.assertRaises(ValueError):
-                        ev.render_hibernate_evidence(
-                            ev.EVIDENCE_REQUIRED_CI_GREEN,
-                            envelope=_env(**{field: bad}),
+                            envelope=envelope(**{field: bad}),
                             workflow="check",
                             run="run",
                         )
@@ -300,7 +207,7 @@ class EnvelopeIdentityTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     ev.render_hibernate_evidence(
                         ev.EVIDENCE_REQUIRED_CI_GREEN,
-                        envelope=_env(head=bad),
+                        envelope=envelope(head=bad),
                         workflow="check",
                         run="run",
                     )
@@ -308,10 +215,10 @@ class EnvelopeIdentityTests(unittest.TestCase):
     def test_absent_head_is_the_empty_string_and_nothing_else(self):
         # ``park_declared`` is lane-anchored, so ``head=""`` renders. ``None`` is a producer error,
         # not a second spelling of absent: ``str(None or "")`` used to make them the same value.
-        rendered = ev.render_hibernate_evidence(ev.EVIDENCE_PARK_DECLARED, envelope=_env(head=""))
+        rendered = ev.render_hibernate_evidence(ev.EVIDENCE_PARK_DECLARED, envelope=envelope(head=""))
         self.assertNotIn("head=", rendered)
         with self.assertRaises(ValueError):
-            ev.render_hibernate_evidence(ev.EVIDENCE_PARK_DECLARED, envelope=_env(head=None))
+            ev.render_hibernate_evidence(ev.EVIDENCE_PARK_DECLARED, envelope=envelope(head=None))
 
 
 class IntegrationEvidenceProducerTests(unittest.TestCase):
@@ -319,16 +226,13 @@ class IntegrationEvidenceProducerTests(unittest.TestCase):
 
     def _render(self, **over):
         kwargs = dict(
-            envelope=_env(),
+            envelope=envelope(),
             integration_head=INTEGRATION_HEAD,
             integration_branch="main-next",
             disposition="merge",
         )
         kwargs.update(over)
         return ie.render_integration_evidence(**kwargs)
-
-    def test_clean_input_still_renders(self):
-        self.assertIn("integration_branch=main-next", self._render())
 
     def test_each_field_is_refused_raw(self):
         for field in ("integration_head", "integration_branch", "disposition"):
@@ -343,7 +247,7 @@ class IntegrationEvidenceProducerTests(unittest.TestCase):
 
 
 class CallSiteTests(unittest.TestCase):
-    """A guard the CALLER pre-normalizes is a guard that never runs."""
+    """A guard the CALLER pre-empts is a guard that never runs."""
 
     def test_the_gate_note_producer_hands_the_envelope_over_raw(self):
         for bad in (" ws-1", "ws-1 ", "ws\n1"):
@@ -353,219 +257,142 @@ class CallSiteTests(unittest.TestCase):
                         "review_result",
                         evidence_workspace=bad,
                         evidence_lane=LANE,
-                        evidence_lane_generation="3",
+                        evidence_lane_generation=3,
                     )
 
-    def test_the_gate_note_producer_refuses_a_bool_generation(self):
-        # ``int(True)`` is ``1``, which would slip past the renderer's own ``bool`` refusal.
-        with self.assertRaises(ValueError):
+    def test_the_gate_note_producer_binds_only_the_generation_it_was_given(self):
+        """Review j#93646 finding 2: ``int()`` in front of the renderer.
+
+        ``1.5`` became ``lane_generation=1`` and ``2.9`` became ``2`` — an evidence marker bound to
+        a generation the caller never named, which is exactly the cross-generation promotion the
+        envelope exists to prevent. A padded / stringy generation was converted the same way.
+        """
+        for bad in (1.5, 2.9, 0.5, " 3 ", "3", True, "three", None, 0, -1):
+            with self.subTest(lane_generation=bad):
+                with self.assertRaises(ValueError):
+                    render_gate_note(
+                        "review_result",
+                        evidence_workspace=WS,
+                        evidence_lane=LANE,
+                        evidence_lane_generation=bad,
+                    )
+        # Negative control: the value it WAS given still renders, unchanged.
+        self.assertIn(
+            "lane_generation=3",
             render_gate_note(
                 "review_result",
                 evidence_workspace=WS,
                 evidence_lane=LANE,
-                evidence_lane_generation=True,
-            )
+                evidence_lane_generation=3,
+            ),
+        )
 
-    def test_the_cli_boundary_answers_with_a_typed_refusal_not_a_traceback(self):
-        """Operator argv is normalized at ONE boundary, which then owes a typed refusal.
+    def test_the_cli_producer_refuses_padding_instead_of_canonicalizing_it(self):
+        """Review j#93646 finding 1: the CLI stripped the identities before validating them.
 
-        The CLI check listed the punctuation tuple itself, so a ``\\n``-bearing identity passed it
-        and reached the renderer — which now raises. An operator typo must stay a fixed refusal
-        token, so the boundary asks the same question the renderer does.
+        This is the producer an operator actually calls, so #14694 survived there in full: a
+        padded ``--evidence-workspace`` became the canonical authority field. Being a CLI licenses
+        a typed refusal, not a rewrite — so each case must come back with a REFUSAL TOKEN and no
+        fields, never with normalized fields and never as a traceback.
         """
-        import argparse
-
-        for bad in ("lane\nb", "lane\rb", "lane\xa0b", "lane:b"):
-            with self.subTest(lane=bad):
-                args = argparse.Namespace(
-                    evidence_workspace=WS,
-                    evidence_lane=bad,
-                    evidence_lane_generation="3",
-                )
-                fields, refusal = lane_envelope_marker_fields(args)
+        cases = (
+            ({"evidence_workspace": " ws "}, "evidence_envelope_malformed_identity"),
+            ({"evidence_workspace": "ws "}, "evidence_envelope_malformed_identity"),
+            ({"evidence_lane": " lane "}, "evidence_envelope_malformed_identity"),
+            ({"evidence_lane": "lane\n"}, "evidence_envelope_malformed_identity"),
+            ({"evidence_lane": "lane\xa0b"}, "evidence_envelope_malformed_identity"),
+            ({"evidence_lane": "lane:b"}, "evidence_envelope_malformed_identity"),
+            ({"evidence_lane_generation": " 3 "}, "evidence_envelope_malformed_generation"),
+            ({"evidence_lane_generation": "3 "}, "evidence_envelope_malformed_generation"),
+        )
+        for over, expected in cases:
+            with self.subTest(**over):
+                values = {
+                    "evidence_workspace": WS,
+                    "evidence_lane": LANE,
+                    "evidence_lane_generation": "3",
+                }
+                values.update(over)
+                fields, refusal = lane_envelope_marker_fields(argparse.Namespace(**values))
                 self.assertEqual(fields, {})
-                self.assertEqual(refusal, "evidence_envelope_malformed_identity")
+                self.assertEqual(refusal, expected)
+        # Inline control, not a test of its own: it exists to stop the refusals above from being
+        # satisfied by "refuse everything", so it guards this detector rather than stating the
+        # CLI's contract (which is asserted in the producer-contract unit tests).
+        fields, refusal = lane_envelope_marker_fields(
+            argparse.Namespace(
+                evidence_workspace=WS, evidence_lane=LANE, evidence_lane_generation="3"
+            )
+        )
+        self.assertIsNone(refusal)
+        self.assertEqual(
+            fields,
+            {"evidence_workspace": WS, "evidence_lane": LANE, "evidence_lane_generation": 3},
+        )
 
 
-class RendererParserAgreementTests(unittest.TestCase):
-    """The contract's own invariant: "renderer は parser が拒否するものを書かない".
+class RendererNeverWritesWhatItWouldNotMeanTests(unittest.TestCase):
+    """The symptom stated as an invariant over BOTH corpora.
 
-    Stated as a bidirectional oracle rather than a list of refusals — this is what the whitespace
-    hole actually broke. A rendered marker must (1) survive the STRICT reader every authority
-    consumer shares, and (2) parse back to the values the caller passed, unchanged. A producer that
-    normalizes fails (2) even when it passes (1), which is exactly how ``" check "`` became
-    ``check`` without anything looking wrong.
+    The defect is "the producer wrote a value the caller did not pass". So for every input, exactly
+    one of two things must hold: the producer refuses, or the marker reads back — through the
+    STRICT reader every authority consumer shares — as exactly what was passed. Running this over
+    the invalid corpus is what makes it a recurrence detector rather than a clean-path round trip:
+    on the broken producer, ``" check "`` rendered and read back as ``check``, satisfying neither
+    branch.
     """
 
-    def _round_trip(self, kind: str, **kwargs) -> ev.HibernateEvidence:
-        envelope = _env(head=kwargs.pop("head", HEAD))
-        marker = ev.render_hibernate_evidence(kind, envelope=envelope, **kwargs)
-        read = strict_marker_fields_in_note(marker)
-        self.assertIsNotNone(read, f"the strict reader refused its own marker {marker!r}")
-        (_, fields), = read
-        parsed = ev.parse_hibernate_evidence(fields, kind=kind)
-        self.assertIsInstance(parsed, ev.HibernateEvidence, f"unreadable evidence from {marker!r}")
-        return parsed
-
-    def test_anything_rendered_reads_back_as_exactly_what_was_passed(self):
-        for token in VALID_TOKENS:
+    def test_every_token_is_either_refused_or_survives_unchanged(self):
+        for token in INVALID_TOKENS + VALID_TOKENS:
             with self.subTest(token=token):
-                parsed = self._round_trip(
-                    ev.EVIDENCE_REQUIRED_CI_GREEN, workflow=token, run=token
+                try:
+                    marker = ev.render_hibernate_evidence(
+                        ev.EVIDENCE_REQUIRED_CI_GREEN,
+                        envelope=envelope(),
+                        workflow=token,
+                        run=token,
+                    )
+                except ValueError:
+                    continue
+                read = strict_marker_fields_in_note(marker)
+                # Asserted rather than unpacked: on the broken producer a whitespace-bearing value
+                # rendered a marker that never closed on its line, so the reader saw NO marker at
+                # all — that must read as a failed invariant, not as an unpacking error.
+                self.assertTrue(read, f"rendered a marker no strict reader can see: {marker!r}")
+                self.assertEqual(len(read), 1, f"rendered {len(read)} markers: {marker!r}")
+                (_, fields), = read
+                parsed = ev.parse_hibernate_evidence(
+                    fields, kind=ev.EVIDENCE_REQUIRED_CI_GREEN
                 )
+                self.assertIsInstance(parsed, ev.HibernateEvidence, f"unreadable {marker!r}")
                 self.assertEqual(parsed.extra[ev.FIELD_WORKFLOW], token)
                 self.assertEqual(parsed.extra[ev.FIELD_RUN], token)
-                parsed = self._round_trip(
-                    ev.EVIDENCE_DOGFOOD_DELEGATED, release_issue=token, acceptance=token
-                )
-                self.assertEqual(parsed.extra[ev.FIELD_RELEASE_ISSUE], token)
-                self.assertEqual(parsed.extra[ev.FIELD_ACCEPTANCE], token)
 
-    def test_the_envelope_reads_back_unchanged_too(self):
-        for token in VALID_TOKENS:
+    def test_every_identity_is_either_refused_or_survives_unchanged(self):
+        for token in INVALID_TOKENS + VALID_TOKENS:
             with self.subTest(token=token):
-                marker = ev.render_hibernate_evidence(
-                    ev.EVIDENCE_REQUIRED_CI_GREEN,
-                    envelope=_env(workspace=token, lane=token),
-                    workflow="check",
-                    run="run",
+                try:
+                    marker = ev.render_hibernate_evidence(
+                        ev.EVIDENCE_REQUIRED_CI_GREEN,
+                        envelope=envelope(workspace=token, lane=token),
+                        workflow="check",
+                        run="run",
+                    )
+                except ValueError:
+                    continue
+                read = strict_marker_fields_in_note(marker)
+                # Asserted rather than unpacked: on the broken producer a whitespace-bearing value
+                # rendered a marker that never closed on its line, so the reader saw NO marker at
+                # all — that must read as a failed invariant, not as an unpacking error.
+                self.assertTrue(read, f"rendered a marker no strict reader can see: {marker!r}")
+                self.assertEqual(len(read), 1, f"rendered {len(read)} markers: {marker!r}")
+                (_, fields), = read
+                parsed = ev.parse_hibernate_evidence(
+                    fields, kind=ev.EVIDENCE_REQUIRED_CI_GREEN
                 )
-                (_, fields), = strict_marker_fields_in_note(marker)
-                parsed = ev.parse_hibernate_evidence(fields, kind=ev.EVIDENCE_REQUIRED_CI_GREEN)
+                self.assertIsInstance(parsed, ev.HibernateEvidence, f"unreadable {marker!r}")
                 self.assertEqual(parsed.envelope.workspace, token)
                 self.assertEqual(parsed.envelope.lane, token)
-
-    def test_valid_but_unusual_tokens_still_render(self):
-        # The over-correction control: a guard that refuses these is no longer a grammar rule.
-        for token in VALID_TOKENS:
-            with self.subTest(token=token):
-                self.assertIn(
-                    f"{ev.FIELD_WORKFLOW}={token}",
-                    ev.render_hibernate_evidence(
-                        ev.EVIDENCE_REQUIRED_CI_GREEN,
-                        envelope=_env(),
-                        workflow=token,
-                        run="run",
-                    ),
-                )
-
-
-class CleanOutputIsUnchangedTests(unittest.TestCase):
-    """Byte pins. The fix may only remove markers that should never have existed."""
-
-    def test_ci_green_marker_is_byte_identical(self):
-        self.assertEqual(
-            ev.render_hibernate_evidence(
-                ev.EVIDENCE_REQUIRED_CI_GREEN,
-                envelope=_env(),
-                workflow="test.yml",
-                run="29860030313",
-            ),
-            "[mozyo:workflow-event:gate=required_ci_green:"
-            f"workspace={WS}:lane={LANE}:lane_generation=3:head={HEAD}:"
-            "workflow=test.yml:run=29860030313:conclusion=success]",
-        )
-
-    def test_an_explicitly_supplied_success_conclusion_changes_nothing(self):
-        self.assertEqual(
-            ev.render_hibernate_evidence(
-                ev.EVIDENCE_REQUIRED_CI_GREEN,
-                envelope=_env(),
-                workflow="test.yml",
-                run="1",
-                conclusion="success",
-            ),
-            ev.render_hibernate_evidence(
-                ev.EVIDENCE_REQUIRED_CI_GREEN, envelope=_env(), workflow="test.yml", run="1"
-            ),
-        )
-
-    def test_dogfood_marker_is_byte_identical(self):
-        self.assertEqual(
-            ev.render_hibernate_evidence(
-                ev.EVIDENCE_DOGFOOD_DELEGATED,
-                envelope=_env(),
-                release_issue="14184",
-                acceptance="85431",
-            ),
-            "[mozyo:workflow-event:gate=dogfood_delegated:"
-            f"workspace={WS}:lane={LANE}:lane_generation=3:head={HEAD}:"
-            "release_issue=14184:acceptance=85431]",
-        )
-
-    def test_park_marker_is_byte_identical(self):
-        self.assertEqual(
-            ev.render_hibernate_evidence(ev.EVIDENCE_PARK_DECLARED, envelope=_env(head="")),
-            f"[mozyo:workflow-event:gate=park_declared:workspace={WS}:lane={LANE}:"
-            "lane_generation=3]",
-        )
-
-    def test_integration_marker_is_byte_identical(self):
-        self.assertEqual(
-            ie.render_integration_evidence(
-                envelope=_env(),
-                integration_head=INTEGRATION_HEAD,
-                integration_branch="main-next",
-                disposition="merge",
-            ),
-            "[mozyo:workflow-event:gate=integration_disposition:"
-            f"workspace={WS}:lane={LANE}:lane_generation=3:head={HEAD}:"
-            f"integration_head={INTEGRATION_HEAD}:integration_branch=main-next:"
-            "disposition=merge]",
-        )
-
-
-class ConsumerIsUnchangedTests(unittest.TestCase):
-    """The fix is producer-side. A tightened READER would be a different change (non-goal)."""
-
-    def _ci_fields(self, **over) -> dict:
-        fields = {
-            "gate": ev.EVIDENCE_REQUIRED_CI_GREEN,
-            "workspace": WS,
-            "lane": LANE,
-            "lane_generation": "3",
-            "head": HEAD,
-            "workflow": "test.yml",
-            "run": "1",
-            "conclusion": "success",
-        }
-        fields.update(over)
-        return fields
-
-    def test_the_parser_still_accepts_what_it_accepted(self):
-        parsed = ev.parse_hibernate_evidence(
-            self._ci_fields(), kind=ev.EVIDENCE_REQUIRED_CI_GREEN
-        )
-        self.assertIsInstance(parsed, ev.HibernateEvidence)
-
-    def test_the_parser_still_refuses_with_the_same_typed_reasons(self):
-        for over, reason in (
-            ({"run": ""}, ev.EVIDENCE_MISSING_RUN),
-            ({"workflow": ""}, ev.EVIDENCE_MISSING_WORKFLOW),
-            ({"conclusion": "failure"}, ev.EVIDENCE_CI_NOT_SUCCESS),
-        ):
-            with self.subTest(over=over):
-                got = ev.parse_hibernate_evidence(
-                    self._ci_fields(**over), kind=ev.EVIDENCE_REQUIRED_CI_GREEN
-                )
-                self.assertEqual(got.reason, reason)
-
-    def test_duplicate_and_conflict_resolution_is_unchanged(self):
-        one = self._ci_fields()
-        self.assertIsInstance(
-            ev.resolve_hibernate_evidence([one, dict(one)], kind=ev.EVIDENCE_REQUIRED_CI_GREEN),
-            ev.HibernateEvidence,
-        )
-        self.assertEqual(
-            ev.resolve_hibernate_evidence(
-                [one, self._ci_fields(run="2")], kind=ev.EVIDENCE_REQUIRED_CI_GREEN
-            ).reason,
-            ev.EVIDENCE_CONFLICT,
-        )
-        self.assertEqual(
-            ev.resolve_hibernate_evidence([], kind=ev.EVIDENCE_REQUIRED_CI_GREEN).reason,
-            ev.EVIDENCE_ABSENT,
-        )
 
 
 if __name__ == "__main__":

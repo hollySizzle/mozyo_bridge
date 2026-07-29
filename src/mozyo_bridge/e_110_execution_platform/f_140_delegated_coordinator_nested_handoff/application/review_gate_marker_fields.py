@@ -79,10 +79,18 @@ def lane_envelope_marker_fields(args: argparse.Namespace) -> "tuple[dict, Option
     :func:`contains_marker_separator` rather than by iterating the punctuation tuple (Redmine
     #14694): a ``\\n``-bearing ``--evidence-lane`` is refused by the renderer, so listing fewer
     characters here would turn an operator typo into a traceback instead of a typed refusal.
+
+    The values are judged RAW (review j#93646 finding 1). This used to ``strip()`` them first,
+    which made THIS the surface that turned ``--evidence-workspace " ws "`` into the canonical
+    authority field ``ws`` — the exact defect #14694 exists to close, surviving in the one producer
+    an operator actually calls. Being a CLI does not license normalizing: what it owes its caller
+    is the fixed refusal vocabulary, and it still gives one, because padding IS a marker separator
+    (``evidence_envelope_malformed_identity``) and a padded generation is not ``isdigit()``
+    (``evidence_envelope_malformed_generation``). Nothing here becomes a traceback.
     """
-    ws = (getattr(args, "evidence_workspace", None) or "").strip()
-    lane = (getattr(args, "evidence_lane", None) or "").strip()
-    gen_raw = (getattr(args, "evidence_lane_generation", None) or "").strip()
+    ws = getattr(args, "evidence_workspace", None) or ""
+    lane = getattr(args, "evidence_lane", None) or ""
+    gen_raw = getattr(args, "evidence_lane_generation", None) or ""
     if not ws and not lane and not gen_raw:
         return {}, None
     if not ws or not lane or not gen_raw:
