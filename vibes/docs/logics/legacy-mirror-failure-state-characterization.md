@@ -912,6 +912,41 @@ T6 (共有 fault schedule fake の新規作成) が触る consumer は**この�
 - `tests/support/legacy_mirror_tree_fixture.py` は `_MirrorTreeFixture` の逐語移動で
   あり test を含まないので、この表の 127 には入らない。
 
+#### 共有 helper の所有 [導出]
+
+landed policy の family 配置基準は「**2 つ以上の移設先 test module** が使う
+fixture / helper は `tests/support/`」である。この述語を **実際の helper 集合に
+適用**した — test → same-class helper の呼び出しを推移閉包で辿り、consumer module を
+AST 導出した結果、**cross-module helper は 7 件**ある:
+
+| helper | 定義 class | 現行 L | consumer module | 移設先 |
+| --- | --- | ---: | ---: | --- |
+| `_stage` | `_MirrorTreeFixture` | 201 | 7 | `tests/support/legacy_mirror_tree_fixture.py` |
+| `_service` | `_MirrorTreeFixture` | 233 | 5 | 〃 |
+| `_mirror` | `_MirrorTreeFixture` | 229 | 4 | 〃 |
+| `_source` | `_MirrorTreeFixture` | 225 | 4 | 〃 |
+| **`_staging_names`** | **`LegacyMirrorSyncServiceTest`** | 1421 | **3** | **`tests/support/legacy_mirror_tree_fixture.py`** |
+| **`_open_descriptor_count`** | **`LegacyMirrorSyncServiceTest`** | 977 | **2** | **`tests/support/legacy_mirror_tree_fixture.py`** |
+| **`_stage_with_wrapper`** | **`LegacyMirrorWrapperCliTest`** | 3719 | **2** | **`tests/support/legacy_mirror_tree_fixture.py`** |
+
+- 上 4 件は `_MirrorTreeFixture` の member なので fixture の逐語移動で覆われる。
+  同 class の `_preflight_already_answered` / `assertBlocksWrite` / `_snapshot` も
+  同じ移動に乗る (consumer は 1 module 以下だが fixture の一部である)。
+- **下 3 件は test class 側に定義されており、R8 まで どの Task も所有していなかった。**
+  複製すれば裁定違反、1 module にだけ残せば他 module が実行不能になる。
+- **移設先を `legacy_mirror_tree_fixture.py` に統一する。** 3 件とも mirror tree に
+  対する構築 / 観測であり、`_stage_with_wrapper` は `_stage` を土台にする。
+  別 support module に分けると consumer が 2 file を import することになり、
+  fixture の凝集を割る理由が無い。
+- consumer が **1 module のみ**の helper (`_source_line` / `_helper_lines` /
+  `_interrupt_*` / `_call_surface_sources` / `_run` 等 19 件) は **module-local**
+  のまま移す。support 閾値を満たさない。
+- **helper は test ではないので 127 / 3,088 に影響しない** (partition 恒等式は不変)。
+
+> R8 まで support の所有を「`_MirrorTreeFixture` の逐語移動」とだけ書き、
+> **裁定の「2 module 以上」という述語を実 helper 集合に適用していなかった**。
+> §5.5 で module は列挙したのに、helper には同じ導出をしていなかった。
+
 **T3 / T4 と T6 は交差しない [導出]。** T3 / T4 が触る test module は
 `test_owned_descriptor_teardown.py` の 1 つである。同 module の `os_patch` は **0** —
 retention 機械の 19 件は `owned_descriptors._ledger` / `_Occurrence` /
@@ -1030,7 +1065,7 @@ ledger admission の idempotence、occurrence 数の保存則 — に限られ�
 | --- | --- | --- | --- | --- |
 | **T0** | design consultation | — | — | **完了**: Redmine #14662、Review j#92458 approved |
 | **T-P** | policy doc 改訂 | `vibes/docs/logics/tests-placement-discovery-policy.md` | — | **完了**: Redmine #14664、Review j#92528 approved → `origin/main-next@6b718673`、required CI success |
-| **T1** | move-only | `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py` (**削除。削除 owner は T1 のみ**) + §5.5 の **10 module** + `tests/support/legacy_mirror_tree_fixture.py` | `.mozyo-bridge/docs/catalog.yaml` / `.mozyo-bridge/docs/file_conventions.generated.yaml` / `vibes/docs/logics/legacy-mirror-failure-state-characterization.md` | 127 件を 1 commit で移動。**D1 = 127** / **D2 = 自 base の `N` 前後一致**。`src/**` diff **byte 0**。catalog に移設先 exact path を追加し `--check` green。**Appendix A に `superseded` を明記して retire** (§8)。commit message に `move-only` |
+| **T1** | move-only | `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py` (**削除。削除 owner は T1 のみ**) + §5.5 の **10 module** + `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/__init__.py` (**新規。integration 側に `f_150_skill_plugin_distribution` は存在しない**) + `tests/support/legacy_mirror_tree_fixture.py` (`_MirrorTreeFixture` + §5.5 の cross-module helper 3 件) | `.mozyo-bridge/docs/catalog.yaml` / `.mozyo-bridge/docs/file_conventions.generated.yaml` / `vibes/docs/logics/legacy-mirror-failure-state-characterization.md` | 127 件を 1 commit で移動。**新設 package に `__init__.py` を置く** (欠落は D1 が通るのに D2 が減る false green。policy `## Anti-patterns`)。**D1 = 127** / **D2 = 自 base の `N` 前後一致**。`src/**` diff **byte 0**。catalog に移設先 exact path を追加し `--check` green。**Appendix A に `superseded` を明記して retire** (§8)。commit message に `move-only` |
 | **T2** | behavior change | `src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/legacy_mirror_sync.py` + `src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/domain/legacy_mirror_contract.py` | — | 状態遷移を filesystem effect から分離。§1.1–1.3 の遷移表が pure に評価できる。T1 の test が無改変で green |
 | **T3** | behavior change | `src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/owned_descriptors.py` + `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py` | — | §3.2(a) の carrier 差し替え seam を公開面へ。private patch を減らす |
 | **T4** | test-only 書き換え | `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py` のみ | — | §3.2(b) を公開 API 経由へ言い換え。`src/**` 不変 |
