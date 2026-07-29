@@ -1417,5 +1417,127 @@ class ResumeRailTests(unittest.TestCase):
             self.assertEqual(self.ops.resume_once(self.continuation), DRAIN_SEND_ERROR)
 
 
+class RunbookAuthorityAnchorTests(unittest.TestCase):
+    """The cataloged runbook must describe the anchor the code actually builds (review j#92767).
+
+    R7 gave each gate its own ruling pointer but left the operator/auditor source of truth
+    describing a ONE-part anchor ("the committed config blob"). Both the broken R6 anchor and the
+    fixed R7 one satisfied that sentence, so the very misattribution R7 fixed was undetectable
+    from the canonical doc — the third docs drift in three rounds.
+
+    So this pins the agreement by DERIVING both sides from the code: the expected pointers come
+    from ``contract_ruling_pointer``, never from a literal spelled here. Change the code pointer
+    and the doc goes red; swap the pointers in the doc and it goes red too. A spelling check
+    could do neither (#14539: pin the operation, not the spelling).
+    """
+
+    OTHER_GATE = "park_declared"
+
+    def setUp(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+            contract_ruling_pointer,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_refresh_approval import (  # noqa: E501
+            WORKER_REFRESH_APPROVAL_GATE,
+        )
+
+        self.gate = WORKER_REFRESH_APPROVAL_GATE
+        self.ruling = contract_ruling_pointer(self.gate)
+        self.other_ruling = contract_ruling_pointer(self.OTHER_GATE)
+        self.repo = Path(__file__).resolve().parents[4]
+        body = (self.repo / "vibes" / "docs" / "tasks" / "herdr-lane-operations.md").read_text(
+            encoding="utf-8"
+        )
+        lines = body.splitlines()
+        start = next(
+            i for i, line in enumerate(lines) if line.startswith("## ") and "#14661" in line
+        )
+        end = next(
+            (i for i, line in enumerate(lines[start + 1:], start + 1) if line.startswith("#")),
+            len(lines),
+        )
+        self.section = lines[start:end]
+
+    def _lines_mentioning(self, token):
+        return [line for line in self.section if token in line]
+
+    def test_the_two_rulings_are_distinct(self):
+        # Without this the two assertions below could both pass on a single shared pointer —
+        # exactly the R6 state — and would prove nothing.
+        self.assertNotEqual(self.ruling, self.other_ruling)
+
+    def test_the_runbook_attributes_this_gate_to_its_own_ruling(self):
+        mentions = self._lines_mentioning(self.gate)
+        self.assertTrue(mentions, f"the runbook never names the gate {self.gate!r}")
+        self.assertTrue(
+            any(self.ruling in line for line in mentions),
+            f"the runbook names {self.gate!r} without the ruling that decided it "
+            f"({self.ruling!r}); code and cataloged doc have drifted",
+        )
+        self.assertFalse(
+            any(self.other_ruling in line for line in mentions),
+            f"the runbook attributes {self.gate!r} to {self.other_ruling!r}, a ruling that "
+            "says nothing about it — the R6 misattribution, restated in the doc",
+        )
+
+    def test_the_runbook_keeps_the_pre_existing_gates_on_their_ruling(self):
+        mentions = self._lines_mentioning(self.OTHER_GATE)
+        self.assertTrue(mentions, f"the runbook never names {self.OTHER_GATE!r}")
+        self.assertTrue(
+            any(self.other_ruling in line for line in mentions),
+            f"the runbook must state that the pre-existing gates keep {self.other_ruling!r}",
+        )
+        self.assertFalse(
+            any(self.ruling in line for line in mentions),
+            "the runbook re-attributes a pre-existing gate to this Task's ruling",
+        )
+
+    def test_the_runbook_explains_every_part_of_the_real_anchor(self):
+        # Derive the parts from a real resolution rather than describing them from memory.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_issuer_policy import (  # noqa: E501
+            config_policy_pointer,
+            resolve_journal_issuer,
+        )
+
+        issuer = resolve_journal_issuer(
+            journal_id="92500",
+            notes=f"[mozyo:workflow-event:gate={self.gate}:head=abc]",
+            policy_pointer=config_policy_pointer("deadbeef"),
+        )
+        parts = issuer.authority_anchor.split(" ")
+        self.assertEqual(len(parts), 3, issuer.authority_anchor)
+        ruling, config, evidence = parts
+        text = "\n".join(self.section)
+        for token in (
+            ruling,                                    # (a) the gate's own ruling
+            config.split("@")[0] + "@",                # (b) the committed config blob
+            evidence.split("j#")[0] + "j#",            # (c) the exact evidence journal
+            ":gate=",                                  # ...bound to the exact gate
+        ):
+            self.assertIn(
+                token, text,
+                f"the runbook does not explain the anchor component {token!r}",
+            )
+
+    def test_the_committed_config_carries_no_gate_role_mapping(self):
+        # The runbook says the config blob alone cannot prove a writer contract, because it has
+        # no gate->role mapping. That is a fact about the committed file, so pin it: if a gate
+        # name ever lands in the config, the runbook's reasoning silently stops holding.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (  # noqa: E501
+            hibernate_evidence_authority as auth,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_issuer_policy import (  # noqa: E501
+            CONFIG_RELPATH,
+        )
+
+        config = (self.repo / CONFIG_RELPATH).read_text(encoding="utf-8")
+        for gate in auth._KIND_ISSUER:
+            self.assertNotIn(
+                gate, config,
+                f"{CONFIG_RELPATH} now mentions the gate {gate!r}; the runbook's claim that the "
+                "config blob carries no gate->role mapping needs re-deriving",
+            )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
