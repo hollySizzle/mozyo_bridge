@@ -882,18 +882,33 @@ T6 (共有 fault schedule fake の新規作成) が触る consumer は**この�
 | regressions | 2 | 99 | `tests/regressions/test_issue_14580_reused_descriptor_number_close.py` | 2 |
 | regressions | 2 | 28 | `tests/regressions/test_issue_14651_capability_advertisement.py` | 2 |
 | integration | 29 | 1,033 | `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_fault_injection.py` | 29 |
-| integration | 47 | 805 | `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_sync.py` | 0 |
+| integration | 51 | 864 | `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_sync.py` | 0 |
 | integration | 7 | 79 | `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_tracked_tree.py` | 0 |
 | integration | 3 | 35 | `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_wrapper_guardrails.py` | 0 |
-| integration | 9 | 167 | `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe_io.py` | 2 |
+| integration | 5 | 108 | `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe_io.py` | 2 |
 | **計** | **127** | **3,088** | **10 module** | **36** |
 
 - **basename 衝突 0** を機械確認済み (policy `### module 名の一意性`)。
-- module 分割の基準: 検証層 (§5.2) と subject。`test_legacy_mirror_fault_injection.py`
-  は E-inject の 29 件、`test_legacy_mirror_sync.py` は patch なしの結線、
-  `test_platform_capability_probe*.py` は probe、`test_legacy_mirror_tracked_tree.py`
-  は tracked tree guardrail、`test_legacy_mirror_wrapper_guardrails.py` は wrapper を
-  実行しない 2 件 + direct-module refusal 1 件。
+- module 分割の基準は **subject** であり、行位置ではない:
+  - `test_platform_capability_probe*.py` — **`platform_capabilities` に触れる** test
+    (unit 2 / integration 5)。判定は「test 本体または同 class helper が
+    `platform_capabilities` / `missing_platform_capabilities` を参照するか」で、
+    source から機械導出できる。
+  - `test_legacy_mirror_fault_injection.py` — probe 以外で `os` primitive を注入する
+    29 件 (E-inject)。
+  - `test_legacy_mirror_sync.py` — 残りの service 契約 51 件 (audit / check / sync /
+    report の結線。注入なし)。
+  - `test_legacy_mirror_tracked_tree.py` — tracked tree guardrail 7 件。
+  - `test_legacy_mirror_wrapper_guardrails.py` — wrapper を実行しない 2 件 +
+    direct-module refusal 1 件。
+
+> **R7 まで probe module を行境界 (`L >= 3424`) で切っていた。** 3424 は
+> `--- R7-F4 / #14651: the capability probe ... ---` の section marker だが、その後ろには
+> `--- R6-F3: unreadable state is typed ---` と `--- action-time recheck ---` も続くため、
+> **audit / report / sync 契約の 4 件 (59 行) が probe module に混入していた**。
+> 「subject で割る」と宣言しながら行位置の代理で導出していたので、上記の
+> subject 述語による導出へ差し替えた (4 件が `test_legacy_mirror_sync.py` へ移り、
+> probe I/O は 5 件 / 108 行、sync は 51 件 / 864 行になった)。
 - `tests/support/legacy_mirror_tree_fixture.py` は `_MirrorTreeFixture` の逐語移動で
   あり test を含まないので、この表の 127 には入らない。
 
@@ -1011,15 +1026,15 @@ ledger admission の idempotence、occurrence 数の保存則 — に限られ�
 **behavior-preserving move** と **behavior change** を別 commit / 別 Task に割る
 (`refactor-split-strategy.md` `## Move Commit Rules` 3 / 5)。
 
-| Task | 種別 | 変更 path (排他) | 完了条件 |
-| --- | --- | --- | --- |
-| **T0** | design consultation | — | **完了**: Redmine #14662、Review j#92458 approved |
-| **T-P** | policy doc 改訂 | `vibes/docs/logics/tests-placement-discovery-policy.md` のみ | **完了**: Redmine #14664、Review j#92528 approved → `origin/main-next@6b718673`、required CI success |
-| **T1** | move-only | `tests/unit/.../test_legacy_project_skill_mirror.py` (**削除。削除 owner は T1 のみ**) + **§5.5 の 10 module** + `tests/support/legacy_mirror_tree_fixture.py` | §5.0 / §5.5 の宣言どおり **127 件すべてを 1 commit で移動**。**D1 = 127** / **D2 = 自 base で測った `N` の前後一致**。`src/**` diff **byte 0**。catalog に移設先 exact path を追加し `--check` green。**Appendix A に `superseded` を明記して retire** (§8)。commit message に `move-only` |
-| **T2** | behavior change | `src/.../application/legacy_mirror_sync.py` + `src/.../domain/**` | 状態遷移を filesystem effect から分離。1.1–1.3 の遷移表が pure に評価できる。T1 の test が無改変で green |
-| **T3** | behavior change | `src/.../application/owned_descriptors.py` + `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py` | 3.2(a) の carrier 差し替え seam を公開面へ。private patch を減らす |
-| **T4** | test-only 書き換え | `tests/unit/.../test_owned_descriptor_teardown.py` のみ | 3.2(b) を公開 API 経由へ言い換え。`src/**` 不変 |
-| **T6** | behavior change (test 側) | `tests/support/legacy_mirror_fault_schedule.py` (新規) + **§5.5 で `os_patch` 非 0 の 5 module のみ**: `tests/integration/.../test_legacy_mirror_fault_injection.py` (29) / `tests/integration/.../test_platform_capability_probe_io.py` (2) / `tests/regressions/test_issue_14580_reused_descriptor_number_close.py` (2) / `tests/regressions/test_issue_14651_capability_advertisement.py` (2) / `tests/unit/.../test_platform_capability_probe.py` (1) | 共有 fault schedule fake の**新規作成**。個別 mock の重複を縮小。**`os_patch` が 0 の module には触らない** |
+| Task | 種別 | **排他 path** (この Task だけが触る) | **共有 path** (順序で直列化。同時 dispatch しない) | 完了条件 |
+| --- | --- | --- | --- | --- |
+| **T0** | design consultation | — | — | **完了**: Redmine #14662、Review j#92458 approved |
+| **T-P** | policy doc 改訂 | `vibes/docs/logics/tests-placement-discovery-policy.md` | — | **完了**: Redmine #14664、Review j#92528 approved → `origin/main-next@6b718673`、required CI success |
+| **T1** | move-only | `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py` (**削除。削除 owner は T1 のみ**) + §5.5 の **10 module** + `tests/support/legacy_mirror_tree_fixture.py` | `.mozyo-bridge/docs/catalog.yaml` / `.mozyo-bridge/docs/file_conventions.generated.yaml` / `vibes/docs/logics/legacy-mirror-failure-state-characterization.md` | 127 件を 1 commit で移動。**D1 = 127** / **D2 = 自 base の `N` 前後一致**。`src/**` diff **byte 0**。catalog に移設先 exact path を追加し `--check` green。**Appendix A に `superseded` を明記して retire** (§8)。commit message に `move-only` |
+| **T2** | behavior change | `src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/legacy_mirror_sync.py` + `src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/domain/legacy_mirror_contract.py` | — | 状態遷移を filesystem effect から分離。§1.1–1.3 の遷移表が pure に評価できる。T1 の test が無改変で green |
+| **T3** | behavior change | `src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/owned_descriptors.py` + `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py` | — | §3.2(a) の carrier 差し替え seam を公開面へ。private patch を減らす |
+| **T4** | test-only 書き換え | `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py` のみ | — | §3.2(b) を公開 API 経由へ言い換え。`src/**` 不変 |
+| **T6** | behavior change (test 側) | `tests/support/legacy_mirror_fault_schedule.py` (新規) + §5.5 で `os_patch` 非 0 の **5 module のみ**: `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_fault_injection.py` (29) / `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe_io.py` (2) / `tests/regressions/test_issue_14580_reused_descriptor_number_close.py` (2) / `tests/regressions/test_issue_14651_capability_advertisement.py` (2) / `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe.py` (1) | `.mozyo-bridge/docs/catalog.yaml` / `.mozyo-bridge/docs/file_conventions.generated.yaml` / `vibes/docs/logics/legacy-mirror-failure-state-characterization.md` | 共有 fault schedule fake の**新規作成**。個別 mock の重複を縮小。**`os_patch` が 0 の module には触らない** |
 
 **移設を行き先ごとに分割しない [R5-F1 修正]。** R5 まで本 doc は regressions 4 件を
 別 Task (T5) に切り、`T1 → T5` を要求していた。**これは実行不能である** — T1 が元
@@ -1046,6 +1061,10 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
 
 **ownership 規則:**
 
+- **排他 path は 1 Task だけが触る。共有 path は排他ではない。** 共有 path
+  (`.mozyo-bridge/docs/catalog.yaml` / `.mozyo-bridge/docs/file_conventions.generated.yaml` / `vibes/docs/logics/legacy-mirror-failure-state-characterization.md`) は T1 と T6 の両方が触るので、**T1 → T6 の順に
+  直列化し、同時 dispatch しない**。T6 は T1 が land した catalog / doc の上に
+  追記する。
 - `src/**` に触るのは **T2 / T3 のみ**。T1 / T4 / T6 は `src/**` diff が
   byte 0 でなければ失格。
 - **T1 の hold は解除された。** T0 (#14662) と T-P (#14664) がともに approved で、
