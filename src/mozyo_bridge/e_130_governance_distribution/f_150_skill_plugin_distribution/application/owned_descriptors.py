@@ -698,13 +698,20 @@ def teardown_during(
 
 
 _teardown_during = teardown_during
-"""The in-package spelling, kept because renaming it is not this Task's to make.
+"""The in-package spelling. Still load-bearing — do not remove it on a guess.
 
-``legacy_mirror_sync`` imports this name, and that module is the exclusive
-changed path of Redmine #14682 (T2) — editing it here would break the
-changed-path ownership the #14660 characterization §7 sets up, which is what
-keeps T2 and T3 dispatchable in parallel. It is one binding to one function, not
-a second implementation, and T2 drops it when it updates its own import.
+``legacy_mirror_sync`` imports this name and calls it twice. That was already
+true when the public spelling was introduced, and it is still true after Redmine
+#14682 (T2) rewrote that module and landed: T2 kept the import rather than
+migrating to :func:`teardown_during`. It is one binding to one function, not a
+second implementation.
+
+An earlier version of this note predicted that T2 would drop the import when it
+updated its own, and offered that as the retirement condition. That was wrong
+twice over — the condition has since come and gone without the drop, and no such
+condition exists in the #14660 characterization to begin with (review j#93688).
+Retiring this name means migrating a live caller, so it waits for a ruling that
+owns that migration, not for an event someone guessed at.
 """
 
 
