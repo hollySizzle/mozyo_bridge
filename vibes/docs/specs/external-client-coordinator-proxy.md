@@ -373,6 +373,21 @@ authorize したかを照合しなければ scope は未検証のままである
     ★★★**この防御は reader 側に置けない。** 切り詰め後に note へ残る bytes は、正規の decision と
     **byte 単位で同一**である — reader が検出できるものは何も残らない。中央 preset
     「renderer は parser が拒否するものを書かない」が producer 側を指定しているのはこのためである。
+    ★★★**検査対象は「与えられたままの値」であり、正規化後の値ではない** (#14667 R2 review j#93063)。
+    初版は producer 側で `.strip()` してから validator を呼び、共有 validator 自身も先頭で
+    `.strip()` していた。結果として「ANY whitespace を拒否」という**宣言と実装が一致しておらず**、
+    前後の whitespace は黙って正規化され *internal* whitespace しか拒否されていなかった。実測では
+    `lane=' ln'` / `lane_generation='2 '` がいずれも clean marker を描画し **send へ到達した**
+    (`send_calls=1`)。→ 共有 `validate_marker_field_value` の先頭 `.strip()` を除去し、宣言どおり
+    raw 値を検査する。**無効値を正規化して通すのは、producer が caller の依頼と違うものを書く経路**
+    である。untrimmed input を持つ caller は、値を「これが意図だ」と主張する前に**自分で明示的に**
+    trim する。
+    ★★★**分岐は raw argument で決める。正規化が判断より先に走ると、判断そのものが変わる。**
+    同 review の最も深刻な形: 分岐条件が `if lane.strip():` だったため **whitespace-only の lane が
+    falsy になり、dispatch を意図した caller に対して `proxy_action=bootstrap_lane` の marker が
+    描画されて送信された** (実測 `lane='\t'` → `verified / deliver / sent`)。R1 の `]` 切り詰めは
+    *値* を変えるものだったが、これは **どの action を authorize するかを変える**。値の検査を直す
+    だけでは閉じない — validator を呼ぶ前に分岐が終わっているからである。
   - journal id は marker を持つ **entry 自身の id** を使う (marker の自己申告は使わない)。
 - 他 journal の引用は **authority にも ambiguity poison にもならない。**
 - 分類:

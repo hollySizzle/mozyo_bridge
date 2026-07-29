@@ -188,11 +188,15 @@ def render_bootstrap_decision_marker(lane: str = "", lane_generation: str = "") 
     is not.
     """
     marker = f"[mozyo:workflow-event:gate=implementation_request:{DECISION_ACTION_FIELD}="
-    if lane.strip():
-        lane_value = validate_marker_field_value("lane", lane.strip())
-        generation_value = validate_marker_field_value(
-            "lane_generation", (lane_generation or "").strip()
-        )
+    # The branch is decided on the RAW argument, and nothing is normalized before it. Testing
+    # ``lane.strip()`` here made a whitespace-only lane falsy, so a caller asking to authorize a
+    # DISPATCH got a marker authorizing a BOOTSTRAP — the argument did not merely lose its
+    # whitespace, it selected the other action (review j#93063; measured `lane='\t'` reaching a
+    # delivered send). Normalization that runs before a decision is normalization that can change
+    # the decision, so the raw value both picks the branch and is what the validator judges.
+    if lane:
+        lane_value = validate_marker_field_value("lane", lane)
+        generation_value = validate_marker_field_value("lane_generation", lane_generation)
         return (
             marker + f"dispatch_next:lane={lane_value}:lane_generation={generation_value}]"
         )

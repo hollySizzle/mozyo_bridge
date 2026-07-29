@@ -350,6 +350,29 @@ class ProducerImpossibleShapeIsZeroSendTest(StrictDecisionBodyTestBase):
         self.assertEqual(context.links.anchor, ANCHOR_DECISION_UNREADABLE)
         self.assertEqual(port.calls, [])
 
+    def test_a_whitespace_bearing_value_sends_nothing_if_it_reaches_a_note_anyway(self):
+        """The other end of R2 finding 1, at the effect entry.
+
+        The producer now refuses to WRITE a whitespace-bearing value, but a hand-written note is
+        not bound by the producer. Both ends are pinned, because "the producer cannot emit it" is
+        a statement about one program and the reader is what stands between a durable note and a
+        send.
+        """
+        for label, body in {
+            "leading whitespace in the lane value":
+                f"gate=implementation_request:{DECISION_ACTION_FIELD}=dispatch_next:"
+                f"lane= {LANE}:lane_generation=2",
+            "trailing whitespace in the generation value":
+                f"gate=implementation_request:{DECISION_ACTION_FIELD}=dispatch_next:"
+                f"lane={LANE}:lane_generation=2 ",
+        }.items():
+            with self.subTest(label):
+                context, _result, port = self._run(
+                    f"{_marker(body)}\n", action=ACTION_DISPATCH_NEXT
+                )
+                self.assertEqual(context.links.anchor, ANCHOR_DECISION_UNREADABLE, label)
+                self.assertEqual(port.calls, [], label)
+
     def test_a_clean_sibling_does_not_rescue_an_unrenderable_shape(self):
         # Same argument as the malformed-body case: dropping the un-renderable marker would remove
         # it from the exactly-one count and hand authority to the clean one beside it.
@@ -432,6 +455,14 @@ class ProducerRefusesUnrenderableValuesTest(unittest.TestCase):
                         render_bootstrap_decision_marker(**kwargs)
 
     def test_whitespace_and_empty_values_are_refused(self):
+        """Whitespace ANYWHERE in the value as GIVEN — not after a normalizing pass.
+
+        R2 review j#93063: the producer stripped before validating and the shared validator
+        stripped again before checking, so "refuses ANY whitespace" was true only of INTERNAL
+        whitespace. Leading and trailing whitespace was silently normalized away and the marker
+        went out looking clean. The table below is written from the boundary's own vocabulary —
+        where the whitespace sits — because that is the axis the old code collapsed.
+        """
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
             MarkerValueError,
         )
@@ -439,6 +470,12 @@ class ProducerRefusesUnrenderableValuesTest(unittest.TestCase):
         for label, kwargs in {
             "internal space in lane": {"lane": "l n", "lane_generation": "2"},
             "internal space in generation": {"lane": "ln", "lane_generation": "2 3"},
+            "leading space in lane": {"lane": " ln", "lane_generation": "2"},
+            "trailing space in lane": {"lane": "ln ", "lane_generation": "2"},
+            "leading space in generation": {"lane": "ln", "lane_generation": " 2"},
+            "trailing space in generation": {"lane": "ln", "lane_generation": "2 "},
+            "tab in lane": {"lane": "\tln", "lane_generation": "2"},
+            "newline in generation": {"lane": "ln", "lane_generation": "2\n"},
             # Stricter than this rail's own reader needs (a blank generation would classify
             # `decision_incomplete`), but a marker that can never authorize anything is not
             # something a producer should be able to write either.
@@ -447,6 +484,34 @@ class ProducerRefusesUnrenderableValuesTest(unittest.TestCase):
             with self.subTest(label):
                 with self.assertRaises(MarkerValueError):
                     render_bootstrap_decision_marker(**kwargs)
+
+    def test_a_whitespace_only_lane_cannot_become_a_BOOTSTRAP_marker(self):
+        """The worst shape of R2 finding 1: the argument selected the other ACTION.
+
+        The branch was ``if lane.strip():``, so a whitespace-only lane was falsy and a caller
+        asking to authorize a DISPATCH got a marker authorizing a BOOTSTRAP — measured reaching a
+        delivered send. This is a step beyond the R1 truncation, which changed a field's VALUE;
+        here the marker names a different action than the caller asked for.
+
+        Asserted as "raises", never as "renders a dispatch marker": a normalization that runs
+        before a decision can change the decision, so the boundary must refuse rather than repair.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+            MarkerValueError,
+        )
+
+        for label, lane in {
+            "single space": " ",
+            "tab": "\t",
+            "newline and space": "\n ",
+            "several spaces": "   ",
+        }.items():
+            with self.subTest(label):
+                with self.assertRaises(MarkerValueError):
+                    render_bootstrap_decision_marker(lane=lane, lane_generation="2")
+                # ...and the control that gives the assertion its meaning: an EMPTY lane is the
+                # legitimate bootstrap call and must keep working.
+                self.assertIn("bootstrap_lane", render_bootstrap_decision_marker(lane=""))
 
     def test_the_truncated_body_is_indistinguishable_at_the_reader(self):
         """Why the fix must live in the producer, stated as a measurement rather than a claim.
