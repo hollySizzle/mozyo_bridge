@@ -17,7 +17,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     MARKER_CHANNEL_WORKFLOW_EVENT,
-    marker_fields_in_note,
+    strict_marker_fields_in_note,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_turn_recovery import (  # noqa: E501
     WORKER_PROGRESS_GATES,
@@ -74,11 +74,42 @@ def worker_progress_facts(
     return False, True, True
 
 def notes_carry_worker_progress(request: WorkerRefreshRequest, notes: str) -> bool:
-    """Does this journal note carry a worker-progress gate marker for this lane? (pure)"""
+    """Does this journal note carry a worker-progress gate marker for this lane? (pure)
+
+    Read STRICTLY, and fail closed toward "progress" (Redmine #14687 review j#93273 R1-F1).
+    This answer reaches an effect: ``False`` here becomes ``expected_gate_absent`` on the turn
+    observation, which is the ONLY path to ``turn_failed_no_durable_gate`` — the one class that
+    admits the guarded worker refresh, a destructive close.
+
+    The lenient fold is unusable for that. Measured on the pre-fix head, with every other axis
+    held at the refresh-admitting value:
+
+        [mozyo:workflow-event:gate=implementation_done]           -> turn_productive
+        [mozyo:workflow-event:gate=implementation_done:gate=zzz]  -> turn_failed_no_durable_gate
+        [mozyo:workflow-event:gate=zzz:gate=implementation_done]  -> turn_productive
+
+    A note that DOES declare ``implementation_done`` did not merely go unnoticed — last-write-wins
+    erased the first declaration, so the reader positively asserted the gate was ABSENT and closed
+    the worker that had delivered it. Whether that happened depended on which occurrence came
+    last, which is not a safety property.
+
+    Parsing strictly and DROPPING the unreadable marker would keep the hole, because a refused
+    marker is also "no progress". So the unit is the NOTE: if any marker in it is one the
+    canonical producer could not have rendered, the note's provenance is unknown, and unknown
+    provenance counts as progress — the direction whose only failure mode is declining to close a
+    worker (:func:`worker_progress_facts`, and the central `### Hibernate Evidence Marker
+    Contract`'s "fragment を捨てて残りを一致させず marker 全体を fail-closed とする").
+
+    A note carrying no marker at all is not unreadable; it simply carries no progress.
+    """
     try:
-        markers = marker_fields_in_note(notes)
-    except Exception:  # noqa: BLE001 - an unparsable note carries no structured marker
-        return False
+        markers = strict_marker_fields_in_note(notes)
+    except Exception:  # noqa: BLE001 - an unreadable note has unknown provenance, not "absent"
+        return True
+    if markers is None:
+        # At least one marker is not producer-renderable. Refusing the whole note is the
+        # contract's own rule, and here it lands on the safe side: refuse the refresh.
+        return True
     for channel, fields in markers:
         if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
             continue

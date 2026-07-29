@@ -2963,33 +2963,17 @@ class ReviewJ92060EffectReachingReaderTests(unittest.TestCase):
             # Re-exports the scanner and its strict counterparts for the ~120 import sites that
             # already name this module; it calls neither itself.
             "redmine_journal_source.py",
-            # NOT a safety claim — a MEASURED, unresolved finding, carried in the literal rather
-            # than in the ``routed_findings`` set below ON PURPOSE (#14687). Pending #14667
-            # DELETES that set (it closed the ``coordinator_proxy_send`` finding), so an entry
-            # added there would vanish in the merge and redden this pin at the integration head —
-            # the same class of silent composition defect this remediation exists to close.
-            #
-            # ``sublane_worker_refresh_durable_read.notes_carry_worker_progress`` arrived with the
-            # #14661 integration: the pin and the reader were each green on their own parent and
-            # only their COMPOSITION is red, which is why it surfaces here and not in #14661's own
-            # rounds. It decides whether a live worker made progress, and ``False`` admits the
-            # guarded worker refresh — a destructive close. Measured on this head, the lenient
-            # fold takes the UNSAFE direction the module's own docstring forbids ("the reverse
-            # would close one that had in fact delivered its gate"):
-            #
-            #     [mozyo:workflow-event:gate=implementation_done:gate=zzz]  -> False (no progress)
-            #     [mozyo:workflow-event:gate=zzz:gate=implementation_done]  -> True
-            #
-            # A note that DOES declare ``implementation_done`` reads as no progress because
-            # last-write-wins erased the first declaration. Every other evasion measured
-            # (whitespace, empty component, two aliases) lands on the safe side.
-            #
-            # The naive fix — parse strictly and DROP the unreadable marker — reproduces the same
-            # hole, because a refused marker is also "no progress"; the real fix is to treat an
-            # unreadable NOTE as progress, which is a behaviour change to #14661's authority
-            # reader while its own review round is open. So it is routed, not patched here.
-            "sublane_worker_refresh_durable_read.py",
         }
+        # ``sublane_worker_refresh_durable_read.py`` was on this list for exactly one round
+        # (#14687 R1) and was REMOVED rather than kept, which is the durable record of why.
+        # It reads the worker-progress gate, and its ``False`` becomes ``expected_gate_absent``
+        # on the turn observation — the only route to ``turn_failed_no_durable_gate``, the one
+        # class that admits the destructive guarded worker refresh. Review j#93273 R1-F1 refused
+        # the carve-out: excepting the reader this pin had just caught is not "keeping the
+        # contract", it is the quiet widening the gate exists to prevent. It now reads through
+        # ``strict_marker_fields_in_note`` and treats an unreadable NOTE as progress, pinned by
+        # (path kept on ONE line so it stays greppable):
+        # tests/regressions/test_issue_14687_worker_progress_fail_closed.py
         # NOT "this is safe" — a MEASURED, unresolved finding in a module this issue does not own,
         # recorded here so the gate stays meaningful instead of being quietly widened.
         #
@@ -4314,9 +4298,9 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         f"{_D}/application/sublane_worker_refresh_durable_read.py": (
             ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token "
-            "itself. Reads worker-progress gates through the LENIENT fold, so a note carrying "
-            "the same gate field twice reads by last-write-wins — a measured, routed finding "
-            "recorded in ReviewJ92060EffectReachingReaderTests",
+            "itself. Reads worker-progress gates STRICTLY and fails closed toward progress: a "
+            "note carrying any marker the canonical producer could not render counts as "
+            "progress, which refuses the destructive refresh (#14687 R1-F1)",
         ),
         f"{_D}/application/sublane_worker_refresh_live.py": (
             ['*', '*', '*', 'handoff', 'recovery-delivery-authorization',
