@@ -1417,6 +1417,75 @@ class ResumeRailTests(unittest.TestCase):
             self.assertEqual(self.ops.resume_once(self.continuation), DRAIN_SEND_ERROR)
 
 
+class RowStatusKeyCoverageTests(unittest.TestCase):
+    """Every status key the row reader accepts must be exercised, not just the ones tests feed.
+
+    Found by sweeping this Task's own closed vocabularies for partial coverage after review
+    j#92846 (the sampling finding). ``_STATUS_KEYS`` has three members and the tests only ever
+    fed ``status`` / ``state``, so deleting ``agent_status`` — the key the LIVE herdr row
+    actually carries — passed all 206 #14661 tests. That is the R2 defect class exactly: a
+    production-only seam no test executes, green all the way to a live no-op.
+
+    The population is derived from the tuple, so a key added to it arrives already covered.
+
+    The probe values are HERDR WIRE tokens, not mozyo runtime states — the two vocabularies read
+    alike (``turn_ended`` vs ``done``) and an unrecognised token maps to ``unknown``, so feeding
+    a runtime state would make every assertion compare unknown to unknown and pass for nothing.
+    That is why the discriminating guard below is asserted first.
+    """
+
+    #: The herdr wire token for a settled turn, and one that must NOT win over it.
+    _WIRE_SETTLED = "done"
+    _WIRE_BUSY = "working"
+
+    def test_each_accepted_status_key_is_honoured_on_its_own(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
+            map_agent_status,
+        )
+
+        expected = map_agent_status(self._WIRE_SETTLED)
+        self.assertNotEqual(expected, map_agent_status(None), "the probe value must discriminate")
+        for key in live_mod._STATUS_KEYS:
+            with self.subTest(key=key):
+                self.assertEqual(
+                    live_mod._row_runtime_state({key: self._WIRE_SETTLED}), expected,
+                    f"a row carrying only {key!r} is not read; if that key is the live one, "
+                    "every runtime observation silently degrades to unknown",
+                )
+
+    def test_the_keys_are_tried_in_the_declared_order(self):
+        # The tuple's order is a contract (the live key first), not decoration: a row that
+        # carries several keys must resolve by the declared precedence, or two readers of the
+        # same row can disagree about the worker's state.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
+            map_agent_status,
+        )
+
+        keys = list(live_mod._STATUS_KEYS)
+        for i, winner in enumerate(keys):
+            with self.subTest(winner=winner):
+                row = {winner: self._WIRE_SETTLED}
+                row.update({loser: self._WIRE_BUSY for loser in keys[i + 1:]})
+                self.assertEqual(
+                    live_mod._row_runtime_state(row), map_agent_status(self._WIRE_SETTLED),
+                    f"{winner!r} must win over the keys declared after it",
+                )
+
+    def test_the_accepted_keys_match_the_shared_herdr_reader(self):
+        # This module keeps its own copy of the shared reader's key tuple. Reported to the
+        # reviewer rather than collapsed here (no finding covers that src surface), but the
+        # duplication must not drift silently: if the shared authority grows a key, this fails
+        # instead of the worker reading rows the rest of the system already understands.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_observability import (  # noqa: E501
+            _ROW_STATUS_KEYS,
+        )
+
+        self.assertEqual(
+            tuple(live_mod._STATUS_KEYS), tuple(_ROW_STATUS_KEYS),
+            "the worker refresh adapter's status keys have drifted from the shared herdr reader",
+        )
+
+
 class RunbookAuthorityAnchorTests(unittest.TestCase):
     """The cataloged runbook must describe the anchor the code actually builds (review j#92767).
 
@@ -1429,21 +1498,29 @@ class RunbookAuthorityAnchorTests(unittest.TestCase):
     from ``contract_ruling_pointer``, never from a literal spelled here. Change the code pointer
     and the doc goes red; swap the pointers in the doc and it goes red too. A spelling check
     could do neither (#14539: pin the operation, not the spelling).
+
+    The POPULATION is derived too (review j#92846). The first version derived the pointer values
+    but hand-picked one representative gate, ``park_declared``, to stand for "the pre-existing
+    gates keep their ruling" — so re-attributing any of the other four in code passed every test.
+    A derived oracle is only derived when BOTH halves are: an oracle whose whole purpose is to
+    catch misattribution across a gate set cannot sample that set.
     """
 
-    OTHER_GATE = "park_declared"
-
     def setUp(self):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
-            contract_ruling_pointer,
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (  # noqa: E501
+            hibernate_evidence_authority as auth,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_refresh_approval import (  # noqa: E501
             WORKER_REFRESH_APPROVAL_GATE,
         )
 
         self.gate = WORKER_REFRESH_APPROVAL_GATE
-        self.ruling = contract_ruling_pointer(self.gate)
-        self.other_ruling = contract_ruling_pointer(self.OTHER_GATE)
+        # The population comes from the map itself, so a gate added to the code is a gate this
+        # oracle immediately demands the runbook account for.
+        self.rulings = {
+            gate: auth.contract_ruling_pointer(gate) for gate in auth._KIND_RULING
+        }
+        self.distinct_rulings = set(self.rulings.values())
         self.repo = Path(__file__).resolve().parents[4]
         body = (self.repo / "vibes" / "docs" / "tasks" / "herdr-lane-operations.md").read_text(
             encoding="utf-8"
@@ -1461,36 +1538,42 @@ class RunbookAuthorityAnchorTests(unittest.TestCase):
     def _lines_mentioning(self, token):
         return [line for line in self.section if token in line]
 
-    def test_the_two_rulings_are_distinct(self):
-        # Without this the two assertions below could both pass on a single shared pointer —
-        # exactly the R6 state — and would prove nothing.
-        self.assertNotEqual(self.ruling, self.other_ruling)
+    def test_every_gate_has_a_rival_ruling_it_could_be_misattributed_to(self):
+        # The per-gate check below asserts a gate's line carries NO OTHER known ruling. If the
+        # map ever collapsed onto a single pointer that assertion would be vacuously true — and
+        # a single repo-wide pointer is exactly the R6 defect. So the rival set must be non-empty
+        # for every gate, or the negative half of the oracle proves nothing.
+        for gate, ruling in sorted(self.rulings.items()):
+            with self.subTest(gate=gate):
+                self.assertTrue(
+                    self.distinct_rulings - {ruling},
+                    "every gate needs some other ruling it could be wrongly attributed to; "
+                    "with one pointer for the whole map the misattribution check is vacuous",
+                )
 
-    def test_the_runbook_attributes_this_gate_to_its_own_ruling(self):
-        mentions = self._lines_mentioning(self.gate)
-        self.assertTrue(mentions, f"the runbook never names the gate {self.gate!r}")
-        self.assertTrue(
-            any(self.ruling in line for line in mentions),
-            f"the runbook names {self.gate!r} without the ruling that decided it "
-            f"({self.ruling!r}); code and cataloged doc have drifted",
-        )
-        self.assertFalse(
-            any(self.other_ruling in line for line in mentions),
-            f"the runbook attributes {self.gate!r} to {self.other_ruling!r}, a ruling that "
-            "says nothing about it — the R6 misattribution, restated in the doc",
-        )
-
-    def test_the_runbook_keeps_the_pre_existing_gates_on_their_ruling(self):
-        mentions = self._lines_mentioning(self.OTHER_GATE)
-        self.assertTrue(mentions, f"the runbook never names {self.OTHER_GATE!r}")
-        self.assertTrue(
-            any(self.other_ruling in line for line in mentions),
-            f"the runbook must state that the pre-existing gates keep {self.other_ruling!r}",
-        )
-        self.assertFalse(
-            any(self.ruling in line for line in mentions),
-            "the runbook re-attributes a pre-existing gate to this Task's ruling",
-        )
+    def test_the_runbook_attributes_every_gate_to_its_own_ruling(self):
+        # Derived on BOTH axes: which gates to check comes from the map, and what each one must
+        # say comes from contract_ruling_pointer. Re-attributing ANY single gate in the code
+        # reddens this (review j#92846 — the version that sampled one gate let four through).
+        for gate, ruling in sorted(self.rulings.items()):
+            with self.subTest(gate=gate):
+                mentions = self._lines_mentioning(gate)
+                self.assertTrue(
+                    mentions,
+                    f"the runbook never names the gate {gate!r}; a gate the authority map "
+                    "carries but the cataloged doc does not account for",
+                )
+                self.assertTrue(
+                    any(ruling in line for line in mentions),
+                    f"the runbook names {gate!r} without the ruling that decided it "
+                    f"({ruling!r}); code and cataloged doc have drifted",
+                )
+                for rival in sorted(self.distinct_rulings - {ruling}):
+                    self.assertFalse(
+                        any(rival in line for line in mentions),
+                        f"the runbook attributes {gate!r} to {rival!r}, a ruling that says "
+                        "nothing about it — the R6 misattribution, restated in the doc",
+                    )
 
     def test_the_runbook_explains_every_part_of_the_real_anchor(self):
         # Derive the parts from a real resolution rather than describing them from memory.
