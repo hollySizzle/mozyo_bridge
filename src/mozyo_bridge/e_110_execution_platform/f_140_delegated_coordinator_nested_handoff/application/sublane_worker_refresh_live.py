@@ -81,10 +81,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_AUTHORITY_UNKNOWN,
     launch_authority_current,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
-    MARKER_CHANNEL_WORKFLOW_EVENT,
-    marker_fields_in_note,
-)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_refresh_approval import (  # noqa: E501
     WorkerRefreshApprovalError,
     verify_worker_refresh_approval,

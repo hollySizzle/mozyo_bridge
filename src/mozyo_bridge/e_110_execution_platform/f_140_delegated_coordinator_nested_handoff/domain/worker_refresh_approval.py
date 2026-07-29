@@ -13,8 +13,9 @@ hardened for the same problem — :mod:`...composer_discard_approval`
 * the exact approval journal must exist **uniquely** on the named issue;
 * that journal must carry **exactly one** canonical structured
   ``[mozyo:workflow-event:...]`` marker of this surface's approval gate — prose mentions are
-  not markers, and :func:`...redmine_journal_source.marker_fields_in_note` does not parse
-  markers inside code fences, so quoted commands and log lines are structurally excluded;
+  not markers, and :func:`...canonical_note_scan.canonical_marker_bodies` (the scan this module
+  actually reads through, see :func:`parse_strict_approval_markers`) does not parse markers
+  inside code fences, so quoted commands and log lines are structurally excluded;
 * every expected field must match by **exact equality**, so a different round, worker, lane or
   action can never satisfy it — and a prefix collision is impossible because the generation is
   compared as a field value, not as a substring of a longer token;
