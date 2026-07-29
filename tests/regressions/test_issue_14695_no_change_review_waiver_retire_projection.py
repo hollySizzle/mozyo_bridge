@@ -1168,26 +1168,80 @@ class CombinedReviewRoundTest(unittest.TestCase):
             lane_signal_from_gate_facts(ISSUE, facts, issue_open=issue_open)
         )
 
-    def _combined(self, conclusion):
-        return [
+    def _combined(self, conclusion, *, closed=True):
+        """A combined-heading round, with or without a trailing Close.
+
+        ``closed`` is a PARAMETER because hard-coding the Close is what hid review j#94206
+        finding 1: every case here appended one, so the suite only ever exercised the
+        close-family branch and never the ordinary pre-Close one, where the same round was
+        still classifying as ``owner_waiting`` / ``implementing``.
+        """
+        journals = [
             ("100", "## Gate: start"),
             ("300", f"## Gate: review request + review\n- 結論: {conclusion}"),
-            ("500", "## Gate: close"),
         ]
+        if closed:
+            journals.append(("500", "## Gate: close"))
+        return journals
 
     def test_a_combined_round_keeps_the_open_requests_identity(self):
-        """Whatever the review half concluded, the request half is still owed."""
+        """Whatever the review half concluded, the request half is still owed.
+
+        Asserted on BOTH sides of the Close (j#94206 finding 1).
+        """
         for conclusion in ("承認", "要修正"):
+            for closed in (True, False):
+                with self.subTest(conclusion=conclusion, closed=closed):
+                    facts, state = self._state(self._combined(conclusion, closed=closed))
+                    self.assertTrue(facts.review_round_unresolved)
+                    self.assertEqual(facts.review_round_gate, "review_request")
+                    # No conclusion is carried: it describes the review half and would contradict
+                    # the request half that keeps the round open.
+                    self.assertEqual(facts.review_round_conclusion, "")
+                    self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
+                    self.assertNotEqual(state, LANE_STATE_OWNER_WAITING)
+                    self.assertNotEqual(state, LANE_STATE_RETIRE_READY)
+
+    def test_a_trailing_close_does_not_change_the_rounds_state(self):
+        """The property the ordering defect violated, stated directly.
+
+        A Close is not a review resolution, so appending one must not move the lane. R10 held
+        this only on the close-family side: pre-Close the ordinary review branch ran first and
+        answered ``owner_waiting`` (承認) / ``implementing`` (要修正), and the SAME record with a
+        Close appended answered ``review_waiting``. Whichever answer one prefers, the two
+        disagreeing is the bug — so the parity is asserted, not just the value.
+        """
+        for conclusion in ("承認", "要修正", "blocker"):
             with self.subTest(conclusion=conclusion):
-                facts, state = self._state(self._combined(conclusion))
-                self.assertTrue(facts.review_round_unresolved)
-                self.assertEqual(facts.review_round_gate, "review_request")
-                # No conclusion is carried: it describes the review half and would contradict
-                # the request half that keeps the round open.
-                self.assertEqual(facts.review_round_conclusion, "")
-                self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
-                self.assertNotEqual(state, LANE_STATE_OWNER_WAITING)
-                self.assertNotEqual(state, LANE_STATE_RETIRE_READY)
+                _, pre = self._state(self._combined(conclusion, closed=False))
+                _, post = self._state(self._combined(conclusion, closed=True))
+                self.assertEqual(
+                    pre, post,
+                    "a trailing Close changed the classification of the same review round",
+                )
+
+    def test_the_ordinary_single_round_is_untouched_before_close(self):
+        """The negative control for the hoist: only the COMBINED heading may move.
+
+        Resolving the round identity before the lifecycle branches could easily have swallowed
+        the ordinary pre-Close review states. It must not: an approved review is still
+        ``owner_waiting`` and a changes_requested one is still ``implementing`` (j#94005 F2), and
+        those are reached by the plain gate, not by the round tuple.
+        """
+        expected = {
+            ("## Gate: review", "承認"): LANE_STATE_OWNER_WAITING,
+            ("## Gate: review", "要修正"): "implementing",
+            ("## Gate: review", "blocker"): LANE_STATE_BLOCKED,
+            ("## Gate: review request", ""): LANE_STATE_REVIEW_WAITING,
+            ("## Gate: implementation done", ""): LANE_STATE_REVIEW_WAITING,
+        }
+        for (heading, conclusion), want in sorted(expected.items()):
+            with self.subTest(heading=heading, conclusion=conclusion):
+                body = heading + (f"\n- 結論: {conclusion}" if conclusion else "")
+                _, state = self._state(
+                    [("100", "## Gate: start"), ("300", body)], issue_open=True
+                )
+                self.assertEqual(state, want)
 
     def test_dropping_the_conclusion_does_not_disarm_the_blocker(self):
         """Carrying no conclusion must not cost the round its most-blocking signal.
@@ -1272,8 +1326,12 @@ class CombinedReviewRoundTest(unittest.TestCase):
             ),
             "a gate outside the round vocabulary": dict(review_round_gate="close"),
         }
+        # Every gate kind, not only the close family: the validation moved ahead of the lifecycle
+        # branches (j#94206 finding 1), so an unclassifiable round tuple is refused wherever it
+        # appears rather than only on the one path that happened to look at it.
         for label, fields in sorted(degraded.items()):
-            for gate in ("close", "owner_close_approval"):
+            for gate in ("close", "owner_close_approval", "review", "review_request",
+                         "implementation_done", "start"):
                 with self.subTest(case=label, gate=gate):
                     state = classify_lane_state(
                         LaneSignal(
@@ -1285,6 +1343,88 @@ class CombinedReviewRoundTest(unittest.TestCase):
                         )
                     )
                     self.assertEqual(state, LANE_STATE_BLOCKED)
+
+    def test_newer_implementation_activity_is_not_overridden_by_a_round(self):
+        """The scope limit on the hoist, pinned from the gate set itself.
+
+        Resolving the round identity before the lifecycle branches must not let a stale open
+        round outrank ``start`` / ``progress`` — newer positive implementation activity, whose
+        non-blocking classification j#94005 F2 restored. They are excluded from
+        :data:`_ROUND_IDENTITY_GATES` for that reason.
+
+        Measured caveat, recorded so the next reader does not overstate this: the production fold
+        reduces ``latest_gate`` by PRECEDENCE, not recency, so a record containing a review round
+        reports a review-family gate even when a ``progress`` journal is newer. This exclusion is
+        therefore defensive for hand-built signals rather than a path the live fold reaches.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
+            _ROUND_IDENTITY_GATES,
+            LaneSignal,
+        )
+
+        for gate in ("start", "progress"):
+            with self.subTest(gate=gate):
+                self.assertNotIn(gate, _ROUND_IDENTITY_GATES)
+                state = classify_lane_state(
+                    LaneSignal(
+                        issue=ISSUE,
+                        latest_gate=gate,
+                        issue_open=True,
+                        review_round_unresolved=True,
+                        review_round_gate="review_request",
+                    )
+                )
+                self.assertEqual(state, "implementing")
+
+    def test_the_fold_never_pairs_an_open_round_with_a_no_review_owed_authority(self):
+        """A fold invariant this correction leans on — so it is pinned, not assumed.
+
+        Hoisting the round identity means the substituted path now reaches ``_no_review_owed``,
+        where the old close-family REPLAY did not (it rebuilt a bare signal and silently dropped
+        ``review_exempt`` / ``review_waived``). For a hand-built signal that changes
+        close-family + open round + exemption from ``review_waiting`` to ``owner_waiting`` —
+        which is the answer the review-family gates already gave, so the two now agree.
+
+        It is invisible to production because the fold never emits the pair: an exemption / waiver
+        is superseded by a round, and an open round means one exists. That is the property this
+        test holds. If it ever stops holding, the corner above becomes live and must be decided
+        deliberately rather than inherited from whichever branch happens to run first.
+
+        The population is DERIVED (orderings of the real gate journals) rather than a list of
+        cases, because the risk is an ordering nobody thought to enumerate.
+        """
+        from itertools import permutations
+
+        pieces = {
+            "exempt": (
+                "## Gate: codex_direct_edit\n- role: 実装者\n- direct_edit: true\n"
+                "- allowed_paths: vibes/docs/rules/**\n- reason: r\n- follow_up_review: false\n"
+            ),
+            "request": "## Gate: review request",
+            "approved": "## Gate: review\n- 結論: 承認",
+            "changes": "## Gate: review\n- 結論: 要修正",
+            "combined": "## Gate: review request + review\n- 結論: 承認",
+            "close": "## Gate: close",
+            "owner_close": CARVE_OUT_CLEARED,
+        }
+        checked = 0
+        for size in (2, 3):
+            for combo in permutations(sorted(pieces), size):
+                journals = [("100", "## Gate: start")] + [
+                    (str(200 + 10 * i), pieces[key]) for i, key in enumerate(combo)
+                ]
+                facts = fold_issue_gate_facts(journals)
+                if facts is None:
+                    continue
+                checked += 1
+                if facts.review_round_unresolved:
+                    with self.subTest(ordering=combo):
+                        self.assertFalse(
+                            facts.review_exempt or facts.review_waived,
+                            "the fold paired an OPEN review round with a no-review-owed "
+                            "authority; the classifier's handling of that pair is now live",
+                        )
+        self.assertGreater(checked, 100, "the derived population collapsed")
 
     def test_a_well_formed_round_still_reaches_its_own_state(self):
         """The negative control: the validation must not block what it should replay.

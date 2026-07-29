@@ -242,6 +242,32 @@ class LaneSignal:
 #: both rules; one added elsewhere is caught by the test that pins this set (#14695 j#93856 F1).
 _CLOSE_FAMILY_GATES: frozenset = frozenset({GATE_OWNER_CLOSE_APPROVAL, GATE_CLOSE})
 
+#: The recognized gates that constitute a review round. A round is an explicit request for an
+#: independent review, so an exemption recorded BEFORE it does not close it (Redmine #14539).
+#: ``implementation_done`` is deliberately absent: it states that implementation finished, not
+#: that a review was requested — whether a review is owed on it is exactly what the exemption
+#: policy decides, so its ordering against the exemption journal is irrelevant.
+#:
+#: Kept beside the gate vocabulary (and re-exported from :mod:`.review_round_state`) for the same
+#: reason :func:`is_open_review_round` is: which gates are rounds, and whether a round is open,
+#: are one question, and answering it in two places is what j#94110 finding 1 measured.
+REVIEW_ROUND_GATES: frozenset = frozenset({GATE_REVIEW_REQUEST, GATE_REVIEW})
+
+#: The gates at which an unresolved round's OWN identity governs the classification.
+#:
+#: Two cases, one rule — the recorded latest gate does not faithfully describe the review:
+#:
+#: - a review-family gate: the latest journal IS the round, and the max-precedence reduction of a
+#:   COMBINED ``review_request + review`` heading drops the request and reports ``review``;
+#: - a close-family gate: the Close was recorded AFTER the round and does not resolve it.
+#:
+#: ``start`` / ``progress`` are deliberately EXCLUDED: they are newer positive implementation
+#: activity, and letting a stale open round outrank them would stop a lane that is merely being
+#: reworked — the exact harm j#94005 finding 2 corrected. ``implementation_done`` is excluded
+#: because it reaches the same branch either way, so including it would only add reach without
+#: changing an answer.
+_ROUND_IDENTITY_GATES: frozenset = REVIEW_ROUND_GATES | _CLOSE_FAMILY_GATES
+
 
 def is_open_review_round(gates: "frozenset | set", conclusion: str) -> bool:
     """Whether these round gates constitute an OPEN review round (pure).
@@ -296,6 +322,12 @@ def classify_lane_state(signal: LaneSignal) -> str:
     Mirrors the spine's `### Lane State Classes`. Precedence is most-blocking /
     most-specific first so a lane lands in exactly one class:
 
+    0. an UNRESOLVED review round replaces the recorded gate / conclusion with the round's own
+       identity, at the gates where the recorded one does not faithfully describe the review
+       (:data:`_ROUND_IDENTITY_GATES`), and its blocker flag is merged in. A round claimed
+       unresolved whose identity does not read as an open round is :data:`LANE_STATE_BLOCKED`.
+       This runs before every branch below so the reading cannot depend on whether a Close
+       happens to follow the round (Redmine #14695 review j#94206);
     1. a recorded blocker (or a ``blocked`` gate) -> :data:`LANE_STATE_BLOCKED`;
     2. ``callback_state`` of ``delivery_failed`` ->
        :data:`LANE_STATE_CALLBACK_DELIVERY_FAILED`; of ``due`` ->
@@ -329,9 +361,43 @@ def classify_lane_state(signal: LaneSignal) -> str:
     drains an unreadable lane rather than dispatching past it.
     """
     gate = signal.latest_gate
+    conclusion = signal.review_conclusion
+    blocker = signal.blocker_recorded
+
+    # 0. an UNRESOLVED review round IS the lane's review identity — resolved ONCE, here, before
+    # any lifecycle branch reads a gate or a conclusion.
+    #
+    # Review j#94206 finding 1 measured why this cannot live inside the close-family branch, which
+    # is where R10 put it: the ordinary review branches are evaluated FIRST, so a combined
+    # ``review_request + review`` heading concluding 承認 still classified as ``owner_waiting``
+    # (要修正 -> ``implementing``) whenever no Close happened to follow. The same round answered
+    # ``review_waiting`` once a Close was appended — so the classification depended on whether a
+    # Close followed, which is backwards: a Close does not resolve a review, and the pre-Close
+    # state is the ordinary live one. Half of j#94110 finding 1 had survived my correction of it.
+    #
+    # Resolving it up front also removes the recursive re-entry the close-family branch used, so
+    # there is one pass and no invariant about which gates can re-enter.
+    #
+    # The tuple is VALIDATED against the same predicate that set the flag, for EVERY gate rather
+    # than only the close family: a signal claiming an unresolved round while carrying an identity
+    # that does not read as an open round is not a state we can classify, so it is blocked instead
+    # of being silently dropped through to a terminal.
+    #
+    # ``blocker`` is merged rather than replaced because ``blocker_recorded`` describes the LATEST
+    # journal and falls back to False once a Close is appended, while the round keeps its own flag
+    # (measured). Reading only one of them loses the blocker on exactly one side of the Close.
+    if signal.review_round_unresolved:
+        if not is_open_review_round(
+            frozenset({signal.review_round_gate}), signal.review_round_conclusion
+        ):
+            return LANE_STATE_BLOCKED
+        if gate in _ROUND_IDENTITY_GATES:
+            gate = signal.review_round_gate
+            conclusion = signal.review_round_conclusion
+            blocker = blocker or signal.review_round_blocker
 
     # 1. explicit blocker (gate or recorded blocker) — most blocking.
-    if signal.blocker_recorded or gate == GATE_BLOCKED:
+    if blocker or gate == GATE_BLOCKED:
         return LANE_STATE_BLOCKED
 
     # 2. callback failure / due — a dispatch happened but the durable pointer is broken.
@@ -347,7 +413,7 @@ def classify_lane_state(signal: LaneSignal) -> str:
     # 3. actively implementing (positive pipeline occupancy, never a stop reason).
     if gate in (GATE_START, GATE_PROGRESS):
         return LANE_STATE_IMPLEMENTING
-    if gate == GATE_REVIEW and signal.review_conclusion == REVIEW_CHANGES_REQUESTED:
+    if gate == GATE_REVIEW and conclusion == REVIEW_CHANGES_REQUESTED:
         return LANE_STATE_IMPLEMENTING
 
     # 4. Codex audit owed — UNLESS a durable review exemption is in force (Redmine #14539).
@@ -360,7 +426,7 @@ def classify_lane_state(signal: LaneSignal) -> str:
     # invalid gate, for ``follow_up_review: true``, and whenever a NEWER review round supersedes
     # the exemption, so each of those keeps the ordinary review path.
     if gate in (GATE_IMPLEMENTATION_DONE, GATE_REVIEW_REQUEST) or (
-        gate == GATE_REVIEW and signal.review_conclusion == REVIEW_PENDING
+        gate == GATE_REVIEW and conclusion == REVIEW_PENDING
     ):
         if not _no_review_owed(signal):
             return LANE_STATE_REVIEW_WAITING
@@ -376,7 +442,7 @@ def classify_lane_state(signal: LaneSignal) -> str:
     # j#84323, #14150 j#84424). Note this deliberately does NOT require ``commit_bearing``: an
     # explicit deferral is stronger evidence than the inferred commit fact, and requiring both
     # would re-open the same unsafe close guidance whenever the commit field is unreadable.
-    if gate == GATE_REVIEW and signal.review_conclusion == REVIEW_APPROVED:
+    if gate == GATE_REVIEW and conclusion == REVIEW_APPROVED:
         if _integration_owed(signal):
             return LANE_STATE_INTEGRATION_WAITING
         return LANE_STATE_OWNER_WAITING
@@ -398,40 +464,10 @@ def classify_lane_state(signal: LaneSignal) -> str:
         # unanswered review_request went to ``integration_waiting``, sending unreviewed work to the
         # integration drain. Integration follows review approval, so review is asked first.
         #
-        # The round's own gate and conclusion are re-classified through THIS SAME function, so the
-        # post-Close state is whatever the live rules already say for that round — pending audit ->
-        # review_waiting, changes_requested -> implementing (non-blocking, the implementer has it),
-        # blocker -> blocked. R8 flattened all three into ``review_waiting``, which stopped the
-        # pipeline on a lane that was merely being reworked and weakened an explicit blocker
-        # (j#94005 F2). Re-using the rules rather than writing a second mapping is what keeps the
-        # live and post-Close readings from drifting apart.
-        #
-        # Terminates in one step: a round gate is ``review_request`` / ``review``, never a
-        # close-family gate, so the recursive call cannot re-enter this branch.
-        #
-        # The carried tuple is VALIDATED against the same openness predicate that produced the
-        # flag, and an unresolved round that does not survive it is blocked rather than fallen
-        # through (j#94110 finding 1). Guarding on ``review_round_gate`` being merely non-empty
-        # was not fail-closed: a caller that set ``review_round_unresolved`` alone — a hand-built
-        # signal, or any future producer that fills the flag before the identity — silently
-        # skipped the whole fence and reached ``retire_ready``, and a contradictory
-        # ``review``/``approved`` tuple replayed an unresolved round as an approved one. Neither
-        # is a state we can classify, so neither may advance past the review fence.
-        if signal.review_round_unresolved:
-            if not is_open_review_round(
-                frozenset({signal.review_round_gate}), signal.review_round_conclusion
-            ):
-                return LANE_STATE_BLOCKED
-            return classify_lane_state(
-                LaneSignal(
-                    issue=signal.issue,
-                    latest_gate=signal.review_round_gate,
-                    review_conclusion=signal.review_round_conclusion,
-                    callback_state=signal.callback_state,
-                    issue_open=signal.issue_open,
-                    blocker_recorded=signal.review_round_blocker,
-                )
-            )
+        # That precedence is now expressed at step 0: an unresolved round has already replaced the
+        # close-family gate with the round's own identity, so a lane reaching THIS branch has no
+        # open round left to outrank it. Asking it here as well — which is where it used to live —
+        # is what let the pre-Close reading drift from the post-Close one (j#94206 finding 1).
         if _integration_owed(signal) or (
             signal.commit_bearing and not signal.integration_recorded
         ):
@@ -632,6 +668,7 @@ __all__ = (
     "GATE_CLOSE",
     "GATE_BLOCKED",
     "GATE_KINDS",
+    "REVIEW_ROUND_GATES",
     "REVIEW_PENDING",
     "REVIEW_APPROVED",
     "REVIEW_CHANGES_REQUESTED",

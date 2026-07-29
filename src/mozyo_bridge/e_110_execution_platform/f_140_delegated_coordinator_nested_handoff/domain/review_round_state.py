@@ -10,13 +10,13 @@ outcome is are one question asked by several consumers (the grammar's F10 progre
 suppression, the ``codex_direct_edit`` exemption's supersession, the #14695 waiver's
 supersession, and the pending-review close fence).
 
-Whether a round is OPEN is deliberately NOT decided here. :func:`.sublane_admission.
-is_open_review_round` owns it, beside the gate vocabulary it reads, and is re-exported from this
-module for the consumers that already import it from here. Review j#94110 finding 1 is why: this
-module used to answer that question a second time, by reducing a combined
-``review_request + review`` heading to ``review``, and the two answers disagreed — the predicate
-called the journal open while the reduction handed the classifier an approved review. One
-question, one definition.
+WHICH gates are rounds (:data:`.sublane_admission.REVIEW_ROUND_GATES`) and whether a round is
+OPEN (:func:`.sublane_admission.is_open_review_round`) are deliberately NOT decided here. Both
+live beside the gate vocabulary they read and are re-exported from this module for the consumers
+that already import them from here. Review j#94110 finding 1 is why: this module used to answer
+the openness question a second time, by reducing a combined ``review_request + review`` heading
+to ``review``, and the two answers disagreed — the predicate called the journal open while the
+reduction handed the classifier an approved review. One question, one definition.
 
 Callers pass their own recognized-journal objects; this module only requires ``journal_id``,
 ``gates_or_gate`` and ``review_conclusion``, so the gate VOCABULARY and gate RECOGNITION stay with
@@ -32,16 +32,9 @@ from typing import Sequence, Tuple
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
     GATE_REVIEW,
     GATE_REVIEW_REQUEST,
+    REVIEW_ROUND_GATES,
     is_open_review_round,
 )
-
-
-#: The recognized gates that constitute an OPEN review round. A round is an explicit request for
-#: an independent review, so an exemption recorded BEFORE it does not close it (Redmine #14539).
-#: ``implementation_done`` is deliberately absent: it states that implementation finished, not
-#: that a review was requested — whether a review is owed on it is exactly what the exemption
-#: policy decides, so its ordering against the exemption journal is irrelevant.
-REVIEW_ROUND_GATES: frozenset[str] = frozenset({GATE_REVIEW_REQUEST, GATE_REVIEW})
 
 
 def review_round_state(recognized: Sequence[object]) -> Tuple[list, bool, str, str, bool]:
