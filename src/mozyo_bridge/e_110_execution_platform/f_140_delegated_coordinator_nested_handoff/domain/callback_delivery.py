@@ -39,6 +39,20 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SOURCE_REDMINE,
     JournalMarker,
 )
+# Redmine #14232: the ONE injection-stage authority over "may a blind retry duplicate?". This
+# module's own private reason table used to answer that question separately (and differently)
+# from the handoff positive-delivery gate; it now projects the shared answer. The f_140 domain
+# already depends on the f_130 handoff domain (``gateway_route_enforcement`` /
+# ``hibernate_park_record`` / ``workflow_step_callback``), so this adds no new coupling
+# direction and the authority module imports nothing back.
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
+    POST_INJECTION_BLOCKED_REASONS,
+    PRE_INJECTION_BLOCKED_REASONS,
+    STAGE_NOT_SENT,
+    STAGE_SUBMITTED_CONFIRMED,
+    STAGE_UNCERTAIN_PARTIAL,
+    injection_stage_for,
+)
 
 # ---------------------------------------------------------------------------
 # Classification disposition (per callback candidate). Whether the exact source journal
@@ -171,64 +185,79 @@ def normalize_send_result(value: object) -> CallbackSendResult:
 # ---------------------------------------------------------------------------
 
 #: Handoff ``status=="sent"`` reasons that mean the send positively landed / started.
+#:
+#: Redmine #14232: retained only as an input to the zero-send reason allowlist below (a
+#: diagnostic may legitimately carry either token). It is NO LONGER a delivery classifier —
+#: :func:`send_outcome_for_delivery` delegates to the shared injection-stage authority, which
+#: admits only ``sent`` + ``ok`` as a confirmed submission. See that function's ruling.
 _DELIVERED_SENT_REASONS = frozenset({"ok", "queue_enter"})
 
 #: Handoff ``status=="blocked"`` reasons that are **deterministic pre-injection** — the send
-#: was refused *before anything was typed*, so a retry cannot duplicate. Anything NOT in this set
-#: (marker_timeout / turn_start_unconfirmed / inject_failed / receiver_blocked / turn_start_absent
-#: / unknown) is treated as uncertain.
+#: was refused *before anything was typed*, so a retry cannot duplicate.
 #:
-#: ``receiver_blocked`` and ``turn_start_absent`` are DELIBERATELY excluded (#13520 review F2,
-#: j#75381): they are the herdr turn-start rail's **post-injection** outcomes — ``OUTCOME_BLOCKED``
-#: ("injected, timed out, re-snapshot found a runtime block") and ``OUTCOME_ABSENT``, both of which
-#: report ``TurnStartResult.delivered == True`` (``turn_start_rail.py``; ``handoff.py`` documents
-#: receiver_blocked as "the injection was delivered but the rail re-snapshotted a runtime block").
-#: The body may already be on the receiver, so a bounded retry would DUPLICATE the callback. They
-#: therefore fall through to ``uncertain`` (no auto-retry). Every reason below is a genuine
-#: pre-injection refusal (``delivered == False`` / route-resolution / precondition failure): the
-#: send edge was never crossed, so a bounded retry is safe.
-_NOT_SENT_BLOCKED_REASONS = frozenset(
-    {
-        "target_unavailable",
-        "target_not_agent",
-        "invalid_anchor",
-        "invalid_args",
-        "precondition_not_idle",
-        # Redmine #13760: the pre-send startup-admission gate refused BEFORE the first
-        # injection (the receiver is on a trust / setup / login screen), so the send
-        # edge was never crossed — zero text, zero keys, zero ACK. A bounded retry can
-        # therefore never duplicate: each attempt either re-refuses (still zero-send)
-        # or, once an operator has cleared the screen, delivers the anchor exactly once.
-        "receiver_startup_interaction_required",
-        "cross_session_claude",
-        "target_repo_mismatch",
-        "gateway_route_blocked",
-        "main_lane_implementation_blocked",
-    }
-)
+#: Redmine #14232: the private table this module used to own is gone. The classification is the
+#: shared, exhaustive, drift-guarded partition
+#: :data:`...f_130_handoff_routing.domain.injection_stage.PRE_INJECTION_BLOCKED_REASONS`, which
+#: this alias re-exports so the reason allowlist below and every existing importer keep working.
+#: Two documented zero-send refusals were **missing** from the old private table
+#: (``reader_upgrade_required`` / ``execution_root_outside_target_repo``), so both classified as
+#: uncertain and were never bounded-retried at all — exactly the "one question, several private
+#: tables" shape #14232 j#84877 recorded. The shared partition is checked against the whole
+#: ``Reason`` wire vocabulary by a drift-guard test, so a newly added reason cannot be forgotten
+#: into a bucket by default.
+#:
+#: The post-injection rationale is preserved at the authority: ``receiver_blocked`` /
+#: ``turn_start_absent`` / ``marker_timeout`` / ``turn_start_unconfirmed`` / ``inject_failed`` /
+#: ``transport_error`` stay excluded (#13520 review F2, j#75381) because the body may already be
+#: on the receiver, so a bounded retry would DUPLICATE the callback.
+_NOT_SENT_BLOCKED_REASONS = PRE_INJECTION_BLOCKED_REASONS
+
+#: The projection of the shared injection-stage vocabulary onto :data:`SEND_OUTCOMES`. Total over
+#: :data:`...injection_stage.INJECTION_STAGES` (a drift-guard test asserts the coverage), so
+#: :func:`send_outcome_for_delivery` needs no fallback branch of its own — the authority's own
+#: fail-closed default is already ``uncertain_partial``.
+_SEND_OUTCOME_BY_STAGE: dict = {
+    STAGE_SUBMITTED_CONFIRMED: SEND_DELIVERED,
+    STAGE_NOT_SENT: SEND_NOT_SENT,
+    STAGE_UNCERTAIN_PARTIAL: SEND_UNCERTAIN,
+}
 
 
 def send_outcome_for_delivery(status: str, reason: str) -> str:
     """Map a handoff ``DeliveryOutcome`` (status, reason) onto a closed send outcome (pure).
 
-    - ``sent`` + a positive reason (``ok`` / ``queue_enter``) -> :data:`SEND_DELIVERED`;
-    - ``blocked`` + a deterministic pre-injection reason -> :data:`SEND_NOT_SENT`
-      (nothing typed, so a bounded retry is safe);
-    - **everything else** — ``blocked`` with an ambiguous or post-injection reason
-      (``marker_timeout`` / ``turn_start_unconfirmed`` / ``inject_failed`` / ``receiver_blocked``
-      / ``turn_start_absent`` / anything unrecognized), or an unexpected status
-      (``pending_input``) — -> :data:`SEND_UNCERTAIN` (no auto-retry; a duplicate send is the
-      failure to avoid). ``receiver_blocked`` / ``turn_start_absent`` are post-injection rail
-      outcomes (``delivered == True``), so they must NOT be retried (#13520 review F2). The
-      default is deliberately the safe one.
+    Redmine #14232 acceptance 4 ("the callback / outbox sender reuses the same
+    classification"): this is now a **projection of the one injection-stage authority**
+    (:func:`...f_130_handoff_routing.domain.injection_stage.injection_stage_for`) onto
+    :data:`SEND_OUTCOMES`, not a second private reason table:
+
+    - :data:`...injection_stage.STAGE_SUBMITTED_CONFIRMED` -> :data:`SEND_DELIVERED`;
+    - :data:`...injection_stage.STAGE_NOT_SENT` -> :data:`SEND_NOT_SENT` (nothing typed, so a
+      bounded retry cannot duplicate);
+    - :data:`...injection_stage.STAGE_UNCERTAIN_PARTIAL` -> :data:`SEND_UNCERTAIN` (no
+      auto-retry; a duplicate send is the failure to avoid). That stage is also the authority's
+      own fail-closed default, so an unrecognised status / reason still lands on the safe
+      outcome — the previous behaviour, now stated once instead of twice.
+
+    **Two deliberate behaviour changes** (both fail-closed or strictly more accurate):
+
+    1. ``sent`` + ``queue_enter`` is no longer :data:`SEND_DELIVERED`. That reason means the
+       landing marker was **never observed** — the relaxed rail pressed Enter without
+       pre-confirming submission — so reporting it delivered closed an outbox row on an
+       unconfirmed delivery. This module and
+       ``...f_130_handoff_routing.application.delivery_outcome_gate.delivery_was_positive``
+       (which has always refused ``queue_enter``) were precisely the two divergent answers
+       #14232 j#84877 recorded, and the issue's Non-goals prohibit reading a timed-out landing
+       as optimistically delivered. Both production callback senders (``callback_send_port`` /
+       ``callback_sweep``) send with ``--mode standard``, on which ``queue_enter`` is
+       unreachable, so no production callback changes disposition; where it *is* reachable the
+       row now becomes ``uncertain`` (retry 0, operator-visible) instead of silently closed.
+    2. ``reader_upgrade_required`` and ``execution_root_outside_target_repo`` are now
+       :data:`SEND_NOT_SENT`. Both are documented zero-send refusals ("Refused pre-send (zero
+       bytes typed)"), so a bounded retry cannot duplicate; previously they fell to uncertain
+       and were therefore never retried at all.
     """
-    status_s = str(status or "").strip()
-    reason_s = str(reason or "").strip()
-    if status_s == "sent" and reason_s in _DELIVERED_SENT_REASONS:
-        return SEND_DELIVERED
-    if status_s == "blocked" and reason_s in _NOT_SENT_BLOCKED_REASONS:
-        return SEND_NOT_SENT
-    return SEND_UNCERTAIN
+    return _SEND_OUTCOME_BY_STAGE[injection_stage_for(status, reason)]
 
 
 #: The fixed token an unrecognized zero-send reason normalizes to (Redmine #14082 review F2). A raw
@@ -246,9 +275,20 @@ UNRECOGNIZED_ZERO_SEND_REASON = "unrecognized_zero_send_reason"
 #: application layer. Those application-layer tokens are enumerated as literals (a domain module must
 #: not import the application), and a drift-guard test asserts they still match their definitions
 #: (``FAIL_CLOSED_REASONS`` / ``ROUND_STALE`` / ``ROUND_UNVERIFIABLE``), so a renamed token is caught.
+#:
+#: Redmine #14232: the handoff-side half is now **derived** from the shared injection-stage
+#: partitions rather than re-listed here. The old literal list of "transport-side ambiguous /
+#: exception outcomes" was a hand-maintained duplicate of
+#: :data:`...injection_stage.POST_INJECTION_BLOCKED_REASONS`, so a new handoff reason had to be
+#: remembered in two places to stay allowlisted — and a forgotten one silently normalized a real
+#: diagnostic to ``unrecognized_zero_send_reason``. Deriving it keeps this allowlist complete over
+#: the whole ``Reason`` wire vocabulary by construction. Only the tokens that genuinely originate
+#: OUTSIDE the handoff outcome (background_service authorization / round-fence / sender-env) stay
+#: literal, because a domain module must not import the application layer.
 ZERO_SEND_REASON_ALLOWLIST = frozenset(
     _DELIVERED_SENT_REASONS
-    | _NOT_SENT_BLOCKED_REASONS
+    | PRE_INJECTION_BLOCKED_REASONS
+    | POST_INJECTION_BLOCKED_REASONS
     | {
         # background_service authorization fail-closed reasons (domain
         # ``background_service_delivery.FAIL_CLOSED_REASONS``; drift-guarded).
@@ -264,13 +304,8 @@ ZERO_SEND_REASON_ALLOWLIST = frozenset(
         # ``background_service_sender.ROUND_STALE`` / ``ROUND_UNVERIFIABLE``; drift-guarded).
         "review_round_stale",
         "review_round_unverifiable",
-        # transport-side ambiguous / exception outcomes a callback send can carry to a zero-send.
-        "transport_error",
-        "inject_failed",
-        "turn_start_unconfirmed",
-        "marker_timeout",
-        "receiver_blocked",
-        "turn_start_absent",
+        # Not a handoff outcome reason: the background_service's own pre-send sender-identity
+        # refusal, so it stays literal alongside the other application-layer tokens.
         "missing_sender_env",
     }
 )

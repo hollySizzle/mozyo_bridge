@@ -47,6 +47,14 @@ import hashlib
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
+    POST_INJECTION_BLOCKED_REASONS,
+    STAGE_SUBMITTED_CONFIRMED,
+    blind_retry_prohibited,
+    injection_stage_for,
+    stage_guidance,
+)
+
 
 class SubmitPlanError(ValueError):
     """A submit intent could not be resolved to a safe delivery rail."""
@@ -293,13 +301,25 @@ def classify_composer_residue(status: object, reason: object) -> str:
       the payload was not duplicated -> ``typed_but_pending``.
     - ``pending_input`` — pending/operator rail: the body was typed and Enter
       deliberately not pressed -> ``typed_but_pending``.
-    - ``blocked`` / ``marker_timeout`` — strict rail, a C-u rollback was issued and
-      Enter was NOT pressed, but the composer clear is not verifiable from tmux
-      capture (j#66977 observed residual prompt text) -> the only safe read is
-      ``unsafe_state_requires_fresh_receiver``.
-    - any other ``blocked`` (``invalid_anchor`` / ``invalid_args`` /
-      ``target_*`` / ``cross_session_claude``) — blocked before anything was typed
-      -> ``not_typed``.
+    - a ``blocked`` outcome the shared injection-stage authority classifies as
+      **post-injection** (:data:`...injection_stage.POST_INJECTION_BLOCKED_REASONS` —
+      ``marker_timeout`` / ``turn_start_unconfirmed`` / ``receiver_blocked`` /
+      ``turn_start_absent`` / ``inject_failed`` / ``transport_error``) -> the only safe
+      read is ``unsafe_state_requires_fresh_receiver``.
+    - a ``blocked`` outcome the same authority classifies as **pre-injection** (nothing
+      was typed: ``invalid_anchor`` / ``invalid_args`` / ``target_*`` /
+      ``cross_session_claude`` / ``precondition_not_idle`` /
+      ``receiver_startup_interaction_required`` / …) -> ``not_typed``.
+
+    Redmine #14232 (j#84877 required correction 2): this branch used to special-case
+    ``marker_timeout`` alone and fold **every other** ``blocked`` onto ``not_typed``. That
+    misread the whole post-injection family as "nothing reached the receiver" — most
+    visibly the herdr ``delivered_not_started`` projection (``blocked`` /
+    ``turn_start_unconfirmed``), where body **and** Enter were injected before the event
+    wait timed out, and the new ``transport_error``, where a primitive raised mid-send.
+    Deriving the split from the shared authority instead of a local literal is what keeps
+    the residue read and the retry decision from disagreeing again: a residue of
+    ``not_typed`` invites exactly the blind retry the injection stage prohibits.
     """
     status_token = status if isinstance(status, str) else ""
     reason_token = reason if isinstance(reason, str) else ""
@@ -307,7 +327,7 @@ def classify_composer_residue(status: object, reason: object) -> str:
         return RESIDUE_CLEARED if reason_token == "ok" else RESIDUE_TYPED_BUT_PENDING
     if status_token == "pending_input":
         return RESIDUE_TYPED_BUT_PENDING
-    if status_token == "blocked" and reason_token == "marker_timeout":
+    if status_token == "blocked" and reason_token in POST_INJECTION_BLOCKED_REASONS:
         return RESIDUE_UNSAFE_REQUIRES_FRESH_RECEIVER
     return RESIDUE_NOT_TYPED
 
@@ -354,12 +374,28 @@ def derive_delivery_id(
 class SubmitOutcome:
     """Front-door (workflow) result of the q-enter primitive, distinct from transport.
 
-    Records the resolved rail / anchor obligation / delivery id and — when the
-    front door fail-closed before any delivery — the blocked reason and the exact
-    next action. The transport ``DeliveryOutcome`` (status / reason / marker) is
-    emitted separately by the rail; this is the workflow-result surface the issue
-    requires kept separate. Free-text-free except ``guidance``, which is a fixed
-    fail-closed instruction string (never operator input).
+    Records the resolved rail / anchor obligation / delivery id and — when the front door
+    fail-closed before any delivery — the blocked reason and the exact next action. The
+    transport ``DeliveryOutcome`` (status / reason / marker) is emitted separately by the
+    rail; this is the workflow-result surface the issue requires kept separate.
+    Free-text-free except ``guidance``, which is a fixed fail-closed instruction string
+    (never operator input).
+
+    Redmine #14232 j#84877 required correction 1 — **plan success is not delivery success.**
+    The front door used to carry a single ``dispatched`` flag set to ``True`` *before*
+    ``orchestrate_handoff`` ran, so a subsequent ``blocked`` / ``turn_start_unconfirmed``
+    never corrected the recorded front-door result. The two facts are now separate fields:
+
+    - ``resolved`` — the intent resolved to a delivery rail and the anchor obligation was
+      satisfied. This is what the old ``dispatched=True`` actually meant, and it is knowable
+      before the transport runs.
+    - ``dispatched`` — the transport **positively delivered** (the shared injection-stage
+      authority classified it :data:`...injection_stage.STAGE_SUBMITTED_CONFIRMED`). Only
+      derivable *after* the transport, and therefore only set by :meth:`from_transport`.
+
+    ``injection_stage`` / ``blind_retry_prohibited`` put the retry decision on the public
+    surface (issue acceptance 2: "retry可否とnext actionを公開JSON/textへ出す") so the LLM
+    reads whether a resend can duplicate instead of inferring it from a rail name.
     """
 
     intent: str
@@ -371,6 +407,16 @@ class SubmitOutcome:
     blocked: bool
     blocked_reason: Optional[str] = None
     guidance: Optional[str] = None
+    #: Redmine #14232: the intent resolved to a rail (planning succeeded). Distinct from
+    #: ``dispatched``; ``False`` only on the front door's own fail-closed paths.
+    resolved: bool = False
+    #: Redmine #14232: the shared injection-stage token for the transport outcome, or ``None``
+    #: when the front door fail-closed before any transport ran (nothing was attempted, which
+    #: is a *stronger* statement than ``not_sent`` — no rail was even resolved).
+    injection_stage: Optional[str] = None
+    #: Redmine #14232: whether re-issuing this send may duplicate the payload. ``False`` on the
+    #: front door's own fail-closed paths (nothing was attempted, so a retry is safe).
+    blind_retry_prohibited: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -380,10 +426,13 @@ class SubmitOutcome:
             "anchor_required": bool(self.anchor_required),
             "ticketless": bool(self.ticketless),
             "delivery_id": self.delivery_id,
+            "resolved": bool(self.resolved),
             "dispatched": bool(self.dispatched),
             "blocked": bool(self.blocked),
             "blocked_reason": self.blocked_reason,
             "guidance": self.guidance,
+            "injection_stage": self.injection_stage,
+            "blind_retry_prohibited": bool(self.blind_retry_prohibited),
         }
 
     def to_json(self) -> str:
@@ -391,9 +440,60 @@ class SubmitOutcome:
 
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True)
 
+    @classmethod
+    def from_transport(
+        cls,
+        *,
+        plan_intent: str,
+        rail: Optional[str],
+        anchor_required: bool,
+        ticketless: bool,
+        delivery_id: str,
+        status: object,
+        reason: object,
+    ) -> "SubmitOutcome":
+        """Derive the front-door result from the transport's terminal outcome (#14232).
+
+        The whole point of j#84877 required correction 1: ``dispatched`` is computed here,
+        after the rail reported, from the SAME injection-stage authority the delivery record
+        and the callback / outbox retry decision read — so a blocked or unconfirmed transport
+        can never leave a "dispatched" front-door record behind. ``resolved`` stays ``True``
+        because planning genuinely did succeed; the two facts are reported side by side rather
+        than one standing in for the other.
+
+        ``status`` / ``reason`` are the transport's own tokens (``None`` when the rail returned
+        no structured outcome at all — an early return or a caller that never sent). An absent
+        outcome resolves through the authority's fail-closed default to ``uncertain_partial``:
+        the front door must not claim a delivery it cannot see.
+        """
+        stage = injection_stage_for(status, reason)
+        delivered = stage == STAGE_SUBMITTED_CONFIRMED
+        return cls(
+            intent=plan_intent,
+            resolved_rail=rail,
+            anchor_required=anchor_required,
+            ticketless=ticketless,
+            delivery_id=delivery_id,
+            resolved=True,
+            dispatched=delivered,
+            # The front door reports `blocked` for anything that did not positively deliver:
+            # the transport's own `blocked` outcomes AND the unconfirmed `sent` / `queue_enter`
+            # and `pending_input` terminals, none of which handed the payload over.
+            blocked=not delivered,
+            blocked_reason=None if delivered else (str(reason) if reason else None),
+            guidance=stage_guidance(stage),
+            injection_stage=stage,
+            blind_retry_prohibited=blind_retry_prohibited(stage),
+        )
+
     def record_lines(self) -> list[str]:
         """Compact pasteable front-door record block (durable-record safe)."""
-        head = "blocked" if self.blocked else "dispatched"
+        if not self.resolved:
+            head = "blocked before any delivery was attempted"
+        elif self.dispatched:
+            head = "delivery confirmed"
+        else:
+            head = f"delivery not confirmed ({self.injection_stage or 'unknown'})"
         lines = [
             f"q-enter front door — {head}",
             "",
@@ -401,16 +501,24 @@ class SubmitOutcome:
             f"- Resolved rail: `{self.resolved_rail or '—'}`",
             f"- Anchor required: `{str(bool(self.anchor_required)).lower()}`",
             f"- Delivery id (idempotency): `{self.delivery_id}`",
+            f"- Rail resolved: `{str(bool(self.resolved)).lower()}` "
+            f"(plan success is not delivery success)",
+            f"- Delivery confirmed: `{str(bool(self.dispatched)).lower()}`",
         ]
-        if self.blocked:
-            lines.append(f"- Blocked reason: `{self.blocked_reason or '—'}`")
-            if self.guidance:
-                lines.append(f"- Next action: {self.guidance}")
-        else:
+        if self.injection_stage:
+            lines.append(f"- Injection stage: `{self.injection_stage}`")
             lines.append(
-                "- Delivered over the resolved rail; read the adjacent transport "
-                "outcome (status / reason / next action) and the `- Submit:` "
-                "composer-residue line for the delivery result."
+                "- Blind retry prohibited: "
+                f"`{str(bool(self.blind_retry_prohibited)).lower()}`"
+            )
+        if self.blocked_reason:
+            lines.append(f"- Blocked reason: `{self.blocked_reason}`")
+        if self.guidance:
+            lines.append(f"- Next action: {self.guidance}")
+        if self.resolved:
+            lines.append(
+                "- Read the adjacent transport outcome (status / reason / next action) and "
+                "the `- Submit:` composer-residue line for the full delivery result."
             )
         return lines
 

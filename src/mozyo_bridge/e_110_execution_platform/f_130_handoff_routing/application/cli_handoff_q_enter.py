@@ -151,9 +151,12 @@ def _emit_submit_outcome(outcome: SubmitOutcome, *, record_format: str) -> None:
     Honors ``--record-format`` exactly like the transport ``_emit_outcome``: the
     pasteable record block first (``text`` / ``both``), then the single-line JSON
     last (``json`` / ``both``) so a script scraping the last JSON line of THIS
-    envelope still works. On the dispatch path the adjacent transport outcome (with
-    its `- Submit:` composer-residue line) follows; on the fail-closed path this is
-    the only outcome and no pane was touched.
+    envelope still works.
+
+    Redmine #14232: on the dispatch path this envelope now comes **after** the transport
+    outcome, because the front-door result is derived from it (``SubmitOutcome.from_transport``)
+    rather than claimed before the rail ran. On the front door's own fail-closed path (a missing
+    anchor / kind) this is still the only outcome and no pane was touched.
     """
     if record_format in (RECORD_FORMAT_TEXT, RECORD_FORMAT_BOTH):
         print("\n".join(outcome.record_lines()))
@@ -255,26 +258,52 @@ def cmd_handoff_q_enter(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # The resolved front-door (workflow) result, distinct from the transport
-    # outcome the rail emits next.
-    _emit_submit_outcome(
-        SubmitOutcome(
-            intent=plan.intent,
-            resolved_rail=plan.rail,
-            anchor_required=plan.anchor_required,
-            ticketless=plan.ticketless,
-            delivery_id=delivery_id,
-            dispatched=True,
-            blocked=False,
-        ),
-        record_format=record_format,
-    )
-
     # Thread the front-door telemetry so the transport delivery record carries the
     # composer-residue classification + the same delivery id.
     args.submit_intent = plan.intent
     args.submit_delivery_id = delivery_id
 
+    # Redmine #14232 (j#84877 required correction 1): run the rail FIRST, then derive the
+    # front-door result from its terminal outcome. This block used to emit
+    # `SubmitOutcome(dispatched=True, blocked=False)` *above* the call, so a later `blocked` /
+    # `turn_start_unconfirmed` left a "dispatched" front-door record standing — pre-transport
+    # plan success masquerading as delivery success. The rail may also `die`
+    # (`SystemExit`) on a blocked terminal; the front-door record is emitted on that path too
+    # (in the `finally`) and the exit is then re-raised unchanged, so the CLI exit code and the
+    # transport's own output stay exactly as before.
+    #
+    # Ordering consequence, deliberately accepted: the transport outcome is now printed before
+    # the front-door envelope, so the LAST JSON line of the combined output is the front-door
+    # one. Readers that scrape a delivery outcome match on its `status` + `reason` keys (see
+    # `callback_send_port._parse_outcome`), which the front-door JSON does not carry, so a
+    # reverse scan still finds the transport outcome.
+    rc = 0
+    try:
+        rc = _run_resolved_rail(args, plan)
+    finally:
+        outcome = getattr(args, "delivery_outcome", None)
+        _emit_submit_outcome(
+            SubmitOutcome.from_transport(
+                plan_intent=plan.intent,
+                rail=plan.rail,
+                anchor_required=plan.anchor_required,
+                ticketless=plan.ticketless,
+                delivery_id=delivery_id,
+                status=getattr(outcome, "status", None),
+                reason=getattr(outcome, "reason", None),
+            ),
+            record_format=record_format,
+        )
+    return rc
+
+
+def _run_resolved_rail(args: argparse.Namespace, plan) -> int:
+    """Drive the plan's resolved rail (extracted so the #14232 front-door derivation is one block).
+
+    Byte-identical rail selection and the #13583 forward-generation completion hook; the only
+    change is that it now returns to a caller which derives the front-door record from the
+    transport outcome instead of having claimed one before this ran.
+    """
     if plan.ticketless:
         rc = orchestrate_handoff(args, default_kind=plan.default_kind, ticketless=True)
         # Redmine #13583 R1-F1 / R2-F2: a consultation_callback that echoes a forward_action_id

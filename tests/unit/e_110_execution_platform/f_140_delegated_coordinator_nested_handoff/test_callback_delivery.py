@@ -111,24 +111,44 @@ class SendOutcomeForDeliveryTest(unittest.TestCase):
     def test_sent_ok_is_delivered(self):
         self.assertEqual(send_outcome_for_delivery("sent", "ok"), SEND_DELIVERED)
 
-    def test_sent_queue_enter_is_delivered(self):
-        self.assertEqual(send_outcome_for_delivery("sent", "queue_enter"), SEND_DELIVERED)
+    def test_sent_queue_enter_is_not_delivered(self):
+        # Redmine #14232: this cell previously asserted SEND_DELIVERED. `queue_enter` means the
+        # landing marker was NEVER observed — the relaxed rail pressed Enter without
+        # pre-confirming submission — so closing the outbox row as delivered was an optimistic
+        # read of an unconfirmed landing (prohibited by the #14232 Non-goals), and it disagreed
+        # with `delivery_outcome_gate.delivery_was_positive`, which has always refused
+        # `queue_enter`. Both now project the ONE injection-stage authority. Production callback
+        # senders use `--mode standard`, on which `queue_enter` is unreachable, so no production
+        # callback changes disposition; where it IS reachable the row becomes uncertain
+        # (retry 0, operator-visible) instead of silently closed.
+        self.assertEqual(send_outcome_for_delivery("sent", "queue_enter"), SEND_UNCERTAIN)
 
     def test_deterministic_pre_injection_blocks_are_not_sent(self):
         # Every reason here is a genuine pre-injection refusal (delivered == False / route
         # resolution / precondition) — the send edge was never crossed, so a retry cannot
         # duplicate. receiver_blocked / turn_start_absent are DELIBERATELY absent (see
         # test_post_injection_blocks_are_uncertain).
+        #
+        # Redmine #14232 added the last three: `receiver_startup_interaction_required` was
+        # already classified, while `reader_upgrade_required` (#13844) and
+        # `execution_root_outside_target_repo` (#14249) were MISSING from this module's old
+        # private table even though both are documented zero-send refusals ("Refused pre-send
+        # (zero bytes typed)"), so both fell to uncertain and were never bounded-retried at all.
+        # The classification is now the shared, drift-guarded partition over the whole `Reason`
+        # wire vocabulary, so a later issue adding a reason cannot silently omit it again.
         for reason in (
             "target_unavailable",
             "target_not_agent",
             "invalid_anchor",
             "invalid_args",
             "precondition_not_idle",
+            "receiver_startup_interaction_required",
             "cross_session_claude",
             "target_repo_mismatch",
             "gateway_route_blocked",
             "main_lane_implementation_blocked",
+            "reader_upgrade_required",
+            "execution_root_outside_target_repo",
         ):
             with self.subTest(reason=reason):
                 self.assertEqual(send_outcome_for_delivery("blocked", reason), SEND_NOT_SENT)
@@ -143,7 +163,14 @@ class SendOutcomeForDeliveryTest(unittest.TestCase):
                 self.assertEqual(send_outcome_for_delivery("blocked", reason), SEND_UNCERTAIN)
 
     def test_ambiguous_blocks_are_uncertain(self):
-        for reason in ("marker_timeout", "turn_start_unconfirmed", "inject_failed"):
+        # Redmine #14232 added `transport_error`: a transport primitive raised at or after the
+        # single body injection, so partial reach of the body and/or Enter cannot be excluded.
+        for reason in (
+            "marker_timeout",
+            "turn_start_unconfirmed",
+            "inject_failed",
+            "transport_error",
+        ):
             with self.subTest(reason=reason):
                 self.assertEqual(send_outcome_for_delivery("blocked", reason), SEND_UNCERTAIN)
 

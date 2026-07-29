@@ -24,8 +24,21 @@ from __future__ import annotations
 import argparse
 from typing import Any, Callable
 
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
+    STAGE_SUBMITTED_CONFIRMED,
+    injection_stage_for,
+)
+
 #: The only transport result that counts as a positive delivery: the send landed AND the landing
 #: marker was observed.
+#:
+#: Redmine #14232: these two constants are now the *statement* of one cell of the shared
+#: injection-stage authority (``injection_stage.injection_stage_for`` maps exactly
+#: ``sent`` + ``ok`` to :data:`...injection_stage.STAGE_SUBMITTED_CONFIRMED`), not a second
+#: private definition. :func:`delivery_was_positive` evaluates that authority so this gate and
+#: the callback / outbox retry authority can no longer drift apart — the divergence #14232
+#: j#84877 recorded, where a marker-unobserved ``queue_enter`` was non-positive here and
+#: *delivered* there. They are kept exported because callers assert against them by name.
 POSITIVE_STATUS = "sent"
 POSITIVE_REASON = "ok"
 
@@ -49,9 +62,15 @@ def delivery_was_positive(args: argparse.Namespace) -> bool:
     outcome = getattr(args, DELIVERY_OUTCOME_ATTR, None)
     if outcome is None:
         return False
+    # Redmine #14232: evaluate the SHARED injection-stage authority rather than re-testing the
+    # two tokens locally. Behaviour is unchanged (``sent`` + ``ok`` is the only
+    # ``submitted_confirmed`` cell) — what changes is that this gate and the callback / outbox
+    # retry authority can no longer answer "was it delivered?" differently.
     return (
-        str(getattr(outcome, "status", "")) == POSITIVE_STATUS
-        and str(getattr(outcome, "reason", "")) == POSITIVE_REASON
+        injection_stage_for(
+            getattr(outcome, "status", ""), getattr(outcome, "reason", "")
+        )
+        == STAGE_SUBMITTED_CONFIRMED
     )
 
 

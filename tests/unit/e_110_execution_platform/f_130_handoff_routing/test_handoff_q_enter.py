@@ -216,18 +216,85 @@ class SubmitOutcomeTest(unittest.TestCase):
         self.assertEqual("anchor_required", data["blocked_reason"])
         self.assertIn("anchor_required", "\n".join(outcome.record_lines()))
 
-    def test_dispatched_outcome_points_at_transport(self) -> None:
+    def test_blocked_outcome_reports_nothing_was_attempted(self) -> None:
+        # Redmine #14232: the front door's OWN fail-closed path never resolved a rail, which is
+        # a stronger statement than a transport `not_sent` — no injection stage exists at all.
         outcome = SubmitOutcome(
-            intent="consultation_callback",
-            resolved_rail=RAIL_TICKETLESS_CALLBACK,
+            intent="reply",
+            resolved_rail=None,
+            anchor_required=True,
+            ticketless=False,
+            delivery_id="qe-abc",
+            dispatched=False,
+            blocked=True,
+            blocked_reason="anchor_required",
+        )
+        data = outcome.to_dict()
+        self.assertFalse(data["resolved"])
+        self.assertIsNone(data["injection_stage"])
+        self.assertFalse(data["blind_retry_prohibited"])
+
+    def test_confirmed_delivery_reports_resolved_and_dispatched(self) -> None:
+        # Redmine #14232: built via `from_transport`, the only path that may set `dispatched` —
+        # it is derived from the transport outcome, not from plan success.
+        outcome = SubmitOutcome.from_transport(
+            plan_intent="consultation_callback",
+            rail=RAIL_TICKETLESS_CALLBACK,
             anchor_required=False,
             ticketless=True,
             delivery_id="qe-abc",
-            dispatched=True,
-            blocked=False,
+            status="sent",
+            reason="ok",
         )
-        self.assertTrue(outcome.to_dict()["dispatched"])
+        data = outcome.to_dict()
+        self.assertTrue(data["resolved"])
+        self.assertTrue(data["dispatched"])
+        self.assertFalse(data["blocked"])
+        self.assertEqual("submitted_confirmed", data["injection_stage"])
         self.assertIn("transport outcome", "\n".join(outcome.record_lines()))
+
+    def test_unconfirmed_transport_reports_resolved_but_not_dispatched(self) -> None:
+        """The #14232 defect shape: plan success must not read as delivery success."""
+        for status, reason, stage in (
+            ("sent", "queue_enter", "uncertain_partial"),
+            ("pending_input", "ok", "uncertain_partial"),
+            ("blocked", "turn_start_unconfirmed", "uncertain_partial"),
+            ("blocked", "transport_error", "uncertain_partial"),
+            ("blocked", "invalid_args", "not_sent"),
+        ):
+            with self.subTest(status=status, reason=reason):
+                outcome = SubmitOutcome.from_transport(
+                    plan_intent="worker_dispatch",
+                    rail=RAIL_ANCHORED_SEND,
+                    anchor_required=True,
+                    ticketless=False,
+                    delivery_id="qe-abc",
+                    status=status,
+                    reason=reason,
+                )
+                self.assertTrue(outcome.resolved)
+                self.assertFalse(outcome.dispatched)
+                self.assertTrue(outcome.blocked)
+                self.assertEqual(stage, outcome.injection_stage)
+                self.assertEqual(reason, outcome.blocked_reason)
+                self.assertEqual(
+                    stage != "not_sent", outcome.blind_retry_prohibited
+                )
+
+    def test_absent_transport_outcome_fails_closed_to_uncertain(self) -> None:
+        """A rail that returned no structured outcome must not read as delivered."""
+        outcome = SubmitOutcome.from_transport(
+            plan_intent="reply",
+            rail=RAIL_ANCHORED_REPLY,
+            anchor_required=True,
+            ticketless=False,
+            delivery_id="qe-abc",
+            status=None,
+            reason=None,
+        )
+        self.assertFalse(outcome.dispatched)
+        self.assertEqual("uncertain_partial", outcome.injection_stage)
+        self.assertTrue(outcome.blind_retry_prohibited)
 
 
 if __name__ == "__main__":
