@@ -1809,6 +1809,63 @@ Tests pin the *injected* resolver's distinct `exec_target` realpath **and** its 
 alias (a real temporary symlink alias for the wrapped-decoupled path; an equal realpath for
 the unsymlinked / unwrapped fallback), plus the argv suffix, never a host path literal.
 
+### The trust boundary is not the only authority over the binary (Redmine #14741)
+
+The resolver pins what mozyo **launches**. It does not, and cannot, pin what the provider's
+own in-TUI **updater** writes: an updater shells out to a package manager on the ambient
+`PATH` (`npm install -g @openai/codex` and its pnpm / bun / brew / installer variants),
+which honors none of mozyo's resolution. When an env override pins one install and the
+package manager owns another, those are two authorities over "the provider binary", and
+the override path never even looks at the second — an override short-circuits the `PATH`
+search entirely.
+
+Measured consequence (#14741, live evidence #14725 j#94108): a managed sublane gateway
+self-attested, reported ready, and exited 0 every 3–4 seconds. Codex's update prompt was
+on the pane; the queue-enter rail's Enter selected its default option (`1. Update now`)
+instead of submitting the Implementation Request, which was destroyed exactly as in
+#13582 j#77917. The update then rewrote the *other* install, so the next managed launch
+started the same old binary, and the lane looped while the transport recorded delivery.
+
+Three contracts follow, and they are deliberately separate:
+
+1. **The update screens are declared data, not source.** Codex's profile now carries
+   `startup_blockers` for `update_prompt_available` and `update_in_progress`, so the
+   provider-neutral #13760 pre-send gate refuses at zero bytes. Declaring a screen still
+   never authorises answering it — choosing `Skip` for the operator would be mozyo
+   accepting a provider prompt, and would also silence the split instead of surfacing it.
+2. **The authority split itself is classified, fail-closed, before any side effect.**
+   `agent_provider_update_authority` compares the managed `exec_target` against the
+   *distinct trusted-`PATH` resolutions* — the updater's reach — and yields
+   `aligned` / `split` / `unknown`. `unknown` never decays to `aligned`: an unreadable
+   `PATH`, an unresolvable provider, or no `PATH` resolution at all are all states in
+   which the updater's target is undescribable, and "the updater has nowhere to write" is
+   a guess. A second axis re-verifies a lane's exact executable identity (realpath **and**
+   version), because path pinning alone cannot see an in-place rewrite and version pinning
+   alone cannot see the split. A same-version reinstall is a *match*, not a drift —
+   nothing the lane runs changed.
+3. **A split lane is never healthy residency, and the preflight is what stops it.** The
+   `startup_health` classifier gains `provider_update_authority_split`,
+   `provider_executable_binding_drift`, and `provider_update_authority_unverified` in the
+   would-be-green tail, so a split lane cannot be reported as healthy. It is ordered
+   *after* the observed causes on purpose: this classifier answers "what is there now",
+   and hoisting a configuration fact above a live one (an unreadable inventory, a startup
+   screen) would trade one unactionable report for another. What actually breaks the loop
+   is the action-time `evaluate_update_authority` preflight, which refuses the re-launch
+   and the send. Both axes are opt-in (`not_evaluated` by default), so every pre-#14741
+   verdict is byte-invariant.
+
+What this explicitly does **not** do, because the incident is what happens when something
+proceeds helpfully: it never relaxes to `PATH` first-match, never rewrites the override,
+never runs or accepts an update, and never puts a path, a version, or an env value on the
+outcome — a verdict is fixed tokens plus a small count, safe for a pasteable record.
+
+The screen signatures are pinned as data read from the shipped binary and then confirmed
+by **rendering the real screen** (codex-cli 0.146.0, a disposable credential-free
+`CODEX_HOME`, zero keystrokes sent), not recalled: a guessed signature either never fires
+or blocks a ready pane. The second signature of `update_prompt_available` is
+`Update now (runs` rather than the rendered command, because the command text varies with
+the detected package manager and pinning it would fail open on every other topology.
+
 ### Honest limit
 
 A data profile absorbs a provider of an **existing** `protocol` family (the claude/codex

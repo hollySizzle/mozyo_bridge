@@ -97,6 +97,21 @@ HEALTH_ATTESTATION_UNAVAILABLE = "attestation_unavailable"
 #: Deliberately NOT read as "the wrapper never ran" or "the provider exited" — it says only
 #: that the evidence is absent, which is a reporting gap, not a diagnosis.
 HEALTH_STARTUP_EVIDENCE_UNAVAILABLE = "startup_evidence_unavailable"
+#: The managed exec target and the provider's own updater target are different installs
+#: (Redmine #14741). Everything observable about the slot may be positive, and it is
+#: still not a green: updating the provider cannot change what this lane runs, so an
+#: update that exits 0 is not a fix, and a self-heal re-launch will start the same old
+#: binary again — which is precisely the loop #14741 was raised on.
+HEALTH_UPDATE_AUTHORITY_SPLIT = "provider_update_authority_split"
+#: The exact executable identity this lane was bound to is not the one that is there
+#: (Redmine #14741): the file or its version changed under the lane, typically because
+#: an update rewrote it. A same-version reinstall is NOT this — nothing that this lane
+#: runs changed — so the reinstall case stays green rather than flapping.
+HEALTH_EXECUTABLE_BINDING_DRIFT = "provider_executable_binding_drift"
+#: The update authority or the executable binding could not be established (Redmine
+#: #14741). Fail-closed and deliberately distinct from ``..._SPLIT``: it says only that
+#: the question is undecided, never that a split was shown.
+HEALTH_UPDATE_AUTHORITY_UNVERIFIED = "provider_update_authority_unverified"
 #: No probe was performed (dry-run, or a read-only surfacing). Not a success verdict.
 HEALTH_NOT_PROBED = "not_probed"
 
@@ -114,6 +129,9 @@ HEALTH_OUTCOMES: frozenset[str] = frozenset(
         HEALTH_LOCATOR_DRIFT,
         HEALTH_INVENTORY_UNREADABLE,
         HEALTH_UNPROFILED_PROVIDER,
+        HEALTH_UPDATE_AUTHORITY_SPLIT,
+        HEALTH_EXECUTABLE_BINDING_DRIFT,
+        HEALTH_UPDATE_AUTHORITY_UNVERIFIED,
         HEALTH_NOT_PROBED,
     }
 )
@@ -186,6 +204,33 @@ ATTESTATION_OK = "ok"
 ATTESTATION_ABSENT = "absent"
 #: A record exists but is stale / foreign / missing-env / conflicting. Terminal.
 ATTESTATION_INVALID = "invalid"
+
+# Update-authority input facts (Redmine #14741). Declared HERE as neutral tokens rather
+# than imported from the provider registry's own
+# `agent_provider_update_authority` domain module, for the same reason `SCREEN_*` and
+# `ATTESTATION_*` are: this module stays free of cross-context imports, and the mapping
+# from the registry's vocabulary onto these facts stays an explicit, visible seam in the
+# application layer instead of an implied shared enum. The spellings match deliberately,
+# so that mapping is an identity — visible, not clever.
+
+#: The caller did not evaluate update authority. Byte-invariant with pre-#14741 verdicts.
+AUTHORITY_NOT_EVALUATED = "not_evaluated"
+#: The managed exec target is the install the provider's own updater writes to.
+AUTHORITY_ALIGNED = "aligned"
+#: Managed exec target and updater target are different installs.
+AUTHORITY_SPLIT = "split"
+#: The authority could not be established. Never read as aligned.
+AUTHORITY_UNKNOWN = "unknown"
+
+#: No executable binding was supplied to re-verify.
+BINDING_NOT_EVALUATED = "not_evaluated"
+#: The observed executable identity is exactly the bound one (a same-version reinstall
+#: lands here: nothing this lane runs changed).
+BINDING_MATCHED = "matched"
+#: The executable identity changed under this lane.
+BINDING_DRIFTED = "drifted"
+#: The executable identity could not be observed. Never read as unchanged.
+BINDING_UNKNOWN = "unknown"
 
 
 class StartupHealthError(ValueError):
@@ -316,6 +361,22 @@ HEALTH_DETAIL: dict[str, str] = {
         "the provider has no profile, so its startup screens cannot be described; the "
         "gate never guesses that an unknown provider has no startup screen"
     ),
+    HEALTH_UPDATE_AUTHORITY_SPLIT: (
+        "the managed exec target and the provider's own updater target are different "
+        "installs, so updating the provider cannot change what this lane runs and a "
+        "self-heal re-launch will start the same binary again; re-point the trusted "
+        "override at the install the updater owns, or remove the extra install"
+    ),
+    HEALTH_EXECUTABLE_BINDING_DRIFT: (
+        "the executable identity this lane was bound to is not the one that is there "
+        "now; a re-launch must re-bind explicitly rather than inherit a pin that no "
+        "longer describes what it starts"
+    ),
+    HEALTH_UPDATE_AUTHORITY_UNVERIFIED: (
+        "the provider's update authority or executable binding could not be "
+        "established, so an authority split can be neither shown nor ruled out; an "
+        "undecidable authority is never admitted as an aligned one"
+    ),
     HEALTH_NOT_PROBED: "no startup probe was performed for this slot",
 }
 
@@ -330,6 +391,8 @@ def classify_startup_health(
     screen: str,
     attestation: str,
     evidence: str = EVIDENCE_NOT_APPLICABLE,
+    update_authority: str = AUTHORITY_NOT_EVALUATED,
+    executable_binding: str = BINDING_NOT_EVALUATED,
 ) -> str:
     """Classify one fresh-launched slot from observed facts (pure, total, fail-closed).
 
@@ -345,7 +408,16 @@ def classify_startup_health(
        reporting ``attestation_*`` there would name the wrong cause;
     4. attestation next: absent (nothing arrived in the deadline) is distinct from
        invalid (something arrived and did not bind);
-    5. execution-stage evidence LAST (Redmine #14231): it only ever downgrades what
+    5. update authority / executable binding (Redmine #14741) in the would-be-green
+       tail: a split authority, a drifted binding, or an undecidable one downgrades a
+       verdict that would otherwise be :data:`HEALTH_HEALTHY`, so a lane whose updater
+       targets a different install is never reported as healthy residency. They are
+       opt-in (:data:`AUTHORITY_NOT_EVALUATED` / :data:`BINDING_NOT_EVALUATED` by
+       default), so every pre-#14741 verdict is byte-invariant, and they are ordered
+       after the observed causes above rather than before them — the action-time
+       preflight, not this classifier, is what actually stops a split lane's re-launch
+       and send;
+    6. execution-stage evidence LAST (Redmine #14231): it only ever downgrades what
        would otherwise be :data:`HEALTH_HEALTHY`. Ordering it last is the point — every
        verdict above names a specific, actionable cause, and an evidence gap must never
        mask one of them. It fires only when ``evidence`` is
@@ -375,9 +447,36 @@ def classify_startup_health(
         # admitted (Answer j#80989 Q1.6).
         return HEALTH_RECEIVER_UNREADABLE
     if attestation == ATTESTATION_OK:
-        # Redmine #14231: the only place the evidence gate can fire. Everything else this
-        # function can return already names a concrete cause; a missing launch record must
-        # downgrade a would-be green, never overwrite a named failure.
+        # Redmine #14741, then #14231. Both gates sit here, in the would-be-green tail,
+        # for the same reason: every verdict above already names a specific, observed
+        # cause, and neither of these may overwrite one.
+        #
+        # Why the update-authority gate is here and NOT above the process facts, even
+        # though a split is the ROOT CAUSE of the #14741 loop while `provider_exited` is
+        # only its symptom: this function answers "what is there now", from observation.
+        # An authority split is a fact about the launch's *configuration*, decidable
+        # before any observation, and the place it must actually stop something is the
+        # action-time preflight — which refuses the re-launch and the send outright
+        # (`agent_provider_update_authority_preflight`). Hoisting it here would let a
+        # configuration fact mask a live one (an unreadable inventory, a startup screen),
+        # trading one unactionable report for another. So the preflight blocks the loop,
+        # and this gate's narrower job is to stop a split lane from ever being *reported*
+        # as healthy residency (#14741 Acceptance 3).
+        #
+        # Split before drift before unverified: a positive diagnosis outranks a weaker
+        # one, and both outrank "undecided". A same-version reinstall reaches none of
+        # them — its binding still matches, because nothing this lane runs changed.
+        if update_authority == AUTHORITY_SPLIT:
+            return HEALTH_UPDATE_AUTHORITY_SPLIT
+        if executable_binding == BINDING_DRIFTED:
+            return HEALTH_EXECUTABLE_BINDING_DRIFT
+        if (
+            update_authority == AUTHORITY_UNKNOWN
+            or executable_binding == BINDING_UNKNOWN
+        ):
+            return HEALTH_UPDATE_AUTHORITY_UNVERIFIED
+        # Redmine #14231: a missing launch record downgrades a would-be green, and is
+        # ordered last because it is a reporting gap rather than a diagnosis.
         if evidence == EVIDENCE_UNAVAILABLE:
             return HEALTH_STARTUP_EVIDENCE_UNAVAILABLE
         return HEALTH_HEALTHY
@@ -395,6 +494,14 @@ __all__ = (
     "ATTESTATION_INVALID",
     "ATTESTATION_NOT_PROBED",
     "ATTESTATION_OK",
+    "AUTHORITY_ALIGNED",
+    "AUTHORITY_NOT_EVALUATED",
+    "AUTHORITY_SPLIT",
+    "AUTHORITY_UNKNOWN",
+    "BINDING_DRIFTED",
+    "BINDING_MATCHED",
+    "BINDING_NOT_EVALUATED",
+    "BINDING_UNKNOWN",
     "COMPENSATIONS",
     "COMPENSATION_NOT_NEEDED",
     "COMPENSATION_ROLLBACK_BLOCKED",
@@ -413,6 +520,7 @@ __all__ = (
     "HEALTH_ATTESTATION_TIMEOUT",
     "HEALTH_ATTESTATION_UNAVAILABLE",
     "HEALTH_DETAIL",
+    "HEALTH_EXECUTABLE_BINDING_DRIFT",
     "HEALTH_HEALTHY",
     "HEALTH_INVENTORY_UNREADABLE",
     "HEALTH_LOCATOR_DRIFT",
@@ -424,6 +532,8 @@ __all__ = (
     "HEALTH_STARTUP_EVIDENCE_UNAVAILABLE",
     "HEALTH_STARTUP_INTERACTION",
     "HEALTH_UNPROFILED_PROVIDER",
+    "HEALTH_UPDATE_AUTHORITY_SPLIT",
+    "HEALTH_UPDATE_AUTHORITY_UNVERIFIED",
     "STARTUP_EVIDENCE_STATES",
     "SCREEN_BLOCKED",
     "SCREEN_CLEAR",
