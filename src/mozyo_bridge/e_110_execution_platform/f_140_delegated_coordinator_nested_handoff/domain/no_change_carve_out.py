@@ -22,10 +22,14 @@ each is now anchored to something real rather than to something invented:
 - **the token vocabulary was invented here.** It is now taken from the words the central preset's
   ``### Owner Close Approval Delegation`` carve-out list actually uses, with a drift test binding
   the two;
-- **the resolution half was a caller flag** the retire route always passed as ``True``, derived
-  from "some lifecycle gate parsed" — which proves the record is readable, not that its
-  classification was resolved. A conjunct the caller can assert fences nothing (#14539 j#91797
-  F2). It is now the record's own governed ``work_unit`` declaration.
+- **the resolution half did not read the thing it claimed to decide.** R1 took a caller flag the
+  retire route always passed as ``True``, derived from "some lifecycle gate parsed"; R2 replaced
+  it with the issue's ``work_unit`` declaration, whose canonical purpose is REVIEW AUTHORITY
+  ROUTING, not impact classification. Review j#93638 finding 1 measured that second version: a
+  record carrying ``work_unit: leaf_issue`` AND an explicit
+  ``carve_out_check: production_verification`` folded to ``clear=True`` and admitted — the record
+  stated the carve-out in the governed field and the reader never looked at it. It is now the
+  canonical ``carve_out_check`` field itself (``## Gate: owner_close_approval`` template).
 
 ``direct_owner`` provenance is explicitly NOT an escape from any of this: provenance says who
 decided, not what surface the work touched.
@@ -42,9 +46,6 @@ from typing import Optional, Sequence, Tuple
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.canonical_note_scan import (  # noqa: E501
     canonical_marker_bodies,
     canonical_note_lines,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_integration_disposition import (  # noqa: E501
-    fold_work_unit,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     MARKER_CHANNEL_WORKFLOW_EVENT,
@@ -85,7 +86,9 @@ HARD_CARVE_OUT_GATE_TOKENS: frozenset[str] = frozenset(
         "permission",
         "billing",
         "destructive_operation",
+        "data_deletion",
         "migration",
+        "external_effect",
         "legal",
         "compliance",
         "security",
@@ -110,6 +113,30 @@ _GATE_HEADING_LINE_RE = re.compile(
 )
 #: Separators a combined governed heading uses between gate names.
 _HEADING_PART_SPLIT_RE = re.compile(r"[+/,、]")
+
+#: The gate whose template owns the canonical carve-out determination. Its ``carve_out_check``
+#: field is read ONLY from a journal structurally declaring this gate (qualify, then read).
+OWNER_CLOSE_APPROVAL_GATE_TOKEN = "owner_close_approval"
+#: The only value that means "no carve-out applies". Anything else non-empty is a stated reason,
+#: which by the preset's own grammar (``none | <該当理由>``) means one DOES apply.
+CARVE_OUT_CHECK_NONE = "none"
+
+#: The governed ``- carve_out_check: <value>`` field line. Read with ``finditer`` (never
+#: ``search``) so the exactly-one rule can see a second, conflicting declaration instead of
+#: silently taking whichever came first.
+_CARVE_OUT_CHECK_FIELD_RE = re.compile(
+    r"^\s*[-*]?\s*\**\s*(?:carve_out_check|carve out check)\**\s*[:：]\s*(?P<value>.+?)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+#: Decoration a governed field value carries around the real token.
+_FIELD_DECORATION_RE = re.compile(r"^[`*\s\"']+|[`*\s\"']+$")
+
+
+def _clean_field_value(value: object) -> str:
+    """Strip list / emphasis decoration off a governed field value (pure)."""
+    return _FIELD_DECORATION_RE.sub("", str(value or "").strip()).strip()
+
+
 #: A trailing parenthetical qualifier governed authors append to a heading part.
 _TRAILING_PAREN_RE = re.compile(r"\s*[（(][^）)]*[）)]\s*$")
 
@@ -202,24 +229,35 @@ def fold_hard_carve_out(
        no marker producer at all, so the detector was looking for something nothing in this repo
        emits, while ``## Gate: production_verification`` — the form they ARE written in — sailed
        through (review j#93576 finding 1, reproduced to a full ``ok`` admission).
-    2. **Resolution.** The issue's governed ``work_unit`` must be DECLARED. The ruling permits
-       either resolution route — "issue 分類 **または** recognized gate" — and this is the issue
-       -classification one, taken from the existing governed, structured, latest-wins declaration
-       (:func:`...glance_integration_disposition.fold_work_unit`) rather than from a new vocabulary
-       or a new config key. An undeclared / unreadable ``work_unit`` is
-       :data:`CARVE_OUT_UNRESOLVED`: "nothing was recognized" and "nothing carve-out-ish is there"
-       are different statements, and treating the first as the second is the default-clear the
-       ruling forbids.
+    2. **Resolution — the CANONICAL field, not a proxy.** The central preset already defines the
+       durable field that records this exact determination: the ``## Gate: owner_close_approval``
+       template's ``carve_out_check: none | <該当理由>``. That field IS the coordinator's
+       carve-out finding, so it is read directly:
 
-       **No caller flag decides this.** R1 took a ``gates_resolved`` boolean that the retire route
-       always passed as True, derived from "some lifecycle gate was readable" — which proves the
-       record parses, not that its classification was resolved. A conjunct a caller can assert
-       fences nothing (the #14539 j#91797 F2 lesson, which this repeated).
+       - ``none`` -> :data:`CARVE_OUT_CLEAR`;
+       - any other non-empty value (a stated reason) -> :data:`CARVE_OUT_DECLARED`. The record
+         says a carve-out applies; nothing else in this module needs to agree with it;
+       - absent, blank, or self-conflicting -> :data:`CARVE_OUT_UNRESOLVED`.
+
+       An unfilled template line (``none | <該当理由>`` copied verbatim) is not the literal
+       ``none``, so it lands in DECLARED — the fail-closed side, which is correct: a template
+       nobody filled in has determined nothing.
+
+       R2 used the issue's ``work_unit`` declaration as a stand-in, and review j#93638 finding 1
+       measured the cost: ``fold_work_unit``'s canonical purpose is REVIEW AUTHORITY ROUTING
+       (``leaf_issue`` / ``user_story``), not impact classification, so a record carrying
+       ``work_unit: leaf_issue`` AND an explicit ``carve_out_check: production_verification``
+       folded to ``clear=True`` and admitted — the record stated the carve-out in the governed
+       field and the reader never looked at it. A proxy is not the fact.
+
+       Before that, R1 took a ``gates_resolved`` boolean the retire route always passed as True.
+       Both failures are the same shape: a conjunct that does not read the thing it claims to
+       decide.
 
     The honest boundary, stated rather than hidden: this proves "no recognized durable fact names
-    a carve-out surface, and the issue carries a governed work-unit classification". It cannot
-    prove the absence of an external effect that was never recorded anywhere — nothing reading a
-    durable record can. That is why it is one conjunct among several and never the whole
+    a carve-out surface, and the coordinator's own carve-out determination says none applies". It
+    cannot prove the absence of an external effect that was never recorded anywhere — nothing
+    reading a durable record can. That is why it is one conjunct among several and never the whole
     admission.
     """
     for journal_id, notes in journals or ():
@@ -233,18 +271,60 @@ def fold_hard_carve_out(
                 detail=f"j#{str(journal_id).strip()}:{sorted(named)[0]}",
             )
 
-    work_unit = str(fold_work_unit(journals or ()) or "").strip()
-    if not work_unit:
+    return _fold_carve_out_check(journals)
+
+
+def _fold_carve_out_check(
+    journals: Sequence[Tuple[object, str]],
+) -> HardCarveOutFacts:
+    """The LATEST governed ``carve_out_check`` determination across the issue (pure).
+
+    Read only from a journal that STRUCTURALLY declares the ``owner_close_approval`` gate, so a
+    stray ``carve_out_check:`` line in an unrelated note never becomes the determination — the
+    same qualify-then-read order :mod:`.review_exemption` uses for its gate fields.
+
+    **Latest wins, and a determination supersedes by EXISTING, not by being valid** — the
+    invariant this bounded context applies to every issue-wide authority fact (#13490 j#85365 F1).
+    A newer owner-close-approval journal that omits the field, or states it twice with different
+    values, SHADOWS an older clean ``none`` rather than being skipped so the stale one stays
+    latest. Both resolve to :data:`CARVE_OUT_UNRESOLVED`, which refuses.
+    """
+    latest: Optional[Tuple[int, str, bool]] = None
+    for journal_id, notes in journals or ():
+        jint = _int_journal(journal_id)
+        if jint is None:
+            continue
+        text = notes or ""
+        if OWNER_CLOSE_APPROVAL_GATE_TOKEN not in _structured_gate_tokens(text):
+            continue
+        values = {
+            _clean_field_value(m.group("value"))
+            for m in _CARVE_OUT_CHECK_FIELD_RE.finditer(text)
+        }
+        # Exactly-one: a journal stating two DIFFERENT determinations has determined neither.
+        conflicted = len(values) > 1
+        value = "" if conflicted or not values else next(iter(values))
+        if latest is None or jint > latest[0]:
+            latest = (jint, value, conflicted)
+
+    if latest is None:
         return HardCarveOutFacts(clear=False, reason=CARVE_OUT_UNRESOLVED)
-    return HardCarveOutFacts(clear=True, reason=CARVE_OUT_CLEAR, detail=work_unit)
+    _, value, conflicted = latest
+    if conflicted or not value:
+        return HardCarveOutFacts(clear=False, reason=CARVE_OUT_UNRESOLVED, detail=value)
+    if value.strip().lower() != CARVE_OUT_CHECK_NONE:
+        return HardCarveOutFacts(clear=False, reason=CARVE_OUT_DECLARED, detail=value)
+    return HardCarveOutFacts(clear=True, reason=CARVE_OUT_CLEAR, detail=value)
 
 
 __all__ = (
+    "CARVE_OUT_CHECK_NONE",
     "CARVE_OUT_CLEAR",
     "CARVE_OUT_DECLARED",
     "CARVE_OUT_UNRESOLVED",
     "HARD_CARVE_OUT_GATE_TOKENS",
     "HARD_CARVE_OUT_REASONS",
     "HardCarveOutFacts",
+    "OWNER_CLOSE_APPROVAL_GATE_TOKEN",
     "fold_hard_carve_out",
 )

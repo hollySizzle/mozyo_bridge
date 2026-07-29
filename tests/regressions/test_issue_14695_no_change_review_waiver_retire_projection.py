@@ -99,17 +99,22 @@ def waiver_marker(
     )
 
 
-#: The governed work-unit declaration. It is what RESOLVES the hard carve-out's classification
-#: half, so every fixture that expects to admit must carry it — and one that omits it is a
-#: negative, not a broken fixture (review j#93576 finding 1).
-WORK_UNIT = "- work_unit: `leaf_issue`"
+#: The CANONICAL carve-out determination: the ``## Gate: owner_close_approval`` template's own
+#: ``carve_out_check`` field. It is what RESOLVES the hard carve-out half, so every fixture that
+#: expects to admit must carry it — and one that omits it is a negative, not a broken fixture.
+#: R2 used the issue's ``work_unit`` as a stand-in and review j#93638 finding 1 measured the cost:
+#: a record stating ``carve_out_check: production_verification`` still admitted, because the
+#: reader never looked at the field the record used to say so.
+CARVE_OUT_CLEARED = (
+    "## Gate: owner_close_approval\n- approval_source: direct_owner\n- carve_out_check: none"
+)
 
 
 def no_change_journals(marker: str | None = None) -> list:
     """A genuinely no-change record: a start, a progress note, and a Close carrying the waiver."""
     return [
-        ("100", f"## Gate: start\n- issue: #14613\n- 目的: characterization\n{WORK_UNIT}"),
-        ("200", "## Progress Log\n- read-only 実測のみ"),
+        ("100", "## Gate: start\n- issue: #14613\n- 目的: characterization"),
+        ("200", f"## Progress Log\n- read-only 実測のみ\n\n{CARVE_OUT_CLEARED}"),
         ("300", f"## Gate: close\n- 受け入れ確認: 済\n{marker if marker else waiver_marker()}"),
     ]
 
@@ -260,7 +265,7 @@ class HardCarveOutTest(unittest.TestCase):
         # THE R1 defect, in the form these gates are actually written (review j#93576 finding 1):
         # a marker-only detector folded this to clear=True and admitted with reason "ok".
         journals = [
-            ("100", f"## Gate: start\n{WORK_UNIT}"),
+            ("100", f"## Gate: start\n\n{CARVE_OUT_CLEARED}"),
             ("200", "## Gate: production_verification\n- 本番反映を確認した"),
             ("300", f"## Gate: close\n{waiver_marker()}"),
         ]
@@ -275,7 +280,7 @@ class HardCarveOutTest(unittest.TestCase):
         # Over-detection is the fail-closed direction for a refusal trigger, so every part of a
         # combined heading is tested — ``Close`` must not shield ``Release``.
         journals = [
-            ("100", f"## Gate: start\n{WORK_UNIT}"),
+            ("100", f"## Gate: start\n\n{CARVE_OUT_CLEARED}"),
             ("300", f"## Gate: Close + Release\n{waiver_marker()}"),
         ]
         self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
@@ -306,36 +311,168 @@ class HardCarveOutTest(unittest.TestCase):
         ]
         self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
 
-    def test_the_token_vocabulary_is_anchored_to_the_central_preset(self):
-        """Every carve-out token must be a word the preset's carve-out list actually uses.
+    def test_every_preset_carve_out_bullet_is_accounted_for(self):
+        """The REVERSE direction: preset -> implementation, which R2 did not have.
 
-        R1 invented this vocabulary, which is why it detected nothing real. Binding it to the
-        正本 means a carve-out the preset adds surfaces as a failing test rather than a hole.
+        R2 only checked that each implementation token appears in the preset (implementation ->
+        preset). That direction cannot detect an omission, and review j#93638 finding 1 found one
+        by hand: ``外部副作用`` had no token, so ``## Gate: external_effect`` admitted.
+
+        This enumerates the preset's carve-out bullets and requires each to be explicitly
+        accounted for — either by a detection token or by a named OTHER conjunct that covers it.
+        A bullet the preset adds fails here until it is classified, which is the whole point.
         """
+        preset = (
+            ROOT / ".mozyo-bridge" / "rules" / "presets" / "redmine-governed" / "agent-workflow.md"
+        ).read_text(encoding="utf-8").splitlines()
+        start = next(i for i, l in enumerate(preset) if "以下の **carve-out**" in l)
+        bullets = []
+        for line in preset[start + 1:]:
+            if line.startswith("- "):
+                bullets.append(line[2:].strip())
+            elif bullets and line.strip():
+                break
+        self.assertTrue(bullets, "the preset carve-out list could not be located")
+
+        # Each bullet -> how this implementation accounts for it. A token means detection; a
+        # reason means another conjunct refuses it before this one is consulted.
+        accounted = {
+            "release / tag / publish / package distribution": "release",
+            "guardrail / preset / router / skill / scaffold rule 変更": (
+                "covered by fold_zero_change_record: any such edit IS repository change"
+            ),
+            "credential / secret / auth / permission / billing / 外部 service 設定": "credential",
+            "destructive operation / data 削除 / migration": "destructive_operation",
+            "production verification または外部副作用を伴う操作": "production_verification",
+            "legal / compliance / security-sensitive な変更": "legal",
+            "仕様・scope・stakeholder 判断が未確定な issue": (
+                "covered by the canonical carve_out_check field: an undetermined issue cannot "
+                "carry a `none` determination, and an absent field is UNRESOLVED"
+            ),
+            "cross-project / cross-workspace ownership や session registry の正本変更": (
+                "covered by fold_zero_change_record: a registry 正本 change IS repository change"
+            ),
+            "issue または parent に owner_approval_required 相当が明示されたもの": (
+                "covered by the canonical carve_out_check field: the coordinator records the "
+                "reason there"
+            ),
+        }
+        self.assertEqual(
+            sorted(accounted), sorted(bullets),
+            "the preset's carve-out list changed; classify each new bullet as a detection token "
+            "or as a named other conjunct before this suite can pass",
+        )
+        for bullet, how in accounted.items():
+            with self.subTest(bullet=bullet):
+                if " " not in how:  # a bare token means detection
+                    self.assertIn(how, HARD_CARVE_OUT_GATE_TOKENS)
+
+    def test_every_token_is_anchored_to_a_phrase_the_preset_actually_uses(self):
+        """The FORWARD direction: implementation -> preset, via an explicit anchor per token.
+
+        R2 asserted that ``token.replace("_", " ")`` appears literally in the preset. That works
+        only while every carve-out happens to be written in ASCII: the preset writes two of them
+        in Japanese (``data 削除``, ``外部副作用``), so the naive check cannot anchor the tokens
+        covering them. Declaring the phrase each token stands for anchors all of them and keeps
+        the map itself reviewable.
+        """
+        anchors = {
+            "release": "release",
+            "tag": "tag",
+            "publish": "publish",
+            "package_distribution": "package distribution",
+            "production_verification": "production verification",
+            "external_effect": "外部副作用",
+            "credential": "credential",
+            "auth": "auth",
+            "permission": "permission",
+            "billing": "billing",
+            "destructive_operation": "destructive operation",
+            "data_deletion": "data 削除",
+            "migration": "migration",
+            "legal": "legal",
+            "compliance": "compliance",
+            "security": "security",
+        }
+        self.assertEqual(
+            sorted(anchors), sorted(HARD_CARVE_OUT_GATE_TOKENS),
+            "every detection token needs a declared preset phrase, and every declared phrase "
+            "needs a token; an unanchored token is exactly the invented vocabulary R1 shipped",
+        )
+        section = self._carve_out_section()
+        for token, phrase in anchors.items():
+            with self.subTest(token=token):
+                self.assertIn(phrase, section)
+
+    def _carve_out_section(self):
         preset = (
             ROOT / ".mozyo-bridge" / "rules" / "presets" / "redmine-governed" / "agent-workflow.md"
         ).read_text(encoding="utf-8")
         start = preset.index("以下の **carve-out**")
-        section = preset[start:start + 1200].lower()
-        for token in sorted(HARD_CARVE_OUT_GATE_TOKENS):
-            with self.subTest(token=token):
-                self.assertIn(token.replace("_", " "), section)
+        return preset[start:start + 1200]
 
-    def test_an_undeclared_work_unit_refuses_rather_than_defaulting_clear(self):
+    def test_an_absent_carve_out_check_refuses_rather_than_defaulting_clear(self):
         # "既定 clear にせず typed refusal": not-found and not-checked are different answers.
-        # The classification half is the record's own governed ``work_unit`` declaration, NOT a
-        # flag the caller passes — R1's ``gates_resolved=True`` was always supplied by the caller
-        # and proved only that the record parsed (review j#93576 finding 1).
         journals = [
-            ("100", "## Gate: start\n- issue: #14613"),  # no work_unit
+            ("100", "## Gate: start\n- issue: #14613"),  # no owner_close_approval at all
             ("300", f"## Gate: close\n{waiver_marker()}"),
         ]
         self.assertEqual(fold_hard_carve_out(journals).reason, CARVE_OUT_UNRESOLVED)
         self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT_UNRESOLVED)
 
+    def test_a_stated_carve_out_reason_refuses_even_with_everything_else_clean(self):
+        """Review j#93638 finding 1, the exact reproduction.
+
+        The record says a carve-out applies, in the governed field the preset defines for saying
+        exactly that. R2 read the ``work_unit`` proxy instead and admitted this with reason ``ok``.
+        """
+        journals = [
+            ("100", "## Gate: start\n- work_unit: `leaf_issue`"),
+            (
+                "200",
+                "## Gate: owner_close_approval\n- approval_source: direct_owner\n"
+                "- carve_out_check: production verification",
+            ),
+            ("300", f"## Gate: close\n{waiver_marker()}"),
+        ]
+        self.assertEqual(fold_hard_carve_out(journals).reason, CARVE_OUT_DECLARED)
+        self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
+
+    def test_an_unfilled_template_line_is_not_a_determination(self):
+        # ``none | <該当理由>`` copied verbatim is not the literal ``none``; a template nobody
+        # filled in has determined nothing, so it lands on the refusing side.
+        journals = no_change_journals()
+        journals[1] = ("200", "## Gate: owner_close_approval\n- carve_out_check: none | <該当理由>")
+        self.assertFalse(fold_hard_carve_out(journals).clear)
+        self.assertFalse(admit(journals).admissible)
+
+    def test_conflicting_determinations_resolve_to_unresolved(self):
+        journals = no_change_journals()
+        journals[1] = (
+            "200",
+            "## Gate: owner_close_approval\n- carve_out_check: none\n- carve_out_check: release",
+        )
+        self.assertEqual(fold_hard_carve_out(journals).reason, CARVE_OUT_UNRESOLVED)
+
+    def test_a_newer_approval_omitting_the_field_shadows_an_older_clean_one(self):
+        # Supersede-by-EXISTING, the invariant this context applies to every issue-wide authority.
+        journals = no_change_journals() + [
+            ("400", "## Gate: owner_close_approval\n- approval_source: direct_owner")
+        ]
+        self.assertEqual(fold_hard_carve_out(journals).reason, CARVE_OUT_UNRESOLVED)
+
+    def test_the_field_is_read_only_from_an_owner_close_approval_journal(self):
+        # Qualify, then read: a stray ``carve_out_check:`` line elsewhere is not the
+        # coordinator's determination.
+        journals = [
+            ("100", "## Gate: start\n- carve_out_check: none"),
+            ("300", f"## Gate: close\n{waiver_marker()}"),
+        ]
+        self.assertEqual(fold_hard_carve_out(journals).reason, CARVE_OUT_UNRESOLVED)
+
     def test_prose_naming_a_release_is_not_a_recognized_fact(self):
-        # Structured gate tokens only. A review discussing a release, or a callback quoting one,
-        # would trip a keyword scan while proving nothing — and a prose scan is not authority.
+        # Structured surfaces only. A review discussing a release, or a callback quoting one,
+        # would trip a keyword scan while proving nothing — a prose scan is not authority.
         journals = no_change_journals() + [
             ("400", "## Progress Log\n- release / publish / migration について議論した")
         ]
@@ -361,7 +498,7 @@ class SupersessionAndMutationTest(unittest.TestCase):
         # The negative control: supersession is about ORDER, not about existence. Without this the
         # test above would pass for a rule that simply refused any record mentioning a review.
         journals = [
-            ("100", f"## Gate: start\n{WORK_UNIT}"),
+            ("100", f"## Gate: start\n\n{CARVE_OUT_CLEARED}"),
             ("150", "## Gate: review request"),
             ("300", f"## Gate: close\n{waiver_marker()}"),
         ]

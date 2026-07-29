@@ -417,8 +417,23 @@ def measure_lane_change(
 
     # Identity FIRST: every fact below is a statement about THIS checkout, so if the checkout is
     # not on the branch the caller named, there is nothing here to say about that branch.
-    on_branch = _git("rev-parse", "--abbrev-ref", "HEAD")
-    if on_branch is None or str(on_branch).strip() != branch_s:
+    #
+    # Compared as a FULLY-QUALIFIED ref, not as an abbreviated name (review j#93638 finding 2).
+    # ``--abbrev-ref HEAD`` prints the literal ``HEAD`` on a detached checkout, and ``--branch``
+    # accepts any string — so a caller naming the branch ``HEAD`` made a detached checkout
+    # "match", and a detached tree measured as a clean zero-change lane (reproduced: a detached
+    # repo returned head=<full SHA>, commits_ahead=0, worktree_clean=True). R2's docstring claimed
+    # a detached HEAD "never matches a branch name"; that was only true if the caller could not
+    # say ``HEAD``, and it could.
+    #
+    # ``--symbolic-full-name HEAD`` yields ``refs/heads/<branch>`` when attached and the literal
+    # ``HEAD`` when detached, so requiring the ``refs/heads/`` form rejects detachment
+    # structurally rather than by blacklisting one spelling. The explicit ``HEAD`` guard stays as
+    # well: a caller passing ``--branch refs/heads/HEAD`` would otherwise be back where it started.
+    if branch_s == "HEAD":
+        return LaneChangeMeasurement()
+    symbolic = _git("rev-parse", "--symbolic-full-name", "HEAD")
+    if symbolic is None or str(symbolic).strip() != f"refs/heads/{branch_s}":
         return LaneChangeMeasurement()
 
     head = str(_git("rev-parse", "HEAD") or "").strip().lower()
