@@ -51,6 +51,7 @@ from pathlib import Path
 
 import yaml
 
+from mozyo_bridge.core.state.lane_lifecycle_model import is_redmine_id
 from mozyo_bridge.e_140_adapter_provider.f_110_ticket_adapter_common.domain.ticket_adapter import IssueRef
 from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_ticket_provider import (
     REDMINE_TICKET_PROVIDER,
@@ -120,15 +121,24 @@ def _latest_issue_payload(issue: IssueRef) -> dict:
     """Project a normalized :class:`IssueRef` onto the minimized cockpit payload.
 
     Backwards compatible with the pre-seam shape (Redmine #11686): the id is
-    emitted as an ``int`` when the provider id is purely numeric so the
-    existing ``latest_issue.id`` JSON contract (a number) is preserved, and as
-    ``None`` when the provider had no id. ``status`` / ``updated_on`` come
+    emitted as an ``int`` when the provider id is a real Redmine record id so
+    the existing ``latest_issue.id`` JSON contract (a number) is preserved, and
+    as ``None`` when the provider had no id. ``status`` / ``updated_on`` come
     straight from the record; no subject is ever included.
+
+    "A real Redmine record id" is :func:`...lane_lifecycle_model.is_redmine_id`, not
+    ``str.isdigit()``, which was the guard here. ``isdigit()`` does not mean "a number
+    ``int()`` can read": measured (Redmine #14753), a provider record whose ``id`` was
+    ``"²"`` raised a raw ``ValueError`` out of this projection and out of the whole
+    cockpit context fetch, which is otherwise total (an unreachable / malformed Redmine
+    read degrades to :data:`STATE_UNAVAILABLE`). A non-id now takes the pre-existing
+    non-numeric branch and is emitted verbatim as a string — the same fallback this
+    function already had, reached instead of an exception.
     """
     issue_id: object
     if issue.id == "":
         issue_id = None
-    elif issue.id.isdigit():
+    elif is_redmine_id(issue.id):
         issue_id = int(issue.id)
     else:
         issue_id = issue.id

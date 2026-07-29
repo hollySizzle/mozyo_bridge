@@ -97,10 +97,10 @@ def attach_argv(session: str, control_mode: bool) -> list[str]:
 def _parse_mozyo_window_rows(table: str) -> list[dict]:
     """Parse ``list-windows`` rows (``index<TAB>name<TAB>process``) into dicts.
 
-    Mirrors the human ``INDEX/NAME/PROCESS`` table emitted by bare ``mozyo`` so
-    the ``--json`` payload exposes the same window facts to external launchers.
-    ``index`` is an int when numeric (tmux window indices always are); a
-    missing/blank process becomes ``None`` rather than an empty string.
+    Mirrors the ``INDEX/NAME/PROCESS`` table from bare ``mozyo`` so ``--json`` exposes the
+    same window facts. ``index`` is an int only for an ASCII decimal within tmux's own
+    ``u_int`` width — anything else stays the raw string as before (``str.isdigit()`` let
+    ``²`` raise in ``int()``; #14753). A blank process becomes ``None``, not ``""``.
     """
     windows: list[dict] = []
     for line in table.splitlines():
@@ -112,7 +112,7 @@ def _parse_mozyo_window_rows(table: str) -> list[dict]:
         process = parts[2] if len(parts) > 2 else ""
         windows.append(
             {
-                "index": int(index) if index.isdigit() else index,
+                "index": int(index) if index.isascii() and index.isdigit() and len(index) <= 10 else index,
                 "name": name,
                 "process": process or None,
             }

@@ -436,6 +436,16 @@ _PROMPT_MARKERS = "›❯>"
 # palette index) reads as ``normal`` here — the fail-SAFE direction, since phase 1
 # only measures and phase 2 requires a STABLE positive separation before acting.
 
+#: The standard-foreground SGR codes, matched as LITERALS after zero-stripping rather than
+#: converted. ``_SGR_RE`` already fences the parameter alphabet to ASCII ``[0-9;]``, so the
+#: Unicode-digit half of Redmine #14753 cannot reach here — but the WIDTH half could: measured,
+#: an ``ESC[<4301 digits>m`` in a rendered pane made ``int(code)`` raise CPython's
+#: int-from-str-cap ``ValueError`` straight out of :func:`_parse_render_payload`, whose contract
+#: is to fail a render CLOSED (``ambiguous_render``), never to raise. Membership answers the same
+#: question — "is this one of 30..37?" — with no conversion to overflow, and keeps the existing
+#: tolerance for zero-padded parameters (``030`` is SGR 30) that a bare literal set would drop.
+_SGR_PLAIN_FOREGROUNDS = frozenset(str(code) for code in range(30, 38))
+
 
 def _apply_sgr(params: str, faint: bool, dim_fg: bool) -> tuple[bool, bool]:
     """Fold one SGR parameter list into the (faint, dim_fg) intensity state."""
@@ -453,7 +463,7 @@ def _apply_sgr(params: str, faint: bool, dim_fg: bool) -> tuple[bool, bool]:
             faint = False
         elif code == "90":
             dim_fg = True
-        elif code == "39" or (code.isdigit() and 30 <= int(code) <= 37):
+        elif code == "39" or code.lstrip("0") in _SGR_PLAIN_FOREGROUNDS:
             dim_fg = False
         elif code == "38":
             # Extended foreground (38;5;N or 38;2;R;G;B): a concrete fg colour, so

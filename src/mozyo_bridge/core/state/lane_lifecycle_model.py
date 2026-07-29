@@ -456,6 +456,34 @@ _ASCII_DIGITS = frozenset("0123456789")
 _MAX_ID_DIGITS = 18
 
 
+def _redmine_id_shape(value: str) -> bool:
+    """Whether ``value`` has the CHARACTERS and width of a Redmine record id (pure).
+
+    Half of the id test — the half that decides whether ``int(value)`` can even run.
+    Split out so ``core/state`` holds ONE answer to "what may a Redmine id be built
+    from" instead of one per caller: the raising :func:`_positive_decimal` and the
+    non-raising :func:`is_redmine_id` are the same question asked by callers with
+    different error contracts, and a second copy of ``_ASCII_DIGITS`` / ``_MAX_ID_DIGITS``
+    is exactly how ``isdigit()`` survived in a sibling module (Redmine #14753).
+    """
+    return bool(value) and len(value) <= _MAX_ID_DIGITS and _ASCII_DIGITS.issuperset(value)
+
+
+def is_redmine_id(value: str) -> bool:
+    """Whether ``value`` is a positive ASCII-decimal Redmine record id (pure, TOTAL).
+
+    The predicate form of :func:`_positive_decimal`, for callers that owe their own
+    caller a value rather than an exception — :func:`...coordinator_proxy_fence.journal_ordinal`
+    promises ``None`` on an unreadable journal, so it cannot reach a raising helper
+    and must not reach ``int()`` unguarded either (Redmine #14753).
+
+    Never raises and never calls ``int()``: leading zeros aside, digits-only and
+    width-bounded already make the string comparable, and a predicate that raises is
+    not a predicate.
+    """
+    return _redmine_id_shape(value) and bool(value.strip("0"))
+
+
 def _positive_decimal(value: str, *, field: str) -> str:
     """A Redmine id: a positive ASCII decimal. Anything else cannot address a record.
 
@@ -467,7 +495,7 @@ def _positive_decimal(value: str, *, field: str) -> str:
     :attr:`LaneLifecycleRecord.decision`, which promises ``None`` on an unreadable
     anchor and instead raised.
     """
-    if not value or len(value) > _MAX_ID_DIGITS or not _ASCII_DIGITS.issuperset(value):
+    if not _redmine_id_shape(value):
         raise DecisionPointerError(
             f"a redmine {field} must be a positive ASCII decimal id, got {value!r}"
         )

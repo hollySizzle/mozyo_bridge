@@ -81,6 +81,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_AUTHORITY_UNKNOWN,
     launch_authority_current,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+    is_journal_id,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_refresh_approval import (  # noqa: E501
     WorkerRefreshApprovalError,
     verify_worker_refresh_approval,
@@ -482,11 +485,18 @@ class LiveWorkerRefreshOps:
         observation carries is anchor-pinned by construction — the delivery record is matched
         on a marker built from the anchor, and the progress re-read is ordered against the
         anchor journal id.
+
+        "NUMERIC" is :func:`...marker_value_contract.is_journal_id`, not ``str.isdigit()``, which
+        was the test here. The two disagree exactly where this classification matters: ``"²"`` is
+        ``isdigit()`` and ``int()`` REFUSES it, so the ordered durable comparison this predicate
+        exists to justify could not run — the reader below caught the ``ValueError`` and reported
+        *unobservable* while this said the observation was anchor-bound (Redmine #14753). Same
+        answer from the same predicate on both sides, so a bound anchor is one that can be
+        compared.
         """
         if not _norm(self._anchor_issue()):
             return False
-        raw = _norm(request.resume_anchor_journal)
-        if not raw.isdigit():
+        if not is_journal_id(_norm(request.resume_anchor_journal)):
             return False
         return _norm(request.resume_gate) in RESUMABLE_GATES
 

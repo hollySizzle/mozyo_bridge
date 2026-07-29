@@ -335,6 +335,13 @@ def _service_target(agent: SupervisorAgent = RECONCILE_AGENT) -> str:
     return f"{_gui_domain()}/{agent.label}"
 
 
+#: The widest process id ``launchctl`` can print. DERIVED, not chosen: POSIX ``pid_t`` is a signed
+#: 32-bit integer on Darwin, so ten digits covers every value the kernel can assign. Deliberately
+#: NOT unified with the Redmine-id / lifecycle-revision widths this lane also bounds — a pid is
+#: the OS's counter and answers to a different authority (Redmine #14753).
+_MAX_PID_DIGITS = len(str(2**31 - 1))
+
+
 def _launchctl(runner: Runner, args: Sequence[str]) -> "subprocess.CompletedProcess[str]":
     return runner([_LAUNCHCTL, *args])
 
@@ -342,7 +349,15 @@ def _launchctl(runner: Runner, args: Sequence[str]) -> "subprocess.CompletedProc
 def _is_loaded(
     runner: Runner, agent: SupervisorAgent = RECONCILE_AGENT
 ) -> tuple[bool, Optional[int]]:
-    """Read-only ``launchctl print`` → (loaded, pid). Never raises for a missing launchctl."""
+    """Read-only ``launchctl print`` → (loaded, pid). Never raises for a missing launchctl.
+
+    The pid is read as an ASCII decimal inside POSIX ``pid_t`` width, NOT via ``str.isdigit()``,
+    which was the guard here and does not mean "a number ``int()`` can read": measured (Redmine
+    #14753), a ``pid = ²`` line in ``launchctl print`` output raised a raw ``ValueError`` out of
+    :func:`service_status`, breaking both this function's own "never raises" promise and the
+    typed status dict its callers consume. An unreadable pid now reads as ``None`` — the same
+    value this already returns when launchctl reports no pid at all.
+    """
     try:
         result = _launchctl(runner, ["print", _service_target(agent)])
     except FileNotFoundError:  # launchctl absent (non-darwin / minimal host)
@@ -354,7 +369,7 @@ def _is_loaded(
         stripped = line.strip()
         if stripped.startswith("pid = "):
             token = stripped.split("=", 1)[1].strip()
-            if token.isdigit():
+            if token.isascii() and token.isdigit() and len(token) <= _MAX_PID_DIGITS:
                 pid = int(token)
             break
     return True, pid

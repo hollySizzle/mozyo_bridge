@@ -40,6 +40,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from .marker_value_contract import is_canonical_positive_decimal
+
 # ---------------------------------------------------------------------------
 # The closed action vocabulary, and — inseparably — the durable decision each action must be
 # authorized by (review j#89878 finding 1).
@@ -385,9 +387,23 @@ class DecisionRecord:
 
 
 def _generation_ordinal(value: object) -> Optional[int]:
-    """The numeric lane generation, or ``None`` when absent / non-numeric (pure, fail-closed)."""
+    """The numeric lane generation, or ``None`` when absent / non-canonical (pure, fail-closed).
+
+    "Numeric" is :func:`.marker_value_contract.is_canonical_positive_decimal` — the feature's
+    single declared shape for ``lane_generation``, bounded by the lifecycle store's own
+    ``lane_generation INTEGER`` column — and NOT ``str.isdigit()``, which was the guard here.
+    ``isdigit()`` is not "a number ``int()`` can read": measured on this surface (Redmine
+    #14753), a decision carrying ``lane_generation="²"`` raised a raw ``ValueError`` out of
+    :func:`_lane_scoped_status`, a function whose whole job is to return a fixed refusal token.
+    ``None`` is that token's precondition — the decision reads as
+    :data:`ANCHOR_DECISION_INCOMPLETE` and authorizes nothing.
+
+    Refusing ``"0"`` / ``"01"`` is the same fail-closed direction, not a new rule: a lane
+    generation is a positive count, and a padded token is not the value the lifecycle row holds,
+    so neither can exact-match a live generation.
+    """
     token = str(value or "").strip()
-    return int(token) if token.isdigit() else None
+    return int(token) if is_canonical_positive_decimal(token) else None
 
 
 @dataclass(frozen=True)
