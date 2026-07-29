@@ -64,8 +64,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_WAIVER_ISSUE_MISMATCH,
     REASON_WAIVER_LANE_MISMATCH,
     REASON_WAIVER_SUPERSEDED,
+    REASON_WRITER_AUTHORITY_UNRESOLVED,
     REASON_WORKTREE_NOT_CLEAN,
     WAIVER_INVALID,
+    WRITER_AUTHORITY_RESOLVABLE,
     WAIVER_NONE,
     WAIVER_WAIVED,
     ZERO_CHANGE_COMMIT_DECLARED,
@@ -164,38 +166,63 @@ class WriterContractRulingTest(unittest.TestCase):
         self.assertEqual(GATE_NO_CHANGE_REVIEW_WAIVER, NO_CHANGE_REVIEW_WAIVER_GATE)
 
 
-class NoChangePositiveTest(unittest.TestCase):
-    """Acceptance: a valid waiver on a no-change lane admits, with no fabricated review."""
+class WriterAuthorityTypedRefusalTest(unittest.TestCase):
+    """Review j#93776 finding 1: the route admits NOTHING while its writer cannot be established.
 
-    def test_valid_waiver_admits_the_terminal_retire(self):
+    The issue's Acceptance sanctions this outcome in as many words — express the waiver as a
+    durable authority "or typed-refuse before Close". This record system cannot establish who
+    wrote a journal: every role posts under one account (ruling #14219 j#86718) and the issuer
+    resolution is a policy binding that takes no author input. A lane worker therefore knows every
+    value the envelope asks for, so the envelope is something it fills in, not something it must
+    forge — and R4's two-self-declaration conjunction was still one self-declaration by one
+    unauthenticated actor.
+    """
+
+    def test_a_wellformed_record_with_no_author_or_receipt_is_refused(self):
+        # The exact reproduction from the review: nothing in this record identifies its writer.
         result = admit(no_change_journals())
-        self.assertTrue(result.admissible, result.reason)
-        self.assertEqual(result.reason, "ok")
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, REASON_WRITER_AUTHORITY_UNRESOLVED)
 
-    def test_glance_projects_retire_ready_without_a_review_conclusion(self):
+    def test_the_glance_refuses_on_the_same_gate_so_the_two_agree(self):
+        # One authority, two consumers. A glance that still said "no review owed" while the retire
+        # refused would re-open the #14539 j#90137 F3 disagreement.
         facts = fold_issue_gate_facts(no_change_journals())
-        self.assertTrue(facts.review_waived)
+        self.assertFalse(facts.review_waived)
         signal = lane_signal_from_gate_facts(ISSUE, facts, issue_open=False)
-        self.assertEqual(classify_lane_state(signal), LANE_STATE_RETIRE_READY)
-        # The preset forbids expressing a waiver AS a review approval. Reaching the post-review
-        # projection by the waiver route is the point; forging the conclusion is not.
         self.assertNotEqual(facts.review_conclusion, "approved")
 
-    def test_a_waiver_before_close_reaches_owner_waiting_not_review_waiting(self):
+    def test_a_waiver_before_close_does_not_reach_owner_waiting(self):
         journals = [
             ("100", "## Gate: start"),
             ("300", f"## Gate: implementation done\n{waiver_marker()}"),
         ]
         facts = fold_issue_gate_facts(journals)
         signal = lane_signal_from_gate_facts(ISSUE, facts, issue_open=True)
-        self.assertEqual(classify_lane_state(signal), LANE_STATE_OWNER_WAITING)
+        self.assertEqual(classify_lane_state(signal), LANE_STATE_REVIEW_WAITING)
 
-    def test_the_same_record_without_a_waiver_still_owes_the_review(self):
-        # The negative control for the case above: the waiver is doing the work, not the shape.
+    def test_the_same_record_without_a_waiver_is_identical(self):
+        # The control that makes the case above meaningful: with the route inert, a waiver changes
+        # nothing at all, which is exactly what "admits nothing" must mean.
         journals = [("100", "## Gate: start"), ("300", "## Gate: implementation done")]
         facts = fold_issue_gate_facts(journals)
         signal = lane_signal_from_gate_facts(ISSUE, facts, issue_open=True)
         self.assertEqual(classify_lane_state(signal), LANE_STATE_REVIEW_WAITING)
+
+    def test_the_gate_is_a_single_flag_the_folds_do_not_depend_on(self):
+        """Everything below the authority gate stays live, so a future ruling flips one thing.
+
+        The folds are still exercised by the rest of this suite; this pins that the refusal is the
+        LAST conjunct, so a malformed / change-bearing record is still diagnosed by its own true
+        cause rather than being swallowed by the authority refusal.
+        """
+        self.assertFalse(WRITER_AUTHORITY_RESOLVABLE)
+        change_bearing = [
+            ("100", "## Gate: start"),
+            ("250", "## Gate: implementation done\n- commit_hash: `deadbeef1234567`"),
+            ("300", f"## Gate: close\n{waiver_marker()}"),
+        ]
+        self.assertEqual(admit(change_bearing).reason, REASON_CHANGE_DECLARED)
 
 
 class SourceChangeCarveOutTest(unittest.TestCase):
@@ -525,12 +552,14 @@ class HardCarveOutTest(unittest.TestCase):
             ("400", "## Progress Log\n- release / publish / migration について議論した")
         ]
         self.assertTrue(fold_hard_carve_out(journals).clear)
-        self.assertTrue(admit(journals).admissible)
+        # Reaching the writer-authority refusal is how this suite says "every other conjunct
+        # passed" while the route itself admits nothing (review j#93776 finding 1).
+        self.assertEqual(admit(journals).reason, REASON_WRITER_AUTHORITY_UNRESOLVED)
 
     def test_a_quoted_carve_out_heading_is_not_a_declaration(self):
         journals = no_change_journals() + [("400", "```\n## Gate: release\n```")]
         self.assertTrue(fold_hard_carve_out(journals).clear)
-        self.assertTrue(admit(journals).admissible)
+        self.assertEqual(admit(journals).reason, REASON_WRITER_AUTHORITY_UNRESOLVED)
 
 
 class SupersessionAndMutationTest(unittest.TestCase):
@@ -550,8 +579,10 @@ class SupersessionAndMutationTest(unittest.TestCase):
             ("150", "## Gate: review request"),
             ("300", f"## Gate: close\n{waiver_marker()}"),
         ]
-        self.assertTrue(fold_issue_gate_facts(journals).review_waived)
-        self.assertTrue(admit(journals).admissible)
+        # The axis under test is ORDER, so assert the supersession fact itself; the admission
+        # then stops at the writer-authority gate rather than at supersession.
+        self.assertTrue(fold_issue_gate_facts(journals).review_waiver_unsuperseded)
+        self.assertEqual(admit(journals).reason, REASON_WRITER_AUTHORITY_UNRESOLVED)
 
     def test_a_moved_head_is_post_waiver_mutation(self):
         self.assertEqual(

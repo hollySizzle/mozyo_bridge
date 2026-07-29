@@ -92,6 +92,28 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AdmissionResult,
 )
 
+#: **THE gate: can this record system establish who WROTE a waiver?** It cannot, and until a
+#: ruling supplies a mechanism that can, this route admits nothing (Redmine #14695 review j#93776
+#: finding 1; the issue's own Acceptance sanctions this outcome — "未対応なら Close 前に typed
+#: refusal する").
+#:
+#: Every role in this workspace posts under one source-system account (ruling #14219 j#86718), and
+#: :func:`...hibernate_issuer_policy.resolve_journal_issuer` says in its own docstring that it is a
+#: POLICY binding, not authentication — it takes no author parameter at all. So a lane worker can
+#: write its own waiver: it knows its own ``workspace`` / ``lane`` / ``lane_generation`` / ``head``,
+#: which makes the envelope a value it fills in rather than a signature it must forge.
+#:
+#: R4 tried to close this by requiring two declarations to agree (the marker's ``carve_out`` and
+#: the governed ``carve_out_check``). Measured: a record carrying neither an author nor a receipt
+#: still admitted with ``ok``. **Conjoining two self-declarations by the same unauthenticated actor
+#: is one self-declaration.** Adding a third would be no different.
+#:
+#: This is deliberately ONE flag rather than a condition spread through the consumers: when a
+#: writer/receipt authority bound to an actual coordinator action is ruled on, flipping this — and
+#: wiring that authority in — is the whole change. Every fold below stays live and tested meanwhile,
+#: so what lands then is an authority check, not a re-implementation.
+WRITER_AUTHORITY_RESOLVABLE = False
+
 #: The gate token this authority is declared under. Named per surface, like every other approval
 #: gate in this context (``worker_refresh_owner_approval`` / ``composer_discard_approval``): a
 #: waiver for one kind of work can never be read as a waiver for another.
@@ -405,6 +427,12 @@ def waived_now(
     direction only, because the retire adds the live conjuncts ON TOP of this one — the retire is
     strictly stricter than the glance, never looser.
     """
+    # The SAME gate the retire admission ends on, so the glance cannot say "no review owed" about a
+    # record the retire refuses (the one-authority-two-consumers rule this module has held since
+    # R1). Leaving the glance projecting while the retire refuses would re-open exactly the
+    # disagreement #14539 j#90137 F3 fixed.
+    if not WRITER_AUTHORITY_RESOLVABLE:
+        return False
     return waiver_unsuperseded(waiver, round_journal_ids) and zero_change.proven
 
 
@@ -561,6 +589,10 @@ REASON_LANE_COMMITS_PRESENT = "lane_carries_commits_over_the_integration_branch"
 REASON_WORKTREE_NOT_CLEAN = "lane_worktree_not_proven_clean"
 #: A coordinator callback is still owed, so the lane's own workflow has not converged.
 REASON_CALLBACK_OWED = "coordinator_callback_still_owed"
+#: Everything the record CAN establish checks out, but who wrote the waiver cannot be established
+#: at all (:data:`WRITER_AUTHORITY_RESOLVABLE`). This is the typed refusal the issue's Acceptance
+#: names, not a gap in the record: no input to this module can satisfy it today.
+REASON_WRITER_AUTHORITY_UNRESOLVED = "waiver_writer_authority_unresolvable"
 #: A recognized durable fact names a hard carve-out surface (release / production verification /
 #: credential / destructive / migration / external effect). Direct owner provenance does not
 #: override this (#14695 j#93412 §3).
@@ -586,6 +618,7 @@ NO_CHANGE_WAIVER_REFUSAL_REASONS: frozenset[str] = frozenset(
         REASON_CALLBACK_OWED,
         REASON_HARD_CARVE_OUT,
         REASON_HARD_CARVE_OUT_UNRESOLVED,
+        REASON_WRITER_AUTHORITY_UNRESOLVED,
     }
 )
 
@@ -731,6 +764,13 @@ def evaluate_no_change_waiver_admissible(
     if live_commits_ahead != 0:
         return AdmissionResult(False, REASON_LANE_COMMITS_PRESENT)
 
+    # LAST, on purpose. Everything above still reports its own true cause, so a malformed or
+    # change-bearing record is diagnosed precisely rather than being swallowed by this refusal.
+    # What reaches here is a record in which every establishable fact holds — and the one fact
+    # this system cannot establish is who wrote it (:data:`WRITER_AUTHORITY_RESOLVABLE`).
+    if not WRITER_AUTHORITY_RESOLVABLE:
+        return AdmissionResult(False, REASON_WRITER_AUTHORITY_UNRESOLVED)
+
     return AdmissionResult(True, REASON_OK)
 
 
@@ -818,8 +858,10 @@ __all__ = (
     "REASON_WAIVER_ISSUE_MISMATCH",
     "REASON_WAIVER_LANE_MISMATCH",
     "REASON_WAIVER_SUPERSEDED",
+    "REASON_WRITER_AUTHORITY_UNRESOLVED",
     "REASON_WORKTREE_NOT_CLEAN",
     "WAIVER_APPROVAL_SOURCE",
+    "WRITER_AUTHORITY_RESOLVABLE",
     "WAIVER_CARVE_OUT_NONE",
     "WAIVER_DECISION",
     "WAIVER_FIELD_ORDER",

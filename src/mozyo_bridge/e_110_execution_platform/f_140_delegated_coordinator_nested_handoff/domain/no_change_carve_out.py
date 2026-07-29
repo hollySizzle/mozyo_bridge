@@ -307,14 +307,24 @@ def _fold_carve_out_check(
     stray ``carve_out_check:`` line in an unrelated note never becomes the determination — the
     same qualify-then-read order :mod:`.review_exemption` uses for its gate fields.
 
-    **A stated carve-out is NOT clearable by appending a note** (review j#93704 finding 1). Any
-    non-``none`` value anywhere in the record refuses, permanently. Plain latest-wins let the
-    reviewer append ``carve_out_check: none`` after an existing ``carve_out_check: release`` and
-    get ``clear=True`` — and because this record system cannot authenticate the writer (every role
-    posts under one source-system account, ruling #14219 j#86718), "the coordinator corrected it"
-    and "someone appended a clear" are indistinguishable here. When the two cannot be told apart,
-    the fence must take the one that refuses. A genuine re-determination is expressed by a NEW
-    lane generation, which invalidates the waiver's envelope anyway.
+    **A stated carve-out is NOT clearable, at all, within this issue's record** (review j#93704
+    finding 1). Any non-``none`` value anywhere in the history refuses, permanently. Plain
+    latest-wins let a ``carve_out_check: none`` appended after an existing
+    ``carve_out_check: release`` produce ``clear=True`` — and because this record system cannot
+    authenticate the writer (every role posts under one source-system account, ruling #14219
+    j#86718), "the coordinator corrected it" and "someone appended a clear" are indistinguishable.
+    When the two cannot be told apart, the fence must take the one that refuses.
+
+    **There is no correction path, and this docstring previously claimed there was** (review
+    j#93776 finding 2). It said a genuine re-determination could be expressed by a new lane
+    generation. That is false: this fold reads the issue's whole history and knows nothing about
+    generations, so an old journal's reason stays in the same snapshot and refuses before any
+    generation-aware logic could run. Stating a reason once disqualifies the waiver for that issue
+    for as long as the history exists.
+
+    Making re-determination possible would mean giving the determination its own generation
+    authority — a different contract than this one, and unimplemented. It is named here as an
+    open design question rather than described as if it already worked.
 
     **Presence still follows latest-wins, supersede-by-EXISTING** — the invariant this bounded
     context applies to every issue-wide authority fact (#13490 j#85365 F1). A newer
