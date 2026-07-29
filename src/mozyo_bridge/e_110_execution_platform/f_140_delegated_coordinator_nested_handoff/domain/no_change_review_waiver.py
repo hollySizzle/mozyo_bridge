@@ -381,8 +381,13 @@ def fold_no_change_review_waiver(
     return latest[1] if latest is not None else NoChangeWaiverFacts()
 
 
-def review_round_supersedes(journal: object, round_journal_ids: Sequence[int]) -> bool:
-    """Whether a review round is recorded AT OR AFTER ``journal`` (pure).
+def review_round_supersedes(
+    journal: object,
+    round_journal_ids: Sequence[int],
+    *,
+    same_journal_supersedes: bool = False,
+) -> bool:
+    """Whether a review round is recorded after ``journal`` — ties per the caller (pure).
 
     The supersession half BOTH no-review-owed authorities share — the ``codex_direct_edit``
     exemption (#14539) and this waiver (#14695). One definition rather than two, because two
@@ -397,25 +402,39 @@ def review_round_supersedes(journal: object, round_journal_ids: Sequence[int]) -
     one — the max-precedence reduction hid exactly that, #14539 review j#91577 F1), and this
     decides only the ordering.
 
-    The comparison is AT-OR-AFTER, not strictly after (Redmine #14695 review j#94240). A round
-    recorded in the SAME journal as the authority ties on id, and a strict ``>`` read that tie as
-    "the authority is newer" — so a single journal carrying a valid ``codex_direct_edit`` AND a
-    ``## Gate: Review Request`` kept ``review_exempt=True`` beside an unanswered request, and the
-    lane advanced to ``owner_waiting``. Reproduced on the real fold. An authority cannot supersede
-    a round recorded in the same breath as itself: nothing orders them, so the fail-closed reading
-    is that the round stands and a review is owed.
+    A round strictly newer than ``journal`` always supersedes. What a TIE means — a round recorded
+    in the SAME journal as the authority — differs by caller, so it is an explicit argument rather
+    than a second copy of the comparison. The ordering arithmetic stays in one place; only the
+    tie policy is named at the call site.
 
-    Strictly OLDER rounds are deliberately untouched. #14539's literal defect was a superseded
-    past Review Request re-projecting as review owed, and it ruled that an exemption recorded
-    after such a request supersedes it; widening this to "any open round wins" reverses that
-    ruling, which is not this issue's to make (measured: it fails
+    ``same_journal_supersedes=True`` (the ``codex_direct_edit`` exemption, #14695 review j#94240):
+    the question there is whether the record CONTRADICTS itself. One journal carrying a valid
+    exemption AND a ``## Gate: Review Request`` claims "no review owed" and "review requested" in
+    the same breath; nothing orders the two, so the fail-closed reading is that the round stands.
+    Reproduced on the real fold — the strict read kept ``review_exempt=True`` beside an unanswered
+    request and advanced the lane to ``owner_waiting``.
+
+    ``same_journal_supersedes=False`` (the default, and both waiver consumers): those ask a pure
+    ordering question — which DECLARATION is the current one — not whether a record contradicts
+    itself. Review j#94260 measured what conflating them costs: applying the tie rule to
+    :func:`waiver_declaration_current` let an approved Review in the waiver's own journal mark the
+    declaration non-current, turning a ``blocked`` terminal into ``retire_ready``. That is a
+    terminal UNBLOCK, not a fail-closed correction, and no ruling or cataloged spec supports it
+    while writer authority is still unresolved — so the waiver keeps strictly-newer until one does.
+
+    Strictly OLDER rounds never supersede, for either caller. #14539's literal defect was a
+    superseded past Review Request re-projecting as review owed, and it ruled that an exemption
+    recorded after such a request supersedes it; widening this to "any open round wins" reverses
+    that ruling, which is not this issue's to make (measured: it fails
     ``test_exemption_supersedes_an_earlier_review_request``).
     """
     anchor = _int_journal(journal)
     if anchor is None:
         return True
     rounds = [r for r in (round_journal_ids or ()) if isinstance(r, int)]
-    return bool(rounds) and max(rounds) >= anchor
+    if not rounds:
+        return False
+    return max(rounds) >= anchor if same_journal_supersedes else max(rounds) > anchor
 
 
 def waiver_unsuperseded(

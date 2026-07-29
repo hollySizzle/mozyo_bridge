@@ -1476,18 +1476,140 @@ class CombinedReviewRoundTest(unittest.TestCase):
             "the exemption fixture is not valid, so every assertion resting on it is vacuous",
         )
 
-    def test_the_supersession_predicate_treats_a_tie_as_superseding(self):
-        """The ordering rule itself, at the boundary, independent of any fold fixture."""
+    def test_the_supersession_predicate_ties_only_when_the_caller_asks(self):
+        """The ordering rule itself, at the boundary, independent of any fold fixture.
+
+        The tie is a CALLER policy (review j#94260). Strictly newer always supersedes and strictly
+        older never does, for both callers; only the tie differs, and it is named at the call site
+        rather than duplicated as a second comparison.
+        """
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_review_waiver import (  # noqa: E501
             review_round_supersedes,
         )
 
-        self.assertTrue(review_round_supersedes(300, [301]), "a later round must supersede")
-        self.assertTrue(review_round_supersedes(300, [300]), "a same-journal round must supersede")
+        for tie in (False, True):
+            with self.subTest(same_journal_supersedes=tie):
+                self.assertTrue(review_round_supersedes(300, [301], same_journal_supersedes=tie))
+                self.assertFalse(review_round_supersedes(300, [299], same_journal_supersedes=tie))
+                self.assertFalse(review_round_supersedes(300, [], same_journal_supersedes=tie))
+        self.assertTrue(review_round_supersedes(300, [300], same_journal_supersedes=True))
+        self.assertFalse(review_round_supersedes(300, [300]))
         self.assertFalse(
-            review_round_supersedes(300, [299]), "a strictly earlier round must NOT supersede"
+            review_round_supersedes(300, [300], same_journal_supersedes=False),
+            "the waiver default must not treat a same-journal round as superseding",
         )
-        self.assertFalse(review_round_supersedes(300, []), "no round supersedes nothing")
+
+
+class WaiverSameJournalTieTest(unittest.TestCase):
+    """Review j#94260: the shared predicate's tie must not UNBLOCK the waiver terminal.
+
+    R12 changed ``review_round_supersedes`` to at-or-after for the exemption's sake, but the
+    predicate is shared, and both waiver consumers use it — including
+    ``waiver_declaration_current``, which decides whether a declaration is still the current one.
+    An approved Review recorded in the waiver's OWN journal therefore marked the declaration
+    non-current, and the lane went from ``blocked`` to ``retire_ready``.
+
+    That is a terminal UNBLOCK, the most dangerous direction and the opposite of what I claimed
+    when I made the change ("fail-closed"). My differential sweep did not catch it because its
+    population contained only exemption records — 2352 folds, none of them a waiver, is zero folds
+    of evidence about the waiver. The tie is now a caller policy, and the waiver keeps the strict
+    comparison until a ruling says otherwise.
+    """
+
+    def _state(self, journals, *, issue_open=False):
+        facts = fold_issue_gate_facts(journals)
+        return facts, classify_lane_state(
+            lane_signal_from_gate_facts(ISSUE, facts, issue_open=issue_open)
+        )
+
+    def _declaration(self):
+        return f"{CARVE_OUT_CLEARED}\n{waiver_marker()}"
+
+    def test_a_review_in_the_waivers_own_journal_does_not_unblock_the_terminal(self):
+        """The finding, on both sides of the Close, through the canonical marker producer."""
+        for conclusion in ("承認", "要修正"):
+            for closed in (False, True):
+                with self.subTest(conclusion=conclusion, closed=closed):
+                    same = f"{self._declaration()}\n\n## Gate: review\n- 結論: {conclusion}\n"
+                    journals = [("100", "## Gate: start"), ("300", same)]
+                    if closed:
+                        journals.append(("500", "## Gate: close"))
+                    facts, state = self._state(journals)
+                    self.assertTrue(
+                        facts.review_waiver_unsuperseded,
+                        "a review in the waiver's own journal superseded the declaration",
+                    )
+                    self.assertTrue(facts.review_waiver_unsupported)
+                    self.assertNotEqual(
+                        state, LANE_STATE_RETIRE_READY,
+                        "the waiver terminal was unblocked by a same-journal review",
+                    )
+
+    def test_a_strictly_newer_review_still_returns_the_lane_to_the_ordinary_route(self):
+        """The negative control: real supersession must keep working.
+
+        Without this, the test above would also pass for a change that simply stopped every
+        review from superseding a waiver — which would strand every waived lane on ``blocked``.
+        """
+        journals = [
+            ("100", "## Gate: start"),
+            ("300", self._declaration()),
+            ("400", "## Gate: review\n- 結論: 承認"),
+            ("500", "## Gate: close"),
+        ]
+        facts, state = self._state(journals)
+        self.assertFalse(facts.review_waiver_unsuperseded)
+        self.assertEqual(state, LANE_STATE_RETIRE_READY)
+
+    def test_a_strictly_older_review_does_not_supersede_the_waiver(self):
+        journals = [
+            ("100", "## Gate: start"),
+            ("200", "## Gate: review\n- 結論: 承認"),
+            ("300", self._declaration()),
+            ("500", "## Gate: close"),
+        ]
+        facts, state = self._state(journals)
+        self.assertTrue(facts.review_waiver_unsuperseded)
+        self.assertEqual(state, LANE_STATE_BLOCKED)
+
+    def test_the_two_consumers_disagree_about_the_tie_on_purpose(self):
+        """The asymmetry itself, asserted through BOTH consumers on the same shape.
+
+        This is the guard my sweep should have been: the exemption and the waiver are exercised
+        together, so a future edit that unifies the tie cannot pass by satisfying only one of
+        them. Unifying is a legitimate decision — it just has to be a deliberate one, made with a
+        ruling and a cataloged spec, not inherited from a shared helper.
+        """
+        head = "4f2b9c1a3d5e6f708192a3b4c5d6e7f809a1b2c3"
+        scope = (
+            "- changed_paths:\n  - `vibes/docs/rules/agent-workflow.md`\n"
+            "  - `vibes/docs/logics/coordinator-sublane-development-flow.md`\n"
+        )
+        exemption = (
+            "## Gate: codex_direct_edit\n- role: 実装者\n- direct_edit: true\n"
+            "- allowed_paths: vibes/docs/rules/**, vibes/docs/logics/**\n"
+            "- reason: r\n- follow_up_review: false\n"
+        )
+        impl = f"## Gate: Implementation Done\n- commit: {head}\n{scope}"
+        request = f"## Gate: Review Request\n- commit: {head}\n{scope}"
+
+        # Exemption: a round in its own journal DOES supersede -> the review fence holds.
+        exempt_facts, exempt_state = self._state(
+            [("100", "## Gate: start"), ("300", f"{exemption}\n{impl}\n{request}")]
+        )
+        self.assertFalse(exempt_facts.review_exempt)
+        self.assertEqual(exempt_state, LANE_STATE_REVIEW_WAITING)
+
+        # Waiver: a review in its own journal does NOT supersede -> the terminal stays refused.
+        waiver_facts, waiver_state = self._state(
+            [
+                ("100", "## Gate: start"),
+                ("300", f"{self._declaration()}\n\n## Gate: review\n- 結論: 承認\n"),
+                ("500", "## Gate: close"),
+            ]
+        )
+        self.assertTrue(waiver_facts.review_waiver_unsuperseded)
+        self.assertEqual(waiver_state, LANE_STATE_BLOCKED)
 
     def test_a_well_formed_round_still_reaches_its_own_state(self):
         """The negative control: the validation must not block what it should replay.

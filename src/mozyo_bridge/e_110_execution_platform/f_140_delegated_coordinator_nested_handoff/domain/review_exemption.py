@@ -71,12 +71,18 @@ def _review_round_supersedes(journal: object, round_ids: Sequence[int]) -> bool:
     Imported inside the call rather than at module scope because
     :mod:`.no_change_review_waiver`, which owns that predicate, imports THIS module. A top-level
     import would be a cycle; the predicate still has exactly one definition.
+
+    A round in the exemption's OWN journal supersedes it (#14695 review j#94240). The exemption
+    asks whether the record contradicts itself — one journal declaring both "no review owed" and
+    "review requested" cannot be ordered, so the round stands. The waiver consumers deliberately
+    keep the default strict comparison, because theirs is a pure "which declaration is current"
+    ordering question and applying the tie rule there UNBLOCKED a terminal (j#94260).
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_review_waiver import (  # noqa: E501
         review_round_supersedes,
     )
 
-    return review_round_supersedes(journal, round_ids)
+    return review_round_supersedes(journal, round_ids, same_journal_supersedes=True)
 
 
 #: The marker gate that declares a journal to BE a ``codex_direct_edit`` gate. Read through the
