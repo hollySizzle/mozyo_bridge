@@ -30,6 +30,7 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     classify_config_sources,
     ACTION_CONFIG_MIGRATE,
     CONFIG_LEAF_KEYS,
+    PLACEMENT_LEAF_KEYS,
     SOURCE_COMPATIBILITY,
 )
 
@@ -72,7 +73,9 @@ class ClassifyConfigSourcesPureTest(unittest.TestCase):
         )
         self.assertEqual(
             {s.key for s in statuses},
-            set(CONFIG_BLOCK_KEYS) | {dotted for dotted, _ in CONFIG_LEAF_KEYS},
+            set(CONFIG_BLOCK_KEYS)
+            | {dotted for dotted, _ in CONFIG_LEAF_KEYS}
+            | set(PLACEMENT_LEAF_KEYS),
         )
         self.assertTrue(all(s.source == SOURCE_DEFAULT for s in statuses))
         self.assertTrue(all(s.note == "" for s in statuses if s.key != "lane_placement"))
@@ -124,6 +127,82 @@ class ClassifyConfigSourcesPureTest(unittest.TestCase):
         by_key = {s.key: s for s in statuses}
         self.assertIn("#13647", by_key["lane_placement"].note)
 
+    def test_undeclared_placement_reports_the_product_default_geometry(self) -> None:
+        # Redmine #14568 close condition: with no config at all, the operator can READ
+        # what a fresh launch will do — `down` on both lane classes, sourced `default`.
+        config = RepoLocalConfig.default()
+        statuses = classify_config_sources(
+            raw_record=None, config=config, schema_version=2, legacy_migratable=False
+        )
+        by_key = {s.key: s for s in statuses}
+        for lane_class in ("default", "sublane"):
+            row = by_key[f"lane_placement.{lane_class}.split"]
+            self.assertEqual(row.effective_value, "down")
+            self.assertEqual(row.source, SOURCE_DEFAULT)
+        # The order rows show WHY the coordinator pair is deterministic and why the
+        # sublane deliberately has no product-default order (it respects the binding).
+        self.assertEqual(
+            by_key["lane_placement.default.order"].effective_value, ("codex", "claude")
+        )
+        self.assertIsNone(by_key["lane_placement.sublane.order"].effective_value)
+
+    def test_declared_placement_rollback_reports_declared(self) -> None:
+        # The rollback is visible as such: `right (declared)`, not `right (default)` —
+        # and declaring one class never flips the other class's row to `declared`.
+        config = RepoLocalConfig.from_record(
+            {"version": 2, "lane_placement": {"sublane": {"split": "right"}}}
+        )
+        statuses = classify_config_sources(
+            raw_record={"lane_placement": {"sublane": {"split": "right"}}},
+            config=config,
+            schema_version=2,
+            legacy_migratable=False,
+        )
+        by_key = {s.key: s for s in statuses}
+        self.assertEqual(by_key["lane_placement.sublane.split"].effective_value, "right")
+        self.assertEqual(by_key["lane_placement.sublane.split"].source, SOURCE_DECLARED)
+        self.assertEqual(by_key["lane_placement.default.split"].effective_value, "down")
+        self.assertEqual(by_key["lane_placement.default.split"].source, SOURCE_DEFAULT)
+        # A declared block with an UNdeclared sibling field: the leaf row must not
+        # inherit the block's `declared` (that is the whole point of leaf rows).
+        self.assertEqual(by_key["lane_placement.sublane.order"].source, SOURCE_DEFAULT)
+
+    def test_placement_status_reads_the_same_resolver_the_launch_reads(self) -> None:
+        # Guards the drift this surface exists to prevent: `config status` must not
+        # re-implement the precedence. Compare the reported value against the launch
+        # chokepoint's own resolution for the same config.
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
+            resolve_placement_policy_for_role,
+        )
+
+        record = {"version": 2, "lane_placement": {"default": {"split": "right"}}}
+        config = RepoLocalConfig.from_record(record)
+        by_key = {
+            s.key: s
+            for s in classify_config_sources(
+                raw_record=record,
+                config=config,
+                schema_version=2,
+                legacy_migratable=False,
+            )
+        }
+        for lane_class in ("default", "sublane"):
+            split, order, ratio = resolve_placement_policy_for_role(
+                config.lane_placement, lane_class, None
+            )
+            self.assertEqual(
+                by_key[f"lane_placement.{lane_class}.split"].effective_value, split
+            )
+            self.assertEqual(
+                by_key[f"lane_placement.{lane_class}.order"].effective_value, order
+            )
+            # Redmine #14569: the ratio leaf is held to the SAME rule — it is the field an
+            # operator cannot read off a running pair without measuring it, so a status row
+            # that drifted from the launch resolution would be worse than no row at all.
+            self.assertEqual(
+                by_key[f"lane_placement.{lane_class}.ratio"].effective_value, ratio
+            )
+
     def test_effective_value_is_json_safe_frozenset_becomes_sorted_list(self) -> None:
         from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_registry import (  # noqa: E501
             CliCompositionConfig,
@@ -170,12 +249,43 @@ class ConfigStatusSettingsSurfaceTest(unittest.TestCase):
             settings = _settings_by_key(out)
             self.assertTrue(all(s["source"] == SOURCE_DEFAULT for s in settings.values()))
 
+    def test_missing_config_reports_the_vertical_default_through_the_cli(self) -> None:
+        # Close condition, at the surface an operator actually runs: a repo with no
+        # `.mozyo-bridge/config.yaml` reports `down` / `default` for both lane classes.
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings_by_key(_status_json(Path(tmp)))
+            for lane_class in ("default", "sublane"):
+                row = settings[f"lane_placement.{lane_class}.split"]
+                self.assertEqual(row["effective_value"], "down")
+                self.assertEqual(row["source"], SOURCE_DEFAULT)
+            # `_json_safe` must have coerced the order tuple into a JSON list.
+            self.assertEqual(
+                settings["lane_placement.default.order"]["effective_value"],
+                ["codex", "claude"],
+            )
+
+    def test_declared_rollback_reports_declared_through_the_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _write(tmp, "version: 2\nlane_placement:\n  default:\n    split: right\n")
+            settings = _settings_by_key(_status_json(Path(tmp)))
+            self.assertEqual(
+                settings["lane_placement.default.split"]["effective_value"], "right"
+            )
+            self.assertEqual(
+                settings["lane_placement.default.split"]["source"], SOURCE_DECLARED
+            )
+            self.assertEqual(
+                settings["lane_placement.sublane.split"]["effective_value"], "down"
+            )
+
     def test_settings_key_set_matches_closed_vocabulary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = _status_json(Path(tmp))
             self.assertEqual(
                 {s["key"] for s in out["settings"]},
-                set(CONFIG_BLOCK_KEYS) | {dotted for dotted, _ in CONFIG_LEAF_KEYS},
+                set(CONFIG_BLOCK_KEYS)
+            | {dotted for dotted, _ in CONFIG_LEAF_KEYS}
+            | set(PLACEMENT_LEAF_KEYS),
             )
 
     def test_text_output_renders_source_per_key(self) -> None:

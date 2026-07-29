@@ -58,8 +58,28 @@ schema（version 1）:
 }
 ```
 
-canonical role 語彙は `grandparent_coordinator | project_gateway`（closed）。旧 `root_coordinator`
-は **compat 入力 alias** として `grandparent_coordinator` へ正規化するが、新規正本語彙へは書かない。
+canonical role 語彙は `grandparent_coordinator | project_gateway | coordinator`（closed）。旧
+`root_coordinator` は **compat 入力 alias** として `grandparent_coordinator` へ正規化するが、
+新規正本語彙へは書かない。
+
+`coordinator` は **single-workspace default coordinator**（Redmine #14546）である。bare `mozyo`
+default pair は department root でも独立した project-gateway lane でもないため、#14546 以前は
+**どの declaration を書いても** default lane に一致する binding が存在せず、`workflow step` は
+設定内容と無関係に `ambiguous_default_coordinator_role` へ落ちた（authority が未設定なのではなく
+**表現不能**だった。Redmine #14500 observed facts）。token は新造語ではなく既存 runtime role
+`...f_140_delegated_coordinator_nested_handoff/domain/workflow_runtime.py` の `ROLE_COORDINATOR`
+であり、`provider_binding` が既に provider を bind している同一 role である。
+
+`coordinator` の制約:
+
+- lane は `default`（§3）。よって `grandparent_coordinator` と **同一 slot** を占める。両方を宣言した
+  declaration は parse 時 slot-collision で `herdr_role_binding_invalid`（typed blocked）になる。
+  一つの default lane は一つの coordinator authority しか持たない、を構造で保証する。
+- `project_scope` は **必須**（非空）。scope は coordinator の一段 forward payload が運び、forward
+  fence の route key を分割するため、空 scope は異なる workspace の generation を一つの縮退 key へ
+  畳んでしまう。grandparent（scope 無し）とはこの点で非対称である。
+- provider は宣言しない。§4 のとおり `provider_binding` の `coordinator` role から別解決する
+  （既定 codex・reboundable）。したがって default coordinator authority は **provider 非依存**である。
 
 schema は **closed** かつ **exactly typed** で fail-closed に検証する: top-level key は
 `{schema, version, bindings}` のみ、`schema` は exact literal string（whitespace padding / 非 string を
@@ -98,7 +118,8 @@ scope / source_pointer は key present なら string（explicit `null` は空 sc
 
 expected provider は既存 `provider_binding`（`role_provider_binding` / `.mozyo-bridge/config.yaml`）
 から別途解決する。`grandparent_coordinator` は provider_binding の compat role `root_coordinator`、
-`project_gateway` はそのまま `project_gateway` に map する（いずれも既定 codex）。現 lane の
+`project_gateway` はそのまま `project_gateway`、`coordinator` はそのまま `coordinator` に map する
+（いずれも既定 codex）。現 lane の
 provider が expected と一致しない、または expected が解決不能なら provider-mismatch で fail-closed。
 provider binding / live inventory / project metadata は独立照合であり current-role authority では
 ない。
@@ -116,6 +137,35 @@ provider binding / live inventory / project metadata は独立照合であり cu
 resolved 時、herdr `workflow step` は tmux / raw Herdr / raw pane へ fallback せず、role を名指し、
 その role の一段 forward を実行する（§6 Increment 3）。blocked（invalid / ambiguous /
 provider_mismatch）は fixed reason + `next_owner=operator`。
+
+## 5b. Mint / readback surface（Redmine #14546）
+
+Increment 1 は declaration の *意味* と loader を与えたが、**product surface** を与えなかった。
+その結果 bare `mozyo` fresh workspace では file が存在せず、operator が spec から JSON を手書き
+する以外に authority を持つ手段が無かった（#14500 observed facts）。`workflow role-authority` が
+その surface である。
+
+- **readback**（flag 無し）: restart / adopt が復元すべき層を **層ごとに分けて** 報告する。
+  (a) repo-local declaration（present / parsed_ok / reason / 各 binding）、(b) registry +
+  workspace anchor（repo root から導出する workspace segment。sender-identity gate が attest する
+  のと同じ anchor）、(c) `provider_binding` から別解決した expected provider、(d) live startup
+  attestation（herdr inventory 上で mzb1 assigned name が当該 workspace の default lane × expected
+  provider に decode する row の cardinality と locator 有無）。読めなかった層は `unavailable` と
+  報告し、**充足として報告しない**。層を一つの boolean へ畳まないことが要件である（畳んだ結果、
+  元の失敗が「どの層が欠けているか」を読み取れない状態になっていた）。
+- **mint**（`--mint-coordinator --project-scope <scope>`）: default lane に `coordinator` binding を
+  宣言する。既定 **dry-run**、`--execute` で書き込む。
+  - 同一 binding が既にあれば **idempotent no-op**（`already_declared`）。既存 `source_pointer` を
+    書き換えない。
+  - default lane が別 role / 別 scope に bind 済みなら `default_lane_already_bound` で fail-closed。
+  - present だが parse 不能な declaration は `declaration_invalid` で fail-closed。**mint は自分が
+    author していない authority を上書きしない。**
+  - `project_scope` 未指定は `project_scope_required`。registry display metadata から derive しない
+    （§1 の「display metadata を authority へ昇格しない」を mint 側でも守る）。
+  - 書き込み後は必ず **readback 検証**する。再読・再 parse が意図した binding を再現しない場合は
+    `readback_failed` で失敗として報告する（書けたこと ≠ 効いたこと）。
+- mint は attestation ではない。宣言された role は依然 action-time の sender-identity / provider
+  cross-check を通ってはじめて `workflow step` の routing 根拠になる。
 
 ## 6. Increment 境界
 
@@ -162,10 +212,22 @@ provider_mismatch）は fixed reason + `next_owner=operator`。
     executable は非 dry-run で dedicated forward leg を一回だけ発火。tmux path / binding 無し lane は
     byte-invariant。既存 tmux-era project-gateway primitive への個別 fallback は追加しない。
 
+- **Increment 4**（Redmine #14546）: single-workspace `coordinator` role の語彙追加、`workflow
+  role-authority` mint / readback surface、および `coordinator` → managed sublane gateway の一段
+  forward leg。forward leg は既存 Increment 3 の rail をそのまま使うが、**direction / primitive /
+  reason は別 token** である（`coordinator_to_delegated_coordinator` /
+  `herdr_forward_managed_gateway` / `herdr_forward_managed_gateway_ready`）。target 解決は
+  project_gateway leg と同じ same-lane self-fence 付き child 解決だが、fence route key の
+  `from_role` が異なるため両 leg は generation を共有しない。work-intake payload の
+  `callback_to_role` closed set に `coordinator` を 1 語だけ追加する（child の read contract と
+  anchor 所有境界は不変）。
+
 ## 7. 実装 surface
 
 - pure domain（authority）: `...f_140_delegated_coordinator_nested_handoff/domain/workflow_role_authority.py`。
 - loader: `...f_140_delegated_coordinator_nested_handoff/application/workflow_role_authority_source.py`。
+- mint / readback surface（#14546）: `...f_140_delegated_coordinator_nested_handoff/application/cli_workflow_role_authority.py`
+  （`workflow role-authority`）。regression pin: `tests/regressions/test_issue_14500_default_coordinator_authority.py`。
 - herdr step 結線: `...domain/workflow_step_herdr.py`（`resolve_herdr_workflow_step` の
   `role_authority` 分岐 / `_role_authority_resolved_outcome` の forward-ready 化）+
   `...application/herdr_workflow_step.py`（`_resolve_role_authority` / `execute_herdr_forward_leg`）。

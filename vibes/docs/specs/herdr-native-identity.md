@@ -263,8 +263,8 @@ flow:
    (byte-invariant)。launch は `agent start --workspace <host> --tab <tab_id>` で行い、tab 内 2
    slot 目 (fresh pair の第 2、または heal で生存 slot の隣) は `--split <dir>` を付ける。方向と
    provider 順序は `lane_placement` config で lane class 別に宣言できる (Redmine #13646、下記
-   §lane_placement)。未設定時は従来どおり sublane が `--split right`、default lane は `--split`
-   を出さず herdr server 既定へ委任する (byte-invariant)。tab root pane は
+   §lane_placement)。**未設定時は product default `--split down` を出す (Redmine #14568)**。
+   default lane は `--tab` を出さないままだが `--split` は出す (両者は独立 flag)。tab root pane は
    #13330 の workspace base pane と同型で全 launch 成功後に reclaim し、tab 内最終 pane close で
    herdr が tab を自動消滅させる (workspace 自動消滅と対称)。**
 3. mint durable name: `encode_assigned_name(workspace_segment, role, lane)` で mzb1 名を作る。
@@ -465,19 +465,22 @@ fail-closed / safety 不変条件:
 live smoke (cold start bare `mozyo` 後に root pane が残らないこと、adopt 経路が byte-invariant で
 あること) は coordinator の post-review 実機 acceptance で確認する。
 
-## 5.1 lane_placement — pair 配置の設定駆動化 (Redmine #13646)
+## 5.1 lane_placement — pair 配置の設定駆動化 (Redmine #13646 / #14569)
 
-herdr pane pair の **split 方向**と**役割順序** (どちらの provider が先 = 左 / 上に置かれるか) を
-lane class 別に宣言する closed config block。`.mozyo-bridge/config.yaml`:
+herdr pane pair の **split 方向**・**役割順序** (どちらの provider が先 = 左 / 上に置かれるか)・
+**pair 内部の相対 split 比率** (Redmine #14569) を lane class 別に宣言する closed config block。
+`.mozyo-bridge/config.yaml`:
 
 ```yaml
 lane_placement:
   default:                    # coordinator / auditor pair (bare `mozyo`)
     split: down               # right | down
     order: [codex, claude]    # exact permutation
+    ratio: 0.6                # order[0] 側 (down なら上 / right なら左) の占有率
   sublane:                    # lane gateway / worker
     split: right
     order: [codex, claude]
+    ratio: 0.5
 ```
 
 ### Schema (fail-closed)
@@ -487,15 +490,84 @@ lane_placement:
 - `split`: `right` | `down`。herdr 0.7.1 `agent start --split right|down` の語彙 (実 `--help` 照合)。
 - `order`: `[codex, claude]` / `[claude, codex]` の **exact permutation**。欠落 / 重複 / 未知 provider /
   非 list は fail-closed (部分順序が silent に provider を落とさない)。
-- lane class object 自体・`split`・`order` はそれぞれ **個別に optional**。欠落した field だけが
-  legacy 規律を継承する (空 `{}` は no-op)。
+- `ratio` (#14569): **有限数値**で `0.1 <= ratio <= 0.9`。意味は常に **effective `order[0]` 側**が
+  pair の split 全体に占める割合 (`down` なら上 pane、`right` なら左 pane)。bool / 文字列
+  (`"0.6"`) / list / mapping / `nan` / `±inf` / 範囲外は **config parse 時に fail-closed** し、
+  pane actuation へ到達させない。
+- lane class object 自体・`split`・`order`・`ratio` はそれぞれ **個別に optional**。欠落した field は
+  product default を継承する (#14568 / #14569。空 `{}` は「宣言しない」であって rollback ではない)。
 - unknown class / unknown key / unknown value / unsupported version は fail-closed。
 
-### Compatibility (byte-invariance)
+#### `ratio` の値域を herdr の実効 domain へ狭めた理由 (#14569、実測 j#91140)
 
-- **未設定は現行 launch argv と byte 一致**: `sublane` は従来どおり 1st slot が tab を占有し 2nd slot が
-  `--split right`、`default` は `--tab` も `--split` も出さず herdr server 既定へ委任する。
+herdr 0.7.4 の CLI parser は有限 `f32` を広く受理するが、**layout 側が split ratio を
+`0.1..0.9` へ silent clamp** する (実測: ratio 0.5 の split に `pane resize --direction up
+--amount 0.9` を適用すると 0.0 ではなく 0.1 に着地)。schema をこの実効 domain へ狭めない場合、
+`ratio: 0.95` と宣言した workspace の pair は恒久的に 0.9 で描画され、**宣言値と effective layout が
+乖離したまま誰も気づかない**。silent clamp に依存せず parse 時に拒否するのはこのためである
+(Design Answer j#91127「silent clamp を採らない理由」)。
+
+`ratio` は **相対比率のみ**で、固定 pixel 幅 / column 数 / row 数は宣言しない (#14569 Non-goals)。
+herdr は split を ratio として保持し pane rect を container から再導出するため、相対比率は terminal
+resize 後も維持・再現される。固定 extent はそれができない。
+
+### Product default (Redmine #14568 — #13646 の未設定 byte-invariance を意図的に置換)
+
+未設定時の既定は **`split: down` (default / sublane 両 class)**。`by_lane_kind` > lane class >
+**product default** の 3 層の最下段であり、宣言が無い workspace でも pair は縦分割される。
+
+| lane class | product default `split` | product default `order` | product default `ratio` | 上段になる provider |
+| --- | --- | --- | --- | --- |
+| `default` | `down` | `[codex, claude]` | `0.5` | codex (coordinator) |
+| `sublane` | `down` | 宣言しない (要求順を維持) | `0.5` | gateway (既定 binding では codex) |
+
+`ratio` の product default `0.5` は **#14568 の supersession を拡張しない** (#14569)。herdr が
+fresh split を等分で作るため、`ratio` を宣言しない workspace の landing geometry は本軸の追加前後で
+同一である。`split` の既定変更 (#14568) が意図的な geometry 変更だったのに対し、`ratio` 軸の追加は
+**未宣言 workspace に対して geometry-preserving** である。`order` と違い `ratio` は尊重すべき role
+binding を持たない (provider の選択ではなく split の配分である) ため、`sublane` でも宣言しない理由が無く、
+両 class に同じ `0.5` を置く。
+
+`order` を lane class で非対称にしているのは、**片方だけが尊重すべき role binding を持つ**ため。
+
+- `default` = bare `mozyo` の coordinator pair は固定 topology
+  (`default_agent_topology.DEFAULT_EXPECTED_AGENTS`) を launch し、その launch 順は `claude` 先である。
+  縦分割すると implementer が上段になるので、product default で `[codex, claude]` に pin する。別 binding
+  の workspace は `lane_placement.default.order` を明示宣言する。
+- `sublane` は既に role binding から解決した `(gateway, worker)` 順で launch する
+  (`sublane_actuator_herdr_ops._launch_providers`)。ここに product default `order` を置くと binding を
+  **尊重ではなく上書き**してしまうため、宣言しない。結果として gateway が上段になり、rebound binding は
+  その binding 順のまま launch される。
+
+#### 互換性と rollback (adopter 向け)
+
+- **既存 live pair は暗黙再配置しない**。product default は fresh launch / heal の argv を決めるだけで、
+  live pane を move / swap / kill しない。既に左右で立っている pair は次の fresh launch まで左右のまま。
+  live で今すぐ変えるなら [[logic-herdr-live-relayout-runbook]] の手順を使う (境界は不変)。
+- **rollback は `split: right` の明示宣言**。粒度は 3 つあり、いずれも従来どおりの優先順で効く。
+
+  ```yaml
+  lane_placement:
+    default:
+      split: right          # coordinator pair だけ左右へ戻す
+    sublane:
+      split: right          # 全 sublane pair を左右へ戻す
+    by_lane_kind:
+      implementation:
+        split: right        # 孫 lane だけ左右へ戻す (lane class より優先)
+  ```
+
+- **確認手段は `mozyo-bridge config status`**。`lane_placement.<class>.{split,order,ratio}` の leaf row が
+  effective 値と `declared` / `default` の別を出すので、宣言していない workspace は
+  `lane_placement.default.split = down (default)` / `lane_placement.default.ratio = 0.5 (default)` として
+  読める。この row は launch chokepoint と **同じ resolver** (`LanePlacementConfig.resolve_effective`) を
+  読むので、status と実 launch は乖離しない。`ratio` は **実機を測らないと読み取れない唯一の placement
+  field** なので、この row の存在が確認手段そのものである。
 - 設定した field だけが差分を生む。`default` を設定しても `sublane` の launch は不変 (逆も同様)。
+- `by_lane_kind` の **wholesale shadowing は不変** (#13647): 宣言された kind は lane class を丸ごと
+  shadow するため、`order` だけ宣言した kind は lane class の `split` を継承せず product default を取る。
+  #14568 も #14569 もこれを per-field merge に変えていない (`ratio` だけ宣言した kind は lane class の
+  `split` を継承せず、`ratio` を宣言しない kind は lane class の `ratio` ではなく `0.5` を取る)。
 
 ### Launch semantics
 
@@ -508,13 +580,17 @@ lane_placement:
   `--no-focus` にすると container の空 root pane が active のままなので、2nd slot の `--split <dir>` は
   **1st agent ではなく root pane** を割り、その root を reclaim した時点で nested split が畳まれ、1st agent
   の暗黙 split が作った外側の既定 `right` だけが残る = **設定方向が無言で効かない**。
-  → **fresh container で explicit placement を実現する時だけ、1st launch を `--focus`** にして split target
-  を 1st agent へ固定し、2nd 以降は `--split <dir> --no-focus` とする。root pane reclaim は従来どおり
-  **全 launch 成功後** (partial-launch safety を壊さない)。
-  発火条件は狭く限定する: container occupancy = 0 かつ launch 対象 2 件以上かつ `split`/`order` が
-  explicit。**unset / single-provider / heal / mixed adopt では発火しない** (byte/layout invariant)。
+  → **fresh container では 1st launch を `--focus`** にして split target を 1st agent へ固定し、2nd 以降は
+  `--split <dir> --no-focus` とする。root pane reclaim は従来どおり **全 launch 成功後**
+  (partial-launch safety を壊さない)。
+  発火条件は: container occupancy = 0 かつ launch 対象 2 件以上かつ **effective split 方向が非空**。
+  **single-provider / heal / mixed adopt では発火しない**。
   なお `--split right` literal (#13411) も同じ理由で本来効いておらず、観測される `right` は herdr 既定
-  split の偶然の一致だった。unset lane class はその挙動をそのまま維持する。
+  split の偶然の一致だった。
+  **#14568 の変更点**: 発火条件の第 3 項は「`split`/`order` が **explicit**」から「**effective** split 方向が
+  非空」へ移った。product default で全 lane class が `down` を持つ以上、「operator が宣言したか」を
+  問うと未宣言 workspace だけが focus を得られず、argv には `--split down` が出るのに実機は
+  reclaim で `right` へ畳まれる — 本 fix が防ぐはずの症状そのものになる。
 - **single-provider request**: `order` は **未要求の peer を暗黙 launch しない**。heal は欠けた provider
   だけを launch する。
 - **heal**: 生存 sibling の隣へ configured `--split <dir>` で launch する。既存 pane は swap / move /
@@ -525,11 +601,113 @@ lane_placement:
   `order_deferred_until_full_relaunch` を出す (silent に「order 適用済み」と主張しない)。full relaunch で
   configured order が物理的に実現する。
 
+#### ratio actuation (Redmine #14569、実測 j#91140)
+
+herdr 0.7.4 `agent start` は **`--ratio` を持たない** (`pane split` / `pane move` は持つ)。したがって
+`ratio` は launch argv には乗らず、**全 launch 成功 + root pane reclaim の後**に herdr-native
+`pane resize --amount` で 1 度だけ actuate し、`pane layout` で **測って** 判定する。正本実装は
+`herdr_pair_split_ratio.finalize_container_geometry` (reclaim と ratio を 1 つの後処理にまとめた
+cohesive sibling。reclaim が先なのは、root pane を閉じると split tree が畳まれ、その前に測った
+geometry が直後に変わるため)。
+
+- **actuate するのは「この run が今作った divider」だけ**。判定は
+  `launched >= 1 かつ (container の初期 occupancy > 0 または launched >= 2)` — `--split` を出した launch が
+  この run に 1 つ以上あることと同値である。all-adopt / dry-run / 空 container への単発 launch は
+  divider を作らないので **何も触らない**。config を読むだけで live pair が動く経路は存在しない。
+  **この述語が「測定するか」も決める**: これを通過した run は測定を負っているので、以降の拒否はすべて
+  `failed` であり `not_applicable` ではない。`not_applicable` になるのは **layout を 1 度も読む前に**
+  決まる場合 (dry-run / divider 未作成 / ratio・direction 未解決) だけである。
+- **pair は「この run が split した slot」を起点に layout から読む**。起点はその run が launch した
+  slot のうち最後の 1 つ (occupancy が最大なので必ず `--split` を出している)。sibling が **この run の
+  slot である必要は無い** — `replacement_target_only` の single-provider heal は 1 slot しか持たないが、
+  生存 sibling の隣へ split して divider を作るのだから測定対象である (review j#91217 R1-F1: 旧実装は
+  「pair の 2 pane が両方この run の slot」を要求したためこの heal を丸ごと素通りさせ、宣言 ratio を
+  適用しないまま成功と報告していた)。
+- **対象 split の同定は幾何で行う**。`pane layout` の `splits[]` は child pane id を持たないため、
+  「起点 slot と他の 1 pane がその split rect を **exact tiling** するか」で同定する。単純な
+  bounding-box 一致は誤判定する (実測: 3 pane の nested layout で、兄弟でない 2 pane の union rect が
+  root split の rect と一致した)。候補が 0 個または 2 個以上なら fail-closed。
+  herdr は split した pane を **second 側**へ置くため、起点 slot が first 側に居る layout は
+  予測しない形として fail-closed とする。
+- **shared tab 安全弁 (#14567 との組合せ)**: herdr の `pane resize` は「指定 pane の、direction と軸が
+  一致する最も近い祖先 split」を動かす。したがって actuate 前に「その最近祖先 split が pair 自身の
+  divider か」を照合し、一致しない場合は **resize を発行せず fail-closed** にする。これが無いと、
+  全 sublane を単一 tab へ集約した構成で外側の divider を動かし隣の lane を再配置しうる。
+- **収束と検証**: `--amount` は 1 回あたり 0.5 に clamp される (実測) ため、観測 ratio から毎回 delta を
+  再計算する有界ループ (最大 4 pass、進捗が止まったら中断) で寄せ、最後に `pane layout` を読み直して
+  判定する。判定は 2 本立てで、split ratio が宣言値と `f32` 誤差内 (`1e-3`) であること、かつ first-child
+  pane の extent が `round(extent * ratio)` の ±1 cell 以内であること。**resize が exit 0 で返ったことは
+  根拠にしない** (herdr は amount も ratio も silent clamp するため)。
+- **outcome は独立軸**として `SessionStartResult.ratio_outcome` に出す (`not_applicable` / `matched` /
+  `applied` / `deferred_until_full_relaunch` / `failed`)。`ratio` は 2 pane の **divider** の性質であり
+  どちらの agent の health でもないので、slot health に畳まない。
+  **成功判定はこの閉じた語彙への membership で行う** (review j#91418 R5-F1)。成功とみなすのは
+  `failed` 以外の **4 値を明示列挙した集合**であり、`!= failed` という否定形では判定しない — 否定形だと
+  producer の typo (`appllied`) / case 違い (`APPLIED`) / 末尾欠け / 空文字といった **語彙外の値がすべて
+  成功へ default** し、verdict を解釈できない run が成功として報告される (実測)。**語彙外の token は
+  非成功**とし、診断のため payload には生のまま残す。成功集合は `RATIO_OUTCOMES` からの引き算で導出せず
+  (導出すると語彙に token を足しただけで自動的に成功側へ入る)、**集合の literal と分割の両方を test で
+  pin** する。片方だけでは、両集合を同時に増やす drift を通してしまうことを実測している。
+- **order-deferred heal**: configured `order[0]` が物理的に 2 番目 (生存 sibling の隣) に着地した場合、
+  そこへ `ratio` を適用すると `order[0]` の取り分が `order[1]` に渡る。live pane の swap / bounce は
+  禁止なので **適用せず `deferred_until_full_relaunch` を明示**する (どちらも主張しない)。full relaunch で
+  order と ratio が同時に実現する。deferral は失敗ではない (pair は使用可能)。
+  判定は **split した slot の provider が effective order の先頭であるか**による — これは
+  `slot_placement` が `order` 軸に対して既に使っている規則と **同一**である (ratio 専用の第二の
+  「primary」定義を作らない)。sibling の provider は判定に不要である。
+
+  **effective order の解決 (Redmine #14569 review j#91263 R2-F1)**。**3 つの authority 層 + 終端 fallback**
+  で解決する (層は 1〜3、4. は「どの層も答えられなかった」という終端であって 4 番目の authority ではない)。
+
+  各層は **canonical provider の exact permutation として受理できる場合のみ**採用し、答えられない層は
+  半端に答えず読み飛ばす (値域は宣言 `order` と同一 = `lane_placement._normalize_order`)。
+
+  1. 宣言 (または product default) された `order` — primary を直接名指しする。
+  2. 無ければ **その run の lane が持つ stable な managed pair 順**。**`order` 未宣言は「順序主張が
+     無い」ではない** — sublane で `order` を宣言しないのは binding が解決した `(gateway, worker)` 順を
+     **尊重する**ためであり (§5.1 Product default の非対称性の理由、j#91127)、その順序は本 block の
+     上位で解決される。したがって `prepare_session` は caller から `pair_order` として受け取る。
+  3. 無ければ **その run 自身の要求 providers**。要求が full pair である限りそれが pair 順そのもので
+     あるため、通常経路は caller からの供給を必要としない。**縮小された要求は permutation にならないので
+     何も寄与しない** — 縮小 list の中ではその 1 provider が自明に「先頭」になり、それが誤帰属だからである。
+  4. (終端) どの層も答えられなければ空 — 帰属できない (`unattributable`) → deferral。
+
+  **`pair_order` は最初の副作用より前に検証する** (`validate_pair_order`、review j#91284 R3-F1 /
+  j#91331 R4-F1)。未知 provider / 重複 / 欠落 / 非 string 要素 / 非 sequence、および
+  **要求 providers を含まない order** は zero-side-effect で拒否する。
+  **「boundary に置く」だけでは足りない**: public `prepare_session` は attestation store lock を先に取得し、
+  その取得が mozyo home directory と lock file を作る。したがって検証は **lock 取得より前**に走らせる
+  (caller-held lock 経路の `_prepare_session_locked` 側でも重ねて検証し、どちらの入口も拒否する)。検証していない値を authority として
+  受理すると実害が出る: `pair_order=("unknown","codex")` は `codex` を primary でなくするため、gateway の
+  target-only heal が pair を resize して **gateway の宣言 share を生存 worker へ渡したまま `applied` と
+  報告**した (実測 j#91299)。resolver 側も `str()` coercion をやめ、認識できない入力は空 = deferral に倒す
+  (誤った分割より必ず安全側)。
+
+  第 2 層が必要なのは、**target-only replacement が要求を 1 provider へ縮小する**ためである
+  (`replacement_target_only` → `startup_providers = (provider,)`)。縮小後の要求はもはや pair 順ではないので、
+  それを effective order として読むと gateway を heal したときに生存 worker が first 側になり、**宣言 share が
+  逆の role へ渡ったまま `applied` と報告される** (R2-F1 の実測)。縮小した caller が stable な順序を渡す。
+  空 (縮小されたのに stable 順序が渡されなかった) の場合は **deferral 側へ倒す** — 縮小 list の中では
+  その 1 provider が自明に「先頭」になり、それこそが R2-F1 の誤帰属だからである。
+- **失敗は成功扱いしない**: layout の read / parse 失敗、pair split の同定失敗、`pane resize` の拒否、
+  最終照合の不一致はいずれも `failed` とし、`SessionStartResult.ok` を False にする。ただし
+  `owes_rollback` には入れない — 分割が意図と違うだけの pair は使用可能であり、それを理由に agent を
+  kill / close する方が有害だからである (`ratio` 経路は pane を一切 close しない)。
+
 ### Boundary
 
+- **tab topology とは直交** (#14567 との境界)。`lane_placement` が決めるのは *container の中で pair を
+  どう割るか* だけで、*どの container に入るか* (workspace / tab) は #13380 / #13411 の join 軸が決める。
+  よって #14567 が全 sublane を単一 tab へ集約しても、その tab の中で各 lane pair は本 block の
+  `split` / `ratio` に従って置ける。両者を組み合わせる時に本 block を変更する必要は無い。**lane 間の
+  配置比率と pair 内部の比率を混同しない**: 本 block の `ratio` は 1 pair の divider だけを指し、lane
+  同士の列幅は #14604 の scope である。実装上その混同を防いでいるのは上記 shared tab 安全弁で、
+  actuate 対象が pair 自身の divider でないと分かった時点で resize を出さない。
 - `lane_placement` は **future launch policy** であり、live layout / liveness / route authority ではない。
-  config を読むだけで既存 live pair を移動しない (herdr は same-tab re-split を拒否する。live 再配置は
-  operator の CLI 操作のまま)。
+  config を読むだけで既存 live pair を移動 / 再分割しない。`ratio` (#14569) が pane を 1 度 resize するのは
+  **その run 自身が今作った divider** に対してだけで、既存 live pair の divider には触れない
+  (herdr は same-tab re-split を拒否する。live 再配置・live での比率変更は operator の CLI 操作のまま:
+  [[logic-herdr-live-relayout-runbook]])。
 - config key は `pane_placement` では **なく** `lane_placement`。repo-local schema boundary
   (`_FORBIDDEN_KEY_PARTS`) は `pane` を含む key を allowed-key 判定より前に拒否するため、live pane
   addressing に見えない名前へ寄せている (boundary screen は緩めない)。
@@ -565,10 +743,17 @@ lane_placement:
 
 ### Precedence
 
-`by_lane_kind[kind]` > `lane_class` > legacy 既定。kind 層が参照されるのは **durable な lane_kind が
-解決でき、かつ config がその kind を明示宣言している時だけ**。未解決 kind / 未宣言 kind / block 不在は
-すべて §5.1 の lane-class 解決へ **byte 一致で** fall-through する (`resolve_container_plan` 幾何
-engine は無改修)。
+`by_lane_kind[kind]` > `lane_class` > **product default** (#14568。#13647 時点の表記は「legacy 既定」)。
+kind 層が参照されるのは **durable な lane_kind が解決でき、かつ config がその kind を明示宣言している
+時だけ**。未解決 kind / 未宣言 kind / block 不在はすべて §5.1 の lane-class 解決へ fall-through する。
+
+3 層の合成は `LanePlacementConfig.resolve_effective` が単独で持ち、launch 経路
+(`resolve_placement_policy_for_role`) と `config status` の双方がそれを読む。どちらかが層を再実装すると
+「status の表示」と「実 launch の幾何」が乖離しうるため、resolver は 1 つに保つ。
+
+宣言された kind は lane class を **丸ごと** shadow する (per-field merge ではない)。したがって
+`order` だけ宣言した kind の `split` は lane class ではなく product default を取る。この shadowing 規律は
+#14568 でも変えていない。
 
 ### lane_kind の 2 authority (Redmine #13647 Tranche 1a / 1b)
 
@@ -874,7 +1059,177 @@ resolver と `coordinator_shared_create_lock` fence をそのまま使う。
 unit / integration は共有 fake (`support.herdr_fake.FakeHerdr`、face H `workspace list` を追加) で駆動し、実 live smoke
 (実 herdr binary + disposable instance) は Review 承認・integration・CI 後に #14185 が同 `SharedSpaceSmokeHarness` を
 真の `multiprocessing` driver で再駆動して行う。CLI `mozyo-bridge herdr smoke-shared-space --isolated-home PATH` は
-**read-only preflight** (isolation + clean-slate 証明) のみで agent を actuate しない。
+既定で **read-only preflight** (isolation + clean-slate 証明) のみで agent を actuate せず、live 実行は
+`--execute` の明示 opt-in で §5.1.2 の disposable instance 上でのみ行う。
+
+### 5.1.2 disposable Herdr instance — endpoint は capability である (Redmine #14187)
+
+`shared_space` の live smoke は自前の Herdr server を持つ。その lifecycle 正本は
+`e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_herdr_instance.py`
+(`DisposableHerdrInstance` / `OwnedEndpointCapability` / `EndpointBoundHerdrRunner`) であり、
+driver は同 package の `disposable_shared_space_smoke.py`。
+
+**Threat model (incident 正本 = #14187 journal。時系列は journal を読み、本 spec に複製しない)**
+
+managed agent は operator の ambient `HERDR_SOCKET_PATH` を継承する。したがって endpoint は設定値ではなく
+**破壊権限**である: disposable binding が一度でも欠落すると、同一の `herdr server stop` argv が
+operator server への control request に変わる。実測 incident では、binding を落とす mutation probe を
+live capability を持つ process 内で実行した結果、実 operator Herdr が graceful shutdown した。
+
+**契約 (fail-closed)**
+
+- **socket path 一致は ownership 証明ではない。** environment は継承・上書き・mutation され得る。
+  cleanup authority は `OwnedEndpointCapability` に bind する: `DisposableHerdrInstance.start()` が
+  自プロセスで `Popen` した server の handle を得た後にのみ mint し、module-private mint token +
+  identity 比較 (`eq=False` + mint registry) で hand-built / clone を拒否し、owned child の `pid` を保持する。
+  `DisposableHerdrBinding` は path 記録に過ぎず authority ではない。
+- **判定は actuation の前。** `EndpointBoundHerdrRunner` は、これから渡す **effective env** の
+  `HERDR_SOCKET_PATH` に対して 4 連言 (capability 存在 / mint 済み / owned socket と exact 一致 /
+  owned root 配下 かつ operator endpoint でない) を評価し、いずれか欠ければ **inner runner を呼ぶ前に**
+  `SmokeEndpointEscapeError` を raise する。refusal reason は closed vocabulary
+  (`capability_absent` / `capability_not_minted` / `endpoint_unbound` /
+  `endpoint_outside_owned_root` / `operator_endpoint_target`)。事後 boolean (`all_calls_bound=false`) は
+  **その時点で request が送信済みなら安全性を担保しない**ため、判定を dispatch 前へ移す。
+- **operator endpoint は base_env と真の ambient (`os.environ`) の双方から capture する。** incident の
+  unbound call は `base_env` ではなく `os.environ` を継承していた。
+- **gate が発火しても cleanup は完了する。** graceful `server stop` は gate 経由。refuse された場合は
+  external request 0 のまま、exact owned process handle への signal に fallback する
+  (`graceful_stop_refused=true`)。handle は他 server を指し得ない。
+- **capability は owned child の lifetime に bind する。pid 一致は生存証明ではない** (review j#85841 F2)。
+  owned child が exit した後も pid 記録は一致し続けるため、capability はそのまま「path 宛 actuation」へ
+  退化する。よって authority を 2 つに分割する:
+  - **client-call capability** — owned endpoint への通常 request (`workspace list` / `agent start` 等)。
+    mint した process とその forked worker が保持する。mint process 内では **owned child 生存**も連言する。
+  - **cleanup authority** — `MINTER_ONLY_SUBCOMMANDS` (= 自分が起動した server への graceful
+    `server stop`)。**mint した process のみ**が、かつ owned child 生存中のみ保持する。
+    forked worker は無条件に拒否する。許可される command 集合そのものは下記 allowlist が定義する。
+
+  分割が必要な理由は fork の非対称性である: forked worker は server の直接 parent ではないため、
+  継承した handle への `Popen.poll()` は `waitpid` の `ChildProcessError` 経由で
+  **生存中の child を「終了」と誤読する**。共有 gate に `poll()` を足すと健全な worker call が全て
+  fail-closed する。liveness は答えられる process (mint process) でのみ問い、それ以外は
+  destructive authority 自体を与えない。refusal reason は closed vocabulary へ
+  `owned_child_not_alive` / `cleanup_authority_not_owner` を追加する。
+- **command 面は allowlist で閉じる。denylist は構造的に fail-open** (review j#91604 F1)。
+  「破壊的 control を列挙して拒否する」形は、列挙し損ねた control をすべて許可する。実測では
+  `("server","stop")` のみを denylist した結果、Herdr 0.7.x が公開する
+  `session stop <name>` / `session delete <name>` (help が `default` を名指しする) /
+  `server reload-config` 等を forked worker が dispatch できた。よって **smoke が必要とする
+  client call を `CLIENT_CALL_SUBCOMMANDS` として閉じた集合で定義し、それ以外は全 process で拒否する**
+  (`command_not_allowlisted`)。mint process のみ `MINTER_ONLY_SUBCOMMANDS` (= 自分が起動した
+  server への graceful `server stop`) を追加で持つ。allowlist に control 動詞
+  (`stop` / `delete` / `attach` / `reload-config` / `reset-keys` / `set`) が紛れ込まないことを
+  drift test で固定する。
+
+  **保証範囲は `(group, subcommand)` pair に限る** (review j#91638 finding_3 / 仮説)。
+  判定は argv の当該 2 token に対して行うので、この allowlist が既定拒否にできるのは
+  **新しい command pair** である。既に allowlist 済みの pair へ将来追加される option
+  (例: 既存 pair に endpoint selector が生える形) は閉じていない。「Herdr の将来の追加を
+  すべて拒否する」とは書かない — 実装が保証していない強さの主張はしない。現行 v0.7.4 では
+  先行 global flag (`--session <name>` / `--remote <target>`) は `command[1:3]` を
+  allowlist 外へずらすため zero-dispatch で拒否される。この argv grammar 上の境界を
+  drift test で固定し、Herdr 側の parser 変更で前提が崩れたら検出できるようにする。
+- **worker timeout は process 起動前に domain 検証し、cleanup は例外経路でも通す** (review j#91604 F2)。
+  `--process-timeout` を無制約 `float` で受けると `inf` / `nan` / 0 / 負値が
+  `Process.join()` まで到達し、**全 worker を起動した後**に `OverflowError` で driver を巻き戻す。
+  結果として owned worker が生存したまま親が server と owned root を shutdown でき、bounded cleanup /
+  全 process evidence / owned-root lifetime bind が同時に破れる。かつ typed error でないため
+  失敗分岐の evidence 契約 (上記) も raw traceback に落ちる。よって:
+  - `bounded_process_timeout` が **finite かつ `(0, MAX_PROCESS_TIMEOUT_SECONDS]`** を CLI 入口と
+    driver の双方で強制し、**何も起動していない時点で** `SharedSpaceSmokeError` として拒否する。
+  - worker 起動以降は `finally` で **起動した exact handle のみ** terminate → join → kill し、
+    最終 kill 後に `is_alive()` を再確認する。generic kill / name scan は行わない。
+  - 生存した worker 数を `worker_processes_orphaned` として evidence に出し、`success` へ `== 0` を
+    連言する。fork round が完了しなかった場合は `-1` (「残留 0 だった」ではなく「確定できなかった」)。
+- **worker containment は teardown の前段 fence であり、事後 boolean ではない** (review j#91638 F1)。
+  survivor 数を `success` に連言するだけでは、危険な teardown が起きたことを事後に採点するに過ぎない。
+  worker は non-minter なので owned child liveness を照合できず、**socket / owned root を解放した後も
+  生存 worker は同 path へ actuate しうる**。よって:
+  - fork round は例外経路を含め **必ず構造化結果を返す** (receipts / missing / orphan count /
+    失敗した場合の closed token)。例外で結果を捨てると、reap で確定した containment の答えも
+    失敗分岐の evidence も同時に失われる。`KeyboardInterrupt` / `SystemExit` は捕捉せず伝播させるが、
+    その場合も exact-handle reap は `finally` で通る。
+  - **受領済み receipt は caller 所有の container へ逐次公開する**。collection 関数の local に
+    溜めると、`output.close()` 等 tail の失敗が **既に届いた receipt ごと巻き戻す**。exact pane
+    locator を失うと receipt-tape 駆動の cleanup が実行できず、観測済み gate counter も失う
+    (review j#91687 F3)。例外時に missing placeholder で埋めるのは **未受領 index のみ**とする。
+  - **receipt の index は worker の自己申告であり、信頼せず検証する**。範囲外 index は無視され、
+    duplicate index は先着を**無言で上書き**して exact locator を落としていた
+    (review j#91741 F3 実測)。expected range / unique / project identity を検証し、anomaly は
+    closed token の typed round failure にする。**ただし拒否した receipt が持つ locator も
+    cleanup 用に lossless に保持する** — 拒否は「evidence に採らない」であって「その pane を
+    放置してよい」ではない。
+  - **index は型についても strict に検証する**。`bool` は `int` の subclass で `True == 1` は
+    `1` と同じ hash を持つため、`isinstance(index, int)` だけでは `bool` index が range 検査を
+    通過し、`collected` map 上で**別 project になりすます**。実測では malformed receipt が
+    anomaly 0 で採用され、`all_projects_completed` / `converged` / `residue_clear` /
+    `proven_zero_external` がすべて green になった (review j#91777)。よって
+    `isinstance(index, bool) or not isinstance(index, int)` を拒否条件に含める
+    (この repo の既存 idiom)。**型不正と範囲外は原因が異なる**ので closed token も分ける
+    (`receipt_index_not_int` / `receipt_index_out_of_range`)。
+  - **root release は lifecycle の state であり、call 引数ではない**。引数にすると渡した call site しか
+    縛れず、`with instance:` の暗黙 `__exit__` が既定値で先に解放してしまう (review j#91687 F1 実測)。
+    `withhold_root_release(reason)` / `permit_root_release()` で instance に policy を持たせ、
+    `shutdown()` は**あらゆる経路がその唯一の decision を読む**。
+  - policy は **worker が存在しうる領域へ入る直前に withhold へ倒す** (`workers_unverified`)。
+    round が containment を positive に返したときだけ permit する。こうすると
+    `KeyboardInterrupt` / `SystemExit` で巻き戻っても policy は withhold のままで、
+    両 teardown が path を解放しない (review j#91687 F2: 修正前は `release_root` 引数が
+    `[True, True]` になっていた)。
+  - **evidence は action 後の実状態を観測して作る。ただし観測 API が「不明」を潰さないこと**。
+    flag の反転で作ると「root は消えたのに withheld」「root は残っているのに released」の両方向に
+    乖離する (review j#91687 F4 実測)。さらに `Path.exists()` は `stat` の失敗を **`False` へ畳んで
+    例外を投げない**ため、読めない root が「不存在」に化け、released と報告され rmtree も skip される
+    (review j#91741 F2 実測)。よって presence は `os.lstat` を直接呼ぶ **tri-state**
+    (`absent` / `present` / `unknown`) とし、**`FileNotFoundError` のみを absent** とする。
+    release 前判定と release 後観測は同一 authority を使い、`unknown` は absent 扱いにしない。
+    evidence は `owned_root_observation` (closed token) を出し、`owned_root_released` は
+    **positive な `absent` 観測のときだけ true**。success は `owned_root_present == False` を連言する。
+  - **worker cleanup registry への登録は `start()` より前に行う**。登録が起動の後にあると、その
+    2 命令の間の `BaseException` で「生存しているが reap 対象に無い」child が生まれる
+    (review j#91741 F1 実測)。未起動 handle は `is_alive()` が false なので、先に登録しても
+    signal されない。
+  - **evidence へ出す reason は closed vocabulary として producer boundary で検証する**。
+    docstring で「closed token」と書くだけでは強制にならず、caller の例外文や path が
+    CLI JSON / durable record へ混入しうる (review j#91741 F4 実測)。未知の値は typed error で拒否する。
+    `endpoint_residue` は socket 2 path のみを数える field なので、**root/config だけが残る状態を
+    表さない**。root の残存は `owned_root_present` で表し、residue field に代弁させない。
+  - **process が生成されなかった startup failure でも owned tree は解放する**。`start()` は `Popen`
+    前に `config.toml` を書くため、`_process is None` で早期 return すると owned tree が残る。
+  - containment 後の反復 shutdown は withhold を**弱めない** (policy は instance state なので
+    既定引数で上書きされない)。
+  - `server stop` 自体は containment を**強める**方向 (自 socket を死なせる) なので停止は行う。
+    withhold するのは path の解放のみ。cleanup (`pane close` 等) も fence しない — 実行した方が
+    residue が減り、かつ path 解放を伴わないため。
+  - load-bearing test は「正常 return の survivor」と「partial-start / queue-close / join-thread
+    例外」の双方で **root removal 0** を要求する。
+- **evidence は 2 方向の負証明を持つ。** `operator_endpoint_requests` (実際に dispatch された
+  operator endpoint 宛 request 数) と `endpoint_escape_refusals` (dispatch 前に拒否した数) は
+  互いに独立で、健全な run では双方 0。binding を落とすと後者が、gate を落とすと前者が動く。
+  どちらも定数では満たせない (#14247 vacuity の教訓)。`bound_calls` は `dispatched_calls` と並べて
+  無条件 increment せず、**effective socket が owned capability の socket と一致する場合のみ**加算する。
+  並べて増やすと `bound_calls == dispatched_calls` が恒真になり `endpoint_bound` が定数化する。
+- **負証明の scope は capability を保持した全 process。counter は fork を越えない** (review j#85841 F1)。
+  実 workspace / agent request は forked worker 側で発生するため、親 process の counter だけを読む
+  evidence は cross-process 面について何も証明していない。worker は自身の counter snapshot
+  (`EndpointGateCounters`) を receipt で親へ返し、親は自分の snapshot と併せて
+  `EndpointGateEvidence` へ集約する。**receipt 欠落・不整合は fail-closed**: 欠落した worker を
+  「request 0 の process」として数えず、`endpoint_gate_receipts_complete` /
+  `endpoint_gate_receipts_consistent` が false なら `endpoint_gate_proven_zero_external` は false、
+  run は success にならない。observe できなかったことを「0 だった」と述べない。
+- **失敗分岐でも evidence を出す** (review j#85841 F3)。`--execute` が収束しなかった run こそ
+  failure phase / residue / 負証明が必要になる。CLI は success/failure どちらでも report を
+  render してから **exit code で失敗を伝える**。JSON mode は同一 key 集合の redacted evidence を
+  stdout へ出し、text mode は closed token 要約 (`failure_phases` / `completed_projects` /
+  `endpoint_gate_*`) を返す。evidence を出さずに「JSON を見よ」と案内しない。
+- **guard-removal mutation は live capability を持つ process で行わない。** mutation / negative test は
+  module の *copy* に対し、fake inner runner を注入し、ambient `HERDR_SOCKET_PATH` を到達不能な poison path に
+  scrub した状態でのみ実行する (`tests/unit/.../test_disposable_herdr_instance.py`)。
+  live 経路 (`run_disposable_shared_space_smoke`) を probe 対象にしてはならない。
+- **live actuation は opt-in。** `tests/integration/.../test_disposable_shared_space_smoke.py` は
+  `MOZYO_SMOKE_LIVE_HERDR=1` が無ければ skip する。同 test は operator 役の stand-in disposable server を
+  先に起動して その socket を ambient に植え、smoke 後に stand-in が生存し応答し続けること
+  (operator process / state 不変) と `operator_endpoint_requests == 0` を assert する。
 
 ## 5.2 mutating-heal runtime fence + `pair_split` projection (Redmine #13705)
 

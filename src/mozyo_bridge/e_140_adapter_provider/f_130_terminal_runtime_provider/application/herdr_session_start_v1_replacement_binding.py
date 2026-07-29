@@ -65,6 +65,7 @@ def prepare_actuator_lane_session(
     startup_fence: StartupTransactionFence | None = None,
     admission_lock_held: bool = False,
     launch_context: object = None,
+    pair_order: object = None,
 ) -> SessionStartResult:
     """Compose one actuator launch, optionally beneath its caller-held store lock.
 
@@ -75,7 +76,10 @@ def prepare_actuator_lane_session(
     only AFTER this launch returns: at a lane's FIRST launch there is no stored kind to heal
     from, so without the caller's context the very launch that creates the panes would place
     them by ``lane_class`` and only later relaunches would honour the configured lane-role
-    geometry. ``None`` (every pre-#13647 caller) is byte-for-byte the previous composition.
+    geometry. ``None`` (every pre-#13647 caller) contributes no kind, so this composition is
+    byte-for-byte the previous one **on the lane-kind axis**: the launch then places by
+    ``lane_class``. What that resolves to is not pre-#13646 — since Redmine #14568 an
+    undeclared lane class lands on the product default (``split: down``).
     """
     from mozyo_bridge.application.repo_local_config_loader import (
         load_repo_local_config,
@@ -90,6 +94,9 @@ def prepare_actuator_lane_session(
     return session_start(
         repo_root=Path(worktree_path),
         providers=list(providers),
+        # Redmine #14569 R2-F1: `providers` may be a target-only SUBSET, so the ratio's
+        # order-relative side must read the lane's stable pair order instead of it.
+        pair_order=list(pair_order) if pair_order else None,
         lane_id=lane_id,
         env=env,
         runner=runner,

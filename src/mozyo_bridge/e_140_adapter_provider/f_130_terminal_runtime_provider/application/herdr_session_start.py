@@ -212,8 +212,8 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.age
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile_config import (
     AgentProviderProfileError,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import finalize_container_geometry  # noqa: E501
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
-    _close_base_pane,
     _create_tab,
     _create_workspace,
     _invoke,
@@ -276,6 +276,7 @@ def prepare_session(
     providers: Sequence[str],
     lane_id: str,
     env: Mapping[str, str],
+    pair_order: Optional[Sequence[str]] = None,
     runner: Optional[Runner] = None,
     timeout: float = COMMAND_TIMEOUT_SECONDS,
     dry_run: bool = False,
@@ -308,6 +309,9 @@ def prepare_session(
 
     A dry run takes no lock: it plans, actuates nothing, and creating a fail-closed path
     for a read-only report would only make diagnosis harder during maintenance.
+
+    ``pair_order`` is the lane's STABLE managed pair order, for a caller that shrank
+    ``providers`` to a subset (contract: :func:`...validate_pair_order`, #14569).
     """
     # The signature is spelled out rather than `**kwargs` (review j#80305 R8-F2): the
     # explicit keyword-only contract is public (introspection / typing / IDE / wrapping
@@ -320,6 +324,7 @@ def prepare_session(
         providers=providers,
         lane_id=lane_id,
         env=env,
+        pair_order=pair_order,
         runner=runner,
         timeout=timeout,
         dry_run=dry_run,
@@ -334,6 +339,9 @@ def prepare_session(
         startup_fence=startup_fence,
         action_nonce=action_nonce,
     )
+    # Before the lock: acquiring it creates the home dir and a lock file, and a malformed
+    # ratio authority must cost neither (#14569 j#91331 R4-F1). The locked entry re-checks.
+    validate_pair_order(pair_order, providers, error_type=HerdrSessionStartError)
     if dry_run:
         return _prepare_session_locked(**call)
     try:
@@ -352,7 +360,7 @@ def prepare_session(
 
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_lifecycle_admission import admit_launch_against_lifecycle  # noqa: E501
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_preflight import validate_session_request  # noqa: E501
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_preflight import validate_pair_order, validate_session_request  # noqa: E501
 
 
 def _prepare_session_locked(
@@ -361,6 +369,7 @@ def _prepare_session_locked(
     providers: Sequence[str],
     lane_id: str,
     env: Mapping[str, str],
+    pair_order: Optional[Sequence[str]] = None,
     runner: Optional[Runner] = None,
     timeout: float = COMMAND_TIMEOUT_SECONDS,
     dry_run: bool = False,
@@ -401,13 +410,15 @@ def _prepare_session_locked(
 
     ``lane_placement`` (Redmine #13646, Design Answer j#76564) is the repo-local herdr
     pane-pair placement policy the launch site resolved from ``.mozyo-bridge/config.yaml``.
-    It reorders the requested ``providers`` (the configured provider launches first and
+    It reorders the requested ``providers`` (the resolved primary launches first and
     occupies; the rest split beside it) and supplies each splitting launch's ``--split
-    <dir>`` — including the tab-less ``default`` pair, previously left to the herdr server
-    default. ``order`` never adds an unrequested peer; a configured primary that can only
+    <dir>`` — including the tab-less ``default`` pair, which before #13646 was left to the
+    herdr server default. ``order`` never adds an unrequested peer; a configured primary that can only
     split beside a live sibling is reported ``order_deferred_until_full_relaunch`` rather
-    than silently claimed (no swap / bounce — Non-goal: no live relayout). ``None`` keeps
-    the requested order and the legacy split discipline (byte-for-byte pre-#13646).
+    than silently claimed (no swap / bounce — Non-goal: no live relayout). ``None`` — and
+    an undeclared lane class — resolve to the PRODUCT default (Redmine #14568): both pairs
+    split ``down``, and the coordinator pair launches ``(codex, claude)`` so the coordinator
+    takes the upper pane. A workspace rolls a class back with ``split: right``.
 
     ``coordinator_placement_mode`` (Redmine #14139) is the *operator-scoped* placement
     knob the launch site resolved from the mozyo-bridge home (never a repo-committed
@@ -446,6 +457,7 @@ def _prepare_session_locked(
         env=env,
         error_type=HerdrSessionStartError,
         launch_context=launch_context,
+        pair_order=pair_order,
     )
     binary = _resolve_binary_or_die(env)
     # The mozyo-bridge launcher the #13637 self-check wraps the provider through
@@ -523,20 +535,25 @@ def _prepare_session_locked(
     )
 
     # Config-driven pane placement (Redmine #13646, Design Answer j#76564): resolve the
-    # lane class's `(split, order)` ONCE, then reorder the requested providers so the
+    # lane's EFFECTIVE `(split, order)` ONCE, then reorder the requested providers so the
     # first-launched slot occupies the container. `lane_class` is the same axis
-    # `agent_launch` keys on, resolved independently (no merge). An unset config yields
-    # `(None, None)`, so every downstream decision stays byte-for-byte pre-#13646. The
-    # decisions are pure (`herdr_lane_topology`).
+    # `agent_launch` keys on, resolved independently (no merge). The decisions are pure
+    # (`herdr_lane_topology`).
     # Lane-role aware placement precedence (Redmine #13647, disposition j#85650): the
     # caller-supplied `launch_context` carries the durable `lane_kind` (親/子/孫) resolved from
     # governance at the create / heal boundary — never inferred from provider / pane / display
-    # cache here. Precedence is `by_lane_kind[kind] > lane_class > default`
+    # cache here. Precedence is `by_lane_kind[kind] > lane_class > product default`
     # (`resolve_placement_policy_for_role`); a `None` context / unresolved kind / a config with
-    # no matching `by_lane_kind` entry all fall through to the pre-#13646 lane-class resolution
-    # (byte-invariant). Fresh launch = that context, heal = the stored kind (reconciled above).
+    # no matching `by_lane_kind` entry all fall through to the lane-class resolution.
+    # Fresh launch = that context, heal = the stored kind (reconciled above).
+    # Redmine #14568: the bottom of that chain is now the PRODUCT default (`split: down` on
+    # both lane classes, `order: (codex, claude)` on the default pair), so a workspace that
+    # declares no `lane_placement` still lands its pairs vertically with the coordinator on
+    # top. `split: right` on the lane class (or on a lane kind) is the rollback.
+    # Redmine #14569 resolves the pair's split RATIO through the same one adapter; it is
+    # consumed after the launches (`agent start` has no `--ratio`), not in the argv.
     lane_class = "default" if result.lane_id == DEFAULT_LANE else "sublane"
-    config_split, config_order = resolve_placement_policy_for_role(
+    config_split, config_order, config_ratio = resolve_placement_policy_for_role(
         lane_placement, lane_class, lane_kind
     )
     providers = resolve_launch_order(providers, config_order)
@@ -842,7 +859,6 @@ def _prepare_session_locked(
         target_tab=target_tab,
         lane_slot_tabs=lane_slot_tabs,
         config_split=config_split,
-        config_order=config_order,
         launch_count=len(launch_plans),
     )
     occupancy = plan_of_container.occupancy  # grows per launch (first occupies, rest split)
@@ -900,24 +916,16 @@ def _prepare_session_locked(
                     ),
                 )
 
-    # Reclaim the empty root panes we created — only after EVERY launch succeeded
-    # (a launch failure raised above, so reaching here means all agents are live and
-    # the workspace/tab is safe to keep with just its agent panes). Close only the
-    # exact root pane ids we captured; a close failure is non-fatal cosmetic residue.
-    # The workspace base pane (#13330) and the lane tab root pane (#13411) are
-    # distinct handles — reclaim each independently, never one guessed for the other.
-    if result.base_pane_id:
-        reclaimed, detail = _close_base_pane(
-            binary, result.base_pane_id, runner, timeout, env
-        )
-        result.base_pane_reclaimed = reclaimed
-        result.base_pane_detail = detail
-    if result.tab_pane_id:
-        reclaimed, detail = _close_base_pane(
-            binary, result.tab_pane_id, runner, timeout, env
-        )
-        result.tab_pane_reclaimed = reclaimed
-        result.tab_pane_detail = detail
+    # Finish the container — reclaim the roots we created (#13330 / #13411), then divide the
+    # pair at the declared ratio (#14569). Only after EVERY launch succeeded, in that order
+    # (closing the root collapses the tree the ratio is measured against); records, not raises.
+    finalize_container_geometry(
+        result, config_split=config_split, config_order=config_order,
+        pair_order=pair_order, requested=providers, config_ratio=config_ratio,
+        launched=len(launch_plans),
+        initial_occupancy=plan_of_container.occupancy, dry_run=dry_run,
+        binary=binary, runner=runner, timeout=timeout, env=env,
+    )
     # Pass 3 — observe what we started (Redmine #13948, Answer j#80989). `agent start`
     # returning a well-formed, correctly-located locator is the LAUNCHER's claim; it says
     # nothing about the process. This bounded read-only probe turns "accepted" into

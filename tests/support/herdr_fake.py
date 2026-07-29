@@ -231,6 +231,18 @@ class FakeHerdr:
         #: every existing scenario relies on.
         self.echo_composer: bool = False
         self._composer: dict = {}
+        # --- pane geometry (face G, Redmine #14569) -----------------------------
+        #: The split ratio and direction per container ``(workspace_id, tab_id)``. herdr
+        #: keeps a split as a ratio and re-derives the rects, so `pane resize` MUTATES this
+        #: and `pane layout` reports it — a frozen layout would let a ratio test pass
+        #: without the code moving anything.
+        self._split_ratio: dict = {}
+        self._split_direction: dict = {}
+        #: Fail-closed stimuli for the geometry face: an unreadable `pane layout`, a payload
+        #: the parser must refuse, and a `pane resize` herdr rejects.
+        self.layout_fails = False
+        self.layout_bad_payload = False
+        self.resize_fails = False
 
     # -- seeding / injection --------------------------------------------------
 
@@ -356,6 +368,10 @@ class FakeHerdr:
             return self._cmd_agent_get(argv, rest)
         if head == ["agent", "read"]:
             return self._cmd_agent_read(argv, rest)
+        if head == ["pane", "layout"]:
+            return self._cmd_pane_layout(argv, rest)
+        if head == ["pane", "resize"]:
+            return self._cmd_pane_resize(argv, rest)
         if head == ["pane", "close"]:
             return self._cmd_pane_close(argv, rest)
         if head in (["pane", "send-text"], ["pane", "send-keys"]):
@@ -465,6 +481,13 @@ class FakeHerdr:
         pane_id = self._mint_pane(ws)
         if parsed.tab_id:
             ws.pane_tab[pane_id] = parsed.tab_id
+        if parsed.split:
+            # G (#14569): this launch is what CREATES the container's divider, so the
+            # container's split direction is whatever this argv asked for. herdr's own
+            # `agent start` has no `--ratio`, so the fresh divider starts at herdr's even
+            # default and only a later `pane resize` moves it.
+            self._split_direction[(ws.workspace_id, parsed.tab_id)] = parsed.split
+            self._split_ratio.setdefault((ws.workspace_id, parsed.tab_id), 0.5)
         self._agents[pane_id] = _Agent(
             name=parsed.name,
             pane_id=pane_id,
@@ -567,12 +590,89 @@ class FakeHerdr:
             {"result": {"read": {"text": text, "truncated": False}}},
         )
 
+    # -- G pane geometry: `pane layout` / `pane resize` (Redmine #14569) ------
+
+    def _container_of(self, pane_id: str):
+        """``(workspace, tab_id, pane ids)`` for the container ``pane_id`` lives in.
+
+        A lane's container is its tab; the default pair's is the workspace itself. Pane
+        order is the workspace's own creation order, which is exactly herdr's placement
+        order: the pane that occupied the container, then the pane that split it. The
+        reclaimed root pane has already left ``ws.panes``, so a launched pair is the two
+        panes that remain.
+        """
+        ws = self._workspace_of_pane(pane_id)
+        if ws is None:
+            return None, "", []
+        tab = ws.pane_tab.get(pane_id, "")
+        panes = [p for p in ws.panes if ws.pane_tab.get(p, "") == tab]
+        return ws, tab, panes
+
+    def _cmd_pane_layout(self, argv, rest):
+        pane_id = _flag_value(rest, "--pane")
+        if self.layout_fails:
+            return _err(argv, "pane layout refused")
+        ws, tab, panes = self._container_of(pane_id)
+        if ws is None:
+            return _err(argv, f"no such pane: {pane_id}")
+        if self.layout_bad_payload:
+            return _ok(argv, {"result": {"type": "not_a_layout"}})
+        key = (ws.workspace_id, tab)
+        return _ok(
+            argv,
+            render_pane_layout(
+                pane_ids=panes,
+                direction=self._split_direction.get(key, "down"),
+                ratio=self._split_ratio.get(key, 0.5),
+                tab_id=tab or f"{ws.workspace_id}:t1",
+                workspace_id=ws.workspace_id,
+            ),
+        )
+
+    def _cmd_pane_resize(self, argv, rest):
+        pane_id = _flag_value(rest, "--pane")
+        direction = _flag_value(rest, "--direction")
+        amount = _flag_value(rest, "--amount")
+        if self.resize_fails:
+            return _err(argv, "pane resize refused")
+        ws, tab, _panes = self._container_of(pane_id)
+        if ws is None:
+            return _err(argv, f"no such pane: {pane_id}")
+        try:
+            value = float(amount)
+        except ValueError:
+            return _err(argv, f"invalid amount: {amount}")
+        if value != value or value in (float("inf"), float("-inf")):
+            # herdr rejects a non-finite amount outright and changes nothing (j#91140).
+            return _err(argv, f"invalid amount: {amount}")
+        key = (ws.workspace_id, tab)
+        self._split_ratio[key] = apply_resize_amount(
+            self._split_ratio.get(key, 0.5), direction, value
+        )
+        return _ok(argv, {"result": {"type": "ok"}})
+
+    def split_ratio_of(self, pane_id: str) -> float:
+        """The live split ratio of the container ``pane_id`` lives in (test read helper)."""
+        ws, tab, _ = self._container_of(pane_id)
+        if ws is None:
+            return 0.0
+        return self._split_ratio.get((ws.workspace_id, tab), 0.5)
+
     def _cmd_pane_close(self, argv, rest):
         pane_id = rest[2] if len(rest) > 2 else ""
         ws = self._workspace_of_pane(pane_id)
         if ws is None:
             return _err(argv, f"no such pane: {pane_id}")
+        _ws, tab, panes = self._container_of(pane_id)
         ws.panes.remove(pane_id)
+        if len(panes) <= 2:
+            # G (#14569): a divider exists only while two panes share it. Closing one
+            # collapses the split, so the stored ratio must go with it — a later
+            # `agent start --split` builds a FRESH divider at herdr's even default rather
+            # than inheriting the dead one's share. Keeping it would let a heal report
+            # `matched` without ever having divided anything.
+            self._split_ratio.pop((ws.workspace_id, tab), None)
+            self._split_direction.pop((ws.workspace_id, tab), None)
         # E (tab axis, #13411): the pane leaves its tab; the tab lives on only while
         # another pane still references it. `pane_tab` is the sole tab registry, so a
         # tab with no remaining panes simply stops being referenced (auto-vanish).
@@ -873,6 +973,99 @@ def _flag_value(rest: list, flag: str) -> str:
         return ""
 
 
+#: The cell extent a modelled pair split divides, and its cross-axis size. Chosen so
+#: ``round(extent * ratio)`` is exact for every ratio the schema admits at one decimal,
+#: which keeps a geometry assertion about the CODE rather than about rounding.
+HERDR_SPLIT_EXTENT = 100
+HERDR_SPLIT_CROSS = 80
+#: The per-call ``--amount`` cap and the ratio clamp herdr 0.7.4 applies (live-measured,
+#: Redmine #14569 j#91140). Both are silent: the CLI exits 0 either way, which is exactly
+#: why the production code re-reads ``pane layout`` instead of trusting the exit status.
+HERDR_RESIZE_MAX_AMOUNT = 0.5
+HERDR_MIN_SPLIT_RATIO = 0.1
+HERDR_MAX_SPLIT_RATIO = 0.9
+
+
+def apply_resize_amount(ratio: float, direction: str, amount: float) -> float:
+    """herdr's measured ``pane resize`` arithmetic — the one model both fakes share.
+
+    ``down`` / ``right`` move the divider toward that edge, growing the FIRST child's
+    share; ``up`` / ``left`` shrink it. The magnitude is capped per call and the result is
+    clamped into herdr's effective split domain (j#91140: ``0.1 + 0.55`` lands on ``0.6``,
+    and ``0.5 - 0.9`` lands on ``0.1`` rather than ``0.0``).
+    """
+    step = min(abs(amount), HERDR_RESIZE_MAX_AMOUNT)
+    moved = ratio + step if direction in ("down", "right") else ratio - step
+    return max(HERDR_MIN_SPLIT_RATIO, min(HERDR_MAX_SPLIT_RATIO, moved))
+
+
+def render_pane_layout(
+    *,
+    pane_ids,
+    direction: str,
+    ratio: float,
+    tab_id: str = "t1",
+    workspace_id: str = "w1",
+    extent: int = HERDR_SPLIT_EXTENT,
+    cross: int = HERDR_SPLIT_CROSS,
+) -> dict:
+    """A ``herdr pane layout`` payload for a container — the one shape both fakes share.
+
+    Reproduces the live 0.7.4 envelope (measured j#91140): panes carry rects, splits carry
+    ``direction`` / ``ratio`` / ``rect`` and — deliberately, as the real one does — **no
+    child pane ids**, so a consumer must identify a pair's divider geometrically. The first
+    pane in ``pane_ids`` is the container's occupant (left / top) and the second is the one
+    that split it; the rects tile the split exactly, with the first child's extent at
+    ``round(extent * ratio)``.
+
+    A container that is not a pair renders its panes with **no** split, which is the shape
+    a single-pane tab really has — and the shape a divider-identifying consumer must refuse
+    rather than guess at.
+    """
+    panes = list(pane_ids)
+    area = (
+        {"x": 0, "y": 0, "width": cross, "height": extent}
+        if direction == "down"
+        else {"x": 0, "y": 0, "width": extent, "height": cross}
+    )
+    layout = {
+        "tab_id": tab_id,
+        "workspace_id": workspace_id,
+        "area": dict(area),
+        "focused_pane_id": panes[0] if panes else "",
+        "zoomed": False,
+    }
+    if len(panes) != 2:
+        layout["panes"] = [{"pane_id": p, "rect": dict(area)} for p in panes]
+        layout["splits"] = []
+        return {"result": {"type": "pane_layout", "layout": layout}}
+    first = round(extent * ratio)
+    second = extent - first
+    if direction == "down":
+        rects = [
+            {"x": 0, "y": 0, "width": cross, "height": first},
+            {"x": 0, "y": first, "width": cross, "height": second},
+        ]
+    else:
+        rects = [
+            {"x": 0, "y": 0, "width": first, "height": cross},
+            {"x": first, "y": 0, "width": second, "height": cross},
+        ]
+    layout["panes"] = [
+        {"pane_id": panes[0], "rect": rects[0], "focused": True},
+        {"pane_id": panes[1], "rect": rects[1], "focused": False},
+    ]
+    layout["splits"] = [
+        {
+            "id": "split_0_root",
+            "direction": direction,
+            "ratio": ratio,
+            "rect": dict(area),
+        }
+    ]
+    return {"result": {"type": "pane_layout", "layout": layout}}
+
+
 def _ok(argv, payload) -> "subprocess.CompletedProcess[str]":
     return subprocess.CompletedProcess(
         list(argv), 0, stdout=json.dumps(payload), stderr=""
@@ -928,6 +1121,13 @@ def attest_capability_epilog(*, include_generation: bool = True) -> str:
 __all__ = (
     "DEFAULT_START_STATUS",
     "FakeHerdr",
+    "HERDR_MAX_SPLIT_RATIO",
+    "HERDR_MIN_SPLIT_RATIO",
+    "HERDR_RESIZE_MAX_AMOUNT",
+    "HERDR_SPLIT_CROSS",
+    "HERDR_SPLIT_EXTENT",
+    "apply_resize_amount",
+    "render_pane_layout",
     "LOCATOR_ALIASES",
     "LOCATOR_KEY",
     "STATUS_BLOCKED",

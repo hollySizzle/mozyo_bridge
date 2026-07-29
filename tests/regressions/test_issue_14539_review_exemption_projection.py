@@ -2778,6 +2778,9 @@ class ReviewJ92106BespokeParserTests(unittest.TestCase):
         allowed = {
             # Owns the grammar: the token regex, the component split, and both strict readers.
             "redmine_journal_source.py",
+            # The canonical quote-aware scan (#14585 / #14665) — it OWNS the token grammar and the
+            # body split for the whole package now, exactly as this module's own owner entry does.
+            "canonical_note_scan.py",
             # A deliberately STRICTER private reader (#14219 j#86569 R8-F2 / j#86675 R18-F3): it
             # refuses whitespace ANYWHERE in a component, where the shared reader refuses it only
             # around a key or value. Routing it through the shared reader would LOOSEN it, so it
@@ -2943,6 +2946,25 @@ class ReviewJ92060EffectReachingReaderTests(unittest.TestCase):
             # Defines the scanner and its strict counterparts.
             "redmine_journal_source.py",
         }
+        # NOT "this is safe" — a MEASURED, unresolved finding in a module this issue does not own,
+        # recorded here so the gate stays meaningful instead of being quietly widened.
+        #
+        # ``coordinator_proxy_send.canonical_decision_in_journal`` arrived on this branch with
+        # ``origin/main-next`` (#14585 / #14546). It decides a PROXY SEND, and it reads the
+        # decision through the lenient fold, so a body no canonical producer could render still
+        # decides. Measured on this head, all three of these produce a decision:
+        #
+        #     gate=some_other:gate=implementation_request   (repeated key, last-write-wins)
+        #     proxy_action=dispatch_next:proxy_action=…     (same, on the action field)
+        #     gate = implementation_request                 (whitespace-contaminated value)
+        #
+        # Fixing it means changing another issue's hardened authority reader inside a
+        # conflict-resolution task, and the naive fix — a strict parse that DROPS an unreadable
+        # marker — would loosen their exactly-one-decision rule by turning a duplicate refusal
+        # into an acceptance. So it is reported for routing rather than patched here
+        # (Implementation Done / Review Request for #14539 R34).
+        routed_findings = {"coordinator_proxy_send.py"}
+        allowed |= routed_findings
         # ``review_exemption.py`` and ``composer_discard_approval.py`` were on this list with
         # reasons that did not survive the effect chain (review j#92106 findings 1 and 2): the
         # first MINTS the exemption the retire admits on, the second is called by
@@ -3821,28 +3843,28 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
     DISCIPLINES = {
         # -- the grammar owner ---------------------------------------------------------
         f"{_D}/domain/redmine_journal_source.py": (
-            ["*", "*", "*:_MARKER_RE"],
+            ["*", "*", "*:MARKER_RE"],
             "owns the grammar: token regex, component split, strict readers, gate-marker "
             "renderer, and the producer-side value validator",
         ),
         # -- readers -------------------------------------------------------------------
         f"{_D}/domain/dispatch_authorization.py": (
-            ["*", "*", "*", "*:_MARKER_RE", "*:_MARKER_RE"],
+            ["*", "*", "*", "*:_MARKER_RE"],
             "reads: note-scoped ambiguity flag invalidates every sibling; also renders, through "
             "the shared value validator",
         ),
         f"{_D}/domain/dispatch_disposition.py": (
-            ["*", "*", "*", "*:_MARKER_RE", "*:_MARKER_RE"],
+            ["*", "*", "*", "*:_MARKER_RE"],
             "reads: note-scoped note_ambiguous flag refuses the discharge; also renders, through "
             "the shared value validator",
         ),
         f"{_D}/domain/recovery_anchor_delivery.py": (
-            ["*", "*", "*", "*", "*:_MARKER_RE", "recovery-delivery-authorization", "recovery-delivery-zero-send"],
+            ["*", "*", "*", "*", "recovery-delivery-authorization", "recovery-delivery-zero-send"],
             "reads: exactly-one-marker rule, so any second marker of its channel makes the note "
             "unreadable before a field is compared",
         ),
         f"{_D}/domain/recovered_pair_pin_reconciliation.py": (
-            ["*", "*", "*:_AUTHORITY_RE", "*:_MARKER_RE"],
+            ["*", "*", "*:_AUTHORITY_RE"],
             "reads: exactly-one-marker rule",
         ),
         f"{_D}/domain/hibernate_park_record.py": (["handoff", "handoff"], "reads one marker per record"),
@@ -3860,12 +3882,12 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         f"{_H}/domain/handoff.py": (["handoff"], "renders the handoff notification marker"),
         f"{_H}/domain/notification.py": (["notify", "notify"], "renders the notify marker"),
         f"{_D}/domain/callback_recovery_key.py": (
-            ["*", "*", "*", "*:_MARKER_RE"],
+            ["*", "*", "*"],
             "renders the recovery-admission marker through the shared value validator it "
             "originally hardened; reads back through the shared strict gate reader",
         ),
         f"{_D}/domain/callback_sweep_watermark.py": (
-            ["*", "*", "*", "*", "*:_MARKER_RE", "workflow-event"],
+            ["*", "*", "*", "*", "workflow-event"],
             "renders the sweep record / dispatch markers",
         ),
         f"{_D}/domain/hibernate_evidence_integration.py": (
@@ -3889,12 +3911,24 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "renders the operator startup gate note",
         ),
         f"{_D}/application/sublane_diagnostics.py": (
-            ["*", "*", "*", "*", "*", "*:_MARKER_RE", "workflow-event"],
+            ["*", "*", "*", "*", "*", "workflow-event"],
             "renders the callback-lease blocker marker",
+        ),
+        # -- arrived with origin/main-next (#14585 / #14665) -----------------------------
+        f"{_D}/domain/canonical_note_scan.py": (
+            ['*:MARKER_RE'],
+            "owns the quote-aware canonical scan: the token regex, the recognized channels and "
+            "the per-line marker scan every reader of this grammar now shares",
+        ),
+        f"{_D}/application/coordinator_proxy_send.py": (
+            ['*', '*', '*:MARKER_RE', 'workflow-event'],
+            "reads ONE named journal for a proxy-send decision, per canonical line, requiring "
+            "exactly one accepted marker; see the routed finding in "
+            "test_only_the_declared_display_readers_still_use_the_lenient_fold",
         ),
         # -- prose ---------------------------------------------------------------------
         f"{_D}/application/cli_workflow_watch.py": (
-            ["*", "*", "*", "*", "*:_MARKER_RE", "*:watch"],
+            ["*", "*", "*", "*", "*:watch"],
             "argparse help text only: it names the token to explain the flag and neither builds "
             "nor matches a marker",
         ),
@@ -3907,10 +3941,6 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
     #: The trade is stated in ``test_no_module_shape_can_hide_a_capability_from_a_wildcard_consumer``:
     #: over-detection costs a declaration line, a missed reader costs a silent gate.
     INHERITED = {
-        "src/mozyo_bridge/application/cli_core.py": (
-            ['*', 'handoff'],
-            "inherits via a used import of sublane_diagnostics, sublane_quarantine; names no marker token itself",
-        ),
         "src/mozyo_bridge/application/commands.py": (
             ['handoff'],
             "inherits via a used import of handoff; names no marker token itself",
@@ -3980,55 +4010,67 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of handoff; names no marker token itself",
         ),
         f"{_D}/application/callback_gate_record.py": (
-            ['*', '*', '*', '*', '*:_MARKER_RE', 'workflow-event'],
+            ['*', '*', '*', '*', 'workflow-event'],
             "inherits via a used import of callback_sweep_watermark, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/callback_outbox_processor.py": (
-            ['*', '*', '*:_MARKER_RE'],
+            ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/callback_recovery_admission.py": (
-            ['*', '*', '*', '*', '*', '*:_MARKER_RE', 'workflow-event'],
+            ['*', '*', '*', '*', '*', 'workflow-event'],
             "inherits via a used import of callback_recovery_key, callback_sweep_watermark, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/callback_recovery_record.py": (
-            ['*', '*', '*', '*', '*', '*:_MARKER_RE', 'workflow-event'],
+            ['*', '*', '*', '*', '*', 'workflow-event'],
             "inherits via a used import of callback_recovery_key, callback_sweep_watermark, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/callback_runtime.py": (
-            ['*', '*', '*:_MARKER_RE'],
+            ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/callback_sweep.py": (
-            ['*', '*', '*', '*', '*:_MARKER_RE', 'workflow-event'],
+            ['*', '*', '*', '*', 'workflow-event'],
             "inherits via a used import of callback_sweep_watermark, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/cli_handoff_delegate_dispatch.py": (
             ['handoff'],
             "inherits via a used import of handoff; names no marker token itself",
         ),
+        f"{_D}/application/cli_sublane_group.py": (
+            ['*', 'handoff'],
+            "inherits via a used import of sublane_diagnostics, sublane_quarantine; names no marker token itself",
+        ),
         f"{_D}/application/cli_workflow.py": (
             ['*', '*', '*:watch', 'operator-startup-gate'],
             "inherits via a used import of cli_workflow_watch, operator_startup_resume_leg; names no marker token itself",
         ),
         f"{_D}/application/cli_workflow_callbacks.py": (
-            ['*', '*', '*:_MARKER_RE'],
+            ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/cli_workflow_dispatch_ir.py": (
-            ['*', '*', '*:_MARKER_RE'],
-            "inherits via a used import of redmine_journal_source; names no marker token itself",
+            ['*', '*', 'handoff'],
+            "inherits via a used import of handoff, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/cli_workflow_proxy.py": (
+            ['workflow-event'],
+            "inherits via a used import of coordinator_proxy_send; names no marker token itself",
         ),
         f"{_D}/application/cli_workflow_recovery_admission.py": (
             ['*'],
             "inherits via a used import of sublane_diagnostics; names no marker token itself",
         ),
+        f"{_D}/application/cli_workflow_role_authority.py": (
+            ['workflow-event'],
+            "inherits via a used import of coordinator_proxy_send; names no marker token itself",
+        ),
         f"{_D}/application/dispatch_disposition_writer.py": (
-            ['*', '*', '*', '*', '*:_MARKER_RE', '*:_MARKER_RE', '*:_MARKER_RE'],
+            ['*', '*', '*', '*', '*:_MARKER_RE', '*:_MARKER_RE'],
             "inherits via a used import of dispatch_authorization, dispatch_disposition, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/gateway_disposition_intake.py": (
-            ['*', '*', '*', '*:_MARKER_RE', '*:_MARKER_RE'],
+            ['*', '*', '*', '*:_MARKER_RE'],
             "inherits via a used import of dispatch_authorization, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/gateway_route_gate.py": (
@@ -4047,16 +4089,12 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             ['*', '*:_MARKER_RE'],
             "inherits via a used import of dispatch_authorization; names no marker token itself",
         ),
-        f"{_D}/application/herdr_workflow_step.py": (
-            ['*', '*', '*:_MARKER_RE'],
-            "inherits via a used import of redmine_journal_source; names no marker token itself",
-        ),
         f"{_D}/application/hibernate_supervisor_wiring.py": (
-            ['*', '*', '*', '*:_MARKER_RE'],
+            ['*', '*', '*'],
             "inherits via a used import of hibernate_evidence_marker, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/live_redmine_journal_source.py": (
-            ['*', '*', '*:_MARKER_RE'],
+            ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/main_lane_guard_gate.py": (
@@ -4072,7 +4110,7 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of operator_startup_resume_leg; names no marker token itself",
         ),
         f"{_D}/application/reconcile_dispatch_writer.py": (
-            ['*', '*', '*:_MARKER_RE'],
+            ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/recovered_pair_pin_reconciliation.py": (
@@ -4092,7 +4130,7 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of handoff, recovery_anchor_delivery; names no marker token itself",
         ),
         f"{_D}/application/retire_admissibility.py": (
-            ['*', '*', '*', '*:_MARKER_RE'],
+            ['*', '*', '*'],
             "inherits via a used import of hibernate_evidence_integration, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/sublane_gateway_recovery_live.py": (
@@ -4108,7 +4146,7 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of hibernated_bound_pair_composer_discard, hibernated_bound_pair_convergence; names no marker token itself",
         ),
         f"{_D}/application/sublane_hibernated_bound_pair_composer_discard_live.py": (
-            ['*', '*', '*:_MARKER_RE', 'handoff', 'workflow-event', 'workflow-event'],
+            ['*', '*', 'handoff', 'workflow-event', 'workflow-event'],
             "inherits via a used import of sublane_quarantine, hibernated_bound_pair_composer_discard, hibernated_bound_pair_convergence, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/sublane_hibernated_bound_pair_convergence.py": (
@@ -4116,7 +4154,7 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of hibernated_bound_pair_convergence; names no marker token itself",
         ),
         f"{_D}/application/sublane_hibernated_bound_pair_convergence_live.py": (
-            ['*', '*', '*:_MARKER_RE', 'workflow-event'],
+            ['*', '*', 'workflow-event'],
             "inherits via a used import of hibernated_bound_pair_convergence, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/sublane_hibernated_live_reconcile_ops.py": (
@@ -4152,15 +4190,15 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of handoff, sublane_quarantine; names no marker token itself",
         ),
         f"{_D}/application/supervisor_wiring.py": (
-            ['*', '*', '*', '*', '*:_MARKER_RE', '*:watch', 'handoff'],
+            ['*', '*', '*', '*', '*:watch', 'handoff'],
             "inherits via a used import of handoff, cli_workflow_watch, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/workspace_callback_review_return.py": (
-            ['*', '*', '*:_MARKER_RE'],
+            ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/application/workspace_callback_supervisor.py": (
-            ['*', '*', '*:_MARKER_RE'],
+            ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/domain/dispatch_authority.py": (
@@ -4172,15 +4210,15 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of handoff; names no marker token itself",
         ),
         f"{_D}/domain/glance_integration_disposition.py": (
-            ['*', '*', '*:_MARKER_RE'],
+            ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/domain/glance_journal_grammar.py": (
-            ['*', '*', '*:_MARKER_RE'],
+            ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/domain/hibernate_basis_producer.py": (
-            ['*', '*', '*', '*', '*:_MARKER_RE', 'handoff'],
+            ['*', '*', '*', '*', 'handoff'],
             "inherits via a used import of hibernate_evidence_integration, hibernate_evidence_marker, hibernate_park_record, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/domain/hibernate_evidence_authority.py": (
@@ -4188,15 +4226,19 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of hibernate_evidence_marker; names no marker token itself",
         ),
         f"{_D}/domain/hibernate_issuer_policy.py": (
-            ['*', '*', '*:_MARKER_RE'],
+            ['*', '*'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/domain/lane_work_anchor.py": (
+            ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/domain/recovered_worker_delivery.py": (
-            ['*', '*', '*', '*', '*:_MARKER_RE', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],
+            ['*', '*', '*', '*', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],
             "inherits via a used import of recovery_anchor_delivery, redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/domain/review_exemption.py": (
-            ['*', '*', '*:_MARKER_RE'],
+            ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
         "src/mozyo_bridge/e_140_adapter_provider/f_110_ticket_adapter_common/domain/ticket_adapter.py": (
@@ -4212,11 +4254,11 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of handoff; names no marker token itself",
         ),
         "src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_retire_ops.py": (
-            ['*', '*', '*', '*', '*:_MARKER_RE', '*:_MARKER_RE', '*:_MARKER_RE', 'handoff'],
+            ['*', '*', '*', '*', '*:_MARKER_RE', '*:_MARKER_RE', 'handoff'],
             "inherits via a used import of sublane_quarantine, dispatch_authorization, dispatch_disposition, redmine_journal_source; names no marker token itself",
         ),
         "src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/domain/composer_discard_approval.py": (
-            ['*', '*', '*:_MARKER_RE'],
+            ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
     }

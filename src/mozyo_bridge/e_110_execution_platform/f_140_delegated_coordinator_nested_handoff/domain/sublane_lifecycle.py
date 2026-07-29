@@ -567,7 +567,8 @@ class SublaneCreateRequest:
     #: tree this lane occupies), which no probe can infer at create time and which the
     #: display cache must never supply. Stored generation-bound on the lifecycle authority
     #: row so a later heal resolves the lane's pane placement offline. Empty (the default)
-    #: records no kind: placement stays ``lane_class``-derived, byte-for-byte pre-#13647.
+    #: records no kind: placement stays ``lane_class``-derived, whose own undeclared
+    #: fallback is the #14568 product default (``split: down``), not the pre-#13646 launch.
     #: Like ``base_ref`` it is not part of the lane *identity*, so the adopt / read-back
     #: identity guard never consults it.
     lane_kind: str = ""

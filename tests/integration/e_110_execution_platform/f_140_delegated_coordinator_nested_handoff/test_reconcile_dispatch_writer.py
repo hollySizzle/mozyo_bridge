@@ -301,6 +301,28 @@ class HandoffArgvTest(unittest.TestCase):
         self.assertIn("lane=lane-a", pf)
         self.assertIn("gateway_callback_target=mzb1_ws1_codex_la", pf)
 
+    def test_argv_carries_the_lane_as_route_authority_too(self):
+        # Redmine #14659 (verdict j#92207): the lane's OTHER consumer. The assertion above pins the
+        # role-profile placeholder; on its own it stayed green while the route derived the workspace
+        # default lane, because `--target-lane` — the tier-1 explicit lane `derive_target_lane`
+        # resolves the slot with — was never written.
+        argv = build_ir_handoff_argv("79600", _ROUTE, issue="13758")
+        self.assertIn("--target-lane", argv)
+        self.assertEqual(argv[argv.index("--target-lane") + 1], "lane-a")
+
+    def test_the_real_handoff_parser_reads_that_lane_back_exactly(self):
+        # The pin above is about the argv we WROTE; this one is about what the receiver's own parser
+        # READS. Both are needed: a flag the parser ignored (or renamed) would satisfy the first
+        # assertion and still leave `target_lane=None` — the exact state that produced the
+        # `invalid_args` zero-send in #14584 j#92197.
+        from mozyo_bridge.application.cli import build_parser
+
+        argv = build_ir_handoff_argv("79600", _ROUTE, issue="13758")
+        parsed = build_parser().parse_args(argv)
+        self.assertEqual(getattr(parsed, "target_lane", None), _ROUTE.lane)
+        # ...and the placeholder consumer is unchanged: one lane value, two destinations.
+        self.assertIn(f"lane={_ROUTE.lane}", list(getattr(parsed, "profile_field", ()) or ()))
+
 
 if __name__ == "__main__":
     unittest.main()

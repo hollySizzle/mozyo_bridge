@@ -31,6 +31,68 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     _norm,
 )
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (  # noqa: E501
+    LANE_PLACEMENT_PROVIDERS as PAIR_ORDER_PROVIDERS,
+)
+
+
+def validate_pair_order(
+    pair_order: "Sequence[str] | None",
+    providers: Sequence[str],
+    *,
+    error_type: type,
+) -> None:
+    """Reject a malformed ``pair_order`` BEFORE any side effect (Redmine #14569 j#91284 R3-F1).
+
+    ``pair_order`` is the ratio's ``order[0]``-side authority for a request the caller shrank
+    to a subset, so it is held to the SAME domain the declared ``order`` already is
+    (``lane_placement._normalize_order``): an **exact permutation** of the canonical provider
+    vocabulary. Anything else — an unknown provider, a duplicate, a missing one, a non-string
+    element, a non-sequence — is refused here rather than coerced downstream.
+
+    Coercing it is not a theoretical hazard: ``pair_order=("unknown", "codex")`` used to be
+    accepted, which made ``codex`` *not* the effective primary, so a gateway target-only heal
+    resized the pair and handed the gateway's declared share to the surviving worker — and
+    reported ``applied`` (measured, j#91299). Authority that nobody validated is not authority.
+
+    The requested ``providers`` must also be a **subset** of it. A caller that names a stable
+    pair order not containing what it is actually launching has contradicted itself, and the
+    side the ratio would pick from that contradiction is meaningless.
+    """
+    if pair_order is None:
+        return
+    if isinstance(pair_order, (str, bytes)) or not isinstance(pair_order, (list, tuple)):
+        raise error_type(
+            f"pair_order must be a list naming each provider "
+            f"{sorted(PAIR_ORDER_PROVIDERS)} exactly once, got "
+            f"{type(pair_order).__name__}"
+        )
+    seen: list = []
+    for element in pair_order:
+        if not isinstance(element, str) or element not in PAIR_ORDER_PROVIDERS:
+            raise error_type(
+                f"pair_order element must be one of {sorted(PAIR_ORDER_PROVIDERS)}, "
+                f"got {element!r}"
+            )
+        if element in seen:
+            raise error_type(
+                f"pair_order lists provider {element!r} more than once; it must be an "
+                "exact permutation"
+            )
+        seen.append(element)
+    if set(seen) != set(PAIR_ORDER_PROVIDERS):
+        missing = sorted(set(PAIR_ORDER_PROVIDERS) - set(seen))
+        raise error_type(
+            f"pair_order must name every provider {sorted(PAIR_ORDER_PROVIDERS)} exactly "
+            f"once; missing {missing}"
+        )
+    unknown = [p for p in providers if p not in seen]
+    if unknown:
+        raise error_type(
+            f"pair_order {seen!r} does not contain the requested provider(s) {unknown!r}; "
+            "a stable pair order that excludes what this run launches cannot say which "
+            "side the declared ratio belongs to"
+        )
 
 
 def validate_session_request(
@@ -42,6 +104,7 @@ def validate_session_request(
     env: Mapping[str, str],
     error_type: type,
     launch_context: object = None,
+    pair_order: "Sequence[str] | None" = None,
 ) -> None:
     """Reject a malformed session request BEFORE any side effect (pure; raises ``error_type``).
 
@@ -59,7 +122,10 @@ def validate_session_request(
       the unit, so a cross-slot defect (duplicate workflow role, two entries for one physical
       slot, one slot asked for two profiles, an unknown role / unregistered provider, an
       ambiguous governance anchor) is refused while nothing has been launched. A context with
-      no ``slot_specs`` skips it entirely, so every pre-#13647 caller is byte-invariant.
+      no ``slot_specs`` skips it entirely, so every pre-#13647 caller is byte-invariant **on
+      this axis** — this step can only refuse, never place. It says nothing about the
+      independent geometry axis, where an undeclared lane class lands on the #14568 product
+      default (``split: down``).
     - **Invalid managed permission policy** (review j#73404). The lane chokepoint requests
       (codex, claude), so a validation that only fired inside the claude slot's launch would
       leave the codex gateway already started — a partial lane — when the env override is
@@ -68,6 +134,7 @@ def validate_session_request(
       here (rather than only in the launch preflight) keeps an invalid override fail-closed even
       on an adopt-only run.
     """
+    validate_pair_order(pair_order, providers, error_type=error_type)
     if coordinator_placement_mode not in COORDINATOR_PLACEMENT_MODES:
         raise error_type(
             f"unknown coordinator placement mode {coordinator_placement_mode!r}; "
@@ -119,7 +186,10 @@ def _validate_slot_plan(
     """
     specs = tuple(getattr(launch_context, "slot_specs", ()) or ())
     if not specs:
-        return  # no role-bearing plan supplied: byte-for-byte the pre-#13647 launch
+        # No role-bearing plan supplied: this gate contributes nothing, byte-for-byte the
+        # pre-#13647 role-plan handling. NOT a pre-#13647 launch — the geometry axis is
+        # resolved elsewhere and defaults to #14568's `split: down` when undeclared.
+        return
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (  # noqa: E501
         WORKFLOW_ROLES,
     )

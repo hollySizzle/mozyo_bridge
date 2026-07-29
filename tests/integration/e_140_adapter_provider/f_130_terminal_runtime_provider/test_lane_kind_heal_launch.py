@@ -163,12 +163,16 @@ class LaneKindHealAuthorityLaunchTest(unittest.TestCase):
         # The heal acceptance: NOTHING is handed to the launch (`launch_context=None`), yet
         # the lane places by the kind its create recorded — read offline from the lifecycle
         # authority record. Without T1b this fell back to `lane_class`.
+        # The lane class is pinned to `right` on purpose: since Redmine #14568 the product
+        # default is `down`, so a `down` assertion against an undeclared class would pass
+        # even if the stored kind were ignored entirely.
         _, herdr = self._run(
             lane="lane-heal",
             stored_kind="delegated_coordinator",
             launch_context=None,
             config=self._placement(
-                by_lane_kind={"delegated_coordinator": {"split": "down"}}
+                by_lane_kind={"delegated_coordinator": {"split": "down"}},
+                sublane={"split": "right"},
             ),
         )
         self.assertEqual(self._second_split(herdr), "down")
@@ -311,21 +315,28 @@ class LaneKindHealAuthorityLaunchTest(unittest.TestCase):
 
     def test_blank_stored_token_still_falls_back(self) -> None:
         # The one legitimate absence: a legacy / pre-v7 lane has no durable kind fact, so it
-        # keeps the pre-#13647 lane-class geometry rather than refusing.
+        # takes the lane-CLASS geometry rather than refusing. The class declares `right` and
+        # the kind declares `down` so the observed value names which layer decided (a bare
+        # undeclared class would resolve `down` from the #14568 product default and make the
+        # assertion agree with the kind layer by coincidence).
         _, herdr = self._run(
             lane="lane-blank",
             stored_kind="",
             tamper="",
             config=self._placement(
                 by_lane_kind={"implementation": {"split": "down"}},
+                sublane={"split": "right"},
             ),
         )
         self.assertEqual(self._second_split(herdr), "right")
 
-    def test_rowless_lane_is_unchanged(self) -> None:
+    def test_rowless_lane_takes_the_product_default(self) -> None:
+        # A lane with no lifecycle row and no config declares nothing on either axis, so it
+        # reaches the third layer: the #14568 product default (`down`). It still launches
+        # the full pair — an unresolved kind is a fall-through, never a refusal.
         _, herdr = self._run(lane="lane-scratch", stored_kind=None, launch_context=None)
         self.assertEqual(len(herdr.start_argvs), 2)
-        self.assertEqual(self._second_split(herdr), "right")
+        self.assertEqual(self._second_split(herdr), "down")
 
 
 class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):

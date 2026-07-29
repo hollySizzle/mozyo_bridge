@@ -24,6 +24,12 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tests"))
+
+from support.herdr_fake import (  # noqa: E402
+    apply_resize_amount,
+    render_pane_layout,
+)
 
 from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
 from mozyo_bridge.core.state.herdr_identity_attestation import (
@@ -91,6 +97,12 @@ class _StatefulHerdr:
         self.start_argvs: list[list] = []
         self._pane_seq = 1
         self._tab_seq = 0  # monotonic tab counter (Redmine #13411 lane=tab)
+        # Redmine #14569: the lane pair's live split ratio + direction. `pane resize`
+        # MOVES the ratio and `pane layout` reports it, so the geometry rail is
+        # exercised rather than answered by a frozen payload.
+        self.split_ratio = 0.5
+        self.split_direction = ""
+        self.pane_resizes: list[list] = []
         # #13378: rendered pane text served by `agent read`; set to "" to simulate a
         # live-but-still-booting TUI (blank render).
         self.read_text = "codex composer rendered"
@@ -168,11 +180,44 @@ class _StatefulHerdr:
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
             )
+        if rest[:2] == ["pane", "layout"]:
+            # Redmine #14569: a lane launch now closes with a pane-geometry read + resize.
+            # Rendered by the SHARED producer so this fake cannot drift from herdr's real
+            # envelope; the container is this lane's tab (its two launched panes).
+            pane_id = rest[rest.index("--pane") + 1]
+            tab = next(
+                (a.get("tab_id", "") for a in self.agents if a["pane_id"] == pane_id), ""
+            )
+            panes = [a["pane_id"] for a in self.agents if a.get("tab_id", "") == tab]
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    render_pane_layout(
+                        pane_ids=panes,
+                        direction=self.split_direction or "down",
+                        ratio=self.split_ratio,
+                    )
+                ),
+                stderr="",
+            )
+        if rest[:2] == ["pane", "resize"]:
+            self.pane_resizes.append(rest)
+            self.split_ratio = apply_resize_amount(
+                self.split_ratio,
+                rest[rest.index("--direction") + 1],
+                float(rest[rest.index("--amount") + 1]),
+            )
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"result": {"type": "ok"}}), stderr=""
+            )
         if rest[:2] == ["agent", "start"]:
             self.start_argvs.append(rest)
             name = rest[2]
             wid = rest[rest.index("--workspace") + 1] if "--workspace" in rest else "w1"
             tab_id = rest[rest.index("--tab") + 1] if "--tab" in rest else ""
+            if "--split" in rest:
+                self.split_direction = rest[rest.index("--split") + 1]
             self._pane_seq += 1
             pane_id = f"{wid}:p{self._pane_seq}"
             row = {"name": name, "pane_id": pane_id}
