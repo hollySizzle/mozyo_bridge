@@ -158,6 +158,41 @@ def _git(*args: str, cwd: Path, capture: bool = False):
     )
 
 
+#: Config that stops git from leaving a DETACHED background writer inside a synthetic repo.
+#:
+#: Since Git 2.50 a foreground command that ends in a commit (``commit``, ``cherry-pick``,
+#: ``fetch``, ...) finishes by spawning ``git maintenance run --auto --detach``. That process
+#: daemonizes (measured: it reparents to pid 1) and keeps writing INSIDE the repository after the
+#: fixture's ``subprocess.run(..., check=True)`` has already returned — git 2.43 ran the same
+#: maintenance synchronously, which is why this only started biting on the runner (the GitHub
+#: Actions ubuntu-latest image that failed run 30422231848 ships git 2.54.0).
+#:
+#: The teardown then races that writer: ``shutil.rmtree`` lists a directory ONCE, removes the
+#: children it listed, and finally ``os.rmdir``s the directory. The detached maintenance writes
+#: through helpers that call ``safe_create_leading_directories()`` (``update_info_file`` for
+#: ``.git/info/refs``, ``odb_mkstemp`` for ``.git/objects/...``), so it RE-CREATES a directory the
+#: teardown had already removed and never revisits. ``os.rmdir('<tmp>/primary/.git')`` then fails
+#: with ``OSError: [Errno 39] Directory not empty`` — the exact #14685 CI error.
+#:
+#: ``maintenance.auto=false`` is the switch that actually prevents the spawn. ``gc.auto=0`` does
+#: NOT: measured on git 2.54, the detached process still starts (it merely has no gc work to do)
+#: and still writes into the repo. Nothing the #14066 fail-closed contract asserts depends on
+#: git's background maintenance, so the synthetic repos opt out of it rather than the teardown
+#: swallowing errors — a suppressed teardown would hide real leaks instead of removing the racer.
+_NO_AUTO_MAINTENANCE = "maintenance.auto=false"
+
+
+def _disable_background_git_maintenance(git_root: Path) -> None:
+    """Opt ``git_root`` out of detached auto maintenance (Redmine #14685).
+
+    Call this on every repository the fixture materialises, BEFORE the first command that can
+    trigger maintenance. A linked worktree shares its parent's config, so configuring the parent
+    covers it; a fresh ``git clone`` gets its own config and is covered at clone time instead.
+    """
+    key, _, value = _NO_AUTO_MAINTENANCE.partition("=")
+    _git("config", key, value, cwd=git_root)
+
+
 def _rev_parse(cwd: Path, ref: str) -> str:
     return _git("rev-parse", ref, cwd=cwd, capture=True).stdout.strip()
 
@@ -552,6 +587,8 @@ class IntegrationDispositionBlockTests(unittest.TestCase):
 def _init_herdr_repo(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     _git("init", "-b", "main", cwd=root)
+    # Before the first commit: that is what spawns the detached writer (Redmine #14685).
+    _disable_background_git_maintenance(root)
     _git("config", "user.email", "t@example.invalid", cwd=root)
     _git("config", "user.name", "t", cwd=root)
     mb = root / ".mozyo-bridge"
@@ -629,7 +666,12 @@ class _Scenario:
         self.integration_head = _rev_parse(self.primary, _INTEGRATION_BRANCH)
         _git("checkout", "main", cwd=self.primary)
         self.origin = tmp / "origin.git"
-        _git("clone", "--bare", str(self.primary), str(self.origin), cwd=tmp)
+        # ``--config`` lands in the NEW repo's config and takes effect immediately after it is
+        # initialized, so the clone itself can never leave a detached writer behind (#14685).
+        _git(
+            "clone", "--bare", "--config", _NO_AUTO_MAINTENANCE,
+            str(self.primary), str(self.origin), cwd=tmp,
+        )
         if not origin_has_integration:
             _git(
                 "update-ref", "-d", f"refs/heads/{_INTEGRATION_BRANCH}", cwd=self.origin
