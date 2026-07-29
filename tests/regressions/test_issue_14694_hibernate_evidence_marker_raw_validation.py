@@ -30,7 +30,13 @@ it took — including the three shapes the FIRST fix left open (review j#93646):
 - **the bound that stopped the predicate raising, raising** (review j#94093 blocker 1): the decimal
   predicate's length bound asked ``sys.get_int_max_str_digits()`` unconditionally — an API new in
   3.10.7, in a package whose ``requires-python`` is ``>=3.10`` — so on 3.10.0–3.10.6 a CLEAN ``req``
-  and a clean ``--evidence-lane-generation`` raised before either boundary could answer.
+  and a clean ``--evidence-lane-generation`` raised before either boundary could answer;
+- **a canonical grammar that moved with the runtime** (review j#94222 blocker 1): reaching for that
+  bound at all made "what a canonical decimal is" depend on the Python version AND on a mutable
+  process-global, so an uncapped producer rendered a 4301-digit ``lane_generation`` with no refusal
+  and the default-capped parser raised ``ValueError`` on it — one durable marker reading back as
+  canonical or as a crash depending on how two processes happened to be configured, with the
+  parser committing the producer's own "a predicate that raises is not a predicate" defect.
 
 Every test in this file detects the recurrence of that symptom. Claims about the producers' public
 contract — the byte shape of a clean marker, the round trip, the unchanged parse side — are the
@@ -99,6 +105,38 @@ def interpreter_without_the_digit_limit_api():
     finally:
         if saved is not missing:
             sys.get_int_max_str_digits = saved
+
+
+#: Read once, before any test moves it, so "the default" stays the default.
+_DEFAULT_INT_MAX_STR_DIGITS = getattr(sys, "get_int_max_str_digits", lambda: 0)()
+
+
+def cap_settings():
+    """Every int-from-str digit cap a supported runtime can actually be in (derived, not listed).
+
+    The lowest the interpreter will accept, the default it starts at, and unlimited — read off
+    ``sys`` rather than written here, so this cannot drift from what a real process can be
+    configured to. ``None`` means "leave it alone", which is the only option on an interpreter with
+    no such API — and the reason this never returns an empty tuple, because a loop over the settings
+    that iterates nothing is a test that passes by measuring nothing.
+    """
+    if not hasattr(sys, "set_int_max_str_digits"):
+        return (None,)
+    return (sys.int_info.str_digits_check_threshold, _DEFAULT_INT_MAX_STR_DIGITS, 0)
+
+
+@contextlib.contextmanager
+def interpreter_cap(cap):
+    """Run the block with the interpreter's digit cap set to ``cap``, restoring it afterwards."""
+    if cap is None or not hasattr(sys, "set_int_max_str_digits"):
+        yield
+        return
+    restore = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(cap)
+    try:
+        yield
+    finally:
+        sys.set_int_max_str_digits(restore)
 
 
 class ReportedSymptomTests(unittest.TestCase):
@@ -583,17 +621,20 @@ class ReviewResultProducerTests(unittest.TestCase):
         # and a module-level import would turn every method in this file into one ImportError —
         # a "they all fail on base" that measures nothing.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+            MAX_CANONICAL_DECIMAL_VALUE,
             is_journal_id,
         )
 
+        widest = str(MAX_CANONICAL_DECIMAL_VALUE)
         for bad in ("01", "007", "0", "", " 1", "1 ", "1.0", "-1", "٣", None, 1, True):
             with self.subTest(value=bad):
                 self.assertFalse(is_journal_id(bad))
-        for good in ("1", "9", "10", "93802", "9" * 4300):
+        for good in ("1", "9", "10", "93802", widest):
             with self.subTest(value=f"{len(good)} digits"):
                 self.assertTrue(is_journal_id(good))
-        # Longer than any consumer could convert to an integer: refused as a False, never raised.
-        for oversized in ("9" * 4301, "1" * 10000):
+        # Wider than any id either source system can hold: refused as a False, never raised. The
+        # widths come off the bound itself, so this cannot drift away from what the code enforces.
+        for oversized in (str(MAX_CANONICAL_DECIMAL_VALUE + 1), "9" * len(widest), "1" * 10000):
             with self.subTest(value=f"{len(oversized)} digits"):
                 self.assertFalse(is_journal_id(oversized))
 
@@ -915,21 +956,26 @@ class CanonicalDecimalFieldsTests(unittest.TestCase):
                 self.assertEqual(is_journal_id(value), is_canonical_positive_decimal(value))
 
 
-class SupportedInterpreterWithoutTheDigitLimitApiTests(unittest.TestCase):
-    """Review j#94093 blocker 1: the guard that stopped the predicate raising, raised.
+class TheDecimalGrammarIsTheProtocolsNotTheRuntimesTests(unittest.TestCase):
+    """Review j#94093 blocker 1 and review j#94222 blocker 1: two rounds of one mistake.
 
-    R5 made the decimal predicate lexical so a 4301-digit input would come back as ``False`` rather
-    than as an exception the CLI boundary could not turn into a typed refusal. The upper bound it
-    asked for was the interpreter's own, ``sys.get_int_max_str_digits()`` — an API that is "New in
-    version 3.10.7", called unconditionally, in a package whose ``requires-python`` is ``>=3.10``.
-    So on 3.10.0–3.10.6 a CLEAN ``req`` and a clean ``--evidence-lane-generation`` both raised
-    ``AttributeError`` before any boundary could answer: the same symptom the fix existed to close,
-    reintroduced by the fix, and on the clean path rather than the malformed one.
+    R5 made the decimal predicate lexical so an oversized input would come back as ``False`` rather
+    than as an exception the CLI boundary could not turn into a typed refusal. For the upper bound
+    it reached for the INTERPRETER's — ``sys.get_int_max_str_digits()``. That was wrong twice:
 
-    The bound is now reached for with ``getattr`` and simply not applied when the interpreter has
-    none — which is not a concession to the older version but the same reasoning: an interpreter
-    without the API has no cap on the conversion either, so there is nothing there for a bound to
-    refuse.
+    - the API is "New in version 3.10.7" in a package whose ``requires-python`` is ``>=3.10``, and
+      it was called unconditionally, so on 3.10.0-3.10.6 a CLEAN ``req`` and a clean
+      ``--evidence-lane-generation`` raised ``AttributeError`` before any boundary could answer
+      (j#94093) — the symptom the fix existed to close, reintroduced by the fix, on the clean path;
+    - and even reached for defensively, "the interpreter's bound" is not a bound a PROTOCOL can be
+      written against: it moves with the Python version AND with a mutable process-global. Measured
+      (j#94222): an uncapped producer rendered a 4301-digit ``lane_generation`` with no refusal and
+      the default-capped parser then raised ``ValueError`` — one durable marker reading back as
+      canonical or as a crash depending on how two processes happened to be configured.
+
+    The grammar is now the protocol's: a canonical decimal is a positive token no wider than a
+    signed 64-bit integer, the widest value either source system can hold. Every value it admits
+    converts under EVERY reachable configuration, because CPython refuses any cap below 640.
     """
 
     _DECIMAL_CORPUS = (
@@ -944,22 +990,28 @@ class SupportedInterpreterWithoutTheDigitLimitApiTests(unittest.TestCase):
         "1 ",
         "1.0",
         "-1",
-        "٣",
+        "\u0663",
         None,
         1,
         True,
-        "9" * 4300,
+        "9" * 19,
+        "9" * 20,
         "9" * 4301,
         "1" * 10000,
     )
 
-    def _predicates(self):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
-            is_canonical_positive_decimal,
-            is_journal_id,
+    def _contract(self):
+        # Imported HERE, not at module scope: these names do not exist on the base revision, and a
+        # module-level import would turn every method in this file into one ImportError.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (  # noqa: E501
+            marker_value_contract as mvc,
         )
 
-        return (is_journal_id, is_canonical_positive_decimal)
+        return mvc
+
+    def _predicates(self):
+        mvc = self._contract()
+        return (mvc.is_journal_id, mvc.is_canonical_positive_decimal)
 
     def _review_args(self, req):
         return argparse.Namespace(
@@ -985,11 +1037,13 @@ class SupportedInterpreterWithoutTheDigitLimitApiTests(unittest.TestCase):
             with shape:
                 for predicate in predicates:
                     for value in self._DECIMAL_CORPUS:
-                        with self.subTest(shape=label, fn=predicate.__name__, value=repr(value)[:24]):
+                        with self.subTest(
+                            shape=label, fn=predicate.__name__, value=repr(value)[:24]
+                        ):
                             self.assertIsInstance(predicate(value), bool)
 
     def test_a_clean_req_and_generation_still_render_without_the_api(self):
-        # The reported symptom: these are the two clean inputs that raised.
+        # The j#94093 symptom: these are the two clean inputs that raised.
         with interpreter_without_the_digit_limit_api():
             fields, refusal = review_gate_marker_fields(self._review_args("93802"), "review_result")
             self.assertIsNone(refusal)
@@ -997,10 +1051,10 @@ class SupportedInterpreterWithoutTheDigitLimitApiTests(unittest.TestCase):
             fields, refusal = lane_envelope_marker_fields(self._envelope_args("3"))
             self.assertIsNone(refusal)
             self.assertEqual(fields["evidence_lane_generation"], 3)
-            # Inline over-correction control rather than its own method: dropping the bound on an
-            # interpreter that has none must not drop the SHAPE rule with it, and nothing here may
+            # Inline over-correction control rather than its own method: a boundary that stops
+            # asking the interpreter must not stop asking about the SHAPE, and nothing here may
             # become a traceback either.
-            for bad in ("01", "007", "0", "-1", "1.5", " 3", "٣", "abc"):
+            for bad in ("01", "007", "0", "-1", "1.5", " 3", "\u0663", "abc"):
                 with self.subTest(value=bad):
                     fields, refusal = lane_envelope_marker_fields(self._envelope_args(bad))
                     self.assertEqual(fields, {})
@@ -1011,37 +1065,131 @@ class SupportedInterpreterWithoutTheDigitLimitApiTests(unittest.TestCase):
                     self.assertEqual(fields, {})
                     self.assertEqual(refusal, "review_marker_malformed_review_request_journal")
 
-    def test_the_bound_is_the_interpreters_own_and_not_a_constant_written_here(self):
-        """Derived from the running interpreter, never from the number 4300 recalled here.
+    def test_the_verdict_does_not_move_when_the_process_cap_moves(self):
+        """The j#94222 symptom, inverted: the same token, the same answer, at every cap.
 
-        Asked at the predicate and never through the CLI: see the context manager's docstring for
-        why an oversized token cannot honestly be carried into the without-API shape's conversion.
+        The predecessor of this method pinned the OPPOSITE — that the canonical verdict tracked
+        the process cap — which fixed the defect in place rather than detecting it.
         """
-        ask = getattr(sys, "get_int_max_str_digits", None)
-        tell = getattr(sys, "set_int_max_str_digits", None)
-        if ask is None or tell is None:
-            # This suite is itself running on an interpreter with no cap — the shape the blocker
-            # was about. There is no bound to track, and every length converts.
-            for predicate in self._predicates():
-                with self.subTest(fn=predicate.__name__):
-                    self.assertTrue(predicate("9" * 10000))
-            return
-        # Move the interpreter's cap and require the predicate to move with it. A bound hard-coded
-        # here would answer the same on both settings.
-        moved = sys.int_info.str_digits_check_threshold  # the lowest cap the interpreter accepts
-        restore = ask()
-        try:
-            tell(moved)
-            for predicate in self._predicates():
-                with self.subTest(fn=predicate.__name__, cap=moved):
-                    self.assertTrue(predicate("9" * moved))
-                    self.assertFalse(predicate("9" * (moved + 1)))
-                    # ...and with the API taken away, the same token is accepted, because an
-                    # interpreter that cannot be asked for a cap does not have one.
-                    with interpreter_without_the_digit_limit_api():
-                        self.assertTrue(predicate("9" * (moved + 1)))
-        finally:
-            tell(restore)
+        mvc = self._contract()
+        probes = (
+            "1",
+            "93802",
+            str(mvc.MAX_CANONICAL_DECIMAL_VALUE),
+            str(mvc.MAX_CANONICAL_DECIMAL_VALUE + 1),
+            "9" * 4301,
+            "1" * 10000,
+        )
+        for predicate in self._predicates():
+            baseline = {p: predicate(p) for p in probes}
+            for cap in cap_settings():
+                with interpreter_cap(cap):
+                    for probe in probes:
+                        with self.subTest(fn=predicate.__name__, cap=cap, digits=len(probe)):
+                            self.assertEqual(predicate(probe), baseline[probe])
+            with interpreter_without_the_digit_limit_api():
+                for probe in probes:
+                    with self.subTest(fn=predicate.__name__, cap="absent API", digits=len(probe)):
+                        self.assertEqual(predicate(probe), baseline[probe])
+
+    def test_what_an_uncapped_producer_writes_a_capped_consumer_can_read(self):
+        """The cross-configuration regression: two processes, two digit caps, one marker.
+
+        Measured on the previous grammar: under an uncapped producer the 4301-digit generation was
+        rendered with ``refusal=None``, and the default-capped parser raised ``ValueError`` on it.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
+            LaneEvidenceEnvelope,
+            parse_lane_envelope,
+        )
+
+        mvc = self._contract()
+        widest = str(mvc.MAX_CANONICAL_DECIMAL_VALUE)
+        for producer_cap in cap_settings():
+            with self.subTest(producer_cap=producer_cap):
+                with interpreter_cap(producer_cap):
+                    # Whatever the producer is configured with, the oversized token is refused...
+                    fields, refusal = lane_envelope_marker_fields(self._envelope_args("9" * 4301))
+                    self.assertEqual(fields, {})
+                    self.assertEqual(refusal, "evidence_envelope_malformed_generation")
+                    # ...and the widest token it WILL accept is produced identically.
+                    accepted, refusal = lane_envelope_marker_fields(self._envelope_args(widest))
+                    self.assertIsNone(refusal)
+                    self.assertEqual(accepted["evidence_lane_generation"], int(widest))
+                for consumer_cap in cap_settings():
+                    with interpreter_cap(consumer_cap):
+                        parsed = parse_lane_envelope(
+                            {"workspace": "ws", "lane": "lane", "lane_generation": widest},
+                            require_head=False,
+                        )
+                        self.assertIsInstance(
+                            parsed,
+                            LaneEvidenceEnvelope,
+                            f"producer cap {producer_cap} -> consumer cap {consumer_cap}",
+                        )
+                        self.assertEqual(parsed.lane_generation, int(widest))
+
+    def test_an_oversized_generation_is_typed_at_the_consumer_too_never_an_exception(self):
+        """The parser had the producer's old defect: ``int()`` decided, so it could raise.
+
+        Only the WIDTH half of the grammar is applied here, deliberately. The parser keeps its own
+        (wider) acceptance in every other respect — refusing to write more than you refuse to read
+        is the safe direction, and a canonical producer never wrote what it would now refuse.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
+            ENVELOPE_MALFORMED_GENERATION,
+            EnvelopeParseError,
+            parse_lane_envelope,
+        )
+
+        for oversized in ("9" * 4301, "1" * 10000, "9" * 4300):
+            for cap in cap_settings():
+                with self.subTest(digits=len(oversized), cap=cap):
+                    with interpreter_cap(cap):
+                        got = parse_lane_envelope(
+                            {"workspace": "ws", "lane": "lane", "lane_generation": oversized},
+                            require_head=False,
+                        )
+                    self.assertIsInstance(got, EnvelopeParseError)
+                    self.assertEqual(got.reason, ENVELOPE_MALFORMED_GENERATION)
+
+    def test_the_int_side_of_the_generation_asks_the_same_bound(self):
+        """Self-detected while reproducing j#94222: the string side was only half the field.
+
+        ``render_lane_envelope`` checked ``is_exact_int`` and ``> 0`` and then rendered with an
+        f-string, so ``10**5000`` either raised ``ValueError`` (capped) or rendered a 5001-digit
+        ``lane_generation`` no capped consumer could parse (uncapped).
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
+            LaneEvidenceEnvelope,
+            render_lane_envelope,
+        )
+
+        mvc = self._contract()
+        oversized = LaneEvidenceEnvelope(
+            workspace="ws", lane="lane", lane_generation=mvc.MAX_CANONICAL_DECIMAL_VALUE + 1, head=""
+        )
+        for cap in cap_settings():
+            with self.subTest(cap=cap):
+                with interpreter_cap(cap):
+                    with self.assertRaises(ValueError):
+                        render_lane_envelope(oversized)
+        # Inline control: the widest generation the bound admits still renders, at every cap.
+        widest = LaneEvidenceEnvelope(
+            workspace="ws", lane="lane", lane_generation=mvc.MAX_CANONICAL_DECIMAL_VALUE, head=""
+        )
+        for cap in cap_settings():
+            with self.subTest(cap=cap, control="widest"):
+                with interpreter_cap(cap):
+                    self.assertIn(
+                        f"lane_generation={mvc.MAX_CANONICAL_DECIMAL_VALUE}",
+                        render_lane_envelope(widest),
+                    )
+        # ...and the string and int halves agree about where the line is.
+        self.assertTrue(mvc.is_canonical_positive_decimal(str(mvc.MAX_CANONICAL_DECIMAL_VALUE)))
+        self.assertTrue(mvc.is_canonical_positive_int(mvc.MAX_CANONICAL_DECIMAL_VALUE))
+        self.assertFalse(mvc.is_canonical_positive_decimal(str(mvc.MAX_CANONICAL_DECIMAL_VALUE + 1)))
+        self.assertFalse(mvc.is_canonical_positive_int(mvc.MAX_CANONICAL_DECIMAL_VALUE + 1))
 
 
 class RendererNeverWritesWhatItWouldNotMeanTests(unittest.TestCase):

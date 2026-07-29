@@ -23,7 +23,12 @@ import re
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
-from .marker_value_contract import is_exact_int, is_exact_str
+from .marker_value_contract import (
+    MAX_CANONICAL_DECIMAL_VALUE,
+    is_canonical_positive_int,
+    is_exact_str,
+    within_marker_decimal_width,
+)
 
 #: A canonical full commit hash: 40 hex (sha1) or 64 hex (sha256), lowercase. A truncated /
 #: abbreviated / uppercase / non-hex head is rejected, matching the repo-wide convention
@@ -116,9 +121,19 @@ def parse_lane_envelope(
     generation_raw = str(fields.get(FIELD_LANE_GENERATION, "") or "").strip()
     if not generation_raw:
         return EnvelopeParseError(ENVELOPE_MISSING_GENERATION)
-    if not generation_raw.isdigit() or int(generation_raw) <= 0:
+    # The width test comes BEFORE the conversion, and it is the producer's own (Redmine #14694
+    # review j#94222). Asking `int()` first is what made this parser RAISE `ValueError` on a
+    # 4301-digit generation instead of answering `ENVELOPE_MALFORMED_GENERATION` — the same "a
+    # predicate that raises is not a predicate" defect that was fixed on the producer side in R5
+    # and left standing here, so one durable marker read back as canonical or as a crash depending
+    # on the two processes' digit caps. The rest of this parser's acceptance is deliberately NOT
+    # narrowed: refusing to WRITE more than you refuse to READ is the safe direction, and the
+    # producer already refuses `01` / `٣`, which a canonical producer therefore never wrote.
+    if not generation_raw.isdigit() or not within_marker_decimal_width(generation_raw):
         return EnvelopeParseError(ENVELOPE_MALFORMED_GENERATION, generation_raw)
     generation = int(generation_raw)
+    if generation <= 0:
+        return EnvelopeParseError(ENVELOPE_MALFORMED_GENERATION, generation_raw)
 
     head = str(fields.get(FIELD_HEAD, "") or "").strip()
     if head and not is_full_sha(head):
@@ -231,8 +246,16 @@ def render_lane_envelope(envelope: LaneEvidenceEnvelope) -> str:
     # with an f-string, so a `str` / `int` subclass overriding `__format__` decides the durable
     # bytes. Measured: such a subclass validated as `ws` rendered `workspace=evil:lane=forged`, and
     # one validated as generation `3` rendered `lane_generation=9:head=forged`.
-    if not is_exact_int(generation) or generation <= 0:
-        raise ValueError(f"lane envelope requires a positive lane_generation, got {generation!r}")
+    # ...and the SAME protocol bound the string side applies, reached through the other type
+    # (self-detected while reproducing review j#94222). `is_exact_int` plus `> 0` let a generation
+    # of `10**5000` through to the f-string below, which either raised `ValueError` — a producer's
+    # programming error arriving as an untyped exception — or, in an uncapped process, rendered a
+    # 5001-digit `lane_generation` that no capped consumer could parse.
+    if not is_canonical_positive_int(generation):
+        raise ValueError(
+            f"lane envelope requires a positive lane_generation no wider than "
+            f"{MAX_CANONICAL_DECIMAL_VALUE}, got {generation!r}"
+        )
     head = envelope.head
     if not is_exact_str(head):
         raise ValueError(f"lane envelope head must be a builtin string, got {head!r}")

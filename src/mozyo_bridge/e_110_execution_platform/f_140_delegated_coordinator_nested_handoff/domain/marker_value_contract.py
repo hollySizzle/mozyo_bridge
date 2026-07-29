@@ -12,8 +12,6 @@ every existing import keeps working.
 
 from __future__ import annotations
 
-import sys
-
 
 #: Characters a field value may not contain: the marker grammar uses them as delimiters, so a
 #: value carrying one forges a field boundary and reads back as a DIFFERENT well-formed body.
@@ -106,21 +104,48 @@ _ASCII_DIGITS = frozenset("0123456789")
 _ASCII_NONZERO_DIGITS = frozenset("123456789")
 
 
-def _int_conversion_digit_limit() -> int:
-    """The interpreter's own cap on ``int``-from-``str`` conversion; ``0`` when it has none (pure).
+#: The widest value either decimal marker field can name. DERIVED, never a number written here:
+#: the lane lifecycle store declares ``lane_generation INTEGER`` (``core.state.lane_lifecycle_schema``)
+#: and SQLite's ``INTEGER`` is a signed 64-bit value, while ``req`` is a Redmine journal id — the
+#: source system's own integer record id. A token wider than this names no row in either system.
+MAX_CANONICAL_DECIMAL_VALUE = 2**63 - 1
 
-    ``sys.get_int_max_str_digits`` is "New in version 3.10.7" and this package supports ``>=3.10``
-    (``pyproject.toml``), so calling it unconditionally made a CLEAN value raise ``AttributeError``
-    on 3.10.0–3.10.6 — before either boundary could answer with the typed refusal it owes its
-    caller, which is the exact failure shape review j#93882 finding 2 was about (Redmine #14694
-    review j#94093 blocker 1). Reaching for the bound with ``getattr`` is not a shrug at the version
-    difference, it IS the difference: an interpreter without the API has no cap on the conversion
-    either, so on it every length converts and there is nothing for this bound to refuse. Raising
-    the package's supported floor to 3.10.7 would answer it the other way, but that is a change to
-    the support contract and not this issue's to make.
+#: The same bound as the decimal string the grammar actually compares against.
+_MAX_CANONICAL_DECIMAL = str(MAX_CANONICAL_DECIMAL_VALUE)
+
+
+def within_marker_decimal_width(value: str) -> bool:
+    """Whether a decimal token is narrow enough for EVERY runtime to convert it (pure).
+
+    The stable half of the grammar, shared by the producer and by the envelope PARSER, because the
+    bound this replaced was not stable at all: it asked ``sys.get_int_max_str_digits()``, so what
+    counted as canonical changed with the Python version AND with a mutable process-global
+    (``PYTHONINTMAXSTRDIGITS`` / :func:`sys.set_int_max_str_digits`). Measured on that grammar
+    (Redmine #14694 review j#94222): an uncapped producer rendered a 4301-digit ``lane_generation``
+    with no refusal, and the default-capped parser then raised ``ValueError`` — one durable marker
+    splitting into canonical or crash depending on how the two processes happened to be configured.
+
+    So the bound is the PROTOCOL's, not the interpreter's. It is also always reachable: CPython
+    refuses any ``int_max_str_digits`` below ``sys.int_info.str_digits_check_threshold`` (640, or 0
+    for unlimited), and this bound is 19 digits — so every value this admits converts under every
+    configuration a supported runtime can be in. That is what makes a canonical producer's output
+    readable by any other one.
     """
-    interpreter_limit = getattr(sys, "get_int_max_str_digits", None)
-    return interpreter_limit() if interpreter_limit is not None else 0
+    return len(value) <= len(_MAX_CANONICAL_DECIMAL)
+
+
+def is_canonical_positive_int(value: object) -> bool:
+    """The INT-side twin of :func:`is_canonical_positive_decimal`, judged raw (pure).
+
+    The same rule reached through the other type, because the defect had both halves. Self-detected
+    while reproducing review j#94222: ``render_lane_envelope`` checked only ``is_exact_int`` and
+    ``> 0`` and then rendered with an f-string, so a generation of ``10**5000`` either RAISED
+    ``ValueError`` (capped process — a producer's programming error arriving as an untyped
+    exception) or rendered a 5001-digit ``lane_generation`` no capped consumer could read
+    (uncapped process). Fixing the string side alone would have left the same defect in the same
+    disguise, which is how ``req`` and ``lane_generation`` diverged in the first place.
+    """
+    return is_exact_int(value) and 0 < value <= MAX_CANONICAL_DECIMAL_VALUE
 
 
 def is_canonical_positive_decimal(value: object) -> bool:
@@ -139,11 +164,12 @@ def is_canonical_positive_decimal(value: object) -> bool:
         return False
     if not set(value) <= _ASCII_DIGITS:
         return False
-    # A token no consumer could convert to an integer names nothing. The bound is the interpreter's
-    # own (0 = it has none) rather than a number chosen here, so this refuses exactly the input that
-    # used to make the predicate RAISE — as a False, which is what a predicate owes its caller.
-    limit = _int_conversion_digit_limit()
-    return not limit or len(value) <= limit
+    # A token naming no row in either source system names nothing. Both digits-only and no leading
+    # zero are already established, so comparing the strings IS comparing the numbers — the bound is
+    # applied without an `int()` the predicate would then have to survive.
+    if len(value) != len(_MAX_CANONICAL_DECIMAL):
+        return within_marker_decimal_width(value)
+    return value <= _MAX_CANONICAL_DECIMAL
 
 
 def is_journal_id(value: object) -> bool:
@@ -162,10 +188,11 @@ def is_journal_id(value: object) -> bool:
     because CPython caps int-from-str conversion at 4300 digits. A predicate that raises is not a
     predicate: the CLI boundary that owes its caller a typed refusal got an exception instead.
 
-    So: a non-``str``, the empty string, a leading zero, and any non-ASCII-decimal character are all
-    refused, on the characters alone and for any length. ``" 93802 "``, ``"93 802"``, ``"abc"``,
-    ``"93802=shadow"``, ``"-5"``, ``"1.5"``, ``"0"`` and ``"01"`` are not journal ids. The producer
-    and the CLI both ask THIS question, so "what a journal id looks like" has one answer.
+    So: a non-``str``, the empty string, a leading zero, any non-ASCII-decimal character, and
+    anything wider than :func:`within_marker_decimal_width` are all refused, on the characters
+    alone. ``" 93802 "``, ``"93 802"``, ``"abc"``, ``"93802=shadow"``, ``"-5"``, ``"1.5"``, ``"0"``
+    and ``"01"`` are not journal ids. The producer and the CLI both ask THIS question, so "what a
+    journal id looks like" has one answer.
     """
     return is_canonical_positive_decimal(value)
 
