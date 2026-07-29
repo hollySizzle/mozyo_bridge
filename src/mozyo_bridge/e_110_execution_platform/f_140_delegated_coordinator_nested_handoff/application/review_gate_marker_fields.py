@@ -25,6 +25,14 @@ def review_gate_marker_fields(args: argparse.Namespace, gate: str) -> "tuple[dic
     ``--review-request-journal`` are required. A missing / malformed input yields a fixed refusal token
     (nothing is written — the producer never emits a marker the fence would reject). A non-review gate
     carries no v2 fields (``({}, None)``).
+
+    Every value is judged RAW, for the reason review j#93646 finding 1 gave about this function's
+    envelope half (Redmine #14694): a CLI producer that trims before validating is the surface
+    that turns an operator's ``--target-head " <sha> "`` into the canonical authority field, and
+    fixing three of this function's five values would have left the finding half-closed in the
+    very function it names. ``is_full_commit_head`` strips for the READ side, so the padding is
+    caught here, before it is consulted. The refusal vocabulary is unchanged for the head; the
+    journal id gains the ``malformed`` token it never had (it only had ``missing``).
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (  # noqa: E501
         is_full_commit_head,
@@ -37,16 +45,18 @@ def review_gate_marker_fields(args: argparse.Namespace, gate: str) -> "tuple[dic
 
     if gate not in (_REVIEW_REQUEST_GATE, _REVIEW_RESULT_GATE):
         return {}, None
-    head = (getattr(args, "target_head", None) or "").strip()
+    head = getattr(args, "target_head", None) or ""
     if not head:
         return {}, "review_marker_missing_target_head"
-    if not is_full_commit_head(head):
+    if contains_marker_separator(head) or not is_full_commit_head(head):
         return {}, "review_marker_malformed_target_head"
     fields: dict = {"target_head": head}
     if gate == _REVIEW_RESULT_GATE:
-        req = (getattr(args, "review_request_journal", None) or "").strip()
+        req = getattr(args, "review_request_journal", None) or ""
         if not req:
             return {}, "review_marker_missing_review_request_journal"
+        if contains_marker_separator(req):
+            return {}, "review_marker_malformed_review_request_journal"
         fields["review_request_journal"] = req
         # v2 (`### Gate Schema`): a review_result marker carries its conclusion. The `--review-decision`
         # maps to the marker vocabulary — an approval / unspecified decision is ``approved``, any

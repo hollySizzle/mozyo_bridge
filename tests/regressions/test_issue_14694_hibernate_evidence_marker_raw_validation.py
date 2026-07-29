@@ -42,6 +42,7 @@ import unittest
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.review_gate_marker_fields import (  # noqa: E501
     lane_envelope_marker_fields,
+    review_gate_marker_fields,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (  # noqa: E501
     hibernate_evidence_integration as ie,
@@ -328,6 +329,71 @@ class CallSiteTests(unittest.TestCase):
         self.assertEqual(
             fields,
             {"evidence_workspace": WS, "evidence_lane": LANE, "evidence_lane_generation": 3},
+        )
+
+
+    def test_the_review_gate_producer_refuses_padding_on_its_own_fields_too(self):
+        """The same CLI producer's OTHER values, found while closing finding 1.
+
+        ``review_gate_marker_fields`` normalized ``--target-head`` and
+        ``--review-request-journal`` exactly as it normalized the envelope identities, so a padded
+        head became the canonical authority field of a ``review_result`` marker — which the
+        central contract also reads as hibernate evidence. Fixing three of this function's five
+        values would have left the finding half-closed inside the function it names.
+        """
+        sha = "c" * 40
+
+        def args(**over):
+            values = {
+                "target_head": sha,
+                "review_request_journal": "93610",
+                "review_decision": "approval",
+                "evidence_workspace": None,
+                "evidence_lane": None,
+                "evidence_lane_generation": None,
+            }
+            values.update(over)
+            return argparse.Namespace(**values)
+
+        cases = (
+            ({"target_head": f" {sha} "}, "review_marker_malformed_target_head"),
+            ({"target_head": f"{sha}\n"}, "review_marker_malformed_target_head"),
+            ({"target_head": f"\t{sha}"}, "review_marker_malformed_target_head"),
+            (
+                {"review_request_journal": " 93610 "},
+                "review_marker_malformed_review_request_journal",
+            ),
+            (
+                {"review_request_journal": "93610\n"},
+                "review_marker_malformed_review_request_journal",
+            ),
+            (
+                {"review_request_journal": "9361 0"},
+                "review_marker_malformed_review_request_journal",
+            ),
+        )
+        for over, expected in cases:
+            with self.subTest(**over):
+                fields, refusal = review_gate_marker_fields(args(**over), "review_result")
+                self.assertEqual(fields, {})
+                self.assertEqual(refusal, expected)
+        # Inline controls: the clean call is untouched, and the pre-existing refusals still say
+        # what they said (a padded value must not be reported as a MISSING one).
+        fields, refusal = review_gate_marker_fields(args(), "review_result")
+        self.assertIsNone(refusal)
+        self.assertEqual(fields["target_head"], sha)
+        self.assertEqual(fields["review_request_journal"], "93610")
+        self.assertEqual(
+            review_gate_marker_fields(args(target_head=""), "review_result")[1],
+            "review_marker_missing_target_head",
+        )
+        self.assertEqual(
+            review_gate_marker_fields(args(target_head="deadbeef"), "review_result")[1],
+            "review_marker_malformed_target_head",
+        )
+        self.assertEqual(
+            review_gate_marker_fields(args(review_request_journal=""), "review_result")[1],
+            "review_marker_missing_review_request_journal",
         )
 
 
