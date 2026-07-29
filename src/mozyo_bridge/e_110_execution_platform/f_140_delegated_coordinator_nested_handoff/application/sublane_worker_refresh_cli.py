@@ -139,7 +139,6 @@ def _run_live_refresh(
     # reports ``turn_unobservable`` (fail-closed), never a fabricated absence of progress.
     journal_reader = None
     journal_reader_fresh = False
-    issuer_resolver = None
     try:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
             LiveRedmineJournalSource,
@@ -148,23 +147,30 @@ def _run_live_refresh(
         source = LiveRedmineJournalSource.from_environment()
         journal_reader = source.read_entries
         journal_reader_fresh = True
-        # The approval issuer authority (#14661 j#92494): the anchor issue's own author, read
-        # fresh from the same trusted source. Identifier only — never the display name.
-        issuer_resolver = source.read_issue_author_id
     except Exception:  # noqa: BLE001 - no live durable boundary => turn_unobservable
         journal_reader = None
         journal_reader_fresh = False
-        issuer_resolver = None
     ops = LiveWorkerRefreshOps(
         repo_root=repo_root, request=request,
         journal_reader=journal_reader, journal_reader_fresh=journal_reader_fresh,
-        issuer_resolver=issuer_resolver,
     )
     # Review j#92487 F2: the shared close boundary admits a close on every non-``working``
     # runtime state (including ``blocked`` and an unreadable ``unknown``). Wrap it so the
     # destructive edge re-requires the positively-settled worker the preflight demanded.
+    def _progress_still_failed() -> bool:
+        """A FRESH durable re-read at the close edge: is the turn STILL failed? (j#92601 F3)"""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_turn_recovery import (  # noqa: E501
+            TURN_CLASS_FAILED,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_turn_recovery import (  # noqa: E501
+            classify_worker_turn,
+        )
+
+        return classify_worker_turn(ops.observe_turn(request)) == TURN_CLASS_FAILED
+
     actuation_port = SettledCloseBoundaryPort(
         inner=shared_port, ops=ops, request=request,
+        progress_still_failed=_progress_still_failed,
     )
     use_case = WorkerRefreshUseCase(store, actuation_port, ops, workspace_id=workspace_id)
     return use_case.run(request, execute=execute)

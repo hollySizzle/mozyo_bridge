@@ -46,7 +46,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     decide_recovery,
     stale_worker_recovery_action_id,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+    ResolvedIssuer,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_refresh_approval import (  # noqa: E501
+    APPROVAL_AUTHORITY_ROLES,
     WorkerRefreshApprovalError,
     parse_strict_approval_markers,
     render_worker_refresh_approval_marker,
@@ -530,38 +534,41 @@ class ApprovalDomainContractTests(unittest.TestCase):
             created_on="",
         )
 
-    def _verify(self, entries, *, issuer=OWNER, **op):
+    def _verify(self, entries, *, issuer=None, **op):
         return verify_worker_refresh_approval(
-            entries, journal=self.JOURNAL, expected_issuer_id=issuer,
-            **self._operation(**op)
+            entries, journal=self.JOURNAL, issuer=issuer, **self._operation(**op)
         )
 
-    def test_a_canonical_approval_by_the_authority_verifies(self):
-        marker = render_worker_refresh_approval_marker(**self._operation())
-        fields = self._verify([self._entry(marker)])
-        self.assertEqual(fields["decision"], "approved")
+    def test_no_role_currently_holds_owner_approval_authority(self):
+        # Review j#92601 F1: comparing the journal's author to the issue's author was not an
+        # authority check — on a single-account workspace every journal satisfies it. The repo
+        # has no durable role resolution that yields an OWNER, so the set is deliberately empty
+        # and every --execute refuses until that representation is ruled on. Pinning the empty
+        # set makes silently populating it with a nearby role a visible change.
+        self.assertEqual(APPROVAL_AUTHORITY_ROLES, frozenset())
 
-    def test_a_missing_author_is_refused_even_when_the_issuer_is_also_missing(self):
-        # ``"" == ""`` would make an equality-only check PASS. Both presence guards exist for
-        # exactly this shape, and the domain function is where they are reachable.
+    def test_an_unresolved_or_unanchored_issuer_is_refused(self):
         marker = render_worker_refresh_approval_marker(**self._operation())
-        with self.assertRaises(WorkerRefreshApprovalError):
-            self._verify([self._entry(marker, author="")], issuer="")
+        for issuer in (
+            None,
+            ResolvedIssuer(),                                    # unresolved
+            ResolvedIssuer(role="coordinator"),                  # role without an anchor
+            ResolvedIssuer(role="", authority_anchor="git:x@y"),  # anchor without a role
+        ):
+            with self.subTest(issuer=issuer):
+                with self.assertRaises(WorkerRefreshApprovalError):
+                    self._verify([self._entry(marker)], issuer=issuer)
 
-    def test_a_missing_author_alone_is_refused(self):
+    def test_an_anchored_but_non_owner_role_is_refused(self):
+        # A coordinator / gateway / worker is anchored but does not hold owner authority.
         marker = render_worker_refresh_approval_marker(**self._operation())
-        with self.assertRaises(WorkerRefreshApprovalError):
-            self._verify([self._entry(marker, author="")])
-
-    def test_a_missing_issuer_alone_is_refused(self):
-        marker = render_worker_refresh_approval_marker(**self._operation())
-        with self.assertRaises(WorkerRefreshApprovalError):
-            self._verify([self._entry(marker)], issuer="")
-
-    def test_a_foreign_author_is_refused(self):
-        marker = render_worker_refresh_approval_marker(**self._operation())
-        with self.assertRaises(WorkerRefreshApprovalError):
-            self._verify([self._entry(marker, author="9")])
+        for role in ("coordinator", "review_gateway", "lane_worker"):
+            with self.subTest(role=role):
+                with self.assertRaises(WorkerRefreshApprovalError):
+                    self._verify(
+                        [self._entry(marker)],
+                        issuer=ResolvedIssuer(role=role, authority_anchor="git:cfg@sha"),
+                    )
 
     def test_the_strict_parser_refuses_a_contradictory_record(self):
         marker = render_worker_refresh_approval_marker(**self._operation())
@@ -569,11 +576,10 @@ class ApprovalDomainContractTests(unittest.TestCase):
             marker.replace("decision=approved", "decision=declined:decision=approved"),
             marker[:-1] + ":bogus=1]",
             marker[:-1] + ":nonsense]",
-            marker + "\n" + marker,
         ):
             with self.subTest(injected=injected[-40:]):
                 with self.assertRaises(WorkerRefreshApprovalError):
-                    self._verify([self._entry(injected)])
+                    parse_strict_approval_markers(injected)
 
     def test_the_strict_parser_is_strict_at_its_own_contract(self):
         # Driven directly: routed only through the verifier, the exact-field-set check masks
@@ -590,6 +596,18 @@ class ApprovalDomainContractTests(unittest.TestCase):
             with self.subTest(body=body):
                 with self.assertRaises(WorkerRefreshApprovalError):
                     parse_strict_approval_markers(f"[mozyo:workflow-event:{body}]")
+
+    def test_a_marker_that_exists_ONLY_inside_a_quotation_is_not_a_marker(self):
+        # The discriminating shape for the span seam (review j#92601 F2): a note whose ONLY
+        # approval-shaped token is quoted. A reader that re-finds tokens with its own scan sees
+        # one well-formed approval here and verifies it; the shared quote-aware scan sees none.
+        # Earlier tests paired a quoted marker with a canonical one, so a naive re-scan was
+        # rejected for having TWO markers rather than for reading the quoted one — they passed
+        # for the wrong reason and a mutation swapping the seam survived them.
+        marker = render_worker_refresh_approval_marker(**self._operation())
+        for notes in (f"参考: `{marker}`", f"```\n{marker}\n```", f"> {marker}"):
+            with self.subTest(notes=notes[:24]):
+                self.assertEqual(parse_strict_approval_markers(notes), [])
 
     def test_the_strict_parser_accepts_a_well_formed_marker_and_ignores_foreign_ones(self):
         marker = render_worker_refresh_approval_marker(**self._operation())

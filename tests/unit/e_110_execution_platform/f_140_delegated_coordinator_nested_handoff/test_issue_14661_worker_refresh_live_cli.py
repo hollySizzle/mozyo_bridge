@@ -739,7 +739,7 @@ class ApprovalVerificationTests(unittest.TestCase):
         )
         self.ops = LiveWorkerRefreshOps(
             repo_root=self.repo, request=self.request,
-            issuer_resolver=lambda issue: self.OWNER,
+            issuer_resolver=lambda entry: None,
         )
         self.marker = render_worker_refresh_approval_marker(**self._operation())
 
@@ -754,44 +754,34 @@ class ApprovalVerificationTests(unittest.TestCase):
 
     # -- the positive case ---------------------------------------------------
 
-    def test_a_canonical_approval_by_the_issue_author_verifies(self):
-        self.assertTrue(self._verify([self._entry(f"## owner approval\n\n{self.marker}\n")]))
+    def test_every_approval_refuses_while_no_owner_authority_is_resolvable(self):
+        # Review j#92601 F1: the surface must not close on an authority it cannot establish.
+        # The preflight is unaffected; only --execute is gated.
+        self.assertFalse(self._verify([self._entry(f"## owner approval\n\n{self.marker}\n")]))
 
     # -- j#92533 F1: issuer authority ---------------------------------------
 
-    def test_an_approval_written_by_another_author_never_verifies(self):
-        # The marker says direct_owner; anyone who can write a note can write that field.
-        self.assertFalse(
-            self._verify([self._entry(self.marker, author=self.OTHER_AUTHOR)])
-        )
-
-    def test_an_unattributable_journal_never_verifies(self):
-        self.assertFalse(self._verify([self._entry(self.marker, author="")]))
-
     def test_an_unresolvable_issuer_never_verifies(self):
-        self.ops.issuer_resolver = lambda issue: ""
+        self.ops.issuer_resolver = lambda entry: None
         self.assertFalse(self._verify([self._entry(self.marker)]))
         self.ops.issuer_resolver = None
         self.assertFalse(self._verify([self._entry(self.marker)]))
 
-    def test_an_unattributable_journal_and_an_unresolvable_issuer_never_agree(self):
-        # The equality check alone would PASS here (`"" == ""`), so the presence guards are
-        # what refuses. Mutation-checked: without them this verifies.
-        self.ops.issuer_resolver = lambda issue: ""
-        self.assertFalse(self._verify([self._entry(self.marker, author="")]))
-
     def test_an_issuer_resolver_that_raises_never_verifies(self):
-        def _boom(issue):
+        def _boom(entry):
             raise RuntimeError("redmine down")
 
         self.ops.issuer_resolver = _boom
         self.assertFalse(self._verify([self._entry(self.marker)]))
 
-    def test_the_issuer_is_resolved_from_the_anchor_issue(self):
+    def test_the_issuer_is_resolved_from_the_approval_JOURNAL_not_the_issue(self):
+        # The authority question is "who wrote THIS journal", so the resolver is handed the
+        # entry, never the issue id.
         seen: list = []
-        self.ops.issuer_resolver = lambda issue: seen.append(issue) or self.OWNER
+        self.ops.issuer_resolver = lambda entry: seen.append(entry) or None
         self._verify([self._entry(self.marker)])
-        self.assertEqual(seen, [ANCHOR_ISSUE])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].journal_id, self.APPROVAL_JOURNAL)
 
     # -- j#92533 F2 A: the approval must bind the WHOLE operation ------------
 
@@ -1052,42 +1042,6 @@ class ResumeRailTests(unittest.TestCase):
             expected_gate=ANCHOR_GATE, next_semantic_action="callback_recovery_once",
         )
 
-    def test_resume_once_never_sends_without_a_distinct_fresh_worker(self):
-        rows = [{"name": "wk", "pane_id": "w4B:p10", "status": "done"}]
-        driven: list = []
-        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows):
-            with patch.object(
-                self.ops, "_drive_cli", side_effect=lambda argv: driven.append(argv) or 0
-            ):
-                with patch.object(
-                    self.ops, "_providers", return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)
-                ):
-                    result = self.ops.resume_once(self.continuation)
-        self.assertEqual(result, DRAIN_SEND_ERROR)
-        self.assertEqual(driven, [])
-
-    def test_resume_once_never_sends_to_a_slot_not_bound_to_this_action(self):
-        # Review j#92487 F3: a slot recycled after the actuator's attestation used to receive
-        # the governed resume, because only the one-shot rail verified the action binding.
-        rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle"}]
-        driven: list = []
-        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows):
-            with patch.object(
-                self.ops, "_drive_cli", side_effect=lambda argv: driven.append(argv) or 0
-            ):
-                with patch.object(
-                    self.ops, "_providers", return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)
-                ):
-                    with patch.object(
-                        self.ops, "_governed_sender_resolves", return_value=True
-                    ):
-                        with patch.object(
-                            self.ops, "_fresh_slot_action_bound", return_value=False
-                        ):
-                            result = self.ops.resume_once(self.continuation)
-        self.assertEqual(result, DRAIN_SEND_ERROR)
-        self.assertEqual(driven, [], "an unbound slot must receive nothing")
-
     def _confirmable(self):
         """Every confirmation axis but the action binding satisfied.
 
@@ -1116,6 +1070,84 @@ class ResumeRailTests(unittest.TestCase):
                     return_value="2026-01-01T00:00:00+00:00"), \
                 patch.object(self.ops, "_fresh_slot_action_bound", return_value=True):
             self.assertTrue(self.ops.resume_confirmed(self.continuation))
+
+    def test_resume_once_never_sends_without_a_distinct_fresh_worker(self):
+        rows = [{"name": "wk", "pane_id": "w4B:p10", "status": "done"}]
+        oneshot: list = []
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
+                patch.object(self.ops, "_providers",
+                             return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
+                patch.object(self.ops, "_recovery_delivery_service_ready", return_value=True), \
+                patch.object(self.ops, "_oneshot_resume",
+                             side_effect=lambda *a: oneshot.append(a) or DRAIN_SEND_OK):
+            # The only row still carries the OLD locator -> never a blind send.
+            self.assertEqual(self.ops.resume_once(self.continuation), DRAIN_SEND_ERROR)
+        self.assertEqual(oneshot, [])
+
+    def test_resume_once_never_sends_to_a_slot_not_bound_to_this_action(self):
+        rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle"}]
+        oneshot: list = []
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
+                patch.object(self.ops, "_providers",
+                             return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
+                patch.object(self.ops, "_recovery_delivery_service_ready", return_value=True), \
+                patch.object(self.ops, "_fresh_slot_action_bound", return_value=False), \
+                patch.object(self.ops, "_oneshot_resume",
+                             side_effect=lambda *a: oneshot.append(a) or DRAIN_SEND_OK):
+            self.assertEqual(self.ops.resume_once(self.continuation), DRAIN_SEND_ERROR)
+        self.assertEqual(oneshot, [], "an unbound slot must receive nothing")
+
+    def test_only_the_action_bound_rail_can_resume(self):
+        # Review j#92601 F4: the governed CLI cannot carry the replacement action into the
+        # transport, so it is no longer a rail this destructive surface may resume on.
+        rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle", "revision": "9"}]
+        oneshot: list = []
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
+                patch.object(self.ops, "_providers",
+                             return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
+                patch.object(self.ops, "_fresh_slot_action_bound", return_value=True), \
+                patch.object(self.ops, "_recovery_delivery_service_ready", return_value=False), \
+                patch.object(self.ops, "_oneshot_resume",
+                             side_effect=lambda *a: oneshot.append(a) or DRAIN_SEND_OK):
+            self.assertEqual(self.ops.resume_once(self.continuation), DRAIN_SEND_ERROR)
+        self.assertEqual(oneshot, [], "no rail is available; nothing may be sent")
+
+    def test_rail_readiness_requires_the_action_bound_service(self):
+        with patch.object(self.ops, "_recovery_delivery_service_ready", return_value=False):
+            self.assertFalse(self.ops.resume_rail_ready(_request()))
+        with patch.object(self.ops, "_recovery_delivery_service_ready", return_value=True):
+            self.assertTrue(self.ops.resume_rail_ready(_request()))
+
+    def test_a_proven_zero_send_is_reported_as_such_not_as_an_error(self):
+        # Review j#92601 F5: collapsing zero_send into the generic error left a post-close
+        # transaction permanently unresumable.
+        rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle", "revision": "9"}]
+
+        class _Svc:
+            def __init__(self, outcome):
+                self.outcome = outcome
+
+            def ready(self):
+                return True
+
+            def deliver(self, request):
+                return self.outcome
+
+        cases = (
+            (SimpleNamespace(started=True, zero_send=False), DRAIN_SEND_OK),
+            (SimpleNamespace(started=False, zero_send=True), live_mod.DRAIN_SEND_ZERO),
+            (SimpleNamespace(started=False, zero_send=False), DRAIN_SEND_ERROR),
+        )
+        for outcome, expected in cases:
+            with self.subTest(expected=expected):
+                with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
+                        patch.object(live_mod, "repo_scope_workspace_id", return_value=LOCAL_WS), \
+                        patch.object(self.ops, "_providers",
+                                     return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
+                        patch.object(self.ops, "_fresh_slot_action_bound", return_value=True), \
+                        patch.object(self.ops, "_recovery_delivery_service",
+                                     return_value=_Svc(outcome)):
+                    self.assertEqual(self.ops.resume_once(self.continuation), expected)
 
     def test_resume_confirmed_requires_the_action_binding(self):
         # Identical setup to the passing case above — ONLY the binding flips. Without this
@@ -1180,101 +1212,6 @@ class ResumeRailTests(unittest.TestCase):
                     self.continuation, "w4B:p22", WORKER_PROVIDER
                 )
             )
-
-    def test_the_action_bound_rail_is_preferred_over_the_governed_cli(self):
-        # Review j#92533 F4: the one-shot service re-runs its full preflight AT the
-        # irreversible edge and carries the action id into the transport; the governed CLI
-        # cannot. When both are available the stronger rail must win.
-        rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle", "revision": "9"}]
-        driven: list = []
-        oneshot: list = []
-        with patch.object(self.ops, "_fresh_slot_action_bound", return_value=True), \
-                patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
-                patch.object(self.ops, "_providers",
-                             return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
-                patch.object(self.ops, "_governed_sender_resolves", return_value=True), \
-                patch.object(self.ops, "_recovery_delivery_service_ready", return_value=True), \
-                patch.object(self.ops, "_oneshot_resume",
-                             side_effect=lambda *a: oneshot.append(a) or DRAIN_SEND_OK), \
-                patch.object(self.ops, "_drive_cli",
-                             side_effect=lambda argv: driven.append(argv) or 0):
-            result = self.ops.resume_once(self.continuation)
-        self.assertEqual(result, DRAIN_SEND_OK)
-        self.assertEqual(len(oneshot), 1, "the action-bound rail must be used")
-        self.assertEqual(driven, [], "the governed CLI must not be driven")
-
-    def test_the_governed_fallback_refuses_when_the_locator_moved(self):
-        # A slot that moved between the first resolution and the drive must send nothing even
-        # though the action binding still reports bound — the argv would target the new pane.
-        moving = [
-            [{"name": "wk", "pane_id": "w4B:p22", "status": "idle", "revision": "9"}],
-            [{"name": "wk", "pane_id": "w4B:p33", "status": "idle", "revision": "9"}],
-        ]
-        driven: list = []
-        with patch.object(live_mod, "list_herdr_agent_rows",
-                          side_effect=lambda *_a, **_k: moving.pop(0) if moving else []), \
-                patch.object(self.ops, "_providers",
-                             return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
-                patch.object(self.ops, "_governed_sender_resolves", return_value=True), \
-                patch.object(self.ops, "_recovery_delivery_service_ready", return_value=False), \
-                patch.object(self.ops, "_fresh_slot_action_bound", return_value=True), \
-                patch.object(self.ops, "_drive_cli",
-                             side_effect=lambda argv: driven.append(argv) or 0):
-            result = self.ops.resume_once(self.continuation)
-        self.assertEqual(result, DRAIN_SEND_ERROR)
-        self.assertEqual(driven, [], "a moved locator must receive nothing")
-
-    def test_the_governed_fallback_rejoins_the_binding_immediately_before_the_drive(self):
-        # When the action-bound rail is unavailable the governed CLI is kept (removing it
-        # would strand contexts where only it resolves), but the binding is re-joined as late
-        # as possible: a slot that recycles after the first check sends nothing.
-        rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle", "revision": "9"}]
-        driven: list = []
-        checks = {"n": 0}
-
-        def bound(*_a, **_k):
-            checks["n"] += 1
-            return checks["n"] == 1        # verified once, then the slot recycles
-
-        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
-                patch.object(self.ops, "_providers",
-                             return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
-                patch.object(self.ops, "_governed_sender_resolves", return_value=True), \
-                patch.object(self.ops, "_recovery_delivery_service_ready", return_value=False), \
-                patch.object(self.ops, "_fresh_slot_action_bound", side_effect=bound), \
-                patch.object(self.ops, "_drive_cli",
-                             side_effect=lambda argv: driven.append(argv) or 0):
-            result = self.ops.resume_once(self.continuation)
-        self.assertEqual(result, DRAIN_SEND_ERROR)
-        self.assertGreaterEqual(checks["n"], 2, "the binding must be re-joined before the drive")
-        self.assertEqual(driven, [], "a recycled slot must receive nothing")
-
-    def test_resume_once_drives_the_governed_rail_with_the_existing_anchor(self):
-        rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle"}]
-        driven: list = []
-        with patch.object(self.ops, "_fresh_slot_action_bound", return_value=True), \
-                patch.object(self.ops, "_recovery_delivery_service_ready", return_value=False), \
-                patch.object(live_mod, "list_herdr_agent_rows", return_value=rows):
-            with patch.object(
-                self.ops, "_drive_cli", side_effect=lambda argv: driven.append(argv) or 0
-            ):
-                with patch.object(
-                    self.ops, "_providers", return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)
-                ):
-                    with patch.object(
-                        self.ops, "_governed_sender_resolves", return_value=True
-                    ):
-                        result = self.ops.resume_once(self.continuation)
-        self.assertEqual(result, DRAIN_SEND_OK)
-        self.assertEqual(len(driven), 1)
-        argv = driven[0]
-        self.assertEqual(argv[:2], ["handoff", "send"])
-        self.assertEqual(argv[argv.index("--to") + 1], WORKER_PROVIDER)
-        self.assertEqual(argv[argv.index("--issue") + 1], ANCHOR_ISSUE)
-        self.assertEqual(argv[argv.index("--journal") + 1], ANCHOR_JOURNAL)
-        self.assertEqual(argv[argv.index("--kind") + 1], "reply")
-        self.assertEqual(argv[argv.index("--target") + 1], "w4B:p22")
-        self.assertEqual(argv[argv.index("--target-lane") + 1], LANE)
 
     def test_resume_confirmed_requires_a_distinct_fresh_worker_and_an_attestation(self):
         rows = [{"name": "wk", "pane_id": "w4B:p10", "status": "idle"}]

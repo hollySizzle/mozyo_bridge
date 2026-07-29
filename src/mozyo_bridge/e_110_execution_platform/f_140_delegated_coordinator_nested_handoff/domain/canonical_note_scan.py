@@ -664,6 +664,39 @@ def canonical_marker_fields(
     return tuple(found)
 
 
+def canonical_marker_bodies(
+    notes: str, *, channels: "frozenset[str] | set[str] | None" = None
+) -> tuple[tuple[str, str], ...]:
+    """Every CANONICAL marker as ``(channel, raw_body)``, in note order (pure).
+
+    The span-preserving sibling of :func:`canonical_marker_fields`, added for readers that must
+    apply STRICTER field rules than the shared parse — duplicate-key refusal, exact field order,
+    unknown-field refusal — and therefore need the marker's verbatim body rather than the
+    already-normalised field mapping (:func:`parse_marker_fields` is last-write-wins by design).
+
+    Such a reader must NOT re-find the token itself. Recovering a body with a plain
+    ``notes.find`` re-implements location without the quote/fence exclusion this scan performs,
+    so a quoted marker earlier in the note is silently substituted for the canonical one — which
+    is exactly how a canonical ``decision=declined`` record was read as an approval (Redmine
+    #14661 review j#92601 F2). Emitting the body from THIS scan keeps one authority for what a
+    marker is and where it is.
+    """
+    if not notes:
+        return ()
+    found: list[tuple[str, str]] = []
+    for line in canonical_note_lines(notes):
+        if not line:
+            continue
+        for match in MARKER_RE.finditer(line):
+            channel = match.group("channel")
+            if channel not in RECOGNIZED_CHANNELS:
+                continue
+            if channels is not None and channel not in channels:
+                continue
+            found.append((channel, match.group("body")))
+    return tuple(found)
+
+
 __all__ = (
     "MARKER_CHANNEL_HANDOFF",
     "MARKER_CHANNEL_WORKFLOW_EVENT",
@@ -672,5 +705,6 @@ __all__ = (
     "canonical_note_lines",
     "canonical_note_text",
     "parse_marker_fields",
+    "canonical_marker_bodies",
     "canonical_marker_fields",
 )

@@ -34,9 +34,7 @@ leaves the positive fact ``False`` (identity_unknown / turn_unobservable — nev
 
 from __future__ import annotations
 
-import contextlib
 import os
-import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
@@ -46,6 +44,7 @@ from mozyo_bridge.core.state.replacement_transaction import ContinuationPointer
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.fresh_coordinator_drain import (  # noqa: E501
     DRAIN_SEND_ERROR,
     DRAIN_SEND_OK,
+    DRAIN_SEND_ZERO,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
     gateway_generation_authority as _gen_authority,
@@ -210,9 +209,8 @@ class LiveWorkerRefreshOps:
     #: Marks the ``journal_reader`` as a FRESH (non-snapshot) source (#13889: only a source
     #: declaring freshness may back the absence-of-progress fact).
     journal_reader_fresh: bool = False
-    #: ``issuer_resolver(issue) -> opaque author id`` for the approval authority (#14661
-    #: j#92494). ``None`` = no durable authority is wired here, which refuses every
-    #: ``--execute`` (fail-closed): an approval nobody can be held to is not an approval.
+    #: ``issuer_resolver(entry) -> ResolvedIssuer`` override for the approval authority
+    #: (#14661 j#92494 / j#92601 F1). ``None`` uses the repo's own issuer-resolution policy.
     issuer_resolver: Optional[object] = None
 
     # -- delegation to the proven #13806 probes --------------------------------
@@ -562,26 +560,6 @@ class LiveWorkerRefreshOps:
             return ""
         return _agent_locator(matches[0])
 
-    def _governed_sender_resolves(self) -> bool:
-        """Does the GOVERNED send rail resolve from THIS context? (read-only)
-
-        Verified with the SAME authority the real send uses — :func:`resolve_sender_identity`
-        over this process env + the repo anchor workspace — never a bare env-presence check
-        (the #14203 j#87370 F1 lesson).
-        """
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (  # noqa: E501
-            resolve_sender_identity,
-        )
-
-        try:
-            anchor_ws = repo_scope_workspace_id(self.repo_root)
-        except Exception:  # noqa: BLE001 - unreadable anchor => the resolver fails closed
-            anchor_ws = None
-        try:
-            return bool(resolve_sender_identity(self.env, anchor_workspace_id=anchor_ws).ok)
-        except Exception:  # noqa: BLE001 - a resolver error is a non-resolving context
-            return False
-
     def _recovery_delivery_service(self):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_anchor_delivery_live import (  # noqa: E501
             LiveRecoveryAnchorDeliveryService,
@@ -629,18 +607,19 @@ class LiveWorkerRefreshOps:
         # The expected issuer comes from the DURABLE RECORD, never from the caller (#14661
         # j#92494): the actor asking for a destructive close must not be able to name its own
         # approver. Unresolvable => not approved.
-        issuer = self._expected_issuer_id(request)
-        if not issuer:
-            return False
         try:
             entries = reader(request.effective_anchor_issue)
         except Exception:  # noqa: BLE001 - unreadable durable source => never approved
             return False
         try:
+            found = [
+                e for e in entries
+                if _norm(getattr(e, "journal_id", "")) == _norm(request.journal)
+            ]
             verify_worker_refresh_approval(
                 list(entries),
                 journal=request.journal,
-                expected_issuer_id=issuer,
+                issuer=self._resolved_issuer(found[0]) if len(found) == 1 else None,
                 issue=request.issue,
                 lane=request.lane,
                 action_id=request.action_id,
@@ -657,52 +636,61 @@ class LiveWorkerRefreshOps:
             return False
         return True
 
-    def _expected_issuer_id(self, request: WorkerRefreshRequest) -> str:
-        """The opaque author id a destructive approval must be attributable to. (fail-closed)
+    def _resolved_issuer(self, entry) -> object:
+        """The approval journal's writer, resolved to an ANCHORED authority. (fail-closed)
 
-        Resolved from the anchor issue's OWN author on a fresh read — the durable anchor, not
-        a caller-supplied expectation. Returns ``""`` when the source cannot supply one, which
-        refuses the approval (an unattributable authority is not an authority).
+        Uses the repo's existing issuer-resolution policy (#14661 j#92601 F1) rather than a
+        model of this module's own: a role resolved from the record's canonical gate structure
+        plus the committed policy pointer, carrying the durable anchor it was resolved from.
+        An earlier revision compared the journal's author id to the issue's author id, which on
+        a single-account workspace every journal satisfies.
         """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+            ResolvedIssuer,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_issuer_policy import (  # noqa: E501
+            resolve_journal_issuer,
+        )
+
         resolver = self.issuer_resolver
-        if resolver is None:
-            return ""
+        if resolver is not None:
+            try:
+                return resolver(entry)
+            except Exception:  # noqa: BLE001 - an unreadable authority is never an authority
+                return ResolvedIssuer()
         try:
-            return _norm(resolver(request.effective_anchor_issue))
-        except Exception:  # noqa: BLE001 - an unreadable authority is never an authority
-            return ""
+            return resolve_journal_issuer(
+                notes=str(getattr(entry, "notes", "") or ""),
+                journal_id=str(getattr(entry, "journal_id", "") or ""),
+                policy_pointer=self._issuer_policy_pointer(),
+            )
+        except Exception:  # noqa: BLE001
+            return ResolvedIssuer()
+
+    def _issuer_policy_pointer(self) -> str:
+        """The committed-config basis the issuer resolution is anchored to, or ``""``.
+
+        ``config_policy_pointer`` names the committed provider-binding blob the role policy is
+        read from. Resolving that blob sha for this repo is not wired here yet, so the basis is
+        empty and EVERY resolution is unanchored — which refuses. That is the correct
+        fail-closed state while the owner-authority representation is a pending design ruling
+        (#14661 j#92601 F1): the surface must not close on an authority it cannot establish.
+        """
+        return ""
 
     def resume_rail_ready(self, request: WorkerRefreshRequest) -> bool:
-        """Pre-close resume-rail capability. (read-only)
+        """Can the ACTION-BOUND resume rail deliver from THIS context? (read-only, pre-close)
 
-        True when EITHER rail can deliver from THIS context: the governed send rail (verified
-        through the REAL sender-identity resolver, same authority as the send), or the
-        operator-capable guarded one-shot rail (sender-env independent; needs only a reachable
-        herdr transport, with the exact target identity verified action-time at the send).
-        Fail-closed when neither resolves.
+        Verified BEFORE the destructive close so a context that cannot resume is a typed
+        up-front refusal, never a post-close ``stopped`` discovery.
+
+        Only the action-bound delivery service counts (review j#92601 F4). The governed
+        ``handoff send`` CLI resolves in more contexts, but it cannot carry the replacement
+        action into the transport, so admitting a close on its availability would authorise a
+        close whose resume can be delivered to a recycled slot. Availability of a weaker rail is
+        not availability.
         """
-        if self._governed_sender_resolves():
-            return True
-        return self._recovery_delivery_service().ready()
-
-    def _resume_argv(self, continuation: ContinuationPointer, locator: str) -> list[str]:
-        """The recovery-family resume argv: ONE ``handoff send --kind reply`` pointer at the
-        EXISTING anchor (the #14203 j#84223 owner-approved resume shape — the anchor journal is
-        the truth, the notification a pointer; no gate is regenerated). Same governed rail the
-        callback-recovery family drives, lane- and target-pinned."""
-        worker_provider, _gateway = self._providers()
-        return [
-            "handoff", "send",
-            "--to", worker_provider,
-            "--source", "redmine",
-            "--issue", _norm(continuation.issue_id),
-            "--journal", _norm(continuation.journal_id),
-            "--kind", _RESUME_TRANSPORT_KIND,
-            "--target", locator,
-            "--target-repo", str(self.repo_root),
-            "--target-lane", _norm(self.request.lane),
-            "--mode", "queue-enter",
-        ]
+        return self._recovery_delivery_service_ready()
 
     def _delivery_request(
         self, continuation: ContinuationPointer, locator: str, worker_provider: str
@@ -784,34 +772,18 @@ class LiveWorkerRefreshOps:
         # this resume.
         if not self._fresh_slot_action_bound(continuation, locator, worker_provider):
             return DRAIN_SEND_ERROR
-        # PREFER the action-bound rail (review j#92533 F4). The one-shot delivery service
-        # re-runs its complete preflight AT the irreversible edge — its own docstring says a
-        # prior public preflight is advisory and never reused as authority — and it carries
-        # the target revision and replacement action id all the way into the transport. The
-        # governed CLI rail cannot: its argv is locator + lane only, so between the binding
-        # check and the injection the slot can recycle and the send has nothing left to
-        # detect it with (measured: action_binding_checks=1, send proceeds after a simulated
-        # recycle). Preferring the stronger rail closes that window rather than narrowing it.
-        if self._recovery_delivery_service_ready():
-            return self._oneshot_resume(continuation, locator, worker_provider)
-        # Fallback only: the action-bound service is unavailable in this context. Keep the
-        # governed rail (removing it would strand environments where only it resolves) but
-        # re-join the authority as late as possible — re-resolve the fresh locator and
-        # re-verify the action binding immediately before the drive, and refuse if either
-        # moved. The residual window is the CLI's own internal choreography, which this
-        # surface cannot reach into.
-        if not self._governed_sender_resolves():
+        # The action-bound rail is the ONLY rail this destructive surface may resume on
+        # (review j#92601 F4). The governed CLI cannot carry the target revision or the
+        # replacement action into the transport — its argv is locator + lane — so a slot that
+        # recycles between the last binding check and the injection receives the resume anyway.
+        # An earlier revision kept it as a "fallback with a late re-join", but "just before
+        # ``_drive_cli``" is not "just before transport", and keeping an unsafe rail available
+        # is the wrong trade for a close/relaunch surface. Contexts where only the governed
+        # sender resolves are refused UP FRONT by ``resume_rail_ready`` instead, so nothing is
+        # ever stranded mid-transaction.
+        if not self._recovery_delivery_service_ready():
             return DRAIN_SEND_ERROR
-        final_locator = self._fresh_worker_locator()
-        if not final_locator or final_locator != locator:
-            return DRAIN_SEND_ERROR
-        if not self._fresh_slot_action_bound(continuation, final_locator, worker_provider):
-            return DRAIN_SEND_ERROR
-        try:
-            rc = self._drive_cli(self._resume_argv(continuation, final_locator))
-        except Exception:  # noqa: BLE001 - a failed drive is a failed send
-            return DRAIN_SEND_ERROR
-        return DRAIN_SEND_OK if rc == 0 else DRAIN_SEND_ERROR
+        return self._oneshot_resume(continuation, locator, worker_provider)
 
     def _recovery_delivery_service_ready(self) -> bool:
         """Can the action-bound one-shot delivery service run here? (read-only, fail-closed)"""
@@ -831,19 +803,18 @@ class LiveWorkerRefreshOps:
             return DRAIN_SEND_ERROR
         try:
             outcome = self._recovery_delivery_service().deliver(request)
-        except Exception:  # noqa: BLE001 - invalid request/service failure is zero-success
+        except Exception:  # noqa: BLE001 - an unknown fate is never a proven zero-send
             return DRAIN_SEND_ERROR
-        return DRAIN_SEND_OK if outcome.started else DRAIN_SEND_ERROR
-
-    def _drive_cli(self, argv: list[str]) -> int:
-        """Parse + run through the composed CLI so the resume is byte-for-byte the governed
-        ``handoff send`` an operator would run."""
-        from mozyo_bridge.application.cli import build_parser, normalize_paths
-
-        args = build_parser().parse_args(argv)
-        args = normalize_paths(args)
-        with contextlib.redirect_stdout(sys.stderr):
-            return int(args.func(args))
+        if outcome.started:
+            return DRAIN_SEND_OK
+        # The delivery domain distinguishes ``zero_send`` (it proved nothing was transmitted)
+        # from ``uncertain`` (it cannot tell). Collapsing both into the generic error threw that
+        # away, and because the drain keeps a recorded attempt on error, a proven zero-send left
+        # the transaction permanently unresumable (Redmine #14661 j#92601 F5). Carry the typed
+        # fact across the boundary instead of re-deriving it.
+        if bool(getattr(outcome, "zero_send", False)):
+            return DRAIN_SEND_ZERO
+        return DRAIN_SEND_ERROR
 
     def resume_confirmed(self, continuation: ContinuationPointer) -> bool:
         """CONFIRMED-landed on the exact FRESH worker (the #13806 R2-F3 oracle, adapted).

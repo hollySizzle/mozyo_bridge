@@ -37,6 +37,7 @@ from mozyo_bridge.core.state.replacement_transaction_model import (
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.fresh_coordinator_drain import (  # noqa: E501
     DRAIN_SEND_OK,
+    DRAIN_SEND_ZERO,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.session_replacement_reconcile import (  # noqa: E501
     drain_state_for,
@@ -126,9 +127,17 @@ def drive_continuation_once(
     # j#82760). On a move the send provably has NOT happened — un-record the attempt.
     if not authority_fn():
         return _un_record_attempt(store, clock, key, holder=holder, gen=gen)
-    if send_fn() != DRAIN_SEND_OK:
-        # Send failed; the state stays attempted. A re-run re-checks the confirmation and only
-        # completes if it confirms — never a blind resend.
+    sent = send_fn()
+    if sent == DRAIN_SEND_ZERO:
+        # A PROVEN zero-send: the rail established that nothing was transmitted (its own typed
+        # disposition, not an inference). That is the same fact the authority-moved branch above
+        # acts on, so it takes the same revert — un-record the attempt so a re-run may send.
+        # Collapsing it into the failure branch below leaves the attempt recorded forever and a
+        # post-close transaction can then never resume its anchor (Redmine #14661 j#92601 F5).
+        return _un_record_attempt(store, clock, key, holder=holder, gen=gen)
+    if sent != DRAIN_SEND_OK:
+        # Send outcome UNCERTAIN; the state stays attempted. A re-run re-checks the confirmation
+        # and only completes if it confirms — never a blind resend.
         return CONTINUATION_SEND_FAILED
     if not confirmed_fn():
         return CONTINUATION_UNCERTAIN

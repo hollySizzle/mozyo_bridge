@@ -30,11 +30,20 @@ locator (``w4B:p10``) contain ``:``. Embedding them raw would split into bogus f
 truncate the marker. The precedent solves this the same way (``slot_digest`` / ``pin_digest``),
 so the exact target travels as :func:`worker_refresh_approval_digest`.
 
-**Known limitation, deliberately not faked (j#92493).** Review j#92487 F1 also asks for issuer
-authority resolved from the durable record's author. :class:`RedmineJournalEntry` carries
-``issue_id`` / ``journal_id`` / ``notes`` / ``created_on`` only — it does not carry an author —
-so this module CANNOT establish authorship, and it does not pretend to. It verifies what the
-note itself can prove and leaves author authority as a recorded residual.
+**Issuer authority (Redmine #14661 j#92494 scope, j#92601 F1).** A marker that NAMES an
+approval source proves nothing — anyone who can write a note can write that field — so the
+approval must also be attributable to an authority. An earlier revision compared the approval
+journal's author to the ISSUE's author and called that owner authority; on the real record every
+role (worker, gateway, coordinator) writes under one source-system user id, so that predicate is
+satisfied by every journal on the issue and proves nothing. The governed preset says so directly:
+source-system author id alone cannot identify the actor, and every issuer must be resolved to a
+role through a durable authority ANCHOR.
+
+So this module takes a :class:`...hibernate_evidence_authority.ResolvedIssuer` — the repo's
+existing model for exactly this question — and requires it to be anchored. It does NOT invent an
+owner-identity model of its own: an unresolved or unanchored issuer is a refusal, which keeps the
+destructive path fail-closed while the representation of "direct owner" is settled as a design
+ruling rather than guessed at here.
 """
 
 from __future__ import annotations
@@ -42,10 +51,15 @@ from __future__ import annotations
 import hashlib
 from typing import Mapping, Sequence
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.canonical_note_scan import (  # noqa: E501
+    canonical_marker_bodies,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+    ISSUER_UNKNOWN,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     MARKER_CHANNEL_WORKFLOW_EVENT,
     RedmineJournalEntry,
-    marker_fields_in_note,
 )
 
 #: This surface's approval gate token (the ``composer_discard_approval.APPROVAL_GATE``
@@ -65,6 +79,16 @@ APPROVAL_EFFECT = "worker_close_relaunch_resume"
 #: ``### Owner Close Approval Delegation`` names as a carve-out from standing delegation — so
 #: only a direct owner approval qualifies.
 APPROVAL_SOURCE = "direct_owner"
+
+
+#: The resolved writer roles that may issue a destructive owner approval for this surface.
+#: EMPTY on purpose (#14661 j#92601 F1): the governed preset's approval carve-out requires a
+#: ``direct_owner`` approval for a destructive operation, and this repo has no durable
+#: role-resolution that yields an owner identity today — only coordinator / review-gateway /
+#: lane-worker. Naming one of those here would re-create the defect this finding closed (any
+#: same-account writer passing as the owner). Until the representation of "direct owner" is
+#: settled by a design ruling, every ``--execute`` refuses. The preflight is unaffected.
+APPROVAL_AUTHORITY_ROLES: frozenset[str] = frozenset()
 
 
 class WorkerRefreshApprovalError(ValueError):
@@ -147,32 +171,35 @@ APPROVAL_FIELD_ORDER = (
 def parse_strict_approval_markers(notes: str) -> list[dict[str, str]]:
     """Every canonical approval marker in ``notes``, parsed STRICTLY. (pure)
 
-    The shared :func:`...redmine_journal_source.marker_fields_in_note` is last-write-wins and
-    silently drops malformed fragments — measured in review j#92533 F2, that turned
-    ``decision=declined:decision=approved`` into an approval, and
-    ``approval_source=standing_delegation:approval_source=direct_owner`` into a direct owner
-    one. A record that says two contradictory things has not decided anything, so this parser
-    refuses it instead of picking a winner. It is the governed preset's exactly-one rule for
-    governed fields, applied to the field this surface actually gates on.
+    The shared :func:`...canonical_note_scan.canonical_marker_fields` is last-write-wins and
+    silently drops malformed fragments, so ``decision=declined:decision=approved`` reads as an
+    approval. A record that says two contradictory things has not decided anything, so this
+    parser refuses it instead of picking a winner — the governed preset's exactly-one rule for
+    governed fields, applied to the field this surface gates on.
 
-    Markers are located with the SHARED scanner first (so code fences and non-canonical text
-    are excluded exactly as everywhere else), then each located marker's body is re-parsed
-    from the note verbatim so duplicates and malformed fragments are visible rather than
-    already collapsed.
+    Bodies come from :func:`...canonical_note_scan.canonical_marker_bodies`, the span-preserving
+    sibling of that scan. An earlier revision took only the COUNT from the shared scan and then
+    re-located each marker with ``notes.find`` — which knows nothing about quote/fence exclusion,
+    so a quoted marker earlier in the note was substituted for the canonical one and a canonical
+    ``decision=declined`` verified as approved (review j#92601 F2). Location and exclusion are
+    one authority; this module never re-derives either.
     """
-    located = [
-        raw for raw in _raw_marker_bodies(notes)
-        if _field_pairs_declare_gate(raw)
-    ]
     parsed: list[dict[str, str]] = []
-    for body in located:
+    for _channel, body in canonical_marker_bodies(
+        notes, channels=frozenset({MARKER_CHANNEL_WORKFLOW_EVENT})
+    ):
+        components = body.split(":")
+        if not any(
+            component.strip() == f"gate={WORKER_REFRESH_APPROVAL_GATE}"
+            for component in components
+        ):
+            continue  # some other surface's marker; not this gate's approval
         fields: dict[str, str] = {}
-        for component in body.split(":"):
+        order: list[str] = []
+        for component in components:
             # ``partition`` makes a missing ``=`` indistinguishable from an empty value
-            # (``"nonsense"`` -> key ``nonsense``, value ``""``), so the emptiness check below
-            # covers both. A separate "not a key=value field" branch was measured to be
-            # unkillable by any input — a guard whose absence provably changes nothing is dead
-            # weight, so it is not kept.
+            # (``"nonsense"`` -> key ``nonsense``, value ``""``), so the emptiness check covers
+            # both; a separate branch for it was measured unkillable and is not kept.
             key, _, value = component.partition("=")
             key, value = key.strip(), value.strip()
             if not key or not value:
@@ -186,48 +213,15 @@ def parse_strict_approval_markers(notes: str) -> list[dict[str, str]]:
                     "says two things has decided nothing"
                 )
             fields[key] = value
+            order.append(key)
+        # The canonical producer emits exactly this sequence. Accepting a permutation would
+        # accept a marker no producer in this repo can render (review j#92601 F2).
+        if tuple(order) != APPROVAL_FIELD_ORDER:
+            raise WorkerRefreshApprovalError(
+                "the approval marker's field sequence is not the canonical one"
+            )
         parsed.append(fields)
     return parsed
-
-
-def _raw_marker_bodies(notes: str) -> list[str]:
-    """The verbatim body of every canonical workflow-event marker the shared scanner sees.
-
-    Uses the shared scanner to decide WHICH spans are markers (one authority for code-fence
-    exclusion and canonical shape), then recovers each body verbatim from the note so this
-    module can apply its own strict field rules to the untouched text.
-    """
-    bodies: list[str] = []
-    prefix = f"[mozyo:{MARKER_CHANNEL_WORKFLOW_EVENT}:"
-    canonical = marker_fields_in_note(notes)
-    if not canonical:
-        return bodies
-    cursor = 0
-    for _channel, _fields in canonical:
-        start = notes.find(prefix, cursor)
-        if start < 0:
-            break
-        end = notes.find("]", start)
-        if end < 0:
-            break
-        bodies.append(notes[start + len(prefix):end])
-        cursor = end + 1
-    return bodies
-
-
-def _field_pairs_declare_gate(body: str) -> bool:
-    """Does this raw marker body declare THIS surface's approval gate? (pure, tolerant)
-
-    Deliberately tolerant: it only decides whether the strict parser should look at this
-    marker at all. A body that names the gate anywhere is claimed, so a malformed or
-    contradictory approval marker is REFUSED by the strict parse rather than skipped as
-    "not ours" — skipping is how a broken approval would silently become "no approval found"
-    and then, with a second well-formed marker present, an approval.
-    """
-    return any(
-        component.strip() == f"gate={WORKER_REFRESH_APPROVAL_GATE}"
-        for component in body.split(":")
-    )
 
 
 def expected_approval_fields(
@@ -283,7 +277,7 @@ def verify_worker_refresh_approval(
     entries: Sequence[RedmineJournalEntry],
     *,
     journal: str,
-    expected_issuer_id: str,
+    issuer: object,
     **operation: object,
 ) -> Mapping[str, str]:
     """Verify ONE exact structured approval from a freshly fetched issue history. (pure)
@@ -291,10 +285,11 @@ def verify_worker_refresh_approval(
     Returns the matched marker fields, or raises :class:`WorkerRefreshApprovalError`. Every
     refusal path is fail-closed — there is no partial acceptance and no "close enough".
 
-    ``expected_issuer_id`` is the opaque author id the approval must be attributable to,
-    resolved by the caller from the DURABLE RECORD (#14661 j#92494) — never from a flag the
-    actor requesting the destructive action supplies, which would be self-approval. An empty
-    expected issuer, an unattributable journal, or a mismatch all refuse.
+    ``issuer`` is a :class:`...hibernate_evidence_authority.ResolvedIssuer` the caller resolved
+    from the DURABLE RECORD (#14661 j#92494) — never from a flag the actor requesting the
+    destructive action supplies, which would be self-approval. It must be ANCHORED: a bare role
+    token is an assertion, not a resolution, when one source-system account writes for several
+    roles. An unresolved, unanchored, or non-approval-authority issuer refuses (j#92601 F1).
     """
     journal_s = str(journal or "").strip()
     issue_s = str(operation.get("issue") or "").strip()
@@ -315,21 +310,18 @@ def verify_worker_refresh_approval(
     entry = exact[0]
 
     # Issuer authority, BEFORE any field is trusted: a marker that names an approval source
-    # proves nothing about who wrote it (#14661 j#92533 F1). The author must be present and
-    # must be the authority the durable record itself names.
-    author_id = str(getattr(entry, "author_id", "") or "").strip()
-    issuer = str(expected_issuer_id or "").strip()
-    if not issuer:
+    # proves nothing about who wrote it (#14661 j#92601 F1).
+    role = str(getattr(issuer, "role", "") or "").strip()
+    anchored = bool(getattr(issuer, "is_anchored", False))
+    if not role or role == ISSUER_UNKNOWN or not anchored:
         raise WorkerRefreshApprovalError(
-            "the expected approval issuer could not be resolved from the durable record"
+            "the approval's issuer could not be resolved to an anchored authority; a role "
+            "token without the durable record it was resolved from is an assertion, not a "
+            "resolution"
         )
-    if not author_id:
+    if role not in APPROVAL_AUTHORITY_ROLES:
         raise WorkerRefreshApprovalError(
-            "the approval journal is not attributable to any author"
-        )
-    if author_id != issuer:
-        raise WorkerRefreshApprovalError(
-            "the approval journal was not written by the issue's approval authority"
+            "the approval journal's resolved writer does not hold owner-approval authority"
         )
 
     candidates = parse_strict_approval_markers(str(getattr(entry, "notes", "") or ""))
@@ -359,6 +351,7 @@ def verify_worker_refresh_approval(
 
 
 __all__ = (
+    "APPROVAL_AUTHORITY_ROLES",
     "APPROVAL_FIELD_ORDER",
     "WORKER_REFRESH_APPROVAL_GATE",
     "APPROVAL_VERSION",

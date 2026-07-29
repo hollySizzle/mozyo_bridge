@@ -56,6 +56,14 @@ class SettledCloseBoundaryPort:
     inner: object
     ops: "LiveWorkerRefreshOps"
     request: WorkerRefreshRequest
+    #: ``() -> bool`` — True only when a FRESH durable read still shows this worker's turn as
+    #: failed (no progress landed). Supplied for a first close, ``None`` for a post-close
+    #: replay, where the close already committed and re-litigating it would refuse every
+    #: legitimate replay. Review j#92601 F3: the use case read progress before the lane
+    #: authority, the target re-observation, and the actuator's own claim/lease/preservation
+    #: reads — so a gate could still land in that window and the worker was closed anyway.
+    #: The last durable observation has to sit on the destructive edge, which is here.
+    progress_still_failed: object = None
 
     #: Forwarded so :func:`...replacement_launch_failure.port_launch_failure_reason` reads the
     #: INNER port's typed diagnostic rather than seeing an attribute-less wrapper.
@@ -84,6 +92,19 @@ class SettledCloseBoundaryPort:
             return replace(
                 observation, running_process=True, detail="pending_composer_input"
             )
+        guard = self.progress_still_failed
+        if guard is not None:
+            try:
+                still_failed = bool(guard())
+            except Exception:  # noqa: BLE001 - an unreadable durable authority never permits
+                still_failed = False
+            if not still_failed:
+                # Landed, ambiguous or unreadable — all three refuse. The worker may have
+                # written its gate moments ago; closing now destroys exactly the work this
+                # surface exists to preserve.
+                return replace(
+                    observation, running_process=True, detail="durable_progress_moved"
+                )
         return observation
 
     def close_exact_generation(self, pin):
