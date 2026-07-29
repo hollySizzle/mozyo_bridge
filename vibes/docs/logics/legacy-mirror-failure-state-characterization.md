@@ -99,35 +99,57 @@ audit を抜けていた (j#90418 R6-F3) のがこの class の由来。
 
 `staging_live` が cleanup ownership を持つ 1 bit である。
 
-#### rail は 2 本ある [実測]
+#### rail は 4 本ある [実測]
 
-同じ失敗でも、**どちらの rail を通ったかで出口が変わる**。`_replace_one` の末尾:
+同じ失敗でも、**どの rail を通ったかで出口が変わる**。rail の数は目視ではなく
+`_replace_one` の top-level 文を AST で列挙して確定した (Appendix A.6 に導出器):
 
 ```
-try:
-    problems = install()
-except BaseException as primary:
-    interrupt = _teardown_during(primary, release, temp.close)
-    if interrupt is not None:
-        raise interrupt
-    raise                                   # ← ここで終わる
-return problems + self._close_staging(temp, subject)
+L579  Assign   payload, failure = self._read_bound(source_fd, name)
+L580  If         → L581 return                          (W0)
+L591  Assign   temp_name = f"...{os.urandom(8).hex()}.tmp"
+L593  Try      try: temp = _OwnedDescriptor(os.open(...))
+               except OSError → L603 return             (W1)
+L612  Assign   ownership = _StagingOwnership(temp)
+L736  Try      try: problems = install()
+               except BaseException → L749 raise interrupt / L750 raise
+L751  Return   return problems + self._close_staging(temp, subject)
 ```
 
-| | **normal-return rail** (`install()` が値を返した) | **unwind rail** (`install()` が `BaseException` を投げた) |
-| --- | --- | --- |
-| cleanup を呼ぶ主体 | `install()` 内の `release()` | `_teardown_during(primary, release, temp.close)` |
-| close を呼ぶ主体 | **`_close_staging`** | `temp.close` (teardown action の 1 つ) |
-| release の violation tuple | **caller への typed violation になる** | **ledger に retain されるだけ** (§1.4 の returned failure channel) |
-| close 失敗 | **`W` / `WRITE_FAILED` "could not be closed cleanly"** | **ledger に retain されるだけ。typed violation にならない** |
-| `_replace_one` の出口 | violation tuple を `sync()` へ返す | 例外を再送出。`sync()` を貫通して呼び出し元へ |
+**L736 の `try` が覆うのは `install()` の呼び出しだけである。** その前 (L579–L593) と
+その後 (L751) はいずれも保護域の外にある。
 
-**`_close_staging` は unwind rail を通らない** — `except` 節は `raise` で終わるため、
-`return problems + self._close_staging(...)` に到達しない。同じ close 失敗が、
-rail によって typed violation になったり ledger 止まりになったりする。
+| rail | 範囲 | teardown | 出口 |
+| --- | --- | --- | --- |
+| **R-A** pre-staging | L579 〜 L593 | **無し** (staging 未作成なので不要) | 非 `OSError` は**そのまま伝播**。`OSError` は W0 / W1 の typed return |
+| **R-B** install unwind | L736 `try` の内側 | `_teardown_during(primary, release, temp.close)` | 例外を再送出 (W13) |
+| **R-C** typed normal return | `install()` が値を返した | `install()` 内の `release()` | L751 で `_close_staging` を足して返す (W2–W12 + W14) |
+| **R-D** post-install close unwind | L751 の評価中 | **無し** | 非 `OSError` が**そのまま伝播** |
 
-以下の表は **normal-return rail** の event → 出口である。unwind rail は W13 の 1 行に
-まとめ、詳細は上の rail 表と §1.4 を読む。
+rail ごとに、同じ失敗の出方が変わる:
+
+| | R-C (typed normal return) | R-B (install unwind) | R-A / R-D (保護域外) |
+| --- | --- | --- | --- |
+| cleanup を呼ぶ主体 | `install()` 内の `release()` | `_teardown_during` | **誰も呼ばない** |
+| close を呼ぶ主体 | `_close_staging` | `temp.close` (teardown action) | R-A: 未作成 / R-D: `_close_staging` 自身が unwind 源 |
+| release の violation tuple | **typed violation になる** | **ledger 止まり** (§1.4 returned failure channel) | — |
+| close 失敗 | **`W`/`WRITE_FAILED` "could not be closed cleanly"** | **ledger 止まり** | R-D: 非 `OSError` は typed 化されず伝播 |
+| `_replace_one` の出口 | violation tuple を `sync()` へ | 例外を再送出 | 例外を再送出 |
+
+**R-D は実在する経路である [実測]。** `_close_quietly` は `except OSError` のみなので、
+`RuntimeError` や control-flow は `_close_staging` から抜ける。
+`test_a_close_that_unwinds_still_releases_the_staging` (1583) が実際に駆動している —
+`legacy_mirror_sync.os.close` を staging fd で `RuntimeError` を投げるよう差し替え、
+`sync()` に `assertRaises(RuntimeError)` を立てる。content drift 前提なので
+`install()` は W12 で成功し、**L751 で unwind する**。
+
+以下の表は **R-C (typed normal return)** の event → 出口である。R-B は W13、
+R-A / R-D は上の rail 表を読む。
+
+> 前 revision は rail を **2 本**と書き、W13 を「任意時点で unwind」、W14 を
+> 「W0–W12 のいずれの後」としていた。どちらも過大である — R-A / R-D が抜けており、
+> W0 / W1 は `_close_staging` に到達しない。rail の数を source から導出せず
+> 決め打ちしたのが原因なので、上記は AST 列挙から組み直した。
 
 **1 event が 2 つの violation を出しうる** (normal-return rail)。`install()` の失敗行は
 `(Violation(...),) + release()` を返し、`release()` は `_release_staging` 経由で
@@ -149,8 +171,8 @@ rail によって typed violation になったり ledger 止まりになった�
 | W10 | `os.replace` 失敗 かつ dest が symlink / 非 regular | 中断 | **`E`** / `ENTRY_SYMLINK`\|`ENTRY_NOT_REGULAR` | `release()` | §1.5 の表 |
 | W11 | `os.replace` 失敗 (その他) | 中断 | `W` / `WRITE_FAILED` "could not be replaced" | `release()` | §1.5 の表 |
 | W12 | `os.replace` 成功 | 完了 | — | 呼ばない (rename が消費、`staging_live=False`) | — |
-| W13 | 任意時点で `BaseException` unwind | **再送出 (rail が変わる)** | **無し** — typed violation を返さない | `_teardown_during(primary, release, temp.close)` | **無し** — release も close も ledger 止まり (§1.4) |
-| W14 | **normal-return rail のみ**、W0–W12 のいずれの後 | — | close 失敗時 `W` / `WRITE_FAILED` "could not be closed cleanly" | `_close_staging` | — |
+| W13 | **`install()` の内側で** `BaseException` unwind (**R-B のみ**) | 再送出 | **無し** — typed violation を返さない | `_teardown_during(primary, release, temp.close)` | **無し** — release も close も ledger 止まり (§1.4) |
+| W14 | **R-C のみ**、**W2–W12** のいずれの後 (W0 / W1 は L581 / L603 で直接 return するので到達しない) | — | close 失敗 (`OSError`) 時 `W` / `WRITE_FAILED` "could not be closed cleanly"。非 `OSError` は R-D として伝播 | `_close_staging` | — |
 
 W2 について [実測]: `prove()` は `os.fstat(self._descriptor.fileno)` そのものなので
 raise しうる。`install()` の `try:` は `prove()` を含み、`flushing = True` は `fsync`
@@ -260,33 +282,55 @@ residual (foreign inode を install しうる) とは**形が違う** — こち
 `sync()` の再実行が収束するかは、直前の失敗が残した状態で決まる。
 
 **判定基準は「staging 名に何かが残っているか」であり、`CLEANUP_FAILED` が出たか
-ではない。** この 2 つは一致しない: W6 (`FOREIGN`) は `release()` を通らないので
-`CLEANUP_FAILED` を発行しないが、foreign entry は staging 名に残る。violation の
-種類で判定すると W6 を取りこぼす。
+ではない。** この 2 つは一致しない、しかも**両方向に**:
+
+- W6 (`FOREIGN`) は `release()` を通らないので `CLEANUP_FAILED` を発行しないが、
+  foreign entry は staging 名に残る。→ violation で判定すると**取りこぼす**。
+- `UNREADABLE` は `CLEANUP_FAILED` を発行するが、detail は source 自身が
+  **"may still be present"** と書くとおり **存在が unknown** である。
+  → violation で判定すると**過剰に非収束と断じる**。
+
+残留は 3 値である。**known-present / unknown / absent** を分ける:
 
 | 直前の終了状態 | staging 名の残留 | 再実行は収束するか | 根拠 |
 | --- | --- | --- | --- |
-| preflight refuse (A–E, P) | なし | **しない** — tree を直すまで同じ refuse | `blocks_write` は preflight で評価される |
-| W12 成功 | なし (rename が消費) | する (idempotent) | `test_clean_tree_passes_and_syncs_idempotently` |
-| W0 / W1 中断 | なし (未作成) | する | mirror 不変 |
-| W2–W5, W7–W11 かつ release が `CONFIRMED` → unlink 成功 | なし | する | staging 削除済。既に replace 済の name は content 一致で no-op |
-| W2–W5, W7–W11 かつ release が `CLEANUP_FAILED` を発行 | **あり** (自分の残骸) | **しない (operator 介入が要る)** | 次回 rule `D` / `UNPINNED_ENTRY` → `blocks_write` |
-| **W6 (`FOREIGN`)** | **あり (他者の entry)** | **しない (operator 介入が要る)** | `CLEANUP_FAILED` は**出ない**が、staging 名の entry は `MIRRORED_REFERENCES` 外なので同じく rule `D` → `blocks_write` |
-| ループ途中の中断 (typed) | 上記いずれかに従う | staging が残らなければする | 先行 name は install 済だが `_replace_one` は content べき等 |
-| **W13 unwind rail** | **`release` の結果次第 (ledger にしか出ない)** | **次 run の audit が見るものだけで決まる** | **`sync()` は値を返さず例外が貫通する。operator は report 行も recovery 行も受け取らない** |
+| preflight refuse (A–E, P) | absent | **しない** — tree を直すまで同じ refuse | `blocks_write` は preflight で評価される |
+| W12 成功 | absent (rename が消費) | する (idempotent) | `test_clean_tree_passes_and_syncs_idempotently` |
+| W0 / W1 中断 | absent (未作成) | する | mirror 不変 |
+| W2–W5, W7–W11 かつ release が `CONFIRMED` → unlink 成功 / `FileNotFoundError` | absent | する | staging 削除済。既に replace 済の name は content 一致で no-op |
+| W2–W5, W7–W11 かつ release が `UNPROVEN` / `CONFIRMED`→unlink `OSError` | **known-present** (自分の残骸。`lstat` は成功している) | **しない (operator 介入が要る)** | 次回 rule `D` / `UNPINNED_ENTRY` → `blocks_write` |
+| W2–W5, W7–W11 かつ release が **`UNREADABLE`** | **unknown** (`lstat` 自体が失敗した) | **次 run の audit 次第** | audit が ABSENT を観測すれば収束する。entry を観測できれば rule `D` で止まる。**この run では判定できない** |
+| **W6 (`FOREIGN`)** | **known-present (他者の entry)** | **しない (operator 介入が要る)** | `CLEANUP_FAILED` は**出ない**が、staging 名の entry は `MIRRORED_REFERENCES` 外なので同じく rule `D` → `blocks_write` |
+| ループ途中の中断 (typed) | 上記いずれかに従う | staging が absent なら する | 先行 name は install 済だが `_replace_one` は content べき等 |
 
-**W13 は他の行と前提が違う [実測]。** `_replace_one` が `BaseException` を再送出すると
+**unknown を「残っている」に丸めない [実測]。** `UNREADABLE` は `os.lstat` が
+`FileNotFoundError` 以外の `OSError` で失敗した状態であり、entry の有無そのものが
+観測できていない。次 run の audit は同じ `lstat` を試みるので、条件が解消していれば
+ABSENT を観測して収束しうる。`CLEANUP_FAILED` の有無で一括判定すると、この場合を
+不必要に「operator 介入が要る」と報告することになる。
+| **R-B** install unwind (W13) | `release` の結果次第 (ledger にしか出ない) | 次 run の audit が見るものだけで決まる | `_teardown_during` が `release` を走らせるが、成否は ledger 止まり |
+| **R-A** pre-staging unwind | absent (staging 未作成) | する | 何も作っていないので mirror 不変 |
+| **R-D** post-install close unwind | **W12 の後なら absent** (rename が消費済) | する | 残骸は無い。伝播するのは close の例外だけ |
+
+**保護域外の 3 rail は他の行と前提が違う [実測]。** `_replace_one` が例外を再送出すると
 `sync()` の `with` を抜けて呼び出し元へ伝播するので、`sync()` は `(1, (), lines)` を
-**返さない**。したがって:
+**返さない**。したがって R-A / R-B / R-D に共通して:
 
 - operator は `report_lines()` を一切見ない。`clear_residue` も `disposition_unpinned` も
   この run では提示されない。
-- `release` は `_teardown_during` 経由で走るので staging が片付くことはあるが、その
-  成否は **ledger にしか無い**。`teardown_failures(primary)` を読む caller がいなければ
-  誰も知らない。
-- よって retry の可否は、この run の出力ではなく **次 run の audit が staging 名に
-  何を見るか**だけで決まる。上の表の他の行と同じ結論 (残っていれば rule `D` で
-  blocks_write) だが、**そこへ至る情報経路が違う**。
+- retry の可否は、この run の出力ではなく **次 run の audit が staging 名に何を見るか**
+  だけで決まる。
+
+rail ごとの違い:
+
+- **R-A** — staging を作る前なので残骸は無い。`_teardown_during` も要らない。
+- **R-B** — `release` は teardown 経由で走るので片付くことはあるが、その成否は
+  **ledger にしか無い**。`teardown_failures(primary)` を読む caller がいなければ
+  誰も知らない。残留は上の 3 値表に従う。
+- **R-D** — `install()` は既に返っている。W12 (成功) の後なら rename が staging を
+  消費済みなので **absent**。W2–W11 の後なら `install()` 内の `release()` が既に
+  走っており、残留はその結果に従う。**`_close_staging` 自身が unwind 源**であって、
+  片付けに失敗したわけではない。
 
 残留した場合に operator が受け取る指示は、**どの run か**で変わる [実測]。
 
@@ -562,7 +606,11 @@ context = `e_130_governance_distribution` / feature = `f_150_skill_plugin_distri
 > していないのか読めない形にしていた。
 
 したがって **#14660 acceptance の「配置 matrix を決める」は本 revision では
-満たしていない。** 満たしたと書かない。確定には §5.1.1 の裁定が要る。
+満たしていない (未充足)。** 満たしたと書かない。確定には §5.1.1 の裁定が要る。
+
+裁定は **Redmine #14662** が所有する独立 Task として進行中である (#14660 j#92392
+consultation → coordinator routing j#92399 → #14662 Start j#92397)。**その approved
+verdict が下りるまで、本 doc §5 / §7 と acceptance は未充足のままである。**
 
 決定木は canonical policy であり、本 doc に上書きする権限はない。同時に、その出力は
 #14592 acceptance と衝突する。事実として書く:
@@ -808,6 +856,10 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
   byte 0 でなければ失格。
 - **T1 / T5 は T0 の裁定を待つ。** §5.1 のとおり決定木の適用結果が #14592
   acceptance と衝突しており、裁定前に移設すると、policy 改訂で再移設になる。
+  T0 は **Redmine #14662「legacy mirror test family へ canonical test 配置決定木を
+  適用した結果の policy 裁定を確定する」** として独立 Task に分離済みであり、
+  その approved verdict が本 doc §5 の入力になる。**裁定前に配置 matrix を
+  仮決定しない。**
 - T2 と T3 は **別 module** を持つので並行可能。ただし両者とも T1 の完了を待つ
   (移設前の test を編集すると move が汚れる)。
 - T4 は T3 と**同じ file** に触る可能性があるため、**T3 の後**に直列化する。
@@ -889,17 +941,34 @@ Appendix A の数値は古くなるのに、それを落とす gate が無い。
 
 ### A.1 実行手順
 
-repo root で、下の 2 script を任意の作業ディレクトリへ保存して実行する
-(いずれも read-only。repo を変更しない):
+**script は repo に何も書かないが、caller が指定した出力 2 file を書く。**
+したがって出力先を repo 外の作業 directory に置く。以下は入力を絶対 path で渡し、
+成果物を temp directory に閉じ込める手順である (`$REPO` は checkout root):
 
 ```text
-python3 A2.py tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py > inventory.json
-python3 A3.py tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py inventory.json tree.json
+WORK="$(mktemp -d)"
+# A2.py / A3.py を $WORK へ保存する
+TARGET="$REPO/tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py"
+
+python3 "$WORK/A2.py" "$TARGET" > "$WORK/inventory.json"
+python3 "$WORK/A3.py" "$TARGET" "$WORK/inventory.json" "$WORK/tree.json"
+python3 "$WORK/A6.py" "$REPO/src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/legacy_mirror_sync.py"
+
+rm -rf "$WORK"
 ```
 
-`A2.py` は stderr に surface ごとの件数を、`A3.py` は stdout に決定木の集計と、
-分岐 3 に落ちなかった test の一覧を出す。`A3.py` は先頭で `len(rows) == 127` を
-assert するので、分類漏れがあれば落ちる。
+書かれる file は **`$WORK/inventory.json`** (A2 の stdout) と
+**`$WORK/tree.json`** (A3 が `sys.argv[3]` へ `write_text`) の 2 つだけである。
+`A6.py` は何も書かない。**repo の tracked / untracked いずれも変更しない。**
+
+> 前 revision はこの手順を repo root で相対 path のまま実行させ、かつ
+> 「read-only。repo を変更しない」と書いていた。**script が source を変更しない
+> ことと、filesystem に何も書かないことは別である** — 記載どおり実行すると
+> repo root に `inventory.json` / `tree.json` が残る。撤回して上の形にした。
+
+`A2.py` は stderr に surface ごとの件数を、`A3.py` は stdout に決定木の集計と
+分岐 3 に落ちなかった test の一覧を、`A6.py` は §1.2 の rail 導出を出す。
+`A3.py` は先頭で `len(rows) == 127` を assert するので、分類漏れがあれば落ちる。
 
 ### A.2 注入 surface 分類器
 
@@ -1369,6 +1438,122 @@ TOTAL                        tests= 127 lines= 3088
 **この表は §5.0 の 69 / 53 / 5 と §2.3 の内訳の両方の原資料である。**
 配置の確定は §5.1 の裁定待ちであり、`行き先` 列は決定木の**出力**であって
 採用した配置ではない。
+
+
+### A.6 rail の導出 (§1.2)
+
+`_replace_one` の rail が 4 本であることは、目視ではなく `try: install()` の
+guard が top-level 文のどれを覆うかを AST で判定して確定した。前 revision は
+rail を 2 本と決め打ちし、保護域外の 2 経路を落としていた。
+
+```python
+"""Enumerate the rails of `_replace_one` from the AST, not by eye.
+
+Read-only: parses the module and prints. Writes nothing.
+
+A "rail" here is an exit path with a distinct teardown regime. What decides
+that is which top-level statements the `try: install()` guard covers: anything
+before it or after it unwinds without `_teardown_during` running at all.
+
+Usage:
+    python3 rails.py <abs path to legacy_mirror_sync.py>
+"""
+
+from __future__ import annotations
+
+import ast
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1]).read_text(encoding="utf-8")
+lines = src.split("\n")
+fn = next(
+    n
+    for n in ast.walk(ast.parse(src))
+    if isinstance(n, ast.FunctionDef) and n.name == "_replace_one"
+)
+
+# The guard is the top-level `try` whose handler catches BaseException.
+guard = None
+for st in fn.body:
+    if isinstance(st, ast.Try) and any(
+        isinstance(h.type, ast.Name) and h.type.id == "BaseException" for h in st.handlers
+    ):
+        guard = st
+        break
+if guard is None:
+    raise AssertionError("no BaseException guard at the top level of _replace_one")
+
+print("guard (try: install()) spans lines "
+      f"{guard.lineno}-{guard.end_lineno}")
+print()
+print("top-level statements, and whether the guard protects them:")
+for st in fn.body:
+    if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant):
+        continue  # docstring
+    covered = guard.lineno <= st.lineno <= (guard.end_lineno or guard.lineno)
+    where = "INSIDE guard" if covered else "OUTSIDE guard"
+    print(f"  L{st.lineno:4d} {type(st).__name__:12s} {where:14s} {lines[st.lineno-1].strip()[:56]}")
+
+before = [s for s in fn.body if s.lineno < guard.lineno and not (
+    isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
+after = [s for s in fn.body if s.lineno > (guard.end_lineno or guard.lineno)]
+print()
+print(f"rails: pre-guard statements={len(before)}, post-guard statements={len(after)}")
+print("  R-A pre-staging      : unprotected, teardown NOT run")
+print("  R-B install unwind   : the guard itself, _teardown_during runs")
+print("  R-C typed return     : guard returned a value, _close_staging runs")
+print("  R-D post-close unwind: unprotected, teardown NOT run")
+
+# Which typed returns sit before the guard? Those never reach _close_staging.
+# Only `_replace_one`'s OWN returns count: `release`/`install` are nested defs
+# whose returns are lexically earlier but execute INSIDE the guard, so walking
+# the whole subtree would list them and misstate which exits skip the close.
+nested = {
+    id(x)
+    for d in ast.walk(fn)
+    if isinstance(d, ast.FunctionDef) and d is not fn
+    for x in ast.walk(d)
+}
+print()
+print("_replace_one's own returns before the guard (never reach _close_staging):")
+for n in ast.walk(fn):
+    if isinstance(n, ast.Return) and id(n) not in nested and n.lineno < guard.lineno:
+        print(f"  L{n.lineno}  {lines[n.lineno-1].strip()[:50]}")
+```
+
+同 head での出力 [実測]:
+
+```text
+guard (try: install()) spans lines 736-750
+
+top-level statements, and whether the guard protects them:
+  L 579 Assign       OUTSIDE guard  payload, failure = self._read_bound(source_fd, name)
+  L 580 If           OUTSIDE guard  if failure is not None:
+  L 590 Assign       OUTSIDE guard  subject = f"{MIRROR_RELATIVE}/{describe_name(name)}"
+  L 591 Assign       OUTSIDE guard  temp_name = f"{_TEMP_PREFIX}{os.urandom(8).hex()}.tmp"
+  L 592 Assign       OUTSIDE guard  staging_subject = f"{MIRROR_RELATIVE}/{describe_name(tem
+  L 593 Try          OUTSIDE guard  try:
+  L 612 Assign       OUTSIDE guard  ownership = _StagingOwnership(temp)
+  L 613 Assign       OUTSIDE guard  staging_live = True
+  L 615 FunctionDef  OUTSIDE guard  def release() -> tuple[Violation, ...]:
+  L 629 FunctionDef  OUTSIDE guard  def install() -> tuple[Violation, ...]:
+  L 736 Try          INSIDE guard   try:
+  L 751 Return       OUTSIDE guard  return problems + self._close_staging(temp, subject)
+
+rails: pre-guard statements=10, post-guard statements=1
+  R-A pre-staging      : unprotected, teardown NOT run
+  R-B install unwind   : the guard itself, _teardown_during runs
+  R-C typed return     : guard returned a value, _close_staging runs
+  R-D post-close unwind: unprotected, teardown NOT run
+
+_replace_one's own returns before the guard (never reach _close_staging):
+  L581  return (
+  L603  return (
+```
+
+`L581` / `L603` は W0 / W1 の typed return であり、**`_close_staging` に到達しない** —
+§1.2 の W14 が W2–W12 に限られる根拠である。
 
 ---
 
