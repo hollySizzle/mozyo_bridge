@@ -61,6 +61,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     register_sublane_recover_stale_parser,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_gateway_recovery_cli import register_sublane_recover_gateway_parser  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_refresh_cli import register_sublane_refresh_worker_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_pair_recovery_cli import (  # noqa: E501
     register_sublane_recover_pair_parser,
 )
@@ -663,6 +664,10 @@ def register_sublane_group(
     register_sublane_quarantine_inspect_parser(sublane_sub)
     register_sublane_recover_stale_parser(sublane_sub)
     register_sublane_recover_gateway_parser(sublane_sub)
+    # Redmine #14661: the WORKER mirror of recover-gateway — a LIVE turn-ended worker that
+    # produced no durable progress. A separate admission from recover-stale (vanished worker),
+    # which it deliberately does not loosen.
+    register_sublane_refresh_worker_parser(sublane_sub)
     register_sublane_recover_pair_parser(sublane_sub)
     register_sublane_repair_pins_parser(sublane_sub)
     register_sublane_repair_worktree_binding_parser(sublane_sub)

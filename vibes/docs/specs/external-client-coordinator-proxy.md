@@ -302,13 +302,115 @@ authorize したかを照合しなければ scope は未検証のままである
     で閉じ、**どの 1 行にも存在しない marker** が成立しうる。
   - canonical 行上の workflow-event marker が**ちょうど 1 件**であること。0 件 / 2 件以上は fixed
     reason で拒否する。
+  - **marker body は uncollapsed component で評価する** (#14667)。canonicality は「引用でない行に
+    ちょうど 1 件ある」だけでは足りない。その body が **canonical producer に描画可能**でなければ
+    ならず、判定は body を dict へ畳む前の `(key, value)` 列に対して行う。
+    ★★★**畳んだ後では「畳めないはずだった」という証拠が消える。** 初版は lenient fold
+    (`marker_fields_in_note`) で読んでいたため、repeated key は last-write-wins で 1 件に化け、
+    key / value 周囲の whitespace は正規化されて消えた。`origin/main-next@4f0d765b` 上で実測した
+    次の 3 body は**いずれも proxy send の decision として成立していた** (#14539 R34 audit
+    j#92652 の独立 probe → routed finding → #14667):
+    ```
+    gate=some_other:gate=implementation_request              (repeated key, LWW)
+    proxy_action=dispatch_next:proxy_action=bootstrap_lane   (同上、action field)
+    gate = implementation_request:proxy_action = …           (whitespace 混入)
+    ```
+    - 規則の**正本はこの rail に無い**。中央 preset `### Hibernate Evidence Marker Contract` が
+      定める producer-impossible body (空 component / `=` を欠く fragment / 空 key / whitespace 混入
+      / 相異なる値での key 重複) の判定は共有 authority
+      `domain/redmine_journal_source.strict_marker_fields` が持ち、どの gate を宣言しているかは
+      `marker_logical_gates` が持つ。**この rail は独自の厳格化軸を足さない** — 足せば sibling
+      consumer との間で「producer に描画可能とは何か」が 2 定義になり、それはこの defect を生んだ
+      drift そのものである。
+    - `gate` / `kind` の 2 alias は**集合として**読む。first-non-empty で読むと、他方の alias に
+      書かれた別 gate が fallback として黙殺される — それは第二の authority 主張であって fallback
+      ではない (#14539 j#91847 F3 / j#91896 F2)。2 gate を名乗る marker は ruling #14219 j#86718 に
+      より**どちらも証明しない**。
+  - **field set は producer から導出した closed shape と一致すること** (#14667 R1 review j#92839 F1)。
+    component が well-formed であることは body の *syntax* についての判定でしかなく、**どの field が
+    この marker のものか**を何も言わない。初版はそこで止まっていたため
+    `…:proxy_action=bootstrap_lane:extra=value` が `verified` を返し **send を配送した** (実測:
+    余剰 field / 空値の余剰 field / 他 gate の field 名 `head=` / `lane` を伴わない `lane_generation`
+    / `gate` の代わりの `kind` alias、いずれも `send_calls=1`)。
+    - **許可 shape は列挙せず producer から導出する** (`canonical_decision_shapes()`)。手書きの list は
+      producer 文法の第二の定義であり、この module が繰り返し踏んできた drift そのものである。
+    - この token の producer 集合が closed であることは実測で確定している:
+      `render_workflow_event_marker()` は `gate` が `GATE_BEARING_KINDS` でなければ `ValueError` を
+      送出し、**`implementation_request` は同集合に含まれない**。よって gate-note 系 producer は
+      この marker を描画できず、`render_bootstrap_decision_marker` が唯一の producer である。
+    - 各 producer shape は `proxy_action` **有り / 無しの両方**を許可する。producer は常に書くが、その
+      *欠落* には固有の分類 (`action_not_declared`) が既に与えられており、set 一致だけで判定すると
+      **精密な理由を曖昧な理由へ差し替える**回帰になる (どちらも zero-send だが operator への指示が違う)。
+    - **既知の限界を明記する**: 導出は producer の 2 branch を 2 回の呼び出しで標本化する。producer が
+      3 本目の branch を得た場合は追随せず、その出力は producer-impossible として拒否される
+      (fail-closed 側に倒れるが、新 branch は同じ変更内で導出へ足す必要がある)。
+  - **読めない claim を drop しない** (same-note poison)。当該 action の token を**名乗って**いる
+    marker が「ちょうどその token 1 件」として数えられないとき、journal 全体を
+    `decision_unreadable` で拒否する。
+    ★★★**素朴な strict 化 (「strict に parse し、parse できない marker は skip する」) は
+    loosening である。** skip すると exactly-one の cardinality から偽造 marker が消えるので、
+    「偽造 1 件 + clean 1 件」の note が **clean な note と完全に同じに読める** — 本来 ambiguity で
+    拒否されるはずの note が、硬化を意図した変更によって受理へ倒れる。中央 preset の
+    「fragment を捨てて残りを一致させず marker 全体を fail-closed とする」/「同一種別の読めない
+    marker を読み飛ばして別の marker を採ることもしない」と同じ規則である。
+    - 「この marker が当該 gate を**名乗っているか**」は **raw component** に問う
+      (`marker_declares_gate`)。「名乗っているか」と「body が読めるか」は別の問いであり、
+      後者だけを問うと 2 gate を名乗る marker が静かに skip される (#14539 j#92174 F1)。
+    - **引用中の marker はここでも例外**である。引用は marker ではないので authority にも poison に
+      もならない (下記)。引用を poison にすると、grammar を例示した journal が恒久的に使用不能に
+      なる (Design Answer j#90329 契約 5 が廃した失敗)。
   - marker は `proxy_action` field で**どの action を authorize するか**を明示する。欠落は
     `action_not_declared` で拒否。lane-scoped の場合は `lane` / `lane_generation` も持つ。
+    値の読み出しで `.strip()` しない — strict reader が whitespace 混入 body を既に拒否している
+    以上、reader 側で再正規化することは**その保証を隠す**だけである (reader に置いた前提は
+    producer 側で保証する)。
+  - **producer は marker value contract を通す** (#14667 R1 review j#92839 F2)。
+    `render_bootstrap_decision_marker` は `lane` / `lane_generation` を**補間せず**、共有
+    `validate_marker_field_value` に通して描画不能値を **write 前に** 拒否する (禁止文字 `[ = : ]`、
+    whitespace、空値)。補間していた版では `lane_generation='2]junk'` が
+    `…:lane_generation=2]junk]` を描画し、scan は最初の `]` までを読んで **generation `2` の
+    「正規」decision** を成立させ、send が配送された (実測 `send_calls=1`)。
+    ★★★**この防御は reader 側に置けない。** 切り詰め後に note へ残る bytes は、正規の decision と
+    **byte 単位で同一**である — reader が検出できるものは何も残らない。中央 preset
+    「renderer は parser が拒否するものを書かない」が producer 側を指定しているのはこのためである。
+    ★★★**検査対象は「与えられたままの値」であり、正規化後の値ではない** (#14667 R2 review j#93063)。
+    初版は producer 側で `.strip()` してから validator を呼び、共有 validator 自身も先頭で
+    `.strip()` していた。結果として「ANY whitespace を拒否」という**宣言と実装が一致しておらず**、
+    前後の whitespace は黙って正規化され *internal* whitespace しか拒否されていなかった。実測では
+    `lane=' ln'` / `lane_generation='2 '` がいずれも clean marker を描画し **send へ到達した**
+    (`send_calls=1`)。→ 共有 `validate_marker_field_value` の先頭 `.strip()` を除去し、宣言どおり
+    raw 値を検査する。**無効値を正規化して通すのは、producer が caller の依頼と違うものを書く経路**
+    である。untrimmed input を持つ caller は、値を「これが意図だ」と主張する前に**自分で明示的に**
+    trim する。
+    ★★★**分岐を決める引数の「型」は分岐より先に確定させる。falsy は sentinel ではない**
+    (#14667 R3 review j#93162)。raw で判定する版を `if lane:` と書いたため、`None` / `False` /
+    `0` / `0.0` / 空 container が bootstrap 分岐へ落ち、**有効な bootstrap marker を描画して送信した**。
+    これは既存の型外入力を保持したのではなく、**それ以前の `lane.strip()` が `AttributeError` で
+    marker 生成前に停止していたものを、positive authority send へ変えた regression** である。
+    → producer 境界で **非 str を marker 生成前に拒否**し、bootstrap の sentinel を
+    **exact empty string 1 綴りに固定**する。「falsy なら bootstrap」は sentinel ではなく
+    Python の真偽値表の偶然にすぎない。
+    ★★★**型の前提は「第二の grammar」ではない。** 値が何を*含んで*よいか (禁止文字 / whitespace /
+    空値) は引き続き共有 validator のものだけを使う。producer が持つのは自分の signature に対する
+    型前提だけである。**この前提を共有 validator 側へ移してはならない** — 実測: 共有 validator は
+    `str(value)` で強制するため `False` → `'False'` / `0` → `'0'` を**通し**、逆に共有側へ str 限定を
+    足すと recovery-admission producer が `lane_generation=1` を int で渡しており **22 error** で壊れる。
+    **どの規則をどの層に置くかは、測ってから決める。**
+    ★★★**分岐は raw argument で決める。正規化が判断より先に走ると、判断そのものが変わる。**
+    同 review の最も深刻な形: 分岐条件が `if lane.strip():` だったため **whitespace-only の lane が
+    falsy になり、dispatch を意図した caller に対して `proxy_action=bootstrap_lane` の marker が
+    描画されて送信された** (実測 `lane='\t'` → `verified / deliver / sent`)。R1 の `]` 切り詰めは
+    *値* を変えるものだったが、これは **どの action を authorize するかを変える**。値の検査を直す
+    だけでは閉じない — validator を呼ぶ前に分岐が終わっているからである。
   - journal id は marker を持つ **entry 自身の id** を使う (marker の自己申告は使わない)。
 - 他 journal の引用は **authority にも ambiguity poison にもならない。**
 - 分類:
   - canonical decision が読めない (0 件 / 引用のみ / 読取不能) → `unverified`
   - 2 件以上 → `decision_ambiguous`
+  - 当該 action の token を名乗るが producer 描画可能な body として数えられない → `decision_unreadable`
+    (`unverified` とも `decision_ambiguous` とも別 status にする。前者は「この journal に decision が
+    無い」、後者は「2 件ある」であり、いずれも remedy が異なる。ここでの remedy は
+    **decision を canonical producer の marker で記録し直すこと**であって、marker を足すことではない)
   - `proxy_action` が当該 action でない → `action_mismatch`
   - **lane-scoped**: lane / 数値 generation 必須 (`decision_incomplete`)、live lifecycle facts と
     exact-match (`lane_unresolved` / `scope_mismatch` / `generation_stale`)
