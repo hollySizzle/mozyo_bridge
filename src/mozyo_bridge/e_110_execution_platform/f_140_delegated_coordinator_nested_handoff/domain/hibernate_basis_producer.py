@@ -115,6 +115,7 @@ from .hibernate_evidence_marker import (
     HibernateEvidence,
     resolve_hibernate_evidence,
 )
+from .marker_value_contract import is_journal_id
 from .redmine_journal_source import (
     MARKER_CHANNEL_WORKFLOW_EVENT,
     declares_gate,
@@ -248,8 +249,16 @@ class ProducedBasis:
         Empty when no marker-sourced conjunct was produced — the actuation leg treats an empty
         decision journal as :data:`...hibernate_actuation.NO_ACTUATION_MISSING_JOURNAL`, so a
         candidate whose basis rests on nothing durable can never be actuated.
+
+        Which values are journals is :func:`.marker_value_contract.is_journal_id` — this feature's
+        one declared shape for a Redmine journal id — and NOT ``str.isdigit()``, which was the
+        guard here and does not mean "a number ``int()`` can read": measured (Redmine #14753), an
+        evidence journal of ``"²"`` passed ``isdigit()`` and raised a raw ``ValueError`` out of
+        :meth:`as_payload`. A non-canonical value is now simply not a journal, so it drops out of
+        the max and the basis falls back to the empty (never-actuatable) decision journal —
+        fail-closed in the same direction the property already documents.
         """
-        journals = [int(j) for j in self.evidence_journals.values() if str(j).isdigit()]
+        journals = [int(j) for j in map(str, self.evidence_journals.values()) if is_journal_id(j)]
         return str(max(journals)) if journals else ""
 
     def as_payload(self) -> dict:

@@ -138,6 +138,34 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     HibernatePreflight,
 )
 
+#: The widest lifecycle revision a supplied token may be written with. DERIVED, not chosen: the
+#: lifecycle store declares ``revision INTEGER NOT NULL`` (``core.state.lane_lifecycle_schema``)
+#: and SQLite's ``INTEGER`` is a signed 64-bit value, so nothing wider can be a revision this
+#: store holds. A WIDTH bound only — it is what keeps the conversion below from raising; whether
+#: a converted value names a live row stays the CAS's question, not this predicate's.
+#: Deliberately NOT unified with the Redmine-id width used elsewhere in this lane — a revision is
+#: this store's own counter, not a source-system record id, and the authorities differ (#14753).
+_MAX_REVISION_DIGITS = len(str(2**63 - 1))
+
+
+def _revision_ordinal(token: str) -> Optional[int]:
+    """A supplied lifecycle revision as an int, or ``None`` when it names no revision (pure).
+
+    ``str.isdigit()`` was the guard on this token and it is not "a number ``int()`` can read":
+    measured (Redmine #14753), ``--expected-revision ²`` passed ``isdigit()`` and then raised a
+    raw ``ValueError`` out of the hibernate preflight — a surface whose whole contract is a typed
+    :class:`HibernatePreflight` verdict with a fixed block reason, reached before any CAS.
+
+    ``None`` keeps the pre-existing fail-closed direction rather than adding a new one: an
+    unreadable revision never equals ``rec.revision``, so the approval fails closed pre-CAS
+    exactly as a drifted revision already did (``BLOCK_STALE_ACTION_REVISION``), and the
+    issue-lane pin below simply does not engage. Zero is admitted because the store's own
+    counter starts there; the character set is ASCII decimal only.
+    """
+    if not token or len(token) > _MAX_REVISION_DIGITS or not token.isascii():
+        return None
+    return int(token) if token.isdigit() else None
+
 
 @dataclass(frozen=True)
 class HibernateOutcome:
@@ -667,18 +695,16 @@ class SublaneHibernateUseCase:
         # already-hibernated redrive above does NOT apply this — it resumes the stored release
         # action id / pins (the row's revision has advanced past the approval by the hibernate
         # itself), so re-asserting the approval's revision there would wrongly block resume.
-        expected_revision = _norm(request.expected_revision)
+        expected_revision = _revision_ordinal(_norm(request.expected_revision))
         cas_expected_revision = rec.revision if rec is not None else 0
         action_revision_current = True
         if project_scope and record_matches_binding(rec, project_scope=project_scope):
             assert rec is not None  # record_matches_binding is False for None
-            action_revision_current = (
-                expected_revision.isdigit() and int(expected_revision) == rec.revision
-            )
+            action_revision_current = expected_revision == rec.revision
             if action_revision_current:
-                cas_expected_revision = int(expected_revision)
+                cas_expected_revision = expected_revision
         elif (
-            expected_revision.isdigit()
+            expected_revision is not None
             and rec is not None
             and record_matches_binding(rec, issue_id=issue)
         ):
@@ -688,9 +714,9 @@ class SublaneHibernateUseCase:
             # instead of being silently re-bound to the current revision. A caller that
             # supplies none (the interactive CLI's default) keeps the prior current-revision
             # behavior unchanged.
-            action_revision_current = int(expected_revision) == rec.revision
+            action_revision_current = expected_revision == rec.revision
             if action_revision_current:
-                cas_expected_revision = int(expected_revision)
+                cas_expected_revision = expected_revision
 
         original_identity_known = (
             rec is not None

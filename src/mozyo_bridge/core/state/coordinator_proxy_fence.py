@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from mozyo_bridge.core.state.lane_lifecycle_model import is_redmine_id
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 COORDINATOR_PROXY_FENCE_FILENAME = "coordinator-proxy-fence.sqlite"
@@ -123,9 +124,17 @@ def journal_ordinal(journal: object) -> Optional[int]:
     Redmine journal ids are monotonically increasing integers, which is what makes "older than the
     delegated one" decidable. A non-numeric / empty value returns ``None`` so the caller fails
     closed instead of falling back to a lexicographic comparison (``"9" > "10"`` as strings).
+
+    "Numeric" is :func:`...lane_lifecycle_model.is_redmine_id` — ``core/state``'s one answer for
+    what a Redmine record id may be built from — and NOT ``str.isdigit()``, which was the guard
+    here and does not mean "a number ``int()`` can read": measured on this surface (Redmine
+    #14753), ``journal="²"`` passed ``isdigit()`` and then raised a raw ``ValueError`` straight out
+    of :meth:`CoordinatorProxyFence.reserve`, whose entire contract is a typed
+    :class:`ProxyReserveResult` verdict. A ``None`` here is that verdict — ``RESERVE_STALE`` with
+    the token quoted — so the delegation is refused rather than crashing the caller.
     """
     token = str(journal or "").strip()
-    if not token.isdigit():
+    if not is_redmine_id(token):
         return None
     return int(token)
 
