@@ -3588,40 +3588,47 @@ _MARKER_TOKEN = "[mozyo:"
 _CHANNEL_CHARS = re.compile(r"[a-z0-9_-]+")
 
 
-def _channels_in(text):
-    """Every channel a marker-token literal can name; ``*`` when the channel is a regex group."""
-    found = set()
+def _capabilities_in(text, binding):
+    """Each marker-token occurrence in ``text`` as one capability token (pure).
+
+    A literal channel names itself. A pattern that takes the channel as a regex group is
+    generic, and generic capabilities must stay TELLABLE APART (Redmine #14539 review j#92420
+    finding 2): folding them all to ``"*"`` in a set meant a module already holding one generic
+    scanner could gain a second and keep its declaration — the very "second capability inherits
+    the discipline" hole R26 finding 1(b) was supposed to close, still open for the nine generic
+    holders. A generic bound to a name is therefore ``*:<name>``, and occurrences are returned
+    with MULTIPLICITY so an added one changes the list even when it is unbound.
+    """
+    found = []
     for start in (match.end() for match in re.finditer(re.escape(_MARKER_TOKEN), text)):
         channel = _CHANNEL_CHARS.match(text, start)
-        found.add(
-            channel.group(0)
-            if channel and text[channel.end() : channel.end() + 1] == ":"
-            else "*"
-        )
+        if channel and text[channel.end() : channel.end() + 1] == ":":
+            found.append(channel.group(0))
+        else:
+            found.append(f"*:{binding}" if binding else "*")
     return found
 
 
 def _marker_token_holders(root):
-    """Every module holding the marker token -> (repo-relative path, channels it can name).
+    """Every module holding the marker token -> (repo-relative path, capabilities it holds).
 
-    Redmine #14539 review j#92374 finding 1. Three rounds of this inventory each enumerated a
-    SHAPE and each leaked through a shape it had not thought of: R23 matched the text
-    ``body.split(``, R25 matched ``\\[mozyo:`` plus ``finditer``, R26 matched
-    ``ast.Assign`` + ``re.compile`` and was defeated by an annotated assignment, a direct
-    ``re.findall(...)`` call, a second owner sharing a basename, and — because the gate compared
-    only dict KEYS — by a declared module quietly gaining a second channel.
+    Redmine #14539 reviews j#92374 and j#92420. Three earlier versions of this inventory each
+    enumerated a SHAPE — the text ``body.split(``, then ``\\[mozyo:`` plus ``finditer``, then
+    ``ast.Assign`` + ``re.compile`` — and each was defeated by a shape it had not considered. So
+    the unit is POSSESSION: a module that names the marker token in a **value position** can
+    build one or match one, whatever syntax it reaches for. Docstrings and bare string statements
+    are ``Expr`` nodes and excluded, which keeps prose out.
 
-    So the unit is no longer a shape at all. It is POSSESSION: a module that mentions the marker
-    token in a **value position** can build one or match one, whatever syntax it reaches for, and
-    must say what it does with it. Docstrings and bare string statements are excluded (they are
-    ``Expr`` statements, not values), which is what keeps prose from counting — the false
-    positive R25's text search produced. Names bound to a token-bearing expression are resolved
-    across imports by **fully-qualified module path**, so two owners may share a basename.
+    Provenance crosses ONE import hop, and every ordinary way of writing that hop resolves
+    (j#92420 finding 1) — the previous version keyed owners by fully-qualified path but read
+    ``node.module`` raw, so it handled only the absolute ``from a.b import RE`` form and lost:
 
-    Possession is deliberately broader than "scans a note": a producer that can emit a marker its
-    own reader would refuse is exactly the j#92374 finding 2 defect, so producers belong in the
-    inventory too. A false positive costs one declaration line; a false negative costs an
-    undeclared authority reader.
+    - ``from .owner import RE`` — a relative import, resolved here against the consumer's package;
+    - ``import a.b as o`` / ``from a import b`` followed by ``o.RE`` / ``b.RE`` — a module import
+      plus attribute access, which the previous version did not look at at all.
+
+    A consumer written either way carries no token literal of its own, so it slipped the gate
+    entirely.
     """
     import ast
 
@@ -3632,44 +3639,58 @@ def _marker_token_holders(root):
             if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
         }
 
-    def value_position_channels(tree):
-        docs = documentation_constants(tree)
-        found = set()
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Constant)
-                and isinstance(node.value, str)
-                and _MARKER_TOKEN in node.value
-                and id(node) not in docs
-            ):
-                found |= _channels_in(node.value)
-        return found
+    def token_literals(node, docs):
+        return [
+            child
+            for child in ast.walk(node)
+            if isinstance(child, ast.Constant)
+            and isinstance(child.value, str)
+            and _MARKER_TOKEN in child.value
+            and id(child) not in docs
+        ]
 
-    def bound_names(tree):
+    def module_capabilities(tree):
+        """(everything this module holds, {bound name -> what that name holds})."""
         docs = documentation_constants(tree)
-        names = {}
+        claimed, held, bound = set(), [], {}
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign) and node.value is not None:
-                targets = node.targets
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                targets = [node.target]
+                targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and node.value is not None
+                and isinstance(node.target, ast.Name)
+            ):
+                targets = [node.target.id]
             else:
                 continue
-            channels = set()
-            for child in ast.walk(node.value):
-                if (
-                    isinstance(child, ast.Constant)
-                    and isinstance(child.value, str)
-                    and _MARKER_TOKEN in child.value
-                    and id(child) not in docs
-                ):
-                    channels |= _channels_in(child.value)
-            if not channels:
+            literals = token_literals(node.value, docs)
+            if not literals or not targets:
                 continue
-            for target in targets:
-                if isinstance(target, ast.Name):
-                    names[target.id] = channels
-        return names
+            capabilities = [
+                capability
+                for literal in literals
+                for capability in _capabilities_in(literal.value, targets[0])
+            ]
+            for name in targets:
+                bound.setdefault(name, []).extend(capabilities)
+            held += capabilities
+            claimed |= {id(literal) for literal in literals}
+        for literal in token_literals(tree, docs):
+            if id(literal) not in claimed:
+                held += _capabilities_in(literal.value, None)
+        return held, bound
+
+    def dotted_name(node):
+        """``a.b.c`` for a Name/Attribute chain, else ``None``."""
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return None
+        parts.append(node.id)
+        return ".".join(reversed(parts))
 
     trees = {}
     for path in sorted(root.rglob("*.py")):
@@ -3678,37 +3699,62 @@ def _marker_token_holders(root):
         except SyntaxError:  # pragma: no cover - src must parse
             continue
 
-    def dotted(path):
-        return ".".join(path.relative_to(root.parent).with_suffix("").parts)
+    def module_path(path):
+        parts = path.relative_to(root.parent).with_suffix("").parts
+        return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
 
-    owners = {}
+    own, owners = {}, {}
     for path, tree in trees.items():
-        bound = bound_names(tree)
+        held, bound = module_capabilities(tree)
+        own[path] = held
         if bound:
-            owners[dotted(path)] = bound
+            owners[module_path(path)] = bound
 
     holders = {}
     for path, tree in trees.items():
-        channels = set(value_position_channels(tree))
+        held = list(own[path])
+        me = module_path(path)
+        package = me.rsplit(".", 1)[0] if "." in me else me
+        module_aliases = {}
         for node in ast.walk(tree):
-            if not (isinstance(node, ast.ImportFrom) and node.module):
+            if isinstance(node, ast.ImportFrom):
+                if node.level:
+                    base = package.split(".")
+                    if node.level > 1:
+                        base = base[: len(base) - (node.level - 1)]
+                    full = ".".join(base + ([node.module] if node.module else []))
+                else:
+                    full = node.module or ""
+                for alias in node.names:
+                    local = alias.asname or alias.name
+                    owned = owners.get(full, {})
+                    if alias.name in owned:
+                        if any(
+                            isinstance(other, ast.Name) and other.id == local
+                            for other in ast.walk(tree)
+                        ):
+                            held += owned[alias.name]
+                    elif f"{full}.{alias.name}" in owners:
+                        module_aliases[local] = f"{full}.{alias.name}"
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        module_aliases[alias.asname] = alias.name
+                    else:
+                        module_aliases[alias.name] = alias.name
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
                 continue
-            # Fully-qualified, so two owners may share a basename (j#92374 finding 1a).
-            owned = owners.get(node.module, {})
-            for alias in node.names:
-                if alias.name not in owned:
-                    continue
-                local = alias.asname or alias.name
-                if any(
-                    isinstance(other, ast.Name) and other.id == local
-                    for other in ast.walk(tree)
-                ):
-                    channels |= owned[alias.name]
-        if channels:
-            holders[str(path.relative_to(root.parent.parent))] = sorted(channels)
+            base = dotted_name(node.value)
+            target = module_aliases.get(base)
+            if not target:
+                continue
+            owned = owners.get(target, {})
+            if node.attr in owned:
+                held += owned[node.attr]
+        if held:
+            holders[str(path.relative_to(root.parent.parent))] = sorted(held)
     return holders
-
-
 def _inventory_mismatch(holders, declared):
     """Every path whose CHANNELS differ, in either direction (pure).
 
@@ -3743,28 +3789,28 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
     DISCIPLINES = {
         # -- the grammar owner ---------------------------------------------------------
         f"{_D}/domain/redmine_journal_source.py": (
-            ["*"],
+            ["*", "*", "*:_MARKER_RE"],
             "owns the grammar: token regex, component split, strict readers, gate-marker "
             "renderer, and the producer-side value validator",
         ),
         # -- readers -------------------------------------------------------------------
         f"{_D}/domain/dispatch_authorization.py": (
-            ["*"],
+            ["*", "*:_MARKER_RE"],
             "reads: note-scoped ambiguity flag invalidates every sibling; also renders, through "
             "the shared value validator",
         ),
         f"{_D}/domain/dispatch_disposition.py": (
-            ["*"],
+            ["*", "*:_MARKER_RE"],
             "reads: note-scoped note_ambiguous flag refuses the discharge; also renders, through "
             "the shared value validator",
         ),
         f"{_D}/domain/recovery_anchor_delivery.py": (
-            ["*", "recovery-delivery-authorization", "recovery-delivery-zero-send"],
+            ["*", "*", "recovery-delivery-authorization", "recovery-delivery-zero-send"],
             "reads: exactly-one-marker rule, so any second marker of its channel makes the note "
             "unreadable before a field is compared",
         ),
         f"{_D}/domain/recovered_pair_pin_reconciliation.py": (
-            ["*"],
+            ["*:_AUTHORITY_RE"],
             "reads: exactly-one-marker rule",
         ),
         f"{_D}/domain/hibernate_park_record.py": (["handoff"], "reads one marker per record"),
@@ -3780,14 +3826,14 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         ),
         # -- producers -----------------------------------------------------------------
         f"{_H}/domain/handoff.py": (["handoff"], "renders the handoff notification marker"),
-        f"{_H}/domain/notification.py": (["notify"], "renders the notify marker"),
+        f"{_H}/domain/notification.py": (["notify", "notify"], "renders the notify marker"),
         f"{_D}/domain/callback_recovery_key.py": (
             ["*"],
             "renders the recovery-admission marker through the shared value validator it "
             "originally hardened; reads back through the shared strict gate reader",
         ),
         f"{_D}/domain/callback_sweep_watermark.py": (
-            ["*", "workflow-event"],
+            ["*", "*", "workflow-event"],
             "renders the sweep record / dispatch markers",
         ),
         f"{_D}/domain/hibernate_evidence_integration.py": (
@@ -3816,7 +3862,7 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         ),
         # -- prose ---------------------------------------------------------------------
         f"{_D}/application/cli_workflow_watch.py": (
-            ["*"],
+            ["*", "*", "*:watch"],
             "argparse help text only: it names the token to explain the flag and neither builds "
             "nor matches a marker",
         ),
@@ -3950,6 +3996,79 @@ class ReviewJ92374InventoryDetectionTests(unittest.TestCase):
             {"annowner.py": owner, "pkg/consumer.py": consumer}, owner=False
         )
         self.assertEqual(holders.get("src/mozyo_bridge/pkg/consumer.py"), ["chan-b"])
+
+    # -- the import forms j#92420 finding 1 measured ---------------------------------
+
+    def test_a_RELATIVE_import_of_a_pattern_resolves(self):
+        """``from .owner import RE`` — the ordinary way to write this hop inside a package.
+
+        The consumer carries no token literal, so before the fix it left the inventory entirely.
+        """
+        holders = self._holders(
+            {
+                "pkg/__init__.py": "",
+                "pkg/owner.py": self.OWNER,
+                "pkg/consumer.py": (
+                    "from .owner import _MARKER_RE\n"
+                    "def read(n): return _MARKER_RE.findall(n or '')\n"
+                ),
+            },
+            owner=False,
+        )
+        self.assertEqual(holders.get("src/mozyo_bridge/pkg/consumer.py"), ["chan-a"])
+
+    def test_a_MODULE_import_plus_attribute_access_resolves(self):
+        """``import a.b as o`` then ``o.RE`` — the previous version never looked at ``ast.Import``."""
+        consumer = (
+            "import mozyo_bridge.owner as o\n"
+            "def read(n): return o._MARKER_RE.findall(n or '')\n"
+        )
+        self.assertEqual(
+            self._holders({"pkg/consumer.py": consumer}).get("src/mozyo_bridge/pkg/consumer.py"),
+            ["chan-a"],
+        )
+
+    def test_importing_the_MODULE_by_name_and_using_an_attribute_resolves(self):
+        """``from pkg import owner`` then ``owner.RE`` — an ImportFrom naming a module, not a name."""
+        holders = self._holders(
+            {
+                "pkg/__init__.py": "",
+                "pkg/owner.py": self.OWNER,
+                "consumer.py": (
+                    "from mozyo_bridge.pkg import owner\n"
+                    "def read(n): return owner._MARKER_RE.findall(n or '')\n"
+                ),
+            },
+            owner=False,
+        )
+        self.assertEqual(holders.get("src/mozyo_bridge/consumer.py"), ["chan-a"])
+
+    # -- generic capabilities stay tellable apart (j#92420 finding 2) -----------------
+
+    def test_a_second_GENERIC_scanner_is_a_new_capability(self):
+        """Folding every generic pattern to ``"*"`` in a set hid the addition entirely."""
+        generic = r'\\[mozyo:(?P<channel>[a-z0-9_-]+):(?P<body>[^\\]]*)\\]'
+        one = f'import re\nRE1 = re.compile(r"{generic}")\ndef a(n): return RE1.findall(n)\n'
+        two = one + (
+            'RE2 = re.compile(r"\\[mozyo:(?P<c2>[a-z]+):(?P<b2>[^\\]]*)\\]")\n'
+            "def b(n): return RE2.findall(n)\n"
+        )
+        self.assertEqual(
+            self._holders({"m.py": one}, owner=False)["src/mozyo_bridge/m.py"], ["*:RE1"]
+        )
+        self.assertEqual(
+            self._holders({"m.py": two}, owner=False)["src/mozyo_bridge/m.py"],
+            ["*:RE1", "*:RE2"],
+        )
+
+    def test_an_added_UNBOUND_generic_occurrence_also_changes_the_capability(self):
+        """Multiplicity, so an occurrence with no name to distinguish it still counts."""
+        one = "import re\ndef a(n): return re.findall(r\"\\[mozyo:(?P<c>[a-z]+):([^\\]]*)\\]\", n)\n"
+        two = one + "def b(n): return re.findall(r\"\\[mozyo:(?P<d>[a-z]+):([^\\]]*)\\]\", n)\n"
+        self.assertEqual(self._holders({"m.py": one}, owner=False)["src/mozyo_bridge/m.py"], ["*"])
+        self.assertEqual(
+            self._holders({"m.py": two}, owner=False)["src/mozyo_bridge/m.py"], ["*", "*"]
+        )
 
     def test_a_direct_regex_call_with_no_binding_is_detected(self):
         """(d) the pattern never becomes a name at all."""
