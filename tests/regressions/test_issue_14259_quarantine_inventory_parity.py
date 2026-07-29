@@ -24,14 +24,20 @@ fake the collaborator one level further out, at ``list_herdr_agent_rows``.
 The second pin is diagnosability. The read collapsed every exception into the literal detail
 ``"inventory_unreadable"`` — the same three words for a misconfigured environment and for a
 defect in this tool — which is why a live dogfood on two lanes could not localise it. A failed
-read must now name its root cause from a closed vocabulary, without ever echoing the exception
-message: a non-zero ``herdr`` exit is re-raised carrying that process's raw stderr.
+read must now name its root cause from a closed vocabulary. Both defects were fixed by #14259,
+so R3-c places both sets of pins in this one file.
+
+Scope of this file (review j#94358 / verdict j#94361): every test below asserts the RECURRENCE
+of one of those two symptoms. The module's public contract — which trusted environment an
+explicitly-supplied ``env`` uses, the classifier's output shape, its ``__cause__`` walk, and the
+standing value-non-exposure invariant — is asserted in
+``tests/unit/.../test_sublane_quarantine_inspect.py`` instead, because R3-b makes ``regressions``
+a FILE-level type whose every test must be recurrence detection.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import json
 import os
 import sys
 import unittest
@@ -51,8 +57,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     INVENTORY_READ_REASONS,
     QuarantineInspectRequest,
     SublaneQuarantineInspectUseCase,
-    classify_inventory_read_failure,
-    format_inspect_text,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.quarantine_approval import (  # noqa: E501
     APPROVAL_INVENTORY_UNREADABLE,
@@ -93,11 +97,12 @@ def _live_row() -> dict:
 class _Base(unittest.TestCase):
     """Drives the use case at its LIVE default: nothing is injected into the read seam."""
 
-    def _run_with_inventory(self, rows_or_exc, *, env_kwargs=None):
+    def _run_with_inventory(self, rows_or_exc):
         """Fake the inventory at ``list_herdr_agent_rows`` — one level OUT from the broken seam.
 
         Faking further in (``rows_reader``) is what let the defect survive: that argument
-        replaces the very call whose argument was wrong.
+        replaces the very call whose argument was wrong. Nothing is passed for ``env`` either,
+        so the use case is always exercised at the construction the live CLI performs.
 
         The fake is deliberately **as strict about its argument as the real reader**: its first
         act is the same ``env.get(...)`` that ``resolve_herdr_binary`` performs. A lenient fake
@@ -114,9 +119,7 @@ class _Base(unittest.TestCase):
                 raise rows_or_exc
             return rows_or_exc
 
-        use_case = SublaneQuarantineInspectUseCase(
-            repo_root=Path("/tmp/repo"), **(env_kwargs or {})
-        )
+        use_case = SublaneQuarantineInspectUseCase(repo_root=Path("/tmp/repo"))
         with mock.patch.object(inspect_module, "list_herdr_agent_rows", _fake_list_rows), \
                 mock.patch.object(inspect_module, "repo_scope_workspace_id", lambda _root: WS):
             outcome = use_case.run(
@@ -161,11 +164,6 @@ class InventoryReadReachesTheBackendTest(_Base):
         self.assertEqual(
             outcome.facts.action_generation, f"quarantine:{LANE}:{ROLE}:{LOCATOR}"
         )
-
-    def test_explicit_env_still_wins_so_tests_and_callers_stay_hermetic(self):
-        custom = {"MOZYO_HERDR_BINARY": "/opt/herdr"}
-        self._run_with_inventory([_live_row()], env_kwargs={"env": custom})
-        self.assertEqual(dict(self.seen_env), custom)
 
 
 class UnreadableInventoryNamesItsCauseTest(_Base):
@@ -222,63 +220,6 @@ class UnreadableInventoryNamesItsCauseTest(_Base):
                 self.assertNotEqual(
                     outcome.inspection_detail, outcome.approval_reason
                 )
-
-
-class ReadFailureNeverLeaksTheMessageTest(_Base):
-    """Value non-exposure survives the new diagnosability (the reason it is a token)."""
-
-    def test_no_rendering_carries_the_exception_message(self):
-        outcome = self._run_with_inventory(HerdrSessionStartError(SECRET_MESSAGE))
-        blob = json.dumps(outcome.as_payload(), ensure_ascii=False) + format_inspect_text(
-            outcome
-        )
-        for fragment in ("SECRET-STDERR", "/Users/private", "exited 3"):
-            self.assertNotIn(fragment, blob)
-
-    def test_every_classification_is_a_bare_closed_vocabulary_token(self):
-        for exc in (
-            AttributeError(SECRET_MESSAGE),
-            HerdrSessionStartError(SECRET_MESSAGE),
-            TerminalTransportError(SECRET_MESSAGE, reason=REASON_BINARY_NOT_FOUND),
-            OSError(SECRET_MESSAGE),
-        ):
-            with self.subTest(exc=type(exc).__name__):
-                token = classify_inventory_read_failure(exc)
-                self.assertIn(token, INVENTORY_READ_REASONS)
-                # A bare token: no whitespace, no path separator, no message fragment.
-                self.assertNotIn(" ", token)
-                self.assertNotIn("/", token)
-
-
-class ClassifierEdgeTest(unittest.TestCase):
-    """The `__cause__` walk must terminate and must not invent a reason."""
-
-    def test_cyclic_cause_chain_terminates(self):
-        a = HerdrSessionStartError("a")
-        b = HerdrSessionStartError("b")
-        a.__cause__ = b
-        b.__cause__ = a
-        self.assertEqual(
-            classify_inventory_read_failure(a), INVENTORY_READ_PROVIDER_COMMAND_FAILED
-        )
-
-    def test_a_reason_outside_the_transport_vocabulary_is_not_adopted(self):
-        # `reason` is a common attribute name; only the closed transport vocabulary counts.
-        exc = OSError("x")
-        exc.reason = "totally-made-up"  # type: ignore[attr-defined]
-        self.assertEqual(
-            classify_inventory_read_failure(exc), INVENTORY_READ_INTERNAL_ERROR
-        )
-
-    def test_nested_cause_is_still_found(self):
-        root = TerminalTransportError("x", reason=REASON_BINARY_UNCONFIGURED)
-        mid = HerdrSessionStartError("mid")
-        mid.__cause__ = root
-        top = HerdrSessionStartError("top")
-        top.__cause__ = mid
-        self.assertEqual(
-            classify_inventory_read_failure(top), REASON_BINARY_UNCONFIGURED
-        )
 
 
 if __name__ == "__main__":  # pragma: no cover

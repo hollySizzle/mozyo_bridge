@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -24,9 +25,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     sublane_quarantine_inspect as inspect_module,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine_inspect import (  # noqa: E501
+    INVENTORY_READ_INTERNAL_ERROR,
+    INVENTORY_READ_PROVIDER_COMMAND_FAILED,
     INVENTORY_READ_REASONS,
     QuarantineInspectRequest,
     SublaneQuarantineInspectUseCase,
+    classify_inventory_read_failure,
     format_inspect_text,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine import (  # noqa: E501
@@ -49,8 +53,16 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AGENT_WORKING,
     PendingComposerSignal,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+    HerdrSessionStartError,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
+    REASON_BINARY_NOT_FOUND,
+    REASON_BINARY_UNCONFIGURED,
+    TerminalTransportError,
 )
 
 WS = "wProj"
@@ -343,6 +355,109 @@ class TextRenderingTest(_Case):
         text = format_inspect_text(self._run(rows=[]))
         self.assertIn("positive owner approval cannot be built", text)
         self.assertIn(APPROVAL_RECEIVER_ABSENT, text)
+
+
+# ---------------------------------------------------------------------------
+# Inventory-read contract (Redmine #14259).
+#
+# These assert the MODULE'S PUBLIC CONTRACT — the trusted environment the read uses, and the
+# shape of the classifier's answer — rather than the recurrence of the #14259 symptom, which is
+# pinned in `tests/regressions/test_issue_14259_quarantine_inventory_parity.py`. The split
+# follows `vibes/docs/logics/tests-placement-discovery-policy.md`: R3-b makes `regressions` a
+# FILE-level type whose every test must be recurrence detection, so a contract assertion placed
+# there disqualifies the whole file (review j#94358, verdict j#94361).
+# ---------------------------------------------------------------------------
+
+#: Stands for the operator-private material a raised read carries in its message: a non-zero
+#: `herdr agent list` is re-raised with that process's raw stderr, and a failed binary
+#: resolution names the absolute path it tried.
+SECRET_MESSAGE = "SECRET-STDERR /Users/private/path/herdr exited 3"
+
+
+class InventoryReadEnvContractTest(unittest.TestCase):
+    """Which trusted environment the read is performed with, and what a failure may emit."""
+
+    def _run(self, rows_or_exc, *, env_kwargs=None):
+        seen: dict = {}
+
+        def _fake_list_rows(env):
+            seen["env"] = env
+            # As strict about its argument as the real reader, whose first act is this lookup.
+            env.get("MOZYO_HERDR_BINARY")
+            if isinstance(rows_or_exc, BaseException):
+                raise rows_or_exc
+            return rows_or_exc
+
+        use_case = SublaneQuarantineInspectUseCase(
+            repo_root=Path("/tmp/repo"), **(env_kwargs or {})
+        )
+        with mock.patch.object(inspect_module, "list_herdr_agent_rows", _fake_list_rows), \
+                mock.patch.object(inspect_module, "repo_scope_workspace_id", lambda _r: WS):
+            outcome = use_case.run(
+                QuarantineInspectRequest(issue=ISSUE, lane=LANE, role=ROLE)
+            )
+        self.seen_env = seen.get("env", "<never called>")
+        return outcome
+
+    def test_explicit_env_still_wins_so_tests_and_callers_stay_hermetic(self):
+        custom = {"MOZYO_HERDR_BINARY": "/opt/herdr"}
+        self._run([_row()], env_kwargs={"env": custom})
+        self.assertEqual(dict(self.seen_env), custom)
+
+    def test_no_rendering_carries_the_exception_message(self):
+        # Value non-exposure (the module's standing invariant) must survive the read failure
+        # now carrying diagnostic information: the token crosses, the message never does.
+        outcome = self._run(HerdrSessionStartError(SECRET_MESSAGE))
+        blob = json.dumps(outcome.as_payload(), ensure_ascii=False) + format_inspect_text(
+            outcome
+        )
+        for fragment in ("SECRET-STDERR", "/Users/private", "exited 3"):
+            self.assertNotIn(fragment, blob)
+
+
+class InventoryReadClassifierTest(unittest.TestCase):
+    """`classify_inventory_read_failure` answers one closed-vocabulary token, always."""
+
+    def test_every_classification_is_a_bare_closed_vocabulary_token(self):
+        for exc in (
+            AttributeError(SECRET_MESSAGE),
+            HerdrSessionStartError(SECRET_MESSAGE),
+            TerminalTransportError(SECRET_MESSAGE, reason=REASON_BINARY_NOT_FOUND),
+            OSError(SECRET_MESSAGE),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                token = classify_inventory_read_failure(exc)
+                self.assertIn(token, INVENTORY_READ_REASONS)
+                # A bare token: no whitespace, no path separator, no message fragment.
+                self.assertNotIn(" ", token)
+                self.assertNotIn("/", token)
+
+    def test_cyclic_cause_chain_terminates(self):
+        a = HerdrSessionStartError("a")
+        b = HerdrSessionStartError("b")
+        a.__cause__ = b
+        b.__cause__ = a
+        self.assertEqual(
+            classify_inventory_read_failure(a), INVENTORY_READ_PROVIDER_COMMAND_FAILED
+        )
+
+    def test_a_reason_outside_the_transport_vocabulary_is_not_adopted(self):
+        # `reason` is a common attribute name; only the closed transport vocabulary counts.
+        exc = OSError("x")
+        exc.reason = "totally-made-up"  # type: ignore[attr-defined]
+        self.assertEqual(
+            classify_inventory_read_failure(exc), INVENTORY_READ_INTERNAL_ERROR
+        )
+
+    def test_nested_cause_is_still_found(self):
+        root = TerminalTransportError("x", reason=REASON_BINARY_UNCONFIGURED)
+        mid = HerdrSessionStartError("mid")
+        mid.__cause__ = root
+        top = HerdrSessionStartError("top")
+        top.__cause__ = mid
+        self.assertEqual(
+            classify_inventory_read_failure(top), REASON_BINARY_UNCONFIGURED
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover
