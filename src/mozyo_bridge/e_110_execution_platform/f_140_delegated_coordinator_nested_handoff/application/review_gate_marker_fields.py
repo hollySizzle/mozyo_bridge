@@ -12,7 +12,11 @@ import argparse
 from typing import Optional
 
 from ..domain.hibernate_evidence_envelope import contains_marker_separator
-from ..domain.marker_value_contract import is_journal_id
+from ..domain.marker_value_contract import (
+    is_canonical_positive_decimal,
+    is_exact_str,
+    is_journal_id,
+)
 
 _REVIEW_REQUEST_GATE = "review_request"
 _REVIEW_RESULT_GATE = "review_result"
@@ -54,7 +58,7 @@ def review_gate_marker_fields(args: argparse.Namespace, gate: str) -> "tuple[dic
     # whose `__str__` looks like a head passed here and was handed on AS THE OBJECT — the domain
     # producer then raised, turning this boundary's typed refusal into a traceback. Self-detected
     # while sweeping F1's family; the CLI must answer with a token whatever it is given.
-    if not isinstance(head, str) or contains_marker_separator(head) or not is_full_commit_head(head):
+    if not is_exact_str(head) or contains_marker_separator(head) or not is_full_commit_head(head):
         return {}, "review_marker_malformed_target_head"
     fields: dict = {"target_head": head}
     if gate == _REVIEW_RESULT_GATE:
@@ -118,13 +122,15 @@ def lane_envelope_marker_fields(args: argparse.Namespace) -> "tuple[dict, Option
     # `isinstance` before the character test, same reason as the head above: the identities are
     # handed to the strict renderer AS SUPPLIED, so a non-`str` that merely stringifies cleanly
     # reached it and raised, instead of being refused here with a token.
-    if not all(isinstance(value, str) for value in (ws, lane)):
+    if not all(is_exact_str(value) for value in (ws, lane)):
         return {}, "evidence_envelope_malformed_identity"
     if any(contains_marker_separator(value) for value in (ws, lane)):
         return {}, "evidence_envelope_malformed_identity"
-    if not isinstance(gen_raw, str):
-        return {}, "evidence_envelope_malformed_generation"
-    if not gen_raw.isdigit() or int(gen_raw) <= 0:
+    # The generation asks the SAME canonical-decimal question as the review contract's `req`
+    # (review j#94038 blocker 1). `isdigit()` + `int()` was not that question: it accepted `"01"`
+    # and `"٣"` and rewrote them into a generation nobody named, and it RAISED on a 4301-digit
+    # input — through the very line whose docstring promised nothing here becomes a traceback.
+    if not is_canonical_positive_decimal(gen_raw):
         return {}, "evidence_envelope_malformed_generation"
     return {
         "evidence_workspace": ws,

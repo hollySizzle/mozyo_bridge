@@ -50,6 +50,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
     MARKER_VALUE_FORBIDDEN_CHARS,
     MarkerValueError,
+    is_exact_str,
     review_anchor_fields,
     review_marker_fields,
     validate_marker_field_value,
@@ -643,7 +644,7 @@ def render_workflow_event_marker(
     # Every value is judged RAW (#14694 review j#93818 F1): the `str(...).strip()` this used to do
     # rewrote `conclusion=" approved "` / `head=" <sha> "` / `req=" 93802 "` into clean canonical
     # authority fields. The envelope's own rule governs this marker's fields too.
-    if not isinstance(gate, str) or gate not in GATE_BEARING_KINDS:
+    if not is_exact_str(gate) or gate not in GATE_BEARING_KINDS:
         raise ValueError(
             f"render_workflow_event_marker gate must be one of {sorted(GATE_BEARING_KINDS)}, got {gate!r}"
         )

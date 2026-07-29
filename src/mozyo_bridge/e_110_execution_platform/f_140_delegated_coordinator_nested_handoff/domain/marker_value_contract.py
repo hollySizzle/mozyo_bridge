@@ -24,6 +24,31 @@ class MarkerValueError(ValueError):
     """A field value the marker grammar cannot round-trip (raised by the producer, never read)."""
 
 
+def is_exact_str(value: object) -> bool:
+    """Whether ``value`` is a builtin ``str`` and not a subclass of one (pure).
+
+    ``isinstance`` is not enough for a PRODUCER (Redmine #14694 review j#94038 blocker 2). Every
+    field here is rendered with an f-string, so ``type(value).__format__`` decides the bytes that
+    reach the durable record — and a ``str`` subclass may override it. Measured: a subclass
+    validated as the head ``a*40`` rendered ``head=b*40``, and one validated as the workspace
+    ``ws`` rendered ``workspace=evil:lane=forged``, injecting a second ``lane`` field ahead of the
+    real one. Returning "the validated object itself" is not enough when the object gets to choose
+    what it looks like at render time; only an exact builtin can promise that what was checked is
+    what is written.
+    """
+    return type(value) is str
+
+
+def is_exact_int(value: object) -> bool:
+    """Whether ``value`` is a builtin ``int`` and not a subclass (and never a ``bool``) (pure).
+
+    The same hazard as :func:`is_exact_str`, on the one numeric field a marker carries. Measured
+    while sweeping that blocker's family: an ``int`` subclass overriding ``__format__`` and
+    validated as generation ``3`` rendered ``lane_generation=9:head=forged``.
+    """
+    return type(value) is int
+
+
 def validate_marker_field_value(field: str, value: object, *, what: str = "marker") -> str:
     """The value as given, or raise — the PRODUCER-side twin of the strict readers (pure).
 
@@ -81,6 +106,30 @@ _ASCII_DIGITS = frozenset("0123456789")
 _ASCII_NONZERO_DIGITS = frozenset("123456789")
 
 
+def is_canonical_positive_decimal(value: object) -> bool:
+    """Whether ``value`` is a canonical positive decimal token, judged on the RAW value (pure).
+
+    THE shape shared by the two decimal marker fields — the review contract's ``req`` (a journal
+    id) and the envelope's ``lane_generation``. One predicate because they had one defect: fixing
+    it for ``req`` in R5 and leaving ``lane_generation`` on ``isdigit()`` + ``int()`` is what review
+    j#94038 blocker 1 found, so the shape now has a single home rather than a per-field copy.
+
+    See :func:`is_journal_id` for why this is lexical and never goes through ``int()``.
+    """
+    if not is_exact_str(value) or not value:
+        return False
+    if value[0] not in _ASCII_NONZERO_DIGITS:
+        return False
+    if not set(value) <= _ASCII_DIGITS:
+        return False
+    # A token no consumer could convert to an integer names nothing. The bound is the interpreter's
+    # own (`sys.get_int_max_str_digits()`, 0 = unlimited) rather than a number chosen here, so this
+    # refuses exactly the input that used to make the predicate RAISE — as a False, which is what a
+    # predicate owes its caller.
+    limit = sys.get_int_max_str_digits()
+    return not limit or len(value) <= limit
+
+
 def is_journal_id(value: object) -> bool:
     """Whether ``value`` is a CANONICAL positive decimal journal id, judged on the RAW value (pure).
 
@@ -102,18 +151,7 @@ def is_journal_id(value: object) -> bool:
     ``"93802=shadow"``, ``"-5"``, ``"1.5"``, ``"0"`` and ``"01"`` are not journal ids. The producer
     and the CLI both ask THIS question, so "what a journal id looks like" has one answer.
     """
-    if not isinstance(value, str) or not value:
-        return False
-    if value[0] not in _ASCII_NONZERO_DIGITS:
-        return False
-    if not set(value) <= _ASCII_DIGITS:
-        return False
-    # An id no consumer could convert to an integer is not an id anyone owns. The bound is the
-    # interpreter's own (`sys.get_int_max_str_digits()`, 0 = unlimited) rather than a number chosen
-    # here, so this refuses exactly the input that used to make the predicate RAISE — as a False,
-    # which is what a predicate owes its caller.
-    limit = sys.get_int_max_str_digits()
-    return not limit or len(value) <= limit
+    return is_canonical_positive_decimal(value)
 
 
 def require_journal_id(value: object, *, field: str = "req") -> str:
@@ -191,7 +229,7 @@ def require_vocabulary(value: object, *, field: str, vocabulary) -> str:
     for the object it was asked about, so what is written must BE that object, not a rendering of
     it. Rejecting a plain ``int`` was never a type contract; it was membership happening to fail.
     """
-    if not isinstance(value, str) or value not in vocabulary:
+    if not is_exact_str(value) or value not in vocabulary:
         raise MarkerValueError(
             f"marker field {field!r} must be one of {sorted(vocabulary)}, got {value!r}"
         )

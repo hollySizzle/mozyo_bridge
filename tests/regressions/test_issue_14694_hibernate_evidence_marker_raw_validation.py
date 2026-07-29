@@ -679,6 +679,195 @@ class ReviewResultProducerTests(unittest.TestCase):
         )
 
 
+class SubclassCannotRewriteWhatWasValidatedTests(unittest.TestCase):
+    """Review j#94038 blocker 2: `isinstance` lets the value choose its own rendering.
+
+    Every marker field is written with an f-string, so ``type(value).__format__`` decides the bytes
+    that land in the durable record. A ``str`` subclass may override it, so "return the validated
+    object itself" — the R5 fix — still allowed the checked value and the written value to differ.
+    Measured on the previous head: a subclass validated as the head ``a*40`` rendered ``head=b*40``,
+    and one validated as the workspace ``ws`` rendered ``workspace=evil:lane=forged``, injecting a
+    second ``lane`` field AHEAD of the real one. The ``int`` sibling was found by sweeping the
+    family rather than from the report: a generation subclass rendered
+    ``lane_generation=9:head=forged``.
+    """
+
+    class _Rewriting(str):
+        """Validates as ``real`` and renders as ``written``."""
+
+        def __new__(cls, real, written):
+            token = super().__new__(cls, real)
+            token.written = written
+            return token
+
+        def __format__(self, spec):
+            return self.written
+
+    class _RewritingInt(int):
+        def __format__(self, spec):
+            return "9:head=forged"
+
+    def test_no_marker_field_can_be_rewritten_at_render_time(self):
+        sha = "a" * 40
+        rewritten = self._Rewriting
+        cases = (
+            (
+                "head",
+                lambda: render_workflow_event_marker(
+                    "review_request", target_head=rewritten(sha, "b" * 40)
+                ),
+            ),
+            (
+                "req",
+                lambda: render_workflow_event_marker(
+                    "review_result",
+                    conclusion="approved",
+                    target_head=sha,
+                    review_request_journal=rewritten("93802", "1"),
+                ),
+            ),
+            (
+                "conclusion",
+                lambda: render_workflow_event_marker(
+                    "review_result",
+                    conclusion=rewritten("approved", "bogus"),
+                    target_head=sha,
+                    review_request_journal="93802",
+                ),
+            ),
+            (
+                "gate",
+                lambda: render_workflow_event_marker(rewritten("review_request", "bogus")),
+            ),
+            (
+                "envelope workspace",
+                lambda: ev.render_hibernate_evidence(
+                    ev.EVIDENCE_PARK_DECLARED,
+                    envelope=envelope(head="", workspace=rewritten("ws", "evil:lane=forged")),
+                ),
+            ),
+            (
+                "envelope lane",
+                lambda: ev.render_hibernate_evidence(
+                    ev.EVIDENCE_PARK_DECLARED,
+                    envelope=envelope(head="", lane=rewritten("lane", "evil:head=forged")),
+                ),
+            ),
+            (
+                "envelope head",
+                lambda: ev.render_hibernate_evidence(
+                    ev.EVIDENCE_REQUIRED_CI_GREEN,
+                    envelope=envelope(head=rewritten(sha, "b" * 40)),
+                    workflow="check",
+                    run="run",
+                ),
+            ),
+            (
+                "envelope lane_generation",
+                lambda: ev.render_hibernate_evidence(
+                    ev.EVIDENCE_PARK_DECLARED,
+                    envelope=envelope(head="", lane_generation=self._RewritingInt(3)),
+                ),
+            ),
+            (
+                "kind-specific workflow",
+                lambda: ev.render_hibernate_evidence(
+                    ev.EVIDENCE_REQUIRED_CI_GREEN,
+                    envelope=envelope(),
+                    workflow=rewritten("check", "evil:run=forged"),
+                    run="run",
+                ),
+            ),
+            (
+                "integration branch",
+                lambda: ie.render_integration_evidence(
+                    envelope=envelope(),
+                    integration_head=INTEGRATION_HEAD,
+                    integration_branch=rewritten("main-next", "evil:disposition=merge"),
+                    disposition="merge",
+                ),
+            ),
+        )
+        for label, render in cases:
+            with self.subTest(field=label):
+                try:
+                    marker = render()
+                except ValueError:
+                    continue
+                self.fail(f"a rewriting {label} rendered the authority marker {marker!r}")
+
+    def test_the_cli_producer_refuses_a_rewriting_value_too(self):
+        sha = "a" * 40
+        base = {
+            "target_head": sha,
+            "review_request_journal": "93802",
+            "review_decision": "approval",
+            "evidence_workspace": "ws",
+            "evidence_lane": "lane",
+            "evidence_lane_generation": "3",
+        }
+        for label, over, expected in (
+            (
+                "head",
+                {"target_head": self._Rewriting(sha, "b" * 40)},
+                "review_marker_malformed_target_head",
+            ),
+            (
+                "workspace",
+                {"evidence_workspace": self._Rewriting("ws", "evil:lane=forged")},
+                "evidence_envelope_malformed_identity",
+            ),
+            (
+                "lane_generation",
+                {"evidence_lane_generation": self._Rewriting("3", "9")},
+                "evidence_envelope_malformed_generation",
+            ),
+        ):
+            with self.subTest(field=label):
+                fields, refusal = review_gate_marker_fields(
+                    argparse.Namespace(**{**base, **over}), "review_result"
+                )
+                self.assertEqual(fields, {})
+                self.assertEqual(refusal, expected)
+
+
+class CanonicalDecimalFieldsTests(unittest.TestCase):
+    """Review j#94038 blocker 1: `req` was fixed in R5 and `lane_generation` was not.
+
+    Both are the contract's canonical positive decimals, and both had the same defect — `isdigit()`
+    plus `int()` accepted ``"01"`` and ``"٣"`` and rewrote them into a value nobody named, and
+    RAISED on a 4301-digit input through the very function whose docstring promised that nothing
+    there becomes a traceback. Fixing one field and not the other is fixing a field rather than a
+    defect, so they now ask one predicate.
+    """
+
+    def _envelope_args(self, generation):
+        return argparse.Namespace(
+            evidence_workspace="ws", evidence_lane="lane", evidence_lane_generation=generation
+        )
+
+    def test_the_generation_is_canonical_or_a_typed_refusal(self):
+        for bad in ("01", "007", "٣", "0", "-1", "1.0", " 3", "3 ", "9" * 4301, "9" * 10000):
+            with self.subTest(value=f"{bad[:6]}… ({len(bad)} chars)"):
+                fields, refusal = lane_envelope_marker_fields(self._envelope_args(bad))
+                self.assertEqual(fields, {})
+                self.assertEqual(refusal, "evidence_envelope_malformed_generation")
+        # Inline control: the canonical generation still resolves to the int the renderer wants.
+        fields, refusal = lane_envelope_marker_fields(self._envelope_args("3"))
+        self.assertIsNone(refusal)
+        self.assertEqual(fields["evidence_lane_generation"], 3)
+
+    def test_both_decimal_fields_ask_the_same_predicate(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+            is_canonical_positive_decimal,
+            is_journal_id,
+        )
+
+        for value in ("1", "3", "93802", "01", "0", "٣", "", "9" * 4301, None, 3):
+            with self.subTest(value=repr(value)[:24]):
+                self.assertEqual(is_journal_id(value), is_canonical_positive_decimal(value))
+
+
 class RendererNeverWritesWhatItWouldNotMeanTests(unittest.TestCase):
     """The symptom stated as an invariant over BOTH corpora.
 

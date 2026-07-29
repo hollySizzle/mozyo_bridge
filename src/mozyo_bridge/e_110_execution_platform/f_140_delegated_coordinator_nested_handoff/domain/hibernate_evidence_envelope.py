@@ -23,6 +23,8 @@ import re
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from .marker_value_contract import is_exact_int, is_exact_str
+
 #: A canonical full commit hash: 40 hex (sha1) or 64 hex (sha256), lowercase. A truncated /
 #: abbreviated / uppercase / non-hex head is rejected, matching the repo-wide convention
 #: (``patch_equivalent_integration._FULL_SHA_RE`` / ``review_return_route``).
@@ -194,9 +196,9 @@ def require_marker_token(value: object, *, field: str, requirement: str) -> str:
     claimed; the central `### Hibernate Evidence Marker Contract` requires the producer error to
     surface at write time instead.
     """
-    if not isinstance(value, str):
+    if not is_exact_str(value):
         raise ValueError(
-            f"{requirement} requires a string {field}, got {type(value).__name__} {value!r}"
+            f"{requirement} requires a builtin string {field}, got {type(value).__name__} {value!r}"
         )
     if not value:
         raise ValueError(f"{requirement} requires a {field}")
@@ -225,11 +227,15 @@ def render_lane_envelope(envelope: LaneEvidenceEnvelope) -> str:
     )
     lane = require_marker_token(envelope.lane, field=FIELD_LANE, requirement="lane envelope")
     generation = envelope.lane_generation
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
+    # EXACT builtins, not `isinstance` (review j#94038 blocker 2): every field below is rendered
+    # with an f-string, so a `str` / `int` subclass overriding `__format__` decides the durable
+    # bytes. Measured: such a subclass validated as `ws` rendered `workspace=evil:lane=forged`, and
+    # one validated as generation `3` rendered `lane_generation=9:head=forged`.
+    if not is_exact_int(generation) or generation <= 0:
         raise ValueError(f"lane envelope requires a positive lane_generation, got {generation!r}")
     head = envelope.head
-    if not isinstance(head, str):
-        raise ValueError(f"lane envelope head must be a string, got {type(head).__name__} {head!r}")
+    if not is_exact_str(head):
+        raise ValueError(f"lane envelope head must be a builtin string, got {head!r}")
     if head:
         # Absent is ``""`` and nothing else: ``None`` is a producer error, not "no head".
         require_marker_token(head, field=FIELD_HEAD, requirement="lane envelope")
