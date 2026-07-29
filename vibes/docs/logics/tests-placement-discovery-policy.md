@@ -61,9 +61,13 @@ integration)。
 - **surface (実 filesystem / 実 subprocess に触れるか) は該当条件ではない。** 本 type が
   課すのは後述の hermetic 要件だけであり、**実 FS に触れることは要求していない**
   (根拠は本節の定義そのもの)。したがって **pure な test も scenarios になり得る**。
-  corpus もこれと整合する [実測、base `dd62e957`: 既存 12 file のうち **6 file は temp
-  dir を作らず**、うち少なくとも 1 file は実 FS API / subprocess を一切使わない]。
   **surface で population を切ってから type を割り当てない。**
+  > 本判断の根拠は上記の定義であり、corpus 集計ではない。参考値として既存 12 file のうち
+  > **6 file は temp dir を作らない** [実測、base `dd62e957`] が、**この集計から「実 FS を
+  > 使わない」は導けない** — temp dir 検出は使用の**下限**であり、非発火は不使用の証明に
+  > ならない (実際 6 file はいずれも `Path(__file__).resolve()` 等で実 FS を叩く)。
+  > 同種の「下限の非発火から不使用を主張する」誤りは `### unit / integration 境界の既知の矛盾`
+  > でも禁じている。
 - cross-cutting なので **bounded context で細分しない**。context は filename /
   docstring に書く。
 - 例: turnkey e2e acceptance (`logic-turnkey-e2e-acceptance`)、cross-project
@@ -346,8 +350,10 @@ integration : 実 外部 collaborator が 1 以上で、hermetic (temp dir / in-
 
 ## #14660 legacy mirror family 裁定 (Redmine #14662 R4)
 
-`tests/regressions/test_legacy_project_skill_mirror.py` (以下 **#14660 family**、127 test)
-の分割・移設に本 doc の決定木を適用した結果の裁定を固定する。正本は Redmine #14662
+`tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py`
+(以下 **#14660 family**、127 test) の分割・移設に本 doc の決定木を適用した結果の裁定を固定する。
+これは **base `dd62e957` 時点の現行 path であって移設先ではない** — 127 件の行き先は本節の基準に
+基づく #14660 の分類で決まり、本 doc は先取りしない。正本は Redmine #14662
 Implementation Done **j#92449** (R4 裁定) / Review **j#92458** (承認、指摘 0)、coordinator
 intake は j#92461。上記 `### scenarios` / `### regressions` / `### unit / integration
 境界の既知の矛盾` / `## Anti-patterns` の改訂は同じ裁定の反映である。
@@ -408,13 +414,26 @@ unit + scenarios + regressions + integration = 127
 検出器にも surface にも依存しない (support へ抽出する fixture は test ではないので 127 の
 分配先にならない)。
 
-これを、移設前後で collected test 数が一致することの確認 (`## discovery / CI 方針` の
-移行契約と同型) と併せて使う。基準値 **D1 = 127 (family focused)** / **D2 = 13,207
-(repository discovery)** は **移設 base 時点の snapshot** であり、#14660 が所有する。
-恒久に残るのは **count 一致を確認する command** であって snapshot の数値ではない
-(D2 は family と無関係な test の増減でも動く)。
+これを、移設前後で collected test 数が一致することの確認 (`## discovery / CI 方針` の移行契約と
+同型) と併せて使う。**恒久に残るのは count 一致を確認する command であって特定の数値ではない**:
 
-**surface 集計は diagnostic であって acceptance invariant ではない:**
+- **D1 (family focused)** = 本 family の test 数 **127**。family 内で閉じた定数であり、
+  上の partition 恒等式と同じ根拠を持つ。
+- **D2 (repository discovery)** = `unittest.defaultTestLoader.discover('tests').countTestCases()`。
+  **各物理移設 Task が自身の exact pre-move base で `N` を測り、post-move が同じ `N` である
+  ことを検証する**。`N` は family と無関係な test の増減でも動くため、**特定の数値を本 doc に
+  固定しない**。
+
+> **数値の出所と、裁定からの correction の明示。** #14662 j#92449 は D2 を `13,207` という
+> 数値ごと「移設後に残る恒久不変条件」と書いている。`13,207` は **#14660 characterization が
+> 自身の base で測った snapshot** (#14660 j#92381 / j#92393) であり、**本 doc の base
+> `dd62e957` で同じ command を実行した実測は `13,343`** である。数値を恒久不変条件として持つと
+> base が進むたびに偽陽性になるため、本 doc は不変条件を **「各 Task が自 base で測り一致を
+> 見る command」へ分離**する。これは j#92449 の literal に対する **policy correction** である
+> (裁定の意図 = 移設で test を落とさないこと、は変えていない)。
+
+**surface 集計は diagnostic であって acceptance invariant ではない** [出所: **#14660 Appendix A.2
+の構文的導出**。同 characterization の base での値であり、本 doc が実測した値ではない]:
 
 | surface | tests |
 | --- | ---: |
@@ -441,7 +460,7 @@ CI に足さない。`### support` の定義 (test から import される共有
 - drift window は「本裁定 → T1 / T5 完了」に限定し、その窓の drift 検出は各移設 Task の
   完了条件とする。移設完了時に **superseded** と明記して retire する。
 - 移設後に残る恒久不変条件は **collected test 数の一致確認** であり、**script ではなく
-  command** である (D1 / D2 はその base 時点の snapshot 値)。
+  command** である (D1 は family 定数、D2 は各移設 Task が自 base で測る。`### 移設の検算`)。
 - **構文的検出器 (Appendix A.2) は分岐 4 / 5 の候補抽出と上記 diagnostic trigger に有効で
   あり、「実外部 collaborator が 0 か」の判定の正本ではない。** 判定は各 test を読んで行う。
 - 必須の訂正 (#14660 所有): 上記 `### regressions` の裁定により **A.3 の分岐 3 判定は
