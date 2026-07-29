@@ -11,7 +11,7 @@ are worth reading as a unit:
 - :class:`_StagingOwnership` — the one answer to "does this name still refer to
   the file this run created?", which is only answerable while the creating
   descriptor is still open (Redmine #14652).
-- :func:`_teardown_during` — runs teardown actions independently during an
+- :func:`teardown_during` — runs teardown actions independently during an
   unwind, keeping three outcome channels distinct: a returned failure, an
   ordinary exception, and a control-flow exception that outranks the primary
   (j#90482 R12-F2 / j#90487 R13-F1/F2/F3 / j#90492 R14-F1/F2).
@@ -22,6 +22,17 @@ are worth reading as a unit:
 
 Keeping them here means the ordering and channel rules have one home rather than
 being restated at each call site.
+
+The public surface is deliberately four names — :func:`teardown_failures`,
+:func:`teardown_during`, :class:`Retention` and :class:`RetentionCarrier` —
+plus the :data:`RETENTION_ATTEMPTS` bound. Everything else stays module-private,
+because the safety argument of this module rests on callers *not* being able to
+name it: the ledger key is an identity, the ledger container is checked by exact
+type, and the descriptor that reaches a primary's instance dictionary is bound
+from ``BaseException`` itself. :class:`RetentionCarrier` is the one seam that had
+to be lifted out (Redmine #14683): "what happens when the carrier fails" is a
+property worth pinning, and pinning it used to mean monkeypatching
+:func:`_ledger` over the module — which is a private name, and a global one.
 """
 
 from __future__ import annotations
@@ -161,6 +172,57 @@ def _ledger(primary: BaseException) -> _Ledger | None:
     return ledger
 
 
+class RetentionCarrier:
+    """Where a :class:`Retention` puts the occurrences it has taken.
+
+    The seam exists because the interesting property is what the retention does
+    when the carrier *fails*: the record has to be acquired and written on the
+    same channel as everything else, so a carrier that raises — ordinarily or
+    with control flow — must not cost a teardown action that has not run
+    (j#90508 R16-F1/F2). Reaching that state needs a carrier that misbehaves on
+    a schedule, and until Redmine #14683 the only way to get one was to patch
+    the module-private :func:`_ledger` over the module itself: a private name,
+    and a process-global one, replaced for the duration of a call.
+
+    Overriding :meth:`ledger` is the supported way to schedule those failures.
+    An override may raise whatever it likes; when it wants the real behaviour it
+    calls ``super().ledger(primary)`` and returns the result untouched.
+
+    **The returned value is opaque, by design.** It is the module's own ledger
+    container, which is private and stays private: :func:`_existing_ledger`
+    admits it by exact type precisely so nothing a caller can construct is ever
+    adopted as the record (j#90517 R17-F1). So this seam replaces *when the
+    carrier answers*, never *what the record is*.
+
+    Fabricating a return value is therefore outside the contract rather than an
+    alternative use of it. Measured: the drain does append occurrences into
+    whatever object is handed back, but :func:`teardown_failures` reads the
+    primary's own ledger by exact type, so a fabricated container is never what
+    a caller reads back — the retention silently becomes unreachable, which is
+    the same boundary as a carrier that never recovers. The channel discipline
+    is unaffected either way: every action still runs.
+
+    That is the narrow shape the #14660 characterization §3.2(a) asks for, and
+    the reason the seam is not simply ":func:`_ledger`, renamed".
+    """
+
+    __slots__ = ()
+
+    def ledger(self, primary: BaseException) -> _Ledger | None:
+        """Acquire the record for ``primary``, creating it on first use."""
+        return _ledger(primary)
+
+
+_DEFAULT_CARRIER = RetentionCarrier()
+"""The carrier every retention uses unless a caller hands one in.
+
+A module-level singleton rather than a per-retention construction: a
+:class:`Retention` is built at the top of :func:`teardown_during`, outside any
+guard, and an allocation there would be one more thing that can fail before the
+rails exist.
+"""
+
+
 class _Occurrence:
     """One arrival of one failure, distinct from every other arrival.
 
@@ -177,11 +239,17 @@ class _Occurrence:
         self.failure = failure
 
 
-_RETENTION_ATTEMPTS = 4
+RETENTION_ATTEMPTS = 4
 """How many times one retention retries a carrier that keeps interrupting.
 
 Bounded so a carrier that never recovers still terminates; the queue survives
 the call anyway and later retentions try again.
+
+Public alongside :class:`RetentionCarrier`, because it is the half of the seam's
+contract a replacement carrier is written against: exercising the exhausted-retry
+boundary means knowing how many attempts there are, and deriving the schedule
+from this bound is what keeps such a test from silently stopping short of it if
+the bound ever changes.
 """
 
 
@@ -270,7 +338,7 @@ def _took_the_interrupt(
     return interrupt if first is None else first
 
 
-class _Retention:
+class Retention:
     """One unwind's retention, with the occurrences the carrier has not taken.
 
     ``_remember`` used to return the control flow it hit and nothing else, so
@@ -298,10 +366,13 @@ class _Retention:
     the same reason: this is not a case this code can create.
     """
 
-    __slots__ = ("primary", "_queued")
+    __slots__ = ("primary", "_carrier", "_queued")
 
-    def __init__(self, primary: BaseException) -> None:
+    def __init__(
+        self, primary: BaseException, carrier: RetentionCarrier | None = None
+    ) -> None:
         self.primary = primary
+        self._carrier = _DEFAULT_CARRIER if carrier is None else carrier
         self._queued: list[_Occurrence] = []
 
     def remember(self, failure: object) -> BaseException | None:
@@ -333,7 +404,7 @@ class _Retention:
         """
         unadmitted: list[_Occurrence] = [] if arriving is None else [arriving]
         first: BaseException | None = None
-        for _ in range(_RETENTION_ATTEMPTS):
+        for _ in range(RETENTION_ATTEMPTS):
             try:
                 self._admit(unadmitted)
                 self._drain()
@@ -365,7 +436,7 @@ class _Retention:
         the append itself, which Python cannot make atomic. It is retried, and
         it is no wider than that.
         """
-        for _ in range(_RETENTION_ATTEMPTS):
+        for _ in range(RETENTION_ATTEMPTS):
             try:
                 self._admit(unadmitted)
                 return first
@@ -390,7 +461,7 @@ class _Retention:
     def _drain(self) -> None:
         """Append every queued occurrence the ledger does not already hold."""
         while True:
-            ledger = _ledger(self.primary)
+            ledger = self._carrier.ledger(self.primary)
             if ledger is None:
                 return  # no carrier; the queue waits for a later attempt
             occurrence = self._unrecorded(ledger)
@@ -449,7 +520,7 @@ def _describe_failure(failure: object) -> str:
         return f"{name}: <unprintable>"
 
 
-def _present(retention: _Retention, failure: object) -> BaseException | None:
+def _present(retention: Retention, failure: object) -> BaseException | None:
     """Render an already-retained failure as a note; never raise.
 
     :func:`_attach_secondary` deliberately lets a control-flow exception out —
@@ -468,12 +539,12 @@ def _present(retention: _Retention, failure: object) -> BaseException | None:
     return None
 
 
-def _record_secondary(retention: _Retention, secondary: object) -> BaseException | None:
+def _record_secondary(retention: Retention, secondary: object) -> BaseException | None:
     """Retain ``secondary``, then present it; return control-flow raised doing so.
 
     The order is the fix: retention first and unconditionally, presentation
     second and best effort. Every occurrence passing through here is retained
-    exactly once, which is what lets :class:`_Retention` drop de-duplication
+    exactly once, which is what lets :class:`Retention` drop de-duplication
     (j#90517 R17-F2).
     """
     retaining = retention.remember(secondary)
@@ -481,7 +552,7 @@ def _record_secondary(retention: _Retention, secondary: object) -> BaseException
     return retaining if retaining is not None else presenting
 
 
-def _run_teardown_action(retention: _Retention, action) -> BaseException | None:
+def _run_teardown_action(retention: Retention, action) -> BaseException | None:
     """Run one action, record what it reports, and never raise.
 
     Every way this can go wrong — the action raising, the action *returning* a
@@ -505,7 +576,9 @@ def _run_teardown_action(retention: _Retention, action) -> BaseException | None:
         return None
 
 
-def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
+def teardown_during(
+    primary: BaseException, *actions, carrier: RetentionCarrier | None = None
+) -> BaseException | None:
     """Run each teardown action independently, preserving ``primary``.
 
     Chaining them meant one failure skipped the rest (j#90482 R12-F2), so each
@@ -543,7 +616,7 @@ def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
 
     Retention is on the same channel as everything else. The carrier broke both
     properties twice by raising out of the loop instead (j#90508 R16-F1/F2), so
-    :meth:`_Retention.flush` returns control flow rather than raising it, and no
+    :meth:`Retention.flush` returns control flow rather than raising it, and no
     step of the record can cost an action that has not run. A carrier that
     refuses an occurrence does not lose it either: it stays queued and is
     retried, including once after the last action (j#90529 R18-F1).
@@ -551,8 +624,13 @@ def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
     Each occurrence is retained at exactly one place — where it arises — so the
     ledger counts occurrences rather than distinct objects. Two actions that
     each return the same singleton ``False`` are two entries (j#90517 R17-F2).
+
+    ``carrier`` replaces where the retention puts what it takes; see
+    :class:`RetentionCarrier`. It defaults to the real one, and the mirror sync
+    never passes it — it exists so the properties above can be exercised against
+    a carrier that fails, which is the only way to reach several of them.
     """
-    retention = _Retention(primary)
+    retention = Retention(primary, carrier)
     control_flow: BaseException | None = None
     for action in actions:
         arrived = _run_teardown_action(retention, action)
@@ -575,6 +653,17 @@ def _teardown_during(primary: BaseException, *actions) -> BaseException | None:
     if control_flow is None:
         control_flow = late
     return control_flow
+
+
+_teardown_during = teardown_during
+"""The in-package spelling, kept because renaming it is not this Task's to make.
+
+``legacy_mirror_sync`` imports this name, and that module is the exclusive
+changed path of Redmine #14682 (T2) — editing it here would break the
+changed-path ownership the #14660 characterization §7 sets up, which is what
+keeps T2 and T3 dispatchable in parallel. It is one binding to one function, not
+a second implementation, and T2 drops it when it updates its own import.
+"""
 
 
 class _OwnedDescriptor:

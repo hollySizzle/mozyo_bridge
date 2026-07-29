@@ -30,6 +30,34 @@ from tests.support.legacy_mirror_tree_fixture import (  # noqa: E402
 )
 
 
+class _ScheduledCarrier(owned_descriptors.RetentionCarrier):
+    """A carrier whose every acquisition is answered by a test function.
+
+    The retention machine's hardest properties are about a carrier that *fails*,
+    so reaching them needs one that misbehaves on a schedule. Until Redmine
+    #14683 that meant `unittest.mock.patch.object(owned_descriptors, "_ledger")`
+    — replacing a module-private global for the duration of the call. The seam
+    is on the public surface now, so the schedule is handed in instead and
+    nothing about the module is mutated.
+
+    The schedule function is called with the primary and may raise; when it
+    wants the real behaviour it calls the carrier the tests keep in
+    `_REAL_CARRIER`, which is the same public seam with nothing overridden.
+    """
+
+    __slots__ = ("_acquire",)
+
+    def __init__(self, acquire) -> None:  # type: ignore[no-untyped-def]
+        self._acquire = acquire
+
+    def ledger(self, primary):  # type: ignore[no-untyped-def]
+        return self._acquire(primary)
+
+
+_REAL_CARRIER = owned_descriptors.RetentionCarrier()
+"""The unmodified seam, so a schedule can defer to it without naming `_ledger`."""
+
+
 class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
     """The retention machine (`owned_descriptors`): teardown ordering, the
     failure ledger, and the carrier. No `os` primitive is injected here."""
@@ -56,7 +84,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
             ran.append("third")
 
         primary = Primary("write failed")
-        control = owned_descriptors._teardown_during(primary, failing, second, third)
+        control = owned_descriptors.teardown_during(primary, failing, second, third)
 
         self.assertIsInstance(control, KeyboardInterrupt)
         self.assertEqual(["failing", "second", "third"], ran)
@@ -80,7 +108,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
             ran.append("third")
 
         primary = Exception("write failed")
-        control = owned_descriptors._teardown_during(primary, first, second, third)
+        control = owned_descriptors.teardown_during(primary, first, second, third)
 
         self.assertIsInstance(control, KeyboardInterrupt)
         self.assertEqual("first", str(control))
@@ -119,7 +147,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
             ran.append("fourth")
 
         primary = Exception("write failed")
-        control = owned_descriptors._teardown_during(primary, first, second, third, fourth)
+        control = owned_descriptors.teardown_during(primary, first, second, third, fourth)
 
         self.assertIsInstance(control, KeyboardInterrupt)
         self.assertEqual(["first", "second", "third", "fourth"], ran)
@@ -157,7 +185,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
             ran.append("third")
 
         primary = Primary("write failed")
-        control = owned_descriptors._teardown_during(primary, first, second, third)
+        control = owned_descriptors.teardown_during(primary, first, second, third)
 
         self.assertIsInstance(control, KeyboardInterrupt)
         self.assertEqual(["first", "second", "third"], ran)
@@ -181,7 +209,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
             return run
 
         wrapped = [tracked(i, action) for i, action in enumerate(actions, start=1)]
-        owned_descriptors._teardown_during(primary, *wrapped)
+        owned_descriptors.teardown_during(primary, *wrapped)
 
         self.assertEqual(
             [f"a{i}" for i in range(1, len(actions) + 1)],
@@ -252,7 +280,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         )
 
         primary = RuntimeError("write failed")
-        owned_descriptors._teardown_during(primary, failing)
+        owned_descriptors.teardown_during(primary, failing)
         self.assertNotEqual((), owned_descriptors.teardown_failures(primary))
         self.assertEqual(
             ["__notes__"],
@@ -285,12 +313,12 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         # A module-level primary type: a class defined in a test body is not
         # picklable for reasons that have nothing to do with the ledger.
         picklable_entries = RuntimeError("write failed")
-        owned_descriptors._teardown_during(picklable_entries, ordinary_failure)
+        owned_descriptors.teardown_during(picklable_entries, ordinary_failure)
         with self.assertRaises(TypeError):
             pickle.loads(pickle.dumps(picklable_entries))
 
         unpicklable_entries = RuntimeError("write failed")
-        owned_descriptors._teardown_during(unpicklable_entries, unpicklable_failure)
+        owned_descriptors.teardown_during(unpicklable_entries, unpicklable_failure)
         with self.assertRaises(TypeError):
             pickle.dumps(unpicklable_entries)
 
@@ -371,7 +399,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         for label, action in (("returned False", returns_false), ("raised", raises_shared)):
             with self.subTest(channel=label):
                 primary = Exception("write failed")
-                owned_descriptors._teardown_during(primary, action, action)
+                owned_descriptors.teardown_during(primary, action, action)
 
                 self.assertEqual(
                     2,
@@ -409,7 +437,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         def quiet() -> None:
             ran.append("a2")
 
-        real_ledger = owned_descriptors._ledger
+        real_ledger = _REAL_CARRIER.ledger
         fired: list[bool] = []
 
         def interrupts_once(primary):  # type: ignore[no-untyped-def]
@@ -419,8 +447,9 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
             return real_ledger(primary)
 
         primary = Exception("write failed")
-        with unittest.mock.patch.object(owned_descriptors, "_ledger", interrupts_once):
-            control = owned_descriptors._teardown_during(primary, failing, quiet)
+        control = owned_descriptors.teardown_during(
+            primary, failing, quiet, carrier=_ScheduledCarrier(interrupts_once)
+        )
 
         self.assertEqual(["a1", "a2"], ran, "a carrier failure skipped a remaining action")
         self.assertIsInstance(control, KeyboardInterrupt)
@@ -455,14 +484,14 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
 
     @classmethod
     def _drain_line(cls, match: str) -> int:
-        return cls._source_line(owned_descriptors._Retention._drain, match)
+        return cls._source_line(owned_descriptors.Retention._drain, match)
 
     def _interrupt_the_queue_append(self, failure: BaseException):
         """Raise `failure` once, on the instruction that admits to the queue."""
         line = self._source_line(
-            owned_descriptors._Retention._enqueue, "self._queued.append("
+            owned_descriptors.Retention._enqueue, "self._queued.append("
         )
-        code = owned_descriptors._Retention._enqueue.__code__
+        code = owned_descriptors.Retention._enqueue.__code__
         fired: list[bool] = []
 
         def local(frame, event, arg):  # type: ignore[no-untyped-def]
@@ -492,7 +521,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         ):
             with self.subTest(failure=label):
                 primary = Exception("write failed")
-                retention = owned_descriptors._Retention(primary)
+                retention = owned_descriptors.Retention(primary)
                 original = RuntimeError("the original teardown failure")
 
                 tracer, fired = self._interrupt_the_queue_append(injected)
@@ -604,8 +633,11 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         return tracer, pending
 
     def _interrupt_the_main_rail(self, reached: list[bool] | None = None):
-        """Interrupt the carrier once, so the main retention rail handles it."""
-        real_ledger = owned_descriptors._ledger
+        """Interrupt the carrier once, so the main retention rail handles it.
+
+        Driven through the public carrier seam, so nothing is patched at all.
+        """
+        real_ledger = _REAL_CARRIER.ledger
         fired: list[bool] = []
         interrupt = KeyboardInterrupt("the carrier was interrupted")
 
@@ -618,13 +650,22 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
             return real_ledger(primary)
 
         return (
-            unittest.mock.patch.object(owned_descriptors, "_ledger", interrupts_once),
+            contextlib.nullcontext(),
+            _ScheduledCarrier(interrupts_once),
             interrupt,
         )
 
     def _interrupt_the_final_rail(self, reached: list[bool] | None = None):
-        """Fail the main admission, then interrupt the exit rail."""
-        real_enqueue = owned_descriptors._Retention._enqueue
+        """Fail the main admission, then interrupt the exit rail.
+
+        Still a patch of a private method, and it has to be: the exit rail
+        (`_admit_before_leaving`) only ever admits to the queue — it never
+        consults the carrier — so the seam #14683 lifted out cannot reach this
+        rail. The queue is the retention's own retry buffer rather than a
+        collaborator, and publishing it to make this patch go away would put the
+        machine's internal state on the public surface for one test's benefit.
+        """
+        real_enqueue = owned_descriptors.Retention._enqueue
         calls: list[int] = []
         interrupt = KeyboardInterrupt("the final admission was interrupted")
 
@@ -640,8 +681,9 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
 
         return (
             unittest.mock.patch.object(
-                owned_descriptors._Retention, "_enqueue", scheduled
+                owned_descriptors.Retention, "_enqueue", scheduled
             ),
+            None,
             interrupt,
         )
 
@@ -710,7 +752,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
                 for line in shape["executable"]:  # type: ignore[union-attr]
                     with self.subTest(rail=rail, schedule=schedule, line=line):
                         reached: list[bool] = []
-                        patch, interrupt = drive(reached)
+                        patch, carrier, interrupt = drive(reached)
                         occurrences, _ = self._fail_occurrences(reached, failures)
                         injected = GeneratorExit("a second interrupt while recording")
                         tracer, pending = self._interrupt_while_taking_an_interrupt(
@@ -733,8 +775,8 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
                             stack.enter_context(occurrences)
                             sys.settrace(tracer)
                             try:
-                                control = owned_descriptors._teardown_during(
-                                    primary, failing, quiet
+                                control = owned_descriptors.teardown_during(
+                                    primary, failing, quiet, carrier=carrier
                                 )
                             except BaseException as out:  # noqa: BLE001 - the point
                                 control, left = None, out
@@ -800,7 +842,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         is reached with no control flow chosen, then the interrupt on it, then
         recovery. Neither earlier regression composes those.
         """
-        real_enqueue = owned_descriptors._Retention._enqueue
+        real_enqueue = owned_descriptors.Retention._enqueue
         interrupt = KeyboardInterrupt("the final admission was interrupted")
         calls: list[int] = []
 
@@ -823,9 +865,9 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
 
         primary = Exception("write failed")
         with unittest.mock.patch.object(
-            owned_descriptors._Retention, "_enqueue", scheduled
+            owned_descriptors.Retention, "_enqueue", scheduled
         ):
-            control = owned_descriptors._teardown_during(primary, failing, quiet)
+            control = owned_descriptors.teardown_during(primary, failing, quiet)
 
         self.assertGreaterEqual(len(calls), 3, "the schedule never reached recovery")
         self.assertEqual(["failing", "quiet"], ran)
@@ -848,8 +890,8 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         an exhausted retry sat in the local that was about to go out of scope,
         so it was never queued — and this is not the documented never-recovers
         boundary, because the carrier works again on the very next call."""
-        real_ledger = owned_descriptors._ledger
-        attempts = owned_descriptors._RETENTION_ATTEMPTS
+        real_ledger = _REAL_CARRIER.ledger
+        attempts = owned_descriptors.RETENTION_ATTEMPTS
         raised: list[BaseException] = []
 
         def interrupts_then_recovers(primary):  # type: ignore[no-untyped-def]
@@ -860,13 +902,12 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
             return real_ledger(primary)
 
         primary = Exception("write failed")
-        retention = owned_descriptors._Retention(primary)
+        retention = owned_descriptors.Retention(
+            primary, _ScheduledCarrier(interrupts_then_recovers)
+        )
         original = RuntimeError("the original teardown failure")
 
-        with unittest.mock.patch.object(
-            owned_descriptors, "_ledger", interrupts_then_recovers
-        ):
-            first = retention.remember(original)
+        first = retention.remember(original)
         retention.flush()
 
         self.assertEqual(attempts, len(raised), "the schedule did not exhaust the retries")
@@ -889,7 +930,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         on the ledger being non-empty is what makes this the post-commit
         boundary rather than some earlier one.
         """
-        code = owned_descriptors._Retention._drain.__code__
+        code = owned_descriptors.Retention._drain.__code__
         fired: list[bool] = []
 
         def local(frame, event, arg):  # type: ignore[no-untyped-def]
@@ -940,7 +981,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
                 )
                 sys.settrace(tracer)
                 try:
-                    control = owned_descriptors._teardown_during(primary, failing, quiet)
+                    control = owned_descriptors.teardown_during(primary, failing, quiet)
                 finally:
                     sys.settrace(None)
 
@@ -975,7 +1016,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         def quiet() -> None:
             ran.append("quiet")
 
-        real_ledger = owned_descriptors._ledger
+        real_ledger = _REAL_CARRIER.ledger
         schedule = ["ordinary", "interrupt"]
 
         def scheduled(primary):  # type: ignore[no-untyped-def]
@@ -986,8 +1027,9 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
             return real_ledger(primary)
 
         primary = Exception("write failed")
-        with unittest.mock.patch.object(owned_descriptors, "_ledger", scheduled):
-            control = owned_descriptors._teardown_during(primary, failing, quiet)
+        control = owned_descriptors.teardown_during(
+            primary, failing, quiet, carrier=_ScheduledCarrier(scheduled)
+        )
 
         self.assertEqual([], schedule, "the schedule never reached the final flush")
         self.assertEqual(["failing", "quiet"], ran)
@@ -1014,8 +1056,9 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
             raise KeyboardInterrupt("the carrier is gone for good")
 
         primary = Exception("write failed")
-        with unittest.mock.patch.object(owned_descriptors, "_ledger", never_recovers):
-            control = owned_descriptors._teardown_during(primary, failing, quiet)
+        control = owned_descriptors.teardown_during(
+            primary, failing, quiet, carrier=_ScheduledCarrier(never_recovers)
+        )
 
         self.assertEqual(["a1", "a2"], ran)
         self.assertIsInstance(control, KeyboardInterrupt)
@@ -1041,7 +1084,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
             raise RuntimeError("teardown failure")
 
         primary = Frozen("write failed")
-        owned_descriptors._teardown_during(primary, failing)
+        owned_descriptors.teardown_during(primary, failing)
 
         ledger = owned_descriptors.teardown_failures(primary)
         self.assertTrue(
