@@ -373,12 +373,26 @@ discovery 件数 D2=13,207 とは別の母数である)。
 `os_patch` (`os` primitive を patch) / `ast_probe` (`ast` を oracle にする) /
 `real_fs` (`_stage()` / `mkdtemp` / tracked tree) / `subprocess`。
 
-§5.0 の配置決定木の適用も、同じ方法で source から導出している (分岐 3 は
-docstring の defect anchor、分岐 4 は注入 surface)。
+**この導出器が答えるのは surface だけである。§5.0 の配置は導出していない。**
 
-> **再現手順は Appendix A にある。** 2 つの導出器の全文、同 head での実行結果、
-> および 127 件全件の mapping (test 名 / 行 / 行数 / surfaces / 決定木の分岐 /
-> 行き先) を載せてある。分類値 127 / 23 / 96 / 8 / 69 / 53 / 5 はそこから再現できる。
+- **導出 (機械)** — test 総数 **127**、および surface 分類 **23 / 96 / 8** (§2.3)。
+  Appendix A.2 が source から機械的に出す。ただし A.2 は**下限の検出器**であり、
+  §5.0 で 1 件 (3469) の false negative を読んで特定している。
+- **著者宣言 (機械導出しない)** — §5.0 の配置。landed policy の裁定 2 / 3 が
+  「分岐 2 と分岐 3 は *test が存在する理由* を問うので code に現れない」として
+  著者宣言を要求する。分岐 4 / 5 も判定の正本は各 test を読むことであって A.2 の
+  出力ではない。
+
+> **`69 / 53 / 5` は historical invalid output である。** R1–R4 は分岐 3 を
+> 「docstring が defect anchor を持つか」で機械判定して この 3 値を得ていたが、
+> **裁定 1 によりこの述語は無効**である (repo 全体で 95–100% 発火し識別力を持たず、
+> 分岐 3 の主語は method でなく file)。Appendix A.3 は再現性のために残してあるが
+> **その分岐 3 arm は無効**で、かつ **分岐 2 を評価していない**。詳細は §5.1 と
+> A.3 冒頭の注記を読む。**この 3 値を配置として引用しないこと。**
+
+> **再現手順は Appendix A にある。** 導出器の全文、同 head での実行結果、および
+> 127 件全件の mapping を載せてある。**確定した配置は A.5 の `宣言` 列**であり、
+> 同表の `分岐` / `行き先` 列 (A.3 出力) ではない。
 
 ### 2.2 class 別 [実測]
 
@@ -500,8 +514,13 @@ FS 依存は 2 件だけ (`test_a_later_control_flow_failure_is_recorded_not_dro
 → **残置。** 順序そのものが契約なので、順序に依存しない書き方は存在しない。
 
 他に「呼び出し回数」を pin するもの: `test_cleanup_helper_runs_exactly_once_when_it_raises`
-(3352)。これは `_release_staging` の二重実行 (j#90467 R9-F3) の regression であり、
-**regressions への移設候補**。
+(3352)。これは `_release_staging` の二重実行 (j#90467 R9-F3) を由来に持つ。
+
+> **最終 disposition は分岐 5 (integration) である** [§5.0 分岐 3 の宣言]。
+> 由来は defect だが、主張しているのは single-shot guard の**契約**
+> (「the guard is what keeps that at one call」) なので R3-b を満たさない。
+> R5 まで本節は「regressions への移設候補」と書いたままで §5.0 の宣言と
+> 接続していなかった。**provenance は分岐 3 の根拠にならない** (裁定 1)。
 
 ---
 
@@ -581,16 +600,16 @@ Appendix A.2 の構文的検出ではない**。
 
 | 行き先 | tests | 行 |
 | --- | ---: | ---: |
-| `tests/scenarios/` (分岐 2) | **8** | 99 |
+| `tests/scenarios/` (分岐 2) | **7** | 78 |
 | `tests/regressions/` (分岐 3) | **4** | 127 |
 | `tests/unit/e_130_governance_distribution/` (分岐 4) | **21** | 764 |
-| `tests/integration/e_130_governance_distribution/` (分岐 5) | **94** | 2,098 |
+| `tests/integration/e_130_governance_distribution/` (分岐 5) | **95** | 2,119 |
 | **計** | **127** | **3,088** |
 
 **検算 (裁定が渡した唯一の無条件不変条件):**
-`unit + scenarios + regressions + integration = 21 + 8 + 4 + 94 = 127` ✓
+`unit + scenarios + regressions + integration = 21 + 7 + 4 + 95 = 127` ✓
 
-全 127 件の per-test 割当は **Appendix A.5** にある (`dest` 列)。
+全 127 件の per-test 割当は **Appendix A.5** の **`宣言` 列**にある。
 
 #### 分岐 1 (support)
 
@@ -601,7 +620,7 @@ Appendix A.2 の構文的検出ではない**。
 
 #### 分岐 2 (scenarios) — 8 件を宣言する
 
-**宣言:** `LegacyMirrorWrapperCliTest` のうち **wrapper を実行する 8 件**。
+**宣言:** `LegacyMirrorWrapperCliTest` のうち **wrapper を実行する 7 件**。
 
 | test | 行 | 行数 |
 | --- | ---: | ---: |
@@ -611,18 +630,35 @@ Appendix A.2 の構文的検出ではない**。
 | `test_unknown_argument_exits_64` | 3782 | 5 |
 | `test_repo_cannot_be_redirected_by_operator_argv` | 3788 | 19 |
 | `test_repo_env_is_overwritten_by_the_wrapper` | 3808 | 17 |
-| `test_module_run_without_the_wrapper_refuses` | 3826 | 21 |
 | `test_wrapper_targets_its_own_repo_not_the_cwd` | 3848 | 14 |
 
-**根拠:** これらは `sh scripts/sync_legacy_project_skill.sh` → `python -m ...
-cli_legacy_mirror_sync` → application service → domain contract → 実 tree を
-**通しで**駆動する。class docstring が宣言するとおり「operator-facing contract,
-black-box」であり、`release check drift` が依存する operator の invocation contract
-そのものである。裁定 3 のとおり `/` は **OR** なので、単一 bounded context
+**根拠 — 境界は「wrapper (shell module) → CLI (python module) を越えるか」である。**
+
+これらは `sh scripts/sync_legacy_project_skill.sh` を operator と同じ形で起動する。
+wrapper は mirror logic を持たず、`--help` も unknown argument も**自分では処理せず**
+`exec "$PYTHON" -m "$module" "$@"` で CLI へ渡す [code fact: `scripts/sync_legacy_project_skill.sh`]。
+したがって 7 件はいずれも **shell module → python CLI module** の境界を越える
+operator の invocation contract であり、`release check drift` が依存する面そのもの
+である。class docstring も「operator-facing contract, black-box」と宣言している。
+裁定 3 のとおり `/` は **OR** なので、単一 bounded context
 (`e_130_governance_distribution`) に閉じていても分岐 2 は成立する。
+
+> **境界を「service まで到達するか」に置いてはならない。** 7 件のうち `--help` /
+> unknown argument / `--repo` 拒否の 3 件は CLI の argument 段で refuse し、
+> application service を構築しない。それでも operator が辿る 2 module の入口経路は
+> 越えている。landed policy `### scenarios` が課すのは「複数 module または複数
+> bounded context をまたぐ operator / coordinator 視点の end-to-end workflow」で
+> あって、service 到達でも subprocess surface でもない。
 
 **分岐 2 に該当しないと宣言したもの (裁定は全 127 件の評価を要求する):**
 
+- **`test_module_run_without_the_wrapper_refuses` (3826)** — 同 class かつ subprocess
+  だが、**wrapper を意図的に迂回**して `python -m ... cli_legacy_mirror_sync --check` を
+  直接起動する。`MOZYO_LEGACY_MIRROR_REPO_ROOT` 不在で CLI は service 構築**前**に
+  64 を返すので、越える module 境界が無い (単一 CLI adapter の禁止入口 contract)。
+  実 subprocess collaborator を持つので → **分岐 5**。
+  *R5 まで本 doc はこれを分岐 2 に入れ、「8 件すべてが service → domain → 実 tree を
+  通す」と書いていた。membership も根拠も誤りだったので両方訂正した。*
 - `test_wrapper_exists_and_is_executable` (3740) / `test_wrapper_carries_no_mirror_logic`
   (3744) — 同 class だが **wrapper を実行しない**。前者は tracked file の mode、後者は
   wrapper の source text に対する guardrail であり、通し受入ではない。→ 分岐 5。
@@ -710,8 +746,9 @@ family 限定の literal rule: **unit = 実外部 collaborator 0** (subject は�
 collaborator が 1 以上なので **分岐 5**である。裁定 4 が「判定は各 test を読んで行う」
 「A.2 は候補抽出と diagnostic」と書いている、まさにその形の false negative だった。
 
-残る **94 件が分岐 5 (integration)**。実 tree を建てる 96 件から分岐 3 へ出た 3 件
-(1618 / 1720 / 3561) を引き、A.2 が pure と誤判定した 3469 を足した数である。
+残る **95 件が分岐 5 (integration)**。実 tree を建てる 96 件から分岐 3 へ出た 3 件
+(1618 / 1720 / 3561) を引き、A.2 が pure と誤判定した 3469 と、分岐 2 から外した
+3826 を足した数である。
 
 #### diagnostic として使った surface 集計
 
@@ -934,12 +971,27 @@ ledger admission の idempotence、occurrence 数の保存則 — に限られ�
 | --- | --- | --- | --- |
 | **T0** | design consultation | — | **完了**: Redmine #14662、Review j#92458 approved |
 | **T-P** | policy doc 改訂 | `vibes/docs/logics/tests-placement-discovery-policy.md` のみ | **完了**: Redmine #14664、Review j#92528 approved → `origin/main-next@6b718673`、required CI success |
-| **T1** | move-only | `tests/unit/.../test_legacy_project_skill_mirror.py` (削除) + `tests/unit/e_130_governance_distribution/**` (21件) + `tests/integration/e_130_governance_distribution/**` (94件) + `tests/scenarios/**` (8件) + `tests/support/legacy_mirror_tree_fixture.py` | §5.0 の宣言どおりに移動。**D1 = 127** と **D2 = 自 base で測った `N` の前後一致**。`src/**` diff **byte 0**。commit message に `move-only` |
+| **T1** | move-only | `tests/unit/.../test_legacy_project_skill_mirror.py` (**削除。削除 owner は T1 のみ**) + `tests/unit/e_130_governance_distribution/**` (21件) + `tests/scenarios/**` (7件) + `tests/regressions/**` (4件 / 2 file) + `tests/integration/e_130_governance_distribution/**` (95件) + `tests/support/legacy_mirror_tree_fixture.py` | §5.0 の宣言どおり **127 件すべてを 1 commit で移動**。**D1 = 127** と **D2 = 自 base で測った `N` の前後一致**。`src/**` diff **byte 0**。commit message に `move-only` |
 | **T2** | behavior change | `src/.../application/legacy_mirror_sync.py` + `src/.../domain/**` | 状態遷移を filesystem effect から分離。1.1–1.3 の遷移表が pure に評価できる。T1 の test が無改変で green |
 | **T3** | behavior change | `src/.../application/owned_descriptors.py` + T1 が作った E-pure module | 3.2(a) の carrier 差し替え seam を公開面へ。private patch を減らす |
 | **T4** | test-only 書き換え | T1 が作った E-pure module のみ | 3.2(b) を公開 API 経由へ言い換え。`src/**` 不変 |
-| **T5** | move-only | `tests/regressions/test_issue_14651_capability_advertisement.py` / `test_issue_14580_reused_descriptor_number_close.py` + T1 が作った module | §5.0 分岐 3 の 4 件を移設。D1 / D2 不変 |
 | **T6** | behavior change (test 側) | `tests/support/legacy_mirror_fault_schedule.py` (新規) + それを使う test module | 共有 fault schedule fake の**新規作成**。個別 mock の重複を縮小 |
+
+**移設を行き先ごとに分割しない [R5-F1 修正]。** R5 まで本 doc は regressions 4 件を
+別 Task (T5) に切り、`T1 → T5` を要求していた。**これは実行不能である** — T1 が元
+file を削除した時点で 4 件はどこにも存在せず、T1 自身の完了条件 `D1 = 127` を
+満たせない。仮に T1 の module へ一時的に置くと、T1 の「§5.0 の宣言どおりに移動」と
+path ownership の排他性が壊れる。
+
+原因は、**移設先の分類 (unit / scenarios / regressions / integration) をそのまま
+commit の分割単位に写した**ことである。分類は「どこへ置くか」の軸であって
+「どの commit で動かすか」の軸ではない。**1 つの file から出ていく test を複数
+commit に分けた時点で、途中の commit は必ず D1 を割る。**
+
+→ **T1 が 127 件すべてを 1 commit で移し、T5 を撤去した。** `## Move Commit Rules` 1
+「Move one family at a time」に沿う — 本 family は 1 つであり、行き先が 4 種類ある
+ことは commit を割る理由にならない。境界が 1 点なので D1 / D2 の検査点も 1 つになり、
+元 file の**削除 owner も T1 に一意**である。
 
 **T1 に新規 fake を含めない [F5a 修正]:** `refactor-split-strategy.md`
 `## Move Commit Rules` 3 は「No logic edits in move commit except import path
@@ -950,9 +1002,9 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
 
 **ownership 規則:**
 
-- `src/**` に触るのは **T2 / T3 のみ**。T1 / T4 / T5 / T6 は `src/**` diff が
+- `src/**` に触るのは **T2 / T3 のみ**。T1 / T4 / T6 は `src/**` diff が
   byte 0 でなければ失格。
-- **T1 / T5 の hold は解除された。** T0 (#14662) と T-P (#14664) がともに approved で、
+- **T1 の hold は解除された。** T0 (#14662) と T-P (#14664) がともに approved で、
   T-P は `origin/main-next@6b718673` へ land し required CI が success である
   [出所: #14664 Review j#92528 / integration j#92531 / CI j#92536]。
   policy `## #14660 legacy mirror family 裁定` の hold 条件は満たされた。
@@ -961,8 +1013,9 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
   (移設前の test を編集すると move が汚れる)。
 - T4 は T3 と**同じ file** に触る可能性があるため、**T3 の後**に直列化する。
 - T6 は T1 の後。T2 / T3 とは触る file が交わらないので並行可能。
+- **T5 は撤去した** (T1 に統合)。以降の Task 番号は R5 までの記載と互換のため詰めない。
 
-依存順: `T0 → T-P → T1 → {T2, T3, T5, T6}`、`T3 → T4`。**T0 / T-P は完了済み。**
+依存順: `T0 → T-P → T1 → {T2, T3, T6}`、`T3 → T4`。**T0 / T-P は完了済み。**
 
 **移設 Task の完了条件に catalog 更新を含める:** `fc-legacy-mirror-sync` の
 `patterns` は **現行の exact path 2 件のみ**である。将来 path を予測して先置き
@@ -976,7 +1029,7 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
 代わりに、**file を動かす Task が、動かした先の exact path を同じ commit で
 `patterns` へ追加し**、`mozyo-bridge docs generate-file-conventions` を再生成して
 `--check` を green にする。これを怠ると移設後の file を編集しても本 doc が
-`docs resolve` で解決されない。**T1 / T5 / T6 の完了条件**であり、後追いの掃除に
+`docs resolve` で解決されない。**T1 / T6 の完了条件**であり、後追いの掃除に
 しない。
 
 **T2 への申し送り [未確認]:** §5.4 のとおり `legacy_mirror_sync.py` は 899 行で
@@ -1030,9 +1083,13 @@ Appendix A の数値は古くなるのに、それを落とす gate が無い。
 
 ## Appendix A. 導出器と全件 mapping (再現用)
 
-本 doc の分類値 (127 / 23 / 96 / 8 / 69 / 53 / 5) は、下記 2 script を
-`origin/main-next@fef86cac` の tree に対して実行した結果である。**第三者が同じ head で
-再実行して検証できるよう、全文と全件 mapping をここに置く。**
+下記 script を `origin/main-next@fef86cac` の tree に対して実行した結果を、
+**第三者が同じ head で再実行して検証できるよう**全文と全件 mapping とともに置く。
+
+**この Appendix が根拠づけるのは surface の導出値 (127 / 23 / 96 / 8) と rail 数だけ
+である。** §5.0 の配置は著者宣言であり、A.5 の **`宣言` 列**がその正本である。
+A.3 が出す `69 / 53 / 5` は **historical invalid output** で、配置ではない
+(裁定 1 / §5.1 / A.3 冒頭の注記)。
 
 前 revision はこの導出器を scratchpad に置いたまま repo へ残さず、「再現不能」と
 注記して未確認事項へ繰延べていた。繰延べは「後で決めること」には使えるが、
@@ -1551,7 +1608,7 @@ TOTAL                        tests= 127 lines= 3088
 | 123 | Cli | `test_unknown_argument_exits_64` | 3782 | 5 | real_fs,subprocess | 5 | int | scen |
 | 124 | Cli | `test_repo_cannot_be_redirected_by_operator_argv` | 3788 | 19 | real_fs,subprocess | 3 | reg | scen |
 | 125 | Cli | `test_repo_env_is_overwritten_by_the_wrapper` | 3808 | 17 | real_fs,subprocess | 5 | int | scen |
-| 126 | Cli | `test_module_run_without_the_wrapper_refuses` | 3826 | 21 | real_fs,subprocess | 5 | int | scen |
+| 126 | Cli | `test_module_run_without_the_wrapper_refuses` | 3826 | 21 | real_fs,subprocess | 5 | int | int |
 | 127 | Cli | `test_wrapper_targets_its_own_repo_not_the_cwd` | 3848 | 14 | real_fs,subprocess | 5 | int | scen |
 
 **この表の原資料としての位置づけ:** `surfaces` 列は §2.3 の内訳の、`宣言` 列は
