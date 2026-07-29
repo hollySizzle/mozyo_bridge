@@ -36,7 +36,10 @@ it took — including the three shapes the FIRST fix left open (review j#93646):
   process-global, so an uncapped producer rendered a 4301-digit ``lane_generation`` with no refusal
   and the default-capped parser raised ``ValueError`` on it — one durable marker reading back as
   canonical or as a crash depending on how two processes happened to be configured, with the
-  parser committing the producer's own "a predicate that raises is not a predicate" defect.
+  parser committing the producer's own "a predicate that raises is not a predicate" defect;
+- **a guard that did not guard what it was in front of** (review j#94247 blocker 1): the parser's
+  ``isdigit()`` is true for 128 characters ``int()`` refuses, so ``lane_generation=²`` came off the
+  strict reader and raised ``ValueError`` out of a function whose whole contract is a typed zero.
 
 Every test in this file detects the recurrence of that symptom. Claims about the producers' public
 contract — the byte shape of a clean marker, the round trip, the unchanged parse side — are the
@@ -50,6 +53,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import sys
+import unicodedata
 import unittest
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.review_gate_marker_fields import (  # noqa: E501
@@ -123,6 +127,27 @@ def cap_settings():
     if not hasattr(sys, "set_int_max_str_digits"):
         return (None,)
     return (sys.int_info.str_digits_check_threshold, _DEFAULT_INT_MAX_STR_DIGITS, 0)
+
+
+def digit_like_but_unconvertible(sample=8):
+    """Characters ``str.isdigit()`` accepts that ``int()`` refuses — asked, not listed (pure).
+
+    The gap the parser's ``isdigit()`` guard fell into (Redmine #14694 review j#94247). Derived by
+    putting the two questions to the interpreter rather than by writing down ``²``: a written list
+    goes stale against a new Unicode version, and it was list-shaped reasoning — "isdigit means
+    int can read it" — that produced the defect in the first place. Sampled across the range so the
+    test stays fast while still spanning superscript, circled and Ethiopic families.
+    """
+    found = []
+    for code_point in range(0x110000):
+        character = chr(code_point)
+        if not character.isdigit():
+            continue
+        try:
+            int(character)
+        except ValueError:
+            found.append(character)
+    return tuple(found[:: max(1, len(found) // sample)])[:sample] if found else ()
 
 
 @contextlib.contextmanager
@@ -1129,13 +1154,71 @@ class TheDecimalGrammarIsTheProtocolsNotTheRuntimesTests(unittest.TestCase):
                         )
                         self.assertEqual(parsed.lane_generation, int(widest))
 
-    def test_an_oversized_generation_is_typed_at_the_consumer_too_never_an_exception(self):
-        """The parser had the producer's old defect: ``int()`` decided, so it could raise.
+    def test_a_digit_like_generation_is_typed_at_the_consumer_never_an_exception(self):
+        """Review j#94247: ``str.isdigit()`` is not "a number ``int()`` can read".
 
-        Only the WIDTH half of the grammar is applied here, deliberately. The parser keeps its own
-        (wider) acceptance in every other respect — refusing to write more than you refuse to read
-        is the safe direction, and a canonical producer never wrote what it would now refuse.
+        The parser guarded its conversion with ``isdigit()``, which is true for 128 characters
+        ``int()`` refuses — so ``lane_generation=²`` came off the strict reader and raised
+        ``ValueError`` out of a function whose whole contract is a typed zero. The R8 argument for
+        keeping that wider acceptance ("refusing to write more than you refuse to read") needed a
+        legacy token it was protecting and there was none, while this repository had already ruled
+        on the same hazard in ``core.state.lane_lifecycle_model``.
+
+        The corpus is DERIVED from the gap itself rather than listed: every character the
+        conversion refuses but ``isdigit()`` accepts, discovered by asking both. A list would go
+        stale against a new Unicode version, and it was a list-shaped assumption that produced the
+        defect.
         """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (  # noqa: E501
+            hibernate_evidence_marker as evidence,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
+            ENVELOPE_MALFORMED_GENERATION,
+            EnvelopeParseError,
+            LaneEvidenceEnvelope,
+            parse_lane_envelope,
+        )
+
+        gap = digit_like_but_unconvertible()
+        self.assertTrue(gap, "the interpreter admits no isdigit()-but-unconvertible character")
+        canonical = evidence.render_hibernate_evidence(
+            evidence.EVIDENCE_REQUIRED_CI_GREEN,
+            envelope=LaneEvidenceEnvelope(workspace="ws", lane="lane", lane_generation=3, head=HEAD),
+            workflow="check",
+            run="1",
+        )
+        for token in gap:
+            with self.subTest(token=token, name=unicodedata.name(token, "?")):
+                # Straight at the parser...
+                got = parse_lane_envelope(
+                    {"workspace": "ws", "lane": "lane", "lane_generation": token},
+                    require_head=False,
+                )
+                self.assertIsInstance(got, EnvelopeParseError)
+                self.assertEqual(got.reason, ENVELOPE_MALFORMED_GENERATION)
+                # ...and through the PUBLIC path the finding was reproduced on: a marker a strict
+                # reader accepts, handed to the evidence parser.
+                poisoned = canonical.replace("lane_generation=3", f"lane_generation={token}")
+                read = strict_marker_fields_in_note(poisoned)
+                self.assertTrue(read, f"the strict reader saw no marker in {poisoned!r}")
+                for _, fields in read:
+                    self.assertEqual(fields["lane_generation"], token)
+                    parsed = evidence.parse_hibernate_evidence(
+                        fields, kind=evidence.EVIDENCE_REQUIRED_CI_GREEN
+                    )
+                    self.assertEqual(parsed.reason, ENVELOPE_MALFORMED_GENERATION)
+        # Negative control from the other side of the same oracle: what the conversion CAN read is
+        # not swept up by the fix — the ASCII decimals still parse.
+        for good in ("1", "3", "93802"):
+            with self.subTest(control=good):
+                got = parse_lane_envelope(
+                    {"workspace": "ws", "lane": "lane", "lane_generation": good}, require_head=False
+                )
+                self.assertIsInstance(got, LaneEvidenceEnvelope)
+                self.assertEqual(got.lane_generation, int(good))
+
+    def test_an_oversized_generation_is_typed_at_the_consumer_too_never_an_exception(self):
+        """The parser had the producer's old defect: ``int()`` decided, so it could raise."""
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
             ENVELOPE_MALFORMED_GENERATION,
             EnvelopeParseError,

@@ -25,9 +25,9 @@ from typing import Mapping, Sequence
 
 from .marker_value_contract import (
     MAX_CANONICAL_DECIMAL_VALUE,
+    is_canonical_positive_decimal,
     is_canonical_positive_int,
     is_exact_str,
-    within_marker_decimal_width,
 )
 
 #: A canonical full commit hash: 40 hex (sha1) or 64 hex (sha256), lowercase. A truncated /
@@ -106,7 +106,10 @@ def parse_lane_envelope(
 ) -> "LaneEvidenceEnvelope | EnvelopeParseError":
     """Parse the common lane envelope from a marker's field mapping, fail-closed.
 
-    ``workspace`` / ``lane`` must be non-empty; ``lane_generation`` must be a POSITIVE integer.
+    ``workspace`` / ``lane`` must be non-empty; ``lane_generation`` must be a CANONICAL positive
+    decimal — the producer's own :func:`~.marker_value_contract.is_canonical_positive_decimal`, so
+    one ASCII-decimal authority answers for both halves of the contract and no token reaches
+    ``int()`` whose convertibility has not already been established.
     A ``head``, if present, must be a full 40/64-hex lowercase SHA — ALWAYS (a malformed head is
     rejected even for a non-head-bearing conjunct). ``require_head`` additionally requires the head
     to be present (a head-bearing conjunct with no head is :data:`ENVELOPE_MISSING_HEAD`).
@@ -121,19 +124,19 @@ def parse_lane_envelope(
     generation_raw = str(fields.get(FIELD_LANE_GENERATION, "") or "").strip()
     if not generation_raw:
         return EnvelopeParseError(ENVELOPE_MISSING_GENERATION)
-    # The width test comes BEFORE the conversion, and it is the producer's own (Redmine #14694
-    # review j#94222). Asking `int()` first is what made this parser RAISE `ValueError` on a
-    # 4301-digit generation instead of answering `ENVELOPE_MALFORMED_GENERATION` — the same "a
-    # predicate that raises is not a predicate" defect that was fixed on the producer side in R5
-    # and left standing here, so one durable marker read back as canonical or as a crash depending
-    # on the two processes' digit caps. The rest of this parser's acceptance is deliberately NOT
-    # narrowed: refusing to WRITE more than you refuse to READ is the safe direction, and the
-    # producer already refuses `01` / `٣`, which a canonical producer therefore never wrote.
-    if not generation_raw.isdigit() or not within_marker_decimal_width(generation_raw):
+    # The producer's OWN question, so one ASCII-decimal authority answers for both sides of the
+    # contract (Redmine #14694 review j#94247). This asked `generation_raw.isdigit()` and then
+    # `int()`, and `str.isdigit()` is not "a number `int()` can read": measured, 128 characters are
+    # `isdigit()` and unconvertible — every one of them `isdigit() and not isdecimal()` — so
+    # `lane_generation=²` came off the strict reader and RAISED `ValueError` out of a parser whose
+    # whole contract is a typed zero. Keeping the wider acceptance was argued as "refusing to write
+    # more than you refuse to read", but that argument needed a legacy token this leniency was
+    # protecting, and there is none: a canonical producer only ever wrote a positive int. The same
+    # hazard was already ruled on in this repository — see `core.state.lane_lifecycle_model`, whose
+    # `_positive_decimal` refuses on an ASCII set and deliberately never calls `int()`.
+    if not is_canonical_positive_decimal(generation_raw):
         return EnvelopeParseError(ENVELOPE_MALFORMED_GENERATION, generation_raw)
     generation = int(generation_raw)
-    if generation <= 0:
-        return EnvelopeParseError(ENVELOPE_MALFORMED_GENERATION, generation_raw)
 
     head = str(fields.get(FIELD_HEAD, "") or "").strip()
     if head and not is_full_sha(head):

@@ -117,8 +117,8 @@ _MAX_CANONICAL_DECIMAL = str(MAX_CANONICAL_DECIMAL_VALUE)
 def within_marker_decimal_width(value: str) -> bool:
     """Whether a decimal token is narrow enough for EVERY runtime to convert it (pure).
 
-    The stable half of the grammar, shared by the producer and by the envelope PARSER, because the
-    bound this replaced was not stable at all: it asked ``sys.get_int_max_str_digits()``, so what
+    The stable half of the grammar, because the bound this replaced was not stable at all: it
+    asked ``sys.get_int_max_str_digits()``, so what
     counted as canonical changed with the Python version AND with a mutable process-global
     (``PYTHONINTMAXSTRDIGITS`` / :func:`sys.set_int_max_str_digits`). Measured on that grammar
     (Redmine #14694 review j#94222): an uncapped producer rendered a 4301-digit ``lane_generation``
