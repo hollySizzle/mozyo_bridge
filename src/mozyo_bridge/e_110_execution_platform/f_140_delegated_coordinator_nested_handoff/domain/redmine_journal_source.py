@@ -57,6 +57,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
     LaneEvidenceEnvelope,
+    coerce_argv_generation,
     render_lane_envelope,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_event_intake import (
@@ -851,7 +852,11 @@ def _render_evidence_envelope(
     marker carrying ``workspace`` but no ``lane`` would read as unenveloped evidence while looking
     enveloped to a human. The values themselves go through the shared strict renderer
     (:func:`render_lane_envelope`), which refuses a non-positive generation, an empty identity, and
-    any value carrying a marker separator.
+    any value carrying a marker separator — RAW, so a ``str(...).strip()`` here is not a tidy-up
+    but a bypass of the very inputs that renderer exists to refuse (Redmine #14694; operator argv
+    is normalized at the ONE CLI boundary that owes a typed refusal, not in a domain producer).
+    The generation's argv-string conversion belongs to the same authority
+    (:func:`coerce_argv_generation`), for the same reason.
     """
     supplied = [v for v in (workspace, lane, lane_generation) if v is not None]
     if not supplied:
@@ -861,15 +866,9 @@ def _render_evidence_envelope(
             "the hibernate-evidence lane envelope is all-or-none: "
             "workspace, lane and lane_generation must be supplied together"
         )
-    try:
-        generation = int(lane_generation)
-    except (TypeError, ValueError):
-        raise ValueError(f"lane_generation must be an integer, got {lane_generation!r}") from None
     return render_lane_envelope(
         LaneEvidenceEnvelope(
-            workspace=str(workspace).strip(),
-            lane=str(lane).strip(),
-            lane_generation=generation,
+            workspace=workspace, lane=lane, lane_generation=coerce_argv_generation(lane_generation)
         )
     )
 

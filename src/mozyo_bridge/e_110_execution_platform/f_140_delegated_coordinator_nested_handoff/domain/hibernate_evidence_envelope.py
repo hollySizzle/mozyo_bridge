@@ -129,12 +129,32 @@ def parse_lane_envelope(
     )
 
 
-#: Characters no marker-field VALUE may contain: the body is split on ``:``, delimited by ``[``
-#: / ``]``, and whitespace ends a token. A value carrying one would silently split into a bogus
-#: extra field or truncate the marker — field injection from a producer-supplied id. One tuple for
-#: the whole hibernate-evidence surface (the integration branch check reads it too) so the rule
-#: cannot drift apart between renderers.
+#: The PUNCTUATION no marker-field VALUE may contain: the body is split on ``:`` and delimited by
+#: ``[`` / ``]``. A value carrying one would silently split into a bogus extra field or truncate
+#: the marker — field injection from a producer-supplied id. Whitespace is forbidden too but is
+#: NOT enumerated here (see :func:`contains_marker_separator`): the space / tab pair this tuple
+#: used to carry was an incomplete enumeration of "空白" and let a newline through (Redmine #14694).
 MARKER_FORBIDDEN_CHARS = (":", "]", "[", " ", "\t")
+
+
+def contains_marker_separator(value: object) -> bool:
+    """Whether ``value`` carries marker punctuation or ANY whitespace (pure).
+
+    THE one predicate for the whole hibernate-evidence surface — the envelope's workspace / lane,
+    the marker's kind-specific fields, the integration branch, and the CLI's own typed refusal —
+    so "which characters a producer-supplied token may not carry" cannot drift apart between them.
+
+    Whitespace is asked as ``str.isspace()`` rather than matched against a literal tuple. The
+    central `### Hibernate Evidence Marker Contract` forbids "marker separator (``:`` ``]`` ``[``
+    空白)", and 空白 is not two characters: markers are scanned PER LINE, so a value carrying a
+    newline is rendered into a marker that never closes on its line and reads back as nothing at
+    all. Enumerating space and tab (Redmine #14694) let ``\\n`` / ``\\r`` / ``\\xa0`` through — a
+    value the strip-then-check order then hid entirely when the whitespace was leading or trailing.
+    """
+    text = str(value)
+    return any(bad in text for bad in MARKER_FORBIDDEN_CHARS) or any(
+        char.isspace() for char in text
+    )
 
 
 def reject_marker_separator(value: str, *, field: str) -> None:
@@ -142,11 +162,65 @@ def reject_marker_separator(value: str, *, field: str) -> None:
 
     One rule for every producer-supplied token — the envelope's workspace / lane and the
     integration marker's branch — so a value that would truncate or inject a field can never be
-    rendered from any of them.
+    rendered from any of them. The membership question is :func:`contains_marker_separator`; this
+    only names the offending character in the producer error.
     """
+    text = str(value)
     for separator in MARKER_FORBIDDEN_CHARS:
-        if separator in str(value):
+        if separator in text:
             raise ValueError(f"{field} must not contain the marker separator {separator!r}")
+    for char in text:
+        if char.isspace():
+            raise ValueError(f"{field} must not contain the whitespace character {char!r}")
+
+
+def require_marker_token(value: object, *, field: str, requirement: str) -> str:
+    """The RAW value as a marker token, or a producer error (pure).
+
+    THE raw-input validator every hibernate-evidence renderer shares. It validates what the caller
+    ACTUALLY passed — it never trims it, never coerces it, and never substitutes a default:
+
+    - a non-``str`` is a producer error, not something to render through ``str()``. ``run=12345``
+      and ``run=True`` are not run ids the caller can read back out of the marker, and ``None`` /
+      ``0`` are not "absent" — falsy-to-empty coercion turned a wrong TYPE into a wrong VALUE;
+    - the emptiness test is on the raw value, so a whitespace-only token is empty-after-trim to
+      nobody: it reaches the separator check and is refused as what it is;
+    - marker punctuation and whitespace are refused on the raw value.
+
+    Redmine #14694: the previous ``str(value or "").strip()`` did all three of those wrong at once,
+    and its worst reading was the ordinary one — ``workflow=" check "`` was trimmed into the clean
+    canonical token ``check`` and became durable auto-hibernate authority. A producer that
+    normalizes raw input into a value the caller did not write is asserting something nobody
+    claimed; the central `### Hibernate Evidence Marker Contract` requires the producer error to
+    surface at write time instead.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{requirement} requires a string {field}, got {type(value).__name__} {value!r}"
+        )
+    if not value:
+        raise ValueError(f"{requirement} requires a {field}")
+    reject_marker_separator(value, field=field)
+    return value
+
+
+def coerce_argv_generation(value: object) -> int:
+    """A CLI-supplied ``lane_generation`` as an ``int``, or a producer error (pure).
+
+    The ONE place an envelope value may legitimately change type: the CLI's generation arrives as
+    an argv string, and the renderer requires an ``int``. It lives here, beside the rule it feeds,
+    so the conversion cannot quietly grow into a normalization of the identities as well.
+
+    A ``bool`` is refused rather than converted (Redmine #14694): ``int(True)`` is ``1``, so a
+    caller-side conversion in front of the renderer defeated the renderer's own ``bool`` refusal —
+    a guard the call site pre-empts is a guard that never runs.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"lane_generation must be an integer, got {value!r}")
+    try:
+        return int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        raise ValueError(f"lane_generation must be an integer, got {value!r}") from None
 
 
 def render_lane_envelope(envelope: LaneEvidenceEnvelope) -> str:
@@ -158,21 +232,30 @@ def render_lane_envelope(envelope: LaneEvidenceEnvelope) -> str:
     refuses is not a strict grammar: it produces records that read back as a typed zero (so the
     evidence silently does not count) or, worse, splits a separator-carrying id into an extra field.
     The producer's programming error must surface at write time, not as unreadable durable evidence.
+
+    Every identity is validated RAW, through :func:`require_marker_token` (Redmine #14694). The
+    previous ``str(x or "").strip()`` normalized before it judged, so ``workspace=" ws "`` became
+    the canonical ``ws`` — the caller's raw value silently replaced by a different one — and a
+    non-``str`` identity was rendered through ``str()``. ``lane_generation`` was already raw-typed
+    (a positive ``int``, and ``bool`` is not one); the string fields now hold the same line.
     """
-    workspace = str(envelope.workspace or "").strip()
-    if not workspace:
-        raise ValueError("lane envelope requires a workspace")
-    reject_marker_separator(workspace, field=FIELD_WORKSPACE)
-    lane = str(envelope.lane or "").strip()
-    if not lane:
-        raise ValueError("lane envelope requires a lane")
-    reject_marker_separator(lane, field=FIELD_LANE)
+    workspace = require_marker_token(
+        envelope.workspace, field=FIELD_WORKSPACE, requirement="lane envelope"
+    )
+    lane = require_marker_token(envelope.lane, field=FIELD_LANE, requirement="lane envelope")
     generation = envelope.lane_generation
     if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
         raise ValueError(f"lane envelope requires a positive lane_generation, got {generation!r}")
-    head = str(envelope.head or "").strip()
-    if head and not is_full_sha(head):
-        raise ValueError("lane envelope head must be a full lowercase commit SHA")
+    head = envelope.head
+    if not isinstance(head, str):
+        raise ValueError(f"lane envelope head must be a string, got {type(head).__name__} {head!r}")
+    if head:
+        # Absent is ``""`` and nothing else: ``None`` is a producer error, not "no head".
+        require_marker_token(head, field=FIELD_HEAD, requirement="lane envelope")
+        # No whitespace survived the token check, so this reads the raw head (``is_full_sha``
+        # strips for the PARSE side, where the field has already been split out of the body).
+        if not is_full_sha(head):
+            raise ValueError("lane envelope head must be a full lowercase commit SHA")
 
     parts = [
         f"{FIELD_WORKSPACE}={workspace}",

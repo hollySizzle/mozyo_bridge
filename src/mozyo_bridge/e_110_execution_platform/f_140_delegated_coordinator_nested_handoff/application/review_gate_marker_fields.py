@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 from typing import Optional
 
-from ..domain.hibernate_evidence_envelope import MARKER_FORBIDDEN_CHARS
+from ..domain.hibernate_evidence_envelope import contains_marker_separator
 
 _REVIEW_REQUEST_GATE = "review_request"
 _REVIEW_RESULT_GATE = "review_result"
@@ -75,7 +75,10 @@ def lane_envelope_marker_fields(args: argparse.Namespace) -> "tuple[dict, Option
     An identity carrying a marker separator is refused HERE with a typed token as well as by the
     renderer (checkpoint j#86443 R2-F3): the renderer raises, which is right for a producer bug, but
     a CLI argument is operator input and deserves the same fixed refusal vocabulary as the other
-    malformed inputs.
+    malformed inputs. That is why the membership question is asked through the surface's shared
+    :func:`contains_marker_separator` rather than by iterating the punctuation tuple (Redmine
+    #14694): a ``\\n``-bearing ``--evidence-lane`` is refused by the renderer, so listing fewer
+    characters here would turn an operator typo into a traceback instead of a typed refusal.
     """
     ws = (getattr(args, "evidence_workspace", None) or "").strip()
     lane = (getattr(args, "evidence_lane", None) or "").strip()
@@ -84,7 +87,7 @@ def lane_envelope_marker_fields(args: argparse.Namespace) -> "tuple[dict, Option
         return {}, None
     if not ws or not lane or not gen_raw:
         return {}, "evidence_envelope_incomplete"
-    if any(bad in value for value in (ws, lane) for bad in MARKER_FORBIDDEN_CHARS):
+    if any(contains_marker_separator(value) for value in (ws, lane)):
         return {}, "evidence_envelope_malformed_identity"
     if not gen_raw.isdigit() or int(gen_raw) <= 0:
         return {}, "evidence_envelope_malformed_generation"
