@@ -251,6 +251,9 @@ class RetireAssertions:
     #: untruthfully for it. `--review-exemption-json` measures the equivalent durable evidence
     #: (exemption + Close + complete integration) at action time instead.
     latest_generation_admissible: bool = False
+    #: The TYPED reason the admissibility resolution refused, when a route produced one (Redmine
+    #: #14695 review j#93807 finding 2). Empty keeps the generic ``stale_review_generation``.
+    latest_generation_blocked_reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +456,7 @@ class SublaneRetireUseCase:
             callbacks_drained=assertions.callbacks_drained,
             durable_record_recorded=assertions.durable_record_recorded,
             latest_generation_admissible=assertions.latest_generation_admissible,
+            latest_generation_blocked_reason=assertions.latest_generation_blocked_reason,
         )
         decision = decide_retire_integration(policy, preflight)
         result = preflight_sublane_retire(
@@ -715,6 +719,9 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
     # retire is admitted against must still be the row the destructive close acts on
     # (Redmine #14539 review j#91847 finding 2).
     evidence_target = resolve_retire_evidence_target(args, _repo_root(args))
+    _generation_admissibility = _resolve_latest_generation_admissible(
+        args, target=evidence_target, repo_root=_repo_root(args)
+    )
     assertions = RetireAssertions(
         issue_closed=bool(getattr(args, "issue_closed", False)),
         callbacks_drained=bool(getattr(args, "callbacks_drained", False)),
@@ -729,9 +736,14 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         # MEASURED from the retire target's own lifecycle row, so the resolution has to happen
         # before the fence runs — the caller's argv is not an independent expectation. An
         # unresolvable target yields None, and the exemption route then refuses.
-        latest_generation_admissible=_resolve_latest_generation_admissible(
-            args, target=evidence_target
-        ),
+        # Redmine #14695: the no-change waiver route additionally needs the repo root, because its
+        # durable evidence is read LIVE and its zero-change half is measured from real git — a
+        # caller-supplied file cannot carry a negative claim (see that route's docstring).
+        latest_generation_admissible=_generation_admissibility.admissible,
+        # #14695 j#93807 F2: a route's own refusal reason reaches the operator instead of being
+        # collapsed into ``stale_review_generation`` — which named a review generation that, for
+        # the waiver route, cannot exist.
+        latest_generation_blocked_reason=_generation_admissibility.reason,
     )
     repo_root = _repo_root(args)
     # Redmine #13331 review j#73338: probe the TARGET lane worktree's dirty state (the

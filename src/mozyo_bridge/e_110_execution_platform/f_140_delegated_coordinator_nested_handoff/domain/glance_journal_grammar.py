@@ -108,8 +108,23 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     fold_integration_disposition,
     fold_work_unit,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_round_state import (
+    REVIEW_ROUND_GATES as _REVIEW_ROUND_GATES,
+    is_open_review_round as _is_open_review_round,
+    review_round_state as _review_round_state,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_review_waiver import (
+    NoChangeWaiverFacts,
+    ZeroChangeFacts,
+    fold_no_change_review_waiver,
+    fold_zero_change_record,
+    waived_now,
+    waiver_declaration_current,
+    waiver_unsuperseded,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_exemption import (
     ReviewExemptionFacts,
+    exemption_in_force_now,
     fold_review_exemption,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
@@ -682,6 +697,29 @@ class GateFacts:
     review_exemption: ReviewExemptionFacts = field(default_factory=ReviewExemptionFacts)
     review_exempt: bool = False
     latest_gate_commit: str = ""
+    #: Redmine #14695: the direct-owner no-change waiver, the record's zero-change verdict, the
+    #: derived "no review owed" fact the classifier consumes (valid + unsuperseded + zero change),
+    #: and its supersession-only half — carried so the retire reports the conjunct it ACTUALLY
+    #: failed rather than blaming a review round for a change-bearing record. Both derived here,
+    #: where the journal ids live, so glance and retire cannot differ (#14539 j#90137 F3).
+    review_waiver: NoChangeWaiverFacts = field(default_factory=NoChangeWaiverFacts)
+    zero_change: ZeroChangeFacts = field(default_factory=ZeroChangeFacts)
+    review_waived: bool = False
+    review_waiver_unsuperseded: bool = False
+    #: A waiver IS declared here but establishes nothing, so the retire refuses it (#14695 review
+    #: j#93807 F1). Keeps a waiver-bearing closed lane out of ``retire_ready``. Scoped to lanes
+    #: that CARRY a waiver: a closed no-commit lane without one projects ``retire_ready`` today
+    #: (measured control) and changing that is a different issue's call.
+    review_waiver_unsupported: bool = False
+    #: The NEWEST review round is unresolved and STAYS so past a later Close (#14695 j#93879 F1):
+    #: pending review means zero-close / zero-retire, and a Close is not a review resolution.
+    #: ``review_round_gate`` / ``review_round_conclusion`` carry that round's OWN typed identity so
+    #: the classifier can re-apply its ordinary rules to it rather than flattening every unresolved
+    #: outcome into one state (#14695 review j#94005 F2).
+    review_round_unresolved: bool = False
+    review_round_gate: str = ""
+    review_round_conclusion: str = ""
+    review_round_blocker: bool = False
 
 
 @dataclass(frozen=True)
@@ -710,13 +748,6 @@ class _RecognizedJournal:
         return self.gates or frozenset({self.gate})
 
 
-#: The recognized gates that constitute an OPEN review round. A round is an explicit request for
-#: an independent review, so an exemption recorded BEFORE it does not close it (Redmine #14539).
-#: ``implementation_done`` is deliberately absent: it states that implementation finished, not
-#: that a review was requested — whether a review is owed on it is exactly what the exemption
-#: policy decides, so its ordering against the exemption journal is irrelevant.
-_REVIEW_ROUND_GATES: frozenset[str] = frozenset({GATE_REVIEW_REQUEST, GATE_REVIEW})
-
 #: The recognized gates whose journal, when it declares a commit, ANNOUNCES A NEW TARGET COMMIT as
 #: an implementation result — so it declares a change scope even when it omits ``changed_paths``
 #: (Redmine #14539 review j#90289 R3-F1). ``close`` / ``owner_close_approval`` are deliberately
@@ -726,51 +757,6 @@ _REVIEW_ROUND_GATES: frozenset[str] = frozenset({GATE_REVIEW_REQUEST, GATE_REVIE
 _CHANGE_BEARING_GATES: frozenset[str] = frozenset(
     {GATE_IMPLEMENTATION_DONE, GATE_REVIEW_REQUEST}
 )
-
-
-def _is_open_review_round(gates: "frozenset | set", conclusion: str) -> bool:
-    """Whether this journal's gates constitute an OPEN review round (pure).
-
-    A ``review_request`` is always open — it asks for a review that has not answered yet. A
-    ``review`` is open unless it CONCLUDED approved; ``pending`` (an unreadable / absent 結論) and
-    ``changes_requested`` both leave the round owed, and ``pending`` in particular must count as
-    open because it is the fail-closed read of a review whose conclusion could not be established.
-    """
-    if GATE_REVIEW_REQUEST in gates:
-        return True
-    return GATE_REVIEW in gates and conclusion != REVIEW_APPROVED
-
-
-def _review_exempt_now(
-    exemption: ReviewExemptionFacts, recognized: Sequence["_RecognizedJournal"]
-) -> bool:
-    """Whether the durable exemption is in force AND not superseded by a review round (pure).
-
-    An exemption exempts what it precedes in the durable record, not what supersedes it:
-
-    - no review round at all (the common direct-edit lane, whose latest gate is
-      ``implementation_done`` / ``close``) -> the exemption stands;
-    - a review round recorded BEFORE the exemption journal (the "superseded past Review Request"
-      the #14539 acceptance names) -> the exemption supersedes it, so the round is not re-projected
-      as ``review_waiting``;
-    - a review round recorded AFTER the exemption journal -> a review was opened on top of the
-      exemption, so the review is owed again. Fail-closed, and the safe side.
-
-    An unparseable exemption journal id also fails closed (no exemption), because the ordering
-    that makes the exemption safe could not be established.
-    """
-    if not exemption.validated().in_force:
-        return False
-    exemption_journal = _int_journal(exemption.journal)
-    if exemption_journal is None:
-        return False
-    # Every recognized gate of each journal, not the max-precedence reduction: a
-    # ``## Gate: Review Request + Close`` IS an open review round, and reducing it to ``close``
-    # made the round invisible here (review j#91577 finding 1).
-    rounds = [r.journal_id for r in recognized if r.gates_or_gate & _REVIEW_ROUND_GATES]
-    if not rounds:
-        return True
-    return exemption_journal > max(rounds)
 
 
 def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[GateFacts]:
@@ -897,8 +883,22 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
     review_exemption = fold_review_exemption(
         journals or (), change_bearing_journals=change_bearing_journals
     )
+    # Redmine #14695: the no-change waiver is a FOURTH issue-wide, latest-wins authority fact of
+    # the same shape, and its zero-change carve-out reads the same change-bearing gate vocabulary
+    # — passed down from here for the same reason the exemption's is (one vocabulary, not two).
+    review_waiver = fold_no_change_review_waiver(journals or ())
+    zero_change = fold_zero_change_record(
+        journals or (), change_bearing_journals=change_bearing_journals
+    )
 
     latest = max(recognized, key=lambda r: r.journal_id)
+    # Computed ONCE and shared by both derived waiver facts: two calls would be two chances for
+    # the round vocabulary to be filtered differently.
+    (
+        round_ids, round_unresolved, round_gate, round_conclusion, round_blocker
+    ) = _review_round_state(recognized)
+    # Computed once: the derived fact and its negation-for-declared-waivers must agree.
+    waived = waived_now(review_waiver, zero_change, round_ids)
     return GateFacts(
         latest_gate=latest.gate,
         latest_gate_journal=str(latest.journal_id),
@@ -909,8 +909,26 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         integration=integration,
         work_unit=work_unit,
         review_exemption=review_exemption,
-        review_exempt=_review_exempt_now(review_exemption, recognized),
+        review_exempt=exemption_in_force_now(review_exemption, round_ids),
         latest_gate_commit=latest.commit,
+        review_waiver=review_waiver,
+        zero_change=zero_change,
+        review_waived=waived,
+        review_waiver_unsuperseded=waiver_unsuperseded(review_waiver, round_ids),
+        # The DECLARATION-ordering fact, not the valid-waiver one (#14695 review j#93879 F2).
+        # ``waiver_unsuperseded`` requires the waiver to be VALID, so a CURRENT but malformed
+        # declaration answered False and the lane read as ready to close — while the terminal route
+        # refused the identical record. Ordering is about existence and supersession, never about
+        # validity; a current invalid declaration is exactly the case that must refuse.
+        # (#14695 review j#93856 F2 remains satisfied: a declaration a newer review round
+        # supersedes is no longer current, so an approved review still returns the lane to the
+        # ordinary projection.)
+        review_waiver_unsupported=waiver_declaration_current(review_waiver, round_ids)
+        and not waived,
+        review_round_unresolved=round_unresolved,
+        review_round_gate=round_gate,
+        review_round_conclusion=round_conclusion,
+        review_round_blocker=round_blocker,
     )
 
 
@@ -944,6 +962,16 @@ def lane_signal_from_gate_facts(
         # newer than the exemption?) is resolved in the fold, where the journal ids live, so the
         # classifier stays a flat function over facts.
         review_exempt=facts.review_exempt,
+        # Redmine #14695: the second no-review-owed authority, derived in the fold for the same
+        # reason — its supersession and zero-change conjuncts need the journal ids, so the
+        # classifier stays a flat function over facts and cannot reach a different conclusion
+        # from the terminal retire about the same record.
+        review_waived=facts.review_waived,
+        review_waiver_unsupported=facts.review_waiver_unsupported,
+        review_round_unresolved=facts.review_round_unresolved,
+        review_round_gate=facts.review_round_gate,
+        review_round_conclusion=facts.review_round_conclusion,
+        review_round_blocker=facts.review_round_blocker,
     )
 
 

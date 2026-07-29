@@ -64,6 +64,27 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AdmissionResult,
 )
 
+
+def _review_round_supersedes(journal: object, round_ids: Sequence[int]) -> bool:
+    """Lazy indirection to the shared ordering predicate (pure).
+
+    Imported inside the call rather than at module scope because
+    :mod:`.no_change_review_waiver`, which owns that predicate, imports THIS module. A top-level
+    import would be a cycle; the predicate still has exactly one definition.
+
+    A round in the exemption's OWN journal supersedes it (#14695 review j#94240). The exemption
+    asks whether the record contradicts itself — one journal declaring both "no review owed" and
+    "review requested" cannot be ordered, so the round stands. The waiver consumers deliberately
+    keep the default strict comparison, because theirs is a pure "which declaration is current"
+    ordering question and applying the tie rule there UNBLOCKED a terminal (j#94260).
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_review_waiver import (  # noqa: E501
+        review_round_supersedes,
+    )
+
+    return review_round_supersedes(journal, round_ids, same_journal_supersedes=True)
+
+
 #: The marker gate that declares a journal to BE a ``codex_direct_edit`` gate. Read through the
 #: policy-free shared marker scanner (never by widening
 #: ``redmine_journal_source.GATE_BEARING_KINDS``) for the same reason the integration disposition
@@ -411,6 +432,24 @@ def uncovered_paths(
         for p in (str(c).strip() for c in changed_paths or ())
         if p and not any(_glob_match(p, a) for a in allowed)
     )
+
+
+def declares_any_commit(notes: object) -> bool:
+    """Whether one journal declares a commit in ANY governed commit field (pure).
+
+    Exported for the no-change review waiver (Redmine #14695), whose carve-out is the mirror
+    image of this module's coverage check: the exemption asks "does the gate cover the commit's
+    changed paths", the waiver asks "is there no commit at all". Both must agree about what
+    DECLARING a commit looks like, so they read the one grammar defined here rather than each
+    carrying a regex — the two-forked-allowlist drift this codebase keeps paying for (#13952).
+
+    Deliberately the EXISTENCE question, not the identity question: a journal naming two
+    different commits declares neither identity (:func:`fold_declared_change_scope` resolves that
+    to ``""``) but it certainly declares that commits exist, and for the waiver's carve-out that
+    is the answer that matters. Reading it through the identity helper instead would let an
+    ambiguous pair read as "no commit declared".
+    """
+    return _COMMIT_FIELD_RE.search(str(notes or "")) is not None
 
 
 @dataclass(frozen=True)
@@ -894,6 +933,30 @@ def evaluate_exemption_integration_admissible(
     return AdmissionResult(True, REASON_OK)
 
 
+def exemption_in_force_now(
+    exemption: "ReviewExemptionFacts", round_ids: Sequence[int]
+) -> bool:
+    """Whether the durable exemption is in force AND not superseded by a review round (pure).
+
+    An exemption exempts what it PRECEDES in the durable record, not what supersedes it: no round
+    at all, or a round recorded BEFORE the exemption journal (the "superseded past Review Request"
+    the #14539 acceptance names), leaves it standing; a round recorded AFTER it re-owes the review.
+    An unparseable exemption journal id fails closed, because the ordering that makes the exemption
+    safe could not be established.
+
+    Ordering is delegated to the SHARED predicate (Redmine #14695) — the no-change waiver asks the
+    identical question, and two copies would eventually answer differently for one record.
+
+    ``round_ids`` is supplied by the caller that owns gate recognition (the glance grammar), so
+    the gate VOCABULARY stays there and only the derivation lives here, with the exemption it is
+    about. It moved out of the grammar when that module hit the oversized-module gate again;
+    splitting by ownership rather than shaving comments is the gate's own prescribed remedy.
+    """
+    return exemption.validated().in_force and not _review_round_supersedes(
+        exemption.journal, round_ids
+    )
+
+
 __all__ = (
     "CANONICAL_DIRECT_EDIT_ROLE",
     "EXEMPTION_EXEMPT",
@@ -916,6 +979,8 @@ __all__ = (
     "REVIEW_EXEMPTION_STATES",
     "DeclaredChangeScope",
     "ReviewExemptionFacts",
+    "declares_any_commit",
+    "exemption_in_force_now",
     "evaluate_exemption_integration_admissible",
     "fold_declared_change_scope",
     "fold_review_exemption",
