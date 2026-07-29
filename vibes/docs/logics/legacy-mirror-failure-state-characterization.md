@@ -911,6 +911,13 @@ T6 (共有 fault schedule fake の新規作成) が触る consumer は**この�
 > probe I/O は 5 件 / 108 行、sync は 51 件 / 864 行になった)。
 - `tests/support/legacy_mirror_tree_fixture.py` は `_MirrorTreeFixture` の逐語移動で
   あり test を含まないので、この表の 127 には入らない。
+- `tests/support/legacy_mirror_fault_schedule.py` (T6 / Redmine #14684 が新規作成)
+  も同様に test を含まないので 127 に入らない。所有するのは `os_patch` 列が非 0 の
+  5 module が重複して書いていた 3 形 — staging descriptor を記録する `os.open`、
+  その descriptor を実際に閉じてから 1 度だけ失敗する `os.close`、実行せず raise する
+  primitive — に限る。**fault の payload 自体が検証対象である場合 (short write /
+  staging 名へ差し替えられた entry / 遅延失敗する `scandir` / staging 名で keying した
+  `lstat` / walk の序数 close) は共有側へ移さず call site に残す。**
 
 #### 共有 helper の所有 [導出]
 
@@ -1132,6 +1139,11 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
 `--check` を green にする。これを怠ると移設後の file を編集しても本 doc が
 `docs resolve` で解決されない。**T1 / T6 の完了条件**であり、後追いの掃除に
 しない。
+
+T1 は 10 module + `legacy_mirror_tree_fixture.py` を、T6 (Redmine #14684) は
+`tests/support/legacy_mirror_fault_schedule.py` を `fc-legacy-mirror-sync` の
+`patterns` へ追加した。T6 の consumer は §5.5 の `os_patch` 非 0 の 5 module のみで、
+`os_patch = 0` の module は触れていない (`src/**` diff は byte 0)。
 
 **T2 への申し送り [未確認]:** §5.4 のとおり `legacy_mirror_sync.py` は 899 行で
 `max_module_lines: 1000` まで 101 行しかない。状態機械を同 module に足すと gate に

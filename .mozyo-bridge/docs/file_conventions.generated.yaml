@@ -70,6 +70,7 @@ rules:
   - tests/scenarios/test_legacy_mirror_wrapper_cli.py
   - tests/regressions/test_issue_14580_reused_descriptor_number_close.py
   - tests/regressions/test_issue_14651_capability_advertisement.py
+  - tests/support/legacy_mirror_fault_schedule.py
   - tests/support/legacy_mirror_tree_fixture.py
   severity: warn
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/legacy-mirror-failure-state-characterization.md と @vibes/docs/logics/tests-placement-discovery-policy.md

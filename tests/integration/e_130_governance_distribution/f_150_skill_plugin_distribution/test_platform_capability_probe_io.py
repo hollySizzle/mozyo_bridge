@@ -6,6 +6,11 @@ per the #14660 characterization (§5.5 移設先 module の確定) and the place
 ruling in `vibes/docs/logics/tests-placement-discovery-policy.md`
 `## #14660 legacy mirror family 裁定`. Test bodies are unchanged; only the
 module frame and import paths moved (Redmine #14666, T1 move-only).
+
+Redmine #14684 (T6) then took the primitive that raises instead of running from
+`tests/support/legacy_mirror_fault_schedule.py`. The stubs that do not raise —
+the one accepting positionals and nothing else, the `scandir` whose failure is
+deferred to the first step — are what those cases are about, so they stay here.
 """
 
 from __future__ import annotations
@@ -31,6 +36,9 @@ from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.
 )
 from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.domain.legacy_mirror_contract import (  # noqa: E402
     PLATFORM_UNSUPPORTED,
+)
+from tests.support.legacy_mirror_fault_schedule import (  # noqa: E402
+    FaultSchedule,
 )
 from tests.support.legacy_mirror_tree_fixture import (  # noqa: E402
     _MirrorTreeFixture,
@@ -187,8 +195,7 @@ class PlatformCapabilityProbeIoTest(_MirrorTreeFixture):
         being capable. It refuses for the same reason a missing primitive
         does, and says which of the two happened."""
         repo = self._stage()
-        exhausted = unittest.mock.Mock(side_effect=OSError(errno.EMFILE, "too many open files"))
-        with unittest.mock.patch.object(os, "pipe", exhausted):
+        with FaultSchedule().raise_on("pipe", OSError(errno.EMFILE, "too many open files")):
             service = self._service(repo)
             missing = platform_capabilities.missing_platform_capabilities()
             audit = service.audit()

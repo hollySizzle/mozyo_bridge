@@ -6,6 +6,13 @@ per the #14660 characterization (§5.5 移設先 module の確定) and the place
 ruling in `vibes/docs/logics/tests-placement-discovery-policy.md`
 `## #14660 legacy mirror family 裁定`. Test bodies are unchanged; only the
 module frame and import paths moved (Redmine #14666, T1 move-only).
+
+Redmine #14684 (T6) then handed the `os` fakes this module had written by hand
+to the shared `tests/support/legacy_mirror_fault_schedule.py`. The faults
+injected and the properties asserted are unchanged; what moved is who owns the
+fake. A fault whose payload is itself the property under test — the short
+write, the entry substituted at the staging name, the `lstat` keyed on that
+name, the walk's ordinal close — stays here with the docstring explaining it.
 """
 
 from __future__ import annotations
@@ -31,6 +38,9 @@ from mozyo_bridge.e_130_governance_distribution.f_150_skill_plugin_distribution.
     CLEANUP_FAILED,
     WRITE_FAILED,
 )
+from tests.support.legacy_mirror_fault_schedule import (  # noqa: E402
+    FaultSchedule,
+)
 from tests.support.legacy_mirror_tree_fixture import (  # noqa: E402
     _MirrorTreeFixture,
 )
@@ -38,6 +48,20 @@ from tests.support.legacy_mirror_tree_fixture import (  # noqa: E402
 
 class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
     """Adversarial cases that inject an `os` primitive against a real tree."""
+
+    def _substitute_a_foreign_entry(self, repo: Path) -> str | None:
+        """Replace this run's staging entry with an ordinary file of its name.
+
+        Two cases need an entry that is *not* ours sitting where cleanup is
+        about to look, and they differ only in what the write raises
+        afterwards, so the substitution itself is written once.
+        """
+        for path in self._mirror(repo).iterdir():
+            if path.name.startswith(".mozyo-legacy-mirror."):
+                path.unlink()
+                path.write_text("FOREIGN\n", encoding="utf-8")
+                return path.name
+        return None
 
     def test_the_staging_descriptor_still_pins_the_inode_at_every_ownership_question(
         self,
@@ -76,8 +100,9 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
                         )
                     return real_resolve(self, dir_fd, name)
 
-                def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-                    raise OSError(errno.ENOSPC, "injected")
+                schedule = FaultSchedule()
+                if break_the_write:
+                    schedule.raise_on("write", OSError(errno.ENOSPC, "injected"))
 
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(
@@ -85,12 +110,7 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
                             owned_descriptors._StagingOwnership, "resolve", observing_resolve
                         )
                     )
-                    if break_the_write:
-                        stack.enter_context(
-                            unittest.mock.patch.object(
-                                legacy_mirror_sync.os, "write", failing_write
-                            )
-                        )
+                    stack.enter_context(schedule)
                     self._service(repo).sync()
 
                 self.assertTrue(pinned, "ownership was never asked")
@@ -111,16 +131,14 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
         entry = self._mirror(repo) / "workflow.md"
         before = entry.read_text(encoding="utf-8")
-        fired: list[int] = []
 
-        def failing_fsync(fd: int) -> None:
-            fired.append(fd)
-            raise OSError(errno.EIO, "injected deferred write error")
-
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "fsync", failing_fsync):
+        schedule = FaultSchedule().raise_on(
+            "fsync", OSError(errno.EIO, "injected deferred write error")
+        )
+        with schedule:
             code, out, err = self._service(repo).sync()
 
-        self.assertTrue(fired, "the staging flush was never reached")
+        self.assertTrue(schedule.calls["fsync"], "the staging flush was never reached")
         self.assertEqual(1, code)
         self.assertEqual((), out, "a failed flush still printed the banner")
         self.assertIn("could not be flushed to disk", "\n".join(err))
@@ -205,17 +223,11 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise OSError(errno.ENOSPC, "injected")
-
-        def failing_unlink(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
-            raise PermissionError(errno.EACCES, "injected")
-
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", failing_write):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "unlink", failing_unlink
-            ):
-                code, out, err = self._service(repo).sync()
+        schedule = FaultSchedule()
+        schedule.raise_on("write", OSError(errno.ENOSPC, "injected"))
+        schedule.raise_on("unlink", PermissionError(errno.EACCES, "injected"))
+        with schedule:
+            code, out, err = self._service(repo).sync()
 
         self.assertEqual(1, code)
         self.assertEqual((), out)
@@ -224,47 +236,28 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         self.assertIn(CLEANUP_FAILED, report, "surviving residue went unreported")
         self.assertIn("still present", report)
 
-    def _fail_only_the_staging_close(self):  # type: ignore[no-untyped-def]
-        """Patch pair that fails the close of the staging fd and nothing else.
-
-        Failing *every* close stops at the preflight read and never reaches the
-        staging branch, which is why the earlier close test passed while the
-        staging path still reported success (j#90467 R9-F1).
-        """
-        real_open, real_close = os.open, os.close
-        state: dict[str, object] = {"fd": None, "fired": False}
-
-        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
-            fd = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_CREAT:
-                state["fd"] = fd
-            return fd
-
-        def selective_close(fd: int) -> None:
-            real_close(fd)
-            if fd == state["fd"] and not state["fired"]:
-                state["fired"] = True
-                state["fd"] = None
-                raise OSError(errno.EIO, "injected staging close failure")
-
-        return tracking_open, selective_close, state
-
     def test_staging_close_failure_is_not_reported_as_success(self) -> None:
         """j#90467 R9-F1. `_close_quietly`'s result was discarded, so a close
         that reported a deferred write error still produced exit 0 and the
-        `synced` banner, with the post-check agreeing."""
+        `synced` banner, with the post-check agreeing.
+
+        The fault has to be keyed on the staging descriptor: failing *every*
+        close stops at the preflight read and never reaches the staging branch,
+        which is why the earlier close test passed while this path still
+        reported success.
+        """
         repo = self._stage()
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        tracking_open, selective_close, state = self._fail_only_the_staging_close()
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "close", selective_close
-            ):
-                code, out, err = self._service(repo).sync()
+        schedule = FaultSchedule().track_descriptors()
+        schedule.raise_after_closing(
+            "staging", OSError(errno.EIO, "injected staging close failure")
+        )
+        with schedule:
+            code, out, err = self._service(repo).sync()
 
-        self.assertTrue(state["fired"], "the staging close was never reached")
+        self.assertTrue(schedule.close_fired, "the staging close was never reached")
         self.assertEqual(1, code)
         self.assertEqual((), out, "a failed staging close still printed the banner")
         self.assertIn(WRITE_FAILED, "\n".join(err))
@@ -283,12 +276,7 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         def rebinding_write(fd: int, data):  # type: ignore[no-untyped-def]
             if not state["done"]:
                 state["done"] = True
-                for path in self._mirror(repo).iterdir():
-                    if path.name.startswith(".mozyo-legacy-mirror."):
-                        path.unlink()
-                        path.write_text("FOREIGN\n", encoding="utf-8")
-                        state["name"] = path.name
-                        break
+                state["name"] = self._substitute_a_foreign_entry(repo)
                 raise OSError(errno.ENOSPC, "injected")
             return real_write(fd, data)
 
@@ -311,27 +299,22 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        real_unlink = os.unlink
-        calls: list[int] = []
+        schedule = FaultSchedule()
+        schedule.raise_on("write", OSError(errno.ENOSPC, "injected"))
+        schedule.raise_on(
+            "unlink", PermissionError(errno.EACCES, "injected"), only_first=True
+        )
 
-        def transient_unlink(*args, **kwargs):  # type: ignore[no-untyped-def]
-            calls.append(1)
-            if len(calls) == 1:
-                raise PermissionError(errno.EACCES, "injected")
-            return real_unlink(*args, **kwargs)
-
-        def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise OSError(errno.ENOSPC, "injected")
-
+        # The unlink fault is keyed on nothing but a call count, so the probe
+        # has to be answered in advance or it absorbs the first one.
         with self._preflight_already_answered():
-            with unittest.mock.patch.object(legacy_mirror_sync.os, "write", failing_write):
-                with unittest.mock.patch.object(
-                    legacy_mirror_sync.os, "unlink", transient_unlink
-                ):
-                    code, _out, err = self._service(repo).sync()
+            with schedule:
+                code, _out, err = self._service(repo).sync()
 
         self.assertEqual(1, code)
-        self.assertEqual(1, len(calls), "cleanup ran more than once for one staging file")
+        self.assertEqual(
+            1, schedule.calls["unlink"], "cleanup ran more than once for one staging file"
+        )
         residue = [
             p.name
             for p in self._mirror(repo).iterdir()
@@ -352,10 +335,7 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        def exploding_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise RuntimeError("injected non-OSError")
-
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", exploding_write):
+        with FaultSchedule().raise_on("write", RuntimeError("injected non-OSError")):
             with self.assertRaises(RuntimeError):
                 self._service(repo).sync()
 
@@ -373,12 +353,7 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         def rebinding_then_raising(fd: int, data):  # type: ignore[no-untyped-def]
             if not state["done"]:
                 state["done"] = True
-                for path in self._mirror(repo).iterdir():
-                    if path.name.startswith(".mozyo-legacy-mirror."):
-                        path.unlink()
-                        path.write_text("FOREIGN\n", encoding="utf-8")
-                        state["name"] = path.name
-                        break
+                state["name"] = self._substitute_a_foreign_entry(repo)
                 raise RuntimeError("injected non-OSError")
             return real_write(fd, data)
 
@@ -441,27 +416,21 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        real_open, real_fstat = os.open, os.fstat
-        staging_fds: set[int] = set()
-
-        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
-            fd = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_CREAT:
-                staging_fds.add(fd)
-            return fd
+        real_fstat = os.fstat
+        schedule = FaultSchedule().track_descriptors()
 
         def failing_identity_fstat(fd: int):  # type: ignore[no-untyped-def]
-            if fd in staging_fds:
+            if fd in schedule.staging_descriptors:
                 raise OSError(errno.EIO, "injected")
             return real_fstat(fd)
 
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
+        with schedule:
             with unittest.mock.patch.object(
                 owned_descriptors.os, "fstat", failing_identity_fstat
             ):
                 code, out, err = self._service(repo).sync()
 
-        self.assertTrue(staging_fds, "the staging create was never reached")
+        self.assertTrue(schedule.staging_descriptors, "the staging create was never reached")
         self.assertEqual(1, code)
         self.assertEqual((), out)
         self.assertIn("ownership could not be proved", "\n".join(err))
@@ -479,29 +448,13 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        real_open, real_close = os.open, os.close
-        state: dict[str, object] = {"fd": None, "fired": False}
+        schedule = FaultSchedule().track_descriptors()
+        schedule.raise_after_closing("staging", RuntimeError("injected close unwind"))
+        with schedule:
+            with self.assertRaises(RuntimeError):
+                self._service(repo).sync()
 
-        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
-            fd = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_CREAT:
-                state["fd"] = fd
-            return fd
-
-        def unwinding_close(fd: int) -> None:
-            real_close(fd)
-            if fd == state["fd"] and not state["fired"]:
-                state["fired"] = True
-                raise RuntimeError("injected close unwind")
-
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "close", unwinding_close
-            ):
-                with self.assertRaises(RuntimeError):
-                    self._service(repo).sync()
-
-        self.assertTrue(state["fired"], "the staging close was never reached")
+        self.assertTrue(schedule.close_fired, "the staging close was never reached")
         self.assertEqual([], self._staging_names(repo), "the staging entry survived")
 
     def test_a_close_unwind_keeps_the_primary_exception(self) -> None:
@@ -510,36 +463,15 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        real_open, real_close = os.open, os.close
-        state: dict[str, object] = {"fd": None, "fired": False}
-
         class PrimaryFailure(Exception):
             pass
 
-        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
-            fd = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_CREAT:
-                state["fd"] = fd
-            return fd
-
-        def unwinding_close(fd: int) -> None:
-            real_close(fd)
-            if fd == state["fd"] and not state["fired"]:
-                state["fired"] = True
-                raise RuntimeError("injected close unwind")
-
-        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise PrimaryFailure("injected write unwind")
-
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "close", unwinding_close
-            ):
-                with unittest.mock.patch.object(
-                    legacy_mirror_sync.os, "write", primary_write
-                ):
-                    with self.assertRaises(PrimaryFailure) as caught:
-                        self._service(repo).sync()
+        schedule = FaultSchedule().track_descriptors()
+        schedule.raise_after_closing("staging", RuntimeError("injected close unwind"))
+        schedule.raise_on("write", PrimaryFailure("injected write unwind"))
+        with schedule:
+            with self.assertRaises(PrimaryFailure) as caught:
+                self._service(repo).sync()
 
         notes = getattr(caught.exception, "__notes__", [])
         self.assertTrue(
@@ -559,33 +491,20 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         descriptors over ten runs.
         """
         repo = self._stage()
-        real_open, real_close = os.open, os.close
-        state: dict[str, object] = {"root": None, "fired": False}
-
-        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
-            fd = real_open(path, flags, *args, **kwargs)
-            if state["root"] is None and "dir_fd" not in kwargs:
-                state["root"] = fd
-            return fd
-
-        def unwinding_close(fd: int) -> None:
-            real_close(fd)
-            if fd == state["root"] and not state["fired"]:
-                state["fired"] = True
-                raise RuntimeError("injected walk close unwind")
 
         def one_run() -> None:
-            state["root"] = None
-            state["fired"] = False
-            with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
-                with unittest.mock.patch.object(
-                    legacy_mirror_sync.os, "close", unwinding_close
-                ):
-                    try:
-                        self._service(repo).audit()
-                    except RuntimeError:
-                        pass
-            self.assertTrue(state["fired"], "the walk close injection never fired")
+            # A fresh schedule per run: the walk root is a descriptor number
+            # this run was handed, and the previous run's is already reused.
+            schedule = FaultSchedule().track_descriptors()
+            schedule.raise_after_closing(
+                "walk_root", RuntimeError("injected walk close unwind")
+            )
+            with schedule:
+                try:
+                    self._service(repo).audit()
+                except RuntimeError:
+                    pass
+            self.assertTrue(schedule.close_fired, "the walk close injection never fired")
 
         one_run()  # settle any first-call allocation
         before = self._open_descriptor_count()
@@ -607,35 +526,14 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
             def add_note(self, note: str) -> None:  # type: ignore[override]
                 raise RuntimeError("injected add_note failure")
 
-        real_open, real_close = os.open, os.close
-        state: dict[str, object] = {"fd": None, "fired": False}
+        schedule = FaultSchedule().track_descriptors()
+        schedule.raise_after_closing("staging", RuntimeError("injected close unwind"))
+        schedule.raise_on("write", PrimaryFailure("injected write unwind"))
+        with schedule:
+            with self.assertRaises(PrimaryFailure):
+                self._service(repo).sync()
 
-        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
-            fd = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_CREAT:
-                state["fd"] = fd
-            return fd
-
-        def unwinding_close(fd: int) -> None:
-            real_close(fd)
-            if fd == state["fd"] and not state["fired"]:
-                state["fired"] = True
-                raise RuntimeError("injected close unwind")
-
-        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise PrimaryFailure("injected write unwind")
-
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "close", unwinding_close
-            ):
-                with unittest.mock.patch.object(
-                    legacy_mirror_sync.os, "write", primary_write
-                ):
-                    with self.assertRaises(PrimaryFailure):
-                        self._service(repo).sync()
-
-        self.assertTrue(state["fired"], "the close injection never fired")
+        self.assertTrue(schedule.close_fired, "the close injection never fired")
         self.assertEqual([], self._staging_names(repo), "the release was skipped")
 
     def test_a_failing_cleanup_does_not_replace_the_primary(self) -> None:
@@ -656,12 +554,7 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
 
         service._release_staging = exploding_release  # type: ignore[method-assign]
 
-        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise PrimaryFailure("injected write unwind")
-
-        with unittest.mock.patch.object(
-            legacy_mirror_sync.os, "write", primary_write
-        ):
+        with FaultSchedule().raise_on("write", PrimaryFailure("injected write unwind")):
             with self.assertRaises(PrimaryFailure) as caught:
                 service.sync()
 
@@ -670,25 +563,6 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
             any("secondary failure during teardown" in note for note in notes),
             "the cleanup failure was dropped instead of being recorded",
         )
-
-    def _fail_staging_close_with(self, error: BaseException):  # type: ignore[no-untyped-def]
-        """Patch pair failing only the staging close, with a chosen exception."""
-        real_open, real_close = os.open, os.close
-        state: dict[str, object] = {"fd": None, "fired": False}
-
-        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
-            fd = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_CREAT:
-                state["fd"] = fd
-            return fd
-
-        def failing_close(fd: int) -> None:
-            real_close(fd)
-            if fd == state["fd"] and not state["fired"]:
-                state["fired"] = True
-                raise error
-
-        return tracking_open, failing_close, state
 
     def test_a_raising_release_does_not_take_the_close_with_it(self) -> None:
         """j#90487 R13-F1, at the position #14652 moved it to.
@@ -717,24 +591,17 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
             raise PrimaryCleanup("injected cleanup failure")
 
         service._release_staging = exploding_release  # type: ignore[method-assign]
-        tracking_open, failing_close, state = self._fail_staging_close_with(
-            SecondaryClose("injected close failure")
+
+        schedule = FaultSchedule().track_descriptors()
+        schedule.raise_after_closing("staging", SecondaryClose("injected close failure"))
+        schedule.raise_on("write", OSError(errno.ENOSPC, "injected"))
+        with schedule:
+            with self.assertRaises(PrimaryCleanup) as caught:
+                service.sync()
+
+        self.assertTrue(
+            schedule.close_fired, "the staging close never ran after the release raised"
         )
-
-        def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise OSError(errno.ENOSPC, "injected")
-
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "close", failing_close
-            ):
-                with unittest.mock.patch.object(
-                    legacy_mirror_sync.os, "write", failing_write
-                ):
-                    with self.assertRaises(PrimaryCleanup) as caught:
-                        service.sync()
-
-        self.assertTrue(state["fired"], "the staging close never ran after the release raised")
         notes = getattr(caught.exception, "__notes__", [])
         self.assertTrue(
             any("SecondaryClose" in note for note in notes),
@@ -744,34 +611,30 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
     def _staging_lifetime_events(self, repo: Path):  # type: ignore[no-untyped-def]
         """A service whose staging release and staging close announce themselves.
 
-        Returns ``(service, events, open_patch, close_patch)``. The close is
-        observed through the real `os.close` call, so what lands in ``events``
-        is the syscall happening, not a flag the implementation set.
+        Returns ``(service, events, schedule, close_patch)``. The schedule names
+        the staging descriptor; the close is not a fault, so it stays here — and
+        it is observed through the real `os.close` call, so what lands in
+        ``events`` is the syscall happening, not a flag the implementation set.
         """
         service = self._service(repo)
         events: list[str] = []
         real_release = service._release_staging
-        real_open, real_close = os.open, os.close
-        staging_fds: set[int] = set()
+        real_close = os.close
+        schedule = FaultSchedule().track_descriptors()
+        announced: set[int] = set()
 
         def watching_release(mirror_fd: int, temp_name: str, ownership):  # type: ignore[no-untyped-def]
             events.append("release")
             return real_release(mirror_fd, temp_name, ownership)
 
-        def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
-            fd = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_CREAT:
-                staging_fds.add(fd)
-            return fd
-
         def watching_close(fd: int) -> None:
-            if fd in staging_fds:
-                staging_fds.discard(fd)
+            if fd in schedule.staging_descriptors and fd not in announced:
+                announced.add(fd)
                 events.append("close")
             real_close(fd)
 
         service._release_staging = watching_release  # type: ignore[method-assign]
-        return service, events, tracking_open, watching_close
+        return service, events, schedule, watching_close
 
     def test_the_staging_release_always_precedes_the_staging_close(self) -> None:
         """#14652. The release consults the ownership proof, and that proof is
@@ -790,26 +653,17 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
                 canonical.write_text(
                     canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8"
                 )
-                service, events, tracking_open, watching_close = self._staging_lifetime_events(
+                service, events, schedule, watching_close = self._staging_lifetime_events(
                     repo
                 )
-
-                def failing_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-                    raise OSError(errno.ENOSPC, "injected")
+                if break_the_write:
+                    schedule.raise_on("write", OSError(errno.ENOSPC, "injected"))
 
                 with contextlib.ExitStack() as stack:
-                    stack.enter_context(
-                        unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open)
-                    )
+                    stack.enter_context(schedule)
                     stack.enter_context(
                         unittest.mock.patch.object(legacy_mirror_sync.os, "close", watching_close)
                     )
-                    if break_the_write:
-                        stack.enter_context(
-                            unittest.mock.patch.object(
-                                legacy_mirror_sync.os, "write", failing_write
-                            )
-                        )
                     service.sync()
 
                 self.assertIn("close", events, "the staging close was never observed")
@@ -871,18 +725,12 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise PrimaryWrite("injected write unwind")
-
-        def failing_unlink(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
-            raise PermissionError(errno.EACCES, "injected")
-
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", primary_write):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "unlink", failing_unlink
-            ):
-                with self.assertRaises(PrimaryWrite) as caught:
-                    self._service(repo).sync()
+        schedule = FaultSchedule()
+        schedule.raise_on("write", PrimaryWrite("injected write unwind"))
+        schedule.raise_on("unlink", PermissionError(errno.EACCES, "injected"))
+        with schedule:
+            with self.assertRaises(PrimaryWrite) as caught:
+                self._service(repo).sync()
 
         notes = "\n".join(getattr(caught.exception, "__notes__", []))
         self.assertIn(CLEANUP_FAILED, notes, "the typed cleanup failure was discarded")
@@ -900,24 +748,16 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        tracking_open, failing_close, state = self._fail_staging_close_with(
-            OSError(errno.EIO, "injected typed close failure")
+        schedule = FaultSchedule().track_descriptors()
+        schedule.raise_after_closing(
+            "staging", OSError(errno.EIO, "injected typed close failure")
         )
+        schedule.raise_on("write", PrimaryWrite("injected write unwind"))
+        with schedule:
+            with self.assertRaises(PrimaryWrite) as caught:
+                self._service(repo).sync()
 
-        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise PrimaryWrite("injected write unwind")
-
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "close", failing_close
-            ):
-                with unittest.mock.patch.object(
-                    legacy_mirror_sync.os, "write", primary_write
-                ):
-                    with self.assertRaises(PrimaryWrite) as caught:
-                        self._service(repo).sync()
-
-        self.assertTrue(state["fired"], "the typed close injection never fired")
+        self.assertTrue(schedule.close_fired, "the typed close injection never fired")
         notes = "\n".join(getattr(caught.exception, "__notes__", []))
         self.assertIn("close reported a failure", notes)
 
@@ -941,10 +781,7 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
 
         service._release_staging = interrupted_release  # type: ignore[method-assign]
 
-        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise PrimaryWrite("injected write unwind")
-
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "write", primary_write):
+        with FaultSchedule().raise_on("write", PrimaryWrite("injected write unwind")):
             with self.assertRaises(KeyboardInterrupt):
                 service.sync()
 
@@ -976,24 +813,17 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
             return real_release(mirror_fd, temp_name, identity)
 
         service._release_staging = counting_release  # type: ignore[method-assign]
-        tracking_open, failing_close, state = self._fail_staging_close_with(
-            RuntimeError("injected ordinary close failure")
+
+        schedule = FaultSchedule().track_descriptors()
+        schedule.raise_after_closing(
+            "staging", RuntimeError("injected ordinary close failure")
         )
+        schedule.raise_on("write", PrimaryWrite("injected write unwind"))
+        with schedule:
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                service.sync()
 
-        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise PrimaryWrite("injected write unwind")
-
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "close", failing_close
-            ):
-                with unittest.mock.patch.object(
-                    legacy_mirror_sync.os, "write", primary_write
-                ):
-                    with self.assertRaises(KeyboardInterrupt) as caught:
-                        service.sync()
-
-        self.assertTrue(state["fired"], "the close injection never fired")
+        self.assertTrue(schedule.close_fired, "the close injection never fired")
         self.assertIsInstance(
             caught.exception.__context__,
             PrimaryWrite,
@@ -1025,24 +855,15 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
             raise KeyboardInterrupt("injected first control flow")
 
         service._release_staging = interrupting_release  # type: ignore[method-assign]
-        tracking_open, failing_close, state = self._fail_staging_close_with(
-            SystemExit("injected second control flow")
-        )
 
-        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise PrimaryWrite("injected write unwind")
+        schedule = FaultSchedule().track_descriptors()
+        schedule.raise_after_closing("staging", SystemExit("injected second control flow"))
+        schedule.raise_on("write", PrimaryWrite("injected write unwind"))
+        with schedule:
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                service.sync()
 
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "close", failing_close
-            ):
-                with unittest.mock.patch.object(
-                    legacy_mirror_sync.os, "write", primary_write
-                ):
-                    with self.assertRaises(KeyboardInterrupt) as caught:
-                        service.sync()
-
-        self.assertTrue(state["fired"], "the close injection never fired")
+        self.assertTrue(schedule.close_fired, "the close injection never fired")
         primary = caught.exception.__context__
         self.assertIsInstance(primary, PrimaryWrite)
         notes = "\n".join(getattr(primary, "__notes__", []))
@@ -1076,30 +897,18 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
             return real_release(mirror_fd, temp_name, identity)
 
         service._release_staging = counting_release  # type: ignore[method-assign]
-        tracking_open, failing_close, state = self._fail_staging_close_with(
-            RuntimeError("injected ordinary close failure")
+
+        schedule = FaultSchedule().track_descriptors()
+        schedule.raise_after_closing(
+            "staging", RuntimeError("injected ordinary close failure")
         )
+        schedule.raise_on("write", PrimaryWrite("injected write unwind"))
+        schedule.raise_on("unlink", PermissionError(errno.EACCES, "injected"))
+        with schedule:
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                service.sync()
 
-        def primary_write(fd: int, data) -> int:  # type: ignore[no-untyped-def]
-            raise PrimaryWrite("injected write unwind")
-
-        def failing_unlink(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
-            raise PermissionError(errno.EACCES, "injected")
-
-        with unittest.mock.patch.object(legacy_mirror_sync.os, "open", tracking_open):
-            with unittest.mock.patch.object(
-                legacy_mirror_sync.os, "close", failing_close
-            ):
-                with unittest.mock.patch.object(
-                    legacy_mirror_sync.os, "write", primary_write
-                ):
-                    with unittest.mock.patch.object(
-                        legacy_mirror_sync.os, "unlink", failing_unlink
-                    ):
-                        with self.assertRaises(KeyboardInterrupt) as caught:
-                            service.sync()
-
-        self.assertTrue(state["fired"], "the close injection never fired")
+        self.assertTrue(schedule.close_fired, "the close injection never fired")
         primary = caught.exception.__context__
         self.assertIsInstance(primary, PrimaryWrite)
         self.assertEqual(1, len(calls), "the release did not run exactly once")
@@ -1142,12 +951,7 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
 
         service._release_staging = exploding_release  # type: ignore[method-assign]
 
-        def failing_replace(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
-            raise PermissionError(errno.EACCES, "injected")
-
-        with unittest.mock.patch.object(
-            legacy_mirror_sync.os, "replace", failing_replace
-        ):
+        with FaultSchedule().raise_on("replace", PermissionError(errno.EACCES, "injected")):
             with self.assertRaises(RuntimeError):
                 service.sync()
 
@@ -1162,12 +966,7 @@ class LegacyMirrorFaultInjectionTest(_MirrorTreeFixture):
         canonical = self._source(repo) / "workflow.md"
         canonical.write_text(canonical.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
 
-        def failing_replace(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
-            raise PermissionError(errno.EACCES, "injected")
-
-        with unittest.mock.patch.object(
-            legacy_mirror_sync.os, "replace", failing_replace
-        ):
+        with FaultSchedule().raise_on("replace", PermissionError(errno.EACCES, "injected")):
             code, out, err = self._service(repo).sync()
 
         self.assertEqual(1, code)
