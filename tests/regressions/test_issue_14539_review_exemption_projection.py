@@ -3704,25 +3704,61 @@ def _marker_token_holders(root):
         return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
 
     def exported_names(tree):
-        """What ``from M import *`` binds, as ``None`` (public names) or an explicit set.
+        """What ``from M import *`` binds: ``None`` (public names), a set, or ``"unknown"``.
 
-        ``"unknown"`` when ``__all__`` exists but is not a literal — the conservative reading,
-        since an inventory that cannot tell must over-detect rather than under-detect.
+        Only a module whose ``__all__`` is declared EXACTLY ONCE, at module level, as a literal
+        list/tuple of strings, is read as an exact set. Everything else is ``"unknown"`` and the
+        caller expands every bound name — the conservative direction, because an inventory that
+        cannot tell what crosses must over-detect.
+
+        Redmine #14539 review j#92477 finding 1: the previous version walked the whole tree and
+        returned on the FIRST ``ast.Assign`` it met, which is wrong three ways at once and each
+        way dropped a consumer Python would have bound —
+
+        - not scope-aware, so an ``__all__`` inside a nested function decided the module's
+          exports (and a module with no module-level ``__all__`` at all read as having one);
+        - first-wins, so ``__all__ = []`` followed by ``__all__ = ["RE"]`` read as empty;
+        - ``ast.Assign`` only, so ``__all__: list[str] = [...]`` was invisible and ``__all__ +=
+          [...]`` was not even noticed as a second declaration.
+
+        j#92470 and j#92471 both stated that a module reassigning ``__all__`` falls back to full
+        expansion. That was the intent and not the behaviour, so this is also the durable record
+        being made true.
         """
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign):
-                continue
-            if not any(
+        declarations = []
+        for node in tree.body:  # module level only — a nested __all__ binds nothing here
+            if isinstance(node, ast.Assign) and any(
                 isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets
             ):
-                continue
-            if isinstance(node.value, (ast.List, ast.Tuple)) and all(
-                isinstance(e, ast.Constant) and isinstance(e.value, str)
-                for e in node.value.elts
+                declarations.append(node.value)
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "__all__"
             ):
-                return frozenset(e.value for e in node.value.elts)
+                declarations.append(node.value)
+            elif (
+                isinstance(node, ast.AugAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "__all__"
+            ):
+                declarations.append(None)  # ``+=`` never yields an exact set on its own
+        if not declarations:
+            return None
+        if len(declarations) > 1:
             return "unknown"
-        return None
+        value = declarations[0]
+        if (
+            isinstance(value, (ast.List, ast.Tuple))
+            and value.elts
+            and all(
+                isinstance(e, ast.Constant) and isinstance(e.value, str) for e in value.elts
+            )
+        ):
+            return frozenset(e.value for e in value.elts)
+        if isinstance(value, (ast.List, ast.Tuple)) and not value.elts:
+            return frozenset()
+        return "unknown"
 
     own, owners, exports = {}, {}, {}
     for path, tree in trees.items():
@@ -4044,86 +4080,220 @@ class ReviewJ92374InventoryDetectionTests(unittest.TestCase):
 
     # -- the one hop, DERIVED rather than remembered (j#92455) ------------------------
 
-    def test_every_one_hop_binding_form_in_the_language_resolves(self):
-        """Generated from the grammar, not from a list of forms I thought of.
+    #: The grammar axes of the two statements that can bind a name from another module. The
+    #: cells are their PRODUCT, filtered by what the grammar actually admits — not a list of
+    #: forms someone thought of (Redmine #14539 review j#92477 finding 2). R28 claimed a
+    #: derivation and shipped five hand-written forms in a loop, which is the same remembered
+    #: enumeration R27 had already been caught by; looping over a list is not deriving it.
+    _FROM_AXES = {
+        "level": (0, 1, 2, 3),
+        "module_present": (True, False),
+        "target": ("symbol", "submodule", "star"),
+        "alias": (True, False),
+        "site": ("module", "init"),
+    }
+    _IMPORT_AXES = {"depth": (2, 3, 4), "alias": (True, False), "site": ("module", "init")}
 
-        R27 and R28 each claimed "every way of writing the one hop" and each enumerated the
-        forms that came to mind — R28's list missed a package ``__init__``'s relative import and
-        the wildcard, both ordinary Python. Only two statements can bind a name from another
-        module, ``import`` and ``from ... import``, so the cells are their grammar's axes:
-        statement kind x relative level x what is named (symbol / submodule / ``*``) x aliasing x
-        whether the consumer is a package ``__init__``. Every cell is built and asserted; a form
-        the language allows and this matrix omits is a hole in the derivation, not a forgotten
-        line.
-        """
-        owner = (
-            "import re\n"
-            'RE = re.compile(r"\\[mozyo:chan-a:(?P<body>[^\\]]*)\\]")\n'
-        )
-        base_tree = {
-            "__init__.py": "",
-            "pkg/__init__.py": "",
-            "pkg/sub/__init__.py": "",
-            "pkg/owner.py": owner,
-        }
+    @staticmethod
+    def _admits(level, module_present, target, alias, site):
+        """The grammar's own constraints, stated once."""
+        if level == 0 and not module_present:
+            return False  # `from  import x` is not a statement
+        if target == "star" and alias:
+            return False  # `from m import * as x` is not a statement
+        if level == 1 and site == "init" and not module_present and target in ("symbol", "star"):
+            return False  # the package would be importing from itself, which is not one hop
+        return True
 
-        def cell(consumer_path, statement, use):
-            modules = dict(base_tree)
-            modules[consumer_path] = f"{statement}\ndef read(n): return {use}.findall(n or '')\n"
-            holders = self._holders(modules, owner=False)
-            return holders.get(f"src/mozyo_bridge/{consumer_path}")
+    def _derive_one_hop_cells(self):
+        import itertools
 
-        # (consumer, level) -> the dotted prefix that reaches the owner's package
-        sites = [
-            ("consumer.py", 0, "mozyo_bridge.pkg"),          # regular module, absolute
-            ("pkg/consumer.py", 1, "."),                      # regular module, one level up
-            ("pkg/__init__.py", 1, "."),                      # the PACKAGE itself
-            ("pkg/sub/consumer.py", 2, ".."),                 # regular module, two levels
-            ("pkg/sub/__init__.py", 2, ".."),                 # a nested package
-        ]
-        checked = 0
-        for consumer, level, prefix in sites:
-            dots = prefix if level else prefix
-            for label, statement, use in (
-                # ImportFrom naming a SYMBOL, with and without `as`
-                ("symbol", f"from {dots}{'owner' if level else '.owner'} import RE", "RE"),
-                (
-                    "symbol as",
-                    f"from {dots}{'owner' if level else '.owner'} import RE as _p",
-                    "_p",
-                ),
-                # ImportFrom naming a SUBMODULE, then attribute access
-                (
-                    "submodule",
-                    f"from {dots if level else 'mozyo_bridge.pkg'} import owner",
-                    "owner.RE",
-                ),
-                (
-                    "submodule as",
-                    f"from {dots if level else 'mozyo_bridge.pkg'} import owner as _m",
-                    "_m.RE",
-                ),
-                # ImportFrom WILDCARD
-                ("wildcard", f"from {dots}{'owner' if level else '.owner'} import *", "RE"),
-            ):
-                with self.subTest(consumer=consumer, form=label):
-                    self.assertEqual(
-                        cell(consumer, statement, use),
-                        ["chan-a"],
-                        f"{label} from {consumer} did not resolve: {statement}",
-                    )
-                    checked += 1
-
-        # `import ...` cannot be relative, so its axes are dotted-vs-plain and aliasing.
-        for label, statement, use in (
-            ("import dotted", "import mozyo_bridge.pkg.owner", "mozyo_bridge.pkg.owner.RE"),
-            ("import dotted as", "import mozyo_bridge.pkg.owner as _o", "_o.RE"),
+        cells = []
+        for level, module_present, target, alias, site in itertools.product(
+            *(self._FROM_AXES[k] for k in
+              ("level", "module_present", "target", "alias", "site"))
         ):
-            with self.subTest(form=label):
-                self.assertEqual(cell("consumer.py", statement, use), ["chan-a"], statement)
-                checked += 1
+            if self._admits(level, module_present, target, alias, site):
+                cells.append(("from", level, module_present, target, alias, site))
+        for depth, alias, site in itertools.product(
+            *(self._IMPORT_AXES[k] for k in ("depth", "alias", "site"))
+        ):
+            # `import` is never relative and always names a module, so its only axes are how
+            # deep the dotted path is and whether it is aliased.
+            cells.append(("import", depth, True, "module", alias, site))
+        return cells
 
-        self.assertEqual(checked, 27, "the derived matrix changed size; re-derive it")
+    def _materialize(self, cells):
+        """One tree holding a consumer per cell; returns {consumer path: (cell, statement)}."""
+        pattern = (
+            'import re\n%s = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
+        )
+        files, expected = {"__init__.py": ""}, {}
+        for index, cell in enumerate(cells):
+            kind, first, module_present, target, alias, site = cell
+            pkg = f"c{index}"
+            consumer_is_package_init = kind == "from" and first == 1 and site == "init"
+            files[f"{pkg}/__init__.py"] = "" if consumer_is_package_init else pattern % "PKG_RE"
+            files[f"{pkg}/owner.py"] = pattern % "RE"
+            files[f"{pkg}/sub2/__init__.py"] = ""
+            files[f"{pkg}/sub2/inner.py"] = pattern % "RE"
+            if kind == "from":
+                level = first
+                nested = [f"d{k}" for k in range(1, level)] if level else (
+                    [] if site == "module" else ["s0"]
+                )
+                leaf = "consumer.py" if site == "module" else "__init__.py"
+                consumer = "/".join([pkg] + nested + [leaf])
+                for depth in range(1, len(nested) + 1):
+                    files.setdefault("/".join([pkg] + nested[:depth] + ["__init__.py"]), "")
+                dots = "." * level
+                suffix = " as _p" if alias else ""
+                if target == "symbol":
+                    statement = (
+                        f"from mozyo_bridge.{pkg}.owner import RE{suffix}" if level == 0
+                        else f"from {dots}owner import RE{suffix}" if module_present
+                        else f"from {dots} import PKG_RE{suffix}"
+                    )
+                    use = "_p" if alias else ("RE" if (level == 0 or module_present) else "PKG_RE")
+                elif target == "submodule":
+                    statement = (
+                        f"from mozyo_bridge.{pkg} import owner{suffix}" if level == 0
+                        else f"from {dots}sub2 import inner{suffix}" if module_present
+                        else f"from {dots} import owner{suffix}"
+                    )
+                    base = "_p" if alias else (
+                        "owner" if (level == 0 or not module_present) else "inner"
+                    )
+                    use = f"{base}.RE"
+                else:
+                    statement = (
+                        f"from mozyo_bridge.{pkg}.owner import *" if level == 0
+                        else f"from {dots}owner import *" if module_present
+                        else f"from {dots} import *"
+                    )
+                    use = "RE" if (level == 0 or module_present) else "PKG_RE"
+            else:
+                module = {
+                    2: f"mozyo_bridge.{pkg}",
+                    3: f"mozyo_bridge.{pkg}.owner",
+                    4: f"mozyo_bridge.{pkg}.sub2.inner",
+                }[first]
+                attribute = "PKG_RE" if first == 2 else "RE"
+                statement = f"import {module}" + (" as _o" if alias else "")
+                use = f"_o.{attribute}" if alias else f"{module}.{attribute}"
+                consumer = f"{pkg}/consumer.py" if site == "module" else f"{pkg}/s0/__init__.py"
+                files.setdefault(f"{pkg}/s0/__init__.py", "")
+            files[consumer] = f"{statement}\ndef read(n): return {use}.findall(n or '')\n"
+            expected[f"src/mozyo_bridge/{consumer}"] = (cell, statement)
+        return files, expected
+
+    def test_every_one_hop_binding_form_the_grammar_admits_resolves(self):
+        """The product of the axes, materialized and checked — every cell, not a chosen few."""
+        import pathlib
+        import tempfile
+
+        cells = self._derive_one_hop_cells()
+        files, expected = self._materialize(cells)
+        # No cell may be silently dropped on the way to being checked. This replaces the
+        # ``checked == 27`` magic count, which only ever proved "the 27 I picked ran".
+        self.assertEqual(
+            len(expected), len(cells), "a derived cell was not materialized into a consumer"
+        )
+        self.assertEqual(
+            {cell for cell, _statement in expected.values()},
+            set(cells),
+            "the materialized cells are not the derived cells",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "repo" / "src" / "mozyo_bridge"
+            root.mkdir(parents=True)
+            for name, text in files.items():
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            holders = _marker_token_holders(root)
+        undetected = {
+            path: statement
+            for path, (_cell, statement) in expected.items()
+            if "chan-a" not in (holders.get(path) or [])
+        }
+        self.assertEqual(
+            undetected,
+            {},
+            "these one-hop consumers hold a marker capability and left the inventory",
+        )
+
+    def test_the_derivation_covers_the_forms_earlier_rounds_missed(self):
+        """Guards the AXES themselves: narrowing them must not quietly shrink the matrix.
+
+        Each of these was a real escape found by review — ``ImportFrom(module=None)`` in both
+        its named and wildcard forms (j#92477), relative level 3 (j#92477), and an alias-less
+        deep dotted ``import`` (j#92477). They are asserted as members of the DERIVED set, so a
+        future edit that drops an axis value reddens here rather than silently narrowing.
+        """
+        cells = set(self._derive_one_hop_cells())
+        for label, cell in (
+            ("from . import NAME", ("from", 1, False, "symbol", False, "module")),
+            ("from . import *", ("from", 1, False, "star", False, "module")),
+            ("from ... import NAME (level 3)", ("from", 3, False, "symbol", False, "module")),
+            ("level 3 into a package __init__", ("from", 3, True, "symbol", False, "init")),
+            ("import a.b.c.d with no alias", ("import", 4, True, "module", False, "module")),
+        ):
+            with self.subTest(label):
+                self.assertIn(cell, cells)
+
+    def test_the_admissibility_predicate_rejects_only_non_statements(self):
+        """The filter must exclude what the grammar forbids — and nothing else."""
+        self.assertFalse(self._admits(0, False, "symbol", False, "module"))  # `from  import x`
+        self.assertFalse(self._admits(1, True, "star", True, "module"))  # `import * as x`
+        self.assertFalse(self._admits(1, False, "symbol", False, "init"))  # self-import
+        self.assertTrue(self._admits(1, False, "submodule", False, "init"))  # its own subpackage
+        self.assertTrue(self._admits(3, False, "star", False, "init"))
+
+
+    def test_the_all_reader_matches_what_python_would_export(self):
+        """R29-F1: the ``__all__`` reader was first-Assign and scope-blind.
+
+        Each owner below DOES export the name it is asked for, by Python's rules, so a consumer
+        wildcard-importing it holds the capability. The previous reader walked the whole tree and
+        returned on the first ``ast.Assign`` it met, so all four lost the consumer — and the two
+        reassignment cases contradicted j#92470 / j#92471, which had already stated that a
+        module reassigning ``__all__`` falls back to full expansion.
+        """
+        public = 'import re\nRE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
+        private = 'import re\n_RE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
+        for label, owner, used in (
+            ("reassigned", public + '__all__ = []\n__all__ = ["RE"]\n', "RE"),
+            ("augmented", public + '__all__ = []\n__all__ += ["RE"]\n', "RE"),
+            ("annotated", private + '__all__: list[str] = ["_RE"]\n', "_RE"),
+            (
+                "nested scope only",
+                public + "def f():\n    __all__ = []\n    return __all__\n",
+                "RE",
+            ),
+        ):
+            with self.subTest(label):
+                consumer = (
+                    "from mozyo_bridge.owner import *\n"
+                    f"def read(n): return {used}.findall(n or '')\n"
+                )
+                self.assertEqual(
+                    self._holders({"owner.py": owner, "c.py": consumer}, owner=False).get(
+                        "src/mozyo_bridge/c.py"
+                    ),
+                    ["chan-a"],
+                    f"{label}: Python exports {used!r} here, so the consumer holds it",
+                )
+
+    def test_an_empty_literal_all_exports_nothing(self):
+        """The boundary: an exact empty ``__all__`` is exact, not unreadable."""
+        owner = 'import re\nRE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n__all__ = []\n'
+        consumer = "from mozyo_bridge.owner import *\ndef read(n): return RE.findall(n or '')\n"
+        self.assertIsNone(
+            self._holders({"owner.py": owner, "c.py": consumer}, owner=False).get(
+                "src/mozyo_bridge/c.py"
+            )
+        )
 
     def test_a_wildcard_respects_what_the_owner_actually_exports(self):
         """Wildcards are expanded by Python's own rule, with the unclear case over-detecting."""
