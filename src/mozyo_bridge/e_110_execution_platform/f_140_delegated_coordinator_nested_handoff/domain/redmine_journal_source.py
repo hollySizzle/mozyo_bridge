@@ -50,6 +50,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
     MARKER_VALUE_FORBIDDEN_CHARS,
     MarkerValueError,
+    is_exact_str,
+    review_anchor_fields,
+    review_marker_fields,
     validate_marker_field_value,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
@@ -575,7 +578,14 @@ def _render_evidence_envelope(
     marker carrying ``workspace`` but no ``lane`` would read as unenveloped evidence while looking
     enveloped to a human. The values themselves go through the shared strict renderer
     (:func:`render_lane_envelope`), which refuses a non-positive generation, an empty identity, and
-    any value carrying a marker separator.
+    any value carrying a marker separator — RAW. Nothing is converted or trimmed on the way in
+    (Redmine #14694 review j#93646 findings 1-2): a ``str(...).strip()`` here bypassed the very
+    inputs that renderer exists to refuse, and an ``int(lane_generation)`` in front of it turned
+    ``1.5`` into generation ``1`` — evidence bound to a generation the caller never named, which is
+    the promotion across generations the whole envelope exists to prevent. There was no argv to
+    convert either: this function's only CLI path
+    (``review_gate_marker_fields.lane_envelope_marker_fields``) resolves the generation to an
+    ``int`` before calling, and ``render_gate_note`` declares it as one.
     """
     supplied = [v for v in (workspace, lane, lane_generation) if v is not None]
     if not supplied:
@@ -585,16 +595,8 @@ def _render_evidence_envelope(
             "the hibernate-evidence lane envelope is all-or-none: "
             "workspace, lane and lane_generation must be supplied together"
         )
-    try:
-        generation = int(lane_generation)
-    except (TypeError, ValueError):
-        raise ValueError(f"lane_generation must be an integer, got {lane_generation!r}") from None
     return render_lane_envelope(
-        LaneEvidenceEnvelope(
-            workspace=str(workspace).strip(),
-            lane=str(lane).strip(),
-            lane_generation=generation,
-        )
+        LaneEvidenceEnvelope(workspace=workspace, lane=lane, lane_generation=lane_generation)
     )
 
 
@@ -639,17 +641,15 @@ def render_workflow_event_marker(
     contract's authority; the agent-facing producer rule lives in the governed preset's
     ``### Review Generation Marker Contract v2``.
     """
-    gate_s = str(gate).strip()
-    if gate_s not in GATE_BEARING_KINDS:
+    # Every value is judged RAW (#14694 review j#93818 F1): the `str(...).strip()` this used to do
+    # rewrote `conclusion=" approved "` / `head=" <sha> "` / `req=" 93802 "` into clean canonical
+    # authority fields. The envelope's own rule governs this marker's fields too.
+    if not is_exact_str(gate) or gate not in GATE_BEARING_KINDS:
         raise ValueError(
-            f"render_workflow_event_marker gate must be one of {sorted(GATE_BEARING_KINDS)}, "
-            f"got {gate!r}"
+            f"render_workflow_event_marker gate must be one of {sorted(GATE_BEARING_KINDS)}, got {gate!r}"
         )
-    fields = [f"gate={gate_s}"]
-    if conclusion is not None:
-        fields.append(f"conclusion={str(conclusion).strip()}")
-    if callback is not None:
-        fields.append(f"callback={str(callback).strip()}")
+    fields = [f"gate={gate}"]
+    fields.extend(review_marker_fields(conclusion=conclusion, callback=callback))
     for key, value in (
         ("commit", commit_bearing),
         ("integrated", integration_recorded),
@@ -658,13 +658,11 @@ def render_workflow_event_marker(
     ):
         if value is not None:
             fields.append(f"{key}={'1' if value else '0'}")
-    # Redmine #13974 additive review-gate contract: the reviewed/requested head (``head``) and, on a
-    # review_result, the answered review_request journal (``req``). A git SHA is hex and a journal id
-    # numeric, so neither collides with the ``:``/``=`` marker grammar. Only emitted when supplied.
-    if target_head is not None:
-        fields.append(f"head={str(target_head).strip()}")
-    if review_request_journal is not None:
-        fields.append(f"req={str(review_request_journal).strip()}")
+    # Redmine #13974 additive review-gate contract: the reviewed/requested head and, on a
+    # review_result, the answered review_request journal. Only emitted when supplied.
+    fields.extend(review_anchor_fields(
+        target_head=target_head, review_request_journal=review_request_journal
+    ))
     # Redmine #14219 T2b: the common hibernate-evidence lane envelope
     # (``workspace``/``lane``/``lane_generation``). ADDITIVE and opt-in — a marker without it is
     # unchanged for the review generation fence / glance (which never read these keys), and simply

@@ -39,6 +39,7 @@ from .hibernate_evidence_envelope import (
     is_full_sha,
     parse_lane_envelope,
     render_lane_envelope,
+    require_marker_token,
 )
 from .hibernate_evidence_marker import MARKER_CHANNEL_WORKFLOW_EVENT
 from .sublane_admission import INTEGRATION_MERGE, INTEGRATION_PATCH_EQUIVALENT
@@ -62,6 +63,13 @@ INTEGRATION_NOT_INTEGRATED = "integration_not_integrated"
 INTEGRATION_EVIDENCE_ABSENT = "integration_evidence_absent"
 INTEGRATION_EVIDENCE_CONFLICT = "integration_evidence_conflict"
 
+#: Characters a PARSED branch ref may never contain, because the marker body is split on ``:`` and
+#: terminated by ``]`` — a value carrying either would silently truncate into a different field set.
+#: Read side only. The renderer asks the stricter raw question (:func:`require_marker_token`, which
+#: also refuses whitespace this tuple does not enumerate), which is the safe direction: a renderer
+#: may refuse what its parser would have accepted, never the reverse (Redmine #14694).
+_BRANCH_FORBIDDEN = MARKER_FORBIDDEN_CHARS
+
 INTEGRATION_EVIDENCE_REASONS = frozenset({
     INTEGRATION_MISSING_INTEGRATION_HEAD,
     INTEGRATION_MALFORMED_INTEGRATION_HEAD,
@@ -72,12 +80,6 @@ INTEGRATION_EVIDENCE_REASONS = frozenset({
     INTEGRATION_EVIDENCE_ABSENT,
     INTEGRATION_EVIDENCE_CONFLICT,
 })
-
-#: Characters a branch ref may never contain, because the marker body is split on ``:`` and
-#: terminated by ``]`` — a value carrying either would silently truncate into a different field set.
-#: The envelope's own rule (step 1) is the single definition; this alias keeps the two renderers
-#: from drifting apart.
-_BRANCH_FORBIDDEN = MARKER_FORBIDDEN_CHARS
 
 
 @dataclass(frozen=True)
@@ -124,16 +126,25 @@ def render_integration_evidence(
     exact staging commit; ``disposition`` must be one of :data:`INTEGRATED_DISPOSITIONS` in its
     canonical spelling. A producer programming error raises ``ValueError`` — an unrenderable
     evidence marker must never be emitted.
+
+    Each field is validated RAW through the surface's shared :func:`require_marker_token` (Redmine
+    #14694): the previous ``str(x or "").strip()`` normalized the caller's value before judging it,
+    so ``integration_branch=" main "`` was rendered as the canonical ``main`` — a value the caller
+    never wrote becoming the durable record of where the work landed.
     """
     if not envelope.head:
         raise ValueError("integration evidence requires a head-bearing envelope (the reviewed head)")
-    head = str(integration_head or "").strip()
+    head = require_marker_token(
+        integration_head, field=FIELD_INTEGRATION_HEAD, requirement="integration evidence"
+    )
     if not is_full_sha(head):
         raise ValueError(f"integration_head must be a full lowercase SHA, got {integration_head!r}")
-    branch = str(integration_branch or "").strip()
-    if not branch or any(bad in branch for bad in _BRANCH_FORBIDDEN):
-        raise ValueError(f"integration_branch must be a bare ref, got {integration_branch!r}")
-    token = str(disposition or "").strip()
+    branch = require_marker_token(
+        integration_branch, field=FIELD_INTEGRATION_BRANCH, requirement="integration evidence"
+    )
+    token = require_marker_token(
+        disposition, field=FIELD_DISPOSITION, requirement="integration evidence"
+    )
     if token not in INTEGRATED_DISPOSITIONS:
         raise ValueError(f"integration evidence disposition must be integrated, got {disposition!r}")
     fields = [

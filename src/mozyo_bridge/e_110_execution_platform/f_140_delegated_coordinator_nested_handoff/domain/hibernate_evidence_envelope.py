@@ -23,6 +23,13 @@ import re
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from .marker_value_contract import (
+    MAX_CANONICAL_DECIMAL_VALUE,
+    is_canonical_positive_decimal,
+    is_canonical_positive_int,
+    is_exact_str,
+)
+
 #: A canonical full commit hash: 40 hex (sha1) or 64 hex (sha256), lowercase. A truncated /
 #: abbreviated / uppercase / non-hex head is rejected, matching the repo-wide convention
 #: (``patch_equivalent_integration._FULL_SHA_RE`` / ``review_return_route``).
@@ -99,7 +106,10 @@ def parse_lane_envelope(
 ) -> "LaneEvidenceEnvelope | EnvelopeParseError":
     """Parse the common lane envelope from a marker's field mapping, fail-closed.
 
-    ``workspace`` / ``lane`` must be non-empty; ``lane_generation`` must be a POSITIVE integer.
+    ``workspace`` / ``lane`` must be non-empty; ``lane_generation`` must be a CANONICAL positive
+    decimal — the producer's own :func:`~.marker_value_contract.is_canonical_positive_decimal`, so
+    one ASCII-decimal authority answers for both halves of the contract and no token reaches
+    ``int()`` whose convertibility has not already been established.
     A ``head``, if present, must be a full 40/64-hex lowercase SHA — ALWAYS (a malformed head is
     rejected even for a non-head-bearing conjunct). ``require_head`` additionally requires the head
     to be present (a head-bearing conjunct with no head is :data:`ENVELOPE_MISSING_HEAD`).
@@ -114,7 +124,17 @@ def parse_lane_envelope(
     generation_raw = str(fields.get(FIELD_LANE_GENERATION, "") or "").strip()
     if not generation_raw:
         return EnvelopeParseError(ENVELOPE_MISSING_GENERATION)
-    if not generation_raw.isdigit() or int(generation_raw) <= 0:
+    # The producer's OWN question, so one ASCII-decimal authority answers for both sides of the
+    # contract (Redmine #14694 review j#94247). This asked `generation_raw.isdigit()` and then
+    # `int()`, and `str.isdigit()` is not "a number `int()` can read": measured, 128 characters are
+    # `isdigit()` and unconvertible — every one of them `isdigit() and not isdecimal()` — so
+    # `lane_generation=²` came off the strict reader and RAISED `ValueError` out of a parser whose
+    # whole contract is a typed zero. Keeping the wider acceptance was argued as "refusing to write
+    # more than you refuse to read", but that argument needed a legacy token this leniency was
+    # protecting, and there is none: a canonical producer only ever wrote a positive int. The same
+    # hazard was already ruled on in this repository — see `core.state.lane_lifecycle_model`, whose
+    # `_positive_decimal` refuses on an ASCII set and deliberately never calls `int()`.
+    if not is_canonical_positive_decimal(generation_raw):
         return EnvelopeParseError(ENVELOPE_MALFORMED_GENERATION, generation_raw)
     generation = int(generation_raw)
 
@@ -129,12 +149,32 @@ def parse_lane_envelope(
     )
 
 
-#: Characters no marker-field VALUE may contain: the body is split on ``:``, delimited by ``[``
-#: / ``]``, and whitespace ends a token. A value carrying one would silently split into a bogus
-#: extra field or truncate the marker — field injection from a producer-supplied id. One tuple for
-#: the whole hibernate-evidence surface (the integration branch check reads it too) so the rule
-#: cannot drift apart between renderers.
+#: The PUNCTUATION no marker-field VALUE may contain: the body is split on ``:`` and delimited by
+#: ``[`` / ``]``. A value carrying one would silently split into a bogus extra field or truncate
+#: the marker — field injection from a producer-supplied id. Whitespace is forbidden too but is
+#: NOT enumerated here (see :func:`contains_marker_separator`): the space / tab pair this tuple
+#: used to carry was an incomplete enumeration of "空白" and let a newline through (Redmine #14694).
 MARKER_FORBIDDEN_CHARS = (":", "]", "[", " ", "\t")
+
+
+def contains_marker_separator(value: object) -> bool:
+    """Whether ``value`` carries marker punctuation or ANY whitespace (pure).
+
+    THE one predicate for the whole hibernate-evidence surface — the envelope's workspace / lane,
+    the marker's kind-specific fields, the integration branch, and the CLI's own typed refusal —
+    so "which characters a producer-supplied token may not carry" cannot drift apart between them.
+
+    Whitespace is asked as ``str.isspace()`` rather than matched against a literal tuple. The
+    central `### Hibernate Evidence Marker Contract` forbids "marker separator (``:`` ``]`` ``[``
+    空白)", and 空白 is not two characters: markers are scanned PER LINE, so a value carrying a
+    newline is rendered into a marker that never closes on its line and reads back as nothing at
+    all. Enumerating space and tab (Redmine #14694) let ``\\n`` / ``\\r`` / ``\\xa0`` through — a
+    value the strip-then-check order then hid entirely when the whitespace was leading or trailing.
+    """
+    text = str(value)
+    return any(bad in text for bad in MARKER_FORBIDDEN_CHARS) or any(
+        char.isspace() for char in text
+    )
 
 
 def reject_marker_separator(value: str, *, field: str) -> None:
@@ -142,11 +182,46 @@ def reject_marker_separator(value: str, *, field: str) -> None:
 
     One rule for every producer-supplied token — the envelope's workspace / lane and the
     integration marker's branch — so a value that would truncate or inject a field can never be
-    rendered from any of them.
+    rendered from any of them. The membership question is :func:`contains_marker_separator`; this
+    only names the offending character in the producer error.
     """
+    text = str(value)
     for separator in MARKER_FORBIDDEN_CHARS:
-        if separator in str(value):
+        if separator in text:
             raise ValueError(f"{field} must not contain the marker separator {separator!r}")
+    for char in text:
+        if char.isspace():
+            raise ValueError(f"{field} must not contain the whitespace character {char!r}")
+
+
+def require_marker_token(value: object, *, field: str, requirement: str) -> str:
+    """The RAW value as a marker token, or a producer error (pure).
+
+    THE raw-input validator every hibernate-evidence renderer shares. It validates what the caller
+    ACTUALLY passed — it never trims it, never coerces it, and never substitutes a default:
+
+    - a non-``str`` is a producer error, not something to render through ``str()``. ``run=12345``
+      and ``run=True`` are not run ids the caller can read back out of the marker, and ``None`` /
+      ``0`` are not "absent" — falsy-to-empty coercion turned a wrong TYPE into a wrong VALUE;
+    - the emptiness test is on the raw value, so a whitespace-only token is empty-after-trim to
+      nobody: it reaches the separator check and is refused as what it is;
+    - marker punctuation and whitespace are refused on the raw value.
+
+    Redmine #14694: the previous ``str(value or "").strip()`` did all three of those wrong at once,
+    and its worst reading was the ordinary one — ``workflow=" check "`` was trimmed into the clean
+    canonical token ``check`` and became durable auto-hibernate authority. A producer that
+    normalizes raw input into a value the caller did not write is asserting something nobody
+    claimed; the central `### Hibernate Evidence Marker Contract` requires the producer error to
+    surface at write time instead.
+    """
+    if not is_exact_str(value):
+        raise ValueError(
+            f"{requirement} requires a builtin string {field}, got {type(value).__name__} {value!r}"
+        )
+    if not value:
+        raise ValueError(f"{requirement} requires a {field}")
+    reject_marker_separator(value, field=field)
+    return value
 
 
 def render_lane_envelope(envelope: LaneEvidenceEnvelope) -> str:
@@ -158,21 +233,42 @@ def render_lane_envelope(envelope: LaneEvidenceEnvelope) -> str:
     refuses is not a strict grammar: it produces records that read back as a typed zero (so the
     evidence silently does not count) or, worse, splits a separator-carrying id into an extra field.
     The producer's programming error must surface at write time, not as unreadable durable evidence.
+
+    Every identity is validated RAW, through :func:`require_marker_token` (Redmine #14694). The
+    previous ``str(x or "").strip()`` normalized before it judged, so ``workspace=" ws "`` became
+    the canonical ``ws`` — the caller's raw value silently replaced by a different one — and a
+    non-``str`` identity was rendered through ``str()``. ``lane_generation`` was already raw-typed
+    (a positive ``int``, and ``bool`` is not one); the string fields now hold the same line.
     """
-    workspace = str(envelope.workspace or "").strip()
-    if not workspace:
-        raise ValueError("lane envelope requires a workspace")
-    reject_marker_separator(workspace, field=FIELD_WORKSPACE)
-    lane = str(envelope.lane or "").strip()
-    if not lane:
-        raise ValueError("lane envelope requires a lane")
-    reject_marker_separator(lane, field=FIELD_LANE)
+    workspace = require_marker_token(
+        envelope.workspace, field=FIELD_WORKSPACE, requirement="lane envelope"
+    )
+    lane = require_marker_token(envelope.lane, field=FIELD_LANE, requirement="lane envelope")
     generation = envelope.lane_generation
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
-        raise ValueError(f"lane envelope requires a positive lane_generation, got {generation!r}")
-    head = str(envelope.head or "").strip()
-    if head and not is_full_sha(head):
-        raise ValueError("lane envelope head must be a full lowercase commit SHA")
+    # EXACT builtins, not `isinstance` (review j#94038 blocker 2): every field below is rendered
+    # with an f-string, so a `str` / `int` subclass overriding `__format__` decides the durable
+    # bytes. Measured: such a subclass validated as `ws` rendered `workspace=evil:lane=forged`, and
+    # one validated as generation `3` rendered `lane_generation=9:head=forged`.
+    # ...and the SAME protocol bound the string side applies, reached through the other type
+    # (self-detected while reproducing review j#94222). `is_exact_int` plus `> 0` let a generation
+    # of `10**5000` through to the f-string below, which either raised `ValueError` — a producer's
+    # programming error arriving as an untyped exception — or, in an uncapped process, rendered a
+    # 5001-digit `lane_generation` that no capped consumer could parse.
+    if not is_canonical_positive_int(generation):
+        raise ValueError(
+            f"lane envelope requires a positive lane_generation no wider than "
+            f"{MAX_CANONICAL_DECIMAL_VALUE}, got {generation!r}"
+        )
+    head = envelope.head
+    if not is_exact_str(head):
+        raise ValueError(f"lane envelope head must be a builtin string, got {head!r}")
+    if head:
+        # Absent is ``""`` and nothing else: ``None`` is a producer error, not "no head".
+        require_marker_token(head, field=FIELD_HEAD, requirement="lane envelope")
+        # No whitespace survived the token check, so this reads the raw head (``is_full_sha``
+        # strips for the PARSE side, where the field has already been split out of the body).
+        if not is_full_sha(head):
+            raise ValueError("lane envelope head must be a full lowercase commit SHA")
 
     parts = [
         f"{FIELD_WORKSPACE}={workspace}",

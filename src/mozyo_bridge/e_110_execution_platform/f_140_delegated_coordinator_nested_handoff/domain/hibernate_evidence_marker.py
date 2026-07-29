@@ -33,12 +33,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from .marker_value_contract import is_exact_str
 from .hibernate_evidence_envelope import (
     EnvelopeParseError,
     LaneEvidenceEnvelope,
     parse_lane_envelope,
-    reject_marker_separator,
     render_lane_envelope,
+    require_marker_token,
 )
 
 # Evidence kinds (closed vocabulary). Each doubles as the marker ``gate=`` value.
@@ -108,35 +109,105 @@ class EvidenceParseError:
     detail: str = ""
 
 
+class _Unsupplied:
+    """The type of :data:`_UNSUPPLIED` — a value no caller can construct or pass by accident."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostic only
+        return "<unsupplied>"
+
+
+#: What a kind-specific producer parameter holds when the caller did not pass it. It is a dedicated
+#: sentinel, not ``""`` (Redmine #14694 review j#93646 finding 3): spelling absence as the empty
+#: string made "the caller passed nothing" and "the caller passed an empty value" the same input,
+#: so ``park(run="")`` and ``dogfood(workflow="")`` were dropped instead of refused — the very
+#: silent-drop this producer's rule forbids, reintroduced by the rule's own implementation. Only
+#: ``CI(run="")`` happened to be refused, and only because CI requires a run.
+_UNSUPPLIED = _Unsupplied()
+
+#: The kind-specific fields each kind's marker CARRIES, in marker order. A field absent from a
+#: kind's tuple is one that kind's marker cannot express, so supplying it is a producer error
+#: rather than something to drop (see :func:`render_hibernate_evidence`).
+_KIND_FIELDS = {
+    EVIDENCE_REQUIRED_CI_GREEN: (FIELD_WORKFLOW, FIELD_RUN, FIELD_CONCLUSION),
+    EVIDENCE_DOGFOOD_DELEGATED: (FIELD_RELEASE_ISSUE, FIELD_ACCEPTANCE),
+    EVIDENCE_PARK_DECLARED: (),
+}
+
+
 def _required(value: object, *, kind: str, field: str) -> str:
-    """The stripped value, or a producer error — and never one carrying a marker separator."""
-    text = str(value or "").strip()
-    if not text:
-        raise ValueError(f"{kind} evidence requires a {field}")
-    reject_marker_separator(text, field=field)
-    return text
+    """The RAW value, or a producer error — never trimmed, coerced, or separator-bearing.
+
+    Redmine #14694: this used to be ``str(value or "").strip()``, which normalized the caller's
+    raw input into a clean canonical token before judging it — ``workflow=" check "`` /
+    ``run=" run "`` became the durable authority ``workflow=check`` / ``run=run``, and ``run=12345``
+    became the string ``"12345"``. The shared raw validator is the whole implementation now, so the
+    marker's kind-specific fields and the envelope's identities cannot drift apart.
+    """
+    return require_marker_token(value, field=field, requirement=f"{kind} evidence")
 
 
 def render_hibernate_evidence(
     kind: str,
     *,
     envelope: LaneEvidenceEnvelope,
-    run: str = "",
-    workflow: str = "",
-    conclusion: str = "",
-    release_issue: str = "",
-    acceptance: str = "",
+    run: object = _UNSUPPLIED,
+    workflow: object = _UNSUPPLIED,
+    conclusion: object = _UNSUPPLIED,
+    release_issue: object = _UNSUPPLIED,
+    acceptance: object = _UNSUPPLIED,
 ) -> str:
     """Render a ``[mozyo:workflow-event:gate=<kind>:<envelope>:<extra>]`` marker, fail-closed.
 
     Validates the kind, the head requirement (head-bearing kinds need a non-empty envelope head),
     and the kind-specific fields; raises ``ValueError`` on a producer programming error (an
     unrenderable evidence marker must never be emitted).
+
+    ONE rule covers every supplied value, whatever the kind (Redmine #14694): **what the caller
+    supplies must appear in the marker, or the producer refuses.** The defect was a producer that
+    quietly wrote something else, and it had two shapes, so a fix that closed only the first would
+    leave the second wearing the same disguise:
+
+    - a value the marker DOES carry, rewritten — ``workflow=" check "`` trimmed to ``check``;
+    - a value the marker does NOT carry, dropped — ``render_hibernate_evidence(park, run="123")``
+      rendered a park marker with no run in it, and ``conclusion="failure"`` on a CI marker was
+      rendered as ``conclusion=success``. The caller asserted something; the durable record says
+      nothing, or says the opposite.
+
+    So a field this kind's marker cannot express is refused, and the one field whose value the
+    producer states rather than echoes (``conclusion``, always ``success``) may only be restated.
+    "Supplied" is asked as ``is _UNSUPPLIED``, an identity test against a sentinel no caller can
+    pass: an explicit ``run=""`` is a value the caller wrote, and refusing it is the same rule, not
+    an extra one.
     """
-    if kind not in HIBERNATE_EVIDENCE_KINDS:
+    # EXACT builtin, not just membership (review j#94038 blocker 2, swept to this field): `kind` is
+    # f-string'd into `gate=`, so a `str` subclass equal to a real kind passed the closed vocabulary
+    # and rendered `gate=evil:head=forged` — field injection into the gate field itself.
+    if not is_exact_str(kind) or kind not in HIBERNATE_EVIDENCE_KINDS:
         raise ValueError(f"unknown hibernate evidence kind {kind!r}")
     if kind in _HEAD_BEARING_EVIDENCE and not envelope.head:
         raise ValueError(f"{kind} evidence requires a head-bearing envelope")
+
+    carried = _KIND_FIELDS[kind]
+    for field, value in (
+        (FIELD_WORKFLOW, workflow),
+        (FIELD_RUN, run),
+        (FIELD_CONCLUSION, conclusion),
+        (FIELD_RELEASE_ISSUE, release_issue),
+        (FIELD_ACCEPTANCE, acceptance),
+    ):
+        if value is _UNSUPPLIED:
+            continue
+        if field not in carried:
+            raise ValueError(f"{kind} evidence does not carry a {field}")
+        _required(value, kind=kind, field=field)
+    if conclusion is not _UNSUPPLIED and conclusion != _CI_CONCLUSION_SUCCESS:
+        raise ValueError(
+            f"hibernate evidence renders {FIELD_CONCLUSION}={_CI_CONCLUSION_SUCCESS} only, "
+            f"got {conclusion!r}"
+        )
+
     fields = [f"gate={kind}", render_lane_envelope(envelope)]
     if kind == EVIDENCE_REQUIRED_CI_GREEN:
         fields.append(f"{FIELD_WORKFLOW}={_required(workflow, kind=kind, field=FIELD_WORKFLOW)}")

@@ -117,6 +117,21 @@ def _res(conclusion="approved", head=None, req=None):
     )
 
 
+def _handwritten_marker(**fields):
+    """A marker body written LITERALLY, for fixtures the canonical producer cannot emit.
+
+    The fence's whole subject is what the consumer does with a marker it should never have been
+    given — a non-full head, an out-of-vocabulary conclusion. Those used to be built by calling the
+    canonical renderer, which then accepted them; since Redmine #14694 review j#93818 finding 1 the
+    renderer refuses raw-invalid review evidence, so a fixture that needs one has to write it by
+    hand. That is the honest shape for these tests either way: a marker the producer would refuse
+    is, by definition, not producer output, and building it through the producer quietly asserted
+    the opposite.
+    """
+    body = ":".join(f"{key}={value}" for key, value in fields.items())
+    return f"[mozyo:workflow-event:{body}]"
+
+
 def _old_round_source(*extra):
     """OLD generation round: review_request j10 -> review_result j20 (still the newest review marker)."""
     return MappingRedmineJournalSource(
@@ -462,7 +477,11 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self._own_and_lease(wsid)
         transport = _CapturingTransport()
         bad = MappingRedmineJournalSource(
-            payload=_journals(("110", _req("deadbeef")), ("120", _res(head="deadbeef", req="110")))
+            payload=_journals(
+                ("110", _handwritten_marker(gate="review_request", head="deadbeef")),
+                ("120", _handwritten_marker(
+                    gate="review_result", conclusion="approved", head="deadbeef", req="110")),
+            )
         )
         supervisor = self._build_supervisor(wsid=wsid, source=bad, transport=transport, anchor=ANCHOR)
         report = supervisor.run_once()
@@ -661,7 +680,11 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         self._own_and_lease(wsid)
         self._enqueue_via_unfenced_discovery(
             MappingRedmineJournalSource(
-                payload=_journals(("110", _req("deadbeef")), ("120", _res(head="deadbeef", req="110")))
+                payload=_journals(
+                ("110", _handwritten_marker(gate="review_request", head="deadbeef")),
+                ("120", _handwritten_marker(
+                    gate="review_result", conclusion="approved", head="deadbeef", req="110")),
+            )
             ),
             wsid,
         )
@@ -851,7 +874,11 @@ class ReviewReturnGenerationFenceScenarioTest(unittest.TestCase):
         malformed_newer = MappingRedmineJournalSource(payload=_journals(
             ("110", _req(CUR_HEAD)),
             ("120", _res(head=CUR_HEAD, req="110", conclusion="approved")),
-            ("130", _res(head=CUR_HEAD, req="110", conclusion="bogus")),  # newer, out-of-vocab
+            # Handwritten: an out-of-vocabulary conclusion is exactly what the canonical
+            # producer refuses to render (#14694 review j#93818 F1), and this fixture needs
+            # the marker a NON-canonical writer would leave in the journal.
+            ("130", _handwritten_marker(
+                gate="review_result", conclusion="bogus", head=CUR_HEAD, req="110")),
         ))
         _wsid, report = self._supervise_current(malformed_newer)
         self.assertEqual(self._transport.calls, [])
