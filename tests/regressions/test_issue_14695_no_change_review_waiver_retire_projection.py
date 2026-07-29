@@ -896,23 +896,73 @@ class CloseFamilyProjectionTest(unittest.TestCase):
         _, closed_state = self._state(journals, issue_open=False)
         self.assertEqual(closed_state, LANE_STATE_BLOCKED)
 
-    def test_every_close_family_gate_carries_the_suppression(self):
-        """Derived from the gate set itself, so a gate added to the family cannot miss it."""
+    def test_every_gate_kind_is_classified_for_an_unsupported_waiver(self):
+        """Derived from GATE_KINDS, so a gate added anywhere lands here unclassified.
+
+        Review j#93879 finding 3: the previous version asserted `_CLOSE_FAMILY_GATES` equalled a
+        literal and then looped THAT SAME SET, so a gate added to the classifier but forgotten in
+        the family set kept the suite green — while the comment and the Implementation Done both
+        promised the omission would be caught. The population must come from somewhere the new
+        gate necessarily appears.
+
+        `GATE_KINDS` is that independent source. Every member is pinned here, so adding one fails
+        this test until its behaviour under an unsupported waiver is decided deliberately.
+        """
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
             _CLOSE_FAMILY_GATES,
+            GATE_KINDS,
             LaneSignal,
         )
 
-        self.assertEqual(_CLOSE_FAMILY_GATES, frozenset({"owner_close_approval", "close"}))
-        for gate in sorted(_CLOSE_FAMILY_GATES):
+        # The close family blocks; every other gate keeps the state its own rule already gives it,
+        # because an unsupported waiver must not silently change an unrelated projection.
+        expected = {
+            "owner_close_approval": LANE_STATE_BLOCKED,
+            "close": LANE_STATE_BLOCKED,
+            "start": "implementing",
+            "progress": "implementing",
+            "implementation_done": LANE_STATE_REVIEW_WAITING,
+            "review_request": LANE_STATE_REVIEW_WAITING,
+            "review": LANE_STATE_REVIEW_WAITING,
+            "blocked": LANE_STATE_BLOCKED,
+            "none": "idle",
+        }
+        self.assertEqual(
+            sorted(expected), sorted(GATE_KINDS),
+            "a gate kind was added or removed; classify it under an unsupported waiver here "
+            "before this suite can pass",
+        )
+        self.assertTrue(_CLOSE_FAMILY_GATES <= set(GATE_KINDS))
+        for gate, want in sorted(expected.items()):
             with self.subTest(gate=gate):
                 signal = LaneSignal(issue=ISSUE, latest_gate=gate, issue_open=True,
                                     review_waiver_unsupported=True)
-                self.assertEqual(classify_lane_state(signal), LANE_STATE_BLOCKED)
-                # …and the same signal without the unsupported waiver is NOT blocked, so the
-                # assertion above is about the waiver rather than about the gate.
-                clean = LaneSignal(issue=ISSUE, latest_gate=gate, issue_open=True)
-                self.assertNotEqual(classify_lane_state(clean), LANE_STATE_BLOCKED)
+                self.assertEqual(classify_lane_state(signal), want)
+
+    def test_the_close_family_is_exactly_what_blocks_that_would_not_otherwise(self):
+        """The other half: which gates the waiver actually CHANGES.
+
+        Without this, the table above would still pass if the suppression stopped working and
+        every gate happened to reach its expected state by another route.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
+            _CLOSE_FAMILY_GATES,
+            GATE_KINDS,
+            LaneSignal,
+        )
+
+        changed = set()
+        for gate in sorted(GATE_KINDS):
+            clean = classify_lane_state(
+                LaneSignal(issue=ISSUE, latest_gate=gate, issue_open=True)
+            )
+            waived = classify_lane_state(
+                LaneSignal(issue=ISSUE, latest_gate=gate, issue_open=True,
+                           review_waiver_unsupported=True)
+            )
+            if clean != waived:
+                changed.add(gate)
+        self.assertEqual(changed, set(_CLOSE_FAMILY_GATES))
 
     def test_an_approved_review_returns_the_lane_to_the_no_waiver_projection(self):
         """Finding 2: a superseded waiver must stop influencing the ordinary review route."""
@@ -925,20 +975,51 @@ class CloseFamilyProjectionTest(unittest.TestCase):
         self.assertEqual(state, control)
         self.assertEqual(state, LANE_STATE_RETIRE_READY)
 
-    def test_a_changes_requested_review_also_matches_its_own_control(self):
-        """The distinguishing case, pinned to what it MEASURES rather than to an expectation.
+    def test_an_unresolved_review_is_zero_close_zero_retire(self):
+        """The design ruling on j#93875, and the correction of what R7 pinned.
 
-        A closed lane whose last review requested changes projects ``retire_ready`` — with a
-        waiver and without one alike. That is pre-existing general behaviour (the close gate is
-        latest, and the F10 open-round suppression is per-journal), not something a waiver causes.
-        The property this issue owes is that the waiver does not CHANGE it; making the waiver case
-        differ would reintroduce exactly the poisoning finding 2 objected to.
+        R7 asserted only that the waiver and no-waiver records AGREED, and both said
+        ``retire_ready`` — pinning a terminal the issue's Acceptance forbids ("pending
+        callback/review では zero-close・zero-retire"). I had argued the control's behaviour put it
+        out of scope; the ruling holds that a defect in the control does not void an explicit
+        Acceptance, and that keeping normal review-round state after Close is part of preserving
+        the ordinary review fence.
+
+        A Close journal arriving after an unresolved review does not resolve the review, so the
+        lane reads as the audit it still owes — with a waiver and without one alike.
         """
-        _, state = self._state(
-            self._closed_lane("要修正", with_waiver=True), issue_open=False
-        )
-        _, control = self._state(self._closed_lane("要修正", with_waiver=False), issue_open=False)
-        self.assertEqual(state, control)
+        for with_waiver in (True, False):
+            with self.subTest(with_waiver=with_waiver):
+                facts, state = self._state(
+                    self._closed_lane("要修正", with_waiver=with_waiver), issue_open=False
+                )
+                self.assertTrue(facts.review_round_unresolved)
+                self.assertNotEqual(state, LANE_STATE_RETIRE_READY)
+                self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
+
+    def test_an_unanswered_review_request_is_also_unresolved(self):
+        # The other unresolved shape: a request nothing ever answered, then a Close.
+        journals = [
+            ("100", "## Gate: start"),
+            ("200", CARVE_OUT_CLEARED),
+            ("300", "## Gate: review request"),
+            ("400", "## Gate: close"),
+        ]
+        facts, state = self._state(journals, issue_open=False)
+        self.assertTrue(facts.review_round_unresolved)
+        self.assertEqual(state, LANE_STATE_REVIEW_WAITING)
+
+    def test_the_two_terminals_are_distinguished_not_merely_equal(self):
+        """approved vs changes_requested must reach DIFFERENT terminals (the ruling's core).
+
+        R7's failure was asserting parity without asserting the terminals themselves, so both
+        being wrong still passed.
+        """
+        _, approved = self._state(self._closed_lane("承認", with_waiver=True), issue_open=False)
+        _, changes = self._state(self._closed_lane("要修正", with_waiver=True), issue_open=False)
+        self.assertEqual(approved, LANE_STATE_RETIRE_READY)
+        self.assertEqual(changes, LANE_STATE_REVIEW_WAITING)
+        self.assertNotEqual(approved, changes)
 
     def test_a_waiver_with_nothing_newer_still_blocks(self):
         """The negative control for both: an UNsuperseded waiver is still refused."""

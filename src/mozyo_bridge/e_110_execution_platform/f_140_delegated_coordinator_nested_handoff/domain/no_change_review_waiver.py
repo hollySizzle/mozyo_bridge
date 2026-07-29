@@ -418,6 +418,29 @@ def waiver_unsuperseded(
     return waiver.in_force and not review_round_supersedes(waiver.journal, round_journal_ids)
 
 
+def waiver_declaration_current(
+    waiver: NoChangeWaiverFacts, round_journal_ids: Sequence[int]
+) -> bool:
+    """Whether a waiver DECLARATION — valid or not — is current and unsuperseded (pure).
+
+    The declaration-ordering fact, kept separate from :func:`waiver_unsuperseded` because those
+    are different questions and merging them lost one (review j#93879 finding 2).
+    :func:`waiver_unsuperseded` asks "is a VALID waiver standing", so it requires ``in_force``;
+    feeding it an INVALID declaration answers False, which reads as "nothing to worry about" —
+    and a current malformed waiver therefore sailed through the glance to ``close_waiting`` while
+    the terminal route refused the same record.
+
+    Ordering is about whether a declaration EXISTS and whether anything newer supersedes it, never
+    about whether it parses. That is the same supersede-by-EXISTING rule this module applies to the
+    waiver fold itself (#14539 j#92012 F1); it simply was not applied here.
+
+    So: a recorded declaration in ANY state, with no newer review round after it, is current.
+    """
+    if not waiver.recorded:
+        return False
+    return not review_round_supersedes(waiver.journal, round_journal_ids)
+
+
 def waived_now(
     waiver: NoChangeWaiverFacts,
     zero_change: "ZeroChangeFacts",
@@ -901,5 +924,6 @@ __all__ = (
     "render_no_change_review_waiver_marker",
     "review_round_supersedes",
     "waived_now",
+    "waiver_declaration_current",
     "waiver_unsuperseded",
 )

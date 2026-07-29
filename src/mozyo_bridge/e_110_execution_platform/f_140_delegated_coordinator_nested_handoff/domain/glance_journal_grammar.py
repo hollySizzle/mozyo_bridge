@@ -108,12 +108,18 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     fold_integration_disposition,
     fold_work_unit,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_round_state import (
+    REVIEW_ROUND_GATES as _REVIEW_ROUND_GATES,
+    is_open_review_round as _is_open_review_round,
+    review_round_state as _review_round_state,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_review_waiver import (
     NoChangeWaiverFacts,
     ZeroChangeFacts,
     fold_no_change_review_waiver,
     fold_zero_change_record,
     waived_now,
+    waiver_declaration_current,
     waiver_unsuperseded,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_exemption import (
@@ -705,6 +711,9 @@ class GateFacts:
     #: that CARRY a waiver: a closed no-commit lane without one projects ``retire_ready`` today
     #: (measured control) and changing that is a different issue's call.
     review_waiver_unsupported: bool = False
+    #: The NEWEST review round is unresolved and STAYS so past a later Close (#14695 j#93879 F1):
+    #: pending review means zero-close / zero-retire, and a Close is not a review resolution.
+    review_round_unresolved: bool = False
 
 
 @dataclass(frozen=True)
@@ -733,13 +742,6 @@ class _RecognizedJournal:
         return self.gates or frozenset({self.gate})
 
 
-#: The recognized gates that constitute an OPEN review round. A round is an explicit request for
-#: an independent review, so an exemption recorded BEFORE it does not close it (Redmine #14539).
-#: ``implementation_done`` is deliberately absent: it states that implementation finished, not
-#: that a review was requested — whether a review is owed on it is exactly what the exemption
-#: policy decides, so its ordering against the exemption journal is irrelevant.
-_REVIEW_ROUND_GATES: frozenset[str] = frozenset({GATE_REVIEW_REQUEST, GATE_REVIEW})
-
 #: The recognized gates whose journal, when it declares a commit, ANNOUNCES A NEW TARGET COMMIT as
 #: an implementation result — so it declares a change scope even when it omits ``changed_paths``
 #: (Redmine #14539 review j#90289 R3-F1). ``close`` / ``owner_close_approval`` are deliberately
@@ -749,28 +751,6 @@ _REVIEW_ROUND_GATES: frozenset[str] = frozenset({GATE_REVIEW_REQUEST, GATE_REVIE
 _CHANGE_BEARING_GATES: frozenset[str] = frozenset(
     {GATE_IMPLEMENTATION_DONE, GATE_REVIEW_REQUEST}
 )
-
-
-def _is_open_review_round(gates: "frozenset | set", conclusion: str) -> bool:
-    """Whether this journal's gates constitute an OPEN review round (pure).
-
-    A ``review_request`` is always open — it asks for a review that has not answered yet. A
-    ``review`` is open unless it CONCLUDED approved; ``pending`` (an unreadable / absent 結論) and
-    ``changes_requested`` both leave the round owed, and ``pending`` in particular must count as
-    open because it is the fail-closed read of a review whose conclusion could not be established.
-    """
-    if GATE_REVIEW_REQUEST in gates:
-        return True
-    return GATE_REVIEW in gates and conclusion != REVIEW_APPROVED
-
-
-def _review_round_ids(recognized: Sequence["_RecognizedJournal"]) -> list:
-    """The journal ids of every recognized review-round journal (pure).
-
-    EVERY recognized gate, not the max-precedence reduction: ``Review Request + Close`` IS a round
-    and reducing it to ``close`` hid it (#14539 review j#91577 F1).
-    """
-    return [r.journal_id for r in recognized if r.gates_or_gate & _REVIEW_ROUND_GATES]
 
 
 def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[GateFacts]:
@@ -908,7 +888,7 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
     latest = max(recognized, key=lambda r: r.journal_id)
     # Computed ONCE and shared by both derived waiver facts: two calls would be two chances for
     # the round vocabulary to be filtered differently.
-    round_ids = _review_round_ids(recognized)
+    round_ids, round_unresolved = _review_round_state(recognized)
     # Computed once: the derived fact and its negation-for-declared-waivers must agree.
     waived = waived_now(review_waiver, zero_change, round_ids)
     return GateFacts(
@@ -927,12 +907,17 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         zero_change=zero_change,
         review_waived=waived,
         review_waiver_unsuperseded=waiver_unsuperseded(review_waiver, round_ids),
-        # UNSUPERSEDED, not merely recorded (#14695 review j#93856 finding 2). Keying on "a waiver
-        # exists anywhere in the history" made a lane whose waiver a newer APPROVED review had
-        # already superseded stay blocked forever — the glance poisoning the ordinary review route
-        # with a historical record that no longer governs. The lane is only relying on the waiver
-        # while nothing newer supersedes it.
-        review_waiver_unsupported=waiver_unsuperseded(review_waiver, round_ids) and not waived,
+        # The DECLARATION-ordering fact, not the valid-waiver one (#14695 review j#93879 F2).
+        # ``waiver_unsuperseded`` requires the waiver to be VALID, so a CURRENT but malformed
+        # declaration answered False and the lane read as ready to close — while the terminal route
+        # refused the identical record. Ordering is about existence and supersession, never about
+        # validity; a current invalid declaration is exactly the case that must refuse.
+        # (#14695 review j#93856 F2 remains satisfied: a declaration a newer review round
+        # supersedes is no longer current, so an approved review still returns the lane to the
+        # ordinary projection.)
+        review_waiver_unsupported=waiver_declaration_current(review_waiver, round_ids)
+        and not waived,
+        review_round_unresolved=round_unresolved,
     )
 
 
@@ -972,6 +957,7 @@ def lane_signal_from_gate_facts(
         # from the terminal retire about the same record.
         review_waived=facts.review_waived,
         review_waiver_unsupported=facts.review_waiver_unsupported,
+        review_round_unresolved=facts.review_round_unresolved,
     )
 
 

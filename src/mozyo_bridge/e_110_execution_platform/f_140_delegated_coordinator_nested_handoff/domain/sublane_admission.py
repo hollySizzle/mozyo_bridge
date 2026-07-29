@@ -220,6 +220,11 @@ class LaneSignal:
     #: deliberately scoped to lanes that CARRY a waiver: a closed no-commit lane with no waiver
     #: projects ``retire_ready`` today and that is not this issue's to change.
     review_waiver_unsupported: bool = False
+    #: The newest review round is unresolved and stays so past a later Close (#14695 review
+    #: j#93879 F1). The issue's Acceptance requires zero-close / zero-retire while a review is
+    #: pending; recording a Close does not resolve the review. FAIL-CLOSED default False so a
+    #: caller that cannot establish it leaves the previous behaviour untouched.
+    review_round_unresolved: bool = False
 
 
 #: The gates whose projection is "the work is done; close it, then retire it". They share the
@@ -360,6 +365,14 @@ def classify_lane_state(signal: LaneSignal) -> str:
             signal.commit_bearing and not signal.integration_recorded
         ):
             return LANE_STATE_INTEGRATION_WAITING
+        # An UNRESOLVED review round outranks the close family, waiver or not (#14695 review
+        # j#93879 F1 + its design ruling). The Acceptance says pending review means zero-close /
+        # zero-retire, and a Close journal arriving afterwards is not a review resolution — so the
+        # lane reads as the audit it still owes rather than as ready to close or retire. This is
+        # deliberately GENERIC: the ruling holds that keeping normal review-round state after Close
+        # is part of "維持 the normal review-generation fence", not a waiver-specific rule.
+        if signal.review_round_unresolved:
+            return LANE_STATE_REVIEW_WAITING
         # A lane relying on a waiver that establishes nothing must not read as "go close it" or
         # "safe to retire": the terminal retire refuses it, and the issue's Acceptance asks for the
         # same conclusion from the glance, the close and the retire.
