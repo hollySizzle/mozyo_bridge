@@ -49,7 +49,12 @@ def review_gate_marker_fields(args: argparse.Namespace, gate: str) -> "tuple[dic
     head = getattr(args, "target_head", None) or ""
     if not head:
         return {}, "review_marker_missing_target_head"
-    if contains_marker_separator(head) or not is_full_commit_head(head):
+    # `isinstance` FIRST, for the reason review j#93882 gave about both halves of this contract:
+    # `contains_marker_separator` and `is_full_commit_head` both judge `str(value)`, so a non-`str`
+    # whose `__str__` looks like a head passed here and was handed on AS THE OBJECT — the domain
+    # producer then raised, turning this boundary's typed refusal into a traceback. Self-detected
+    # while sweeping F1's family; the CLI must answer with a token whatever it is given.
+    if not isinstance(head, str) or contains_marker_separator(head) or not is_full_commit_head(head):
         return {}, "review_marker_malformed_target_head"
     fields: dict = {"target_head": head}
     if gate == _REVIEW_RESULT_GATE:
@@ -110,8 +115,15 @@ def lane_envelope_marker_fields(args: argparse.Namespace) -> "tuple[dict, Option
         return {}, None
     if not ws or not lane or not gen_raw:
         return {}, "evidence_envelope_incomplete"
+    # `isinstance` before the character test, same reason as the head above: the identities are
+    # handed to the strict renderer AS SUPPLIED, so a non-`str` that merely stringifies cleanly
+    # reached it and raised, instead of being refused here with a token.
+    if not all(isinstance(value, str) for value in (ws, lane)):
+        return {}, "evidence_envelope_malformed_identity"
     if any(contains_marker_separator(value) for value in (ws, lane)):
         return {}, "evidence_envelope_malformed_identity"
+    if not isinstance(gen_raw, str):
+        return {}, "evidence_envelope_malformed_generation"
     if not gen_raw.isdigit() or int(gen_raw) <= 0:
         return {}, "evidence_envelope_malformed_generation"
     return {

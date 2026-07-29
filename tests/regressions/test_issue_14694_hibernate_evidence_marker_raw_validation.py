@@ -587,6 +587,69 @@ class ReviewResultProducerTests(unittest.TestCase):
                 self.assertEqual(fields, {})
                 self.assertEqual(refusal, "review_marker_malformed_review_request_journal")
 
+    def test_the_cli_producer_answers_a_non_string_with_a_token_not_a_traceback(self):
+        """Self-detected while sweeping finding 1's family across the boundaries.
+
+        `contains_marker_separator` and `is_full_commit_head` both judge ``str(value)``, so a
+        non-``str`` whose ``__str__`` looks like a clean head or identity passed this boundary and
+        was handed on AS THE OBJECT. The domain producer then raised — turning the typed refusal a
+        CLI owes its caller into a traceback, which is the shape review j#93882 finding 2 named for
+        the oversized ``req``. The ``isinstance`` test now comes before the character tests.
+        """
+
+        class _Stringy:
+            def __init__(self, text):
+                self.text = text
+
+            def __str__(self):
+                return self.text
+
+        sha = "c" * 40
+        base = {
+            "target_head": sha,
+            "review_request_journal": "93802",
+            "review_decision": "approval",
+            "evidence_workspace": None,
+            "evidence_lane": None,
+            "evidence_lane_generation": None,
+        }
+        envelope_ok = {
+            "evidence_workspace": "ws",
+            "evidence_lane": "lane",
+            "evidence_lane_generation": "3",
+        }
+        for label, over, expected in (
+            ("head", {"target_head": _Stringy(sha)}, "review_marker_malformed_target_head"),
+            (
+                "workspace",
+                {**envelope_ok, "evidence_workspace": _Stringy("ws")},
+                "evidence_envelope_malformed_identity",
+            ),
+            (
+                "lane",
+                {**envelope_ok, "evidence_lane": _Stringy("lane")},
+                "evidence_envelope_malformed_identity",
+            ),
+            (
+                "lane_generation",
+                {**envelope_ok, "evidence_lane_generation": _Stringy("3")},
+                "evidence_envelope_malformed_generation",
+            ),
+        ):
+            with self.subTest(field=label):
+                values = {**base, **over}
+                fields, refusal = review_gate_marker_fields(
+                    argparse.Namespace(**values), "review_result"
+                )
+                self.assertEqual(fields, {})
+                self.assertEqual(refusal, expected)
+        # Inline control: the clean call still builds fields the renderer accepts, end to end.
+        fields, refusal = review_gate_marker_fields(
+            argparse.Namespace(**{**base, **envelope_ok}), "review_result"
+        )
+        self.assertIsNone(refusal)
+        self.assertIn("head=" + sha, render_gate_note("review_result", **fields))
+
     def test_the_cli_producer_refuses_a_req_that_is_not_a_journal_id(self):
         """Review j#93818 finding 2: only whitespace was refused, never the SHAPE."""
         sha = "c" * 40
