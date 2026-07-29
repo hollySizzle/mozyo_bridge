@@ -99,7 +99,13 @@ NO_CHANGE_REVIEW_WAIVER_GATE = "no_change_review_waiver"
 
 #: The schema version. A marker of an unknown version is REFUSED rather than interpreted under
 #: today's field meanings — the next version may give an existing field a different weight.
-WAIVER_VERSION = "1"
+#:
+#: Bumped to ``2`` when the carve-out determination joined the marker (Redmine #14695 review
+#: j#93704 finding 1). A ``version=1`` marker carries no ``carve_out`` field, so honouring it
+#: would be honouring a waiver whose determination is unbound — exactly what the finding refuses.
+#: Nothing in production carries a v1 waiver (#14613's record is not conformant), so this
+#: invalidates no real authority.
+WAIVER_VERSION = "2"
 #: The only admissible decision. A record written to DECLINE a waiver carries a different token
 #: and therefore cannot admit anything.
 WAIVER_DECISION = "waived"
@@ -110,6 +116,15 @@ WAIVER_SCOPE = "no_change_investigation"
 #: ``### Owner Close Approval Delegation`` standing delegation does not reach it: only a DIRECT
 #: owner decision qualifies. This is the provenance axis, never the writer axis.
 WAIVER_APPROVAL_SOURCE = "direct_owner"
+#: The only admissible ``carve_out`` value. The marker states the coordinator's carve-out finding
+#: INSIDE the lane envelope, so overwriting it requires forging the exact workspace / lane /
+#: generation / head — not merely appending another note to the issue (review j#93704 finding 1).
+#:
+#: This does NOT make the marker self-certifying, which j#93412 §3 forbids: the separate governed
+#: ``carve_out_check`` field must independently agree, and a carve-out surface named ANYWHERE in
+#: the record still refuses. The marker binds the determination to a lane; the governed field is
+#: the determination; a recognized fact overrides both.
+WAIVER_CARVE_OUT_NONE = "none"
 
 #: The COMPLETE, ORDERED field set a canonical waiver marker carries — no more, no less, in this
 #: sequence. An unknown / missing / permuted field is a marker the canonical producer could not
@@ -121,6 +136,7 @@ WAIVER_FIELD_ORDER: Tuple[str, ...] = (
     "approval_source",
     "decision",
     "scope",
+    "carve_out",
     "issue",
     "workspace",
     "lane",
@@ -266,6 +282,10 @@ def _journal_waiver(notes: str) -> Optional[NoChangeWaiverFacts]:
         "approval_source": WAIVER_APPROVAL_SOURCE,
         "decision": WAIVER_DECISION,
         "scope": WAIVER_SCOPE,
+        # The lane-bound half of the carve-out determination (review j#93704 finding 1). Any
+        # other value is not this authority; the governed ``carve_out_check`` field must agree
+        # independently, and that conjunction is enforced by the caller.
+        "carve_out": WAIVER_CARVE_OUT_NONE,
     }
     if any(fields.get(key) != value for key, value in constants.items()):
         return NoChangeWaiverFacts(state=WAIVER_INVALID)
@@ -683,6 +703,13 @@ def evaluate_no_change_waiver_admissible(
     # ``scope`` field (#14695 j#93412 §3). Its two refusals stay distinguishable, and neither is
     # reachable by a ``direct_owner`` provenance claim — provenance says who decided, not what
     # surface the work touched.
+    #
+    # Note what the two halves each contribute (review j#93704 finding 1). The marker's
+    # ``carve_out=none`` — validated above as part of the closed field set — binds a determination
+    # to THIS lane envelope and head, so changing it requires forging that identity rather than
+    # appending a note. ``carve_out`` here is the INDEPENDENT governed ``carve_out_check`` field
+    # plus the recognized-fact detection. Requiring both is what keeps the marker from certifying
+    # itself while still denying an arbitrary journal the power to write the clear.
     if not carve_out.clear:
         return AdmissionResult(
             False,
@@ -765,6 +792,7 @@ def render_no_change_review_waiver_marker(
             f"approval_source={WAIVER_APPROVAL_SOURCE}",
             f"decision={WAIVER_DECISION}",
             f"scope={WAIVER_SCOPE}",
+            f"carve_out={WAIVER_CARVE_OUT_NONE}",
             f"issue={issue_s}",
             envelope_body,
         ]
@@ -792,6 +820,7 @@ __all__ = (
     "REASON_WAIVER_SUPERSEDED",
     "REASON_WORKTREE_NOT_CLEAN",
     "WAIVER_APPROVAL_SOURCE",
+    "WAIVER_CARVE_OUT_NONE",
     "WAIVER_DECISION",
     "WAIVER_FIELD_ORDER",
     "WAIVER_INVALID",

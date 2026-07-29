@@ -446,13 +446,61 @@ class HardCarveOutTest(unittest.TestCase):
         self.assertFalse(fold_hard_carve_out(journals).clear)
         self.assertFalse(admit(journals).admissible)
 
-    def test_conflicting_determinations_resolve_to_unresolved(self):
+    def test_a_conflict_that_names_a_reason_takes_the_stronger_refusal(self):
+        # ``none`` beside ``release`` in one journal: the stated reason disqualifies outright, so
+        # this reports DECLARED rather than the weaker UNRESOLVED. Both refuse; the reported
+        # cause should be the more specific true one.
         journals = no_change_journals()
         journals[1] = (
             "200",
             "## Gate: owner_close_approval\n- carve_out_check: none\n- carve_out_check: release",
         )
+        self.assertEqual(fold_hard_carve_out(journals).reason, CARVE_OUT_DECLARED)
+        self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
+
+    def test_two_differing_none_spellings_are_not_uniquely_interpretable(self):
+        # The conflict path proper: neither value states a reason, but the journal declares the
+        # determination twice with textually different values, so it has determined neither.
+        journals = no_change_journals()
+        journals[1] = (
+            "200",
+            "## Gate: owner_close_approval\n- carve_out_check: none\n- carve_out_check: NONE",
+        )
         self.assertEqual(fold_hard_carve_out(journals).reason, CARVE_OUT_UNRESOLVED)
+
+    def test_a_stated_reason_cannot_be_cleared_by_appending_a_later_note(self):
+        """Review j#93704 finding 1: the override channel.
+
+        Plain latest-wins let a ``carve_out_check: none`` appended after an existing
+        ``carve_out_check: release`` produce clear=True. This record system cannot authenticate
+        the writer (one account for every role, ruling #14219 j#86718), so "the coordinator
+        corrected it" and "someone appended a clear" are indistinguishable — and a fence that
+        cannot tell them apart must take the refusing one.
+        """
+        journals = [
+            ("100", "## Gate: start"),
+            ("150", "## Gate: owner_close_approval\n- carve_out_check: release"),
+            ("200", CARVE_OUT_CLEARED),
+            ("300", f"## Gate: close\n{waiver_marker()}"),
+        ]
+        self.assertEqual(fold_hard_carve_out(journals).reason, CARVE_OUT_DECLARED)
+        self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
+
+    def test_a_fenced_only_determination_does_not_resolve(self):
+        """Review j#93704 finding 2, reproduced end-to-end then pinned.
+
+        Gate qualification went through the quote-aware canonical scan while the FIELD was matched
+        against the raw note. A ``carve_out_check: none`` appearing only inside a code fence
+        therefore resolved the determination and the full admission returned ``ok``.
+        """
+        journals = no_change_journals()
+        journals[1] = (
+            "200",
+            "## Gate: owner_close_approval\n- approval_source: direct_owner\n\n"
+            "```\n- carve_out_check: none\n```",
+        )
+        self.assertEqual(fold_hard_carve_out(journals).reason, CARVE_OUT_UNRESOLVED)
+        self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT_UNRESOLVED)
 
     def test_a_newer_approval_omitting_the_field_shadows_an_older_clean_one(self):
         # Supersede-by-EXISTING, the invariant this context applies to every issue-wide authority.
@@ -625,13 +673,21 @@ class StrictMarkerGrammarTest(unittest.TestCase):
         quoted = "## Gate: close\n```\n" + waiver_marker() + "\n```"
         self.assertEqual(fold_no_change_review_waiver([("300", quoted)]).state, WAIVER_NONE)
 
+    def test_a_v1_marker_is_refused_because_its_determination_is_unbound(self):
+        # The schema bump is load-bearing: a v1 marker carries no ``carve_out`` field, so
+        # honouring it would honour a waiver whose determination is not bound to the lane
+        # (review j#93704 finding 1).
+        v1 = waiver_marker().replace("version=2:", "version=1:").replace("carve_out=none:", "")
+        self.assertEqual(fold_no_change_review_waiver([("300", v1)]).state, WAIVER_INVALID)
+
     def test_every_constant_field_is_load_bearing(self):
         canonical = waiver_marker()
         for original, tampered in (
             ("decision=waived", "decision=declined"),
             ("approval_source=direct_owner", "approval_source=standing_delegation"),
             ("scope=no_change_investigation", "scope=release"),
-            ("version=1", "version=2"),
+            ("carve_out=none", "carve_out=release"),
+            ("version=2", "version=3"),
         ):
             with self.subTest(field=original):
                 self.assertIn(original, canonical)
@@ -643,7 +699,7 @@ class StrictMarkerGrammarTest(unittest.TestCase):
     def test_a_permuted_field_order_is_refused(self):
         canonical = waiver_marker()
         permuted = canonical.replace(
-            "version=1:approval_source=direct_owner", "approval_source=direct_owner:version=1"
+            "version=2:approval_source=direct_owner", "approval_source=direct_owner:version=2"
         )
         self.assertNotEqual(permuted, canonical)
         self.assertEqual(

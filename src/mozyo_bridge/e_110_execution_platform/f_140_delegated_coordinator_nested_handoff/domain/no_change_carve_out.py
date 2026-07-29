@@ -121,13 +121,37 @@ OWNER_CLOSE_APPROVAL_GATE_TOKEN = "owner_close_approval"
 #: which by the preset's own grammar (``none | <該当理由>``) means one DOES apply.
 CARVE_OUT_CHECK_NONE = "none"
 
-#: The governed ``- carve_out_check: <value>`` field line. Read with ``finditer`` (never
-#: ``search``) so the exactly-one rule can see a second, conflicting declaration instead of
-#: silently taking whichever came first.
+#: The governed ``- carve_out_check: <value>`` field line, matched against ONE canonical line.
+#:
+#: Read with ``finditer`` over the canonical lines (never ``search`` over the raw note) so the
+#: exactly-one rule can see a second, conflicting declaration instead of silently taking whichever
+#: came first — and so a QUOTED one is not seen at all.
+#:
+#: Review j#93704 finding 2: the earlier version ran this over the raw note while the gate
+#: qualification beside it went through ``canonical_note_lines``. That asymmetry — declaration
+#: quote-aware, value not — meant a ``- carve_out_check: none`` appearing ONLY inside a fenced
+#: code block resolved the determination, and the full admission returned ``ok`` (reproduced
+#: end-to-end). A contract example, or a past record transcribed into a note, is not this issue's
+#: determination.
 _CARVE_OUT_CHECK_FIELD_RE = re.compile(
     r"^\s*[-*]?\s*\**\s*(?:carve_out_check|carve out check)\**\s*[:：]\s*(?P<value>.+?)\s*$",
-    re.MULTILINE | re.IGNORECASE,
+    re.IGNORECASE,
 )
+
+
+def _carve_out_check_values(notes: str) -> "set[str]":
+    """Every ``carve_out_check`` value declared on a CANONICAL line of ``notes`` (pure).
+
+    One scan of the quote-aware canonical lines, so declaration and value are read from the same
+    surface. A fenced / quoted / blockquoted occurrence is not a line here and therefore does not
+    exist as far as this determination is concerned.
+    """
+    found: set[str] = set()
+    for line in canonical_note_lines(notes or ""):
+        match = _CARVE_OUT_CHECK_FIELD_RE.match(line or "")
+        if match is not None:
+            found.add(_clean_field_value(match.group("value")))
+    return found
 #: Decoration a governed field value carries around the real token.
 _FIELD_DECORATION_RE = re.compile(r"^[`*\s\"']+|[`*\s\"']+$")
 
@@ -283,11 +307,19 @@ def _fold_carve_out_check(
     stray ``carve_out_check:`` line in an unrelated note never becomes the determination — the
     same qualify-then-read order :mod:`.review_exemption` uses for its gate fields.
 
-    **Latest wins, and a determination supersedes by EXISTING, not by being valid** — the
-    invariant this bounded context applies to every issue-wide authority fact (#13490 j#85365 F1).
-    A newer owner-close-approval journal that omits the field, or states it twice with different
-    values, SHADOWS an older clean ``none`` rather than being skipped so the stale one stays
-    latest. Both resolve to :data:`CARVE_OUT_UNRESOLVED`, which refuses.
+    **A stated carve-out is NOT clearable by appending a note** (review j#93704 finding 1). Any
+    non-``none`` value anywhere in the record refuses, permanently. Plain latest-wins let the
+    reviewer append ``carve_out_check: none`` after an existing ``carve_out_check: release`` and
+    get ``clear=True`` — and because this record system cannot authenticate the writer (every role
+    posts under one source-system account, ruling #14219 j#86718), "the coordinator corrected it"
+    and "someone appended a clear" are indistinguishable here. When the two cannot be told apart,
+    the fence must take the one that refuses. A genuine re-determination is expressed by a NEW
+    lane generation, which invalidates the waiver's envelope anyway.
+
+    **Presence still follows latest-wins, supersede-by-EXISTING** — the invariant this bounded
+    context applies to every issue-wide authority fact (#13490 j#85365 F1). A newer
+    owner-close-approval journal that omits the field, or states it twice with different values,
+    SHADOWS an older clean ``none``. Both resolve to :data:`CARVE_OUT_UNRESOLVED`, which refuses.
     """
     latest: Optional[Tuple[int, str, bool]] = None
     for journal_id, notes in journals or ():
@@ -297,10 +329,13 @@ def _fold_carve_out_check(
         text = notes or ""
         if OWNER_CLOSE_APPROVAL_GATE_TOKEN not in _structured_gate_tokens(text):
             continue
-        values = {
-            _clean_field_value(m.group("value"))
-            for m in _CARVE_OUT_CHECK_FIELD_RE.finditer(text)
-        }
+        values = _carve_out_check_values(text)
+        # A stated reason ANYWHERE disqualifies, before any latest-wins resolution runs.
+        stated = sorted(v for v in values if v and v.strip().lower() != CARVE_OUT_CHECK_NONE)
+        if stated:
+            return HardCarveOutFacts(
+                clear=False, reason=CARVE_OUT_DECLARED, detail=stated[0]
+            )
         # Exactly-one: a journal stating two DIFFERENT determinations has determined neither.
         conflicted = len(values) > 1
         value = "" if conflicted or not values else next(iter(values))
