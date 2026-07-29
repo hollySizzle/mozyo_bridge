@@ -11,7 +11,7 @@ The controls are load-bearing: a derivation that reported everything would satis
 mutant while being useless, so a benign counter read, a probe-free tree, and each class
 construct the walk claims to model must stay silent.
 
-**Opt-in.**  40 tree copies and 40 full derivations run for about five minutes, which does
+**Opt-in.**  48 tree copies and 48 full derivations run for about six minutes, which does
 not belong in every ``unittest discover``.  Set ``MOZYO_DERIVATION_EDGE_SWEEP=1`` to run
 it.  The per-edge regressions that must never regress silently live in
 ``tests/unit/.../test_disposable_smoke_command_surface.py`` and run unconditionally.
@@ -262,6 +262,36 @@ CLASS_CONSTRUCTION_EDGES = [
      '    def _p(self):\n        return None\n\n', False),
 ]
 
+# -- class BINDING resolution (review j#92639 F10) --------------------------------------
+# R9 closed the set of statement node types; these close the inside of the statements it
+# admitted, the writes that happen after the class statement, and the one decorator still
+# called modelled.  Every row here is ordinary Python, not an exotic construct.
+#
+# (label, recorder-body injection, recorder-tail injection, expect)
+CLASS_BINDING_EDGES = [
+    ("binding: annotated dunder alias",
+     '\n\n    def _probe_ann_len(self):\n        self(["bin", "probe", "annotated-dunder"])\n'
+     "        return 1\n\n    __len__: object = _probe_ann_len\n", None, True),
+    ("binding: unpacking target",
+     '\n\n    def _probe_unpack_len(self):\n        self(["bin", "probe", "unpacked-dunder"])\n'
+     "        return 1\n\n    (__len__,) = (_probe_unpack_len,)\n", None, True),
+    ("binding: right-hand side writes the namespace",
+     '\n\n    def _probe_side_len(self):\n        self(["bin", "probe", "assign-side-effect"])\n'
+     '        return 1\n\n    _installed = locals().__setitem__("__len__", _probe_side_len)\n',
+     None, True),
+    ("mutation: member assigned after the class statement", None,
+     '\n\ndef _probe_post_len(self):\n    self(["bin", "probe", "post-class-mutation"])\n'
+     "    return 1\n\n\nRecordingHerdrRunner.__len__ = _probe_post_len\n", True),
+    ("mutation: setattr spelling", None,
+     '\n\ndef _probe_setattr_len(self):\n    self(["bin", "probe", "setattr-mutation"])\n'
+     '    return 1\n\n\nsetattr(RecordingHerdrRunner, "__len__", _probe_setattr_len)\n', True),
+    ("CONTROL binding: plain alias",
+     "\n\n    def _probe_plain(self):\n        return 0\n\n    probe_alias = _probe_plain\n",
+     None, False),
+    ("CONTROL binding: annotated constant", "\n\n    probe_slot: int = 0\n", None, False),
+    ("CONTROL binding: bare annotation", "\n\n    probe_unbound: int\n", None, False),
+]
+
 DECLARED_METHOD = (
     "attribute call: declared method dispatching",
     None,
@@ -299,6 +329,31 @@ def run_edge(init_inj, tail_inj, owner_inj):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+
+def run_binding_edge(body_inj, tail_inj):
+    """Inject a class binding (or a post-definition write) into the recorder module.
+
+    Reported is measured over the whole surface, as in :func:`run_class_edge`: a binding
+    defect surfaces where the class is used, which is production code here.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="mozyo-binding-edge-"))
+    try:
+        shutil.copytree(ROOT / "src" / "mozyo_bridge", tmp / "mozyo_bridge",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        recorder = tmp / RECORDER
+        s = recorder.read_text()
+        if body_inj:
+            assert TAIL in s, "the recorder body injection point moved"
+            s = s.replace(TAIL, TAIL + body_inj, 1)
+        if tail_inj:
+            s = s + tail_inj
+        recorder.write_text(s)
+        d = derive_dispatch_surface(tmp)
+        pairs = [p for p in d.pairs if p[0] == "probe"]
+        return bool(pairs or d.unresolved_sites or d.unresolved_flows), pairs
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def run_class_edge(anchor, class_stmt, owner_inj):
@@ -345,9 +400,15 @@ class DerivationEdgeSweepTests(unittest.TestCase):
             got, _pairs = run_class_edge(anchor, class_stmt, owner_inj)
             if got != expect:
                 mismatches.append(f"{label}: expected reported={expect}, got {got}")
+        for label, body_inj, tail_inj, expect in CLASS_BINDING_EDGES:
+            got, _pairs = run_binding_edge(body_inj, tail_inj)
+            if got != expect:
+                mismatches.append(f"{label}: expected reported={expect}, got {got}")
         self.assertEqual(mismatches, [], "\n".join(mismatches))
         self.assertGreaterEqual(
-            len(rows) + len(CLASS_CONSTRUCTION_EDGES), 40, "the sweep lost edges"
+            len(rows) + len(CLASS_CONSTRUCTION_EDGES) + len(CLASS_BINDING_EDGES),
+            48,
+            "the sweep lost edges",
         )
 
 

@@ -1251,6 +1251,29 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
       報告になる** — 実際、どの finding も挙げていない「class body 内の `if` 下 binding」が
       追加の列挙なしに報告側へ落ちることを実測した。これは R7 で dunder の列挙をやめたのと同じ
       修正を一段外側で行ったものである。
+    - **ただし R9 の反転は statement の外形までしか閉じていなかった** (review j#92639)。閉じたのは
+      class body の **statement node 型**だけで、許可した `Assign` / `AnnAssign` の**内側**
+      (target 形・value 形・RHS の副作用) は無検査、しかも `_declared_dunders` /
+      `_lookup_member` が実際に読むのは許可集合より**狭い部分集合** (top-level simple-name
+      `Assign` のみ) だった。**「許可した集合」と「実際に読む集合」がずれている限り、その差分は
+      すべて silent に absent へ落ちる**。実測で沈黙した 6 形: `__len__: object = f` /
+      `(__len__,) = (f,)` / `_x = locals().__setitem__("__len__", f)` /
+      `Cls.__len__ = f` / `setattr(Cls, "__len__", f)` / **allow table 掲載済み property の
+      body に dispatch を足した形**。
+      よって **binding の正本を 1 つにする**。node 型 allowlist をやめ、target・value・
+      namespace 副作用を含む**単一の class-binding resolver** を置き、surface の可読判定と
+      member lookup と descriptor lookup が**同じ解決結果**を使う。完全に解決できない binding
+      (unpacking / 非 Name target / 未解決 value / 任意の Call RHS) は surface を unreadable
+      にする。「許可する層」と「読む層」が同一 resolver なら、両者のずれが**構造的に発生しない**。
+    - **class surface は「body が何を束縛するか」ではなく「class が何を持つに至るか」**とする。
+      `ClassDef` 後の member write (module-level の attribute 代入と `setattr`) を index し、
+      対象が解析対象 class なら surface を unreadable にする。
+    - **modelled decorator は証明があるものだけ**にする。`property` は read 時に receiver を
+      getter へ bind して **body を解析する**ようにしたので modelled に残る (exception table は
+      read が何を**返す**かの契約であり、read が**起きること**の免罪符ではない — この取り違えが
+      F10-3 の沈黙だった)。`classmethod` / `staticmethod` は R9 で「無害そう」という論拠だけで
+      modelled にしていたが positive proof が無いため **modelled 集合から外した**。証明が無いものを
+      modelled と呼ばない。
     - **「位置の集合が完全である」とは主張しない**。同種の完全性主張は複数 round 連続で次の review に
       反証されている。設計が提供するのは完全性ではなく、**読めない class / 解決できない chain /
       owner 不明の位置は報告される**という性質である。

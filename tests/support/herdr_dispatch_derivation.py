@@ -172,6 +172,11 @@ DRIVER_MODULE = (
 #: chains, and hitting it stays a reported unresolved rather than a silent truncation.
 _MAX_DEPTH = 32
 
+#: Distinguishes "this binding holds something inert" from "the walk cannot say what this
+#: binding holds".  ``None`` already means the former, and collapsing the two is the exact
+#: shape of every finding this module has taken.
+_UNRESOLVED = object()
+
 
 class DerivationError(RuntimeError):
     """The walk could not be performed at all (missing source, unparseable module)."""
@@ -735,6 +740,169 @@ class _Walker:
             resolved.append(found)
         return (tuple(resolved), unresolved)
 
+    def _index_post_definition_mutations(self) -> set:
+        """Classes whose members are written after the ``class`` statement has run.
+
+        Review j#92639 F10-2: reading a ``ClassDef`` describes what the body binds, and
+        ``RecordingHerdrRunner.__len__ = _probe_post_len`` at module level binds a member
+        that the body will never mention.  The class surface index has to answer "what
+        does this class end up with", not "what does its body say".
+
+        Both spellings are collected — attribute assignment and ``setattr`` — and a hit
+        makes the surface unresolved rather than trying to model the write.  Assignments
+        through anything other than a bare class name (``self.x``, ``obj.x``) are not
+        class-surface writes and are handled by the assignment-target hook path instead.
+        """
+        mutated = set()
+        for module, indexed in self.index.items():
+            for node in ast.walk(indexed.tree):
+                targets = []
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = (
+                        node.targets
+                        if isinstance(node, ast.Assign)
+                        else [node.target]
+                    )
+                elif isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name) and node.func.id == "setattr":
+                        if node.args and isinstance(node.args[0], ast.Name):
+                            found = self._resolve_name(module, node.args[0].id)
+                            if found is not None and found[1] in self.index[
+                                found[0]
+                            ].classes:
+                                mutated.add(found)
+                    continue
+                for target in targets:
+                    if not isinstance(target, ast.Attribute):
+                        continue
+                    if not isinstance(target.value, ast.Name):
+                        continue
+                    found = self._resolve_name(module, target.value.id)
+                    if found is not None and found[1] in self.index[found[0]].classes:
+                        mutated.add(found)
+        return mutated
+
+    def _class_bindings(self, class_ref: tuple) -> tuple:
+        """``(name -> member ref or None, surface is fully resolved)`` for one class body.
+
+        **This is the single authority on what a class binds.**  Review j#92639 F10-1
+        found the reason it has to be: R9 closed the set of statement *node types* a class
+        body may contain, but the consumers each re-read those statements with narrower
+        rules of their own — ``_declared_dunders`` and ``_lookup_member`` only understood a
+        top-level simple-name ``Assign`` with a resolvable ``Name`` on the right.  So the
+        set a class was *allowed* to contain was strictly larger than the set anyone
+        actually *read*, and every binding in the gap resolved to "absent" in silence.
+        Widening the allowed set (R9 added ``AnnAssign`` for descriptors) widened the gap.
+
+        One resolver removes the gap by construction: whatever this returns is both what
+        makes the surface readable and what every lookup sees.  A binding it cannot fully
+        resolve — an unpacking target, a non-``Name`` target, a value that is not a
+        resolvable name or construction, a call that could write the namespace — makes the
+        whole surface unresolved rather than binding a name to nothing.
+        """
+        cached = self._class_binding_cache.get(class_ref)
+        if cached is not None:
+            return cached
+        result = self._compute_class_bindings(class_ref)
+        self._class_binding_cache[class_ref] = result
+        return result
+
+    def _compute_class_bindings(self, class_ref: tuple) -> tuple:
+        module, class_name = class_ref
+        indexed = self.index.get(module)
+        class_def = indexed.classes.get(class_name) if indexed else None
+        if class_def is None:
+            return ({}, False)
+        # A class can also be rewritten AFTER its body runs, and no amount of reading the
+        # body will show it (review j#92639 F10-2).
+        if class_ref in self._mutated_classes:
+            return ({}, False)
+        if class_def.decorator_list or class_def.keywords:
+            return ({}, False)
+        bindings: dict = {}
+        for node in class_def.body:
+            if isinstance(node, ast.Expr):
+                if isinstance(node.value, ast.Constant):
+                    continue
+                return ({}, False)
+            if isinstance(node, ast.Pass):
+                continue
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not self._decorators_are_modelled(node):
+                    return ({}, False)
+                bindings[node.name] = (module, f"{class_name}.{node.name}")
+                continue
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                # Only plain names bind a member this walk can name.  A tuple target
+                # (``(__len__,) = ...``) binds one all the same, which is why an unpacking
+                # form has to make the surface unresolved instead of being skipped.
+                if not all(isinstance(t, ast.Name) for t in targets):
+                    return ({}, False)
+                if node.value is None:
+                    continue  # a bare annotation binds nothing
+                resolved = self._resolve_class_binding_value(
+                    module, class_name, node.value
+                )
+                if resolved is _UNRESOLVED:
+                    return ({}, False)
+                for target in targets:
+                    bindings[target.id] = resolved
+                continue
+            return ({}, False)
+        return (bindings, True)
+
+    def _resolve_class_binding_value(self, module: str, class_name: str, value):
+        """The member a class-body right-hand side binds, ``None``, or ``_UNRESOLVED``.
+
+        ``None`` means "binds something inert" — a literal.  ``_UNRESOLVED`` means the walk
+        cannot say, which includes every call: ``locals().__setitem__("__len__", f)`` is a
+        perfectly ordinary ``Assign`` whose right-hand side installs a dunder that appears
+        nowhere in the body (review j#92639 F10-1 mutant C).  Constructions are resolved
+        because the descriptor rule needs them; anything else is not guessed at.
+        """
+        if isinstance(value, ast.Name):
+            aliased = f"{class_name}.{value.id}"
+            if aliased in self.index[module].functions:
+                return (module, aliased)
+            return _UNRESOLVED
+        if isinstance(value, ast.Constant):
+            return None
+        if isinstance(value, ast.Call):
+            constructed = self._constructed_class(module, "", value)
+            if constructed is not None:
+                return constructed
+            return _UNRESOLVED
+        return _UNRESOLVED
+
+    def _decorators_are_modelled(self, node) -> bool:
+        """Whether every decorator on a member is one whose effect the walk accounts for.
+
+        A dunder with ANY decorator is unreadable: ``property`` on ``__len__`` changes what
+        the protocol invokes, and the modelled set was justified for ordinary attributes.
+        """
+        is_dunder = node.name.startswith("__") and node.name.endswith("__")
+        for decorator in node.decorator_list:
+            if is_dunder:
+                return False
+            if not isinstance(decorator, ast.Name):
+                return False
+            if decorator.id not in self._MODELLED_MEMBER_DECORATORS:
+                return False
+        return True
+
+    def _member_is_property(self, member: tuple) -> bool:
+        found_module, found_qualname = member
+        function = self.index[found_module].functions.get(found_qualname)
+        if function is None:
+            return False
+        return any(
+            isinstance(d, ast.Name) and d.id == "property"
+            for d in getattr(function, "decorator_list", [])
+        )
+
     def _class_surface_is_modelled(self, class_ref: tuple) -> bool:
         """Whether ``class_ref``'s member surface comes only from constructs the walk reads.
 
@@ -744,8 +912,8 @@ class _Walker:
         It answers "is every part of this class construction one I model", so a construct
         nobody anticipated is unreadable by default rather than absent by default.
 
-        Three surfaces are checked, because all three can put members on a class without
-        appearing in its body:
+        Four surfaces can put members on a class, and :meth:`_class_bindings` checks all
+        of them, which is why this is a one-line delegation rather than a second opinion:
 
         * **class decorators** — a decorator returns whatever it likes, including a
           different class entirely.
@@ -753,46 +921,13 @@ class _Walker:
           body is not the member list.  The previous round predicted this rode the
           unresolved-base path; it does not, and saying so without measuring it is what
           made F9-2 blocking.
-        * **body statements** — see :data:`_MODELLED_CLASS_BODY`.
+        * **body bindings** — resolved one by one, target and value alike.
+        * **writes after the class statement** — ``Cls.x = f`` and ``setattr(Cls, ...)``.
 
-        A decorated *dunder* is unreadable even when its decorator is one of the modelled
-        ones: ``property`` on ``__len__`` changes what the protocol invokes, and the
-        modelled set was justified for ordinary attributes only.
+        This used to re-read the body with its own rules, which is precisely how the
+        readable set and the readable-and-actually-read set drifted apart (j#92639 F10-1).
         """
-        cached = self._modelled_surfaces.get(class_ref)
-        if cached is not None:
-            return cached
-        module, class_name = class_ref
-        indexed = self.index.get(module)
-        class_def = indexed.classes.get(class_name) if indexed else None
-        modelled = self._compute_class_surface_is_modelled(class_def)
-        self._modelled_surfaces[class_ref] = modelled
-        return modelled
-
-    def _compute_class_surface_is_modelled(self, class_def) -> bool:
-        if class_def is None:
-            return False
-        if class_def.decorator_list or class_def.keywords:
-            return False
-        for node in class_def.body:
-            if isinstance(node, ast.Expr):
-                # A docstring is inert.  Any other bare expression is a call whose effect
-                # on the namespace the walk does not follow.
-                if isinstance(node.value, ast.Constant):
-                    continue
-                return False
-            if not isinstance(node, self._MODELLED_CLASS_BODY):
-                return False
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                is_dunder = node.name.startswith("__") and node.name.endswith("__")
-                for decorator in node.decorator_list:
-                    if is_dunder:
-                        return False
-                    if not isinstance(decorator, ast.Name):
-                        return False
-                    if decorator.id not in self._MODELLED_MEMBER_DECORATORS:
-                        return False
-        return True
+        return self._class_bindings(class_ref)[1]
 
     def _class_is_callable(self, class_ref: tuple, _seen: tuple = ()) -> bool:
         """Whether instances of ``class_ref`` can be called (define a dispatch entry).
@@ -895,7 +1030,8 @@ class _Walker:
         self.dispatch_calls = []
         self.unresolved_flows = []
         self.used_read_exceptions = set()
-        self._modelled_surfaces: dict = {}
+        self._class_binding_cache: dict = {}
+        self._mutated_classes = self._index_post_definition_mutations()
         for module_name, module in self.index.items():
             for qualname, function in module.functions.items():
                 local, kwargs_maps = self._local_taint(module_name, qualname, function)
@@ -1110,34 +1246,18 @@ class _Walker:
     #: Attribute spellings that ARE the dispatch entry point (see :meth:`_is_dispatch`).
     _DISPATCH_ATTRS = frozenset({"run", "__call__"})
 
-    #: The class-body statements this walk actually models.  Read the polarity carefully:
-    #: this is **not** a list of constructs that make a class unreadable, it is the closed
-    #: set of constructs that make one readable.  Everything else — a nested ``class``, a
-    #: binding under ``if``, a ``for`` that fills the namespace, an ``exec`` — falls to
-    #: unreadable without anyone having to think of it first.
+    #: Decorators whose effect on a member the walk can account for.  Read the polarity
+    #: carefully: this is **not** a list of decorators that make a class unreadable, it is
+    #: the closed set that leaves one readable.  Anything else — a decorator that returns
+    #: a different function, a ``metaclass=``, a nested ``class``, an ``exec`` — falls to
+    #: unreadable without anyone having to think of it first (review j#92541).
     #:
-    #: Review j#92541 landed three findings (decorated dunder, ``metaclass=``, annotated
-    #: descriptor) that were all the same defect: the previous round claimed member
-    #: discovery was tri-state, but "unreadable" was itself a list of shapes I had thought
-    #: of, so every shape I had not thought of came back as *absent*.  That is the R7
-    #: mistake one level out, and enumerating harder would only move it one level further.
-    #: Inverting it is the only version where being wrong produces a report.
-    _MODELLED_CLASS_BODY: tuple = (
-        ast.FunctionDef,
-        ast.AsyncFunctionDef,
-        ast.Assign,
-        ast.AnnAssign,
-        ast.Pass,
-    )
-
-    #: Decorators whose effect on a member the walk can account for.  ``property`` and the
-    #: two method transforms change how an attribute is *reached*, which the read table
-    #: already covers; they do not substitute a different function body.  Any other
-    #: decorator can return anything at all, so the raw ``def`` underneath it is not
-    #: evidence of what runs (j#92541 F9-1).
-    _MODELLED_MEMBER_DECORATORS: frozenset = frozenset(
-        {"property", "classmethod", "staticmethod"}
-    )
+    #: ``property`` earns its place only because the walk now analyses the getter body
+    #: (:meth:`_read_yields_no_dispatcher`).  ``classmethod`` and ``staticmethod`` were in
+    #: this set for one round on the strength of an argument rather than a measurement;
+    #: review j#92639 F10-3 asked for the proof, there is none, so they are out.  A
+    #: decorator is not modelled because it sounds harmless.
+    _MODELLED_MEMBER_DECORATORS: frozenset = frozenset({"property"})
 
     def _check_escapes(
         self, module: str, qualname: str, owner: str, local: set, function: ast.AST
@@ -1222,26 +1342,13 @@ class _Walker:
         indexed = self.index.get(module)
         if indexed is None:
             return None
-        candidate = f"{class_name}.{attr}"
-        if candidate in indexed.functions:
-            return (module, candidate)
-        # A class-body alias (``__len__ = _probe_truth``) declares the member just as a
-        # ``def`` does, but resolves to a different qualname.  Collecting the alias NAME
-        # without being able to look it up left F8-3 silent even after the name was known.
-        class_def = indexed.classes.get(class_name)
-        if class_def is not None:
-            for node in class_def.body:
-                if not isinstance(node, ast.Assign):
-                    continue
-                if not any(
-                    isinstance(t, ast.Name) and t.id == attr for t in node.targets
-                ):
-                    continue
-                if isinstance(node.value, ast.Name):
-                    aliased = f"{class_name}.{node.value.id}"
-                    if aliased in indexed.functions:
-                        return (module, aliased)
-                break
+        # Both a ``def`` and a class-body alias (``__len__ = _probe_truth``) declare the
+        # member; the resolver returns whichever one the body actually binds, so this no
+        # longer re-reads the body with rules of its own.
+        bindings, _ = self._class_bindings(class_ref)
+        bound = bindings.get(attr)
+        if bound is not None:
+            return bound
         bases, _ = self._base_classes(class_ref)
         for base in bases:
             found = self._lookup_member(base, attr, _seen + (class_ref,))
@@ -1378,14 +1485,38 @@ class _Walker:
         assigned value.  A container holds callables, a property returns them, and a
         ``@property`` that looks like a list read can be anything — each of those was a
         separate silent omission (j#92213).
+
+        A ``@property`` read RUNS code, so the getter is analysed before either reason is
+        consulted.  Review j#92639 F10-3: the exception table says what a read *yields*
+        and was being used to excuse the read *happening at all*, so a dispatch added to
+        the body of an already-tabled property — reached from a production read — stayed
+        silent.  Binding the receiver into the getter is what makes ``property`` a
+        modelled decorator rather than an assumed-harmless one.
         """
         module, class_name = class_ref
+        member = self._lookup_member(class_ref, attr)
+        if member is not None and self._member_is_property(member):
+            if not self._bind_receiver_parameter(member, class_ref):
+                return False
         if (module, class_name, attr) in self.tainted_attrs:
             return True
         if (class_name, attr) in _MODELLED_ATTRIBUTE_READS:
             self.used_read_exceptions.add((class_name, attr))
             return True
         return False
+
+    def _bind_receiver_parameter(self, member: tuple, class_ref: tuple) -> bool:
+        """Taint the receiver (``self``) of ``member`` so its body gets analysed."""
+        found_module, found_qualname = member
+        function = self.index[found_module].functions[found_qualname]
+        names = _parameter_names(function)
+        if not names:
+            return False
+        self.tainted_params.add((found_module, found_qualname, names[0]))
+        self.param_classes.setdefault(
+            (found_module, found_qualname, names[0]), set()
+        ).add(class_ref)
+        return True
 
     def _protocol_for_position(self, node: ast.AST, parent: ast.AST) -> Optional[tuple]:
         """The dunders this position runs on ``node``, or ``None`` if it only carries it."""
@@ -1460,38 +1591,13 @@ class _Walker:
         indexed = self.index.get(module)
         if indexed is None:
             return (set(), True)
-        prefix = f"{class_name}."
+        bindings, resolved = self._class_bindings(class_ref)
         found = {
-            name[len(prefix):]
-            for name in indexed.functions
-            if name.startswith(prefix)
-            and name[len(prefix):].startswith("__")
-            and name[len(prefix):].endswith("__")
-            and "." not in name[len(prefix):]
+            name for name in bindings
+            if name.startswith("__") and name.endswith("__")
         }
-        unknown = False
-        class_def = indexed.classes.get(class_name)
-        if class_def is None or not self._class_surface_is_modelled(class_ref):
-            # Not "this class has no dunders" — "the walk cannot say what its members are".
-            unknown = True
-        if class_def is not None:
-            for node in class_def.body:
-                if not isinstance(node, ast.Assign):
-                    continue
-                names = [
-                    t.id for t in node.targets
-                    if isinstance(t, ast.Name)
-                    and t.id.startswith("__") and t.id.endswith("__")
-                ]
-                if not names:
-                    continue
-                if isinstance(node.value, ast.Name) and (
-                    f"{class_name}.{node.value.id}" in indexed.functions
-                ):
-                    found.update(names)
-                else:
-                    # A dunder declared as something this walk cannot follow.
-                    unknown = True
+        # Not "this class has no dunders" — "the walk cannot say what its members are".
+        unknown = not resolved
         bases, saw_unresolved = self._base_classes(class_ref)
         if saw_unresolved:
             unknown = True
@@ -1557,27 +1663,16 @@ class _Walker:
         descriptor" and its ``__set__`` was never analysed.  Anything the class body binds
         by some other route is caught upstream by :meth:`_class_surface_is_modelled`.
         """
-        module, class_name = class_ref
-        indexed = self.index.get(module)
-        class_def = indexed.classes.get(class_name) if indexed else None
-        if class_def is None or not self._class_surface_is_modelled(class_ref):
+        bindings, resolved = self._class_bindings(class_ref)
+        if not resolved:
             return (None, False)
-        for node in class_def.body:
-            if isinstance(node, ast.Assign):
-                targets = node.targets
-            elif isinstance(node, ast.AnnAssign):
-                targets = [node.target]
-            else:
-                continue
-            if not any(isinstance(t, ast.Name) and t.id == attr for t in targets):
-                continue
-            if node.value is None:
-                # A bare annotation binds nothing on the class.
-                continue
-            constructed = self._constructed_class(module, "", node.value)
-            if constructed is not None:
-                return (constructed, True)
-            return (None, False)
+        bound = bindings.get(attr)
+        if bound is not None:
+            module, name = bound
+            # A binding that resolves to a CLASS is a descriptor instance; one that
+            # resolves to a function is an ordinary member.
+            if name in self.index[module].classes:
+                return (bound, True)
         for base in self._base_classes(class_ref)[0]:
             descriptor, readable = self._class_level_attribute_type(base, attr)
             if descriptor is not None or not readable:

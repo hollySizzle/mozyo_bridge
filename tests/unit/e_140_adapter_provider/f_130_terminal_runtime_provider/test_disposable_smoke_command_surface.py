@@ -53,6 +53,7 @@ if str(ROOT / "tests") not in sys.path:
 
 from support.herdr_dispatch_derivation import (  # noqa: E402
     derive_dispatch_surface,
+    _Walker,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E402,E501
     disposable_herdr_instance as live_module,
@@ -343,6 +344,8 @@ class DerivationLivenessTests(unittest.TestCase):
         tail_addition: str = "",
         recorder_addition: str = "",
         recorder_replace: tuple = (),
+        recorder_tail: str = "",
+        recorder_property_addition: str = "",
     ) -> Path:
         tmp = Path(tempfile.mkdtemp(prefix="mozyo-derivation-probe-"))
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -392,6 +395,26 @@ class DerivationLivenessTests(unittest.TestCase):
             self.assertIn(recorder_marker, body, "the recorder injection point moved")
             recorder.write_text(
                 body.replace(recorder_marker, recorder_marker + recorder_addition, 1),
+                encoding="utf-8",
+            )
+        if recorder_tail:
+            # Appended at the real module tail: a write that happens AFTER the class
+            # statement has run cannot be expressed by injecting into the body.
+            recorder = seed.parent / "shared_space_smoke_observation.py"
+            recorder.write_text(
+                recorder.read_text(encoding="utf-8") + recorder_tail, encoding="utf-8"
+            )
+        if recorder_property_addition:
+            # Injected into the body of a property that is ALREADY in the read-exception
+            # table and already read from production, so the mutant changes one thing.
+            recorder = seed.parent / "shared_space_smoke_observation.py"
+            body = recorder.read_text(encoding="utf-8")
+            anchor = "    def created_coordinators_workspaces(self)"
+            self.assertIn(anchor, body, "the tabled property moved")
+            start = body.index(anchor)
+            line_end = body.index("\n", body.index(":", body.index("->", start)))
+            recorder.write_text(
+                body[: line_end + 1] + recorder_property_addition + body[line_end + 1:],
                 encoding="utf-8",
             )
         return tmp
@@ -1070,6 +1093,126 @@ class DerivationLivenessTests(unittest.TestCase):
                         [s.anchor for s in surface.unresolved_sites],
                     ),
                     f"a modelled construct ({label}) was reported as unreadable",
+                )
+
+    def test_class_bindings_the_walk_cannot_resolve_are_reported(self) -> None:
+        """Review j#92639 F10-1, verdict j#92649.
+
+        R9 closed the set of statement *node types* a class body may hold, but the
+        consumers re-read those statements with narrower rules of their own, so every
+        binding in the gap resolved to "absent" in silence.  Each of these is an ordinary
+        Python class binding, not an exotic one.
+        """
+        cases = {
+            "annotated alias": (
+                "\n\n    def _probe_ann_len(self):\n"
+                '        self(["bin", "probe", "annotated-dunder"])\n'
+                "        return 1\n\n"
+                "    __len__: object = _probe_ann_len\n"
+            ),
+            "unpacking target": (
+                "\n\n    def _probe_unpack_len(self):\n"
+                '        self(["bin", "probe", "unpacked-dunder"])\n'
+                "        return 1\n\n"
+                "    (__len__,) = (_probe_unpack_len,)\n"
+            ),
+            "right-hand side writes the namespace": (
+                "\n\n    def _probe_side_len(self):\n"
+                '        self(["bin", "probe", "assign-side-effect"])\n'
+                "        return 1\n\n"
+                '    _installed = locals().__setitem__("__len__", _probe_side_len)\n'
+            ),
+        }
+        for label, addition in cases.items():
+            with self.subTest(binding=label):
+                tree = self._mutated_tree("", recorder_addition=addition)
+                surface = derive_dispatch_surface(tree)
+                self.assertTrue(
+                    [p for p in surface.pairs if p[0] == "probe"]
+                    or surface.unresolved_flows
+                    or surface.unresolved_sites,
+                    f"a class binding ({label}) resolved to absent in silence",
+                )
+
+    def test_a_member_written_after_the_class_statement_is_reported(self) -> None:
+        """Review j#92639 F10-2, verdict j#92649.
+
+        Reading a ``ClassDef`` says what the body binds.  It cannot say what the class
+        ends up with, and both spellings of a later write are ordinary Python.
+        """
+        cases = {
+            "attribute assignment": (
+                "\n\ndef _probe_post_len(self):\n"
+                '    self(["bin", "probe", "post-class-mutation"])\n'
+                "    return 1\n\n\n"
+                "RecordingHerdrRunner.__len__ = _probe_post_len\n"
+            ),
+            "setattr": (
+                "\n\ndef _probe_setattr_len(self):\n"
+                '    self(["bin", "probe", "setattr-mutation"])\n'
+                "    return 1\n\n\n"
+                'setattr(RecordingHerdrRunner, "__len__", _probe_setattr_len)\n'
+            ),
+        }
+        for label, addition in cases.items():
+            with self.subTest(spelling=label):
+                tree = self._mutated_tree("", recorder_tail=addition)
+                surface = derive_dispatch_surface(tree)
+                self.assertTrue(
+                    surface.unresolved_flows or surface.unresolved_sites,
+                    f"a post-definition member write ({label}) was not reported",
+                )
+
+    def test_a_property_body_is_analysed_not_excused_by_the_table(self) -> None:
+        """Review j#92639 F10-3, verdict j#92649.
+
+        The exception table records what a read *yields*; it was being used to excuse the
+        read *happening*.  This mutant adds a dispatch to the body of a property that is
+        already in the table and already read from production, changing nothing else.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_property_addition=(
+                '        self(["bin", "probe", "property-read"])\n'
+            ),
+        )
+        self.assertIn(
+            ("probe", "property-read"), derive_dispatch_surface(tree).pairs
+        )
+
+    def test_only_proven_member_decorators_are_modelled(self) -> None:
+        """``classmethod`` / ``staticmethod`` were modelled on an argument, not a proof.
+
+        Review j#92639 F10-3 asked for the proof.  There is none, so they are out of the
+        modelled set — and this pins that they stay out until one exists, rather than
+        drifting back in because they sound harmless.
+        """
+        self.assertEqual(frozenset({"property"}), _Walker._MODELLED_MEMBER_DECORATORS)
+
+    def test_ordinary_class_bindings_stay_silent(self) -> None:
+        """The control for the resolver: refusing every binding would pass every probe."""
+        cases = {
+            "plain alias": (
+                "\n\n    def _probe_plain(self):\n        return 0\n\n"
+                "    probe_alias = _probe_plain\n"
+            ),
+            "annotated constant": "\n\n    probe_slot: int = 0\n",
+            "bare annotation": "\n\n    probe_unbound: int\n",
+            "plain direct-def dunder": (
+                "\n\n    def __len__(self):\n        return 0\n"
+            ),
+        }
+        for label, addition in cases.items():
+            with self.subTest(binding=label):
+                tree = self._mutated_tree("", recorder_addition=addition)
+                surface = derive_dispatch_surface(tree)
+                self.assertEqual(
+                    ([], []),
+                    (
+                        list(surface.unresolved_flows),
+                        [s.anchor for s in surface.unresolved_sites],
+                    ),
+                    f"an ordinary class binding ({label}) was reported as unreadable",
                 )
 
     def test_the_probe_does_not_touch_the_live_source(self) -> None:
