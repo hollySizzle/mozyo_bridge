@@ -59,14 +59,8 @@ rules:
   - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/owned_descriptors.py
   - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/platform_capabilities.py
   - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/domain/legacy_mirror_contract.py
-  - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/**
-  - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/**
-  - tests/support/legacy_mirror_tree_fixture.py
-  - tests/support/legacy_mirror_fault_schedule.py
-  - tests/regressions/test_issue_14580_*.py
-  - tests/regressions/test_issue_14651_*.py
-  - tests/regressions/test_issue_14652_*.py
-  - tests/regressions/test_legacy_mirror_*.py
+  - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py
+  - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_contract.py
   severity: warn
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/legacy-mirror-failure-state-characterization.md と @vibes/docs/logics/tests-placement-discovery-policy.md
     と @vibes/docs/logics/skill-distribution.md をよく確認し従うこと

@@ -1556,21 +1556,16 @@ file_conventions:
       - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/owned_descriptors.py
       - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/platform_capabilities.py
       - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/domain/legacy_mirror_contract.py
-      # Directory-scoped, not `test_legacy_*` prefixed: the split (Redmine
-      # #14660 doc section 5) lands modules like `test_owned_descriptor_teardown.py`
-      # in the same feature directory, and a prefix pattern silently drops them.
-      - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/**
-      - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/**
-      # Destinations the split creates outside the feature directory. Named
-      # exactly so the doc stays resolvable after the move commits (T1 / T5 /
-      # T6); a moved file whose convention no longer resolves is how the
-      # characterisation stops being read.
-      - tests/support/legacy_mirror_tree_fixture.py
-      - tests/support/legacy_mirror_fault_schedule.py
-      - tests/regressions/test_issue_14580_*.py
-      - tests/regressions/test_issue_14651_*.py
-      - tests/regressions/test_issue_14652_*.py
-      - tests/regressions/test_legacy_mirror_*.py
+      # Exact current paths only. A directory glob over the feature pulled the
+      # characterisation into `test_plugin_marketplace.py` and
+      # `test_skill_workflow_guidance.py`, which have nothing to do with the
+      # mirror -- the noise the governance rule asks us to weigh before
+      # widening patterns. The split's destinations are not settled yet
+      # (the placement ruling is still open), so speculative patterns would
+      # name paths that may never exist; each move task adds its own real
+      # paths here as part of finishing.
+      - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py
+      - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_contract.py
     severity: warn
     document_refs:
       - logic-legacy-mirror-failure-state-characterization

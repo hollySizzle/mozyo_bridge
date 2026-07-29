@@ -97,10 +97,39 @@ audit を抜けていた (j#90418 R6-F3) のがこの class の由来。
 
 ### 1.2 Write 機械 (`_replace_one`)
 
-1 つの pinned name について、event → 遷移 → **primary violation** → cleanup 経路 →
-**cleanup が追加しうる violation**。`staging_live` が cleanup ownership を持つ 1 bit である。
+`staging_live` が cleanup ownership を持つ 1 bit である。
 
-**1 event が 2 つの violation を出しうる。** `install()` の失敗行は
+#### rail は 2 本ある [実測]
+
+同じ失敗でも、**どちらの rail を通ったかで出口が変わる**。`_replace_one` の末尾:
+
+```
+try:
+    problems = install()
+except BaseException as primary:
+    interrupt = _teardown_during(primary, release, temp.close)
+    if interrupt is not None:
+        raise interrupt
+    raise                                   # ← ここで終わる
+return problems + self._close_staging(temp, subject)
+```
+
+| | **normal-return rail** (`install()` が値を返した) | **unwind rail** (`install()` が `BaseException` を投げた) |
+| --- | --- | --- |
+| cleanup を呼ぶ主体 | `install()` 内の `release()` | `_teardown_during(primary, release, temp.close)` |
+| close を呼ぶ主体 | **`_close_staging`** | `temp.close` (teardown action の 1 つ) |
+| release の violation tuple | **caller への typed violation になる** | **ledger に retain されるだけ** (§1.4 の returned failure channel) |
+| close 失敗 | **`W` / `WRITE_FAILED` "could not be closed cleanly"** | **ledger に retain されるだけ。typed violation にならない** |
+| `_replace_one` の出口 | violation tuple を `sync()` へ返す | 例外を再送出。`sync()` を貫通して呼び出し元へ |
+
+**`_close_staging` は unwind rail を通らない** — `except` 節は `raise` で終わるため、
+`return problems + self._close_staging(...)` に到達しない。同じ close 失敗が、
+rail によって typed violation になったり ledger 止まりになったりする。
+
+以下の表は **normal-return rail** の event → 出口である。unwind rail は W13 の 1 行に
+まとめ、詳細は上の rail 表と §1.4 を読む。
+
+**1 event が 2 つの violation を出しうる** (normal-return rail)。`install()` の失敗行は
 `(Violation(...),) + release()` を返し、`release()` は `_release_staging` 経由で
 `CLEANUP_FAILED` を **追加**発行しうる。primary だけを読むと、residue が残ったのか
 片付いたのかが分からない。したがって列を分けてある。
@@ -109,7 +138,7 @@ audit を抜けていた (j#90418 R6-F3) のがこの class の由来。
 | --- | --- | --- | --- | --- | --- |
 | W0 | source `_read_bound` 失敗 | 中断 | `B` / `SOURCE_SWAPPED_DURING_SYNC` | 未作成 | — |
 | W1 | `O_CREAT\|O_EXCL\|O_NOFOLLOW` 失敗 | 中断 | `W` / `WRITE_FAILED` "staging file could not be created" | 未作成 | — |
-| **W2** | **`ownership.prove()` (`fstat`) 失敗** | **中断** | **`W` / `WRITE_FAILED` "could not be written"** (`flushing` はまだ `False`) | **`release()`** | **`§1.5` の表。`_identity` が `None` のままなので `resolve()` は `UNPROVEN` → `CLEANUP_FAILED` "ownership could not be proved"** |
+| **W2** | **`ownership.prove()` (`fstat`) 失敗** | **中断** | **`W` / `WRITE_FAILED` "could not be written"** (`flushing` はまだ `False`) | **`release()`** | **§1.5 の表のうち到達可能な 3 値のみ** (下記) |
 | W3 | `os.write` ループ失敗 / 無進捗 16 回超 | 中断 | `W` / `WRITE_FAILED` "could not be written" | `release()` | §1.5 の表 |
 | W4 | `os.fchmod(0o644)` 失敗 | 中断 | 同上 | `release()` | §1.5 の表 |
 | W5 | `os.fsync` 失敗 (`flushing=True`) | 中断 | `W` / `WRITE_FAILED` "could not be flushed to disk" | `release()` | §1.5 の表 |
@@ -120,16 +149,30 @@ audit を抜けていた (j#90418 R6-F3) のがこの class の由来。
 | W10 | `os.replace` 失敗 かつ dest が symlink / 非 regular | 中断 | **`E`** / `ENTRY_SYMLINK`\|`ENTRY_NOT_REGULAR` | `release()` | §1.5 の表 |
 | W11 | `os.replace` 失敗 (その他) | 中断 | `W` / `WRITE_FAILED` "could not be replaced" | `release()` | §1.5 の表 |
 | W12 | `os.replace` 成功 | 完了 | — | 呼ばない (rename が消費、`staging_live=False`) | — |
-| W13 | 任意時点で `BaseException` unwind | 再送出 | — | `_teardown_during(primary, release, temp.close)` | ledger へ (§1.4) |
-| W14 | 上記いずれの後も必ず | — | close 失敗時 `W` / `WRITE_FAILED` "could not be closed cleanly" | `_close_staging` | — |
+| W13 | 任意時点で `BaseException` unwind | **再送出 (rail が変わる)** | **無し** — typed violation を返さない | `_teardown_during(primary, release, temp.close)` | **無し** — release も close も ledger 止まり (§1.4) |
+| W14 | **normal-return rail のみ**、W0–W12 のいずれの後 | — | close 失敗時 `W` / `WRITE_FAILED` "could not be closed cleanly" | `_close_staging` | — |
 
 W2 について [実測]: `prove()` は `os.fstat(self._descriptor.fileno)` そのものなので
 raise しうる。`install()` の `try:` は `prove()` を含み、`flushing = True` は `fsync`
 の直前まで立たないため、`prove()` の `OSError` は "could not be written" 側に落ちる。
-この分岐は仮想ではなく `test_an_unprovable_staging_identity_never_unlinks` が実際に
-駆動しており (staging fd への `fstat` に `OSError(EIO)` を注入)、出力には
-`WRITE_FAILED` と `CLEANUP_FAILED` の **両方**が現れる — これがこの表で列を分けている
-理由そのものである。
+
+**W2 後に到達しうる cleanup 結果は 3 値だけである。** `resolve()` は `os.lstat` を
+**先に**実行し、`FileNotFoundError` → `ABSENT` / `OSError` → `UNREADABLE` を pin 参照
+**前**に返す。`identity is None` の判定はその後なので:
+
+| resolve | 到達可否 | cleanup 追加 violation |
+| --- | --- | --- |
+| `ABSENT` | 到達する (entry が消えていた) | **無し** |
+| `UNREADABLE` | 到達する | `CLEANUP_FAILED` "could not be inspected and may still be present" |
+| `UNPROVEN` | 到達する (entry が在る) | `CLEANUP_FAILED` "ownership could not be proved, so it was left in place" |
+| `CONFIRMED` | **到達しない** | — (`_identity` が `None` なので identity 比較に進めない) |
+| `FOREIGN` | **到達しない** | — (同上) |
+
+`test_an_unprovable_staging_identity_never_unlinks` が駆動するのは `UNPROVEN` の
+場合であり (staging fd への `fstat` に `OSError(EIO)` を注入し、entry は在る)、出力には
+`WRITE_FAILED` と `CLEANUP_FAILED` の **両方**が現れる。ただし **これは 3 値のうち
+1 つ**であって、W2 の結果ではない — 前 revision はこの 1 例を W2 行に無条件の結果として
+書いていた。
 
 W6 について [実測]: FOREIGN だけが `release()` を **通らない**。したがって W6 は
 `CLEANUP_FAILED` を一切発行しない。「片付けに失敗した」のではなく「自分のものでは
@@ -229,7 +272,21 @@ residual (foreign inode を install しうる) とは**形が違う** — こち
 | W2–W5, W7–W11 かつ release が `CONFIRMED` → unlink 成功 | なし | する | staging 削除済。既に replace 済の name は content 一致で no-op |
 | W2–W5, W7–W11 かつ release が `CLEANUP_FAILED` を発行 | **あり** (自分の残骸) | **しない (operator 介入が要る)** | 次回 rule `D` / `UNPINNED_ENTRY` → `blocks_write` |
 | **W6 (`FOREIGN`)** | **あり (他者の entry)** | **しない (operator 介入が要る)** | `CLEANUP_FAILED` は**出ない**が、staging 名の entry は `MIRRORED_REFERENCES` 外なので同じく rule `D` → `blocks_write` |
-| ループ途中の中断 | 上記いずれかに従う | staging が残らなければする | 先行 name は install 済だが `_replace_one` は content べき等 |
+| ループ途中の中断 (typed) | 上記いずれかに従う | staging が残らなければする | 先行 name は install 済だが `_replace_one` は content べき等 |
+| **W13 unwind rail** | **`release` の結果次第 (ledger にしか出ない)** | **次 run の audit が見るものだけで決まる** | **`sync()` は値を返さず例外が貫通する。operator は report 行も recovery 行も受け取らない** |
+
+**W13 は他の行と前提が違う [実測]。** `_replace_one` が `BaseException` を再送出すると
+`sync()` の `with` を抜けて呼び出し元へ伝播するので、`sync()` は `(1, (), lines)` を
+**返さない**。したがって:
+
+- operator は `report_lines()` を一切見ない。`clear_residue` も `disposition_unpinned` も
+  この run では提示されない。
+- `release` は `_teardown_during` 経由で走るので staging が片付くことはあるが、その
+  成否は **ledger にしか無い**。`teardown_failures(primary)` を読む caller がいなければ
+  誰も知らない。
+- よって retry の可否は、この run の出力ではなく **次 run の audit が staging 名に
+  何を見るか**だけで決まる。上の表の他の行と同じ結論 (残っていれば rule `D` で
+  blocks_write) だが、**そこへ至る情報経路が違う**。
 
 残留した場合に operator が受け取る指示は、**どの run か**で変わる [実測]。
 
@@ -275,11 +332,9 @@ discovery 件数 D2=13,207 とは別の母数である)。
 §5.0 の配置決定木の適用も、同じ方法で source から導出している (分岐 3 は
 docstring の defect anchor、分岐 4 は注入 surface)。
 
-> **再現性の欠如 [未確認]:** この導出器は本 Task の scratchpad で走らせた read-only
-> な調査 script であり、repo に commit していない。つまり **本 doc の 127 / 23 / 96 /
-> 8 / 69 / 53 / 5 という分類値は、現状では第三者が再実行して確認できない**。
-> R1 review j#92353 の Verification 節が指摘したとおりであり、事実として認める。
-> 対応方針 (案 A / 案 B) と、どちらも採らない選択肢が無いことは §8 に書いた。
+> **再現手順は Appendix A にある。** 2 つの導出器の全文、同 head での実行結果、
+> および 127 件全件の mapping (test 名 / 行 / 行数 / surfaces / 決定木の分岐 /
+> 行き先) を載せてある。分類値 127 / 23 / 96 / 8 / 69 / 53 / 5 はそこから再現できる。
 
 ### 2.2 class 別 [実測]
 
@@ -496,12 +551,21 @@ context = `e_130_governance_distribution` / feature = `f_150_skill_plugin_distri
 `test_the_exact_linux_312_advertisement_is_accepted` (3582) /
 `test_the_probe_anchor_is_not_a_directory` (3607)。
 
-### 5.1 決定木の結論と、それが露出させた設計上の問題 [未確認]
+### 5.1 配置 matrix は **未決** である [OPEN]
 
-**この配置をそのまま採る。** 決定木は canonical policy であり、本 doc に上書きする
-権限はない (R1 はここで doc-local な例外を作っていた。撤回済み)。
+**現時点で配置 matrix は確定していない。** §5.0 は「決定木を機械適用したらこう出た」
+という**測定結果**であって、採用した配置ではない。
 
-同時に、この結果は #14592 acceptance との緊張を露出させる。事実として書く:
+> 前 revision はここに「この配置をそのまま採る」と書きながら、同じ節の末尾で
+> 「本 doc は判断を持たない」とも書いていた。両立しない。撤回し、**未決である**に
+> 一本化する。R1 の「doc が policy を上書きする」を直した反動で、今度は決定したのか
+> していないのか読めない形にしていた。
+
+したがって **#14660 acceptance の「配置 matrix を決める」は本 revision では
+満たしていない。** 満たしたと書かない。確定には §5.1.1 の裁定が要る。
+
+決定木は canonical policy であり、本 doc に上書きする権限はない。同時に、その出力は
+#14592 acceptance と衝突する。事実として書く:
 
 - §4.1 が E-pure の正本とした retention 機械 19 件のうち、**大半が分岐 3 で
   `tests/regressions/` に落ちる**。docstring が R15–R26 の finding id を持つためである。
@@ -510,23 +574,47 @@ context = `e_130_governance_distribution` / feature = `f_150_skill_plugin_distri
   は、決定木の出力だけでは満たされない。
 - 逆に分岐 3 を弱めると、policy の regressions 定義そのものを変えることになる。
 
-**これは本 Task が決めてよい範囲を越える。** `refactor-split-strategy.md`
+### 5.1.1 求める裁定 (T0 design consultation)
+
+**これは本 Task が単独で決めてよい範囲を越える。** `refactor-split-strategy.md`
 `## Move Commit Rules` 6 (「move が隠れた結合を露出したら押し通さず design
-consultation を記録する」) に従い、**policy-level の design consultation として
-分離する**。論点:
+consultation を記録する」) に従い、policy-level の裁定を求める。論点と、本 doc の
+**推奨案**を添える (推奨であって決定ではない):
 
-1. 「defect anchor を docstring に持つ」ことは regressions の十分条件か。
-   R15–R26 の finding id は *由来* の記録であって、その test が現在主張している
-   property が defect pin であるとは限らない (例: `test_each_occurrence_is_one_ledger_entry`
-   は R17-F2 由来だが、主張しているのは ledger の恒久的な保存則である)。
-2. 十分条件でないなら、regressions と unit/integration を分ける判定を policy 側で
-   どう書き直すか。
-3. 書き直すまでの間、本 family をどう置くか (決定木どおり置く / 移設を保留する)。
+**論点 1. 「docstring に defect anchor がある」は regressions の十分条件か。**
 
-この 3 点が解決するまで **T1 (test 移設) は着手しない**。§7 の依存順に反映済み。
+policy `### regressions` は「過去に確定した defect の**再発防止 pin**」「1 ファイル =
+1 つの修正済み症状」「**新規機能の通常テストは regressions に置かない**」と定義する。
+R15–R26 の finding id は *由来* の記録であり、その test が**現在主張している property**
+が defect pin であるとは限らない。例:
 
-> 本 doc は判断を持たない。上記は「決定木を適用したらこうなった」という実測と、
-> それが acceptance と衝突するという観測である。解決は policy 側の正本で行う。
+- `test_each_occurrence_is_one_ledger_entry` — R17-F2 由来だが、主張は
+  「1 occurrence = 1 ledger entry」という ledger の**恒久的な保存則**である。
+- `test_the_directory_walk_never_closes_a_reused_descriptor_number` — j#90482 由来で、
+  主張も「あの defect が戻らない」に近い。
+
+→ **推奨: 十分条件ではない。** 由来 (provenance) と主張 (property) は別軸であり、
+決定木の分岐 3 は後者で判定されるべきである。
+
+**論点 2. 十分条件でないなら、判定を policy 側でどう書き直すか。**
+
+→ **推奨: 「その test が失われたとき何が検出できなくなるか」で切る。**
+失われるのが *特定の過去の欠陥の再来* なら regressions、*module の contract そのもの*
+なら unit / integration。ただしこれは docstring から機械導出できない (意図の判断)。
+policy に判定基準として書くなら、**機械判定ではなく著者宣言** (例: docstring の
+所定行、あるいは module 配置そのもの) を根拠にする形になる。
+
+**論点 3. 裁定までの間、本 family をどう置くか。**
+
+→ **推奨: 移設を保留する。** 決定木どおり 69 件を `tests/regressions/` へ動かすと、
+論点 1 が「十分条件ではない」と裁定された場合に再移設になる。移設は D1 / D2 の
+両不変条件を要する重い操作であり、往復させる価値がない。
+
+**裁定が済むまで T1 / T5 (test 移設) に着手しない。** §7 の依存順に反映済み。
+
+> 上の推奨は本 doc の意見であり、**裁定ではない**。裁定は policy 側の正本
+> (`tests-placement-discovery-policy.md`) で行い、その結果を受けて §5.0 の測定値を
+> 配置 matrix へ確定させる。
 
 ### 5.2 検証層ごとの内訳 (参考、配置とは独立)
 
@@ -727,11 +815,20 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
 
 依存順: `T0 → T1 → {T2, T3, T5, T6}`、`T3 → T4`。
 
-**T1 / T5 完了時の catalog 更新は完了条件である [F5b 修正]:** §5.0 の行き先が
-確定した時点で、その exact path を `fc-legacy-mirror-sync` の `patterns` に加え、
-`mozyo-bridge docs generate-file-conventions` を再生成し `--check` を green に
-すること。これを怠ると、移設後の file を編集しても本 doc が `docs resolve` で
-解決されなくなる。**T1 / T5 の完了条件に含める** (後追いの掃除にしない)。
+**移設 Task の完了条件に catalog 更新を含める:** `fc-legacy-mirror-sync` の
+`patterns` は **現行の exact path 2 件のみ**である。将来 path を予測して先置き
+しない — 予測 pattern は裁定次第で存在しない path を指し続け、feature directory
+全体への glob は無関係な test (`test_plugin_marketplace.py` /
+`test_skill_workflow_guidance.py`) にまで本 doc を配布する。後者は実測で確認し、
+`.mozyo-bridge/rules/docs_catalog_governance.yaml` の「対象ファイル変更時に実際に
+読むべき docs に絞る」「patterns を広げる時は agent へのノイズ増加も評価する」に
+反するので撤回した。
+
+代わりに、**file を動かす Task が、動かした先の exact path を同じ commit で
+`patterns` へ追加し**、`mozyo-bridge docs generate-file-conventions` を再生成して
+`--check` を green にする。これを怠ると移設後の file を編集しても本 doc が
+`docs resolve` で解決されない。**T1 / T5 / T6 の完了条件**であり、後追いの掃除に
+しない。
 
 **T2 への申し送り [未確認]:** §5.4 のとおり `legacy_mirror_sync.py` は 899 行で
 `max_module_lines: 1000` まで 101 行しかない。状態機械を同 module に足すと gate に
@@ -754,26 +851,524 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
 4. **`_StagingOwnership` の公開性** — 現状 module-private だが、invariant 2 の
    正本主張がここに集中している。公開型にするかは T3 の判断。
 5. **§5.1 の policy 裁定 (T0)** — 「docstring の defect anchor は regressions の
-   十分条件か」。本 doc は判断を持たず、決定木の出力をそのまま報告している。
+   十分条件か」。本 doc は §5.1.1 に**推奨案**を書いたが、裁定は policy 側で行う。
+   **これが済むまで配置 matrix は未決であり、acceptance の当該項目は OPEN である。**
 
-### 導出器の再現性 [R1 review j#92353 Verification 節より]
+### 導出器の恒久的な置き場 [未確認]
 
-R1 の 23 / 96 / 8 等の分類は scratchpad の AST 導出器で得たもので、その script を
-repo に残していない。**したがって R1 時点では第三者が同じ導出を再実行できなかった。**
-これは finding として立てられていないが、事実として正しい。
+**本 revision で再現性そのものは閉じた** — Appendix A に導出器の全文、同 head での
+実行結果、127 件全件の mapping を載せたので、第三者は script を写して再実行し、
+各 test の分岐理由まで独立に検証できる。
 
-本 doc は R2 でさらに §5.0 の決定木適用 (69 / 53 / 5) を導出しており、再現性の
-欠如は R1 より重くなっている。対応は 2 案あり、**T0 と同じ round で決める**:
+残る問いは**恒久的な置き場**である。Appendix A は「この head の測定を検証できる」を
+満たすが、**doc と script の drift を検出する仕組みが無い** — test file が変われば
+Appendix A の数値は古くなるのに、それを落とす gate が無い。
 
-- **案 A** — 導出器を `tests/support/` へ commit し、共有 oracle にする。
+- **案 A** — 導出器を `tests/support/` へ移し、共有 oracle にする。
   「列挙が漏れたら oracle を自分の外へ出す」という repo の既存方針と整合し、
   分割後も同じ分類を再実行できる。ただし support 配下に「test ではないが CI で
   実行されない script」を置くことになり、腐敗検出の手段が別途要る。
-- **案 B** — 導出器を doc の付録として貼り、実行可能な形で残す。commit 対象は
-  doc だけになるが、doc と script の drift を検出する仕組みが無い。
+- **案 B** — Appendix A のまま据え置き、更新を各移設 Task の完了条件にする。
+  追加の実行面を作らないが、drift 検出は人手に依存する。
 
-**本 Task では決めない。** ただし、どちらも採らずに R1 の状態のままにする選択肢は
-無い — 導出結果を根拠に実装 Task を分割する以上、導出は再現可能でなければならない。
+**本 Task では決めない** (allowed scope が docs/catalog-only であり、案 A は
+`tests/` への書き込みを要する)。T0 と同じ round で裁定を求める。
+
+---
+
+## Appendix A. 導出器と全件 mapping (再現用)
+
+本 doc の分類値 (127 / 23 / 96 / 8 / 69 / 53 / 5) は、下記 2 script を
+`origin/main-next@fef86cac` の tree に対して実行した結果である。**第三者が同じ head で
+再実行して検証できるよう、全文と全件 mapping をここに置く。**
+
+前 revision はこの導出器を scratchpad に置いたまま repo へ残さず、「再現不能」と
+注記して未確認事項へ繰延べていた。繰延べは「後で決めること」には使えるが、
+**すでに doc に書いた数値の検証可能性**には使えない — review はこの head に対して
+行われる。
+
+### A.1 実行手順
+
+repo root で、下の 2 script を任意の作業ディレクトリへ保存して実行する
+(いずれも read-only。repo を変更しない):
+
+```text
+python3 A2.py tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py > inventory.json
+python3 A3.py tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py inventory.json tree.json
+```
+
+`A2.py` は stderr に surface ごとの件数を、`A3.py` は stdout に決定木の集計と、
+分岐 3 に落ちなかった test の一覧を出す。`A3.py` は先頭で `len(rows) == 127` を
+assert するので、分類漏れがあれば落ちる。
+
+### A.2 注入 surface 分類器
+
+```python
+"""Derive, from the test module's AST, which injection surfaces each test uses.
+
+Read-only. Emits a machine-checkable inventory instead of a hand list, because a
+hand list is exactly what this characterisation must not ship (the acceptance
+asks which tests depend on source lines / private call order, and a missed entry
+is invisible).
+
+Surfaces classified per test method, transitively through helper methods defined
+in the same class:
+
+  source_line      - resolves a source LINE (inspect.getsourcelines / co_lines /
+                     settrace on f_lineno) to place an injection
+  private_symbol   - patches or reads a module-private name (leading underscore)
+  os_patch         - patches an os primitive on the module under test
+  trace            - installs sys.settrace
+  ast_probe        - parses source with `ast` as the oracle
+  real_fs          - builds a real tree via the fixture / tmp dir
+  subprocess       - shells out (wrapper CLI tests)
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import sys
+from pathlib import Path
+
+TEST = Path(sys.argv[1])
+tree = ast.parse(TEST.read_text(encoding="utf-8"))
+
+SOURCE_LINE_CALLS = {"getsourcelines", "findsource", "getsource", "co_lines"}
+OS_NAMES = {
+    "open", "close", "write", "read", "lstat", "fstat", "fchmod", "fsync",
+    "replace", "unlink", "mkdir", "scandir", "urandom", "pipe",
+    "supports_dir_fd", "supports_fd",
+}
+
+
+def attr_chain(node: ast.AST) -> list[str]:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return list(reversed(parts))
+
+
+class BodyScan(ast.NodeVisitor):
+    """Surfaces used directly in one function body, plus same-class helper calls."""
+
+    def __init__(self) -> None:
+        self.surfaces: set[str] = set()
+        self.helpers: set[str] = set()
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in SOURCE_LINE_CALLS:
+            self.surfaces.add("source_line")
+        if node.attr == "f_lineno":
+            self.surfaces.add("source_line")
+        if node.attr == "settrace":
+            self.surfaces.add("trace")
+        # self._helper / cls._helper -> transitive edge
+        chain = attr_chain(node)
+        if len(chain) == 2 and chain[0] in {"self", "cls"}:
+            self.helpers.add(chain[1])
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id == "ast":
+            self.surfaces.add("ast_probe")
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        chain = attr_chain(node.func)
+        dotted = ".".join(chain)
+        if dotted.endswith("patch.object") or dotted.endswith("mock.patch"):
+            if node.args:
+                target = node.args[0]
+                tchain = attr_chain(target)
+                # patch.object(<obj>, "<name>", ...)
+                if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                    name = node.args[1].value
+                    if isinstance(name, str):
+                        if name.startswith("_"):
+                            self.surfaces.add("private_symbol")
+                        if name in OS_NAMES:
+                            self.surfaces.add("os_patch")
+                if tchain and tchain[-1].startswith("_"):
+                    self.surfaces.add("private_symbol")
+        if dotted.startswith("ast."):
+            self.surfaces.add("ast_probe")
+        if "run" in chain and "subprocess" in chain:
+            self.surfaces.add("subprocess")
+        if dotted.endswith("check_output") or dotted.endswith("Popen"):
+            self.surfaces.add("subprocess")
+        self.generic_visit(node)
+
+
+def scan(fn: ast.FunctionDef) -> BodyScan:
+    s = BodyScan()
+    for stmt in fn.body:
+        s.visit(stmt)
+    # a private module symbol referenced directly (owned_descriptors._foo)
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Attribute):
+            chain = attr_chain(node)
+            if len(chain) >= 2 and chain[0] in {
+                "owned_descriptors",
+                "legacy_mirror_sync",
+                "platform_capabilities",
+            }:
+                if any(p.startswith("_") for p in chain[1:]):
+                    s.surfaces.add("private_symbol")
+    # A real tree is built only through the fixture's staging helper, or the
+    # tracked repo tree itself (ROOT / SYNC_SCRIPT_PATH).
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Attribute) and node.attr in {
+            "_stage",
+            "mkdtemp",
+            "TemporaryDirectory",
+            "NamedTemporaryFile",
+            "mkstemp",
+        }:
+            s.surfaces.add("real_fs")
+        if isinstance(node, ast.Name) and node.id in {"ROOT", "SYNC_SCRIPT_PATH"}:
+            s.surfaces.add("real_fs")
+        if isinstance(node, ast.Attribute) and node.attr in {
+            "canonical_ref_dir",
+            "mirror_ref_dir",
+            "mirror_skill_dir",
+        }:
+            s.surfaces.add("real_fs")
+    return s
+
+
+report: dict[str, dict] = {}
+for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+    members = {
+        n.name: n
+        for n in cls.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    scans = {name: scan(fn) for name, fn in members.items()}
+
+    def resolve(name: str, seen: set[str]) -> set[str]:
+        if name in seen or name not in scans:
+            return set()
+        seen.add(name)
+        out = set(scans[name].surfaces)
+        for helper in scans[name].helpers:
+            out |= resolve(helper, seen)
+        return out
+
+    tests = {}
+    for name, fn in members.items():
+        if not name.startswith("test_"):
+            continue
+        surfaces = resolve(name, set())
+        body_lines = (fn.end_lineno or fn.lineno) - fn.lineno + 1
+        tests[name] = {
+            "line": fn.lineno,
+            "lines": body_lines,
+            "surfaces": sorted(surfaces),
+        }
+    if tests:
+        report[cls.name] = tests
+
+print(json.dumps(report, indent=2, ensure_ascii=False))
+
+totals: dict[str, int] = {}
+for cls, tests in report.items():
+    for name, info in tests.items():
+        for s in info["surfaces"] or ["<none>"]:
+            totals[s] = totals.get(s, 0) + 1
+print("=== surface totals ===", file=sys.stderr)
+for k in sorted(totals):
+    print(f"{k}: {totals[k]}", file=sys.stderr)
+print(
+    f"tests: {sum(len(t) for t in report.values())} in {len(report)} classes",
+    file=sys.stderr,
+)
+```
+
+### A.3 配置決定木の適用
+
+```python
+"""Apply the canonical placement decision tree mechanically to each test.
+
+Read-only. `tests-placement-discovery-policy.md` `## 配置決定木` is the authority:
+
+  1. shared helper/fixture (not a test)      -> tests/support/
+  2. cross-module/context workflow acceptance -> tests/scenarios/
+  3. pin for an ALREADY-FIXED defect          -> tests/regressions/
+  4. single unit in isolation, collaborators faked -> tests/unit/<ctx>/
+  5. otherwise (several real collaborators, hermetic) -> tests/integration/<ctx>/
+
+Tie-break (policy lines 21-23): the EARLIER branch wins when the type boundary
+is ambiguous.
+
+Branch 3 is decided from the test's own docstring: a test whose docstring
+anchors a fixed defect (a `j#NNNNN` review-round journal, an `RN-FN` finding
+id, or `Redmine #NNNNN`) is a regression pin by the policy's definition. This is
+derived from the source text, not hand-assigned.
+
+Branch 4 vs 5 is decided from the injection surfaces: the filesystem is a REAL
+collaborator, never a fake, so any test that builds a tree or shells out fails
+branch 4 and falls to 5.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import re
+import sys
+from pathlib import Path
+
+TEST = Path(sys.argv[1])
+INVENTORY = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+
+tree = ast.parse(TEST.read_text(encoding="utf-8"))
+
+# A fixed-defect anchor in the docstring: review journal, finding id, or issue.
+ANCHOR = re.compile(r"j#\d{5}|\bR\d+-F\d+\b|Redmine #\d+|#14\d{3}")
+
+rows = []
+for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
+    for fn in cls.body:
+        if not isinstance(fn, ast.FunctionDef) or not fn.name.startswith("test_"):
+            continue
+        info = INVENTORY.get(cls.name, {}).get(fn.name)
+        if info is None:
+            raise AssertionError(f"inventory missing {cls.name}.{fn.name}")
+        doc = ast.get_docstring(fn) or ""
+        surfaces = set(info["surfaces"])
+
+        # branch 3: does the docstring anchor an already-fixed defect?
+        anchors = ANCHOR.findall(doc)
+        if anchors:
+            branch, dest = 3, "tests/regressions/"
+        # branch 4: single unit isolated, collaborators faked.
+        elif not (surfaces & {"real_fs", "subprocess"}):
+            branch, dest = 4, "tests/unit/<ctx>/"
+        else:
+            branch, dest = 5, "tests/integration/<ctx>/"
+
+        rows.append(
+            {
+                "cls": cls.name,
+                "name": fn.name,
+                "line": info["line"],
+                "lines": info["lines"],
+                "branch": branch,
+                "dest": dest,
+                "anchors": sorted(set(anchors))[:3],
+                "surfaces": sorted(surfaces),
+            }
+        )
+
+assert len(rows) == 127, f"expected 127 tests, classified {len(rows)}"
+
+by_dest: dict[str, list] = {}
+for r in rows:
+    by_dest.setdefault(r["dest"], []).append(r)
+
+print("=== canonical decision tree applied mechanically ===")
+for dest in sorted(by_dest):
+    rs = by_dest[dest]
+    print(f"{dest:28s} tests={len(rs):4d} lines={sum(r['lines'] for r in rs):5d}")
+print(f"{'TOTAL':28s} tests={len(rows):4d} lines={sum(r['lines'] for r in rows):5d}")
+
+print()
+print("=== branch 3 (regressions) share ===")
+b3 = by_dest.get("tests/regressions/", [])
+print(f"{len(b3)}/127 = {100*len(b3)/127:.0f}% of tests, "
+      f"{sum(r['lines'] for r in b3)}/3088 = {100*sum(r['lines'] for r in b3)/3088:.0f}% of lines")
+
+print()
+print("=== NOT branch 3: what survives into unit / integration ===")
+for dest in ("tests/unit/<ctx>/", "tests/integration/<ctx>/"):
+    for r in sorted(by_dest.get(dest, []), key=lambda r: r["line"]):
+        print(f"  {dest:26s} {r['line']:5d} {r['lines']:4d} {r['name']}")
+
+Path(sys.argv[3]).write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+```
+
+### A.4 同 head での実行結果 [実測]
+
+`A2.py` (stderr):
+
+```text
+=== surface totals ===
+<none>: 1
+ast_probe: 1
+os_patch: 36
+private_symbol: 23
+real_fs: 104
+source_line: 3
+subprocess: 8
+trace: 3
+tests: 127 in 3 classes
+```
+
+> **`real_fs: 104` と §2.3 の「実 tree 96」は別の数え方である。** ここは surface
+> 単位の集計で、1 test が複数 surface を持てば各々に計上される。`subprocess` の 8 件は
+> すべて `real_fs` でもあるため `96 + 8 = 104` になる。§2.3 は
+> `subprocess > real_fs > pure` の順に振り分けた**排他**集計である。
+>
+> `<none>: 1` は `test_reading_the_ledger_does_not_create_one` — 公開 read
+> (`teardown_failures`) だけを呼び、patch も tree 構築もしない唯一の test である。
+
+`A3.py` (stdout 冒頭):
+
+```text
+=== canonical decision tree applied mechanically ===
+tests/integration/<ctx>/     tests=  53 lines=  812
+tests/regressions/           tests=  69 lines= 2200
+tests/unit/<ctx>/            tests=   5 lines=   76
+TOTAL                        tests= 127 lines= 3088
+
+=== branch 3 (regressions) share ===
+69/127 = 54% of tests, 2200/3088 = 71% of lines
+```
+
+### A.5 全 127 件の mapping
+
+`surfaces` は A.2 の分類 (`line` = `source_line`、`priv` = `private_symbol`、
+`ast` = `ast_probe`)。`分岐` は A.3 の決定木分岐番号、`行き先` は
+`reg` = `tests/regressions/` / `unit` = `tests/unit/<ctx>/` /
+`int` = `tests/integration/<ctx>/`。
+
+| # | class | test | line | 行 | surfaces | 分岐 | 行き先 |
+| ---: | --- | --- | ---: | ---: | --- | ---: | --- |
+| 1 | Tracked | `test_mirror_reference_dirs_present` | 111 | 3 | real_fs | 5 | int |
+| 2 | Tracked | `test_mirror_reference_files_match_canonical` | 115 | 25 | real_fs | 5 | int |
+| 3 | Tracked | `test_mirror_reference_set_is_exactly_the_partial_set` | 141 | 16 | real_fs | 3 | reg |
+| 4 | Tracked | `test_mirror_references_are_regular_files` | 158 | 14 | real_fs | 3 | reg |
+| 5 | Tracked | `test_mirror_path_has_no_symlinked_component` | 173 | 10 | real_fs | 3 | reg |
+| 6 | Tracked | `test_tracked_tree_satisfies_the_contract` | 184 | 4 | real_fs | 5 | int |
+| 7 | Tracked | `test_adapter_skill_md_present_and_not_a_canonical_copy` | 189 | 7 | real_fs | 5 | int |
+| 8 | Service | `test_clean_tree_passes_and_syncs_idempotently` | 286 | 6 | real_fs | 5 | int |
+| 9 | Service | `test_canonical_only_edit_is_caught_and_repaired` | 293 | 15 | real_fs | 5 | int |
+| 10 | Service | `test_content_drift_does_not_block_the_write` | 309 | 9 | real_fs | 5 | int |
+| 11 | Service | `test_missing_mirror_directory_is_created_by_the_sync` | 319 | 9 | real_fs | 5 | int |
+| 12 | Service | `test_sync_never_writes_the_adapter_stub_or_extra_references` | 329 | 9 | real_fs | 5 | int |
+| 13 | Service | `test_entry_names_are_compared_losslessly` | 341 | 17 | real_fs | 3 | reg |
+| 14 | Service | `test_a_glob_named_entry_does_not_report_unrelated_paths` | 359 | 9 | real_fs | 5 | int |
+| 15 | Service | `test_a_newline_named_entry_cannot_forge_a_success_line` | 369 | 10 | real_fs | 5 | int |
+| 16 | Service | `test_unpinned_subdirectory_is_an_entry_too` | 380 | 4 | real_fs | 5 | int |
+| 17 | Service | `test_a_file_sharing_the_temp_prefix_is_never_deleted` | 387 | 8 | real_fs | 3 | reg |
+| 18 | Service | `test_a_directory_sharing_the_temp_prefix_blocks_rather_than_hangs` | 396 | 4 | real_fs | 5 | int |
+| 19 | Service | `test_crash_residue_asks_for_a_reviewed_disposition` | 401 | 10 | real_fs | 5 | int |
+| 20 | Service | `test_a_concurrent_run_neither_deletes_nor_is_deleted` | 412 | 28 | real_fs | 3 | reg |
+| 21 | Service | `test_successful_sync_leaves_no_temp_behind` | 441 | 5 | real_fs | 5 | int |
+| 22 | Service | `test_failed_sync_cleans_only_its_own_temp` | 447 | 31 | real_fs | 3 | reg |
+| 23 | Service | `test_success_is_not_reported_on_an_unverified_tree` | 479 | 22 | real_fs | 5 | int |
+| 24 | Service | `test_written_references_are_mode_644` | 502 | 6 | real_fs | 5 | int |
+| 25 | Service | `test_invalid_source_never_offers_the_resync` | 511 | 9 | real_fs | 3 | reg |
+| 26 | Service | `test_content_parity_is_skipped_when_the_source_is_invalid` | 521 | 6 | real_fs | 5 | int |
+| 27 | Service | `test_symlinked_canonical_reference_is_rejected` | 530 | 14 | real_fs | 3 | reg |
+| 28 | Service | `test_symlinked_canonical_directory_is_rejected` | 545 | 7 | real_fs | 5 | int |
+| 29 | Service | `test_non_directory_ancestor_is_topology_not_missing_mirror` | 555 | 14 | real_fs | 3 | reg |
+| 30 | Service | `test_symlinked_mirror_destination_is_rejected` | 570 | 12 | real_fs | 5 | int |
+| 31 | Service | `test_symlinked_pinned_entry_is_rejected_without_writing_through` | 583 | 10 | real_fs | 5 | int |
+| 32 | Service | `test_dangling_symlink_entry_is_rejected` | 594 | 4 | real_fs | 5 | int |
+| 33 | Service | `test_non_regular_pinned_entries_are_rejected_without_blocking` | 599 | 15 | real_fs | 5 | int |
+| 34 | Service | `test_hardlinked_entry_is_replaced_not_written_through` | 615 | 14 | real_fs | 3 | reg |
+| 35 | Service | `test_entry_swapped_after_the_type_audit_is_not_read_through` | 632 | 21 | real_fs | 3 | reg |
+| 36 | Service | `test_source_parent_swapped_after_audit_writes_no_external_bytes` | 654 | 28 | real_fs | 3 | reg |
+| 37 | Service | `test_mirror_parent_swapped_after_audit_writes_nothing_outside` | 683 | 28 | real_fs | 3 | reg |
+| 38 | Service | `test_staging_entry_rebound_mid_sync_is_not_swapped_into_place` | 712 | 37 | real_fs | 3 | reg |
+| 39 | Service | `test_staging_entry_rebound_to_a_regular_file_is_not_swapped_into_place` | 750 | 40 | real_fs | 3 | reg |
+| 40 | Service | `test_ownership_refuses_to_answer_once_the_descriptor_is_closed` | 793 | 36 | priv,real_fs | 5 | int |
+| 41 | Service | `test_the_staging_descriptor_still_pins_the_inode_at_every_ownership_question` | 830 | 58 | os_patch,priv,real_fs | 5 | int |
+| 42 | Service | `test_a_deferred_write_error_is_reported_before_anything_is_installed` | 889 | 32 | os_patch,real_fs | 3 | reg |
+| 43 | Service | `test_source_becoming_unreadable_after_the_walk_is_typed` | 922 | 24 | real_fs | 5 | int |
+| 44 | Service | `test_unreadable_canonical_directory_is_a_typed_violation` | 947 | 12 | real_fs | 5 | int |
+| 45 | Service | `test_platform_without_the_required_primitives_fails_closed` | 960 | 14 | real_fs | 5 | int |
+| 46 | Service | `test_abnormal_topology_does_not_leak_descriptors` | 980 | 16 | real_fs | 3 | reg |
+| 47 | Service | `test_repeated_sync_on_an_invalid_tree_does_not_leak_descriptors` | 997 | 10 | real_fs | 5 | int |
+| 48 | Service | `test_every_topology_failure_shape_is_descriptor_neutral` | 1008 | 21 | real_fs | 5 | int |
+| 49 | Service | `test_entry_swapped_to_a_fifo_after_the_type_audit_does_not_block` | 1032 | 32 | real_fs | 3 | reg |
+| 50 | Service | `test_action_time_type_failure_advises_a_recovery_that_converges` | 1065 | 20 | real_fs | 3 | reg |
+| 51 | Service | `test_source_swapped_to_a_fifo_is_bounded_in_both_modes` | 1086 | 21 | real_fs | 5 | int |
+| 52 | Service | `test_replace_onto_a_directory_is_typed_not_raised` | 1110 | 27 | real_fs | 3 | reg |
+| 53 | Service | `test_payload_is_written_in_full_under_injected_short_writes` | 1138 | 22 | os_patch,real_fs | 3 | reg |
+| 54 | Service | `test_a_write_that_never_progresses_is_bounded` | 1161 | 21 | os_patch,real_fs | 5 | int |
+| 55 | Service | `test_late_type_swaps_all_carry_rule_e_weight` | 1185 | 38 | real_fs | 3 | reg |
+| 56 | Service | `test_close_failure_does_not_escape_either_mode` | 1224 | 19 | os_patch,real_fs | 3 | reg |
+| 57 | Service | `test_cleanup_failure_is_reported_with_the_primary_failure` | 1244 | 27 | os_patch,real_fs | 3 | reg |
+| 58 | Service | `test_staging_close_failure_is_not_reported_as_success` | 1297 | 19 | os_patch,real_fs | 3 | reg |
+| 59 | Service | `test_cleanup_leaves_a_foreign_entry_at_the_staging_name` | 1317 | 31 | os_patch,real_fs | 3 | reg |
+| 60 | Service | `test_a_transient_cleanup_failure_is_not_reported_as_surviving_residue` | 1349 | 42 | os_patch,real_fs | 3 | reg |
+| 61 | Service | `test_entry_deleted_between_observation_and_read_is_missing_not_unreadable` | 1392 | 28 | real_fs | 3 | reg |
+| 62 | Service | `test_a_non_oserror_unwinding_the_write_still_releases_the_staging` | 1428 | 16 | os_patch,real_fs | 3 | reg |
+| 63 | Service | `test_a_non_oserror_unwind_still_spares_a_foreign_entry` | 1445 | 30 | os_patch,real_fs | 5 | int |
+| 64 | Service | `test_an_unreadable_staging_name_at_swap_time_releases_the_staging` | 1476 | 36 | os_patch,real_fs | 3 | reg |
+| 65 | Service | `test_a_staging_entry_gone_before_the_swap_is_reported_without_residue` | 1513 | 29 | real_fs | 3 | reg |
+| 66 | Service | `test_an_unprovable_staging_identity_never_unlinks` | 1543 | 39 | os_patch,real_fs | 3 | reg |
+| 67 | Service | `test_a_close_that_unwinds_still_releases_the_staging` | 1583 | 34 | os_patch,real_fs | 3 | reg |
+| 68 | Service | `test_a_close_unwind_never_closes_a_reused_descriptor_number` | 1618 | 57 | os_patch,real_fs | 3 | reg |
+| 69 | Service | `test_a_close_unwind_keeps_the_primary_exception` | 1676 | 43 | os_patch,real_fs | 5 | int |
+| 70 | Service | `test_the_directory_walk_never_closes_a_reused_descriptor_number` | 1720 | 42 | os_patch,real_fs | 3 | reg |
+| 71 | Service | `test_a_walk_close_that_unwinds_leaks_no_descriptor` | 1763 | 46 | os_patch,real_fs | 5 | int |
+| 72 | Service | `test_a_failing_add_note_does_not_replace_the_primary` | 1810 | 42 | os_patch,real_fs | 3 | reg |
+| 73 | Service | `test_a_failing_cleanup_does_not_replace_the_primary` | 1853 | 32 | os_patch,real_fs | 3 | reg |
+| 74 | Service | `test_a_raising_release_does_not_take_the_close_with_it` | 1905 | 50 | os_patch,real_fs | 3 | reg |
+| 75 | Service | `test_the_staging_release_always_precedes_the_staging_close` | 1988 | 51 | os_patch,real_fs | 3 | reg |
+| 76 | Service | `test_the_walk_keeps_the_first_close_failure` | 2040 | 32 | os_patch,real_fs | 3 | reg |
+| 77 | Service | `test_a_typed_cleanup_failure_is_recorded_not_discarded` | 2073 | 31 | os_patch,real_fs | 3 | reg |
+| 78 | Service | `test_a_typed_close_failure_is_recorded_not_discarded` | 2105 | 30 | os_patch,real_fs | 5 | int |
+| 79 | Service | `test_an_interrupt_during_teardown_outranks_the_primary` | 2136 | 26 | os_patch,real_fs | 3 | reg |
+| 80 | Service | `test_an_interrupt_while_recording_still_releases_the_staging_entry` | 2163 | 53 | os_patch,real_fs | 3 | reg |
+| 81 | Service | `test_a_later_control_flow_failure_is_recorded_not_dropped` | 2217 | 45 | os_patch,real_fs | 3 | reg |
+| 82 | Service | `test_teardown_continues_when_recording_a_secondary_is_interrupted` | 2263 | 26 | priv | 3 | reg |
+| 83 | Service | `test_control_flow_priority_keeps_the_first_and_records_the_rest` | 2290 | 26 | priv | 3 | reg |
+| 84 | Service | `test_a_broken_note_still_leaves_the_cleanup_failure_reachable` | 2317 | 73 | os_patch,real_fs | 3 | reg |
+| 85 | Service | `test_a_secondary_that_cannot_be_stringified_is_still_retained` | 2391 | 45 | priv | 3 | reg |
+| 86 | Service | `test_an_interrupt_while_recording_a_later_failure_is_retained` | 2437 | 30 | priv | 3 | reg |
+| 87 | Service | `test_the_ledger_survives_a_hostile_dict_descriptor` | 2503 | 32 | priv | 3 | reg |
+| 88 | Service | `test_the_carrier_key_is_not_an_attribute_name` | 2536 | 30 | priv | 3 | reg |
+| 89 | Service | `test_the_pickle_boundary_depends_on_the_entries` | 2567 | 29 | priv | 3 | reg |
+| 90 | Service | `test_a_value_at_the_carrier_key_is_never_replaced` | 2597 | 47 | priv | 3 | reg |
+| 91 | Service | `test_reading_the_ledger_does_not_create_one` | 2645 | 11 | - | 3 | reg |
+| 92 | Service | `test_each_occurrence_is_one_ledger_entry` | 2657 | 29 | priv | 3 | reg |
+| 93 | Service | `test_a_carrier_failure_never_skips_a_remaining_action` | 2687 | 52 | priv | 3 | reg |
+| 94 | Service | `test_an_arrival_survives_a_failure_before_it_reaches_the_queue` | 2779 | 43 | priv,line,trace | 3 | reg |
+| 95 | Service | `test_a_nested_interrupt_never_skips_a_remaining_action` | 2972 | 117 | priv,line,trace | 3 | reg |
+| 96 | Service | `test_an_interrupt_during_the_final_admission_still_counts` | 3090 | 55 | priv | 3 | reg |
+| 97 | Service | `test_an_exhausted_retry_still_reaches_the_queue` | 3146 | 37 | priv | 3 | reg |
+| 98 | Service | `test_retention_survives_an_interrupt_at_a_commit_boundary` | 3211 | 51 | priv,line,trace | 3 | reg |
+| 99 | Service | `test_the_final_flush_surfaces_the_control_flow_it_hits` | 3263 | 36 | priv | 3 | reg |
+| 100 | Service | `test_a_carrier_that_never_recovers_gives_up_the_record_only` | 3300 | 23 | priv | 4 | unit |
+| 101 | Service | `test_the_ledger_survives_a_primary_that_refuses_attributes` | 3324 | 27 | priv | 4 | unit |
+| 102 | Service | `test_cleanup_helper_runs_exactly_once_when_it_raises` | 3352 | 30 | os_patch,real_fs | 3 | reg |
+| 103 | Service | `test_replace_failure_is_classified_by_what_actually_happened` | 3383 | 23 | os_patch,real_fs | 3 | reg |
+| 104 | Service | `test_replace_onto_a_changed_type_still_says_so` | 3407 | 16 | real_fs | 5 | int |
+| 105 | Service | `test_capability_manifest_is_exactly_the_primitives_the_module_calls` | 3469 | 24 | ast,priv | 3 | reg |
+| 106 | Service | `test_each_required_capability_individually_fails_closed` | 3494 | 29 | priv,real_fs | 5 | int |
+| 107 | Service | `test_a_scandir_whose_failure_is_deferred_still_fails_closed` | 3524 | 24 | os_patch,real_fs | 5 | int |
+| 108 | Service | `test_an_interrupt_during_the_probe_is_not_a_missing_capability` | 3549 | 11 | os_patch | 4 | unit |
+| 109 | Service | `test_a_supported_host_is_not_refused_by_a_stale_advertisement` | 3561 | 20 | os_patch,real_fs | 3 | reg |
+| 110 | Service | `test_the_exact_linux_312_advertisement_is_accepted` | 3582 | 8 | os_patch | 4 | unit |
+| 111 | Service | `test_the_probe_writes_nothing_and_leaks_no_descriptor` | 3591 | 15 | real_fs | 5 | int |
+| 112 | Service | `test_the_probe_anchor_is_not_a_directory` | 3607 | 7 | priv | 4 | unit |
+| 113 | Service | `test_a_probe_that_cannot_be_set_up_fails_closed` | 3615 | 16 | os_patch,real_fs | 5 | int |
+| 114 | Service | `test_unreadable_canonical_reference_is_a_typed_violation` | 3645 | 18 | real_fs | 3 | reg |
+| 115 | Service | `test_unreadable_mirror_directory_is_a_typed_violation` | 3664 | 12 | real_fs | 5 | int |
+| 116 | Service | `test_diagnostics_carry_no_host_absolute_paths` | 3677 | 7 | real_fs | 5 | int |
+| 117 | Service | `test_source_swapped_after_preflight_is_fail_closed` | 3687 | 22 | real_fs | 5 | int |
+| 118 | Cli | `test_wrapper_exists_and_is_executable` | 3740 | 3 | real_fs | 5 | int |
+| 119 | Cli | `test_wrapper_carries_no_mirror_logic` | 3744 | 11 | real_fs | 5 | int |
+| 120 | Cli | `test_check_and_sync_round_trip` | 3756 | 10 | real_fs,subprocess | 5 | int |
+| 121 | Cli | `test_check_reports_a_violation_and_writes_nothing` | 3767 | 8 | real_fs,subprocess | 5 | int |
+| 122 | Cli | `test_help_exits_zero` | 3776 | 5 | real_fs,subprocess | 5 | int |
+| 123 | Cli | `test_unknown_argument_exits_64` | 3782 | 5 | real_fs,subprocess | 5 | int |
+| 124 | Cli | `test_repo_cannot_be_redirected_by_operator_argv` | 3788 | 19 | real_fs,subprocess | 3 | reg |
+| 125 | Cli | `test_repo_env_is_overwritten_by_the_wrapper` | 3808 | 17 | real_fs,subprocess | 5 | int |
+| 126 | Cli | `test_module_run_without_the_wrapper_refuses` | 3826 | 21 | real_fs,subprocess | 5 | int |
+| 127 | Cli | `test_wrapper_targets_its_own_repo_not_the_cwd` | 3848 | 14 | real_fs,subprocess | 5 | int |
+
+**この表は §5.0 の 69 / 53 / 5 と §2.3 の内訳の両方の原資料である。**
+配置の確定は §5.1 の裁定待ちであり、`行き先` 列は決定木の**出力**であって
+採用した配置ではない。
 
 ---
 
