@@ -3703,110 +3703,32 @@ def _marker_token_holders(root):
         parts = path.relative_to(root.parent).with_suffix("").parts
         return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
 
-    def exported_names(tree):
-        """What ``from M import *`` binds: ``None`` (public names), a set, or ``"unknown"``.
-
-        Only a module whose ``__all__`` is declared EXACTLY ONCE, at module level, as a literal
-        list/tuple of strings, is read as an exact set. Everything else is ``"unknown"`` and the
-        caller expands every bound name — the conservative direction, because an inventory that
-        cannot tell what crosses must over-detect.
-
-        Redmine #14539 review j#92477 finding 1: the previous version walked the whole tree and
-        returned on the FIRST ``ast.Assign`` it met, which is wrong three ways at once and each
-        way dropped a consumer Python would have bound —
-
-        - not scope-aware, so an ``__all__`` inside a nested function decided the module's
-          exports (and a module with no module-level ``__all__`` at all read as having one);
-        - first-wins, so ``__all__ = []`` followed by ``__all__ = ["RE"]`` read as empty;
-        - ``ast.Assign`` only, so ``__all__: list[str] = [...]`` was invisible and ``__all__ +=
-          [...]`` was not even noticed as a second declaration.
-
-        j#92470 and j#92471 both stated that a module reassigning ``__all__`` falls back to full
-        expansion. That was the intent and not the behaviour, so this is also the durable record
-        being made true.
-        """
-        def names_all(node):
-            return isinstance(node, ast.Name) and node.id == "__all__"
-
-        def module_scope_nodes(root):
-            """Every node evaluated in the MODULE's own scope.
-
-            Scope comes from the language, not from tree depth (Redmine #14539 review j#92508).
-            A function / class / lambda body binds in its own scope, so it is skipped — but its
-            decorators, defaults and bases are evaluated out here and are not. Everything else,
-            including the body of an ``if`` / ``try`` / loop / ``with`` / ``match``, runs in
-            module scope, and the two previous versions of this reader missed exactly that: R29
-            took the first node ``ast.walk`` produced, R30 took only ``tree.body``'s direct
-            children. Both substituted a depth in the syntax tree for the scoping rule.
-            """
-            scoped = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
-            found = []
-
-            def visit(node):
-                for field, value in ast.iter_fields(node):
-                    if isinstance(node, scoped) and field == "body":
-                        continue
-                    for item in value if isinstance(value, list) else [value]:
-                        if isinstance(item, ast.AST):
-                            found.append(item)
-                            visit(item)
-
-            visit(root)
-            return found
-
-        # Every WRITE to ``__all__`` that module execution can reach, in any statement form.
-        events = []
-        for node in module_scope_nodes(tree):
-            if isinstance(node, ast.Assign) and any(names_all(t) for t in node.targets):
-                events.append(node)
-            elif isinstance(node, ast.AnnAssign) and names_all(node.target) and node.value:
-                events.append(node)
-            elif isinstance(node, ast.AugAssign) and names_all(node.target):
-                events.append(node)
-            elif isinstance(node, ast.NamedExpr) and names_all(node.target):
-                events.append(node)
-            elif isinstance(node, ast.Delete) and any(names_all(t) for t in node.targets):
-                events.append(node)
-        if not events:
-            return None
-        # Exact only when the module makes ONE unconditional, literal declaration at its top
-        # level. A single write nested in control flow is not unconditional, a ``del`` can undo
-        # one, and ``+=`` / ``:=`` never yield an exact set — all of those fall to full
-        # expansion, which is the direction that cannot lose a consumer.
-        if len(events) > 1 or events[0] not in tree.body:
-            return "unknown"
-        if not isinstance(events[0], (ast.Assign, ast.AnnAssign)):
-            return "unknown"
-        value = events[0].value
-        if (
-            isinstance(value, (ast.List, ast.Tuple))
-            and value.elts
-            and all(
-                isinstance(e, ast.Constant) and isinstance(e.value, str) for e in value.elts
-            )
-        ):
-            return frozenset(e.value for e in value.elts)
-        if isinstance(value, (ast.List, ast.Tuple)) and not value.elts:
-            return frozenset()
-        return "unknown"
-
-    own, owners, exports = {}, {}, {}
+    own, owners = {}, {}
     for path, tree in trees.items():
         held, bound = module_capabilities(tree)
         own[path] = held
         if bound:
             owners[module_path(path)] = bound
-            exports[module_path(path)] = exported_names(tree)
 
     def wildcard_bindings(module):
-        """The owner's pattern names a ``import *`` would bring into the consumer."""
-        bound = owners.get(module, {})
-        declared = exports.get(module)
-        if declared is None:  # no __all__: everything not underscore-prefixed
-            return {n: caps for n, caps in bound.items() if not n.startswith("_")}
-        if declared == "unknown":  # cannot tell -> assume it all crosses
-            return dict(bound)
-        return {n: caps for n, caps in bound.items() if n in declared}
+        """EVERY marker capability the owner binds — a wildcard propagates all of them.
+
+        Deliberately NOT an emulation of ``__all__`` (Redmine #14539 review j#92538). Three
+        rounds were spent extending an allowlist of AST binder nodes so this could decide which
+        names a ``import *`` really brings across, and each round a form outside the allowlist
+        turned up: reassignment, ``+=``, annotated targets, a nested scope, an ``if`` / ``try``
+        body, ``:=``, ``del`` — then ``for`` / ``with`` / ``match`` / ``except`` targets, with
+        ``async for``, ``async with``, destructuring, import aliases and def/class names still
+        queued behind them. The set of ways Python binds a module-level name is not something an
+        inventory should be enumerating: every miss is a consumer silently leaving the gate.
+
+        So the emulation is gone. A wildcard propagates the owner's whole capability set and the
+        consumer-side "is this name actually used" filter stays, which cannot produce a false
+        negative however Python decides ``__all__``. It can over-detect — a module that would
+        not really export a name still declares it — and over-detection costs one declaration
+        line, while the alternative costs an undeclared authority reader.
+        """
+        return dict(owners.get(module, {}))
 
     holders = {}
     for path, tree in trees.items():
@@ -4326,179 +4248,126 @@ class ReviewJ92374InventoryDetectionTests(unittest.TestCase):
                 )
 
 
-    def test_the_all_reader_matches_what_python_would_export(self):
-        """R29-F1: the ``__all__`` reader was first-Assign and scope-blind.
+    #: Every ``__all__`` shape review has thrown at this gate, R29 through R31. Each one is a
+    #: module whose wildcard importer Python DOES bind ``used`` in — the whole corpus exists
+    #: because three rounds of emulating ``__all__`` kept missing another binding form.
+    _ALL_SHAPES = (
+        # j#92477 — the reader took the first `ast.Assign` `ast.walk` produced
+        ("reassigned", "private", '__all__ = []\n__all__ = ["_RE"]\n'),
+        ("augmented", "private", '__all__ = []\n__all__ += ["_RE"]\n'),
+        ("annotated", "private", '__all__: list[str] = ["_RE"]\n'),
+        ("nested function scope only", "public", "def f():\n    __all__ = []\n    return __all__\n"),
+        # j#92508 — the reader looked only at `tree.body`'s direct children
+        ("if body", "private", 'if True:\n    __all__ = ["_RE"]\n'),
+        ("try body", "private", 'try:\n    __all__ = ["_RE"]\nexcept Exception:\n    pass\n'),
+        ("for body", "private", 'for _ in (1,):\n    __all__ = ["_RE"]\n'),
+        (
+            "with body",
+            "private",
+            'import contextlib\nwith contextlib.suppress():\n    __all__ = ["_RE"]\n',
+        ),
+        ("deleted again", "public", "__all__ = []\ndel __all__\n"),
+        ("assignment expression", "private", '(__all__ := ["_RE"])\n'),
+        # j#92538 — the reader enumerated five binder node types
+        ("for target", "private", 'for __all__ in [["_RE"]]:\n    pass\n'),
+        (
+            "with target",
+            "private",
+            'from contextlib import nullcontext\nwith nullcontext(["_RE"]) as __all__:\n    pass\n',
+        ),
+        ("match capture", "private", 'match ["_RE"]:\n    case __all__:\n        pass\n'),
+        (
+            "except target",
+            "public",
+            "__all__ = []\ntry:\n    raise RuntimeError()\nexcept RuntimeError as __all__:\n    pass\n",
+        ),
+        # Shapes no allowlist ever reached, kept because they cost nothing now
+        ("computed", "private", "__all__ = sorted(globals())\n"),
+        ("empty literal", "public", "__all__ = []\n"),
+        ("star-import target", "private", "for (__all__,) in [(['_RE'],)]:\n    pass\n"),
+        ("no __all__ at all", "private", ""),
+    )
 
-        Each owner below DOES export the name it is asked for, by Python's rules, so a consumer
-        wildcard-importing it holds the capability. The previous reader walked the whole tree and
-        returned on the first ``ast.Assign`` it met, so all four lost the consumer — and the two
-        reassignment cases contradicted j#92470 / j#92471, which had already stated that a
-        module reassigning ``__all__`` falls back to full expansion.
+    def test_no_module_shape_can_hide_a_capability_from_a_wildcard_consumer(self):
+        """R31-F1: a wildcard propagates the owner's whole capability set, unconditionally.
+
+        Three rounds were spent extending an allowlist of binder nodes so the gate could decide
+        which names ``from M import *`` really brings across. Every round a form outside the
+        allowlist turned up, and every miss was a consumer silently leaving the inventory. The
+        emulation is gone: the corpus below is not a list of cases the reader must classify
+        correctly, it is a list of shapes that must all reach the SAME answer, because the
+        answer no longer depends on reading ``__all__`` at all.
+
+        Note ``empty literal`` and ``no __all__``: under the old emulation those two were the
+        negative cases — a private name did NOT cross. They cross now, and that is the trade the
+        convergence makes. Over-detection costs one declaration line; a missed authority reader
+        costs a silent gate.
         """
-        public = 'import re\nRE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
-        private = 'import re\n_RE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
-        for label, owner, used in (
-            ("reassigned", public + '__all__ = []\n__all__ = ["RE"]\n', "RE"),
-            ("augmented", public + '__all__ = []\n__all__ += ["RE"]\n', "RE"),
-            ("annotated", private + '__all__: list[str] = ["_RE"]\n', "_RE"),
-            (
-                "nested scope only",
-                public + "def f():\n    __all__ = []\n    return __all__\n",
-                "RE",
-            ),
-        ):
+        patterns = {
+            "public": 'import re\nRE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n',
+            "private": 'import re\n_RE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n',
+        }
+        used = {"public": "RE", "private": "_RE"}
+        for label, kind, tail in self._ALL_SHAPES:
             with self.subTest(label):
                 consumer = (
                     "from mozyo_bridge.owner import *\n"
-                    f"def read(n): return {used}.findall(n or '')\n"
+                    f"def read(n): return {used[kind]}.findall(n or '')\n"
                 )
                 self.assertEqual(
-                    self._holders({"owner.py": owner, "c.py": consumer}, owner=False).get(
-                        "src/mozyo_bridge/c.py"
-                    ),
+                    self._holders(
+                        {"owner.py": patterns[kind] + tail, "c.py": consumer}, owner=False
+                    ).get("src/mozyo_bridge/c.py"),
                     ["chan-a"],
-                    f"{label}: Python exports {used!r} here, so the consumer holds it",
+                    f"{label}: a wildcard consumer must never leave the inventory",
                 )
 
-    def test_the_all_reader_takes_scope_from_the_language_not_tree_depth(self):
-        """R30-F1: the reader looked only at ``tree.body``'s direct children.
+    def test_the_resolver_does_not_read_dunder_all_at_all(self):
+        """The convergence itself, pinned: re-introducing the emulation reddens here.
 
-        Everything below runs in MODULE scope, so Python binds the name for a wildcard importer
-        in every case — an ``if`` / ``try`` body, an assignment expression, and a ``del`` that
-        removes an earlier ``__all__`` and hands the module back to the public-name rule. This
-        was the third miss in a row on "where do declarations live" (R29 took the first node
-        ``ast.walk`` yielded, R30 took only the top level), so the reader now skips exactly what
-        the language scopes away — function, class and lambda BODIES — and nothing else.
+        Structural on purpose. The property being protected is not "``__all__`` is handled
+        correctly" — that is what failed three times — but "``__all__`` is not consulted", which
+        is the only shape of this gate with no binder enumeration behind it to fall out of date.
+
+        Read from the AST, not the text: the resolver's docstring necessarily says the word
+        while explaining why it does not look at it, and a text search flags that. (Detect the
+        operation, not the spelling — the same rule the inventory itself had to learn.)
         """
-        public = 'import re\nRE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
-        private = 'import re\n_RE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
-        for label, owner, used in (
-            ("if body", private + 'if True:\n    __all__ = ["_RE"]\n', "_RE"),
-            (
-                "try body",
-                private + 'try:\n    __all__ = ["_RE"]\nexcept Exception:\n    pass\n',
-                "_RE",
-            ),
-            ("for body", private + 'for _ in (1,):\n    __all__ = ["_RE"]\n', "_RE"),
-            ("with body", private + 'import contextlib\nwith contextlib.suppress():\n    __all__ = ["_RE"]\n', "_RE"),
-            ("deleted again", public + '__all__ = []\ndel __all__\n', "RE"),
-            ("assignment expression", private + '(__all__ := ["_RE"])\n', "_RE"),
-        ):
-            with self.subTest(label):
-                consumer = (
-                    "from mozyo_bridge.owner import *\n"
-                    f"def read(n): return {used}.findall(n or '')\n"
-                )
-                self.assertEqual(
-                    self._holders({"owner.py": owner, "c.py": consumer}, owner=False).get(
-                        "src/mozyo_bridge/c.py"
-                    ),
-                    ["chan-a"],
-                    f"{label}: module scope binds {used!r} here, so the consumer holds it",
-                )
+        import ast
+        import inspect
+        import textwrap
 
-    def test_a_function_local_all_is_still_a_different_scope(self):
-        """The boundary the scope rule must keep: a body the language scopes away is not ours."""
-        public = 'import re\nRE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
-        consumer = "from mozyo_bridge.owner import *\ndef read(n): return RE.findall(n or '')\n"
-        for label, owner in (
-            ("function", public + "def f():\n    __all__ = []\n    return __all__\n"),
-            ("class", public + "class C:\n    __all__ = []\n"),
-            ("lambda", public + "g = lambda: (__all__ := [])\n"),
-        ):
-            with self.subTest(label):
-                # None of these declare the MODULE's __all__, so the public-name rule applies
-                # and the public ``RE`` still crosses.
-                self.assertEqual(
-                    self._holders({"owner.py": owner, "c.py": consumer}, owner=False).get(
-                        "src/mozyo_bridge/c.py"
-                    ),
-                    ["chan-a"],
-                )
+        tree = ast.parse(textwrap.dedent(inspect.getsource(_marker_token_holders)))
+        references = [
+            node
+            for node in ast.walk(tree)
+            if (isinstance(node, ast.Constant) and node.value == "__all__")
+            or (isinstance(node, ast.Name) and node.id == "__all__")
+            or (isinstance(node, ast.Attribute) and node.attr == "__all__")
+        ]
+        self.assertEqual(
+            references,
+            [],
+            "the wildcard resolver is consulting __all__ again; propagate the owner's whole "
+            "capability set instead (Redmine #14539 review j#92538)",
+        )
 
-    def test_a_scoped_body_does_not_turn_an_exact_all_into_full_expansion(self):
-        """The discriminating half of the scope boundary.
+    def test_a_wildcard_still_only_counts_names_the_consumer_uses(self):
+        """The other half of the rule: propagation is conservative, not unconditional.
 
-        Asserting that a public name still crosses cannot tell "correctly scoped away" from
-        "counted, so the module fell back to full expansion" — over-detection satisfies it too.
-        Here the module makes ONE exact declaration naming only the public pattern, and a
-        function body happens to contain ``__all__`` as a local. Reading that local as a second
-        module declaration would fall to full expansion and let the PRIVATE name cross, which
-        Python never does.
+        Whole-set propagation would be meaningless if it also ignored whether the consumer
+        touches the name — every module doing ``import *`` from a grammar owner would inherit
+        its capabilities.
         """
         owner = (
             "import re\n"
             'RE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
-            '_RE = re.compile(r"\\[mozyo:chan-b:([^\\]]*)\\]")\n'
-            '__all__ = ["RE"]\n'
-            "def f():\n    __all__ = []\n    return __all__\n"
         )
-        crosses = "from mozyo_bridge.owner import *\ndef read(n): return RE.findall(n or '')\n"
-        blocked = "from mozyo_bridge.owner import *\ndef read(n): return _RE.findall(n or '')\n"
-        holders = self._holders(
-            {"owner.py": owner, "yes.py": crosses, "no.py": blocked}, owner=False
-        )
+        unused = "from mozyo_bridge.owner import *\nVALUE = 1\n"
+        used = "from mozyo_bridge.owner import *\ndef read(n): return RE.findall(n or '')\n"
+        holders = self._holders({"owner.py": owner, "no.py": unused, "yes.py": used}, owner=False)
+        self.assertIsNone(holders.get("src/mozyo_bridge/no.py"))
         self.assertEqual(holders.get("src/mozyo_bridge/yes.py"), ["chan-a"])
-        self.assertIsNone(
-            holders.get("src/mozyo_bridge/no.py"),
-            "a function-local __all__ was counted as a module declaration",
-        )
-
-    def test_a_decorator_runs_in_module_scope_even_though_the_body_does_not(self):
-        """The other half of the scope rule: only the BODY is scoped away, not the decorators."""
-        private = 'import re\n_RE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
-        owner = private + (
-            "def deco(f):\n    return f\n"
-            "@deco((__all__ := ['_RE']) and deco)\n"
-            "def g():\n    pass\n"
-        )
-        consumer = "from mozyo_bridge.owner import *\ndef read(n): return _RE.findall(n or '')\n"
-        self.assertEqual(
-            self._holders({"owner.py": owner, "c.py": consumer}, owner=False).get(
-                "src/mozyo_bridge/c.py"
-            ),
-            ["chan-a"],
-        )
-
-    def test_an_empty_literal_all_exports_nothing(self):
-        """The boundary: an exact empty ``__all__`` is exact, not unreadable."""
-        owner = 'import re\nRE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n__all__ = []\n'
-        consumer = "from mozyo_bridge.owner import *\ndef read(n): return RE.findall(n or '')\n"
-        self.assertIsNone(
-            self._holders({"owner.py": owner, "c.py": consumer}, owner=False).get(
-                "src/mozyo_bridge/c.py"
-            )
-        )
-
-    def test_a_wildcard_respects_what_the_owner_actually_exports(self):
-        """Wildcards are expanded by Python's own rule, with the unclear case over-detecting."""
-        private = (
-            "import re\n"
-            '_RE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
-        )
-        consumer = "from mozyo_bridge.owner import *\ndef read(n): return _RE.findall(n or '')\n"
-        # No __all__ and an underscore name: `import *` would not bind it, so neither do we.
-        self.assertIsNone(
-            self._holders({"owner.py": private, "c.py": consumer}, owner=False).get(
-                "src/mozyo_bridge/c.py"
-            )
-        )
-        # An explicit __all__ that names it DOES bind it.
-        listed = private + '__all__ = ["_RE"]\n'
-        self.assertEqual(
-            self._holders({"owner.py": listed, "c.py": consumer}, owner=False).get(
-                "src/mozyo_bridge/c.py"
-            ),
-            ["chan-a"],
-        )
-        # A computed __all__ cannot be read, so the inventory over-detects rather than under.
-        computed = private + "__all__ = sorted(globals())\n"
-        self.assertEqual(
-            self._holders({"owner.py": computed, "c.py": consumer}, owner=False).get(
-                "src/mozyo_bridge/c.py"
-            ),
-            ["chan-a"],
-        )
 
     # -- the import forms j#92420 finding 1 measured ---------------------------------
 
