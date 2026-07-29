@@ -729,8 +729,11 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
         # MEASURED from the retire target's own lifecycle row, so the resolution has to happen
         # before the fence runs — the caller's argv is not an independent expectation. An
         # unresolvable target yields None, and the exemption route then refuses.
+        # Redmine #14695: the no-change waiver route additionally needs the repo root, because its
+        # durable evidence is read LIVE and its zero-change half is measured from real git — a
+        # caller-supplied file cannot carry a negative claim (see that route's docstring).
         latest_generation_admissible=_resolve_latest_generation_admissible(
-            args, target=evidence_target
+            args, target=evidence_target, repo_root=_repo_root(args)
         ),
     )
     repo_root = _repo_root(args)

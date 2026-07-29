@@ -413,6 +413,24 @@ def uncovered_paths(
     )
 
 
+def declares_any_commit(notes: object) -> bool:
+    """Whether one journal declares a commit in ANY governed commit field (pure).
+
+    Exported for the no-change review waiver (Redmine #14695), whose carve-out is the mirror
+    image of this module's coverage check: the exemption asks "does the gate cover the commit's
+    changed paths", the waiver asks "is there no commit at all". Both must agree about what
+    DECLARING a commit looks like, so they read the one grammar defined here rather than each
+    carrying a regex — the two-forked-allowlist drift this codebase keeps paying for (#13952).
+
+    Deliberately the EXISTENCE question, not the identity question: a journal naming two
+    different commits declares neither identity (:func:`fold_declared_change_scope` resolves that
+    to ``""``) but it certainly declares that commits exist, and for the waiver's carve-out that
+    is the answer that matters. Reading it through the identity helper instead would let an
+    ambiguous pair read as "no commit declared".
+    """
+    return _COMMIT_FIELD_RE.search(str(notes or "")) is not None
+
+
 @dataclass(frozen=True)
 class DeclaredChangeScope:
     """The change scope the durable record declares: a target commit and its changed paths.
@@ -916,6 +934,7 @@ __all__ = (
     "REVIEW_EXEMPTION_STATES",
     "DeclaredChangeScope",
     "ReviewExemptionFacts",
+    "declares_any_commit",
     "evaluate_exemption_integration_admissible",
     "fold_declared_change_scope",
     "fold_review_exemption",

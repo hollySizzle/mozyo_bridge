@@ -3867,6 +3867,14 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             ["*", "*", "*:_AUTHORITY_RE"],
             "reads: exactly-one-marker rule",
         ),
+        f"{_D}/domain/no_change_review_waiver.py": (
+            ["*", "*", "*", "*:MARKER_RE"],
+            "reads (Redmine #14695): the no-change review waiver gate. Exactly-one-marker rule "
+            "per note — a second declaration of this gate, or one this gate names but cannot "
+            "read, poisons the note for the gate rather than yielding the readable sibling; "
+            "also renders, through the shared closed-vocabulary reader and the lane envelope's "
+            "own renderer",
+        ),
         f"{_D}/domain/hibernate_park_record.py": (["handoff", "handoff"], "reads one marker per record"),
         f"{_D}/application/operator_startup_resume_leg.py": (
             ["*", "operator-startup-gate"],
@@ -4130,8 +4138,9 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of handoff, recovery_anchor_delivery; names no marker token itself",
         ),
         f"{_D}/application/retire_admissibility.py": (
-            ['*', '*', '*'],
-            "inherits via a used import of hibernate_evidence_integration, redmine_journal_source; names no marker token itself",
+            ['*', '*', '*', '*'],
+            "inherits via a used import of hibernate_evidence_integration, redmine_journal_source "
+            "and (Redmine #14695) no_change_review_waiver; names no marker token itself",
         ),
         f"{_D}/application/sublane_gateway_recovery_live.py": (
             ['*', '*', 'handoff', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],
@@ -4214,8 +4223,9 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
         f"{_D}/domain/glance_journal_grammar.py": (
-            ['*', '*'],
-            "inherits via a used import of redmine_journal_source; names no marker token itself",
+            ['*', '*', '*'],
+            "inherits via a used import of redmine_journal_source and (Redmine #14695) "
+            "no_change_review_waiver; names no marker token itself",
         ),
         f"{_D}/domain/hibernate_basis_producer.py": (
             ['*', '*', '*', '*', 'handoff'],

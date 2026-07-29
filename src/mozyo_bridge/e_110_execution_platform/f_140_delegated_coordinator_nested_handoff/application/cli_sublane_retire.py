@@ -151,6 +151,34 @@ def register_sublane_retire(
         ),
     )
     sublane_retire.add_argument(
+        "--no-change-review-waiver",
+        dest="no_change_review_waiver",
+        action="store_true",
+        help=(
+            "#14695: re-verify at action-time that this lane produced NO repository change and "
+            "carries a direct-owner `no_change_review_waiver` — the third measured route past the "
+            "latest-generation fence, for an investigation that has no review generation because "
+            "it changed nothing (#14613 j#93256 / j#93262). Deliberately a bare opt-in and NOT a "
+            "JSON path: the issue's full journal history is read LIVE over the credential-gated "
+            "Redmine read, because this route's premise is NEGATIVE (no commit, no changed_paths, "
+            "no change-bearing gate, no integration disposition anywhere in the record) and a "
+            "caller-supplied file would satisfy a negative claim by omission alone. Admits only "
+            "when ALL of: one canonical `no_change_review_waiver` marker whose issue and whose "
+            "workspace/lane/lane_generation envelope exact-match the retire TARGET's own "
+            "lifecycle row (measured from durable state, never from a flag); its writer resolves "
+            "to the coordinator under the gate's own ruling; the latest gate is Close; no review "
+            "round is newer than the waiver; the record declares zero change; no recognized "
+            "durable fact names a hard carve-out surface (release / production verification / "
+            "credential / destructive / migration / external effect) and the gate inventory "
+            "actually resolved; --callbacks-drained; and the live repository still agrees — the "
+            "branch head literal-equals the waiver's head, the branch carries 0 commits over "
+            "--integration-branch, and the --worktree checkout is clean. Fail-closed on every "
+            "gap, including unconfigured credentials and an unmeasurable repository. Never pass "
+            "--latest-generation-admissible for such a lane: there is no review generation, so "
+            "the assert would be false."
+        ),
+    )
+    sublane_retire.add_argument(
         "--review-generation-json",
         dest="review_generation_json",
         default=None,

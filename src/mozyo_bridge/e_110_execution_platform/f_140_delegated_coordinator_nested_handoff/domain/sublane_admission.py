@@ -205,6 +205,28 @@ class LaneSignal:
     #: known. FAIL-CLOSED default: a caller that cannot establish the exemption (the advisory
     #: store fallback, any hand-built signal) leaves the ordinary review path fully armed.
     review_exempt: bool = False
+    #: A durable direct-owner ``no_change_review_waiver`` is in force, no newer review round
+    #: supersedes it, and the record declares zero repository change (Redmine #14695). Derived in
+    #: :func:`...glance_journal_grammar.lane_signal_from_gate_facts` alongside ``review_exempt``.
+    #: Kept a SEPARATE field rather than folded into ``review_exempt`` because the two are
+    #: different authorities with different premises and different evidence — collapsing them
+    #: would make a diagnosis say "codex_direct_edit exemption" about a lane that has none. They
+    #: meet at exactly one place, the step-4 predicate below. FAIL-CLOSED default, like its
+    #: sibling: any caller that cannot establish the waiver leaves the review path fully armed.
+    review_waived: bool = False
+
+
+def _no_review_owed(signal: LaneSignal) -> bool:
+    """Whether ANY durable authority says no independent review is owed right now (pure).
+
+    The single place the two no-review-owed authorities meet (Redmine #14695). Both reach the
+    SAME post-review projection, and both reach it by their own route — never by fabricating a
+    ``REVIEW_APPROVED`` conclusion, which the preset forbids in as many words ("exemption を
+    Review Gate approval または自己 review と表現しないこと"; #14695 j#93412 §4 repeats it for
+    the waiver). Written as one predicate so a future third authority adds one disjunct here
+    instead of a third branch that drifts from the other two.
+    """
+    return signal.review_exempt or signal.review_waived
 
 
 def _integration_owed(signal: LaneSignal) -> bool:
@@ -233,10 +255,11 @@ def classify_lane_state(signal: LaneSignal) -> str:
     3. a ``start`` / ``progress`` gate, or a ``review`` that requested changes (work is
        back with the implementer) -> :data:`LANE_STATE_IMPLEMENTING` (**not** blocking);
     4. ``implementation_done`` / ``review_request``, or a ``review`` still pending ->
-       :data:`LANE_STATE_REVIEW_WAITING` (Codex audit owed) — UNLESS ``review_exempt`` is
-       set by a valid ``codex_direct_edit`` gate (Redmine #14539), in which case no review
-       is owed and the lane takes step 5's projection (``integration_waiting`` when a
-       pending integration disposition is recorded, else ``owner_waiting``);
+       :data:`LANE_STATE_REVIEW_WAITING` (Codex audit owed) — UNLESS a durable authority says
+       no review is owed: ``review_exempt`` from a valid ``codex_direct_edit`` gate (Redmine
+       #14539) or ``review_waived`` from a direct-owner no-change waiver (Redmine #14695), in
+       which case the lane takes step 5's projection (``integration_waiting`` when a pending
+       integration disposition is recorded, else ``owner_waiting``);
     5. a ``review`` approved -> :data:`LANE_STATE_INTEGRATION_WAITING` when a PENDING
        integration disposition is recorded (``explicit_deferral`` / ``integration_blocked`` /
        unreadable — the approved work is durably NOT on the integration branch), else
@@ -290,7 +313,7 @@ def classify_lane_state(signal: LaneSignal) -> str:
     if gate in (GATE_IMPLEMENTATION_DONE, GATE_REVIEW_REQUEST) or (
         gate == GATE_REVIEW and signal.review_conclusion == REVIEW_PENDING
     ):
-        if not signal.review_exempt:
+        if not _no_review_owed(signal):
             return LANE_STATE_REVIEW_WAITING
         if _integration_owed(signal):
             return LANE_STATE_INTEGRATION_WAITING

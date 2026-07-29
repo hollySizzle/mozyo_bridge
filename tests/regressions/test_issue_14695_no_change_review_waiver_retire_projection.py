@@ -1,0 +1,588 @@
+"""Redmine #14695 — a direct-owner no-change Review waiver must reach glance, close and retire.
+
+#14613 was a characterization: zero repository change, zero commits, and an owner who said in as
+many words that no separate reviewer was owed. The coordinator recorded that waiver durably and
+closed the issue — and the standard ``sublane retire`` still blocked with
+``stale_review_generation``, because the only durable authority that fence reads is a REVIEW
+GENERATION and a lane that changed nothing has none (reproduction: #14613 j#93256 / j#93262).
+
+The two escapes correctly refused there are what this suite exists to keep refused: asserting
+``--latest-generation-admissible`` about a review that never happened is a FALSE assert, and a
+fabricated Review Gate is the "exemption を Review Gate approval または自己 review と表現しない"
+the central preset forbids.
+
+So this pins BOTH directions, which is the whole point of a safety route:
+
+* the positive — a valid waiver on a genuinely no-change lane projects the same conclusion
+  through the glance and the terminal retire, with no false assert anywhere;
+* the negatives — and there are far more of them. A record that declares ANY repository change,
+  a hard carve-out surface, a newer review round, a foreign issue / lane / generation, a moved
+  head, a dirty worktree, an owed callback, a marker the canonical producer could not render, or
+  a heading with no marker at all must each keep the ordinary fence fully armed.
+
+The design ruling is #14695 j#93412 (superseding j#93406 on the same consultation j#93404).
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (  # noqa: E501
+    fold_issue_gate_facts,
+    lane_signal_from_gate_facts,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_authority import (  # noqa: E501
+    GATE_NO_CHANGE_REVIEW_WAIVER,
+    ISSUER_COORDINATOR,
+    contract_ruling_pointer,
+    contract_writer_role,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_review_waiver import (  # noqa: E501
+    CARVE_OUT_DECLARED,
+    CARVE_OUT_UNRESOLVED,
+    NO_CHANGE_REVIEW_WAIVER_GATE,
+    REASON_CALLBACK_OWED,
+    REASON_CHANGE_DECLARED,
+    REASON_CLOSE_NOT_RECORDED,
+    REASON_HARD_CARVE_OUT,
+    REASON_HARD_CARVE_OUT_UNRESOLVED,
+    REASON_LANE_COMMITS_PRESENT,
+    REASON_LANE_HEAD_UNMEASURED,
+    REASON_NO_WAIVER_RECORDED,
+    REASON_POST_WAIVER_MUTATION,
+    REASON_WAIVER_INVALID,
+    REASON_WAIVER_ISSUE_MISMATCH,
+    REASON_WAIVER_LANE_MISMATCH,
+    REASON_WAIVER_SUPERSEDED,
+    REASON_WORKTREE_NOT_CLEAN,
+    WAIVER_INVALID,
+    WAIVER_NONE,
+    WAIVER_WAIVED,
+    ZERO_CHANGE_COMMIT_DECLARED,
+    ZERO_CHANGE_INTEGRATION_DECLARED,
+    ZERO_CHANGE_SCOPE_DECLARED,
+    evaluate_no_change_waiver_admissible,
+    fold_hard_carve_out,
+    fold_no_change_review_waiver,
+    fold_zero_change_record,
+    render_no_change_review_waiver_marker,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
+    LANE_STATE_OWNER_WAITING,
+    LANE_STATE_RETIRE_READY,
+    LANE_STATE_REVIEW_WAITING,
+    classify_lane_state,
+)
+
+HEAD = "a" * 40
+OTHER_HEAD = "b" * 40
+ISSUE = "14613"
+WORKSPACE = "ws1"
+LANE = "issue_14613_herdr_075"
+GENERATION = 3
+
+
+def waiver_marker(
+    *, issue=ISSUE, workspace=WORKSPACE, lane=LANE, generation=GENERATION, head=HEAD
+) -> str:
+    return render_no_change_review_waiver_marker(
+        issue=issue, workspace=workspace, lane=lane, lane_generation=generation, head=head
+    )
+
+
+def no_change_journals(marker: str | None = None) -> list:
+    """A genuinely no-change record: a start, a progress note, and a Close carrying the waiver."""
+    return [
+        ("100", "## Gate: start\n- issue: #14613\n- 目的: characterization"),
+        ("200", "## Progress Log\n- read-only 実測のみ"),
+        ("300", f"## Gate: close\n- 受け入れ確認: 済\n{marker if marker else waiver_marker()}"),
+    ]
+
+
+def admit(journals, **overrides):
+    """Evaluate the retire admission over ``journals`` with all live facts satisfied."""
+    facts = fold_issue_gate_facts(journals)
+    kwargs = dict(
+        # The supersession half only — the retire's own wiring. Passing the folded
+        # ``review_waived`` here would make every change-bearing record refuse as "superseded",
+        # which is what this suite caught during development.
+        currently_in_force=facts.review_waiver_unsuperseded if facts else False,
+        zero_change=fold_zero_change_record(journals),
+        carve_out=fold_hard_carve_out(journals, gates_resolved=facts is not None),
+        close_recorded=(facts.latest_gate == "close") if facts else False,
+        target_issue=ISSUE,
+        expected_workspace=WORKSPACE,
+        expected_lane=LANE,
+        expected_lane_generation=GENERATION,
+        live_head=HEAD,
+        live_commits_ahead=0,
+        worktree_clean=True,
+        callbacks_drained=True,
+    )
+    kwargs.update(overrides)
+    return evaluate_no_change_waiver_admissible(fold_no_change_review_waiver(journals), **kwargs)
+
+
+class WriterContractRulingTest(unittest.TestCase):
+    """The gate's writer role and the record that DECIDED it (#14661 j#92715's requirement)."""
+
+    def test_canonical_writer_is_the_coordinator(self):
+        self.assertEqual(
+            contract_writer_role(GATE_NO_CHANGE_REVIEW_WAIVER), ISSUER_COORDINATOR
+        )
+
+    def test_ruling_pointer_names_this_gates_own_answer(self):
+        # Not #14219 j#85530 Q3 and not #14661 j#92641: neither mentions this gate, and an anchor
+        # whose target is silent about the gate passes ``is_anchored`` while being untraceable.
+        self.assertEqual(
+            contract_ruling_pointer(GATE_NO_CHANGE_REVIEW_WAIVER), "redmine:#14695:j#93412"
+        )
+
+    def test_the_authority_module_and_the_waiver_module_name_one_token(self):
+        # The token is re-declared as a literal in the authority module to avoid an import cycle;
+        # a test is what keeps the two spellings from drifting into two gates.
+        self.assertEqual(GATE_NO_CHANGE_REVIEW_WAIVER, NO_CHANGE_REVIEW_WAIVER_GATE)
+
+
+class NoChangePositiveTest(unittest.TestCase):
+    """Acceptance: a valid waiver on a no-change lane admits, with no fabricated review."""
+
+    def test_valid_waiver_admits_the_terminal_retire(self):
+        result = admit(no_change_journals())
+        self.assertTrue(result.admissible, result.reason)
+        self.assertEqual(result.reason, "ok")
+
+    def test_glance_projects_retire_ready_without_a_review_conclusion(self):
+        facts = fold_issue_gate_facts(no_change_journals())
+        self.assertTrue(facts.review_waived)
+        signal = lane_signal_from_gate_facts(ISSUE, facts, issue_open=False)
+        self.assertEqual(classify_lane_state(signal), LANE_STATE_RETIRE_READY)
+        # The preset forbids expressing a waiver AS a review approval. Reaching the post-review
+        # projection by the waiver route is the point; forging the conclusion is not.
+        self.assertNotEqual(facts.review_conclusion, "approved")
+
+    def test_a_waiver_before_close_reaches_owner_waiting_not_review_waiting(self):
+        journals = [
+            ("100", "## Gate: start"),
+            ("300", f"## Gate: implementation done\n{waiver_marker()}"),
+        ]
+        facts = fold_issue_gate_facts(journals)
+        signal = lane_signal_from_gate_facts(ISSUE, facts, issue_open=True)
+        self.assertEqual(classify_lane_state(signal), LANE_STATE_OWNER_WAITING)
+
+    def test_the_same_record_without_a_waiver_still_owes_the_review(self):
+        # The negative control for the case above: the waiver is doing the work, not the shape.
+        journals = [("100", "## Gate: start"), ("300", "## Gate: implementation done")]
+        facts = fold_issue_gate_facts(journals)
+        signal = lane_signal_from_gate_facts(ISSUE, facts, issue_open=True)
+        self.assertEqual(classify_lane_state(signal), LANE_STATE_REVIEW_WAITING)
+
+
+class SourceChangeCarveOutTest(unittest.TestCase):
+    """Acceptance: a record that declares repository change must FAIL CLOSED, every way."""
+
+    def test_a_declared_commit_refuses(self):
+        # Inserted BEFORE the Close so the latest gate stays ``close`` and the earlier conjuncts
+        # pass: this test must fail on the declared change, not on a rearranged lifecycle.
+        journals = [
+            ("100", "## Gate: start"),
+            ("250", "## Gate: implementation done\n- commit_hash: `deadbeef1234567`"),
+            ("300", f"## Gate: close\n{waiver_marker()}"),
+        ]
+        self.assertEqual(
+            fold_zero_change_record(journals).reason, ZERO_CHANGE_COMMIT_DECLARED
+        )
+        self.assertEqual(admit(journals).reason, REASON_CHANGE_DECLARED)
+
+    def test_declared_changed_paths_refuse(self):
+        # A plain note, deliberately NOT a ``review_request`` gate: that would also open a newer
+        # review round, and the record would then refuse for supersession rather than for the
+        # declared change. Each negative must isolate the conjunct it claims to test.
+        journals = [
+            ("100", "## Gate: start"),
+            ("250", "## Progress Log\n- changed_paths:\n  - `src/a.py`"),
+            ("300", f"## Gate: close\n{waiver_marker()}"),
+        ]
+        self.assertEqual(
+            fold_zero_change_record(journals).reason, ZERO_CHANGE_SCOPE_DECLARED
+        )
+        self.assertEqual(admit(journals).reason, REASON_CHANGE_DECLARED)
+
+    def test_a_recorded_integration_disposition_refuses(self):
+        # Not "did integration succeed" — an integration disposition of ANY kind presupposes work
+        # that exists, and a no-change lane has none to integrate.
+        journals = no_change_journals() + [
+            ("400", "## Integration disposition\n- disposition: merge")
+        ]
+        self.assertEqual(
+            fold_zero_change_record(journals).reason, ZERO_CHANGE_INTEGRATION_DECLARED
+        )
+        self.assertEqual(admit(journals).reason, REASON_CHANGE_DECLARED)
+
+    def test_a_deferred_integration_disposition_also_refuses(self):
+        journals = no_change_journals() + [
+            ("400", "## Integration disposition\n- disposition: explicit_deferral")
+        ]
+        self.assertEqual(admit(journals).reason, REASON_CHANGE_DECLARED)
+
+    def test_the_glance_agrees_with_the_retire_about_a_change_bearing_record(self):
+        # The disagreement #14539 j#90137 F3 measured: one authority, two consumers. A record the
+        # retire refuses must not read as "no review owed" in the glance.
+        journals = [
+            ("100", "## Gate: start"),
+            ("300", f"## Gate: implementation done\n- commit_hash: `deadbeef1234567`\n{waiver_marker()}"),
+        ]
+        facts = fold_issue_gate_facts(journals)
+        self.assertFalse(facts.review_waived)
+        signal = lane_signal_from_gate_facts(ISSUE, facts, issue_open=True)
+        self.assertEqual(classify_lane_state(signal), LANE_STATE_REVIEW_WAITING)
+
+
+class HardCarveOutTest(unittest.TestCase):
+    """#14695 j#93412 §3: the marker's own ``scope`` never proves external-effect absence."""
+
+    def test_a_recognized_release_fact_refuses(self):
+        journals = no_change_journals() + [
+            ("400", "## Gate: close\n[mozyo:workflow-event:gate=release:version=0.14.0]")
+        ]
+        self.assertEqual(
+            fold_hard_carve_out(journals, gates_resolved=True).reason, CARVE_OUT_DECLARED
+        )
+        self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
+
+    def test_a_production_verification_fact_refuses(self):
+        journals = no_change_journals() + [
+            ("400", "[mozyo:workflow-event:gate=production_verification:run=7]")
+        ]
+        self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
+
+    def test_an_unresolved_gate_inventory_refuses_rather_than_defaulting_clear(self):
+        # "既定 clear にせず typed refusal": not-found and not-checked are different answers.
+        self.assertEqual(
+            fold_hard_carve_out(no_change_journals(), gates_resolved=False).reason,
+            CARVE_OUT_UNRESOLVED,
+        )
+        self.assertEqual(
+            admit(
+                no_change_journals(),
+                carve_out=fold_hard_carve_out(no_change_journals(), gates_resolved=False),
+            ).reason,
+            REASON_HARD_CARVE_OUT_UNRESOLVED,
+        )
+
+    def test_prose_naming_a_release_is_not_a_recognized_fact(self):
+        # Structured gate tokens only. A review discussing a release, or a callback quoting one,
+        # would trip a keyword scan while proving nothing — and a prose scan is not authority.
+        journals = no_change_journals() + [
+            ("400", "## Progress Log\n- release / publish / migration について議論した")
+        ]
+        self.assertTrue(fold_hard_carve_out(journals, gates_resolved=True).clear)
+        self.assertTrue(admit(journals).admissible)
+
+
+class SupersessionAndMutationTest(unittest.TestCase):
+    """Stale / post-waiver states must be zero-retire."""
+
+    def test_a_newer_review_round_re_owes_the_review(self):
+        journals = no_change_journals() + [("400", "## Gate: review request\n- 対象US: #14613")]
+        facts = fold_issue_gate_facts(journals)
+        self.assertFalse(facts.review_waived)
+        self.assertEqual(admit(journals).reason, REASON_WAIVER_SUPERSEDED)
+
+    def test_a_review_round_BEFORE_the_waiver_does_not_supersede_it(self):
+        # The negative control: supersession is about ORDER, not about existence. Without this the
+        # test above would pass for a rule that simply refused any record mentioning a review.
+        journals = [
+            ("100", "## Gate: start"),
+            ("150", "## Gate: review request"),
+            ("300", f"## Gate: close\n{waiver_marker()}"),
+        ]
+        self.assertTrue(fold_issue_gate_facts(journals).review_waived)
+        self.assertTrue(admit(journals).admissible)
+
+    def test_a_moved_head_is_post_waiver_mutation(self):
+        self.assertEqual(
+            admit(no_change_journals(), live_head=OTHER_HEAD).reason,
+            REASON_POST_WAIVER_MUTATION,
+        )
+
+    def test_lane_commits_over_the_integration_branch_refuse(self):
+        self.assertEqual(
+            admit(no_change_journals(), live_commits_ahead=2).reason,
+            REASON_LANE_COMMITS_PRESENT,
+        )
+
+    def test_an_unmeasurable_repository_refuses(self):
+        self.assertEqual(
+            admit(no_change_journals(), live_head="", live_commits_ahead=None).reason,
+            REASON_LANE_HEAD_UNMEASURED,
+        )
+        self.assertEqual(
+            admit(no_change_journals(), live_commits_ahead=None).reason,
+            REASON_LANE_HEAD_UNMEASURED,
+        )
+
+    def test_a_dirty_or_unreadable_worktree_refuses(self):
+        self.assertEqual(
+            admit(no_change_journals(), worktree_clean=False).reason,
+            REASON_WORKTREE_NOT_CLEAN,
+        )
+
+    def test_an_owed_callback_refuses(self):
+        self.assertEqual(
+            admit(no_change_journals(), callbacks_drained=False).reason, REASON_CALLBACK_OWED
+        )
+
+    def test_an_unclosed_issue_refuses(self):
+        self.assertEqual(
+            admit(no_change_journals(), close_recorded=False).reason,
+            REASON_CLOSE_NOT_RECORDED,
+        )
+
+
+class ForeignIdentityTest(unittest.TestCase):
+    """Evidence from another issue, lane or generation must never unlock the fence."""
+
+    def test_a_foreign_issue_refuses(self):
+        self.assertEqual(
+            admit(no_change_journals(), target_issue="99999").reason,
+            REASON_WAIVER_ISSUE_MISMATCH,
+        )
+
+    def test_a_foreign_lane_refuses(self):
+        self.assertEqual(
+            admit(no_change_journals(), expected_lane="issue_99999_other").reason,
+            REASON_WAIVER_LANE_MISMATCH,
+        )
+
+    def test_a_superseded_generation_refuses(self):
+        self.assertEqual(
+            admit(no_change_journals(), expected_lane_generation=GENERATION + 1).reason,
+            REASON_WAIVER_LANE_MISMATCH,
+        )
+
+    def test_an_unresolved_retire_target_refuses(self):
+        # An identity that could not be measured fences nothing, so it must not pass. This is why
+        # the expectation comes from the lane's own lifecycle row and never from argv.
+        for gap in ({"expected_workspace": ""}, {"expected_lane": ""},
+                    {"expected_lane_generation": 0}):
+            with self.subTest(gap=gap):
+                self.assertEqual(
+                    admit(no_change_journals(), **gap).reason, REASON_WAIVER_LANE_MISMATCH
+                )
+
+
+class StrictMarkerGrammarTest(unittest.TestCase):
+    """Only a marker the canonical producer could render may mint the authority."""
+
+    def test_no_waiver_at_all_is_none_not_invalid(self):
+        journals = [("100", "## Gate: start"), ("300", "## Gate: close")]
+        self.assertEqual(fold_no_change_review_waiver(journals).state, WAIVER_NONE)
+        self.assertEqual(admit(journals).reason, REASON_NO_WAIVER_RECORDED)
+
+    def test_a_heading_declares_but_cannot_mint(self):
+        journals = [
+            ("100", "## Gate: start"),
+            ("300", "## Gate: close\n## Gate: no_change_review_waiver\n- approval_source: direct_owner"),
+        ]
+        self.assertEqual(fold_no_change_review_waiver(journals).state, WAIVER_INVALID)
+        self.assertEqual(admit(journals).reason, REASON_WAIVER_INVALID)
+
+    def test_a_newer_malformed_waiver_shadows_an_older_valid_one(self):
+        # Supersede-by-EXISTING. Skipping the malformed newer record would resurrect the stale
+        # authority — the invariant #14539 j#92012 F1 fixed for the exemption.
+        journals = [
+            ("300", f"## Gate: close\n{waiver_marker()}"),
+            ("400", "## Gate: no_change_review_waiver\n(rewritten, marker dropped)"),
+        ]
+        self.assertEqual(fold_no_change_review_waiver(journals).state, WAIVER_INVALID)
+
+    def test_a_note_carrying_an_unreadable_sibling_marker_is_poisoned(self):
+        # A clean marker beside a forged one must NOT read like a clean note.
+        poisoned = f"## Gate: close\n{waiver_marker()}\n[mozyo:workflow-event:gate={NO_CHANGE_REVIEW_WAIVER_GATE}:bogus]"
+        self.assertEqual(
+            fold_no_change_review_waiver([("300", poisoned)]).state, WAIVER_INVALID
+        )
+
+    def test_two_declarations_in_one_note_decide_nothing(self):
+        doubled = f"## Gate: close\n{waiver_marker()}\n{waiver_marker()}"
+        self.assertEqual(
+            fold_no_change_review_waiver([("300", doubled)]).state, WAIVER_INVALID
+        )
+
+    def test_an_extra_field_is_refused_not_ignored(self):
+        extra = waiver_marker()[:-1] + ":extra=1]"
+        self.assertEqual(
+            fold_no_change_review_waiver([("300", extra)]).state, WAIVER_INVALID
+        )
+
+    def test_a_quoted_marker_is_not_a_marker(self):
+        quoted = "## Gate: close\n```\n" + waiver_marker() + "\n```"
+        self.assertEqual(fold_no_change_review_waiver([("300", quoted)]).state, WAIVER_NONE)
+
+    def test_every_constant_field_is_load_bearing(self):
+        canonical = waiver_marker()
+        for original, tampered in (
+            ("decision=waived", "decision=declined"),
+            ("approval_source=direct_owner", "approval_source=standing_delegation"),
+            ("scope=no_change_investigation", "scope=release"),
+            ("version=1", "version=2"),
+        ):
+            with self.subTest(field=original):
+                self.assertIn(original, canonical)
+                mutated = canonical.replace(original, tampered)
+                self.assertEqual(
+                    fold_no_change_review_waiver([("300", mutated)]).state, WAIVER_INVALID
+                )
+
+    def test_a_permuted_field_order_is_refused(self):
+        canonical = waiver_marker()
+        permuted = canonical.replace(
+            "version=1:approval_source=direct_owner", "approval_source=direct_owner:version=1"
+        )
+        self.assertNotEqual(permuted, canonical)
+        self.assertEqual(
+            fold_no_change_review_waiver([("300", permuted)]).state, WAIVER_INVALID
+        )
+
+    def test_a_short_or_absent_head_is_refused(self):
+        for bad in ("deadbeef", "", "A" * 40):
+            with self.subTest(head=bad):
+                with self.assertRaises(ValueError):
+                    waiver_marker(head=bad)
+
+    def test_a_non_positive_generation_is_refused_at_write_time(self):
+        # The renderer must refuse what its own parser refuses: an unreadable durable record makes
+        # the authority silently not count.
+        for bad in (0, -1, "x"):
+            with self.subTest(generation=bad):
+                with self.assertRaises(ValueError):
+                    waiver_marker(generation=bad)
+
+    def test_the_rendered_marker_round_trips(self):
+        facts = fold_no_change_review_waiver([("300", waiver_marker())])
+        self.assertEqual(facts.state, WAIVER_WAIVED)
+        self.assertEqual(facts.issue, ISSUE)
+        self.assertEqual(facts.envelope.workspace, WORKSPACE)
+        self.assertEqual(facts.envelope.lane, LANE)
+        self.assertEqual(facts.envelope.lane_generation, GENERATION)
+        self.assertEqual(facts.head, HEAD)
+
+
+class ExistingFencesUnchangedTest(unittest.TestCase):
+    """Acceptance: the #14539 exemption and the ordinary generation fence stay exactly as they were."""
+
+    def test_a_lane_with_neither_authority_is_still_fenced(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
+            _resolve_latest_generation_admissible,
+        )
+
+        args = argparse.Namespace(
+            issue=ISSUE,
+            review_generation_json=None,
+            review_exemption_json=None,
+            no_change_review_waiver=False,
+            latest_generation_admissible=False,
+        )
+        self.assertFalse(_resolve_latest_generation_admissible(args))
+
+    def test_the_operator_assertion_still_works_when_no_route_is_supplied(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
+            _resolve_latest_generation_admissible,
+        )
+
+        args = argparse.Namespace(
+            issue=ISSUE,
+            review_generation_json=None,
+            review_exemption_json=None,
+            no_change_review_waiver=False,
+            latest_generation_admissible=True,
+        )
+        self.assertTrue(_resolve_latest_generation_admissible(args))
+
+    def test_opting_into_the_waiver_route_never_falls_back_to_the_hand_assert(self):
+        # "measured input を渡した場合は operator assertion へ fall back しない" (#14695 j#93412 §4).
+        # No target and no repo root -> the measured route refuses, and the True assertion beside
+        # it must NOT rescue the retire.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
+            _resolve_latest_generation_admissible,
+        )
+
+        args = argparse.Namespace(
+            issue=ISSUE,
+            review_generation_json=None,
+            review_exemption_json=None,
+            no_change_review_waiver=True,
+            latest_generation_admissible=True,
+        )
+        self.assertFalse(_resolve_latest_generation_admissible(args))
+
+    def test_an_exemption_lane_is_unaffected_by_the_waiver_fold(self):
+        # A ``codex_direct_edit`` record carries no waiver marker, so the new fold must leave it
+        # in exactly the state #14539 established.
+        journals = [
+            ("100", "## Gate: start"),
+            (
+                "200",
+                "## Gate: codex_direct_edit\n- role: 実装者\n- direct_edit: true\n"
+                "- allowed_paths:\n  - `vibes/docs/rules/**`\n- reason: policy\n"
+                "- follow_up_review: false",
+            ),
+            (
+                "300",
+                "## Gate: implementation done\n- commit_hash: `deadbeef1234567`\n"
+                "- changed_paths:\n  - `vibes/docs/rules/a.md`",
+            ),
+        ]
+        facts = fold_issue_gate_facts(journals)
+        self.assertTrue(facts.review_exempt)
+        self.assertFalse(facts.review_waived)
+        self.assertEqual(fold_no_change_review_waiver(journals).state, WAIVER_NONE)
+
+
+class LiveMeasurementTest(unittest.TestCase):
+    """The git probes fail closed on anything they cannot read."""
+
+    def test_missing_refs_measure_nothing(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
+            measure_lane_change,
+        )
+
+        measured = measure_lane_change(ROOT, branch="", integration_branch="main-next")
+        self.assertEqual(measured.head, "")
+        self.assertIsNone(measured.commits_ahead)
+        self.assertFalse(measured.worktree_clean)
+
+    def test_an_unknown_ref_yields_no_head_and_no_count(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
+            measure_lane_change,
+        )
+
+        measured = measure_lane_change(
+            ROOT, branch="no/such/branch/14695", integration_branch="main-next"
+        )
+        self.assertEqual(measured.head, "")
+        self.assertIsNone(measured.commits_ahead)
+
+    def test_an_absent_worktree_is_not_clean(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
+            measure_lane_change,
+        )
+
+        measured = measure_lane_change(
+            ROOT,
+            branch="HEAD",
+            integration_branch="HEAD",
+            worktree="/nonexistent/lane/worktree/14695",
+        )
+        self.assertFalse(measured.worktree_clean)
+
+
+if __name__ == "__main__":
+    unittest.main()
