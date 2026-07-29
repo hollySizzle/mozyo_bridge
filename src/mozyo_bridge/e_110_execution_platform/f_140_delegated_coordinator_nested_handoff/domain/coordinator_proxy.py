@@ -145,6 +145,14 @@ ANCHOR_SCOPE_MISMATCH = "scope_mismatch"
 #: QUOTED in prose or backticks, so a quotation appears as a second decision. An issue's bootstrap
 #: is authorized once; two candidates is ambiguity, and this rail never picks between them.
 ANCHOR_DECISION_AMBIGUOUS = "decision_ambiguous"
+#: The named journal CLAIMS this action's decision token in a marker body the canonical producer
+#: could not have rendered — a repeated key, a whitespace-contaminated field, a malformed component,
+#: or a body naming a second gate alongside it (Redmine #14667). Distinct from
+#: :data:`ANCHOR_UNVERIFIED` ("this journal carries no decision") and from
+#: :data:`ANCHOR_DECISION_AMBIGUOUS` ("it carries two"): here there IS a same-kind claim and it is
+#: uncountable, so the remedy is different — the coordinator re-records the decision with a
+#: producer-rendered marker. The claim is never dropped in favour of a clean sibling.
+ANCHOR_DECISION_UNREADABLE = "decision_unreadable"
 
 FENCE_OPEN = "open"  # the fence reserved this delegation (the single caller cleared to deliver)
 FENCE_DUPLICATE = "duplicate"  # in flight, or this exact decision was already delegated
@@ -173,6 +181,7 @@ REASON_ANCHOR_GENERATION_STALE = "proxy_anchor_generation_stale"
 REASON_ANCHOR_LANE_UNRESOLVED = "proxy_anchor_lane_unresolved"
 REASON_ANCHOR_SCOPE_MISMATCH = "proxy_anchor_scope_mismatch"
 REASON_ANCHOR_DECISION_AMBIGUOUS = "proxy_anchor_decision_ambiguous"
+REASON_ANCHOR_DECISION_UNREADABLE = "proxy_anchor_decision_unreadable"
 #: The single send fired but did not positively land; the fence holds an ``uncertain`` generation
 #: awaiting an operator reconcile (review j#89878 finding 3). NOT a success.
 REASON_DELIVERY_UNCERTAIN = "proxy_delivery_uncertain"
@@ -200,6 +209,7 @@ _ANCHOR_REASON = {
     ANCHOR_LANE_UNRESOLVED: REASON_ANCHOR_LANE_UNRESOLVED,
     ANCHOR_SCOPE_MISMATCH: REASON_ANCHOR_SCOPE_MISMATCH,
     ANCHOR_DECISION_AMBIGUOUS: REASON_ANCHOR_DECISION_AMBIGUOUS,
+    ANCHOR_DECISION_UNREADABLE: REASON_ANCHOR_DECISION_UNREADABLE,
 }
 
 _FENCE_REASON = {
@@ -413,10 +423,13 @@ class LaneExpectation:
 #: Canonical-read refusals the adapter reports, mapped onto anchor statuses. The reader looks at
 #: exactly ONE journal — the one the invocation names — so each refusal is about that journal alone
 #: and can never be caused by, or poisoned by, anything else on the issue (Design Answer j#90329
-#: contract 5).
+#: contract 5). Within that one journal the refusals ARE same-note: a claim of this action's token
+#: that the canonical producer could not have rendered refuses the journal rather than being
+#: dropped in favour of a clean sibling marker beside it (Redmine #14667).
 DECISION_REFUSAL_STATUS: "dict[str, str]" = {
     "no_canonical_decision": ANCHOR_UNVERIFIED,
     "duplicate_canonical_decision": ANCHOR_DECISION_AMBIGUOUS,
+    "unreadable_canonical_decision": ANCHOR_DECISION_UNREADABLE,
     "action_not_declared": ANCHOR_ACTION_MISMATCH,
 }
 
@@ -519,6 +532,7 @@ __all__ = (
     "ANCHOR_LANE_UNRESOLVED",
     "ANCHOR_SCOPE_MISMATCH",
     "ANCHOR_DECISION_AMBIGUOUS",
+    "ANCHOR_DECISION_UNREADABLE",
     "FENCE_OPEN",
     "FENCE_DUPLICATE",
     "FENCE_STALE",
@@ -541,6 +555,7 @@ __all__ = (
     "REASON_ANCHOR_LANE_UNRESOLVED",
     "REASON_ANCHOR_SCOPE_MISMATCH",
     "REASON_ANCHOR_DECISION_AMBIGUOUS",
+    "REASON_ANCHOR_DECISION_UNREADABLE",
     "REASON_DELIVERY_UNCERTAIN",
     "REASON_DUPLICATE",
     "REASON_STALE",
