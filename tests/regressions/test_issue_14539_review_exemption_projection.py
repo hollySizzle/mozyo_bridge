@@ -3650,9 +3650,21 @@ def _marker_token_holders(root):
         ]
 
     def module_capabilities(tree):
-        """(everything this module holds, {bound name -> what that name holds})."""
+        """Everything this module holds — a flat capability list, with NO name association.
+
+        There is deliberately no ``{name: capabilities}`` map (Redmine #14539 review j#92567).
+        Building one means deciding which statement bound which name, and that is an enumeration
+        of Python's binding forms — the approach R31 already abandoned one layer up. It came
+        back here: ``Assign`` and ``AnnAssign`` were read, so an owner writing
+        ``for RE in [re.compile(marker)]`` or ``(RE := re.compile(marker))`` had an EMPTY map
+        and propagated nothing, losing its direct and wildcard consumers alike.
+
+        A name label is still used for the capability TOKEN of a generic pattern (``*:RE``), so
+        two generic scanners in one module stay distinguishable. That is a label on the owner's
+        own inventory entry; nothing about propagation depends on it.
+        """
         docs = documentation_constants(tree)
-        claimed, held, bound = set(), [], {}
+        claimed, held = set(), []
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign) and node.value is not None:
                 targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
@@ -3667,19 +3679,16 @@ def _marker_token_holders(root):
             literals = token_literals(node.value, docs)
             if not literals or not targets:
                 continue
-            capabilities = [
+            held += [
                 capability
                 for literal in literals
                 for capability in _capabilities_in(literal.value, targets[0])
             ]
-            for name in targets:
-                bound.setdefault(name, []).extend(capabilities)
-            held += capabilities
             claimed |= {id(literal) for literal in literals}
         for literal in token_literals(tree, docs):
             if id(literal) not in claimed:
                 held += _capabilities_in(literal.value, None)
-        return held, bound
+        return held
 
     def dotted_name(node):
         """``a.b.c`` for a Name/Attribute chain, else ``None``."""
@@ -3705,30 +3714,10 @@ def _marker_token_holders(root):
 
     own, owners = {}, {}
     for path, tree in trees.items():
-        held, bound = module_capabilities(tree)
+        held = module_capabilities(tree)
         own[path] = held
-        if bound:
-            owners[module_path(path)] = bound
-
-    def wildcard_bindings(module):
-        """EVERY marker capability the owner binds — a wildcard propagates all of them.
-
-        Deliberately NOT an emulation of ``__all__`` (Redmine #14539 review j#92538). Three
-        rounds were spent extending an allowlist of AST binder nodes so this could decide which
-        names a ``import *`` really brings across, and each round a form outside the allowlist
-        turned up: reassignment, ``+=``, annotated targets, a nested scope, an ``if`` / ``try``
-        body, ``:=``, ``del`` — then ``for`` / ``with`` / ``match`` / ``except`` targets, with
-        ``async for``, ``async with``, destructuring, import aliases and def/class names still
-        queued behind them. The set of ways Python binds a module-level name is not something an
-        inventory should be enumerating: every miss is a consumer silently leaving the gate.
-
-        So the emulation is gone. A wildcard propagates the owner's whole capability set and the
-        consumer-side "is this name actually used" filter stays, which cannot produce a false
-        negative however Python decides ``__all__``. It can over-detect — a module that would
-        not really export a name still declares it — and over-detection costs one declaration
-        line, while the alternative costs an undeclared authority reader.
-        """
-        return dict(owners.get(module, {}))
+        if held:
+            owners[module_path(path)] = held
 
     holders = {}
     for path, tree in trees.items():
@@ -3744,6 +3733,11 @@ def _marker_token_holders(root):
         used_names = {
             other.id for other in ast.walk(tree) if isinstance(other, ast.Name)
         }
+        # Owners reached by a USED import relation. Collected as a set so an owner's capability
+        # list is propagated once however many times the consumer imports from it — otherwise a
+        # second `from M import helper` line would change the consumer's capability multiset for
+        # a reason that says nothing about capability.
+        inherited_from = set()
         module_aliases = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
@@ -3756,17 +3750,20 @@ def _marker_token_holders(root):
                     full = node.module or ""
                 for alias in node.names:
                     if alias.name == "*":
-                        # A wildcard is a normal import here — no rule forbids it, so the gate
-                        # may not silently exclude it (j#92455).
-                        for name, capabilities in wildcard_bindings(full).items():
-                            if name in used_names:
-                                held += capabilities
+                        # A wildcard propagates the owner's WHOLE set, with no per-name filter:
+                        # that filter needed the bound-name map, which is exactly what cannot be
+                        # computed reliably (j#92567). An unused wildcard consumer is therefore
+                        # over-detected, which is the side that cannot hide a reader.
+                        if full in owners:
+                            inherited_from.add(full)
                         continue
                     local = alias.asname or alias.name
-                    owned = owners.get(full, {})
-                    if alias.name in owned:
+                    if full in owners:
+                        # The import RELATION is what matters, not which name inside the owner
+                        # carries the capability. Asking the latter means deciding which
+                        # statement bound which name — the enumeration this gate keeps losing to.
                         if local in used_names:
-                            held += owned[alias.name]
+                            inherited_from.add(full)
                     elif f"{full}.{alias.name}" in owners:
                         module_aliases[local] = f"{full}.{alias.name}"
             elif isinstance(node, ast.Import):
@@ -3775,16 +3772,18 @@ def _marker_token_holders(root):
                         module_aliases[alias.asname] = alias.name
                     else:
                         module_aliases[alias.name] = alias.name
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Attribute):
-                continue
-            base = dotted_name(node.value)
-            target = module_aliases.get(base)
-            if not target:
-                continue
-            owned = owners.get(target, {})
-            if node.attr in owned:
-                held += owned[node.attr]
+        for local, target in module_aliases.items():
+            if target in owners and (
+                local in used_names
+                or any(
+                    dotted_name(node.value) == local
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Attribute)
+                )
+            ):
+                inherited_from.add(target)
+        for target in sorted(inherited_from):
+            held += owners[target]
         if held:
             holders[str(path.relative_to(root.parent.parent))] = sorted(held)
     return holders
@@ -3828,27 +3827,27 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         ),
         # -- readers -------------------------------------------------------------------
         f"{_D}/domain/dispatch_authorization.py": (
-            ["*", "*:_MARKER_RE"],
+            ["*", "*", "*", "*:_MARKER_RE", "*:_MARKER_RE"],
             "reads: note-scoped ambiguity flag invalidates every sibling; also renders, through "
             "the shared value validator",
         ),
         f"{_D}/domain/dispatch_disposition.py": (
-            ["*", "*:_MARKER_RE"],
+            ["*", "*", "*", "*:_MARKER_RE", "*:_MARKER_RE"],
             "reads: note-scoped note_ambiguous flag refuses the discharge; also renders, through "
             "the shared value validator",
         ),
         f"{_D}/domain/recovery_anchor_delivery.py": (
-            ["*", "*", "recovery-delivery-authorization", "recovery-delivery-zero-send"],
+            ["*", "*", "*", "*", "*:_MARKER_RE", "recovery-delivery-authorization", "recovery-delivery-zero-send"],
             "reads: exactly-one-marker rule, so any second marker of its channel makes the note "
             "unreadable before a field is compared",
         ),
         f"{_D}/domain/recovered_pair_pin_reconciliation.py": (
-            ["*:_AUTHORITY_RE"],
+            ["*", "*", "*:_AUTHORITY_RE", "*:_MARKER_RE"],
             "reads: exactly-one-marker rule",
         ),
-        f"{_D}/domain/hibernate_park_record.py": (["handoff"], "reads one marker per record"),
+        f"{_D}/domain/hibernate_park_record.py": (["handoff", "handoff"], "reads one marker per record"),
         f"{_D}/application/operator_startup_resume_leg.py": (
-            ["operator-startup-gate"],
+            ["*", "operator-startup-gate"],
             "reads by version-agnostic prefix match, and builds the versioned marker from that "
             "same prefix",
         ),
@@ -3861,16 +3860,16 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         f"{_H}/domain/handoff.py": (["handoff"], "renders the handoff notification marker"),
         f"{_H}/domain/notification.py": (["notify", "notify"], "renders the notify marker"),
         f"{_D}/domain/callback_recovery_key.py": (
-            ["*"],
+            ["*", "*", "*", "*:_MARKER_RE"],
             "renders the recovery-admission marker through the shared value validator it "
             "originally hardened; reads back through the shared strict gate reader",
         ),
         f"{_D}/domain/callback_sweep_watermark.py": (
-            ["*", "*", "workflow-event"],
+            ["*", "*", "*", "*", "*:_MARKER_RE", "workflow-event"],
             "renders the sweep record / dispatch markers",
         ),
         f"{_D}/domain/hibernate_evidence_integration.py": (
-            ["*"],
+            ["*", "*"],
             "renders the integration evidence marker",
         ),
         f"{_D}/domain/hibernate_evidence_marker.py": (
@@ -3878,7 +3877,7 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "renders the lane evidence marker, fail-closed on its own fields",
         ),
         f"{_D}/domain/hibernated_bound_pair_composer_discard.py": (
-            ["workflow-event"],
+            ["workflow-event", "workflow-event"],
             "renders the composer-discard approval marker",
         ),
         f"{_D}/domain/hibernated_bound_pair_convergence.py": (
@@ -3890,16 +3889,344 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "renders the operator startup gate note",
         ),
         f"{_D}/application/sublane_diagnostics.py": (
-            ["*"],
+            ["*", "*", "*", "*", "*", "*:_MARKER_RE", "workflow-event"],
             "renders the callback-lease blocker marker",
         ),
         # -- prose ---------------------------------------------------------------------
         f"{_D}/application/cli_workflow_watch.py": (
-            ["*", "*", "*:watch"],
+            ["*", "*", "*", "*", "*:_MARKER_RE", "*:watch"],
             "argparse help text only: it names the token to explain the flag and neither builds "
             "nor matches a marker",
         ),
     }
+
+    #: Modules that hold NO marker token of their own but inherit an owner's capability set
+    #: through a used import relation (Redmine #14539 review j#92567). They are declared because
+    #: the gate can no longer ask WHICH name inside the owner carries the capability — deciding
+    #: that means enumerating Python's binding forms, which this gate has lost to three times.
+    #: The trade is stated in ``test_no_module_shape_can_hide_a_capability_from_a_wildcard_consumer``:
+    #: over-detection costs a declaration line, a missed reader costs a silent gate.
+    INHERITED = {
+        "src/mozyo_bridge/application/cli_core.py": (
+            ['*', 'handoff'],
+            "inherits via a used import of sublane_diagnostics, sublane_quarantine; names no marker token itself",
+        ),
+        "src/mozyo_bridge/application/commands.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        "src/mozyo_bridge/application/handoff_delivery_command.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        "src/mozyo_bridge/application/handoff_target_activation_command.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        "src/mozyo_bridge/application/notify_command.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        "src/mozyo_bridge/application/pane_primitive_command.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        "src/mozyo_bridge/e_110_execution_platform/f_110_workspace_session_identity/application/commands_session.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        "src/mozyo_bridge/e_110_execution_platform/f_110_workspace_session_identity/domain/session_boundary.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_H}/application/cli_handoff.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_H}/application/cli_handoff_q_enter.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_H}/application/cli_handoff_ticketless.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_H}/application/handoff_admission_pipeline.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_H}/application/handoff_envelope_planner.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_H}/application/handoff_herdr_standard_rail.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_H}/application/handoff_target_resolution.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_H}/application/handoff_tmux_transport_rail.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_H}/application/startup_admission_gate.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_H}/domain/delivery_record_sink.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_D}/application/callback_gate_record.py": (
+            ['*', '*', '*', '*', '*:_MARKER_RE', 'workflow-event'],
+            "inherits via a used import of callback_sweep_watermark, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/callback_outbox_processor.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/callback_recovery_admission.py": (
+            ['*', '*', '*', '*', '*', '*:_MARKER_RE', 'workflow-event'],
+            "inherits via a used import of callback_recovery_key, callback_sweep_watermark, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/callback_recovery_record.py": (
+            ['*', '*', '*', '*', '*', '*:_MARKER_RE', 'workflow-event'],
+            "inherits via a used import of callback_recovery_key, callback_sweep_watermark, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/callback_runtime.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/callback_sweep.py": (
+            ['*', '*', '*', '*', '*:_MARKER_RE', 'workflow-event'],
+            "inherits via a used import of callback_sweep_watermark, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/cli_handoff_delegate_dispatch.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_D}/application/cli_workflow.py": (
+            ['*', '*', '*:watch', 'operator-startup-gate'],
+            "inherits via a used import of cli_workflow_watch, operator_startup_resume_leg; names no marker token itself",
+        ),
+        f"{_D}/application/cli_workflow_callbacks.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/cli_workflow_dispatch_ir.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/cli_workflow_recovery_admission.py": (
+            ['*'],
+            "inherits via a used import of sublane_diagnostics; names no marker token itself",
+        ),
+        f"{_D}/application/dispatch_disposition_writer.py": (
+            ['*', '*', '*', '*', '*:_MARKER_RE', '*:_MARKER_RE', '*:_MARKER_RE'],
+            "inherits via a used import of dispatch_authorization, dispatch_disposition, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/gateway_disposition_intake.py": (
+            ['*', '*', '*', '*:_MARKER_RE', '*:_MARKER_RE'],
+            "inherits via a used import of dispatch_authorization, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/gateway_route_gate.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_D}/application/herdr_dispatch_authority.py": (
+            ['*', '*:_MARKER_RE'],
+            "inherits via a used import of dispatch_authorization; names no marker token itself",
+        ),
+        f"{_D}/application/herdr_dispatch_cli.py": (
+            ['*', '*:_MARKER_RE'],
+            "inherits via a used import of dispatch_authorization; names no marker token itself",
+        ),
+        f"{_D}/application/herdr_dispatch_execution.py": (
+            ['*', '*:_MARKER_RE'],
+            "inherits via a used import of dispatch_authorization; names no marker token itself",
+        ),
+        f"{_D}/application/herdr_workflow_step.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/hibernate_supervisor_wiring.py": (
+            ['*', '*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of hibernate_evidence_marker, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/live_redmine_journal_source.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/main_lane_guard_gate.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_D}/application/operator_startup_resume_record.py": (
+            ['operator-startup-gate'],
+            "inherits via a used import of operator_startup_resume_leg; names no marker token itself",
+        ),
+        f"{_D}/application/operator_startup_resume_target.py": (
+            ['operator-startup-gate'],
+            "inherits via a used import of operator_startup_resume_leg; names no marker token itself",
+        ),
+        f"{_D}/application/reconcile_dispatch_writer.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/recovered_pair_pin_reconciliation.py": (
+            ['*:_AUTHORITY_RE'],
+            "inherits via a used import of recovered_pair_pin_reconciliation; names no marker token itself",
+        ),
+        f"{_D}/application/recovered_pair_pin_reconciliation_live.py": (
+            ['*', '*', '*:_AUTHORITY_RE', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],
+            "inherits via a used import of recovered_pair_pin_reconciliation, recovery_anchor_delivery; names no marker token itself",
+        ),
+        f"{_D}/application/recovered_worker_delivery_live.py": (
+            ['*', '*', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],
+            "inherits via a used import of recovery_anchor_delivery; names no marker token itself",
+        ),
+        f"{_D}/application/recovery_anchor_delivery_live.py": (
+            ['*', '*', 'handoff', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],
+            "inherits via a used import of handoff, recovery_anchor_delivery; names no marker token itself",
+        ),
+        f"{_D}/application/retire_admissibility.py": (
+            ['*', '*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of hibernate_evidence_integration, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_gateway_recovery_live.py": (
+            ['*', '*', 'handoff', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],
+            "inherits via a used import of handoff, recovery_anchor_delivery; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_hibernate_boundary.py": (
+            ['handoff'],
+            "inherits via a used import of sublane_quarantine; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_hibernated_bound_pair_composer_discard.py": (
+            ['workflow-event', 'workflow-event'],
+            "inherits via a used import of hibernated_bound_pair_composer_discard, hibernated_bound_pair_convergence; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_hibernated_bound_pair_composer_discard_live.py": (
+            ['*', '*', '*:_MARKER_RE', 'handoff', 'workflow-event', 'workflow-event'],
+            "inherits via a used import of sublane_quarantine, hibernated_bound_pair_composer_discard, hibernated_bound_pair_convergence, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_hibernated_bound_pair_convergence.py": (
+            ['workflow-event'],
+            "inherits via a used import of hibernated_bound_pair_convergence; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_hibernated_bound_pair_convergence_live.py": (
+            ['*', '*', '*:_MARKER_RE', 'workflow-event'],
+            "inherits via a used import of hibernated_bound_pair_convergence, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_hibernated_live_reconcile_ops.py": (
+            ['handoff'],
+            "inherits via a used import of sublane_quarantine; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_hibernated_pair_recovery.py": (
+            ['*', '*', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],
+            "inherits via a used import of recovery_anchor_delivery; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_hibernated_pair_recovery_live.py": (
+            ['*', '*', 'handoff', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],
+            "inherits via a used import of sublane_quarantine, recovery_anchor_delivery; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_prepare_readonly_projection.py": (
+            ['handoff', 'workflow-event'],
+            "inherits via a used import of sublane_quarantine, hibernated_bound_pair_convergence; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_quarantine_inspect.py": (
+            ['handoff'],
+            "inherits via a used import of sublane_quarantine; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_recover_pair_redispatch_edge.py": (
+            ['*', '*', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],
+            "inherits via a used import of recovery_anchor_delivery; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_recovered_pair_pin_reconciliation_cli.py": (
+            ['*:_AUTHORITY_RE'],
+            "inherits via a used import of recovered_pair_pin_reconciliation; names no marker token itself",
+        ),
+        f"{_D}/application/sublane_stale_worker_recovery_live.py": (
+            ['handoff', 'handoff'],
+            "inherits via a used import of handoff, sublane_quarantine; names no marker token itself",
+        ),
+        f"{_D}/application/supervisor_wiring.py": (
+            ['*', '*', '*', '*', '*:_MARKER_RE', '*:watch', 'handoff'],
+            "inherits via a used import of handoff, cli_workflow_watch, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/workspace_callback_review_return.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/application/workspace_callback_supervisor.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/domain/dispatch_authority.py": (
+            ['*', '*:_MARKER_RE'],
+            "inherits via a used import of dispatch_authorization; names no marker token itself",
+        ),
+        f"{_D}/domain/gateway_route_enforcement.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_D}/domain/glance_integration_disposition.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/domain/glance_journal_grammar.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/domain/hibernate_basis_producer.py": (
+            ['*', '*', '*', '*', '*:_MARKER_RE', 'handoff'],
+            "inherits via a used import of hibernate_evidence_integration, hibernate_evidence_marker, hibernate_park_record, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/domain/hibernate_evidence_authority.py": (
+            ['*'],
+            "inherits via a used import of hibernate_evidence_marker; names no marker token itself",
+        ),
+        f"{_D}/domain/hibernate_issuer_policy.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/domain/recovered_worker_delivery.py": (
+            ['*', '*', '*', '*', '*:_MARKER_RE', 'recovery-delivery-authorization', 'recovery-delivery-zero-send'],
+            "inherits via a used import of recovery_anchor_delivery, redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/domain/review_exemption.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        "src/mozyo_bridge/e_140_adapter_provider/f_110_ticket_adapter_common/domain/ticket_adapter.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        "src/mozyo_bridge/e_140_adapter_provider/f_120_redmine_adapter/infrastructure/redmine_ticket_provider.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        "src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_send_entry.py": (
+            ['handoff'],
+            "inherits via a used import of handoff; names no marker token itself",
+        ),
+        "src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_session_retire_ops.py": (
+            ['*', '*', '*', '*', '*:_MARKER_RE', '*:_MARKER_RE', '*:_MARKER_RE', 'handoff'],
+            "inherits via a used import of sublane_quarantine, dispatch_authorization, dispatch_disposition, redmine_journal_source; names no marker token itself",
+        ),
+        "src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/domain/composer_discard_approval.py": (
+            ['*', '*', '*:_MARKER_RE'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+    }
+
+    @classmethod
+    def _declared(cls):
+        """Every declared holder: the curated own-token table plus the inherited entries."""
+        merged = dict(cls.DISCIPLINES)
+        merged.update(cls.INHERITED)
+        return {path: sorted(channels) for path, (channels, _why) in merged.items()}
 
     def _root(self):
         import pathlib
@@ -3907,9 +4234,8 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         return pathlib.Path(__file__).resolve().parents[2] / "src" / "mozyo_bridge"
 
     def test_every_marker_token_holder_declares_its_channels(self):
-        declared = {path: sorted(channels) for path, (channels, _why) in self.DISCIPLINES.items()}
         self.assertEqual(
-            _inventory_mismatch(_marker_token_holders(self._root()), declared),
+            _inventory_mismatch(_marker_token_holders(self._root()), self._declared()),
             {},
             "a module names the mozyo marker token without a matching declaration. Compare the "
             "CHANNELS too: a declared module that gains a second channel is a new capability and "
@@ -3932,7 +4258,7 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         self.assertIn("b.py", _inventory_mismatch({"a.py": ["c1"], "b.py": ["c1"]}, declared))
 
     def test_the_declared_identities_are_repo_relative_paths(self):
-        for declared in self.DISCIPLINES:
+        for declared in self._declared():
             self.assertTrue(
                 declared.startswith("src/mozyo_bridge/") and declared.endswith(".py"),
                 f"{declared!r} is not a repo-relative module path; a basename key lets an "
@@ -3940,7 +4266,7 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             )
 
     def test_every_declaration_says_what_the_module_does(self):
-        for path, (channels, why) in self.DISCIPLINES.items():
+        for path, (channels, why) in {**self.DISCIPLINES, **self.INHERITED}.items():
             self.assertTrue(channels, f"{path} declares no channel")
             self.assertGreater(len(why), 20, f"{path} has no real discipline text")
 
@@ -4352,22 +4678,89 @@ class ReviewJ92374InventoryDetectionTests(unittest.TestCase):
             "capability set instead (Redmine #14539 review j#92538)",
         )
 
-    def test_a_wildcard_still_only_counts_names_the_consumer_uses(self):
-        """The other half of the rule: propagation is conservative, not unconditional.
+    def test_a_wildcard_propagates_even_when_nothing_is_used(self):
+        """R32-F1: the wildcard used-name filter is gone, deliberately.
 
-        Whole-set propagation would be meaningless if it also ignored whether the consumer
-        touches the name — every module doing ``import *`` from a grammar owner would inherit
-        its capabilities.
+        It could only ask "is this name used" by consulting the owner's bound-name map, and that
+        map cannot be built without enumerating Python's binding forms — the thing this gate has
+        lost to three times. So a wildcard consumer inherits the owner's capabilities whether or
+        not it touches them: an unused ``import *`` is over-detected, which costs a declaration
+        line, rather than under-detected, which costs a silent reader.
         """
-        owner = (
-            "import re\n"
-            'RE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
-        )
+        owner = 'import re\nRE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
         unused = "from mozyo_bridge.owner import *\nVALUE = 1\n"
         used = "from mozyo_bridge.owner import *\ndef read(n): return RE.findall(n or '')\n"
         holders = self._holders({"owner.py": owner, "no.py": unused, "yes.py": used}, owner=False)
+        self.assertEqual(holders.get("src/mozyo_bridge/no.py"), ["chan-a"])
+        self.assertEqual(holders.get("src/mozyo_bridge/yes.py"), ["chan-a"])
+
+    def test_an_explicit_import_still_has_to_be_used(self):
+        """The boundary that survives: an unused EXPLICIT import names a local the consumer can
+        be checked against, so it needs no bound-name map and still gates."""
+        owner = 'import re\nRE = re.compile(r"\\[mozyo:chan-a:([^\\]]*)\\]")\n'
+        unused = "from mozyo_bridge.owner import RE  # noqa: F401\nVALUE = 1\n"
+        used = "from mozyo_bridge.owner import RE\ndef read(n): return RE.findall(n or '')\n"
+        holders = self._holders({"owner.py": owner, "no.py": unused, "yes.py": used}, owner=False)
         self.assertIsNone(holders.get("src/mozyo_bridge/no.py"))
         self.assertEqual(holders.get("src/mozyo_bridge/yes.py"), ["chan-a"])
+
+    def test_the_owner_capability_set_propagates_whatever_bound_it(self):
+        """R32-F1 proper: four owner binding forms, each reached both ways.
+
+        The owner's capability is real in every case — Python binds ``RE`` and both a direct and
+        a wildcard consumer can call it. Before this round the propagation asked which name the
+        owner had bound the pattern to, learned that only from ``Assign`` / ``AnnAssign``, and so
+        returned an empty map for all four, dropping both consumers.
+        """
+        marker = '\\[mozyo:chan-a:([^\\]]*)\\]'
+        owners = {
+            "for target": f'import re\nfor RE in [re.compile(r"{marker}")]:\n    pass\n',
+            "with target": (
+                "import re\nfrom contextlib import nullcontext\n"
+                f'with nullcontext(re.compile(r"{marker}")) as RE:\n    pass\n'
+            ),
+            "assignment expression": f'import re\n(RE := re.compile(r"{marker}"))\n',
+            "decorator result": (
+                f'import re\ndef deco(f):\n    return re.compile(r"{marker}")\n'
+                "@deco\ndef RE():\n    pass\n"
+            ),
+        }
+        direct = "from mozyo_bridge.owner import RE\ndef read(n): return RE.findall(n or '')\n"
+        wildcard = "from mozyo_bridge.owner import *\ndef read(n): return RE.findall(n or '')\n"
+        for label, owner in owners.items():
+            with self.subTest(label):
+                holders = self._holders(
+                    {"owner.py": owner, "d.py": direct, "w.py": wildcard}, owner=False
+                )
+                self.assertEqual(holders.get("src/mozyo_bridge/owner.py"), ["chan-a"])
+                self.assertEqual(holders.get("src/mozyo_bridge/d.py"), ["chan-a"], "direct")
+                self.assertEqual(holders.get("src/mozyo_bridge/w.py"), ["chan-a"], "wildcard")
+
+    def test_the_resolver_keeps_no_bound_name_map(self):
+        """The convergence, pinned structurally: no ``{name: capabilities}`` anywhere.
+
+        Same shape as the ``__all__`` pin one layer up — the property worth protecting is that
+        the question is not asked, because every answer to it has been an enumeration that fell
+        behind the language.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(_marker_token_holders)))
+        returns = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "module_capabilities"
+        ]
+        self.assertEqual(len(returns), 1)
+        for node in ast.walk(returns[0]):
+            self.assertNotIsInstance(
+                node,
+                ast.Dict,
+                "module_capabilities is building a name map again; owners hold a flat capability "
+                "list and propagation must not depend on which name bound it (j#92567)",
+            )
 
     # -- the import forms j#92420 finding 1 measured ---------------------------------
 
