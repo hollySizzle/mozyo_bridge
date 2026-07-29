@@ -427,18 +427,69 @@ class HandoffEnvelopePlanner:
         Raises :class:`EnvelopePlanError` with the exact cumulative partial-state extras the
         original inline block emitted at each failing stage.
         """
-        # Execution root / workdir propagation (Redmine #12098).
+        # Execution root / workdir propagation (Redmine #12098), with the target-repo
+        # relative base + containment fence from Redmine #14249.
         execution_root = None
         if inp.workdir:
-            workdir_abs = str(Path(inp.workdir).expanduser().resolve())
+            # The repo anchor is resolved FIRST, because it is also the base a relative
+            # `--workdir` resolves against (#14249). An explicit `--target-repo` (or the
+            # `auto` sentinel already resolved to a concrete root by the target-resolution
+            # tranche) is an ASSERTION about the receiver's repo root, gated by
+            # `target_repo_mismatch`; when it is present the receiver's frame — not the
+            # sender's cwd — is the meaningful base.
             repo_anchor_abs: str | None
-            if resolved_target_repo and resolved_target_repo != AUTO_TARGET_REPO:
-                repo_anchor_abs = str(Path(resolved_target_repo).expanduser().resolve())
+            target_repo_declared = bool(
+                resolved_target_repo and resolved_target_repo != AUTO_TARGET_REPO
+            )
+            if target_repo_declared:
+                repo_anchor_abs = str(
+                    Path(cast(str, resolved_target_repo)).expanduser().resolve()
+                )
             else:
                 repo_anchor_abs = self._ops.infer_repo_root(target_cwd) or None
+
+            # Redmine #14249: a relative `--workdir` used to resolve against the SENDER's
+            # process cwd, so the portable `--workdir .` meant "the sender's directory",
+            # not "the target repo root" — delivering a lane-external execution root while
+            # the send still reported success. With an asserted `--target-repo`, resolve
+            # relative forms against that repo root instead. Without one there is no
+            # authoritative receiver frame, so sender-cwd resolution is kept unchanged
+            # (the #12098 contract for the inferred-anchor case).
+            raw_workdir = Path(inp.workdir).expanduser()
+            if raw_workdir.is_absolute() or not (
+                target_repo_declared and repo_anchor_abs
+            ):
+                workdir_abs = str(raw_workdir.resolve())
+            else:
+                workdir_abs = str((Path(repo_anchor_abs) / raw_workdir).resolve())
+
             execution_root = self._ops.build_execution_root(
                 workdir_abs, repo_root_abs=repo_anchor_abs
             )
+
+            # Redmine #14249 pre-send containment fence: when the sender ASSERTED a target
+            # repo, an execution root that does not live under it is a self-contradictory
+            # delivery — the receiver was gated into one repo and pointed at another. Refuse
+            # with zero bytes typed rather than recording it as a successful send. Scoped to
+            # the asserted case on purpose: with a merely INFERRED anchor the #12098 contract
+            # still carries an out-of-tree workdir (redacted to the structured outcome), and
+            # blocking that would regress deliveries that never asserted a repo at all.
+            if target_repo_declared and execution_root.relative is None:
+                raise EnvelopePlanError(
+                    "execution_root_outside_target_repo",
+                    (
+                        "`--workdir` resolves outside the asserted `--target-repo`: "
+                        f"workdir={inp.workdir!r} resolved to a path that does not "
+                        "live under the target repo root. Refusing to deliver an "
+                        "execution root outside the repo the receiver was gated into "
+                        "(nothing was typed, no Enter was pressed, no delivery was "
+                        "recorded). A relative `--workdir` is resolved against "
+                        "`--target-repo`, so pass `.` for the target repo root or a "
+                        "path beneath it — or drop `--target-repo` if the execution "
+                        "root genuinely lives outside it."
+                    ),
+                    outcome_extra={"execution_root": execution_root},
+                )
 
         # Role profile (Redmine #12388 / #13477).
         role_profile_resolution = None

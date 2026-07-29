@@ -247,6 +247,22 @@ pane cwd / repo root   != target execution root (nested project)
   (例: `rovoice/shinsei_llm`) を計算する。relative pointer は personal home prefix
   を持たない portable 表現であり、pane notification と durable delivery record の
   唯一の表記に使う (`public-private-boundary.md`)。
+- **relative `--workdir` の解決基準は asserted `--target-repo` である**
+  (Redmine #14249)。`--target-repo` は `target_repo_mismatch` gate 付きで
+  「receiver の repo root はここだ」と主張する assertion なので、relative path は
+  sender の process cwd ではなく **その target repo root** を基準に解決する。
+  したがって portable な `--workdir .` は target repo root を意味し、lane の
+  absolute path を渡した場合と A/B で同一の execution root になる。
+  `--target-repo` 未指定時は権威ある receiver frame が無いため、relative path は
+  従来どおり sender cwd 基準で解決する (既存契約は不変)。
+- **asserted `--target-repo` 配下に無い execution root は pre-send で
+  zero-send 拒否する** (Redmine #14249)。repo_root と workdir が互いに矛盾した
+  delivery — receiver は gate を通された repo とは別の root を指される — を
+  `sent` として記録しない。`blocked` / `execution_root_outside_target_repo` で
+  transport rail の手前で落とし、body も Enter も送らない。この reason は
+  `target_repo_mismatch` (target *pane cwd* が repo gate に落ちた) とは別軸で、
+  pane gate は通ったうえで sender 自身の `--workdir` が自分の `--target-repo` と
+  矛盾している場合を指す。next action owner は sender。
 - **absolute workdir は structured delivery outcome (`execution_root.workdir`) に
   だけ runtime fact として残す**。Redmine / Asana に貼る pasteable markdown delivery
   record と pane notification body には absolute path を出さない。Redmine journal や
@@ -256,6 +272,10 @@ pane cwd / repo root   != target execution root (nested project)
   計算できないときは、pasteable record / notification body は absolute を出さず、
   `execution_root.workdir` (structured outcome) を見るよう redaction 表記に倒す。
   OSS docs / defaults / tests には abstract placeholder のみ使う。
+  ただしこの redaction fallback が適用されるのは **anchor が inferred の場合
+  (`--target-repo` 未指定)** に限る。`--target-repo` を assert した out-of-tree は
+  上記のとおり pre-send で zero-send 拒否され、record 自体が作られない
+  (Redmine #14249)。
 - receiver 契約は不変: pane notification は pointer であり、receiver は durable
   anchor を source-of-truth として読んでから着手する。execution root も「anchor で
   確認する」pointer であって新しい権威ではない。
