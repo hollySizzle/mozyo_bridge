@@ -1,4 +1,4 @@
-"""Redmine #14665 — ONE canonical gate-heading literal across every governed instruction surface.
+"""Redmine #14665 — ONE canonical gate-heading literal across every governed write surface.
 
 The defect (#14664 j#92503): the central preset's ``## Journal Templates`` mandated
 ``## Gate: review_request`` while the distributed skill's ``implementation_worker`` role
@@ -13,13 +13,23 @@ structured marker (``gate=<gate>``) name the same token the same way. The readin
 folding the space-opened / case-folded spelling so journals written before the ruling stay
 readable — an alias contract for READING, not a second spelling anyone may write.
 
+The write side has TWO halves, and the first version of this regression only guarded one of
+them (review j#92560 Major): prose that tells an agent what to write, AND runtime modules that
+POST a durable journal themselves. ``sublane_diagnostics`` was writing ``## Gate: Blocked`` to
+real Redmine journals — the very spelling this issue demoted — and the guard could not see it,
+because producers were classified by which file family they lived in rather than by what the
+code does. Both halves are scanned here now.
+
 These tests are derivation-based on purpose. The literals are never re-listed here:
 
 * the canonical token universe is parsed out of the *central preset itself* (its Gate Schema
   keys plus its Journal Template headings), so adding a gate to the authority doc widens the
   check automatically;
-* the producer-instruction surfaces are derived from ``git ls-files``, so a new preset copy,
-  a new skill mirror or a new packaged template joins the scan without an edit here;
+* the instruction surfaces are derived from ``git ls-files``, so a new preset copy, a new skill
+  mirror or a new packaged template joins the scan without an edit here;
+* the runtime writers are derived by walking ``src/`` with the grammar's OWN heading regexes
+  over non-docstring string constants, plus the modules that call ``canonical_gate_heading``,
+  so a new durable writer anywhere is covered without an edit here;
 * the reading-side aliases are derived from the grammar's canonical token map, so a one-sided
   alias cannot be re-introduced.
 
@@ -28,6 +38,7 @@ A hand-maintained list on either side is exactly what produced this issue.
 
 from __future__ import annotations
 
+import ast
 import posixpath
 import re
 import subprocess
@@ -41,11 +52,17 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain import (
     role_profile as rp,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (
+    glance_journal_grammar as grammar,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (
     CANONICAL_GATE_TOKENS,
     CANONICAL_REVIEW_HEADING,
     canonical_gate_heading,
     fold_issue_gate_facts,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (
+    GATE_BLOCKED,
 )
 
 #: The central preset's canonical body — the authority this issue resolved the conflict toward.
@@ -99,11 +116,14 @@ def _tracked_files() -> tuple[str, ...]:
     return tuple(line for line in out.splitlines() if line)
 
 
-def _is_producer_surface(path: str) -> bool:
-    """A file that TELLS an agent what to write (as opposed to one that reads what was written).
+def _is_instruction_surface(path: str) -> bool:
+    """A file that TELLS an agent what to write, in prose.
 
-    Reader-side modules (the glance grammar) legitimately quote the non-canonical spellings
-    they must keep folding, so they are not instruction surfaces and are not scanned here.
+    This is only HALF of the write side (review j#92560): a runtime module that POSTs a durable
+    journal is just as much a producer of the gate contract, and none of them live here. Those
+    are found by :func:`_code_constructed_gate_headings` instead — by what the code builds, not
+    by where the file sits. The first version of this regression classified producers by file
+    family, so a real durable writer emitting the demoted alias was structurally invisible.
     """
     if path.startswith("tests/"):
         return False
@@ -115,8 +135,83 @@ def _is_producer_surface(path: str) -> bool:
     )
 
 
-def _producer_surfaces() -> tuple[str, ...]:
-    return tuple(p for p in _tracked_files() if _is_producer_surface(p))
+def _instruction_surfaces() -> tuple[str, ...]:
+    return tuple(p for p in _tracked_files() if _is_instruction_surface(p))
+
+
+def _docstring_constants(tree: ast.Module) -> set[int]:
+    """ids of the string Constants that are docstrings (module / class / function)."""
+    out: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", None) or []
+            first = body[0] if body else None
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                out.add(id(first.value))
+    return out
+
+
+def _code_constructed_gate_headings() -> tuple[tuple[str, int, str, str], ...]:
+    """Every gate heading a runtime module BUILDS, as ``(path, lineno, shape, raw_title)``.
+
+    Walks all of ``src/`` and applies the grammar's OWN heading regexes to each non-docstring
+    string constant, so the test and the reader share one lexical authority instead of a second
+    hand-written pattern. Docstrings are excluded because the reader module documents the
+    non-canonical spellings it must keep folding — that is prose about reading, not a write.
+    """
+    found: list[tuple[str, int, str, str]] = []
+    for path in sorted((ROOT / "src").rglob("*.py")):
+        rel = path.relative_to(ROOT).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        skip = _docstring_constants(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if id(node) in skip:
+                continue
+            for shape, pattern in (
+                ("prefix", grammar._GATE_HEADING_RE),
+                ("suffix", grammar._SUFFIX_GATE_HEADING_RE),
+            ):
+                for match in pattern.finditer(node.value):
+                    title = match.group("title").strip()
+                    if title:
+                        found.append((rel, node.lineno, shape, title))
+    return tuple(found)
+
+
+def _canonical_heading_builders() -> frozenset[str]:
+    """Modules that BUILD their heading via :func:`canonical_gate_heading`, as repo-relative paths.
+
+    The static scan above only sees literal text, so a writer that derives its heading from the
+    contract disappears from it — including the ``f"{canonical_gate_heading(...)} — ..."`` form,
+    whose literal part carries no heading. That is the COMPLIANT shape, so it must be counted as
+    covered rather than counted as absent; otherwise the writer inventory silently shrinks to
+    zero as writers are fixed, and the guard passes by finding nothing.
+
+    (A writer that hard-codes the heading inside an f-string, ``f"## Gate: Blocked — {x}"``, is
+    still caught by the static scan: the literal part of a ``JoinedStr`` is an ``ast.Constant``.)
+    """
+    builders: set[str] = set()
+    for path in sorted((ROOT / "src").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = getattr(func, "id", None) or getattr(func, "attr", None)
+                if name == "canonical_gate_heading":
+                    builders.add(path.relative_to(ROOT).as_posix())
+    return frozenset(builders)
+
+
+def _gate_heading_writers() -> frozenset[str]:
+    """Every module that emits a gate heading, literally or by derivation."""
+    literal = {path for path, _lineno, _shape, _title in _code_constructed_gate_headings()}
+    return frozenset(literal | _canonical_heading_builders())
 
 
 def _normalized_title(raw: str) -> str:
@@ -124,6 +219,23 @@ def _normalized_title(raw: str) -> str:
     stripped = _TRAILING_PAREN_RE.sub("", raw.strip())
     stripped = _BOUNDED_QUALIFIER_RE.split(stripped)[0].strip()
     return _WS_RE.sub(" ", stripped)
+
+
+#: A qualifier marker left dangling at the end of a truncated literal.
+_DANGLING_QUALIFIER_RE = re.compile(r"[\s—–-]+$")
+
+
+def _normalized_code_title(raw: str) -> str:
+    """:func:`_normalized_title` for a literal that may be CUT OFF mid-heading.
+
+    A writer that interpolates its qualifier leaves the literal ending at the separator
+    (``f"## Gate: Blocked — {reason}"`` -> ``"## Gate: Blocked — "``). The grammar's bounded
+    qualifier split needs whitespace on BOTH sides, so that title normalizes to ``Blocked —``,
+    matches no allowlist entry, and would be skipped as "names no gate" — the alias would sail
+    through the guard. Trimming the dangling separator makes the truncated form normalize to the
+    same token the reader sees at runtime, where the line is complete.
+    """
+    return _DANGLING_QUALIFIER_RE.sub("", _normalized_title(raw)).strip()
 
 
 class CentralPresetCarriesTheRuling(unittest.TestCase):
@@ -136,7 +248,7 @@ class CentralPresetCarriesTheRuling(unittest.TestCase):
         # only ever reads its repo-local preset store must find it there.
         carriers = [
             p
-            for p in _producer_surfaces()
+            for p in _instruction_surfaces()
             if p.endswith("bodies/workflow.md") or "governed/agent-workflow.md" in p
         ]
         self.assertGreaterEqual(
@@ -186,7 +298,7 @@ class NoProducerSurfaceWritesANonCanonicalSpelling(unittest.TestCase):
     def test_the_surface_scan_is_not_vacuous(self) -> None:
         # A derivation that silently selects nothing would make the scan below pass by
         # accident. Pin that the known instruction families are all present.
-        surfaces = _producer_surfaces()
+        surfaces = _instruction_surfaces()
         self.assertGreaterEqual(len(surfaces), 10, f"surface derivation collapsed: {surfaces}")
         for needle in (
             "src/mozyo_bridge/scaffold/canonical_sources/governed-workflow/bodies/workflow.md",
@@ -208,7 +320,7 @@ class NoProducerSurfaceWritesANonCanonicalSpelling(unittest.TestCase):
         spaced = {token.replace("_", " "): token for token in universe}
         offenders: list[str] = []
         scanned = 0
-        for path in _producer_surfaces():
+        for path in _instruction_surfaces():
             text = (ROOT / path).read_text(encoding="utf-8")
             for match in _HEADING_RE.finditer(text):
                 title = _normalized_title(match.group("title"))
@@ -226,6 +338,124 @@ class NoProducerSurfaceWritesANonCanonicalSpelling(unittest.TestCase):
             f"(central preset '{RULING_HEADING}'); found: {offenders}",
         )
         self.assertGreater(scanned, 0, "no canonical gate heading was seen at all")
+
+
+class RuntimeWritersEmitTheCanonicalSpelling(unittest.TestCase):
+    """Review j#92560 Major: a durable WRITER is a producer too, wherever its file lives.
+
+    ``sublane_diagnostics`` POSTs a lease-blocker journal to Redmine and wrote
+    ``## Gate: Blocked`` — the exact spelling this issue demoted to a read-only alias. The first
+    version of this regression scanned instruction files only, so the writer was structurally
+    invisible: the guard could not have caught it no matter how the docs changed.
+    """
+
+    def test_the_writer_inventory_is_not_vacuous(self) -> None:
+        # Both scans could silently stop matching (an AST shape change, a regex edit), and the
+        # spelling check below would then pass by finding nothing. Pin that each known durable
+        # journal writer is still accounted for — by literal text or by derivation.
+        writers = _gate_heading_writers()
+        self.assertGreaterEqual(len(writers), 2, f"writer inventory collapsed: {sorted(writers)}")
+        for needle in (
+            "src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff"
+            "/application/sublane_diagnostics.py",
+            "src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff"
+            "/application/callback_recovery_record.py",
+        ):
+            with self.subTest(writer=needle):
+                self.assertIn(needle, writers)
+
+    def test_no_runtime_module_builds_a_non_canonical_spelling_of_a_real_gate(self) -> None:
+        # The rule is scoped to headings that NAME A RECOGNIZED GATE: those are the ones whose
+        # spelling the contract fixes. A heading naming no gate is a vocabulary question, pinned
+        # separately below rather than silently swept into this one.
+        offenders = []
+        for path, lineno, shape, title in _code_constructed_gate_headings():
+            normalized = _normalized_code_title(title)
+            folded = grammar._HEADING_GATE.get(normalized.lower())
+            if folded is None:
+                continue
+            if normalized not in CANONICAL_GATE_TOKENS:
+                offenders.append(f"{path}:{lineno} [{shape}] '{title}' -> {folded}")
+        self.assertEqual(
+            offenders,
+            [],
+            "a runtime module builds a durable gate heading with a non-canonical spelling "
+            f"(central preset '{RULING_HEADING}'); found: {offenders}",
+        )
+
+    def test_a_hardcoded_alias_inside_an_f_string_is_still_caught(self) -> None:
+        # The check above scans literal text, and the fix moved the real writer to a derived
+        # heading — so prove the scan still SEES the shape it must catch, rather than trusting
+        # that it would. A JoinedStr's literal part is an ast.Constant, so an inline alias in an
+        # f-string is visible; if it ever stopped being visible, this guard is fail-open.
+        tree = ast.parse('note = f"## Gate: Blocked — {reason}"\n')
+        titles = []
+        skip = _docstring_constants(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip:
+                for match in grammar._GATE_HEADING_RE.finditer(node.value):
+                    titles.append(_normalized_code_title(match.group("title")))
+        self.assertEqual(titles, ["Blocked"])
+        self.assertEqual(grammar._HEADING_GATE.get("blocked"), GATE_BLOCKED)
+        self.assertNotIn("Blocked", CANONICAL_GATE_TOKENS)
+
+    def test_the_real_lease_blocker_writer_emits_the_canonical_heading(self) -> None:
+        # Drive the ACTUAL producer, not a re-spelled copy of it: a fixture that repeats the
+        # expected string proves only that the test can spell. This calls the same function the
+        # projection posts and folds its real output through the reader.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_diagnostics,
+        )
+
+        self.assertIn(sublane_diagnostics.LEASE_BLOCKER_GATE_TOKEN, CANONICAL_GATE_TOKENS)
+        note = sublane_diagnostics._format_lease_blocker_note(
+            {
+                "callback_lease_diagnosis": {
+                    "state": "inconsistent",
+                    "recoverable": False,
+                    "has_live_owner": False,
+                    "fingerprint": "fp",
+                },
+                "state": "blocked",
+                "issue": "14665",
+                "lane": "lane",
+                "lane_generation": 1,
+                "summary": "summary",
+                "recovery": ["step"],
+                "invariants": ["invariant"],
+            },
+            "[mozyo:callback-lease-blocker:issue=14665]",
+        )
+        heading = note.splitlines()[0]
+        self.assertTrue(
+            heading.startswith(
+                canonical_gate_heading(sublane_diagnostics.LEASE_BLOCKER_GATE_TOKEN)
+            ),
+            f"the lease-blocker writer emitted {heading!r}",
+        )
+        facts = fold_issue_gate_facts([("100", note)])
+        self.assertIsNotNone(facts)
+        self.assertEqual(facts.latest_gate, GATE_BLOCKED)
+
+    def test_runtime_built_headings_naming_no_defined_token_stay_at_their_known_size(
+        self,
+    ) -> None:
+        # ``progress_log`` is written as a ``## Gate:`` heading but is defined by no vocabulary
+        # (Gate Schema, Journal Templates, or the grammar). Defining it is a policy decision this
+        # issue does not own (review j#92560 excluded token definition from the Major), so — as
+        # with ``blocked`` — the gap is pinned at exactly its size instead of being hidden: a NEW
+        # undefined token fails here, and closing this one fails here as a prompt to update it.
+        universe = _canonical_token_universe() | set(CANONICAL_GATE_TOKENS)
+        undefined = {
+            _normalized_code_title(title)
+            for _path, _lineno, shape, title in _code_constructed_gate_headings()
+            if shape == "prefix" and _normalized_code_title(title) not in universe
+        }
+        self.assertEqual(
+            undefined,
+            {"progress_log"},
+            f"the set of runtime-written gate tokens no vocabulary defines changed: {undefined}",
+        )
 
 
 class RoleProfileTemplatesMandateTheDerivedLiteral(unittest.TestCase):
@@ -282,7 +512,7 @@ class SkillSectionAndPackagedTemplatesStayByteIdentical(unittest.TestCase):
         }
 
     def test_every_skill_copy_reproduces_the_packaged_template_bodies(self) -> None:
-        copies = [p for p in _producer_surfaces() if p.endswith("references/workflow.md")]
+        copies = [p for p in _instruction_surfaces() if p.endswith("references/workflow.md")]
         self.assertGreaterEqual(len(copies), 3, f"skill copy derivation collapsed: {copies}")
         expected = {role: body.rstrip("\n") for role, body in rp.ROLE_PROFILE_TEMPLATES.items()}
         for path in copies:
