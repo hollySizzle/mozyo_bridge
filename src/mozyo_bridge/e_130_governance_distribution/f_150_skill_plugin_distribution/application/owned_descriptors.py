@@ -23,20 +23,26 @@ are worth reading as a unit:
 Keeping them here means the ordering and channel rules have one home rather than
 being restated at each call site.
 
-The public surface is :func:`teardown_failures`, :func:`teardown_during`,
-:class:`RetentionCarrier`, :class:`TeardownRecord` and the
-:data:`RETENTION_ATTEMPTS` bound. Everything else stays module-private, because
-the safety argument of this module rests on callers *not* being able to name it:
-the ledger key is an identity, the ledger container is checked by exact type, and
-the descriptor that reaches a primary's instance dictionary is bound from
-``BaseException`` itself.
+The teardown API this module intends is :func:`teardown_failures`,
+:func:`teardown_during`, :class:`RetentionCarrier`, :class:`TeardownRecord` and
+the :data:`RETENTION_ATTEMPTS` bound. Everything else stays module-private,
+because the safety argument of this module rests on callers *not* being able to
+name it: the ledger key is an identity, the ledger container is checked by exact
+type, and the descriptor that reaches a primary's instance dictionary is bound
+from ``BaseException`` itself.
 
-"Public" here means a module binding a caller can reach, not a curated list —
-there is no ``__all__``, so an ``import x`` is as reachable as a ``def``. Imports
-this module needs for itself are therefore bound privately (``Callable as
-_Callable``), which is why a typing helper does not quietly join the API (review
-j#93181 R2-F1). The exceptions are ``os`` and ``Violation``, which predate this
-seam.
+Intending an API is not the same as having one, though: there is no ``__all__``,
+so *every* non-underscore module binding is reachable and an ``import x`` is as
+reachable as a ``def``. Imports this module needs for itself are therefore bound
+privately (``Callable as _Callable``), which is why a typing helper does not
+quietly join the API (review j#93181 R2-F1).
+
+Three reachable bindings predate this seam and are left alone: ``os``,
+``Violation``, and ``annotations`` — the last from ``from __future__ import
+annotations``, which reads like a declaration and binds a name like any other
+import. Missing exactly that one is what review j#93216 R3-F1 caught here — so
+the authoritative list lives in the unit tests, where it is asserted against the
+live namespace rather than against this paragraph.
 
 :class:`RetentionCarrier` is the one seam that had to be lifted out (Redmine
 #14683): "what happens when the carrier fails" is a property worth pinning, and
