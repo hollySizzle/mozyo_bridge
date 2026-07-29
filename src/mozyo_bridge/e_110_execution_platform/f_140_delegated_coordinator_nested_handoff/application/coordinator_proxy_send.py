@@ -36,7 +36,6 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping, Optional, Protocol, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.canonical_note_scan import (  # noqa: E501
-    MARKER_CHANNEL_WORKFLOW_EVENT,
     canonical_note_text,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
@@ -59,7 +58,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ZERO_SEND,
     ProxyDecision,
     ProxyLinks,
-    ACTION_DECISION_TOKENS,
     ACTION_SCOPES,
     SCOPE_ISSUE,
     DecisionRecord,
@@ -153,129 +151,16 @@ def live_agent_rows(env: Mapping[str, str]) -> Sequence[Mapping]:
         return ()
 
 
-#: The workflow-event marker channel whose ``gate`` / ``kind`` field names a durable decision. Bound
-#: to the shared channel constant rather than re-spelled: the channel set is the scan authority's,
-#: and a second literal here is a token this rail could drift on alone.
-_WORKFLOW_EVENT_CHANNEL = MARKER_CHANNEL_WORKFLOW_EVENT
-
-#: The marker field that binds a decision to the proxy action it authorizes (Design Answer j#90329
-#: contract 5). Without it the same ``implementation_request`` token had to serve every purpose, so
-#: "which action does this decision authorize" was never expressed and had to be guessed from the
-#: issue's history — which is what let a quotation elsewhere on the issue become authority, and then
-#: what let the anti-quotation rule poison the issue permanently.
-DECISION_ACTION_FIELD = "proxy_action"
-
-def canonical_decision_in_journal(
-    notes: str, *, action: str
-) -> "tuple[Optional[DecisionRecord], str]":
-    """The single canonical decision a NAMED journal carries for ``action``, or a refusal reason.
-
-    Reads exactly one journal — the one the invocation named — instead of scanning the issue's
-    history (Design Answer j#90329 contract 5). The history scan was the root of both failures: a
-    quotation anywhere on the issue became a candidate, and the rule that refused two candidates
-    then made the issue permanently unusable. Neither can happen when the only text considered is
-    the named journal's, with quotations stripped first.
-
-    Canonicality is exact **twice over**, and the second half was missing (Redmine #14667). It is
-    not enough that the note carry exactly one accepted marker: that marker's BODY must be one the
-    canonical producer (:func:`render_bootstrap_decision_marker`) could have rendered. The reader
-    used to fold each body to a dict with last-write-wins, which erases the evidence that it could
-    not — so three bodies measured on ``origin/main-next@4f0d765b`` each decided a proxy SEND:
-
-        gate=some_other:gate=implementation_request      (repeated key, last-write-wins)
-        proxy_action=dispatch_next:proxy_action=…        (the same, on the action field)
-        gate = implementation_request:proxy_action = …   (whitespace-contaminated fields)
-
-    So the body is judged from its **uncollapsed components** by the shared strict reader every
-    authority consumer uses (:func:`...redmine_journal_source.strict_marker_fields`), and which
-    gate a readable body declares comes from :func:`...redmine_journal_source.marker_logical_gates`
-    — both aliases read as a SET, never first-non-empty, because a second gate spelled in the other
-    alias is a second authority claim rather than a fallback. Every strictness rule here is that
-    shared authority's; this module adds none of its own, or the two would drift the way the two
-    notions of "quoted" once did.
-
-    An unreadable marker is **not dropped**. A marker that claims one of this action's tokens and
-    is not countable as exactly that token refuses the whole journal
-    (``unreadable_canonical_decision``), so a clean sibling written beside a forged one can never
-    make the journal read like a clean one — which is how "parse strictly" turns a duplicate
-    refusal into an acceptance if the unreadable marker is simply skipped. The claim itself is
-    asked of the RAW components (:func:`...redmine_journal_source.marker_declares_gate`), because
-    "does this marker claim this gate" and "is its body readable" are different questions and only
-    the second one had been asked.
-
-    Zero, two-or-more, an unreadable claim, or a marker that names a different action are all
-    refusals with a fixed reason; the caller turns those into zero-send statuses.
-
-    What counts as a quotation is **not** decided here (Redmine #14585), and neither is where a
-    marker may be scanned from. Both live in the shared :mod:`...domain.canonical_note_scan`
-    authority, which :func:`...redmine_journal_source.marker_components_in_note` scans **per
-    canonical line** over :func:`...canonical_note_scan.canonical_note_lines`'s output. The
-    per-line property is load-bearing, not decorative: the marker grammar's body is ``[^\\]]*``,
-    which spans newlines, so scanning the blanked note as one string would let an unclosed
-    ``[mozyo:`` on a quoted line close on a ``]`` further down and read as a marker that no single
-    line contains. That property now comes from the shared scan rather than from a loop here plus a
-    promise about an injected parser — one authority for both which text is the writer's own voice
-    and where a marker may be read from.
-    """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
-        marker_components_in_note,
-        marker_declares_gate,
-        marker_logical_gates,
-        strict_marker_fields,
-    )
-
-    declared_action = normalize_action(action)
-    accepted = ACTION_DECISION_TOKENS.get(declared_action, ())
-    found: list = []
-    unreadable = False
-    for channel, components in marker_components_in_note(notes):
-        if channel != _WORKFLOW_EVENT_CHANNEL:
-            continue
-        fields = strict_marker_fields(components)
-        gates = marker_logical_gates(fields)
-        if len(gates) == 1 and next(iter(gates)) in accepted:
-            found.append((next(iter(gates)), fields))
-            continue
-        # Not countable as one of this action's decisions. If it CLAIMS one anyway, it is a
-        # same-kind claim this rail cannot honour, and the journal is fail-closed.
-        if any(marker_declares_gate(components, token) for token in accepted):
-            unreadable = True
-    if unreadable:
-        return None, "unreadable_canonical_decision"
-    if not found:
-        return None, "no_canonical_decision"
-    if len(found) >= 2:
-        return None, "duplicate_canonical_decision"
-    token, fields = found[0]
-    # No ``.strip()`` on any field read below: the strict reader has already refused every body
-    # carrying whitespace around a key or a value, so stripping here would only hide that
-    # guarantee — and a reader that re-normalizes what its producer is required to render exactly
-    # is how the lenient fold looked correct in the first place.
-    if fields.get(DECISION_ACTION_FIELD, "") != declared_action:
-        return None, "action_not_declared"
-    return (
-        DecisionRecord(
-            journal="",  # filled by the caller with the OWNING entry id, never self-reported
-            token=token,
-            lane=fields.get("lane", ""),
-            lane_generation=fields.get("lane_generation", ""),
-        ),
-        "",
-    )
-
-
-def render_bootstrap_decision_marker(lane: str = "", lane_generation: str = "") -> str:
-    """The canonical decision marker a coordinator writes to authorize a proxy action (producer).
-
-    ``proxy_action`` is what makes the decision unambiguous about *what it authorizes*; the reader
-    refuses a marker that omits it. A lane-scoped action additionally names its lane and generation.
-    """
-    marker = f"[mozyo:workflow-event:gate=implementation_request:{DECISION_ACTION_FIELD}="
-    if lane.strip():
-        return (
-            marker + f"dispatch_next:lane={lane.strip()}:lane_generation={(lane_generation or '').strip()}]"
-        )
-    return marker + "bootstrap_lane]"
+#: The proxy decision's marker grammar — producer, shapes, reader — now lives in the pure domain
+#: module beside the decision matrix (Redmine #14667). It is re-exported here because this module's
+#: ``__all__`` is the import site every caller and test already uses, and because the rail's own
+#: docstring is where the grammar's role in the send decision is explained.
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy_decision import (  # noqa: E501,E402
+    DECISION_ACTION_FIELD,
+    canonical_decision_in_journal,
+    canonical_decision_shapes,
+    render_bootstrap_decision_marker,
+)
 
 
 def live_named_journal_note(args: argparse.Namespace, issue: str, journal: str) -> "tuple[str, bool]":
@@ -955,6 +840,7 @@ __all__ = (
     "canonical_note_text",
     "canonical_decision_in_journal",
     "render_bootstrap_decision_marker",
+    "canonical_decision_shapes",
     "DECISION_ACTION_FIELD",
     "live_attestation_join",
     "live_lane_expectation",

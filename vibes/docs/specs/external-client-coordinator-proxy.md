@@ -326,6 +326,24 @@ authorize したかを照合しなければ scope は未検証のままである
       書かれた別 gate が fallback として黙殺される — それは第二の authority 主張であって fallback
       ではない (#14539 j#91847 F3 / j#91896 F2)。2 gate を名乗る marker は ruling #14219 j#86718 に
       より**どちらも証明しない**。
+  - **field set は producer から導出した closed shape と一致すること** (#14667 R1 review j#92839 F1)。
+    component が well-formed であることは body の *syntax* についての判定でしかなく、**どの field が
+    この marker のものか**を何も言わない。初版はそこで止まっていたため
+    `…:proxy_action=bootstrap_lane:extra=value` が `verified` を返し **send を配送した** (実測:
+    余剰 field / 空値の余剰 field / 他 gate の field 名 `head=` / `lane` を伴わない `lane_generation`
+    / `gate` の代わりの `kind` alias、いずれも `send_calls=1`)。
+    - **許可 shape は列挙せず producer から導出する** (`canonical_decision_shapes()`)。手書きの list は
+      producer 文法の第二の定義であり、この module が繰り返し踏んできた drift そのものである。
+    - この token の producer 集合が closed であることは実測で確定している:
+      `render_workflow_event_marker()` は `gate` が `GATE_BEARING_KINDS` でなければ `ValueError` を
+      送出し、**`implementation_request` は同集合に含まれない**。よって gate-note 系 producer は
+      この marker を描画できず、`render_bootstrap_decision_marker` が唯一の producer である。
+    - 各 producer shape は `proxy_action` **有り / 無しの両方**を許可する。producer は常に書くが、その
+      *欠落* には固有の分類 (`action_not_declared`) が既に与えられており、set 一致だけで判定すると
+      **精密な理由を曖昧な理由へ差し替える**回帰になる (どちらも zero-send だが operator への指示が違う)。
+    - **既知の限界を明記する**: 導出は producer の 2 branch を 2 回の呼び出しで標本化する。producer が
+      3 本目の branch を得た場合は追随せず、その出力は producer-impossible として拒否される
+      (fail-closed 側に倒れるが、新 branch は同じ変更内で導出へ足す必要がある)。
   - **読めない claim を drop しない** (same-note poison)。当該 action の token を**名乗って**いる
     marker が「ちょうどその token 1 件」として数えられないとき、journal 全体を
     `decision_unreadable` で拒否する。
@@ -346,6 +364,15 @@ authorize したかを照合しなければ scope は未検証のままである
     値の読み出しで `.strip()` しない — strict reader が whitespace 混入 body を既に拒否している
     以上、reader 側で再正規化することは**その保証を隠す**だけである (reader に置いた前提は
     producer 側で保証する)。
+  - **producer は marker value contract を通す** (#14667 R1 review j#92839 F2)。
+    `render_bootstrap_decision_marker` は `lane` / `lane_generation` を**補間せず**、共有
+    `validate_marker_field_value` に通して描画不能値を **write 前に** 拒否する (禁止文字 `[ = : ]`、
+    whitespace、空値)。補間していた版では `lane_generation='2]junk'` が
+    `…:lane_generation=2]junk]` を描画し、scan は最初の `]` までを読んで **generation `2` の
+    「正規」decision** を成立させ、send が配送された (実測 `send_calls=1`)。
+    ★★★**この防御は reader 側に置けない。** 切り詰め後に note へ残る bytes は、正規の decision と
+    **byte 単位で同一**である — reader が検出できるものは何も残らない。中央 preset
+    「renderer は parser が拒否するものを書かない」が producer 側を指定しているのはこのためである。
   - journal id は marker を持つ **entry 自身の id** を使う (marker の自己申告は使わない)。
 - 他 journal の引用は **authority にも ambiguity poison にもならない。**
 - 分類:

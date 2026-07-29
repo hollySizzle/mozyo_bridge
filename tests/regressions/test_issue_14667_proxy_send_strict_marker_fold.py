@@ -25,12 +25,22 @@ later link happened to produce — which is exactly how the quoted-marker defect
 reached live acceptance with ``links.anchor=verified``. So each case runs the whole choreography
 against a counting port and asserts both the fixed zero-send reason AND ``port.calls == []``.
 
-Two properties carry the fix, and both have a dedicated case:
+Four properties carry the fix, and each has a dedicated case:
 
-- **the strictness is the SHARED reader's, not this rail's.** Every rule applied to a marker body
-  comes from ``redmine_journal_source.strict_marker_fields`` / ``marker_logical_gates``, the ones
-  every other authority consumer calls. A private second opinion about what a producer can render
-  is the same drift class that let two notions of "quoted" coexist (#14585);
+- **syntax comes from the SHARED reader, not from this rail.** Every rule applied to a body's
+  components comes from ``redmine_journal_source.strict_marker_fields`` / ``marker_logical_gates``,
+  the ones every other authority consumer calls. A private second opinion about what a producer can
+  render is the same drift class that let two notions of "quoted" coexist (#14585);
+- **vocabulary comes from the PRODUCER** (R1 review j#92839 finding 1). Well-formed components say
+  nothing about which fields belong to this marker, so ``…:proxy_action=bootstrap_lane:extra=value``
+  passed every syntax rule and delivered a send. The first version of this file made that worse: it
+  asserted the rail's verdict EQUALS the shared reader's, which pinned the fail-open as if it were
+  the design. Both halves are now asserted separately, with a case proving each is load-bearing;
+- **the producer refuses what the grammar cannot round-trip** (finding 2). ``lane_generation``
+  carrying a ``]`` rendered a token that closes early and reads back as a byte-for-byte legitimate
+  decision for the prefix generation — nothing is left for a reader to detect, which is why
+  ``test_the_truncated_body_is_indistinguishable_at_the_reader`` pins that the defence must stay at
+  the producer;
 - **an unreadable claim is not dropped.** The naive strict fix — parse strictly, skip what does not
   parse — is a LOOSENING here: it turns the exactly-one-decision rule's duplicate refusal into an
   acceptance, so a note carrying one forged marker beside one clean marker reads exactly like a
@@ -58,6 +68,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SEND_DELIVERED,
     ProxySendOutcome,
     canonical_decision_in_journal,
+    canonical_decision_shapes,
     execute_proxy_delegation,
     render_bootstrap_decision_marker,
     resolve_proxy_context,
@@ -67,6 +78,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTION_DISPATCH_NEXT,
     ANCHOR_ACTION_MISMATCH,
     ANCHOR_DECISION_AMBIGUOUS,
+    ANCHOR_DECISION_INCOMPLETE,
     ANCHOR_DECISION_UNREADABLE,
     ANCHOR_UNVERIFIED,
     ANCHOR_VERIFIED,
@@ -135,6 +147,32 @@ PRODUCER_IMPOSSIBLE_BODIES = {
     "a second gate in the other alias":
         f"gate=implementation_request:kind=some_other_gate:"
         f"{DECISION_ACTION_FIELD}=bootstrap_lane",
+}
+
+#: Bodies whose every COMPONENT is well-formed and whose FIELD SET no producer can render
+#: (R1 review j#92839 finding 1). The first implementation checked component syntax only, so each
+#: of these resolved ``verified`` and delivered a send. They are kept apart from
+#: :data:`PRODUCER_IMPOSSIBLE_BODIES` because they fail a different half of "canonical-producer
+#: renderable" — syntax there, vocabulary here — and a single mixed table would hide which half a
+#: regression broke.
+PRODUCER_IMPOSSIBLE_SHAPES = {
+    "an extra field":
+        f"gate=implementation_request:{DECISION_ACTION_FIELD}=bootstrap_lane:extra=value",
+    "an extra field with an empty value":
+        f"gate=implementation_request:{DECISION_ACTION_FIELD}=bootstrap_lane:extra=",
+    # A field name that is real ELSEWHERE. The value is a valid full head, so nothing about this
+    # body is malformed — it is simply not a field this producer writes.
+    "another gate's field name":
+        f"gate=implementation_request:{DECISION_ACTION_FIELD}=bootstrap_lane:head={'a' * 40}",
+    # Half of the lane-scoped pair. The producer emits lane and lane_generation together or not at
+    # all, and this one would otherwise resolve issue-scoped (no lane) and DELIVER.
+    "lane_generation without lane":
+        f"gate=implementation_request:{DECISION_ACTION_FIELD}=bootstrap_lane:lane_generation=2",
+    # The other alias. `marker_logical_gates` reads `gate` and `kind` as one logical field, which is
+    # right for "which gate is claimed" — but the producer writes `gate`, so a body spelled with
+    # `kind` is not producer output even though it claims exactly one gate.
+    "the kind alias in place of gate":
+        f"kind=implementation_request:{DECISION_ACTION_FIELD}=bootstrap_lane",
 }
 
 
@@ -284,6 +322,154 @@ class ProducerImpossibleBodyIsZeroSendTest(StrictDecisionBodyTestBase):
         self.assertEqual(port.calls, [])
 
 
+class ProducerImpossibleShapeIsZeroSendTest(StrictDecisionBodyTestBase):
+    """R1 review j#92839 finding 1: well-formed components, un-renderable field set.
+
+    The first implementation of this fix judged a body by its components alone and never asked
+    which FIELDS it carried, so ``…:proxy_action=bootstrap_lane:extra=value`` reached
+    ``anchor=verified`` and delivered. The reader's own docstring already claimed the criterion the
+    implementation did not meet — the field set now comes from the producer itself.
+    """
+
+    def test_every_producer_impossible_shape_sends_nothing(self):
+        for label, body in PRODUCER_IMPOSSIBLE_SHAPES.items():
+            with self.subTest(label):
+                context, result, port = self._run(f"decision:\n{_marker(body)}\n")
+                self.assertEqual(context.links.anchor, ANCHOR_DECISION_UNREADABLE, label)
+                self.assertEqual(result.reason, REASON_ANCHOR_DECISION_UNREADABLE, label)
+                self.assertEqual(port.calls, [], label)
+
+    def test_an_extra_field_on_a_dispatch_decision_sends_nothing(self):
+        body = (
+            f"gate=implementation_request:{DECISION_ACTION_FIELD}=dispatch_next:"
+            f"lane={LANE}:lane_generation=2:extra=value"
+        )
+        context, result, port = self._run(
+            f"{_marker(body)}\n", action=ACTION_DISPATCH_NEXT
+        )
+        self.assertEqual(context.links.anchor, ANCHOR_DECISION_UNREADABLE)
+        self.assertEqual(port.calls, [])
+
+    def test_a_clean_sibling_does_not_rescue_an_unrenderable_shape(self):
+        # Same argument as the malformed-body case: dropping the un-renderable marker would remove
+        # it from the exactly-one count and hand authority to the clean one beside it.
+        forged = _marker(PRODUCER_IMPOSSIBLE_SHAPES["an extra field"])
+        for label, notes in {
+            "forged first": f"{forged}\n{BOOTSTRAP_MARKER}\n",
+            "forged second": f"{BOOTSTRAP_MARKER}\n{forged}\n",
+        }.items():
+            with self.subTest(label):
+                context, result, port = self._run(notes)
+                self.assertEqual(context.links.anchor, ANCHOR_DECISION_UNREADABLE, label)
+                self.assertEqual(port.calls, [], label)
+
+    def test_the_shape_check_does_not_swallow_the_documented_reasons(self):
+        """Two field sets the producer also cannot render, which must NOT read as unreadable.
+
+        Spec §3 assigns them their own classifications, and replacing a precise reason with a
+        vaguer one is a regression even when both are zero-send: the operator is told to do a
+        different thing. A shape rule written as plain set-equality would have broken both, which
+        is why the derivation admits each producer shape with and without ``proxy_action``.
+        """
+        cases = {
+            # `action_not_declared` -> action_mismatch (spec §3: 欠落は action_not_declared で拒否)
+            "no proxy_action at all": (
+                "gate=implementation_request", ACTION_BOOTSTRAP_LANE, ANCHOR_ACTION_MISMATCH,
+            ),
+            # a bootstrap-shaped body asked to authorize a LANE-scoped action: the decision names
+            # no lane, so it is incomplete rather than un-renderable.
+            "lane-scoped action, lane-less body": (
+                f"gate=implementation_request:{DECISION_ACTION_FIELD}=dispatch_next",
+                ACTION_DISPATCH_NEXT, ANCHOR_DECISION_INCOMPLETE,
+            ),
+        }
+        for label, (body, action, expected) in cases.items():
+            with self.subTest(label):
+                context, _result, port = self._run(f"{_marker(body)}\n", action=action)
+                self.assertEqual(context.links.anchor, expected, label)
+                self.assertEqual(port.calls, [], label)
+
+
+class ProducerRefusesUnrenderableValuesTest(unittest.TestCase):
+    """R1 review j#92839 finding 2: the producer wrote what the grammar cannot round-trip.
+
+    ``render_bootstrap_decision_marker`` interpolated its arguments, so a value carrying a marker
+    separator rendered a token that reads back as a DIFFERENT well-formed body. The remedy is at
+    the producer, and it has to be — see
+    ``test_the_truncated_body_is_indistinguishable_at_the_reader``.
+    """
+
+    def test_the_valid_shapes_still_render(self):
+        """The control: a producer that refused everything would pass every case below."""
+        self.assertEqual(
+            render_bootstrap_decision_marker(),
+            _marker(f"gate=implementation_request:{DECISION_ACTION_FIELD}=bootstrap_lane"),
+        )
+        self.assertEqual(
+            render_bootstrap_decision_marker(lane="ln", lane_generation="2"),
+            _marker(
+                f"gate=implementation_request:{DECISION_ACTION_FIELD}=dispatch_next:"
+                "lane=ln:lane_generation=2"
+            ),
+        )
+
+    def test_every_forbidden_character_is_refused_before_it_is_written(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+            MARKER_VALUE_FORBIDDEN_CHARS,
+            MarkerValueError,
+        )
+
+        # Derived from the shared contract's own character set, not re-listed here: a character
+        # added there must be refused here without editing this test.
+        self.assertTrue(MARKER_VALUE_FORBIDDEN_CHARS)
+        for char in sorted(MARKER_VALUE_FORBIDDEN_CHARS):
+            for field, kwargs in (
+                ("lane", {"lane": f"l{char}n", "lane_generation": "2"}),
+                ("lane_generation", {"lane": "ln", "lane_generation": f"2{char}x"}),
+            ):
+                with self.subTest(char=char, field=field):
+                    with self.assertRaises(MarkerValueError):
+                        render_bootstrap_decision_marker(**kwargs)
+
+    def test_whitespace_and_empty_values_are_refused(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+            MarkerValueError,
+        )
+
+        for label, kwargs in {
+            "internal space in lane": {"lane": "l n", "lane_generation": "2"},
+            "internal space in generation": {"lane": "ln", "lane_generation": "2 3"},
+            # Stricter than this rail's own reader needs (a blank generation would classify
+            # `decision_incomplete`), but a marker that can never authorize anything is not
+            # something a producer should be able to write either.
+            "empty generation beside a lane": {"lane": "ln", "lane_generation": ""},
+        }.items():
+            with self.subTest(label):
+                with self.assertRaises(MarkerValueError):
+                    render_bootstrap_decision_marker(**kwargs)
+
+    def test_the_truncated_body_is_indistinguishable_at_the_reader(self):
+        """Why the fix must live in the producer, stated as a measurement rather than a claim.
+
+        ``lane_generation='2]junk'`` used to render ``…:lane_generation=2]junk]``. The scan stops
+        at the first ``]``, so what lands in the note is a byte-for-byte LEGITIMATE decision for
+        generation 2 — there is nothing left for a reader to detect. Pinned so that a later
+        "the reader will catch it anyway" simplification of the producer is refused here.
+        """
+        truncated = _marker(
+            f"gate=implementation_request:{DECISION_ACTION_FIELD}=dispatch_next:"
+            f"lane={LANE}:lane_generation=2"
+        )
+        self.assertEqual(
+            truncated, render_bootstrap_decision_marker(lane=LANE, lane_generation="2")
+        )
+        decision, refusal = canonical_decision_in_journal(
+            f"{truncated}\n", action=ACTION_DISPATCH_NEXT
+        )
+        self.assertEqual(refusal, "")
+        self.assertEqual((decision.lane, decision.lane_generation), (LANE, "2"))
+
+
 class DecisionCardinalityIsPreservedTest(StrictDecisionBodyTestBase):
     """0 / 1 / 2+ and the quotation contract survive the strict read unchanged."""
 
@@ -371,17 +557,25 @@ class ForeignActionIsZeroSendTest(StrictDecisionBodyTestBase):
         self.assertEqual(port.calls, [])
 
 
-class TheStrictnessIsTheSharedReadersTest(unittest.TestCase):
-    """No private strictness axis lives in this rail — the grammar verdict is the shared one.
+class TheStrictnessIsSharedSyntaxAndProducerVocabularyTest(unittest.TestCase):
+    """Where each half of "producer-renderable" comes from — and that neither half stands alone.
 
-    Stated as a property rather than as a list of bodies: for every body, "does this rail read a
-    decision here" agrees with "does the SHARED strict reader read exactly this action's gate
-    here". A rule added on either side alone breaks it. That is the guard the module comment can
-    only promise: the previous reader also documented that the quotation rules were shared, and it
-    was the parse it accepted from its caller that was not.
+    The first version of this class asserted a single property: this rail's verdict EQUALS the
+    shared strict reader's. Review j#92839 finding 1 is that the property was true and the criterion
+    was not — the shared reader judges a body's SYNTAX and says nothing about which fields belong to
+    this marker, so an equivalence test made the resulting fail-open look deliberate. A test that
+    pins the wrong invariant is worse than no test: it answers the question a reviewer would
+    otherwise ask.
+
+    So the criterion is asserted as a CONJUNCTION, with a case proving each half is load-bearing:
+
+    - syntax comes from the shared authority (`strict_marker_fields` / `marker_logical_gates`), and
+      this rail adds nothing to it;
+    - vocabulary comes from the producer (`canonical_decision_shapes`), which the shared reader
+      cannot know about.
     """
 
-    def _shared_verdict(self, notes: str) -> bool:
+    def _shared_syntax_verdict(self, notes: str) -> bool:
         """Whether the shared authority alone counts exactly one ``implementation_request``."""
         counted = 0
         for channel, components in marker_components_in_note(notes):
@@ -393,18 +587,60 @@ class TheStrictnessIsTheSharedReadersTest(unittest.TestCase):
                 counted += 1
         return counted == 1
 
-    def test_the_rails_verdict_equals_the_shared_readers_for_every_body(self):
-        bodies = dict(PRODUCER_IMPOSSIBLE_BODIES)
-        bodies["canonical producer output"] = (
-            f"gate=implementation_request:{DECISION_ACTION_FIELD}=bootstrap_lane"
+    def _rail_reads_a_decision(self, body: str) -> bool:
+        decision, _refusal = canonical_decision_in_journal(
+            f"{_marker(body)}\n", action=ACTION_BOOTSTRAP_LANE
         )
+        return decision is not None
+
+    CLEAN_BODY = f"gate=implementation_request:{DECISION_ACTION_FIELD}=bootstrap_lane"
+
+    def test_the_rail_adds_no_syntax_rule_of_its_own(self):
+        # On bodies that differ only in SYNTAX, the two verdicts still agree: no private strictness
+        # axis was added beside the shared reader.
+        bodies = dict(PRODUCER_IMPOSSIBLE_BODIES)
+        bodies["canonical producer output"] = self.CLEAN_BODY
         for label, body in bodies.items():
             with self.subTest(label):
-                notes = f"{_marker(body)}\n"
-                decision, _refusal = canonical_decision_in_journal(
-                    notes, action=ACTION_BOOTSTRAP_LANE
+                self.assertEqual(
+                    self._rail_reads_a_decision(body),
+                    self._shared_syntax_verdict(f"{_marker(body)}\n"),
+                    label,
                 )
-                self.assertEqual(decision is not None, self._shared_verdict(notes), label)
+
+    def test_the_rail_is_STRICTLY_stronger_than_the_shared_reader_on_vocabulary(self):
+        # The case the old equivalence assertion would have forbidden. Each of these is perfectly
+        # well-formed to the shared reader — it has no opinion about which fields this marker owns —
+        # and is not producer output, so the rail must refuse where the shared reader accepts.
+        for label, body in PRODUCER_IMPOSSIBLE_SHAPES.items():
+            with self.subTest(label):
+                self.assertTrue(
+                    self._shared_syntax_verdict(f"{_marker(body)}\n"),
+                    f"{label}: fixture is not syntactically clean, so it proves nothing here",
+                )
+                self.assertFalse(self._rail_reads_a_decision(body), label)
+
+    def test_the_allowed_shapes_are_derived_from_the_producer(self):
+        """Re-derived here independently, so a hand-edited list in the module would fail.
+
+        The shapes are never spelled out on either side: the module renders the producer's two
+        branches and takes their key sets, and this test does the same from the producer's public
+        entry point. If someone replaces the derivation with a literal set that drifts from what
+        `render_bootstrap_decision_marker` emits, these stop matching.
+        """
+        expected = set()
+        for marker in (
+            render_bootstrap_decision_marker(),
+            render_bootstrap_decision_marker(lane="x", lane_generation="1"),
+        ):
+            ((_channel, components),) = marker_components_in_note(marker)
+            keys = frozenset(key for key, _value in components)
+            expected.add(keys)
+            # ...and the same shape without the action field, which spec §3 gives its own
+            # classification (`action_not_declared`) rather than folding into "unreadable".
+            expected.add(keys - {DECISION_ACTION_FIELD})
+        self.assertEqual(canonical_decision_shapes(), frozenset(expected))
+        self.assertEqual(len(canonical_decision_shapes()), 4)
 
     def test_a_field_repeated_with_the_SAME_value_is_one_declaration(self):
         """The shared reader's rule, named here so it is a decision rather than an accident.

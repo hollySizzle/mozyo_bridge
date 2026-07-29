@@ -3918,11 +3918,22 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "owns the quote-aware canonical scan: the token regex, the recognized channels and "
             "the per-line marker scan every reader of this grammar now shares",
         ),
-        f"{_D}/application/coordinator_proxy_send.py": (
+        # #14667 moved the proxy decision's marker grammar — producer, shapes, reader — out of
+        # ``application/coordinator_proxy_send.py`` and into the pure domain module below. The
+        # rail no longer NAMES the token; it holds `workflow-event` only by inheriting the new
+        # owner across one used import, so its entry moves to INHERITED. Two consumers that used
+        # to inherit through it (`cli_workflow_proxy`, `cli_workflow_role_authority`) are now two
+        # hops from the owner and hold nothing — their entries are removed rather than kept, since
+        # this gate compares channels in BOTH directions and a declaration for a module that no
+        # longer holds the token is exactly the stale capability record it exists to catch.
+        f"{_D}/domain/coordinator_proxy_decision.py": (
             ['*', '*', '*:MARKER_RE', 'workflow-event'],
-            "reads ONE named journal for a proxy-send decision, per canonical line, requiring "
-            "exactly one accepted marker; see the routed finding in "
-            "test_only_the_declared_display_readers_still_use_the_lenient_fold",
+            "owns the proxy decision's marker grammar: RENDERS the decision marker (through the "
+            "shared marker value contract, so it cannot write a body that reads back as a "
+            "different one) and READS ONE named journal for it, per canonical line, requiring "
+            "exactly one accepted marker whose field set is a shape the producer can render. A "
+            "note carrying two such markers, or one unreadable/un-renderable claim beside a clean "
+            "one, refuses the whole journal rather than picking (#14667)",
         ),
         # -- prose ---------------------------------------------------------------------
         f"{_D}/application/cli_workflow_watch.py": (
@@ -3939,6 +3950,11 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
     #: The trade is stated in ``test_no_module_shape_can_hide_a_capability_from_a_wildcard_consumer``:
     #: over-detection costs a declaration line, a missed reader costs a silent gate.
     INHERITED = {
+        f"{_D}/application/coordinator_proxy_send.py": (
+            ['workflow-event'],
+            "inherits via a used import of coordinator_proxy_decision; names no marker token "
+            "itself since #14667 moved the decision grammar to that owner",
+        ),
         "src/mozyo_bridge/application/commands.py": (
             ['handoff'],
             "inherits via a used import of handoff; names no marker token itself",
@@ -4051,17 +4067,9 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             ['*', '*', 'handoff'],
             "inherits via a used import of handoff, redmine_journal_source; names no marker token itself",
         ),
-        f"{_D}/application/cli_workflow_proxy.py": (
-            ['workflow-event'],
-            "inherits via a used import of coordinator_proxy_send; names no marker token itself",
-        ),
         f"{_D}/application/cli_workflow_recovery_admission.py": (
             ['*'],
             "inherits via a used import of sublane_diagnostics; names no marker token itself",
-        ),
-        f"{_D}/application/cli_workflow_role_authority.py": (
-            ['workflow-event'],
-            "inherits via a used import of coordinator_proxy_send; names no marker token itself",
         ),
         f"{_D}/application/dispatch_disposition_writer.py": (
             ['*', '*', '*', '*', '*:_MARKER_RE', '*:_MARKER_RE'],
