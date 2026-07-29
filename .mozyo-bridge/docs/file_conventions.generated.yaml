@@ -59,8 +59,18 @@ rules:
   - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/owned_descriptors.py
   - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/platform_capabilities.py
   - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/domain/legacy_mirror_contract.py
-  - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py
   - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_contract.py
+  - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py
+  - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe.py
+  - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_fault_injection.py
+  - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_sync.py
+  - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_tracked_tree.py
+  - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_wrapper_guardrails.py
+  - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe_io.py
+  - tests/scenarios/test_legacy_mirror_wrapper_cli.py
+  - tests/regressions/test_issue_14580_reused_descriptor_number_close.py
+  - tests/regressions/test_issue_14651_capability_advertisement.py
+  - tests/support/legacy_mirror_tree_fixture.py
   severity: warn
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/legacy-mirror-failure-state-characterization.md と @vibes/docs/logics/tests-placement-discovery-policy.md
     と @vibes/docs/logics/skill-distribution.md をよく確認し従うこと

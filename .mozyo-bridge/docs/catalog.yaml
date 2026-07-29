@@ -1560,12 +1560,22 @@ file_conventions:
       # characterisation into `test_plugin_marketplace.py` and
       # `test_skill_workflow_guidance.py`, which have nothing to do with the
       # mirror -- the noise the governance rule asks us to weigh before
-      # widening patterns. The split's destinations are not settled yet
-      # (the placement ruling is still open), so speculative patterns would
-      # name paths that may never exist; each move task adds its own real
-      # paths here as part of finishing.
-      - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py
+      # widening patterns. Redmine #14666 (T1 move-only) split the former
+      # 3,865-line `test_legacy_project_skill_mirror.py` into the ten modules
+      # below plus the shared tree fixture, per #14660 characterisation 5.5;
+      # each move task adds its own real paths here as part of finishing.
       - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_contract.py
+      - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py
+      - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe.py
+      - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_fault_injection.py
+      - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_sync.py
+      - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_tracked_tree.py
+      - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_wrapper_guardrails.py
+      - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe_io.py
+      - tests/scenarios/test_legacy_mirror_wrapper_cli.py
+      - tests/regressions/test_issue_14580_reused_descriptor_number_close.py
+      - tests/regressions/test_issue_14651_capability_advertisement.py
+      - tests/support/legacy_mirror_tree_fixture.py
     severity: warn
     document_refs:
       - logic-legacy-mirror-failure-state-characterization
