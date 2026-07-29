@@ -255,6 +255,32 @@ pane cwd / repo root   != target execution root (nested project)
   absolute path を渡した場合と A/B で同一の execution root になる。
   `--target-repo` 未指定時は権威ある receiver frame が無いため、relative path は
   従来どおり sender cwd 基準で解決する (既存契約は不変)。
+- **`--target-repo auto` は target 自身の frame へ解決し、sender cwd へ fallback
+  しない** (Redmine #14249 R2、reproduction j#94419)。上記の「`auto` は解決後の
+  root」は誰の root かを述べていなかった。tmux では target `%pane` の cwd から
+  推論する。herdr には読むべき pane cwd が無く、#13331 j#73312 #2 はそこを
+  **sender の repo root** で埋めていたが、それが正しいのは target が sender 自身の
+  lane であるときに限られる。cross-lane send では receiver が居ない repo を
+  assert し、しかも上記の relative-workdir 基準がそれを検証済みとして運んでいた。
+  herdr の `auto` は次の frame で解決する。
+  - target unit == sender unit: この checkout が target の root である (#13331 の
+    ケース。resolved route identity から**検証**して選ぶ。仮定しない)。
+  - 同一 workspace の別 lane: その lane の canonical worktree。join key は
+    lifecycle authority の `worktree_identity` token であり、workspace repo 自身の
+    `git worktree list --porcelain` entry のうち exactly one がその token を
+    re-derive しなければならない (`bind_lane_worktree` — hibernate topology
+    observation と共有する単一 join。send 経路なので local only、`ls-remote` は
+    しない)。lane id を branch と見なす推論はしない (review j#86739 R3-F2)。
+    display metadata の `lane_metadata.worktree_path` を authority に昇格させない。
+  - それ以外 (identity 未 attested / foreign workspace / lifecycle row 不在 /
+    `worktree_identity` 空 / join 非一意 / store 読取不能): **typed fail-closed**。
+    `blocked` / `target_repo_mismatch` で zero-send し、explicit
+    `--target-repo <target lane worktree>` を要求する。sender cwd への silent
+    fallback は禁止 — それが本 defect であり、誤った execution root を検証済みの
+    ものとして送達する。
+  herdr の synthesized target record の `cwd` も、この解決済み root で re-state
+  する。そうしないと下流の `target_repo_mismatch` gate が「検証済み target root」対
+  「sender root」を比較し、正しくなった send を構造的に落とす。
 - **asserted `--target-repo` 配下に無い execution root は pre-send で
   zero-send 拒否する** (Redmine #14249)。repo_root と workdir が互いに矛盾した
   delivery — receiver は gate を通された repo とは別の root を指される — を

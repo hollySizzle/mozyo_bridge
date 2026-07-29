@@ -41,16 +41,16 @@ the transport rails after them:
 - :class:`TargetResolutionOps` is the port for the *side-effecting* dependencies the slice needs
   from its environment (resolve the herdr / tmux target, emit the ``<session>:codex`` gateway
   diagnostic, resolve the same-lane duplicate rows, resolve the herdr / cwd-inferred auto repo
-  root, print the auto-resolution diagnostic, project the preflight target, emit the blocked
+  root, print the auto-resolution diagnostics, project the preflight target, emit the blocked
   outcome, ``die``), so :meth:`TargetResolutionUseCase.execute` is exercisable with a synthetic
   fake port and no live tmux / herdr / Redmine.
 - :class:`TargetResolutionUseCase` holds the slice body: the herdr-vs-tmux resolution branch, the
-  ``SystemExit`` diagnostic-then-re-raise boundary, the herdr no-op guards on the duplicate and
-  auto steps, and the three ``--target-repo auto`` policy conditions (herdr self-root,
-  explicit-``%pane`` requirement, cwd-must-reach-a-marker) live here as typed control flow over the
-  injected effects.
+  ``SystemExit`` diagnostic-then-re-raise boundary, the herdr no-op guard on the duplicate step,
+  and the ``--target-repo auto`` policy conditions (the herdr target-frame resolution and its
+  fail-closed refusal, the tmux explicit-``%pane`` requirement, the tmux
+  cwd-must-reach-a-marker) live here as typed control flow over the injected effects.
 - :class:`LiveTargetResolutionOps` routes every effect through the :mod:`commands` module *at call
-  time* (``resolve_herdr_send_target`` / ``pane_info`` / ``herdr_auto_target_repo`` /
+  time* (``resolve_herdr_send_target`` / ``pane_info`` /
   ``project_preflight_target`` and the pane-resolver / project-discovery / diagnostic seams), so
   every ``commands.*`` and ``pane_resolver.*`` monkeypatch seam keeps intercepting the side effects
   unchanged and no import cycle is introduced (``commands`` imports this module at module load;
@@ -75,6 +75,9 @@ from typing import Callable, Dict, List, Optional, Protocol
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     PreflightTarget,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root import (  # noqa: E501
+    AutoTargetRoot,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AUTO_TARGET_REPO,
@@ -174,8 +177,10 @@ class TargetResolutionOps(Protocol):
         """Live same-lane receiver-duplicate rows (diagnostic; a snapshot-read failure -> [])."""
         ...
 
-    def herdr_auto_target_repo(self, repo_root: Path) -> str:
-        """Resolve ``--target-repo auto`` for a herdr send to the sender's own repo root."""
+    def herdr_auto_target_repo(
+        self, repo_root: Path, target_info: Dict[str, str]
+    ) -> AutoTargetRoot:
+        """Resolve ``--target-repo auto`` for a herdr send to the TARGET agent's repo root."""
         ...
 
     def resolve_workspace_root(self, cwd: str) -> Optional[str]:
@@ -186,6 +191,12 @@ class TargetResolutionOps(Protocol):
         self, *, target: str, cwd: str, root: str
     ) -> None:
         """Print the ``--target-repo auto`` resolved-root stderr audit line."""
+        ...
+
+    def print_herdr_auto_repo_diagnostic(
+        self, *, target: str, root: str, basis: str
+    ) -> None:
+        """Print the herdr ``--target-repo auto`` audit line (no pane cwd; a resolved basis)."""
         ...
 
     def project_preflight_target(self, target_info: Dict[str, str]) -> PreflightTarget:
@@ -323,10 +334,41 @@ class TargetResolutionUseCase:
         # hand-passed `--target-repo <root>`; auto cannot weaken them.
         resolved_target_repo = request.resolved_target_repo
         if resolved_target_repo == AUTO_TARGET_REPO and request.herdr_send:
-            # Redmine #13331 (j#73312 #2): herdr has no `%pane` to infer from, so `auto` resolves to
-            # the sender's own repo root (the same-workspace target's repo). tmux `auto` is
-            # untouched (guarded on `herdr_send`). See `herdr_auto_target_repo`.
-            resolved_target_repo = ops.herdr_auto_target_repo(request.repo_root)
+            # Redmine #14249 R2 (reproduction j#94419): herdr has no `%pane` cwd to read, and
+            # #13331 j#73312 #2 filled that gap with the SENDER's own repo root. That answer is
+            # only right while the target is the sender's own lane; for the cross-lane sends the
+            # coordinator rail is built on it asserted a repo the receiver does not run in, and
+            # the (correct) R1 relative-workdir base then carried the sender's root as if it had
+            # been verified. `auto` now resolves the TARGET's frame — its own lane when that IS
+            # the sender's lane, otherwise that lane's canonical worktree via its lifecycle
+            # worktree binding — and refuses when neither is establishable. There is deliberately
+            # no sender-cwd fallback: that fallback IS the defect.
+            auto = ops.herdr_auto_target_repo(request.repo_root, target_info)
+            if not auto.ok:
+                self._emit_blocked(
+                    request, reason="target_repo_mismatch", target=target
+                )
+                ops.die(
+                    "`--target-repo auto` could not verify the target agent's repo root "
+                    f"under the herdr backend (reason={auto.reason}): {auto.detail}. "
+                    "herdr carries no target pane cwd, so auto resolves the TARGET lane's "
+                    "own worktree from its lifecycle worktree binding and never falls back "
+                    "to the sender's cwd (Redmine #14249) — a sender root would deliver an "
+                    "execution root the receiver does not run in. Pass an explicit "
+                    "`--target-repo <target lane worktree>`, or repair the lane's worktree "
+                    "binding."
+                )
+                raise AssertionError("unreachable")
+            # The synthesized herdr record carries no `cwd` for `auto` (there is no pane cwd to
+            # read, and the sender's root is not the target's — `resolve_herdr_send_target`).
+            # Re-state it with the root auto just verified: that field IS "the target agent's
+            # repo root" for every other shape, and the downstream `target_repo_mismatch` gate
+            # reads it — left unknown it would fail closed on a send that is now correct.
+            target_info = {**target_info, "cwd": auto.root}
+            ops.print_herdr_auto_repo_diagnostic(
+                target=target, root=auto.root, basis=auto.basis
+            )
+            resolved_target_repo = auto.root
         elif resolved_target_repo == AUTO_TARGET_REPO:
             raw_target = request.target
             if not is_explicit_pane_target(raw_target):
@@ -386,8 +428,9 @@ class LiveTargetResolutionOps:
     """Live :class:`TargetResolutionOps`.
 
     Every effect routes through the :mod:`commands` module *at call time*:
-    ``resolve_herdr_send_target`` / ``pane_info`` / ``herdr_auto_target_repo`` /
-    ``project_preflight_target`` and the pane-resolver / project-discovery / diagnostic seams.
+    ``resolve_herdr_send_target`` / ``pane_info`` /
+    ``project_preflight_target`` and the pane-resolver / project-discovery / diagnostic seams
+    (the herdr ``auto`` root resolves through its own application module, Redmine #14249).
     Resolving them from ``commands`` (and its lazily-imported collaborators) keeps every
     monkeypatch seam in force and introduces no import cycle. The emit closure is the facade's
     per-call publishing emitter, injected at construction so publication stays a property of
@@ -466,10 +509,14 @@ class LiveTargetResolutionOps:
         except (Exception, SystemExit):
             return []
 
-    def herdr_auto_target_repo(self, repo_root: Path) -> str:
-        from mozyo_bridge.application import commands as _commands
+    def herdr_auto_target_repo(
+        self, repo_root: Path, target_info: Dict[str, str]
+    ) -> AutoTargetRoot:
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root import (  # noqa: E501
+            resolve_herdr_auto_target_repo,
+        )
 
-        return _commands.herdr_auto_target_repo(repo_root)
+        return resolve_herdr_auto_target_repo(repo_root, target_info)
 
     def resolve_workspace_root(self, cwd: str) -> Optional[str]:
         from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
@@ -486,6 +533,20 @@ class LiveTargetResolutionOps:
         print(
             f"--target-repo auto resolved: target_pane={target} "
             f"target_cwd={cwd!r} -> repo_root={root!r}",
+            file=sys.stderr,
+        )
+
+    def print_herdr_auto_repo_diagnostic(
+        self, *, target: str, root: str, basis: str
+    ) -> None:
+        # A separate line from the tmux one on purpose (Redmine #14249): there is no target
+        # pane cwd to report under herdr, so the audit trail records the BASIS the root was
+        # resolved from instead of a cwd the resolver never read.
+        import sys
+
+        print(
+            f"--target-repo auto resolved (herdr): target={target} "
+            f"basis={basis} -> repo_root={root!r}",
             file=sys.stderr,
         )
 
