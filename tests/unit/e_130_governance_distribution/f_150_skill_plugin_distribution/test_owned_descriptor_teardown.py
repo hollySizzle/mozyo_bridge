@@ -16,6 +16,7 @@ import pickle
 import sys
 import unittest
 import unittest.mock
+from collections.abc import Callable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -30,6 +31,9 @@ from tests.support.legacy_mirror_tree_fixture import (  # noqa: E402
 )
 
 
+_Acquire = Callable[[BaseException], "owned_descriptors.TeardownRecord | None"]
+
+
 class _ScheduledCarrier(owned_descriptors.RetentionCarrier):
     """A carrier whose every acquisition is answered by a test function.
 
@@ -40,17 +44,20 @@ class _ScheduledCarrier(owned_descriptors.RetentionCarrier):
     is on the public surface now, so the schedule is handed in instead and
     nothing about the module is mutated.
 
-    The schedule function is called with the primary and may raise; when it
-    wants the real behaviour it calls the carrier the tests keep in
-    `_REAL_CARRIER`, which is the same public seam with nothing overridden.
+    The fake is written the way the port expects one to be written (review
+    j#93039 F2): every signature is annotated, no `type: ignore` is needed, and
+    nothing private is named. `TeardownRecord` is passed straight through — the
+    schedule never looks inside it, which is the whole contract.
     """
 
     __slots__ = ("_acquire",)
 
-    def __init__(self, acquire) -> None:  # type: ignore[no-untyped-def]
+    def __init__(self, acquire: _Acquire) -> None:
         self._acquire = acquire
 
-    def ledger(self, primary):  # type: ignore[no-untyped-def]
+    def ledger(
+        self, primary: BaseException
+    ) -> owned_descriptors.TeardownRecord | None:
         return self._acquire(primary)
 
 
@@ -440,7 +447,9 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         real_ledger = _REAL_CARRIER.ledger
         fired: list[bool] = []
 
-        def interrupts_once(primary):  # type: ignore[no-untyped-def]
+        def interrupts_once(
+            primary: BaseException,
+        ) -> owned_descriptors.TeardownRecord | None:
             if not fired:
                 fired.append(True)
                 raise KeyboardInterrupt("interrupt from inside the carrier")
@@ -484,14 +493,14 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
 
     @classmethod
     def _drain_line(cls, match: str) -> int:
-        return cls._source_line(owned_descriptors.Retention._drain, match)
+        return cls._source_line(owned_descriptors._Retention._drain, match)
 
     def _interrupt_the_queue_append(self, failure: BaseException):
         """Raise `failure` once, on the instruction that admits to the queue."""
         line = self._source_line(
-            owned_descriptors.Retention._enqueue, "self._queued.append("
+            owned_descriptors._Retention._enqueue, "self._queued.append("
         )
-        code = owned_descriptors.Retention._enqueue.__code__
+        code = owned_descriptors._Retention._enqueue.__code__
         fired: list[bool] = []
 
         def local(frame, event, arg):  # type: ignore[no-untyped-def]
@@ -521,7 +530,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         ):
             with self.subTest(failure=label):
                 primary = Exception("write failed")
-                retention = owned_descriptors.Retention(primary)
+                retention = owned_descriptors._Retention(primary)
                 original = RuntimeError("the original teardown failure")
 
                 tracer, fired = self._interrupt_the_queue_append(injected)
@@ -641,7 +650,9 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         fired: list[bool] = []
         interrupt = KeyboardInterrupt("the carrier was interrupted")
 
-        def interrupts_once(primary):  # type: ignore[no-untyped-def]
+        def interrupts_once(
+            primary: BaseException,
+        ) -> owned_descriptors.TeardownRecord | None:
             if not fired:
                 fired.append(True)
                 if reached is not None:
@@ -665,7 +676,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         collaborator, and publishing it to make this patch go away would put the
         machine's internal state on the public surface for one test's benefit.
         """
-        real_enqueue = owned_descriptors.Retention._enqueue
+        real_enqueue = owned_descriptors._Retention._enqueue
         calls: list[int] = []
         interrupt = KeyboardInterrupt("the final admission was interrupted")
 
@@ -681,7 +692,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
 
         return (
             unittest.mock.patch.object(
-                owned_descriptors.Retention, "_enqueue", scheduled
+                owned_descriptors._Retention, "_enqueue", scheduled
             ),
             None,
             interrupt,
@@ -842,7 +853,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         is reached with no control flow chosen, then the interrupt on it, then
         recovery. Neither earlier regression composes those.
         """
-        real_enqueue = owned_descriptors.Retention._enqueue
+        real_enqueue = owned_descriptors._Retention._enqueue
         interrupt = KeyboardInterrupt("the final admission was interrupted")
         calls: list[int] = []
 
@@ -865,7 +876,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
 
         primary = Exception("write failed")
         with unittest.mock.patch.object(
-            owned_descriptors.Retention, "_enqueue", scheduled
+            owned_descriptors._Retention, "_enqueue", scheduled
         ):
             control = owned_descriptors.teardown_during(primary, failing, quiet)
 
@@ -889,29 +900,48 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         """j#90620 R20-F1, the far end of the same defect. The last interrupt of
         an exhausted retry sat in the local that was about to go out of scope,
         so it was never queued — and this is not the documented never-recovers
-        boundary, because the carrier works again on the very next call."""
+        boundary, because the carrier works again on the very next call.
+
+        Driven entirely through the public entry point (review j#93039 F1). It
+        used to construct the retention directly, which was the only thing
+        keeping the machine on the public surface; the schedule reaches the same
+        exhausted-retry boundary as an argument, and asserting the remaining
+        action ran comes free with going through the rail.
+        """
         real_ledger = _REAL_CARRIER.ledger
         attempts = owned_descriptors.RETENTION_ATTEMPTS
         raised: list[BaseException] = []
 
-        def interrupts_then_recovers(primary):  # type: ignore[no-untyped-def]
+        def interrupts_then_recovers(
+            primary: BaseException,
+        ) -> owned_descriptors.TeardownRecord | None:
             if len(raised) < attempts:
                 interrupt = KeyboardInterrupt(f"interrupt-{len(raised) + 1}")
                 raised.append(interrupt)
                 raise interrupt
             return real_ledger(primary)
 
-        primary = Exception("write failed")
-        retention = owned_descriptors.Retention(
-            primary, _ScheduledCarrier(interrupts_then_recovers)
-        )
+        ran: list[str] = []
         original = RuntimeError("the original teardown failure")
 
-        first = retention.remember(original)
-        retention.flush()
+        def failing() -> None:
+            ran.append("failing")
+            raise original
+
+        def quiet() -> None:
+            ran.append("quiet")
+
+        primary = Exception("write failed")
+        first = owned_descriptors.teardown_during(
+            primary,
+            failing,
+            quiet,
+            carrier=_ScheduledCarrier(interrupts_then_recovers),
+        )
 
         self.assertEqual(attempts, len(raised), "the schedule did not exhaust the retries")
         self.assertIs(first, raised[0], "the first interrupt did not take priority")
+        self.assertEqual(["failing", "quiet"], ran, "an exhausted retry skipped an action")
 
         ledger = owned_descriptors.teardown_failures(primary)
         self.assertEqual(1, sum(1 for entry in ledger if entry is original))
@@ -930,7 +960,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         on the ledger being non-empty is what makes this the post-commit
         boundary rather than some earlier one.
         """
-        code = owned_descriptors.Retention._drain.__code__
+        code = owned_descriptors._Retention._drain.__code__
         fired: list[bool] = []
 
         def local(frame, event, arg):  # type: ignore[no-untyped-def]
@@ -1019,7 +1049,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         real_ledger = _REAL_CARRIER.ledger
         schedule = ["ordinary", "interrupt"]
 
-        def scheduled(primary):  # type: ignore[no-untyped-def]
+        def scheduled(primary: BaseException) -> owned_descriptors.TeardownRecord | None:
             if schedule:
                 if schedule.pop(0) == "ordinary":
                     raise MemoryError("the carrier failed, leaving the queue")
@@ -1052,7 +1082,7 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         def quiet() -> None:
             ran.append("a2")
 
-        def never_recovers(_primary):  # type: ignore[no-untyped-def]
+        def never_recovers(_primary: BaseException) -> owned_descriptors.TeardownRecord | None:
             raise KeyboardInterrupt("the carrier is gone for good")
 
         primary = Exception("write failed")
@@ -1063,6 +1093,56 @@ class OwnedDescriptorTeardownTest(_MirrorTreeFixture):
         self.assertEqual(["a1", "a2"], ran)
         self.assertIsInstance(control, KeyboardInterrupt)
         self.assertEqual((), owned_descriptors.teardown_failures(primary))
+
+    def test_a_record_the_module_did_not_create_is_never_written_to(self) -> None:
+        """The seam replaces *when* the carrier answers, not *what* the record
+        is (review j#93039 F2).
+
+        `TeardownRecord` is public so an override has a return type to name, and
+        subclassing it is therefore something a caller can do. It must not be a
+        way to become the record: admission is exact-type identity, the same
+        rule `_existing_ledger` applies on the way out (j#90517 R17-F1).
+        Measured before the narrow was added: the drain appended occurrences
+        into the substitute, building a second ledger that no reader could ever
+        reach — a silent record is worse than a refused one.
+
+        Refusing is the never-recovers boundary, so the channel discipline is
+        unchanged: every remaining action still runs.
+        """
+
+        class Substitute(owned_descriptors.TeardownRecord):
+            __slots__ = ("entries",)
+
+            def __init__(self) -> None:
+                self.entries: list[object] = []
+
+        substitute = Substitute()
+
+        def hands_back_a_substitute(
+            _primary: BaseException,
+        ) -> owned_descriptors.TeardownRecord | None:
+            return substitute
+
+        ran: list[str] = []
+
+        def failing() -> None:
+            ran.append("a1")
+            raise RuntimeError("teardown failure")
+
+        def quiet() -> None:
+            ran.append("a2")
+
+        primary = Exception("write failed")
+        control = owned_descriptors.teardown_during(
+            primary, failing, quiet, carrier=_ScheduledCarrier(hands_back_a_substitute)
+        )
+
+        self.assertEqual(
+            [], substitute.entries, "a record the module did not create was written to"
+        )
+        self.assertEqual((), owned_descriptors.teardown_failures(primary))
+        self.assertEqual(["a1", "a2"], ran, "refusing the record skipped an action")
+        self.assertIsNone(control, "refusing the record invented control flow")
 
     def test_the_ledger_survives_a_primary_that_refuses_attributes(self) -> None:
         """The carrier has to be the instance dictionary, not `setattr`.

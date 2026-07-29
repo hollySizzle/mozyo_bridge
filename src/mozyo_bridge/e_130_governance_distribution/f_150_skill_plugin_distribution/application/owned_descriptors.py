@@ -23,21 +23,27 @@ are worth reading as a unit:
 Keeping them here means the ordering and channel rules have one home rather than
 being restated at each call site.
 
-The public surface is deliberately four names — :func:`teardown_failures`,
-:func:`teardown_during`, :class:`Retention` and :class:`RetentionCarrier` —
-plus the :data:`RETENTION_ATTEMPTS` bound. Everything else stays module-private,
-because the safety argument of this module rests on callers *not* being able to
-name it: the ledger key is an identity, the ledger container is checked by exact
-type, and the descriptor that reaches a primary's instance dictionary is bound
-from ``BaseException`` itself. :class:`RetentionCarrier` is the one seam that had
-to be lifted out (Redmine #14683): "what happens when the carrier fails" is a
-property worth pinning, and pinning it used to mean monkeypatching
-:func:`_ledger` over the module — which is a private name, and a global one.
+The public surface is :func:`teardown_failures`, :func:`teardown_during`,
+:class:`RetentionCarrier`, :class:`TeardownRecord` and the
+:data:`RETENTION_ATTEMPTS` bound. Everything else stays module-private, because
+the safety argument of this module rests on callers *not* being able to name it:
+the ledger key is an identity, the ledger container is checked by exact type, and
+the descriptor that reaches a primary's instance dictionary is bound from
+``BaseException`` itself.
+
+:class:`RetentionCarrier` is the one seam that had to be lifted out (Redmine
+#14683): "what happens when the carrier fails" is a property worth pinning, and
+pinning it used to mean monkeypatching :func:`_ledger` over the module — a
+private name, and a global one. The retention *machine* is not part of that seam
+and stays private (review j#93039 F1): a caller replaces where the record goes,
+never how the queue and the rails behave. :class:`TeardownRecord` exists only so
+the seam's return type can be named without naming a private one (F2).
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 
 from ..domain.legacy_mirror_contract import Violation
 
@@ -93,7 +99,25 @@ that ``BaseException`` itself defines cannot dispatch to a subclass at all.
 """
 
 
-class _Ledger:
+class TeardownRecord:
+    """A primary's retained record, named but not opened.
+
+    This exists so :meth:`RetentionCarrier.ledger` has a *public* return type to
+    declare. It has no members and nothing useful can be done with an instance:
+    the real container is :class:`_Ledger`, which stays private because the
+    admission rule is exact-type identity — anything a caller can construct must
+    not be adopted as the record (j#90517 R17-F1). Subclassing this does not
+    change that; ``type(x) is _Ledger`` is still false.
+
+    A carrier override therefore annotates ``TeardownRecord | None`` and passes
+    the value through without inspecting it. Naming the type is all the public
+    surface needs; reading the record is what :func:`teardown_failures` is for.
+    """
+
+    __slots__ = ()
+
+
+class _Ledger(TeardownRecord):
     """The container the implementation owns, and the only one it will trust.
 
     A module-private type, checked by exact identity, so nothing a caller can
@@ -173,7 +197,7 @@ def _ledger(primary: BaseException) -> _Ledger | None:
 
 
 class RetentionCarrier:
-    """Where a :class:`Retention` puts the occurrences it has taken.
+    """Where a :class:`_Retention` puts the occurrences it has taken.
 
     The seam exists because the interesting property is what the retention does
     when the carrier *fails*: the record has to be acquired and written on the
@@ -188,19 +212,12 @@ class RetentionCarrier:
     An override may raise whatever it likes; when it wants the real behaviour it
     calls ``super().ledger(primary)`` and returns the result untouched.
 
-    **The returned value is opaque, by design.** It is the module's own ledger
-    container, which is private and stays private: :func:`_existing_ledger`
-    admits it by exact type precisely so nothing a caller can construct is ever
-    adopted as the record (j#90517 R17-F1). So this seam replaces *when the
-    carrier answers*, never *what the record is*.
-
-    Fabricating a return value is therefore outside the contract rather than an
-    alternative use of it. Measured: the drain does append occurrences into
-    whatever object is handed back, but :func:`teardown_failures` reads the
-    primary's own ledger by exact type, so a fabricated container is never what
-    a caller reads back — the retention silently becomes unreachable, which is
-    the same boundary as a carrier that never recovers. The channel discipline
-    is unaffected either way: every action still runs.
+    **The returned value is opaque**: :class:`TeardownRecord` names it without
+    opening it. So this seam replaces *when the carrier answers*, never *what
+    the record is* — the drain admits only the container this module created,
+    by exact type, exactly as :func:`_existing_ledger` does. A fabricated return
+    value is refused rather than written to, so it cannot become a second record
+    that nothing reads back (j#90517 R17-F1).
 
     That is the narrow shape the #14660 characterization §3.2(a) asks for, and
     the reason the seam is not simply ":func:`_ledger`, renamed".
@@ -208,7 +225,7 @@ class RetentionCarrier:
 
     __slots__ = ()
 
-    def ledger(self, primary: BaseException) -> _Ledger | None:
+    def ledger(self, primary: BaseException) -> TeardownRecord | None:
         """Acquire the record for ``primary``, creating it on first use."""
         return _ledger(primary)
 
@@ -217,7 +234,7 @@ _DEFAULT_CARRIER = RetentionCarrier()
 """The carrier every retention uses unless a caller hands one in.
 
 A module-level singleton rather than a per-retention construction: a
-:class:`Retention` is built at the top of :func:`teardown_during`, outside any
+:class:`_Retention` is built at the top of :func:`teardown_during`, outside any
 guard, and an allocation there would be one more thing that can fail before the
 rails exist.
 """
@@ -338,7 +355,7 @@ def _took_the_interrupt(
     return interrupt if first is None else first
 
 
-class Retention:
+class _Retention:
     """One unwind's retention, with the occurrences the carrier has not taken.
 
     ``_remember`` used to return the control flow it hit and nothing else, so
@@ -459,11 +476,19 @@ class Retention:
         self._queued.append(occurrence)
 
     def _drain(self) -> None:
-        """Append every queued occurrence the ledger does not already hold."""
+        """Append every queued occurrence the ledger does not already hold.
+
+        The carrier's answer is admitted by exact type, the same rule
+        :func:`_existing_ledger` applies on the way out. A carrier that hands
+        back something this module did not create is refused rather than written
+        to: appending into it would build a record no reader can reach, which is
+        a second, silent ledger — the failure mode the identity key exists to
+        prevent (j#90517 R17-F1).
+        """
         while True:
             ledger = self._carrier.ledger(self.primary)
-            if ledger is None:
-                return  # no carrier; the queue waits for a later attempt
+            if type(ledger) is not _Ledger:
+                return  # no carrier, or not ours; the queue waits for later
             occurrence = self._unrecorded(ledger)
             if occurrence is None:
                 return
@@ -520,7 +545,7 @@ def _describe_failure(failure: object) -> str:
         return f"{name}: <unprintable>"
 
 
-def _present(retention: Retention, failure: object) -> BaseException | None:
+def _present(retention: _Retention, failure: object) -> BaseException | None:
     """Render an already-retained failure as a note; never raise.
 
     :func:`_attach_secondary` deliberately lets a control-flow exception out —
@@ -539,12 +564,12 @@ def _present(retention: Retention, failure: object) -> BaseException | None:
     return None
 
 
-def _record_secondary(retention: Retention, secondary: object) -> BaseException | None:
+def _record_secondary(retention: _Retention, secondary: object) -> BaseException | None:
     """Retain ``secondary``, then present it; return control-flow raised doing so.
 
     The order is the fix: retention first and unconditionally, presentation
     second and best effort. Every occurrence passing through here is retained
-    exactly once, which is what lets :class:`Retention` drop de-duplication
+    exactly once, which is what lets :class:`_Retention` drop de-duplication
     (j#90517 R17-F2).
     """
     retaining = retention.remember(secondary)
@@ -552,7 +577,9 @@ def _record_secondary(retention: Retention, secondary: object) -> BaseException 
     return retaining if retaining is not None else presenting
 
 
-def _run_teardown_action(retention: Retention, action) -> BaseException | None:
+def _run_teardown_action(
+    retention: _Retention, action: Callable[[], object]
+) -> BaseException | None:
     """Run one action, record what it reports, and never raise.
 
     Every way this can go wrong — the action raising, the action *returning* a
@@ -577,7 +604,9 @@ def _run_teardown_action(retention: Retention, action) -> BaseException | None:
 
 
 def teardown_during(
-    primary: BaseException, *actions, carrier: RetentionCarrier | None = None
+    primary: BaseException,
+    *actions: Callable[[], object],
+    carrier: RetentionCarrier | None = None,
 ) -> BaseException | None:
     """Run each teardown action independently, preserving ``primary``.
 
@@ -616,7 +645,7 @@ def teardown_during(
 
     Retention is on the same channel as everything else. The carrier broke both
     properties twice by raising out of the loop instead (j#90508 R16-F1/F2), so
-    :meth:`Retention.flush` returns control flow rather than raising it, and no
+    :meth:`_Retention.flush` returns control flow rather than raising it, and no
     step of the record can cost an action that has not run. A carrier that
     refuses an occurrence does not lose it either: it stays queued and is
     retried, including once after the last action (j#90529 R18-F1).
@@ -630,7 +659,7 @@ def teardown_during(
     never passes it — it exists so the properties above can be exercised against
     a carrier that fails, which is the only way to reach several of them.
     """
-    retention = Retention(primary, carrier)
+    retention = _Retention(primary, carrier)
     control_flow: BaseException | None = None
     for action in actions:
         arrived = _run_teardown_action(retention, action)
