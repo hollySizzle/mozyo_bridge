@@ -52,7 +52,7 @@ Two notes on what the schedule patches:
   pick out their own call and do not need it.
 
 What the consumers defend, and what they do not, measured rather than asserted
-(Redmine #14684, reviews j#93050 / j#93155 / j#93223):
+(Redmine #14684, reviews j#93050 / j#93155 / j#93223 / j#93289):
 
 *Behaviour a consumer catches breaking.* Mutating each of these fails cases, in
 the count shown: the faults firing at all (19 / 12 / 15), `staging` matching only
@@ -60,23 +60,28 @@ an `O_CREAT` open (10), `close_fired` recording that the close fault fired (9),
 the close fault closing for real before it raises (3), `before_raising` running
 (2), and `calls` counting what the fault reached (1).
 
-*Fail-loud boundaries no case exercises.* `_name`'s refusal to bind one name to
-two different descriptors, and the rejection of an `error` that is not an
-exception instance. **Removing either leaves all 40 cases green** — the subject
-never produces two distinct matching descriptors, and every call site passes an
-instance. They are kept as boundaries rather than promises: breaking one cannot
-hand a consumer a wrong answer quietly, only an error. Closing them properly
-would take cases built against this module directly, which is outside the paths
-this task declared; the gateway ruled that acceptable here (j#93223) rather than
-required.
+*What no case exercises.* Two fail-loud boundaries — `_name`'s refusal to bind
+one name to two different descriptors, and the rejection of an `error` that is
+not an exception instance — and one consequence of the instance-only API: the
+exception raised **is** the object handed in, not a copy of it. Removing any of
+the three leaves all 40 cases green; rebuilding the exception per fire
+(`type(error)(*error.args)`) kills nothing either. The subject never produces two
+distinct matching descriptors, every call site passes an instance, and no case
+looks at exception identity. The boundaries are kept as boundaries rather than
+promises: breaking one cannot hand a consumer a wrong answer quietly, only an
+error. Closing any of this properly would take cases built against this module
+directly, which is outside the paths this task declared; the gateway ruled that
+acceptable here (j#93223 / j#93289) rather than required.
 
 *Behaviour removed because nothing could observe it.* A "fail only the first
-call" knob, the close fault firing at most once, an exception *instance* being
-re-raised as the same object rather than rebuilt, and the rule for choosing
+call" knob, the close fault firing at most once, the second `error` mode that
+took a callable and built a fresh exception per fire, and the rule for choosing
 between two descriptors matching one name — that last one deleted by making the
-ambiguity raise instead. A shared fake that promises what nothing checks lets a
-later consumer build on behaviour no case defends. Anything added back needs the
-case that would notice, in the same change.
+ambiguity raise instead. Note what the third one is and is not: the *choice*
+between an instance and a factory is gone, while same-object raising remains and
+sits in the paragraph above, unexercised. A shared fake that promises what
+nothing checks lets a later consumer build on behaviour no case defends.
+Anything added back needs the case that would notice, in the same change.
 """
 
 from __future__ import annotations
@@ -181,10 +186,11 @@ class FaultSchedule:
     def raise_on(self, primitive: str, error: BaseException) -> FaultSchedule:
         """``os.<primitive>`` raises `error` instead of running — on every call.
 
-        `error` is the exception object, raised as it is. There was briefly a
-        second mode taking a callable to build a fresh exception per fire; no
-        case could tell the two apart, so the choice is gone rather than
-        documented (review j#93155 F2).
+        `error` is the exception object, and the fault raises that object rather
+        than a copy of it. There was briefly a second mode taking a callable to
+        build a fresh exception per fire; no case could tell the two apart, so
+        the *choice* is gone (review j#93155 F2) — but raising the same object is
+        still not something any case checks, so do not build on it (j#93289).
 
         There is also deliberately no "only the first call" variant. One case
         needs a failure that does not persist, and it writes that fake itself: a
@@ -229,6 +235,9 @@ class FaultSchedule:
         `before_raising` runs between the close and the raise, for the cases
         whose payload is itself the property (#14580 takes the freed number
         before anyone else can).
+
+        `error` behaves as it does in `raise_on`, which is where that is
+        described — it is not restated here, so the two cannot drift apart.
         """
         if descriptor not in DESCRIPTORS:
             raise ValueError(f"unknown descriptor {descriptor!r}; expected one of {DESCRIPTORS}")
