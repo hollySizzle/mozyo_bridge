@@ -3867,6 +3867,14 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             ["*", "*", "*:_AUTHORITY_RE"],
             "reads: exactly-one-marker rule",
         ),
+        f"{_D}/domain/no_change_carve_out.py": (
+            ["*", "*", "*:MARKER_RE"],
+            "reads (Redmine #14695): NAMES-a-carve-out-surface detection over both structured "
+            "surfaces — canonical gate headings and workflow-event marker gate tokens. Reads RAW "
+            "tokens on purpose: the question is whether a record NAMES a carve-out gate, so a "
+            "malformed marker naming one still counts (refusing to see it would make a broken "
+            "record safer than a well-formed one). Renders nothing",
+        ),
         f"{_D}/domain/no_change_review_waiver.py": (
             ["*", "*", "*", "*:MARKER_RE"],
             "reads (Redmine #14695): the no-change review waiver gate. Exactly-one-marker rule "

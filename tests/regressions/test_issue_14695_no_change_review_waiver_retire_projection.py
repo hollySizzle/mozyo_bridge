@@ -43,9 +43,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     contract_ruling_pointer,
     contract_writer_role,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_review_waiver import (  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_carve_out import (  # noqa: E501
     CARVE_OUT_DECLARED,
     CARVE_OUT_UNRESOLVED,
+    HARD_CARVE_OUT_GATE_TOKENS,
+    fold_hard_carve_out,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_review_waiver import (  # noqa: E501
     NO_CHANGE_REVIEW_WAIVER_GATE,
     REASON_CALLBACK_OWED,
     REASON_CHANGE_DECLARED,
@@ -68,7 +72,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ZERO_CHANGE_INTEGRATION_DECLARED,
     ZERO_CHANGE_SCOPE_DECLARED,
     evaluate_no_change_waiver_admissible,
-    fold_hard_carve_out,
     fold_no_change_review_waiver,
     fold_zero_change_record,
     render_no_change_review_waiver_marker,
@@ -96,10 +99,16 @@ def waiver_marker(
     )
 
 
+#: The governed work-unit declaration. It is what RESOLVES the hard carve-out's classification
+#: half, so every fixture that expects to admit must carry it — and one that omits it is a
+#: negative, not a broken fixture (review j#93576 finding 1).
+WORK_UNIT = "- work_unit: `leaf_issue`"
+
+
 def no_change_journals(marker: str | None = None) -> list:
     """A genuinely no-change record: a start, a progress note, and a Close carrying the waiver."""
     return [
-        ("100", "## Gate: start\n- issue: #14613\n- 目的: characterization"),
+        ("100", f"## Gate: start\n- issue: #14613\n- 目的: characterization\n{WORK_UNIT}"),
         ("200", "## Progress Log\n- read-only 実測のみ"),
         ("300", f"## Gate: close\n- 受け入れ確認: 済\n{marker if marker else waiver_marker()}"),
     ]
@@ -114,7 +123,7 @@ def admit(journals, **overrides):
         # which is what this suite caught during development.
         currently_in_force=facts.review_waiver_unsuperseded if facts else False,
         zero_change=fold_zero_change_record(journals),
-        carve_out=fold_hard_carve_out(journals, gates_resolved=facts is not None),
+        carve_out=fold_hard_carve_out(journals),
         close_recorded=(facts.latest_gate == "close") if facts else False,
         target_issue=ISSUE,
         expected_workspace=WORKSPACE,
@@ -247,34 +256,82 @@ class SourceChangeCarveOutTest(unittest.TestCase):
 class HardCarveOutTest(unittest.TestCase):
     """#14695 j#93412 §3: the marker's own ``scope`` never proves external-effect absence."""
 
-    def test_a_recognized_release_fact_refuses(self):
-        journals = no_change_journals() + [
-            ("400", "## Gate: close\n[mozyo:workflow-event:gate=release:version=0.14.0]")
+    def test_a_heading_declared_production_verification_refuses(self):
+        # THE R1 defect, in the form these gates are actually written (review j#93576 finding 1):
+        # a marker-only detector folded this to clear=True and admitted with reason "ok".
+        journals = [
+            ("100", f"## Gate: start\n{WORK_UNIT}"),
+            ("200", "## Gate: production_verification\n- 本番反映を確認した"),
+            ("300", f"## Gate: close\n{waiver_marker()}"),
         ]
-        self.assertEqual(
-            fold_hard_carve_out(journals, gates_resolved=True).reason, CARVE_OUT_DECLARED
+        self.assertEqual(fold_hard_carve_out(journals).reason, CARVE_OUT_DECLARED)
+        self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
+
+    def test_a_heading_declared_release_refuses(self):
+        journals = no_change_journals() + [("400", "## Gate: release\n- 0.14.0 を publish した")]
+        self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
+
+    def test_a_combined_heading_naming_a_carve_out_refuses(self):
+        # Over-detection is the fail-closed direction for a refusal trigger, so every part of a
+        # combined heading is tested — ``Close`` must not shield ``Release``.
+        journals = [
+            ("100", f"## Gate: start\n{WORK_UNIT}"),
+            ("300", f"## Gate: Close + Release\n{waiver_marker()}"),
+        ]
+        self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
+
+    def test_the_canonical_marker_producer_cannot_emit_these_gates(self):
+        """Why the heading is the real surface, pinned rather than asserted in prose.
+
+        Review j#93576 finding 1(b): R1's negatives used ``gate=release`` markers, but
+        ``render_workflow_event_marker`` refuses every token outside the callback-bearing
+        ``GATE_BEARING_KINDS``. Those negatives therefore exercised a marker form nothing in this
+        repo can produce. Marker detection is kept as defence in depth; this pins WHY it cannot be
+        the only surface.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            GATE_BEARING_KINDS,
+            render_workflow_event_marker,
         )
-        self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
 
-    def test_a_production_verification_fact_refuses(self):
+        for token in ("release", "production_verification", "migration"):
+            with self.subTest(gate=token):
+                self.assertNotIn(token, GATE_BEARING_KINDS)
+                with self.assertRaises(ValueError):
+                    render_workflow_event_marker(gate=token)
+
+    def test_a_carve_out_marker_still_refuses_as_defence_in_depth(self):
         journals = no_change_journals() + [
-            ("400", "[mozyo:workflow-event:gate=production_verification:run=7]")
+            ("400", "[mozyo:workflow-event:gate=migration:step=3]")
         ]
         self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT)
 
-    def test_an_unresolved_gate_inventory_refuses_rather_than_defaulting_clear(self):
+    def test_the_token_vocabulary_is_anchored_to_the_central_preset(self):
+        """Every carve-out token must be a word the preset's carve-out list actually uses.
+
+        R1 invented this vocabulary, which is why it detected nothing real. Binding it to the
+        正本 means a carve-out the preset adds surfaces as a failing test rather than a hole.
+        """
+        preset = (
+            ROOT / ".mozyo-bridge" / "rules" / "presets" / "redmine-governed" / "agent-workflow.md"
+        ).read_text(encoding="utf-8")
+        start = preset.index("以下の **carve-out**")
+        section = preset[start:start + 1200].lower()
+        for token in sorted(HARD_CARVE_OUT_GATE_TOKENS):
+            with self.subTest(token=token):
+                self.assertIn(token.replace("_", " "), section)
+
+    def test_an_undeclared_work_unit_refuses_rather_than_defaulting_clear(self):
         # "既定 clear にせず typed refusal": not-found and not-checked are different answers.
-        self.assertEqual(
-            fold_hard_carve_out(no_change_journals(), gates_resolved=False).reason,
-            CARVE_OUT_UNRESOLVED,
-        )
-        self.assertEqual(
-            admit(
-                no_change_journals(),
-                carve_out=fold_hard_carve_out(no_change_journals(), gates_resolved=False),
-            ).reason,
-            REASON_HARD_CARVE_OUT_UNRESOLVED,
-        )
+        # The classification half is the record's own governed ``work_unit`` declaration, NOT a
+        # flag the caller passes — R1's ``gates_resolved=True`` was always supplied by the caller
+        # and proved only that the record parsed (review j#93576 finding 1).
+        journals = [
+            ("100", "## Gate: start\n- issue: #14613"),  # no work_unit
+            ("300", f"## Gate: close\n{waiver_marker()}"),
+        ]
+        self.assertEqual(fold_hard_carve_out(journals).reason, CARVE_OUT_UNRESOLVED)
+        self.assertEqual(admit(journals).reason, REASON_HARD_CARVE_OUT_UNRESOLVED)
 
     def test_prose_naming_a_release_is_not_a_recognized_fact(self):
         # Structured gate tokens only. A review discussing a release, or a callback quoting one,
@@ -282,7 +339,12 @@ class HardCarveOutTest(unittest.TestCase):
         journals = no_change_journals() + [
             ("400", "## Progress Log\n- release / publish / migration について議論した")
         ]
-        self.assertTrue(fold_hard_carve_out(journals, gates_resolved=True).clear)
+        self.assertTrue(fold_hard_carve_out(journals).clear)
+        self.assertTrue(admit(journals).admissible)
+
+    def test_a_quoted_carve_out_heading_is_not_a_declaration(self):
+        journals = no_change_journals() + [("400", "```\n## Gate: release\n```")]
+        self.assertTrue(fold_hard_carve_out(journals).clear)
         self.assertTrue(admit(journals).admissible)
 
 
@@ -299,7 +361,7 @@ class SupersessionAndMutationTest(unittest.TestCase):
         # The negative control: supersession is about ORDER, not about existence. Without this the
         # test above would pass for a rule that simply refused any record mentioning a review.
         journals = [
-            ("100", "## Gate: start"),
+            ("100", f"## Gate: start\n{WORK_UNIT}"),
             ("150", "## Gate: review request"),
             ("300", f"## Gate: close\n{waiver_marker()}"),
         ]
@@ -582,6 +644,76 @@ class LiveMeasurementTest(unittest.TestCase):
             worktree="/nonexistent/lane/worktree/14695",
         )
         self.assertFalse(measured.worktree_clean)
+
+    def _branch_of(self, path):
+        import subprocess
+
+        return subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def _head_of(self, path):
+        import subprocess
+
+        return subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True
+        ).stdout.strip()
+
+    def test_a_foreign_branch_measures_NOTHING_rather_than_a_free_zero(self):
+        """Review j#93576 finding 2, reproduced then pinned.
+
+        R1 resolved the head and the ahead-count from ``--branch`` in the REPO ROOT while taking
+        cleanliness from ``--worktree``, with nothing tying the two to one checkout. Pointing
+        ``--branch`` at the integration branch therefore returned a foreign head, zero commits
+        ahead and a clean tree — a free "this lane changed nothing" reading. Measured on this very
+        worktree: actual HEAD ``156b384f``, measured head ``735a5f88``.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
+            measure_lane_change,
+        )
+
+        measured = measure_lane_change(
+            ROOT,
+            branch="origin/main-next",
+            integration_branch="origin/main-next",
+            worktree=str(ROOT),
+        )
+        # Wholly unmeasured, not a partial reading: the checkout is not on that branch.
+        self.assertEqual(measured.head, "")
+        self.assertIsNone(measured.commits_ahead)
+        self.assertFalse(measured.worktree_clean)
+
+    def test_the_measured_head_is_the_checkouts_own_head(self):
+        # The positive control for the case above: with the branch the checkout is ACTUALLY on,
+        # the measurement reports that checkout's real HEAD — not a ref resolved elsewhere.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
+            measure_lane_change,
+        )
+
+        branch = self._branch_of(ROOT)
+        if branch in ("", "HEAD"):
+            self.skipTest("detached or unreadable checkout; nothing to correlate")
+        measured = measure_lane_change(
+            ROOT, branch=branch, integration_branch=branch, worktree=str(ROOT)
+        )
+        self.assertEqual(measured.head, self._head_of(ROOT).lower())
+        self.assertEqual(measured.commits_ahead, 0)
+
+    def test_an_omitted_worktree_measures_nothing(self):
+        # No fallback to the repo root: that fallback IS the decorrelation finding 2 names, and a
+        # coordinator repo's state says nothing about the lane.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_admissibility import (  # noqa: E501
+            measure_lane_change,
+        )
+
+        branch = self._branch_of(ROOT)
+        if branch in ("", "HEAD"):
+            self.skipTest("detached or unreadable checkout")
+        measured = measure_lane_change(ROOT, branch=branch, integration_branch=branch)
+        self.assertEqual(measured.head, "")
+        self.assertIsNone(measured.commits_ahead)
 
 
 if __name__ == "__main__":

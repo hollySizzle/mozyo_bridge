@@ -69,6 +69,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     fold_integration_disposition,
     has_conflicting_disposition_declaration,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_carve_out import (  # noqa: E501
+    CARVE_OUT_DECLARED,
+    HardCarveOutFacts,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
     EnvelopeParseError,
     LaneEvidenceEnvelope,
@@ -507,139 +511,6 @@ def fold_zero_change_record(
 
 
 # ---------------------------------------------------------------------------
-# The HARD carve-out: surfaces a direct-owner waiver may never cross (#14695 j#93412 §3).
-# ---------------------------------------------------------------------------
-
-#: Structured gate tokens that INDICATE a hard carve-out surface. Closed, and matched as whole
-#: marker ``gate=`` / ``kind=`` tokens — never as substrings and never against prose, because
-#: "prose keyword scan は authority にしない" (j#93412 §3). These mirror the central preset's
-#: ``### Owner Close Approval Delegation`` carve-out list: release / publish / distribution,
-#: production verification and external effect, credential / auth / permission / billing, and
-#: destructive operations / migrations.
-#:
-#: Guardrail / preset / router / skill / scaffold changes are deliberately ABSENT from this set,
-#: and their absence is not a gap: any such change is repository change, so it is already refused
-#: one conjunct earlier by :func:`fold_zero_change_record`. Listing them here as well would imply
-#: this set is what protects them, and a later edit to that assumption would silently open a hole.
-HARD_CARVE_OUT_GATE_TOKENS: frozenset[str] = frozenset(
-    {
-        "release",
-        "release_approval",
-        "publish",
-        "package_distribution",
-        "tag",
-        "production_verification",
-        "qa_verification",
-        "credential_rotation",
-        "auth_change",
-        "permission_change",
-        "billing",
-        "destructive_operation",
-        "migration",
-        "external_effect",
-    }
-)
-
-#: The carve-out surface is provably not applicable.
-CARVE_OUT_CLEAR = "hard_carve_out_not_applicable"
-#: A recognized durable fact names a carve-out surface.
-CARVE_OUT_DECLARED = "hard_carve_out_fact_recorded"
-#: The classification could not be resolved, so non-applicability could not be PROVEN.
-CARVE_OUT_UNRESOLVED = "hard_carve_out_classification_unresolved"
-
-HARD_CARVE_OUT_REASONS: frozenset[str] = frozenset(
-    {CARVE_OUT_CLEAR, CARVE_OUT_DECLARED, CARVE_OUT_UNRESOLVED}
-)
-
-
-@dataclass(frozen=True)
-class HardCarveOutFacts:
-    """Whether the hard carve-out is provably not applicable to this waiver.
-
-    ``clear`` is the fail-closed predicate: it is True only when the classification RESOLVED and
-    no recognized carve-out fact was found. ``reason`` distinguishes "we checked and it is clear"
-    from "we could not check" — operationally different problems that must not collapse into one
-    boolean, and ``detail`` names the token or journal that refused.
-    """
-
-    clear: bool = False
-    reason: str = CARVE_OUT_UNRESOLVED
-    detail: str = ""
-
-
-def _structured_gate_tokens(notes: str) -> frozenset[str]:
-    """Every gate token the note's canonical workflow-event markers name (pure).
-
-    Structured surfaces only, from the shared canonical scan: a quoted marker is not a marker, and
-    body text is never inspected. Read from the RAW components rather than a strict parse, because
-    the question here is "does this record NAME a carve-out surface" — a malformed marker naming
-    ``gate=release`` still names it, and refusing to see it because its body is unrenderable would
-    let a broken record be safer than a well-formed one.
-    """
-    tokens: set[str] = set()
-    for _channel, body in canonical_marker_bodies(
-        notes or "", channels=frozenset({MARKER_CHANNEL_WORKFLOW_EVENT})
-    ):
-        for component in str(body or "").split(":"):
-            key, _, value = component.partition("=")
-            if key.strip() in MARKER_GATE_ALIASES and value.strip():
-                tokens.add(value.strip().lower())
-    return frozenset(tokens)
-
-
-def fold_hard_carve_out(
-    journals: Sequence[Tuple[object, str]],
-    *,
-    gates_resolved: bool = False,
-) -> HardCarveOutFacts:
-    """Whether the hard carve-out is provably NOT applicable to this waiver (pure).
-
-    Redmine #14695 j#93412 §3 makes this a distinct conjunct from zero-change, and states its
-    direction twice: a recognized durable fact naming a carve-out surface REFUSES, and an
-    unresolvable classification ALSO refuses — "既定 clear にせず typed refusal とする". Direct
-    owner provenance is explicitly not an escape from it.
-
-    Two independent halves, both required:
-
-    1. **Detection.** No journal's canonical workflow-event markers may name a token in
-       :data:`HARD_CARVE_OUT_GATE_TOKENS`. Structured gate tokens only — this is deliberately not
-       a keyword search over note bodies, because a review discussing a release, or a callback
-       quoting one, would trip a prose scan while proving nothing.
-    2. **Resolution.** ``gates_resolved`` must be True: the caller must have actually resolved the
-       issue's RECOGNIZED GATE inventory, not merely failed to find anything. The ruling permits
-       either resolution route — "issue 分類 **または** recognized gate" — and this is the second,
-       chosen because it needs no per-workspace vocabulary to be declared anywhere. Its default is
-       False, so a caller that cannot resolve the record's gate structure is refused rather than
-       passed: "nothing was recognized" and "nothing carve-out-ish is there" are different
-       statements, and treating the first as the second is the default-clear the ruling forbids.
-
-       This is not a formality. #14613's own record — the reproduction this issue was filed for —
-       folds to NO recognized gate at all, because its waiver was written under a non-canonical
-       combined heading. Under this conjunct that record refuses, which is the correct answer:
-       nothing about its lifecycle was resolvable, so nothing about it was proven.
-
-    The honest boundary, stated rather than hidden: this proves "no recognized durable fact says
-    otherwise, and the record's gate structure was actually readable". It cannot prove the absence
-    of an external effect that was never recorded anywhere — nothing reading a durable record can.
-    That is why it is one conjunct among several and never the whole admission.
-    """
-    for journal_id, notes in journals or ():
-        if _int_journal(journal_id) is None:
-            continue
-        named = _structured_gate_tokens(notes) & HARD_CARVE_OUT_GATE_TOKENS
-        if named:
-            return HardCarveOutFacts(
-                clear=False,
-                reason=CARVE_OUT_DECLARED,
-                detail=f"j#{str(journal_id).strip()}:{sorted(named)[0]}",
-            )
-
-    if not gates_resolved:
-        return HardCarveOutFacts(clear=False, reason=CARVE_OUT_UNRESOLVED)
-    return HardCarveOutFacts(clear=True, reason=CARVE_OUT_CLEAR)
-
-
-# ---------------------------------------------------------------------------
 # The terminal-retire admissibility fence for a waived lane (#14695 acceptance 2).
 # ---------------------------------------------------------------------------
 
@@ -902,12 +773,6 @@ def render_no_change_review_waiver_marker(
 
 
 __all__ = (
-    "CARVE_OUT_CLEAR",
-    "CARVE_OUT_DECLARED",
-    "CARVE_OUT_UNRESOLVED",
-    "HARD_CARVE_OUT_GATE_TOKENS",
-    "HARD_CARVE_OUT_REASONS",
-    "HardCarveOutFacts",
     "NO_CHANGE_REVIEW_WAIVER_GATE",
     "NO_CHANGE_WAIVER_REFUSAL_REASONS",
     "NO_CHANGE_WAIVER_STATES",
@@ -942,7 +807,6 @@ __all__ = (
     "ZERO_CHANGE_SCOPE_DECLARED",
     "ZeroChangeFacts",
     "evaluate_no_change_waiver_admissible",
-    "fold_hard_carve_out",
     "fold_no_change_review_waiver",
     "fold_zero_change_record",
     "render_no_change_review_waiver_marker",

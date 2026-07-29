@@ -358,60 +358,79 @@ def measure_lane_change(
 ) -> LaneChangeMeasurement:
     """Measure the lane's live change facts, read-only and fail-closed (Redmine #14695 j#93412 §2).
 
-    Three read-only git probes, each of which resolves to the unmeasured value on ANY failure (a
-    missing ref, a non-repository, an OS error), so a probe that cannot answer never fabricates a
-    "nothing changed" reading:
+    **Every probe runs in the LANE CHECKOUT, and that checkout's own branch identity must be the
+    branch the caller named.** Redmine #14695 review j#93576 finding 2 measured what the earlier
+    split cost: the head and the ahead-count were resolved from ``--branch`` in the *repo root*
+    while only the cleanliness came from ``--worktree``, and nothing checked that the two were the
+    same checkout. Pointing ``--branch`` at the integration branch therefore produced a foreign
+    head with zero commits ahead and a clean tree — a free "this lane changed nothing" reading for
+    a checkout sitting on entirely different work. Reproduced on this very worktree: actual HEAD
+    ``156b384f``, measured head ``735a5f88``, ``commits_ahead=0``, ``worktree_clean=True``.
 
-    - ``rev-parse <branch>`` — the lane head, compared downstream against the waiver's own head so
-      a lane that moved AFTER the waiver was written is refused;
-    - ``rev-list --count <integration_branch>..<branch>`` — the commits the lane carries that the
-      integration branch does not. The ruling is explicit that this is the right question rather
-      than head equality with the integration branch: "integration branch が後に進んだ場合、lane
-      head がその ancestor であることは許容する。current integration head との literal 一致まで
-      は要求しない". A lane that added nothing stays at zero however far the integration branch
-      advances past it;
-    - ``status --porcelain`` in the lane worktree — uncommitted change is repository change the
-      waiver never covered.
+    So identity is established FIRST and everything else is measured relative to it:
 
-    **What this cannot decide, stated rather than implied.** Zero commits ahead does NOT mean the
-    lane never produced a commit: a lane whose work was already merged is also zero ahead. Only
-    the durable-record half (:func:`...no_change_review_waiver.fold_zero_change_record`) excludes
-    that case, because integrated work necessarily leaves a commit record and an integration
-    disposition behind. The two halves are conjoined for exactly this reason.
+    - ``rev-parse --abbrev-ref HEAD`` in the checkout must exact-equal ``branch``. A detached HEAD
+      prints ``HEAD`` and so never matches a branch name — the correct refusal, because a detached
+      checkout has no branch identity to correlate. Any mismatch yields the wholly unmeasured
+      value, never a partial reading;
+    - ``rev-parse HEAD`` in the checkout — the head that checkout is ACTUALLY on, never a named ref
+      resolved somewhere else. Compared downstream against the waiver's own head, so a lane that
+      moved after the waiver was written is refused;
+    - ``rev-list --count <integration_branch>..HEAD`` in the checkout — the commits this checkout
+      carries that the integration branch does not. The ruling is explicit that this, not head
+      equality with the integration branch, is the right question: "integration branch が後に
+      進んだ場合、lane head がその ancestor であることは許容する". A lane that added nothing stays
+      at zero however far the integration branch advances past it;
+    - ``status --porcelain`` in the checkout — uncommitted change is repository change the waiver
+      never covered.
+
+    ``worktree`` is REQUIRED. Falling back to the repo root would reintroduce the very
+    decorrelation this fixes, and the coordinator repo's cleanliness says nothing about the lane
+    (the #13331 j#73338 boundary). ``repo_root`` is retained only as the caller's context; no
+    probe reads it. Every probe resolves to the unmeasured value on ANY failure — a missing ref, a
+    non-repository, an OS error — so a probe that cannot answer never fabricates a "nothing
+    changed" reading.
+
+    **What this still cannot decide, stated rather than implied.** Zero commits ahead does NOT
+    mean the lane never produced a commit: a lane whose work was already merged is also zero
+    ahead. Only the durable-record half
+    (:func:`...no_change_review_waiver.fold_zero_change_record`) excludes that case, because
+    integrated work necessarily leaves a commit record and an integration disposition behind. The
+    two halves are conjoined for exactly this reason.
     """
     branch_s = str(branch or "").strip()
     integration_s = str(integration_branch or "").strip()
-    if not branch_s or not integration_s:
+    checkout = str(worktree or "").strip()
+    if not branch_s or not integration_s or not checkout:
         return LaneChangeMeasurement()
 
-    def _git(*argv: str, cwd: Optional[str] = None) -> Optional[str]:
+    def _git(*argv: str) -> Optional[str]:
         import subprocess
 
         try:
             result = subprocess.run(
-                ["git", "-C", cwd or str(repo_root), *argv],
-                text=True,
-                capture_output=True,
+                ["git", "-C", checkout, *argv], text=True, capture_output=True
             )
         except OSError:
             return None
         return result.stdout if result.returncode == 0 else None
 
-    head_out = _git("rev-parse", branch_s)
-    head = str(head_out or "").strip().lower()
+    # Identity FIRST: every fact below is a statement about THIS checkout, so if the checkout is
+    # not on the branch the caller named, there is nothing here to say about that branch.
+    on_branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+    if on_branch is None or str(on_branch).strip() != branch_s:
+        return LaneChangeMeasurement()
 
-    ahead_out = _git("rev-list", "--count", f"{integration_s}..{branch_s}")
+    head = str(_git("rev-parse", "HEAD") or "").strip().lower()
+
+    ahead_out = _git("rev-list", "--count", f"{integration_s}..HEAD")
     ahead: Optional[int]
     try:
         ahead = int(str(ahead_out).strip()) if ahead_out is not None else None
     except (TypeError, ValueError):
         ahead = None
 
-    # The lane CHECKOUT, not the repo the command runs in: a clean coordinator repo says nothing
-    # about the lane's worktree, and it is the lane's uncommitted state that would be unreviewed
-    # change (the #13331 j#73338 boundary, applied to this route).
-    checkout = str(worktree or "").strip()
-    status_out = _git("status", "--porcelain", cwd=checkout) if checkout else None
+    status_out = _git("status", "--porcelain")
     worktree_clean = status_out is not None and not status_out.strip()
 
     return LaneChangeMeasurement(
@@ -473,9 +492,11 @@ def _resolve_no_change_waiver_admissible(
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_issuer_policy import (  # noqa: E501
             resolve_journal_issuer,
         )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_carve_out import (  # noqa: E501
+            fold_hard_carve_out,
+        )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_review_waiver import (  # noqa: E501
             evaluate_no_change_waiver_admissible,
-            fold_hard_carve_out,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_admission import (  # noqa: E501
             GATE_CLOSE,
@@ -536,9 +557,11 @@ def _resolve_no_change_waiver_admissible(
                 # by a newer review round", pointing an operator at a review that does not exist.
                 currently_in_force=gate_facts.review_waiver_unsuperseded,
                 zero_change=gate_facts.zero_change,
-                # ``gates_resolved`` is True precisely because ``fold_issue_gate_facts`` returned
-                # facts above — the resolution actually happened, it was not merely not-refuted.
-                carve_out=fold_hard_carve_out(journals, gates_resolved=True),
+                # No flag: the carve-out resolves itself from the record's governed ``work_unit``
+                # declaration. R1 passed ``gates_resolved=True`` here on the strength of "a
+                # lifecycle gate parsed", which proved the record was readable, not that its
+                # classification was resolved (review j#93576 finding 1).
+                carve_out=fold_hard_carve_out(journals),
                 close_recorded=gate_facts.latest_gate == GATE_CLOSE,
                 target_issue=issue,
                 expected_workspace=target.workspace,
