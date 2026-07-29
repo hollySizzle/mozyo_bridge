@@ -1,4 +1,5 @@
 approval_policy = "never"
+sandbox_mode = "danger-full-access"
 
 [redmine]
 default_project = "giken-3800-mozyo-bridge"
