@@ -2776,8 +2776,22 @@ class ReviewJ92106BespokeParserTests(unittest.TestCase):
         import re
 
         allowed = {
-            # Owns the grammar: the token regex, the component split, and both strict readers.
-            "redmine_journal_source.py",
+            # Owns the grammar ABOVE the token scan: the component split and both strict readers.
+            # It moved here out of ``redmine_journal_source`` in #14687 when the #14661
+            # integration pushed that module past the module-health line; the split is
+            # byte-identical, so what this entry allows is unchanged.
+            #
+            # Measured, so the entry is not read as more than it is: this module splits bodies
+            # but holds no token regex LITERAL (it imports ``MARKER_RE``), and the scope filter
+            # above requires both — so the entry is a declaration of ownership, not the thing
+            # keeping the module green. ``worker_refresh_approval`` (#14661) has the same shape
+            # and is likewise out of the filter's reach; that is a property of the filter, which
+            # this remediation reports rather than redesigns.
+            "strict_marker_read.py",
+            # ``redmine_journal_source`` is deliberately NOT on this list any more: it re-exports
+            # these readers and parses no body itself. Probed on this head — appending a private
+            # token regex plus a body split to it reddens this test, which it would not have
+            # while the name was still allowed.
             # The canonical quote-aware scan (#14585 / #14665) — it OWNS the token grammar and the
             # body split for the whole package now, exactly as this module's own owner entry does.
             "canonical_note_scan.py",
@@ -2943,9 +2957,23 @@ class ReviewJ92060EffectReachingReaderTests(unittest.TestCase):
             # Display projection only. #14213 deliberately keeps its historical leniency; the
             # authority consumers ask ``has_conflicting_disposition_declaration`` first.
             "glance_integration_disposition.py",
-            # Defines the scanner and its strict counterparts.
+            # Defines the scanner and its strict counterparts (#14687 moved them here out of
+            # ``redmine_journal_source``, byte-identical).
+            "strict_marker_read.py",
+            # Re-exports the scanner and its strict counterparts for the ~120 import sites that
+            # already name this module; it calls neither itself.
             "redmine_journal_source.py",
         }
+        # ``sublane_worker_refresh_durable_read.py`` was on this list for exactly one round
+        # (#14687 R1) and was REMOVED rather than kept, which is the durable record of why.
+        # It reads the worker-progress gate, and its ``False`` becomes ``expected_gate_absent``
+        # on the turn observation — the only route to ``turn_failed_no_durable_gate``, the one
+        # class that admits the destructive guarded worker refresh. Review j#93273 R1-F1 refused
+        # the carve-out: excepting the reader this pin had just caught is not "keeping the
+        # contract", it is the quiet widening the gate exists to prevent. It now reads through
+        # ``strict_marker_fields_in_note`` and treats an unreadable NOTE as progress, pinned by
+        # (path kept on ONE line so it stays greppable):
+        # tests/regressions/test_issue_14687_worker_progress_fail_closed.py
         # ``coordinator_proxy_send.py`` was carved out here in R34 as a MEASURED, unresolved
         # finding — its ``canonical_decision_in_journal`` decided a PROXY SEND through the lenient
         # fold, so three bodies no canonical producer could render each produced a decision. It was
@@ -3842,8 +3870,17 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         # -- the grammar owner ---------------------------------------------------------
         f"{_D}/domain/redmine_journal_source.py": (
             ["*", "*", "*:MARKER_RE"],
-            "owns the grammar: token regex, component split, strict readers, gate-marker "
-            "renderer, and the producer-side value validator",
+            "renders the gate marker and the dispatch marker, and re-exports the strict readers "
+            "#14687 moved to ``strict_marker_read``; the two token literals are its own, the "
+            "third is the shared scan's",
+        ),
+        f"{_D}/domain/worker_refresh_approval.py": (
+            ["*", "*", "*", "*:MARKER_RE"],
+            "renders the worker-refresh owner-approval marker and reads it back through a "
+            "deliberately STRICTER private parser: a repeated field, a malformed field or a "
+            "non-canonical field order raises, and a note carrying more than one marker of this "
+            "gate authorizes nothing (a record that declares the gate twice cannot say which is "
+            "authoritative)",
         ),
         # -- readers -------------------------------------------------------------------
         f"{_D}/domain/dispatch_authorization.py": (
@@ -4246,6 +4283,37 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         f"{_D}/domain/review_exemption.py": (
             ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
+        ),
+        f"{_D}/domain/strict_marker_read.py": (
+            ['*:MARKER_RE'],
+            "inherits via a used import of canonical_note_scan; names no marker token itself "
+            "(#14687 moved the strict readers here byte-identical, and the token regex stayed "
+            "with the scan that owns quote/fence exclusion)",
+        ),
+        f"{_D}/domain/worker_turn_recovery.py": (
+            ['*', '*'],
+            "inherits via a used import of redmine_journal_source; names no marker token itself "
+            "(it declares the worker-progress gate vocabulary, it does not read notes)",
+        ),
+        f"{_D}/application/sublane_worker_refresh.py": (
+            ['*'],
+            "inherits via a used import of worker_refresh_approval; names no marker token "
+            "itself, and reads no note — it plans the refresh and delegates approval "
+            "verification to that module's strict parser",
+        ),
+        f"{_D}/application/sublane_worker_refresh_durable_read.py": (
+            ['*', '*'],
+            "inherits via a used import of redmine_journal_source; names no marker token "
+            "itself. Reads worker-progress gates STRICTLY and fails closed toward progress: a "
+            "note carrying any marker the canonical producer could not render counts as "
+            "progress, which refuses the destructive refresh (#14687 R1-F1)",
+        ),
+        f"{_D}/application/sublane_worker_refresh_live.py": (
+            ['*', '*', '*', 'handoff', 'recovery-delivery-authorization',
+             'recovery-delivery-zero-send'],
+            "inherits via used imports of worker_refresh_approval, recovery_anchor_delivery and "
+            "handoff; names no marker token itself and reads no note directly — the durable "
+            "read, the approval check and the recovery delivery each keep their own discipline",
         ),
         "src/mozyo_bridge/e_140_adapter_provider/f_110_ticket_adapter_common/domain/ticket_adapter.py": (
             ['handoff'],

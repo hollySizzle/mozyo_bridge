@@ -88,6 +88,12 @@ The registries remain internal built-in registries. Their purpose is to make
 composition explicit and auditable before any future external plugin surface is
 designed.
 
+Herdr 0.7.5 の host/plugin mechanism はこの禁止と競合しない。mozyo-bridge は
+Herdr plugin を import / load / trust provider 化しない。Herdr plugin は
+presentation consumer として public-safe projection を読み、preview-first safe
+action の境界を介して接続する。具体境界と engine-first sequence は
+`vibes/docs/logics/herdr-plugin-presentation-consumer-boundary.md` を読む。
+
 ## Design Rules
 
 1. Keep core small and hard.

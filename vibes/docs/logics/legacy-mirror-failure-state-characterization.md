@@ -1186,7 +1186,24 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
 
 ---
 
-## Appendix A. 導出器と全件 mapping (再現用)
+## Appendix A. 導出器と全件 mapping (再現用) [superseded]
+
+> **`superseded` — 実行不能。歴史記録として残す [Redmine #14666 T1 move-only]。**
+> §8 `### 導出器の lifecycle` の landed policy 裁定どおり、T1 の完了をもって本
+> Appendix の導出器を retire する。**T1 が `TARGET`
+> (`tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py`)
+> を削除したので、A.1 の手順も A.3 の `assert len(rows) == 127` も、もはや実行
+> できない** — 単一 file を引数に取る導出器の subject が消えたためである。
+> `tests/support/` へ昇格させない (`### support` の定義に合わない) という裁定も
+> 同じ理由に基づく。
+>
+> **本文は改変しない。** A.2 / A.4 / A.5 の値は base `origin/main-next@fef86cac`
+> における実測であり、§2 / §5.0 / §5.5 の原資料としての参照可能性を保つ。
+> 127 件の行き先は A.5 の **`宣言` 列**が正本のままである。
+>
+> **移設後に残る恒久不変条件は D1 / D2 の command であって本 script ではない**
+> (§5.3)。移設先の 10 module は §5.5 の表を読む。drift window (「裁定 → T1 完了」)
+> は本 commit で閉じた。
 
 下記 script を `origin/main-next@fef86cac` の tree に対して実行した結果を、
 **第三者が同じ head で再実行して検証できるよう**全文と全件 mapping とともに置く。

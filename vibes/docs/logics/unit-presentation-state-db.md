@@ -185,6 +185,11 @@ config と live observation が矛盾した場合、read model は `desired_but_
 `observed_elsewhere` / `stale` のような表示状態へ倒す。action permission は
 side-effecting command の live preflight が決める。
 
+Herdr plugin 等の presentation consumer は repo-local config や本 DB を独自に
+workflow truthへ昇格させず、desired / observed を区別した public-safe projection
+として読む。operator-local UX state、plugin action、engine-first sequence の境界は
+`herdr-plugin-presentation-consumer-boundary.md` を正本とする。
+
 #### repo-local config boundary (#12254)
 
 Project Group / sublane placement の repo-local config は、runtime state の保存先では

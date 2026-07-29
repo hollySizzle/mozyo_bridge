@@ -29,6 +29,16 @@ The authority chain (each tightened by a review round, all fail-closed):
 
 These are module-level functions taking the request + stores explicitly (no ``self``), so the
 recovery ops delegate to them and the whole chain stays independently testable.
+
+**The pinned row revision is an EXPLICIT required argument (Redmine #14661 review j#92443
+F1).** It used to be read off the request as ``getattr(request, "gateway_revision", "")``,
+which silently yielded ``""`` — and therefore a permanent ``False`` — for any caller whose
+request spells that pin differently. The #14661 worker refresh (``worker_revision``) hit
+exactly that: its live turn-start binding could never succeed, so the surface was inert in
+production while every fake-backed test stayed green. A defaulted attribute lookup across a
+shared seam cannot fail loudly, so the seam now takes ``pin_revision`` as a required
+keyword-only argument: a caller that does not supply it raises at the call site instead of
+degrading to a silent never-binds.
 """
 
 from __future__ import annotations
@@ -45,7 +55,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 )
 
 
-def record_observed_turn_start(rec, *, request, repo_root, attestation_home) -> bool:
+def record_observed_turn_start(
+    rec, *, request, repo_root, attestation_home, pin_revision
+) -> bool:
     """Did the ANCHOR delivery's QUEUE-ENTER rail OBSERVE the turn start, GENERATION-BOUND?
 
     (j#87397 / design j#87409 / j#87418 / j#87424 / j#87445 / j#87472.) SCOPE: the herdr
@@ -67,11 +79,14 @@ def record_observed_turn_start(rec, *, request, repo_root, attestation_home) -> 
     if not observed:
         return False
     return record_generation_bound(
-        rec, request=request, repo_root=repo_root, attestation_home=attestation_home
+        rec, request=request, repo_root=repo_root, attestation_home=attestation_home,
+        pin_revision=pin_revision,
     )
 
 
-def record_generation_bound(rec, *, request, repo_root, attestation_home) -> bool:
+def record_generation_bound(
+    rec, *, request, repo_root, attestation_home, pin_revision
+) -> bool:
     """The record's persisted binding is the SAME generation as THIS request's LIVE gateway.
 
     Fail-closed generation authority: the binding must be present and its ``assigned_name`` /
@@ -80,6 +95,13 @@ def record_generation_bound(rec, *, request, repo_root, attestation_home) -> boo
     equal the LIVE current-generation token (j#87472) — never the ``observed_at`` timestamp
     (two same-second launches share it). A same-second recycle, an ABA relaunch, a foreign
     provider, or a tokenless legacy record never binds.
+
+    ``pin_revision`` is the caller's pinned LIVE INVENTORY ROW revision, passed explicitly
+    (#14661 review j#92443 F1). Each recovery surface spells that pin in its own request
+    field — ``gateway_revision`` for the gateway refresh, ``worker_revision`` for the worker
+    refresh — so reading it off the request here would have to guess a field name, and a
+    wrong guess degrades to a permanently unbound (always-``False``) authority rather than an
+    error. An empty ``pin_revision`` still fails closed, as before.
     """
     qe = getattr(rec, "queue_enter_observation", None)
     if not isinstance(qe, dict):
@@ -87,7 +109,7 @@ def record_generation_bound(rec, *, request, repo_root, attestation_home) -> boo
     binding = qe.get("gateway_binding")
     if not isinstance(binding, dict):
         return False
-    pin_rev = _norm(getattr(request, "gateway_revision", ""))
+    pin_rev = _norm(pin_revision)
     if not (
         _norm(str(binding.get("assigned_name") or "")) == _norm(request.assigned_name)
         and _norm(str(binding.get("locator") or "")) == _norm(request.locator)
