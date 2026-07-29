@@ -618,7 +618,7 @@ Appendix A.2 の構文的検出ではない**。
 移設後の integration / scenarios / regressions のいずれからも使われる。**test ではないので
 127 の分配先にならない** (partition 恒等式に影響しない)。
 
-#### 分岐 2 (scenarios) — 8 件を宣言する
+#### 分岐 2 (scenarios) — 7 件を宣言する
 
 **宣言:** `LegacyMirrorWrapperCliTest` のうち **wrapper を実行する 7 件**。
 
@@ -864,6 +864,50 @@ source 側は `legacy_mirror_sync.py` 899 / `owned_descriptors.py` 725 で
 
 ---
 
+### 5.5 移設先 module の確定 [著者宣言]
+
+§5.0 の宣言を **exact path** へ落とす。Task の changed-path ownership (§7) は
+この表を参照する — 「それを使う module」のような未解決の表現を残すと、dispatch 時に
+ownership conflict を判定できない。
+
+`os_patch` 列は、その module が含む「`os` primitive を注入する test」の数である。
+T6 (共有 fault schedule fake の新規作成) が触る consumer は**この列が非 0 の module
+に限られる**ので、T3 / T4 との交差はこの表から判定できる。
+
+| 行き先 | tests | 行 | module | os_patch |
+| --- | ---: | ---: | --- | ---: |
+| unit | 19 | 746 | `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py` | 0 |
+| unit | 2 | 18 | `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe.py` | 1 |
+| scenarios | 7 | 78 | `tests/scenarios/test_legacy_mirror_wrapper_cli.py` | 0 |
+| regressions | 2 | 99 | `tests/regressions/test_issue_14580_reused_descriptor_number_close.py` | 2 |
+| regressions | 2 | 28 | `tests/regressions/test_issue_14651_capability_advertisement.py` | 2 |
+| integration | 29 | 1,033 | `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_fault_injection.py` | 29 |
+| integration | 47 | 805 | `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_sync.py` | 0 |
+| integration | 7 | 79 | `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_tracked_tree.py` | 0 |
+| integration | 3 | 35 | `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_wrapper_guardrails.py` | 0 |
+| integration | 9 | 167 | `tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe_io.py` | 2 |
+| **計** | **127** | **3,088** | **10 module** | **36** |
+
+- **basename 衝突 0** を機械確認済み (policy `### module 名の一意性`)。
+- module 分割の基準: 検証層 (§5.2) と subject。`test_legacy_mirror_fault_injection.py`
+  は E-inject の 29 件、`test_legacy_mirror_sync.py` は patch なしの結線、
+  `test_platform_capability_probe*.py` は probe、`test_legacy_mirror_tracked_tree.py`
+  は tracked tree guardrail、`test_legacy_mirror_wrapper_guardrails.py` は wrapper を
+  実行しない 2 件 + direct-module refusal 1 件。
+- `tests/support/legacy_mirror_tree_fixture.py` は `_MirrorTreeFixture` の逐語移動で
+  あり test を含まないので、この表の 127 には入らない。
+
+**T3 / T4 と T6 は交差しない [導出]。** T3 / T4 が触る test module は
+`test_owned_descriptor_teardown.py` の 1 つである。同 module の `os_patch` は **0** —
+retention 機械の 19 件は `owned_descriptors._ledger` / `_Occurrence` /
+`_Retention._enqueue` を差し替えるのであって `os` primitive を注入しないためである
+[実測: A.2 の surface 分類]。したがって T6 の consumer 集合 (`os_patch` 非 0 の
+5 module) に `test_owned_descriptor_teardown.py` は**含まれない**。
+
+> R6 まで §7 は「T6 は T2 / T3 とは触る file が交わらないので並行可能」と
+> **根拠なしに断定**していた。consumer を特定していない以上それは導出できない。
+> 上の表を出して初めて主張になる。
+
 ## 6. Hypothesis 採否
 
 ### 6.1 判定
@@ -971,11 +1015,11 @@ ledger admission の idempotence、occurrence 数の保存則 — に限られ�
 | --- | --- | --- | --- |
 | **T0** | design consultation | — | **完了**: Redmine #14662、Review j#92458 approved |
 | **T-P** | policy doc 改訂 | `vibes/docs/logics/tests-placement-discovery-policy.md` のみ | **完了**: Redmine #14664、Review j#92528 approved → `origin/main-next@6b718673`、required CI success |
-| **T1** | move-only | `tests/unit/.../test_legacy_project_skill_mirror.py` (**削除。削除 owner は T1 のみ**) + `tests/unit/e_130_governance_distribution/**` (21件) + `tests/scenarios/**` (7件) + `tests/regressions/**` (4件 / 2 file) + `tests/integration/e_130_governance_distribution/**` (95件) + `tests/support/legacy_mirror_tree_fixture.py` | §5.0 の宣言どおり **127 件すべてを 1 commit で移動**。**D1 = 127** と **D2 = 自 base で測った `N` の前後一致**。`src/**` diff **byte 0**。commit message に `move-only` |
+| **T1** | move-only | `tests/unit/.../test_legacy_project_skill_mirror.py` (**削除。削除 owner は T1 のみ**) + **§5.5 の 10 module** + `tests/support/legacy_mirror_tree_fixture.py` | §5.0 / §5.5 の宣言どおり **127 件すべてを 1 commit で移動**。**D1 = 127** / **D2 = 自 base で測った `N` の前後一致**。`src/**` diff **byte 0**。catalog に移設先 exact path を追加し `--check` green。**Appendix A に `superseded` を明記して retire** (§8)。commit message に `move-only` |
 | **T2** | behavior change | `src/.../application/legacy_mirror_sync.py` + `src/.../domain/**` | 状態遷移を filesystem effect から分離。1.1–1.3 の遷移表が pure に評価できる。T1 の test が無改変で green |
-| **T3** | behavior change | `src/.../application/owned_descriptors.py` + T1 が作った E-pure module | 3.2(a) の carrier 差し替え seam を公開面へ。private patch を減らす |
-| **T4** | test-only 書き換え | T1 が作った E-pure module のみ | 3.2(b) を公開 API 経由へ言い換え。`src/**` 不変 |
-| **T6** | behavior change (test 側) | `tests/support/legacy_mirror_fault_schedule.py` (新規) + それを使う test module | 共有 fault schedule fake の**新規作成**。個別 mock の重複を縮小 |
+| **T3** | behavior change | `src/.../application/owned_descriptors.py` + `tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py` | 3.2(a) の carrier 差し替え seam を公開面へ。private patch を減らす |
+| **T4** | test-only 書き換え | `tests/unit/.../test_owned_descriptor_teardown.py` のみ | 3.2(b) を公開 API 経由へ言い換え。`src/**` 不変 |
+| **T6** | behavior change (test 側) | `tests/support/legacy_mirror_fault_schedule.py` (新規) + **§5.5 で `os_patch` 非 0 の 5 module のみ**: `tests/integration/.../test_legacy_mirror_fault_injection.py` (29) / `tests/integration/.../test_platform_capability_probe_io.py` (2) / `tests/regressions/test_issue_14580_reused_descriptor_number_close.py` (2) / `tests/regressions/test_issue_14651_capability_advertisement.py` (2) / `tests/unit/.../test_platform_capability_probe.py` (1) | 共有 fault schedule fake の**新規作成**。個別 mock の重複を縮小。**`os_patch` が 0 の module には触らない** |
 
 **移設を行き先ごとに分割しない [R5-F1 修正]。** R5 まで本 doc は regressions 4 件を
 別 Task (T5) に切り、`T1 → T5` を要求していた。**これは実行不能である** — T1 が元
@@ -1012,7 +1056,10 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
 - T2 と T3 は **別 module** を持つので並行可能。ただし両者とも T1 の完了を待つ
   (移設前の test を編集すると move が汚れる)。
 - T4 は T3 と**同じ file** に触る可能性があるため、**T3 の後**に直列化する。
-- T6 は T1 の後。T2 / T3 とは触る file が交わらないので並行可能。
+- T6 は T1 の後。**T3 / T4 とは交差しない** — T3 / T4 が触る test module は
+  `test_owned_descriptor_teardown.py` の 1 つで、その `os_patch` は **0** なので
+  T6 の consumer 集合に含まれない (§5.5 の表で判定できる)。したがって並行可能。
+  T2 とは `src/**` と `tests/**` で面が分かれる。
 - **T5 は撤去した** (T1 に統合)。以降の Task 番号は R5 までの記載と互換のため詰めない。
 
 依存順: `T0 → T-P → T1 → {T2, T3, T6}`、`T3 → T4`。**T0 / T-P は完了済み。**
@@ -1052,32 +1099,36 @@ file 名も役割どおり `legacy_mirror_tree_fixture.py` とする。
 4. **移設 Task の着手判断** — T0 / T-P が完了し policy 上の hold は解除されたが、
    lane 再開・dispatch そのものは coordinator 所有である。本 doc は移設を開始しない。
 
-> **解決済み (R5):** 「配置 matrix を決める」と「実装 Task 境界 / changed-path
-> ownership」は §5.0 / §7 で確定した。R4 まで OPEN としていた T0 は Redmine #14662
+> **解決済み (R6):** 「配置 matrix を決める」と「実装 Task 境界 / changed-path
+> ownership」は §5.0 / §5.5 / §7 で確定した。R5 の同 2 項目は Review j#92566 の
+> F1 / F2 により要修正であり (実行不能な T1→T5 と分岐 2 の 1 件誤分類)、**R6 が
+> 初めて** 7 / 95 の matrix と単一 move commit の T1 に直した。R4 まで OPEN としていた T0 は Redmine #14662
 > (Review j#92458) が裁定し、その doc 反映 T-P は #14664 (Review j#92528) が
 > `origin/main-next@6b718673` へ land させ required CI success を得ている。
 > 「`tests/regressions/` 移設の file 粒度」も §5.0 分岐 3 の宣言 (2 file / 4 件) で
 > 確定したので未確認事項から外した。
 
-### 導出器の恒久的な置き場 [未確認]
+### 導出器の lifecycle [landed policy の裁定]
 
-**本 revision で再現性そのものは閉じた** — Appendix A に導出器の全文、同 head での
-実行結果、127 件全件の mapping を載せたので、第三者は script を写して再実行し、
-各 test の分岐理由まで独立に検証できる。
+**landed policy が裁定済みである** [`tests-placement-discovery-policy.md`
+`### 導出器 (#14660 Appendix A) の位置づけ`、`origin/main-next@6b718673`]。
+本 doc に選択の余地は無いので、その disposition をここに写す:
 
-残る問いは**恒久的な置き場**である。Appendix A は「この head の測定を検証できる」を
-満たすが、**doc と script の drift を検出する仕組みが無い** — test file が変われば
-Appendix A の数値は古くなるのに、それを落とす gate が無い。
+- **Appendix A に据え置く** (`tests/support/` へ昇格しない)。導出器は移設前の単一
+  file を引数に取り、A.3 は `assert len(rows) == 127` を持つので、**移設完了時点で
+  subject が消えて実行不能になる** — 恒久 gate に見せかけた一時 gate を CI に足さない。
+  `### support` の定義 (test から import される共有 fixture) にも合わない。
+- **drift window は「裁定 → T1 完了」に限定**し、その窓の drift 検出は T1 の完了条件
+  とする (A.1 再実行 + A.4 / A.5 照合)。
+- **T1 完了時に Appendix A へ `superseded` と明記して retire する。** §7 の T1 完了
+  条件に入れた。
+- **移設後に残る恒久不変条件は D1 / D2 の command** であって script ではない (§5.3)。
 
-- **案 A** — 導出器を `tests/support/` へ移し、共有 oracle にする。
-  「列挙が漏れたら oracle を自分の外へ出す」という repo の既存方針と整合し、
-  分割後も同じ分類を再実行できる。ただし support 配下に「test ではないが CI で
-  実行されない script」を置くことになり、腐敗検出の手段が別途要る。
-- **案 B** — Appendix A のまま据え置き、更新を各移設 Task の完了条件にする。
-  追加の実行面を作らないが、drift 検出は人手に依存する。
+> R6 まで本節は案 A / 案 B を並べ「本 Task では決めない。T0 と同じ round で裁定を
+> 求める」と書いていた。**その裁定は既に下りて land 済であり、未決へ戻していた。**
+> ImplDone / Review Request 側には正しく書きながら doc に反映していなかったもので、
+> 「更新を書いた場所以外にも残る」class の再発である。
 
-**本 Task では決めない** (allowed scope が docs/catalog-only であり、案 A は
-`tests/` への書き込みを要する)。T0 と同じ round で裁定を求める。
 
 ---
 
