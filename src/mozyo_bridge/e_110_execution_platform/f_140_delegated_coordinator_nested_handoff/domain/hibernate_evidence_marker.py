@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from .marker_value_contract import is_exact_str
 from .hibernate_evidence_envelope import (
     EnvelopeParseError,
     LaneEvidenceEnvelope,
@@ -180,7 +181,10 @@ def render_hibernate_evidence(
     pass: an explicit ``run=""`` is a value the caller wrote, and refusing it is the same rule, not
     an extra one.
     """
-    if kind not in HIBERNATE_EVIDENCE_KINDS:
+    # EXACT builtin, not just membership (review j#94038 blocker 2, swept to this field): `kind` is
+    # f-string'd into `gate=`, so a `str` subclass equal to a real kind passed the closed vocabulary
+    # and rendered `gate=evil:head=forged` — field injection into the gate field itself.
+    if not is_exact_str(kind) or kind not in HIBERNATE_EVIDENCE_KINDS:
         raise ValueError(f"unknown hibernate evidence kind {kind!r}")
     if kind in _HEAD_BEARING_EVIDENCE and not envelope.head:
         raise ValueError(f"{kind} evidence requires a head-bearing envelope")

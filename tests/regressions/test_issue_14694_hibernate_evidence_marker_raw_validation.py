@@ -740,6 +740,24 @@ class SubclassCannotRewriteWhatWasValidatedTests(unittest.TestCase):
                 lambda: render_workflow_event_marker(rewritten("review_request", "bogus")),
             ),
             (
+                # Self-detected while sweeping: `kind` was membership-checked and then f-string'd
+                # into `gate=`, so a subclass equal to a real kind injected into the gate field.
+                "evidence kind",
+                lambda: ev.render_hibernate_evidence(
+                    rewritten(ev.EVIDENCE_PARK_DECLARED, "evil:head=forged"),
+                    envelope=envelope(head=""),
+                ),
+            ),
+            (
+                "integration disposition",
+                lambda: ie.render_integration_evidence(
+                    envelope=envelope(),
+                    integration_head=INTEGRATION_HEAD,
+                    integration_branch="main-next",
+                    disposition=rewritten("merge", "evil:x=1"),
+                ),
+            ),
+            (
                 "envelope workspace",
                 lambda: ev.render_hibernate_evidence(
                     ev.EVIDENCE_PARK_DECLARED,
