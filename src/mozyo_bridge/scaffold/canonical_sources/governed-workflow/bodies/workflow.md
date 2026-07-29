@@ -819,6 +819,14 @@ impact resolver の推奨が fail-closed に `full` の場合は、full suite �
 
 ## Journal Templates
 
+### Gate Heading Canonical Literal
+
+durable gate journal の heading は canonical literal `## Gate: <gate>` に固定する。`<gate>` は `### Gate Schema` と本節の template が定義する gate token を **その綴りのまま (lower snake_case)** 書く。journal heading と structured marker (`gate=<gate>`) が同一 token の同一綴りを指すため、同じ gate に二つの綴りが生まれない。round・補足は gate token 本体へ埋め込まず、bounded qualifier (` — R3`)、trailing `(...)`、または body field へ置く。gate token を言い換えると workflow projection が anchor を失う。
+
+読取側 (`workflow glance` 等) は既存 journal を読み続けるために、case を畳んだ綴りと `_` を空白へ開いた綴り (例: `review_request` に対する `Review Request`) も同じ gate として受理する。これは **過去の記録を読むための alias contract であって、新規に書いてよい綴りではない**。alias を canonical と読み替えて綴りを増やさない。
+
+この canonical literal は本節を正本とする。配布 skill、role profile template、scaffold 生成物などの下流 instruction 面は本節の綴りに従い、独自の canonical literal を宣言しない。
+
 ```markdown
 ## Gate: codex_direct_edit
 - role: 実装者

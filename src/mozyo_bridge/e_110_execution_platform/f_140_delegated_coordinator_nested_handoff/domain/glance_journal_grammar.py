@@ -145,31 +145,63 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 # (j#74307 point 5): dispatch, implementation_done, review_request, audit review,
 # owner_close_approval, blocked, close/retire. The integration disposition is read separately
 # (and typed) by :mod:`...domain.glance_integration_disposition`; it is NOT a lifecycle gate.
+#
+# WRITE side vs READ side (Redmine #14665). The central preset's
+# ``## Journal Templates`` / ``### Gate Heading Canonical Literal`` fixes ONE canonical
+# spelling a producer may write — ``## Gate: <gate>`` with the Gate Schema's own lower
+# snake_case token — so a journal heading and its structured marker (``gate=<gate>``) name the
+# same token the same way. The read side additionally accepts the space-opened spelling
+# (``## Gate: Review Request``; case is folded by the normalization) so journals written before
+# that ruling stay readable. That alias is DERIVED from the canonical token below, never
+# hand-maintained beside it — the twin lists were how the preset and the skill drifted into two
+# different "canonical" literals in the first place.
 # ---------------------------------------------------------------------------
 
-_HEADING_GATE: dict[str, str] = {
+#: The canonical WRITE-side gate tokens: the spelling a governed producer is told to write,
+#: mapped to the lifecycle gate the heading establishes. The Gate Schema token IS the literal.
+CANONICAL_GATE_TOKENS: dict[str, str] = {
     "start": GATE_START,
+    "implementation_done": GATE_IMPLEMENTATION_DONE,
+    "review_request": GATE_REVIEW_REQUEST,
+    "review": GATE_REVIEW,
+    "owner_close_approval": GATE_OWNER_CLOSE_APPROVAL,
+    "blocked": GATE_BLOCKED,
+    "task_close": GATE_CLOSE,
+    "close": GATE_CLOSE,
+}
+
+#: READ-side only: non-canonical wordings durable journals have used and must keep folding.
+#: A producer must NOT write these; they are here so old records stay readable.
+_ALIAS_GATE_HEADINGS: dict[str, str] = {
     "implementation request": GATE_START,
     "implementation request dispatch": GATE_START,
     "wave rebalance dispatch decision": GATE_START,
     "dispatch": GATE_START,
-    "implementation done": GATE_IMPLEMENTATION_DONE,
-    "implementation_done": GATE_IMPLEMENTATION_DONE,
-    "review request": GATE_REVIEW_REQUEST,
-    "review_request": GATE_REVIEW_REQUEST,
-    "review": GATE_REVIEW,
     # The same-lane reviewer's durable wording for the audit review itself (#13952 j#81029
     # `## Gate: Review Result — changes_requested`). It is the review gate, not a request.
-    "review result": GATE_REVIEW,
     "review_result": GATE_REVIEW,
-    "owner close approval": GATE_OWNER_CLOSE_APPROVAL,
-    "owner_close_approval": GATE_OWNER_CLOSE_APPROVAL,
-    "blocked": GATE_BLOCKED,
-    "close": GATE_CLOSE,
-    "task close": GATE_CLOSE,
-    "task_close": GATE_CLOSE,
     "retire": GATE_CLOSE,
     "retirement": GATE_CLOSE,
+}
+
+
+def canonical_gate_heading(token: str) -> str:
+    """The canonical durable heading literal for ``token`` (Redmine #14665, prefixed shape)."""
+    return f"## Gate: {token}"
+
+
+def _with_spaced_aliases(spellings: dict[str, str]) -> dict[str, str]:
+    """Each spelling plus its ``_``-opened twin, both folding to the same gate."""
+    opened: dict[str, str] = {}
+    for spelling, gate in spellings.items():
+        opened[spelling] = gate
+        opened[spelling.replace("_", " ")] = gate
+    return opened
+
+
+_HEADING_GATE: dict[str, str] = {
+    **_with_spaced_aliases(CANONICAL_GATE_TOKENS),
+    **_with_spaced_aliases(_ALIAS_GATE_HEADINGS),
 }
 
 #: Collision-prone canonical headings that are **explicitly not** the gate they resemble
@@ -237,10 +269,16 @@ _CONCLUSION_RE = re.compile(r"^\s*[-*]?\s*結論\s*[:：]\s*(?P<value>.+?)\s*$",
 # drift test asserts the packaged template mandates exactly these, then folds a journal
 # written to them and asserts the projection. Changing a literal here without changing the
 # template (or vice versa) fails that test.
+#
+# Redmine #14665: the heading literal is no longer spelled out a second time here — it is
+# DERIVED from :data:`CANONICAL_GATE_TOKENS` via :func:`canonical_gate_heading`, so this
+# module, the central preset's ``### Gate Heading Canonical Literal`` and the role profile
+# template cannot each declare a different "canonical" spelling of the same gate token (the
+# preset said ``## Gate: review``, the skill said ``## Gate: Review Request``).
 # ---------------------------------------------------------------------------
 
 #: The canonical review-gate heading a reviewer writes (the prefixed shape).
-CANONICAL_REVIEW_HEADING = "## Gate: Review"
+CANONICAL_REVIEW_HEADING = canonical_gate_heading("review")
 
 #: The canonical explicit-conclusion field label on that journal.
 CANONICAL_REVIEW_CONCLUSION_LABEL = "結論"
@@ -759,11 +797,13 @@ def lane_signal_from_gate_facts(
 
 
 __all__ = (
+    "CANONICAL_GATE_TOKENS",
     "CANONICAL_REVIEW_CONCLUSION_LABEL",
     "CANONICAL_REVIEW_CONCLUSION_TOKENS",
     "CANONICAL_REVIEW_HEADING",
     "GateFacts",
     "REVIEW_OUTCOME_BLOCKER",
+    "canonical_gate_heading",
     "fold_issue_gate_facts",
     "lane_signal_from_gate_facts",
 )

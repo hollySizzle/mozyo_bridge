@@ -46,6 +46,17 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SOURCE_ENV_OVERRIDE,
     describe_launch_policy,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.glance_journal_grammar import (
+    canonical_gate_heading,
+)
+
+#: The governed gate this module's durable blocker projection records under. This is the gate
+#: TOKEN (the spelling written into the heading), which is deliberately NOT the ``GATE_BLOCKED``
+#: lane-gate constant: several tokens can map to one gate (``task_close`` and ``close`` both mean
+#: ``GATE_CLOSE``), so a gate value is not a spelling and the two must not be conflated even where
+#: they happen to coincide today. Pinned against ``CANONICAL_GATE_TOKENS`` by the #14665
+#: regression, so renaming the token here without renaming it in the contract fails.
+LEASE_BLOCKER_GATE_TOKEN = "blocked"
 
 
 # --- readiness ---------------------------------------------------------------
@@ -258,10 +269,19 @@ def _blocker_already_projected(source, issue: str, marker: str) -> bool:
 
 
 def _format_lease_blocker_note(blocker: dict[str, Any], marker: str) -> str:
-    """Render the redaction-safe durable blocker note (canonical Blocked heading + the dedup marker)."""
+    """Render the redaction-safe durable blocker note (canonical blocked heading + the dedup marker).
+
+    The heading is BUILT from :func:`canonical_gate_heading`, not spelled here (Redmine #14665
+    review j#92560): this function POSTs to a durable Redmine journal, so it is a write-side
+    producer of the governed gate contract exactly as a role profile template is. It used to
+    write ``## Gate: Blocked``, which the central preset's ``### Gate Heading Canonical Literal``
+    demoted to a READ-side alias — a durable writer emitting the alias would have kept minting
+    non-canonical records. Deriving the literal means this writer cannot drift from the contract
+    again. The reader is unaffected: both spellings fold to the same ``blocked`` gate.
+    """
     diag = blocker["callback_lease_diagnosis"]
     lines = [
-        "## Gate: Blocked — callback-sweep lease store inconsistent",
+        f"{canonical_gate_heading(LEASE_BLOCKER_GATE_TOKEN)} — callback-sweep lease store inconsistent",
         "",
         marker,
         "",

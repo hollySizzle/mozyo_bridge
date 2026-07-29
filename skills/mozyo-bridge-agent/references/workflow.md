@@ -1054,6 +1054,8 @@ assistant provider に渡された依頼はこれを変えない。`## Claude / 
 
 各 role の custom instruction (固定 role profile 本文) の template を以下に示す。`<...>` は handoff の structured field で埋めるプレースホルダである。mozyo-bridge の handoff runtime では、この template 本文は packaged 設定 (`role_profile_templates.yaml`) が runtime source of truth として搬送・展開する。
 
+template 本文が名指しする durable gate heading の canonical literal (`## Gate: <gate>`、`<gate>` は lower snake_case の gate token) は central preset `## Journal Templates` の `### Gate Heading Canonical Literal` を正本とする。本リファレンスはその綴りに従うだけで、独自の canonical literal を宣言しない。読取側が過去 journal のために受理する空白・case の alias は「読むための contract」であり、新規に書いてよい綴りではない。
+
 ```text
 # role profile: coordinator
 - あなたは <project> の最上位 coordinator (管制塔 Codex) である。
@@ -1089,7 +1091,7 @@ assistant provider に渡された依頼はこれを変えない。`## Claude / 
 - durable anchor の `work_unit` 宣言を per-dispatch override > repo-local `work_unit.granularity` > built-in `user_story` fallback で解決した effective work unit と照合する。`user_story` では 1 US 配下の Task / Test / Bug を同一 lane の 1 dispatch で一気通貫に扱う。
 - 親 US を持つ `leaf_issue` dispatch は独立した durable owner/operator decision anchor を確認し、task-level review の必要性を leaf dispatch の根拠にしない。
 - same-lane の implementation_worker へ submit 完結で route する。`changes_requested` は same-lane worker へ単回送達し、blind re-send しない。
-- review 結論は durable journal へ canonical heading `## Gate: Review` と明示 `結論: 承認 | 要修正 | blocker` の 1 組で記録する。この heading / 結論 語彙は `workflow glance` が最新 review を認識する契約であり、言い換えない。coordinator が後から pointer journal を足す前提にしない。
+- review 結論は durable journal へ canonical heading `## Gate: review` と明示 `結論: 承認 | 要修正 | blocker` の 1 組で記録する。この heading / 結論 語彙は `workflow glance` が最新 review を認識する契約であり、言い換えない。coordinator が後から pointer journal を足す前提にしない。
 - review_result が `approved` のときは上位 (<upstream_coordinator>) へ状態だけを callback し、diff review を main で重複させない。
 - blocked / review-ready / owner-action-needed を上位 (<upstream_coordinator>) へ callback する。
 - callback outcome (sent / blocked / not-attempted) を durable 記録する。actual target が self-route / foreign lane / ambiguous、または delivery が uncertain なら fail-closed で停止し、blind retry しない。
@@ -1103,7 +1105,7 @@ assistant provider に渡された依頼はこれを変えない。`## Claude / 
 # role profile: implementation_worker
 - あなたは <lane> の implementation_worker (sublane Claude) である。
 - durable anchor <durable_anchor> から実装し、implementation_done / review_request / verification / residual risk を記録する。
-- durable gate heading は canonical literal に固定する (`## Gate: Implementation Done` / `## Gate: Review Request`)。round・説明は gate token 本体へ埋め込まず、bounded qualifier (` — R3`) か body field へ置く。gate token を言い換えると `workflow glance` が anchor を失う。
+- durable gate heading は canonical literal に固定する (`## Gate: implementation_done` / `## Gate: review_request`)。round・説明は gate token 本体へ埋め込まず、bounded qualifier (` — R3`) か body field へ置く。gate token を言い換えると `workflow glance` が anchor を失う。
 - implementation / review finding verdict / correction を durable 記録し、same-lane gateway (<gateway_callback_target>) へ返す。
 - owner approval 回収・issue close・coordinator-owned 仕様決定の自己確定はしない。
 - main coordinator や foreign lane へ直接 callback せず、same-lane gateway を経由する階層 route を維持する。
