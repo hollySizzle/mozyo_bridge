@@ -764,11 +764,11 @@ class CanonicalDecisionGrammarTest(unittest.TestCase):
     """A decision is read from the NAMED journal, and a quotation is never one (j#90329 c5)."""
 
     def _read(self, notes, action="bootstrap_lane"):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
-            marker_fields_in_note,
-        )
-
-        return canonical_decision_in_journal(notes, action=action, parse=marker_fields_in_note)
+        # No parser is injected any more (Redmine #14667). The reader used to take one, and these
+        # tests handed it the LENIENT fold — so the grammar under test was the caller's choice
+        # rather than the rail's, and a strict reader could have been added without a single test
+        # exercising it. The scan and its strictness are the shared authority's now.
+        return canonical_decision_in_journal(notes, action=action)
 
     def test_a_canonical_marker_is_a_decision(self):
         decision, refusal = self._read(f"body\n{BOOTSTRAP_MARKER}")
@@ -836,11 +836,11 @@ class QuotedDecisionShapeTest(ProxySendTestBase):
     )
 
     def _read(self, notes, action="bootstrap_lane"):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
-            marker_fields_in_note,
-        )
-
-        return canonical_decision_in_journal(notes, action=action, parse=marker_fields_in_note)
+        # No parser is injected any more (Redmine #14667). The reader used to take one, and these
+        # tests handed it the LENIENT fold — so the grammar under test was the caller's choice
+        # rather than the rail's, and a strict reader could have been added without a single test
+        # exercising it. The scan and its strictness are the shared authority's now.
+        return canonical_decision_in_journal(notes, action=action)
 
     def test_the_live_acceptance_note_is_not_a_decision(self):
         _d, refusal = self._read(self.LIVE_QUOTED_NOTE)

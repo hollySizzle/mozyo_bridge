@@ -3,7 +3,7 @@
 In a single-Redmine-author workspace every role posts through the same account, so a journal's
 writer role cannot be resolved from author identity. The ruling adopts the one thing the
 workspace CAN durably express: the **canonical gate structure -> contractual writer role**
-mapping the producer ruling itself defines (j#85530 Q3), bound to the committed role/provider
+mapping each gate's OWN ruling defines (see ``contract_ruling_pointer``), bound to the committed role/provider
 configuration by exact git blob.
 
 **This is a policy binding, NOT identity authentication** (the ruling's own words). It answers
@@ -27,7 +27,9 @@ from typing import Optional
 
 from .hibernate_evidence_authority import (
     ISSUER_UNKNOWN,
+    HIBERNATE_EVIDENCE_RULING,
     ResolvedIssuer,
+    contract_ruling_pointer,
     contract_writer_role,
 )
 from .glance_integration_disposition import canonical_marker_value
@@ -39,8 +41,12 @@ from .redmine_journal_source import (
     strict_marker_fields,
 )
 
-#: The ruling that defines the gate->writer-role contract this policy binds to.
-POLICY_RULING_POINTER = "redmine:#14219:j#85530:Q3"
+#: The ruling that founded this policy module. Retained as the compatibility default for the
+#: hibernate-evidence gates it was written for; the anchor a resolution actually cites now comes
+#: from the GATE's own ruling (:func:`...hibernate_evidence_authority.contract_ruling_pointer`),
+#: because a repo-wide pointer attributes every future gate to a record that never mentioned it
+#: (Redmine #14661 j#92715).
+POLICY_RULING_POINTER = HIBERNATE_EVIDENCE_RULING
 
 #: The committed configuration file whose exact blob the binding is anchored to.
 CONFIG_RELPATH = ".mozyo-bridge/config.yaml"
@@ -114,8 +120,12 @@ def resolve_journal_issuer(
         # an ANCHORED unknown would be a resolution-shaped value for an unresolved question.
         return ResolvedIssuer()
 
+    ruling = contract_ruling_pointer(gate)
+    if not ruling:
+        # A gate whose writer contract no ruling claims cannot be anchored to one.
+        return ResolvedIssuer()
     anchor = (
-        f"{POLICY_RULING_POINTER} {policy_pointer} "
+        f"{ruling} {policy_pointer} "
         f"evidence:redmine:j#{str(journal_id).strip()}:gate={gate}"
     )
 

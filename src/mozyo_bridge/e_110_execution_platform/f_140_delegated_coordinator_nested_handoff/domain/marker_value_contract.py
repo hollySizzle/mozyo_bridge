@@ -23,7 +23,7 @@ class MarkerValueError(ValueError):
 
 
 def validate_marker_field_value(field: str, value: object, *, what: str = "marker") -> str:
-    """The stripped value, or raise — the PRODUCER-side twin of the strict readers (pure).
+    """The value as given, or raise — the PRODUCER-side twin of the strict readers (pure).
 
     Promoted from :mod:`...domain.callback_recovery_key`, which hardened exactly this check for
     the recovery-admission channel (its ``_FORBIDDEN_VALUE_CHARS`` / ``_validate_value``) and now
@@ -38,8 +38,17 @@ def validate_marker_field_value(field: str, value: object, *, what: str = "marke
     AROUND a component: ``lane_id='r 1'`` does round-trip today, but a producer that has to
     reason about which whitespace survives is one refactor away from emitting the kind that does
     not. A producer should only emit what it is certain reads back.
+
+    "ANY whitespace" means the value AS GIVEN (Redmine #14667 review j#93063). This function used
+    to ``.strip()`` before checking, so the rule it stated was not the rule it applied: surrounding
+    whitespace was silently normalized away and only INTERNAL whitespace was ever refused. A caller
+    passing ``lane=' r1'`` got a clean marker back and no indication that its argument was not what
+    got written — and in the proxy rail that normalization reached a send. Normalizing an invalid
+    value is how a producer ends up emitting something its caller did not ask for; the boundary's
+    job is to refuse it and say so. Callers that genuinely hold untrimmed input must trim it
+    themselves, deliberately, before they claim the value is what they mean.
     """
-    text = str(value if value is not None else "").strip()
+    text = str(value if value is not None else "")
     if not text:
         raise MarkerValueError(
             f"{what} field {field!r} is empty; a blank field names nothing and the strict "

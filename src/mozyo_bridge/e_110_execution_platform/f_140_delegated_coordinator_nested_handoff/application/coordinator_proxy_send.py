@@ -36,7 +36,6 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping, Optional, Protocol, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.canonical_note_scan import (  # noqa: E501
-    canonical_note_lines,
     canonical_note_text,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
@@ -59,7 +58,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ZERO_SEND,
     ProxyDecision,
     ProxyLinks,
-    ACTION_DECISION_TOKENS,
     ACTION_SCOPES,
     SCOPE_ISSUE,
     DecisionRecord,
@@ -153,82 +151,16 @@ def live_agent_rows(env: Mapping[str, str]) -> Sequence[Mapping]:
         return ()
 
 
-#: The workflow-event marker channel whose ``gate`` / ``kind`` field names a durable decision.
-_WORKFLOW_EVENT_CHANNEL = "workflow-event"
-
-#: The marker field that binds a decision to the proxy action it authorizes (Design Answer j#90329
-#: contract 5). Without it the same ``implementation_request`` token had to serve every purpose, so
-#: "which action does this decision authorize" was never expressed and had to be guessed from the
-#: issue's history — which is what let a quotation elsewhere on the issue become authority, and then
-#: what let the anti-quotation rule poison the issue permanently.
-DECISION_ACTION_FIELD = "proxy_action"
-
-def canonical_decision_in_journal(
-    notes: str, *, action: str, parse
-) -> "tuple[Optional[DecisionRecord], str]":
-    """The single canonical decision a NAMED journal carries for ``action``, or a refusal reason.
-
-    Reads exactly one journal — the one the invocation named — instead of scanning the issue's
-    history (Design Answer j#90329 contract 5). The history scan was the root of both failures: a
-    quotation anywhere on the issue became a candidate, and the rule that refused two candidates
-    then made the issue permanently unusable. Neither can happen when the only text considered is
-    the named journal's, with quotations stripped first.
-
-    Canonicality is exact: the note must carry **exactly one** top-level workflow-event marker whose
-    token is accepted for this action AND whose :data:`DECISION_ACTION_FIELD` names that action.
-    Zero, two-or-more, or a marker that names a different action are all refusals with a fixed
-    reason; the caller turns those into zero-send statuses.
-
-    What counts as a quotation is **not** decided here (Redmine #14585): the rule set lives in the
-    shared :mod:`...domain.canonical_note_scan` authority that this rail and the Redmine journal
-    reader both call, so the two cannot drift apart on the question. "Top-level" is enforced, not
-    merely described: the scan runs **per canonical line** over :func:`canonical_note_lines`'s
-    output. The marker grammar's body is ``[^\\]]*``, which spans newlines, so scanning the blanked
-    note as one string would let an unclosed ``[mozyo:`` on a quoted line close on a ``]`` further
-    down and read as a marker that no single line contains. Feeding ``parse`` one canonical line at
-    a time keeps that property structural rather than a promise about the injected ``parse``.
-    """
-    accepted = ACTION_DECISION_TOKENS.get(normalize_action(action), ())
-    found: list = []
-    for line in canonical_note_lines(notes):
-        for channel, fields in parse(line):
-            if channel != _WORKFLOW_EVENT_CHANNEL:
-                continue
-            token = (fields.get("gate") or fields.get("kind") or "").strip()
-            if token not in accepted:
-                continue
-            found.append((token, fields))
-    if not found:
-        return None, "no_canonical_decision"
-    if len(found) >= 2:
-        return None, "duplicate_canonical_decision"
-    token, fields = found[0]
-    declared = (fields.get(DECISION_ACTION_FIELD) or "").strip()
-    if declared != normalize_action(action):
-        return None, "action_not_declared"
-    return (
-        DecisionRecord(
-            journal="",  # filled by the caller with the OWNING entry id, never self-reported
-            token=token,
-            lane=(fields.get("lane") or "").strip(),
-            lane_generation=(fields.get("lane_generation") or "").strip(),
-        ),
-        "",
-    )
-
-
-def render_bootstrap_decision_marker(lane: str = "", lane_generation: str = "") -> str:
-    """The canonical decision marker a coordinator writes to authorize a proxy action (producer).
-
-    ``proxy_action`` is what makes the decision unambiguous about *what it authorizes*; the reader
-    refuses a marker that omits it. A lane-scoped action additionally names its lane and generation.
-    """
-    marker = f"[mozyo:workflow-event:gate=implementation_request:{DECISION_ACTION_FIELD}="
-    if lane.strip():
-        return (
-            marker + f"dispatch_next:lane={lane.strip()}:lane_generation={(lane_generation or '').strip()}]"
-        )
-    return marker + "bootstrap_lane]"
+#: The proxy decision's marker grammar — producer, shapes, reader — now lives in the pure domain
+#: module beside the decision matrix (Redmine #14667). It is re-exported here because this module's
+#: ``__all__`` is the import site every caller and test already uses, and because the rail's own
+#: docstring is where the grammar's role in the send decision is explained.
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy_decision import (  # noqa: E501,E402
+    DECISION_ACTION_FIELD,
+    canonical_decision_in_journal,
+    canonical_decision_shapes,
+    render_bootstrap_decision_marker,
+)
 
 
 def live_named_journal_note(args: argparse.Namespace, issue: str, journal: str) -> "tuple[str, bool]":
@@ -553,18 +485,12 @@ def resolve_proxy_context(
         else ProxyTarget(status=target_status_from_cardinality(0, 0))
     )
 
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
-        marker_fields_in_note,
-    )
-
     decision = None
     decision_refusal = "no_canonical_decision"
     if issue and journal:
         notes, read_ok = read_note(issue, journal)
         if read_ok:
-            decision, decision_refusal = canonical_decision_in_journal(
-                notes, action=action, parse=marker_fields_in_note
-            )
+            decision, decision_refusal = canonical_decision_in_journal(notes, action=action)
             if decision is not None:
                 # The journal id is the OWNING entry's, never the marker's self-report.
                 decision = replace(decision, journal=journal)
@@ -914,6 +840,7 @@ __all__ = (
     "canonical_note_text",
     "canonical_decision_in_journal",
     "render_bootstrap_decision_marker",
+    "canonical_decision_shapes",
     "DECISION_ACTION_FIELD",
     "live_attestation_join",
     "live_lane_expectation",

@@ -209,6 +209,7 @@ rules:
 - name: external-client coordinator proxy delegation rail
   patterns:
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/coordinator_proxy.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/coordinator_proxy_decision.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/canonical_note_scan.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/coordinator_proxy_send.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_proxy.py
@@ -219,6 +220,7 @@ rules:
   - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_coordinator_proxy_send.py
   - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_cli_workflow_step_forward_leg.py
   - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_proxy_ack_authority.py
+  - tests/regressions/test_issue_14667_proxy_send_strict_marker_fold.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/specs/external-client-coordinator-proxy.md と @vibes/docs/specs/herdr-default-lane-workflow-role-authority.md
     と @vibes/docs/specs/herdr-native-identity.md と @vibes/docs/logics/workflow-step-command-design.md と @vibes/docs/logics/managed-state-model.md

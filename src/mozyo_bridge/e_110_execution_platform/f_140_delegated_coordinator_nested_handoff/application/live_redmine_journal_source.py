@@ -202,7 +202,14 @@ def _apply_since(
     kept = [j for j in _journal_mappings(payload) if _after_cursor(j, since)]
     issue = payload.get("issue")
     issue_id = issue.get("id") if isinstance(issue, Mapping) else None
-    return {"issue": {"id": issue_id}, "journals": kept}
+    # Redmine #14661 j#92494: the issue's own author is the durable anchor an approval issuer
+    # is resolved against, so the cursor projection must carry it through. Rebuilding the issue
+    # mapping with only its id silently dropped that authority, which fails closed at the
+    # verifier (correct) but for the wrong reason (a cursored read, not an unattributable one).
+    projected: dict[str, object] = {"id": issue_id}
+    if isinstance(issue, Mapping) and "author" in issue:
+        projected["author"] = issue.get("author")
+    return {"issue": projected, "journals": kept}
 
 
 @dataclass(frozen=True)
@@ -289,6 +296,32 @@ class LiveRedmineJournalSource:
             )
         filtered = _apply_since(payload, self.since)
         return MappingRedmineJournalSource(payload=filtered).read_entries(issue)
+
+    def read_issue_author_id(self, issue_id: str) -> str:
+        """The issue's own opaque author id from a FRESH read, or ``""``. (read-only)
+
+        The durable anchor a destructive approval's issuer is resolved against (#14661
+        j#92494). Same fetch discipline as :meth:`read_entries` — a new network read every
+        call, so it is a real action-time observation rather than a cached one. Returns ``""``
+        (not attributable) when the projection carries no author; the consumer fails closed on
+        that. Identifier only: the display name is never read (値非表示).
+        """
+        issue = str(issue_id or "").strip()
+        if not issue:
+            raise LiveRedmineJournalError(
+                "live Redmine poll requires an issue id (pass --source-issue)"
+            )
+        payload = self.transport(
+            base_url=self.base_url, api_key=self.api_key, issue_id=issue, since=self.since,
+        )
+        if not isinstance(payload, Mapping):
+            raise LiveRedmineJournalError(
+                f"live transport for issue {issue} returned a "
+                f"{type(payload).__name__}, not an issue-detail mapping"
+            )
+        return MappingRedmineJournalSource(
+            payload=_apply_since(payload, self.since)
+        ).issue_author_id()
 
 
 __all__ = (

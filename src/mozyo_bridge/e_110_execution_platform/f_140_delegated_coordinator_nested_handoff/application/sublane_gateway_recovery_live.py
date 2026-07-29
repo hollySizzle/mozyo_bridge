@@ -365,16 +365,24 @@ class LiveGatewayRecoveryOps:
         return None
 
     def _record_observed_turn_start(self, rec) -> bool:
-        """Delegate to the shared generation-authority leaf (#14203 module-health split)."""
+        """Delegate to the shared generation-authority leaf (#14203 module-health split).
+
+        The pinned row revision is passed EXPLICITLY (#14661 review j#92443 F1): this
+        surface spells it ``gateway_revision``, its worker sibling spells it
+        ``worker_revision``, and a defaulted attribute lookup inside the shared seam degrades
+        a mis-spelled pin to a silent never-binds instead of an error.
+        """
         return _gen_authority.record_observed_turn_start(
             rec, request=self.request, repo_root=self.repo_root,
             attestation_home=self.attestation_home,
+            pin_revision=self.request.gateway_revision,
         )
 
     def _record_generation_bound(self, rec) -> bool:
         return _gen_authority.record_generation_bound(
             rec, request=self.request, repo_root=self.repo_root,
             attestation_home=self.attestation_home,
+            pin_revision=self.request.gateway_revision,
         )
 
     def _current_request_generation_token(self) -> str:
