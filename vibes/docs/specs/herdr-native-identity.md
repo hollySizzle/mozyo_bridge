@@ -1266,8 +1266,34 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
       (unpacking / 非 Name target / 未解決 value / 任意の Call RHS) は surface を unreadable
       にする。「許可する層」と「読む層」が同一 resolver なら、両者のずれが**構造的に発生しない**。
     - **class surface は「body が何を束縛するか」ではなく「class が何を持つに至るか」**とする。
-      `ClassDef` 後の member write (module-level の attribute 代入と `setattr`) を index し、
-      対象が解析対象 class なら surface を unreadable にする。
+    - **ただし「write の綴りを列挙する」形は再び破られた** (review j#92902 F11-3)。R10 は
+      `Cls.attr = ...` と `setattr(Cls, ...)` の **2 綴りを列挙**しただけで、
+      `type.__setattr__(Cls, ...)` / alias (`A = Cls; A.__len__ = f`) / helper 経由
+      (`_install(Cls)`) の 3 形を落とした。**列挙で塞いだ穴は次の綴りで開く**。
+      よって問いを「どの write が存在するか」から **「class object が模型化された位置から
+      出ていないか」** へ変える。これは runner taint が最初から使っている escape 規律
+      (模型に無い文脈に値が現れたら報告) と同一であり、本 issue で唯一 review に破られて
+      いない規則である。**新機構ではなく、実績のある規律の適用範囲拡大**として実装する。
+      模型化位置は 2 つだけ: **construction の callee** (`_constructed_class` が解決する) と
+      **`ClassDef` の base** (`_base_classes` が追う)。alias 代入・引数渡し・class object への
+      attribute access・subscript・return はすべて unreadable。**規則採用前の実測**: live tree
+      全体で解析対象 2 class の名前が現れるのは construction callee の 2 箇所のみ。したがって
+      deny-by-default の実コストはゼロであり、**誰も列挙しなかった綴りも同じ規則で落ちる**。
+    - **class-body の Call RHS は例外なく unreadable** (review j#92902 F11-1、裁定 j#92917)。
+      constructor は自分が呼ばれている class namespace を書けるので、構築を解決しても
+      「class が何を持つに至るか」は何も分からない。無害性の証明は任意 Python の解析へ
+      拡張し、本設計の境界と両立しない。**なお本節は R10 時点で既に「任意の Call RHS は
+      unreadable」と書いており、first-party constructor 例外を残していた実装の方が
+      doc から逸脱していた**。F11-1 は未実装の設計ではなく **doc と実装の食い違い**である。
+    - **precision trade を明記する** (裁定 j#92917)。descriptor を持つ class は
+      resolved pair ではなく **explicit report** になる。detection は維持され、失うのは
+      精度だけである。**report は本 oracle の正しい出力であり、silent 化ではない**。
+      既存 descriptor test 2 件の期待値が pair から report へ変わったのはこの trade による。
+    - **member lookup は found / absent / unreadable の tri-state を全 consumer が保持する**
+      (review j#92902 F11-2)。`resolved` flag を捨てて `Optional` に潰すと、「hook が無い」と
+      「members を読めない」が同じ `None` になり、metaclass 由来 descriptor の `__set__` が
+      absent として通った。**この collapse は本 issue が面を変えて繰り返し再発させている
+      唯一の欠陥**なので、型として表現できない形にする。
     - **modelled decorator は証明があるものだけ**にする。`property` は read 時に receiver を
       getter へ bind して **body を解析する**ようにしたので modelled に残る (exception table は
       read が何を**返す**かの契約であり、read が**起きること**の免罪符ではない — この取り違えが

@@ -875,13 +875,22 @@ class DerivationLivenessTests(unittest.TestCase):
         )
         self.assertIn(("probe", "aenter"), derive_dispatch_surface(tree).pairs)
 
-    def test_a_data_descriptor_set_hook_is_analysed(self) -> None:
-        """Review j#92480 F8-1, verdict j#92484.
+    def test_a_data_descriptor_set_hook_is_reported(self) -> None:
+        """Review j#92480 F8-1 (verdict j#92484), retargeted by ruling j#92917.
 
         A data descriptor's ``__set__`` lives on the type of the object the class-level
-        attribute holds — not on the owner, which is where the previous round looked.
-        The descriptor is installed as the real ``_inner``, so the existing
+        attribute holds — not on the owner, which is where an early round looked.  The
+        descriptor is installed as the real ``_inner``, so the existing
         ``self._inner = inner`` triggers it.
+
+        **The expectation changed from a resolved pair to a report**, and the reason is
+        worth stating rather than quietly editing: installing a descriptor means a call on
+        the right-hand side of a class-body binding, and a constructor is free to write the
+        namespace it is called from (j#92902 F11-1).  Resolving such a call precisely
+        requires proving arbitrary Python harmless, so calls are now unreadable without
+        exception.  Detection is preserved — the surface is *reported* — and only the
+        precision is traded away.  What must never happen, then or now, is silence, so the
+        assertion is on the report rather than loosened to accept anything.
         """
         tree = self._mutated_tree(
             "",
@@ -896,7 +905,11 @@ class DerivationLivenessTests(unittest.TestCase):
                 "    _inner = _ProbeDescriptor()\n",
             ),
         )
-        self.assertIn(("probe", "descriptor-set"), derive_dispatch_surface(tree).pairs)
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            surface.unresolved_flows or surface.unresolved_sites,
+            "a descriptor-bearing class surface was neither resolved nor reported",
+        )
 
     def test_an_unresolvable_base_is_not_read_as_having_no_members(self) -> None:
         """Review j#92480 F8-2, verdict j#92484.
@@ -1040,12 +1053,16 @@ class DerivationLivenessTests(unittest.TestCase):
             "an unmodelled class-body statement was read as absent",
         )
 
-    def test_an_annotated_descriptor_binding_is_analysed(self) -> None:
-        """Review j#92541 F9-3, verdict j#92548.
+    def test_an_annotated_descriptor_binding_is_reported(self) -> None:
+        """Review j#92541 F9-3 (verdict j#92548), retargeted by ruling j#92917.
 
         ``_inner: _ProbeDescriptor = _ProbeDescriptor()`` is the ordinary annotated
         spelling.  Scanning only ``ast.Assign`` made it "readable, no descriptor", so the
         F8-1 fix held for one of the two ways Python binds a class attribute.
+
+        Like its plain-``Assign`` sibling above, this now expects a **report** rather than
+        a resolved pair: the binding's right-hand side is a call, and calls are unreadable
+        without exception since j#92902 F11-1.  Precision traded, detection kept.
         """
         tree = self._mutated_tree(
             "",
@@ -1060,9 +1077,10 @@ class DerivationLivenessTests(unittest.TestCase):
                 "    _inner: _ProbeDescriptor = _ProbeDescriptor()\n",
             ),
         )
-        self.assertIn(
-            ("probe", "annotated-descriptor-set"),
-            derive_dispatch_surface(tree).pairs,
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            surface.unresolved_flows or surface.unresolved_sites,
+            "an annotated descriptor binding was neither resolved nor reported",
         )
 
     def test_the_modelled_class_constructs_stay_silent(self) -> None:
@@ -1214,6 +1232,125 @@ class DerivationLivenessTests(unittest.TestCase):
                     ),
                     f"an ordinary class binding ({label}) was reported as unreadable",
                 )
+
+    def test_a_class_body_constructor_side_effect_is_reported(self) -> None:
+        """Review j#92902 F11-1, verdict j#92910, ruling j#92917.
+
+        The constructor writes the class namespace it is being called from.  Resolving the
+        construction said what object the binding held and nothing about what the class
+        ended up with, which is why the first-party exception had to go entirely.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_replace=(
+                "class RecordingHerdrRunner:",
+                "import sys as _probe_sys\n\n\n"
+                "class _ProbeInstaller:\n"
+                "    def __init__(self):\n"
+                "        def _injected(self):\n"
+                '            self(["bin", "probe", "constructor-side-effect"])\n'
+                "            return 1\n"
+                '        _probe_sys._getframe(1).f_locals["__len__"] = _injected\n\n\n'
+                "class RecordingHerdrRunner:",
+            ),
+            recorder_addition="\n\n    _installed = _ProbeInstaller()\n",
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            surface.unresolved_flows or surface.unresolved_sites,
+            "a class-body constructor side effect was not reported",
+        )
+
+    def test_an_unreadable_descriptor_hook_is_not_read_as_absent(self) -> None:
+        """Review j#92902 F11-2, verdict j#92910.
+
+        The descriptor's own members come from a metaclass, so they cannot be enumerated.
+        Discarding that state made "no ``__set__`` here" indistinguishable from "I cannot
+        read this class", and the assignment into the descriptor went unreported.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_replace=(
+                "class RecordingHerdrRunner:",
+                "class _ProbeSetMeta(type):\n"
+                "    def __new__(mcls, name, bases, ns):\n"
+                "        def _injected(self, obj, value):\n"
+                "            if callable(value):\n"
+                '                value(["bin", "probe", "unreadable-descriptor-set"])\n'
+                '            obj.__dict__["_inner"] = value\n'
+                '        ns["__set__"] = _injected\n'
+                "        return super().__new__(mcls, name, bases, ns)\n\n\n"
+                "class _ProbeDesc(metaclass=_ProbeSetMeta):\n"
+                "    pass\n\n\n"
+                "class RecordingHerdrRunner:\n"
+                "    _inner = _ProbeDesc()\n",
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            surface.unresolved_flows or surface.unresolved_sites,
+            "an unreadable descriptor surface was read as having no hook",
+        )
+
+    def test_a_class_object_leaving_its_modelled_positions_is_reported(self) -> None:
+        """Review j#92902 F11-3, verdict j#92910.
+
+        The previous round indexed post-definition writes by listing their spellings, and
+        these three are the ones that listing missed.  They are pinned individually, but
+        what makes them pass is not three more entries: the class object simply may not
+        leave the positions the walk analyses, so a fourth spelling nobody has thought of
+        is covered by the same rule.
+        """
+        cases = {
+            "type.__setattr__": (
+                "\n\ndef _probe_type_setattr_len(self):\n"
+                '    self(["bin", "probe", "type-setattr"])\n'
+                "    return 1\n\n\n"
+                'type.__setattr__(RecordingHerdrRunner, "__len__", _probe_type_setattr_len)\n'
+            ),
+            "alias binding": (
+                "\n\ndef _probe_alias_len(self):\n"
+                '    self(["bin", "probe", "alias-mutation"])\n'
+                "    return 1\n\n\n"
+                "_ProbeAlias = RecordingHerdrRunner\n"
+                "_ProbeAlias.__len__ = _probe_alias_len\n"
+            ),
+            "passed to a helper": (
+                "\n\ndef _probe_helper_len(self):\n"
+                '    self(["bin", "probe", "helper-mutation"])\n'
+                "    return 1\n\n\n"
+                "def _probe_install(target):\n"
+                "    target.__len__ = _probe_helper_len\n\n\n"
+                "_probe_install(RecordingHerdrRunner)\n"
+            ),
+        }
+        for label, addition in cases.items():
+            with self.subTest(spelling=label):
+                tree = self._mutated_tree("", recorder_tail=addition)
+                surface = derive_dispatch_surface(tree)
+                self.assertTrue(
+                    surface.unresolved_flows or surface.unresolved_sites,
+                    f"a class object escaping via {label} was not reported",
+                )
+
+    def test_the_modelled_class_object_positions_stay_silent(self) -> None:
+        """The control for the escape rule.
+
+        Construction and inheritance are the two positions the walk genuinely analyses.
+        If either started reporting, the rule would have degenerated into "any mention of
+        a class is unreadable", and the reports above would prove nothing.  Both are
+        exercised by the untouched live tree and by the sweep's inheritance edge; this
+        pins the construction case directly.
+        """
+        surface = _surface()
+        self.assertEqual(
+            ([], []),
+            (
+                list(surface.unresolved_flows),
+                [s.anchor for s in surface.unresolved_sites],
+            ),
+            "the live tree constructs both runner classes and must stay silent",
+        )
 
     def test_the_probe_does_not_touch_the_live_source(self) -> None:
         """Probe hygiene: mutating the copy must leave the real tree byte-identical.

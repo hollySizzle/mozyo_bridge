@@ -11,7 +11,7 @@ The controls are load-bearing: a derivation that reported everything would satis
 mutant while being useless, so a benign counter read, a probe-free tree, and each class
 construct the walk claims to model must stay silent.
 
-**Opt-in.**  48 tree copies and 48 full derivations run for about six minutes, which does
+**Opt-in.**  53 tree copies and 53 full derivations run for about seven minutes, which does
 not belong in every ``unittest discover``.  Set ``MOZYO_DERIVATION_EDGE_SWEEP=1`` to run
 it.  The per-edge regressions that must never regress silently live in
 ``tests/unit/.../test_disposable_smoke_command_surface.py`` and run unconditionally.
@@ -292,6 +292,42 @@ CLASS_BINDING_EDGES = [
     ("CONTROL binding: bare annotation", "\n\n    probe_unbound: int\n", None, False),
 ]
 
+# -- class OBJECT escape (review j#92902 F11) -------------------------------------------
+# These are not eight more spellings.  The three mutation rows all pass for one reason —
+# the class object left the two positions the walk analyses — and a fourth spelling nobody
+# has written down is covered by that same rule.  The controls pin the two modelled
+# positions, without which the rule would just mean "everything is unreadable".
+CLASS_ESCAPE_EDGES = [
+    ("escape: type.__setattr__", None,
+     '\n\ndef _probe_type_setattr_len(self):\n    self(["bin", "probe", "type-setattr"])\n'
+     '    return 1\n\n\ntype.__setattr__(RecordingHerdrRunner, "__len__", _probe_type_setattr_len)\n',
+     True),
+    ("escape: alias binding", None,
+     '\n\ndef _probe_alias_len(self):\n    self(["bin", "probe", "alias-mutation"])\n'
+     "    return 1\n\n\n_ProbeAlias = RecordingHerdrRunner\n_ProbeAlias.__len__ = _probe_alias_len\n",
+     True),
+    ("escape: passed to a helper", None,
+     '\n\ndef _probe_helper_len(self):\n    self(["bin", "probe", "helper-mutation"])\n'
+     "    return 1\n\n\ndef _probe_install(target):\n    target.__len__ = _probe_helper_len\n\n\n"
+     "_probe_install(RecordingHerdrRunner)\n", True),
+    ("construction: class-body constructor side effect",
+     "\n\n    _installed = _ProbeInstaller()\n", None, True),
+    ("CONTROL escape: construction callee stays modelled", None,
+     "\n\n_probe_constructed = RecordingHerdrRunner(None)\n", False),
+]
+
+# Injected ahead of the recorder class so the constructor-side-effect row can name it.
+INSTALLER = (
+    "import sys as _probe_sys\n\n\n"
+    "class _ProbeInstaller:\n"
+    "    def __init__(self):\n"
+    "        def _injected(self):\n"
+    '            self(["bin", "probe", "constructor-side-effect"])\n'
+    "            return 1\n"
+    '        _probe_sys._getframe(1).f_locals["__len__"] = _injected\n\n\n'
+    "class RecordingHerdrRunner:"
+)
+
 DECLARED_METHOD = (
     "attribute call: declared method dispatching",
     None,
@@ -331,7 +367,7 @@ def run_edge(init_inj, tail_inj, owner_inj):
 
 
 
-def run_binding_edge(body_inj, tail_inj):
+def run_binding_edge(body_inj, tail_inj, class_replace=None):
     """Inject a class binding (or a post-definition write) into the recorder module.
 
     Reported is measured over the whole surface, as in :func:`run_class_edge`: a binding
@@ -343,6 +379,9 @@ def run_binding_edge(body_inj, tail_inj):
                         ignore=shutil.ignore_patterns("__pycache__"))
         recorder = tmp / RECORDER
         s = recorder.read_text()
+        if class_replace:
+            assert RECORDER_CLASS in s, "the recorder class statement moved"
+            s = s.replace(RECORDER_CLASS, class_replace, 1)
         if body_inj:
             assert TAIL in s, "the recorder body injection point moved"
             s = s.replace(TAIL, TAIL + body_inj, 1)
@@ -404,10 +443,20 @@ class DerivationEdgeSweepTests(unittest.TestCase):
             got, _pairs = run_binding_edge(body_inj, tail_inj)
             if got != expect:
                 mismatches.append(f"{label}: expected reported={expect}, got {got}")
+        for label, body_inj, tail_inj, expect in CLASS_ESCAPE_EDGES:
+            needs_installer = body_inj is not None and "_ProbeInstaller" in body_inj
+            got, _pairs = run_binding_edge(
+                body_inj, tail_inj, class_replace=INSTALLER if needs_installer else None
+            )
+            if got != expect:
+                mismatches.append(f"{label}: expected reported={expect}, got {got}")
         self.assertEqual(mismatches, [], "\n".join(mismatches))
         self.assertGreaterEqual(
-            len(rows) + len(CLASS_CONSTRUCTION_EDGES) + len(CLASS_BINDING_EDGES),
-            48,
+            len(rows)
+            + len(CLASS_CONSTRUCTION_EDGES)
+            + len(CLASS_BINDING_EDGES)
+            + len(CLASS_ESCAPE_EDGES),
+            53,
             "the sweep lost edges",
         )
 

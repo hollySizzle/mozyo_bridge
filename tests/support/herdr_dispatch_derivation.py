@@ -740,47 +740,58 @@ class _Walker:
             resolved.append(found)
         return (tuple(resolved), unresolved)
 
-    def _index_post_definition_mutations(self) -> set:
-        """Classes whose members are written after the ``class`` statement has run.
+    def _index_escaped_classes(self) -> set:
+        """Classes whose object escapes into a position this walk does not model.
 
-        Review j#92639 F10-2: reading a ``ClassDef`` describes what the body binds, and
-        ``RecordingHerdrRunner.__len__ = _probe_post_len`` at module level binds a member
-        that the body will never mention.  The class surface index has to answer "what
-        does this class end up with", not "what does its body say".
+        This **replaces** an enumeration rather than extending one.  The previous round
+        indexed post-definition writes by listing their spellings — ``Cls.attr = f`` and
+        ``setattr(Cls, ...)`` — and review j#92902 F11-3 broke it with three more:
+        ``type.__setattr__(Cls, ...)``, an alias (``A = Cls; A.__len__ = f``), and a
+        helper that takes the class and writes it.  Listing those three would leave the
+        fourth, which is how every round of this issue has gone.
 
-        Both spellings are collected — attribute assignment and ``setattr`` — and a hit
-        makes the surface unresolved rather than trying to model the write.  Assignments
-        through anything other than a bare class name (``self.x``, ``obj.x``) are not
-        class-surface writes and are handled by the assignment-target hook path instead.
+        So the question changes from "which writes exist" to "does the class object ever
+        leave the positions I model".  That is the same discipline the runner taint has
+        used since the beginning — a value in an unmodelled context is reported, not
+        assumed inert — and it is the one rule here that no review has broken.
+
+        Two positions are modelled, each because the walk genuinely analyses it:
+
+        * the callee of a construction, ``Cls(...)`` — resolved by ``_constructed_class``;
+        * a base in another ``ClassDef`` — followed by ``_base_classes``.
+
+        Everything else makes the surface unreadable: an alias binding, an argument, an
+        attribute access on the class object, a subscript, a return.  Measured before
+        choosing the rule: across the whole live tree the two analysed classes are named
+        in exactly two places, both construction callees, so deny-by-default costs
+        nothing here.
         """
-        mutated = set()
+        escaped = set()
         for module, indexed in self.index.items():
+            parents = {}
             for node in ast.walk(indexed.tree):
-                targets = []
-                if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                    targets = (
-                        node.targets
-                        if isinstance(node, ast.Assign)
-                        else [node.target]
-                    )
-                elif isinstance(node, ast.Call):
-                    if isinstance(node.func, ast.Name) and node.func.id == "setattr":
-                        if node.args and isinstance(node.args[0], ast.Name):
-                            found = self._resolve_name(module, node.args[0].id)
-                            if found is not None and found[1] in self.index[
-                                found[0]
-                            ].classes:
-                                mutated.add(found)
+                for child in ast.iter_child_nodes(node):
+                    parents[child] = node
+            for node in ast.walk(indexed.tree):
+                if not isinstance(node, ast.Name):
                     continue
-                for target in targets:
-                    if not isinstance(target, ast.Attribute):
-                        continue
-                    if not isinstance(target.value, ast.Name):
-                        continue
-                    found = self._resolve_name(module, target.value.id)
-                    if found is not None and found[1] in self.index[found[0]].classes:
-                        mutated.add(found)
-        return mutated
+                found = self._resolve_name(module, node.id)
+                if found is None or found[1] not in self.index[found[0]].classes:
+                    continue
+                if not self._class_reference_is_modelled(node, parents.get(node)):
+                    escaped.add(found)
+        return escaped
+
+    @staticmethod
+    def _class_reference_is_modelled(node: ast.Name, parent) -> bool:
+        """Whether this mention of a class object sits in a position the walk analyses."""
+        if isinstance(parent, ast.Call) and parent.func is node:
+            return True  # construction: _constructed_class resolves it
+        if isinstance(parent, ast.ClassDef) and any(
+            base is node for base in parent.bases
+        ):
+            return True  # inheritance: _base_classes follows it
+        return False
 
     def _class_bindings(self, class_ref: tuple) -> tuple:
         """``(name -> member ref or None, surface is fully resolved)`` for one class body.
@@ -813,9 +824,10 @@ class _Walker:
         class_def = indexed.classes.get(class_name) if indexed else None
         if class_def is None:
             return ({}, False)
-        # A class can also be rewritten AFTER its body runs, and no amount of reading the
-        # body will show it (review j#92639 F10-2).
-        if class_ref in self._mutated_classes:
+        # A class object that leaves the modelled positions can be rewritten from
+        # anywhere, and no amount of reading the body will show it (j#92639 F10-2 for the
+        # writes themselves, j#92902 F11-3 for the spellings that reach them).
+        if class_ref in self._escaped_classes:
             return ({}, False)
         if class_def.decorator_list or class_def.keywords:
             return ({}, False)
@@ -858,10 +870,22 @@ class _Walker:
         """The member a class-body right-hand side binds, ``None``, or ``_UNRESOLVED``.
 
         ``None`` means "binds something inert" — a literal.  ``_UNRESOLVED`` means the walk
-        cannot say, which includes every call: ``locals().__setitem__("__len__", f)`` is a
-        perfectly ordinary ``Assign`` whose right-hand side installs a dunder that appears
-        nowhere in the body (review j#92639 F10-1 mutant C).  Constructions are resolved
-        because the descriptor rule needs them; anything else is not guessed at.
+        cannot say, and **every call is unresolved, with no exception for first-party
+        constructions**.
+
+        The previous round kept that exception so a descriptor instance could be resolved
+        precisely, and review j#92902 F11-1 showed what it costs: a constructor is free to
+        write the class namespace it is being called from, so resolving the construction
+        says nothing about what the class ends up with.  Proving a constructor harmless
+        means analysing arbitrary Python, which is the boundary this design exists to
+        avoid.  Ruling j#92917 adopted soundness over precision here, and §5.1.2 had in
+        fact already specified it — the exception was an implementation deviation from a
+        document I had written in the same commit, not a design still up for debate.
+
+        Descriptors therefore resolve to an unreadable surface and get **reported** rather
+        than modelled.  A report is the correct output of this oracle; silence is the only
+        wrong answer.  It costs nothing on the live tree, whose analysed class bodies
+        contain no call on the right-hand side at all.
         """
         if isinstance(value, ast.Name):
             aliased = f"{class_name}.{value.id}"
@@ -870,11 +894,6 @@ class _Walker:
             return _UNRESOLVED
         if isinstance(value, ast.Constant):
             return None
-        if isinstance(value, ast.Call):
-            constructed = self._constructed_class(module, "", value)
-            if constructed is not None:
-                return constructed
-            return _UNRESOLVED
         return _UNRESOLVED
 
     def _decorators_are_modelled(self, node) -> bool:
@@ -1031,7 +1050,7 @@ class _Walker:
         self.unresolved_flows = []
         self.used_read_exceptions = set()
         self._class_binding_cache: dict = {}
-        self._mutated_classes = self._index_post_definition_mutations()
+        self._escaped_classes = self._index_escaped_classes()
         for module_name, module in self.index.items():
             for qualname, function in module.functions.items():
                 local, kwargs_maps = self._local_taint(module_name, qualname, function)
@@ -1335,26 +1354,47 @@ class _Walker:
             )
 
     def _lookup_member(self, class_ref: tuple, attr: str, _seen: tuple = ()) -> Optional[tuple]:
-        """``(module, qualname)`` of ``attr`` on ``class_ref`` or a base, else ``None``."""
+        """``(module, qualname)`` of ``attr``, or ``None`` for absent OR unreadable.
+
+        Prefer :meth:`_resolve_member`.  This wrapper exists for the callers that genuinely
+        only need "did I find something", and every caller that can act on the difference
+        uses the tri-state form instead.
+        """
+        return self._resolve_member(class_ref, attr, _seen)[0]
+
+    def _resolve_member(self, class_ref: tuple, attr: str, _seen: tuple = ()) -> tuple:
+        """``(member or None, state)`` with state ``found`` / ``absent`` / ``unreadable``.
+
+        Review j#92902 F11-2: the previous version threw away the resolver's ``resolved``
+        flag, so "this class has no ``__set__``" and "I cannot read this class's members"
+        produced the same ``None``.  A metaclass-built descriptor was therefore treated as
+        having no hook at all, and the assignment into it went unreported.
+
+        That collapse is the single defect this issue keeps re-finding, in one surface
+        after another.  Returning a state instead of a bare ``Optional`` is what stops it
+        being expressible: a caller that ignores ``unreadable`` now has to do so visibly.
+        """
         if class_ref in _seen:
-            return None
-        module, class_name = class_ref
-        indexed = self.index.get(module)
-        if indexed is None:
-            return None
+            return (None, "absent")
+        if self.index.get(class_ref[0]) is None:
+            return (None, "unreadable")
         # Both a ``def`` and a class-body alias (``__len__ = _probe_truth``) declare the
         # member; the resolver returns whichever one the body actually binds, so this no
         # longer re-reads the body with rules of its own.
-        bindings, _ = self._class_bindings(class_ref)
+        bindings, readable = self._class_bindings(class_ref)
         bound = bindings.get(attr)
         if bound is not None:
-            return bound
-        bases, _ = self._base_classes(class_ref)
+            return (bound, "found")
+        if not readable:
+            return (None, "unreadable")
+        bases, saw_unresolved = self._base_classes(class_ref)
+        unreadable = saw_unresolved
         for base in bases:
-            found = self._lookup_member(base, attr, _seen + (class_ref,))
-            if found is not None:
-                return found
-        return None
+            found, state = self._resolve_member(base, attr, _seen + (class_ref,))
+            if state == "found":
+                return (found, "found")
+            unreadable = unreadable or state == "unreadable"
+        return (None, "unreadable" if unreadable else "absent")
 
     def _method_on_receiver(
         self, module: str, qualname: str, owner: str, local: set, receiver, attr: str
@@ -1494,7 +1534,10 @@ class _Walker:
         modelled decorator rather than an assumed-harmless one.
         """
         module, class_name = class_ref
-        member = self._lookup_member(class_ref, attr)
+        member, state = self._resolve_member(class_ref, attr)
+        if state == "unreadable":
+            # A read off a class whose members cannot be enumerated is not a modelled read.
+            return False
         if member is not None and self._member_is_property(member):
             if not self._bind_receiver_parameter(member, class_ref):
                 return False
@@ -1624,7 +1667,9 @@ class _Walker:
             return False
         for class_ref in classes:
             # ``__setattr__`` is looked up on the OWNER...
-            found = self._lookup_member(class_ref, "__setattr__")
+            found, state = self._resolve_member(class_ref, "__setattr__")
+            if state == "unreadable":
+                return False
             if found is not None and not self._bind_value_parameter(found):
                 return False
             # ...but a data descriptor's ``__set__`` lives on the type of the object the
@@ -1636,7 +1681,11 @@ class _Walker:
             if not readable:
                 return False
             if descriptor is not None:
-                found = self._lookup_member(descriptor, "__set__")
+                # "no ``__set__`` here" and "I cannot read this descriptor's members" are
+                # different answers; conflating them is what left F11-2 silent.
+                found, state = self._resolve_member(descriptor, "__set__")
+                if state == "unreadable":
+                    return False
                 if found is not None and not self._bind_value_parameter(found):
                     return False
         return True
