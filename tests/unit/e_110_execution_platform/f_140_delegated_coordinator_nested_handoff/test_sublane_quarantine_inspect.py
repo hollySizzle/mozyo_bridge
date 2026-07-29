@@ -24,6 +24,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     sublane_quarantine_inspect as inspect_module,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine_inspect import (  # noqa: E501
+    INVENTORY_READ_REASONS,
     QuarantineInspectRequest,
     SublaneQuarantineInspectUseCase,
     format_inspect_text,
@@ -237,6 +238,14 @@ class TypedFailClosedTest(_Case):
 
     def test_unreadable_inventory(self):
         self._assert_refused(self._run(rows_raise=True), APPROVAL_INVENTORY_UNREADABLE)
+
+    def test_unreadable_inventory_details_why_from_a_closed_vocabulary(self):
+        # Redmine #14259: the refusal stays fail-closed, but the detail must name the ROOT
+        # cause rather than echo the refusal, and must be a bare token — the exception message
+        # carries raw herdr stderr and absolute paths.
+        out = self._run(rows_raise=True)
+        self.assertIn(out.inspection_detail, INVENTORY_READ_REASONS)
+        self.assertNotEqual(out.inspection_detail, out.approval_reason)
 
     def test_receiver_absent_on_empty_inventory(self):
         # An empty inventory is a POSITIVE absence, never "unreadable".
