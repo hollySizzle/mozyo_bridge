@@ -96,6 +96,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.stale_worker_recovery import (  # noqa: E501
     worker_close_committed,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_refresh_approval import (  # noqa: E501
+    WorkerRefreshApprovalError,
+    render_worker_refresh_approval_marker,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_turn_recovery import (  # noqa: E501
     WORKER_REFRESH_ACTIONABLE,
     WORKER_REFRESH_BLOCK_LAUNCH_AUTHORITY,
@@ -180,10 +184,13 @@ class WorkerRefreshRequest:
     def holder(self) -> str:
         """The stable, action-bound lease identity for this refresh (resume-safe).
 
-        It is also the ONE literal a positive owner approval must name (review j#92443 F2):
-        it is the only token that carries the exact action id AND the approved generation
-        together, so an approval quoting it cannot be an approval of a different target or a
-        different round. See :meth:`WorkerRefreshOps.approval_verified`.
+        A LEASE identity only. An earlier revision also used it as the literal an owner
+        approval had to quote; review j#92487 F1 showed why that was wrong — it was designed
+        as a lease token, carries no approval semantics, and (because ``action_id`` already
+        begins with ``refresh-worker:``) renders with a doubled prefix that no approval
+        vocabulary would have chosen. The approval contract now lives in
+        :mod:`...domain.worker_refresh_approval` as a canonical structured marker. The value
+        here is unchanged so an in-flight transaction's lease identity stays stable.
         """
         return f"refresh-worker:{norm(self.action_id)}:g{int(self.action_generation)}"
 
@@ -231,6 +238,11 @@ class WorkerRefreshOutcome:
     #: "launch was fine". Value-free by construction: an axis / fence name, never a path,
     #: locator, credential, or exception prose.
     launch_failure_reason: str = LAUNCH_FAILURE_NONE
+    #: The EXACT canonical marker a positive owner approval must carry for this action
+    #: (review j#92487 F1). Emitted on the read-only preflight so an operator can record an
+    #: approval that will actually verify — an approval contract nobody can produce is one
+    #: nobody will use. ``""`` when the request does not yet identify one exact action.
+    required_approval_marker: str = ""
 
     @property
     def is_blocked(self) -> bool:
@@ -263,6 +275,7 @@ class WorkerRefreshOutcome:
             "launch_authority_reason": self.launch_authority_reason,
             "launch_authority_runbook": self.launch_authority_runbook or None,
             "launch_failure_reason": self.launch_failure_reason or None,
+            "required_approval_marker": self.required_approval_marker or None,
         }
 
 
@@ -515,7 +528,7 @@ class WorkerRefreshUseCase:
             return None
         outcome = self._execute(
             request, turn_class, turn_reason, verdict, turn_obs, observation,
-            authority_reason,
+            authority_reason, post_close=True,
         )
         return replace(outcome, post_close_resume=True)
 
@@ -530,6 +543,7 @@ class WorkerRefreshUseCase:
         turn_obs: WorkerTurnObservation,
         observation: WorkerRefreshObservation,
         authority_reason: str,
+        post_close: bool = False,
     ) -> WorkerRefreshOutcome:
         def refused(detail: str) -> WorkerRefreshOutcome:
             return self._outcome(
@@ -669,7 +683,35 @@ class WorkerRefreshUseCase:
                 authority_reason=authority_reason,
             )
 
-        # 3. Drive the guarded close → launch → attest (the tranche B actuator). The launch
+        # 3. ACTION-TIME re-observation (review j#92487 F2). Everything above ran between the
+        #    preflight and here — a durable approval read, a rail probe, a transaction plan —
+        #    and the worker can have started a turn, hit a permission prompt, or gained unsent
+        #    composer input in that window. Re-derive the verdict from a FRESH observation and
+        #    refuse with the exact typed blocker rather than closing on a stale one. The turn
+        #    classification is deliberately NOT re-run: it is the durable-history judgement the
+        #    approval was granted against, and re-deriving it here would let a newly-landed
+        #    unrelated gate silently retract an approved action mid-flight.
+        #    Skipped on a POST-CLOSE replay: there the exact worker was already closed, so its
+        #    absence (``identity_unknown``) is the expected state and re-deriving the verdict
+        #    would refuse every legitimate replay — the very transactions that exist to be
+        #    finished. Those runs close nothing; their remaining legs (launch / attest /
+        #    resume) re-join the lane authority action-time inside the actuator and the drain.
+        if not post_close:
+            fresh_authority = self._lane_authority_reason(request)
+            fresh_observation = self._ops.observe_target(request).with_launch_authority(
+                launch_authority_current(fresh_authority)
+            )
+            fresh_verdict = decide_worker_refresh(fresh_observation, turn_class)
+            if fresh_verdict != WORKER_REFRESH_ACTIONABLE:
+                return self._outcome(
+                    request, turn_class, turn_reason, fresh_verdict,
+                    status=WORKER_REFRESH_STATUS_REFUSED, executed=True,
+                    turn_observation=turn_obs, observation=fresh_observation,
+                    detail=f"target drifted after preflight ({fresh_verdict}); zero close",
+                    authority_reason=fresh_authority,
+                )
+
+        # 4. Drive the guarded close → launch → attest (the tranche B actuator). The launch
         #    authority is re-joined action-time immediately before the launch effect: the
         #    exact lane authority AND the worker name free of any live (foreign) process.
         actuator = ReplacementActuatorUseCase(
@@ -719,7 +761,7 @@ class WorkerRefreshUseCase:
                 authority_reason=self._lane_authority_reason(request),
             )
 
-        # 4. Fresh worker attested — drive the resume continuation exactly once through the
+        # 5. Fresh worker attested — drive the resume continuation exactly once through the
         #    shared drain authority (idempotency-first; record attempted BEFORE the send;
         #    action-time authority re-join; typed zero-send revert; never a blind resend).
         resume = drive_continuation_once(
@@ -785,6 +827,17 @@ class WorkerRefreshUseCase:
         # The closed axis token + its runbook are TYPED fields on every outcome the surface
         # can return, not prose inside ``detail`` (the #14475 j#88477 F2 discipline).
         reason = normalize_launch_authority_reason(authority_reason)
+        # The approval marker the operator must record. Derived from the request alone, so it
+        # is available on a preflight (before any approval exists) — which is exactly when it
+        # is needed. An under-specified request cannot name one exact action, and then there
+        # is no marker to show.
+        try:
+            required_marker = render_worker_refresh_approval_marker(
+                issue=request.effective_anchor_issue, lane=request.lane,
+                action_id=request.action_id, action_generation=request.action_generation,
+            )
+        except WorkerRefreshApprovalError:
+            required_marker = ""
         return WorkerRefreshOutcome(
             issue=norm(request.issue),
             lane=norm(request.lane),
@@ -811,6 +864,7 @@ class WorkerRefreshUseCase:
             # Normalized at the composer so EVERY return path yields a well-shaped token,
             # including the ones that never touch the launch leg (they pass the default).
             launch_failure_reason=normalize_launch_failure_reason(launch_failure_reason),
+            required_approval_marker=required_marker,
         )
 
 

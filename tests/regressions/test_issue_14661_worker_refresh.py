@@ -531,9 +531,11 @@ class ExecuteTests(_RefreshCase):
         # moves the authority after the close/launch and before the send.
         probe = FakeWorkerOps()
         self._use_case(probe).run(self._request(), execute=True)
-        self.assertEqual(len(probe.authority_checks), 3)
+        # preflight axis, the action-time drift re-check (j#92487 F2), the launch leg's
+        # re-join, and the resume leg's re-join.
+        self.assertEqual(len(probe.authority_checks), 4)
         self.setUp()
-        ops = FakeWorkerOps(lane_authority=[True, True, False])
+        ops = FakeWorkerOps(lane_authority=[True, True, True, False])
         outcome = self._use_case(ops).run(self._request(), execute=True)
         self.assertEqual(outcome.status, WORKER_REFRESH_STATUS_STOPPED)
         self.assertEqual(outcome.resume_status, CONTINUATION_AUTHORITY_MOVED)
@@ -604,6 +606,78 @@ class ExecuteTests(_RefreshCase):
         self.assertEqual(len(self.port.closed), closes)
         self.assertEqual(len(self.port.launched), launches)
         self.assertEqual(ops.resumes, [])
+
+
+class ActionTimeDriftTests(_RefreshCase):
+    """The target is re-observed immediately before the destructive drive (j#92487 F2).
+
+    Everything between the preflight and the close — a durable approval read, a rail probe, a
+    transaction plan — is a window in which the worker can start a turn, hit a permission
+    prompt, or gain unsent composer input.
+    """
+
+    class _DriftingOps(FakeWorkerOps):
+        """Actionable at preflight; the scripted drift appears on the NEXT observation."""
+
+        def __init__(self, drifted, **kwargs):
+            super().__init__(**kwargs)
+            self._drifted = drifted
+            self.observations = 0
+
+        def observe_target(self, request):
+            self.observations += 1
+            return self._target if self.observations == 1 else self._drifted
+
+    def _drifts_to(self, drifted, expected_verdict):
+        ops = self._DriftingOps(drifted)
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, WORKER_REFRESH_STATUS_REFUSED)
+        self.assertEqual(outcome.verdict, expected_verdict)
+        self.assertIn("drifted after preflight", outcome.detail)
+        self.assertGreaterEqual(ops.observations, 2, "the target must be re-observed")
+        self.assertEqual(self.port.closed, [])   # zero close
+        self.assertEqual(self.port.launched, [])
+        self.assertEqual(ops.resumes, [])        # zero send
+        return outcome
+
+    def test_a_worker_that_started_a_turn_after_preflight_is_not_closed(self):
+        self._drifts_to(_target(settled_idle=False), WORKER_REFRESH_BLOCK_NOT_SETTLED)
+
+    def test_composer_input_gained_after_preflight_is_not_closed(self):
+        self._drifts_to(
+            _target(composer_clear=False), "pending_composer_input"
+        )
+
+    def test_a_slot_recycled_after_preflight_is_not_closed(self):
+        self._drifts_to(_target(generation_matches=False), "stale_generation")
+
+    def test_a_gateway_that_vanished_after_preflight_is_not_closed(self):
+        self._drifts_to(
+            _target(gateway_distinct_preserved=False), "gateway_not_distinguished"
+        )
+
+    def test_an_undrifted_target_still_completes(self):
+        # The re-check must be discriminating in both directions.
+        ops = self._DriftingOps(_target())
+        outcome = self._use_case(ops).run(self._request(), execute=True)
+        self.assertEqual(outcome.status, WORKER_REFRESH_STATUS_COMPLETED)
+        self.assertEqual(len(self.port.closed), 1)
+
+    def test_the_drift_recheck_is_skipped_on_a_post_close_replay(self):
+        # After a committed close the pinned worker is EXPECTEDLY absent; re-deriving the
+        # verdict there would refuse every legitimate replay.
+        identity = (
+            WORKER["lane_id"], WORKER["role"], WORKER["provider"], WORKER["assigned_name"]
+        )
+        self.port.launch_result[identity] = LAUNCH_ERROR
+        self._use_case(FakeWorkerOps()).run(self._request(), execute=True)
+        closes = len(self.port.closed)
+        self.port.launch_result.pop(identity)
+        ops = FakeWorkerOps(target=WorkerRefreshObservation())
+        replay = self._use_case(ops).run(self._request(), execute=True)
+        self.assertTrue(replay.post_close_resume)
+        self.assertEqual(replay.status, WORKER_REFRESH_STATUS_COMPLETED)
+        self.assertEqual(len(self.port.closed), closes)  # still zero extra closes
 
 
 class AnchorIssueSplitTests(_RefreshCase):

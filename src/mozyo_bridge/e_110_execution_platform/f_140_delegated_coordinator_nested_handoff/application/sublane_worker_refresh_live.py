@@ -37,7 +37,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -86,6 +86,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     MARKER_CHANNEL_WORKFLOW_EVENT,
     marker_fields_in_note,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_refresh_approval import (  # noqa: E501
+    WorkerRefreshApprovalError,
+    verify_worker_refresh_approval,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_turn_recovery import (  # noqa: E501
     WORKER_PROGRESS_GATES,
     WorkerRefreshObservation,
@@ -94,6 +98,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_AWAITING_INPUT,
     RUNTIME_TURN_ENDED,
+    RUNTIME_UNKNOWN,
     map_agent_status,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
@@ -163,6 +168,82 @@ def _row_runtime_state(row: Mapping[str, object]) -> str:
 def _row_revision(row: Mapping[str, object]) -> str:
     raw = row.get("revision")
     return _norm(raw) if not isinstance(raw, bool) else ""
+
+
+@dataclass
+class SettledCloseBoundaryPort:
+    """The shared #13806 actuation port, fenced on a POSITIVELY SETTLED worker (j#92487 F2).
+
+    The shared close boundary reduces the runtime to one boolean —
+    ``running_process = (state == busy)`` — and
+    :func:`...replacement_preservation.assess_worker_recovery_preservation` decides ``may_close``
+    from it. Measured over the whole herdr status vocabulary, that admits a close on every
+    non-``working`` state:
+
+    ============= ================ ==============
+    herdr status  runtime state    may_close
+    ============= ================ ==============
+    ``working``   busy             False (correct)
+    ``done``      turn_ended       True  (correct)
+    ``idle``      awaiting_input   True  (correct)
+    ``blocked``   blocked          **True — a live agent at a permission prompt**
+    (absent)      unknown          **True — an unreadable observation**
+    (novel token) unknown          **True — an unrecognised state**
+    ============= ================ ==============
+
+    The preflight requires ``settled_idle``; this restores that requirement at the boundary
+    that actually closes, and adds the composer re-read the preflight also performs. It is a
+    THIN wrapper: identity, lane lifecycle and row-revision re-verification stay entirely with
+    the shared implementation (no second implementation to drift), and this only ever turns a
+    ``may_close`` into a refusal — never the reverse.
+
+    Scoped to this surface deliberately. The same fail-open exists for ``recover-stale`` and
+    ``recover-gateway``, but those modules are outside this task's changed-path boundary and
+    are not silently retuned here (the coordinator's j#92454 disposition); the gap is reported
+    instead.
+    """
+
+    inner: object
+    ops: "LiveWorkerRefreshOps"
+    request: WorkerRefreshRequest
+
+    #: Forwarded so :func:`...replacement_launch_failure.port_launch_failure_reason` reads the
+    #: INNER port's typed diagnostic rather than seeing an attribute-less wrapper.
+    @property
+    def launch_failure_reason(self) -> str:
+        return getattr(self.inner, "launch_failure_reason", "")
+
+    def observe_old_slot(self, pin):
+        return self.inner.observe_old_slot(pin)
+
+    def observe_preservation(self, pin):
+        observation = self.inner.observe_preservation(pin)
+        if not observation.identity_matches:
+            return observation  # the shared fence already refuses; do not mask its detail
+        state = self.ops.pinned_runtime_state(self.request)
+        if state not in (RUNTIME_TURN_ENDED, RUNTIME_AWAITING_INPUT):
+            # ``running_process`` is the closed reason meaning "closing would destroy live
+            # work". A ``blocked`` slot is a live agent awaiting a permission answer, and an
+            # ``unknown`` / absent / novel state cannot prove it is not one — fail-closed. The
+            # concrete axis travels in ``detail`` so the refusal is diagnosable without adding
+            # a token to a shared closed vocabulary.
+            return replace(
+                observation, running_process=True, detail=f"worker_not_settled:{state}"
+            )
+        if not self.ops._composer_clear(self.request):
+            return replace(
+                observation, running_process=True, detail="pending_composer_input"
+            )
+        return observation
+
+    def close_exact_generation(self, pin):
+        return self.inner.close_exact_generation(pin)
+
+    def launch_action_bound(self, action_id: str, pin):
+        return self.inner.launch_action_bound(action_id, pin)
+
+    def verify_attestation(self, action_id: str, pin):
+        return self.inner.verify_attestation(action_id, pin)
 
 
 @dataclass
@@ -253,6 +334,20 @@ class LiveWorkerRefreshOps:
         if len(exact) != 1 or len(matches) != 1:
             return None
         return exact[0]
+
+    def pinned_runtime_state(self, request: WorkerRefreshRequest) -> str:
+        """The pinned worker's FRESH runtime state, or ``unknown``. (read-only, fail-closed)
+
+        Public because the close-boundary fence (:class:`SettledCloseBoundaryPort`) re-reads
+        it at the destructive edge, and it must be the SAME derivation the preflight's
+        ``settled_idle`` axis uses — a boundary backed by a second reading would not fence the
+        state the preflight predicted. An absent / ambiguous row yields ``unknown``, which is
+        not settled and therefore refuses.
+        """
+        row = self._pinned_row(request)
+        if row is None:
+            return RUNTIME_UNKNOWN
+        return _row_runtime_state(row)
 
     def _participant_revision_matches(self, request: WorkerRefreshRequest) -> bool:
         """Does the pinned row revision EXACTLY equal the approval's pinned revision?
@@ -640,29 +735,38 @@ class LiveWorkerRefreshOps:
           written for a different worker, a different generation, or a different round can
           never authorize this close.
 
-        The check deliberately introduces NO new marker grammar: it requires the approval to
-        quote a token this module already derives, rather than inventing an approval
-        vocabulary a leaf task has no standing to define.
+        Verification is delegated to :func:`...worker_refresh_approval.verify_worker_refresh_approval`,
+        which copies the repo's already-hardened composer-discard approval shape: the journal
+        must exist uniquely, carry exactly ONE canonical structured approval marker of this
+        surface's gate, and match every expected field by exact equality including a positive
+        ``decision`` and the exact ``action_digest``.
+
+        This replaces an R2 implementation that asked whether a token appeared anywhere in the
+        notes (review j#92487 F1). That admitted a negation, a quoted retry command, a log
+        line, and a ``:g30`` approval standing in for ``:g3`` — prose containment is not a
+        decision, and a substring is not a field.
         """
         reader = self.journal_reader
         if reader is None or not self.journal_reader_fresh:
-            return False
-        wanted_journal = _norm(request.journal)
-        token = _norm(request.holder)
-        # A holder over an empty action id / generation would be a token that matches loosely;
-        # the caller validates both before reaching here, but this seam refuses independently.
-        if not wanted_journal or not _norm(request.action_id) or not token:
             return False
         try:
             entries = reader(request.effective_anchor_issue)
         except Exception:  # noqa: BLE001 - unreadable durable source => never approved
             return False
-        for entry in entries:
-            if _norm(getattr(entry, "journal_id", "")) != wanted_journal:
-                continue
-            notes = str(getattr(entry, "notes", "") or "")
-            return token in notes
-        return False
+        try:
+            verify_worker_refresh_approval(
+                list(entries),
+                issue=request.effective_anchor_issue,
+                journal=request.journal,
+                lane=request.lane,
+                action_id=request.action_id,
+                action_generation=request.action_generation,
+            )
+        except WorkerRefreshApprovalError:
+            return False
+        except Exception:  # noqa: BLE001 - a malformed history is never an approval
+            return False
+        return True
 
     def resume_rail_ready(self, request: WorkerRefreshRequest) -> bool:
         """Pre-close resume-rail capability. (read-only)
@@ -696,6 +800,73 @@ class LiveWorkerRefreshOps:
             "--mode", "queue-enter",
         ]
 
+    def _delivery_request(
+        self, continuation: ContinuationPointer, locator: str, worker_provider: str
+    ):
+        """The action-bound delivery request for the fresh slot, or ``None``. (read-only)"""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
+            KIND_REPLY,
+            RecoveryAnchorDeliveryRequest,
+        )
+
+        try:
+            workspace_id = repo_scope_workspace_id(self.repo_root)
+            rows = self._rows()
+        except Exception:  # noqa: BLE001 - unreadable identity / inventory
+            return None
+        matches = [
+            row for row in rows
+            if isinstance(row, Mapping)
+            and _norm(row.get(AGENT_KEY_NAME)) == _norm(self.request.assigned_name)
+            and _agent_locator(row) == locator
+        ]
+        if len(matches) != 1:
+            return None
+        revision = _row_revision(matches[0])
+        if not revision:
+            return None
+        try:
+            return RecoveryAnchorDeliveryRequest(
+                issue=_norm(continuation.issue_id),
+                journal=_norm(continuation.journal_id),
+                kind=KIND_REPLY,
+                workspace_id=workspace_id,
+                lane_id=_norm_lane(self.request.lane),
+                provider=_norm(worker_provider),
+                target_assigned_name=_norm(self.request.assigned_name),
+                target_locator=_norm(locator),
+                target_revision=revision,
+                target_action_id=_norm(self.request.action_id),
+            )
+        except Exception:  # noqa: BLE001 - an invalid request is not a deliverable one
+            return None
+
+    def _fresh_slot_action_bound(
+        self, continuation: ContinuationPointer, locator: str, worker_provider: str
+    ) -> bool:
+        """Is the FRESH slot's attestation bound to THIS replacement action? (fail-closed)
+
+        Review j#92487 F3: the governed rail re-resolved the logical slot and sent, and the
+        confirmation only fenced on the fresh attestation's ``observed_at`` — a seconds-precision
+        timestamp that #14203 j#87445 already rejected as a generation identity (two launches in
+        the same second share it). A slot recycled after the actuator's attestation therefore
+        read as this refresh's fresh worker on both the send and the confirm edge.
+
+        The one-shot rail never had that gap because it passes ``target_action_id`` and
+        :class:`LiveRecoveryAnchorDeliveryService` verifies the action binding (native-v2
+        ``replacement_action_id`` equality, or the v1 side-binding store). This routes the
+        governed rail through that SAME public authority — ``preflight`` re-runs every
+        read-only action gate without injecting or writing — instead of re-implementing the
+        v1/v2 branch here and letting the two drift.
+        """
+        request = self._delivery_request(continuation, locator, worker_provider)
+        if request is None:
+            return False
+        try:
+            return bool(self._recovery_delivery_service().preflight(request).may_deliver)
+        except Exception:  # noqa: BLE001 - an unverifiable binding is never a bound one
+            return False
+
     def resume_once(self, continuation: ContinuationPointer) -> str:
         locator = self._fresh_worker_locator()
         if not locator or locator == _norm(self.request.locator):
@@ -703,6 +874,11 @@ class LiveWorkerRefreshOps:
             return DRAIN_SEND_ERROR
         worker_provider, _gateway = self._providers()
         if not worker_provider:
+            return DRAIN_SEND_ERROR
+        # The action binding is required on BOTH rails (j#92487 F3), verified immediately
+        # before the send so a slot recycled after the actuator's attestation cannot receive
+        # this resume.
+        if not self._fresh_slot_action_bound(continuation, locator, worker_provider):
             return DRAIN_SEND_ERROR
         if self._governed_sender_resolves():
             try:
@@ -718,45 +894,11 @@ class LiveWorkerRefreshOps:
         """Operator-capable guarded one-shot: sender-env independent, target-identity verified
         action-time, read-back before Enter, real ledger writer (the #14203 j#87370 F1 /
         j#85972 formalization of the owner-approved break-glass shape)."""
+        request = self._delivery_request(continuation, locator, worker_provider)
+        if request is None:
+            return DRAIN_SEND_ERROR
         try:
-            workspace_id = repo_scope_workspace_id(self.repo_root)
-            rows = self._rows()
-        except Exception:  # noqa: BLE001
-            return DRAIN_SEND_ERROR
-        matches = [
-            candidate
-            for candidate in rows
-            if (
-                isinstance(candidate, Mapping)
-                and _norm(candidate.get(AGENT_KEY_NAME)) == _norm(self.request.assigned_name)
-                and _agent_locator(candidate) == locator
-            )
-        ]
-        if len(matches) != 1:
-            return DRAIN_SEND_ERROR
-        revision = _row_revision(matches[0])
-        if not revision:
-            return DRAIN_SEND_ERROR
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
-            KIND_REPLY,
-            RecoveryAnchorDeliveryRequest,
-        )
-
-        try:
-            outcome = self._recovery_delivery_service().deliver(
-                RecoveryAnchorDeliveryRequest(
-                    issue=_norm(continuation.issue_id),
-                    journal=_norm(continuation.journal_id),
-                    kind=KIND_REPLY,
-                    workspace_id=workspace_id,
-                    lane_id=_norm_lane(self.request.lane),
-                    provider=_norm(worker_provider),
-                    target_assigned_name=_norm(self.request.assigned_name),
-                    target_locator=_norm(locator),
-                    target_revision=revision,
-                    target_action_id=_norm(self.request.action_id),
-                )
-            )
+            outcome = self._recovery_delivery_service().deliver(request)
         except Exception:  # noqa: BLE001 - invalid request/service failure is zero-success
             return DRAIN_SEND_ERROR
         return DRAIN_SEND_OK if outcome.started else DRAIN_SEND_ERROR
@@ -787,6 +929,12 @@ class LiveWorkerRefreshOps:
             return False
         fresh_locator = self._fresh_worker_locator()
         if not fresh_locator or fresh_locator == _norm(self.request.locator):
+            return False
+        # The timestamp boundary below is necessary but NOT sufficient as a generation
+        # identity (#14203 j#87445: two same-second launches share ``observed_at``). Require
+        # the fresh slot to be attested for THIS replacement action as well, so a recycled
+        # slot's delivery is never confirmed as this refresh's resume (j#92487 F3).
+        if not self._fresh_slot_action_bound(continuation, fresh_locator, worker_provider):
             return False
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             RedmineAnchor,
@@ -846,5 +994,6 @@ class LiveWorkerRefreshOps:
 
 __all__ = (
     "LiveWorkerRefreshOps",
+    "SettledCloseBoundaryPort",
     "port_pin_request",
 )

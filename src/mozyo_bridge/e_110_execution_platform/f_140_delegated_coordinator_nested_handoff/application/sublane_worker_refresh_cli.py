@@ -74,6 +74,11 @@ def format_refresh_worker_text(outcome: WorkerRefreshOutcome) -> str:
     # invite reading absence-of-failure as a diagnosis.
     if outcome.launch_failure_reason:
         lines.append(f"  launch_failure: {outcome.launch_failure_reason}")
+    # The exact marker a positive owner approval must carry (j#92487 F1). Shown on the
+    # read-only preflight — the moment the operator is deciding whether to approve — so the
+    # approval contract is producible rather than merely enforceable.
+    if outcome.required_approval_marker and not outcome.executed:
+        lines.append(f"  required_approval_marker: {outcome.required_approval_marker}")
     if outcome.detail:
         lines.append(f"  detail: {outcome.detail}")
     return "\n".join(lines)
@@ -93,6 +98,7 @@ def _run_live_refresh(
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_refresh_live import (  # noqa: E501
         LiveWorkerRefreshOps,
+        SettledCloseBoundaryPort,
         port_pin_request,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery_live import (  # noqa: E501
@@ -125,7 +131,7 @@ def _run_live_refresh(
     except Exception:  # noqa: BLE001 - incomplete identity => the use case refuses downstream
         key = ReplacementTransactionKey(workspace_id, "refresh-worker:pending")
     store = ReplacementTransactionStore()
-    actuation_port = LiveRecoveryActuatorPort(
+    shared_port = LiveRecoveryActuatorPort(
         repo_root=repo_root, request=port_pin_request(request), store=store, key=key,
     )
     # The FRESH durable journal boundary (#13889): the credential-gated live Redmine source.
@@ -147,6 +153,12 @@ def _run_live_refresh(
     ops = LiveWorkerRefreshOps(
         repo_root=repo_root, request=request,
         journal_reader=journal_reader, journal_reader_fresh=journal_reader_fresh,
+    )
+    # Review j#92487 F2: the shared close boundary admits a close on every non-``working``
+    # runtime state (including ``blocked`` and an unreadable ``unknown``). Wrap it so the
+    # destructive edge re-requires the positively-settled worker the preflight demanded.
+    actuation_port = SettledCloseBoundaryPort(
+        inner=shared_port, ops=ops, request=request,
     )
     use_case = WorkerRefreshUseCase(store, actuation_port, ops, workspace_id=workspace_id)
     return use_case.run(request, execute=execute)
@@ -233,9 +245,10 @@ def register_sublane_refresh_worker_parser(sublane_sub: Any) -> None:
         "--journal", default="",
         help=(
             "Redmine journal id of the positive owner approval (--execute: required). The "
-            "journal must exist at a fresh durable read AND name the exact action it "
-            "authorizes as the literal token refresh-worker:<action id>:g<generation>; "
-            "anything else is refused with zero close"
+            "journal must exist uniquely at a fresh durable read AND carry exactly one "
+            "canonical structured approval marker whose every field matches this action; run "
+            "the preflight and copy its required_approval_marker. A prose mention, a quoted "
+            "command or a neighbouring round is refused with zero close"
         ),
     )
     parser.add_argument(

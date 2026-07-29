@@ -21,7 +21,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from mozyo_bridge.core.state.replacement_preservation import (
+    PreservationObservation,
+    assess_worker_recovery_preservation,
+)
 from mozyo_bridge.core.state.replacement_transaction import ContinuationPointer
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_launch_failure import (  # noqa: E501
+    port_launch_failure_reason,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     RedmineAnchor,
     build_marker,
@@ -55,6 +62,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LAUNCH_AUTHORITY_REASONS,
     LAUNCH_AUTHORITY_UNKNOWN,
     LAUNCH_AUTHORITY_WORKTREE_MISMATCH,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_refresh_approval import (  # noqa: E501
+    render_worker_refresh_approval_marker,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.worker_turn_recovery import (  # noqa: E501
     WORKER_REFRESH_BLOCK_UNKNOWN,
@@ -112,9 +122,10 @@ def _request(**overrides) -> WorkerRefreshRequest:
 
 
 class _Entry:
-    def __init__(self, journal_id, notes):
+    def __init__(self, journal_id, notes, issue=ANCHOR_ISSUE):
         self.journal_id = journal_id
         self.notes = notes
+        self.issue_id = issue
 
 
 def _record(marker: str, **overrides):
@@ -126,6 +137,47 @@ def _record(marker: str, **overrides):
     )
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def _pin():
+    """A minimal ParticipantPin for the close-boundary port under test."""
+    from mozyo_bridge.core.state.replacement_transaction import ParticipantPin
+
+    return ParticipantPin(
+        lane_id=LANE, role=WORKER_PROVIDER, provider=WORKER_PROVIDER,
+        assigned_name="wk", old_locator="w4B:p10", is_self=False,
+        lane_revision="5", lane_generation="2",
+    )
+
+
+class _FakeInnerPort:
+    """The shared #13806 port, faked: it always permits the close on identity grounds."""
+
+    def __init__(self):
+        self.observation = PreservationObservation(
+            identity_matches=True, attestation_fresh=True
+        )
+        self.calls: list[str] = []
+        self.launch_failure_reason = ""
+
+    def observe_old_slot(self, pin):
+        self.calls.append("observe_old_slot")
+        return "present"
+
+    def observe_preservation(self, pin):
+        return self.observation
+
+    def close_exact_generation(self, pin):
+        self.calls.append("close_exact_generation")
+        return "closed"
+
+    def launch_action_bound(self, action_id, pin):
+        self.calls.append("launch_action_bound")
+        return "launched"
+
+    def verify_attestation(self, action_id, pin):
+        self.calls.append("verify_attestation")
+        return "bound"
 
 
 class _FakeLedger:
@@ -661,61 +713,131 @@ class RealTurnObservationTests(unittest.TestCase):
 
 
 class ApprovalVerificationTests(unittest.TestCase):
-    """The positive owner-approval authority (review j#92443 F2)."""
+    """The structured owner-approval authority (review j#92487 F1).
+
+    The R2 implementation asked whether a token appeared anywhere in the notes. Every case
+    below that ends in "never verifies" was admitted by that check.
+    """
 
     APPROVAL_JOURNAL = "92500"
+    ACTION_ID = "refresh-worker:" + LANE + ":claude:claude:wk:w4B:p10:r4"
 
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp())
         self.request = _request(
-            journal=self.APPROVAL_JOURNAL,
-            action_id="refresh-worker:" + LANE + ":claude:claude:wk:w4B:p10:r4",
-            action_generation=3,
-            worker_revision="4",
+            journal=self.APPROVAL_JOURNAL, action_id=self.ACTION_ID,
+            action_generation=3, worker_revision="4",
         )
-        self.token = self.request.holder
         self.ops = LiveWorkerRefreshOps(repo_root=self.repo, request=self.request)
+        self.marker = render_worker_refresh_approval_marker(
+            issue=ANCHOR_ISSUE, lane=LANE, action_id=self.ACTION_ID, action_generation=3,
+        )
 
-    def _with_entries(self, entries):
+    def _verify(self, entries, request=None):
         self.ops.journal_reader = lambda issue: entries
         self.ops.journal_reader_fresh = True
-        return self.ops.approval_verified(self.request)
+        return self.ops.approval_verified(request or self.request)
 
-    def test_an_approval_naming_the_exact_action_and_generation_verifies(self):
-        notes = f"## Gate: owner_close_approval\n- approves: {self.token}\n"
-        self.assertTrue(self._with_entries([_Entry(self.APPROVAL_JOURNAL, notes)]))
+    def _entry(self, notes, journal=None):
+        return _Entry(journal or self.APPROVAL_JOURNAL, notes, issue=ANCHOR_ISSUE)
 
-    def test_a_journal_that_does_not_name_the_action_is_not_an_approval(self):
-        # The R1 hole verbatim: any well-shaped, existing journal used to authorize a close.
-        self.assertTrue(bool(self.token))
+    # -- the positive case ---------------------------------------------------
+
+    def test_a_canonical_structured_approval_verifies(self):
+        notes = f"## Gate: owner approval\n\n{self.marker}\n"
+        self.assertTrue(self._verify([self._entry(notes)]))
+
+    # -- the four holes review j#92487 F1 reproduced -------------------------
+
+    def test_a_negated_prose_mention_never_verifies(self):
+        notes = f"この action は **承認しない**。{self.ACTION_ID} は保留する。"
+        self.assertFalse(self._verify([self._entry(notes)]))
+
+    def test_a_quoted_retry_command_never_verifies(self):
+        notes = (
+            "参考までに retry command:\n```\n"
+            f"mozyo-bridge sublane refresh-worker --action-id {self.ACTION_ID} --execute\n"
+            "```\n(未承認)"
+        )
+        self.assertFalse(self._verify([self._entry(notes)]))
+
+    def test_a_log_line_never_verifies(self):
+        notes = f"[debug] refused action {self.ACTION_ID} (no approval on file)"
+        self.assertFalse(self._verify([self._entry(notes)]))
+
+    def test_a_neighbouring_generation_never_verifies(self):
+        # ``:g30`` used to satisfy ``:g3`` by substring containment. The generation is now a
+        # digest input compared by field equality, so a prefix relation cannot exist.
+        other = render_worker_refresh_approval_marker(
+            issue=ANCHOR_ISSUE, lane=LANE, action_id=self.ACTION_ID, action_generation=30,
+        )
+        self.assertNotEqual(other, self.marker)
+        self.assertFalse(self._verify([self._entry(other)]))
+
+    # -- exact-field / uniqueness / decision fences --------------------------
+
+    def test_an_approval_of_a_different_worker_never_verifies(self):
+        other = render_worker_refresh_approval_marker(
+            issue=ANCHOR_ISSUE, lane=LANE,
+            action_id="refresh-worker:" + LANE + ":claude:claude:other:w4B:p11:r4",
+            action_generation=3,
+        )
+        self.assertFalse(self._verify([self._entry(other)]))
+
+    def test_an_approval_for_a_different_lane_never_verifies(self):
+        other = render_worker_refresh_approval_marker(
+            issue=ANCHOR_ISSUE, lane="issue_99999_other",
+            action_id=self.ACTION_ID, action_generation=3,
+        )
+        self.assertFalse(self._verify([self._entry(other)]))
+
+    def test_a_declined_decision_never_verifies(self):
+        declined = self.marker.replace("decision=approved", "decision=declined")
+        self.assertFalse(self._verify([self._entry(declined)]))
+
+    def test_a_missing_or_unknown_version_never_verifies(self):
         self.assertFalse(
-            self._with_entries([_Entry(self.APPROVAL_JOURNAL, "looks good, go ahead")])
+            self._verify([self._entry(self.marker.replace("version=1", "version=2"))])
         )
 
-    def test_an_approval_of_a_different_generation_does_not_verify(self):
-        other = self.token.replace(":g3", ":g2")
-        self.assertNotEqual(other, self.token)
-        self.assertFalse(self._with_entries([_Entry(self.APPROVAL_JOURNAL, other)]))
+    def test_a_delegated_approval_source_never_verifies(self):
+        # A guarded worker refresh is a destructive operation — a carve-out from standing
+        # delegation, so only a direct owner approval qualifies.
+        delegated = self.marker.replace(
+            "approval_source=direct_owner", "approval_source=standing_delegation"
+        )
+        self.assertFalse(self._verify([self._entry(delegated)]))
 
-    def test_an_approval_of_a_different_worker_does_not_verify(self):
-        other = self.token.replace(":wk:", ":other_worker:")
-        self.assertNotEqual(other, self.token)
-        self.assertFalse(self._with_entries([_Entry(self.APPROVAL_JOURNAL, other)]))
+    def test_two_approval_markers_on_one_journal_never_verify(self):
+        # A record that declares this gate twice cannot say which is authoritative.
+        self.assertFalse(self._verify([self._entry(self.marker + "\n" + self.marker)]))
 
-    def test_the_token_must_live_on_the_PINNED_journal(self):
-        # A correct approval sitting on a different journal never authorizes this pointer.
-        self.assertFalse(self._with_entries([_Entry("99999", self.token)]))
+    def test_a_conflicting_second_marker_never_verifies(self):
+        declined = self.marker.replace("decision=approved", "decision=declined")
+        self.assertFalse(self._verify([self._entry(self.marker + "\n" + declined)]))
+
+    # -- pointer / source fences ---------------------------------------------
+
+    def test_the_marker_must_live_on_the_PINNED_journal(self):
+        self.assertFalse(self._verify([self._entry(self.marker, journal="99999")]))
+
+    def test_a_duplicated_journal_id_never_verifies(self):
+        self.assertFalse(
+            self._verify([self._entry(self.marker), self._entry(self.marker)])
+        )
 
     def test_an_absent_journal_never_verifies(self):
-        self.assertFalse(self._with_entries([]))
+        self.assertFalse(self._verify([]))
+
+    def test_a_marker_on_another_issue_never_verifies(self):
+        entry = _Entry(self.APPROVAL_JOURNAL, self.marker, issue="99999")
+        self.assertFalse(self._verify([entry]))
 
     def test_no_reader_or_a_snapshot_reader_never_verifies(self):
         self.ops.journal_reader = None
         self.ops.journal_reader_fresh = True
         self.assertFalse(self.ops.approval_verified(self.request))
-        self.ops.journal_reader = lambda issue: [
-            _Entry(self.APPROVAL_JOURNAL, self.token)
-        ]
+        self.ops.journal_reader = lambda issue: [self._entry(self.marker)]
         self.ops.journal_reader_fresh = False
         self.assertFalse(self.ops.approval_verified(self.request))
 
@@ -734,19 +856,112 @@ class ApprovalVerificationTests(unittest.TestCase):
         self.ops.approval_verified(self.request)
         self.assertEqual(seen, [ANCHOR_ISSUE])
 
-    def test_an_empty_journal_or_action_id_never_verifies(self):
-        self.ops.journal_reader_fresh = True
-        self.ops.journal_reader = lambda issue: [_Entry("", "anything")]
-        self.assertFalse(self.ops.approval_verified(_request(journal="", action_id="x")))
+    def test_an_under_specified_request_never_verifies(self):
+        self.assertFalse(self._verify([self._entry(self.marker)], _request(journal="")))
         self.assertFalse(
-            self.ops.approval_verified(_request(journal="1", action_id=""))
+            self._verify([self._entry(self.marker)], _request(action_id="", journal="1"))
+        )
+
+
+class CloseBoundarySettledFenceTests(unittest.TestCase):
+    """The action-time close-boundary fence (review j#92487 F2).
+
+    The shared #13806 boundary reduces the runtime to ``running_process = (state == busy)``,
+    so every non-``working`` herdr status — including a ``blocked`` permission prompt and an
+    unreadable ``unknown`` — reached ``may_close=True``. Each case below was admitted before.
+    """
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        self.request = _request(worker_revision="4")
+        self.ops = LiveWorkerRefreshOps(repo_root=self.repo, request=self.request)
+        self.inner = _FakeInnerPort()
+        self.port = live_mod.SettledCloseBoundaryPort(
+            inner=self.inner, ops=self.ops, request=self.request
+        )
+
+    def _may_close(self, raw_status, composer_clear=True):
+        rows = [{"name": "wk", "pane_id": "w4B:p10", "revision": "4"}]
+        if raw_status is not None:
+            rows[0]["status"] = raw_status
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows):
+            with patch.object(self.ops, "_composer_clear", return_value=composer_clear):
+                observation = self.port.observe_preservation(_pin())
+        return assess_worker_recovery_preservation(observation).may_close, observation
+
+    def test_a_settled_worker_may_close(self):
+        for raw in ("done", "idle"):
+            with self.subTest(status=raw):
+                may_close, _obs = self._may_close(raw)
+                self.assertTrue(may_close)
+
+    def test_a_working_worker_never_closes(self):
+        may_close, _obs = self._may_close("working")
+        self.assertFalse(may_close)
+
+    def test_a_blocked_worker_never_closes(self):
+        # A live agent sitting at a permission prompt.
+        may_close, obs = self._may_close("blocked")
+        self.assertFalse(may_close)
+        self.assertIn("worker_not_settled:blocked", obs.detail)
+
+    def test_an_unreadable_or_novel_state_never_closes(self):
+        for raw in (None, "some_novel_status", "unknown"):
+            with self.subTest(status=raw):
+                may_close, obs = self._may_close(raw)
+                self.assertFalse(may_close)
+                self.assertIn("worker_not_settled:unknown", obs.detail)
+
+    def test_an_absent_row_never_closes(self):
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=[]):
+            with patch.object(self.ops, "_composer_clear", return_value=True):
+                observation = self.port.observe_preservation(_pin())
+        self.assertFalse(assess_worker_recovery_preservation(observation).may_close)
+
+    def test_composer_input_gained_after_preflight_never_closes(self):
+        may_close, obs = self._may_close("done", composer_clear=False)
+        self.assertFalse(may_close)
+        self.assertIn("pending_composer_input", obs.detail)
+
+    def test_the_shared_identity_refusal_is_preserved_verbatim(self):
+        # The wrapper only ever ADDS a refusal; a shared identity refusal must reach the
+        # policy with its own detail intact, not be masked by a settled-state message.
+        self.inner.observation = PreservationObservation(
+            identity_matches=False, detail="row_revision_drift:pinned=4:live=9"
+        )
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=[]):
+            observation = self.port.observe_preservation(_pin())
+        self.assertFalse(observation.identity_matches)
+        self.assertEqual(observation.detail, "row_revision_drift:pinned=4:live=9")
+
+    def test_the_wrapper_forwards_every_actuation_call_and_the_typed_diagnostic(self):
+        self.port.observe_old_slot(_pin())
+        self.port.close_exact_generation(_pin())
+        self.port.launch_action_bound("a", _pin())
+        self.port.verify_attestation("a", _pin())
+        self.assertEqual(
+            self.inner.calls,
+            ["observe_old_slot", "close_exact_generation", "launch_action_bound",
+             "verify_attestation"],
+        )
+        # ``port_launch_failure_reason`` must read the INNER port's diagnostic through the
+        # wrapper, not see an attribute-less object.
+        self.inner.launch_failure_reason = "launch_target_absent"
+        self.assertEqual(
+            port_launch_failure_reason(self.port), "launch_target_absent"
         )
 
 
 class ResumeRailTests(unittest.TestCase):
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp())
-        self.ops = LiveWorkerRefreshOps(repo_root=self.repo, request=_request())
+        self.ops = LiveWorkerRefreshOps(
+            repo_root=self.repo,
+            request=_request(
+                action_id="refresh-worker:" + LANE + ":claude:claude:wk:w4B:p10:r4",
+                action_generation=3, worker_revision="4",
+            ),
+        )
         self.continuation = ContinuationPointer(
             source="redmine", issue_id=ANCHOR_ISSUE, journal_id=ANCHOR_JOURNAL,
             expected_gate=ANCHOR_GATE, next_semantic_action="callback_recovery_once",
@@ -766,10 +981,126 @@ class ResumeRailTests(unittest.TestCase):
         self.assertEqual(result, DRAIN_SEND_ERROR)
         self.assertEqual(driven, [])
 
-    def test_resume_once_drives_the_governed_rail_with_the_existing_anchor(self):
+    def test_resume_once_never_sends_to_a_slot_not_bound_to_this_action(self):
+        # Review j#92487 F3: a slot recycled after the actuator's attestation used to receive
+        # the governed resume, because only the one-shot rail verified the action binding.
         rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle"}]
         driven: list = []
         with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows):
+            with patch.object(
+                self.ops, "_drive_cli", side_effect=lambda argv: driven.append(argv) or 0
+            ):
+                with patch.object(
+                    self.ops, "_providers", return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)
+                ):
+                    with patch.object(
+                        self.ops, "_governed_sender_resolves", return_value=True
+                    ):
+                        with patch.object(
+                            self.ops, "_fresh_slot_action_bound", return_value=False
+                        ):
+                            result = self.ops.resume_once(self.continuation)
+        self.assertEqual(result, DRAIN_SEND_ERROR)
+        self.assertEqual(driven, [], "an unbound slot must receive nothing")
+
+    def _confirmable(self):
+        """Every confirmation axis but the action binding satisfied.
+
+        Built so the action binding is the SOLE discriminator: an earlier version of this
+        test asserted ``False`` while the ledger lookup was failing anyway, so it passed
+        whether or not the binding was checked at all.
+        """
+        reply_marker = build_marker(
+            RedmineAnchor(issue=ANCHOR_ISSUE, journal=ANCHOR_JOURNAL), "reply",
+            WORKER_PROVIDER,
+        )
+        record = _record(
+            reply_marker, target="w4B:p22", recorded_at="2026-06-01T00:00:00+00:00"
+        )
+        self.ops.ledger = _FakeLedger([record])
+        return [{"name": "wk", "pane_id": "w4B:p22", "status": "idle"}]
+
+    def test_resume_confirmed_holds_when_the_slot_is_action_bound(self):
+        rows = self._confirmable()
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
+                patch.object(
+                    self.ops, "_providers",
+                    return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
+                patch.object(
+                    self.ops, "_fresh_attestation_observed_at",
+                    return_value="2026-01-01T00:00:00+00:00"), \
+                patch.object(self.ops, "_fresh_slot_action_bound", return_value=True):
+            self.assertTrue(self.ops.resume_confirmed(self.continuation))
+
+    def test_resume_confirmed_requires_the_action_binding(self):
+        # Identical setup to the passing case above — ONLY the binding flips. Without this
+        # symmetry the assertion would hold even if the binding were never consulted.
+        rows = self._confirmable()
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
+                patch.object(
+                    self.ops, "_providers",
+                    return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
+                patch.object(
+                    self.ops, "_fresh_attestation_observed_at",
+                    return_value="2026-01-01T00:00:00+00:00"), \
+                patch.object(self.ops, "_fresh_slot_action_bound", return_value=False):
+            self.assertFalse(self.ops.resume_confirmed(self.continuation))
+
+    def test_the_action_binding_helper_delegates_to_the_delivery_authority(self):
+        # C3: with the helper itself never exercised, an implementation that always returned
+        # True survived every test. This drives its real body.
+        class _Svc:
+            def __init__(self, may, boom=False):
+                self.may, self.boom, self.seen = may, boom, []
+
+            def preflight(self, request):
+                if self.boom:
+                    raise RuntimeError("attestation store unreadable")
+                self.seen.append(request)
+                return SimpleNamespace(may_deliver=self.may)
+
+        rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle", "revision": "9"}]
+        def bound(svc):
+            with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
+                    patch.object(
+                        live_mod, "repo_scope_workspace_id", return_value=LOCAL_WS), \
+                    patch.object(self.ops, "_recovery_delivery_service", return_value=svc):
+                return self.ops._fresh_slot_action_bound(
+                    self.continuation, "w4B:p22", WORKER_PROVIDER
+                )
+
+        ok = _Svc(True)
+        self.assertTrue(bound(ok))
+        # The request handed to the authority carries THIS action and the fresh slot.
+        self.assertEqual(ok.seen[0].target_action_id, self.ops.request.action_id)
+        self.assertEqual(ok.seen[0].target_locator, "w4B:p22")
+        self.assertFalse(bound(_Svc(False)))
+        self.assertFalse(bound(_Svc(True, boom=True)))
+
+    def test_the_action_binding_helper_fails_closed_on_an_unresolvable_slot(self):
+        class _Svc:
+            def preflight(self, request):
+                raise AssertionError("must not be consulted for an unresolvable slot")
+
+        # Ambiguous rows at the assigned name => no delivery request can be built.
+        rows = [
+            {"name": "wk", "pane_id": "w4B:p22", "status": "idle", "revision": "9"},
+            {"name": "wk", "pane_id": "w4B:p22", "status": "idle", "revision": "9"},
+        ]
+        with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows), \
+                patch.object(live_mod, "repo_scope_workspace_id", return_value=LOCAL_WS), \
+                patch.object(self.ops, "_recovery_delivery_service", return_value=_Svc()):
+            self.assertFalse(
+                self.ops._fresh_slot_action_bound(
+                    self.continuation, "w4B:p22", WORKER_PROVIDER
+                )
+            )
+
+    def test_resume_once_drives_the_governed_rail_with_the_existing_anchor(self):
+        rows = [{"name": "wk", "pane_id": "w4B:p22", "status": "idle"}]
+        driven: list = []
+        with patch.object(self.ops, "_fresh_slot_action_bound", return_value=True), \
+                patch.object(live_mod, "list_herdr_agent_rows", return_value=rows):
             with patch.object(
                 self.ops, "_drive_cli", side_effect=lambda argv: driven.append(argv) or 0
             ):
