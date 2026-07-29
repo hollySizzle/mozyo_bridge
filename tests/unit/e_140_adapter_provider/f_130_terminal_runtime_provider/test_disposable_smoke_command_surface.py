@@ -915,6 +915,163 @@ class DerivationLivenessTests(unittest.TestCase):
         )
         self.assertIn(("probe", "dunder-alias"), derive_dispatch_surface(tree).pairs)
 
+    def test_a_decorated_dunder_is_not_read_as_its_undecorated_body(self) -> None:
+        """Review j#92541 F9-1, verdict j#92548.
+
+        A decorator returns whatever it likes.  Reading the ``def`` underneath it as the
+        thing that runs meant a replacement decorator could put a dispatching ``__len__``
+        on the runner while the derivation stayed silent — and the truth test that invokes
+        it is production code, unmodified by this probe.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_replace=(
+                "class RecordingHerdrRunner:",
+                "def _probe_replace(fn):\n"
+                "    def _wrapper(self):\n"
+                '        self(["bin", "probe", "decorated-len"])\n'
+                "        return 1\n"
+                "    return _wrapper\n\n\n"
+                "class RecordingHerdrRunner:",
+            ),
+            recorder_addition=(
+                "\n\n    @_probe_replace\n"
+                "    def __len__(self):\n"
+                "        return 0\n"
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            surface.unresolved_flows or surface.unresolved_sites,
+            "a decorated dunder was read as its raw body",
+        )
+
+    def test_a_metaclass_makes_the_member_surface_unreadable(self) -> None:
+        """Review j#92541 F9-2, verdict j#92548.
+
+        ``metaclass=`` builds the namespace, so the class body is not the member list.
+        The previous round predicted this rode the unresolved-base path; it did not, and
+        predicting it instead of measuring it is what made the finding blocking.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_replace=(
+                "class RecordingHerdrRunner:",
+                "class _ProbeMeta(type):\n"
+                "    def __new__(mcls, name, bases, ns):\n"
+                "        def _injected(self):\n"
+                '            self(["bin", "probe", "metaclass-len"])\n'
+                "            return 1\n"
+                '        ns["__len__"] = _injected\n'
+                "        return super().__new__(mcls, name, bases, ns)\n\n\n"
+                "class RecordingHerdrRunner(metaclass=_ProbeMeta):",
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            surface.unresolved_flows or surface.unresolved_sites,
+            "a metaclass-built member surface was read as the class body",
+        )
+
+    def test_a_class_decorator_makes_the_member_surface_unreadable(self) -> None:
+        """Sibling of F9-2: the other way to rewrite a class after its body is read."""
+        tree = self._mutated_tree(
+            "",
+            recorder_replace=(
+                "class RecordingHerdrRunner:",
+                "def _probe_class_decorator(cls):\n"
+                "    def _injected(self):\n"
+                '        self(["bin", "probe", "class-decorator-len"])\n'
+                "        return 1\n"
+                "    cls.__len__ = _injected\n"
+                "    return cls\n\n\n"
+                "@_probe_class_decorator\n"
+                "class RecordingHerdrRunner:",
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            surface.unresolved_flows or surface.unresolved_sites,
+            "a class decorator rewrote the members without a report",
+        )
+
+    def test_a_conditional_class_body_binding_is_unreadable(self) -> None:
+        """The shape nobody listed — which is the point of inverting the check.
+
+        No finding named ``if`` in a class body.  It reports because the inversion admits
+        a closed set of modelled statements and refuses everything else, so shapes that
+        were never enumerated are covered without being enumerated.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_addition=(
+                "\n\n    if True:\n"
+                "        def __len__(self):\n"
+                '            self(["bin", "probe", "conditional-len"])\n'
+                "            return 1\n"
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            surface.unresolved_flows or surface.unresolved_sites,
+            "an unmodelled class-body statement was read as absent",
+        )
+
+    def test_an_annotated_descriptor_binding_is_analysed(self) -> None:
+        """Review j#92541 F9-3, verdict j#92548.
+
+        ``_inner: _ProbeDescriptor = _ProbeDescriptor()`` is the ordinary annotated
+        spelling.  Scanning only ``ast.Assign`` made it "readable, no descriptor", so the
+        F8-1 fix held for one of the two ways Python binds a class attribute.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_replace=(
+                "class RecordingHerdrRunner:",
+                "class _ProbeDescriptor:\n"
+                "    def __set__(self, obj, value):\n"
+                "        if callable(value):\n"
+                '            value(["bin", "probe", "annotated-descriptor-set"])\n'
+                '        obj.__dict__["_inner"] = value\n\n\n'
+                "class RecordingHerdrRunner:\n"
+                "    _inner: _ProbeDescriptor = _ProbeDescriptor()\n",
+            ),
+        )
+        self.assertIn(
+            ("probe", "annotated-descriptor-set"),
+            derive_dispatch_surface(tree).pairs,
+        )
+
+    def test_the_modelled_class_constructs_stay_silent(self) -> None:
+        """The control for the inversion: refusing *everything* would pass every probe.
+
+        Each of these is a construct the walk claims to model.  If any of them starts
+        reporting, the inversion has degenerated into "unreadable", and the reports above
+        would no longer be evidence of anything.
+        """
+        cases = {
+            "plain direct-def dunder": (
+                "\n\n    def __len__(self):\n        return 0\n"
+            ),
+            "decorated non-dunder member": (
+                "\n\n    @property\n    def probe_reading(self):\n        return 0\n"
+            ),
+            "annotated class constant": ("\n\n    probe_slot: int = 0\n"),
+            "bare annotation": ("\n\n    probe_unbound: int\n"),
+        }
+        for label, addition in cases.items():
+            with self.subTest(construct=label):
+                tree = self._mutated_tree("", recorder_addition=addition)
+                surface = derive_dispatch_surface(tree)
+                self.assertEqual(
+                    ([], []),
+                    (
+                        list(surface.unresolved_flows),
+                        [s.anchor for s in surface.unresolved_sites],
+                    ),
+                    f"a modelled construct ({label}) was reported as unreadable",
+                )
+
     def test_the_probe_does_not_touch_the_live_source(self) -> None:
         """Probe hygiene: mutating the copy must leave the real tree byte-identical.
 

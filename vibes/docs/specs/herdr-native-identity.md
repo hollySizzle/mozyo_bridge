@@ -1233,6 +1233,24 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
       (source root 外) を「member 無し」と同一視、(c) data descriptor の `__set__` を
       **owner 側**で探す (実際は class 属性が保持する **descriptor object の型**にある) の
       3 点で成立していなかった。**読めない member surface は absent ではない**ので報告する。
+    - **tri-state の判定極性を反転した** (review j#92541)。R8 の tri-state は宣言としては
+      正しかったが、実装上の「読めない」が **こちらが思いついた構文の列挙**だったため、列挙外の
+      構文は unreadable ではなく **absent** に落ちていた。実測で 3 形が完全沈黙した:
+      (a) **decorated dunder** — decorator は runtime 実体を差し替えるのに、下の raw `def` を
+      解析していた、(b) **`metaclass=` / class decorator** — class body は member 一覧ではない。
+      R8 は「unresolved base と同じ経路に乗る」と**予測して書いたが、`ClassDef.keywords` も
+      decorator も読んでいなかった**、(c) **annotated class binding**
+      (`_inner: _Descriptor = _Descriptor()`) — `ast.Assign` しか走査せず、F8-1 の descriptor
+      修正が Python の 2 つの binding 形の片方にしか効いていなかった。
+      よって **「読めない形の列挙」をやめ、「完全に模型化できる構文の閉じた集合」を列挙して
+      それ以外を unreadable とする**。class 自身に decorator / keyword が無く、全 base が解決でき、
+      class body の各文が modelled 集合 (docstring / `Pass` / `Assign` / `AnnAssign` /
+      既知 decorator のみを持つ `def`) に属するときだけ member surface を読めたとする。
+      dunder に付いた decorator は既知のものでも unreadable とする (`property` on `__len__` は
+      protocol が呼ぶものを変える)。この極性なら、**今後こちらが思いつかなかった構文は沈黙ではなく
+      報告になる** — 実際、どの finding も挙げていない「class body 内の `if` 下 binding」が
+      追加の列挙なしに報告側へ落ちることを実測した。これは R7 で dunder の列挙をやめたのと同じ
+      修正を一段外側で行ったものである。
     - **「位置の集合が完全である」とは主張しない**。同種の完全性主張は複数 round 連続で次の review に
       反証されている。設計が提供するのは完全性ではなく、**読めない class / 解決できない chain /
       owner 不明の位置は報告される**という性質である。
@@ -1249,9 +1267,13 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     実行形が `tests/integration/.../test_dispatch_derivation_edge_sweep.py` であり、
     `required_surface` の各 edge (seed / local・parameter・attribute 伝播 / `**kwargs` 転送 /
     wrapper 構築 / 継承 / attribute call・read / container carrier / context protocol /
-    escape 各形 / argv 未解決 / Process 境界) に **1 mutant ずつ**を copy tree へ単独注入し、
-    導出が何かを言うことを実測する。**control 2 件 (benign read / probe 無し) が沈黙する**
-    ことも同時に固定し、「全部報告する」で全 mutant を通す退化を検出する。実行時間の都合で
+    escape 各形 / argv 未解決 / Process 境界 / **class 構築面**) に **1 mutant ずつ**を copy tree
+    へ単独注入し、導出が何かを言うことを実測する。**control が沈黙する**ことも同時に固定し
+    (benign read / probe 無し / 模型化済み class 構文 3 形)、「全部報告する」で全 mutant を
+    通す退化を検出する。class 構築 edge は **どの runner class を書き換えるかが load-bearing**
+    である: descriptor edge は `RecordingHerdrRunner` に置く必要があり、seed class に置いた
+    初版は沈黙した (seed class の `__init__` 引数が tainted path 上に無いため沈黙が正しい)。
+    この誤設置を検出したのが sweep 自身である。実行時間の都合で
     `MOZYO_DERIVATION_EDGE_SWEEP=1` の opt-in とし、個別 regression は unit 側で常時実行する。
     **`Process` 境界は「live tree が現在通るから」で代替しない** (review j#92266)。propagation が
     効くことと、worker の argv が解決できないときに fail-closed で報告されることを、

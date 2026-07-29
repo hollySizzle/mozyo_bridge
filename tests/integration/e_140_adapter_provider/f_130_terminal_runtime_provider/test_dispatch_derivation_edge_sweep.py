@@ -7,11 +7,11 @@ into a COPY of the tree, asserting the derivation says *something* — a resolve
 unresolved site, or an unresolved flow.  Silence is the failure mode the whole subsystem
 exists to prevent.
 
-The two controls are load-bearing: a derivation that reported everything would satisfy
-every mutant while being useless, so a benign counter read and a probe-free tree must stay
-silent.
+The controls are load-bearing: a derivation that reported everything would satisfy every
+mutant while being useless, so a benign counter read, a probe-free tree, and each class
+construct the walk claims to model must stay silent.
 
-**Opt-in.**  23 tree copies and 23 full derivations run for about two minutes, which does
+**Opt-in.**  40 tree copies and 40 full derivations run for about five minutes, which does
 not belong in every ``unittest discover``.  Set ``MOZYO_DERIVATION_EDGE_SWEEP=1`` to run
 it.  The per-edge regressions that must never regress silently live in
 ``tests/unit/.../test_disposable_smoke_command_surface.py`` and run unconditionally.
@@ -179,6 +179,89 @@ EDGES = [
      '    def _p(self):\n        return None\n\n', False),
 ]
 
+RUNNER_CLASS = "class EndpointBoundHerdrRunner:"
+RECORDER_CLASS = "class RecordingHerdrRunner:"
+RECORDER = SEED.rsplit("/", 1)[0] + "/shared_space_smoke_observation.py"
+
+# -- class CONSTRUCTION surface (review j#92541 F9) -------------------------------------
+# These rewrite the class statement itself, which the injections above cannot reach: a
+# metaclass or a class decorator puts members on the class without appearing in its body,
+# and a decorated ``def`` is not the function that ends up bound.  Each expects a REPORT,
+# because the walk models none of them; the controls below expect silence, because the
+# walk does model those and an inversion that refuses everything would prove nothing.
+#
+# The anchor names WHICH runner class the row rewrites, and that choice is load-bearing:
+# the descriptor row has to sit on ``RecordingHerdrRunner``, because that is the class
+# whose ``self._inner = inner`` carries a tainted value.  Siting it on the seed class made
+# it silent — correctly, since that ``__init__`` parameter is not on a tainted path — and
+# the sweep caught the mis-siting, which is what the sweep is for.
+#
+# (label, anchor, class-statement replacement, owner-method injection, expect)
+CLASS_CONSTRUCTION_EDGES = [
+    ("construction: metaclass injects a dunder", RUNNER_CLASS,
+     "class _ProbeMeta(type):\n"
+     "    def __new__(mcls, name, bases, ns):\n"
+     "        def _injected(self):\n"
+     '            self(["bin", "probe", "metaclass-len"])\n'
+     "            return 1\n"
+     '        ns["__len__"] = _injected\n'
+     "        return super().__new__(mcls, name, bases, ns)\n\n\n"
+     "class EndpointBoundHerdrRunner(metaclass=_ProbeMeta):",
+     '    def _p(self):\n        return 1 if self.runner else 0\n\n', True),
+    ("construction: class decorator rewrites the members", RUNNER_CLASS,
+     "def _probe_class_decorator(cls):\n"
+     "    def _injected(self):\n"
+     '        self(["bin", "probe", "class-decorator-len"])\n'
+     "        return 1\n"
+     "    cls.__len__ = _injected\n"
+     "    return cls\n\n\n"
+     "@_probe_class_decorator\n"
+     "class EndpointBoundHerdrRunner:",
+     '    def _p(self):\n        return 1 if self.runner else 0\n\n', True),
+    ("construction: decorated dunder is not its raw body", RUNNER_CLASS,
+     "def _probe_replace(fn):\n"
+     "    def _wrapper(self):\n"
+     '        self(["bin", "probe", "decorated-len"])\n'
+     "        return 1\n"
+     "    return _wrapper\n\n\n"
+     "class EndpointBoundHerdrRunner:\n"
+     "    @_probe_replace\n"
+     "    def __len__(self):\n"
+     "        return 0\n",
+     '    def _p(self):\n        return 1 if self.runner else 0\n\n', True),
+    ("construction: annotated descriptor __set__ is analysed", RECORDER_CLASS,
+     "class _ProbeDescriptor:\n"
+     "    def __set__(self, obj, value):\n"
+     "        if callable(value):\n"
+     '            value(["bin", "probe", "annotated-descriptor-set"])\n'
+     '        obj.__dict__["_inner"] = value\n\n\n'
+     "class RecordingHerdrRunner:\n"
+     "    _inner: _ProbeDescriptor = _ProbeDescriptor()\n",
+     '    def _p(self):\n        return None\n\n', True),
+    ("construction: conditional class-body binding", RUNNER_CLASS,
+     "class EndpointBoundHerdrRunner:\n"
+     "    if True:\n"
+     "        def __len__(self):\n"
+     '            self(["bin", "probe", "conditional-len"])\n'
+     "            return 1\n",
+     '    def _p(self):\n        return 1 if self.runner else 0\n\n', True),
+    ("CONTROL construction: plain direct-def dunder", RUNNER_CLASS,
+     "class EndpointBoundHerdrRunner:\n"
+     "    def __len__(self):\n"
+     "        return 0\n",
+     '    def _p(self):\n        return None\n\n', False),
+    ("CONTROL construction: modelled member decorator", RUNNER_CLASS,
+     "class EndpointBoundHerdrRunner:\n"
+     "    @property\n"
+     "    def probe_reading(self):\n"
+     "        return 0\n",
+     '    def _p(self):\n        return None\n\n', False),
+    ("CONTROL construction: annotated class constant", RUNNER_CLASS,
+     "class EndpointBoundHerdrRunner:\n"
+     "    probe_slot: int = 0\n",
+     '    def _p(self):\n        return None\n\n', False),
+]
+
 DECLARED_METHOD = (
     "attribute call: declared method dispatching",
     None,
@@ -218,6 +301,33 @@ def run_edge(init_inj, tail_inj, owner_inj):
 
 
 
+def run_class_edge(anchor, class_stmt, owner_inj):
+    """Like :func:`run_edge`, but rewrites the class statement itself.
+
+    "Reported" is measured against the whole surface rather than filtered to probe-named
+    functions, because a class-construction defect surfaces where the class is *used* —
+    the production truth test in ``_prepare_session_locked`` — and not in the injected
+    method.  The live tree derives zero unresolved sites and zero unresolved flows, so any
+    non-zero count here is caused by the mutation.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="mozyo-class-edge-"))
+    try:
+        shutil.copytree(ROOT / "src" / "mozyo_bridge", tmp / "mozyo_bridge",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        target = tmp / (SEED if anchor == RUNNER_CLASS else RECORDER)
+        s = target.read_text()
+        assert anchor in s, f"the class statement moved: {anchor}"
+        target.write_text(s.replace(anchor, class_stmt, 1))
+        seed = tmp / SEED
+        body = seed.read_text()
+        seed.write_text(body.replace(OWNER, owner_inj + OWNER, 1))
+        d = derive_dispatch_surface(tmp)
+        pairs = [p for p in d.pairs if p[0] == "probe"]
+        return bool(pairs or d.unresolved_sites or d.unresolved_flows), pairs
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 @unittest.skipUnless(
     os.environ.get(OPT_IN) == "1",
     f"the full-surface edge sweep is opt-in; set {OPT_IN}=1 to run it",
@@ -231,8 +341,14 @@ class DerivationEdgeSweepTests(unittest.TestCase):
             got, _pairs = run_edge(init_inj, tail_inj, owner_inj)
             if got != expect:
                 mismatches.append(f"{label}: expected reported={expect}, got {got}")
+        for label, anchor, class_stmt, owner_inj, expect in CLASS_CONSTRUCTION_EDGES:
+            got, _pairs = run_class_edge(anchor, class_stmt, owner_inj)
+            if got != expect:
+                mismatches.append(f"{label}: expected reported={expect}, got {got}")
         self.assertEqual(mismatches, [], "\n".join(mismatches))
-        self.assertGreaterEqual(len(rows), 32, "the sweep lost edges")
+        self.assertGreaterEqual(
+            len(rows) + len(CLASS_CONSTRUCTION_EDGES), 40, "the sweep lost edges"
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

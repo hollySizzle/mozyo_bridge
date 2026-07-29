@@ -735,6 +735,65 @@ class _Walker:
             resolved.append(found)
         return (tuple(resolved), unresolved)
 
+    def _class_surface_is_modelled(self, class_ref: tuple) -> bool:
+        """Whether ``class_ref``'s member surface comes only from constructs the walk reads.
+
+        The question this answers is deliberately not "does this class do anything
+        dangerous" — that would be another enumeration of shapes I happened to think of,
+        and review j#92541 falsified the last three such enumerations in a single round.
+        It answers "is every part of this class construction one I model", so a construct
+        nobody anticipated is unreadable by default rather than absent by default.
+
+        Three surfaces are checked, because all three can put members on a class without
+        appearing in its body:
+
+        * **class decorators** — a decorator returns whatever it likes, including a
+          different class entirely.
+        * **class keywords** — ``metaclass=`` runs code that builds the namespace, so the
+          body is not the member list.  The previous round predicted this rode the
+          unresolved-base path; it does not, and saying so without measuring it is what
+          made F9-2 blocking.
+        * **body statements** — see :data:`_MODELLED_CLASS_BODY`.
+
+        A decorated *dunder* is unreadable even when its decorator is one of the modelled
+        ones: ``property`` on ``__len__`` changes what the protocol invokes, and the
+        modelled set was justified for ordinary attributes only.
+        """
+        cached = self._modelled_surfaces.get(class_ref)
+        if cached is not None:
+            return cached
+        module, class_name = class_ref
+        indexed = self.index.get(module)
+        class_def = indexed.classes.get(class_name) if indexed else None
+        modelled = self._compute_class_surface_is_modelled(class_def)
+        self._modelled_surfaces[class_ref] = modelled
+        return modelled
+
+    def _compute_class_surface_is_modelled(self, class_def) -> bool:
+        if class_def is None:
+            return False
+        if class_def.decorator_list or class_def.keywords:
+            return False
+        for node in class_def.body:
+            if isinstance(node, ast.Expr):
+                # A docstring is inert.  Any other bare expression is a call whose effect
+                # on the namespace the walk does not follow.
+                if isinstance(node.value, ast.Constant):
+                    continue
+                return False
+            if not isinstance(node, self._MODELLED_CLASS_BODY):
+                return False
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                is_dunder = node.name.startswith("__") and node.name.endswith("__")
+                for decorator in node.decorator_list:
+                    if is_dunder:
+                        return False
+                    if not isinstance(decorator, ast.Name):
+                        return False
+                    if decorator.id not in self._MODELLED_MEMBER_DECORATORS:
+                        return False
+        return True
+
     def _class_is_callable(self, class_ref: tuple, _seen: tuple = ()) -> bool:
         """Whether instances of ``class_ref`` can be called (define a dispatch entry).
 
@@ -836,6 +895,7 @@ class _Walker:
         self.dispatch_calls = []
         self.unresolved_flows = []
         self.used_read_exceptions = set()
+        self._modelled_surfaces: dict = {}
         for module_name, module in self.index.items():
             for qualname, function in module.functions.items():
                 local, kwargs_maps = self._local_taint(module_name, qualname, function)
@@ -1049,6 +1109,35 @@ class _Walker:
 
     #: Attribute spellings that ARE the dispatch entry point (see :meth:`_is_dispatch`).
     _DISPATCH_ATTRS = frozenset({"run", "__call__"})
+
+    #: The class-body statements this walk actually models.  Read the polarity carefully:
+    #: this is **not** a list of constructs that make a class unreadable, it is the closed
+    #: set of constructs that make one readable.  Everything else — a nested ``class``, a
+    #: binding under ``if``, a ``for`` that fills the namespace, an ``exec`` — falls to
+    #: unreadable without anyone having to think of it first.
+    #:
+    #: Review j#92541 landed three findings (decorated dunder, ``metaclass=``, annotated
+    #: descriptor) that were all the same defect: the previous round claimed member
+    #: discovery was tri-state, but "unreadable" was itself a list of shapes I had thought
+    #: of, so every shape I had not thought of came back as *absent*.  That is the R7
+    #: mistake one level out, and enumerating harder would only move it one level further.
+    #: Inverting it is the only version where being wrong produces a report.
+    _MODELLED_CLASS_BODY: tuple = (
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.Assign,
+        ast.AnnAssign,
+        ast.Pass,
+    )
+
+    #: Decorators whose effect on a member the walk can account for.  ``property`` and the
+    #: two method transforms change how an attribute is *reached*, which the read table
+    #: already covers; they do not substitute a different function body.  Any other
+    #: decorator can return anything at all, so the raw ``def`` underneath it is not
+    #: evidence of what runs (j#92541 F9-1).
+    _MODELLED_MEMBER_DECORATORS: frozenset = frozenset(
+        {"property", "classmethod", "staticmethod"}
+    )
 
     def _check_escapes(
         self, module: str, qualname: str, owner: str, local: set, function: ast.AST
@@ -1382,9 +1471,10 @@ class _Walker:
         }
         unknown = False
         class_def = indexed.classes.get(class_name)
-        if class_def is None:
+        if class_def is None or not self._class_surface_is_modelled(class_ref):
+            # Not "this class has no dunders" — "the walk cannot say what its members are".
             unknown = True
-        else:
+        if class_def is not None:
             for node in class_def.body:
                 if not isinstance(node, ast.Assign):
                     continue
@@ -1460,18 +1550,29 @@ class _Walker:
 
         ``readable`` is False when the class body binds the attribute to something this
         walk cannot resolve — that is an unknown descriptor surface, not an absent one.
+
+        Both bindings Python offers are scanned.  Review j#92541 F9-3 found only
+        ``ast.Assign`` here, so ``_inner: _ProbeDescriptor = _ProbeDescriptor()`` — the
+        ordinary annotated spelling, not an exotic one — fell through to "readable, no
+        descriptor" and its ``__set__`` was never analysed.  Anything the class body binds
+        by some other route is caught upstream by :meth:`_class_surface_is_modelled`.
         """
         module, class_name = class_ref
         indexed = self.index.get(module)
         class_def = indexed.classes.get(class_name) if indexed else None
-        if class_def is None:
+        if class_def is None or not self._class_surface_is_modelled(class_ref):
             return (None, False)
         for node in class_def.body:
-            if not isinstance(node, ast.Assign):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
                 continue
-            if not any(
-                isinstance(t, ast.Name) and t.id == attr for t in node.targets
-            ):
+            if not any(isinstance(t, ast.Name) and t.id == attr for t in targets):
+                continue
+            if node.value is None:
+                # A bare annotation binds nothing on the class.
                 continue
             constructed = self._constructed_class(module, "", node.value)
             if constructed is not None:
