@@ -117,6 +117,13 @@ without appearing anywhere in this file.  Assignment targets are handled as thei
 position, since the value travels into the owner's hooks rather than having something run
 on itself.
 
+"Every dunder the class declares" then turned out to mean "every ``def``" (review j#92480):
+a class-body alias (``__len__ = _probe_truth``) declares one just as surely, a base the
+walk cannot read was being treated as a base with nothing in it, and a data descriptor's
+``__set__`` lives on the type of the object the class attribute holds rather than on the
+owner where the code was looking for it.  Member discovery is now tri-state — resolved,
+absent, or *unreadable* — and an unreadable surface reports instead of passing.
+
 No claim is made here that the set of positions is complete.  Six rounds of such claims
 were each falsified by the next review; what the design offers instead is that an
 unreadable class, an unresolvable chain, or a position with no resolvable owner is
@@ -1129,6 +1136,23 @@ class _Walker:
         candidate = f"{class_name}.{attr}"
         if candidate in indexed.functions:
             return (module, candidate)
+        # A class-body alias (``__len__ = _probe_truth``) declares the member just as a
+        # ``def`` does, but resolves to a different qualname.  Collecting the alias NAME
+        # without being able to look it up left F8-3 silent even after the name was known.
+        class_def = indexed.classes.get(class_name)
+        if class_def is not None:
+            for node in class_def.body:
+                if not isinstance(node, ast.Assign):
+                    continue
+                if not any(
+                    isinstance(t, ast.Name) and t.id == attr for t in node.targets
+                ):
+                    continue
+                if isinstance(node.value, ast.Name):
+                    aliased = f"{class_name}.{node.value.id}"
+                    if aliased in indexed.functions:
+                        return (module, aliased)
+                break
         bases, _ = self._base_classes(class_ref)
         for base in bases:
             found = self._lookup_member(base, attr, _seen + (class_ref,))
@@ -1306,8 +1330,12 @@ class _Walker:
         if not classes:
             return False
         for class_ref in classes:
+            declared, surface_unknown = self._declared_dunders(class_ref)
+            if surface_unknown:
+                # An unreadable member surface is not an empty one.
+                return False
             skip = self._CONSTRUCTION_DUNDERS | self._DISPATCH_DUNDERS
-            for dunder in self._declared_dunders(class_ref) - skip:
+            for dunder in declared - skip:
                 found = self._lookup_member(class_ref, dunder)
                 if found is None:
                     continue
@@ -1322,14 +1350,27 @@ class _Walker:
                 ).add(class_ref)
         return True
 
-    def _declared_dunders(self, class_ref: tuple, _seen: tuple = ()) -> set:
-        """Every ``__dunder__`` the class or a base declares."""
+    def _declared_dunders(self, class_ref: tuple, _seen: tuple = ()) -> tuple:
+        """``(dunder names, surface_is_unknown)`` for the class and its bases.
+
+        Tri-state on purpose (review j#92480 F8-2): "this class declares no ``__len__``"
+        and "I could not read where its members come from" are different answers, and
+        collapsing them made an unresolvable base look like an empty one.  ``_base_classes``
+        already reported ``saw_unresolved`` and the previous version discarded it — a gap
+        the prior review had explicitly asked me to close and which I recorded as a
+        residual instead of closing.
+
+        Class-body aliases count as declarations (F8-3): ``__len__ = _probe_truth`` is a
+        dunder the class declares just as much as a ``def`` is.  An alias whose right-hand
+        side is not a resolvable name (a lambda, a call, a decorator result) makes the
+        surface unknown rather than absent.
+        """
         if class_ref in _seen:
-            return set()
+            return (set(), False)
         module, class_name = class_ref
         indexed = self.index.get(module)
         if indexed is None:
-            return set()
+            return (set(), True)
         prefix = f"{class_name}."
         found = {
             name[len(prefix):]
@@ -1339,9 +1380,38 @@ class _Walker:
             and name[len(prefix):].endswith("__")
             and "." not in name[len(prefix):]
         }
-        for base in self._base_classes(class_ref)[0]:
-            found |= self._declared_dunders(base, _seen + (class_ref,))
-        return found
+        unknown = False
+        class_def = indexed.classes.get(class_name)
+        if class_def is None:
+            unknown = True
+        else:
+            for node in class_def.body:
+                if not isinstance(node, ast.Assign):
+                    continue
+                names = [
+                    t.id for t in node.targets
+                    if isinstance(t, ast.Name)
+                    and t.id.startswith("__") and t.id.endswith("__")
+                ]
+                if not names:
+                    continue
+                if isinstance(node.value, ast.Name) and (
+                    f"{class_name}.{node.value.id}" in indexed.functions
+                ):
+                    found.update(names)
+                else:
+                    # A dunder declared as something this walk cannot follow.
+                    unknown = True
+        bases, saw_unresolved = self._base_classes(class_ref)
+        if saw_unresolved:
+            unknown = True
+        for base in bases:
+            base_found, base_unknown = self._declared_dunders(
+                base, _seen + (class_ref,)
+            )
+            found |= base_found
+            unknown = unknown or base_unknown
+        return (found, unknown)
 
     def _target_hook_is_analysed(
         self, module: str, qualname: str, owner: str, local: set, target: ast.Attribute
@@ -1357,19 +1427,61 @@ class _Walker:
         if not classes:
             return False
         for class_ref in classes:
-            for hook in self._TARGET_HOOK_POSITIONS:
-                found = self._lookup_member(class_ref, hook)
-                if found is None:
-                    continue
-                found_module, found_qualname = found
-                function = self.index[found_module].functions[found_qualname]
-                names = _parameter_names(function)
-                # ``__setattr__(self, name, value)`` — the VALUE is the last parameter,
-                # and that is the one carrying the runner.
-                if len(names) < 3:
+            # ``__setattr__`` is looked up on the OWNER...
+            found = self._lookup_member(class_ref, "__setattr__")
+            if found is not None and not self._bind_value_parameter(found):
+                return False
+            # ...but a data descriptor's ``__set__`` lives on the type of the object the
+            # class-level attribute holds, not on the owner at all (review j#92480 F8-1).
+            # Looking for it on the owner was a plain misreading of the protocol.
+            descriptor, readable = self._class_level_attribute_type(
+                class_ref, target.attr
+            )
+            if not readable:
+                return False
+            if descriptor is not None:
+                found = self._lookup_member(descriptor, "__set__")
+                if found is not None and not self._bind_value_parameter(found):
                     return False
-                self.tainted_params.add((found_module, found_qualname, names[-1]))
         return True
+
+    def _bind_value_parameter(self, member: tuple) -> bool:
+        """Taint the VALUE parameter of ``__setattr__`` / ``__set__`` (its last one)."""
+        found_module, found_qualname = member
+        function = self.index[found_module].functions[found_qualname]
+        names = _parameter_names(function)
+        if len(names) < 3:
+            return False
+        self.tainted_params.add((found_module, found_qualname, names[-1]))
+        return True
+
+    def _class_level_attribute_type(self, class_ref: tuple, attr: str) -> tuple:
+        """``(descriptor class or None, readable)`` for ``class_ref.attr``'s class binding.
+
+        ``readable`` is False when the class body binds the attribute to something this
+        walk cannot resolve — that is an unknown descriptor surface, not an absent one.
+        """
+        module, class_name = class_ref
+        indexed = self.index.get(module)
+        class_def = indexed.classes.get(class_name) if indexed else None
+        if class_def is None:
+            return (None, False)
+        for node in class_def.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(
+                isinstance(t, ast.Name) and t.id == attr for t in node.targets
+            ):
+                continue
+            constructed = self._constructed_class(module, "", node.value)
+            if constructed is not None:
+                return (constructed, True)
+            return (None, False)
+        for base in self._base_classes(class_ref)[0]:
+            descriptor, readable = self._class_level_attribute_type(base, attr)
+            if descriptor is not None or not readable:
+                return (descriptor, readable)
+        return (None, True)
 
     def _is_modelled_parent(
         self, node: ast.AST, parent: ast.AST, rebound: set = frozenset()

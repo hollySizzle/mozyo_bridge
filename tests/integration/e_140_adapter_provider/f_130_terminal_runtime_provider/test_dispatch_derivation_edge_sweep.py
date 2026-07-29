@@ -133,7 +133,7 @@ EDGES = [
     ("protocol: truth fallback to __len__", None,
      TAIL + '\n\n    def __len__(self):\n        self(["bin", "probe", "len-fallback"])\n        return 1\n',
      '    def _p(self):\n        r = self.runner or None\n        return 1 if r else 0\n\n', True),
-    ("protocol: async context (__aenter__)", None,
+    ("protocol: __aenter__ reached by static over-analysis", None,
      TAIL + '\n\n    async def __aenter__(self):\n        return self(["bin", "probe", "aenter"])\n\n    async def __aexit__(self, *e):\n        return False\n',
      '    def _p(self):\n        with self.runner:\n            return None\n\n', True),
     # The hook must live on the class that OWNS the assignment target.  The first version
@@ -145,6 +145,13 @@ EDGES = [
      '            value(["bin", "probe", "setattr-target"])\n'
      '        object.__setattr__(self, name, value)\n\n'
      '    def _p(self):\n        self._probe_slot = self.runner\n        return None\n\n', True),
+    # -- semantic class construction (review j#92480 F8) ---------------------------------
+    ("declaration: dunder declared by class-body alias", None,
+     TAIL + '\n\n    def _probe_truth(self):\n        self(["bin", "probe", "dunder-alias"])\n        return 1\n\n    __len__ = _probe_truth\n',
+     '    def _p(self):\n        return 1 if self.runner else 0\n\n', True),
+    ("protocol: REAL async with (async def + async with)", None,
+     TAIL + '\n\n    async def __aenter__(self):\n        return self(["bin", "probe", "real-async-with"])\n\n    async def __aexit__(self, *e):\n        return False\n',
+     '    async def _p(self):\n        async with self.runner:\n            return None\n\n', True),
     # -- module / enclosing-scope carriers (review j#92266 F4) ---------------------------
     ("carrier: global module state", None,
      "\n\n_PROBE_GLOBAL_RUNNER = None\n\n\ndef _probe_global_dispatch():\n    return _PROBE_GLOBAL_RUNNER([\"bin\", \"probe\", \"global-carrier\"])\n",
@@ -225,7 +232,7 @@ class DerivationEdgeSweepTests(unittest.TestCase):
             if got != expect:
                 mismatches.append(f"{label}: expected reported={expect}, got {got}")
         self.assertEqual(mismatches, [], "\n".join(mismatches))
-        self.assertGreaterEqual(len(rows), 30, "the sweep lost edges")
+        self.assertGreaterEqual(len(rows), 32, "the sweep lost edges")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1227,6 +1227,12 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
       interpreter がどれを選ぶかを当てる必要が無くなる。`__aenter__` もこの方針で自動的に射程へ入る
       (実測)。**assignment target は独立した位置**として扱い、owner の `__setattr__` / `__set__` を
       解析するか報告する。
+    - **member discovery は tri-state (resolved / absent / unreadable)** とする (review j#92480)。
+      R7 の「class が宣言する dunder を全て bind」は実際には「`def` で書かれたものを全て」であり、
+      (a) class body の **alias 宣言** (`__len__ = _probe_truth`)、(b) **解決できない base**
+      (source root 外) を「member 無し」と同一視、(c) data descriptor の `__set__` を
+      **owner 側**で探す (実際は class 属性が保持する **descriptor object の型**にある) の
+      3 点で成立していなかった。**読めない member surface は absent ではない**ので報告する。
     - **「位置の集合が完全である」とは主張しない**。同種の完全性主張は複数 round 連続で次の review に
       反証されている。設計が提供するのは完全性ではなく、**読めない class / 解決できない chain /
       owner 不明の位置は報告される**という性質である。

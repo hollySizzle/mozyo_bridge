@@ -342,6 +342,7 @@ class DerivationLivenessTests(unittest.TestCase):
         init_addition: str = "",
         tail_addition: str = "",
         recorder_addition: str = "",
+        recorder_replace: tuple = (),
     ) -> Path:
         tmp = Path(tempfile.mkdtemp(prefix="mozyo-derivation-probe-"))
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -376,6 +377,14 @@ class DerivationLivenessTests(unittest.TestCase):
             self.assertIn(tail_marker, source, "the module tail injection point moved")
             source = source.replace(tail_marker, tail_marker + tail_addition, 1)
         seed.write_text(source.replace(marker, addition + marker, 1), encoding="utf-8")
+        if recorder_replace:
+            recorder = seed.parent / "shared_space_smoke_observation.py"
+            body = recorder.read_text(encoding="utf-8")
+            self.assertIn(recorder_replace[0], body, "the recorder anchor moved")
+            recorder.write_text(
+                body.replace(recorder_replace[0], recorder_replace[1], 1),
+                encoding="utf-8",
+            )
         if recorder_addition:
             recorder = seed.parent / "shared_space_smoke_observation.py"
             body = recorder.read_text(encoding="utf-8")
@@ -824,13 +833,14 @@ class DerivationLivenessTests(unittest.TestCase):
     def test_an_async_context_protocol_is_analysed(self) -> None:
         """A residual the reviewer named but did not push to a mutant (j#92400).
 
-        Probed rather than assumed: binding every declared dunder covers ``__aenter__``
-        without it having to be listed, which is the property that made this approach
-        worth taking.
+        The use site is a real ``async def`` + ``async with``.  The first version of this
+        test injected ``async def __aenter__`` and then used a plain ``with``, so its name
+        claimed more than it exercised — review j#92480 was right to call that out, and
+        the evidence it produced was reported as stronger than it was.
         """
         tree = self._mutated_tree(
-            "    def _probe_async_ctx(self):\n"
-            "        with self.runner:\n"
+            "    async def _probe_async_ctx(self):\n"
+            "        async with self.runner:\n"
             "            return None\n\n",
             runner_addition=(
                 "    run = __call__\n\n"
@@ -841,6 +851,69 @@ class DerivationLivenessTests(unittest.TestCase):
             ),
         )
         self.assertIn(("probe", "aenter"), derive_dispatch_surface(tree).pairs)
+
+    def test_a_data_descriptor_set_hook_is_analysed(self) -> None:
+        """Review j#92480 F8-1, verdict j#92484.
+
+        A data descriptor's ``__set__`` lives on the type of the object the class-level
+        attribute holds — not on the owner, which is where the previous round looked.
+        The descriptor is installed as the real ``_inner``, so the existing
+        ``self._inner = inner`` triggers it.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_replace=(
+                "class RecordingHerdrRunner:",
+                'class _ProbeDescriptor:\n'
+                "    def __set__(self, obj, value):\n"
+                "        if callable(value):\n"
+                '            value(["bin", "probe", "descriptor-set"])\n'
+                '        obj.__dict__["_inner"] = value\n\n\n'
+                "class RecordingHerdrRunner:\n"
+                "    _inner = _ProbeDescriptor()\n",
+            ),
+        )
+        self.assertIn(("probe", "descriptor-set"), derive_dispatch_surface(tree).pairs)
+
+    def test_an_unresolvable_base_is_not_read_as_having_no_members(self) -> None:
+        """Review j#92480 F8-2, verdict j#92484.
+
+        ``_base_classes`` already reported ``saw_unresolved`` and the member scan threw it
+        away, so a base the walk cannot read looked like a base with nothing in it.  The
+        previous review had asked for exactly this and I recorded it as a residual instead
+        of closing it.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_replace=(
+                "class RecordingHerdrRunner:",
+                "from probe_external_base import _ProbeExternalBase  # noqa: E402\n\n\n"
+                "class RecordingHerdrRunner(_ProbeExternalBase):",
+            ),
+        )
+        surface = derive_dispatch_surface(tree)
+        self.assertTrue(
+            surface.unresolved_flows or surface.unresolved_sites,
+            "an unreadable member surface was reported as an empty one",
+        )
+
+    def test_a_dunder_declared_by_alias_is_analysed(self) -> None:
+        """Review j#92480 F8-3, verdict j#92484.
+
+        ``__len__ = _probe_truth`` declares the dunder as surely as a ``def`` does.  The
+        previous round claimed to bind "every dunder the class declares" while collecting
+        only ``def`` forms — the claim was false inside a resolved first-party class.
+        """
+        tree = self._mutated_tree(
+            "",
+            recorder_addition=(
+                "\n\n    def _probe_truth(self):\n"
+                '        self(["bin", "probe", "dunder-alias"])\n'
+                "        return 1\n\n"
+                "    __len__ = _probe_truth\n"
+            ),
+        )
+        self.assertIn(("probe", "dunder-alias"), derive_dispatch_surface(tree).pairs)
 
     def test_the_probe_does_not_touch_the_live_source(self) -> None:
         """Probe hygiene: mutating the copy must leave the real tree byte-identical.
