@@ -639,6 +639,7 @@ class LaneLifecycleRecord:
     reconcile_phase: str = ""
     lane_kind: str = ""
     hibernated_at: str = ""
+    release_observation: str = ""
 
     @property
     def key(self) -> LaneLifecycleKey:
@@ -712,6 +713,7 @@ class LaneLifecycleRecord:
             "reconcile_phase": self.reconcile_phase,
             "lane_kind": self.lane_kind,
             "hibernated_at": self.hibernated_at,
+            "release_observation": self.release_observation,
         }
 
 

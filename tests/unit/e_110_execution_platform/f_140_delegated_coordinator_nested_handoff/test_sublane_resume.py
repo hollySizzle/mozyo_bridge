@@ -19,6 +19,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    build_release_observation,
+)
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
     VERDICT_MISSING,
@@ -194,7 +197,7 @@ class SublaneResumeTest(unittest.TestCase):
                 key,
                 expected_revision=rec.revision,
                 action_id=f"hibernate:{LANE}",
-                pins=[
+                observation=build_release_observation([
                     # Redmine #14477 (disposition j#94544 A): the released-locator fence needs
                     # the release generation to cover EVERY slot it closed. One pin for a
                     # two-slot pair is incomplete evidence and now fails closed, so the seed
@@ -209,7 +212,7 @@ class SublaneResumeTest(unittest.TestCase):
                         assigned_name=encode_assigned_name(WS, "claude", LANE),
                         locator=f"{WS}:pOLD_WK",
                     ),
-                ],
+                ]),
                 now=HIBERNATE_AT,
             )
             rec = store.get(key)
@@ -508,13 +511,13 @@ class SublaneResumeTest(unittest.TestCase):
                 key,
                 expected_revision=rec.revision,
                 action_id=f"hibernate:{LANE}",
-                pins=[
+                observation=build_release_observation([
                     ReleasePin(
                         role="codex",
                         assigned_name=encode_assigned_name(WS, "codex", LANE),
                         locator=f"{WS}:p20",
                     )
-                ],
+                ]),
                 now=HIBERNATE_AT,
             )
             # A genuinely fresh pair is present — proving the ONLY blocker is the

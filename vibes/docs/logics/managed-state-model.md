@@ -356,14 +356,16 @@ Table naming:
     - **launch 時の 2 authority と矛盾時の扱い** (`herdr-native-identity.md` §5.2): fresh launch は
       caller-supplied `LaneLaunchContext`、heal は本 field。両方あり **不一致**なら片方が stale なので
       launch は **zero side effect で fail-closed 拒否** (どちらかを黙って採用しない)。
-  - **hibernate freshness 境界 (resume の post-hibernate 世代証明の正本)** (schema v8、#14477 /
-    live evidence #14476 j#88614-j#88618)。追加 field `hibernated_at`。semantics と「代替境界を
-    与えない」理由の実装正本は `core/state/lane_hibernation_anchor.py`。
+  - **hibernate liveness 境界 (resume の immutable timestamp 境界。世代証明ではない)**
+    (schema v8、#14477 / live evidence #14476 j#88614-j#88618)。追加 field `hibernated_at`。
+    semantics と「代替境界を与えない」理由の実装正本は `core/state/lane_hibernation_anchor.py`。
     - **何を保存するか**: lane が `hibernated` へ入った **transition の時刻**。resume (#13682) は
       各 slot の startup self-attestation (#13637) が **この時刻より厳密に後** に観測されたことを
-      要求して、relaunch された pair と **release を生き残った pane** を区別する (locator は
-      pane-id なので survivor も自分の pre-hibernate attestation に一致し、locator pin だけでは
-      世代を証明できない)。
+      要求する。**これは liveness 境界であり世代証明ではない** (#14477 review j#94531 R2-F1 /
+      disposition j#94544 A.3): locator は pane-id なので survivor も自分の pre-hibernate
+      attestation に一致し、かつ timestamp 自体も 3 vector (caller 供給 CAS stamp の backdate /
+      host clock 後退 / 自己申告 `observed_at`) で破れる。**clock 非依存の判別は下記
+      released-locator fence が担う**。
     - **なぜ `updated_at` と分けるか**: `updated_at` は **全ての write が動かす** column である。
       metadata-only な write が境界を前へ押し、その write 自身が直前に検証した live pair を
       `stale_generation` に落とす。実測は `repair-pins` (#13879、declared-pin 補填 + revision /
@@ -426,8 +428,37 @@ Table naming:
         出すので、operator は真の survivor と切り分けられる。
       - resume は **この fence と既存の attestation / provider / multiplicity / declared-pin fence
         すべて**を満たしたときのみ可 (A.3 / A.6)。いずれも緩めない。
-      - clock / locator 再利用に依存しない正しい終点 (lane epoch を attestation へ bind し
-        strictly-newer を要求) は **#14756** (disposition B)。本 fence はその設計ではなく即時 fence。
+      - **fence の権威は `release_pins` 単体ではない** (#14477 review j#94570 R3-F1 →
+        disposition j#94582 A″)。旧実装は locator 件数で「release が完全か」を判定していたが、
+        件数は完全性を証明しない: **別 locator 2 件を記録すれば count は充足し交差も起きず、
+        true survivor が admit される**ことを実測した。根本原因は `release_pins` が
+        **caller 供給**だったこと — timestamp と同型の欠陥である。
+  - **release generation observation (release が閉じた slot 集合の immutable 正本)**
+    (schema v9、#14477 disposition j#94582)。追加 field `release_observation`。実装正本は
+    `core/state/lane_release_observation.py` / `core/state/lane_release.py`。
+    - **何を保存するか**: release driver が live inventory から **1 度だけ列挙**した exact
+      observed slot snapshot。store は **この snapshot から release pins を単一導出**し、
+      caller から別値を受け取らない。raw `pins=` public API は **authority seam として残さず
+      fail-closed** (後方互換なし)。
+    - **absent と complete-empty を literal に区別する**。`''` = **absent** (legacy / 未記録) は
+      「証拠が無い」であり resume は fail-closed。記録済みの **complete-empty**
+      (`{"v":1,"slots":[]}`) は「driver が見て live slot 0 だった」という **positive evidence**
+      で、resume は許可しうる。両者を「空」に畳むのが、本 issue の review chain が繰り返し
+      検出した「証拠不在を証拠と読む」誤りである。
+    - **writer gate と read gate の双方で完全一致を検証**する。observation と格納 pins が
+      食い違う row は proof に使えない (欠け = 未証明 slot、過剰 = 観測していない close の主張)。
+    - **generation 中は write-once**。metadata repair / decision / revision / outcome writer は
+      変更しない。新 release generation の開始時のみ exact replacement。`active` へ戻る際は
+      release 一式と共に clear される。
+    - **live-zero でも generation を開く**。従来は「閉じる slot が無い」と early return して
+      何も記録しなかったが、それでは resume が「hibernate 時 process 0」と「survivor がいて
+      証拠が残らなかった」を区別できない。complete-empty を記録することでこれを検査可能な
+      事実にする。**その結果 live-zero hibernate の `process_release` は `released` へ到達する**
+      (従来 `not_requested`)。
+    - **残る trust boundary**: writer が **fabricated observation** を渡す余地は残る。今日の
+      「`pins=` ならどこでも暗黙に受理」から「唯一の監査可能な seam で明示的に主張」へ変わった
+      が、暗号的証明ではない。clock / locator 再利用にも依存しない正しい終点 (lane epoch を
+      attestation へ bind し strictly-newer を要求) は **#14756**。
   - **binding kind / lane generation / typed process pins** (schema v5、#13810 / Design Answer
     j#78386)。project-gateway 用の別 owner component は作らず、同一 `lane_lifecycle_records` row /
     同一 revision CAS を additive 拡張する (別 component にすると owner row と release/replacement

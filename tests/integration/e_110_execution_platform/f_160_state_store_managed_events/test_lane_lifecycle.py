@@ -18,6 +18,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    build_release_observation,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     CAS_ACTION_MISMATCH,
     CAS_ALREADY_DECLARED,
@@ -437,7 +440,7 @@ class LaneLifecycleStoreTest(unittest.TestCase):
             decision=_decision(),
         )
         self.store.request_release(
-            self.key_a, expected_revision=2, action_id="act-1", pins=_pins()
+            self.key_a, expected_revision=2, action_id="act-1", observation=build_release_observation(_pins())
         )
         self.store.record_release_outcome(
             self.key_a,
@@ -565,7 +568,7 @@ class LaneLifecycleStoreTest(unittest.TestCase):
     def test_release_cannot_be_requested_for_an_active_lane(self) -> None:
         self.store.declare_active(self.key_a, decision=_decision(), issue_id=ISSUE)
         outcome = self.store.request_release(
-            self.key_a, expected_revision=1, action_id="act-1", pins=_pins()
+            self.key_a, expected_revision=1, action_id="act-1", observation=build_release_observation(_pins())
         )
         self.assertFalse(outcome.applied)
         self.assertEqual(outcome.reason, CAS_UNEXPECTED_STATE)
@@ -573,7 +576,7 @@ class LaneLifecycleStoreTest(unittest.TestCase):
     def test_request_release_pins_the_slots(self) -> None:
         self._hibernated()
         outcome = self.store.request_release(
-            self.key_a, expected_revision=2, action_id="act-1", pins=_pins()
+            self.key_a, expected_revision=2, action_id="act-1", observation=build_release_observation(_pins())
         )
         self.assertTrue(outcome.applied)
         record = self.store.get(self.key_a)
@@ -581,21 +584,21 @@ class LaneLifecycleStoreTest(unittest.TestCase):
         self.assertEqual(record.release_action_id, "act-1")
         self.assertEqual(record.pins, _stored_pins())
 
-    def test_request_release_needs_an_action_and_pins(self) -> None:
+    def test_request_release_needs_an_action_id(self) -> None:
         self._hibernated()
         with self.assertRaises(ValueError):
             self.store.request_release(
-                self.key_a, expected_revision=2, action_id="", pins=_pins()
+                self.key_a, expected_revision=2, action_id="",
+                observation=build_release_observation(_pins()),
             )
-        with self.assertRaises(ValueError):
-            self.store.request_release(
-                self.key_a, expected_revision=2, action_id="act-1", pins=()
-            )
+        # An EMPTY observation is no longer an error: Redmine #14477 j#94582 item 2 makes
+        # "the driver observed zero live slots" a recordable COMPLETE-EMPTY fact, distinct
+        # from an absent observation. Its acceptance is pinned in the test below.
 
     def test_partial_release_is_retryable_to_released(self) -> None:
         self._hibernated()
         self.store.request_release(
-            self.key_a, expected_revision=2, action_id="act-1", pins=_pins()
+            self.key_a, expected_revision=2, action_id="act-1", observation=build_release_observation(_pins())
         )
         partial = self.store.record_release_outcome(
             self.key_a, action_id="act-1", expected_revision=3, target=RELEASE_PARTIAL
@@ -612,7 +615,7 @@ class LaneLifecycleStoreTest(unittest.TestCase):
         # generation done (it would report slots closed that are still live).
         self._hibernated()
         self.store.request_release(
-            self.key_a, expected_revision=2, action_id="act-1", pins=_pins()
+            self.key_a, expected_revision=2, action_id="act-1", observation=build_release_observation(_pins())
         )
         outcome = self.store.record_release_outcome(
             self.key_a, action_id="act-OLD", expected_revision=3, target=RELEASE_RELEASED
@@ -634,7 +637,7 @@ class LaneLifecycleStoreTest(unittest.TestCase):
     def test_released_is_terminal_within_the_generation(self) -> None:
         self._hibernated()
         self.store.request_release(
-            self.key_a, expected_revision=2, action_id="act-1", pins=_pins()
+            self.key_a, expected_revision=2, action_id="act-1", observation=build_release_observation(_pins())
         )
         self.store.record_release_outcome(
             self.key_a, action_id="act-1", expected_revision=3, target=RELEASE_RELEASED
@@ -810,7 +813,7 @@ class LaneLifecycleStoreTest(unittest.TestCase):
     def test_state_survives_a_reopen(self) -> None:
         self._hibernated()
         self.store.request_release(
-            self.key_a, expected_revision=2, action_id="act-1", pins=_pins()
+            self.key_a, expected_revision=2, action_id="act-1", observation=build_release_observation(_pins())
         )
         reopened = LaneLifecycleStore(home=self.home)
         record = reopened.get(self.key_a)
@@ -929,7 +932,7 @@ class R1RegressionTest(unittest.TestCase):
         self.store.declare_active(self.key_b, decision=_decision(), issue_id=_UNBOUND)
         self._hibernate(self.key_b, _decision())
         self.store.request_release(
-            self.key_b, expected_revision=2, action_id="act-live", pins=_pins()
+            self.key_b, expected_revision=2, action_id="act-live", observation=build_release_observation(_pins())
         )
         outcome = self.store.supersede_and_activate(
             superseded=self.key_a,
@@ -962,7 +965,7 @@ class R1RegressionTest(unittest.TestCase):
                     decision=_decision(),
                 )
                 store.request_release(
-                    key, expected_revision=2, action_id="act-live", pins=_pins()
+                    key, expected_revision=2, action_id="act-live", observation=build_release_observation(_pins())
                 )
                 revision = 3
                 if state == RELEASE_PARTIAL:
@@ -992,7 +995,7 @@ class R1RegressionTest(unittest.TestCase):
         self.store.declare_active(key, decision=_decision(), issue_id=ISSUE)
         self._hibernate(key, _decision())
         self.store.request_release(
-            key, expected_revision=2, action_id="act-1", pins=_pins()
+            key, expected_revision=2, action_id="act-1", observation=build_release_observation(_pins())
         )
         self.store.record_release_outcome(
             key, action_id="act-1", expected_revision=3, target=RELEASE_RELEASED
@@ -1033,16 +1036,22 @@ class R1RegressionTest(unittest.TestCase):
         with self.assertRaises(ReleasePinError):
             validate_release_pins(dup)
 
-    def test_f4_request_release_rejects_an_empty_pin_set(self) -> None:
+    def test_f4_request_release_records_an_empty_observation_as_complete_empty(self) -> None:
         self.store.declare_active(self.key_a, decision=_decision(), issue_id=ISSUE)
         self._hibernate(self.key_a, _decision())
-        with self.assertRaises(ReleasePinError):
-            self.store.request_release(
-                self.key_a, expected_revision=2, action_id="act-1", pins=()
-            )
-        self.assertEqual(
-            self.store.get(self.key_a).process_release, RELEASE_NOT_REQUESTED
+        # Redmine #14477 j#94582 item 2: a COMPLETE-EMPTY observation is positive evidence
+        # ("the driver looked and found no live slot"), so it opens a generation and is
+        # recorded. It must stay distinguishable from an ABSENT observation, which is what a
+        # pre-v9 row or a never-opened generation carries.
+        opened = self.store.request_release(
+            self.key_a, expected_revision=2, action_id="act-1",
+            observation=build_release_observation(()),
         )
+        self.assertTrue(opened.applied, opened.reason)
+        rec = self.store.get(self.key_a)
+        self.assertEqual(rec.process_release, RELEASE_REQUESTED)
+        self.assertEqual(rec.release_pins, "")  # no pins to close
+        self.assertNotEqual(rec.release_observation, "")  # but the observation IS recorded
 
     # -- R1-F5: every authority write names its durable record --
 
@@ -1424,6 +1433,7 @@ class R3RegressionTest(unittest.TestCase):
                 "reconcile_phase",
                 "lane_kind",
                 "hibernated_at",
+        "release_observation",
             ):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
@@ -1470,6 +1480,7 @@ class R3RegressionTest(unittest.TestCase):
                 "reconcile_phase",
                 "lane_kind",
                 "hibernated_at",
+        "release_observation",
             ):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
@@ -1906,6 +1917,7 @@ class BackupFirstMigrationTest(unittest.TestCase):
         "reconcile_phase",
         "lane_kind",
         "hibernated_at",
+        "release_observation",
     ]
 
     def _v2_store(self) -> Path:

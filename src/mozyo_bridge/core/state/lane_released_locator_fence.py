@@ -1,46 +1,39 @@
-"""Clock-independent survivor fence from the release generation (Redmine #14477 disposition A).
+"""Clock-independent survivor fence over the release observation (Redmine #14477 j#94582 A″).
 
-``sublane resume`` must refuse a pane that **survived** hibernate's release. Until this surface
-that proof was purely a timestamp comparison: the pane's startup self-attestation had to be
-observed after the lane's hibernate boundary. Review j#94531 R2-F1 showed a timestamp can never
-carry that proof, because three independent vectors defeat it and changing *which* clock is
-trusted only closes the first:
+``sublane resume`` must refuse a pane that **survived** hibernate's release. Three authorities
+have been tried, and the first two failed for the same reason — they trusted a caller:
 
-1. the hibernate CAS stores a caller-supplied ``now``, and no writer on the lifecycle component
-   validates it against the row's prior stamp — a backdated stamp admits a real survivor;
-2. a regressed host wall clock (NTP step-back, skew) produces the same ordering even from a
-   trusted clock, because the pane's attestation was recorded before the clock moved;
-3. ``observed_at`` is written by the attesting process itself, so a misconfigured or hostile
-   pane can claim a later time.
+1. the **timestamp** boundary (``hibernated_at``, v8): defeated by a backdated CAS stamp, a
+   regressed host clock, or a self-written ``observed_at`` (review j#94531 R2-F1);
+2. the **released-locator** comparison against ``release_pins`` alone (v8 fence): defeated
+   because ``request_release`` accepted any pin list, so a caller could record locators that
+   were never live and the disjointness test passed vacuously (review j#94570 R3-F1);
+3. **this** surface: the pins are DERIVED by the store from the release driver's single live
+   enumeration, recorded as an immutable v9 observation, and both fields must agree exactly at
+   the writer gate and again here (:mod:`...lane_release`, :mod:`...lane_release_observation`).
 
-The fence here uses a fact that no clock can rewrite: **hibernate's release recorded the exact
-locators it closed** (``release_pins`` on the lifecycle row, authority-grade). A survivor keeps
-its tmux pane-id, so its locator is *in that set*; a genuine relaunch is assigned a new pane-id,
-so its locator is *not*. Comparing locators therefore refuses all three vectors at once
-(coordinator disposition j#94544 A.1).
+A survivor keeps its tmux pane-id, so its locator is inside the observation; a genuine relaunch
+is assigned a new pane-id and is not. That comparison is independent of every clock, which is why
+the timestamp is only a *liveness* conjunct now and never the generation proof (j#94582 item 3).
 
-**Absent, unreadable or incomplete evidence is a REFUSAL, not a pass** (j#94544 A.2). The row
-cannot distinguish "no process existed at hibernate" from "a survivor existed and no release
-evidence was recorded", so absence of evidence is never read as freshness. This is a deliberate
-functional regression for a lane hibernated without a completed release generation.
+The verdicts below implement j#94582 item 4 exactly:
 
-**Locator reuse is accepted as a false refusal in the safe direction** (j#94544 A.4). tmux may
-recycle a pane-id after enough churn, so a genuine relaunch can land on a locator the previous
-generation used. That yields a refusal, never an admission, and the typed reason names it so an
-operator can tell it apart from a real survivor.
+- observation ABSENT or UNREADABLE, or its pins disagreeing with it → **fail closed**. Absence of
+  evidence is never freshness: the row cannot distinguish "nothing was live at hibernate" from
+  "a survivor existed and nothing was recorded". That is a deliberate functional regression for
+  a lane whose release generation was never completed or was written by an older build.
+- **COMPLETE-EMPTY** observation → allowed. The driver looked and found no live slot; that is
+  positive evidence, not missing evidence, and it is representable precisely because the v9
+  envelope keeps it distinct from absent.
+- non-empty observation intersecting the currently observed locators → **fail closed** as a
+  survivor. A recycled tmux pane-id lands here too: a false refusal in the safe direction, named
+  by its own token so an operator can tell the two apart (j#94582 item 4 / A.4).
+- non-empty, disjoint, and exactly matching → allowed, provided every other fence is green
+  (attestation, provider binding, multiplicity, declared pins). None of them is relaxed.
 
-Completeness is deliberately **not** keyed on the pins' ``role`` field. That vocabulary is not
-consistent across callers (some record lane roles like ``gateway`` / ``worker``, others record
-provider names), so a role-based rule would silently mis-evaluate. The rule is instead on
-distinct locators: the released set must cover at least as many distinct locators as there are
-observed live slots, or the uncovered slot is unproven.
-
-This fence does not replace the timestamp comparison and does not relax any existing gate. It is
-one more conjunct: resume requires the released-locator inequality AND the existing attestation /
-provider / generation / declared-pin fences (j#94544 A.3, A.6). The correct long-term proof — an
-authority-grade lane epoch bound into the startup attestation, with resume requiring a strictly
-newer epoch — is Redmine #14756 (disposition B); this surface is the immediate fence, not that
-design.
+Still a trust-boundary authority, not a cryptographic one: a writer inside the boundary can
+record a false observation, but only through one explicit auditable seam. Redmine #14756 replaces
+that with an epoch bound into the startup attestation.
 """
 
 from __future__ import annotations
@@ -50,27 +43,26 @@ from typing import Iterable, Optional
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     RELEASE_RELEASED,
     LaneLifecycleRecord,
-    ReleasePinError,
-    decode_release_pins,
     norm,
 )
+from mozyo_bridge.core.state.lane_release import (
+    OBSERVATION_ABSENT,
+    OBSERVATION_OK,
+    verify_release_observation,
+)
 
-#: The observed pair carries no locator the release generation closed, and the evidence was
-#: complete enough to say so.
+#: The observed pair carries no locator the release generation closed, on evidence the row can
+#: prove. Either a complete-empty observation or a disjoint non-empty one.
 FENCE_OK = "released_locator_fence_ok"
-#: An observed slot's locator IS one the release generation closed — the defining survivor
-#: signature. Also the token a pane-id-reuse false refusal surfaces under (j#94544 A.4), so an
-#: operator seeing it should check whether the pane-id was recycled before assuming a survivor.
+#: An observed slot's locator IS one the release generation observed — the defining survivor
+#: signature. A recycled pane-id surfaces here too (a false refusal in the safe direction), so an
+#: operator seeing this should check pane-id reuse before concluding a survivor.
 FENCE_LOCATOR_REUSED = "released_locator_reuse"
-#: No release generation evidence exists: no row, or the release never durably completed. Not a
-#: pass — the row cannot tell "no process existed" from "a survivor was never recorded".
+#: No usable release-generation evidence: the generation never completed, or the observation is
+#: absent / unreadable / contradicted by the stored pins. Never a pass.
 FENCE_EVIDENCE_ABSENT = "release_evidence_absent"
-#: The stored pin set could not be decoded. Fail closed rather than treat a shorter/failed
-#: decode as "nothing was released" (the ``decode_release_pins`` R1-F4 discipline).
-FENCE_EVIDENCE_UNREADABLE = "release_evidence_unreadable"
-#: Evidence exists but does not cover every observed live slot (or a pin carries no locator), so
-#: at least one observed slot is unproven.
-FENCE_EVIDENCE_INCOMPLETE = "release_evidence_incomplete"
+#: The driver observed ZERO live slots and recorded it. Positive evidence, distinct from absent.
+FENCE_COMPLETE_EMPTY = "release_observation_complete_empty"
 
 
 def released_locator_verdict(
@@ -79,41 +71,42 @@ def released_locator_verdict(
 ) -> tuple[bool, str]:
     """``(ok, reason)`` — may this observed pair be a genuine post-release generation?
 
-    ``ok`` is True only when a COMPLETE release generation is on record and none of the observed
-    locators appears in it. Every other outcome is a refusal with a typed reason from this
-    module's vocabulary. Pure: no IO, no clock, no environment.
+    ``ok`` is True only on evidence the row can actually prove. Pure: no IO, no clock, no
+    environment. The reason token is surfaced in the typed resume outcome.
     """
     if record is None:
         return False, FENCE_EVIDENCE_ABSENT
     if norm(record.process_release) != RELEASE_RELEASED:
-        # Only a durably COMPLETED release proves which locators were closed. A never-requested
-        # or in-flight generation is missing evidence, not evidence of absence.
+        # Only a durably COMPLETED generation proves what it closed. A never-requested or
+        # in-flight one is missing evidence, not evidence of absence.
         return False, FENCE_EVIDENCE_ABSENT
-    try:
-        pins = decode_release_pins(record.release_pins)
-    except ReleasePinError:
-        return False, FENCE_EVIDENCE_UNREADABLE
-    if not pins:
-        return False, FENCE_EVIDENCE_ABSENT
-    released = {norm(pin.locator) for pin in pins}
-    if "" in released:
-        # A pin without a locator proves nothing about the slot it names.
-        return False, FENCE_EVIDENCE_INCOMPLETE
+    observation, reason = verify_release_observation(record)
+    if observation is None:
+        # absent / unreadable / pins-disagree — all fail closed. The specific token is folded
+        # into the caller's detail via this reason so the operator sees which one it was.
+        return False, (
+            FENCE_EVIDENCE_ABSENT if reason == OBSERVATION_ABSENT else reason
+        )
+    if reason != OBSERVATION_OK:  # defensive: a present observation must verify OK
+        return False, reason
     observed = {norm(locator) for locator in observed_locators if norm(locator)}
+    if observation.is_complete_empty:
+        # The driver looked and found nothing live: positive evidence that no pane could have
+        # survived this generation, whatever is live now.
+        return True, FENCE_COMPLETE_EMPTY
     if not observed:
-        return False, FENCE_EVIDENCE_INCOMPLETE
-    if observed & released:
+        # Nothing observed to compare; the both-slots-live fence owns that refusal, but this
+        # surface must not report a pass it cannot justify.
+        return False, FENCE_EVIDENCE_ABSENT
+    if observed & observation.locators:
         return False, FENCE_LOCATOR_REUSED
-    if len(released) < len(observed):
-        return False, FENCE_EVIDENCE_INCOMPLETE
     return True, FENCE_OK
 
 
 __all__ = (
     "FENCE_OK",
+    "FENCE_COMPLETE_EMPTY",
     "FENCE_LOCATOR_REUSED",
     "FENCE_EVIDENCE_ABSENT",
-    "FENCE_EVIDENCE_UNREADABLE",
-    "FENCE_EVIDENCE_INCOMPLETE",
     "released_locator_verdict",
 )

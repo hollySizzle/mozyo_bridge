@@ -45,6 +45,10 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
 from mozyo_bridge.core.state.lane_pin_role import (
     resolve_declared_pin_pair,
 )
+from mozyo_bridge.core.state.lane_release_observation import (
+    ReleaseObservationError,
+    build_release_observation,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     RELEASE_NOT_REQUESTED,
@@ -142,15 +146,22 @@ def evaluate_pair_attestation(
     brand-new *different* lane, so a survivor is impossible); ``fresh_after`` is not
     passed there.
 
-    ``fresh_after`` (resume, Redmine #13682) adds the missing half of a *freshness*
+    ``fresh_after`` (resume, Redmine #13682) adds a *liveness* boundary — NOT a generation
     proof. The locator is the tmux pane-id, which changes only when the process truly
     dies — so a pane that **survived** hibernate's release keeps its locator and still
-    matches its own *pre-hibernate* attestation, and the locator pin alone cannot tell a
-    survivor from a genuine relaunch. When ``fresh_after`` is given (the lane's
-    hibernation timestamp), a slot additionally must carry a self-attestation
-    ``observed_at`` **strictly after** it — a fresh relaunch self-attests after the lane
-    hibernated, a survivor's record predates it. A missing / not-after ``observed_at`` is
-    ``stale_generation`` (fail closed).
+    matches its own *pre-hibernate* attestation, and the locator pin alone cannot separate
+    a survivor from a relaunch. When ``fresh_after`` is given (the lane's hibernation
+    boundary), a slot additionally must carry a self-attestation ``observed_at``
+    **strictly after** it. A missing / not-after ``observed_at`` is ``stale_generation``
+    (fail closed).
+
+    **This comparison must not be read as proving the generation** (Redmine #14477 review
+    j#94531 R2-F1, disposition j#94544 A.3). Three vectors defeat any timestamp: a
+    caller-supplied CAS stamp that regresses, a host clock that rolls back, and an
+    ``observed_at`` written by the attesting process itself. The clock-independent
+    discriminator lives in
+    :mod:`mozyo_bridge.core.state.lane_released_locator_fence`, and the authority-grade
+    proof is Redmine #14756.
     """
     slots = unit_slots(rows, workspace_id, lane)
     if GATEWAY_ROLE not in slots or WORKER_ROLE not in slots:
@@ -169,8 +180,8 @@ def evaluate_pair_attestation(
         if not join.ok:
             return True, False, f"{role}: {join.state}"
         if threshold:
-            # A locator-matched attestation proves a FRESH generation only when it was
-            # observed after the lane hibernated (a survivor's record predates it). Both
+            # A locator-matched attestation is CONSISTENT with a fresh generation only when
+            # observed after the lane hibernated; it does not prove one (#14477 A.3). Both
             # timestamps are fixed-width UTC ISO-seconds, so a lexical compare is a time
             # compare. An absent / not-after stamp fails closed.
             observed = _norm(record.observed_at) if record is not None else ""
@@ -562,24 +573,33 @@ def drive_process_release(
 
     rows = ops.live_rows() if rows is None else rows
     if rec.process_release == RELEASE_NOT_REQUESTED:
-        pins = release_pins(rows, workspace_id, lane_id)
-        if not pins:
-            # No live managed slots to release — the processes are already gone. A
-            # non-active lane already draws zero capacity (W4), so leaving the generation
-            # unopened is honest, not a gap.
+        # Redmine #14477 j#94582 item 1: the driver's enumeration IS the authority. It is
+        # wrapped once here and handed to the store, which derives the generation's pins from
+        # it — there is no separate caller-supplied pin list any more.
+        #
+        # A zero-slot enumeration now OPENS the generation instead of returning early. Leaving
+        # it unopened used to look honest, but it recorded nothing, and resume cannot tell "no
+        # process was live at hibernate" from "a survivor existed and nothing was written"
+        # (j#94582 item 2 / item 4). Recording a COMPLETE-EMPTY observation makes that a
+        # positive, checkable fact instead of an absence.
+        try:
+            observation = build_release_observation(
+                release_pins(rows, workspace_id, lane_id)
+            )
+        except ReleaseObservationError as exc:
             return ReleaseOutcome(
                 action_id=action_id,
-                process_release=RELEASE_NOT_REQUESTED,
-                detail="no live managed slots to release",
+                process_release=rec.process_release,
+                detail=f"release observation unusable ({type(exc).__name__})",
             )
         try:
             opened = store.request_release(
                 key,
                 expected_revision=rec.revision,
                 action_id=action_id,
-                pins=pins,
+                observation=observation,
             )
-        except (ReleasePinError, LaneLifecycleError, OSError) as exc:
+        except (ReleaseObservationError, ReleasePinError, LaneLifecycleError, OSError) as exc:
             return ReleaseOutcome(
                 action_id=action_id,
                 process_release=rec.process_release,

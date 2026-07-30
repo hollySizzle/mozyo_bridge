@@ -27,6 +27,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    build_release_observation,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     BINDING_KIND_ISSUE,
     BINDING_KIND_PROJECT_GATEWAY,
@@ -588,10 +591,11 @@ class SchemaV5MigrationTest(unittest.TestCase):
         LaneLifecycleStore(home=self.home).ensure_schema()
         self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
         # v5 added the binding/generation columns; v6 (Redmine #13842) added reconcile_phase;
-        # v7 (Redmine #13647) added lane_kind; v8 (Redmine #14477) added hibernated_at.
-        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 8)
+        # v7 added lane_kind; v8 added hibernated_at; v9 added release_observation (#14477).
+        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 9)
         for col in ("binding_kind", "project_scope", "lane_generation", "declared_slots",
-                    "reconcile_phase", "lane_kind", "hibernated_at"):
+                    "reconcile_phase", "lane_kind", "hibernated_at",
+                    "release_observation"):
             self.assertIn(col, self._columns())
         self.assertIn("idx_lane_lifecycle_active_owner", self._indexes())
         self.assertIn("idx_lane_lifecycle_active_project_owner", self._indexes())
@@ -610,7 +614,8 @@ class SchemaV5MigrationTest(unittest.TestCase):
             # Drop the v5 binding/generation columns, the v6 reconcile_phase AND the v7
             # lane_kind so the rewound shape is a genuine pre-#13810 v4 signature.
             for col in ("binding_kind", "project_scope", "lane_generation", "declared_slots",
-                        "reconcile_phase", "lane_kind", "hibernated_at"):
+                        "reconcile_phase", "lane_kind", "hibernated_at",
+                    "release_observation"):
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 4 WHERE component = ?",
@@ -661,6 +666,8 @@ class SchemaV5MigrationTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
+            # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -687,7 +694,7 @@ class SchemaV5MigrationTest(unittest.TestCase):
         LaneLifecycleStore(home=self.home).ensure_schema()
 
         self.assertEqual(self._recorded(), LANE_LIFECYCLE_SCHEMA_VERSION)
-        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 8)
+        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 9)
         # the pre-migration snapshot was preserved before the first write (backup-first)
         backups = sorted((self.home / "backups").glob("state-*"))
         self.assertEqual(len(backups), 1)
@@ -820,7 +827,7 @@ class ReviewCorrectionJ78868Test(unittest.TestCase):
         # A release generation opens on the (non-active) lane and is left in flight.
         self.store.request_release(
             key, expected_revision=rec.revision, action_id="rel1",
-            pins=[ReleasePin(role="codex", assigned_name="n", locator="%1")],
+            observation=build_release_observation([ReleasePin(role="codex", assigned_name="n", locator="%1")]),
         )
         rec = self.store.get(key)
         self.assertEqual(rec.process_release, "requested")
@@ -848,7 +855,7 @@ class ReviewCorrectionJ78868Test(unittest.TestCase):
         rec = self.store.get(key)
         self.store.request_release(
             key, expected_revision=rec.revision, action_id="rel1",
-            pins=[ReleasePin(role="codex", assigned_name="n", locator="%1")],
+            observation=build_release_observation([ReleasePin(role="codex", assigned_name="n", locator="%1")]),
         )
         rec = self.store.get(key)
         self.store.record_release_outcome(

@@ -149,6 +149,8 @@ from mozyo_bridge.core.state.lane_lifecycle_rows import (
     _rollback,
     _utc_now,
 )
+from mozyo_bridge.core.state.lane_release import open_release_generation
+from mozyo_bridge.core.state.lane_release_observation import ReleaseObservation
 from mozyo_bridge.core.state.lane_lifecycle_readonly import (
     LaneLifecycleReader,
     LaneLifecycleReaderUpgradeRequired,
@@ -747,85 +749,27 @@ class LaneLifecycleStore:
         *,
         expected_revision: int,
         action_id: str,
-        pins: Iterable[ReleasePin],
+        observation: "ReleaseObservation",
+        pins: Optional[Iterable[ReleasePin]] = None,
         now: Optional[str] = None,
     ) -> CasOutcome:
-        """Open a release generation, pinning the slots it is allowed to close.
+        """Open a release generation whose pins are DERIVED from the driver's observation.
 
-        Only a lane that has already left ``active`` may open one: a lane still
-        holding its work is never a release target. The pins are the *only* slots
-        this generation may ever close, and the actuator must re-verify each one
-        against the live inventory before closing it.
+        Thin delegator to :func:`...lane_release.open_release_generation`, which owns the release
+        axis and the Redmine #14477 j#94582 observation contract (a legacy ``pins=`` call is
+        refused there rather than honoured). The axis lives in its own module for the same reason
+        :mod:`...lane_replacement` does; the call signature is unchanged apart from the keyword.
         """
-        action = norm(action_id)
-        if not action:
-            raise ValueError("a release generation requires a non-empty action id")
-        # Every pin must name a slot the actuator can actually re-resolve, and no slot
-        # may appear twice (R1-F4); an unusable pin is refused, never stored.
-        pinned = validate_release_pins(tuple(pins))
-        stamp = now or _utc_now()
-        conn = self._connect_write(key)
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            current = _locked_row(conn, key)
-            if current is None:
-                conn.execute("ROLLBACK")
-                return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
-            if current.revision != expected_revision:
-                conn.execute("ROLLBACK")
-                return CasOutcome(
-                    applied=False,
-                    reason=CAS_STALE_REVISION,
-                    revision=current.revision,
-                )
-            if current.lane_disposition == DISPOSITION_ACTIVE:
-                conn.execute("ROLLBACK")
-                return CasOutcome(
-                    applied=False,
-                    reason=CAS_UNEXPECTED_STATE,
-                    revision=current.revision,
-                )
-            if not replacement_settled(current.replacement_state):
-                conn.execute("ROLLBACK")
-                return CasOutcome(
-                    applied=False,
-                    reason=CAS_FORBIDDEN_TRANSITION,
-                    revision=current.revision,
-                )
-            if not release_transition_allowed(
-                current.process_release, RELEASE_REQUESTED
-            ):
-                conn.execute("ROLLBACK")
-                return CasOutcome(
-                    applied=False,
-                    reason=CAS_FORBIDDEN_TRANSITION,
-                    revision=current.revision,
-                )
-            revision = current.revision + 1
-            conn.execute(
-                f"UPDATE {_TABLE} SET process_release = ?, release_action_id = ?, "
-                "release_pins = ?, revision = ?, updated_at = ? "
-                "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
-                (
-                    RELEASE_REQUESTED,
-                    action,
-                    encode_release_pins(pinned),
-                    revision,
-                    stamp,
-                    key.repo_workspace_id,
-                    key.lane_id,
-                    current.revision,
-                ),
-            )
-            conn.execute("COMMIT")
-            return CasOutcome(applied=True, reason=CAS_APPLIED, revision=revision)
-        except sqlite3.DatabaseError as exc:
-            _rollback(conn)
-            raise LaneLifecycleError(
-                f"lane release request failed ({type(exc).__name__}); fail closed"
-            ) from exc
-        finally:
-            conn.close()
+        return open_release_generation(
+            self,
+            key,
+            expected_revision=expected_revision,
+            action_id=action_id,
+            observation=observation,
+            pins=pins,
+            now=now,
+        )
+
 
     def record_release_outcome(
         self,

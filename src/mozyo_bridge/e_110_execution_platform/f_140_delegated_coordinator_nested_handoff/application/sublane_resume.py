@@ -15,13 +15,13 @@ disposition CAS:
    generation is settled (``not_requested`` / ``released`` — never resume onto a lane whose
    panes an actuator is still closing); the issue was not re-owned by another lane while it
    slept; and the relaunched pair is **both-slots live, generation-matched attested, AND
-   self-attested after the lane hibernated** (#13637 locator-bound startup self-attestation
-   plus a hibernation timestamp anchor). The locator pin alone is *not* sufficient: a pane
-   that **survived** the release keeps its tmux pane-id and would still match its own
-   pre-hibernate attestation — so the fresh-pair proof also requires the self-attestation's
-   ``observed_at`` to post-date the lane's hibernation, which a genuine relaunch satisfies
-   and a survivor never does (correcting the design's "the locator IS the generation",
-   Q4 — true only for a *killed-and-relaunched* pane, not a survived one). That hibernation
+   past the survivor fences below** (#13637 locator-bound startup self-attestation plus the
+   released-locator fence). The locator pin alone is *not* sufficient: a pane that
+   **survived** the release keeps its tmux pane-id and would still match its own
+   pre-hibernate attestation. A self-attestation ``observed_at`` that post-dates the lane's
+   hibernation is required as a LIVENESS boundary — it is NOT the generation proof, because
+   no timestamp can be one (review j#94531 R2-F1: a backdated CAS stamp, a regressed host
+   clock and a self-written ``observed_at`` each defeat it). That hibernation
    timestamp is the **immutable hibernate-transition stamp** (``hibernated_at``, schema v8),
    not the generic lifecycle ``updated_at``: Redmine #14477 measured a metadata-only
    ``repair-pins`` moving the mutable column past the self-attestation of the exact live pair
@@ -421,8 +421,9 @@ class SublaneResumeUseCase:
         issue_not_reowned = owner.status != OWNER_RESOLVED or owner.lane_id == lane
 
         rows = self.ops.live_rows()
-        # The hibernation timestamp anchors the freshness gate: only a pair self-attested
-        # AFTER the lane hibernated is a genuine relaunch (a survivor's record predates it).
+        # The hibernation timestamp is a LIVENESS boundary, not the generation proof
+        # (disposition j#94544 A.3): a pair self-attested after the lane hibernated is
+        # consistent with a relaunch, but no timestamp can PROVE one.
         # Redmine #14477: that boundary is the IMMUTABLE hibernate-transition stamp, never the
         # generic lifecycle ``updated_at`` every metadata write moves — reading the mutable
         # column let a pins repair invalidate the exact fresh pair it had just verified

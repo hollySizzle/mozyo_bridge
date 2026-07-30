@@ -580,7 +580,7 @@ class SublaneHibernateTest(unittest.TestCase):
             self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
             self.assertEqual(len(ops.close_calls), 1)
 
-    def test_dead_processes_hibernate_with_no_release(self) -> None:
+    def test_dead_processes_hibernate_recording_a_complete_empty_release(self) -> None:
         # The lane's slots are already gone. The disposition still moves to hibernated;
         # there is nothing to release (a hibernated lane draws zero capacity regardless).
         with tempfile.TemporaryDirectory() as tmp:
@@ -595,7 +595,11 @@ class SublaneHibernateTest(unittest.TestCase):
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
                 DISPOSITION_HIBERNATED,
             )
-            self.assertEqual(outcome.release.process_release, RELEASE_NOT_REQUESTED)
+            # Redmine #14477 j#94582 item 2: a zero-slot enumeration now OPENS the generation
+        # and records a COMPLETE-EMPTY observation, so the release reaches `released`.
+        # Leaving it `not_requested` recorded nothing, and resume could not tell "no
+        # process was live" from "a survivor existed and nothing was written".
+        self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
             self.assertEqual(ops.close_calls, [])
 
     def test_non_git_lane_hibernates(self) -> None:

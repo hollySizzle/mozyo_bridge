@@ -34,11 +34,16 @@ with ``hibernated_at`` (schema v8) stamped ONLY at T0. Pinned here:
 6. the anchor's own lifecycle: cleared on rehydrate, re-stamped on the next hibernation, and
    its inbound-edge enumeration DERIVED from the public transition policy rather than recalled,
    so a future edge into ``hibernated`` cannot quietly bypass the stamp;
-7. the stamp's own TRUST boundary, which is still OPEN — review j#94531 R2-F1. A backdated
-   ``now`` on the hibernate CAS stores a boundary earlier than a survivor's attestation and
-   admits it. ``PostV8BackdatedStampTest`` states the correct refusal as an expected failure
-   (not inverted into a pin of the defect) plus a fact-pin on the missing stamp validation, so
-   the hole is durable and visible in the suite. Scope disposition: design_consultation j#94543.
+7. the CLOCK-INDEPENDENT survivor fence (``ReleasedLocatorFenceTest``) — review j#94531 R2-F1,
+   disposition j#94544 A. A backdated stamp defeats the timestamp, so the generation is
+   discriminated by the locators hibernate's release closed: the same locator refuses,
+   all-different resumes, absent evidence refuses. The timestamp is a liveness boundary only;
+   it is never called the generation proof anywhere in this module.
+8. the fence's own REMAINING hole (``ReleaseObservationBindingTest``) — review j#94570 R3-F1.
+   ``release_pins`` is driver-enumerated on the public hibernate rail but the store-level
+   ``request_release`` accepts arbitrary pins, so a direct store caller can record locators
+   other than the live ones and a survivor is admitted. Stated as an expected failure rather
+   than inverted into a pin of the defect; scope disposition requested in j#94581.
 
 Everything is synthetic: a temp store path, a fake herdr inventory and fake attestation reads.
 No pane / process / route / worktree mutation. Hermeticity is itself CHECKED rather than
@@ -63,6 +68,9 @@ _SRC = _TESTS_ROOT.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    build_release_observation,
+)
 from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
     IdentityAttestationRecord,
     VERDICT_PRESENT,
@@ -95,10 +103,18 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
 )
 from mozyo_bridge.core.state.lane_pin_repair import LanePinRepairStore  # noqa: E402
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair  # noqa: E402
+from mozyo_bridge.core.state.lane_release import (  # noqa: E402
+    OBSERVATION_PIN_MISMATCH,
+    OBSERVATION_UNREADABLE,
+)
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    ReleaseObservationError,
+    build_release_observation,
+    encode_release_observation,
+)
 from mozyo_bridge.core.state.lane_released_locator_fence import (  # noqa: E402
+    FENCE_COMPLETE_EMPTY,
     FENCE_EVIDENCE_ABSENT,
-    FENCE_EVIDENCE_INCOMPLETE,
-    FENCE_EVIDENCE_UNREADABLE,
     FENCE_LOCATOR_REUSED,
     FENCE_OK,
     released_locator_verdict,
@@ -260,10 +276,10 @@ class _Fixture(unittest.TestCase):
             self.key,
             expected_revision=self._rec().revision,
             action_id="rel-14477",
-            pins=[
+            observation=build_release_observation([
                 ReleasePin("gateway", _gw_name(), f"{_WS}:pOLD_G"),
                 ReleasePin("worker", _wk_name(), f"{_WS}:pOLD_W"),
-            ],
+            ]),
             now=T_RELEASE,
         )
         self.assertTrue(out.applied, f"seed request_release refused: {out.reason}")
@@ -461,6 +477,8 @@ class PreV8CompatibilityTest(_Fixture):
         conn = sqlite3.connect(self.path)
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
+            # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 7 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -611,10 +629,10 @@ class ReleasedLocatorFenceTest(_Fixture):
                 self.key,
                 expected_revision=self._rec().revision,
                 action_id="rel-again",
-                pins=[
+                observation=build_release_observation([
                     ReleasePin("gateway", _gw_name(), released[0]),
                     ReleasePin("worker", _wk_name(), released[1]),
-                ],
+                ]),
                 now=now,
             ).applied
         )
@@ -678,63 +696,293 @@ class ReleasedLocatorFenceTest(_Fixture):
         self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
 
 
-class ReleasedLocatorVerdictUnitTest(unittest.TestCase):
-    """The pure predicate's own boundaries (no store, no clock)."""
+class ReleaseObservationBindingTest(_Fixture):
+    """What the v9 observation contract closes, and the residual it does NOT.
 
-    def _rec(self, *, release=RELEASE_RELEASED, pins_raw=None, locators=(_GW_LOC, _WK_LOC)):
-        raw = pins_raw
-        if raw is None:
-            raw = encode_release_pins(
-                tuple(ReleasePin("gateway", _gw_name(), loc) for loc in locators)
+    Redmine #14477 review j#94570 R3-F1 showed that ``release_pins`` was caller-supplied, so a
+    caller could record locators that were never live and a survivor passed the disjointness
+    test. Disposition j#94582 closed that seam: ``request_release`` no longer accepts ``pins`` at
+    all, the store DERIVES them from a single :class:`ReleaseObservation`, and the two fields must
+    match at the writer and read gates.
+
+    The residual, acknowledged in j#94581 and accepted in j#94582: a writer inside the trust
+    boundary can still hand over a FABRICATED observation. What changed is that it must now do so
+    explicitly through one auditable seam instead of being accepted implicitly wherever ``pins=``
+    was passed. The cryptographic/epoch replacement is Redmine #14756 — so the fabrication case
+    below is pinned as a KNOWN, DOCUMENTED residual rather than as an expected failure that
+    #14477 could retire.
+    """
+
+    def test_the_legacy_raw_pins_seam_is_refused_outright(self) -> None:
+        """j#94582 item 6: no backward compatibility, no silent fallback."""
+        self.assertTrue(self._repair_pins().applied)
+        self.assertFalse(self._resume().is_blocked)
+        out = self.store.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=self._rec().revision,
+            target=DISPOSITION_HIBERNATED,
+            decision=_decision(),
+            now=T_RESUME,
+        )
+        self.assertTrue(out.applied, out.reason)
+        with self.assertRaises(ReleaseObservationError):
+            self.store.request_release(
+                self.key,
+                expected_revision=self._rec().revision,
+                action_id="rel-legacy",
+                observation=build_release_observation(()),
+                pins=[ReleasePin("gateway", _gw_name(), f"{_WS}:pRAW")],
             )
+
+    def test_a_fabricated_observation_is_the_documented_residual(self) -> None:
+        """The trust-boundary residual #14756 owns — pinned as a FACT, not as a fixed hole.
+
+        A writer that fabricates the observation is still believed. This is asserted so the
+        boundary is visible and so a future change that closes it (an epoch bound into the
+        attestation) makes this pin FAIL and forces the reader here to be updated.
+        """
+        self.assertTrue(self._repair_pins().applied)
+        self.assertFalse(self._resume().is_blocked)
+        out = self.store.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=self._rec().revision,
+            target=DISPOSITION_HIBERNATED,
+            decision=_decision(),
+            now=T_BACKDATED,
+        )
+        self.assertTrue(out.applied, out.reason)
+        fabricated = build_release_observation(
+            (
+                ReleasePin("gateway", _gw_name(), f"{_WS}:pOTHER_G"),
+                ReleasePin("worker", _wk_name(), f"{_WS}:pOTHER_W"),
+            )
+        )
+        self.assertTrue(
+            self.store.request_release(
+                self.key,
+                expected_revision=self._rec().revision,
+                action_id="rel-fabricated",
+                observation=fabricated,
+                now=T_BACKDATED,
+            ).applied
+        )
+        self.assertTrue(
+            self.store.record_release_outcome(
+                self.key,
+                action_id="rel-fabricated",
+                expected_revision=self._rec().revision,
+                target=RELEASE_RELEASED,
+                now=T_BACKDATED,
+            ).applied
+        )
+        outcome = self._resume(ops=_FakeOps(observed_at=T_SURVIVOR))
+        self.assertFalse(
+            outcome.is_blocked,
+            "a fabricated observation is still trusted; Redmine #14756 replaces this "
+            "trust-boundary authority with an epoch bound into the attestation",
+        )
+
+
+
+class ReleasedLocatorVerdictUnitTest(unittest.TestCase):
+    """The pure predicate's edge matrix over the v9 observation contract (no store, no clock).
+
+    Enumerates the adversarial edges j#94582 lists: absent, unreadable, pin-mismatch (partial /
+    extra), complete-empty, locator reuse, and the disjoint pass. Duplicate and empty-locator
+    enumerations are refused at construction, so they are pinned on the builder.
+    """
+
+    def _rec(self, *, release=RELEASE_RELEASED, observation_raw=None, pins=None, locators=(_GW_LOC,)):
+        obs = build_release_observation(
+            tuple(ReleasePin("gateway", _gw_name(), loc) for loc in locators)
+        )
+        raw = encode_release_observation(obs) if observation_raw is None else observation_raw
+        stored = obs.slots if pins is None else pins
         return LaneLifecycleRecord(
-            repo_workspace_id=_WS, lane_id=_LANE, process_release=release, release_pins=raw
+            repo_workspace_id=_WS,
+            lane_id=_LANE,
+            process_release=release,
+            release_pins=encode_release_pins(stored) if stored else "",
+            release_observation=raw,
         )
 
     def test_no_record_is_absent(self) -> None:
-        self.assertEqual(released_locator_verdict(None, [_GW_LOC]), (False, FENCE_EVIDENCE_ABSENT))
+        self.assertEqual(
+            released_locator_verdict(None, [_GW_LOC]), (False, FENCE_EVIDENCE_ABSENT)
+        )
 
     def test_an_unreleased_generation_is_absent(self) -> None:
-        ok, reason = released_locator_verdict(self._rec(release="not_requested"), [_GW_LOC])
-        self.assertEqual((ok, reason), (False, FENCE_EVIDENCE_ABSENT))
+        rec = self._rec(release="not_requested")
+        self.assertEqual(released_locator_verdict(rec, [_GW_LOC]), (False, FENCE_EVIDENCE_ABSENT))
 
-    def test_corrupt_pins_are_unreadable_not_empty(self) -> None:
-        ok, reason = released_locator_verdict(self._rec(pins_raw="{not json"), [_GW_LOC])
-        self.assertEqual((ok, reason), (False, FENCE_EVIDENCE_UNREADABLE))
+    def test_a_pre_v9_row_with_no_observation_is_absent_not_empty(self) -> None:
+        """The v9 distinction: an ABSENT observation must never read as complete-empty."""
+        rec = self._rec(observation_raw="")
+        self.assertEqual(released_locator_verdict(rec, [f"{_WS}:pN"]), (False, FENCE_EVIDENCE_ABSENT))
 
-    def test_an_observed_locator_in_the_released_set_is_reuse(self) -> None:
-        ok, reason = released_locator_verdict(self._rec(), [_GW_LOC, f"{_WS}:pNEW"])
-        self.assertEqual((ok, reason), (False, FENCE_LOCATOR_REUSED))
+    def test_a_corrupt_observation_is_unreadable_not_empty(self) -> None:
+        rec = self._rec(observation_raw="{not json")
+        self.assertEqual(released_locator_verdict(rec, [f"{_WS}:pN"]), (False, OBSERVATION_UNREADABLE))
 
-    def test_fewer_released_locators_than_observed_slots_is_incomplete(self) -> None:
-        rec = self._rec(locators=(f"{_WS}:pOLD_ONLY",))
-        ok, reason = released_locator_verdict(rec, [f"{_WS}:pN1", f"{_WS}:pN2"])
-        self.assertEqual((ok, reason), (False, FENCE_EVIDENCE_INCOMPLETE))
+    def test_a_future_envelope_version_is_unreadable(self) -> None:
+        rec = self._rec(observation_raw='{"v": 999, "slots": []}')
+        self.assertEqual(released_locator_verdict(rec, [f"{_WS}:pN"]), (False, OBSERVATION_UNREADABLE))
 
-    def test_all_different_locators_with_complete_evidence_pass(self) -> None:
-        ok, reason = released_locator_verdict(self._rec(), [f"{_WS}:pN1", f"{_WS}:pN2"])
-        self.assertEqual((ok, reason), (True, FENCE_OK))
+    def test_pins_missing_a_slot_the_observation_has_is_a_mismatch(self) -> None:
+        rec = self._rec(locators=(_GW_LOC, _WK_LOC), pins=())
+        self.assertEqual(released_locator_verdict(rec, [f"{_WS}:pN"]), (False, OBSERVATION_PIN_MISMATCH))
 
-    def test_the_stamp_itself_is_still_unvalidated_by_design(self) -> None:
-        """A does NOT validate the hibernate stamp; it makes the stamp non-load-bearing.
-
-        Recorded so nobody later reads the green suite as "the stamp is now trustworthy". The
-        authority-grade epoch that would make it trustworthy is Redmine #14756 (disposition B).
-        """
-        store_pins = encode_release_pins((ReleasePin("gateway", _gw_name(), _GW_LOC),))
-        rec = LaneLifecycleRecord(
-            repo_workspace_id=_WS,
-            lane_id=_LANE,
-            process_release=RELEASE_RELEASED,
-            release_pins=store_pins,
-            hibernated_at=T_BACKDATED,
+    def test_pins_claiming_an_extra_slot_is_a_mismatch(self) -> None:
+        extra = (
+            ReleasePin("gateway", _gw_name(), _GW_LOC),
+            ReleasePin("worker", _wk_name(), _WK_LOC),
         )
-        # The anchor is happily a backdated value — nothing here rejects it...
-        self.assertEqual(resume_freshness_anchor(rec), (T_BACKDATED, ANCHOR_HIBERNATE_TRANSITION))
-        # ...and the locator fence is what actually refuses the survivor.
+        rec = self._rec(locators=(_GW_LOC,), pins=extra)
+        self.assertEqual(released_locator_verdict(rec, [f"{_WS}:pN"]), (False, OBSERVATION_PIN_MISMATCH))
+
+    def test_a_complete_empty_observation_is_positive_evidence(self) -> None:
+        rec = self._rec(locators=())
         self.assertEqual(
-            released_locator_verdict(rec, [_GW_LOC]), (False, FENCE_LOCATOR_REUSED)
+            released_locator_verdict(rec, [f"{_WS}:pN1", f"{_WS}:pN2"]),
+            (True, FENCE_COMPLETE_EMPTY),
         )
+
+    def test_an_observed_locator_in_the_observation_is_reuse(self) -> None:
+        rec = self._rec(locators=(_GW_LOC, _WK_LOC))
+        self.assertEqual(
+            released_locator_verdict(rec, [_GW_LOC, f"{_WS}:pNEW"]), (False, FENCE_LOCATOR_REUSED)
+        )
+
+    def test_all_different_locators_pass(self) -> None:
+        rec = self._rec(locators=(_GW_LOC, _WK_LOC))
+        self.assertEqual(
+            released_locator_verdict(rec, [f"{_WS}:pN1", f"{_WS}:pN2"]), (True, FENCE_OK)
+        )
+
+    def test_a_duplicate_locator_enumeration_is_refused_at_construction(self) -> None:
+        with self.assertRaises(ReleaseObservationError):
+            build_release_observation(
+                (
+                    ReleasePin("gateway", _gw_name(), _GW_LOC),
+                    ReleasePin("worker", _wk_name(), _GW_LOC),
+                )
+            )
+
+    def test_a_slot_without_a_locator_is_refused_at_construction(self) -> None:
+        with self.assertRaises(Exception):
+            build_release_observation((ReleasePin("gateway", _gw_name(), ""),))
+
+
+
+class DriverDerivedObservationE2ETest(_Fixture):
+    """The AUTHORITY SUCCESS PATH, driven end to end from the public hibernate rail.
+
+    Redmine #14477 j#94582 requires the success path to run observation-generation → request →
+    outcome → resume through ``drive_process_release`` with a fake inventory, and NOT through a
+    store-level fixture that hands over arbitrary pins. That is the whole point of the contract:
+    the observation must come from the driver's own enumeration of the live inventory, so no test
+    may establish the success path by asserting what it wants the observation to be.
+
+    Two orderings are pinned against that same driver-derived observation:
+
+    - the j#94570 adversarial one — a survivor keeps a locator the driver actually observed, so
+      it is REFUSED (this is the red→green regression the disposition asked for);
+    - a genuine relaunch on new pane-ids, which resumes.
+    """
+
+    class _ReleaseOps:
+        """Fake release IO: a canned live inventory plus a close that always succeeds."""
+
+        def __init__(self, rows):
+            self._rows = list(rows)
+
+        def live_rows(self):
+            return list(self._rows)
+
+        def execute_close(self, plan):
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
+                HerdrRetireCloseResult,
+            )
+            return HerdrRetireCloseResult(
+                workspace_id=plan.workspace_id,
+                lane_id=plan.lane_id,
+                closed=tuple(plan.close_targets),
+                failed=(),
+                foreign_names=(),
+            )
+
+    def _drive_release(self, live):
+        """Run the real driver so the observation is DERIVED, never supplied by this test."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
+            drive_process_release,
+        )
+        rows = [
+            {"name": _gw_name(), "pane_id": live[0]},
+            {"name": _wk_name(), "pane_id": live[1]},
+        ]
+        return drive_process_release(
+            store=self.store,
+            ops=self._ReleaseOps(rows),
+            key=self.key,
+            lane_id=_LANE,
+            workspace_id=_WS,
+            action_id=f"hibernate:{_LANE}",
+            rows=rows,
+        )
+
+    def _hibernate_then_drive(self, live, *, now):
+        out = self.store.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=self._rec().revision,
+            target=DISPOSITION_HIBERNATED,
+            decision=_decision(),
+            now=now,
+        )
+        self.assertTrue(out.applied, out.reason)
+        released = self._drive_release(live)
+        self.assertEqual(released.process_release, RELEASE_RELEASED, released.detail)
+        # The observation came from the driver's enumeration of exactly those live rows.
+        rec = self._rec()
+        self.assertNotEqual(rec.release_observation, "")
+        return rec
+
+    def test_a_survivor_on_a_driver_observed_locator_is_refused(self) -> None:
+        """j#94570 ordering, now red->green: the driver saw the pane, so a survivor is caught."""
+        self.assertTrue(self._repair_pins().applied)
+        self.assertFalse(self._resume().is_blocked)
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_ACTIVE)
+
+        # Backdate the stamp too, so the timestamp conjunct cannot be what refuses.
+        self._hibernate_then_drive((_GW_LOC, _WK_LOC), now=T_BACKDATED)
+        self.assertLess(self._rec().hibernated_at, T_SURVIVOR)
+
+        outcome = self._resume(ops=_FakeOps(observed_at=T_SURVIVOR))
+
+        self.assertTrue(outcome.is_blocked)
+        self.assertIn(BLOCK_PAIR_ATTESTATION, outcome.preflight.blocked_reasons)
+        self.assertIn(FENCE_LOCATOR_REUSED, outcome.preflight.pair_attestation_detail)
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertIsNone(outcome.transition)
+
+    def test_a_relaunch_on_new_pane_ids_resumes(self) -> None:
+        """Not a blanket refusal: the same driver-derived evidence admits a real relaunch."""
+        self.assertTrue(self._repair_pins().applied)
+        self.assertFalse(self._resume().is_blocked)
+        self._hibernate_then_drive((_GW_LOC, _WK_LOC), now=T_RESUME)
+        outcome = self._resume(
+            ops=_FakeOps(
+                observed_at=T_LATER, gw_locator=f"{_WS}:p9A", wk_locator=f"{_WS}:p9B"
+            )
+        )
+        self.assertFalse(
+            outcome.is_blocked,
+            f"blocked: {outcome.preflight.blocked_reasons} "
+            f"({outcome.preflight.pair_attestation_detail})",
+        )
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_ACTIVE)
 
 
 class OperatorHomeHermeticityTest(_Fixture):
@@ -801,7 +1049,7 @@ class OperatorHomeHermeticityTest(_Fixture):
 
 class SchemaVersionTest(unittest.TestCase):
     def test_the_anchor_landed_as_schema_v8(self) -> None:
-        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 8)
+        self.assertEqual(LANE_LIFECYCLE_SCHEMA_VERSION, 9)
 
 
 if __name__ == "__main__":  # pragma: no cover

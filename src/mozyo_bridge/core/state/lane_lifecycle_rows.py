@@ -74,6 +74,7 @@ def _record(row: Sequence[object]) -> LaneLifecycleRecord:
         reconcile_phase=str(row[21] or ""),
         lane_kind=str(row[22] or ""),
         hibernated_at=str(row[23] or ""),
+        release_observation=str(row[24] or ""),
     )
 
 
@@ -144,6 +145,9 @@ def _insert_active_row(
             lane_kind,  # v7 (#13647): generation-bound lane-role heal authority
             # v8 (#14477): a brand-new ACTIVE lane has never hibernated, so it holds no
             # freshness boundary. Only the disposition CAS into ``hibernated`` writes one.
+            "",
+            # v9 (#14477 j#94582): no release generation has been opened, so there is no
+            # observation. ABSENT (not complete-empty) — only opening a generation records one.
             "",
         ),
     )
