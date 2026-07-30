@@ -109,6 +109,7 @@ from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair  # noqa
 from mozyo_bridge.core.state.lane_release import (  # noqa: E402
     OBSERVATION_GENERATION_NOT_COMPLETED,
     OBSERVATION_PIN_MISMATCH,
+    OBSERVATION_RELEASE_STATE_UNKNOWN,
     OBSERVATION_STALE_AFTER_RESET,
     OBSERVATION_UNREADABLE,
     open_release_generation,
@@ -1109,6 +1110,92 @@ class ReleaseAxisResetClearsObservationTest(_Fixture):
         self.assertIsNone(got)
         self.assertEqual(reason, OBSERVATION_STALE_AFTER_RESET)
         self.assertNotEqual(reason, OBSERVATION_GENERATION_NOT_COMPLETED)
+
+    def _row_with_release_state(self, token: str) -> LaneLifecycleRecord:
+        pins = (ReleasePin("gateway", _gw_name(), _GW_LOC),)
+        return LaneLifecycleRecord(
+            repo_workspace_id=_WS,
+            lane_id=_LANE,
+            issue_id=_ISSUE,
+            lane_disposition=DISPOSITION_HIBERNATED,
+            process_release=token,
+            release_pins=encode_release_pins(pins),
+            release_observation=encode_release_observation(build_release_observation(pins)),
+        )
+
+    def test_a_non_canonical_release_state_is_typed_unknown_not_a_deterministic_class(self):
+        """Review j#94738 R6-F1: an unknown release state is OUTCOME-UNKNOWN.
+
+        ``process_release`` is ``TEXT NOT NULL`` with no CHECK constraint and the row decoder
+        passes the string through, so a legacy / corrupted / hand-edited row can hold anything.
+        The standing ruling for the same storage fact on the hibernate rail is that such a state
+        is *uncertain* and must never be folded into a deterministic classification
+        (``release_state_unknown``, review j#86776 R5-F5 / j#87226). Collapsing it into
+        ``stale_after_reset`` claimed a specific invariant violation the row does not evidence.
+
+        Hand-built on purpose: the canonical store refuses to persist a non-canonical token, so a
+        readable-invalid storage row is exactly what has to be simulated — the same reasoning the
+        #14219 regression uses for this shape.
+        """
+        for token in ("weird_unknown_token", "", "RELEASED", "requeste", "not_requested "):
+            with self.subTest(process_release=token):
+                got, reason = verify_release_observation(self._row_with_release_state(token))
+                self.assertIsNone(got)
+                self.assertEqual(reason, OBSERVATION_RELEASE_STATE_UNKNOWN)
+                # Never a deterministic class, and never a pass.
+                self.assertNotIn(
+                    reason,
+                    (
+                        OBSERVATION_STALE_AFTER_RESET,
+                        OBSERVATION_GENERATION_NOT_COMPLETED,
+                        "release_observation_ok",
+                    ),
+                )
+
+    def test_a_release_state_that_only_normalises_to_canonical_is_not_a_proof(self) -> None:
+        """A padded token used to be ADMITTED — worse than being misclassified.
+
+        Found while reproducing R6-F1 (recorded in verdict j#94739). The gate compared
+        ``norm(process_release)``, so ``"released "`` normalised to the canonical token and the
+        observation was returned as ``release_observation_ok``. A closed vocabulary is compared as
+        STORED — the same discipline the ``lane_kind`` vocabulary was given in review j#85852 F1.
+        """
+        got, reason = verify_release_observation(self._row_with_release_state("released "))
+        self.assertIsNone(got, "a padded release state must never yield a survivor proof")
+        self.assertEqual(reason, OBSERVATION_RELEASE_STATE_UNKNOWN)
+        # Control: the byte-exact token still passes, so this is a canonicality check and not a
+        # blanket refusal of everything that contains "released".
+        got, reason = verify_release_observation(self._row_with_release_state(RELEASE_RELEASED))
+        self.assertIsNotNone(got)
+        self.assertEqual(reason, "release_observation_ok")
+
+    def test_the_fence_detail_for_an_unknown_state_is_recorded_as_is(self) -> None:
+        """What the SURVIVOR FENCE reports for these rows — pinned, not assumed.
+
+        The fence keeps its own ``norm``-ed ``released`` precheck, so the two non-canonical shapes
+        surface differently in its typed detail even though both refuse:
+
+        - a token that does not normalise to ``released`` is caught by the precheck and reported
+          as ``release_evidence_absent`` (the component's finer reason is not surfaced);
+        - a token that normalises to ``released`` passes the precheck, so the component's
+          ``release_observation_release_state_unknown`` reaches the operator.
+
+        Both are fail-closed. The asymmetry is a diagnostic imprecision, not a hole, and it is
+        pinned here so it is a recorded decision rather than an accident — narrowing the fence's
+        own vocabulary would flip an existing pinned assertion
+        (``ReleasedLocatorVerdictUnitTest.test_an_unreleased_generation_is_absent``) and is
+        deliberately left for a disposition rather than done unasked (see review request).
+        """
+        ok, reason = released_locator_verdict(
+            self._row_with_release_state("weird_unknown_token"), [_GW_LOC]
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, FENCE_EVIDENCE_ABSENT)
+        ok, reason = released_locator_verdict(
+            self._row_with_release_state("released "), [_WK_LOC]
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, OBSERVATION_RELEASE_STATE_UNKNOWN)
 
 
 class ReleasedLocatorVerdictUnitTest(unittest.TestCase):

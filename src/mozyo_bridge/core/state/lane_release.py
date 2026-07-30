@@ -45,9 +45,11 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     CAS_STALE_REVISION,
     CAS_UNEXPECTED_STATE,
     DISPOSITION_ACTIVE,
+    RELEASE_NOT_REQUESTED,
     RELEASE_PARTIAL,
     RELEASE_RELEASED,
     RELEASE_REQUESTED,
+    RELEASE_STATES,
     CasOutcome,
     LaneLifecycleKey,
     LaneLifecycleRecord,
@@ -96,8 +98,23 @@ OBSERVATION_GENERATION_NOT_COMPLETED = "release_observation_generation_not_compl
 #: writers make unreachable, because they clear the observation with the rest of the release set
 #: (review j#94707 R4-F1). Reaching it means that invariant was violated (an older build, a
 #: hand-edited row, a writer added without its reset), so it is named as the violation it is
-#: rather than folded into the in-flight case.
+#: rather than folded into the in-flight case. Reserved for the CANONICAL ``not_requested`` token
+#: only — a non-canonical value is :data:`OBSERVATION_RELEASE_STATE_UNKNOWN`, not this.
 OBSERVATION_STALE_AFTER_RESET = "release_observation_stale_after_reset"
+#: The row's ``process_release`` is not a canonical release-state token at all, so what the
+#: observation means cannot be classified (review j#94738 R6-F1). ``process_release`` is
+#: ``TEXT NOT NULL`` with no CHECK constraint and the row decoder passes the string through, so a
+#: legacy / corrupted / hand-edited row can carry anything. This is OUTCOME-UNKNOWN, matching the
+#: standing ruling for the same storage fact on the hibernate rail (``release_state_unknown``,
+#: review j#86776 R5-F5, time-classification rulings j#87181 / j#87182 / j#87188 / j#87226): an
+#: unknown state must never be folded into a DETERMINISTIC classification — neither the in-flight
+#: case nor the reset-invariant violation, and above all not into a pass.
+#:
+#: Canonicality is checked BYTE-EXACT, not after trimming. ``"released "`` normalises to the
+#: canonical token, and the pre-R7 gate accepted it as a proof — a non-canonical stored value
+#: being ADMITTED, which is worse than being misclassified. Same discipline as the ``lane_kind``
+#: vocabulary (review j#85852 F1): a closed vocabulary is compared as stored.
+OBSERVATION_RELEASE_STATE_UNKNOWN = "release_observation_release_state_unknown"
 
 
 def open_release_generation(
@@ -218,10 +235,14 @@ def verify_release_observation(
     outcome returns ``None`` with a typed reason, and the caller must fail closed on it: an ABSENT
     observation is missing evidence, not evidence of absence.
 
-    The completeness check lives here, not in the caller (review j#94707 R4-F1). It refuses two
-    distinct shapes, named apart because a consumer branching on the reason needs them apart
-    (review j#94727 R5-F1):
+    The completeness check lives here, not in the caller (review j#94707 R4-F1), and it branches
+    over the release axis EXPLICITLY — one reason per state, because a consumer branching on the
+    reason needs them apart (reviews j#94727 R5-F1, j#94738 R6-F1):
 
+    - not a canonical release-state token at all — ``process_release`` is unconstrained ``TEXT``
+      and the decoder passes it through, so a legacy / corrupted / hand-edited row can hold
+      anything. OUTCOME-UNKNOWN: :data:`OBSERVATION_RELEASE_STATE_UNKNOWN`. Checked byte-exact,
+      so a value that merely *normalises* to a canonical token is unknown too, never a pass.
     - ``requested`` / ``partial`` — the observation IS this generation's, written by
       :func:`open_release_generation` in the same CAS that opened it, and left untouched by
       :meth:`...LaneLifecycleStore.record_release_outcome` as the generation advances. It is not
@@ -230,10 +251,12 @@ def verify_release_observation(
     - ``not_requested`` with an observation still present — the reset writers make this
       unreachable, so it is an invariant VIOLATION, not an in-flight state. Reason:
       :data:`OBSERVATION_STALE_AFTER_RESET`.
+    - ``released`` — the only state that may yield the observation, and only if the stored pins
+      describe it exactly.
 
-    Refusing the second shape here rather than trusting the writers is deliberate: "no caller can
-    currently reach that shape" is precisely the caller-side assumption this issue has had to
-    retract twice.
+    Refusing the unreachable shapes here rather than trusting the writers is deliberate: "no
+    caller can currently reach that shape" is precisely the caller-side assumption this issue has
+    had to retract twice.
 
     A complete-empty observation is returned successfully — it is positive evidence that the
     driver observed no live slot. Whether that is sufficient is the caller's decision; this
@@ -247,16 +270,16 @@ def verify_release_observation(
         return None, OBSERVATION_UNREADABLE
     if observation is None:
         return None, OBSERVATION_ABSENT
-    release = norm(record.process_release)
-    if release != RELEASE_RELEASED:
-        # Both are refusals, but for different reasons — see the docstring. An in-flight
-        # generation owns this observation and simply has not finished; a ``not_requested`` row
-        # carrying one has had its reset invariant broken.
-        return None, (
-            OBSERVATION_GENERATION_NOT_COMPLETED
-            if release in (RELEASE_REQUESTED, RELEASE_PARTIAL)
-            else OBSERVATION_STALE_AFTER_RESET
-        )
+    # Byte-exact, deliberately NOT ``norm``-ed: a stored value that only normalises to a canonical
+    # token is itself non-canonical, and the pre-R7 gate let ``"released "`` through as a proof.
+    release = record.process_release
+    if release not in RELEASE_STATES:
+        return None, OBSERVATION_RELEASE_STATE_UNKNOWN
+    if release in (RELEASE_REQUESTED, RELEASE_PARTIAL):
+        return None, OBSERVATION_GENERATION_NOT_COMPLETED
+    if release == RELEASE_NOT_REQUESTED:
+        return None, OBSERVATION_STALE_AFTER_RESET
+    # Only ``released`` reaches the pin check; RELEASE_STATES has no fifth member.
     try:
         stored_pins = decode_release_pins(record.release_pins)
     except ReleasePinError:
@@ -273,6 +296,7 @@ __all__ = (
     "OBSERVATION_PIN_MISMATCH",
     "OBSERVATION_GENERATION_NOT_COMPLETED",
     "OBSERVATION_STALE_AFTER_RESET",
+    "OBSERVATION_RELEASE_STATE_UNKNOWN",
     "RELEASE_RELEASED",
     "open_release_generation",
     "verify_release_observation",

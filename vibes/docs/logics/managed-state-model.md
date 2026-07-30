@@ -460,13 +460,22 @@ Table naming:
       うち v9 field だけが 3 経路とも clear 対象から漏れていたことを検出した。
     - **read gate は完了した generation の observation しか返さない**。`process_release` が
       `released` でない row は、caller が何を検査しているかに関わらず component 境界で拒否する。
-      拒否理由は **2 つに分かれる** (混同すると consumer が retry 可能な状態と invariant 違反を
-      区別できない。j#94727 R5-F1)。
+      拒否理由は release 軸の状態ごとに**明示分岐**する (畳むと consumer が retry 可能な状態 /
+      invariant 違反 / 判定不能を区別できない。j#94727 R5-F1 / j#94738 R6-F1)。
+      - **canonical でない token** (`RELEASE_STATES` に無い) →
+        **`release_observation_release_state_unknown`**。`process_release` は
+        `TEXT NOT NULL` で **CHECK 制約が無く**、row decoder も文字列を pass-through するので、
+        legacy / corrupted / 手編集 row は任意の値を持ちうる。これは **outcome-unknown** であり、
+        hibernate rail の既存 ruling (`release_state_unknown`、j#86776 R5-F5 / j#87226) と同じ扱い =
+        **決定的な分類へ畳まない**。判定は **byte-exact** で行い trim しない
+        (`"released "` は normalize すると canonical になり、R7 以前は **proof として通っていた**。
+        closed vocabulary は格納値のまま比較する — `lane_kind` の j#85852 F1 と同じ規律)。
       - `requested` / `partial` → **`release_observation_generation_not_completed`**。
         observation は**現 generation のもの**である (`record_release_outcome` は
         `process_release` のみを進め observation を書き換えない)。未完了なだけであり、
         `partial` はまだ slot を閉じうるので survivor proof にはならない。
       - `not_requested` かつ observation が残存 → **`release_observation_stale_after_reset`**。
+        canonical `not_requested` **のみ**に予約する。
         reset writer が clear するのでこの shape は到達不能であり、**reset invariant 違反**
         (旧 build / 手編集 / reset を伴わない writer 追加) を名指しする。
       reset writer が正しく clear していれば後者は生じないが、「caller が到達しないから残しても
