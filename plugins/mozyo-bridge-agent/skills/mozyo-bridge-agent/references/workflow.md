@@ -882,9 +882,13 @@ push は二層の権限であり、層ごとに所有者が異なる (Redmine #1
 
 ## Publication checkpoint (integration 層と publication 層の分離)
 
-`## Integration disposition と push authority` は push が二層の権限であることを固定したが、そこで扱うのは *統合 (integration)* — coordinator が review approval 済みの commit を integration branch へ進めること — までである。統合された commit が *いつ公開履歴 (`origin/main`) へ昇格するか* は別の checkpoint であり、本節がそれを固定する。この doctrine の出所は owner_intent である (durable anchor: Redmine #13126 j#71777 確定事項 5、Codex triage: #13126 j#71786 item 4)。owner の原発話は「メインブランチにマージした時に、オーナーにプッシュ承認を求める。反応がない場合はプッシュせずローカルの commit を積んでいくフロー」であり、実装者提案 (staging branch + Redmine Version close = publication checkpoint) に owner が同意したものである。
+**適用: 両 topology。** 本 preamble は section の読み方だけを固定する。規範は topology 別の subsection にあり、preamble はそれを先取りしない。
 
-integration と publication を 2 層に分離する。前者は lane base の鮮度維持のための自律操作、後者は公開履歴を進める owner-gated な checkpoint であり、両者を混同しない。ただし *その 2 層が別々の branch に載るか、1 本の branch に畳まれるか* は project ごとの topology 選択であり、次節が要求するとおり採用 project が宣言する。
+`## Integration disposition と push authority` は push が二層の権限であることを固定したが、そこで扱うのは *統合 (integration)* — coordinator が review approval 済みの commit を integration branch へ進めること — までである。本節が扱うのはその先、すなわち **統合された commit が公開履歴へ到達する経路** である。その経路が integration とは別の checkpoint になるのか、それとも統合そのものと同一なのかは、integration branch と公開履歴 branch が別かどうか — つまり project の branch topology — で決まる。どちらを採るかは `### branch topology を宣言する (staged / single-canonical)` が宣言を要求し、規範は宣言した topology の subsection だけを読む。
+
+この doctrine の出所は owner_intent である (durable anchor: Redmine #13126 j#71777 確定事項 5、Codex triage: #13126 j#71786 item 4)。owner の原発話は「メインブランチにマージした時に、オーナーにプッシュ承認を求める。反応がない場合はプッシュせずローカルの commit を積んでいくフロー」であり、staged topology を前提にした実装者提案 (staging branch + Redmine Version close = publication checkpoint) に owner が同意したものである。**この合意は staged topology — staging branch と公開履歴 branch が別である構成 — についての合意であり、staging 層を持たない single-canonical topology へ自動的には及ばない。** 前者の規範は `### integration 層` 以下、後者の規範は `### single-canonical-branch topology` にある。
+
+topology の選択は *どの branch へ統合するか* の選択であって *何の承認を経るか* の選択ではない。どちらの topology でも、統合は Review Gate approval を経た後の coordinator の integration disposition であり、release は別建ての gate である (`### 本 doctrine が緩めない境界`)。
 
 ### branch topology を宣言する (staged / single-canonical)
 
@@ -962,7 +966,8 @@ project は、staging branch を持たず `origin/main` を新規 lane の base�
 - **review 承認後の統合は coordinator の自律操作である。** integration disposition (`merge` / `patch_equivalent` / `explicit_deferral`) の到達先は `origin/main` であり、その push は `## Integration disposition と push authority` が coordinator に与える通常の integration authority で実行する。統合ごとに別建ての owner checkpoint を要求しない。disposition journal の記録義務は変わらない。
 - **staging 層の state 語彙は適用されない。** staging branch head も `push_waiting` も存在しない。統合済みか未統合かは `integration_waiting` (`## Dispatch 後の fill loop` の coordinator-blocking 語彙) と integration disposition journal で表現する。存在しない staging branch を待つ state を作らない。
 - **Redmine Version close は昇格 checkpoint ではない。** この topology では Redmine Version は roadmap / milestone / acceptance grouping surface のままであり (`### release gate は publication とは別である` の用語規律)、公開履歴の前進を gate しない。`### Redmine Version close 前の readiness checklist` と `### 手動 Redmine Version close 手順` は適用されない。
-- **公開履歴が checkpoint 無しで前進することは、gate の消滅ではない。** この topology で `origin/main` を守るのは per-Version の publication checkpoint ではなく、その手前にある unit ごとの gate である: UserStory ごとの Review Gate approval、Close Approval Separation を伴う owner close approval、そして `## Integration disposition と push authority` の実装者 / coordinator の push 権限分離である。これらは一切緩まない。topology の選択は *どの branch に統合するか* の選択であって、*何の承認を経て統合するか* の選択ではない。
+- **公開履歴が checkpoint 無しで前進することは、gate の消滅ではない。** この topology で `origin/main` を守るのは per-Version の publication checkpoint ではなく unit ごとの gate である。ただしそれらは同じ位置に並んでいないので、順序を明示して固定する: **UserStory ごとの Review Gate approval → coordinator の integration disposition (`origin/main` への統合 push) → Close Approval Separation を伴う owner close approval → Close Gate (issue の close)**。すなわち *統合* を gate するのは Review Gate approval であり、*issue の close* を gate するのが owner close approval である。これに `## Integration disposition と push authority` の実装者 / coordinator の push 権限分離が重なる。これらは一切緩まない。topology の選択は *どの branch に統合するか* の選択であって、*何の承認を経て統合するか* の選択ではない。
+- **owner close approval を統合の前提条件として扱わない。** 上の順序のとおり owner close approval は統合の *後* にある close 側の gate であり (`Close Approval Separation`)、integration branch を前進させる条件ではない。統合を owner close 待ちにすると、review 承認済みの統合が close 待ちで無期限に停止する — 本 topology が解こうとした failure と同型のものが、checkpoint ではなく close を待つ形で再発する。
 - **release gate は据え置かれる。** release tag / package version bump / publish は `### release gate は publication とは別である` のとおり別 gate であり、引き続き direct_owner 承認を要する。`origin/main` への統合がそのまま release になることは決してない。
 - **staged からの移行では旧 staging branch の disposition を宣言する。** staged topology から移行する project は、旧 staging branch を新規書き込み先として使わないこと、そして凍結 / 削除のいずれを採るかを repo-local docs と durable record に記録する。宣言の無い staging branch は、後続 agent にとって「まだ生きている integration target」と区別できない。
 

@@ -63,6 +63,65 @@ FROZEN_STAGING_BRANCH = "main-next"
 _PUBLICATION_SECTION_HEADING = "## Publication checkpoint"
 _APPLICABILITY_RE = re.compile(r"^\*\*適用:\s*(?P<scope>[^*]+?)\s*\*\*", re.MULTILINE)
 
+#: Concepts that only exist when the integration branch and the public-history branch are
+#: DIFFERENT. Stated without naming a topology they read as universal norms — which is exactly
+#: how a single-canonical project ends up waiting for a checkpoint that does not exist.
+#: ``昇格`` (promotion to public history) is on this list because a topology whose integration
+#: target IS the public-history branch has no promotion step to gate.
+STAGED_ONLY_TOKENS = ("Redmine Version", "staging branch", "push_waiting", "昇格")
+
+#: Naming any of these binds the surrounding claim to a topology, which is all this rule asks.
+TOPOLOGY_QUALIFIERS = ("staged", "single-canonical", "topology")
+
+#: The gate order the whole US exists to make unambiguous. Review approval gates the
+#: INTEGRATION; owner close approval gates the ISSUE CLOSE. Stating them as an unordered set is
+#: what let ``owner close approval`` be read as a pre-integration gate.
+GATE_ORDER = (
+    "Review Gate approval",
+    "integration disposition",
+    "owner close approval",
+    "Close Gate",
+)
+
+#: ``「…」`` spans quote the owner verbatim; the quote's own ``。`` are not sentence breaks of
+#: the surrounding prose.
+_QUOTED_SPAN_RE = re.compile(r"「[^」]*」")
+
+
+def _preamble(section: str) -> str:
+    """The section body BEFORE its first ``###`` subsection.
+
+    The applicability markers live on subsections, so a norm parked above the first one is
+    read by every topology while being checked by none.
+    """
+    lines = section.splitlines()[1:]  # drop the ``##`` heading itself
+    for index, line in enumerate(lines):
+        if line.startswith("### "):
+            return "\n".join(lines[:index])
+    return "\n".join(lines)
+
+
+def _sentences(text: str) -> list[str]:
+    without_quotes = _QUOTED_SPAN_RE.sub("「」", text)
+    return [part for part in re.split(r"(?<=。)", without_quotes) if part.strip()]
+
+
+def _states_in_order(line: str, tokens: tuple[str, ...]) -> bool:
+    """Does ``line`` contain ``tokens`` in this order?
+
+    Scanned sequentially — each token is looked for AFTER the previous match — because a
+    prose line legitimately names some of these terms more than once (``integration
+    disposition`` appears both as a lane-state pointer and inside the ordering chain).
+    Comparing first occurrences would report a correctly ordered chain as unordered.
+    """
+    cursor = 0
+    for token in tokens:
+        index = line.find(token, cursor)
+        if index < 0:
+            return False
+        cursor = index + len(token)
+    return True
+
 
 def _section(text: str, heading_prefix: str, level: int) -> str:
     """The body of the first ``#`` * ``level`` heading starting with ``heading_prefix``.
@@ -160,6 +219,35 @@ class RepoLocalAdoptionRecordTest(unittest.TestCase):
             f"{FROZEN_STAGING_BRANCH} must be declared frozen, not merely unmentioned",
         )
 
+    def test_adoption_record_orders_the_gates(self) -> None:
+        ordered = [
+            line
+            for line in self.section.splitlines()
+            if _states_in_order(line, GATE_ORDER)
+        ]
+        self.assertTrue(
+            ordered,
+            "the repo-local adoption record does not state the gate order "
+            f"{' -> '.join(GATE_ORDER)}; the distributed doctrine and the adoption record "
+            "have to answer 'what triggers the integration push' the same way",
+        )
+
+    def test_no_bullet_claims_both_a_review_trigger_and_a_close_trigger(self) -> None:
+        # The regression form: one bullet calling origin/main the "review 承認後の
+        # integration target" AND the "UserStory close 後の自律 push 先". Two triggers for
+        # one push is not a clarification, it is a fork the next agent has to guess at.
+        conflicting = [
+            line.strip()
+            for line in self.section.splitlines()
+            if "close 後" in line and ("push 先" in line or "push する" in line)
+        ]
+        self.assertEqual(
+            conflicting,
+            [],
+            "these bullets tie the integration push to issue close as well as to review "
+            f"approval: {conflicting}",
+        )
+
     def test_no_surviving_claim_that_main_next_is_the_integration_target(self) -> None:
         stale = [
             line
@@ -224,6 +312,87 @@ class DistributedDoctrineTopologyTest(unittest.TestCase):
                         f"{lines[index]!r} carries no '**適用: ...**' marker; a subsection "
                         "whose topology is undeclared is applied unconditionally",
                     )
+
+    def test_section_preamble_declares_its_own_topology_scope(self) -> None:
+        # The subsection rule above starts at the FIRST ``###``. Everything above it was
+        # unchecked, so the section could open with a staged-only norm and still pass.
+        for path in SKILL_WORKFLOW_BODIES:
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                preamble = _preamble(self._publication_section(path))
+                self.assertRegex(
+                    preamble,
+                    _APPLICABILITY_RE,
+                    "the Publication checkpoint preamble carries no '**適用: ...**' marker; "
+                    "text above the first subsection is read by both topologies",
+                )
+
+    def test_section_preamble_states_no_unconditional_staged_norm(self) -> None:
+        # A staged-only concept named in the preamble must say which topology it belongs to,
+        # in the same sentence. This is the shape the review found missing: the preamble
+        # defined promotion-to-public-history as a separate owner-gated checkpoint before the
+        # reader ever reaches the topology declaration.
+        for path in SKILL_WORKFLOW_BODIES:
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                preamble = _preamble(self._publication_section(path))
+                offenders = [
+                    sentence.strip()
+                    for sentence in _sentences(preamble)
+                    if any(token in sentence for token in STAGED_ONLY_TOKENS)
+                    and not any(
+                        qualifier in sentence for qualifier in TOPOLOGY_QUALIFIERS
+                    )
+                ]
+                self.assertEqual(
+                    offenders,
+                    [],
+                    "these preamble sentences state a staged-only concept without naming a "
+                    "topology, so a single-canonical project reads them as binding: "
+                    f"{offenders}",
+                )
+
+    def test_single_canonical_subsection_orders_the_gates(self) -> None:
+        # Review approval gates the integration; owner close approval gates the close. Listed
+        # as an unordered set, ``owner close approval`` reads as a pre-integration gate and a
+        # review-approved integration waits for a close that is waiting for the integration.
+        for path in SKILL_WORKFLOW_BODIES:
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                subsection = _section(
+                    self._publication_section(path),
+                    "### single-canonical-branch topology",
+                    3,
+                )
+                self.assertTrue(subsection, f"{path} lost the single-canonical subsection")
+                ordered = [
+                    line
+                    for line in subsection.splitlines()
+                    if _states_in_order(line, GATE_ORDER)
+                ]
+                self.assertTrue(
+                    ordered,
+                    "no line states the gate order "
+                    f"{' -> '.join(GATE_ORDER)}; without it the four gates read as an "
+                    "unordered set and the integration trigger is ambiguous",
+                )
+
+    def test_single_canonical_subsection_denies_close_as_an_integration_precondition(
+        self,
+    ) -> None:
+        # The ordering statement alone can be read as descriptive. The subsection also has to
+        # rule out the wrong reading, because that reading is the one that stalls a lane.
+        for path in SKILL_WORKFLOW_BODIES:
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                subsection = _section(
+                    self._publication_section(path),
+                    "### single-canonical-branch topology",
+                    3,
+                )
+                self.assertIn(
+                    "統合の前提条件",
+                    subsection,
+                    "the subsection never says owner close approval is NOT a precondition of "
+                    "integration; stating the order without denying the inverse leaves the "
+                    "stalling reading available",
+                )
 
     def test_release_gate_stays_independent_of_branch_topology(self) -> None:
         # The one boundary a topology switch must NOT move: reaching the integration branch
