@@ -80,6 +80,33 @@ RELEASE_STATES = frozenset(
     }
 )
 
+
+def is_canonical_release_state(value: object) -> bool:
+    """Is ``value`` a stored ``process_release`` this vocabulary recognises — as stored?
+
+    ``process_release`` is ``TEXT NOT NULL`` with no CHECK constraint and the row decoder passes
+    the string through, so any reader can be handed a legacy / corrupted / hand-edited value.
+
+    **Byte-exact: never trimmed first.** ``"released "`` is NOT canonical. Normalising it first
+    promotes an invalid stored value into an authority token — the read gate returned it as a
+    survivor proof (j#94738 R6-F1 follow-up), the hibernate enumeration dropped it as a completed
+    generation (j#94750 R7-F3), and the release CAS rewrote it INTO canonical ``requested``
+    (j#94778 R8-F2). Same discipline the ``lane_kind`` vocabulary was given in review j#85852 F1.
+
+    **The rule this expresses is "ingress may normalise, stored authority may not."** A surface
+    that accepts an argument from a caller is free to trim it; a surface that classifies what the
+    row already HOLDS is not, because the trim invents a canonical fact the storage never carried.
+
+    Scope note (review j#94778 corrected an over-claim of mine): this answers "is the value in the
+    vocabulary", and it is NOT the only release-state predicate. The observation read gate
+    deliberately uses its own narrower literal set (``_CLASSIFIED_RELEASE_STATES`` in
+    :mod:`...lane_release`) so that a state ADDED to this vocabulary without a rule there fails
+    closed instead of inheriting ``released``'s meaning (j#94750 R7-F1). Two questions, two
+    predicates — do not describe them as one.
+    """
+    return isinstance(value, str) and value in RELEASE_STATES
+
+
 #: Allowed disposition edges (Design Answer D3). ``superseded -> active`` is
 #: forbidden: reviving a superseded lane would re-create two active owners for one
 #: issue, the very state this component makes unrepresentable.
@@ -215,28 +242,66 @@ OWNER_UNKNOWN = "unknown"
 
 
 def disposition_transition_allowed(current: str, target: str) -> bool:
-    """Is ``current -> target`` a legal disposition edge? (pure)"""
-    return target in _DISPOSITION_EDGES.get(norm(current), frozenset())
+    """Is ``current -> target`` a legal disposition edge? (pure)
+
+    ``current`` is the STORED value, matched byte-exact (Redmine #14477 review j#94805). The real
+    :meth:`...LaneLifecycleStore.transition_disposition` already refuses a padded stored
+    disposition earlier, at its exact expected-state guard (measured: ``unexpected_state``,
+    zero-write), so this is a CONTRACT alignment and a guard against future reuse of the
+    predicate on its own — not a reproduced laundering path. Stated that way deliberately: the
+    strong claim would not be true.
+    """
+    return target in _DISPOSITION_EDGES.get(current, frozenset())
 
 
 def release_transition_allowed(current: str, target: str) -> bool:
-    """Is ``current -> target`` a legal release edge within one generation? (pure)"""
-    return target in _RELEASE_EDGES.get(norm(current), frozenset())
+    """Is ``current -> target`` a legal release edge within one generation? (pure)
+
+    ``current`` is the STORED authority value and is matched byte-exact — never normalised first
+    (Redmine #14477 review j#94778 R8-F2). This is the CAS guard of
+    :func:`...lane_release.open_release_generation` and of
+    :meth:`...LaneLifecycleStore.record_release_outcome`, so normalising here did not merely
+    misclassify: a padded ``"not_requested "`` row was ADMITTED and the CAS then rewrote it to the
+    canonical ``requested`` — laundering an invalid stored value into real authority, which every
+    byte-exact reader downstream then correctly trusted. A non-canonical current has no outgoing
+    edge, so it is refused zero-write.
+    """
+    return target in _RELEASE_EDGES.get(current, frozenset())
 
 
 def replacement_transition_allowed(current: str, target: str) -> bool:
-    """Is ``current -> target`` a legal receiver-replacement edge? (pure)"""
-    return target in _REPLACEMENT_EDGES.get(norm(current), frozenset())
+    """Is ``current -> target`` a legal receiver-replacement edge? (pure)
+
+    Byte-exact on the STORED value — see :func:`replacement_settled` for what normalising it did.
+    """
+    return target in _REPLACEMENT_EDGES.get(current, frozenset())
 
 
 def replacement_open_allowed(current: str) -> bool:
-    """May a new owner-approved replacement generation be opened? (pure)"""
-    return norm(current) in _OPENABLE_REPLACEMENT_STATES
+    """May a new owner-approved replacement generation be opened? (pure)
+
+    Byte-exact on the STORED value — see :func:`replacement_settled`.
+    """
+    return current in _OPENABLE_REPLACEMENT_STATES
 
 
 def replacement_settled(current: str) -> bool:
-    """Has this lane no receiver replacement actuation in flight? (pure)"""
-    return norm(current) in _SETTLED_REPLACEMENT_STATES
+    """Has this lane no receiver replacement actuation in flight? (pure)
+
+    Byte-exact on the STORED value, never normalised first (Redmine #14477 review j#94805 R9-F3).
+    These three predicates guard REAL writes, and normalising the stored value reproduced the same
+    laundering the release axis had (j#94778 R8-F2) — measured on an isolated store through the
+    public API:
+
+    - stored ``" not_requested"`` -> ``request_replacement`` applied, row rewritten to ``requested``
+    - stored ``"requested "`` -> ``record_replacement_outcome`` applied, row rewritten to ``pending``
+    - stored ``"replaced "`` -> this settled gate passed, so the lane rehydrated to ``active``
+
+    An unclassifiable stored value has no outgoing edge and is not settled, so each is now refused
+    zero-write. The rule is the one :func:`is_canonical_release_state` states: ingress may
+    normalise, stored authority may not.
+    """
+    return current in _SETTLED_REPLACEMENT_STATES
 
 
 def rehydrate_allowed(process_release: str) -> bool:
@@ -248,8 +313,12 @@ def rehydrate_allowed(process_release: str) -> bool:
     refused; there is deliberately no "cancel a release" state, so the caller must
     finish or abandon the generation through the release API, not by side-stepping
     it with a disposition write.
+
+    Byte-exact on the STORED value, never normalised first (review j#94778 R8-F2): a padded
+    ``"released "`` row rehydrated to ``active`` under the old spelling-insensitive check, so an
+    unclassifiable release state became a live lane.
     """
-    return norm(process_release) in _REHYDRATABLE_RELEASE_STATES
+    return process_release in _REHYDRATABLE_RELEASE_STATES
 
 
 # -- records -----------------------------------------------------------------
@@ -418,6 +487,32 @@ BINDING_KIND_ISSUE = "issue"
 BINDING_KIND_PROJECT_GATEWAY = "project_gateway"
 
 BINDING_KINDS = frozenset({BINDING_KIND_ISSUE, BINDING_KIND_PROJECT_GATEWAY})
+
+
+def stored_binding_kind_is(value: object, kind: str) -> bool:
+    """Is the STORED ``binding_kind`` exactly ``kind``? (pure, byte-exact)
+
+    ``binding_kind`` is ``TEXT NOT NULL`` with no CHECK constraint and the row decoder passes the
+    string through, so a legacy / corrupted / hand-edited row can hold anything. Every surface that
+    classifies one asks the same question, so it is answered once here (Redmine #14477 review
+    j#94840 R10-F1 found 18 stored-read sites across 14 modules, each spelling it ``norm(...) ==``).
+
+    The pass-through is load-bearing and was NOT always true: until review j#94992 R11-F1 the
+    decoder read ``str(row[17] or BINDING_KIND_ISSUE)``, so an EMPTY stored value arrived here
+    already wearing the canonical token and this predicate could not see it — a raw ``''`` row
+    reopened its generation. The decoder now keeps the raw bytes, which is what makes every
+    classifier below able to refuse them.
+
+    **Byte-exact: never trimmed first**, the rule :func:`is_canonical_release_state` states —
+    ingress may normalise, stored authority may not. Measured before the fix on an isolated store:
+    a row holding ``"issue "`` passed ``backfill_active_binding`` (revision 1->2) and
+    ``open_next_generation`` (generation 1->2), because trimming invented an ``issue`` binding the
+    storage never carried.
+
+    Only the DECLARING surface normalises, on the argument a caller hands it
+    (``LaneDeclarationStore.declare_lane``) — that is ingress, and it is left alone.
+    """
+    return isinstance(value, str) and value == kind
 
 
 # The declared-slot snapshot value + codec live in the cohesive leaf
@@ -601,6 +696,18 @@ class LaneLifecycleRecord:
     row or a lane created without a durable kind fact (the launch path then falls back to
     ``lane_class`` geometry — the issue's close condition), never a guessed value. It is a
     stored token, NOT folded into ``declared_slots`` (that stays post-launch observation).
+
+    ``hibernated_at`` (v8, Redmine #14477) is the IMMUTABLE hibernate-transition boundary the
+    resume freshness proof (#13682) compares startup self-attestations against. Unlike
+    ``updated_at`` — which every lifecycle write moves — it is stamped by exactly one event,
+    the disposition CAS INTO ``hibernated``, and cleared on the way back to ``active``. That
+    separation is the whole point: a metadata-only write (a revision bump, a decision anchor,
+    a declared-pin repair) must not be able to push the boundary past the attestation of the
+    pair it just verified (#14476 j#88614-j#88618). Empty on a pre-v8 row / a lane that never
+    hibernated, and an empty anchor gets NO substitute — the freshness proof reports it
+    unavailable and the caller fails closed, because ``updated_at`` is not monotonic and
+    standing in for the boundary admitted a real survivor (review j#94515 / verdict j#94520).
+    Semantics: :mod:`...lane_hibernation_anchor`.
     """
 
     repo_workspace_id: str
@@ -626,6 +733,8 @@ class LaneLifecycleRecord:
     declared_slots: str = ""
     reconcile_phase: str = ""
     lane_kind: str = ""
+    hibernated_at: str = ""
+    release_observation: str = ""
 
     @property
     def key(self) -> LaneLifecycleKey:
@@ -653,7 +762,7 @@ class LaneLifecycleRecord:
         **not** auto-completed from the lane id, and its ``binding_kind`` stays ``issue``
         (a project-gateway lane is an explicit declaration, never a guess).
         """
-        return norm(self.binding_kind) == BINDING_KIND_ISSUE and not norm(self.issue_id)
+        return stored_binding_kind_is(self.binding_kind, BINDING_KIND_ISSUE) and not self.issue_id
 
     @property
     def decision(self) -> Optional[DecisionPointer]:
@@ -698,6 +807,8 @@ class LaneLifecycleRecord:
             "declared_slots": [p.as_payload() for p in self.declared_pins],
             "reconcile_phase": self.reconcile_phase,
             "lane_kind": self.lane_kind,
+            "hibernated_at": self.hibernated_at,
+            "release_observation": self.release_observation,
         }
 
 
@@ -840,6 +951,8 @@ __all__ = (
     "RELEASE_RELEASED",
     "RELEASE_REQUESTED",
     "RELEASE_STATES",
+    "is_canonical_release_state",
+    "stored_binding_kind_is",
     "REPLACEMENT_NOT_REQUESTED",
     "REPLACEMENT_PENDING",
     "REPLACEMENT_REPLACED",

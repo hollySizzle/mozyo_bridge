@@ -345,7 +345,7 @@ def run_hibernated_live_reconcile(
     obligations — are established upstream.
     """
     from mozyo_bridge.core.state.lane_lifecycle import (
-        BINDING_KIND_ISSUE,
+        BINDING_KIND_ISSUE, stored_binding_kind_is,  # one check, one line (module at ceiling)
         CAS_FORBIDDEN_TRANSITION,
         CAS_NOT_FOUND,
         CAS_STALE_REVISION,
@@ -781,7 +781,7 @@ def run_hibernated_live_reconcile(
     # legacy row migrates through #13841).
     if (
         record.lane_disposition != DISPOSITION_HIBERNATED
-        or norm(record.binding_kind) != BINDING_KIND_ISSUE
+        or not stored_binding_kind_is(record.binding_kind, BINDING_KIND_ISSUE)
         or (record.issue_id or "").strip() != issue
         or record.project_scope
         or record.process_release != RELEASE_RELEASED

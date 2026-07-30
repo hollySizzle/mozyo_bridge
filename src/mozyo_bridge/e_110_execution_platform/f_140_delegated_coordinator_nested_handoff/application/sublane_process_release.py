@@ -45,6 +45,11 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
 from mozyo_bridge.core.state.lane_pin_role import (
     resolve_declared_pin_pair,
 )
+from mozyo_bridge.core.state.lane_release_observation import (
+    ReleaseObservationError,
+    build_release_observation,
+)
+from mozyo_bridge.core.state.lane_lifecycle_model import is_canonical_release_state
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     RELEASE_NOT_REQUESTED,
@@ -78,6 +83,28 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 #: The two managed slots a lane unit carries (gateway + worker), under the resolved
 #: binding. Shared by the inventory helpers and the pin matcher.
 _LANE_ROLES = (GATEWAY_ROLE, WORKER_ROLE)
+
+#: Typed detail token for a stored ``process_release`` this driver has no rule for (Redmine
+#: #14477 review j#94778 R8-F1). Deliberately the SAME literal the hibernate supervisor rail uses
+#: for the identical storage fact (``ATTEMPT_RELEASE_STATE_UNKNOWN``, #14219 j#86776 R5-F5), so one
+#: grep finds every surface that classifies an unknown release state.
+RELEASE_STATE_UNKNOWN = "release_state_unknown"
+
+
+def render_release_state(value: str) -> str:
+    """The stored release state as TEXT output may safely show it (review j#94805 R9-F2).
+
+    A canonical token renders verbatim, so every ordinary line is byte-identical to before. Any
+    other stored value is rendered as a Python literal, which is reversible and escapes control
+    bytes. Measured before the fix: a stored value of ``"weird\n  commit: applied=True\x1b[31m"``
+    reached ``mozyo-bridge sublane hibernate``'s text output with the newline and the ANSI ESC
+    intact, forging a second line that read ``commit: applied=True``.
+
+    This is a PRESENTATION boundary only. The domain keeps the raw value untouched — that is the
+    R8-F1 requirement, and the JSON payload still carries it verbatim (its encoder escapes) so the
+    operator-facing text and the machine-facing payload stay consistent and reversible.
+    """
+    return value if is_canonical_release_state(value) else repr(value)
 
 
 # ---------------------------------------------------------------------------
@@ -142,15 +169,22 @@ def evaluate_pair_attestation(
     brand-new *different* lane, so a survivor is impossible); ``fresh_after`` is not
     passed there.
 
-    ``fresh_after`` (resume, Redmine #13682) adds the missing half of a *freshness*
+    ``fresh_after`` (resume, Redmine #13682) adds a *liveness* boundary — NOT a generation
     proof. The locator is the tmux pane-id, which changes only when the process truly
     dies — so a pane that **survived** hibernate's release keeps its locator and still
-    matches its own *pre-hibernate* attestation, and the locator pin alone cannot tell a
-    survivor from a genuine relaunch. When ``fresh_after`` is given (the lane's
-    hibernation timestamp), a slot additionally must carry a self-attestation
-    ``observed_at`` **strictly after** it — a fresh relaunch self-attests after the lane
-    hibernated, a survivor's record predates it. A missing / not-after ``observed_at`` is
-    ``stale_generation`` (fail closed).
+    matches its own *pre-hibernate* attestation, and the locator pin alone cannot separate
+    a survivor from a relaunch. When ``fresh_after`` is given (the lane's hibernation
+    boundary), a slot additionally must carry a self-attestation ``observed_at``
+    **strictly after** it. A missing / not-after ``observed_at`` is ``stale_generation``
+    (fail closed).
+
+    **This comparison must not be read as proving the generation** (Redmine #14477 review
+    j#94531 R2-F1, disposition j#94544 A.3). Three vectors defeat any timestamp: a
+    caller-supplied CAS stamp that regresses, a host clock that rolls back, and an
+    ``observed_at`` written by the attesting process itself. The clock-independent
+    discriminator lives in
+    :mod:`mozyo_bridge.core.state.lane_released_locator_fence`, and the authority-grade
+    proof is Redmine #14756.
     """
     slots = unit_slots(rows, workspace_id, lane)
     if GATEWAY_ROLE not in slots or WORKER_ROLE not in slots:
@@ -169,8 +203,8 @@ def evaluate_pair_attestation(
         if not join.ok:
             return True, False, f"{role}: {join.state}"
         if threshold:
-            # A locator-matched attestation proves a FRESH generation only when it was
-            # observed after the lane hibernated (a survivor's record predates it). Both
+            # A locator-matched attestation is CONSISTENT with a fresh generation only when
+            # observed after the lane hibernated; it does not prove one (#14477 A.3). Both
             # timestamps are fixed-width UTC ISO-seconds, so a lexical compare is a time
             # compare. An absent / not-after stamp fails closed.
             observed = _norm(record.observed_at) if record is not None else ""
@@ -493,6 +527,25 @@ def release_pins(
     return pins
 
 
+def _release_recorded_detail(plan, close) -> str:
+    """Describe what the generation actually did, factually (Redmine #14477 j#94596 item 3).
+
+    A live-zero release completes a generation having observed nothing and closed nothing. Saying
+    only "release recorded" invites reading it as "the processes were closed", and ``released`` is
+    a *command/generation completion*, never a proof of process absence — the liveness authority
+    stays the live inventory. So the zero case names all three facts explicitly.
+    """
+    if not plan.close_targets:
+        return (
+            "release recorded: 0 slots observed, 0 close actuation, release generation "
+            "completed (not a proof that no process exists; liveness is the live inventory)"
+        )
+    return (
+        f"release recorded: {len(plan.close_targets)} slot(s) observed, "
+        f"{len(close.closed)} closed, {len(close.failed)} failed"
+    )
+
+
 def drive_process_release(
     *,
     store: LaneLifecycleStore,
@@ -562,24 +615,33 @@ def drive_process_release(
 
     rows = ops.live_rows() if rows is None else rows
     if rec.process_release == RELEASE_NOT_REQUESTED:
-        pins = release_pins(rows, workspace_id, lane_id)
-        if not pins:
-            # No live managed slots to release — the processes are already gone. A
-            # non-active lane already draws zero capacity (W4), so leaving the generation
-            # unopened is honest, not a gap.
+        # Redmine #14477 j#94582 item 1: the driver's enumeration IS the authority. It is
+        # wrapped once here and handed to the store, which derives the generation's pins from
+        # it — there is no separate caller-supplied pin list any more.
+        #
+        # A zero-slot enumeration now OPENS the generation instead of returning early. Leaving
+        # it unopened used to look honest, but it recorded nothing, and resume cannot tell "no
+        # process was live at hibernate" from "a survivor existed and nothing was written"
+        # (j#94582 item 2 / item 4). Recording a COMPLETE-EMPTY observation makes that a
+        # positive, checkable fact instead of an absence.
+        try:
+            observation = build_release_observation(
+                release_pins(rows, workspace_id, lane_id)
+            )
+        except ReleaseObservationError as exc:
             return ReleaseOutcome(
                 action_id=action_id,
-                process_release=RELEASE_NOT_REQUESTED,
-                detail="no live managed slots to release",
+                process_release=rec.process_release,
+                detail=f"release observation unusable ({type(exc).__name__})",
             )
         try:
             opened = store.request_release(
                 key,
                 expected_revision=rec.revision,
                 action_id=action_id,
-                pins=pins,
+                observation=observation,
             )
-        except (ReleasePinError, LaneLifecycleError, OSError) as exc:
+        except (ReleaseObservationError, ReleasePinError, LaneLifecycleError, OSError) as exc:
             return ReleaseOutcome(
                 action_id=action_id,
                 process_release=rec.process_release,
@@ -595,11 +657,30 @@ def drive_process_release(
     elif rec.process_release in (RELEASE_REQUESTED, RELEASE_PARTIAL):
         # Resume the open generation, closing whatever slots remain live.
         action_id = rec.release_action_id or action_id
-    else:  # RELEASE_RELEASED — the generation already finished.
+    elif rec.process_release == RELEASE_RELEASED:
+        # The generation already finished — byte-exact, a POSITIVE branch. It used to be the
+        # ``else``, which meant every value this driver could not classify was reported as a
+        # completed release (review j#94778 R8-F1): an unknown or padded stored state returned
+        # ``released`` with ZERO panes closed, and ``HibernateOutcome.is_success`` accepted that as
+        # a clean fully-actuated hibernate. Exactly the fall-through shape j#94750 R7-F1 removed
+        # from the read gate — this surface was not checked at the time.
         return ReleaseOutcome(
             action_id=rec.release_action_id or action_id,
             process_release=RELEASE_RELEASED,
             detail="release generation already released",
+        )
+    else:
+        # A stored state this driver has no rule for. The RAW value is carried back untouched, so
+        # no caller can mistake it for a canonical outcome: ``HibernateOutcome.is_success``
+        # requires ``released`` / ``not_requested`` exactly, so this is not a success, and the
+        # supervisor rail already classifies the same fact as typed uncertain.
+        return ReleaseOutcome(
+            action_id=rec.release_action_id or action_id,
+            process_release=rec.process_release,
+            detail=(
+                f"{RELEASE_STATE_UNKNOWN}: stored process_release is not a canonical release "
+                "state; refusing to classify it (zero close, zero write)"
+            ),
         )
 
     # Close only the slots this generation durably pinned, and only when their live
@@ -650,7 +731,7 @@ def drive_process_release(
         failed=close.failed,
         foreign_names=close.foreign_names,
         detail=(
-            "release recorded"
+            _release_recorded_detail(plan, close)
             if recorded.applied
             else f"release outcome refused ({recorded.reason})"
         ),
@@ -667,4 +748,6 @@ __all__ = (
     "pin_matched_close_plan",
     "release_pins",
     "unit_slots",
+    "RELEASE_STATE_UNKNOWN",
+    "render_release_state",
 )

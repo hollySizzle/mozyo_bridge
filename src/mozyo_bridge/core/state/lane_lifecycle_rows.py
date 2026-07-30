@@ -67,12 +67,23 @@ def _record(row: Sequence[object]) -> LaneLifecycleRecord:
         created_at=str(row[14]),
         updated_at=str(row[15]),
         worktree_identity=str(row[16] or ""),
-        binding_kind=str(row[17] or BINDING_KIND_ISSUE),
+        # RAW, never defaulted (Redmine #14477 review j#94992 R11-F1). This used to read
+        # ``str(row[17] or BINDING_KIND_ISSUE)``, so an EMPTY stored value decoded as the
+        # canonical ``issue`` and every byte-exact classifier downstream was handed an owner
+        # authority the storage never carried — measured: a raw ``''`` row reopened its
+        # generation (1 -> 2) through ``open_next_generation``. I had defended the default as a
+        # "pre-v5 legacy" mapping; that was wrong. A v4 row has no ``binding_kind`` COLUMN, and
+        # the migration is ``ADD COLUMN binding_kind TEXT NOT NULL DEFAULT 'issue'``, which
+        # backfills the literal token — so a genuinely migrated row reads ``'issue'`` and an
+        # empty one is not a legacy artifact at all.
+        binding_kind=str(row[17] or ""),
         project_scope=str(row[18] or ""),
         lane_generation=int(row[19]),
         declared_slots=str(row[20] or ""),
         reconcile_phase=str(row[21] or ""),
         lane_kind=str(row[22] or ""),
+        hibernated_at=str(row[23] or ""),
+        release_observation=str(row[24] or ""),
     )
 
 
@@ -141,6 +152,12 @@ def _insert_active_row(
             declared_slots,
             "",  # reconcile_phase: a fresh lane is never reconcile-retired (v6, #13842)
             lane_kind,  # v7 (#13647): generation-bound lane-role heal authority
+            # v8 (#14477): a brand-new ACTIVE lane has never hibernated, so it holds no
+            # freshness boundary. Only the disposition CAS into ``hibernated`` writes one.
+            "",
+            # v9 (#14477 j#94582): no release generation has been opened, so there is no
+            # observation. ABSENT (not complete-empty) — only opening a generation records one.
+            "",
         ),
     )
 

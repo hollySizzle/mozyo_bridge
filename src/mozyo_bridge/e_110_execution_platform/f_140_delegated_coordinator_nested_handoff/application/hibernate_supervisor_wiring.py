@@ -49,8 +49,10 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
     RELEASE_NOT_REQUESTED,
+    RELEASE_PARTIAL,
     RELEASE_RELEASED,
-    RELEASE_STATES,
+    RELEASE_REQUESTED,
+    is_canonical_release_state,
 )
 from mozyo_bridge.core.state.lane_lifecycle_readonly import load_lane_lifecycle_readonly
 from mozyo_bridge.core.state.workflow_runtime_store import (
@@ -315,7 +317,16 @@ def enumerate_hibernated_redrives(
             continue
         if not str(getattr(row, "issue_id", "") or "").strip():
             continue
-        release = str(getattr(row, "process_release", "") or "").strip()
+        # Byte-exact, NOT stripped (Redmine #14477 review j#94750 R7-F3). Stripping first let a
+        # padded storage value impersonate a canonical token: ``"released "`` was dropped as a
+        # completed generation and ``" not_requested"`` was admitted to the REDRIVE (mutating)
+        # path, both of which contradict this function's own contract that a non-canonical token
+        # is typed uncertain. ``process_release`` is unconstrained ``TEXT``, so the value is
+        # classified as stored — the shared predicate is the vocabulary's own.
+        release = str(getattr(row, "process_release", "") or "")
+        if not is_canonical_release_state(release):
+            unknown.append(row)  # non-canonical token -> typed uncertain (R5-F5 / R7-F3)
+            continue
         if release == RELEASE_RELEASED:
             continue  # terminal for the generation
         if release == RELEASE_NOT_REQUESTED:
@@ -324,10 +335,13 @@ def enumerate_hibernated_redrives(
                 continue  # confirmed no live slot -> terminal (processes already gone)
             redrives.append(row)  # live slot present, or unreadable inventory (fail-closed)
             continue
-        if release in RELEASE_STATES:  # requested / partial
+        if release in (RELEASE_REQUESTED, RELEASE_PARTIAL):
             redrives.append(row)
             continue
-        unknown.append(row)  # non-canonical token -> typed uncertain (R5-F5)
+        # Canonical, but a state this function has no rule for — a future vocabulary member must
+        # fail closed as uncertain rather than inherit a neighbouring state's handling, the same
+        # discipline review j#94750 R7-F1 imposed on the observation read gate.
+        unknown.append(row)
     return RedriveEnumeration(redrives=tuple(redrives), unknown_release=tuple(unknown))
 
 
