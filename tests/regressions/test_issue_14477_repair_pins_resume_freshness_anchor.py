@@ -985,6 +985,70 @@ class DriverDerivedObservationE2ETest(_Fixture):
         self.assertEqual(self._rec().lane_disposition, DISPOSITION_ACTIVE)
 
 
+class ReleasedIsNotDeadnessProofTest(_Fixture):
+    """`released` is generation completion, never a proof of process absence.
+
+    Redmine #14477 j#94596 item 1 / j#94653 item 3. Since a live-zero release now records a
+    COMPLETE-EMPTY observation and reaches `released`, a consumer could be tempted to read
+    `released` as "no process exists". It does not mean that, and this pins it directly: the
+    liveness authority is the live inventory, and a `released` row can coexist with a fully live
+    pair. Any consumer that promoted `released` alone to a deadness/empty proof would fail here.
+    """
+
+    def test_a_released_row_coexists_with_a_live_pair(self) -> None:
+        rec = self._rec()
+        self.assertEqual(rec.process_release, RELEASE_RELEASED)
+        # The lane's release generation completed, yet a full live pair is observable right now.
+        live = _FakeOps().live_rows()
+        self.assertEqual(len(live), 2)
+        self.assertEqual(
+            {row["pane_id"] for row in live},
+            {_GW_LOC, _WK_LOC},
+            "`released` says a release generation completed; it says nothing about what is live",
+        )
+
+    def test_a_complete_empty_observation_is_not_a_claim_about_now(self) -> None:
+        """Complete-empty is a statement about hibernate time, not about the present."""
+        from mozyo_bridge.core.state.lane_release import verify_release_observation
+
+        # Drive a complete-empty generation, then observe a live pair afterwards.
+        self.assertTrue(self._repair_pins().applied)
+        self.assertFalse(self._resume().is_blocked)
+        out = self.store.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=self._rec().revision,
+            target=DISPOSITION_HIBERNATED,
+            decision=_decision(),
+            now=T_RESUME,
+        )
+        self.assertTrue(out.applied, out.reason)
+        self.assertTrue(
+            self.store.request_release(
+                self.key,
+                expected_revision=self._rec().revision,
+                action_id="rel-empty",
+                observation=build_release_observation(()),
+                now=T_RESUME,
+            ).applied
+        )
+        self.assertTrue(
+            self.store.record_release_outcome(
+                self.key,
+                action_id="rel-empty",
+                expected_revision=self._rec().revision,
+                target=RELEASE_RELEASED,
+                now=T_RESUME,
+            ).applied
+        )
+        observation, reason = verify_release_observation(self._rec())
+        self.assertIsNotNone(observation)
+        self.assertTrue(observation.is_complete_empty)
+        # ...and a live pair is still observable. The observation describes the release
+        # generation's instant, not the current world.
+        self.assertEqual(len(_FakeOps().live_rows()), 2)
+
+
 class OperatorHomeHermeticityTest(_Fixture):
     """This module never resolves — let alone migrates — the operator's shared home.
 

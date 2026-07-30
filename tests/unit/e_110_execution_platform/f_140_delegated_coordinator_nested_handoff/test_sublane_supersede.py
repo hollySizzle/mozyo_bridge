@@ -360,6 +360,14 @@ class SublaneSupersedeTest(unittest.TestCase):
             self.assertEqual(len(ops.close_calls), 1)
             self.assertEqual(ops.close_calls[0].close_targets, ())
             self.assertEqual(outcome.release.closed, ())
+            # j#94653 item 3: the SUPERSEDE fences are unaffected by the live-zero release
+            # change. The handover authority outcome is asserted explicitly here so a future
+            # change to the release axis cannot quietly alter it: the original is superseded,
+            # the recovery lane owns the issue, and `released` did not stand in for either.
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, REC)).lane_disposition, DISPOSITION_ACTIVE
+            )
+            self.assertEqual(store.get(LaneLifecycleKey(WS, REC)).issue_id, ISSUE)
 
     def test_resume_never_closes_a_recycled_replacement_pane(self) -> None:
         # R1 F1 (j#77247): a partial release stays open pinned to the ORIGINAL locators.

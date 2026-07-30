@@ -306,6 +306,11 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
         )
         return assembled.candidate
 
+    def _capture_ops(self):
+        """Keep the fake so assertions can inspect what the pass actuated."""
+        self._last_ops = _FakeOps()
+        return self._last_ops
+
     def _run(self, world: _World, candidate):
         """Run one bounded pass with seams bound to the CURRENT (possibly drifted) world."""
         seams = world.assembler().pass_seams()
@@ -314,7 +319,7 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
             refresh_fn=seams.refresh_fn,
             obligations_fn=seams.obligations_fn,
             journal_fn=seams.journal_fn,
-            use_case=SublaneHibernateUseCase(ops=_FakeOps(), store=world.store),
+            use_case=SublaneHibernateUseCase(ops=self._capture_ops(), store=world.store),
             lease_renew_fn=lambda: True,
         )
 
@@ -327,6 +332,16 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
         # The lane keeps whatever disposition the drift itself left it in — what must NOT happen is
         # this pass hibernating it.
         self.assertEqual(self._disposition(world), disposition)
+        # Redmine #14477 j#94653 item 3: the CI-evidence fences stay INTACT. Since j#94596 a
+        # live-zero release legitimately reaches the driver with an EMPTY plan, so "closed
+        # nothing" is no longer sufficient evidence that a fence blocked. Every blocked case
+        # must leave the release driver UNINVOKED — that is what separates "the fence stopped
+        # this" from "a release ran and happened to have nothing to close".
+        self.assertEqual(
+            getattr(self, "_last_ops", None).close_calls if getattr(self, "_last_ops", None) else [],
+            [],
+            "a blocked evidence fence must not invoke the release driver at all",
+        )
 
     def _drift(self, mutate, *, disposition=DISPOSITION_ACTIVE):
         """Build from clean evidence, apply ``mutate(world)``, then run the pass."""
