@@ -117,9 +117,26 @@ class _FakeOps:
     def read_lane_activity(self, workspace_id, lane, rows):
         return LaneActivityObservation(readable=True)
 
-    def execute_close(self, plan):  # pragma: no cover - no live rows to close
+    def execute_close(self, plan):
+        """No live row may ever be CLOSED; an empty plan is allowed.
+
+        Redmine #14477 j#94582/j#94596: a zero-slot release generation is now OPENED and
+        completed so the complete-empty observation is recorded, which means the driver does
+        reach this call — with zero targets. The invariant that matters is unchanged and is
+        asserted more precisely here: no pane is ever actuated.
+        """
         self.close_calls.append(plan)
-        raise AssertionError("no live rows: execute_close must not be reached")
+        if plan.close_targets:
+            raise AssertionError(
+                f"no live rows: nothing may be closed, got {plan.close_targets!r}"
+            )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
+            HerdrRetireCloseResult,
+        )
+        return HerdrRetireCloseResult(
+            workspace_id=plan.workspace_id, lane_id=plan.lane_id,
+            closed=(), failed=(), foreign_names=(),
+        )
 
 
 def _env(*, lane=LANE, gen, head=HEAD) -> LaneEvidenceEnvelope:
