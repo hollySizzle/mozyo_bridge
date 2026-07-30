@@ -107,6 +107,7 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
 from mozyo_bridge.core.state.lane_pin_repair import LanePinRepairStore  # noqa: E402
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair  # noqa: E402
 from mozyo_bridge.core.state.lane_release import (  # noqa: E402
+    OBSERVATION_ABSENT,
     OBSERVATION_GENERATION_NOT_COMPLETED,
     OBSERVATION_PIN_MISMATCH,
     OBSERVATION_RELEASE_STATE_UNKNOWN,
@@ -1169,33 +1170,146 @@ class ReleaseAxisResetClearsObservationTest(_Fixture):
         self.assertIsNotNone(got)
         self.assertEqual(reason, "release_observation_ok")
 
-    def test_the_fence_detail_for_an_unknown_state_is_recorded_as_is(self) -> None:
-        """What the SURVIVOR FENCE reports for these rows — pinned, not assumed.
+    def test_the_fence_reports_one_reason_for_every_non_canonical_spelling(self) -> None:
+        """The fence's typed detail no longer depends on HOW the invalid value is spelled.
 
-        The fence keeps its own ``norm``-ed ``released`` precheck, so the two non-canonical shapes
-        surface differently in its typed detail even though both refuse:
-
-        - a token that does not normalise to ``released`` is caught by the precheck and reported
-          as ``release_evidence_absent`` (the component's finer reason is not surfaced);
-        - a token that normalises to ``released`` passes the precheck, so the component's
-          ``release_observation_release_state_unknown`` reaches the operator.
-
-        Both are fail-closed. The asymmetry is a diagnostic imprecision, not a hole, and it is
-        pinned here so it is a recorded decision rather than an accident — narrowing the fence's
-        own vocabulary would flip an existing pinned assertion
-        (``ReleasedLocatorVerdictUnitTest.test_an_unreleased_generation_is_absent``) and is
-        deliberately left for a disposition rather than done unasked (see review request).
+        Review j#94750 R7-F2. R7 left the fence's own ``norm``-ed precheck in place, so
+        ``weird_unknown_token`` was folded into ``release_evidence_absent`` while ``"released "``
+        surfaced the component reason — the same non-canonical class reported two ways. I had
+        argued that fixing it would flip the existing ``not_requested`` pin; that was wrong, and I
+        had not read which state that pin uses. Classifying the RAW state first fixes the
+        asymmetry AND leaves canonical non-released rows on their long-standing generic reason.
         """
-        ok, reason = released_locator_verdict(
-            self._row_with_release_state("weird_unknown_token"), [_GW_LOC]
-        )
-        self.assertFalse(ok)
-        self.assertEqual(reason, FENCE_EVIDENCE_ABSENT)
-        ok, reason = released_locator_verdict(
-            self._row_with_release_state("released "), [_WK_LOC]
-        )
-        self.assertFalse(ok)
+        for token in ("weird_unknown_token", "released ", "", " not_requested"):
+            with self.subTest(process_release=token):
+                ok, reason = released_locator_verdict(
+                    self._row_with_release_state(token), [_WK_LOC]
+                )
+                self.assertFalse(ok)
+                self.assertEqual(reason, OBSERVATION_RELEASE_STATE_UNKNOWN)
+        # Canonical non-released states keep the generic reason they have always had.
+        for token in (RELEASE_NOT_REQUESTED, RELEASE_REQUESTED, RELEASE_PARTIAL):
+            with self.subTest(canonical=token):
+                ok, reason = released_locator_verdict(
+                    self._row_with_release_state(token), [_WK_LOC]
+                )
+                self.assertFalse(ok)
+                self.assertEqual(reason, FENCE_EVIDENCE_ABSENT)
+
+    def test_an_unknown_state_is_classified_before_the_observation_is_decoded(self) -> None:
+        """The state diagnosis must not depend on another field's shape (j#94750 R7-F2).
+
+        Before this fix the observation was decoded first, so the SAME unknown token reported
+        ``absent`` when the observation was empty and ``unreadable`` when it was malformed — the
+        state-specific reason only appeared when the observation happened to be valid.
+        """
+        pins = (ReleasePin("gateway", _gw_name(), _GW_LOC),)
+        for label, raw in (
+            ("valid", encode_release_observation(build_release_observation(pins))),
+            ("absent", ""),
+            ("malformed", "{not-json"),
+        ):
+            with self.subTest(observation=label):
+                rec = LaneLifecycleRecord(
+                    repo_workspace_id=_WS,
+                    lane_id=_LANE,
+                    issue_id=_ISSUE,
+                    lane_disposition=DISPOSITION_HIBERNATED,
+                    process_release="weird_unknown_token",
+                    release_pins=encode_release_pins(pins),
+                    release_observation=raw,
+                )
+                got, reason = verify_release_observation(rec)
+                self.assertIsNone(got)
+                self.assertEqual(reason, OBSERVATION_RELEASE_STATE_UNKNOWN)
+        # Control: a CANONICAL state still gets the observation-shape reasons, so the reordering
+        # did not swallow the absent / unreadable diagnoses.
+        for raw, expected in (("", OBSERVATION_ABSENT), ("{not-json", OBSERVATION_UNREADABLE)):
+            with self.subTest(canonical_observation=expected):
+                rec = LaneLifecycleRecord(
+                    repo_workspace_id=_WS,
+                    lane_id=_LANE,
+                    issue_id=_ISSUE,
+                    lane_disposition=DISPOSITION_HIBERNATED,
+                    process_release=RELEASE_RELEASED,
+                    release_pins=encode_release_pins(pins),
+                    release_observation=raw,
+                )
+                got, reason = verify_release_observation(rec)
+                self.assertIsNone(got)
+                self.assertEqual(reason, expected)
+
+    def test_a_future_release_state_added_to_the_vocabulary_never_yields_a_proof(self) -> None:
+        """Growing `RELEASE_STATES` must not hand an unclassified state a survivor proof.
+
+        Review j#94750 R7-F1, and a direct refutation of what I claimed in review request j#94742
+        observation 4. The R7 gate refused the states it knew and let everything else FALL THROUGH
+        to the ``released`` pin check, so a fifth vocabulary member returned
+        ``release_observation_ok`` — measured. The gate now classifies against its OWN literal set,
+        so a state it has no rule for fails closed and the omission is visible as a refusal.
+
+        The vocabulary is patched on the module under test and restored, with identity asserted
+        after the run so a leak cannot silently widen any other pin in this process.
+        """
+        from mozyo_bridge.core.state import lane_release as module
+
+        original = module.RELEASE_STATES
+        module.RELEASE_STATES = frozenset(set(original) | {"future_settling_state"})
+        try:
+            got, reason = verify_release_observation(
+                self._row_with_release_state("future_settling_state")
+            )
+        finally:
+            module.RELEASE_STATES = original
+        self.assertIs(module.RELEASE_STATES, original)
+        self.assertIsNone(got, "an unclassified state must never yield a survivor proof")
         self.assertEqual(reason, OBSERVATION_RELEASE_STATE_UNKNOWN)
+
+    def test_the_hibernate_enumeration_classifies_the_stored_state_byte_exact(self) -> None:
+        """The precedent rail this issue cited had the same defect (j#94750 R7-F3).
+
+        ``enumerate_hibernated_redrives`` stripped ``process_release`` before classifying it, so a
+        padded value impersonated a canonical token against that function's own documented
+        contract: ``"released "`` vanished as a completed generation, and — worse, which I measured
+        while verifying the finding — ``" not_requested"`` was admitted to the REDRIVE path, which
+        actuates. Pinned here, in the issue whose review found it, for both spellings.
+        """
+        from types import SimpleNamespace
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            enumerate_hibernated_redrives,
+        )
+
+        def _row(token: str):
+            return SimpleNamespace(
+                binding_kind="issue",
+                lane_disposition=DISPOSITION_HIBERNATED,
+                repo_workspace_id=_WS,
+                issue_id=_ISSUE,
+                lane_id=_LANE,
+                lane_generation=1,
+                revision=3,
+                process_release=token,
+            )
+
+        for token in ("released ", " not_requested", "RELEASED", "weird_unknown_token"):
+            with self.subTest(process_release=token):
+                out = enumerate_hibernated_redrives(
+                    [_row(token)], workspace_id=_WS, live_slot_fn=lambda _row: True
+                )
+                self.assertEqual(
+                    (len(out.redrives), len(out.unknown_release)),
+                    (0, 1),
+                    "a non-canonical stored state is typed uncertain and never actuated",
+                )
+        # Controls: the canonical tokens keep their existing classification.
+        out = enumerate_hibernated_redrives(
+            [_row(RELEASE_RELEASED)], workspace_id=_WS, live_slot_fn=lambda _row: True
+        )
+        self.assertEqual((len(out.redrives), len(out.unknown_release)), (0, 0))
+        out = enumerate_hibernated_redrives(
+            [_row(RELEASE_NOT_REQUESTED)], workspace_id=_WS, live_slot_fn=lambda _row: True
+        )
+        self.assertEqual((len(out.redrives), len(out.unknown_release)), (1, 0))
 
 
 class ReleasedLocatorVerdictUnitTest(unittest.TestCase):

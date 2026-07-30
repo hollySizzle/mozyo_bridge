@@ -116,6 +116,17 @@ OBSERVATION_STALE_AFTER_RESET = "release_observation_stale_after_reset"
 #: vocabulary (review j#85852 F1): a closed vocabulary is compared as stored.
 OBSERVATION_RELEASE_STATE_UNKNOWN = "release_observation_release_state_unknown"
 
+#: The release states this gate has an explicit RULE for. Deliberately its own literal set and
+#: **not** :data:`RELEASE_STATES` (review j#94750 R7-F1): the pre-R8 gate refused the states it
+#: knew and let everything else fall through to the ``released`` pin check, so adding a fifth
+#: member to the vocabulary — without touching this module — made that member return a survivor
+#: proof. Measured: injecting ``future_settling_state`` yielded ``release_observation_ok``. A state
+#: this gate cannot classify must fail closed as unknown, so growing the vocabulary is safe by
+#: construction and the omission surfaces as a refusal instead of an admission.
+_CLASSIFIED_RELEASE_STATES = frozenset(
+    {RELEASE_NOT_REQUESTED, RELEASE_REQUESTED, RELEASE_PARTIAL, RELEASE_RELEASED}
+)
+
 
 def open_release_generation(
     store,
@@ -239,10 +250,12 @@ def verify_release_observation(
     over the release axis EXPLICITLY — one reason per state, because a consumer branching on the
     reason needs them apart (reviews j#94727 R5-F1, j#94738 R6-F1):
 
-    - not a canonical release-state token at all — ``process_release`` is unconstrained ``TEXT``
-      and the decoder passes it through, so a legacy / corrupted / hand-edited row can hold
-      anything. OUTCOME-UNKNOWN: :data:`OBSERVATION_RELEASE_STATE_UNKNOWN`. Checked byte-exact,
-      so a value that merely *normalises* to a canonical token is unknown too, never a pass.
+    - not a state this gate has a rule for — ``process_release`` is unconstrained ``TEXT`` and the
+      decoder passes it through, so a legacy / corrupted / hand-edited row can hold anything, and
+      a future vocabulary member this module has not been taught lands here too. OUTCOME-UNKNOWN:
+      :data:`OBSERVATION_RELEASE_STATE_UNKNOWN`. Checked byte-exact, so a value that merely
+      *normalises* to a canonical token is unknown too, never a pass. Decided FIRST, before the
+      observation is decoded, so this diagnosis does not depend on another field's shape.
     - ``requested`` / ``partial`` — the observation IS this generation's, written by
       :func:`open_release_generation` in the same CAS that opened it, and left untouched by
       :meth:`...LaneLifecycleStore.record_release_outcome` as the generation advances. It is not
@@ -264,22 +277,25 @@ def verify_release_observation(
     """
     if record is None:
         return None, OBSERVATION_ABSENT
+    # The STATE is classified before the observation is even decoded (review j#94750 R7-F2):
+    # otherwise an unknown state on a row whose observation happens to be empty / malformed was
+    # reported as ``absent`` / ``unreadable``, so the state-specific diagnosis this gate promises
+    # depended on the shape of a different field. Byte-exact, deliberately NOT ``norm``-ed.
+    release = record.process_release
+    if release not in _CLASSIFIED_RELEASE_STATES:
+        return None, OBSERVATION_RELEASE_STATE_UNKNOWN
     try:
         observation = decode_release_observation(record.release_observation)
     except ReleaseObservationError:
         return None, OBSERVATION_UNREADABLE
     if observation is None:
         return None, OBSERVATION_ABSENT
-    # Byte-exact, deliberately NOT ``norm``-ed: a stored value that only normalises to a canonical
-    # token is itself non-canonical, and the pre-R7 gate let ``"released "`` through as a proof.
-    release = record.process_release
-    if release not in RELEASE_STATES:
-        return None, OBSERVATION_RELEASE_STATE_UNKNOWN
     if release in (RELEASE_REQUESTED, RELEASE_PARTIAL):
         return None, OBSERVATION_GENERATION_NOT_COMPLETED
     if release == RELEASE_NOT_REQUESTED:
         return None, OBSERVATION_STALE_AFTER_RESET
-    # Only ``released`` reaches the pin check; RELEASE_STATES has no fifth member.
+    if release != RELEASE_RELEASED:  # unreachable today; see _CLASSIFIED_RELEASE_STATES
+        return None, OBSERVATION_RELEASE_STATE_UNKNOWN
     try:
         stored_pins = decode_release_pins(record.release_pins)
     except ReleasePinError:

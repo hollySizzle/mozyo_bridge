@@ -80,6 +80,25 @@ RELEASE_STATES = frozenset(
     }
 )
 
+
+def is_canonical_release_state(value: object) -> bool:
+    """Is ``value`` a stored ``process_release`` this vocabulary recognises — as stored?
+
+    ``process_release`` is ``TEXT NOT NULL`` with no CHECK constraint and the row decoder passes
+    the string through, so any reader can be handed a legacy / corrupted / hand-edited value. Every
+    surface that classifies one needs the same answer, so the predicate lives here rather than
+    being re-derived per consumer (Redmine #14477 review j#94750 R7-F2 / R7-F3 found two surfaces
+    that had each written their own, and disagreed).
+
+    **Byte-exact: never trimmed first.** ``"released "`` is NOT canonical. Normalising it first
+    promotes an invalid stored value into an authority token — the read gate returned it as a
+    survivor proof (j#94738 R6-F1 follow-up) and the hibernate enumeration dropped it as a
+    completed generation (j#94750 R7-F3). Same discipline the ``lane_kind`` vocabulary was given
+    in review j#85852 F1.
+    """
+    return isinstance(value, str) and value in RELEASE_STATES
+
+
 #: Allowed disposition edges (Design Answer D3). ``superseded -> active`` is
 #: forbidden: reviving a superseded lane would re-create two active owners for one
 #: issue, the very state this component makes unrepresentable.
@@ -856,6 +875,7 @@ __all__ = (
     "RELEASE_RELEASED",
     "RELEASE_REQUESTED",
     "RELEASE_STATES",
+    "is_canonical_release_state",
     "REPLACEMENT_NOT_REQUESTED",
     "REPLACEMENT_PENDING",
     "REPLACEMENT_REPLACED",

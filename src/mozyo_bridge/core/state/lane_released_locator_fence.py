@@ -43,11 +43,13 @@ from typing import Iterable, Optional
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     RELEASE_RELEASED,
     LaneLifecycleRecord,
+    is_canonical_release_state,
     norm,
 )
 from mozyo_bridge.core.state.lane_release import (
     OBSERVATION_ABSENT,
     OBSERVATION_OK,
+    OBSERVATION_RELEASE_STATE_UNKNOWN,
     verify_release_observation,
 )
 
@@ -76,9 +78,16 @@ def released_locator_verdict(
     """
     if record is None:
         return False, FENCE_EVIDENCE_ABSENT
-    if norm(record.process_release) != RELEASE_RELEASED:
-        # Only a durably COMPLETED generation proves what it closed. A never-requested or
-        # in-flight one is missing evidence, not evidence of absence.
+    if not is_canonical_release_state(record.process_release):
+        # A stored value outside the vocabulary is OUTCOME-UNKNOWN and says so, rather than being
+        # folded into "no evidence" (review j#94750 R7-F2). Byte-exact: the old ``norm``-ed check
+        # let ``"released "`` past this precheck entirely, so the same non-canonical class got two
+        # different operator details depending on spelling.
+        return False, OBSERVATION_RELEASE_STATE_UNKNOWN
+    if record.process_release != RELEASE_RELEASED:
+        # A CANONICAL but non-released state keeps the generic reason it has always had: only a
+        # durably COMPLETED generation proves what it closed, and a never-requested or in-flight
+        # one is missing evidence, not evidence of absence.
         return False, FENCE_EVIDENCE_ABSENT
     observation, reason = verify_release_observation(record)
     if observation is None:

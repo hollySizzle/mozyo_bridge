@@ -462,14 +462,29 @@ Table naming:
       `released` でない row は、caller が何を検査しているかに関わらず component 境界で拒否する。
       拒否理由は release 軸の状態ごとに**明示分岐**する (畳むと consumer が retry 可能な状態 /
       invariant 違反 / 判定不能を区別できない。j#94727 R5-F1 / j#94738 R6-F1)。
-      - **canonical でない token** (`RELEASE_STATES` に無い) →
+      - **この gate が分類規則を持たない state** →
         **`release_observation_release_state_unknown`**。`process_release` は
         `TEXT NOT NULL` で **CHECK 制約が無く**、row decoder も文字列を pass-through するので、
         legacy / corrupted / 手編集 row は任意の値を持ちうる。これは **outcome-unknown** であり、
         hibernate rail の既存 ruling (`release_state_unknown`、j#86776 R5-F5 / j#87226) と同じ扱い =
-        **決定的な分類へ畳まない**。判定は **byte-exact** で行い trim しない
-        (`"released "` は normalize すると canonical になり、R7 以前は **proof として通っていた**。
-        closed vocabulary は格納値のまま比較する — `lane_kind` の j#85852 F1 と同じ規律)。
+        **決定的な分類へ畳まない**。3 つの規律がある (j#94750 R7-F1 / R7-F2)。
+        - 判定は **byte-exact** で行い trim しない
+          (`"released "` は normalize すると canonical になり、R7 以前は **proof として通っていた**。
+          closed vocabulary は格納値のまま比較する — `lane_kind` の j#85852 F1 と同じ規律)。
+        - 判定は **`RELEASE_STATES` への membership ではなく、gate 自身が規則を持つ token 集合**で
+          行う。R7 以前は「知っている state を拒否し、残りは `released` として fall-through」だった
+          ため、**vocabulary に第五 member を足すと proof を返した** (実測)。
+          **accepted-set への membership は、各 member に規則があることを保証しない。**
+        - state の判定は **observation の decode より前**に行う。R7 以前は decode が先だったので、
+          同じ unknown token が observation の形 (empty / malformed) に応じて `absent` /
+          `unreadable` と報告され、**state 固有の診断が別 field の形に乗っ取られていた**。
+      - survivor fence (`released_locator_verdict`) も **raw exact state を先に分類**し、
+        non-canonical はすべて同じ typed unknown を surface する (綴りで detail が変わらない)。
+        canonical な非 `released` state は従来どおり generic な `release_evidence_absent` を保つ。
+      - 同じ `process_release` を読む **hibernate supervisor enumeration も byte-exact** に分類する。
+        R7 以前は `.strip()` していたため `"released "` が terminal として消え、
+        **`" not_requested"` が redrive (actuation を伴う) path へ admit されていた** (j#94750 R7-F3)。
+        canonical 判定は pure vocabulary module の `is_canonical_release_state()` を 3 surface で共有する。
       - `requested` / `partial` → **`release_observation_generation_not_completed`**。
         observation は**現 generation のもの**である (`record_release_outcome` は
         `process_release` のみを進め observation を書き換えない)。未完了なだけであり、
