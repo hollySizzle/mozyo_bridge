@@ -595,12 +595,21 @@ class SublaneHibernateTest(unittest.TestCase):
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
                 DISPOSITION_HIBERNATED,
             )
-            # Redmine #14477 j#94582 item 2: a zero-slot enumeration now OPENS the generation
-        # and records a COMPLETE-EMPTY observation, so the release reaches `released`.
-        # Leaving it `not_requested` recorded nothing, and resume could not tell "no
-        # process was live" from "a survivor existed and nothing was written".
-        self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
-            self.assertEqual(ops.close_calls, [])
+            # Redmine #14477 j#94582 item 2 / j#94596: a zero-slot enumeration now OPENS the
+            # generation and records a COMPLETE-EMPTY observation, so the release reaches
+            # `released`. That is release-generation COMPLETION, not a proof of process
+            # absence — liveness stays the live inventory (j#94596 item 1). Leaving it
+            # `not_requested` recorded nothing, so resume could not tell "no process was
+            # live" from "a survivor existed and nothing was written".
+            self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
+            # ZERO close actuation is the point (j#94596 item 3): the generation runs, but
+            # with an empty plan, so no pane is ever touched. Asserting the plan's emptiness
+            # is stronger than asserting the driver skipped the call — it pins that the
+            # release completed AND closed nothing.
+            self.assertEqual(len(ops.close_calls), 1)
+            self.assertEqual(ops.close_calls[0].close_targets, ())
+            self.assertEqual(outcome.release.closed, ())
+            self.assertIn("0 close actuation", outcome.release.detail)
 
     def test_non_git_lane_hibernates(self) -> None:
         # A non-git (directory scaffold) lane hibernates identically — the disposition and

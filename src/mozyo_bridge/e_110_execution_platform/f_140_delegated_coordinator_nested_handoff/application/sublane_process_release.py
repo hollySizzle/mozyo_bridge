@@ -504,6 +504,25 @@ def release_pins(
     return pins
 
 
+def _release_recorded_detail(plan, close) -> str:
+    """Describe what the generation actually did, factually (Redmine #14477 j#94596 item 3).
+
+    A live-zero release completes a generation having observed nothing and closed nothing. Saying
+    only "release recorded" invites reading it as "the processes were closed", and ``released`` is
+    a *command/generation completion*, never a proof of process absence — the liveness authority
+    stays the live inventory. So the zero case names all three facts explicitly.
+    """
+    if not plan.close_targets:
+        return (
+            "release recorded: 0 slots observed, 0 close actuation, release generation "
+            "completed (not a proof that no process exists; liveness is the live inventory)"
+        )
+    return (
+        f"release recorded: {len(plan.close_targets)} slot(s) observed, "
+        f"{len(close.closed)} closed, {len(close.failed)} failed"
+    )
+
+
 def drive_process_release(
     *,
     store: LaneLifecycleStore,
@@ -670,7 +689,7 @@ def drive_process_release(
         failed=close.failed,
         foreign_names=close.foreign_names,
         detail=(
-            "release recorded"
+            _release_recorded_detail(plan, close)
             if recorded.applied
             else f"release outcome refused ({recorded.reason})"
         ),

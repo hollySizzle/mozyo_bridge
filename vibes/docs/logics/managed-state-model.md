@@ -454,7 +454,16 @@ Table naming:
       何も記録しなかったが、それでは resume が「hibernate 時 process 0」と「survivor がいて
       証拠が残らなかった」を区別できない。complete-empty を記録することでこれを検査可能な
       事実にする。**その結果 live-zero hibernate の `process_release` は `released` へ到達する**
-      (従来 `not_requested`)。
+      (従来 `not_requested`)。coordinator 承認: #14477 j#94596 item 1。
+    - **`released` は release command / generation の完了であり、process absence の正本ではない**
+      (j#94596 item 1)。actuation 0 件でも矛盾しない。**consumer は `released` 単独を deadness /
+      empty の証明へ昇格してはならない**。liveness の正本は引き続き live inventory である。
+      retire / reconcile の各 surface は `released` に加えて既存の fresh live-zero / foreign /
+      multiplicity / binding / revision fence を **連言し続ける**こと。complete-empty でそれらを
+      short-circuit しない (j#94596 item 2)。
+    - **CLI / JSON / docs は live-zero を事実どおり表現する** (j#94596 item 3):
+      「0 slot observed・0 close actuation・release generation completed」。「process を閉じた」と
+      誤読させる表現にしない。
     - **残る trust boundary**: writer が **fabricated observation** を渡す余地は残る。今日の
       「`pins=` ならどこでも暗黙に受理」から「唯一の監査可能な seam で明示的に主張」へ変わった
       が、暗号的証明ではない。clock / locator 再利用にも依存しない正しい終点 (lane epoch を
