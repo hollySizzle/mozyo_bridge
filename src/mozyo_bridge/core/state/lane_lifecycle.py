@@ -720,9 +720,15 @@ class LaneLifecycleStore:
                             RELEASE_NOT_REQUESTED,
                             "",
                             "",
-                            # v9 (#14477 j#94707 R4-F1): the promoted lane owns a NEW generation,
-                            # so the superseded one's release observation clears with the rest of
-                            # the release set — never carried into the generation it precedes.
+                            # v9 (#14477 j#94707 R4-F1): this UPDATE rewrites the INCOMING
+                            # recovery lane's own row, so what clears here is ITS prior release
+                            # cycle's observation — a lane going active carries no release
+                            # evidence, the same reason its own pins and action id clear above.
+                            # It stays the same lane_generation (only `revision` advances; a
+                            # re-incarnation is `open_next_generation`'s job), which is why the
+                            # stale evidence has to be cleared rather than outgrown.
+                            # Corrected per review j#94727 R5-F2 — the previous comment named the
+                            # superseded lane and a generation bump, and both were wrong.
                             "",
                             REPLACEMENT_NOT_REQUESTED,
                             "",

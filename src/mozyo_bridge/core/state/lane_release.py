@@ -45,6 +45,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     CAS_STALE_REVISION,
     CAS_UNEXPECTED_STATE,
     DISPOSITION_ACTIVE,
+    RELEASE_PARTIAL,
     RELEASE_RELEASED,
     RELEASE_REQUESTED,
     CasOutcome,
@@ -84,11 +85,19 @@ OBSERVATION_UNREADABLE = "release_observation_unreadable"
 #: The stored release pins do not describe exactly the recorded observation (missing, extra, or
 #: different). A row whose two fields disagree is never usable as proof.
 OBSERVATION_PIN_MISMATCH = "release_observation_pin_mismatch"
-#: The row carries an observation but its release generation is not COMPLETED, so the observation
-#: is not this generation's authority (review j#94707 R4-F1). The reset writers clear the whole
-#: release set, so a live row should never be in this shape; the read gate refuses it anyway
-#: rather than depending on every caller to check ``process_release`` first.
-OBSERVATION_NOT_CURRENT_GENERATION = "release_observation_not_current_generation"
+#: The observation belongs to the CURRENT generation, but that generation has not COMPLETED
+#: (``requested`` / ``partial``). Only a completed generation establishes what it closed: a
+#: partial run may still close more slots, so its observation is not yet a survivor proof.
+#: Review j#94727 R5-F1 corrected this: ``advance_release`` walks ``requested -> partial ->
+#: released`` without rewriting the observation, so an in-flight row's observation is this
+#: generation's — not a stale one — and the reason must say so.
+OBSERVATION_GENERATION_NOT_COMPLETED = "release_observation_generation_not_completed"
+#: An observation is present on a row whose release axis is ``not_requested`` — a shape the reset
+#: writers make unreachable, because they clear the observation with the rest of the release set
+#: (review j#94707 R4-F1). Reaching it means that invariant was violated (an older build, a
+#: hand-edited row, a writer added without its reset), so it is named as the violation it is
+#: rather than folded into the in-flight case.
+OBSERVATION_STALE_AFTER_RESET = "release_observation_stale_after_reset"
 
 
 def open_release_generation(
@@ -209,11 +218,22 @@ def verify_release_observation(
     outcome returns ``None`` with a typed reason, and the caller must fail closed on it: an ABSENT
     observation is missing evidence, not evidence of absence.
 
-    The generation check lives here, not in the caller (review j#94707 R4-F1). Every writer that
-    resets the release axis clears the observation with it, so a row that has left ``released``
-    carries no observation at all — but "no caller can currently reach that shape" is precisely
-    the kind of caller-side assumption this issue has had to retract twice, so the component
-    refuses a non-current observation itself.
+    The completeness check lives here, not in the caller (review j#94707 R4-F1). It refuses two
+    distinct shapes, named apart because a consumer branching on the reason needs them apart
+    (review j#94727 R5-F1):
+
+    - ``requested`` / ``partial`` — the observation IS this generation's, written by
+      :func:`open_release_generation` in the same CAS that opened it, and left untouched by
+      :meth:`...LaneLifecycleStore.record_release_outcome` as the generation advances. It is not
+      yet a proof because the generation has not completed: a ``partial`` run may still close
+      more slots. Reason: :data:`OBSERVATION_GENERATION_NOT_COMPLETED`.
+    - ``not_requested`` with an observation still present — the reset writers make this
+      unreachable, so it is an invariant VIOLATION, not an in-flight state. Reason:
+      :data:`OBSERVATION_STALE_AFTER_RESET`.
+
+    Refusing the second shape here rather than trusting the writers is deliberate: "no caller can
+    currently reach that shape" is precisely the caller-side assumption this issue has had to
+    retract twice.
 
     A complete-empty observation is returned successfully — it is positive evidence that the
     driver observed no live slot. Whether that is sufficient is the caller's decision; this
@@ -227,10 +247,16 @@ def verify_release_observation(
         return None, OBSERVATION_UNREADABLE
     if observation is None:
         return None, OBSERVATION_ABSENT
-    if norm(record.process_release) != RELEASE_RELEASED:
-        # Present but not this generation's proof: an in-flight generation has not established
-        # what it closed, and a reset row should not be carrying one at all.
-        return None, OBSERVATION_NOT_CURRENT_GENERATION
+    release = norm(record.process_release)
+    if release != RELEASE_RELEASED:
+        # Both are refusals, but for different reasons — see the docstring. An in-flight
+        # generation owns this observation and simply has not finished; a ``not_requested`` row
+        # carrying one has had its reset invariant broken.
+        return None, (
+            OBSERVATION_GENERATION_NOT_COMPLETED
+            if release in (RELEASE_REQUESTED, RELEASE_PARTIAL)
+            else OBSERVATION_STALE_AFTER_RESET
+        )
     try:
         stored_pins = decode_release_pins(record.release_pins)
     except ReleasePinError:
@@ -245,7 +271,8 @@ __all__ = (
     "OBSERVATION_ABSENT",
     "OBSERVATION_UNREADABLE",
     "OBSERVATION_PIN_MISMATCH",
-    "OBSERVATION_NOT_CURRENT_GENERATION",
+    "OBSERVATION_GENERATION_NOT_COMPLETED",
+    "OBSERVATION_STALE_AFTER_RESET",
     "RELEASE_RELEASED",
     "open_release_generation",
     "verify_release_observation",

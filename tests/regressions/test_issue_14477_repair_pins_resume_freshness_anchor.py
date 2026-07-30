@@ -88,7 +88,9 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     DISPOSITION_RETIRED,
     DISPOSITIONS,
     RELEASE_NOT_REQUESTED,
+    RELEASE_PARTIAL,
     RELEASE_RELEASED,
+    RELEASE_REQUESTED,
     DecisionPointer,
     LaneLifecycleKey,
     LaneLifecycleRecord,
@@ -105,8 +107,9 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
 from mozyo_bridge.core.state.lane_pin_repair import LanePinRepairStore  # noqa: E402
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair  # noqa: E402
 from mozyo_bridge.core.state.lane_release import (  # noqa: E402
-    OBSERVATION_NOT_CURRENT_GENERATION,
+    OBSERVATION_GENERATION_NOT_COMPLETED,
     OBSERVATION_PIN_MISMATCH,
+    OBSERVATION_STALE_AFTER_RESET,
     OBSERVATION_UNREADABLE,
     open_release_generation,
     verify_release_observation,
@@ -999,44 +1002,113 @@ class ReleaseAxisResetClearsObservationTest(_Fixture):
         self.assertEqual(self._rec().lane_generation, rec.lane_generation + 1)
         self._assert_release_set_cleared(self._rec(), path="open_next_generation")
 
-    def test_the_read_gate_refuses_an_observation_from_a_non_current_generation(self) -> None:
-        """The component-boundary half of the fix (j#94707 R4-F1, third required item).
+    def test_the_read_gate_refuses_an_in_flight_generation_as_not_completed(self) -> None:
+        """An in-flight generation's observation is ITS OWN, and is refused for being unfinished.
 
-        The reset writers above mean a live row never reaches this shape. That is exactly the
-        kind of caller-side reachability argument this issue has had to retract twice, so the
-        read gate refuses a non-``released`` observation itself instead of trusting that every
-        present and future consumer checks ``process_release`` first.
+        Review j#94727 R5-F1: ``record_release_outcome`` advances ``requested -> partial ->
+        released`` WITHOUT rewriting the observation, so a ``requested`` / ``partial`` row holds
+        the current generation's observation — it is not stale, it is incomplete. The earlier
+        version of this pin called it "not the current generation" and built the states by hand
+        with ``lane_disposition=active``, a shape no writer can produce, which hid that meaning.
+
+        Both states are therefore reached HERE THROUGH THE REAL TRANSITIONS, so the pin proves
+        what a caller can actually observe rather than what a fabricated record can hold.
+        """
+        # Rehydrate the seeded lane, then hibernate it so a fresh generation may be opened.
+        for expected, target in (
+            (DISPOSITION_HIBERNATED, DISPOSITION_ACTIVE),
+            (DISPOSITION_ACTIVE, DISPOSITION_HIBERNATED),
+        ):
+            out = self.store.transition_disposition(
+                self.key,
+                expected_disposition=expected,
+                expected_revision=self._rec().revision,
+                target=target,
+                decision=_decision(),
+                now=T_RESUME,
+            )
+            self.assertTrue(out.applied, out.reason)
+        observation = build_release_observation([
+            ReleasePin("gateway", _gw_name(), _GW_LOC),
+            ReleasePin("worker", _wk_name(), _WK_LOC),
+        ])
+        self.assertTrue(
+            self.store.request_release(
+                self.key,
+                expected_revision=self._rec().revision,
+                action_id="rel-inflight",
+                observation=observation,
+                now=T_RESUME,
+            ).applied
+        )
+        # `requested`: the generation is open and owns this observation.
+        rec = self._rec()
+        self.assertEqual(rec.process_release, RELEASE_REQUESTED)
+        self.assertNotEqual(rec.release_observation, "")
+        got, reason = verify_release_observation(rec)
+        self.assertIsNone(got)
+        self.assertEqual(reason, OBSERVATION_GENERATION_NOT_COMPLETED)
+
+        # `partial`: one slot closed, the run may still close more — still not a proof.
+        self.assertTrue(
+            self.store.record_release_outcome(
+                self.key,
+                action_id="rel-inflight",
+                expected_revision=rec.revision,
+                target=RELEASE_PARTIAL,
+                now=T_RESUME,
+            ).applied
+        )
+        partial = self._rec()
+        self.assertEqual(partial.process_release, RELEASE_PARTIAL)
+        # The advance did NOT rewrite the observation — that is why it is "not completed" and
+        # never "not the current generation".
+        self.assertEqual(partial.release_observation, rec.release_observation)
+        got, reason = verify_release_observation(partial)
+        self.assertIsNone(got)
+        self.assertEqual(reason, OBSERVATION_GENERATION_NOT_COMPLETED)
+
+        # Completing the SAME generation makes the SAME observation readable: the gate
+        # discriminates on completion, not by refusing everything.
+        self.assertTrue(
+            self.store.record_release_outcome(
+                self.key,
+                action_id="rel-inflight",
+                expected_revision=partial.revision,
+                target=RELEASE_RELEASED,
+                now=T_RESUME,
+            ).applied
+        )
+        done = self._rec()
+        self.assertEqual(done.release_observation, rec.release_observation)
+        got, reason = verify_release_observation(done)
+        self.assertIsNotNone(got)
+        self.assertEqual(reason, "release_observation_ok")
+
+    def test_the_read_gate_names_a_reset_invariant_violation_as_its_own_reason(self) -> None:
+        """`not_requested` + a residual observation is a VIOLATION, not an in-flight state.
+
+        The reset writers pinned above make this shape unreachable through any transition, which
+        is exactly why it is built by hand here: an unreachable shape is the honest way to pin an
+        invariant violation, whereas building a *reachable* state by hand (the R5-F1 mistake)
+        misrepresents what the code does. If a future writer forgets its reset, or an older
+        build's row is read, this is the reason an operator sees — distinct from the in-flight
+        case so the two are never confused.
         """
         pins = (ReleasePin("gateway", _gw_name(), _GW_LOC),)
-        observation = build_release_observation(pins)
-        for release in (RELEASE_NOT_REQUESTED, "requested", "partial"):
-            with self.subTest(process_release=release):
-                stale = LaneLifecycleRecord(
-                    repo_workspace_id=_WS,
-                    lane_id=_LANE,
-                    issue_id=_ISSUE,
-                    lane_disposition=DISPOSITION_ACTIVE,
-                    process_release=release,
-                    release_pins=encode_release_pins(pins),
-                    release_observation=encode_release_observation(observation),
-                )
-                got, reason = verify_release_observation(stale)
-                self.assertIsNone(got)
-                self.assertEqual(reason, OBSERVATION_NOT_CURRENT_GENERATION)
-        # Control: the same row IS readable once its generation is the completed one, so the
-        # guard discriminates by generation rather than refusing everything.
-        current = LaneLifecycleRecord(
+        violated = LaneLifecycleRecord(
             repo_workspace_id=_WS,
             lane_id=_LANE,
             issue_id=_ISSUE,
-            lane_disposition=DISPOSITION_HIBERNATED,
-            process_release=RELEASE_RELEASED,
+            lane_disposition=DISPOSITION_ACTIVE,
+            process_release=RELEASE_NOT_REQUESTED,
             release_pins=encode_release_pins(pins),
-            release_observation=encode_release_observation(observation),
+            release_observation=encode_release_observation(build_release_observation(pins)),
         )
-        got, reason = verify_release_observation(current)
-        self.assertIsNotNone(got)
-        self.assertEqual(reason, "release_observation_ok")
+        got, reason = verify_release_observation(violated)
+        self.assertIsNone(got)
+        self.assertEqual(reason, OBSERVATION_STALE_AFTER_RESET)
+        self.assertNotEqual(reason, OBSERVATION_GENERATION_NOT_COMPLETED)
 
 
 class ReleasedLocatorVerdictUnitTest(unittest.TestCase):

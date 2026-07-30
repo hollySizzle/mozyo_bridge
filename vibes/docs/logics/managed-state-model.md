@@ -458,11 +458,19 @@ Table naming:
       **同一 CAS で**落とす: `transition_disposition` の rehydrate / `supersede_and_activate` の
       existing recovery promotion / `open_next_generation`。R4 review (j#94707 R4-F1) は、この
       うち v9 field だけが 3 経路とも clear 対象から漏れていたことを検出した。
-    - **read gate は現 generation の observation 以外を返さない**。`process_release` が
-      `released` でない row の observation は、caller が何を検査しているかに関わらず
-      component 境界で拒否する (`release_observation_not_current_generation`)。reset writer が
-      正しく clear していればこの shape は生じないが、「caller が到達しないから残しても安全」
-      という前提は本 issue で 2 度撤回している (timestamp / caller 供給 pins) ため、
+    - **read gate は完了した generation の observation しか返さない**。`process_release` が
+      `released` でない row は、caller が何を検査しているかに関わらず component 境界で拒否する。
+      拒否理由は **2 つに分かれる** (混同すると consumer が retry 可能な状態と invariant 違反を
+      区別できない。j#94727 R5-F1)。
+      - `requested` / `partial` → **`release_observation_generation_not_completed`**。
+        observation は**現 generation のもの**である (`record_release_outcome` は
+        `process_release` のみを進め observation を書き換えない)。未完了なだけであり、
+        `partial` はまだ slot を閉じうるので survivor proof にはならない。
+      - `not_requested` かつ observation が残存 → **`release_observation_stale_after_reset`**。
+        reset writer が clear するのでこの shape は到達不能であり、**reset invariant 違反**
+        (旧 build / 手編集 / reset を伴わない writer 追加) を名指しする。
+      reset writer が正しく clear していれば後者は生じないが、「caller が到達しないから残しても
+      安全」という前提は本 issue で 2 度撤回している (timestamp / caller 供給 pins) ため、
       **到達可能性の前提を安全性の根拠にしない**。
     - **live-zero でも generation を開く**。従来は「閉じる slot が無い」と early return して
       何も記録しなかったが、それでは resume が「hibernate 時 process 0」と「survivor がいて
