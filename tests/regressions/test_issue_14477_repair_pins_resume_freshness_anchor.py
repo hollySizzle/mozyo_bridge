@@ -33,7 +33,12 @@ with ``hibernated_at`` (schema v8) stamped ONLY at T0. Pinned here:
    ordering is pinned here, as is the absence of ANY substitute column;
 6. the anchor's own lifecycle: cleared on rehydrate, re-stamped on the next hibernation, and
    its inbound-edge enumeration DERIVED from the public transition policy rather than recalled,
-   so a future edge into ``hibernated`` cannot quietly bypass the stamp.
+   so a future edge into ``hibernated`` cannot quietly bypass the stamp;
+7. the stamp's own TRUST boundary, which is still OPEN — review j#94531 R2-F1. A backdated
+   ``now`` on the hibernate CAS stores a boundary earlier than a survivor's attestation and
+   admits it. ``PostV8BackdatedStampTest`` states the correct refusal as an expected failure
+   (not inverted into a pin of the defect) plus a fact-pin on the missing stamp validation, so
+   the hole is durable and visible in the suite. Scope disposition: design_consultation j#94543.
 
 Everything is synthetic: a temp store path, a fake herdr inventory and fake attestation reads.
 No pane / process / route / worktree mutation. Hermeticity is itself CHECKED rather than
@@ -82,6 +87,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     ProcessGenerationPin,
     ReleasePin,
     disposition_transition_allowed,
+    encode_release_pins,
 )
 from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
     LANE_LIFECYCLE_COMPONENT,
@@ -89,6 +95,14 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
 )
 from mozyo_bridge.core.state.lane_pin_repair import LanePinRepairStore  # noqa: E402
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair  # noqa: E402
+from mozyo_bridge.core.state.lane_released_locator_fence import (  # noqa: E402
+    FENCE_EVIDENCE_ABSENT,
+    FENCE_EVIDENCE_INCOMPLETE,
+    FENCE_EVIDENCE_UNREADABLE,
+    FENCE_LOCATOR_REUSED,
+    FENCE_OK,
+    released_locator_verdict,
+)
 from mozyo_bridge.core.state.state_store import state_store_path  # noqa: E402
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_resume import (  # noqa: E402,E501
     BLOCK_PAIR_ATTESTATION,
@@ -121,6 +135,8 @@ T_RESUME = "2026-07-26T20:30:00+00:00"
 #: on this component validates ``now`` against the row's prior stamp, so this is reachable from
 #: a backdated programmatic caller or a regressed wall clock — not a contrived value.
 T_BACKDATED = "2026-07-26T19:40:00+00:00"
+#: A relaunch attested after the SECOND hibernation (stamped ``T_RESUME``).
+T_LATER = "2026-07-26T20:40:00+00:00"
 
 _GW_LOC = f"{_WS}:p4A"
 _WK_LOC = f"{_WS}:p4B"
@@ -173,14 +189,21 @@ def _attest(provider: str, locator: str, observed_at: str) -> IdentityAttestatio
 class _FakeOps:
     """The resume IO port: a canned live inventory + attestation reads (read-only)."""
 
-    def __init__(self, *, observed_at: str = T_FRESH, providers=(_GW_PROVIDER, _WK_PROVIDER)):
+    def __init__(
+        self,
+        *,
+        observed_at: str = T_FRESH,
+        providers=(_GW_PROVIDER, _WK_PROVIDER),
+        gw_locator: str = _GW_LOC,
+        wk_locator: str = _WK_LOC,
+    ):
         self._rows = [
-            {"name": _gw_name(), "pane_id": _GW_LOC},
-            {"name": _wk_name(), "pane_id": _WK_LOC},
+            {"name": _gw_name(), "pane_id": gw_locator},
+            {"name": _wk_name(), "pane_id": wk_locator},
         ]
         self._attest = {
-            _gw_name(): _attest(_GW_PROVIDER, _GW_LOC, observed_at),
-            _wk_name(): _attest(_WK_PROVIDER, _WK_LOC, observed_at),
+            _gw_name(): _attest(_GW_PROVIDER, gw_locator, observed_at),
+            _wk_name(): _attest(_WK_PROVIDER, wk_locator, observed_at),
         }
         self._providers = providers
 
@@ -557,6 +580,161 @@ class PreV8CompatibilityTest(_Fixture):
             self.assertNotEqual(
                 anchor, value, f"{name} was used as a substitute freshness boundary"
             )
+
+class ReleasedLocatorFenceTest(_Fixture):
+    """The clock-independent survivor fence — Redmine #14477 review j#94531 R2-F1,
+    coordinator disposition j#94544 A.
+
+    A timestamp cannot carry the generation proof: a backdated CAS stamp, a regressed host clock
+    and a self-written ``observed_at`` each defeat it. So the proof is that hibernate's release
+    recorded the exact locators it closed — a survivor keeps its pane-id and is in that set, a
+    relaunch is not. These pins are ordinary red->green regressions (the earlier known-hole
+    marker is retired), covering the three boundaries the disposition names: the SAME locator
+    refuses, ALL-DIFFERENT locators still resume, and ABSENT evidence refuses.
+    """
+
+    def _hibernate_again(self, *, released, now):
+        """Drive active -> hibernated -> released again, recording ``released`` as closed."""
+        out = self.store.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=self._rec().revision,
+            target=DISPOSITION_HIBERNATED,
+            decision=_decision(),
+            now=now,
+        )
+        self.assertTrue(out.applied, out.reason)
+        if released is None:  # leave the release generation unrequested (no evidence at all)
+            return
+        self.assertTrue(
+            self.store.request_release(
+                self.key,
+                expected_revision=self._rec().revision,
+                action_id="rel-again",
+                pins=[
+                    ReleasePin("gateway", _gw_name(), released[0]),
+                    ReleasePin("worker", _wk_name(), released[1]),
+                ],
+                now=now,
+            ).applied
+        )
+        self.assertTrue(
+            self.store.record_release_outcome(
+                self.key,
+                action_id="rel-again",
+                expected_revision=self._rec().revision,
+                target=RELEASE_RELEASED,
+                now=now,
+            ).applied
+        )
+
+    def _resumed_once(self) -> None:
+        self.assertTrue(self._repair_pins().applied)
+        self.assertFalse(self._resume().is_blocked)
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_a_backdated_stamp_no_longer_admits_a_survivor_on_a_released_locator(self) -> None:
+        """The R2-F1 scenario, now REFUSED: the timestamp is defeated, the locator is not."""
+        self._resumed_once()
+        # Hibernate again with a stamp EARLIER than the survivor's attestation, closing exactly
+        # the panes that are live now — so a survivor keeps one of those locators.
+        self._hibernate_again(released=(_GW_LOC, _WK_LOC), now=T_BACKDATED)
+        rec = self._rec()
+        self.assertEqual(rec.hibernated_at, T_BACKDATED)
+        self.assertLess(rec.hibernated_at, T_SURVIVOR)  # the timestamp half is defeated...
+
+        outcome = self._resume(ops=_FakeOps(observed_at=T_SURVIVOR))
+
+        self.assertTrue(outcome.is_blocked)  # ...and the locator half refuses anyway
+        self.assertIn(BLOCK_PAIR_ATTESTATION, outcome.preflight.blocked_reasons)
+        self.assertIn(FENCE_LOCATOR_REUSED, outcome.preflight.pair_attestation_detail)
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertIsNone(outcome.transition)
+
+    def test_a_relaunch_on_new_locators_still_resumes(self) -> None:
+        """Not a blanket refusal: different pane-ids are exactly what a real relaunch has."""
+        self._resumed_once()
+        self._hibernate_again(released=(_GW_LOC, _WK_LOC), now=T_RESUME)
+        fresh_gw, fresh_wk = f"{_WS}:p9A", f"{_WS}:p9B"
+        outcome = self._resume(
+            ops=_FakeOps(observed_at=T_LATER, gw_locator=fresh_gw, wk_locator=fresh_wk)
+        )
+        self.assertFalse(
+            outcome.is_blocked,
+            f"blocked: {outcome.preflight.blocked_reasons} "
+            f"({outcome.preflight.pair_attestation_detail})",
+        )
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_absent_release_evidence_refuses(self) -> None:
+        """j#94544 A.2: the row cannot tell "no process existed" from "a survivor was never
+        recorded", so absence of evidence is never read as freshness."""
+        self._resumed_once()
+        self._hibernate_again(released=None, now=T_RESUME)  # release never requested
+        outcome = self._resume(ops=_FakeOps(observed_at=T_LATER, gw_locator=f"{_WS}:p9A",
+                                           wk_locator=f"{_WS}:p9B"))
+        self.assertTrue(outcome.is_blocked)
+        self.assertIn(FENCE_EVIDENCE_ABSENT, outcome.preflight.pair_attestation_detail)
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
+
+
+class ReleasedLocatorVerdictUnitTest(unittest.TestCase):
+    """The pure predicate's own boundaries (no store, no clock)."""
+
+    def _rec(self, *, release=RELEASE_RELEASED, pins_raw=None, locators=(_GW_LOC, _WK_LOC)):
+        raw = pins_raw
+        if raw is None:
+            raw = encode_release_pins(
+                tuple(ReleasePin("gateway", _gw_name(), loc) for loc in locators)
+            )
+        return LaneLifecycleRecord(
+            repo_workspace_id=_WS, lane_id=_LANE, process_release=release, release_pins=raw
+        )
+
+    def test_no_record_is_absent(self) -> None:
+        self.assertEqual(released_locator_verdict(None, [_GW_LOC]), (False, FENCE_EVIDENCE_ABSENT))
+
+    def test_an_unreleased_generation_is_absent(self) -> None:
+        ok, reason = released_locator_verdict(self._rec(release="not_requested"), [_GW_LOC])
+        self.assertEqual((ok, reason), (False, FENCE_EVIDENCE_ABSENT))
+
+    def test_corrupt_pins_are_unreadable_not_empty(self) -> None:
+        ok, reason = released_locator_verdict(self._rec(pins_raw="{not json"), [_GW_LOC])
+        self.assertEqual((ok, reason), (False, FENCE_EVIDENCE_UNREADABLE))
+
+    def test_an_observed_locator_in_the_released_set_is_reuse(self) -> None:
+        ok, reason = released_locator_verdict(self._rec(), [_GW_LOC, f"{_WS}:pNEW"])
+        self.assertEqual((ok, reason), (False, FENCE_LOCATOR_REUSED))
+
+    def test_fewer_released_locators_than_observed_slots_is_incomplete(self) -> None:
+        rec = self._rec(locators=(f"{_WS}:pOLD_ONLY",))
+        ok, reason = released_locator_verdict(rec, [f"{_WS}:pN1", f"{_WS}:pN2"])
+        self.assertEqual((ok, reason), (False, FENCE_EVIDENCE_INCOMPLETE))
+
+    def test_all_different_locators_with_complete_evidence_pass(self) -> None:
+        ok, reason = released_locator_verdict(self._rec(), [f"{_WS}:pN1", f"{_WS}:pN2"])
+        self.assertEqual((ok, reason), (True, FENCE_OK))
+
+    def test_the_stamp_itself_is_still_unvalidated_by_design(self) -> None:
+        """A does NOT validate the hibernate stamp; it makes the stamp non-load-bearing.
+
+        Recorded so nobody later reads the green suite as "the stamp is now trustworthy". The
+        authority-grade epoch that would make it trustworthy is Redmine #14756 (disposition B).
+        """
+        store_pins = encode_release_pins((ReleasePin("gateway", _gw_name(), _GW_LOC),))
+        rec = LaneLifecycleRecord(
+            repo_workspace_id=_WS,
+            lane_id=_LANE,
+            process_release=RELEASE_RELEASED,
+            release_pins=store_pins,
+            hibernated_at=T_BACKDATED,
+        )
+        # The anchor is happily a backdated value — nothing here rejects it...
+        self.assertEqual(resume_freshness_anchor(rec), (T_BACKDATED, ANCHOR_HIBERNATE_TRANSITION))
+        # ...and the locator fence is what actually refuses the survivor.
+        self.assertEqual(
+            released_locator_verdict(rec, [_GW_LOC]), (False, FENCE_LOCATOR_REUSED)
+        )
 
 
 class OperatorHomeHermeticityTest(_Fixture):

@@ -403,6 +403,31 @@ Table naming:
       anchor を欠く row は `unavailable` として **freshness 半分を fail-closed** にする
       (threshold 不在を「比較対象が無いので fresh」と読ませない。`evaluate_pair_attestation` は
       空 threshold で freshness 比較を skip するため、caller 側で明示的に倒す必要がある)。
+    - **timestamp は liveness 境界であり、世代証明ではない** (#14477 review j#94531 R2-F1 /
+      coordinator disposition j#94544 A.3)。**どの clock を信じるかを変えても閉じない** vector が
+      3 つある: ① hibernate CAS の stamp は caller 供給 `now` で、prior stamp との比較を検証する
+      writer が 1 つも無いため backdate できる、② host wall clock の後退 (NTP step-back / skew) は
+      trusted clock でも同じ順序を生む、③ `observed_at` は attest する process 自身が書く。
+      実測 (j#94539): anchor を backdate すると true survivor が admit され lane が active 化した。
+    - **世代証明は clock 非依存の released-locator fence** (`core/state/lane_released_locator_fence.py`)。
+      hibernate の release は **閉じた exact locator** を `release_pins` に authority grade で残す。
+      survivor は tmux pane-id を保持するのでこの集合に入り、genuine relaunch は入らない。よって
+      上記 3 vector すべてに依存せず拒否できる。
+      - **証拠不在 / 判読不能 / 不完全は refuse** (A.2)。row だけでは「hibernate 時に process 0」と
+        「release 証拠を残さず survivor がいた」を区別できない。**証拠不在を fresh と推定しない**。
+        `process_release` が `released` に到達していない (never requested / in flight) 場合、pin が
+        判読不能な場合、released locator が observed slot 数を下回る場合はいずれも拒否する。
+        これは release 証拠を残さず hibernate した lane に対する **意図した機能後退**である。
+      - **完全性を pin の `role` で判定しない**。`release_pins` の role 語彙は caller 間で不統一
+        (lane role `gateway`/`worker` と provider 名が混在) なので、role 基準は誤判定する。
+        distinct locator 数で判定する。
+      - **pane-id 再利用による false refusal は安全方向として受容** (A.4)。tmux が pane-id を
+        再利用すると genuine relaunch が拒否され得る。typed detail に `released_locator_reuse` を
+        出すので、operator は真の survivor と切り分けられる。
+      - resume は **この fence と既存の attestation / provider / multiplicity / declared-pin fence
+        すべて**を満たしたときのみ可 (A.3 / A.6)。いずれも緩めない。
+      - clock / locator 再利用に依存しない正しい終点 (lane epoch を attestation へ bind し
+        strictly-newer を要求) は **#14756** (disposition B)。本 fence はその設計ではなく即時 fence。
   - **binding kind / lane generation / typed process pins** (schema v5、#13810 / Design Answer
     j#78386)。project-gateway 用の別 owner component は作らず、同一 `lane_lifecycle_records` row /
     同一 revision CAS を additive 拡張する (別 component にすると owner row と release/replacement
@@ -1507,9 +1532,21 @@ reviewed v7 facade からの review_result delivery が `reader_upgrade_required
   解決される default home store path と一致しないことを test 自身が pin する
   (実装例: `tests/regressions/test_issue_14477_repair_pins_resume_freshness_anchor.py`
   `OperatorHomeHermeticityTest` — 無引数構築の不在は自 module の AST から導出して pin する)。
-- 診断で共有 store を読む必要がある場合は **strict read-only** で開く
-  (`sqlite3.connect("file:...?mode=ro&immutable=1", uri=True)`。`-wal` / `-shm` を作らず write lock
-  も取らない)。downgrade / raw repair / hand edit はしない。
+- 診断で共有 store を読む必要がある場合は **read-only** で開く
+  (`sqlite3.connect("file:...?mode=ro", uri=True)`)。downgrade / raw repair / hand edit はしない。
+  - **`immutable=1` を付けてはならない** (#14477 review j#94531 R2-F3)。公式 URI 契約
+    (https://www.sqlite.org/uri.html) では `immutable` は「file が read-only media 上にあり
+    **elevated privilege を持つ別 process によってさえ変更されない**」ことの宣言であり、SQLite は
+    **file locking と change detection を全て skip** する。実際に変更される file へ設定すると
+    **incorrect query result / `SQLITE_CORRUPT`** を返し得る。home scope の authority store は
+    複数 lane / supervisor が並行更新する **mutable** store なので、この宣言は成立しない。
+    `mode=ro` は locking / change detection / WAL を維持するので、こちらを使う。
+  - **一貫した snapshot が必要な場合**は「読む前に snapshot を作る」。SQLite の
+    `VACUUM INTO '<dest>'` または backup API を使う。`state.sqlite` だけを `cp` する方法は
+    **WAL / `-shm` を取り残して不整合になり得る**ため snapshot として扱わない。
+  - **単発の file 読取 (size / mtime / hash) は transactional snapshot ではない**。並行書込み中は
+    torn read になり得るので、「変化していない」ことの根拠に使うときはこの限界を併記する。
+    「変更を防いだ」ことの証明は SQLite に依存しない層 (上記 kernel deny の negative proof) で採る。
 
 ### corruption quarantine / component repair
 

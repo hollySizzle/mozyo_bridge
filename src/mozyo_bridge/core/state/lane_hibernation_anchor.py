@@ -86,8 +86,9 @@ def hibernation_anchor_on_transition(current: str, *, target: str, stamp: str) -
       ``""`` — an awake lane has no boundary in force. Clearing is the fail-closed
       direction, not merely tidier: a stale earlier boundary left on a row that some future
       writer moved back to ``hibernated`` **without** stamping would be a threshold far in
-      the past (a looser gate), whereas an empty one falls back to ``updated_at``, which is
-      that write's own stamp (a correct, and at worst stricter, gate);
+      the past, i.e. a looser gate, whereas an empty anchor is reported
+      :data:`ANCHOR_UNAVAILABLE` and the freshness half is REFUSED (Redmine #14477 review
+      j#94515, verdict j#94520 — no column stands in for the boundary);
     - any other target (``superseded`` / ``retired``): preserved byte-for-byte — a terminal
       row keeps the boundary it was hibernated at as an audit fact.
     """
