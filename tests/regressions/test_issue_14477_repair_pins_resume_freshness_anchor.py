@@ -83,6 +83,7 @@ from mozyo_bridge.core.state.lane_hibernation_anchor import (  # noqa: E402
     resume_freshness_anchor,
 )
 from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
+    CAS_FORBIDDEN_TRANSITION,
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
     DISPOSITION_RETIRED,
@@ -1635,6 +1636,185 @@ class OperatorHomeHermeticityTest(_Fixture):
             "these resolve MOZYO_BRIDGE_HOME / ~/.mozyo_bridge (the operator's shared authority "
             f"store); always pass an explicit temp path=: {offenders}",
         )
+
+
+class UnclassifiedStoredReleaseStateTest(_Fixture):
+    """A stored release state nobody has a rule for must not become authority or success.
+
+    Redmine #14477 review j#94778. R6–R8 made the READ surfaces byte-exact, and R8-F1 / R8-F2
+    showed that was not enough because two WRITE-side surfaces still classified the stored value
+    by something other than its exact bytes:
+
+    - the release driver's ``else`` reported every unclassifiable state as ``released`` with zero
+      panes closed, which ``HibernateOutcome.is_success`` accepts as a clean actuation (R8-F1);
+    - the core CAS policy predicates normalised the stored value, so a padded row was ADMITTED and
+      then rewritten to the canonical token — laundering an invalid value into real authority that
+      every byte-exact reader downstream would then correctly trust (R8-F2).
+
+    The rows here are seeded with raw SQL on the fixture's TEMP store, which is the only way to
+    hold a value the canonical writers refuse to persist — the same justification the reviewer
+    accepted for the R7 hand-built pins, and the reason these are storage-boundary pins.
+    """
+
+    NON_CANONICAL = ("weird_unknown_token", "released ", " not_requested", "", "RELEASED")
+
+    def _force_release_state(self, token: str) -> None:
+        conn = sqlite3.connect(str(self.path))
+        try:
+            conn.execute(
+                "UPDATE lane_lifecycle_records SET process_release = ? "
+                "WHERE repo_workspace_id = ? AND lane_id = ?",
+                (token, _WS, _LANE),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self._rec().process_release, token, "raw seed did not stick")
+
+    # ---------------------------------------------------------------- R8-F1
+    def test_the_driver_refuses_an_unclassified_state_instead_of_reporting_released(self):
+        """The driver carries the RAW state back, closes nothing, and is not a success."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
+            RELEASE_STATE_UNKNOWN,
+            drive_process_release,
+        )
+
+        class _Ops:
+            def __init__(self) -> None:
+                self.close_calls: list = []
+
+            def live_rows(self):
+                return []
+
+            def execute_close(self, plan):
+                self.close_calls.append(plan)
+                return []
+
+        for token in self.NON_CANONICAL:
+            with self.subTest(process_release=token):
+                self._force_release_state(token)
+                ops = _Ops()
+                outcome = drive_process_release(
+                    store=self.store, ops=ops, key=self.key, lane_id=_LANE,
+                    workspace_id=_WS, action_id="probe",
+                )
+                self.assertEqual(outcome.process_release, token, "the raw state must survive")
+                self.assertIn(RELEASE_STATE_UNKNOWN, outcome.detail)
+                self.assertEqual(ops.close_calls, [], "zero close")
+                self.assertEqual(self._rec().process_release, token, "zero write")
+                # The exact condition HibernateOutcome.is_success applies to a release.
+                self.assertNotIn(
+                    outcome.process_release,
+                    (RELEASE_RELEASED, RELEASE_NOT_REQUESTED),
+                    "an unclassified state must never satisfy the completed-release condition",
+                )
+
+    def test_the_driver_still_reports_a_genuinely_released_generation(self) -> None:
+        """Positive control: the ``released`` branch is a real classification, not a fallback."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
+            drive_process_release,
+        )
+
+        class _Ops:
+            def live_rows(self):
+                return []
+
+            def execute_close(self, plan):  # pragma: no cover - must not be reached
+                raise AssertionError("a completed generation closes nothing")
+
+        # The seed already left this row hibernated / released.
+        self.assertEqual(self._rec().process_release, RELEASE_RELEASED)
+        outcome = drive_process_release(
+            store=self.store, ops=_Ops(), key=self.key, lane_id=_LANE,
+            workspace_id=_WS, action_id="probe",
+        )
+        self.assertEqual(outcome.process_release, RELEASE_RELEASED)
+        self.assertIn("already released", outcome.detail)
+
+    # ---------------------------------------------------------------- R8-F2
+    def test_a_padded_state_cannot_open_a_release_generation(self) -> None:
+        """The release CAS refuses it zero-write instead of laundering it to ``requested``."""
+        for token in ("not_requested ", " not_requested", "weird_unknown_token"):
+            with self.subTest(process_release=token):
+                self._force_release_state(token)
+                out = self.store.request_release(
+                    self.key,
+                    expected_revision=self._rec().revision,
+                    action_id="probe-open",
+                    observation=build_release_observation(()),
+                )
+                self.assertFalse(out.applied)
+                self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+                self.assertEqual(
+                    self._rec().process_release,
+                    token,
+                    "the refusal must not rewrite the invalid value into a canonical one",
+                )
+
+    def test_a_padded_in_flight_state_cannot_advance_to_an_outcome(self) -> None:
+        """The same policy guards ``record_release_outcome``."""
+        for token in ("requested ", " partial"):
+            with self.subTest(process_release=token):
+                self._force_release_state(token)
+                rec = self._rec()
+                out = self.store.record_release_outcome(
+                    self.key,
+                    action_id=rec.release_action_id,
+                    expected_revision=rec.revision,
+                    target=RELEASE_RELEASED,
+                )
+                self.assertFalse(out.applied)
+                self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+                self.assertEqual(self._rec().process_release, token)
+
+    def test_a_padded_released_state_cannot_rehydrate_the_lane(self) -> None:
+        """A lane whose release state cannot be classified must not come back ``active``."""
+        for token in ("released ", "RELEASED", "weird_unknown_token"):
+            with self.subTest(process_release=token):
+                self._force_release_state(token)
+                out = self.store.transition_disposition(
+                    self.key,
+                    expected_disposition=DISPOSITION_HIBERNATED,
+                    expected_revision=self._rec().revision,
+                    target=DISPOSITION_ACTIVE,
+                    decision=_decision(),
+                )
+                self.assertFalse(out.applied)
+                self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+                rec = self._rec()
+                self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+                self.assertEqual(rec.process_release, token)
+
+    def test_the_canonical_states_still_pass_the_same_policies(self) -> None:
+        """Controls: the byte-exact tightening refuses ONLY the unclassifiable values."""
+        # `released` rehydrates.
+        self.assertEqual(self._rec().process_release, RELEASE_RELEASED)
+        out = self.store.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_HIBERNATED,
+            expected_revision=self._rec().revision,
+            target=DISPOSITION_ACTIVE,
+            decision=_decision(),
+        )
+        self.assertTrue(out.applied, out.reason)
+        # ...and a canonical `not_requested` hibernated row opens a generation.
+        out = self.store.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=self._rec().revision,
+            target=DISPOSITION_HIBERNATED,
+            decision=_decision(),
+        )
+        self.assertTrue(out.applied, out.reason)
+        self.assertEqual(self._rec().process_release, RELEASE_NOT_REQUESTED)
+        out = self.store.request_release(
+            self.key,
+            expected_revision=self._rec().revision,
+            action_id="probe-canonical",
+            observation=build_release_observation(()),
+        )
+        self.assertTrue(out.applied, out.reason)
+        self.assertEqual(self._rec().process_release, RELEASE_REQUESTED)
 
 
 class SchemaVersionTest(unittest.TestCase):

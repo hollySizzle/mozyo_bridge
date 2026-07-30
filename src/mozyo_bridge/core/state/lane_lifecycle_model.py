@@ -85,16 +85,24 @@ def is_canonical_release_state(value: object) -> bool:
     """Is ``value`` a stored ``process_release`` this vocabulary recognises — as stored?
 
     ``process_release`` is ``TEXT NOT NULL`` with no CHECK constraint and the row decoder passes
-    the string through, so any reader can be handed a legacy / corrupted / hand-edited value. Every
-    surface that classifies one needs the same answer, so the predicate lives here rather than
-    being re-derived per consumer (Redmine #14477 review j#94750 R7-F2 / R7-F3 found two surfaces
-    that had each written their own, and disagreed).
+    the string through, so any reader can be handed a legacy / corrupted / hand-edited value.
 
     **Byte-exact: never trimmed first.** ``"released "`` is NOT canonical. Normalising it first
     promotes an invalid stored value into an authority token — the read gate returned it as a
-    survivor proof (j#94738 R6-F1 follow-up) and the hibernate enumeration dropped it as a
-    completed generation (j#94750 R7-F3). Same discipline the ``lane_kind`` vocabulary was given
-    in review j#85852 F1.
+    survivor proof (j#94738 R6-F1 follow-up), the hibernate enumeration dropped it as a completed
+    generation (j#94750 R7-F3), and the release CAS rewrote it INTO canonical ``requested``
+    (j#94778 R8-F2). Same discipline the ``lane_kind`` vocabulary was given in review j#85852 F1.
+
+    **The rule this expresses is "ingress may normalise, stored authority may not."** A surface
+    that accepts an argument from a caller is free to trim it; a surface that classifies what the
+    row already HOLDS is not, because the trim invents a canonical fact the storage never carried.
+
+    Scope note (review j#94778 corrected an over-claim of mine): this answers "is the value in the
+    vocabulary", and it is NOT the only release-state predicate. The observation read gate
+    deliberately uses its own narrower literal set (``_CLASSIFIED_RELEASE_STATES`` in
+    :mod:`...lane_release`) so that a state ADDED to this vocabulary without a rule there fails
+    closed instead of inheriting ``released``'s meaning (j#94750 R7-F1). Two questions, two
+    predicates — do not describe them as one.
     """
     return isinstance(value, str) and value in RELEASE_STATES
 
@@ -239,8 +247,18 @@ def disposition_transition_allowed(current: str, target: str) -> bool:
 
 
 def release_transition_allowed(current: str, target: str) -> bool:
-    """Is ``current -> target`` a legal release edge within one generation? (pure)"""
-    return target in _RELEASE_EDGES.get(norm(current), frozenset())
+    """Is ``current -> target`` a legal release edge within one generation? (pure)
+
+    ``current`` is the STORED authority value and is matched byte-exact — never normalised first
+    (Redmine #14477 review j#94778 R8-F2). This is the CAS guard of
+    :func:`...lane_release.open_release_generation` and of
+    :meth:`...LaneLifecycleStore.record_release_outcome`, so normalising here did not merely
+    misclassify: a padded ``"not_requested "`` row was ADMITTED and the CAS then rewrote it to the
+    canonical ``requested`` — laundering an invalid stored value into real authority, which every
+    byte-exact reader downstream then correctly trusted. A non-canonical current has no outgoing
+    edge, so it is refused zero-write.
+    """
+    return target in _RELEASE_EDGES.get(current, frozenset())
 
 
 def replacement_transition_allowed(current: str, target: str) -> bool:
@@ -267,8 +285,12 @@ def rehydrate_allowed(process_release: str) -> bool:
     refused; there is deliberately no "cancel a release" state, so the caller must
     finish or abandon the generation through the release API, not by side-stepping
     it with a disposition write.
+
+    Byte-exact on the STORED value, never normalised first (review j#94778 R8-F2): a padded
+    ``"released "`` row rehydrated to ``active`` under the old spelling-insensitive check, so an
+    unclassifiable release state became a live lane.
     """
-    return norm(process_release) in _REHYDRATABLE_RELEASE_STATES
+    return process_release in _REHYDRATABLE_RELEASE_STATES
 
 
 # -- records -----------------------------------------------------------------

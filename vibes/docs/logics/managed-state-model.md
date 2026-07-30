@@ -484,7 +484,24 @@ Table naming:
       - 同じ `process_release` を読む **hibernate supervisor enumeration も byte-exact** に分類する。
         R7 以前は `.strip()` していたため `"released "` が terminal として消え、
         **`" not_requested"` が redrive (actuation を伴う) path へ admit されていた** (j#94750 R7-F3)。
-        canonical 判定は pure vocabulary module の `is_canonical_release_state()` を 3 surface で共有する。
+      - **release driver も 4 canonical state の explicit rule** にする。R8 以前は `else` が
+        `released` を意味していたため、未分類の格納 state が **pane を 1 つも閉じずに
+        `released` を返し、hibernate の clean fully-actuated success として公開されていた**
+        (j#94778 R8-F1)。未分類値は **raw state を保持した typed refusal** (`release_state_unknown`)
+        とし、`HibernateOutcome.is_success` の completed-release 条件を満たさないようにする。
+      - **CAS policy predicate も byte-exact**。R8 以前は `release_transition_allowed()` /
+        `rehydrate_allowed()` が格納値を `norm()` していたため、padded `not_requested ` からの
+        `request_release` が **applied=True** になり、**格納値が canonical `requested` へ
+        書き換えられていた** (j#94778 R8-F2)。invalid な格納値が **canonical authority へ洗浄され**、
+        以後の byte-exact reader はその row を正当な canonical row として正しく信用してしまう。
+        read 側だけを exact にしても writer が塞がっていなければ意味がない。
+    - **原則: ingress は正規化してよい / 格納 authority の判定は正規化してはならない**
+      (j#94778)。caller から受け取る引数は trim してよいが、**row が既に保持している値**の権威判定を
+      trim すると、storage が持っていない canonical な事実を捏造することになる。
+    - 2 つの述語は責務が異なるので混同しない: `is_canonical_release_state()` =
+      **vocabulary に属する値か** (fence / hibernate enumeration / driver / CAS policy) /
+      `_CLASSIFIED_RELEASE_STATES` = **read gate が規則を持つ値か** (第五 member を proof へ
+      通さないため意図的に別集合。j#94750 R7-F1)。
       - `requested` / `partial` → **`release_observation_generation_not_completed`**。
         observation は**現 generation のもの**である (`record_release_outcome` は
         `process_release` のみを進め observation を書き換えない)。未完了なだけであり、

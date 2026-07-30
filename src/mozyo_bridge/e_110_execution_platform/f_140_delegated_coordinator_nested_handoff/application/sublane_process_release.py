@@ -83,6 +83,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 #: binding. Shared by the inventory helpers and the pin matcher.
 _LANE_ROLES = (GATEWAY_ROLE, WORKER_ROLE)
 
+#: Typed detail token for a stored ``process_release`` this driver has no rule for (Redmine
+#: #14477 review j#94778 R8-F1). Deliberately the SAME literal the hibernate supervisor rail uses
+#: for the identical storage fact (``ATTEMPT_RELEASE_STATE_UNKNOWN``, #14219 j#86776 R5-F5), so one
+#: grep finds every surface that classifies an unknown release state.
+RELEASE_STATE_UNKNOWN = "release_state_unknown"
+
 
 # ---------------------------------------------------------------------------
 # Injected IO port (the subset a release driver needs).
@@ -634,11 +640,30 @@ def drive_process_release(
     elif rec.process_release in (RELEASE_REQUESTED, RELEASE_PARTIAL):
         # Resume the open generation, closing whatever slots remain live.
         action_id = rec.release_action_id or action_id
-    else:  # RELEASE_RELEASED — the generation already finished.
+    elif rec.process_release == RELEASE_RELEASED:
+        # The generation already finished — byte-exact, a POSITIVE branch. It used to be the
+        # ``else``, which meant every value this driver could not classify was reported as a
+        # completed release (review j#94778 R8-F1): an unknown or padded stored state returned
+        # ``released`` with ZERO panes closed, and ``HibernateOutcome.is_success`` accepted that as
+        # a clean fully-actuated hibernate. Exactly the fall-through shape j#94750 R7-F1 removed
+        # from the read gate — this surface was not checked at the time.
         return ReleaseOutcome(
             action_id=rec.release_action_id or action_id,
             process_release=RELEASE_RELEASED,
             detail="release generation already released",
+        )
+    else:
+        # A stored state this driver has no rule for. The RAW value is carried back untouched, so
+        # no caller can mistake it for a canonical outcome: ``HibernateOutcome.is_success``
+        # requires ``released`` / ``not_requested`` exactly, so this is not a success, and the
+        # supervisor rail already classifies the same fact as typed uncertain.
+        return ReleaseOutcome(
+            action_id=rec.release_action_id or action_id,
+            process_release=rec.process_release,
+            detail=(
+                f"{RELEASE_STATE_UNKNOWN}: stored process_release is not a canonical release "
+                "state; refusing to classify it (zero close, zero write)"
+            ),
         )
 
     # Close only the slots this generation durably pinned, and only when their live
@@ -706,4 +731,5 @@ __all__ = (
     "pin_matched_close_plan",
     "release_pins",
     "unit_slots",
+    "RELEASE_STATE_UNKNOWN",
 )

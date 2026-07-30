@@ -487,6 +487,61 @@ class SublaneHibernateTest(unittest.TestCase):
                 DISPOSITION_ACTIVE,  # never moved to hibernated
             )
 
+    def test_an_unclassified_stored_release_state_is_not_a_hibernate_success(self) -> None:
+        """Redmine #14477 review j#94778 R8-F1, through the PUBLIC already-hibernated path.
+
+        The driver used to report every stored release state it could not classify as
+        ``released`` with zero panes closed, and :attr:`HibernateOutcome.is_success` accepted
+        that as a clean fully-actuated hibernate. Fixing the driver is only half a claim — this
+        pin drives the public use case so the composed outcome is what is asserted.
+
+        The invalid value is written with raw SQL on the TEMP store: the canonical writers refuse
+        to persist it, so a readable-invalid row cannot be produced any other way. The DEFECT's own
+        unit pins (driver return shape, CAS refusals) live in
+        ``tests/regressions/test_issue_14477_repair_pins_resume_freshness_anchor.py``; this one
+        lives here because it needs this module's hibernate IO-port harness, and duplicating that
+        fake would be a divergence risk.
+        """
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            first = SublaneHibernateUseCase(ops=self._live_ops(), store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(first.transition.applied)
+            self.assertEqual(first.release.process_release, RELEASE_RELEASED)
+            self.assertTrue(first.is_success)
+
+            conn = sqlite3.connect(str(store.path))
+            try:
+                conn.execute(
+                    "UPDATE lane_lifecycle_records SET process_release = ? WHERE lane_id = ?",
+                    ("weird_unknown_token", LANE),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            ops = self._live_ops()
+            retry = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(retry.already_hibernated)
+            self.assertEqual(retry.release.process_release, "weird_unknown_token")
+            self.assertIn("release_state_unknown", retry.release.detail)
+            self.assertEqual(ops.close_calls, [], "an unclassified state closes nothing")
+            self.assertFalse(
+                retry.is_success,
+                "a synthetic released with zero actuation must never read as a clean success",
+            )
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).process_release,
+                "weird_unknown_token",
+                "zero write: the refusal must not launder the invalid value",
+            )
+
     def test_already_hibernated_redrive_reevaluates_preservation_gate(self) -> None:
         # F2 (R1 j#77907): a partial-release retry on an already-hibernated lane must
         # re-check the CURRENT preservation gate. A lane that has since started working,
