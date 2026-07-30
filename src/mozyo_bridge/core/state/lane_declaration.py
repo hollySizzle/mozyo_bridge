@@ -57,6 +57,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     rehydrate_allowed,
     replacement_settled,
     validate_declared_slots,
+    stored_binding_kind_is,
 )
 from mozyo_bridge.core.state.lane_kind import optional_lane_kind
 from mozyo_bridge.core.state.lane_lifecycle_rows import (
@@ -191,7 +192,7 @@ class LaneDeclarationStore:
                 # disposition) is a real conflict a re-declare must not overwrite.
                 if (
                     existing.lane_disposition == DISPOSITION_ACTIVE
-                    and norm(existing.binding_kind) == kind
+                    and stored_binding_kind_is(existing.binding_kind, kind)
                     and existing.issue_id == issue
                     and existing.project_scope == scope
                     and existing.worktree_identity == worktree
@@ -328,7 +329,7 @@ class LaneDeclarationStore:
                 )
             if (
                 current.lane_disposition != DISPOSITION_ACTIVE
-                or norm(current.binding_kind) != BINDING_KIND_ISSUE
+                or not stored_binding_kind_is(current.binding_kind, BINDING_KIND_ISSUE)
                 or current.issue_id != issue
                 or current.project_scope
             ):
@@ -506,8 +507,22 @@ class LaneDeclarationStore:
                     reason=CAS_UNEXPECTED_STATE,
                     revision=current.revision,
                 )
+            if current.binding_kind not in BINDING_KINDS:
+                # A stored binding kind outside the vocabulary is refused OUTRIGHT, not merely
+                # excluded from the kind-specific branches below (Redmine #14477 review j#94840
+                # R10-F1). Byte-exact classification alone was not enough here: with a stored
+                # ``"issue "`` every branch simply failed to fire and control fell through to the
+                # write, so the re-incarnation applied and bumped the generation — measured. A
+                # kind this code has no rule for must fail closed, the same discipline j#94750
+                # R7-F1 imposed on the observation read gate.
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_UNEXPECTED_STATE,
+                    revision=current.revision,
+                )
             # While this lane was retired another lane may have taken its issue / scope.
-            if norm(current.binding_kind) == BINDING_KIND_ISSUE and current.issue_id:
+            if stored_binding_kind_is(current.binding_kind, BINDING_KIND_ISSUE) and current.issue_id:
                 owner = _active_owner(conn, key.repo_workspace_id, current.issue_id)
                 if owner is not None and owner != key.lane_id:
                     conn.execute("ROLLBACK")
@@ -517,7 +532,7 @@ class LaneDeclarationStore:
                         revision=current.revision,
                     )
             elif (
-                norm(current.binding_kind) == BINDING_KIND_PROJECT_GATEWAY
+                stored_binding_kind_is(current.binding_kind, BINDING_KIND_PROJECT_GATEWAY)
                 and current.project_scope
             ):
                 owner = _active_project_owner(
@@ -530,7 +545,7 @@ class LaneDeclarationStore:
                         reason=CAS_OWNER_CONFLICT,
                         revision=current.revision,
                     )
-            if norm(current.binding_kind) == BINDING_KIND_PROJECT_GATEWAY and not pinned:
+            if stored_binding_kind_is(current.binding_kind, BINDING_KIND_PROJECT_GATEWAY) and not pinned:
                 # A project-gateway lane always owns a provider-bound slot set; the new
                 # generation must declare it too (Redmine #13810 R1-F3). Only ``declare_lane``
                 # enforced this at create time — the reopen must re-check the kind-specific

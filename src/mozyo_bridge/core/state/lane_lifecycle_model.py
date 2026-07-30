@@ -489,6 +489,26 @@ BINDING_KIND_PROJECT_GATEWAY = "project_gateway"
 BINDING_KINDS = frozenset({BINDING_KIND_ISSUE, BINDING_KIND_PROJECT_GATEWAY})
 
 
+def stored_binding_kind_is(value: object, kind: str) -> bool:
+    """Is the STORED ``binding_kind`` exactly ``kind``? (pure, byte-exact)
+
+    ``binding_kind`` is ``TEXT NOT NULL`` with no CHECK constraint and the row decoder passes the
+    string through, so a legacy / corrupted / hand-edited row can hold anything. Every surface that
+    classifies one asks the same question, so it is answered once here (Redmine #14477 review
+    j#94840 R10-F1 found 18 stored-read sites across 14 modules, each spelling it ``norm(...) ==``).
+
+    **Byte-exact: never trimmed first**, the rule :func:`is_canonical_release_state` states —
+    ingress may normalise, stored authority may not. Measured before the fix on an isolated store:
+    a row holding ``"issue "`` passed ``backfill_active_binding`` (revision 1->2) and
+    ``open_next_generation`` (generation 1->2), because trimming invented an ``issue`` binding the
+    storage never carried.
+
+    Only the DECLARING surface normalises, on the argument a caller hands it
+    (``LaneDeclarationStore.declare_lane``) — that is ingress, and it is left alone.
+    """
+    return isinstance(value, str) and value == kind
+
+
 # The declared-slot snapshot value + codec live in the cohesive leaf
 # :mod:`mozyo_bridge.core.state.lane_declared_slots` (carved out unchanged for
 # module health, Redmine #13647 T1b). Re-exported here so every existing importer of
@@ -736,7 +756,7 @@ class LaneLifecycleRecord:
         **not** auto-completed from the lane id, and its ``binding_kind`` stays ``issue``
         (a project-gateway lane is an explicit declaration, never a guess).
         """
-        return norm(self.binding_kind) == BINDING_KIND_ISSUE and not norm(self.issue_id)
+        return stored_binding_kind_is(self.binding_kind, BINDING_KIND_ISSUE) and not self.issue_id
 
     @property
     def decision(self) -> Optional[DecisionPointer]:
@@ -926,6 +946,7 @@ __all__ = (
     "RELEASE_REQUESTED",
     "RELEASE_STATES",
     "is_canonical_release_state",
+    "stored_binding_kind_is",
     "REPLACEMENT_NOT_REQUESTED",
     "REPLACEMENT_PENDING",
     "REPLACEMENT_REPLACED",

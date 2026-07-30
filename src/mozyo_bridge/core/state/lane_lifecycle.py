@@ -130,6 +130,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     guard,
     norm,
     release_transition_allowed,
+    stored_binding_kind_is,
 )
 from mozyo_bridge.core.state.lane_kind import optional_lane_kind
 from mozyo_bridge.core.state.lane_lifecycle_schema import (

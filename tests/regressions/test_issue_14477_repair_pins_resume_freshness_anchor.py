@@ -84,6 +84,7 @@ from mozyo_bridge.core.state.lane_hibernation_anchor import (  # noqa: E402
     resume_freshness_anchor,
 )
 from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
+    BINDING_KIND_ISSUE,
     CAS_FORBIDDEN_TRANSITION,
     CAS_UNEXPECTED_STATE,
     DISPOSITION_ACTIVE,
@@ -2081,8 +2082,7 @@ class RawAuthorityRenderingTest(unittest.TestCase):
                 # Reversible: the escaped form still names the exact stored bytes.
                 self.assertEqual(ast.literal_eval(out), hostile)
 
-    def test_neither_text_surface_can_be_line_forged(self) -> None:
-        """hibernate and the shared supersede renderer, which had the same line."""
+    def _hibernate_text(self, state: str) -> str:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_cli import (  # noqa: E501
             format_hibernate_text,
         )
@@ -2094,26 +2094,68 @@ class RawAuthorityRenderingTest(unittest.TestCase):
             HibernateAssertions,
         )
 
-        preflight = HibernatePreflight(
-            original_identity_known=True, park_satisfied=True, obligations_satisfied=True,
-            lane_idle=True, boundary_ok=True, inventory_readable=True,
-            project_generation_matched=True, project_attestation_ok=True,
-            action_generation_current=True, action_revision_current=True,
-            action_identity_current=True, assertions=HibernateAssertions(),
+        return format_hibernate_text(
+            HibernateOutcome(
+                executed=True,
+                preflight=HibernatePreflight(
+                    original_identity_known=True, park_satisfied=True,
+                    obligations_satisfied=True, lane_idle=True, boundary_ok=True,
+                    inventory_readable=True, project_generation_matched=True,
+                    project_attestation_ok=True, action_generation_current=True,
+                    action_revision_current=True, action_identity_current=True,
+                    assertions=HibernateAssertions(),
+                ),
+                issue=_ISSUE, lane=_LANE, release=self._release(state),
+            )
         )
-        for state, expect_lines in ((RELEASE_RELEASED, None), (self.HOSTILE, None)):
-            with self.subTest(process_release=state):
-                text = format_hibernate_text(
-                    HibernateOutcome(
-                        executed=True, preflight=preflight, issue=_ISSUE, lane=_LANE,
-                        release=self._release(state),
-                    )
-                )
-                self.assertNotIn("\x1b", text)
-                release_lines = [ln for ln in text.splitlines() if ln.startswith("  release: ")]
-                self.assertEqual(len(release_lines), 1)
-                # The forged text must not appear as its own line.
-                self.assertNotIn("  commit: applied=True", text.splitlines())
+
+    def _supersede_text(self, state: str) -> str:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_supersede import (  # noqa: E501
+            SupersedeOutcome,
+            SupersedePreflight,
+            format_supersede_text,
+        )
+
+        return format_supersede_text(
+            SupersedeOutcome(
+                executed=True,
+                preflight=SupersedePreflight(
+                    original_identity_known=True, recovery_both_slots_live=True,
+                    recovery_attested=True, original_idle=True,
+                ),
+                issue=_ISSUE, original_lane=_LANE, recovery_lane=f"{_LANE}_recovery",
+                release=self._release(state),
+            )
+        )
+
+    def test_neither_text_surface_can_be_line_forged(self) -> None:
+        """BOTH public renderers, each actually executed (review j#94840 R10-F2).
+
+        The earlier version of this pin claimed "both text surfaces" but only ever called
+        `format_hibernate_text`; the supersede renderer — which carries the identical line — was
+        never run. Reading the shared helper and inferring the second surface is not the same as
+        executing it, and the name asserted a coverage the body did not have.
+        """
+        for surface, render in (
+            ("hibernate", self._hibernate_text),
+            ("supersede", self._supersede_text),
+        ):
+            for state in (RELEASE_RELEASED, self.HOSTILE):
+                with self.subTest(surface=surface, process_release=state):
+                    text = render(state)
+                    self.assertNotIn("\x1b", text)
+                    release_lines = [
+                        ln for ln in text.splitlines() if ln.startswith("  release: ")
+                    ]
+                    self.assertEqual(len(release_lines), 1, "exactly one release line")
+                    # The forged text must not appear as its own line.
+                    self.assertNotIn("  commit: applied=True", text.splitlines())
+                    if state == RELEASE_RELEASED:
+                        # Canonical rendering is unchanged: verbatim, unquoted.
+                        self.assertEqual(
+                            release_lines[0],
+                            f"  release: {RELEASE_RELEASED} (unknown state)",
+                        )
 
     def test_the_json_payload_keeps_the_raw_value_verbatim(self) -> None:
         """Escaping is presentation-only: the machine surface stays exact and reversible."""
@@ -2122,6 +2164,257 @@ class RawAuthorityRenderingTest(unittest.TestCase):
         rel = self._release(self.HOSTILE)
         payload = _json.loads(_json.dumps({"process_release": rel.process_release}))
         self.assertEqual(payload["process_release"], self.HOSTILE)
+
+
+class StoredBindingKindIsNeverNormalisedTest(_Fixture):
+    """`binding_kind` is a stored authority too (review j#94840 R10-F1).
+
+    The census that finding names: 19 ``norm(...binding_kind)`` sites across 14 modules, of which
+    exactly ONE — ``LaneDeclarationStore.declare_lane``'s ``kind = norm(binding_kind)`` — is
+    ingress (a caller's argument). The other 18 classified what the ROW already held, so a padded
+    value was read as a canonical kind. Measured through the public API before the fix:
+
+    - ``backfill_active_binding`` applied on a stored ``"issue "`` row (revision 1 -> 2)
+    - ``open_next_generation`` applied on one (generation 1 -> 2, back to ``active``)
+    - ``record_matches_binding``'s issue branch returned True for a stored ``"project_gateway"``
+      row, because it compared the issue id ALONE and never looked at the kind
+
+    Byte-exact classification alone was not sufficient for ``open_next_generation``: with an
+    unclassifiable kind every branch simply failed to fire and control fell through to the write,
+    so that CAS now refuses an out-of-vocabulary kind outright — the j#94750 R7-F1 discipline.
+    """
+
+    # NOT including "": the row decoder maps an EMPTY stored binding_kind to the canonical
+    # ``issue`` (``lane_lifecycle_rows.py`` ``binding_kind=str(row[17] or BINDING_KIND_ISSUE)``),
+    # which is the declared pre-v5 legacy default — a codec mapping stated in one place, not a
+    # classifier inventing a fact. Pinned below rather than assumed.
+    NON_CANONICAL = ("issue ", " issue", "ISSUE", "weird_kind")
+
+    def _seed(self) -> None:  # noqa: D401 - the fixture's own seed is not needed here
+        super()._seed()
+
+    def _decl(self):
+        return LaneDeclarationStore(path=self.path)
+
+    def _force_kind(self, token: str, *, lane: str = _LANE) -> None:
+        conn = sqlite3.connect(str(self.path))
+        try:
+            conn.execute(
+                "UPDATE lane_lifecycle_records SET binding_kind = ? WHERE lane_id = ?",
+                (token, lane),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self._rec().binding_kind, token, "raw seed did not stick")
+
+    def _legacy_owner(self, token: str):
+        """An ACTIVE issue owner whose worktree binding is MISSING — the backfill precondition."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "state.sqlite"
+        key = LaneLifecycleKey(_WS, _LANE)
+        store = LaneLifecycleStore(path=path)
+        self.assertTrue(
+            LaneDeclarationStore(path=path).declare_lane(
+                key, decision=_decision(), issue_id=_ISSUE,
+                declared_slots=(), worktree_identity="",
+            ).applied
+        )
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.execute(
+                "UPDATE lane_lifecycle_records SET binding_kind = ? WHERE lane_id = ?",
+                (token, _LANE),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return store, key, path
+
+    # ------------------------------------------------- public boundary: backfill
+    def test_backfill_refuses_a_non_canonical_stored_binding_kind(self) -> None:
+        for token in self.NON_CANONICAL + ("project_gateway",):
+            with self.subTest(binding_kind=token):
+                store, key, path = self._legacy_owner(token)
+                rec0 = store.get(key)
+                out = LaneDeclarationStore(path=path).backfill_active_binding(
+                    key, expected_revision=rec0.revision,
+                    issue_id=_ISSUE, worktree_identity="wt-new",
+                )
+                self.assertFalse(out.applied)
+                rec1 = store.get(key)
+                self.assertEqual(rec1.revision, rec0.revision, "zero write")
+                self.assertEqual(rec1.worktree_identity, "", "zero write")
+                self.assertEqual(rec1.binding_kind, token, "the invalid value is not laundered")
+
+    def test_backfill_still_applies_for_the_canonical_kind(self) -> None:
+        store, key, path = self._legacy_owner(BINDING_KIND_ISSUE)
+        rec0 = store.get(key)
+        out = LaneDeclarationStore(path=path).backfill_active_binding(
+            key, expected_revision=rec0.revision, issue_id=_ISSUE, worktree_identity="wt-new",
+        )
+        self.assertTrue(out.applied, out.reason)
+        self.assertEqual(store.get(key).worktree_identity, "wt-new")
+
+    # ------------------------------------- public boundary: open_next_generation
+    def _retired(self, token: str):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "state.sqlite"
+        key = LaneLifecycleKey(_WS, _LANE)
+        store = LaneLifecycleStore(path=path)
+        self.assertTrue(
+            LaneDeclarationStore(path=path).declare_lane(
+                key, decision=_decision(), issue_id=_ISSUE,
+                declared_slots=(), worktree_identity=_BOUND_WT,
+            ).applied
+        )
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.execute(
+                "UPDATE lane_lifecycle_records SET binding_kind = ?, lane_disposition = ? "
+                "WHERE lane_id = ?",
+                (token, DISPOSITION_RETIRED, _LANE),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return store, key, path
+
+    def test_open_next_generation_refuses_a_non_canonical_stored_binding_kind(self) -> None:
+        for token in self.NON_CANONICAL:
+            with self.subTest(binding_kind=token):
+                store, key, path = self._retired(token)
+                rec0 = store.get(key)
+                out = LaneDeclarationStore(path=path).open_next_generation(
+                    key, expected_revision=rec0.revision,
+                    expected_generation=rec0.lane_generation, decision=_decision(),
+                )
+                self.assertFalse(out.applied)
+                self.assertEqual(out.reason, CAS_UNEXPECTED_STATE)
+                rec1 = store.get(key)
+                self.assertEqual(rec1.lane_generation, rec0.lane_generation, "zero write")
+                self.assertEqual(rec1.lane_disposition, DISPOSITION_RETIRED, "zero write")
+                self.assertEqual(rec1.binding_kind, token)
+
+    def test_open_next_generation_still_applies_for_the_canonical_kind(self) -> None:
+        store, key, path = self._retired(BINDING_KIND_ISSUE)
+        rec0 = store.get(key)
+        out = LaneDeclarationStore(path=path).open_next_generation(
+            key, expected_revision=rec0.revision,
+            expected_generation=rec0.lane_generation, decision=_decision(),
+        )
+        self.assertTrue(out.applied, out.reason)
+        rec1 = store.get(key)
+        self.assertEqual(rec1.lane_generation, rec0.lane_generation + 1)
+        self.assertEqual(rec1.lane_disposition, DISPOSITION_ACTIVE)
+
+    # ------------------------------------------ representative retire / repair
+    def test_a_retire_and_a_repair_refuse_a_non_canonical_stored_binding_kind(self) -> None:
+        """Two of the 18 sites, driven through their own public stores."""
+        from mozyo_bridge.core.state.lane_bound_retire import LaneBoundRetireStore
+        from mozyo_bridge.core.state.lane_pin_repair import LanePinRepairStore
+
+        for token in ("issue ", "weird_kind"):
+            with self.subTest(binding_kind=token):
+                self._force_kind(token)
+                rec = self._rec()
+                retire = LaneBoundRetireStore(path=self.path).retire_released_hibernated_bound(
+                    self.key,
+                    expected_revision=rec.revision,
+                    issue_id=_ISSUE,
+                    worktree_identity=_BOUND_WT,
+                    decision=_decision(),
+                )
+                self.assertFalse(retire.applied)
+                self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
+
+                repair = LanePinRepairStore(path=self.path).repair_hibernated_bound_pins(
+                    self.key,
+                    expected_revision=rec.revision,
+                    expected_generation=rec.lane_generation,
+                    issue_id=_ISSUE,
+                    worktree_identity=_BOUND_WT,
+                    declared_slots=_live_pins(),
+                    decision=_decision(),
+                )
+                self.assertFalse(repair.applied)
+                self.assertEqual(self._rec().revision, rec.revision, "zero write")
+
+    # -------------------------------------------- pure / preflight classifiers
+    def test_the_identity_predicate_requires_the_canonical_issue_kind(self) -> None:
+        from mozyo_bridge.core.state.lane_binding import record_matches_binding
+
+        for token in self.NON_CANONICAL + ("project_gateway",):
+            with self.subTest(binding_kind=token):
+                self._force_kind(token)
+                self.assertFalse(
+                    record_matches_binding(self._rec(), issue_id=_ISSUE),
+                    "an issue binding requires an issue-kind row, not just a matching issue id",
+                )
+        self._force_kind(BINDING_KIND_ISSUE)
+        self.assertTrue(record_matches_binding(self._rec(), issue_id=_ISSUE))
+
+    def test_the_pure_classifiers_reject_a_non_canonical_stored_kind(self) -> None:
+        from mozyo_bridge.core.state.lane_lifecycle_model import stored_binding_kind_is
+        from mozyo_bridge.core.state.lane_worktree_binding_signature import (
+            SIGNATURE_OK,
+            classify_repair_signature,
+        )
+
+        self.assertTrue(stored_binding_kind_is(BINDING_KIND_ISSUE, BINDING_KIND_ISSUE))
+        for token in self.NON_CANONICAL:
+            with self.subTest(binding_kind=token):
+                self.assertFalse(stored_binding_kind_is(token, BINDING_KIND_ISSUE))
+                self._force_kind(token)
+                verdict = classify_repair_signature(self._rec(), issue_id=_ISSUE)
+                self.assertNotEqual(
+                    verdict, SIGNATURE_OK,
+                    "the preflight signature must not accept a non-issue-kind row",
+                )
+
+    def test_an_empty_stored_kind_is_the_declared_legacy_default_not_a_laundering(self):
+        """`''` decodes to the canonical `issue` — a codec mapping, pinned so it is a decision.
+
+        The row decoder maps an empty stored ``binding_kind`` to ``issue`` (the pre-v5 legacy
+        default). That is the one place the mapping is declared, and it is a CODEC, not a
+        classifier normalising an authority value at each read site — the distinction this
+        finding turns on. Recorded here so a later change to the decoder is visible.
+        """
+        conn = sqlite3.connect(str(self.path))
+        try:
+            conn.execute(
+                "UPDATE lane_lifecycle_records SET binding_kind = '' WHERE lane_id = ?", (_LANE,)
+            )
+            conn.commit()
+            stored = conn.execute(
+                "SELECT binding_kind FROM lane_lifecycle_records WHERE lane_id = ?", (_LANE,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(stored, "", "the STORED bytes are empty")
+        self.assertEqual(
+            self._rec().binding_kind,
+            BINDING_KIND_ISSUE,
+            "...and the decoder maps them to the canonical legacy default",
+        )
+
+    def test_only_the_declaring_surface_normalises_its_argument(self) -> None:
+        """Ingress stays normalised: `declare_lane` still accepts a padded ARGUMENT."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "state.sqlite"
+        key = LaneLifecycleKey(_WS, f"{_LANE}_ingress")
+        out = LaneDeclarationStore(path=path).declare_lane(
+            key, decision=_decision(), binding_kind=" issue ", issue_id=_ISSUE,
+            declared_slots=(), worktree_identity=_BOUND_WT,
+        )
+        self.assertTrue(out.applied, out.reason)
+        # ...and what it STORES is the canonical token, so no reader ever sees the padding.
+        self.assertEqual(
+            LaneLifecycleStore(path=path).get(key).binding_kind, BINDING_KIND_ISSUE
+        )
 
 
 class SchemaVersionTest(unittest.TestCase):

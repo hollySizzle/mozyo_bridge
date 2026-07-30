@@ -167,6 +167,7 @@ def run_hibernated_pin_repair(
     """
     from mozyo_bridge.core.state.lane_lifecycle import (
         BINDING_KIND_ISSUE,
+        stored_binding_kind_is,
         CAS_ALREADY_DECLARED,
         CAS_FORBIDDEN_TRANSITION,
         CAS_GENERATION_MISMATCH,
@@ -337,7 +338,7 @@ def run_hibernated_pin_repair(
     # producing precise reasons; the CAS re-checks the same axes under the row lock.
     if (
         record.lane_disposition != DISPOSITION_HIBERNATED
-        or norm(record.binding_kind) != BINDING_KIND_ISSUE
+        or not stored_binding_kind_is(record.binding_kind, BINDING_KIND_ISSUE)
         or (record.issue_id or "").strip() != issue
         or record.project_scope
         or norm(record.worktree_identity) != metadata_token

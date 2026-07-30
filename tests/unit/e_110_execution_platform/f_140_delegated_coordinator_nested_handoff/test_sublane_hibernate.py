@@ -11,6 +11,8 @@ non-active, so the W4 roster join excludes it from active capacity).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -167,11 +169,15 @@ class _FakeOps:
         self.close_calls: list = []
         self.worktree_reads = 0
         self.activity_reads = 0
+        #: Redmine #14477 j#94840 R10-F3: proves the FAKE was the one consulted, so a test that
+        #: patched the wrong module namespace cannot pass on the real store's behaviour.
+        self.inventory_reads = 0
 
     def workspace_id(self) -> str:
         return WS
 
     def read_inventory(self):
+        self.inventory_reads += 1
         if self._inventory_sequence:
             return self._inventory_sequence.pop(0), self._readable
         return list(self._rows), self._readable
@@ -793,13 +799,24 @@ class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
                 json=False,
             )
             fake_ops = _FakeOps(rows=[], readable=False)
+            # Patch the CLI module's namespace (Redmine #14477 review j#94840 R10-F3).
+            # `cmd_sublane_hibernate` resolves `LiveSublaneHibernateOps` / `LaneLifecycleStore`
+            # from `_CLI_MOD`; patching `_HIBERNATE_MOD` left BOTH real, so the fake ops and the
+            # temp store were unused and the real store resolved the ambient home — the exit 1
+            # this asserted came from a row-absent block, not from the unreadable inventory the
+            # test is named for.
+            buf = io.StringIO()
             with mock.patch(
-                f"{_HIBERNATE_MOD}.LiveSublaneHibernateOps", return_value=fake_ops
+                f"{_CLI_MOD}.LiveSublaneHibernateOps", return_value=fake_ops
             ), mock.patch(
-                f"{_HIBERNATE_MOD}.LaneLifecycleStore", return_value=store
-            ):
+                f"{_CLI_MOD}.LaneLifecycleStore", return_value=store
+            ), contextlib.redirect_stdout(buf):
                 rc = cmd_sublane_hibernate(args)
             self.assertEqual(rc, 1)
+            # The fake WAS used, and the named reason is the one the test claims.
+            self.assertGreater(fake_ops.inventory_reads, 0, "the fake inventory was never read")
+            self.assertIn(BLOCK_INVENTORY_UNREADABLE, buf.getvalue())
+            self.assertIn("fail-closed blocked", buf.getvalue())
 
     def test_cmd_exit_code_follows_is_success_for_an_unknown_release_state(self) -> None:
         """Redmine #14477 review j#94805 R9-F1, through the PUBLIC command.

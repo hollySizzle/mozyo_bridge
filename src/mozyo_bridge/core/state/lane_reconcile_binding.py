@@ -66,6 +66,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     norm,
     replacement_settled,
     validate_declared_slots,
+    stored_binding_kind_is,
 )
 from mozyo_bridge.core.state.lane_lifecycle_rows import (
     _locked_row,
@@ -187,7 +188,7 @@ class LaneReconcileBindingStore:
                 )
             if (
                 current.lane_disposition != DISPOSITION_HIBERNATED
-                or norm(current.binding_kind) != BINDING_KIND_ISSUE
+                or not stored_binding_kind_is(current.binding_kind, BINDING_KIND_ISSUE)
                 or current.issue_id != issue
                 or current.project_scope
                 or current.worktree_identity

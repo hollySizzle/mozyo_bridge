@@ -514,6 +514,18 @@ Table naming:
       未分類 state をそのまま text へ埋めると **改行で偽の行を作れ、ANSI ESC も通る**ことを実測した。
       canonical token はそのまま表示し、それ以外は可逆な quoted 表現で出す
       (`render_release_state`)。JSON payload は raw を保持する (encoder が escape するため安全)。
+    - **同じ規律は `binding_kind` にも適用する** (j#94840 R10-F1)。census は
+      `norm(...binding_kind)` **19 site / 14 module**で、`declare_lane` の
+      `kind = norm(binding_kind)` **1 件だけが ingress**、残る **18 が stored-read** だった。
+      実測: 格納 `"issue "` の row が `backfill_active_binding` (revision 1→2) と
+      `open_next_generation` (generation 1→2) を通り、`record_matches_binding` の issue branch は
+      **`binding_kind` を一切見ずに** `project_gateway` row を issue binding として match していた。
+      18 site を共有述語 `stored_binding_kind_is()` (byte-exact) へ寄せ、issue branch に
+      canonical kind 要求を追加した。**byte-exact だけでは不十分**な site もある:
+      `open_next_generation` は分岐がどれも成立せず **fall-through して write に到達**していたので、
+      vocabulary 外の kind を **outright 拒否**する guard を足した (j#94750 R7-F1 と同じ形)。
+      空文字の格納値は decoder が canonical `issue` へ写す **宣言済みの pre-v5 legacy default**
+      (`lane_lifecycle_rows.py`) であり、codec であって read 毎の正規化ではない。
     - 2 つの述語は責務が異なるので混同しない: `is_canonical_release_state()` =
       **vocabulary に属する値か** (fence / hibernate enumeration / driver / CAS policy) /
       `_CLASSIFIED_RELEASE_STATES` = **read gate が規則を持つ値か** (第五 member を proof へ
