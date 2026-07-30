@@ -506,6 +506,11 @@ class LaneLifecycleStore:
             release = RELEASE_NOT_REQUESTED if rehydrating else current.process_release
             action = "" if rehydrating else current.release_action_id
             pins = "" if rehydrating else current.release_pins
+            # v9 (#14477 j#94707 R4-F1): the release OBSERVATION is part of the release set, so
+            # it clears with the rest of it. A rehydrated lane holding the previous generation's
+            # observation is the same defect shape as a retained ``reconcile_phase``: an old
+            # generation's evidence must never be readable as the current generation's authority.
+            observation = "" if rehydrating else current.release_observation
             replacement = REPLACEMENT_NOT_REQUESTED if rehydrating else current.replacement_state
             replacement_action = "" if rehydrating else current.replacement_action_id
             replacement_pins = "" if rehydrating else current.replacement_pins
@@ -518,7 +523,8 @@ class LaneLifecycleStore:
             try:
                 conn.execute(
                     f"UPDATE {_TABLE} SET lane_disposition = ?, process_release = ?, "
-                    "release_action_id = ?, release_pins = ?, replacement_state = ?, "
+                    "release_action_id = ?, release_pins = ?, release_observation = ?, "
+                    "replacement_state = ?, "
                     "replacement_action_id = ?, replacement_pins = ?, declared_slots = ?, "
                     "hibernated_at = ?, revision = ?, "
                     "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
@@ -529,6 +535,7 @@ class LaneLifecycleStore:
                         release,
                         action,
                         pins,
+                        observation,
                         replacement,
                         replacement_action,
                         replacement_pins,
@@ -701,6 +708,7 @@ class LaneLifecycleStore:
                     conn.execute(
                         f"UPDATE {_TABLE} SET issue_id = ?, lane_disposition = ?, "
                         "process_release = ?, release_action_id = ?, release_pins = ?, "
+                        "release_observation = ?, "
                         "replacement_state = ?, replacement_action_id = ?, "
                         "replacement_pins = ?, hibernated_at = ?, revision = ?, "
                         "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
@@ -711,6 +719,10 @@ class LaneLifecycleStore:
                             DISPOSITION_ACTIVE,
                             RELEASE_NOT_REQUESTED,
                             "",
+                            "",
+                            # v9 (#14477 j#94707 R4-F1): the promoted lane owns a NEW generation,
+                            # so the superseded one's release observation clears with the rest of
+                            # the release set — never carried into the generation it precedes.
                             "",
                             REPLACEMENT_NOT_REQUESTED,
                             "",
@@ -749,7 +761,7 @@ class LaneLifecycleStore:
         *,
         expected_revision: int,
         action_id: str,
-        observation: "ReleaseObservation",
+        observation: Optional["ReleaseObservation"] = None,
         pins: Optional[Iterable[ReleasePin]] = None,
         now: Optional[str] = None,
     ) -> CasOutcome:
@@ -759,6 +771,12 @@ class LaneLifecycleStore:
         axis and the Redmine #14477 j#94582 observation contract (a legacy ``pins=`` call is
         refused there rather than honoured). The axis lives in its own module for the same reason
         :mod:`...lane_replacement` does; the call signature is unchanged apart from the keyword.
+
+        ``observation`` defaults to ``None`` here for the same reason it does there (review j#94707
+        R4-F2): the *public* seam is this delegator, so if it kept ``observation`` required, a
+        literal legacy ``pins=`` call would die of ``TypeError`` at this boundary and never reach
+        the typed refusal. Both the legacy and the omitted shape are refused by
+        :func:`...lane_release.open_release_generation` as ``ReleaseObservationError``.
         """
         return open_release_generation(
             self,

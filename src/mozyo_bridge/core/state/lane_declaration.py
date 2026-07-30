@@ -545,6 +545,7 @@ class LaneDeclarationStore:
                 conn.execute(
                     f"UPDATE {_TABLE} SET lane_disposition = ?, lane_generation = ?, "
                     "process_release = ?, release_action_id = ?, release_pins = ?, "
+                    "release_observation = ?, "
                     "replacement_state = ?, replacement_action_id = ?, "
                     "replacement_pins = ?, declared_slots = ?, reconcile_phase = ?, "
                     "lane_kind = ?, hibernated_at = ?, revision = ?, "
@@ -556,6 +557,12 @@ class LaneDeclarationStore:
                         generation,
                         RELEASE_NOT_REQUESTED,
                         "",
+                        "",
+                        # v9 (Redmine #14477 j#94707 R4-F1): the previous generation's release
+                        # OBSERVATION clears with the rest of the release set, for exactly the
+                        # reasoning spelled out for ``reconcile_phase`` and ``hibernated_at``
+                        # below — an old generation's evidence must never be readable as this
+                        # generation's authority.
                         "",
                         REPLACEMENT_NOT_REQUESTED,
                         "",

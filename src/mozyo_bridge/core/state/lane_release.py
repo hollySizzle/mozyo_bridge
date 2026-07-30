@@ -84,6 +84,11 @@ OBSERVATION_UNREADABLE = "release_observation_unreadable"
 #: The stored release pins do not describe exactly the recorded observation (missing, extra, or
 #: different). A row whose two fields disagree is never usable as proof.
 OBSERVATION_PIN_MISMATCH = "release_observation_pin_mismatch"
+#: The row carries an observation but its release generation is not COMPLETED, so the observation
+#: is not this generation's authority (review j#94707 R4-F1). The reset writers clear the whole
+#: release set, so a live row should never be in this shape; the read gate refuses it anyway
+#: rather than depending on every caller to check ``process_release`` first.
+OBSERVATION_NOT_CURRENT_GENERATION = "release_observation_not_current_generation"
 
 
 def open_release_generation(
@@ -92,7 +97,7 @@ def open_release_generation(
     *,
     expected_revision: int,
     action_id: str,
-    observation: ReleaseObservation,
+    observation: Optional[ReleaseObservation] = None,
     pins: Optional[Iterable[ReleasePin]] = None,
     now: Optional[str] = None,
 ) -> CasOutcome:
@@ -104,6 +109,13 @@ def open_release_generation(
 
     ``pins`` exists solely to refuse the legacy call shape loudly (j#94582 item 6). It is never
     read; passing it raises rather than being honoured for compatibility.
+
+    ``observation`` is a keyword with a ``None`` default *so that the legacy shape reaches this
+    body*. Review j#94707 R4-F2 measured that a required parameter made the literal legacy call —
+    ``pins=`` with no ``observation`` — fail as ``TypeError`` at argument binding, never reaching
+    the typed refusal the seam exists to give. The refusal is a domain fact about the authority
+    contract, so it must be a :class:`ReleaseObservationError` carrying that reason, not an
+    arity error; the missing-argument case is refused just as loudly below.
     """
     if pins is not None:
         raise ReleaseObservationError(
@@ -111,7 +123,7 @@ def open_release_generation(
             "derived from the driver's ReleaseObservation so the recorded locators cannot be "
             "values that were never live (Redmine #14477 j#94570 R3-F1 / j#94582 item 6)"
         )
-    if not isinstance(observation, ReleaseObservation):
+    if observation is None or not isinstance(observation, ReleaseObservation):
         raise ReleaseObservationError(
             "a release generation requires a ReleaseObservation from the release driver"
         )
@@ -192,10 +204,16 @@ def verify_release_observation(
 ) -> tuple[Optional[ReleaseObservation], str]:
     """``(observation, reason)`` — the READ gate over a completed release generation.
 
-    Returns the observation only when it is present, readable, AND exactly described by the
-    stored release pins (j#94582 items 3, 4). Every other outcome returns ``None`` with a typed
-    reason, and the caller must fail closed on it: an ABSENT observation is missing evidence, not
-    evidence of absence.
+    Returns the observation only when it belongs to a COMPLETED release generation, is present,
+    readable, AND exactly described by the stored release pins (j#94582 items 3, 4). Every other
+    outcome returns ``None`` with a typed reason, and the caller must fail closed on it: an ABSENT
+    observation is missing evidence, not evidence of absence.
+
+    The generation check lives here, not in the caller (review j#94707 R4-F1). Every writer that
+    resets the release axis clears the observation with it, so a row that has left ``released``
+    carries no observation at all — but "no caller can currently reach that shape" is precisely
+    the kind of caller-side assumption this issue has had to retract twice, so the component
+    refuses a non-current observation itself.
 
     A complete-empty observation is returned successfully — it is positive evidence that the
     driver observed no live slot. Whether that is sufficient is the caller's decision; this
@@ -209,6 +227,10 @@ def verify_release_observation(
         return None, OBSERVATION_UNREADABLE
     if observation is None:
         return None, OBSERVATION_ABSENT
+    if norm(record.process_release) != RELEASE_RELEASED:
+        # Present but not this generation's proof: an in-flight generation has not established
+        # what it closed, and a reset row should not be carrying one at all.
+        return None, OBSERVATION_NOT_CURRENT_GENERATION
     try:
         stored_pins = decode_release_pins(record.release_pins)
     except ReleasePinError:
@@ -223,6 +245,7 @@ __all__ = (
     "OBSERVATION_ABSENT",
     "OBSERVATION_UNREADABLE",
     "OBSERVATION_PIN_MISMATCH",
+    "OBSERVATION_NOT_CURRENT_GENERATION",
     "RELEASE_RELEASED",
     "open_release_generation",
     "verify_release_observation",

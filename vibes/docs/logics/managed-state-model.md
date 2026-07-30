@@ -439,7 +439,11 @@ Table naming:
     - **何を保存するか**: release driver が live inventory から **1 度だけ列挙**した exact
       observed slot snapshot。store は **この snapshot から release pins を単一導出**し、
       caller から別値を受け取らない。raw `pins=` public API は **authority seam として残さず
-      fail-closed** (後方互換なし)。
+      fail-closed** (後方互換なし)。**拒否は typed domain error (`ReleaseObservationError`) で
+      あること**が契約で、arity error ではない: `observation` を required parameter にすると
+      literal legacy 呼出 (`pins=` のみ) が argument binding 段階の `TypeError` になり、seam が
+      説明を返せないまま落ちる (j#94707 R4-F2 が実測)。`observation` 省略も同じ typed error で
+      拒否する。
     - **absent と complete-empty を literal に区別する**。`''` = **absent** (legacy / 未記録) は
       「証拠が無い」であり resume は fail-closed。記録済みの **complete-empty**
       (`{"v":1,"slots":[]}`) は「driver が見て live slot 0 だった」という **positive evidence**
@@ -449,7 +453,17 @@ Table naming:
       食い違う row は proof に使えない (欠け = 未証明 slot、過剰 = 観測していない close の主張)。
     - **generation 中は write-once**。metadata repair / decision / revision / outcome writer は
       変更しない。新 release generation の開始時のみ exact replacement。`active` へ戻る際は
-      release 一式と共に clear される。
+      release 一式と共に clear される。**clear する writer は 3 経路**で、いずれも
+      `process_release` / `release_action_id` / `release_pins` / `release_observation` を
+      **同一 CAS で**落とす: `transition_disposition` の rehydrate / `supersede_and_activate` の
+      existing recovery promotion / `open_next_generation`。R4 review (j#94707 R4-F1) は、この
+      うち v9 field だけが 3 経路とも clear 対象から漏れていたことを検出した。
+    - **read gate は現 generation の observation 以外を返さない**。`process_release` が
+      `released` でない row の observation は、caller が何を検査しているかに関わらず
+      component 境界で拒否する (`release_observation_not_current_generation`)。reset writer が
+      正しく clear していればこの shape は生じないが、「caller が到達しないから残しても安全」
+      という前提は本 issue で 2 度撤回している (timestamp / caller 供給 pins) ため、
+      **到達可能性の前提を安全性の根拠にしない**。
     - **live-zero でも generation を開く**。従来は「閉じる slot が無い」と early return して
       何も記録しなかったが、それでは resume が「hibernate 時 process 0」と「survivor がいて
       証拠が残らなかった」を区別できない。complete-empty を記録することでこれを検査可能な

@@ -87,6 +87,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     DISPOSITION_HIBERNATED,
     DISPOSITION_RETIRED,
     DISPOSITIONS,
+    RELEASE_NOT_REQUESTED,
     RELEASE_RELEASED,
     DecisionPointer,
     LaneLifecycleKey,
@@ -104,8 +105,11 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (  # noqa: E402
 from mozyo_bridge.core.state.lane_pin_repair import LanePinRepairStore  # noqa: E402
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair  # noqa: E402
 from mozyo_bridge.core.state.lane_release import (  # noqa: E402
+    OBSERVATION_NOT_CURRENT_GENERATION,
     OBSERVATION_PIN_MISMATCH,
     OBSERVATION_UNREADABLE,
+    open_release_generation,
+    verify_release_observation,
 )
 from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
     ReleaseObservationError,
@@ -713,8 +717,8 @@ class ReleaseObservationBindingTest(_Fixture):
     #14477 could retire.
     """
 
-    def test_the_legacy_raw_pins_seam_is_refused_outright(self) -> None:
-        """j#94582 item 6: no backward compatibility, no silent fallback."""
+    def _rehibernate(self) -> None:
+        """Put the lane back in the one state from which a release may be requested."""
         self.assertTrue(self._repair_pins().applied)
         self.assertFalse(self._resume().is_blocked)
         out = self.store.transition_disposition(
@@ -726,6 +730,15 @@ class ReleaseObservationBindingTest(_Fixture):
             now=T_RESUME,
         )
         self.assertTrue(out.applied, out.reason)
+
+    def test_the_hybrid_observation_plus_pins_call_is_refused_outright(self) -> None:
+        """j#94582 item 6: no backward compatibility, no silent fallback.
+
+        This is the shape that passes BOTH keywords. It is kept as the positive control for the
+        ``pins is not None`` refusal; the literal legacy shape is pinned separately below,
+        because review j#94707 R4-F2 showed the two do NOT fail the same way.
+        """
+        self._rehibernate()
         with self.assertRaises(ReleaseObservationError):
             self.store.request_release(
                 self.key,
@@ -734,6 +747,62 @@ class ReleaseObservationBindingTest(_Fixture):
                 observation=build_release_observation(()),
                 pins=[ReleasePin("gateway", _gw_name(), f"{_WS}:pRAW")],
             )
+
+    def test_the_literal_legacy_pins_only_call_is_refused_with_a_typed_error(self) -> None:
+        """Review j#94707 R4-F2: the shape an actual legacy caller writes.
+
+        Before this fix ``observation`` was a REQUIRED keyword, so ``pins=`` alone died of
+        ``TypeError: missing a required argument`` at argument binding and never reached the
+        typed refusal that this seam exists to give. A refusal that cannot state its reason is
+        not the authority seam j#94582 item 6 specified, so the exception TYPE is pinned, not
+        just the fact that something was raised.
+        """
+        self._rehibernate()
+        for label, call in (
+            (
+                "public delegator",
+                lambda: self.store.request_release(
+                    self.key,
+                    expected_revision=self._rec().revision,
+                    action_id="rel-legacy-literal",
+                    pins=[ReleasePin("gateway", _gw_name(), f"{_WS}:pRAW")],
+                ),
+            ),
+            (
+                "axis function",
+                lambda: open_release_generation(
+                    self.store,
+                    self.key,
+                    expected_revision=self._rec().revision,
+                    action_id="rel-legacy-literal",
+                    pins=[ReleasePin("gateway", _gw_name(), f"{_WS}:pRAW")],
+                ),
+            ),
+        ):
+            with self.subTest(seam=label):
+                with self.assertRaises(ReleaseObservationError) as caught:
+                    call()
+                # A TypeError would satisfy "it refused" while telling the caller nothing about
+                # the authority contract. ReleaseObservationError does not subclass it.
+                self.assertNotIsInstance(caught.exception, TypeError)
+                self.assertIn("pins", str(caught.exception))
+
+    def test_an_omitted_observation_is_refused_with_a_typed_error(self) -> None:
+        """The other half of making ``observation`` defaultable: forgetting it must still be
+        loud, and loud in the same typed vocabulary rather than as an arity error."""
+        self._rehibernate()
+        with self.assertRaises(ReleaseObservationError) as caught:
+            self.store.request_release(
+                self.key,
+                expected_revision=self._rec().revision,
+                action_id="rel-no-observation",
+            )
+        self.assertNotIsInstance(caught.exception, TypeError)
+        self.assertIn("ReleaseObservation", str(caught.exception))
+        # Refused BEFORE any write: no generation was opened, so the axis is still the one the
+        # rehydrate left behind (reset), not ``requested``.
+        self.assertEqual(self._rec().process_release, RELEASE_NOT_REQUESTED)
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_HIBERNATED)
 
     def test_a_fabricated_observation_is_the_documented_residual(self) -> None:
         """The trust-boundary residual #14756 owns — pinned as a FACT, not as a fixed hole.
@@ -784,6 +853,190 @@ class ReleaseObservationBindingTest(_Fixture):
             "trust-boundary authority with an epoch bound into the attestation",
         )
 
+
+class ReleaseAxisResetClearsObservationTest(_Fixture):
+    """Every writer that resets the release axis clears the OBSERVATION with it.
+
+    Review j#94707 R4-F1: the v9 field was added to exactly one writer
+    (``open_release_generation``) and to none of the three that reset the axis, so a rehydrated /
+    promoted / re-incarnated lane kept the previous generation's observation. The declared
+    contract is `vibes/docs/logics/managed-state-model.md` — "``active`` へ戻る際は release 一式と
+    共に clear される" — and "release 一式" includes the authority field that decides freshness.
+
+    The seed's observation is NON-EMPTY (``pOLD_G`` / ``pOLD_W``), so a leftover value is
+    distinguishable from a correctly cleared one: an empty string cannot be mistaken for it.
+    Each pin asserts the WHOLE set at once, because the defect was precisely that three of four
+    fields were reset and the fourth was forgotten.
+    """
+
+    def _assert_release_set_cleared(self, rec: LaneLifecycleRecord, *, path: str) -> None:
+        self.assertEqual(
+            (
+                rec.process_release,
+                rec.release_action_id,
+                rec.release_pins,
+                rec.release_observation,
+            ),
+            (RELEASE_NOT_REQUESTED, "", "", ""),
+            f"{path}: the release set must clear as ONE set, in one CAS",
+        )
+        # And the read gate agrees the row holds no usable proof, by the same evidence.
+        observation, reason = verify_release_observation(rec)
+        self.assertIsNone(observation)
+        self.assertEqual(reason, "release_observation_absent")
+
+    def _seeded_observation_is_non_empty(self) -> None:
+        self.assertNotEqual(self._rec().release_observation, "")
+        self.assertEqual(self._rec().process_release, RELEASE_RELEASED)
+
+    def test_rehydrate_to_active_clears_the_release_observation(self) -> None:
+        """``transition_disposition`` hibernated -> active — the resume path of this issue."""
+        self._seeded_observation_is_non_empty()
+        out = self.store.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_HIBERNATED,
+            expected_revision=self._rec().revision,
+            target=DISPOSITION_ACTIVE,
+            decision=_decision(),
+            now=T_RESUME,
+        )
+        self.assertTrue(out.applied, out.reason)
+        self._assert_release_set_cleared(self._rec(), path="rehydrate")
+
+    def test_supersede_promotion_clears_the_recovery_lanes_release_observation(self) -> None:
+        """``supersede_and_activate`` promoting an EXISTING recovery lane.
+
+        The promoted lane is the one whose row is rewritten, so the observation that must not
+        survive is the recovery lane's own — seeded here by driving it through a full release
+        generation before the handover.
+        """
+        recovery = LaneLifecycleKey(_WS, f"{_LANE}_recovery")
+        # An UNBOUND recovery lane: it owns no issue yet, which is what makes it promotable
+        # (a lane already bound to a different issue is refused with CAS_OWNER_CONFLICT).
+        out = self.store.declare_active(
+            recovery, decision=_decision(), issue_id="", now=T_DECLARE
+        )
+        self.assertTrue(out.applied, out.reason)
+        out = self.store.transition_disposition(
+            recovery,
+            expected_disposition=DISPOSITION_ACTIVE,
+            expected_revision=self.store.get(recovery).revision,
+            target=DISPOSITION_HIBERNATED,
+            decision=_decision(),
+            now=T_HIBERNATE,
+        )
+        self.assertTrue(out.applied, out.reason)
+        self.assertTrue(
+            self.store.request_release(
+                recovery,
+                expected_revision=self.store.get(recovery).revision,
+                action_id="rel-recovery",
+                observation=build_release_observation([
+                    ReleasePin("gateway", _gw_name(), f"{_WS}:pREC_G"),
+                ]),
+                now=T_RELEASE,
+            ).applied
+        )
+        self.assertTrue(
+            self.store.record_release_outcome(
+                recovery,
+                action_id="rel-recovery",
+                expected_revision=self.store.get(recovery).revision,
+                target=RELEASE_RELEASED,
+                now=T_RELEASE,
+            ).applied
+        )
+        self.assertNotEqual(self.store.get(recovery).release_observation, "")
+
+        # The superseded lane must be ACTIVE to hand ownership over.
+        out = self.store.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_HIBERNATED,
+            expected_revision=self._rec().revision,
+            target=DISPOSITION_ACTIVE,
+            decision=_decision(),
+            now=T_RESUME,
+        )
+        self.assertTrue(out.applied, out.reason)
+        out = self.store.supersede_and_activate(
+            superseded=self.key,
+            expected_revision=self._rec().revision,
+            recovery=recovery,
+            decision=_decision(),
+            recovery_expected_disposition=DISPOSITION_HIBERNATED,
+            recovery_expected_revision=self.store.get(recovery).revision,
+            now=T_LATER,
+        )
+        self.assertTrue(out.applied, out.reason)
+        promoted = self.store.get(recovery)
+        self.assertEqual(promoted.lane_disposition, DISPOSITION_ACTIVE)
+        self._assert_release_set_cleared(promoted, path="supersede promotion")
+
+    def test_open_next_generation_clears_the_release_observation(self) -> None:
+        """``open_next_generation`` — a re-incarnated generation inherits no release evidence."""
+        self._seeded_observation_is_non_empty()
+        out = self.store.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_HIBERNATED,
+            expected_revision=self._rec().revision,
+            target=DISPOSITION_RETIRED,
+            decision=_decision(),
+            now=T_RESUME,
+        )
+        self.assertTrue(out.applied, out.reason)
+        # Retiring does not rewrite the release axis, so the evidence is still there to inherit.
+        self.assertNotEqual(self._rec().release_observation, "")
+        rec = self._rec()
+        out = LaneDeclarationStore(path=self.path).open_next_generation(
+            self.key,
+            expected_revision=rec.revision,
+            expected_generation=rec.lane_generation,
+            decision=_decision(),
+            declared_slots=_live_pins(),
+            now=T_LATER,
+        )
+        self.assertTrue(out.applied, out.reason)
+        self.assertEqual(self._rec().lane_generation, rec.lane_generation + 1)
+        self._assert_release_set_cleared(self._rec(), path="open_next_generation")
+
+    def test_the_read_gate_refuses_an_observation_from_a_non_current_generation(self) -> None:
+        """The component-boundary half of the fix (j#94707 R4-F1, third required item).
+
+        The reset writers above mean a live row never reaches this shape. That is exactly the
+        kind of caller-side reachability argument this issue has had to retract twice, so the
+        read gate refuses a non-``released`` observation itself instead of trusting that every
+        present and future consumer checks ``process_release`` first.
+        """
+        pins = (ReleasePin("gateway", _gw_name(), _GW_LOC),)
+        observation = build_release_observation(pins)
+        for release in (RELEASE_NOT_REQUESTED, "requested", "partial"):
+            with self.subTest(process_release=release):
+                stale = LaneLifecycleRecord(
+                    repo_workspace_id=_WS,
+                    lane_id=_LANE,
+                    issue_id=_ISSUE,
+                    lane_disposition=DISPOSITION_ACTIVE,
+                    process_release=release,
+                    release_pins=encode_release_pins(pins),
+                    release_observation=encode_release_observation(observation),
+                )
+                got, reason = verify_release_observation(stale)
+                self.assertIsNone(got)
+                self.assertEqual(reason, OBSERVATION_NOT_CURRENT_GENERATION)
+        # Control: the same row IS readable once its generation is the completed one, so the
+        # guard discriminates by generation rather than refusing everything.
+        current = LaneLifecycleRecord(
+            repo_workspace_id=_WS,
+            lane_id=_LANE,
+            issue_id=_ISSUE,
+            lane_disposition=DISPOSITION_HIBERNATED,
+            process_release=RELEASE_RELEASED,
+            release_pins=encode_release_pins(pins),
+            release_observation=encode_release_observation(observation),
+        )
+        got, reason = verify_release_observation(current)
+        self.assertIsNotNone(got)
+        self.assertEqual(reason, "release_observation_ok")
 
 
 class ReleasedLocatorVerdictUnitTest(unittest.TestCase):
