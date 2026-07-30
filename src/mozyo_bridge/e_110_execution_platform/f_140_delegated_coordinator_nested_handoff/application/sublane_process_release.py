@@ -49,6 +49,7 @@ from mozyo_bridge.core.state.lane_release_observation import (
     ReleaseObservationError,
     build_release_observation,
 )
+from mozyo_bridge.core.state.lane_lifecycle_model import is_canonical_release_state
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     RELEASE_NOT_REQUESTED,
@@ -88,6 +89,22 @@ _LANE_ROLES = (GATEWAY_ROLE, WORKER_ROLE)
 #: for the identical storage fact (``ATTEMPT_RELEASE_STATE_UNKNOWN``, #14219 j#86776 R5-F5), so one
 #: grep finds every surface that classifies an unknown release state.
 RELEASE_STATE_UNKNOWN = "release_state_unknown"
+
+
+def render_release_state(value: str) -> str:
+    """The stored release state as TEXT output may safely show it (review j#94805 R9-F2).
+
+    A canonical token renders verbatim, so every ordinary line is byte-identical to before. Any
+    other stored value is rendered as a Python literal, which is reversible and escapes control
+    bytes. Measured before the fix: a stored value of ``"weird\n  commit: applied=True\x1b[31m"``
+    reached ``mozyo-bridge sublane hibernate``'s text output with the newline and the ANSI ESC
+    intact, forging a second line that read ``commit: applied=True``.
+
+    This is a PRESENTATION boundary only. The domain keeps the raw value untouched — that is the
+    R8-F1 requirement, and the JSON payload still carries it verbatim (its encoder escapes) so the
+    operator-facing text and the machine-facing payload stay consistent and reversible.
+    """
+    return value if is_canonical_release_state(value) else repr(value)
 
 
 # ---------------------------------------------------------------------------
@@ -732,4 +749,5 @@ __all__ = (
     "release_pins",
     "unit_slots",
     "RELEASE_STATE_UNKNOWN",
+    "render_release_state",
 )

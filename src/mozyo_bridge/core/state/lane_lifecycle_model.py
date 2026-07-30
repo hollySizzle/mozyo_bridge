@@ -242,8 +242,16 @@ OWNER_UNKNOWN = "unknown"
 
 
 def disposition_transition_allowed(current: str, target: str) -> bool:
-    """Is ``current -> target`` a legal disposition edge? (pure)"""
-    return target in _DISPOSITION_EDGES.get(norm(current), frozenset())
+    """Is ``current -> target`` a legal disposition edge? (pure)
+
+    ``current`` is the STORED value, matched byte-exact (Redmine #14477 review j#94805). The real
+    :meth:`...LaneLifecycleStore.transition_disposition` already refuses a padded stored
+    disposition earlier, at its exact expected-state guard (measured: ``unexpected_state``,
+    zero-write), so this is a CONTRACT alignment and a guard against future reuse of the
+    predicate on its own — not a reproduced laundering path. Stated that way deliberately: the
+    strong claim would not be true.
+    """
+    return target in _DISPOSITION_EDGES.get(current, frozenset())
 
 
 def release_transition_allowed(current: str, target: str) -> bool:
@@ -262,18 +270,38 @@ def release_transition_allowed(current: str, target: str) -> bool:
 
 
 def replacement_transition_allowed(current: str, target: str) -> bool:
-    """Is ``current -> target`` a legal receiver-replacement edge? (pure)"""
-    return target in _REPLACEMENT_EDGES.get(norm(current), frozenset())
+    """Is ``current -> target`` a legal receiver-replacement edge? (pure)
+
+    Byte-exact on the STORED value — see :func:`replacement_settled` for what normalising it did.
+    """
+    return target in _REPLACEMENT_EDGES.get(current, frozenset())
 
 
 def replacement_open_allowed(current: str) -> bool:
-    """May a new owner-approved replacement generation be opened? (pure)"""
-    return norm(current) in _OPENABLE_REPLACEMENT_STATES
+    """May a new owner-approved replacement generation be opened? (pure)
+
+    Byte-exact on the STORED value — see :func:`replacement_settled`.
+    """
+    return current in _OPENABLE_REPLACEMENT_STATES
 
 
 def replacement_settled(current: str) -> bool:
-    """Has this lane no receiver replacement actuation in flight? (pure)"""
-    return norm(current) in _SETTLED_REPLACEMENT_STATES
+    """Has this lane no receiver replacement actuation in flight? (pure)
+
+    Byte-exact on the STORED value, never normalised first (Redmine #14477 review j#94805 R9-F3).
+    These three predicates guard REAL writes, and normalising the stored value reproduced the same
+    laundering the release axis had (j#94778 R8-F2) — measured on an isolated store through the
+    public API:
+
+    - stored ``" not_requested"`` -> ``request_replacement`` applied, row rewritten to ``requested``
+    - stored ``"requested "`` -> ``record_replacement_outcome`` applied, row rewritten to ``pending``
+    - stored ``"replaced "`` -> this settled gate passed, so the lane rehydrated to ``active``
+
+    An unclassifiable stored value has no outgoing edge and is not settled, so each is now refused
+    zero-write. The rule is the one :func:`is_canonical_release_state` states: ingress may
+    normalise, stored authority may not.
+    """
+    return current in _SETTLED_REPLACEMENT_STATES
 
 
 def rehydrate_allowed(process_release: str) -> bool:

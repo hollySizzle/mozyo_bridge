@@ -801,6 +801,77 @@ class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
                 rc = cmd_sublane_hibernate(args)
             self.assertEqual(rc, 1)
 
+    def test_cmd_exit_code_follows_is_success_for_an_unknown_release_state(self) -> None:
+        """Redmine #14477 review j#94805 R9-F1, through the PUBLIC command.
+
+        The exit decision used to test the literal ``partial`` token only, so an executed run whose
+        stored release state the driver could not classify — which ``is_success`` correctly rejects
+        — exited 0 and a coordinator or script read an incomplete actuation as done. The three cases
+        below pin the contract at the public boundary: unknown -> 1, canonical success -> 0, and
+        preflight-only -> 0 (unchanged).
+        """
+        import sqlite3
+
+        def _args(**kw):
+            base = dict(
+                repo=None, issue=ISSUE, lane=LANE, journal=JOURNAL,
+                # Exactly the gate set `_all_gates()` treats as a clean lane.
+                explicitly_parked=True, callbacks_drained=True, no_review_pending=True,
+                no_owner_approval_pending=True, no_integration_pending=True,
+                no_pending_prompt=True, not_working=True, worktree_clean=True,
+                boundary_recorded=False,
+                execute=True, json=False,
+            )
+            base.update(kw)
+            return argparse.Namespace(**base)
+
+        def _run(store, args):
+            # Patch the CLI module's namespace: `cmd_sublane_hibernate` resolves
+            # `LaneLifecycleStore` / `LiveSublaneHibernateOps` from `_CLI_MOD`, so patching
+            # `_HIBERNATE_MOD` (the use-case module) leaves the REAL store in place — which
+            # resolves the ambient MOZYO_BRIDGE_HOME. See the note in the review request.
+            with mock.patch(
+                f"{_CLI_MOD}.LiveSublaneHibernateOps",
+                return_value=_FakeOps(
+                    rows=[_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")]
+                ),
+            ), mock.patch(f"{_CLI_MOD}.LaneLifecycleStore", return_value=store):
+                return cmd_sublane_hibernate(args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            store.declare_active(
+                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+            )
+            # A canonical, fully-actuated hibernate exits 0.
+            self.assertEqual(_run(store, _args()), 0)
+
+            # Force the stored release state to a value no rule classifies, then re-run the
+            # already-hibernated path: the domain says non-success, so the CLI must too.
+            conn = sqlite3.connect(str(store.path))
+            try:
+                conn.execute(
+                    "UPDATE lane_lifecycle_records SET process_release = ? WHERE lane_id = ?",
+                    ("weird_unknown_token", LANE),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(_run(store, _args()), 1)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).process_release,
+                "weird_unknown_token",
+                "zero write",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            store.declare_active(
+                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+            )
+            # Preflight-only keeps its exit-0 contract (it never actuated).
+            self.assertEqual(_run(store, _args(execute=False)), 0)
+
     def test_cmd_returns_nonzero_when_success_withheld(self) -> None:
         # Redmine #13843: a released lane whose post-release check finds residue is a WITHHELD
         # success, not a clean one — the CLI must exit non-zero so the coordinator converges to

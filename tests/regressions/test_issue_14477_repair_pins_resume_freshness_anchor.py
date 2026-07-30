@@ -55,6 +55,7 @@ takes the write-MIGRATING gate.
 
 from __future__ import annotations
 
+import ast
 import sqlite3
 import sys
 import tempfile
@@ -84,6 +85,7 @@ from mozyo_bridge.core.state.lane_hibernation_anchor import (  # noqa: E402
 )
 from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     CAS_FORBIDDEN_TRANSITION,
+    CAS_UNEXPECTED_STATE,
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
     DISPOSITION_RETIRED,
@@ -1815,6 +1817,311 @@ class UnclassifiedStoredReleaseStateTest(_Fixture):
         )
         self.assertTrue(out.applied, out.reason)
         self.assertEqual(self._rec().process_release, RELEASE_REQUESTED)
+
+
+class StoredAuthorityIsNeverNormalisedTest(_Fixture):
+    """No policy predicate may normalise a STORED authority value (review j#94805 R9-F3).
+
+    R8-F2 fixed the release axis. The replacement axis had the identical hole, and it was a REAL
+    write path — measured through the public store on an isolated temp DB before the fix:
+
+    - stored ``" not_requested"`` -> ``request_replacement`` applied, row rewritten to ``requested``
+    - stored ``"requested "`` -> ``record_replacement_outcome`` applied, row rewritten to ``pending``
+    - stored ``"replaced "`` -> the settled gate passed, so the lane rehydrated to ``active``
+
+    The disposition axis is included on the reviewer's ruling as a CONTRACT fix: its pure predicate
+    normalised too, but the real ``transition_disposition`` already refuses a padded stored
+    disposition at its exact expected-state guard (``unexpected_state``, zero-write) — pinned below
+    so the two layers of defence are both recorded rather than one being assumed.
+    """
+
+    def _force(self, field: str, value: str) -> None:
+        conn = sqlite3.connect(str(self.path))
+        try:
+            conn.execute(
+                f"UPDATE lane_lifecycle_records SET {field} = ? "
+                "WHERE repo_workspace_id = ? AND lane_id = ?",
+                (value, _WS, _LANE),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _replacement_store(self):
+        from mozyo_bridge.core.state.lane_replacement import LaneReplacementStore
+
+        return LaneReplacementStore(path=self.path)
+
+    def test_the_pure_predicates_reject_every_padded_stored_value(self) -> None:
+        from mozyo_bridge.core.state.lane_lifecycle_model import (
+            disposition_transition_allowed,
+            replacement_open_allowed,
+            replacement_settled,
+            replacement_transition_allowed,
+        )
+
+        self.assertFalse(disposition_transition_allowed("hibernated ", DISPOSITION_ACTIVE))
+        self.assertFalse(replacement_transition_allowed("requested ", "pending"))
+        self.assertFalse(replacement_open_allowed(" not_requested"))
+        self.assertFalse(replacement_settled("replaced "))
+        # Controls: the canonical spellings still pass.
+        self.assertTrue(
+            disposition_transition_allowed(DISPOSITION_HIBERNATED, DISPOSITION_ACTIVE)
+        )
+        self.assertTrue(replacement_transition_allowed("requested", "pending"))
+        self.assertTrue(replacement_open_allowed("not_requested"))
+        self.assertTrue(replacement_settled("replaced"))
+
+    def _activate(self) -> None:
+        """Rehydrate the seeded lane to ACTIVE — a replacement only happens on an active lane.
+
+        Without this the replacement CAS refuses at its earlier disposition guard
+        (``unexpected_state``) and the pin would pass without ever reaching the predicate under
+        test — green for a reason it does not state.
+        """
+        self.assertTrue(
+            self.store.transition_disposition(
+                self.key,
+                expected_disposition=DISPOSITION_HIBERNATED,
+                expected_revision=self._rec().revision,
+                target=DISPOSITION_ACTIVE,
+                decision=_decision(),
+                now=T_RESUME,
+            ).applied
+        )
+        self.assertEqual(self._rec().lane_disposition, DISPOSITION_ACTIVE)
+
+    def test_a_padded_replacement_state_cannot_open_a_generation(self) -> None:
+        self._activate()
+        for token in (" not_requested", "not_requested ", "weird_unknown_token"):
+            with self.subTest(replacement_state=token):
+                self._force("replacement_state", token)
+                out = self._replacement_store().request_replacement(
+                    self.key,
+                    expected_revision=self._rec().revision,
+                    action_id="probe-open",
+                    pins=[ReleasePin("worker", _wk_name(), f"{_WS}:pOLD")],
+                    decision=_decision(),
+                )
+                self.assertFalse(out.applied)
+                self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+                self.assertEqual(
+                    self._rec().replacement_state,
+                    token,
+                    "the refusal must not rewrite the invalid value into a canonical one",
+                )
+
+    def test_a_padded_replacement_state_cannot_advance_to_an_outcome(self) -> None:
+        """Reached through a REAL open generation, then padding the state it left behind."""
+        self._activate()
+        self._force("replacement_state", "not_requested")
+        opened = self._replacement_store().request_replacement(
+            self.key,
+            expected_revision=self._rec().revision,
+            action_id="probe-advance",
+            pins=[ReleasePin("worker", _wk_name(), f"{_WS}:pOLD")],
+            decision=_decision(),
+        )
+        self.assertTrue(opened.applied, opened.reason)
+        self.assertEqual(self._rec().replacement_state, "requested")
+        action = self._rec().replacement_action_id
+        self.assertTrue(action)
+
+        for token in ("requested ", " requested", "weird_unknown_token"):
+            with self.subTest(replacement_state=token):
+                self._force("replacement_state", token)
+                out = self._replacement_store().record_replacement_outcome(
+                    self.key,
+                    action_id=action,
+                    expected_revision=self._rec().revision,
+                    target="pending",
+                )
+                self.assertFalse(out.applied)
+                self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+                self.assertEqual(self._rec().replacement_state, token)
+        # Control: restoring the canonical spelling lets the SAME generation advance.
+        self._force("replacement_state", "requested")
+        out = self._replacement_store().record_replacement_outcome(
+            self.key,
+            action_id=action,
+            expected_revision=self._rec().revision,
+            target="pending",
+        )
+        self.assertTrue(out.applied, out.reason)
+        self.assertEqual(self._rec().replacement_state, "pending")
+
+    def test_a_padded_settled_replacement_cannot_be_consumed_by_a_rehydrate(self) -> None:
+        """The settled gate is a conjunct of BOTH rehydrate paths — pin them both."""
+        self._force("replacement_state", "replaced ")
+        out = self.store.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_HIBERNATED,
+            expected_revision=self._rec().revision,
+            target=DISPOSITION_ACTIVE,
+            decision=_decision(),
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+        rec = self._rec()
+        self.assertEqual(rec.lane_disposition, DISPOSITION_HIBERNATED)
+        self.assertEqual(rec.replacement_state, "replaced ")
+
+        # ...and the supersede promotion of an EXISTING recovery lane applies the same gate.
+        recovery = LaneLifecycleKey(_WS, f"{_LANE}_recovery_r10")
+        self.assertTrue(
+            self.store.declare_active(
+                recovery, decision=_decision(), issue_id="", now=T_DECLARE
+            ).applied
+        )
+        conn = sqlite3.connect(str(self.path))
+        try:
+            conn.execute(
+                "UPDATE lane_lifecycle_records SET lane_disposition = ?, replacement_state = ? "
+                "WHERE lane_id = ?",
+                (DISPOSITION_HIBERNATED, "replaced ", recovery.lane_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        # The superseded lane must be ACTIVE to hand ownership over; rehydrate it first with a
+        # canonical replacement state so the ONLY unsettled input is the recovery lane's.
+        self._force("replacement_state", "replaced")
+        self.assertTrue(
+            self.store.transition_disposition(
+                self.key,
+                expected_disposition=DISPOSITION_HIBERNATED,
+                expected_revision=self._rec().revision,
+                target=DISPOSITION_ACTIVE,
+                decision=_decision(),
+                now=T_RESUME,
+            ).applied
+        )
+        out = self.store.supersede_and_activate(
+            superseded=self.key,
+            expected_revision=self._rec().revision,
+            recovery=recovery,
+            decision=_decision(),
+            recovery_expected_disposition=DISPOSITION_HIBERNATED,
+            recovery_expected_revision=self.store.get(recovery).revision,
+            now=T_LATER,
+        )
+        self.assertFalse(out.applied, "a non-canonical replacement state is never settled")
+        self.assertEqual(out.reason, CAS_FORBIDDEN_TRANSITION)
+        self.assertEqual(self.store.get(recovery).replacement_state, "replaced ")
+
+    def test_a_padded_stored_disposition_is_refused_by_the_expected_state_guard(self) -> None:
+        """The measured second line of defence — recorded, not assumed (j#94805 ruling)."""
+        self._force("lane_disposition", "hibernated ")
+        out = self.store.transition_disposition(
+            self.key,
+            expected_disposition=DISPOSITION_HIBERNATED,
+            expected_revision=self._rec().revision,
+            target=DISPOSITION_ACTIVE,
+            decision=_decision(),
+        )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_UNEXPECTED_STATE)
+        self.assertEqual(self._rec().lane_disposition, "hibernated ")
+
+    def test_the_canonical_replacement_lifecycle_still_works(self) -> None:
+        """Control: the tightening refuses ONLY the unclassifiable values."""
+        self._force("replacement_state", "not_requested")
+        self.assertTrue(
+            self.store.transition_disposition(
+                self.key,
+                expected_disposition=DISPOSITION_HIBERNATED,
+                expected_revision=self._rec().revision,
+                target=DISPOSITION_ACTIVE,
+                decision=_decision(),
+            ).applied,
+            "a canonical settled replacement state rehydrates",
+        )
+        out = self._replacement_store().request_replacement(
+            self.key,
+            expected_revision=self._rec().revision,
+            action_id="probe-canonical",
+            pins=[ReleasePin("worker", _wk_name(), f"{_WS}:pOLD")],
+            decision=_decision(),
+        )
+        self.assertTrue(out.applied, out.reason)
+        self.assertEqual(self._rec().replacement_state, "requested")
+
+
+class RawAuthorityRenderingTest(unittest.TestCase):
+    """A raw stored state may not forge lines or inject terminal control bytes (j#94805 R9-F2).
+
+    The domain deliberately keeps the raw value (R8-F1). The presentation boundary is what has to
+    be safe, and it was not: measured before the fix, a stored value of
+    ``"weird\\n  commit: applied=True\\x1b[31m"`` reached the hibernate text output with the newline
+    and the ANSI ESC intact, forging a line that read ``commit: applied=True``.
+    """
+
+    HOSTILE = "weird\n  commit: applied=True\x1b[31m"
+
+    def _release(self, state: str):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
+            ReleaseOutcome,
+        )
+
+        return ReleaseOutcome(action_id="a", process_release=state, detail="unknown state")
+
+    def test_the_helper_escapes_every_control_byte_and_leaves_canonical_alone(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
+            render_release_state,
+        )
+
+        for token in (RELEASE_RELEASED, RELEASE_NOT_REQUESTED, RELEASE_REQUESTED, RELEASE_PARTIAL):
+            self.assertEqual(render_release_state(token), token, "canonical renders verbatim")
+        for hostile in (self.HOSTILE, "a\rb", "a\tb", "x\x00y", "released ", ""):
+            with self.subTest(value=hostile):
+                out = render_release_state(hostile)
+                self.assertTrue(out.isprintable(), f"control byte survived: {out!r}")
+                self.assertNotIn("\n", out)
+                self.assertNotIn("\x1b", out)
+                # Reversible: the escaped form still names the exact stored bytes.
+                self.assertEqual(ast.literal_eval(out), hostile)
+
+    def test_neither_text_surface_can_be_line_forged(self) -> None:
+        """hibernate and the shared supersede renderer, which had the same line."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_cli import (  # noqa: E501
+            format_hibernate_text,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate import (  # noqa: E501
+            HibernateOutcome,
+            HibernatePreflight,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_assertions import (  # noqa: E501
+            HibernateAssertions,
+        )
+
+        preflight = HibernatePreflight(
+            original_identity_known=True, park_satisfied=True, obligations_satisfied=True,
+            lane_idle=True, boundary_ok=True, inventory_readable=True,
+            project_generation_matched=True, project_attestation_ok=True,
+            action_generation_current=True, action_revision_current=True,
+            action_identity_current=True, assertions=HibernateAssertions(),
+        )
+        for state, expect_lines in ((RELEASE_RELEASED, None), (self.HOSTILE, None)):
+            with self.subTest(process_release=state):
+                text = format_hibernate_text(
+                    HibernateOutcome(
+                        executed=True, preflight=preflight, issue=_ISSUE, lane=_LANE,
+                        release=self._release(state),
+                    )
+                )
+                self.assertNotIn("\x1b", text)
+                release_lines = [ln for ln in text.splitlines() if ln.startswith("  release: ")]
+                self.assertEqual(len(release_lines), 1)
+                # The forged text must not appear as its own line.
+                self.assertNotIn("  commit: applied=True", text.splitlines())
+
+    def test_the_json_payload_keeps_the_raw_value_verbatim(self) -> None:
+        """Escaping is presentation-only: the machine surface stays exact and reversible."""
+        import json as _json
+
+        rel = self._release(self.HOSTILE)
+        payload = _json.loads(_json.dumps({"process_release": rel.process_release}))
+        self.assertEqual(payload["process_release"], self.HOSTILE)
 
 
 class SchemaVersionTest(unittest.TestCase):

@@ -17,13 +17,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from mozyo_bridge.core.state.lane_lifecycle import RELEASE_PARTIAL, LaneLifecycleStore
+from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate import (  # noqa: E501
     HibernateAssertions,
     HibernateOutcome,
     HibernateRequest,
     LiveSublaneHibernateOps,
     SublaneHibernateUseCase,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
+    render_release_state,
 )
 
 
@@ -69,7 +72,9 @@ def format_hibernate_text(outcome: HibernateOutcome) -> str:
         )
     if outcome.release is not None:
         rel = outcome.release
-        lines.append(f"  release: {rel.process_release} ({rel.detail})")
+        lines.append(
+            f"  release: {render_release_state(rel.process_release)} ({rel.detail})"
+        )
         for role, locator in rel.closed:
             lines.append(f"    - closed {role} {locator}")
         for role, locator, detail in rel.failed:
@@ -126,13 +131,17 @@ def cmd_sublane_hibernate(args: argparse.Namespace) -> int:
     # must exit non-zero so the coordinator converges to the recovery / boundary-record path.
     if outcome.is_blocked or outcome.success_withheld:
         return 1
-    # Review F5: a partial (incomplete) release under --execute still needs a re-drive, so it
-    # is not a clean exit — surface it non-zero rather than reporting a fully-actuated success.
-    if (
-        outcome.executed
-        and outcome.release is not None
-        and outcome.release.process_release == RELEASE_PARTIAL
-    ):
+    # Review F5 + Redmine #14477 review j#94805 R9-F1: an EXECUTED run exits non-zero unless the
+    # domain calls it a clean success. This used to test the literal ``partial`` token only, so a
+    # release state the driver could not classify — which `is_success` correctly rejects — exited
+    # 0, and a coordinator or script read an incomplete actuation as done. Deriving the exit code
+    # from the same predicate closes that gap for `partial`, `requested` and any unclassifiable
+    # value at once, instead of enumerating tokens here and drifting from the domain again.
+    #
+    # Bounded to ``executed`` on purpose: a preflight-only run is never ``is_success`` (it did
+    # not actuate), and its exit-0 contract is unchanged. A refused commit already arrives here
+    # as ``is_blocked`` (measured), so it needs no separate clause.
+    if outcome.executed and not outcome.is_success:
         return 1
     return 0
 

@@ -498,6 +498,22 @@ Table naming:
     - **原則: ingress は正規化してよい / 格納 authority の判定は正規化してはならない**
       (j#94778)。caller から受け取る引数は trim してよいが、**row が既に保持している値**の権威判定を
       trim すると、storage が持っていない canonical な事実を捏造することになる。
+      この原則は release 軸に限らない。**`replacement_state` 軸でも同型の実 write laundering を実測**
+      した (j#94805 R9-F3): padded `" not_requested"` から replacement generation が開き、
+      padded `"requested "` が `pending` へ進み、padded `"replaced "` が settled gate を通って
+      lane を `active` へ戻していた。`replacement_transition_allowed` /
+      `replacement_open_allowed` / `replacement_settled` / `disposition_transition_allowed` は
+      いずれも byte-exact。disposition については **実 CAS は先行する exact expected-state guard で
+      既に `unexpected_state` / zero-write 拒否**であり、pure predicate の契約整合と将来 reuse 対策
+      として修正した (実 laundering は再現していない)。
+    - **domain の非成功判定は public 境界の exit code と一致させる** (j#94805 R9-F1)。
+      `HibernateOutcome.is_success` が非成功と判定する executed outcome は、CLI も非 0 で終わる。
+      literal token を CLI 側で列挙すると domain から drift する (unknown / `requested` が exit 0 に
+      なっていた)。preflight-only は `executed=False` なので従来どおり exit 0。
+    - **格納 raw 値の text 表示は escape する / domain は raw を保持する** (j#94805 R9-F2)。
+      未分類 state をそのまま text へ埋めると **改行で偽の行を作れ、ANSI ESC も通る**ことを実測した。
+      canonical token はそのまま表示し、それ以外は可逆な quoted 表現で出す
+      (`render_release_state`)。JSON payload は raw を保持する (encoder が escape するため安全)。
     - 2 つの述語は責務が異なるので混同しない: `is_canonical_release_state()` =
       **vocabulary に属する値か** (fence / hibernate enumeration / driver / CAS policy) /
       `_CLASSIFIED_RELEASE_STATES` = **read gate が規則を持つ値か** (第五 member を proof へ
