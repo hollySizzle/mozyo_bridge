@@ -2184,11 +2184,12 @@ class StoredBindingKindIsNeverNormalisedTest(_Fixture):
     so that CAS now refuses an out-of-vocabulary kind outright — the j#94750 R7-F1 discipline.
     """
 
-    # NOT including "": the row decoder maps an EMPTY stored binding_kind to the canonical
-    # ``issue`` (``lane_lifecycle_rows.py`` ``binding_kind=str(row[17] or BINDING_KIND_ISSUE)``),
-    # which is the declared pre-v5 legacy default — a codec mapping stated in one place, not a
-    # classifier inventing a fact. Pinned below rather than assumed.
-    NON_CANONICAL = ("issue ", " issue", "ISSUE", "weird_kind")
+    # "" IS non-canonical (Redmine #14477 review j#94992 R11-F1). I previously excluded it,
+    # calling the decoder's ``or BINDING_KIND_ISSUE`` a "pre-v5 legacy default"; that was wrong.
+    # A v4 row has no ``binding_kind`` COLUMN and the migration is
+    # ``ADD COLUMN binding_kind TEXT NOT NULL DEFAULT 'issue'``, which backfills the literal
+    # token — so a migrated row reads ``'issue'`` and an empty one is not a legacy artifact.
+    NON_CANONICAL = ("issue ", " issue", "ISSUE", "weird_kind", "")
 
     def _seed(self) -> None:  # noqa: D401 - the fixture's own seed is not needed here
         super()._seed()
@@ -2374,13 +2375,15 @@ class StoredBindingKindIsNeverNormalisedTest(_Fixture):
                     "the preflight signature must not accept a non-issue-kind row",
                 )
 
-    def test_an_empty_stored_kind_is_the_declared_legacy_default_not_a_laundering(self):
-        """`''` decodes to the canonical `issue` — a codec mapping, pinned so it is a decision.
+    def test_the_decoder_does_not_promote_an_empty_stored_kind_to_canonical(self) -> None:
+        """Review j#94992 R11-F1 — the inversion of what this pin used to assert.
 
-        The row decoder maps an empty stored ``binding_kind`` to ``issue`` (the pre-v5 legacy
-        default). That is the one place the mapping is declared, and it is a CODEC, not a
-        classifier normalising an authority value at each read site — the distinction this
-        finding turns on. Recorded here so a later change to the decoder is visible.
+        The decoder read ``str(row[17] or BINDING_KIND_ISSUE)``, so an empty stored value became
+        the canonical ``issue`` BEFORE any classifier saw it: every byte-exact predicate and the
+        vocabulary guard added in R11 were handed an owner authority the storage never carried,
+        and a raw ``''`` row reopened its generation (1 -> 2). I defended that default as a
+        "pre-v5 legacy" mapping and pinned it as a decision; the defence was wrong and is
+        retracted here in the pin itself, not only in the journal.
         """
         conn = sqlite3.connect(str(self.path))
         try:
@@ -2394,11 +2397,94 @@ class StoredBindingKindIsNeverNormalisedTest(_Fixture):
         finally:
             conn.close()
         self.assertEqual(stored, "", "the STORED bytes are empty")
-        self.assertEqual(
-            self._rec().binding_kind,
-            BINDING_KIND_ISSUE,
-            "...and the decoder maps them to the canonical legacy default",
+        self.assertEqual(self._rec().binding_kind, "", "...and the decode keeps them empty")
+        from mozyo_bridge.core.state.lane_lifecycle_model import stored_binding_kind_is
+
+        self.assertFalse(stored_binding_kind_is(self._rec().binding_kind, BINDING_KIND_ISSUE))
+
+    def test_an_empty_stored_kind_cannot_reopen_a_generation(self) -> None:
+        """The exact write the finding measured, now refused zero-write."""
+        store, key, path = self._retired("")
+        rec0 = store.get(key)
+        self.assertEqual(rec0.binding_kind, "")
+        out = LaneDeclarationStore(path=path).open_next_generation(
+            key, expected_revision=rec0.revision,
+            expected_generation=rec0.lane_generation, decision=_decision(),
         )
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_UNEXPECTED_STATE)
+        conn = sqlite3.connect(str(path))
+        try:
+            raw = conn.execute(
+                "SELECT binding_kind, lane_disposition, lane_generation, revision "
+                "FROM lane_lifecycle_records WHERE lane_id = ?",
+                (_LANE,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(
+            raw,
+            ("", DISPOSITION_RETIRED, rec0.lane_generation, rec0.revision),
+            "zero write: the raw bytes, disposition, generation and revision are untouched",
+        )
+
+    def test_a_genuine_v4_migration_yields_the_canonical_token(self) -> None:
+        """The positive compatibility control the finding requires (j#94992 item 4).
+
+        A v4 row has no ``binding_kind`` column at all. Rewinding to that shape and re-opening
+        the store runs the real migration, whose
+        ``ADD COLUMN binding_kind TEXT NOT NULL DEFAULT 'issue'`` backfills the LITERAL token —
+        so a genuinely migrated legacy row is canonical and keeps working. That is what makes the
+        empty value above a corruption rather than a legacy artifact.
+        """
+        conn = sqlite3.connect(str(self.path))
+        try:
+            # The partial owner index references the column, so it goes first.
+            conn.execute("DROP INDEX IF EXISTS idx_lane_lifecycle_active_project_owner")
+            # A genuine v4 shape lacks every column added after it, not only the v5 tranche —
+            # the schema gate matches the FULL signature and refuses a partial rewind.
+            for column in (
+                "release_observation",  # v9
+                "hibernated_at",  # v8
+                "lane_kind",  # v7
+                "reconcile_phase",  # v6
+                "declared_slots", "lane_generation", "project_scope", "binding_kind",  # v5
+            ):
+                conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {column}")
+            conn.execute(
+                "UPDATE state_schema_components SET schema_version = 4 WHERE component = ?",
+                (LANE_LIFECYCLE_COMPONENT,),
+            )
+            conn.commit()
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT 1 FROM pragma_table_info('lane_lifecycle_records') "
+                    "WHERE name = 'binding_kind'"
+                ).fetchone(),
+                "the v4 shape genuinely has no binding_kind column",
+            )
+        finally:
+            conn.close()
+
+        # A WRITE-path open runs the backfilling migration.
+        migrated = LaneDeclarationStore(path=self.path).declare_lane(
+            LaneLifecycleKey(_WS, f"{_LANE}_v4probe"),
+            decision=_decision(), issue_id=_ISSUE,
+            declared_slots=(), worktree_identity=_BOUND_WT,
+        )
+        self.assertTrue(migrated.applied, migrated.reason)
+        conn = sqlite3.connect(str(self.path))
+        try:
+            raw = conn.execute(
+                "SELECT binding_kind FROM lane_lifecycle_records WHERE lane_id = ?", (_LANE,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(raw, BINDING_KIND_ISSUE, "the migration backfills the literal token")
+        self.assertEqual(self._rec().binding_kind, BINDING_KIND_ISSUE)
+        from mozyo_bridge.core.state.lane_binding import record_matches_binding
+
+        self.assertTrue(record_matches_binding(self._rec(), issue_id=_ISSUE))
 
     def test_only_the_declaring_surface_normalises_its_argument(self) -> None:
         """Ingress stays normalised: `declare_lane` still accepts a padded ARGUMENT."""

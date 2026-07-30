@@ -497,6 +497,12 @@ def stored_binding_kind_is(value: object, kind: str) -> bool:
     classifies one asks the same question, so it is answered once here (Redmine #14477 review
     j#94840 R10-F1 found 18 stored-read sites across 14 modules, each spelling it ``norm(...) ==``).
 
+    The pass-through is load-bearing and was NOT always true: until review j#94992 R11-F1 the
+    decoder read ``str(row[17] or BINDING_KIND_ISSUE)``, so an EMPTY stored value arrived here
+    already wearing the canonical token and this predicate could not see it — a raw ``''`` row
+    reopened its generation. The decoder now keeps the raw bytes, which is what makes every
+    classifier below able to refuse them.
+
     **Byte-exact: never trimmed first**, the rule :func:`is_canonical_release_state` states —
     ingress may normalise, stored authority may not. Measured before the fix on an isolated store:
     a row holding ``"issue "`` passed ``backfill_active_binding`` (revision 1->2) and

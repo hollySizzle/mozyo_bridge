@@ -524,8 +524,15 @@ Table naming:
       canonical kind 要求を追加した。**byte-exact だけでは不十分**な site もある:
       `open_next_generation` は分岐がどれも成立せず **fall-through して write に到達**していたので、
       vocabulary 外の kind を **outright 拒否**する guard を足した (j#94750 R7-F1 と同じ形)。
-      空文字の格納値は decoder が canonical `issue` へ写す **宣言済みの pre-v5 legacy default**
-      (`lane_lifecycle_rows.py`) であり、codec であって read 毎の正規化ではない。
+      **空文字も non-canonical** である (j#94992 R11-F1)。R11 では decoder の
+      `str(row[17] or BINDING_KIND_ISSUE)` を「pre-v5 legacy default の codec」と説明したが、
+      **これは実 migration と一致しない誤りだったので撤回する**: v4 row は `binding_kind` 列
+      **自体を持たず**、migration は `ADD COLUMN binding_kind TEXT NOT NULL DEFAULT 'issue'` で
+      **literal token を backfill** する (SQLite の ALTER 挙動を単独で実測済み)。したがって
+      **genuinely migrated row は `'issue'` を持ち、空文字は legacy 産物ではない**。
+      decoder は raw bytes を保持し、空文字は他の non-canonical 値と同じく fail-closed にする
+      (実測: 修正前は raw `''` が canonical へ昇格して `open_next_generation` が
+      **generation 1→2 で applied**、修正後は `unexpected_state` / zero-write)。
     - 2 つの述語は責務が異なるので混同しない: `is_canonical_release_state()` =
       **vocabulary に属する値か** (fence / hibernate enumeration / driver / CAS policy) /
       `_CLASSIFIED_RELEASE_STATES` = **read gate が規則を持つ値か** (第五 member を proof へ
