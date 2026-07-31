@@ -32,6 +32,15 @@ j#94494 F1, verdict j#94497). They now live where the decision tree puts them: t
 in ``tests/unit/core/state/test_coordinator_proxy_fence.py`` (branch 4) and the rail-level one in
 ``tests/integration/.../test_coordinator_proxy_send.py`` (branch 5). The boundary triple's other two
 arms and the exact-repeat duplicate were already covered there and were not duplicated.
+
+R3-b is about each test's CLAIM, not about which methods happen to go red, so joining a
+contract arm to a symptom arm inside one method does not make it a symptom test: a later version
+kept ``prior+1 -> RESERVE_WON`` next to the equal arm, arguing the pair is one statement about
+where the line sits, and that positive arm is still the module's public contract (review j#95727
+F1, verdict j#95746). It is gone from here; the same claim is asserted by
+``test_a_superseding_journal_on_a_different_issue_mints_the_next_generation`` in the fence unit
+file and by ``test_a_superseding_decision_from_another_issue_still_delivers_once`` in the
+integration file, which together satisfy Acceptance 4's positive control.
 """
 
 from __future__ import annotations
@@ -49,7 +58,6 @@ from mozyo_bridge.core.state.coordinator_proxy_fence import (  # noqa: E501
     PROXY_COMPLETED,
     PROXY_DELIVERED,
     RESERVE_STALE,
-    RESERVE_WON,
     CoordinatorProxyFence,
     ProxyRouteKey,
 )
@@ -165,18 +173,6 @@ class EqualOrdinalIsNotStrictlyNewerTest(StrictlyNewerFenceTestBase):
         self.assertFalse(result.won, result)
         self.assertIn(PRIOR_JOURNAL, result.detail)
         self.assertIn("supersede", result.detail)
-
-    def test_the_boundary_admits_only_a_greater_ordinal_on_a_different_issue(self):
-        # The equal arm is the symptom; the +1 arm is here because it is what makes the equal arm a
-        # BOUNDARY claim rather than a blanket refusal — the two are one assertion about where the
-        # line sits, and pre-fix the pair could not both hold.
-        self._terminal()
-        equal = self.fence.reserve(ROUTE, issue=OTHER_ISSUE, journal=PRIOR_JOURNAL)
-        self.assertEqual(equal.verdict, RESERVE_STALE, equal)
-        greater = str(int(PRIOR_JOURNAL) + 1)
-        admitted = self.fence.reserve(ROUTE, issue=OTHER_ISSUE, journal=greater)
-        self.assertEqual(admitted.verdict, RESERVE_WON, admitted)
-        self.assertEqual(self.fence.active(ROUTE).journal, greater)
 
 
 class EqualOrdinalSendsNothingTest(S.ProxySendTestBase):

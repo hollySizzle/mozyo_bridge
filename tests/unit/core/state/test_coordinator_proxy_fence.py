@@ -20,7 +20,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[3]
+# `parents[4]` is the repo root from `tests/unit/core/state/`, matching every sibling in this
+# directory. It read `parents[3]` — i.e. `tests/` — so the self-insert added a `tests/src` that does
+# not exist. A full discovery run hid it: a sibling module imported earlier had already put the real
+# `src` on `sys.path`, so this module free-rode on that side effect and only single-file isolated
+# discovery failed (review j#95727 F2). Each test module must stand on its own.
+ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.coordinator_proxy_fence import (  # noqa: E501
