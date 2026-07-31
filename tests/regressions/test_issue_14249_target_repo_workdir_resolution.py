@@ -668,6 +668,103 @@ class AutoRefusalIsDurableAndTypedTest(unittest.TestCase):
         # And it still carries the repair that belongs to IT.
         self.assertIn("`--workdir` inside the target repo", expected)
 
+    #: Hostile subreason values. R7 added an "unknown token" display and tested exactly one
+    #: safe lower-snake-case example; review j#96042 measured that a newline crossed the
+    #: markdown line boundary, an absolute path survived into the ticket-facing record, and a
+    #: 10,000-char value produced a 10,530-char next_action.
+    HOSTILE_TOKENS = (
+        ("newline", "future\n- Injected: yes"),
+        ("crlf", "future\r\nx"),
+        ("backtick", "future`x`"),
+        ("markdown", "future](http://x)"),
+        ("posix_path", "/Users/example/private/repo"),
+        ("windows_path", "C:\\Users\\example\\repo"),
+        ("home_path", "~/private/repo"),
+        ("overlong", "f" * 10000),
+        ("whitespace", "   "),
+        ("leading_space", " future"),
+        ("uppercase", "FutureRefusal"),
+        ("dash", "future-refusal"),
+        ("empty_after_strip", "\t\n "),
+    )
+
+    def test_no_hostile_subreason_reaches_a_durable_surface(self) -> None:
+        """Review j#96042 F1: the unknown-token path must prove the value, not inherit it.
+
+        The producer emits a closed vocabulary, but this path exists precisely for values the
+        producer did not make. Checked on both durable surfaces: `next_action` (wire + record)
+        and the record's own subreason line.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
+            SUBREASON_TOKEN_MAX_LENGTH,
+            SUBREASON_TOKEN_PLACEHOLDER,
+            auto_target_repo_lines,
+            execution_root_fence_next_action,
+        )
+
+        for label, token in self.HOSTILE_TOKENS:
+            action = execution_root_fence_next_action(
+                "auto_target_repo_unresolved", {"subreason": token}
+            )
+            rendered = " ".join(auto_target_repo_lines({"subreason": token, "basis": token}))
+            for surface, text in (("next_action", action), ("record", rendered)):
+                where = f"{label}/{surface}"
+                # single line — a token cannot break out of its markdown line
+                self.assertNotIn("\n", text, where)
+                self.assertNotIn("\r", text, where)
+                # path-free — the property review j#95911 F2 established, kept on this path
+                self.assertNotIn("/", text, where)
+                self.assertNotIn("\\", text, where)
+                self.assertNotIn("~", text, where)
+                # bounded
+                self.assertLess(len(text), 1000, where)
+                # the raw value never appears; the reader sees it was refused
+                self.assertNotIn(token, text, where)
+                self.assertIn(SUBREASON_TOKEN_PLACEHOLDER, text, where)
+        # the cap is a real number, and a token at the boundary still renders
+        self.assertGreater(SUBREASON_TOKEN_MAX_LENGTH, 0)
+
+    def test_a_wellformed_unknown_token_is_still_shown(self) -> None:
+        """The hardening must not swallow the legitimate case R7 added it for."""
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
+            SUBREASON_TOKEN_MAX_LENGTH,
+            renderable_subreason_token,
+            execution_root_fence_next_action,
+        )
+
+        token = "future_refusal_this_build_never_heard_of"
+        action = execution_root_fence_next_action(
+            "auto_target_repo_unresolved", {"subreason": token}
+        )
+        self.assertIn(token, action)
+        self.assertIn("not one this build knows", action)
+        # exactly at the cap renders; one over does not
+        at_cap = "f" * SUBREASON_TOKEN_MAX_LENGTH
+        self.assertEqual(renderable_subreason_token(at_cap), at_cap)
+        self.assertNotEqual(
+            renderable_subreason_token("f" * (SUBREASON_TOKEN_MAX_LENGTH + 1)), at_cap
+        )
+
+    def test_a_malformed_payload_never_raises(self) -> None:
+        """Review j#96042 F1: a wording helper must not add a failure to the one reported."""
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
+            auto_target_repo_lines,
+            execution_root_fence_next_action,
+        )
+
+        for label, payload in (
+            ("unhashable subreason", {"subreason": ["future"]}),   # raised TypeError
+            ("payload not a mapping", "notadict"),                 # raised AttributeError
+            ("payload is a list", ["subreason"]),
+            ("int subreason", {"subreason": 5}),
+            ("none subreason", {"subreason": None}),
+            ("no payload", None),
+        ):
+            action = execution_root_fence_next_action("auto_target_repo_unresolved", payload)
+            self.assertTrue(action, label)
+            self.assertNotIn("\n", action, label)
+            self.assertIsInstance(auto_target_repo_lines(payload), list, label)
+
     def test_payload_less_outcomes_still_route_to_the_sender(self) -> None:
         """Non-regression: owner and reachability of both fence reasons without a payload."""
         for reason in ("execution_root_outside_target_repo", "auto_target_repo_unresolved"):

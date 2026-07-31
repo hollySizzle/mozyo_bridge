@@ -13,6 +13,9 @@ f_140 module (``render_block_die_message`` / ``render_exception_advisory``).
 
 from __future__ import annotations
 
+import re
+from typing import Mapping
+
 #: ``DeliveryOutcome.next_action`` for a ``gateway_route_blocked`` outcome — the
 #: suggested safe route, carried in the structured command result (#12918
 #: acceptance: "resolved receiver / blocked reason / suggested safe route").
@@ -197,16 +200,65 @@ def auto_target_repo_lines(payload: "dict[str, str] | None") -> "list[str]":
     path the way an interpolated message can (finding 2, same review). Empty list when the
     outcome is not an auto refusal, so every other record is byte-identical.
     """
-    if not payload:
+    if not isinstance(payload, Mapping) or not payload:
         return []
-    subreason = str(payload.get("subreason") or "").strip() or "—"
-    basis = str(payload.get("basis") or "").strip()
+    # Both fields go through the SAME renderability proof as the next_action token
+    # (review j#96042 finding 1). This line lands in a ticket, so an unshowable value
+    # becomes the placeholder rather than carrying a newline / backtick / path into it.
+    raw_sub = payload.get("subreason")
+    subreason = "—" if raw_sub in (None, "") else renderable_subreason_token(raw_sub)
+    raw_basis = payload.get("basis")
+    basis = "" if raw_basis in (None, "") else renderable_subreason_token(raw_basis)
     line = f"- Auto target-repo: subreason `{subreason}`"
     return [f"{line} (basis `{basis}`)" if basis else line]
 
 
+#: The exact shape a subreason token may have to be shown in a durable outcome. Closed to
+#: lower snake_case and bounded (review j#96042 finding 1): the unknown-token path is precisely
+#: the one where the producer's closed-vocabulary guarantee does NOT hold, so the value has to
+#: prove itself here. Anything else — whitespace, a newline, a backtick, a POSIX or Windows
+#: path, an over-long string, a non-string — is never rendered.
+_SUBREASON_TOKEN_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+#: Hard cap on a rendered token. Present so the `next_action` stays bounded no matter what a
+#: future producer emits; R7 turned a 10,000-char value into a 10,530-char next_action.
+SUBREASON_TOKEN_MAX_LENGTH: int = 64
+
+#: Shown INSTEAD of an unshowable token, so the reader learns the value was refused rather
+#: than that there was no value.
+SUBREASON_TOKEN_PLACEHOLDER: str = "<unprintable>"
+
+
+def _payload_subreason(auto_target_repo: object) -> str:
+    """The payload's ``subreason`` as a lookup-safe string, or ``""`` (never raises).
+
+    Review j#96042 finding 1: a non-Mapping payload raised ``AttributeError`` and an
+    unhashable ``subreason`` raised ``TypeError`` from the table lookup. A wording helper on
+    a refusal path must not add a second failure to the one being reported.
+    """
+    if not isinstance(auto_target_repo, Mapping):
+        return ""
+    value = auto_target_repo.get("subreason")
+    return value if isinstance(value, str) else ""
+
+
+def renderable_subreason_token(subreason: object) -> str:
+    """The token if it is safe to show in a durable record, else the placeholder.
+
+    Bounded, single-line, path-free by construction: only ``[a-z][a-z0-9_]*`` up to
+    :data:`SUBREASON_TOKEN_MAX_LENGTH` renders. This is the boundary that PROVES the property
+    the ticket-facing contract requires, rather than inheriting it from a producer that, on
+    this path, is by definition not the one that made the value.
+    """
+    if not isinstance(subreason, str):
+        return SUBREASON_TOKEN_PLACEHOLDER
+    if len(subreason) > SUBREASON_TOKEN_MAX_LENGTH:
+        return SUBREASON_TOKEN_PLACEHOLDER
+    return subreason if _SUBREASON_TOKEN_RE.match(subreason) else SUBREASON_TOKEN_PLACEHOLDER
+
+
 def execution_root_fence_next_action(
-    reason: str, auto_target_repo: "dict[str, str] | None" = None
+    reason: str, auto_target_repo: object = None
 ) -> str:
     """``next_action`` for the #14249 fence pair, specialised by subreason (j#95995 F1).
 
@@ -225,17 +277,19 @@ def execution_root_fence_next_action(
         # threads an auto payload alongside it — otherwise a mismatched pair silently swaps
         # in another reason's advice. Coupling is checked here, not assumed at the call site.
         return EXECUTION_ROOT_FENCE_NEXT_ACTION[reason]
-    subreason = (auto_target_repo or {}).get("subreason") or ""
+    subreason = _payload_subreason(auto_target_repo)
     repair = AUTO_TARGET_REPO_SUBREASON_REPAIR.get(subreason)
     if repair is None:
         # No payload, or a subreason this build does not know. Do NOT guess a cause: return
-        # the safe-generic text, naming the unknown token when there is one so the reader can
-        # see WHY the advice is generic rather than wondering if it was tailored.
-        if not subreason:
+        # the safe-generic text. The token is shown only if it PROVES it is renderable here
+        # (review j#96042 finding 1) — the producer guarantee does not cover this path.
+        raw = auto_target_repo.get("subreason") if isinstance(auto_target_repo, Mapping) else None
+        if raw is None or raw == "":
             return AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION
+        token = renderable_subreason_token(raw)
         return AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION.replace(
             "delivery recorded).",
-            f"delivery recorded). Subreason `{subreason}` is not one this build knows, so "
+            f"delivery recorded). Subreason `{token}` is not one this build knows, so "
             "no cause is inferred.",
             1,
         )
@@ -266,6 +320,9 @@ EXECUTION_ROOT_FENCE_NARRATIVE: dict[str, str] = {
 
 __all__ = (
     "auto_target_repo_lines",
+    "renderable_subreason_token",
+    "SUBREASON_TOKEN_MAX_LENGTH",
+    "SUBREASON_TOKEN_PLACEHOLDER",
     "execution_root_fence_next_action",
     "auto_target_repo_die_message",
     "AUTO_TARGET_REPO_SUBREASON_REPAIR",

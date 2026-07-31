@@ -293,6 +293,15 @@ pane cwd / repo root   != target execution root (nested project)
     (review j#95843 finding 1)。narrative は全 subreason に対して真である表現に
     留め、具体的な段は同 field を読ませる。**受信側が持っていない情報を
     next_action で参照しない** — R3 は存在しない「structured detail」を参照していた。
+  - **未知 token を durable 文面へ出してよい条件** (review j#96042 finding 1)。
+    producer が closed vocabulary を出すことは、**producer 保証が及ばない経路**
+    (未知 token の表示) の安全性を意味しない。表示する側の境界で値自身を検証する:
+    **`str` 型であること / `[a-z][a-z0-9_]*` に一致すること / 明示的最大長以内であること**。
+    いずれかを満たさなければ **raw 値を出さず stable placeholder** にする。
+    payload が Mapping でない・値が unhashable でも**例外を出さず** generic へ閉じる。
+    これにより ticket へ出る token は **single-line・bounded・path-free** であることが
+    構造的に保証される (R7 は raw 補間で newline / backtick / absolute path / 10,000 文字を
+    そのまま durable 文面へ通していた)。
   - **fallback は最も保守的な文面にする**。subreason が欠損 / 未知のときに通る経路は
     「最も情報が無い」経路であり、**原因を推測してはならない**。全 refusal に真な
     generic repair のみを返し、未知 token は「未知である」と提示する
