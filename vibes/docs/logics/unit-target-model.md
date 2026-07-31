@@ -293,6 +293,13 @@ pane cwd / repo root   != target execution root (nested project)
     (review j#95843 finding 1)。narrative は全 subreason に対して真である表現に
     留め、具体的な段は同 field を読ませる。**受信側が持っていない情報を
     next_action で参照しない** — R3 は存在しない「structured detail」を参照していた。
+  - **fallback は最も保守的な文面にする**。subreason が欠損 / 未知のときに通る経路は
+    「最も情報が無い」経路であり、**原因を推測してはならない**。全 refusal に真な
+    generic repair のみを返し、未知 token は「未知である」と提示する
+    (review j#96019 finding 1)。R6 は既知 token 経路だけを直し、fallback を
+    直前に誤りと確定した最も具体的な文面のまま残していた。
+    **reason と payload の coupling も helper 内で検証する** — 別 reason の payload が
+    紛れても、その reason 自身の repair を返す。
   - **surface ごとに検査すべき属性は 2 つある: 可読性 (subreason が読めるか) と
     助言の正しさ (その subreason に対する repair か)**。R5 は前者だけを全 surface で
     測り、後者は stderr でしか確認しなかったため、`next_action` (wire JSON と

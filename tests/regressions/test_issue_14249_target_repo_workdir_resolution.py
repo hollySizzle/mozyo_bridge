@@ -607,16 +607,74 @@ class AutoRefusalIsDurableAndTypedTest(unittest.TestCase):
                     "repair that lane's worktree binding", text, f"{subreason}/{surface}"
                 )
 
-    def test_a_payload_less_fence_outcome_keeps_the_generic_next_action(self) -> None:
-        """Non-regression: the fence's other reason, and any outcome with no payload."""
+    def test_the_fallback_advice_is_safe_not_the_retired_specific_text(self) -> None:
+        """Review j#96019 F1: the least-informed path must give the most conservative advice.
+
+        R6 fixed the known-token path and left missing/unknown falling back to the R5 text
+        that j#95995 had just retired — enumerating causes (without
+        `lifecycle_store_unreadable`), pointing at a payload that by definition is absent,
+        and prescribing a worktree-binding repair. The previous version of THIS test asserted
+        byte-equality with that mapping, so the guard pinned the defect instead of catching
+        it. It now checks what the advice says.
+        """
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
-            EXECUTION_ROOT_FENCE_NEXT_ACTION,
+            AUTO_TARGET_REPO_GENERIC_REPAIR,
+            execution_root_fence_next_action,
         )
 
+        for label, payload in (
+            ("missing", None),
+            ("unknown", {"subreason": "future_refusal_this_build_never_heard_of"}),
+        ):
+            action = execution_root_fence_next_action(
+                "auto_target_repo_unresolved", payload
+            )
+            # no cause is invented…
+            self.assertNotIn("repair that lane's worktree binding", action, label)
+            self.assertNotIn("an unattested sender/target identity", action, label)
+            # …the reader is not sent to a field that is absent or uninformative…
+            self.assertNotIn("auto_target_repo.subreason", action, label)
+            # …the advice is the one true of every refusal, and the invariant is kept.
+            self.assertIn(AUTO_TARGET_REPO_GENERIC_REPAIR, action, label)
+            self.assertIn("Do NOT drop `--target-repo`", action, label)
+        # An unknown token is surfaced as an unknown, not silently dropped.
+        unknown = execution_root_fence_next_action(
+            "auto_target_repo_unresolved",
+            {"subreason": "future_refusal_this_build_never_heard_of"},
+        )
+        self.assertIn("future_refusal_this_build_never_heard_of", unknown)
+        self.assertIn("not one this build knows", unknown)
+
+    def test_the_containment_reason_keeps_its_own_repair_whatever_the_payload(self) -> None:
+        """Review j#96019 F1: a mismatched payload must not swap in another reason's advice."""
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
+            EXECUTION_ROOT_FENCE_NEXT_ACTION,
+            execution_root_fence_next_action,
+        )
+
+        expected = EXECUTION_ROOT_FENCE_NEXT_ACTION["execution_root_outside_target_repo"]
+        for payload in (
+            None,
+            {"subreason": "lane_binding_absent"},          # a REAL auto subreason
+            {"subreason": "future_refusal"},               # an unknown one
+        ):
+            self.assertEqual(
+                execution_root_fence_next_action(
+                    "execution_root_outside_target_repo", payload
+                ),
+                expected,
+                payload,
+            )
+        # And it still carries the repair that belongs to IT.
+        self.assertIn("`--workdir` inside the target repo", expected)
+
+    def test_payload_less_outcomes_still_route_to_the_sender(self) -> None:
+        """Non-regression: owner and reachability of both fence reasons without a payload."""
         for reason in ("execution_root_outside_target_repo", "auto_target_repo_unresolved"):
             owner, action = next_action_for("blocked", reason, "codex")
             self.assertEqual(owner, "sender", reason)
-            self.assertEqual(action, EXECUTION_ROOT_FENCE_NEXT_ACTION[reason], reason)
+            self.assertIn("Do NOT drop", action) if reason.startswith("auto") else None
+            self.assertTrue(action)
 
     def test_post_injection_reasons_still_stay_uncertain(self) -> None:
         """The guard must keep its teeth — widening the set must not swallow these."""

@@ -80,22 +80,28 @@ EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE: str = (
 )
 
 
-#: ``DeliveryOutcome.next_action`` for an ``auto_target_repo_unresolved`` outcome
-#: (Redmine #14249 R2, review j#94499 finding 1). `--target-repo auto` asked which
-#: repo the TARGET runs in and got no answer, so no root can be asserted. The owner
-#: is the SENDER: the repairs (name the root explicitly, or repair the lane's
-#: worktree binding) are both sender / operator side, and neither is "drop the flag"
-#: — dropping `--target-repo` restores the sender-cwd execution root #14249 removed.
+#: True of EVERY refusal — the basis of the safe-generic wording below and the fallback for a
+#: subreason with no entry in the per-subreason table (review j#96019 finding 1). It names no
+#: cause, because the cases that use it are exactly the ones where the cause is unknown.
+AUTO_TARGET_REPO_GENERIC_REPAIR: str = (
+    "auto could not establish the target's frame. Pass an explicit "
+    "`--target-repo <target lane worktree>`."
+)
+
+
+#: This is the SAFE-GENERIC text — the one used when the subreason is missing or unknown, so
+#: it must be true of every refusal, present and future. Review j#96019 finding 1: it used to
+#: be the R5 text that enumerated causes (omitting `lifecycle_store_unreadable`), told the
+#: reader to consult a payload that by definition is not there, and prescribed a worktree-
+#: binding repair for refusals that never reach a binding. A fallback is taken exactly when
+#: the least is known, so it has to be the most conservative wording, not the most specific.
 AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION: str = (
     "`--target-repo auto` could not establish which repo the target runs in, so no "
     "repo root was asserted and nothing was injected (nothing typed, no Enter, no "
-    "delivery recorded). Read `auto_target_repo.subreason` on this outcome for which "
-    "step failed: an unattested sender/target identity, a target in another "
-    "workspace, or a target lane whose worktree binding is absent / unbound / not "
-    "uniquely resolvable. Pass an explicit `--target-repo <target lane worktree>`, or "
-    "repair that lane's worktree binding. Do NOT drop `--target-repo` to get past "
-    "this: without it a relative `--workdir` resolves against the SENDER's cwd, which "
-    "is the lane-external execution root this fence exists to prevent."
+    f"delivery recorded). {AUTO_TARGET_REPO_GENERIC_REPAIR} Do NOT drop "
+    "`--target-repo` to get past this: without it a relative `--workdir` resolves "
+    "against the SENDER's cwd, which is the lane-external execution root this fence "
+    "exists to prevent."
 )
 
 #: ``DeliveryOutcome`` narrative for an ``auto_target_repo_unresolved`` outcome.
@@ -158,12 +164,6 @@ AUTO_TARGET_REPO_SUBREASON_REPAIR: dict[str, str] = {
     ),
 }
 
-#: True of every subreason — used when a new subreason has no entry above yet.
-AUTO_TARGET_REPO_GENERIC_REPAIR: str = (
-    "auto could not establish the target's frame. Pass an explicit "
-    "`--target-repo <target lane worktree>`."
-)
-
 
 def auto_target_repo_die_message(subreason: str, detail: str) -> str:
     """The terminal (stderr) message for an ``--target-repo auto`` refusal.
@@ -219,10 +219,26 @@ def execution_root_fence_next_action(
     per-subreason table drives both; the generic text remains for the fence's other reason
     and for a payload-less outcome.
     """
+    if reason != "auto_target_repo_unresolved":
+        # Review j#96019 finding 1: the payload belongs to the auto refusal ONLY. A
+        # containment-fence outcome must keep its own `--workdir` repair even if a caller
+        # threads an auto payload alongside it — otherwise a mismatched pair silently swaps
+        # in another reason's advice. Coupling is checked here, not assumed at the call site.
+        return EXECUTION_ROOT_FENCE_NEXT_ACTION[reason]
     subreason = (auto_target_repo or {}).get("subreason") or ""
     repair = AUTO_TARGET_REPO_SUBREASON_REPAIR.get(subreason)
     if repair is None:
-        return EXECUTION_ROOT_FENCE_NEXT_ACTION[reason]
+        # No payload, or a subreason this build does not know. Do NOT guess a cause: return
+        # the safe-generic text, naming the unknown token when there is one so the reader can
+        # see WHY the advice is generic rather than wondering if it was tailored.
+        if not subreason:
+            return AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION
+        return AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION.replace(
+            "delivery recorded).",
+            f"delivery recorded). Subreason `{subreason}` is not one this build knows, so "
+            "no cause is inferred.",
+            1,
+        )
     return (
         "`--target-repo auto` could not establish which repo the target runs in, so no repo "
         "root was asserted and nothing was injected (nothing typed, no Enter, no delivery "
