@@ -217,6 +217,68 @@ _TURN_START_OUTCOME_STARTED = "started"
 _WAIT_KIND_CHANGED = "changed"
 
 
+#: The queue-enter observation schema version the rail stamps when — and only when — it
+#: publishes the generation-coherent causal fields (``handoff_tmux_transport_rail``).
+_OBSERVATION_VERSION_V2 = 2
+
+#: Every field the canonical gateway-binding producer emits
+#: (``observe_queue_enter_gateway_binding``). All must be present and ``str``.
+_BINDING_FIELDS: tuple[str, ...] = (
+    "provider",
+    "assigned_name",
+    "locator",
+    "row_revision",
+    "attestation_observed_at",
+    "startup_action_id",
+)
+
+#: The producer's ONE optional-empty field: ``row_revision`` is ``_norm(str(revision))`` and
+#: collapses to ``""`` for a bool row value, so an empty string is a legitimate canonical
+#: binding. Every other field is guaranteed non-empty at the producer — it returns ``None``
+#: outright when the attestation timestamp or the launch-generation token is missing, and the
+#: remaining three are built from an identity that already decoded and matched the target.
+_BINDING_OPTIONAL_EMPTY: frozenset[str] = frozenset({"row_revision"})
+
+
+def canonical_v2_generation_binding(observation: object) -> bool:
+    """True iff ``observation`` carries a canonical v2 generation binding (pure, fail-closed).
+
+    Redmine #14232 review j#95827. The previous check read only the *truthiness* of
+    ``gateway_binding``, so a string, a list, an int, a partial dict, a dict with an empty
+    required field, and a full dict on a legacy/absent ``observation_version`` all passed —
+    every one of them promoted to a confirmed delivery, and from there into the front door's
+    ``dispatched``, ``delivery_was_positive``, and the callback completion. #14203 j#87418 had
+    already ruled that the mere non-emptiness of a binding field is **not** a generation
+    authority; this restores that ruling on the reading side.
+
+    The check is a *shape* gate, deliberately not an identity re-verification: the producer
+    already builds the binding from a ``verdict=present`` attestation whose workspace / lane /
+    role / assigned-name / locator all match the live inventory row and this target, so
+    re-resolving the live target here would duplicate that work in every consumer (which the
+    review explicitly does not ask for). What this adds is the guarantee that the record in
+    hand actually came from that producer.
+
+    Unknown extra keys are **allowed**. Rejecting them would mean an additive field in a future
+    #14203 observation silently demoted every delivery to unconfirmed — a fail-closed rule that
+    fails in the more damaging direction, since it would look like a transport regression
+    rather than a schema change.
+    """
+    if not isinstance(observation, dict):
+        return False
+    if observation.get("observation_version") != _OBSERVATION_VERSION_V2:
+        return False
+    binding = observation.get("gateway_binding")
+    if not isinstance(binding, dict):
+        return False
+    for field in _BINDING_FIELDS:
+        value = binding.get(field)
+        if not isinstance(value, str):
+            return False
+        if not value and field not in _BINDING_OPTIONAL_EMPTY:
+            return False
+    return True
+
+
 def turn_start_positively_observed(
     queue_enter_turn_start_observation: object = None,
     turn_start_outcome: object = None,
@@ -270,8 +332,9 @@ def turn_start_positively_observed(
         )
         # Required alongside it, not implied: the rail writes the two together only under a
         # coherent generation, so a record carrying one without the other did not come from
-        # that gate and must not be trusted as if it had.
-        if armed_wait_fired and observation.get("gateway_binding"):
+        # that gate and must not be trusted as if it had. And the binding must be the
+        # canonical v2 shape — its mere presence is NOT a generation authority (#14203 j#87418).
+        if armed_wait_fired and canonical_v2_generation_binding(observation):
             return True
     return False
 
@@ -473,6 +536,7 @@ def injection_stage_record_lines(telemetry: object) -> list[str]:
 
 
 __all__: Iterable[str] = (
+    "canonical_v2_generation_binding",
     "INJECT_FAILED_NARRATIVE",
     "INJECT_FAILED_NEXT_ACTION",
     "INJECTION_STAGES",

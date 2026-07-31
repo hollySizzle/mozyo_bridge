@@ -2,9 +2,9 @@
 
 Every test here detects the return of one of the **five** defects this issue fixed: the three
 residual defects #14232 j#84877 recorded against the daily-default handoff rails (1-3, each
-reproduced non-passing on the lane base ``a83587a3``), plus the two the same-lane review
-j#95333 found in the first fix (4-5, each reproduced non-passing on the reviewed head
-``0426e915``).
+reproduced non-passing on the lane base ``a83587a3``), plus the ones each same-lane review
+found in the preceding fix: j#95333 -> 4-5 (non-passing on ``0426e915``), j#95601 -> 6
+(non-passing on ``3c1f724d``), j#95827 -> 7 (non-passing on ``3322a343``).
 
 None of them asserts a general module contract. The injection-stage vocabulary's own contract
 — including the guards that the 4-5 fixes are not *over*-corrections, which are green on both
@@ -12,7 +12,7 @@ heads — lives in
 ``tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_injection_stage.py``,
 because the tests-placement policy's R3-b is a file-unit rule.
 
-The five symptoms, and why each is a #14232 defect rather than a design preference:
+The seven symptoms, and why each is a #14232 defect rather than a design preference:
 
 1. **A transport exception escaped the high-level handoff boundary.** Under
    ``terminal_transport.backend: herdr`` the shim
@@ -57,6 +57,19 @@ The five symptoms, and why each is a #14232 defect rather than a design preferen
    automated caller. (The same fix narrowed a defect the first fix introduced: it derived
    ``blocked`` from ``not delivered``, which swept an explicitly requested ``--mode pending``
    park in with the failures.)
+
+6. **The confirmation rested on a non-causal signal.** The fix for 4 required "positive
+   turn-start evidence" and read the post-choreography ``runtime_state`` poll — which that
+   field's own source contract forbids being read as an event-observed turn start. The
+   queue-enter rail runs no idle precondition gate, so an already-busy receiver reads ``busy``
+   identically, reintroducing the false confirmation in a new cell; symmetrically it dropped
+   the rail's real causal signal, so a fast turn read as unconfirmed.
+
+7. **The generation binding was accepted on truthiness alone.** The fix for 6 required a
+   ``gateway_binding`` alongside the fired wait but never checked its shape, so a string, a
+   list, an int, a partial dict, an empty required field, or a legacy/versionless record all
+   promoted to confirmed — the inference "these fields are present, therefore the record came
+   from the coherence gate" assumed what it needed to establish.
 """
 from __future__ import annotations
 
@@ -707,6 +720,92 @@ class NonCausalSnapshotIsNotAConfirmationTest(unittest.TestCase):
         )
         self.assertTrue(front.dispatched)
         self.assertFalse(front.blocked)
+
+
+class MalformedGenerationBindingIsNotCausalEvidenceTest(unittest.TestCase):
+    """Defect 7 (review j#95827): the binding was accepted on truthiness alone.
+
+    R3 required a ``gateway_binding`` alongside the fired wait, reasoning that the rail writes
+    the two together only under a coherent generation — so their presence *is* the coherence
+    guarantee. But it checked only that the value was truthy, which makes the inference circular:
+    it assumes the record came from that producer instead of establishing it. #14203 j#87418 had
+    already ruled that the mere non-emptiness of a binding field is not a generation authority,
+    and R3's own docstring promised an "unrecognised shape" would fail closed.
+
+    Measured on ``3322a343``: a string, a list, an int, a partial dict, a dict with an empty
+    required field, a non-``str`` field, and a full dict on a legacy or absent
+    ``observation_version`` ALL returned ``submitted_confirmed``. R3's regression covered only
+    ``_MISSING`` / ``None`` / ``{}`` — the three falsy shapes — so every truthy malformation
+    walked straight through into ``dispatched``, ``delivery_was_positive`` and callback
+    completion at once.
+    """
+
+    def _observation(self, binding, *, version=2):
+        observation = {
+            "observation_kind": "post_choreography_snapshot",
+            "source": "herdr_agent_get", "runtime_state": "busy", "read_ok": True,
+            "read_reason": None, "poll_attempts": 3, "event_wait_kind": "changed",
+        }
+        if binding is not _MISSING:
+            observation["gateway_binding"] = binding
+        if version is not None:
+            observation["observation_version"] = version
+        return observation
+
+    def _stage(self, binding, *, version=2):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            make_outcome,
+        )
+
+        outcome = make_outcome(
+            status="sent", reason="ok", receiver="codex", target="w4B:p4T",
+            anchor=RedmineAnchor(issue="14232", journal="95816"), mode=_MODE_QUEUE_ENTER,
+            kind="review_request", notification_marker="[m]", source="redmine",
+            queue_enter_turn_start_observation=self._observation(binding, version=version),
+        )
+        return outcome.injection_stage["stage"]
+
+    def test_a_non_mapping_binding_is_not_evidence(self):
+        for binding in ("not-a-binding", ["not-a-binding"], 1, 3.5, True):
+            with self.subTest(binding=binding):
+                self.assertEqual(self._stage(binding), STAGE_UNCERTAIN_PARTIAL)
+
+    def test_a_partial_binding_is_not_evidence(self):
+        """Every canonical generation field must be present — a subset proves nothing."""
+        for drop in (
+            "provider", "assigned_name", "locator", "row_revision",
+            "attestation_observed_at", "startup_action_id",
+        ):
+            with self.subTest(missing=drop):
+                partial = {k: v for k, v in _GATEWAY_BINDING.items() if k != drop}
+                self.assertEqual(self._stage(partial), STAGE_UNCERTAIN_PARTIAL)
+
+    def test_an_empty_required_field_is_not_evidence(self):
+        """The producer guarantees these non-empty; an empty one did not come from it."""
+        for field in (
+            "provider", "assigned_name", "locator",
+            "attestation_observed_at", "startup_action_id",
+        ):
+            with self.subTest(empty=field):
+                self.assertEqual(
+                    self._stage({**_GATEWAY_BINDING, field: ""}), STAGE_UNCERTAIN_PARTIAL
+                )
+
+    def test_a_non_string_field_is_not_evidence(self):
+        for value in (1, None, [], {}):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self._stage({**_GATEWAY_BINDING, "row_revision": value}),
+                    STAGE_UNCERTAIN_PARTIAL,
+                )
+
+    def test_a_legacy_or_versionless_observation_is_not_evidence(self):
+        """The rail stamps ``observation_version=2`` exactly when it publishes these fields."""
+        for version in (None, 1, "2", 3):
+            with self.subTest(observation_version=version):
+                self.assertEqual(
+                    self._stage(_GATEWAY_BINDING, version=version), STAGE_UNCERTAIN_PARTIAL
+                )
 
 
 class FrontDoorBlockedTerminalDoesNotExitZeroTest(unittest.TestCase):

@@ -38,6 +38,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injectio
     injection_stage_for,
     injection_stage_record_lines,
     injection_stage_telemetry,
+    canonical_v2_generation_binding,
     injection_stage_for_outcome,
     stage_from_telemetry,
     stage_guidance,
@@ -354,6 +355,46 @@ class QueueEnterConfirmationCarveOutTest(unittest.TestCase):
         self.assertEqual(
             injection_stage_for("sent", "ok"), STAGE_SUBMITTED_CONFIRMED
         )
+
+
+class CanonicalV2BindingShapeTest(unittest.TestCase):
+    """What the shape gate ACCEPTS (review j#95827). Green on both heads -> contract, not pin.
+
+    The rejections it must make are recurrence pins and live in the #14232 regressions file;
+    these are the cells that keep the gate from becoming a blanket refusal.
+    """
+
+    def test_a_canonical_v2_binding_is_accepted(self):
+        self.assertTrue(canonical_v2_generation_binding(_causal()))
+
+    def test_an_empty_row_revision_is_accepted(self):
+        """The producer's ONE optional-empty field.
+
+        ``row_revision`` is ``_norm(str(revision))`` and collapses to ``""`` for a bool row
+        value, so rejecting an empty one would refuse a genuinely canonical binding.
+        """
+        observation = _snapshot(
+            "busy", event_wait_kind="changed",
+            binding={**_BINDING, "row_revision": ""},
+        )
+        self.assertTrue(canonical_v2_generation_binding(observation))
+
+    def test_unknown_extra_keys_are_accepted(self):
+        """Additive schema growth must not silently demote every delivery.
+
+        Rejecting unknown keys would fail closed in the more damaging direction: a future
+        #14203 field would look like a transport regression rather than a schema change.
+        """
+        observation = _snapshot(
+            "busy", event_wait_kind="changed",
+            binding={**_BINDING, "future_field": "x"},
+        )
+        self.assertTrue(canonical_v2_generation_binding(observation))
+
+    def test_a_non_mapping_observation_is_rejected(self):
+        for value in (None, "obs", ["obs"], 1):
+            with self.subTest(value=value):
+                self.assertFalse(canonical_v2_generation_binding(value))
 
 
 class CarveOutIsNotAnOverCorrectionTest(unittest.TestCase):
