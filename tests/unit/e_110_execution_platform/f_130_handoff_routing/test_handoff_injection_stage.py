@@ -161,9 +161,26 @@ class InjectionStageTruthTableTest(unittest.TestCase):
         self.assertEqual(injection_stage_for(" sent ", " ok "), STAGE_SUBMITTED_CONFIRMED)
 
 
-def _snapshot(runtime_state: str, *, read_ok: bool = True) -> dict:
-    """A queue-enter post-choreography snapshot in the shape the rail persists."""
-    return {
+#: A generation-coherent gateway binding, in the shape `observe_queue_enter_gateway_binding`
+#: returns. The rail writes it together with `event_wait_kind` ONLY when the pre-arm and
+#: post-collect generations match, so its presence is what makes the wait attributable.
+_BINDING = {
+    "provider": "codex", "assigned_name": "mzb1_ws_codex_lane", "locator": "w4B:p4T",
+    "row_revision": "1", "attestation_observed_at": "2026-07-29T20:10:01+00:00",
+    "startup_action_id": "startup-abc",
+}
+
+
+def _snapshot(
+    runtime_state: str, *, read_ok: bool = True, event_wait_kind=None, binding=None
+) -> dict:
+    """A queue-enter observation in the shape the rail persists.
+
+    Without ``event_wait_kind`` / ``binding`` this is the v1 post-choreography snapshot (a
+    non-causal poll). With both it is the v2 record the rail emits under a coherent
+    generation — the only queue-enter shape that carries a causally attributable start.
+    """
+    observation = {
         "observation_kind": "post_choreography_snapshot",
         "source": "herdr_agent_get",
         "runtime_state": runtime_state,
@@ -171,6 +188,20 @@ def _snapshot(runtime_state: str, *, read_ok: bool = True) -> dict:
         "read_reason": None if read_ok else "transport_error",
         "poll_attempts": 3,
     }
+    extra = {}
+    if event_wait_kind is not None:
+        extra["event_wait_kind"] = event_wait_kind
+    if binding is not None:
+        extra["gateway_binding"] = binding
+    if extra:
+        extra["observation_version"] = 2
+        observation.update(extra)
+    return observation
+
+
+def _causal(runtime_state: str = "busy") -> dict:
+    """The v2 observation whose armed wait fired under a coherent generation."""
+    return _snapshot(runtime_state, event_wait_kind="changed", binding=_BINDING)
 
 
 def _run_front_door(status, reason, *, mode="queue-enter", rail_rc=0):
@@ -210,26 +241,64 @@ def _run_front_door(status, reason, *, mode="queue-enter", rail_rc=0):
 class TurnStartEvidenceTest(unittest.TestCase):
     """What counts as POSITIVE evidence that the receiver began a turn (j#95333 F1)."""
 
-    def test_only_a_busy_snapshot_or_a_started_event_wait_counts(self):
-        self.assertTrue(turn_start_positively_observed(_snapshot("busy")))
+    def test_only_an_armed_wait_counts(self):
+        # The queue-enter rail's own armed working-transition wait, under a coherent
+        # generation ...
+        self.assertTrue(turn_start_positively_observed(_causal()))
+        # ... and the herdr event rail's armed wait (used by `--mode standard`).
         self.assertTrue(
             turn_start_positively_observed(None, {"outcome": "started"})
         )
 
-    def test_awaiting_input_is_evidence_AGAINST_a_start(self):
+    def test_a_post_hoc_busy_snapshot_is_not_evidence(self):
+        """Review j#95601: the field's own source contract forbids reading it as a start.
+
+        `DeliveryOutcome.queue_enter_turn_start_observation` says a post-hoc snapshot "does
+        not prove causality the way an armed `wait agent-status` transition does, so it must
+        not be read as an event-observed turn start". The queue-enter rail runs no idle
+        precondition gate, so a receiver that was ALREADY busy before the send — or a recycled
+        process running someone else's turn — reads `busy` just the same.
+        """
+        self.assertFalse(turn_start_positively_observed(_snapshot("busy")))
+        self.assertFalse(
+            turn_start_positively_observed(_snapshot("busy", event_wait_kind="timeout"))
+        )
+
+    def test_a_causal_start_is_not_retracted_by_the_later_snapshot_state(self):
+        """A fast turn reads `turn_ended`; an idle-again receiver reads `awaiting_input`.
+
+        Neither retracts an armed wait that already fired — the wait was set up BEFORE this
+        send's Enter, so what it saw belongs to this send.
+        """
+        for runtime_state in ("turn_ended", "awaiting_input", "blocked", "unknown"):
+            with self.subTest(runtime_state=runtime_state):
+                self.assertTrue(turn_start_positively_observed(_causal(runtime_state)))
+
+    def test_awaiting_input_is_evidence_AGAINST_a_start_absent_a_causal_signal(self):
         # The observation module documents it as "delivered, but a turn start was not
         # observed" — so it is not merely an absent signal.
         self.assertFalse(turn_start_positively_observed(_snapshot("awaiting_input")))
 
-    def test_turn_ended_is_not_evidence_of_this_send_starting_a_turn(self):
-        # Ambiguous, and the exact post snapshot #14232 j#84870 recorded as the defect.
-        self.assertFalse(turn_start_positively_observed(_snapshot("turn_ended")))
+    def test_an_incoherent_generation_is_not_evidence(self):
+        """The rail drops BOTH fields when the generation is incoherent.
+
+        A record carrying one without the other therefore did not come from that gate, and
+        must not be trusted as if it had.
+        """
+        self.assertFalse(
+            turn_start_positively_observed(_snapshot("busy", event_wait_kind="changed"))
+        )
+        self.assertFalse(
+            turn_start_positively_observed(_snapshot("busy", binding=_BINDING))
+        )
 
     def test_every_other_signal_fails_closed(self):
         for observation, event in (
             (_snapshot("blocked"), None),
             (_snapshot("unknown"), None),
             (_snapshot("busy", read_ok=False), None),   # a failed read observed nothing
+            (_snapshot("busy", event_wait_kind="absent", binding=_BINDING), None),
+            (_snapshot("busy", event_wait_kind="timeout", binding=_BINDING), None),
             (None, None),                                # no observation at all
             (None, {"outcome": "delivered_not_started"}),
             (None, {"outcome": "inject_failed"}),
@@ -242,13 +311,14 @@ class TurnStartEvidenceTest(unittest.TestCase):
 class QueueEnterConfirmationCarveOutTest(unittest.TestCase):
     """`sent`/`ok` means different things per rail, so the mode is part of the input."""
 
-    def test_queue_enter_ok_needs_positive_turn_start_evidence(self):
+    def test_queue_enter_ok_needs_a_causally_attributable_start(self):
         self.assertEqual(
             injection_stage_for("sent", "ok", mode="queue-enter",
-                                queue_enter_turn_start_observation=_snapshot("busy")),
+                                queue_enter_turn_start_observation=_causal()),
             STAGE_SUBMITTED_CONFIRMED,
         )
-        for state in ("awaiting_input", "turn_ended", "blocked", "unknown"):
+        # No post-hoc snapshot state confirms on its own — including `busy`.
+        for state in ("busy", "awaiting_input", "turn_ended", "blocked", "unknown"):
             with self.subTest(runtime_state=state):
                 self.assertEqual(
                     injection_stage_for("sent", "ok", mode="queue-enter",
@@ -300,7 +370,7 @@ class CarveOutIsNotAnOverCorrectionTest(unittest.TestCase):
         self.assertEqual(
             injection_stage_for(
                 "sent", "ok", mode="queue-enter",
-                queue_enter_turn_start_observation=_snapshot("busy"),
+                queue_enter_turn_start_observation=_causal(),
             ),
             STAGE_SUBMITTED_CONFIRMED,
         )
@@ -447,21 +517,14 @@ class MakeOutcomeCarriesTheStageTest(unittest.TestCase):
         receiver never started a turn would be recorded as a confirmed submission — the exact
         j#95333 F1 defect.
         """
+        # Same terminal `(status, reason)`, same rail — only the causal telemetry differs.
         confirmed = self._built(
             "sent", "ok", mode="queue-enter",
-            queue_enter_turn_start_observation={
-                "runtime_state": "busy", "read_ok": True, "read_reason": None,
-                "poll_attempts": 1, "observation_kind": "post_choreography_snapshot",
-                "source": "herdr_agent_get",
-            },
+            queue_enter_turn_start_observation=_causal(),
         )
         unconfirmed = self._built(
             "sent", "ok", mode="queue-enter",
-            queue_enter_turn_start_observation={
-                "runtime_state": "awaiting_input", "read_ok": True, "read_reason": None,
-                "poll_attempts": 4, "observation_kind": "post_choreography_snapshot",
-                "source": "herdr_agent_get",
-            },
+            queue_enter_turn_start_observation=_snapshot("awaiting_input"),
         )
         self.assertEqual(
             confirmed.injection_stage["stage"], STAGE_SUBMITTED_CONFIRMED

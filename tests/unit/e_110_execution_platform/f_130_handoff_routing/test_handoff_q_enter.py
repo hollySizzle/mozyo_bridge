@@ -320,24 +320,35 @@ class SubmitOutcomeTest(unittest.TestCase):
         self.assertEqual("uncertain_partial", outcome.injection_stage)
         self.assertTrue(outcome.blind_retry_prohibited)
 
-    def test_marker_observed_queue_enter_is_confirmed_only_with_a_started_turn(self) -> None:
-        """Review j#95333 F1 at the front door: `queue-enter` + `ok` is not proof of submit."""
-        for runtime_state, expect_dispatched in (
-            ("busy", True),
-            ("awaiting_input", False),
-            ("turn_ended", False),
+    def test_marker_observed_queue_enter_is_confirmed_only_by_a_causal_start(self) -> None:
+        """Review j#95333 F1 / j#95601: `queue-enter` + `ok` is not proof of submit.
+
+        j#95601 corrected which signal proves it: the armed working-transition wait that fired
+        under a coherent generation, NOT the post-hoc `runtime_state` poll. So `busy` alone no
+        longer confirms, and a causal start confirms whatever the later poll happens to read.
+        """
+        binding = {"provider": "codex", "assigned_name": "mzb1_ws_codex_lane", "locator": "%2", "row_revision": "1", "attestation_observed_at": "2026-07-29T20:10:01+00:00", "startup_action_id": "startup-abc"}
+        for runtime_state, causal, expect_dispatched in (
+            ("busy", False, False),            # non-causal poll: not a confirmation
+            ("awaiting_input", False, False),
+            ("turn_ended", False, False),
+            ("busy", True, True),              # armed wait fired, coherent generation
+            ("turn_ended", True, True),        # a fast turn that already finished
         ):
-            with self.subTest(runtime_state=runtime_state):
+            with self.subTest(runtime_state=runtime_state, causal=causal):
+                observation = {
+                    "runtime_state": runtime_state, "read_ok": True,
+                    "read_reason": None, "poll_attempts": 2,
+                    "observation_kind": "post_choreography_snapshot",
+                    "source": "herdr_agent_get",
+                }
+                if causal:
+                    observation.update(
+                        event_wait_kind="changed", gateway_binding=binding,
+                        observation_version=2,
+                    )
                 outcome = SubmitOutcome.from_transport(
-                    _outcome(
-                        "sent", "ok",
-                        queue_enter_turn_start_observation={
-                            "runtime_state": runtime_state, "read_ok": True,
-                            "read_reason": None, "poll_attempts": 2,
-                            "observation_kind": "post_choreography_snapshot",
-                            "source": "herdr_agent_get",
-                        },
-                    ),
+                    _outcome("sent", "ok", queue_enter_turn_start_observation=observation),
                     plan_intent="worker_dispatch",
                     rail=RAIL_ANCHORED_SEND,
                     anchor_required=True,

@@ -95,6 +95,19 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 _MODE_QUEUE_ENTER = "queue-enter"
 _MODE_STANDARD = "standard"
 
+#: Sentinel: "do not put a `gateway_binding` key on the observation at all", distinct from
+#: putting one whose value is `None` / empty (the rail can do neither, but a reader must fail
+#: closed on both).
+_MISSING = object()
+
+#: A generation-coherent gateway binding, in the shape the rail persists when the pre-arm and
+#: post-collect generations match.
+_GATEWAY_BINDING = {
+    "provider": "codex", "assigned_name": "mzb1_ws_codex_lane", "locator": "w4B:p4T",
+    "row_revision": "1", "attestation_observed_at": "2026-07-29T20:10:01+00:00",
+    "startup_action_id": "startup-abc",
+}
+
 
 class _FakeDie(Exception):
     """Stand-in for ``commands.die``: raises so the rail's control flow terminates."""
@@ -538,7 +551,10 @@ class MarkerObservedQueueEnterIsNotAConfirmedSubmissionTest(unittest.TestCase):
     defect) produced ``stage=submitted_confirmed dispatched=True delivery_was_positive=True``.
     """
 
-    def _built(self, runtime_state=None, *, mode=_MODE_QUEUE_ENTER):
+    def _built(
+        self, runtime_state=None, *, mode=_MODE_QUEUE_ENTER,
+        event_wait_kind=None, binding=_MISSING,
+    ):
         observation = None
         if runtime_state is not None:
             observation = {
@@ -549,6 +565,14 @@ class MarkerObservedQueueEnterIsNotAConfirmedSubmissionTest(unittest.TestCase):
                 "read_reason": None,
                 "poll_attempts": 3,
             }
+            extra = {}
+            if event_wait_kind is not None:
+                extra["event_wait_kind"] = event_wait_kind
+            if binding is not _MISSING:
+                extra["gateway_binding"] = binding
+            if extra:
+                extra["observation_version"] = 2
+                observation.update(extra)
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             make_outcome,
         )
@@ -560,10 +584,15 @@ class MarkerObservedQueueEnterIsNotAConfirmedSubmissionTest(unittest.TestCase):
             queue_enter_turn_start_observation=observation,
         )
 
+    def _causal(self, runtime_state="busy"):
+        return self._built(
+            runtime_state, event_wait_kind="changed", binding=_GATEWAY_BINDING
+        )
+
     def test_a_receiver_that_never_started_a_turn_is_not_confirmed(self):
         for runtime_state in ("awaiting_input", "turn_ended"):
             with self.subTest(runtime_state=runtime_state):
-                outcome = self._built(runtime_state)
+                outcome = self._built(runtime_state)  # no causal signal at all
                 self.assertEqual(
                     outcome.injection_stage["stage"], STAGE_UNCERTAIN_PARTIAL
                 )
@@ -601,6 +630,83 @@ class MarkerObservedQueueEnterIsNotAConfirmedSubmissionTest(unittest.TestCase):
             ),
             RESIDUE_CLEARED,
         )
+
+
+class NonCausalSnapshotIsNotAConfirmationTest(unittest.TestCase):
+    """Defect 6 (review j#95601): the confirmation rested on a non-causal signal.
+
+    R2 fixed defect 4 by requiring "positive turn-start evidence" for a marker-observed
+    ``queue-enter`` send — but chose the wrong signal. It read the post-choreography
+    ``runtime_state`` poll, whose own source contract
+    (``DeliveryOutcome.queue_enter_turn_start_observation``) says a post-hoc snapshot *"does
+    not prove causality the way an armed ``wait agent-status`` transition does, so it must not
+    be read as an event-observed turn start"*. The queue-enter rail runs no idle precondition
+    gate, so a receiver that was already busy before the send — or a recycled process running
+    someone else's turn — reads ``busy`` identically, which reintroduced the very false
+    confirmation defect 4 had just removed. Symmetrically it dropped the rail's *real* causal
+    signal, so a fast turn that had already finished by snapshot time read as unconfirmed.
+
+    Measured on ``3c1f724d``: ``busy`` + ``event_wait_kind=timeout`` and ``busy`` with no event
+    at all both returned ``submitted_confirmed``; ``turn_ended``/``awaiting_input`` WITH a
+    coherent ``changed`` wait both returned ``uncertain_partial``.
+    """
+
+    _built = MarkerObservedQueueEnterIsNotAConfirmedSubmissionTest._built
+    _causal = MarkerObservedQueueEnterIsNotAConfirmedSubmissionTest._causal
+
+    def test_a_busy_snapshot_without_a_fired_wait_is_not_confirmed(self):
+        """(a) busy + timeout / absent event -> uncertain."""
+        for event_wait_kind in (None, "timeout", "absent"):
+            with self.subTest(event_wait_kind=event_wait_kind):
+                outcome = self._built(
+                    "busy", event_wait_kind=event_wait_kind,
+                    binding=_GATEWAY_BINDING if event_wait_kind else _MISSING,
+                )
+                self.assertEqual(
+                    outcome.injection_stage["stage"], STAGE_UNCERTAIN_PARTIAL
+                )
+
+    def test_a_fired_wait_without_a_coherent_binding_is_not_confirmed(self):
+        """(b) busy + missing / incoherent binding -> uncertain.
+
+        The rail writes ``event_wait_kind`` and ``gateway_binding`` together, and drops BOTH
+        when the pre-arm and post-collect generations disagree. A record carrying one without
+        the other did not come from that gate.
+        """
+        for binding in (_MISSING, None, {}):
+            with self.subTest(binding=binding):
+                outcome = self._built("busy", event_wait_kind="changed", binding=binding)
+                self.assertEqual(
+                    outcome.injection_stage["stage"], STAGE_UNCERTAIN_PARTIAL
+                )
+
+    def test_a_fast_turn_that_already_finished_is_still_confirmed(self):
+        """(c) changed + coherent binding + final `turn_ended` -> confirmed.
+
+        The armed wait was set up BEFORE this send's Enter, so the transition it observed
+        belongs to this send; the later poll finding the turn already over does not retract it.
+        """
+        outcome = self._causal("turn_ended")
+        self.assertEqual(
+            outcome.injection_stage["stage"], STAGE_SUBMITTED_CONFIRMED
+        )
+        args = argparse.Namespace()
+        args.delivery_outcome = outcome
+        self.assertTrue(delivery_was_positive(args))
+
+    def test_the_front_door_reports_the_causal_confirmation(self):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter import (
+            RAIL_ANCHORED_SEND,
+            SubmitOutcome,
+        )
+
+        front = SubmitOutcome.from_transport(
+            self._causal("turn_ended"),
+            plan_intent="worker_dispatch", rail=RAIL_ANCHORED_SEND,
+            anchor_required=True, ticketless=False, delivery_id="qe-x",
+        )
+        self.assertTrue(front.dispatched)
+        self.assertFalse(front.blocked)
 
 
 class FrontDoorBlockedTerminalDoesNotExitZeroTest(unittest.TestCase):

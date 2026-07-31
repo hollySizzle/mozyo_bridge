@@ -605,22 +605,34 @@ class CallbackTransportOutcomeBoundaryTest(unittest.TestCase):
         import argparse as _ap
         from mozyo_bridge.application.commands import delivery_was_positive
 
-        def _positive_with(runtime_state):
+        def _positive_with(runtime_state, *, causal=False):
+            observation = {
+                "observation_kind": "post_choreography_snapshot",
+                "source": "herdr_agent_get", "runtime_state": runtime_state,
+                "read_ok": True, "read_reason": None, "poll_attempts": 2,
+            }
+            if causal:
+                # Review j#95601: the armed working-transition wait, published by the rail
+                # only under a coherent generation — the one causally attributable signal.
+                observation.update(
+                    event_wait_kind="changed", observation_version=2,
+                    gateway_binding={"provider": "codex", "assigned_name": "mzb1_ws_codex_lane", "locator": "%2", "row_revision": "1", "attestation_observed_at": "2026-07-29T20:10:01+00:00", "startup_action_id": "startup-abc"},
+                )
             args = _ap.Namespace()
             args.delivery_outcome = self._mk_outcome(
                 "sent", "ok", mode="queue-enter",
-                queue_enter_turn_start_observation={
-                    "observation_kind": "post_choreography_snapshot",
-                    "source": "herdr_agent_get", "runtime_state": runtime_state,
-                    "read_ok": True, "read_reason": None, "poll_attempts": 2,
-                },
+                queue_enter_turn_start_observation=observation,
             )
             return delivery_was_positive(args)
 
+        # A post-hoc poll never confirms, whatever it reads — including `busy`, which the
+        # queue-enter rail can also read from a receiver that was already busy before the send.
         self.assertFalse(_positive_with("awaiting_input"))
         self.assertFalse(_positive_with("turn_ended"))
-        # Not vacuous: an observed working receiver still completes.
-        self.assertTrue(_positive_with("busy"))
+        self.assertFalse(_positive_with("busy"))
+        # Not vacuous: a causally observed start completes, even if the turn already finished.
+        self.assertTrue(_positive_with("busy", causal=True))
+        self.assertTrue(_positive_with("turn_ended", causal=True))
 
     def test_pending_input_is_not_positive(self):
         # pending_input carries reason="ok" -> the status MUST be checked too.

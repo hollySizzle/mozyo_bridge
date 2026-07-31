@@ -54,9 +54,6 @@ from typing import Any, Iterable, Optional
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (
     MODE_QUEUE_ENTER,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (
-    RUNTIME_BUSY,
-)
 
 # --- The closed injection-stage vocabulary (j#84877 required correction 2). ---------
 STAGE_NOT_SENT = "not_sent"
@@ -211,46 +208,70 @@ _STATUS_PENDING_INPUT = "pending_input"
 _STATUS_BLOCKED = "blocked"
 
 #: The herdr event rail's confirmed-start outcome token (``...turn_start_rail.OUTCOME_STARTED``).
-#: Kept as a literal so this module stays a leaf over the adapter package; the sibling
-#: ``RUNTIME_BUSY`` is imported because ``agent_state`` is already a leaf-safe constants module.
+#: Kept as a literal so this module stays a leaf over the adapter package.
 _TURN_START_OUTCOME_STARTED = "started"
+
+#: The armed working-transition wait result meaning the transition was actually observed
+#: (``...turn_start_rail.WAIT_CHANGED``). On the queue-enter rail this is the ONLY causally
+#: attributable start signal, and the rail publishes it only under a coherent generation.
+_WAIT_KIND_CHANGED = "changed"
 
 
 def turn_start_positively_observed(
     queue_enter_turn_start_observation: object = None,
     turn_start_outcome: object = None,
 ) -> bool:
-    """True only on **positive** evidence that the receiver began a turn (pure).
+    """True only on **causally attributable** evidence that the receiver began a turn (pure).
 
-    Redmine #14232 review j#95333 finding 1. Two independent signals count, and nothing else:
+    Redmine #14232 review j#95601 finding 1. Only an *armed wait* counts — an observation that
+    was set up **before** this send's Enter and then fired, so the start it saw belongs to
+    THIS send. Exactly two such signals exist:
 
     - the herdr **event** rail's armed ``wait agent-status --status working`` transition
-      (``turn_start_outcome.outcome == "started"``) — a causally-attributable observation;
-    - the queue-enter **post-choreography snapshot** reporting a receiver that is actually
-      producing a turn (``read_ok`` and ``runtime_state == "busy"``).
+      (``turn_start_outcome.outcome == "started"``), used by ``--mode standard``;
+    - the queue-enter rail's own armed working-transition wait (Redmine #14203), surfaced on
+      the v2 observation as ``event_wait_kind == "changed"`` **together with** a
+      ``gateway_binding``. The rail writes those two fields only when the pre-arm and
+      post-collect gateway generations are present and exactly equal
+      (``handoff_tmux_transport_rail`` — "a None / mismatched pair drops BOTH"), so their
+      presence *is* the generation-coherence guarantee: the receiver process did not change
+      across the observation window, and an old process's start can never pair with a new
+      process's binding.
 
-    Every other snapshot state is explicitly NOT evidence of a start, and the reason each is
-    excluded matters:
+    **The post-choreography ``runtime_state`` snapshot is NOT evidence of a start**, in either
+    direction of this predicate. Review j#95601 established that reading ``busy`` as a
+    confirmation violates the source contract of the field itself
+    (``DeliveryOutcome.queue_enter_turn_start_observation``: *"a post-hoc snapshot does not
+    prove causality the way an armed ``wait agent-status`` transition does, so it must not be
+    read as an event-observed turn start"*). A post-hoc poll cannot attribute what it sees to
+    this send: the queue-enter rail runs no idle precondition gate, so a receiver that was
+    already busy before the send — or a recycled process running someone else's turn — reads
+    ``busy`` just the same. Redmine #14232 R2 made exactly that mistake and thereby
+    reintroduced, in the ``busy`` cell, the false confirmation j#95333 had just removed.
 
-    - ``awaiting_input`` — the observation module documents it as *"receiver is idle — no turn
-      was observed starting within the window (delivered, but a turn start was not observed)"*.
-      That is positive evidence AGAINST a start, not an absence of evidence.
-    - ``turn_ended`` — ambiguous between "a fast turn ran and finished" and "the previous turn's
-      end state never changed". It is also the exact post snapshot #14232 j#84870 recorded as the
-      residual defect (``dispatched=true`` alongside a receiver that never started), so it fails
-      closed.
-    - ``blocked`` / ``unknown`` / a failed read / no observation at all — nothing was observed.
+    Conversely, when a causal signal IS present the snapshot state does not override it. A fast
+    turn that has already finished reads ``turn_ended``, and an idle-again receiver reads
+    ``awaiting_input``; neither retracts an armed wait that fired. The snapshot's
+    ``awaiting_input`` remains meaningful only in the ABSENCE of a causal signal, where the
+    observation module documents it as *"delivered, but a turn start was not observed"* — that
+    is evidence against a start, which is why nothing here promotes it.
 
-    Fail-closed by construction: the default answer is ``False``.
+    Fail-closed by construction: the default answer is ``False`` — no observation at all (the
+    tmux backend runs none), an incoherent generation (the rail dropped both fields), a
+    ``timeout`` / ``absent`` wait, or an unrecognised shape all return ``False``.
     """
     if isinstance(turn_start_outcome, dict):
         if str(turn_start_outcome.get("outcome") or "") == _TURN_START_OUTCOME_STARTED:
             return True
     if isinstance(queue_enter_turn_start_observation, dict):
         observation = queue_enter_turn_start_observation
-        if bool(observation.get("read_ok")) and (
-            str(observation.get("runtime_state") or "") == RUNTIME_BUSY
-        ):
+        armed_wait_fired = (
+            str(observation.get("event_wait_kind") or "") == _WAIT_KIND_CHANGED
+        )
+        # Required alongside it, not implied: the rail writes the two together only under a
+        # coherent generation, so a record carrying one without the other did not come from
+        # that gate and must not be trusted as if it had.
+        if armed_wait_fired and observation.get("gateway_binding"):
             return True
     return False
 
