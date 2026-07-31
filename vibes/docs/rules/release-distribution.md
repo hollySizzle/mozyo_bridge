@@ -47,11 +47,16 @@ completion criteria for beta and production distribution live here.
   completed.
 - Internal beta publication must not require promoting public history first.
   The manual TestPyPI dispatch builds an exact reviewed candidate `source_sha`
-  from a `main`-fixed workflow and does NOT require an `origin/main` push or a
-  Redmine Version close as a precondition (Redmine #13601). This breaks the
+  from a `main`-fixed workflow and does NOT require a Redmine Version close as a
+  precondition (Redmine #13601). This broke the
   `Version close -> origin/main -> TestPyPI -> #13528/#13527 -> Version close`
-  cycle: the `main`-only publication checkpoint still gates public-history
-  promotion, but internal beta distribution is decoupled from it.
+  cycle that the staged branch topology of the time created.
+- Since Redmine #14761 this repo runs a single-canonical-branch topology:
+  `origin/main` is the integration target for ordinary development, so a
+  Redmine Version close no longer gates public-history promotion at all. That
+  does NOT relax this section. Internal beta distribution stays gated on the
+  exact candidate below, independently of branch topology: reaching
+  `origin/main` is an integration outcome, never an authorization to publish.
 - The manual dispatch is gated fail-closed on the exact candidate: the 40-hex
   `source_sha`, its `expected_version` mirror match, a candidate
   `.github/workflows/test.yml` byte-identical to trusted `origin/main` (so a
