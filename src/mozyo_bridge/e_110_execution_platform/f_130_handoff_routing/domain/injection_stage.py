@@ -237,6 +237,10 @@ _BINDING_FIELDS: tuple[str, ...] = (
 #: binding. Every other field is guaranteed non-empty at the producer — it returns ``None``
 #: outright when the attestation timestamp or the launch-generation token is missing, and the
 #: remaining three are built from an identity that already decoded and matched the target.
+#:
+#: Only the *literal* empty string qualifies: ``" "`` is not a canonical value at all, because
+#: ``_norm`` would have stripped it to ``""`` (review j#95881). The normalized-form check above
+#: rejects it before this exemption is ever consulted.
 _BINDING_OPTIONAL_EMPTY: frozenset[str] = frozenset({"row_revision"})
 
 
@@ -250,6 +254,12 @@ def canonical_v2_generation_binding(observation: object) -> bool:
     ``dispatched``, ``delivery_was_positive``, and the callback completion. #14203 j#87418 had
     already ruled that the mere non-emptiness of a binding field is **not** a generation
     authority; this restores that ruling on the reading side.
+
+    Review j#95881 closed two further ways the same inference leaked. Both came from checking a
+    weaker property than the producer actually guarantees: numeric equality where the rail
+    stamps an ``int`` literal, and non-emptiness where the producer emits ``_norm``-stripped
+    tokens. A shape gate that establishes provenance has to use the producer's *own* boundaries,
+    not merely compatible ones.
 
     The check is a *shape* gate, deliberately not an identity re-verification: the producer
     already builds the binding from a ``verdict=present`` attestation whose workspace / lane /
@@ -265,7 +275,12 @@ def canonical_v2_generation_binding(observation: object) -> bool:
     """
     if not isinstance(observation, dict):
         return False
-    if observation.get("observation_version") != _OBSERVATION_VERSION_V2:
+    version = observation.get("observation_version")
+    # Exact int, not numeric equality (review j#95881): `2.0 == 2` and `complex(2, 0) == 2` are
+    # both true in Python, so `!= 2` admitted schema versions the rail cannot stamp — it writes
+    # the integer literal `2`. `type(...) is int` also excludes `bool` structurally rather than
+    # by coincidence (`True == 2` merely happens to be false).
+    if type(version) is not int or version != _OBSERVATION_VERSION_V2:
         return False
     binding = observation.get("gateway_binding")
     if not isinstance(binding, dict):
@@ -273,6 +288,13 @@ def canonical_v2_generation_binding(observation: object) -> bool:
     for field in _BINDING_FIELDS:
         value = binding.get(field)
         if not isinstance(value, str):
+            return False
+        # The producer routes every field through `herdr_identity._norm`, which is
+        # `str(value).strip()` — so a canonical value is ALWAYS already stripped. Requiring the
+        # normalized form (rather than merely a non-empty one) is what rejects the tokens the
+        # producer cannot emit: whitespace-only values such as `" "` / `"\t"` / `"\n"` (which a
+        # bare non-empty check accepts), and unnormalized values such as `" w4B:p4T "`.
+        if value != value.strip():
             return False
         if not value and field not in _BINDING_OPTIONAL_EMPTY:
             return False

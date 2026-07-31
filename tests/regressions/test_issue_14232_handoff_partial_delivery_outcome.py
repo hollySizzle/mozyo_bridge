@@ -4,7 +4,8 @@ Every test here detects the return of one of the **five** defects this issue fix
 residual defects #14232 j#84877 recorded against the daily-default handoff rails (1-3, each
 reproduced non-passing on the lane base ``a83587a3``), plus the ones each same-lane review
 found in the preceding fix: j#95333 -> 4-5 (non-passing on ``0426e915``), j#95601 -> 6
-(non-passing on ``3c1f724d``), j#95827 -> 7 (non-passing on ``3322a343``).
+(non-passing on ``3c1f724d``), j#95827 -> 7 (non-passing on ``3322a343``), j#95881 -> 8
+(non-passing on ``703109b4``).
 
 None of them asserts a general module contract. The injection-stage vocabulary's own contract
 — including the guards that the 4-5 fixes are not *over*-corrections, which are green on both
@@ -12,7 +13,7 @@ heads — lives in
 ``tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_injection_stage.py``,
 because the tests-placement policy's R3-b is a file-unit rule.
 
-The seven symptoms, and why each is a #14232 defect rather than a design preference:
+The eight symptoms, and why each is a #14232 defect rather than a design preference:
 
 1. **A transport exception escaped the high-level handoff boundary.** Under
    ``terminal_transport.backend: herdr`` the shim
@@ -70,6 +71,13 @@ The seven symptoms, and why each is a #14232 defect rather than a design prefere
    list, an int, a partial dict, an empty required field, or a legacy/versionless record all
    promoted to confirmed — the inference "these fields are present, therefore the record came
    from the coherence gate" assumed what it needed to establish.
+
+8. **The shape gate checked weaker properties than the producer guarantees.** The fix for 7
+   verified key presence and type, but the rail stamps an **integer literal** version (so
+   ``2.0`` and ``complex(2, 0)`` slipped through numeric equality) and every binding field is
+   ``_norm``-stripped (so whitespace-only and unnormalized tokens slipped through a bare
+   non-empty check). Establishing provenance means using the producer's own boundaries, not
+   merely compatible ones.
 """
 from __future__ import annotations
 
@@ -805,6 +813,70 @@ class MalformedGenerationBindingIsNotCausalEvidenceTest(unittest.TestCase):
             with self.subTest(observation_version=version):
                 self.assertEqual(
                     self._stage(_GATEWAY_BINDING, version=version), STAGE_UNCERTAIN_PARTIAL
+                )
+
+
+class NonCanonicalTypeOrTokenIsNotEvidenceTest(unittest.TestCase):
+    """Defect 8 (review j#95881): the shape gate checked weaker properties than the producer holds.
+
+    R4's gate promised to establish that a record "actually came from that producer", but it
+    verified only key presence and type. Two producer guarantees were left unchecked, and each
+    admitted records the rail cannot emit:
+
+    - the rail stamps the **integer literal** ``2``, yet the gate compared with ``!= 2``. Python's
+      numeric equality makes ``2.0 == 2`` and ``complex(2, 0) == 2`` true, so both passed.
+    - every binding field goes through ``herdr_identity._norm`` (``str(value).strip()``), so a
+      canonical value is always already stripped. The gate asked only for non-emptiness, so
+      whitespace-only tokens (``" "`` / ``"\t"`` / ``"\n"``) and unnormalized values
+      (``" w4B:p4T "``) passed on all six fields.
+
+    Measured on ``703109b4``: float and complex versions, all 18 whitespace-only field cells, and
+    unnormalized non-empty values every one returned ``submitted_confirmed``.
+    """
+
+    _build = MalformedGenerationBindingIsNotCausalEvidenceTest._observation
+
+    def _stage(self, binding, *, version=2):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            make_outcome,
+        )
+
+        return make_outcome(
+            status="sent", reason="ok", receiver="codex", target="w4B:p4T",
+            anchor=RedmineAnchor(issue="14232", journal="95862"), mode=_MODE_QUEUE_ENTER,
+            kind="review_request", notification_marker="[m]", source="redmine",
+            queue_enter_turn_start_observation=self._build(binding, version=version),
+        ).injection_stage["stage"]
+
+    def test_a_numerically_equal_but_non_int_version_is_not_evidence(self):
+        """`2.0 == 2` is true in Python; the rail stamps an int literal."""
+        for version in (2.0, complex(2, 0)):
+            with self.subTest(version=version):
+                self.assertEqual(
+                    self._stage(_GATEWAY_BINDING, version=version), STAGE_UNCERTAIN_PARTIAL
+                )
+
+    def test_a_whitespace_only_field_is_not_evidence(self):
+        """`_norm` strips, so the producer can never emit one — on ANY of the six fields."""
+        for field in _GATEWAY_BINDING:
+            for blank in (" ", "\t", "\n", "  \t "):
+                with self.subTest(field=field, blank=repr(blank)):
+                    self.assertEqual(
+                        self._stage({**_GATEWAY_BINDING, field: blank}),
+                        STAGE_UNCERTAIN_PARTIAL,
+                    )
+
+    def test_an_unnormalized_field_is_not_evidence(self):
+        """Non-empty but un-stripped: also outside what `_norm` can produce."""
+        for field, value in (
+            ("locator", " w4B:p4T "),
+            ("provider", "codex\n"),
+            ("assigned_name", "\tmzb1_ws_codex_lane"),
+            ("row_revision", "1 "),
+        ):
+            with self.subTest(field=field, value=repr(value)):
+                self.assertEqual(
+                    self._stage({**_GATEWAY_BINDING, field: value}), STAGE_UNCERTAIN_PARTIAL
                 )
 
 

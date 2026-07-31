@@ -391,6 +391,26 @@ class CanonicalV2BindingShapeTest(unittest.TestCase):
         )
         self.assertTrue(canonical_v2_generation_binding(observation))
 
+    def test_the_canonical_int_version_is_the_only_accepted_version(self):
+        """Review j#95881: exact type, so numeric equality cannot widen the schema gate."""
+        self.assertTrue(canonical_v2_generation_binding(_causal()))
+
+    def test_a_literal_empty_row_revision_survives_the_normalization_check(self):
+        """The optional-empty exemption must not be swallowed by the stripped-form rule.
+
+        `""` is already its own stripped form, so it passes the normalization check and is then
+        exempted from non-emptiness — while `" "` is rejected by the normalization check before
+        the exemption is ever consulted.
+        """
+        observation = _snapshot(
+            "busy", event_wait_kind="changed", binding={**_BINDING, "row_revision": ""},
+        )
+        self.assertTrue(canonical_v2_generation_binding(observation))
+        blank = _snapshot(
+            "busy", event_wait_kind="changed", binding={**_BINDING, "row_revision": " "},
+        )
+        self.assertFalse(canonical_v2_generation_binding(blank))
+
     def test_a_non_mapping_observation_is_rejected(self):
         for value in (None, "obs", ["obs"], 1):
             with self.subTest(value=value):
