@@ -200,15 +200,15 @@ def auto_target_repo_lines(payload: "dict[str, str] | None") -> "list[str]":
     path the way an interpolated message can (finding 2, same review). Empty list when the
     outcome is not an auto refusal, so every other record is byte-identical.
     """
-    if not isinstance(payload, Mapping) or not payload:
+    if type(payload) is not dict or not payload:
         return []
     # Both fields go through the SAME renderability proof as the next_action token
     # (review j#96042 finding 1). This line lands in a ticket, so an unshowable value
     # becomes the placeholder rather than carrying a newline / backtick / path into it.
-    raw_sub = payload.get("subreason")
-    subreason = "—" if raw_sub in (None, "") else renderable_subreason_token(raw_sub)
-    raw_basis = payload.get("basis")
-    basis = "" if raw_basis in (None, "") else renderable_subreason_token(raw_basis)
+    raw_sub = _payload_field(payload, "subreason")
+    subreason = "—" if _is_absent(raw_sub) else renderable_subreason_token(raw_sub)
+    raw_basis = _payload_field(payload, "basis")
+    basis = "" if _is_absent(raw_basis) else renderable_subreason_token(raw_basis)
     line = f"- Auto target-repo: subreason `{subreason}`"
     return [f"{line} (basis `{basis}`)" if basis else line]
 
@@ -229,17 +229,58 @@ SUBREASON_TOKEN_MAX_LENGTH: int = 64
 SUBREASON_TOKEN_PLACEHOLDER: str = "<unprintable>"
 
 
-def _payload_subreason(auto_target_repo: object) -> str:
-    """The payload's ``subreason`` as a lookup-safe string, or ``""`` (never raises).
+def _is_absent(value: object) -> bool:
+    """Absent = ``None`` or an empty string, decided without running the value's own methods.
 
-    Review j#96042 finding 1: a non-Mapping payload raised ``AttributeError`` and an
-    unhashable ``subreason`` raised ``TypeError`` from the table lookup. A wording helper on
-    a refusal path must not add a second failure to the one being reported.
+    ``value == ""`` would hand control to an adversarial ``__eq__`` (review j#96049 finding
+    1). ``len(value)`` is no better: it reaches ``__len__``, which a subclass can also make
+    raise — found by probing one adversary beyond the review's list. So the characters are
+    OWNED first, and only the owned copy is measured.
     """
-    if not isinstance(auto_target_repo, Mapping):
-        return ""
-    value = auto_target_repo.get("subreason")
-    return value if isinstance(value, str) else ""
+    if value is None:
+        return True
+    return isinstance(value, str) and len(_owned_str(value)) == 0
+
+
+def _owned_str(value: str) -> str:
+    """An exact, inert ``str`` with the same characters — no subclass hook runs.
+
+    Re-stated from the launch-plan / launch-context carriers (reviews j#86068 / j#86081),
+    deliberately rather than imported: that docstring records that one module's ownership
+    must not be what makes another module's cases pass. The reason the obvious alternatives
+    are wrong is recorded there too — ``"" + value`` reaches ``__radd__`` (a subclass right
+    operand takes priority), ``str(value)`` reaches ``__str__``, ``value[:]`` reaches
+    ``__getitem__``. Only the base method invoked explicitly declines to dispatch on the
+    caller's type.
+    """
+    return str.__str__(value)
+
+
+def _payload_field(auto_target_repo: object, field: str) -> object:
+    """One raw payload field, or ``None``. Total — never raises (review j#96049 finding 1).
+
+    The payload contract is an EXACT ``dict``. R8 accepted any ``Mapping`` and paid for it: an
+    adversarial ``.get`` raised straight out of a wording helper that had just declared
+    itself total, on the one code path whose job is to report a failure. Narrowing the
+    accepted type is what makes "never raises" provable rather than asserted.
+    """
+    if type(auto_target_repo) is not dict:
+        return None
+    try:
+        return auto_target_repo.get(field)
+    except Exception:  # noqa: BLE001 - totality is the contract; a payload cannot break it
+        return None
+
+
+def _payload_subreason(auto_target_repo: object) -> str:
+    """The payload's ``subreason`` as a lookup-safe exact ``str``, or ``""`` (never raises).
+
+    Returns an OWNED string: the table lookup below hashes it, and R8 returned the caller's
+    object, so an unhashable subclass raised ``TypeError`` and a raising ``__hash__``
+    propagated (review j#96049 finding 1).
+    """
+    value = _payload_field(auto_target_repo, "subreason")
+    return _owned_str(value) if isinstance(value, str) else ""
 
 
 def renderable_subreason_token(subreason: object) -> str:
@@ -252,9 +293,14 @@ def renderable_subreason_token(subreason: object) -> str:
     """
     if not isinstance(subreason, str):
         return SUBREASON_TOKEN_PLACEHOLDER
-    if len(subreason) > SUBREASON_TOKEN_MAX_LENGTH:
+    # Own the characters BEFORE measuring or matching them, and return the owned copy — never
+    # the caller's object (review j#96049 finding 1). R8 validated the characters and handed
+    # back the original, whose `__format__` then re-ran at interpolation time and put a
+    # newline and an absolute path back into text that had just been proven free of both.
+    owned = _owned_str(subreason)
+    if len(owned) > SUBREASON_TOKEN_MAX_LENGTH:
         return SUBREASON_TOKEN_PLACEHOLDER
-    return subreason if _SUBREASON_TOKEN_RE.match(subreason) else SUBREASON_TOKEN_PLACEHOLDER
+    return owned if _SUBREASON_TOKEN_RE.match(owned) else SUBREASON_TOKEN_PLACEHOLDER
 
 
 def execution_root_fence_next_action(
@@ -283,8 +329,8 @@ def execution_root_fence_next_action(
         # No payload, or a subreason this build does not know. Do NOT guess a cause: return
         # the safe-generic text. The token is shown only if it PROVES it is renderable here
         # (review j#96042 finding 1) — the producer guarantee does not cover this path.
-        raw = auto_target_repo.get("subreason") if isinstance(auto_target_repo, Mapping) else None
-        if raw is None or raw == "":
+        raw = _payload_field(auto_target_repo, "subreason")
+        if _is_absent(raw):
             return AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION
         token = renderable_subreason_token(raw)
         return AUTO_TARGET_REPO_UNRESOLVED_NEXT_ACTION.replace(

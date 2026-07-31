@@ -765,6 +765,106 @@ class AutoRefusalIsDurableAndTypedTest(unittest.TestCase):
             self.assertNotIn("\n", action, label)
             self.assertIsInstance(auto_target_repo_lines(payload), list, label)
 
+    def test_no_adversarial_special_method_reaches_a_durable_surface(self) -> None:
+        """Review j#96049 F1: validating characters is not the same as using the result.
+
+        R8 checked the regex and the length on the caller's object and then handed that same
+        object to a dict lookup and an f-string, so `__hash__` raised and `__format__` put a
+        newline and an absolute path back into text that had just been proven free of both.
+        The `str.__str__` idiom this repo already ruled on (j#86068 / j#86081) is what makes
+        the checked characters and the printed characters the same characters.
+
+        `__len__` / `__str__` / `__getitem__` / `__bool__` are probed beyond the review's
+        list; `__len__` was still escaping when this was first run.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
+            SUBREASON_TOKEN_PLACEHOLDER,
+            auto_target_repo_lines,
+            execution_root_fence_next_action,
+            renderable_subreason_token,
+        )
+
+        hostile = "future\n- Injected: /Users/example/private"
+
+        class Fmt(str):
+            def __format__(self, spec): return hostile
+
+        class Unhashable(str):
+            __hash__ = None
+
+        class RaisingHash(str):
+            def __hash__(self): raise RuntimeError("hash")
+
+        class RaisingEq(str):
+            def __eq__(self, other): raise RuntimeError("eq")
+            def __hash__(self): return 0
+
+        class RaisingLen(str):
+            def __len__(self): raise RuntimeError("len")
+
+        class RaisingStr(str):
+            def __str__(self): raise RuntimeError("str")
+
+        class RaisingGetItem(str):
+            def __getitem__(self, key): raise RuntimeError("getitem")
+
+        class RaisingGet(dict):
+            def get(self, *a, **k): raise RuntimeError("get")
+
+        class RaisingBool(dict):
+            def __bool__(self): raise RuntimeError("bool")
+
+        payloads = [
+            ("format", {"subreason": Fmt("future_refusal")}),
+            ("unhashable", {"subreason": Unhashable("future_refusal")}),
+            ("hash", {"subreason": RaisingHash("future_refusal")}),
+            ("eq", {"subreason": RaisingEq("future_refusal")}),
+            ("len", {"subreason": RaisingLen("future_refusal")}),
+            ("str", {"subreason": RaisingStr("future_refusal")}),
+            ("getitem", {"subreason": RaisingGetItem("future_refusal")}),
+            ("mapping_get", RaisingGet(subreason="future_refusal")),
+            ("mapping_bool", RaisingBool(subreason="future_refusal")),
+        ]
+        for label, payload in payloads:
+            action = execution_root_fence_next_action(
+                "auto_target_repo_unresolved", payload
+            )
+            record = " ".join(auto_target_repo_lines(payload))
+            for surface, text in (("next_action", action), ("record", record)):
+                where = f"{label}/{surface}"
+                self.assertNotIn("\n", text, where)
+                self.assertNotIn("\r", text, where)
+                self.assertNotIn("/", text, where)
+                self.assertNotIn("\\", text, where)
+                self.assertLess(len(text), 1000, where)
+        # the validator hands back an EXACT str, so nothing downstream can re-dispatch
+        self.assertIs(type(renderable_subreason_token(Fmt("future_refusal"))), str)
+        self.assertEqual(
+            renderable_subreason_token(Unhashable("Not A Token")),
+            SUBREASON_TOKEN_PLACEHOLDER,
+        )
+
+    def test_control_and_bidi_characters_close_to_the_placeholder(self) -> None:
+        """Explicit rows for NUL / RTL override / zero-width / bell / non-ASCII (j#96049)."""
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
+            SUBREASON_TOKEN_PLACEHOLDER,
+            renderable_subreason_token,
+        )
+
+        for label, token in (
+            ("nul", "fut\x00ure"),
+            ("rtl_override", "fut\u202eure"),
+            ("zero_width", "fut\u200bure"),
+            ("bell", "fut\a"),
+            ("non_ascii_letter", "fut\u00fcre"),
+            ("emoji", "fut\U0001f642"),
+            ("vertical_tab", "fut\vure"),
+            ("form_feed", "fut\fure"),
+        ):
+            self.assertEqual(
+                renderable_subreason_token(token), SUBREASON_TOKEN_PLACEHOLDER, label
+            )
+
     def test_payload_less_outcomes_still_route_to_the_sender(self) -> None:
         """Non-regression: owner and reachability of both fence reasons without a payload."""
         for reason in ("execution_root_outside_target_repo", "auto_target_repo_unresolved"):

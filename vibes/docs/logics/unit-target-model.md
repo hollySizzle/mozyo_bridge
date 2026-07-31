@@ -293,6 +293,17 @@ pane cwd / repo root   != target execution root (nested project)
     (review j#95843 finding 1)。narrative は全 subreason に対して真である表現に
     留め、具体的な段は同 field を読ませる。**受信側が持っていない情報を
     next_action で参照しない** — R3 は存在しない「structured detail」を参照していた。
+  - **検証した「文字」ではなく、検証済みの「値」を使う** (review j#96049 finding 1)。
+    `str` subclass は `__format__` / `__hash__` / `__len__` / `__eq__` 等で
+    **検証の後に**再介入できる。R8 は regex と長さを caller の object に対して確認し、
+    その object をそのまま table lookup と f-string へ渡したため、
+    `__hash__` が例外を投げ、`__format__` が newline と absolute path を再注入した。
+    **exact builtin `str` へ正規化してから使う**。本 repo は既に同じ問題を裁定しており
+    (`_owned_str(value) = str.__str__(value)`、review **j#86068 / j#86081**)、
+    `str(value)` / `value[:]` / `"" + value` がいずれも subclass hook に届くことも
+    そこに記録されている。**同種の問題は、まず既存 ruling を探す。**
+    payload 型は **exact `dict`** に限定し、adversarial な `Mapping.get` / equality を
+    generic fallback へ閉じる (「never raises」を宣言ではなく証明可能にするため)。
   - **未知 token を durable 文面へ出してよい条件** (review j#96042 finding 1)。
     producer が closed vocabulary を出すことは、**producer 保証が及ばない経路**
     (未知 token の表示) の安全性を意味しない。表示する側の境界で値自身を検証する:
