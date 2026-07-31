@@ -30,11 +30,15 @@ restates the other:
    path resolves its own lane class, and a config that pins the model on the wrong row lands
    an argv without it.
 
-The counting oracle carries its own teeth test. An earlier revision folded the argv into a
-SET of ``(flag, value)`` pairs, so a repeated *identical* ``--model`` collapsed to one and the
-"exactly one" assertion passed on argv that declares the flag twice — the detector for this
-symptom could go false-green (Review j#95508 finding 1; verdict j#95511). Multiplicity is
-preserved now, and a test pins that it is.
+"Exactly one" is counted off the committed config's own raw token list, in the test that
+makes the claim. An earlier revision folded the argv into a SET of ``(flag, value)`` pairs, so
+a repeated *identical* ``--model`` collapsed to one and the assertion passed on argv that
+declares the flag twice (Review j#95508 finding 1). Routing the count through a separable
+helper then needed a synthetic test to guard that helper — a claim about a helper's contract,
+which is not re-detection of this symptom and does not belong in this file (Review j#95547
+finding 1; verdicts j#95511, j#95737). Counting positions in the raw list removes the folding
+container and the helper at once: nothing here can fold, and no contract is left to guard, so
+every test stays on the symptom's own surface.
 
 The owner-pinned model/effort literals appear here because the owner named them; everything
 else (which roles coordinate, which lane classes the coordination profile declares) is
@@ -107,11 +111,11 @@ _FAST_PROBE = StartupProbe(polls=1, interval=0.0, sleeper=lambda _seconds: None)
 def _flag_pairs(argv):
     """The ``(flag, value)`` pairs of ``argv``, so an assertion pins adjacency, not presence.
 
-    Returns a LIST, in argv order, with multiplicity preserved. A set would silently fold a
-    repeated identical pair into one, which is how the "exactly one ``--model``" check below
-    went false-green before Review j#95508 finding 1: an argv declaring the same model flag
-    twice counted as one. Membership assertions read the same either way; only counting
-    depends on multiplicity, and counting is what the symptom detector rests on.
+    Used for membership and for telling two lane classes apart — never for counting. The
+    "exactly one ``--model``" claim counts positions in the raw token list where it is made,
+    so no caller depends on this returning a container that preserves multiplicity. It returns
+    a list anyway: a set here folded a repeated identical pair into one once already (Review
+    j#95508 finding 1), and there is no reason to keep a folding container around.
     """
     return [
         (tok, argv[i + 1])
@@ -123,15 +127,6 @@ def _flag_pairs(argv):
         and i + 1 < len(argv)
         and not argv[i + 1].startswith("--")
     ]
-
-
-def _model_tokens(argv):
-    """Every value bound to ``--model`` in ``argv``, with repeats kept.
-
-    A bare trailing ``--model`` binds no value and so contributes nothing: a flag without a
-    value pins no model, which is the condition this file exists to catch.
-    """
-    return [value for flag, value in _flag_pairs(argv) if flag == MODEL_FLAG]
 
 
 def _committed_config():
@@ -191,33 +186,35 @@ class CommittedCoordinationLaunchArgvTest(unittest.TestCase):
         )
         for lane_class, tokens in declared:
             with self.subTest(lane_class=lane_class):
-                models = _model_tokens(list(tokens))
+                tokens = list(tokens)
+                # Counted as POSITIONS in the config's own raw token list. Nothing is folded
+                # into a set or a dict on the way, so a row declaring `--model` twice — with
+                # the same value or a different one — is two, and the count cannot go
+                # false-green the way it did in 9cdc5e7f (Review j#95508 finding 1). Doing it
+                # here rather than through a helper also leaves no helper contract needing a
+                # synthetic test of its own, which is what put a non-symptom claim in this
+                # file (Review j#95547 finding 1 / verdicts j#95511, j#95737).
+                at = [i for i, tok in enumerate(tokens) if tok == MODEL_FLAG]
                 self.assertEqual(
                     1,
-                    len(models),
+                    len(at),
                     f"profile {DEFAULT_PROFILE_COORDINATION!r} lane_class {lane_class!r} "
-                    f"declares {list(tokens)!r}; it must pin exactly one {MODEL_FLAG} "
-                    f"(nothing is inherited from another lane class)",
+                    f"declares {tokens!r}; it must pin exactly one {MODEL_FLAG} as a separate "
+                    f"token (nothing is inherited from another lane class, and a joined "
+                    f"{MODEL_FLAG}=value spelling is not this repo's form)",
                 )
-                self.assertTrue(models[0], "the pinned model token must not be empty")
-
-    def test_the_model_count_oracle_does_not_fold_a_repeated_identical_flag(self) -> None:
-        # Teeth for the counter the test above rests on. Folding the argv into a SET of
-        # (flag, value) pairs made a repeated IDENTICAL `--model` count as one, so argv
-        # declaring the flag twice satisfied "exactly one" — the symptom detector itself
-        # could go false-green (Review j#95508 finding 1 / verdict j#95511). A repeat with
-        # a DIFFERENT value was already counted twice, which is why the gap survived: only
-        # the identical case folded.
-        repeated_identical = ["--model", "gpt-5.6-sol", "--model", "gpt-5.6-sol"]
-        self.assertEqual(
-            ["gpt-5.6-sol", "gpt-5.6-sol"],
-            _model_tokens(repeated_identical),
-            "a repeated identical --model must be counted twice, not folded to one",
-        )
-        repeated_conflicting = ["--model", "gpt-5.6-sol", "--model", "some-other-model"]
-        self.assertEqual(2, len(_model_tokens(repeated_conflicting)))
-        # A flag with no value binds no model, so it must not be counted as pinning one.
-        self.assertEqual([], _model_tokens(["--config", "x=1", "--model"]))
+                # The flag has to actually bind a value: a trailing or flag-followed
+                # `--model` declares nothing, which is the same launch outcome as omitting it.
+                value_at = at[0] + 1
+                self.assertLess(
+                    value_at, len(tokens), f"{MODEL_FLAG} is not followed by a value"
+                )
+                value = tokens[value_at]
+                self.assertFalse(
+                    value.startswith("--"),
+                    f"{MODEL_FLAG} is followed by {value!r}, which is another flag",
+                )
+                self.assertTrue(value, "the pinned model token must not be empty")
 
 
 class EffectiveManagedLaunchArgvTest(unittest.TestCase):
