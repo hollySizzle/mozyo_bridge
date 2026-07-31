@@ -293,6 +293,12 @@ pane cwd / repo root   != target execution root (nested project)
     (review j#95843 finding 1)。narrative は全 subreason に対して真である表現に
     留め、具体的な段は同 field を読ませる。**受信側が持っていない情報を
     next_action で参照しない** — R3 は存在しない「structured detail」を参照していた。
+  - **surface ごとに検査すべき属性は 2 つある: 可読性 (subreason が読めるか) と
+    助言の正しさ (その subreason に対する repair か)**。R5 は前者だけを全 surface で
+    測り、後者は stderr でしか確認しなかったため、`next_action` (wire JSON と
+    pasteable record の両方に載る) が 6 subreason で同一の誤 repair を出し続けた
+    (review j#95995 finding 1)。**「全 surface を見た」ではなく
+    「surface × 属性」の行列で測る**。
   - **subreason は reader surface 全てに届かせる** (review j#95911 finding 1/4)。
     wire JSON だけでは足りない。`--persist-delivery` が保存し人が ticket に貼るのは
     **pasteable markdown** であり、sender が最初に読むのは **stderr** である。

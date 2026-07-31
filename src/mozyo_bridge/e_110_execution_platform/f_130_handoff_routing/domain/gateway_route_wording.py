@@ -205,6 +205,33 @@ def auto_target_repo_lines(payload: "dict[str, str] | None") -> "list[str]":
     return [f"{line} (basis `{basis}`)" if basis else line]
 
 
+def execution_root_fence_next_action(
+    reason: str, auto_target_repo: "dict[str, str] | None" = None
+) -> str:
+    """``next_action`` for the #14249 fence pair, specialised by subreason (j#95995 F1).
+
+    R5 gave stderr a per-subreason repair and left ``next_action`` — which rides the wire
+    outcome AND the pasteable / persisted record — sharing ONE text across six subreasons.
+    That text enumerated causes without ``lifecycle_store_unreadable`` and told every one of
+    them to "repair that lane's worktree binding": a step ``identity_unattested`` and
+    ``foreign_workspace`` never reach, and a repair that cannot fix an unreadable authority.
+    The advice a reader acts on must be right on the surface they read it from, so the same
+    per-subreason table drives both; the generic text remains for the fence's other reason
+    and for a payload-less outcome.
+    """
+    subreason = (auto_target_repo or {}).get("subreason") or ""
+    repair = AUTO_TARGET_REPO_SUBREASON_REPAIR.get(subreason)
+    if repair is None:
+        return EXECUTION_ROOT_FENCE_NEXT_ACTION[reason]
+    return (
+        "`--target-repo auto` could not establish which repo the target runs in, so no repo "
+        "root was asserted and nothing was injected (nothing typed, no Enter, no delivery "
+        f"recorded). Subreason `{subreason}`: {repair} Do NOT drop `--target-repo` to get "
+        "past this: without it a relative `--workdir` resolves against the SENDER's cwd, "
+        "which is the lane-external execution root this fence exists to prevent."
+    )
+
+
 #: The #14249 execution-root fence pair, keyed by wire ``Reason``. Both are sender-owned
 #: pre-send refusals whose wording lives here, so ``handoff.py`` dispatches them through one
 #: lookup instead of a per-reason branch — which is also what keeps that oversized module
@@ -223,6 +250,7 @@ EXECUTION_ROOT_FENCE_NARRATIVE: dict[str, str] = {
 
 __all__ = (
     "auto_target_repo_lines",
+    "execution_root_fence_next_action",
     "auto_target_repo_die_message",
     "AUTO_TARGET_REPO_SUBREASON_REPAIR",
     "EXECUTION_ROOT_FENCE_NEXT_ACTION",

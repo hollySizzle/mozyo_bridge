@@ -352,8 +352,10 @@ class AutoRefusalIsDurableAndTypedTest(unittest.TestCase):
         carried = outcome.to_dict()["auto_target_repo"]
         self.assertEqual(carried["subreason"], REFUSE_LANE_BINDING_ABSENT)
         self.assertIn("lane", carried["detail"])
-        # And the next_action names the field the reader can now actually read.
-        self.assertIn("auto_target_repo.subreason", outcome.next_action)
+        # The invariant is that the reader can tell WHICH step failed from what they were
+        # handed. Since review j#95995 F1 the next_action states the subreason inline rather
+        # than pointing at a field to go look up — strictly more legible, same invariant.
+        self.assertIn(REFUSE_LANE_BINDING_ABSENT, outcome.next_action)
 
     def test_the_narrative_does_not_assert_a_cause_it_cannot_know(self) -> None:
         """R3's narrative claimed the worktree binding was non-unique — false for most cases.
@@ -521,6 +523,100 @@ class AutoRefusalIsDurableAndTypedTest(unittest.TestCase):
                 auto_target_repo_die_message(subreason, "d"),
                 subreason,
             )
+
+    #: Every subreason the resolver can actually emit, paired with the wire reason it maps
+    #: onto. Derived from the module's own REFUSE_* constants so a new subreason cannot be
+    #: added without this matrix noticing.
+    def _all_subreasons(self) -> "list[str]":
+        import mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root as mod
+
+        subs = sorted(
+            getattr(mod, name) for name in dir(mod) if name.startswith("REFUSE_")
+        )
+        self.assertEqual(len(subs), 7, subs)
+        return subs
+
+    def _outcome_for(self, subreason: str):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root import (  # noqa: E501
+            AutoTargetRoot,
+        )
+
+        refusal = AutoTargetRoot(reason=subreason, detail="d")
+        return make_outcome(
+            status="blocked",
+            reason=refusal.wire_reason(),
+            receiver="codex",
+            target="mzb1_x",
+            anchor=RedmineAnchor(issue=ISSUE, journal="95964"),
+            mode="queue-enter",
+            kind="review_request",
+            notification_marker=None,
+            auto_target_repo=refusal.to_structured_dict(),
+        )
+
+    def test_next_action_is_correct_per_subreason_on_wire_and_record(self) -> None:
+        """Review j#95995 F1: `next_action` rides the wire AND the pasteable record.
+
+        R5 gave stderr a per-subreason repair and left `next_action` sharing ONE text across
+        six subreasons — a text that omitted `lifecycle_store_unreadable` from its cause list
+        and told all of them to repair a worktree binding. Measured here on the REAL outcome,
+        for every subreason, on both surfaces the reader receives.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
+            AUTO_TARGET_REPO_SUBREASON_REPAIR,
+        )
+
+        actions = {}
+        for subreason in self._all_subreasons():
+            outcome = self._outcome_for(subreason)
+            action = outcome.next_action
+            record = build_delivery_record(outcome)
+            actions[subreason] = action
+            # (a) the subreason is always legible on the record the reader keeps.
+            self.assertIn(subreason, record, subreason)
+            if outcome.reason != "auto_target_repo_unresolved":
+                # `lifecycle_store_upgrade_required` maps onto `reader_upgrade_required`,
+                # whose own next_action already IS the one correct repair (use a current
+                # runtime, never downgrade). Requiring the token there would only restate
+                # what the wire reason already says unambiguously.
+                self.assertIn("do NOT downgrade", action, subreason)
+                continue
+            # (b) where the wire reason alone is ambiguous, the action names WHICH step…
+            self.assertIn(subreason, action, subreason)
+            # …and carries the repair that fits that step…
+            self.assertIn(
+                AUTO_TARGET_REPO_SUBREASON_REPAIR[subreason], action, subreason
+            )
+            # …and the invariant that holds for all of them.
+            self.assertIn("Do NOT drop `--target-repo`", action, subreason)
+        # (c) no two subreasons share a next_action — the R5 defect was 6 sharing one.
+        self.assertEqual(len(set(actions.values())), len(actions), sorted(actions))
+
+    def test_no_subreason_is_told_to_repair_a_binding_it_never_reached(self) -> None:
+        """The specific wrong advice, per surface, for the subreasons it cannot help."""
+        for subreason in (
+            "identity_unattested", "foreign_workspace", "lifecycle_store_unreadable",
+            "lifecycle_store_upgrade_required",
+        ):
+            outcome = self._outcome_for(subreason)
+            for surface, text in (
+                ("next_action", outcome.next_action),
+                ("record", build_delivery_record(outcome)),
+            ):
+                self.assertNotIn(
+                    "repair that lane's worktree binding", text, f"{subreason}/{surface}"
+                )
+
+    def test_a_payload_less_fence_outcome_keeps_the_generic_next_action(self) -> None:
+        """Non-regression: the fence's other reason, and any outcome with no payload."""
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (  # noqa: E501
+            EXECUTION_ROOT_FENCE_NEXT_ACTION,
+        )
+
+        for reason in ("execution_root_outside_target_repo", "auto_target_repo_unresolved"):
+            owner, action = next_action_for("blocked", reason, "codex")
+            self.assertEqual(owner, "sender", reason)
+            self.assertEqual(action, EXECUTION_ROOT_FENCE_NEXT_ACTION[reason], reason)
 
     def test_post_injection_reasons_still_stay_uncertain(self) -> None:
         """The guard must keep its teeth — widening the set must not swallow these."""

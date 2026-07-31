@@ -36,8 +36,8 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketle
 # small f_130 sibling so this oversized module does not grow inline prose for the
 # new reason (the policy is in the f_140 enforcement module, uncyclable from here).
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_route_wording import (
-    EXECUTION_ROOT_FENCE_NARRATIVE,
-    EXECUTION_ROOT_FENCE_NEXT_ACTION,
+    EXECUTION_ROOT_FENCE_NARRATIVE, EXECUTION_ROOT_FENCE_NEXT_ACTION,
+    execution_root_fence_next_action,
     auto_target_repo_lines,
     GATEWAY_ROUTE_BLOCKED_NARRATIVE,
     GATEWAY_ROUTE_BLOCKED_NEXT_ACTION,
@@ -853,8 +853,7 @@ class DeliveryOutcome:
     # it was still starting up" from every other blocked reason, WITHOUT reading a
     # transcript. `None` for every admitted send and every non-herdr path.
     startup_admission: Optional[dict[str, Any]] = None
-    # Redmine #14249 R4 (j#95843 F1): `--target-repo auto` refusal subreason/basis/detail.
-    auto_target_repo: Optional[dict[str, Any]] = None
+    auto_target_repo: Optional[dict[str, Any]] = None  # #14249: refusal subreason
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1007,6 +1006,7 @@ def next_action_for(
     receiver: str,
     *,
     turn_start_outcome: Optional[str] = None,
+    auto_target_repo: Optional[dict[str, Any]] = None,
 ) -> tuple[NextActionOwner, str]:
     """Return the canonical owner/action phrase for an outcome.
 
@@ -1201,7 +1201,7 @@ def next_action_for(
             ),
         )
     if reason in EXECUTION_ROOT_FENCE_NEXT_ACTION:
-        return "sender", EXECUTION_ROOT_FENCE_NEXT_ACTION[reason]
+        return "sender", execution_root_fence_next_action(reason, auto_target_repo)
     if reason == "gateway_route_blocked":
         # Redmine #12918: governed delivery to a cross-lane Claude worker, blocked.
         # Wording lives in the f_130 sibling `gateway_route_wording` (the policy is
@@ -2117,6 +2117,7 @@ def make_outcome(
         reason,
         receiver,
         turn_start_outcome=_herdr_turn_start_token(turn_start_outcome),
+        auto_target_repo=auto_target_repo,
     )
     return DeliveryOutcome(
         status=status,
