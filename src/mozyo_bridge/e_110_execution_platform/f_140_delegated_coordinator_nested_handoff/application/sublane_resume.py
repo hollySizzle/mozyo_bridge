@@ -15,13 +15,31 @@ disposition CAS:
    generation is settled (``not_requested`` / ``released`` — never resume onto a lane whose
    panes an actuator is still closing); the issue was not re-owned by another lane while it
    slept; and the relaunched pair is **both-slots live, generation-matched attested, AND
-   self-attested after the lane hibernated** (#13637 locator-bound startup self-attestation
-   plus a hibernation timestamp anchor). The locator pin alone is *not* sufficient: a pane
-   that **survived** the release keeps its tmux pane-id and would still match its own
-   pre-hibernate attestation — so the fresh-pair proof also requires the self-attestation's
-   ``observed_at`` to post-date the lane's hibernation, which a genuine relaunch satisfies
-   and a survivor never does (correcting the design's "the locator IS the generation",
-   Q4 — true only for a *killed-and-relaunched* pane, not a survived one).
+   past the survivor fences below** (#13637 locator-bound startup self-attestation plus the
+   released-locator fence). The locator pin alone is *not* sufficient: a pane that
+   **survived** the release keeps its tmux pane-id and would still match its own
+   pre-hibernate attestation. A self-attestation ``observed_at`` that post-dates the lane's
+   hibernation is required as a LIVENESS boundary — it is NOT the generation proof, because
+   no timestamp can be one (review j#94531 R2-F1: a backdated CAS stamp, a regressed host
+   clock and a self-written ``observed_at`` each defeat it). That hibernation
+   timestamp is the **immutable hibernate-transition stamp** (``hibernated_at``, schema v8),
+   not the generic lifecycle ``updated_at``: Redmine #14477 measured a metadata-only
+   ``repair-pins`` moving the mutable column past the self-attestation of the exact live pair
+   it had just verified, which refused that pair ``stale_generation`` until an operator
+   glass-break. A row carrying NO such stamp (a pre-v8 / older-build hibernation) has no
+   boundary at all, and the freshness half then fails CLOSED — no other column stands in for
+   it. See :mod:`mozyo_bridge.core.state.lane_hibernation_anchor`.
+
+   **The timestamp is a liveness boundary, NOT the generation proof** (coordinator disposition
+   j#94544 A.3). Review j#94531 R2-F1 showed no clock can carry that proof: a backdated CAS
+   stamp, a regressed host clock, and a self-written ``observed_at`` each defeat it. The
+   generation proof is the CLOCK-INDEPENDENT released-locator fence — a survivor keeps the
+   pane-id hibernate's release closed, a relaunch does not
+   (:mod:`mozyo_bridge.core.state.lane_released_locator_fence`). Absent / unreadable /
+   incomplete release evidence REFUSES (A.2), and a recycled pane-id yields a false refusal in
+   the safe direction (A.4). Resume needs that fence AND every existing attestation / provider
+   / generation / declared-pin fence; none of them is relaxed. The correct long-term proof (an
+   authority-grade lane epoch bound into the attestation) is Redmine #14756.
 2. **commit point** — :meth:`LaneLifecycleStore.transition_disposition` CAS-moves the lane
    ``hibernated -> active``, clearing the (finished) release generation on rehydrate. The
    substrate refuses the rehydrate while a generation is still in flight (R1-F3) and refuses
@@ -47,6 +65,10 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
 )
+from mozyo_bridge.core.state.lane_hibernation_anchor import (
+    ANCHOR_HIBERNATE_TRANSITION,
+    resume_freshness_anchor,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
@@ -62,11 +84,15 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     ProcessGenerationPin,
 )
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
+from mozyo_bridge.core.state.lane_released_locator_fence import (
+    released_locator_verdict,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
     resolve_declared_pins,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_process_release import (  # noqa: E501
     evaluate_pair_attestation,
+    unit_slots,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     _norm,
@@ -395,9 +421,14 @@ class SublaneResumeUseCase:
         issue_not_reowned = owner.status != OWNER_RESOLVED or owner.lane_id == lane
 
         rows = self.ops.live_rows()
-        # The hibernation timestamp anchors the freshness gate: only a pair self-attested
-        # AFTER the lane hibernated is a genuine relaunch (a survivor's record predates it).
-        hibernation_anchor = rec.updated_at if rec is not None else ""
+        # The hibernation timestamp is a LIVENESS boundary, not the generation proof
+        # (disposition j#94544 A.3): a pair self-attested after the lane hibernated is
+        # consistent with a relaunch, but no timestamp can PROVE one.
+        # Redmine #14477: that boundary is the IMMUTABLE hibernate-transition stamp, never the
+        # generic lifecycle ``updated_at`` every metadata write moves — reading the mutable
+        # column let a pins repair invalidate the exact fresh pair it had just verified
+        # (#14476 j#88614-j#88618).
+        hibernation_anchor, anchor_authority = resume_freshness_anchor(rec)
         both_live, attested, attest_detail = evaluate_pair_attestation(
             rows,
             workspace_id,
@@ -405,6 +436,28 @@ class SublaneResumeUseCase:
             self.ops.read_attestation,
             fresh_after=hibernation_anchor,
         )
+        # Redmine #14477 disposition j#94544 A: the CLOCK-INDEPENDENT half of the proof. A
+        # survivor keeps its tmux pane-id, so its locator is among the ones hibernate's release
+        # closed; a genuine relaunch gets a new one. This refuses all three vectors a timestamp
+        # cannot (backdated CAS stamp, regressed host clock, self-written ``observed_at`` —
+        # review j#94531 R2-F1). Absent / unreadable / incomplete evidence refuses too: the row
+        # cannot tell "no process existed" from "a survivor was never recorded" (A.2).
+        observed_slots = unit_slots(rows, workspace_id, lane)
+        fence_ok, fence_reason = released_locator_verdict(
+            rec, (locator for _name, locator in observed_slots.values())
+        )
+        if not fence_ok:
+            attested = False
+            attest_detail = f"{attest_detail}; {fence_reason}"
+        if rec is not None and anchor_authority != ANCHOR_HIBERNATE_TRANSITION:
+            # No boundary exists for this row (a pre-v8 / older-build hibernation). FAIL the
+            # freshness half CLOSED and name the reason: ``evaluate_pair_attestation`` skips
+            # that half on an empty threshold, so without this a survivor would be admitted on
+            # the locator pin alone — measured in review j#94515 when ``updated_at`` stood in
+            # for the boundary. Such a lane resumes only after a v8 hibernate transition; it is
+            # never waved through on a substitute timestamp.
+            attested = False
+            attest_detail = f"{attest_detail}; freshness anchor: {anchor_authority}"
         fresh_pair_pins: tuple[ProcessGenerationPin, ...] = ()
         if both_live and attested:
             try:

@@ -62,9 +62,16 @@ The pure collaborators (:func:`make_outcome`, :func:`submit_lines_for`,
 :func:`turn_start_record_lines`, :func:`queue_enter_turn_start_record_lines`,
 :func:`resolve_turn_start_window`, :func:`resolve_queue_enter_retry_policy`,
 :func:`marker_visible_in`) are imported and called directly — they take no environment and are
-already unit-covered — so the port stays scoped to the genuine side effects. This is a pure,
-behavior-preserving restructuring: the injected keys, the emitted outcomes, the ledger / persisted
-records, the exit code, and both ``die`` messages are byte-identical to the original inline block.
+already unit-covered — so the port stays scoped to the genuine side effects. The #13729 carve was
+a pure, behavior-preserving restructuring: the injected keys, the emitted outcomes, the ledger /
+persisted records, the exit code, and both ``die`` messages were byte-identical to the original
+inline block.
+
+Redmine #14232 adds ONE behavioural terminal: every transport-touching step now runs inside
+:meth:`TmuxTransportRailUseCase.execute`'s ``TerminalTransportError`` guard, so a raised herdr
+primitive closes to a typed ``blocked`` / ``transport_error`` outcome (assembled by the
+:mod:`handoff_transport_failure_gate` sibling) instead of escaping as an uncaught traceback. tmux
+is unaffected — its failures are ``subprocess.CalledProcessError``, which the guard does not catch.
 """
 from __future__ import annotations
 
@@ -92,8 +99,26 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     make_outcome,
     resolve_queue_enter_retry_policy,
 )
+# Redmine #14232: typed containment for a raised transport primitive + the fixed step vocabulary.
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_transport_failure_gate import (  # noqa: E501
+    STEP_READ_PANE_LANDING_WAIT,
+    STEP_READ_PANE_RETRY_PROBE,
+    STEP_READ_PANE_TURN_START_BASELINE,
+    STEP_READ_PANE_TURN_START_OBSERVE,
+    STEP_SEND_KEYS_ENTER,
+    STEP_SEND_KEYS_ENTER_RETRY,
+    STEP_SEND_KEYS_ROLLBACK,
+    STEP_SEND_TEXT_BODY,
+    close_transport_failure,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
+    REASON_TRANSPORT_ERROR,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
     RoleProfileResolution,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
+    TerminalTransportError,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_callback import (
     TicketlessCallback,
@@ -284,6 +309,7 @@ class TmuxTransportRailUseCase:
 
     def __init__(self, ops: TmuxTransportRailOps) -> None:
         self._ops = ops
+        self._current_step = STEP_SEND_TEXT_BODY  # Redmine #14232: primitive in flight
 
     def _outcome(
         self,
@@ -330,10 +356,42 @@ class TmuxTransportRailUseCase:
             submit_delivery_id=request.submit_delivery_id,
         )
 
+    def _fail_transport(
+        self, request: TmuxTransportRailRequest, primitive: str
+    ) -> "None":
+        """Close a raised transport primitive into a typed terminal outcome (Redmine #14232).
+
+        Defect, classification, and secret-safety posture: ``handoff_transport_failure_gate``.
+        """
+        outcome = self._outcome(
+            request, status="blocked", reason=REASON_TRANSPORT_ERROR
+        )
+        close_transport_failure(
+            outcome=outcome, primitive=primitive,
+            target=request.target, marker=request.marker,
+            emit=self._ops.emit, die=self._ops.die,
+            record_format=request.record_format, record_command=request.record_command,
+            duplicate_lane_panes=request.duplicate_lane_panes,
+            role_profile_contract=request.role_profile_contract,
+            submit_lines=self._submit_lines(request, outcome),
+        )
+        raise AssertionError("unreachable")
+
     def execute(self, request: TmuxTransportRailRequest) -> int:
+        # Redmine #14232 (see the module docstring): the transport-failure containment guard. The
+        # failed primitive comes from `_step`, never from the exception's adapter-authored message.
+        try:
+            return self._execute(request)
+        except TerminalTransportError:
+            self._fail_transport(request, self._current_step)
+            raise AssertionError("unreachable")
+
+
+    def _execute(self, request: TmuxTransportRailRequest) -> int:
         ops = self._ops
         # The common body injection: the marker+body is typed ONCE here. No later path re-types
         # it — the whole no-blind-retry / rollback contract rests on this single injection.
+        self._current_step = STEP_SEND_TEXT_BODY
         ops.inject_body(request.target, f"{request.marker} {request.body}")
 
         if request.mode == MODE_PENDING:
@@ -358,6 +416,7 @@ class TmuxTransportRailUseCase:
 
         landing_timeout = float(request.landing_timeout or 8.0)
         landing_lines = max(request.read_lines, 200)
+        self._current_step = STEP_READ_PANE_LANDING_WAIT
         marker_observed = ops.wait_for_marker(
             request.target, request.marker, landing_lines, landing_timeout
         )
@@ -366,6 +425,7 @@ class TmuxTransportRailUseCase:
             # C-u rollback is allowed ONLY here: a strict (non queue-enter) send whose marker
             # never landed. Roll back the unsubmitted line, emit blocked/marker_timeout, print
             # the recovery guidance, and die WITHOUT pressing Enter.
+            self._current_step = STEP_SEND_KEYS_ROLLBACK
             ops.rollback(request.target)
             outcome = self._outcome(request, status="blocked", reason="marker_timeout")
             ops.emit(
@@ -396,6 +456,7 @@ class TmuxTransportRailUseCase:
         turn_start_window = resolve_turn_start_window(
             request.landing_timeout, landing_timeout
         )
+        self._current_step = STEP_READ_PANE_TURN_START_BASELINE
         turn_start_baseline = (
             ops.capture(request.target, landing_lines) if standard_rail else None
         )
@@ -428,6 +489,7 @@ class TmuxTransportRailUseCase:
                 except Exception:  # noqa: BLE001 - observation-only; never breaks the send
                     queue_enter_armed_wait = None
 
+        self._current_step = STEP_SEND_KEYS_ENTER
         ops.press_enter(request.target)
         enter_attempts = 1
 
@@ -451,11 +513,13 @@ class TmuxTransportRailUseCase:
             for _ in range(retry_policy.max_retries):
                 if retry_policy.interval_seconds:
                     ops.sleep(retry_policy.interval_seconds)
+                self._current_step = STEP_READ_PANE_RETRY_PROBE
                 if marker_visible_in(
                     ops.capture(request.target, landing_lines), request.marker
                 ):
                     marker_observed = True
                     break
+                self._current_step = STEP_SEND_KEYS_ENTER_RETRY
                 ops.press_enter(request.target)
                 enter_attempts += 1
 
@@ -468,6 +532,7 @@ class TmuxTransportRailUseCase:
         # turn start dies with NO C-u rollback and NO re-send. The queue-enter rail is untouched.
         turn_start_lines: Optional[List[str]] = None
         if standard_rail:
+            self._current_step = STEP_READ_PANE_TURN_START_OBSERVE
             turn_start = ops.observe_standard_turn_start(
                 request.target,
                 baseline_capture=turn_start_baseline or "",

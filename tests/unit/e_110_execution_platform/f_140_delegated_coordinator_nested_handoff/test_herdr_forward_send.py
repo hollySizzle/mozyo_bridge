@@ -555,7 +555,16 @@ class CallbackTransportOutcomeBoundaryTest(unittest.TestCase):
     receiver, so neither may complete a forward generation.
     """
 
-    def _mk_outcome(self, status, reason):
+    def _mk_outcome(self, status, reason, *, mode="standard", **extra):
+        """Redmine #14232 review j#95333 F1: the RAIL is part of what `sent`/`ok` means.
+
+        This fixture used to say ``mode="queue-enter"``, on which ``ok`` means only "the marker
+        landed and Enter was pressed" — that rail runs no turn-start gate — so it asserted a
+        positive delivery the transport had never confirmed. It now names ``standard``, which is
+        both what these tests mean by a delivered send AND what the production callback senders
+        actually use (``callback_send_port`` / ``callback_sweep`` both pass ``--mode standard``).
+        The queue-enter cell is pinned separately below rather than dropped.
+        """
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             make_outcome,
         )
@@ -568,7 +577,7 @@ class CallbackTransportOutcomeBoundaryTest(unittest.TestCase):
                 consultation_kind="project_domain_consultation",
                 callback_to_role="grandparent_coordinator",
             ),
-            mode="queue-enter", kind="design_consultation", notification_marker="m",
+            mode=mode, kind="design_consultation", notification_marker="m", **extra,
         )
 
     def _positive(self, status, reason):
@@ -583,6 +592,47 @@ class CallbackTransportOutcomeBoundaryTest(unittest.TestCase):
 
     def test_marker_unobserved_queue_enter_is_not_positive(self):
         self.assertFalse(self._positive("sent", "queue_enter"))
+
+    def test_marker_observed_queue_enter_is_not_positive_without_a_started_turn(self):
+        """Redmine #14232 review j#95333 F1: `sent`/`ok` on queue-enter is not a confirmation.
+
+        The queue-enter rail resolves a landed marker to ``ok`` WITHOUT running any turn-start
+        gate, so completing a forward generation on it would forward again while the previous
+        consultation is still unanswered — precisely what this boundary exists to prevent. Only
+        positive evidence (the post-choreography snapshot seeing the receiver actually
+        producing a turn) confirms it.
+        """
+        import argparse as _ap
+        from mozyo_bridge.application.commands import delivery_was_positive
+
+        def _positive_with(runtime_state, *, causal=False):
+            observation = {
+                "observation_kind": "post_choreography_snapshot",
+                "source": "herdr_agent_get", "runtime_state": runtime_state,
+                "read_ok": True, "read_reason": None, "poll_attempts": 2,
+            }
+            if causal:
+                # Review j#95601: the armed working-transition wait, published by the rail
+                # only under a coherent generation — the one causally attributable signal.
+                observation.update(
+                    event_wait_kind="changed", observation_version=2,
+                    gateway_binding={"provider": "codex", "assigned_name": "mzb1_ws_codex_lane", "locator": "%2", "row_revision": "1", "attestation_observed_at": "2026-07-29T20:10:01+00:00", "startup_action_id": "startup-abc"},
+                )
+            args = _ap.Namespace()
+            args.delivery_outcome = self._mk_outcome(
+                "sent", "ok", mode="queue-enter",
+                queue_enter_turn_start_observation=observation,
+            )
+            return delivery_was_positive(args)
+
+        # A post-hoc poll never confirms, whatever it reads — including `busy`, which the
+        # queue-enter rail can also read from a receiver that was already busy before the send.
+        self.assertFalse(_positive_with("awaiting_input"))
+        self.assertFalse(_positive_with("turn_ended"))
+        self.assertFalse(_positive_with("busy"))
+        # Not vacuous: a causally observed start completes, even if the turn already finished.
+        self.assertTrue(_positive_with("busy", causal=True))
+        self.assertTrue(_positive_with("turn_ended", causal=True))
 
     def test_pending_input_is_not_positive(self):
         # pending_input carries reason="ok" -> the status MUST be checked too.
@@ -648,12 +698,15 @@ class QEnterCallbackTransportBoundaryTest(unittest.TestCase):
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_anchors import (
             TicketlessAnchor,
         )
+        # Redmine #14232 review j#95333 F1: `standard` is the rail that actually verifies a
+        # turn start before resolving to `ok`, and the rail the production callback senders
+        # use. On `queue-enter`, `ok` is not a confirmed submission — pinned separately below.
         return make_outcome(
             status=status, reason=reason, receiver="codex", target="%1",
             anchor=TicketlessAnchor(
                 classification="consultation_result", dispatch_decision="no_dispatch"
             ),
-            mode="queue-enter", kind="design_consultation", notification_marker="m",
+            mode="standard", kind="design_consultation", notification_marker="m",
         )
 
     def _drive_q_enter(self, status, reason):
@@ -697,13 +750,22 @@ class QEnterCallbackTransportBoundaryTest(unittest.TestCase):
         self.assertTrue(delivered)
 
     def test_q_enter_marker_unobserved_queue_enter_does_not_complete(self):
+        # Redmine #14232 review j#95333 F2: this cell used to assert rc 0 to demonstrate that
+        # the rc is not the completion gate. The front door now exits NON-zero for an
+        # unconfirmed delivery (that IS the F2 fix — a `blocked` record must not report shell
+        # success), so the demonstration moves to `test_q_enter_pending_input_does_not_complete`
+        # below, where rc really is 0 and completion is still refused. The claim this test owns
+        # — completion is gated on the structured outcome — is unchanged and still asserted.
         rc, delivered = self._drive_q_enter("sent", "queue_enter")
-        self.assertEqual(rc, 0)  # rc 0 -- but NOT delivered
+        self.assertNotEqual(rc, 0)
         self.assertFalse(delivered)
 
     def test_q_enter_pending_input_does_not_complete(self):
+        # The rc-is-not-the-gate demonstration: a deliberate `--mode pending` park exits 0
+        # (the caller got exactly what it asked for) and STILL does not complete the forward
+        # generation, because reason "ok" is disqualified by the STATUS.
         rc, delivered = self._drive_q_enter("pending_input", "ok")
-        self.assertEqual(rc, 0)  # rc 0, reason "ok" -- the STATUS disqualifies it
+        self.assertEqual(rc, 0)
         self.assertFalse(delivered)
 
 

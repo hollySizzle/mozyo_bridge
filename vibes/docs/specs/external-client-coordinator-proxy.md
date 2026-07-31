@@ -453,6 +453,15 @@ attestation であり key に含めない（target rename が generation を進�
   decision 自身を再開できてはならない。
 - **supersede しない journal は stale。** Redmine journal id は整数なので比較は**数値**で行う
   （文字列比較では `"9" > "10"` となり古い決定が新しく見える）。非数値 journal は fail-closed。
+- **「supersede する」= 厳密に大きい ordinal であり、比較は journal ordinal 単独で行う
+  (Redmine #14701)。** candidate の `issue` は比較を緩めない — 別 issue であることは「新しい
+  decision である」証拠ではない。したがって terminal row に対する **equal ordinal は、同一 issue でも
+  別 issue でも stale** とする。同一 `(issue, journal)` の repeat は前段で永久 duplicate になるため、
+  この規定が新たに閉じるのは *別の anchor 文字列で同一 ordinal に到達した* 入力 — 別 issue、および
+  leading zero 付きで書かれた同一 issue (`"089688"` と `"89688"`) — である。Redmine journal id は
+  instance 全体で一意なので、1 つの ordinal が 2 つの issue を名乗る入力は「新しい decision」ではなく
+  **解決不能な anchor** であり、fail-closed 側に倒す。stale は zero-write / zero-send であり、
+  fence row は一切変更しない。
 - state 集合: `reserved` / `uncertain` を **active**（次 decision を通さない）、`delivered` /
   `abandoned` / legacy `completed` を **terminal**（strictly newer decision が次 generation を
   mint できる）とする。`delivered` が terminal 側に居ることが §3b の contract そのものである。

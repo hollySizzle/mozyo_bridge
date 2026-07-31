@@ -30,6 +30,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     ProcessGenerationPin,
     norm,
     replacement_settled,
+    stored_binding_kind_is,
 )
 from mozyo_bridge.core.state.lane_pin_repair import LanePinRepairStore
 from mozyo_bridge.core.state.lane_pin_role import PIN_ROLE_GATEWAY, PIN_ROLE_WORKER
@@ -453,7 +454,7 @@ class LiveBoundPairConvergenceOps:
         faults: list[str] = []
         if record.lane_disposition != DISPOSITION_HIBERNATED:
             faults.append(FAULT_NOT_HIBERNATED)
-        if norm(record.binding_kind) != BINDING_KIND_ISSUE:
+        if not stored_binding_kind_is(record.binding_kind, BINDING_KIND_ISSUE):
             faults.append(FAULT_NOT_ISSUE_BOUND)
         if norm(record.issue_id) != norm(request.issue):
             faults.append(FAULT_ISSUE_MISMATCH)

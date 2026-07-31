@@ -346,9 +346,14 @@ pane cwd / repo root   != target execution root (nested project)
     (R4 が実際に起こした)。exception は **type 名のみ**を使い、path・秘密値は載せない。
     正本: organization baseline (個人情報を chat / ticket / Git / log へ記録しない)。
   - **これらの refusal は proven pre-injection zero-send として closed consumer に
-    登録する** (review j#95843 finding 2)。`callback_delivery._NOT_SENT_BLOCKED_REASONS`
-    と `sublane_worker_dispatch.SEND_KNOWN_NOT_SENT_REASONS` の双方。未登録だと
-    `uncertain` へ劣化し、安全な bounded retry が行われない。
+    登録する** (review j#95843 finding 2)。未登録だと `uncertain` へ劣化し、安全な
+    bounded retry が行われない。登録先は **共有 partition**
+    `injection_stage.PRE_INJECTION_BLOCKED_REASONS` (Redmine #14232) と
+    `sublane_worker_dispatch.SEND_KNOWN_NOT_SENT_REASONS` の双方。
+    `callback_delivery._NOT_SENT_BLOCKED_REASONS` は #14232 以降その共有 partition の
+    alias であり **private table ではない** — callback 側に reason を再列挙しない。
+    共有 partition は wire `Reason` 全体に対する網羅性を drift-guard test で検査する
+    ため、新 reason を既定 bucket へ取りこぼせない。
     **この失敗に `target_repo_mismatch` を使ってはならない** (review j#94499
     finding 1)。同 reason の narrative / next_action は「観測された target pane の
     repo root が asserted 値と不一致」「flag を外して repo gate を skip」を述べるが、

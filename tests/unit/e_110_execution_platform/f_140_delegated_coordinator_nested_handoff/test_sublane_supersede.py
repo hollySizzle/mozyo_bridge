@@ -351,8 +351,23 @@ class SublaneSupersedeTest(unittest.TestCase):
                 store.get(LaneLifecycleKey(WS, ORIG)).lane_disposition,
                 DISPOSITION_SUPERSEDED,
             )
-            self.assertEqual(outcome.release.process_release, "not_requested")
-            self.assertEqual(ops.close_calls, [])
+            # Redmine #14477 j#94582/j#94596: the supersede path shares the release driver, so a
+            # zero-slot enumeration now OPENS the generation and records a COMPLETE-EMPTY
+            # observation -> the release reaches `released`. That is release-generation
+            # COMPLETION, never a proof of process absence (liveness stays the live inventory),
+            # and ZERO panes are actuated — which is what the assertions below pin.
+            self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
+            self.assertEqual(len(ops.close_calls), 1)
+            self.assertEqual(ops.close_calls[0].close_targets, ())
+            self.assertEqual(outcome.release.closed, ())
+            # j#94653 item 3: the SUPERSEDE fences are unaffected by the live-zero release
+            # change. The handover authority outcome is asserted explicitly here so a future
+            # change to the release axis cannot quietly alter it: the original is superseded,
+            # the recovery lane owns the issue, and `released` did not stand in for either.
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, REC)).lane_disposition, DISPOSITION_ACTIVE
+            )
+            self.assertEqual(store.get(LaneLifecycleKey(WS, REC)).issue_id, ISSUE)
 
     def test_resume_never_closes_a_recycled_replacement_pane(self) -> None:
         # R1 F1 (j#77247): a partial release stays open pinned to the ORIGINAL locators.

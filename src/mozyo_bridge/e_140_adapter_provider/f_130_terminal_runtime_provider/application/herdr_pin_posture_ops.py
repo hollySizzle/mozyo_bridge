@@ -8,11 +8,12 @@ The pure model (:mod:`...domain.herdr_pin_posture`) decides what a pinned postur
   operator config (writing herdr's config is a home mutation, and this US keeps the
   only opt-in home mutation in the hook installer). ``render`` is a read-only
   generator.
-- **verify** — read an *existing* herdr config file, parse it with the stdlib
-  ``tomllib`` (read-only, no third-party dependency), and validate its ``[update]``
-  posture. Every way reading can fail — a missing file, a non-file, unreadable
-  bytes, invalid TOML, an ``[update]`` that is not a table — resolves to a
-  fail-closed unpinned verdict, never a silent pass.
+- **verify** — read an *existing* herdr config file, parse it with the TOML parser
+  bound at import (read-only; no dependency beyond the one the package already
+  declares — see ``_toml`` below), and validate its ``[update]`` posture. Every way
+  reading can fail — a missing file, a non-file, unreadable bytes, invalid TOML, an
+  ``[update]`` that is not a table — resolves to a fail-closed unpinned verdict,
+  never a silent pass.
 
 Both surfaces are pure of side effects on operator state: verify only *reads*, and it
 reads only the small ``[update]`` table it needs (it never echoes the file's other
@@ -21,7 +22,6 @@ contents, so a herdr config carrying anything sensitive is not surfaced).
 
 from __future__ import annotations
 
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -37,6 +37,21 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     render_pin_config,
     validate_pin_record,
 )
+
+# `tomllib` is stdlib on Python 3.11+. The package supports >=3.10, so fall
+# back to the third-party `tomli` (same API) on 3.10. That fallback adds no new
+# dependency: `tomli>=2.0; python_version < '3.11'` is already a declared
+# runtime dependency. Resolved at import time so a genuinely missing TOML parser
+# surfaces clearly rather than at call time. Same shape as
+# `mozyo_bridge.application.instruction_doctor`; the binding is duplicated
+# rather than imported from there because that module is in another bounded
+# context and this ops layer must not depend on it.
+try:  # Python 3.11+
+    import tomllib as _toml
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as _toml  # type: ignore[no-redef]
+
+_TOMLDecodeError = _toml.TOMLDecodeError
 
 
 def build_posture(
@@ -134,8 +149,8 @@ def _verify_verdict(
             f"herdr config at {config_path} is unreadable ({exc.__class__.__name__})",
         )
     try:
-        parsed = tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        parsed = _toml.loads(raw.decode("utf-8"))
+    except (_TOMLDecodeError, UnicodeDecodeError) as exc:
         return PinVerdict.unpinned(
             REASON_UPDATE_TABLE_MALFORMED,
             f"herdr config at {config_path} is not valid TOML ({exc.__class__.__name__})",

@@ -11,6 +11,8 @@ non-active, so the W4 roster join excludes it from active capacity).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -167,11 +169,15 @@ class _FakeOps:
         self.close_calls: list = []
         self.worktree_reads = 0
         self.activity_reads = 0
+        #: Redmine #14477 j#94840 R10-F3: proves the FAKE was the one consulted, so a test that
+        #: patched the wrong module namespace cannot pass on the real store's behaviour.
+        self.inventory_reads = 0
 
     def workspace_id(self) -> str:
         return WS
 
     def read_inventory(self):
+        self.inventory_reads += 1
         if self._inventory_sequence:
             return self._inventory_sequence.pop(0), self._readable
         return list(self._rows), self._readable
@@ -487,6 +493,61 @@ class SublaneHibernateTest(unittest.TestCase):
                 DISPOSITION_ACTIVE,  # never moved to hibernated
             )
 
+    def test_an_unclassified_stored_release_state_is_not_a_hibernate_success(self) -> None:
+        """Redmine #14477 review j#94778 R8-F1, through the PUBLIC already-hibernated path.
+
+        The driver used to report every stored release state it could not classify as
+        ``released`` with zero panes closed, and :attr:`HibernateOutcome.is_success` accepted
+        that as a clean fully-actuated hibernate. Fixing the driver is only half a claim — this
+        pin drives the public use case so the composed outcome is what is asserted.
+
+        The invalid value is written with raw SQL on the TEMP store: the canonical writers refuse
+        to persist it, so a readable-invalid row cannot be produced any other way. The DEFECT's own
+        unit pins (driver return shape, CAS refusals) live in
+        ``tests/regressions/test_issue_14477_repair_pins_resume_freshness_anchor.py``; this one
+        lives here because it needs this module's hibernate IO-port harness, and duplicating that
+        fake would be a divergence risk.
+        """
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare(store)
+            first = SublaneHibernateUseCase(ops=self._live_ops(), store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(first.transition.applied)
+            self.assertEqual(first.release.process_release, RELEASE_RELEASED)
+            self.assertTrue(first.is_success)
+
+            conn = sqlite3.connect(str(store.path))
+            try:
+                conn.execute(
+                    "UPDATE lane_lifecycle_records SET process_release = ? WHERE lane_id = ?",
+                    ("weird_unknown_token", LANE),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            ops = self._live_ops()
+            retry = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(retry.already_hibernated)
+            self.assertEqual(retry.release.process_release, "weird_unknown_token")
+            self.assertIn("release_state_unknown", retry.release.detail)
+            self.assertEqual(ops.close_calls, [], "an unclassified state closes nothing")
+            self.assertFalse(
+                retry.is_success,
+                "a synthetic released with zero actuation must never read as a clean success",
+            )
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).process_release,
+                "weird_unknown_token",
+                "zero write: the refusal must not launder the invalid value",
+            )
+
     def test_already_hibernated_redrive_reevaluates_preservation_gate(self) -> None:
         # F2 (R1 j#77907): a partial-release retry on an already-hibernated lane must
         # re-check the CURRENT preservation gate. A lane that has since started working,
@@ -580,7 +641,7 @@ class SublaneHibernateTest(unittest.TestCase):
             self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
             self.assertEqual(len(ops.close_calls), 1)
 
-    def test_dead_processes_hibernate_with_no_release(self) -> None:
+    def test_dead_processes_hibernate_recording_a_complete_empty_release(self) -> None:
         # The lane's slots are already gone. The disposition still moves to hibernated;
         # there is nothing to release (a hibernated lane draws zero capacity regardless).
         with tempfile.TemporaryDirectory() as tmp:
@@ -595,8 +656,21 @@ class SublaneHibernateTest(unittest.TestCase):
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
                 DISPOSITION_HIBERNATED,
             )
-            self.assertEqual(outcome.release.process_release, RELEASE_NOT_REQUESTED)
-            self.assertEqual(ops.close_calls, [])
+            # Redmine #14477 j#94582 item 2 / j#94596: a zero-slot enumeration now OPENS the
+            # generation and records a COMPLETE-EMPTY observation, so the release reaches
+            # `released`. That is release-generation COMPLETION, not a proof of process
+            # absence — liveness stays the live inventory (j#94596 item 1). Leaving it
+            # `not_requested` recorded nothing, so resume could not tell "no process was
+            # live" from "a survivor existed and nothing was written".
+            self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
+            # ZERO close actuation is the point (j#94596 item 3): the generation runs, but
+            # with an empty plan, so no pane is ever touched. Asserting the plan's emptiness
+            # is stronger than asserting the driver skipped the call — it pins that the
+            # release completed AND closed nothing.
+            self.assertEqual(len(ops.close_calls), 1)
+            self.assertEqual(ops.close_calls[0].close_targets, ())
+            self.assertEqual(outcome.release.closed, ())
+            self.assertIn("0 close actuation", outcome.release.detail)
 
     def test_non_git_lane_hibernates(self) -> None:
         # A non-git (directory scaffold) lane hibernates identically — the disposition and
@@ -725,13 +799,95 @@ class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
                 json=False,
             )
             fake_ops = _FakeOps(rows=[], readable=False)
+            # Patch the CLI module's namespace (Redmine #14477 review j#94840 R10-F3).
+            # `cmd_sublane_hibernate` resolves `LiveSublaneHibernateOps` / `LaneLifecycleStore`
+            # from `_CLI_MOD`; patching `_HIBERNATE_MOD` left BOTH real, so the fake ops and the
+            # temp store were unused and the real store resolved the ambient home — the exit 1
+            # this asserted came from a row-absent block, not from the unreadable inventory the
+            # test is named for.
+            buf = io.StringIO()
             with mock.patch(
-                f"{_HIBERNATE_MOD}.LiveSublaneHibernateOps", return_value=fake_ops
+                f"{_CLI_MOD}.LiveSublaneHibernateOps", return_value=fake_ops
             ), mock.patch(
-                f"{_HIBERNATE_MOD}.LaneLifecycleStore", return_value=store
-            ):
+                f"{_CLI_MOD}.LaneLifecycleStore", return_value=store
+            ), contextlib.redirect_stdout(buf):
                 rc = cmd_sublane_hibernate(args)
             self.assertEqual(rc, 1)
+            # The fake WAS used, and the named reason is the one the test claims.
+            self.assertGreater(fake_ops.inventory_reads, 0, "the fake inventory was never read")
+            self.assertIn(BLOCK_INVENTORY_UNREADABLE, buf.getvalue())
+            self.assertIn("fail-closed blocked", buf.getvalue())
+
+    def test_cmd_exit_code_follows_is_success_for_an_unknown_release_state(self) -> None:
+        """Redmine #14477 review j#94805 R9-F1, through the PUBLIC command.
+
+        The exit decision used to test the literal ``partial`` token only, so an executed run whose
+        stored release state the driver could not classify — which ``is_success`` correctly rejects
+        — exited 0 and a coordinator or script read an incomplete actuation as done. The three cases
+        below pin the contract at the public boundary: unknown -> 1, canonical success -> 0, and
+        preflight-only -> 0 (unchanged).
+        """
+        import sqlite3
+
+        def _args(**kw):
+            base = dict(
+                repo=None, issue=ISSUE, lane=LANE, journal=JOURNAL,
+                # Exactly the gate set `_all_gates()` treats as a clean lane.
+                explicitly_parked=True, callbacks_drained=True, no_review_pending=True,
+                no_owner_approval_pending=True, no_integration_pending=True,
+                no_pending_prompt=True, not_working=True, worktree_clean=True,
+                boundary_recorded=False,
+                execute=True, json=False,
+            )
+            base.update(kw)
+            return argparse.Namespace(**base)
+
+        def _run(store, args):
+            # Patch the CLI module's namespace: `cmd_sublane_hibernate` resolves
+            # `LaneLifecycleStore` / `LiveSublaneHibernateOps` from `_CLI_MOD`, so patching
+            # `_HIBERNATE_MOD` (the use-case module) leaves the REAL store in place — which
+            # resolves the ambient MOZYO_BRIDGE_HOME. See the note in the review request.
+            with mock.patch(
+                f"{_CLI_MOD}.LiveSublaneHibernateOps",
+                return_value=_FakeOps(
+                    rows=[_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")]
+                ),
+            ), mock.patch(f"{_CLI_MOD}.LaneLifecycleStore", return_value=store):
+                return cmd_sublane_hibernate(args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            store.declare_active(
+                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+            )
+            # A canonical, fully-actuated hibernate exits 0.
+            self.assertEqual(_run(store, _args()), 0)
+
+            # Force the stored release state to a value no rule classifies, then re-run the
+            # already-hibernated path: the domain says non-success, so the CLI must too.
+            conn = sqlite3.connect(str(store.path))
+            try:
+                conn.execute(
+                    "UPDATE lane_lifecycle_records SET process_release = ? WHERE lane_id = ?",
+                    ("weird_unknown_token", LANE),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(_run(store, _args()), 1)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, LANE)).process_release,
+                "weird_unknown_token",
+                "zero write",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            store.declare_active(
+                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+            )
+            # Preflight-only keeps its exit-0 contract (it never actuated).
+            self.assertEqual(_run(store, _args(execute=False)), 0)
 
     def test_cmd_returns_nonzero_when_success_withheld(self) -> None:
         # Redmine #13843: a released lane whose post-release check finds residue is a WITHHELD

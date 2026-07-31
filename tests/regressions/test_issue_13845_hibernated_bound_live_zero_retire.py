@@ -66,6 +66,9 @@ _SRC = _TESTS_ROOT.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    build_release_observation,
+)
 from mozyo_bridge.core.state.lane_bound_retire import (  # noqa: E402
     LaneBoundRetireStore,
 )
@@ -226,10 +229,10 @@ def _seed_hibernated_released_bound(
         key,
         expected_revision=rec.revision,
         action_id="rel-1",
-        pins=[
+        observation=build_release_observation([
             ReleasePin("gateway", "codex-mzb1", "w28:p3S"),
             ReleasePin("worker", "claude-mzb1", "w28:p3T"),
-        ],
+        ]),
     )
     if release_target == RELEASE_REQUESTED:
         return

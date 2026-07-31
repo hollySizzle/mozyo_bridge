@@ -48,21 +48,32 @@ mozyo-bridge が current lane / durable gate / route identity から解く。
    `ticketless-callback` / `q-enter` は workflow step の実装部品として残す。
    compatibility と debug の価値はあるが、AI が通常選ぶ command ではない。
 
-## 標準 surface
+## Agent-facing surface
 
-最小 surface は次の形にする。
+通常 workflow で AI が選ぶ実行入口は 1 つだけにする。
 
 ```text
 mozyo-bridge workflow step
-mozyo-bridge workflow step --dry-run
+```
+
+structured result が必要な UI / automation は、同じ本実行へ出力形式だけを指定する。
+
+```text
 mozyo-bridge workflow step --json
 ```
 
-`--dry-run` は side effect を発生させず、解決された state / next_action / reason を返す。
-`--json` は UI / automation が読む structured result を出す。
+`--json` は実行 mode ではなく出力 modifier であり、通常実行を二段階にしない。
+
+`--dry-run` は side effect を発生させず、解決された state / next_action / reason を返す
+debug / verification surface とする。通常 agent workflow の事前 step ではなく、
+`--dry-run` の後に同じ action を本実行する二重呼び出しを標準手順にしない。
+dry-run と本実行の間に durable state や live identity が変化し得るため、dry-run の成功を
+後続実行の authorization や安全証明として再利用してはならない。本実行は一回の invocation
+内部で action-time state / identity / gate を再検証する。診断結果を structured に読む場合だけ
+`workflow step --dry-run --json` を使う。
 
 `--to-role`、`--intent`、`--target %pane`、`--mode queue-enter` のような選択は標準入口に置かない。
-必要なら debug / primitive command 側に残す。
+`--dry-run` とともに、必要な debug / primitive command 側に残す。
 
 ## State machine の入力
 
@@ -147,6 +158,9 @@ durable_anchor: <provider_or_ticketless_pointer_or_none>
 5. anchored worker dispatch はprovider-issued durable anchor ready stateに限定して委譲する。
 6. help / docs で `workflow step` を標準入口、既存 primitive を内部 / compatibility / debug として分類する。
 
+この順序は resolver を副作用なしで先に検証するための実装履歴であり、通常 runtime に
+dry-run -> execute の二段実行を要求するものではない。
+
 ## GK3500 を `workflow step` で駆動するシーケンス
 
 通常 smoke では、各 visible lane で AI が同じ `mozyo-bridge workflow step` を叩くだけでよい。
@@ -168,9 +182,11 @@ anchorを決めた後、そのalready-determined anchorを渡すprovider-specifi
 標準arg-free surfaceでは`anchor_required`にfail-closedする。これは
 `## 禁止される自動実行`のwork item作成・選択判断、およびanchorなしworker dispatch禁止と整合する。
 
-`--dry-run` は各 step の解決結果 (`state` / `next_action` / `execution` / `reason` /
-`next_owner` / `primitive` / `durable_anchor`) を mutate せずに返す。`--json` は同じ envelope を
-1 個の JSON object として返す。実 flag / state / reason token は CLI help / tests を正本にする。
+診断時の `--dry-run` は各 step の解決結果 (`state` / `next_action` / `execution` / `reason` /
+`next_owner` / `primitive` / `durable_anchor`) を mutate せずに返す。`--json` は本実行・dry-run
+いずれでも同じ envelope を 1 個の JSON object として返す出力 modifier である。通常 smoke は
+dry-run を前置せず、一回の `workflow step` または `workflow step --json` で進める。
+実 flag / state / reason token は CLI help / tests を正本にする。
 
 primitive (`project-gateway consult` / `child-intake` / `handoff send` /
 `ticketless-callback` / `q-enter` / `delegate-*`) は internal / compatibility / debug surface

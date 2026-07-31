@@ -19,6 +19,9 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    build_release_observation,
+)
 from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
 from mozyo_bridge.core.state.lane_lifecycle_model import DecisionPointer, LaneLifecycleKey
 from mozyo_bridge.core.state.lane_metadata import record_lane_created
@@ -454,7 +457,7 @@ class T2cProductionActuationTest(unittest.TestCase):
             locator="%9",
         )
         opened = self.store.request_release(
-            key, expected_revision=cas.revision, action_id=f"hibernate:{LANE}", pins=[pin],
+            key, expected_revision=cas.revision, action_id=f"hibernate:{LANE}", observation=build_release_observation([pin],)
         )
         assert opened.applied, opened
         if target is not None:
