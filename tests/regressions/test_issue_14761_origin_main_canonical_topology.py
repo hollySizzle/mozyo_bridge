@@ -41,6 +41,19 @@ from mozyo_bridge.application.repo_local_config_loader import (
 CONFIG_PATH = ROOT / ".mozyo-bridge" / "config.yaml"
 ADOPTION_DOC = ROOT / "vibes" / "docs" / "logics" / "coordinator-sublane-development-flow.md"
 
+#: The governing rule the distributed doctrine must not contradict. Read from the in-repo
+#: scaffold source rather than the installed repo-local copy: the two are kept byte-identical
+#: by `scaffold canonical --check`, and this one is the version-controlled distribution input.
+CENTRAL_PRESET = (
+    ROOT
+    / "src"
+    / "mozyo_bridge"
+    / "scaffold"
+    / "presets"
+    / "redmine-governed"
+    / "agent-workflow.md"
+)
+
 #: The canonical skill body plus every mirror of it. Derived rather than listed one by one so
 #: a new mirror is covered; the mirror-parity drift check lives elsewhere, what matters here
 #: is that no COPY carries an unconditional staged doctrine.
@@ -393,6 +406,72 @@ class DistributedDoctrineTopologyTest(unittest.TestCase):
                     "integration; stating the order without denying the inverse leaves the "
                     "stalling reading available",
                 )
+
+    def test_staged_integration_is_triggered_by_review_approval(self) -> None:
+        # The staged layer integrates into a DIFFERENT branch than the public history, but it
+        # is triggered by the same thing: Review Gate approval. Saying "after the UserStory is
+        # closed" makes a staged adopter wait for owner close approval before integrating —
+        # the same stall this US fixed on the single-canonical side, and a contradiction with
+        # `## Integration disposition と push authority`, which the subsection itself cites.
+        for path in SKILL_WORKFLOW_BODIES:
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                subsection = _section(
+                    self._publication_section(path), "### integration 層", 3
+                )
+                self.assertTrue(subsection, f"{path} lost the staged integration subsection")
+                granting = [
+                    line
+                    for line in subsection.splitlines()
+                    # Bullets only. The subsection heading names the same action ("staging
+                    # branch への自律 push") without granting it, and a heading carries no
+                    # trigger by construction.
+                    if line.startswith("- ")
+                    and ("自律 push" in line or "push してよい" in line)
+                ]
+                self.assertTrue(
+                    granting,
+                    "the staged integration subsection no longer grants the staging push; "
+                    "if it moved, this rule has to move with it",
+                )
+                for line in granting:
+                    self.assertIn(
+                        "Review Gate approval",
+                        line,
+                        "a line granting the staging push must name Review Gate approval as "
+                        f"its trigger; this one does not: {line.strip()!r}",
+                    )
+
+    def test_staged_integration_denies_issue_close_as_a_precondition(self) -> None:
+        for path in SKILL_WORKFLOW_BODIES:
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                subsection = _section(
+                    self._publication_section(path), "### integration 層", 3
+                )
+                self.assertIn(
+                    "前提条件ではない",
+                    subsection,
+                    "the staged subsection never rules out UserStory close / owner close "
+                    "approval as an integration precondition; stating the right trigger "
+                    "without denying the wrong one leaves the stalling reading available",
+                )
+
+    def test_central_preset_still_triggers_integration_on_review_approval(self) -> None:
+        # The cross-check that makes the two tests above more than a duplicated constant: if
+        # the governing preset ever moves the integration trigger, this fails and forces the
+        # distributed doctrine to be re-derived instead of silently drifting from it.
+        text = CENTRAL_PRESET.read_text(encoding="utf-8")
+        trigger = (
+            "integration branch (origin/main / release branch) を前進させるのは "
+            "review 承認後の coordinator"
+        )
+        # assertTrue, not assertIn: the haystack is a ~96KB rule book and assertIn prints it
+        # in full on failure, burying the message.
+        self.assertTrue(
+            trigger in text,
+            f"{CENTRAL_PRESET.name} no longer states a review-approval integration trigger "
+            f"({trigger!r}); the skill's staged and single-canonical subsections are derived "
+            "from it and must be re-derived, not left to drift",
+        )
 
     def test_release_gate_stays_independent_of_branch_topology(self) -> None:
         # The one boundary a topology switch must NOT move: reaching the integration branch

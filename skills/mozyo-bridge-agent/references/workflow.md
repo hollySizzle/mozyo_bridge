@@ -905,8 +905,9 @@ publication checkpoint の適用範囲は、その project の branch topology �
 
 **適用: staged topology。**
 
-- UserStory が close された後、coordinator は staging branch (例 `main-next`) へ owner 承認なしに自律 push してよい。目的は各 sublane が cut し直す lane base の鮮度維持であり、公開ではない。
-- これは `## Integration disposition と push authority` の integration disposition (`merge` / `patch_equivalent` / `explicit_deferral`) の到達先を、`origin/main` ではなく staging branch にすることを既定にする。disposition journal の記録義務は変わらない。
+- **Review Gate approval の後**、coordinator は staging branch (例 `main-next`) へ owner 承認なしに自律 push してよい。目的は各 sublane が cut し直す lane base の鮮度維持であり、公開ではない。
+- **UserStory の close も owner close approval も、staging branch への統合の前提条件ではない。** 統合の trigger は topology によらず Review Gate approval である (`## Integration disposition と push authority`、および central preset の commit-hash 到達可能性規約)。staging への統合を close 待ちにすると、review 承認済みの統合が owner close approval 待ちで停止し、lane base の鮮度維持という本層の目的そのものが失われる。owner close approval が gate するのは issue の close であって統合ではない。
+- これは `## Integration disposition と push authority` の integration disposition (`merge` / `patch_equivalent` / `explicit_deferral`) の **到達先だけ**を、`origin/main` ではなく staging branch にすることを既定にする。trigger と disposition journal の記録義務は上流節のまま変わらない。
 - staging branch への push は Redmine Version close でも release tag でも package version bump でもない。統合の鮮度維持であって、下記 publication 層の昇格ではない。
 
 ### publication 層: Redmine Version close = `origin/main` 昇格 checkpoint
