@@ -39,10 +39,22 @@ implemented and tested here rather than reimplementing it.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import ClassVar, Iterable, Mapping, Protocol, Sequence
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.canonical_note_scan import (  # noqa: E501
+    MARKER_CHANNEL_HANDOFF,
+    MARKER_CHANNEL_WORKFLOW_EVENT,
+    canonical_marker_fields,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.marker_value_contract import (  # noqa: E501
+    MARKER_VALUE_FORBIDDEN_CHARS,
+    MarkerValueError,
+    is_exact_str,
+    review_anchor_fields,
+    review_marker_fields,
+    validate_marker_field_value,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernate_evidence_envelope import (  # noqa: E501
     LaneEvidenceEnvelope,
     render_lane_envelope,
@@ -60,22 +72,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 # ---------------------------------------------------------------------------
-# Structured marker schema (machine token, never prose). The watcher recognizes the
-# existing handoff marker channel and a dedicated workflow-event channel; both are
-# ``[mozyo:<channel>:key=value:key=value:...]`` with ':'-separated key=value fields.
+# Structured marker schema (machine token, never prose). The token grammar, the recognized
+# channels, and the QUOTE-AWARE canonical scan all live in one shared authority
+# (:mod:`...domain.canonical_note_scan`) that this reader and the proxy rail's reader both
+# call — two readers of the same grammar with two notions of "quoted" is a drift generator,
+# and the drift is exactly what let a quoted marker become gate authority (#14585).
+#
+# :data:`MARKER_CHANNEL_HANDOFF` / :data:`MARKER_CHANNEL_WORKFLOW_EVENT` are re-exported here
+# because this module's ``__all__`` is the import site the rest of the package already uses.
 # ---------------------------------------------------------------------------
-
-#: The handoff marker channel (:func:`...domain.handoff.build_marker`). Its ``kind`` field
-#: carries the gate; the source anchor is ``issue`` / ``journal``.
-MARKER_CHANNEL_HANDOFF = "handoff"
-#: A dedicated watcher channel a gate journal can embed to carry the full structured event
-#: (gate + conclusion / callback / commit / integrated / open / blocker). Its gate field is
-#: ``gate`` (``kind`` is also accepted as an alias).
-MARKER_CHANNEL_WORKFLOW_EVENT = "workflow-event"
-
-_RECOGNIZED_CHANNELS = frozenset(
-    {MARKER_CHANNEL_HANDOFF, MARKER_CHANNEL_WORKFLOW_EVENT}
-)
 
 #: The **callback-required** gate kinds a marker may name — the states that must wake the
 #: coordinator (``skills/mozyo-bridge-agent/references/workflow.md`` ``### coordinator callback
@@ -100,41 +105,26 @@ GATE_BEARING_KINDS: frozenset[str] = frozenset(
     }
 )
 
-#: ``[mozyo:<channel>:<body>]`` — the body is the ':'-separated key=value field list.
-_MARKER_RE = re.compile(r"\[mozyo:(?P<channel>[a-z0-9_-]+):(?P<body>[^\]]*)\]")
 
-
-def _parse_marker_fields(body: str) -> dict[str, str]:
-    """Parse a ``key=value:key=value`` marker body into a dict (pure; last write wins)."""
-    fields: dict[str, str] = {}
-    for token in body.split(":"):
-        token = token.strip()
-        if not token:
-            continue
-        key, eq, value = token.partition("=")
-        if not eq:
-            continue
-        fields[key.strip()] = value.strip()
-    return fields
-
-
-def marker_fields_in_note(notes: str) -> tuple[tuple[str, dict[str, str]], ...]:
-    """Every ``[mozyo:<channel>:...]`` marker in a note as ``(channel, fields)``, in note order (pure).
-
-    The shared structured-token scan the marker readers are built on: it recognizes the token
-    grammar and parses the field list, but applies **no** vocabulary policy — each reader decides
-    which channel / kind it accepts. Unrecognized channels are dropped here so a reader never has
-    to know the channel set. Prose is never inspected; a note with no token yields ``()``.
-    """
-    if not notes:
-        return ()
-    found: list[tuple[str, dict[str, str]]] = []
-    for match in _MARKER_RE.finditer(notes):
-        channel = match.group("channel")
-        if channel not in _RECOGNIZED_CHANNELS:
-            continue
-        found.append((channel, _parse_marker_fields(match.group("body"))))
-    return tuple(found)
+# ---------------------------------------------------------------------------
+# The marker-body strict readers moved to :mod:`.strict_marker_read` (Redmine #14687) when the
+# #14661 integration pushed this module past the module-health line. They are re-exported here
+# UNCHANGED because this module's ``__all__`` is the import site the rest of the package already
+# uses (~120 modules and tests), and because a second import path for one grammar is the drift
+# this package keeps paying for. New callers should prefer the owning module.
+# ---------------------------------------------------------------------------
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.strict_marker_read import (  # noqa: E501
+    MARKER_GATE_ALIASES,
+    declares_gate,
+    marker_components_in_note,
+    marker_declares_gate,
+    marker_fields_in_note,
+    marker_logical_gates,
+    strict_gate_markers,
+    strict_marker_body_fields,
+    strict_marker_fields,
+    strict_marker_fields_in_note,
+)
 
 
 @dataclass(frozen=True)
@@ -155,6 +145,34 @@ class RedmineJournalEntry:
     #: start time (the basis decision journal's ``created_on``). Blank when the provider projection
     #: did not carry one; NEVER inferred from the journal id or a local observation.
     created_on: str = ""
+    #: The provider's OPAQUE author identifier for this journal (Redmine #14661 scope resolution
+    #: j#92494). A destructive owner approval must be attributable to an authority, and a marker
+    #: that merely *names* an approval source proves nothing — anyone who can write a note can
+    #: write that field. This carries the author so a verifier can compare it against an issuer
+    #: resolved from the durable record itself.
+    #:
+    #: **Identifier only, never the display name.** j#92494 requires the evidence be carried
+    #: "値非表示" (without exposing the value), and a person's name is personal data that must
+    #: not reach a repo file, a journal, or a log. The provider's numeric user id is an opaque
+    #: comparison key that satisfies the authority check without carrying anything about who the
+    #: person is.
+    #:
+    #: Blank when the provider projection did not carry one — which a fail-closed consumer must
+    #: treat as "not attributable", never as "attributable to anyone".
+    author_id: str = ""
+
+
+def _author_id(actor: object) -> str:
+    """The provider's opaque author id from a ``{"id": ..., "name": ...}`` actor. (pure)
+
+    Reads ONLY the identifier. The display name is deliberately never read, so a personal name
+    cannot reach a DTO, a durable record, or a log through this path (#14661 j#92494's
+    値非表示 requirement and the organisation's personal-data baseline). A missing / malformed
+    actor yields ``""`` — "not attributable", which every consumer must fail closed on.
+    """
+    if not isinstance(actor, Mapping):
+        return ""
+    return str(actor.get("id", "") or "").strip()
 
 
 def _gate_marker_from_fields(
@@ -223,12 +241,13 @@ def extract_markers_from_note(
     *,
     channels: "frozenset[str] | set[str] | None" = None,
 ) -> tuple[JournalMarker, ...]:
-    """Extract every structured gate marker from one journal note (pure; never prose).
+    """Extract every CANONICAL structured gate marker from one journal note (pure; never prose).
 
-    Scans ``notes`` for ``[mozyo:<channel>:...]`` tokens on a recognized channel, parses each
-    into a :class:`JournalMarker` when it names a gate-bearing kind, and returns them in
-    note order. A note with no recognized marker token yields ``()`` — the watcher reads the
-    structured token, never the surrounding narrative.
+    Scans ``notes`` through the shared quote-aware scan (:func:`canonical_marker_fields`), parses
+    each canonical marker into a :class:`JournalMarker` when it names a gate-bearing kind, and
+    returns them in note order. A note with no canonical marker token yields ``()`` — the watcher
+    reads the structured token, never the surrounding narrative, and never a **quotation** of the
+    token (Redmine #14585: a journal that echoes a marker while discussing it is not a gate).
 
     ``channels`` optionally restricts extraction to a SUBSET of the recognized channels — the
     channel provenance a caller needs to keep the two channels apart (Redmine #13952 R6 review
@@ -244,13 +263,7 @@ def extract_markers_from_note(
         notes=notes,
     )
     markers: list[JournalMarker] = []
-    for match in _MARKER_RE.finditer(notes):
-        channel = match.group("channel")
-        if channel not in _RECOGNIZED_CHANNELS:
-            continue
-        if channels is not None and channel not in channels:
-            continue
-        fields = _parse_marker_fields(match.group("body"))
+    for channel, fields in canonical_marker_fields(notes, channels=channels):
         marker = _gate_marker_from_fields(entry, channel, fields)
         if marker is not None:
             markers.append(marker)
@@ -373,9 +386,23 @@ class MappingRedmineJournalSource:
                 RedmineJournalEntry(
                     issue_id=resolved, journal_id=jid, notes=notes,
                     created_on=str(journal.get("created_on", "") or "").strip(),
+                    author_id=_author_id(journal.get("user")),
                 )
             )
         return entries
+
+    def issue_author_id(self) -> str:
+        """The provider's opaque author id for the ISSUE itself, or ``""``. (pure)
+
+        The durable anchor an approval issuer is resolved against (#14661 j#92494: the expected
+        issuer must come from the record, never from the caller — a caller-supplied expectation
+        would let the actor requesting a destructive action name its own approver). Blank when
+        the projection did not carry one, which fails closed at the consumer.
+        """
+        issue = self.payload.get("issue")
+        if isinstance(issue, Mapping):
+            return _author_id(issue.get("author"))
+        return ""
 
 
 def markers_from_source(
@@ -446,11 +473,14 @@ def dispatch_entry_journals(
         entry_journal = str(getattr(entry, "journal_id", "") or "").strip()
         if not entry_journal:
             continue
-        for channel, fields in marker_fields_in_note(getattr(entry, "notes", "") or ""):
-            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
-                continue
-            if str(fields.get("kind", "")).strip() != DISPATCH_KIND_IMPLEMENTATION_REQUEST:
-                continue
+        # Effect-reaching: the anchor this resolves drives the callback sweep's send decision, so
+        # the note is read strictly and an unreadable marker refuses the whole entry.
+        # ``strict_gate_markers`` carries all three requirements at once: the workflow-event
+        # channel, a renderable body, and a logical gate set of exactly this kind — so a note
+        # naming a second gate in the other alias proves neither and matches nothing.
+        for fields in strict_gate_markers(
+            getattr(entry, "notes", "") or "", DISPATCH_KIND_IMPLEMENTATION_REQUEST
+        ):
             if str(fields.get("lane", "")).strip() != lane_s:
                 continue
             if str(fields.get("lane_generation", "")).strip() != gen_s:
@@ -474,11 +504,9 @@ def dispatch_generations(entries: "Iterable[RedmineJournalEntry]", *, lane: str)
         return ()
     found: set[int] = set()
     for entry in entries or ():
-        for channel, fields in marker_fields_in_note(getattr(entry, "notes", "") or ""):
-            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
-                continue
-            if str(fields.get("kind", "")).strip() != DISPATCH_KIND_IMPLEMENTATION_REQUEST:
-                continue
+        for fields in strict_gate_markers(
+            getattr(entry, "notes", "") or "", DISPATCH_KIND_IMPLEMENTATION_REQUEST
+        ):
             if str(fields.get("lane", "")).strip() != lane_s:
                 continue
             raw = str(fields.get("lane_generation", "")).strip()
@@ -486,6 +514,31 @@ def dispatch_generations(entries: "Iterable[RedmineJournalEntry]", *, lane: str)
                 found.add(int(raw))
             except (TypeError, ValueError):
                 continue
+    return tuple(sorted(found))
+
+
+def dispatch_lanes(entries: "Iterable[RedmineJournalEntry]") -> "tuple[str, ...]":
+    """Every lane this issue carries a canonical dispatch marker for (pure, sorted).
+
+    The lane-free counterpart of :func:`dispatch_entry_journals`, which fixes a lane and can
+    therefore never tell "this issue has no dispatch at all" from "this issue's dispatches belong to
+    somebody else". A caller resolving its own work anchor needs that distinction to say so: a lane
+    reading an issue whose dispatches all name OTHER lanes is a cross-lane read, and reporting it as
+    a plain absence sends the operator looking for a missing record that is not missing.
+
+    Both cases are equally fail-closed — this only names which one happened. A blank lane field is
+    skipped (never guessed).
+    """
+    found: set[str] = set()
+    for entry in entries or ():
+        for channel, fields in marker_fields_in_note(getattr(entry, "notes", "") or ""):
+            if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
+                continue
+            if str(fields.get("kind", "")).strip() != DISPATCH_KIND_IMPLEMENTATION_REQUEST:
+                continue
+            lane = str(fields.get("lane", "")).strip()
+            if lane:
+                found.add(lane)
     return tuple(sorted(found))
 
 
@@ -525,7 +578,14 @@ def _render_evidence_envelope(
     marker carrying ``workspace`` but no ``lane`` would read as unenveloped evidence while looking
     enveloped to a human. The values themselves go through the shared strict renderer
     (:func:`render_lane_envelope`), which refuses a non-positive generation, an empty identity, and
-    any value carrying a marker separator.
+    any value carrying a marker separator — RAW. Nothing is converted or trimmed on the way in
+    (Redmine #14694 review j#93646 findings 1-2): a ``str(...).strip()`` here bypassed the very
+    inputs that renderer exists to refuse, and an ``int(lane_generation)`` in front of it turned
+    ``1.5`` into generation ``1`` — evidence bound to a generation the caller never named, which is
+    the promotion across generations the whole envelope exists to prevent. There was no argv to
+    convert either: this function's only CLI path
+    (``review_gate_marker_fields.lane_envelope_marker_fields``) resolves the generation to an
+    ``int`` before calling, and ``render_gate_note`` declares it as one.
     """
     supplied = [v for v in (workspace, lane, lane_generation) if v is not None]
     if not supplied:
@@ -535,16 +595,8 @@ def _render_evidence_envelope(
             "the hibernate-evidence lane envelope is all-or-none: "
             "workspace, lane and lane_generation must be supplied together"
         )
-    try:
-        generation = int(lane_generation)
-    except (TypeError, ValueError):
-        raise ValueError(f"lane_generation must be an integer, got {lane_generation!r}") from None
     return render_lane_envelope(
-        LaneEvidenceEnvelope(
-            workspace=str(workspace).strip(),
-            lane=str(lane).strip(),
-            lane_generation=generation,
-        )
+        LaneEvidenceEnvelope(workspace=workspace, lane=lane, lane_generation=lane_generation)
     )
 
 
@@ -589,17 +641,15 @@ def render_workflow_event_marker(
     contract's authority; the agent-facing producer rule lives in the governed preset's
     ``### Review Generation Marker Contract v2``.
     """
-    gate_s = str(gate).strip()
-    if gate_s not in GATE_BEARING_KINDS:
+    # Every value is judged RAW (#14694 review j#93818 F1): the `str(...).strip()` this used to do
+    # rewrote `conclusion=" approved "` / `head=" <sha> "` / `req=" 93802 "` into clean canonical
+    # authority fields. The envelope's own rule governs this marker's fields too.
+    if not is_exact_str(gate) or gate not in GATE_BEARING_KINDS:
         raise ValueError(
-            f"render_workflow_event_marker gate must be one of {sorted(GATE_BEARING_KINDS)}, "
-            f"got {gate!r}"
+            f"render_workflow_event_marker gate must be one of {sorted(GATE_BEARING_KINDS)}, got {gate!r}"
         )
-    fields = [f"gate={gate_s}"]
-    if conclusion is not None:
-        fields.append(f"conclusion={str(conclusion).strip()}")
-    if callback is not None:
-        fields.append(f"callback={str(callback).strip()}")
+    fields = [f"gate={gate}"]
+    fields.extend(review_marker_fields(conclusion=conclusion, callback=callback))
     for key, value in (
         ("commit", commit_bearing),
         ("integrated", integration_recorded),
@@ -608,13 +658,11 @@ def render_workflow_event_marker(
     ):
         if value is not None:
             fields.append(f"{key}={'1' if value else '0'}")
-    # Redmine #13974 additive review-gate contract: the reviewed/requested head (``head``) and, on a
-    # review_result, the answered review_request journal (``req``). A git SHA is hex and a journal id
-    # numeric, so neither collides with the ``:``/``=`` marker grammar. Only emitted when supplied.
-    if target_head is not None:
-        fields.append(f"head={str(target_head).strip()}")
-    if review_request_journal is not None:
-        fields.append(f"req={str(review_request_journal).strip()}")
+    # Redmine #13974 additive review-gate contract: the reviewed/requested head and, on a
+    # review_result, the answered review_request journal. Only emitted when supplied.
+    fields.extend(review_anchor_fields(
+        target_head=target_head, review_request_journal=review_request_journal
+    ))
     # Redmine #14219 T2b: the common hibernate-evidence lane envelope
     # (``workspace``/``lane``/``lane_generation``). ADDITIVE and opt-in — a marker without it is
     # unchanged for the review generation fence / glance (which never read these keys), and simply
@@ -651,11 +699,22 @@ def render_gate_note(gate: str, *, body: str = "", **marker_fields: object) -> s
 
 
 __all__ = (
+    "MARKER_VALUE_FORBIDDEN_CHARS",
+    "MarkerValueError",
+    "validate_marker_field_value",
     "MARKER_CHANNEL_HANDOFF",
     "MARKER_CHANNEL_WORKFLOW_EVENT",
     "GATE_BEARING_KINDS",
     "RedmineJournalEntry",
+    "MARKER_GATE_ALIASES",
+    "marker_components_in_note",
+    "marker_declares_gate",
     "marker_fields_in_note",
+    "marker_logical_gates",
+    "declares_gate",
+    "strict_gate_markers",
+    "strict_marker_fields_in_note",
+    "strict_marker_fields",
     "extract_markers_from_note",
     "extract_marker",
     "extract_markers",
@@ -669,6 +728,7 @@ __all__ = (
     "render_dispatch_note",
     "dispatch_entry_journals",
     "dispatch_generations",
+    "dispatch_lanes",
     "resolve_dispatch_entry_journal",
     "dispatch_entry_journal_from_source",
 )

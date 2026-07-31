@@ -11,7 +11,7 @@ helper invocation を以下の節で各 step に併記する。helper を呼ば�
 | Source Tree Hygiene | `mozyo-bridge release check tree` | classifier 後の blocker disposition は operator |
 | Fresh Scaffold Smoke | `mozyo-bridge release check scaffold` | strict-fail; preset 修正で再実行 |
 | Build Artifact Inspection | `mozyo-bridge release check artifact` | classifier 後の blocker disposition は operator |
-| Canonical Renderer / Plugin Mirror Drift | `mozyo-bridge release check drift` | strict-fail; canonical 再 render または mirror 再 sync で復旧 |
+| Canonical Renderer / Skill Mirror Drift | `mozyo-bridge release check drift` | strict-fail; canonical 再 render または mirror 再 sync (plugin / legacy project) で復旧 |
 | Release Ref Consistency (mirror set 内 version 確認) | `mozyo-bridge release bump --check` | mirror set 不一致は strict-fail |
 | GitHub Actions run status / conclusion 確認 | `mozyo-bridge release check workflow --run-id <id>` | `failure` 受領可否は operator |
 | GitHub Actions run polling | `mozyo-bridge release workflow wait --run-id <id> --timeout <s>` | timeout exit (124) は operator が次手を決定 |
@@ -164,15 +164,16 @@ mozyo-bridge release check artifact
 
 helper は `release check` family の read-only invariant を守るため repo の `dist/` を一切触らない。`python -m build --outdir <tmp>/dist` で隔離 tmp に書き出し、wheel / sdist を `<tmp>/extracted` に展開してから candidate scan と classifier を実行する。helper は safe-code pattern を内部で除外し、real credential literal / tracked secret file / personal path を strict-fail (exit 1) で返す。operator は残った blocker を clean に直すか active release ticket に disposition を残す。
 
-### Canonical Renderer / Plugin Mirror Drift
+### Canonical Renderer / Skill Mirror Drift
 
-`mozyo-bridge scaffold canonical [--check]` で render される router pair (`_router/AGENTS.md` / `_router/CLAUDE.md`) と governed preset workflow pair (`redmine-governed/agent-workflow.md` / `redmine-rails-governed/agent-workflow.md`) は canonical source (`src/mozyo_bridge/scaffold/canonical_sources/*.yaml`) から再生成可能であること、`plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/` は `skills/mozyo-bridge-agent/` の byte mirror であることを release 前に確認する。
+`mozyo-bridge scaffold canonical [--check]` で render される router pair (`_router/AGENTS.md` / `_router/CLAUDE.md`) と governed preset workflow pair (`redmine-governed/agent-workflow.md` / `redmine-rails-governed/agent-workflow.md`) は canonical source (`src/mozyo_bridge/scaffold/canonical_sources/*.yaml`) から再生成可能であること、`plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/` は `skills/mozyo-bridge-agent/` の byte mirror であること、`.claude/skills/mozyo-bridge-agent/references/` は同 canonical の partial mirror であることを release 前に確認する。
 
 手元検査:
 
 ```bash
 mozyo-bridge scaffold canonical --check --repo .
 scripts/sync_plugin_skill.sh --check
+scripts/sync_legacy_project_skill.sh --check
 ```
 
 Helper:
@@ -181,11 +182,13 @@ Helper:
 mozyo-bridge release check drift
 ```
 
-両 sub-check を 1 command で走らせる release helper。clean tree で exit 0、いずれか drift があれば strict-fail (exit 1) として `result: blocker` を返す。helper は `release check` family の read-only / idempotent invariant を守り、worktree や mirror に書き戻さない。復旧 command は stdout に verbatim で列挙される (`mozyo-bridge scaffold canonical` / `scripts/sync_plugin_skill.sh`, no `--check`)。
+全 sub-check を 1 command で走らせる release helper。clean tree で exit 0、いずれか drift があれば strict-fail (exit 1) として `result: blocker` を返す。helper は `release check` family の read-only / idempotent invariant を守り、worktree や mirror に書き戻さない。復旧 command は stdout に verbatim で列挙される (`mozyo-bridge scaffold canonical` / `scripts/sync_plugin_skill.sh` / `scripts/sync_legacy_project_skill.sh`, no `--check`)。
+
+legacy project skill sub-check は Redmine #14580 で追加した。plugin mirror だけが script と gate を持ち、legacy partial mirror は「canonical を先に編集して手で写す」運用規約しか持たなかったため、commit `7ca3380f` が canonical + plugin mirror を更新して legacy mirror を落とし、drift が full suite まで検出されなかった。detection (parity regression) は #13483 で既にあったが、recovery command と pre-release gate が無い検出は commit 前に効かない。
 
 CI gate:
 
-- `.github/workflows/test.yml` の `python -m unittest discover -s tests -v` step が、`tests/test_docs_canonical_workspace.py` の `CanonicalRendererTest` / `GovernedWorkflowCanonicalTest` (canonical render) と `tests/test_plugin_marketplace.py` の `PluginMarketplaceTest` (mirror byte gate + `sync_plugin_skill.sh --check` shell gate) を毎 push / PR で実行する。release helper を pre-merge gate として別に追加せず、unittest layer に集約する。
+- `.github/workflows/test.yml` の `python -m unittest discover -s tests -v` step が、`tests/test_docs_canonical_workspace.py` の `CanonicalRendererTest` / `GovernedWorkflowCanonicalTest` (canonical render)、`PluginMarketplaceTest` (plugin mirror byte gate + `sync_plugin_skill.sh --check` shell gate)、`LegacyProjectSkillMirrorTest` / `LegacySkillSyncScriptTest` (legacy partial mirror parity + `sync_legacy_project_skill.sh` の sync / `--check` 挙動) を毎 push / PR で実行する。release helper を pre-merge gate として別に追加せず、unittest layer に集約する。
 - release helper `release check drift` は pre-release operator が release commit 直前に 1 command で確認するための facade。active release ticket の audit trail にも `release check drift` の出力を貼る運用とする。
 
 ### Release Ref Consistency
@@ -323,6 +326,31 @@ PyPI production publisher:
 4. `git push origin main`。
 5. GitHub Actions `Test` の green を待つ。
    - Helper: `mozyo-bridge release workflow runs --workflow Test` で最新 run-id を確認し、`mozyo-bridge release workflow wait --run-id <id> --timeout <seconds>` で `completed` まで polling できる。
+
+## Release Note Entries (behaviour change ledger)
+
+helper は release notes を生成しない (`### Tag and Release`)。よって **既定挙動を変える変更は、その実装
+issue の時点でここに 1 entry を残す**。release 時に notes を書く operator はこの節を読み、当該 release に
+含まれる entry を転記する。転記済み entry は release journal に version を記録した上で削除する
+(ここは *未反映* の台帳であり、履歴の正本ではない — 履歴の正本は tag / release notes / release journal)。
+
+entry は「何が変わったか」「adopter は何もしないとどうなるか」「元へ戻す方法」の 3 点を必ず含める。
+
+### 未反映 entry
+
+- **`lane_placement` 未設定時の pair 配置が左右 → 上下になった (Redmine #14568)**
+  - 変更: `lane_placement` を宣言していない workspace でも、coordinator pair と sublane の
+    gateway/worker pair が `--split down` で縦に並ぶ。coordinator pair の launch 順は
+    `[codex, claude]` に固定され、codex が上段になる (sublane は role binding の
+    `(gateway, worker)` 順を尊重するため、既定 binding では gateway = codex が上段)。
+    #13646 が固定した「未設定は byte 一致」は意図的に置換された。
+  - 何もしない場合: **既存の live pair は動かない**。次の fresh launch / heal から縦になる。
+    live pane の move / swap / kill は一切行わない。
+  - 戻し方: `.mozyo-bridge/config.yaml` に `lane_placement.default.split: right` (coordinator pair) /
+    `lane_placement.sublane.split: right` (全 sublane) / `lane_placement.by_lane_kind.<kind>.split: right`
+    (特定 lane role のみ) を明示宣言する。`mozyo-bridge config status` の
+    `lane_placement.<class>.split` row で effective 値と `declared` / `default` の別を確認できる。
+  - 詳細: [[spec-herdr-native-identity]] §5.1 Product default。
 
 ## Tag and Release
 

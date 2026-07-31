@@ -3,7 +3,7 @@
 In a single-Redmine-author workspace every role posts through the same account, so a journal's
 writer role cannot be resolved from author identity. The ruling adopts the one thing the
 workspace CAN durably express: the **canonical gate structure -> contractual writer role**
-mapping the producer ruling itself defines (j#85530 Q3), bound to the committed role/provider
+mapping each gate's OWN ruling defines (see ``contract_ruling_pointer``), bound to the committed role/provider
 configuration by exact git blob.
 
 **This is a policy binding, NOT identity authentication** (the ruling's own words). It answers
@@ -27,14 +27,26 @@ from typing import Optional
 
 from .hibernate_evidence_authority import (
     ISSUER_UNKNOWN,
+    HIBERNATE_EVIDENCE_RULING,
     ResolvedIssuer,
+    contract_ruling_pointer,
     contract_writer_role,
 )
+from .glance_integration_disposition import canonical_marker_value
 from .hibernate_evidence_envelope import EnvelopeParseError, parse_lane_envelope
-from .redmine_journal_source import marker_fields_in_note
+from .redmine_journal_source import (
+    MARKER_CHANNEL_WORKFLOW_EVENT,
+    marker_components_in_note,
+    marker_logical_gates,
+    strict_marker_fields,
+)
 
-#: The ruling that defines the gate->writer-role contract this policy binds to.
-POLICY_RULING_POINTER = "redmine:#14219:j#85530:Q3"
+#: The ruling that founded this policy module. Retained as the compatibility default for the
+#: hibernate-evidence gates it was written for; the anchor a resolution actually cites now comes
+#: from the GATE's own ruling (:func:`...hibernate_evidence_authority.contract_ruling_pointer`),
+#: because a repo-wide pointer attributes every future gate to a record that never mentioned it
+#: (Redmine #14661 j#92715).
+POLICY_RULING_POINTER = HIBERNATE_EVIDENCE_RULING
 
 #: The committed configuration file whose exact blob the binding is anchored to.
 CONFIG_RELPATH = ".mozyo-bridge/config.yaml"
@@ -67,14 +79,35 @@ def resolve_journal_issuer(
         return ResolvedIssuer()
 
     gates: dict[str, list[dict]] = {}
-    for _channel, fields in marker_fields_in_note(notes or ""):
-        gate = str(fields.get("gate", "") or "").strip()
-        if not gate:
+    for channel, components in marker_components_in_note(notes or ""):
+        # ONLY the workflow-event channel is authority. The handoff channel is a delivery
+        # NOTIFICATION (the same F5 boundary the glance grammar holds) and it carries a ``kind``
+        # field, so once ``kind`` became an authority alias a delivery record sitting in the same
+        # journal as an evidence marker would have read as a second gate claim and unresolved a
+        # perfectly good issuer. Restricting the channel is what makes the alias union safe.
+        if channel != MARKER_CHANNEL_WORKFLOW_EVENT:
             continue
-        role = contract_writer_role(gate)
-        if role == ISSUER_UNKNOWN:
-            continue
-        gates.setdefault(gate, []).append(fields)
+        # The SHARED strict reader, over UNCOLLAPSED components (Redmine #14539 review j#91896
+        # finding 2). Reading the folded dict lost two things at once: a repeated ``gate`` key was
+        # erased by last-write-wins, and surrounding whitespace was normalized away. Either let a
+        # marker the canonical producer could not render resolve to a clean coordinator issuer.
+        # The SAME canonicalizer every other authority consumer passes: two spellings of one
+        # governed token are one declaration, so a canonically-equal duplicate does not make the
+        # body ambiguous. Without this the three consumers would disagree about the same marker.
+        fields = strict_marker_fields(components, canonicalize=canonical_marker_value)
+        if fields is None:
+            # A marker whose body is not renderable declares nothing — and "nothing" must not mean
+            # "skip it and read the next one", so a note carrying one is left unresolved below
+            # unless some OTHER marker establishes exactly one gate. That is the same fail-closed
+            # shape as the conflict case: it never promotes, only withholds.
+            return ResolvedIssuer()
+        declared = marker_logical_gates(fields)
+        for gate in declared:
+            # An UNRECOGNIZED gate token still counts as a claim (review j#91896 finding 2):
+            # skipping it let ``gate=integration_disposition:kind=unknown_gate`` resolve as if only
+            # one contract had been named. Its role is unknown, so the note ends up with two gates
+            # and proves neither.
+            gates.setdefault(gate, []).append(fields)
 
     if len(gates) != 1:
         # Zero authority-bearing gates -> unknown; two DIFFERENT authority gates in one note
@@ -82,9 +115,17 @@ def resolve_journal_issuer(
         return ResolvedIssuer()
     (gate, marker_list), = gates.items()
     role = contract_writer_role(gate)
+    if role == ISSUER_UNKNOWN:
+        # The one gate the note names has no contractual writer, so nothing is resolved. Returning
+        # an ANCHORED unknown would be a resolution-shaped value for an unresolved question.
+        return ResolvedIssuer()
 
+    ruling = contract_ruling_pointer(gate)
+    if not ruling:
+        # A gate whose writer contract no ruling claims cannot be anchored to one.
+        return ResolvedIssuer()
     anchor = (
-        f"{POLICY_RULING_POINTER} {policy_pointer} "
+        f"{ruling} {policy_pointer} "
         f"evidence:redmine:j#{str(journal_id).strip()}:gate={gate}"
     )
 

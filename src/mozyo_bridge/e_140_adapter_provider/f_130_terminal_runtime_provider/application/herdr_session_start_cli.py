@@ -35,6 +35,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
     SessionStartResult,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import (  # noqa: E501
+    RATIO_NOT_APPLICABLE,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
     COMPENSATION_NOT_NEEDED,
 )
@@ -82,6 +85,15 @@ def _render_text(result: SessionStartResult) -> str:
             else f"reclaim-failed ({result.tab_pane_detail})"
         )
         lines.append(f"tab root pane {result.tab_pane_id}: {state}")
+    if result.ratio_outcome != RATIO_NOT_APPLICABLE:
+        # Redmine #14569: the pair's declared division is its own axis, so it gets its own
+        # line whenever this run had an opinion about it — including on success, because
+        # `matched` / `applied` is the only place an operator can read that the geometry was
+        # actually MEASURED rather than merely requested.
+        lines.append(
+            f"pair split ratio: {result.ratio_outcome}"
+            + (f" ({result.ratio_detail})" if result.ratio_detail else "")
+        )
     if not result.ok:
         # Name the next action AND hand over the handle it needs. The text used to say
         # "converge it with the rollback rail" without ever printing the action id that
@@ -90,7 +102,8 @@ def _render_text(result: SessionStartResult) -> str:
         # the one argument of the recovery command is not a pointer.
         lines.append(
             "session-start did NOT fully succeed: at least one requested role is not "
-            "live-and-attested (see health above). This run closed nothing."
+            "live-and-attested, or the declared pair split ratio was not applied "
+            "(see the lines above). This run closed nothing."
         )
         if result.action_id and any(
             s.compensation != COMPENSATION_NOT_NEEDED for s in result.slots

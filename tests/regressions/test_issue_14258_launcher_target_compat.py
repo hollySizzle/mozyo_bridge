@@ -2465,7 +2465,7 @@ class R14DeclaresNothingTest(unittest.TestCase):
                     f"usage: x [{_MARKER} NAME]",
                     "mozyo_attest_capability_schema=2",
                     "mozyo_attest_capability_stores=1_2",
-                    "mozyo_attest_capability_lifecycle=1_2_3_4_5_6_7",
+                    "mozyo_attest_capability_lifecycle=1_2_3_4_5_6_7_8_9",
                     "mozyo_generation_protocol_capability=1",
                 )
             )

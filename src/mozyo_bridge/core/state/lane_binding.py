@@ -33,9 +33,11 @@ anchor for an (empty-``issue_id``) project lane.
 from __future__ import annotations
 
 from mozyo_bridge.core.state.lane_lifecycle_model import (
+    BINDING_KIND_ISSUE,
     BINDING_KIND_PROJECT_GATEWAY,
     LaneLifecycleRecord,
     norm,
+    stored_binding_kind_is,
 )
 
 
@@ -54,9 +56,11 @@ def record_matches_binding(
       requested scope AND whose ``issue_id`` is empty (a project lane never owns an issue).
       A scope is the full canonical string, never a digest — the caller passes what it
       declared, so a divergent scope is a non-match, not a coerced one.
-    - ``project_scope`` empty -> **issue** binding. Matches ``record.issue_id == issue_id``
-      — byte-identical to the pre-#13811 hard-coded check every action used, so an
-      issue-owned lane's identity verdict is unchanged.
+    - ``project_scope`` empty -> **issue** binding. Requires the row to BE an issue-kind row
+      AND to own ``issue_id``. The kind requirement is Redmine #14477 review j#94840 R10-F1:
+      the branch used to compare the issue id alone, so a stored
+      ``binding_kind='project_gateway'`` row matched an issue binding — measured True before
+      the fix. The kind is compared byte-exact, so ``'issue '`` is not an issue row either.
 
     ``None`` (no row) is never a match. An empty ``issue_id`` on the issue path only
     matches an (also empty) legacy row, but every in-scope action requires a non-empty
@@ -67,11 +71,13 @@ def record_matches_binding(
     scope = norm(project_scope)
     if scope:
         return (
-            norm(record.binding_kind) == BINDING_KIND_PROJECT_GATEWAY
+            stored_binding_kind_is(record.binding_kind, BINDING_KIND_PROJECT_GATEWAY)
             and norm(record.project_scope) == scope
             and not norm(record.issue_id)
         )
-    return norm(record.issue_id) == norm(issue_id)
+    return stored_binding_kind_is(
+        record.binding_kind, BINDING_KIND_ISSUE
+    ) and norm(record.issue_id) == norm(issue_id)
 
 
 __all__ = ("record_matches_binding",)

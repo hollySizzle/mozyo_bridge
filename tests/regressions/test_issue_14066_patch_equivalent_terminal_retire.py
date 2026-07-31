@@ -65,6 +65,9 @@ _SRC = _TESTS_ROOT.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    build_release_observation,
+)
 from mozyo_bridge.core.state.lane_lifecycle import (  # noqa: E402
     DISPOSITION_HIBERNATED,
     DISPOSITION_RETIRED,
@@ -156,6 +159,48 @@ def _git(*args: str, cwd: Path, capture: bool = False):
         stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+#: Config that stops git from leaving a DETACHED background writer inside a synthetic repo.
+#:
+#: **Git 2.47.0 made auto maintenance detach by default.** A foreground command that ends in a
+#: commit (``commit``, ``cherry-pick``, ``fetch``, ...) finishes by spawning
+#: ``git maintenance run --auto --detach``, and that process daemonizes (measured: it reparents to
+#: pid 1) and keeps writing INSIDE the repository after the fixture's
+#: ``subprocess.run(..., check=True)`` has already returned. Upstream boundary, read directly from
+#: ``run-command.c`` at the release tags: **v2.46.0's ``prepare_auto_maintenance()`` pushes no
+#: ``--detach``; v2.47.0 adds the ``auto_detach`` default** (``maintenance.autoDetach`` falling
+#: back to ``gc.autoDetach``, defaulting to on) **and pushes it**. The GitHub Actions
+#: ubuntu-latest image that failed run 30422231848 ships git 2.54.0.
+#:
+#: An earlier revision of this comment said "Since Git 2.50", interpolating between two measured
+#: points (2.43 = no detach, 2.50.1 / 2.54.0 = detach) instead of checking upstream. That was
+#: wrong and is corrected here (Redmine #14685 review j#94444 F2 / verdict j#94448).
+#:
+#: The teardown then races that writer: ``shutil.rmtree`` lists a directory ONCE, removes the
+#: children it listed, and finally ``os.rmdir``s the directory. The detached maintenance writes
+#: through helpers that call ``safe_create_leading_directories()`` (``update_info_file`` for
+#: ``.git/info/refs``, ``odb_mkstemp`` for ``.git/objects/...``), so it RE-CREATES a directory the
+#: teardown had already removed and never revisits. ``os.rmdir('<tmp>/primary/.git')`` then fails
+#: with ``OSError: [Errno 39] Directory not empty`` — the exact #14685 CI error.
+#:
+#: ``maintenance.auto=false`` is the switch that actually prevents the spawn. ``gc.auto=0`` does
+#: NOT: measured on git 2.54, the detached process still starts (it merely has no gc work to do)
+#: and still writes into the repo. Nothing the #14066 fail-closed contract asserts depends on
+#: git's background maintenance, so the synthetic repos opt out of it rather than the teardown
+#: swallowing errors — a suppressed teardown would hide real leaks instead of removing the racer.
+_NO_AUTO_MAINTENANCE = "maintenance.auto=false"
+
+
+def _disable_background_git_maintenance(git_root: Path) -> None:
+    """Opt ``git_root`` out of detached auto maintenance (Redmine #14685).
+
+    Call this on every repository the fixture materialises, BEFORE the first command that can
+    trigger maintenance. A linked worktree shares its parent's config, so configuring the parent
+    covers it; a fresh ``git clone`` gets its own config and is covered at clone time instead.
+    """
+    key, _, value = _NO_AUTO_MAINTENANCE.partition("=")
+    _git("config", key, value, cwd=git_root)
 
 
 def _rev_parse(cwd: Path, ref: str) -> str:
@@ -552,6 +597,8 @@ class IntegrationDispositionBlockTests(unittest.TestCase):
 def _init_herdr_repo(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     _git("init", "-b", "main", cwd=root)
+    # Before the first commit: that is what spawns the detached writer (Redmine #14685).
+    _disable_background_git_maintenance(root)
     _git("config", "user.email", "t@example.invalid", cwd=root)
     _git("config", "user.name", "t", cwd=root)
     mb = root / ".mozyo-bridge"
@@ -629,7 +676,12 @@ class _Scenario:
         self.integration_head = _rev_parse(self.primary, _INTEGRATION_BRANCH)
         _git("checkout", "main", cwd=self.primary)
         self.origin = tmp / "origin.git"
-        _git("clone", "--bare", str(self.primary), str(self.origin), cwd=tmp)
+        # ``--config`` lands in the NEW repo's config and takes effect immediately after it is
+        # initialized, so the clone itself can never leave a detached writer behind (#14685).
+        _git(
+            "clone", "--bare", "--config", _NO_AUTO_MAINTENANCE,
+            str(self.primary), str(self.origin), cwd=tmp,
+        )
         if not origin_has_integration:
             _git(
                 "update-ref", "-d", f"refs/heads/{_INTEGRATION_BRANCH}", cwd=self.origin
@@ -719,10 +771,10 @@ def _seed_hibernated_released_bound(
         key,
         expected_revision=rec.revision,
         action_id="rel-1",
-        pins=[
+        observation=build_release_observation([
             ReleasePin("gateway", "codex-mzb1", "w28:p3S"),
             ReleasePin("worker", "claude-mzb1", "w28:p3T"),
-        ],
+        ]),
     )
     rec = lifecycle.get(key)
     lifecycle.record_release_outcome(

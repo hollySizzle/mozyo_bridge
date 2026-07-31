@@ -20,6 +20,12 @@ consumer / presentation plane の責務である。どの project family を同�
 載せるか、どの色を使うか、どの operator workflow を優先するかは private
 consumer 側に置く。
 
+Herdr-hosted plugin もこの presentation consumer family に含める。Herdr plugin、
+iTerm / WebViewer、private cockpit UI は、同じ public-safe projection を読む兄弟
+consumer であり、いずれも workflow / routing authority を持たない。Herdr 0.7.5
+固有の user-global enable 境界と sublane UX intent は
+`herdr-plugin-presentation-consumer-boundary.md` を正本とする。
+
 ## Source Of Truth
 
 ```text

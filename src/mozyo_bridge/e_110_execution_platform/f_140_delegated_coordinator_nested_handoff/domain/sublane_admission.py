@@ -186,7 +186,8 @@ class LaneSignal:
     "explicitly deferred / blocked", which the ``integration_recorded`` boolean cannot
     express (Redmine #14213). ``issue_open`` reflects the Redmine issue status (open vs
     closed). ``blocker_recorded`` marks a recorded blocker / failed handoff / unresolved
-    dependency.
+    dependency. ``review_exempt`` is the derived "no independent review is owed" fact from a
+    valid ``codex_direct_edit`` gate (Redmine #14539) — see :func:`classify_lane_state` step 4.
     """
 
     issue: str
@@ -198,6 +199,119 @@ class LaneSignal:
     issue_open: bool = True
     blocker_recorded: bool = False
     integration_disposition: str = INTEGRATION_NONE
+    #: A durable ``codex_direct_edit`` gate with ``follow_up_review: false`` is in force AND is
+    #: not superseded by a newer review round (Redmine #14539). Derived in
+    #: :func:`...glance_journal_grammar.lane_signal_from_gate_facts`, where both journal ids are
+    #: known. FAIL-CLOSED default: a caller that cannot establish the exemption (the advisory
+    #: store fallback, any hand-built signal) leaves the ordinary review path fully armed.
+    review_exempt: bool = False
+    #: A durable direct-owner ``no_change_review_waiver`` is in force, no newer review round
+    #: supersedes it, and the record declares zero repository change (Redmine #14695). Derived in
+    #: :func:`...glance_journal_grammar.lane_signal_from_gate_facts` alongside ``review_exempt``.
+    #: Kept a SEPARATE field rather than folded into ``review_exempt`` because the two are
+    #: different authorities with different premises and different evidence — collapsing them
+    #: would make a diagnosis say "codex_direct_edit exemption" about a lane that has none. They
+    #: meet at exactly one place, the step-4 predicate below. FAIL-CLOSED default, like its
+    #: sibling: any caller that cannot establish the waiver leaves the review path fully armed.
+    review_waived: bool = False
+    #: A waiver is DECLARED on this lane but establishes nothing, so the terminal retire refuses
+    #: it (Redmine #14695 review j#93807 finding 1). Blocks the ``retire_ready`` projection so the
+    #: glance and the retire agree about a waiver-bearing record. FAIL-CLOSED default False, and
+    #: deliberately scoped to lanes that CARRY a waiver: a closed no-commit lane with no waiver
+    #: projects ``retire_ready`` today and that is not this issue's to change.
+    review_waiver_unsupported: bool = False
+    #: The newest review round is unresolved and stays so past a later Close (#14695 review
+    #: j#93879 F1). The issue's Acceptance requires zero-close / zero-retire while a review is
+    #: pending; recording a Close does not resolve the review. FAIL-CLOSED default False so a
+    #: caller that cannot establish it leaves the previous behaviour untouched.
+    review_round_unresolved: bool = False
+    #: That round's OWN gate / conclusion, so the classifier re-applies its ordinary rules to it
+    #: instead of flattening every unresolved outcome into one state (#14695 j#94005 F2).
+    review_round_gate: str = ""
+    review_round_conclusion: str = ""
+    #: That round concluded BLOCKER. Carried as the round's own flag rather than inferred from the
+    #: conclusion string: the grammar keeps a blocker in a separate flag and leaves the conclusion
+    #: ``pending``, so comparing conclusions would silently never fire (measured while wiring
+    #: #14695 j#94005 F2).
+    review_round_blocker: bool = False
+
+
+#: The gates whose projection is "the work is done; close it, then retire it". They share the
+#: integration precedence and the unsupported-waiver suppression, so they are enumerated once and
+#: :func:`classify_lane_state` handles them together. A new close-family gate added here inherits
+#: both rules; one added elsewhere is caught by the test that pins this set (#14695 j#93856 F1).
+_CLOSE_FAMILY_GATES: frozenset = frozenset({GATE_OWNER_CLOSE_APPROVAL, GATE_CLOSE})
+
+#: The recognized gates that constitute a review round. A round is an explicit request for an
+#: independent review, so an exemption recorded BEFORE it does not close it (Redmine #14539).
+#: ``implementation_done`` is deliberately absent: it states that implementation finished, not
+#: that a review was requested — whether a review is owed on it is exactly what the exemption
+#: policy decides, so its ordering against the exemption journal is irrelevant.
+#:
+#: Kept beside the gate vocabulary (and re-exported from :mod:`.review_round_state`) for the same
+#: reason :func:`is_open_review_round` is: which gates are rounds, and whether a round is open,
+#: are one question, and answering it in two places is what j#94110 finding 1 measured.
+REVIEW_ROUND_GATES: frozenset = frozenset({GATE_REVIEW_REQUEST, GATE_REVIEW})
+
+#: The gates at which an unresolved round's OWN identity governs the classification.
+#:
+#: Two cases, one rule — the recorded latest gate does not faithfully describe the review:
+#:
+#: - a review-family gate: the latest journal IS the round, and the max-precedence reduction of a
+#:   COMBINED ``review_request + review`` heading drops the request and reports ``review``;
+#: - a close-family gate: the Close was recorded AFTER the round and does not resolve it.
+#:
+#: ``start`` / ``progress`` are deliberately EXCLUDED: they are newer positive implementation
+#: activity, and letting a stale open round outrank them would stop a lane that is merely being
+#: reworked — the exact harm j#94005 finding 2 corrected. This is REACHABLE, not merely defensive:
+#: among recognized gates the fold takes the latest JOURNAL (precedence only reduces gates written
+#: in one combined journal), so a ``## Gate: start`` recorded after an open round is the latest
+#: gate and classifies ``implementing``. (Measured — and it corrects what j#94235 claimed; see
+#: the note on that RR. ``## Gate: progress`` is not a recognized heading token at all, so it
+#: never becomes the latest gate.) ``implementation_done`` is excluded because it reaches the same
+#: branch either way, so including it would only add reach without changing an answer.
+_ROUND_IDENTITY_GATES: frozenset = REVIEW_ROUND_GATES | _CLOSE_FAMILY_GATES
+
+
+def is_open_review_round(gates: "frozenset | set", conclusion: str) -> bool:
+    """Whether these round gates constitute an OPEN review round (pure).
+
+    A ``review_request`` is open — it asks for a review that has not answered yet. A ``review``
+    is open unless it CONCLUDED approved; ``pending`` (an unreadable / absent 結論) and
+    ``changes_requested`` both leave the round owed, and ``pending`` in particular must count as
+    open because it is the fail-closed read of a review whose conclusion could not be established.
+
+    It lives HERE, beside the gate / conclusion vocabulary it reads, because it is the ONE
+    definition of "open" that both producer and consumer must share. Review j#94110 finding 1
+    measured what a second, disagreeing rulebook costs: :mod:`.review_round_state` reduced a
+    combined ``review_request + review`` heading to ``review`` while this predicate called the
+    same journal open, so the fold emitted the self-contradictory
+    ``unresolved=True / gate=review / conclusion=approved`` and the close-family branch replayed
+    it as an APPROVED review (``owner_waiting``) — losing the pending-review fence. Both sides now
+    answer "is this round open" with this function, so they cannot disagree again.
+    """
+    if GATE_REVIEW_REQUEST in gates:
+        return True
+    return GATE_REVIEW in gates and conclusion != REVIEW_APPROVED
+
+
+def _no_review_owed(signal: LaneSignal) -> bool:
+    """Whether ANY durable authority says no independent review is owed right now (pure).
+
+    The single place the two no-review-owed authorities meet (Redmine #14695). Both reach the
+    SAME post-review projection, and both reach it by their own route — never by fabricating a
+    ``REVIEW_APPROVED`` conclusion, which the preset forbids in as many words ("exemption を
+    Review Gate approval または自己 review と表現しないこと"; #14695 j#93412 §4 repeats it for
+    the waiver). Written as one predicate so a future third authority adds one disjunct here
+    instead of a third branch that drifts from the other two.
+
+    Whether an OPEN round defeats an authority is decided by ORDERING, in
+    :func:`.no_change_review_waiver.review_round_supersedes`, not here. #14539 ruled that an
+    exemption recorded after an earlier Review Request supersedes it (its literal defect was that
+    such a request re-projected as review owed), so "an open round always owes a review" is NOT
+    the rule and must not be imposed here.
+    """
+    return signal.review_exempt or signal.review_waived
 
 
 def _integration_owed(signal: LaneSignal) -> bool:
@@ -218,6 +332,12 @@ def classify_lane_state(signal: LaneSignal) -> str:
     Mirrors the spine's `### Lane State Classes`. Precedence is most-blocking /
     most-specific first so a lane lands in exactly one class:
 
+    0. an UNRESOLVED review round replaces the recorded gate / conclusion with the round's own
+       identity, at the gates where the recorded one does not faithfully describe the review
+       (:data:`_ROUND_IDENTITY_GATES`), and its blocker flag is merged in. A round claimed
+       unresolved whose identity does not read as an open round is :data:`LANE_STATE_BLOCKED`.
+       This runs before every branch below so the reading cannot depend on whether a Close
+       happens to follow the round (Redmine #14695 review j#94206);
     1. a recorded blocker (or a ``blocked`` gate) -> :data:`LANE_STATE_BLOCKED`;
     2. ``callback_state`` of ``delivery_failed`` ->
        :data:`LANE_STATE_CALLBACK_DELIVERY_FAILED`; of ``due`` ->
@@ -226,7 +346,11 @@ def classify_lane_state(signal: LaneSignal) -> str:
     3. a ``start`` / ``progress`` gate, or a ``review`` that requested changes (work is
        back with the implementer) -> :data:`LANE_STATE_IMPLEMENTING` (**not** blocking);
     4. ``implementation_done`` / ``review_request``, or a ``review`` still pending ->
-       :data:`LANE_STATE_REVIEW_WAITING` (Codex audit owed);
+       :data:`LANE_STATE_REVIEW_WAITING` (Codex audit owed) — UNLESS a durable authority says
+       no review is owed: ``review_exempt`` from a valid ``codex_direct_edit`` gate (Redmine
+       #14539) or ``review_waived`` from a direct-owner no-change waiver (Redmine #14695), in
+       which case the lane takes step 5's projection (``integration_waiting`` when a pending
+       integration disposition is recorded, else ``owner_waiting``);
     5. a ``review`` approved -> :data:`LANE_STATE_INTEGRATION_WAITING` when a PENDING
        integration disposition is recorded (``explicit_deferral`` / ``integration_blocked`` /
        unreadable — the approved work is durably NOT on the integration branch), else
@@ -247,9 +371,43 @@ def classify_lane_state(signal: LaneSignal) -> str:
     drains an unreadable lane rather than dispatching past it.
     """
     gate = signal.latest_gate
+    conclusion = signal.review_conclusion
+    blocker = signal.blocker_recorded
+
+    # 0. an UNRESOLVED review round IS the lane's review identity — resolved ONCE, here, before
+    # any lifecycle branch reads a gate or a conclusion.
+    #
+    # Review j#94206 finding 1 measured why this cannot live inside the close-family branch, which
+    # is where R10 put it: the ordinary review branches are evaluated FIRST, so a combined
+    # ``review_request + review`` heading concluding 承認 still classified as ``owner_waiting``
+    # (要修正 -> ``implementing``) whenever no Close happened to follow. The same round answered
+    # ``review_waiting`` once a Close was appended — so the classification depended on whether a
+    # Close followed, which is backwards: a Close does not resolve a review, and the pre-Close
+    # state is the ordinary live one. Half of j#94110 finding 1 had survived my correction of it.
+    #
+    # Resolving it up front also removes the recursive re-entry the close-family branch used, so
+    # there is one pass and no invariant about which gates can re-enter.
+    #
+    # The tuple is VALIDATED against the same predicate that set the flag, for EVERY gate rather
+    # than only the close family: a signal claiming an unresolved round while carrying an identity
+    # that does not read as an open round is not a state we can classify, so it is blocked instead
+    # of being silently dropped through to a terminal.
+    #
+    # ``blocker`` is merged rather than replaced because ``blocker_recorded`` describes the LATEST
+    # journal and falls back to False once a Close is appended, while the round keeps its own flag
+    # (measured). Reading only one of them loses the blocker on exactly one side of the Close.
+    if signal.review_round_unresolved:
+        if not is_open_review_round(
+            frozenset({signal.review_round_gate}), signal.review_round_conclusion
+        ):
+            return LANE_STATE_BLOCKED
+        if gate in _ROUND_IDENTITY_GATES:
+            gate = signal.review_round_gate
+            conclusion = signal.review_round_conclusion
+            blocker = blocker or signal.review_round_blocker
 
     # 1. explicit blocker (gate or recorded blocker) — most blocking.
-    if signal.blocker_recorded or gate == GATE_BLOCKED:
+    if blocker or gate == GATE_BLOCKED:
         return LANE_STATE_BLOCKED
 
     # 2. callback failure / due — a dispatch happened but the durable pointer is broken.
@@ -265,14 +423,26 @@ def classify_lane_state(signal: LaneSignal) -> str:
     # 3. actively implementing (positive pipeline occupancy, never a stop reason).
     if gate in (GATE_START, GATE_PROGRESS):
         return LANE_STATE_IMPLEMENTING
-    if gate == GATE_REVIEW and signal.review_conclusion == REVIEW_CHANGES_REQUESTED:
+    if gate == GATE_REVIEW and conclusion == REVIEW_CHANGES_REQUESTED:
         return LANE_STATE_IMPLEMENTING
 
-    # 4. Codex audit owed.
-    if gate in (GATE_IMPLEMENTATION_DONE, GATE_REVIEW_REQUEST):
-        return LANE_STATE_REVIEW_WAITING
-    if gate == GATE_REVIEW and signal.review_conclusion == REVIEW_PENDING:
-        return LANE_STATE_REVIEW_WAITING
+    # 4. Codex audit owed — UNLESS a durable review exemption is in force (Redmine #14539).
+    # A valid ``codex_direct_edit`` gate with ``follow_up_review: false`` promotes Codex to the
+    # implementation subject for its scope and, by policy, owes no separate auditor review. An
+    # exempt lane therefore advances to the SAME post-review projection an approved review
+    # reaches (step 5) — reached by the exemption route, NEVER by fabricating a REVIEW_APPROVED
+    # conclusion, which the preset explicitly forbids ("exemption を Review Gate approval または
+    # 自己 review と表現しないこと"). ``review_exempt`` is fail-closed: it is False for an
+    # invalid gate, for ``follow_up_review: true``, and whenever a NEWER review round supersedes
+    # the exemption, so each of those keeps the ordinary review path.
+    if gate in (GATE_IMPLEMENTATION_DONE, GATE_REVIEW_REQUEST) or (
+        gate == GATE_REVIEW and conclusion == REVIEW_PENDING
+    ):
+        if not _no_review_owed(signal):
+            return LANE_STATE_REVIEW_WAITING
+        if _integration_owed(signal):
+            return LANE_STATE_INTEGRATION_WAITING
+        return LANE_STATE_OWNER_WAITING
 
     # 5. review approved — owner aggregation is the next coordinator-only action, UNLESS the
     # durable record already carries a PENDING integration disposition. A recorded
@@ -282,27 +452,43 @@ def classify_lane_state(signal: LaneSignal) -> str:
     # j#84323, #14150 j#84424). Note this deliberately does NOT require ``commit_bearing``: an
     # explicit deferral is stronger evidence than the inferred commit fact, and requiring both
     # would re-open the same unsafe close guidance whenever the commit field is unreadable.
-    if gate == GATE_REVIEW and signal.review_conclusion == REVIEW_APPROVED:
+    if gate == GATE_REVIEW and conclusion == REVIEW_APPROVED:
         if _integration_owed(signal):
             return LANE_STATE_INTEGRATION_WAITING
         return LANE_STATE_OWNER_WAITING
 
-    # 6. owner close approval recorded — integration, then close, then retirement.
-    if gate == GATE_OWNER_CLOSE_APPROVAL:
+    # 6-7. the CLOSE FAMILY — owner close approval, then close. Both branches share the same
+    # integration precedence and the same unsupported-waiver suppression, so the suppression is
+    # asked ONCE for the whole family rather than per branch.
+    #
+    # Asking it per branch is exactly what went wrong (Redmine #14695 review j#93856 finding 1):
+    # R6 put the check on the ``close`` branch alone and its comment claimed the refusal was
+    # "visible BEFORE Close" — but the pre-Close gate is ``owner_close_approval``, which never
+    # consulted it, so a record one step from Close still read as ``close_waiting`` and steered
+    # the operator into a Close the retire would refuse. :data:`_CLOSE_FAMILY_GATES` makes the
+    # membership explicit so a gate added to this family cannot silently miss the suppression.
+    if gate in _CLOSE_FAMILY_GATES:
+        # An UNRESOLVED review round outranks the close family — INCLUDING its integration
+        # precedence (#14695 reviews j#93879 F1 and j#94005 F1). Evaluating integration first meant
+        # the fence only ever fired for zero-change records: a commit-bearing lane with an
+        # unanswered review_request went to ``integration_waiting``, sending unreviewed work to the
+        # integration drain. Integration follows review approval, so review is asked first.
+        #
+        # That precedence is now expressed at step 0: an unresolved round has already replaced the
+        # close-family gate with the round's own identity, so a lane reaching THIS branch has no
+        # open round left to outrank it. Asking it here as well — which is where it used to live —
+        # is what let the pre-Close reading drift from the post-Close one (j#94206 finding 1).
         if _integration_owed(signal) or (
             signal.commit_bearing and not signal.integration_recorded
         ):
             return LANE_STATE_INTEGRATION_WAITING
-        if signal.issue_open:
+        # A lane relying on a waiver that establishes nothing must not read as "go close it" or
+        # "safe to retire": the terminal retire refuses it, and the issue's Acceptance asks for the
+        # same conclusion from the glance, the close and the retire.
+        if signal.review_waiver_unsupported:
+            return LANE_STATE_BLOCKED
+        if gate == GATE_OWNER_CLOSE_APPROVAL and signal.issue_open:
             return LANE_STATE_CLOSE_WAITING
-        return LANE_STATE_RETIRE_READY
-
-    # 7. close gate — retire_ready unless commit-bearing work is still unmerged.
-    if gate == GATE_CLOSE:
-        if _integration_owed(signal) or (
-            signal.commit_bearing and not signal.integration_recorded
-        ):
-            return LANE_STATE_INTEGRATION_WAITING
         return LANE_STATE_RETIRE_READY
 
     # 8. no gate — no active durable work.
@@ -492,6 +678,7 @@ __all__ = (
     "GATE_CLOSE",
     "GATE_BLOCKED",
     "GATE_KINDS",
+    "REVIEW_ROUND_GATES",
     "REVIEW_PENDING",
     "REVIEW_APPROVED",
     "REVIEW_CHANGES_REQUESTED",
@@ -516,6 +703,7 @@ __all__ = (
     "SublaneAdmissionInputs",
     "SublaneAdmissionOutcome",
     "classify_lane_state",
+    "is_open_review_round",
     "evaluate_sublane_admission",
     "render_admission_journal",
 )

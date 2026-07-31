@@ -114,6 +114,16 @@ BLOCKED_DURABLE_RECORD_MISSING = "durable_record_missing"
 #: approved AND clean, never merely "an approval exists somewhere". Defined here (above the
 #: precedence tuple) so it can rank among the fundamental invariants.
 INTEGRATION_STALE_REVIEW_GENERATION = "stale_review_generation"
+#: The lane's recorded worktree path is **gone** (Redmine #14499). Distinct from
+#: :data:`BLOCKED_DIRTY_WORKTREE`, which the fail-closed dirty probe would otherwise report
+#: for the same lane: a host reboot wipes every ``/private/tmp`` worktree, so the retire's
+#: dirty probe cannot even spawn ``git`` there (live evidence #13490 j#89060 — 15 residue
+#: panes, every recorded worktree missing). "Dirty" would tell the coordinator to inspect and
+#: commit uncommitted work that no longer exists on disk; this reason names the actual state
+#: so the convergence rail (restore the exact worktree, or terminalize the lifecycle metadata)
+#: is the visible next step. The lane's branch and commits are untouched and MUST NOT be
+#: deleted on the strength of this reason — it is a statement about the checkout only.
+BLOCKED_WORKTREE_MISSING_AFTER_REBOOT = "worktree_missing_after_reboot"
 
 #: Precedence order for the *primary* blocked reason (most fundamental first): an
 #: unidentified target, then the close / owner / callback / durable invariants, then the
@@ -124,6 +134,9 @@ _BLOCKED_REASON_PRECEDENCE: Tuple[str, ...] = (
     BLOCKED_ISSUE_NOT_CLOSED,
     BLOCKED_UNRESOLVED_CALLBACK,
     BLOCKED_DURABLE_RECORD_MISSING,
+    # A missing worktree outranks a dirty one: it is the more fundamental fact and the two
+    # are mutually exclusive by construction (see `decide_retire_integration`).
+    BLOCKED_WORKTREE_MISSING_AFTER_REBOOT,
     BLOCKED_DIRTY_WORKTREE,
     BLOCKED_VERIFICATION_FAILURE,
     BLOCKED_TARGET_BRANCH_UNRESOLVED,
@@ -296,6 +309,12 @@ class RetirePreflight:
     is_git_workspace: bool
     # Git-specific.
     worktree_dirty: bool = False
+    #: The lane's recorded worktree path does not exist (Redmine #14499). Positively
+    #: measured by the caller — ``False`` means "present, or not measured", never "assumed
+    #: gone". Default ``False`` so every existing caller is byte-for-byte unchanged: an
+    #: unmeasured missing worktree still blocks, via the fail-closed ``worktree_dirty``
+    #: probe, exactly as before; supplying it only sharpens the *diagnosis*.
+    worktree_missing: bool = False
     integration_branch_resolved: bool = True
     merge_conflict: bool = False
     # Always-enforced invariants.
@@ -311,6 +330,16 @@ class RetirePreflight:
     #: case, or CLI — that omits it is BLOCKED (``stale_review_generation``), never default-admitted.
     #: Every caller must positively supply the measured / durable-record-asserted admissibility.
     latest_generation_admissible: bool = False
+    #: The TYPED reason the admissibility resolution refused, when a route produced one (Redmine
+    #: #14695 review j#93807 finding 2). Empty means "no route said anything more specific", and
+    #: the generic :data:`INTEGRATION_STALE_REVIEW_GENERATION` stands.
+    #:
+    #: This exists because a boolean cannot carry a diagnosis. The #14695 waiver route refuses with
+    #: ``waiver_writer_authority_unresolvable`` — a permanent, structural refusal that is NOT a
+    #: stale approval — and collapsing it to ``stale_review_generation`` told the operator to go
+    #: look for a review generation that never existed and never could. A route's own reason is
+    #: reported verbatim so the two are never confused; routes that say nothing are unaffected.
+    latest_generation_blocked_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -390,12 +419,27 @@ def decide_retire_integration(
         # #13518 review R2-F7 / R3-F2: the latest review generation is not admissible (a stale
         # approval for an older generation, or an unresolved blocking finding in the latest). The
         # actual integration decision — not only the non-CLI use case — now fences it.
-        blockers.add(INTEGRATION_STALE_REVIEW_GENERATION)
+        #
+        # #14695 review j#93807 finding 2: when the resolution produced a TYPED reason, report it
+        # instead. The waiver route's refusal is structural and permanent, not a stale approval,
+        # and naming it ``stale_review_generation`` sent the operator hunting for a review
+        # generation that cannot exist. A blank reason keeps the generic token exactly as before.
+        blockers.add(
+            str(preflight.latest_generation_blocked_reason or "").strip()
+            or INTEGRATION_STALE_REVIEW_GENERATION
+        )
 
     # Git-specific gates — only in a Git workspace.
     merge_attempted = False
     if preflight.is_git_workspace:
-        if preflight.worktree_dirty:
+        if preflight.worktree_missing:
+            # Redmine #14499: a *gone* worktree is reported as itself, never folded into
+            # "dirty". The dirty probe fails closed on an uninspectable path, so a missing
+            # worktree arrives here as BOTH facts; reporting both would tell the coordinator
+            # to go commit work that has no checkout to live in. The two are emitted
+            # mutually exclusively so the blocked-reason set names one true state.
+            blockers.add(BLOCKED_WORKTREE_MISSING_AFTER_REBOOT)
+        elif preflight.worktree_dirty:
             blockers.add(BLOCKED_DIRTY_WORKTREE)
         if policy.merge_on_retire:
             merge_attempted = True
@@ -405,7 +449,19 @@ def decide_retire_integration(
                 blockers.add(BLOCKED_MERGE_CONFLICT)
 
     if blockers:
-        ordered = tuple(r for r in _BLOCKED_REASON_PRECEDENCE if r in blockers)
+        # Known reasons first, in the fixed precedence; then any reason a ROUTE supplied that this
+        # table does not know, sorted for determinism.
+        #
+        # The append half matters (Redmine #14695 review j#93807 finding 2, found while wiring it):
+        # filtering solely by the precedence tuple silently DROPPED an unregistered reason — and,
+        # when it was the only blocker, left ``ordered`` empty so ``ordered[0]`` raised. A typed
+        # reason that a route went to the trouble of producing must not vanish because a generic
+        # table has not heard of it; that silent drop is the same class of defect as collapsing it
+        # into ``stale_review_generation`` in the first place.
+        known = tuple(r for r in _BLOCKED_REASON_PRECEDENCE if r in blockers)
+        ordered = known + tuple(
+            sorted(r for r in blockers if r not in _BLOCKED_REASON_PRECEDENCE)
+        )
         return RetireDecision(
             state=INTEGRATION_BLOCKED,
             blocked_reasons=ordered,
@@ -428,7 +484,11 @@ def decide_retire_integration(
 
 
 def render_integration_decision_journal(
-    decision: RetireDecision, *, issue: str, integration_branch: Optional[str] = None
+    decision: RetireDecision,
+    *,
+    issue: str,
+    integration_branch: Optional[str] = None,
+    checkout_cleanup_in_scope: bool = True,
 ) -> str:
     """Render a retire / integration decision as a durable-record journal (pure).
 
@@ -438,6 +498,13 @@ def render_integration_decision_journal(
     Only the machine-readable decision fields and the issue id / branch name are emitted
     — never private paths or pane ids (those are added by the coordinator-side retire
     journal).
+
+    ``checkout_cleanup_in_scope`` (Redmine #14499 j#89291) is ``False`` for a metadata-only
+    retire intent, whose whole effect is a lifecycle CAS. The ``retire_ok`` ``next_action``
+    otherwise tells the coordinator to "proceed to the destructive retire (pane kill /
+    worktree remove)" — an instruction that is simply wrong for such an intent, and one that
+    lands in a *durable record*, where a later reader would take it as authorization. The
+    default ``True`` leaves every existing caller's journal byte-for-byte unchanged.
     """
     heading = (
         "## integration_blocked"
@@ -459,11 +526,18 @@ def render_integration_decision_journal(
             "- blocked_reasons: " + ", ".join(decision.blocked_reasons)
         )
         lines.append("- next_action: coordinator callback (fail-closed; lane not retired)")
-    else:
+    elif checkout_cleanup_in_scope:
         lines.append("- blocked_reasons: none")
         lines.append(
             "- next_action: coordinator may proceed to the destructive retire "
             "(pane kill / worktree remove) under the Sublane Retirement Drain preflight"
+        )
+    else:
+        lines.append("- blocked_reasons: none")
+        lines.append(
+            "- next_action: metadata-only terminalization; the lifecycle CAS is the whole "
+            "effect. No worktree is removed, no branch or commit is deleted, and no pane "
+            "is closed"
         )
     return "\n".join(lines)
 
@@ -487,6 +561,7 @@ __all__ = (
     "BLOCKED_ISSUE_NOT_CLOSED",
     "BLOCKED_UNRESOLVED_CALLBACK",
     "BLOCKED_DURABLE_RECORD_MISSING",
+    "BLOCKED_WORKTREE_MISSING_AFTER_REBOOT",
     "SublaneIntegrationPolicy",
     "LaunchPreflight",
     "WorktreeLaunchDecision",

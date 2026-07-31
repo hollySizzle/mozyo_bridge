@@ -79,6 +79,14 @@ class TicketlessWorkIntakeError(ValueError):
 # and anchor-decision owner are durable-record literals, not inferred at runtime.
 ROLE_DELEGATED_COORDINATOR = "delegated_coordinator"
 
+# The single-workspace default coordinator (Redmine #14546). Kept literal here for the same
+# reason `ROLE_DELEGATED_COORDINATOR` above is: this bounded context must not depend on the
+# execution-platform f_140 module that owns the runtime role vocabulary (the dependency runs
+# f_140 -> f_130, never back). It mirrors
+# `...f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime.ROLE_COORDINATOR`,
+# which stays the canonical declaration; a test pins the two to the same token.
+ROLE_COORDINATOR = "coordinator"
+
 
 # --- Invariant: this no-anchor forward rail does NOT relax the Redmine-anchor gate
 # for any actual worker dispatch / implementation / domain probe. The child must
@@ -128,7 +136,14 @@ WORK_SHAPES: tuple[str, ...] = (
 # Expressed as a role, never a `%pane`: the child resolves the caller lane by
 # semantic identity (Redmine #12748 constraint: no pane ids to ticketless
 # receivers). ---
-CALLBACK_TO_ROLES: tuple[str, ...] = (ROLE_PROJECT_GATEWAY,)
+#
+# Redmine #14546 adds the single-workspace default `coordinator`. A bare `mozyo` workspace has no
+# separate project-gateway lane: its default pair IS the actor that forwards work-intake to the
+# managed sublane gateway, so the child returns to `coordinator`. This widens the closed set by
+# exactly one already-defined runtime workflow role (`workflow_runtime.ROLE_COORDINATOR`, the same
+# token `provider_binding` binds) — it does not open the vocabulary, and the child's contract is
+# unchanged (it still owns the anchor decision and still may not dispatch without one).
+CALLBACK_TO_ROLES: tuple[str, ...] = (ROLE_PROJECT_GATEWAY, ROLE_COORDINATOR)
 
 # --- Read-contract tokens: which contract set governs the RECEIVER's action. The
 # work-intake's receiver is the child coordinator, so this names that it must act
@@ -383,6 +398,7 @@ def ticketless_work_intake_from_payload(
 __all__: Iterable[str] = (
     "TicketlessWorkIntakeError",
     "ROLE_DELEGATED_COORDINATOR",
+    "ROLE_COORDINATOR",
     "WORKER_DISPATCH_REQUIRES_ANCHOR",
     "PARENT_MUST_NOT_ANSWER_DOMAIN",
     "CHILD_OWNS_ANCHOR_DECISION",

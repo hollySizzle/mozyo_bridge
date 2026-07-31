@@ -105,12 +105,16 @@ class MarkerShapeTest(unittest.TestCase):
 
     def test_the_channel_is_not_a_gate_or_watcher_channel(self):
         """It explains a correlation; it must never become a callback / gate candidate."""
+        # The recognized-channel set moved to the shared canonical scan (Redmine #14585) so the
+        # gate reader and the proxy reader cannot disagree about it; the assertion is unchanged.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.canonical_note_scan import (  # noqa: E501
+            RECOGNIZED_CHANNELS,
+        )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
             GATE_BEARING_KINDS,
-            _RECOGNIZED_CHANNELS,
         )
 
-        self.assertNotIn(MARKER_CHANNEL_DISPATCH_DISPOSITION, _RECOGNIZED_CHANNELS)
+        self.assertNotIn(MARKER_CHANNEL_DISPATCH_DISPOSITION, RECOGNIZED_CHANNELS)
         self.assertNotIn(MARKER_CHANNEL_DISPATCH_DISPOSITION, GATE_BEARING_KINDS)
 
 

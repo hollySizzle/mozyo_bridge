@@ -922,18 +922,23 @@ class ProviderBindingConfigTest(unittest.TestCase):
 class LanePlacementConfigTest(unittest.TestCase):
     """The closed ``lane_placement`` schema (Redmine #13646, Design Answer j#76564).
 
-    Declares the herdr pane-pair split direction + provider order per lane class. Absent
-    is behavior-preserving; every unknown / invalid shape fails closed. The block is a
-    future-launch policy, never a live-layout / route authority — which is also why the
-    key is ``lane_placement`` and NOT ``pane_placement`` (the boundary screen rejects any
-    key containing ``pane``).
+    Declares the herdr pane-pair split direction + provider order per lane class. Every
+    unknown / invalid shape fails closed. The block is a future-launch policy, never a
+    live-layout / route authority — which is also why the key is ``lane_placement`` and
+    NOT ``pane_placement`` (the boundary screen rejects any key containing ``pane``).
+
+    These tests cover the **declaration** layer (``resolve``): what an absent block records.
+    Absent declares nothing, which is NOT the same as preserving pre-#14568 launch behaviour
+    — the effective launch geometry comes from ``resolve_effective``, where an undeclared
+    lane class lands on the product default (``split: down``, Redmine #14568). That layer is
+    pinned in ``tests/regressions/test_issue_14568_default_vertical_split.py``.
     """
 
-    def test_absent_block_is_behavior_preserving(self) -> None:
+    def test_absent_block_declares_nothing(self) -> None:
         config = RepoLocalConfig.from_record({})
         self.assertEqual(config.lane_placement, LanePlacementConfig.default())
         self.assertEqual(config.lane_placement.placements, ())
-        # Every lane class resolves to the legacy (inherit-everything) placement.
+        # Every lane class declares neither field (the declaration layer, not the launch).
         for lane_class in ("default", "sublane"):
             resolved = config.lane_placement.resolve(lane_class)
             self.assertIsNone(resolved.split)
@@ -956,7 +961,7 @@ class LanePlacementConfigTest(unittest.TestCase):
         self.assertEqual(sublane.order, ("claude", "codex"))
 
     def test_fields_are_individually_optional(self) -> None:
-        # A partial object configures only its own field; the other inherits legacy.
+        # A partial object declares only its own field; the other stays undeclared.
         config = RepoLocalConfig.from_record(
             {"lane_placement": {"default": {"split": "down"}, "sublane": {}}}
         )
@@ -967,7 +972,7 @@ class LanePlacementConfigTest(unittest.TestCase):
         self.assertIsNone(sublane.split)
         self.assertIsNone(sublane.order)
 
-    def test_absent_lane_class_inherits_legacy(self) -> None:
+    def test_absent_lane_class_declares_nothing(self) -> None:
         config = RepoLocalConfig.from_record(
             {"lane_placement": {"sublane": {"split": "down"}}}
         )
@@ -1037,11 +1042,19 @@ class LanePlacementConfigTest(unittest.TestCase):
         # own LanePlacementError; RepoLocalConfig.from_record re-raises it as a
         # RepoLocalConfigError so the loader keeps one fail-closed boundary (asserted above).
         with self.assertRaises(LanePlacementError):
-            LanePlacementConfig(placements=(("default", "sideways", None),))
+            LanePlacementConfig(placements=(("default", "sideways", None, None),))
         with self.assertRaises(LanePlacementError):
-            LanePlacementConfig(placements=(("nowhere", "down", None),))
+            LanePlacementConfig(placements=(("nowhere", "down", None, None),))
         with self.assertRaises(LanePlacementError):
-            LanePlacementConfig(placements=(("default", None, ("codex",)),))
+            LanePlacementConfig(placements=(("default", None, ("codex",), None),))
+        # Redmine #14569: the ratio axis closes the same back door. Both the range and the
+        # type screen run on direct construction, not only on a parsed record.
+        with self.assertRaises(LanePlacementError):
+            LanePlacementConfig(placements=(("default", None, None, 1.5),))
+        with self.assertRaises(LanePlacementError):
+            LanePlacementConfig(placements=(("default", None, None, "0.5"),))
+        with self.assertRaises(LanePlacementError):
+            LanePlacementConfig(kind_placements=(("implementation", None, None, 0.05),))
 
     def test_config_is_hashable(self) -> None:
         # The placements tuple keeps RepoLocalConfig hashable (the frozen-record rule).

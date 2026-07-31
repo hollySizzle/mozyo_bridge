@@ -117,9 +117,26 @@ class _FakeOps:
     def read_lane_activity(self, workspace_id, lane, rows):
         return LaneActivityObservation(readable=True)
 
-    def execute_close(self, plan):  # pragma: no cover - no live rows to close
+    def execute_close(self, plan):
+        """No live row may ever be CLOSED; an empty plan is allowed.
+
+        Redmine #14477 j#94582/j#94596: a zero-slot release generation is now OPENED and
+        completed so the complete-empty observation is recorded, which means the driver does
+        reach this call — with zero targets. The invariant that matters is unchanged and is
+        asserted more precisely here: no pane is ever actuated.
+        """
         self.close_calls.append(plan)
-        raise AssertionError("no live rows: execute_close must not be reached")
+        if plan.close_targets:
+            raise AssertionError(
+                f"no live rows: nothing may be closed, got {plan.close_targets!r}"
+            )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
+            HerdrRetireCloseResult,
+        )
+        return HerdrRetireCloseResult(
+            workspace_id=plan.workspace_id, lane_id=plan.lane_id,
+            closed=(), failed=(), foreign_names=(),
+        )
 
 
 def _env(*, lane=LANE, gen, head=HEAD) -> LaneEvidenceEnvelope:
@@ -289,6 +306,11 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
         )
         return assembled.candidate
 
+    def _capture_ops(self):
+        """Keep the fake so assertions can inspect what the pass actuated."""
+        self._last_ops = _FakeOps()
+        return self._last_ops
+
     def _run(self, world: _World, candidate):
         """Run one bounded pass with seams bound to the CURRENT (possibly drifted) world."""
         seams = world.assembler().pass_seams()
@@ -297,7 +319,7 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
             refresh_fn=seams.refresh_fn,
             obligations_fn=seams.obligations_fn,
             journal_fn=seams.journal_fn,
-            use_case=SublaneHibernateUseCase(ops=_FakeOps(), store=world.store),
+            use_case=SublaneHibernateUseCase(ops=self._capture_ops(), store=world.store),
             lease_renew_fn=lambda: True,
         )
 
@@ -310,6 +332,16 @@ class HibernateEvidenceDriftTests(unittest.TestCase):
         # The lane keeps whatever disposition the drift itself left it in — what must NOT happen is
         # this pass hibernating it.
         self.assertEqual(self._disposition(world), disposition)
+        # Redmine #14477 j#94653 item 3: the CI-evidence fences stay INTACT. Since j#94596 a
+        # live-zero release legitimately reaches the driver with an EMPTY plan, so "closed
+        # nothing" is no longer sufficient evidence that a fence blocked. Every blocked case
+        # must leave the release driver UNINVOKED — that is what separates "the fence stopped
+        # this" from "a release ran and happened to have nothing to close".
+        self.assertEqual(
+            getattr(self, "_last_ops", None).close_calls if getattr(self, "_last_ops", None) else [],
+            [],
+            "a blocked evidence fence must not invoke the release driver at all",
+        )
 
     def _drift(self, mutate, *, disposition=DISPOSITION_ACTIVE):
         """Build from clean evidence, apply ``mutate(world)``, then run the pass."""

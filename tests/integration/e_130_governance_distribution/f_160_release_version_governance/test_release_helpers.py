@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge import __version__
 from mozyo_bridge.application.cli import build_parser
+from tests.support.private_path_fixtures import linux_home_path, macos_home_path
 
 class ReleaseHelperParserTest(unittest.TestCase):
     """The contract-admitted release helper subcommands must round-trip
@@ -59,7 +60,7 @@ class ReleaseHelperParserTest(unittest.TestCase):
 
     def test_release_check_drift(self) -> None:
         args = self.parse("release", "check", "drift")
-        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import cmd_release_check_drift
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release_drift import cmd_release_check_drift
 
         self.assertIs(args.func, cmd_release_check_drift)
 
@@ -186,6 +187,36 @@ class ReleaseCheckTreeTest(unittest.TestCase):
             self.assertEqual(release_mod.EXIT_BLOCKER, rc)
             self.assertIn(personal_path, out.getvalue())
             self.assertIn("result: blocker", out.getvalue())
+
+    def test_shared_home_path_fixtures_are_what_this_gate_blocks(self) -> None:
+        """The suite's private-path negative controls compose their home-shaped
+        values with `tests.support.private_path_fixtures` instead of writing the
+        literal, so that the tracked bytes carry nothing this gate blocks while
+        the code under test still receives exactly such a path (Redmine #14656).
+
+        That indirection is only a negative control while the composed value is
+        still blocker-shaped: a helper quietly degraded to a neutral path would
+        leave every call site green and testing nothing. Pin it against the real
+        command, not against a second copy of the pattern.
+        """
+        from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
+
+        for fixture, composed in (
+            ("macos_home_path", macos_home_path("someone", "secret", "path")),
+            ("linux_home_path", linux_home_path("someone", ".claude")),
+        ):
+            with self.subTest(fixture=fixture):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self._init_repo(root)
+                    self._commit_file(
+                        root, "AGENTS.md", f"see {composed} for context\n"
+                    )
+                    args = argparse.Namespace(repo=str(root))
+                    with contextlib.redirect_stdout(io.StringIO()) as out:
+                        rc = release_mod.cmd_release_check_tree(args)
+                    self.assertEqual(release_mod.EXIT_BLOCKER, rc)
+                    self.assertIn(composed, out.getvalue())
 
     def test_secret_value_shape_in_tracked_file_is_blocker(self) -> None:
         from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application import release as release_mod
@@ -1731,30 +1762,46 @@ class ReleasePublishTest(unittest.TestCase):
                 release_mod.cmd_release_publish(ns)
 
 
+#: Repo-relative legacy mirror reference dir, as the sub-check prints it.
+LEGACY_MIRROR_REL = ".claude/skills/mozyo-bridge-agent/references"
+
+
 class ReleaseCheckDriftTest(unittest.TestCase):
-    """Pin Redmine #10688: `mozyo-bridge release check drift` runs both
-    pre-existing drift gates and strict-fails on either side.
+    """Pin Redmine #10688: `mozyo-bridge release check drift` runs every
+    pre-existing drift gate and strict-fails on any side.
 
     The unittest suite already gates each drift surface independently:
     - `CanonicalRendererTest::test_committed_templates_match_canonical_render`
       and `GovernedWorkflowCanonicalTest::test_both_governed_outputs_match_canonical_render`
       for `scaffold canonical --check`;
     - `PluginMarketplaceTest::test_plugin_skill_mirror_matches_canonical`
-      and `test_sync_script_check_mode_*` for the plugin mirror.
+      and `test_sync_script_check_mode_*` for the plugin mirror;
+    - `LegacyProjectSkillMirrorTest` for the legacy project Claude skill
+      partial mirror (Redmine #14580).
 
     This class pins the *release helper* surface: the operator-facing
-    command that bundles both checks into one call (mirroring the
+    command that bundles the checks into one call (mirroring the
     `release check tree` / `release check scaffold` / `release check
     artifact` pattern). A future helper edit that, for example, swallows
     a sub-check's non-zero exit and reports `result: clean` would slip
     past the per-surface tests but fails here.
+
+    Redmine #14580 also pins a staging invariant: every sub-check's inputs
+    must be staged into the temp repo. When `.claude/skills/` and the legacy
+    sync script were absent from `SOURCE_TREE_PATHS`, the drift tests below
+    still saw exit 1 — but partly because an unstaged gate blocked, not only
+    because the mutation they injected did. Each drift test therefore asserts
+    that the *other* gates report up to date, so a masked failure cannot pass
+    for the wrong reason.
     """
 
     SOURCE_TREE_PATHS = (
         Path("src/mozyo_bridge"),
         Path("scripts/sync_plugin_skill.sh"),
+        Path("scripts/sync_legacy_project_skill.sh"),
         Path("skills/mozyo-bridge-agent"),
         Path("plugins/mozyo-bridge-agent"),
+        Path(".claude/skills"),
         Path("vibes/docs/logics"),
         Path(".mozyo-bridge/docs/catalog.yaml"),
         Path(".mozyo-bridge/docs/file_conventions.generated.yaml"),
@@ -1800,17 +1847,34 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             result = args.func(args)
         return result, stdout.getvalue(), stderr.getvalue()
 
-    def test_clean_tree_exits_zero_and_reports_both_checks(self) -> None:
+    def test_clean_tree_exits_zero_and_reports_all_checks(self) -> None:
         result, stdout, stderr = self._run_helper(ROOT)
         self.assertEqual(0, result, msg=stdout + stderr)
-        # Both sub-check section headers must appear so operators can
+        # Every sub-check section header must appear so operators can
         # see what ran without re-reading the source.
         self.assertIn("scaffold canonical --check", stdout)
         self.assertIn("sync_plugin_skill.sh --check", stdout)
-        # Both sub-checks must report up-to-date on a clean tree.
+        self.assertIn("sync_legacy_project_skill.sh --check", stdout)
+        # Every sub-check must report up-to-date on a clean tree.
         self.assertIn("AGENTS.md is up to date", stdout)
         self.assertIn("plugin skill mirror is up to date", stdout)
+        self.assertIn("legacy project skill mirror is up to date", stdout)
         self.assertIn("result: clean", stdout)
+
+    def test_staged_repo_is_clean_before_any_mutation(self) -> None:
+        """The staging fixture itself must produce a clean drift result.
+
+        Without this, a drift test's `assertEqual(1, result)` can pass
+        because an unstaged gate blocked rather than because the injected
+        mutation was detected — the exact vacuity Redmine #14580 hit when
+        the new legacy-mirror gate landed against an incomplete
+        `SOURCE_TREE_PATHS`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            result, stdout, stderr = self._run_helper(repo)
+            self.assertEqual(0, result, msg=stdout + stderr)
+            self.assertIn("result: clean", stdout)
 
     def test_canonical_drift_causes_strict_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1827,9 +1891,10 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             # Recovery hint must name the real CLI verbatim so the
             # operator can copy-paste from the release-flow doc.
             self.assertIn("mozyo-bridge scaffold canonical", stdout)
-            # The mirror check must still have run; its section header
-            # is the proof.
-            self.assertIn("sync_plugin_skill.sh --check", stdout)
+            # The mirror checks must still have run AND still be clean, so
+            # the exit 1 is attributable to the canonical mutation alone.
+            self.assertIn("plugin skill mirror is up to date", stdout)
+            self.assertIn("legacy project skill mirror is up to date", stdout)
 
     def test_mirror_drift_causes_strict_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1852,8 +1917,235 @@ class ReleaseCheckDriftTest(unittest.TestCase):
             self.assertIn("from the repo root", stdout)
             # The canonical check must still have run on the same
             # invocation; failing fast on one side without reporting
-            # the other defeats the bundled-helper purpose.
+            # the other defeats the bundled-helper purpose. The legacy
+            # mirror stays clean, isolating the injected mutation.
             self.assertIn("scaffold canonical --check", stdout)
+            self.assertIn("legacy project skill mirror is up to date", stdout)
+
+    def test_legacy_project_mirror_drift_causes_strict_fail(self) -> None:
+        """Redmine #14580: a canonical-only edit must block the release gate.
+
+        This reproduces the confirmed defect's shape exactly — canonical
+        moves, the legacy `.claude/skills/` partial mirror does not — and
+        pins that `release check drift` now catches it instead of leaving
+        detection to a full-suite run nobody ran before commit.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            canonical = repo / "skills/mozyo-bridge-agent/references/workflow.md"
+            canonical.write_text(
+                canonical.read_text(encoding="utf-8") + "\nCANONICAL-ONLY EDIT\n",
+                encoding="utf-8",
+            )
+            # Keep the plugin mirror in lockstep, so the ONLY drift left is
+            # the legacy partial mirror. Otherwise this test would also pass
+            # on the plugin gate's blocker and prove nothing new.
+            plugin_mirror = (
+                repo
+                / "plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/references/workflow.md"
+            )
+            plugin_mirror.write_text(
+                canonical.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("legacy project skill mirror drift detected", stdout)
+            self.assertIn("[F/content_drift]", stdout)
+            self.assertIn("workflow.md", stdout)
+            self.assertIn("result: blocker", stdout)
+            # Recovery hint must be repo-root runnable, matching the plugin
+            # gate's contract.
+            self.assertIn("scripts/sync_legacy_project_skill.sh", stdout)
+            self.assertIn("from the repo root", stdout)
+            # The other gates ran and stayed clean.
+            self.assertIn("plugin skill mirror is up to date", stdout)
+            self.assertNotIn("scaffold canonical drift detected", stdout)
+
+    def test_legacy_mirror_gate_recovers_after_running_the_sync(self) -> None:
+        """Running the sync script turns the blocker back into `clean`.
+
+        Pins the round trip the Acceptance names: canonical-only mutation
+        goes red, the documented recovery command makes it green again.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            canonical = repo / "skills/mozyo-bridge-agent/references/workflow.md"
+            canonical.write_text(
+                canonical.read_text(encoding="utf-8") + "\nCANONICAL-ONLY EDIT\n",
+                encoding="utf-8",
+            )
+            plugin_mirror = (
+                repo
+                / "plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/references/workflow.md"
+            )
+            plugin_mirror.write_text(
+                canonical.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+
+            before, stdout_before, _ = self._run_helper(repo)
+            self.assertEqual(1, before, msg=stdout_before)
+
+            recovery = subprocess.run(
+                ["sh", str(repo / "scripts/sync_legacy_project_skill.sh")],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, recovery.returncode, msg=recovery.stderr)
+
+            after, stdout_after, stderr_after = self._run_helper(repo)
+            self.assertEqual(0, after, msg=stdout_after + stderr_after)
+            self.assertIn("legacy project skill mirror is up to date", stdout_after)
+
+    def test_legacy_mirror_blocker_names_a_recovery_that_fits_the_drift(self) -> None:
+        """Review j#90322 F1: per-gate recovery, not one line for every class.
+
+        An unpinned mirrored reference is the one legacy drift class the sync
+        refuses to resolve. A blocker bullet that just says "rerun the sync"
+        sends the operator to a command that exits 1 on the same tree.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            (
+                repo / ".claude/skills/mozyo-bridge-agent/references/unpinned.md"
+            ).write_text("smuggled in\n", encoding="utf-8")
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("[D/unpinned_entry]", stdout)
+            self.assertIn("unpinned.md", stdout)
+            self.assertIn("result: blocker", stdout)
+            # The bullet must say the sync will NOT clear this class.
+            self.assertIn("refuses while one is present", stdout)
+            self.assertIn("never deletes it for you", stdout)
+            # The plugin gate keeps its own, still-correct recovery.
+            self.assertIn("plugin skill mirror is up to date", stdout)
+
+    def test_legacy_mirror_dangling_symlink_is_a_release_blocker(self) -> None:
+        """Review j#90342 R2-F1 condition 4: the gate must see it too.
+
+        A dangling `unpinned.md` symlink previously passed the sub-check's
+        file-set audit, so `release check drift` reported `result: clean` with
+        an unpinned entry in the mirror.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            (
+                repo / ".claude/skills/mozyo-bridge-agent/references/unpinned.md"
+            ).symlink_to("missing-target")
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("[D/unpinned_entry]", stdout)
+            self.assertIn("unpinned.md", stdout)
+            self.assertIn("result: blocker", stdout)
+            self.assertIn("never deletes it for you", stdout)
+            self.assertIn("plugin skill mirror is up to date", stdout)
+
+    def test_legacy_mirror_invalid_entry_type_is_a_release_blocker(self) -> None:
+        """Review j#90342 R3-F1 condition 4: the gate must see bad topology.
+
+        A directory under a pinned reference name is not something the sync can
+        resolve, so `release check drift` has to report it rather than leave it
+        to whoever next runs the script.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            pinned = (
+                repo / ".claude/skills/mozyo-bridge-agent/references/safety.md"
+            )
+            pinned.unlink()
+            pinned.mkdir()
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("[E/entry_not_regular]", stdout)
+            self.assertIn("safety.md", stdout)
+            self.assertIn("result: blocker", stdout)
+            self.assertIn("plugin skill mirror is up to date", stdout)
+
+    def test_legacy_mirror_non_md_entry_is_a_release_blocker(self) -> None:
+        """Review j#90378 R4-F1 condition 3: the gate needs the full domain.
+
+        `unpinned.txt`, a dotfile and a stale temp all sat in the mirror with
+        `release check drift` reporting `result: clean`, because the sub-check
+        audited `*.md` only and a shell glob also skips hidden entries.
+        """
+        for name in ("unpinned.txt", ".unpinned.md"):
+            with self.subTest(entry=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = self._stage_repo(Path(tmp) / "repo")
+                    (
+                        repo / ".claude/skills/mozyo-bridge-agent/references" / name
+                    ).write_text("smuggled\n", encoding="utf-8")
+                    result, stdout, _stderr = self._run_helper(repo)
+                    self.assertEqual(1, result)
+                    self.assertIn("[D/unpinned_entry]", stdout)
+                    self.assertIn(name, stdout)
+                    self.assertIn("result: blocker", stdout)
+                    self.assertIn("plugin skill mirror is up to date", stdout)
+
+    def test_legacy_mirror_aliased_canonical_source_is_a_release_blocker(self) -> None:
+        """Review j#90378 R4-F2 condition 2: the source side gates too.
+
+        `-f "$src/$name"` follows symlinks, so a canonical reference pointed at
+        an external file was accepted and its bytes copied into the mirror
+        while the gate reported clean.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            external = repo / "external-body.md"
+            external.write_text("EXTERNAL BODY\n", encoding="utf-8")
+            source = repo / "skills/mozyo-bridge-agent/references/safety.md"
+            source.unlink()
+            source.symlink_to(external)
+
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("[B/source_symlink]", stdout)
+            self.assertIn("result: blocker", stdout)
+
+    def test_legacy_mirror_unreadable_state_is_a_typed_release_blocker(self) -> None:
+        """Review j#90418 R6-F3: the gate must get a disposition, not a crash.
+
+        A mode-000 canonical file raised out of the sub-check, so the bullet
+        telling the operator to "follow the disposition the sub-check printed"
+        pointed at a traceback.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            target = repo / "skills/mozyo-bridge-agent/references/safety.md"
+            target.chmod(0o000)
+            try:
+                result, stdout, _stderr = self._run_helper(repo)
+            finally:
+                # Restore inside the temp dir's lifetime; an addCleanup would
+                # run after it is gone.
+                target.chmod(0o644)
+
+            self.assertEqual(1, result)
+            self.assertNotIn("Traceback", stdout)
+            self.assertIn("[B/source_unreadable]", stdout)
+            self.assertIn("Restore read access", stdout)
+            self.assertIn("result: blocker", stdout)
+            # The legacy bullet must still name its own gate. The plugin gate
+            # legitimately also trips here — the unreadable file is in the
+            # canonical body both mirrors read — so its state is not asserted.
+            self.assertIn("legacy project skill mirror drift detected", stdout)
+
+    def test_missing_legacy_sync_script_is_release_blocker(self) -> None:
+        """A deleted legacy sync script must block, not silently pass.
+
+        The plugin gate already pins this; the legacy gate needs its own
+        assertion because a `not script.is_file()` branch that `return`s
+        without appending a blocker reads as success.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._stage_repo(Path(tmp) / "repo")
+            (repo / "scripts/sync_legacy_project_skill.sh").unlink()
+            result, stdout, _stderr = self._run_helper(repo)
+            self.assertEqual(1, result)
+            self.assertIn("missing sync script", stdout)
+            self.assertIn("legacy project skill mirror sync script missing", stdout)
+            self.assertIn("result: blocker", stdout)
 
     def test_helper_reports_both_drifts_in_one_run(self) -> None:
         """When both sides drift, the operator sees both findings in

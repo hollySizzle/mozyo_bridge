@@ -108,6 +108,25 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     fold_integration_disposition,
     fold_work_unit,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_round_state import (
+    REVIEW_ROUND_GATES as _REVIEW_ROUND_GATES,
+    is_open_review_round as _is_open_review_round,
+    review_round_state as _review_round_state,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.no_change_review_waiver import (
+    NoChangeWaiverFacts,
+    ZeroChangeFacts,
+    fold_no_change_review_waiver,
+    fold_zero_change_record,
+    waived_now,
+    waiver_declaration_current,
+    waiver_unsuperseded,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_exemption import (
+    ReviewExemptionFacts,
+    exemption_in_force_now,
+    fold_review_exemption,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_return_route import (
     correlated_review_request_journal,
     is_explicit_review_conclusion,
@@ -145,31 +164,63 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 # (j#74307 point 5): dispatch, implementation_done, review_request, audit review,
 # owner_close_approval, blocked, close/retire. The integration disposition is read separately
 # (and typed) by :mod:`...domain.glance_integration_disposition`; it is NOT a lifecycle gate.
+#
+# WRITE side vs READ side (Redmine #14665). The central preset's
+# ``## Journal Templates`` / ``### Gate Heading Canonical Literal`` fixes ONE canonical
+# spelling a producer may write — ``## Gate: <gate>`` with the Gate Schema's own lower
+# snake_case token — so a journal heading and its structured marker (``gate=<gate>``) name the
+# same token the same way. The read side additionally accepts the space-opened spelling
+# (``## Gate: Review Request``; case is folded by the normalization) so journals written before
+# that ruling stay readable. That alias is DERIVED from the canonical token below, never
+# hand-maintained beside it — the twin lists were how the preset and the skill drifted into two
+# different "canonical" literals in the first place.
 # ---------------------------------------------------------------------------
 
-_HEADING_GATE: dict[str, str] = {
+#: The canonical WRITE-side gate tokens: the spelling a governed producer is told to write,
+#: mapped to the lifecycle gate the heading establishes. The Gate Schema token IS the literal.
+CANONICAL_GATE_TOKENS: dict[str, str] = {
     "start": GATE_START,
+    "implementation_done": GATE_IMPLEMENTATION_DONE,
+    "review_request": GATE_REVIEW_REQUEST,
+    "review": GATE_REVIEW,
+    "owner_close_approval": GATE_OWNER_CLOSE_APPROVAL,
+    "blocked": GATE_BLOCKED,
+    "task_close": GATE_CLOSE,
+    "close": GATE_CLOSE,
+}
+
+#: READ-side only: non-canonical wordings durable journals have used and must keep folding.
+#: A producer must NOT write these; they are here so old records stay readable.
+_ALIAS_GATE_HEADINGS: dict[str, str] = {
     "implementation request": GATE_START,
     "implementation request dispatch": GATE_START,
     "wave rebalance dispatch decision": GATE_START,
     "dispatch": GATE_START,
-    "implementation done": GATE_IMPLEMENTATION_DONE,
-    "implementation_done": GATE_IMPLEMENTATION_DONE,
-    "review request": GATE_REVIEW_REQUEST,
-    "review_request": GATE_REVIEW_REQUEST,
-    "review": GATE_REVIEW,
     # The same-lane reviewer's durable wording for the audit review itself (#13952 j#81029
     # `## Gate: Review Result — changes_requested`). It is the review gate, not a request.
-    "review result": GATE_REVIEW,
     "review_result": GATE_REVIEW,
-    "owner close approval": GATE_OWNER_CLOSE_APPROVAL,
-    "owner_close_approval": GATE_OWNER_CLOSE_APPROVAL,
-    "blocked": GATE_BLOCKED,
-    "close": GATE_CLOSE,
-    "task close": GATE_CLOSE,
-    "task_close": GATE_CLOSE,
     "retire": GATE_CLOSE,
     "retirement": GATE_CLOSE,
+}
+
+
+def canonical_gate_heading(token: str) -> str:
+    """The canonical durable heading literal for ``token`` (Redmine #14665, prefixed shape)."""
+    return f"## Gate: {token}"
+
+
+def _with_spaced_aliases(spellings: dict[str, str]) -> dict[str, str]:
+    """Each spelling plus its ``_``-opened twin, both folding to the same gate."""
+    opened: dict[str, str] = {}
+    for spelling, gate in spellings.items():
+        opened[spelling] = gate
+        opened[spelling.replace("_", " ")] = gate
+    return opened
+
+
+_HEADING_GATE: dict[str, str] = {
+    **_with_spaced_aliases(CANONICAL_GATE_TOKENS),
+    **_with_spaced_aliases(_ALIAS_GATE_HEADINGS),
 }
 
 #: Collision-prone canonical headings that are **explicitly not** the gate they resemble
@@ -237,10 +288,16 @@ _CONCLUSION_RE = re.compile(r"^\s*[-*]?\s*結論\s*[:：]\s*(?P<value>.+?)\s*$",
 # drift test asserts the packaged template mandates exactly these, then folds a journal
 # written to them and asserts the projection. Changing a literal here without changing the
 # template (or vice versa) fails that test.
+#
+# Redmine #14665: the heading literal is no longer spelled out a second time here — it is
+# DERIVED from :data:`CANONICAL_GATE_TOKENS` via :func:`canonical_gate_heading`, so this
+# module, the central preset's ``### Gate Heading Canonical Literal`` and the role profile
+# template cannot each declare a different "canonical" spelling of the same gate token (the
+# preset said ``## Gate: review``, the skill said ``## Gate: Review Request``).
 # ---------------------------------------------------------------------------
 
 #: The canonical review-gate heading a reviewer writes (the prefixed shape).
-CANONICAL_REVIEW_HEADING = "## Gate: Review"
+CANONICAL_REVIEW_HEADING = canonical_gate_heading("review")
 
 #: The canonical explicit-conclusion field label on that journal.
 CANONICAL_REVIEW_CONCLUSION_LABEL = "結論"
@@ -318,8 +375,13 @@ _MARKER_SHADOW = "shadow"
 
 # An explicit commit-hash field on a gate journal (``commit`` / ``commit_or_diff`` /
 # ``commit_hash`` / ``target_commit`` … : <hex>). Markdown emphasis / list markers tolerated.
+#: The hash is CAPTURED, not merely detected: ``commit_bearing`` only needs "a commit is declared",
+#: but the review-exemption retire fence needs the identity itself (Redmine #14539 j#91577 F2).
+#: The upper bound is 64 (SHA-256) rather than 40 so a longer hash is captured whole instead of
+#: truncated into a value that could never equal the exemption module's — the match set is
+#: unchanged, since a 64-hex run already matched here as its first 40 characters.
 _COMMIT_FIELD_RE = re.compile(
-    r"(?im)^\s*[-*]?\s*\**\s*(?:commit|commit_or_diff|commit_hash|target_commit(?:_or_diff)?)\**\s*[:：]\s*\**`?\s*[0-9a-f]{7,40}"
+    r"(?im)^\s*[-*]?\s*\**\s*(?:commit|commit_or_diff|commit_hash|target_commit(?:_or_diff)?)\**\s*[:：]\s*\**`?\s*(?P<value>[0-9a-f]{7,64})"
 )
 
 
@@ -613,6 +675,13 @@ class GateFacts:
     it False *and* records the pending disposition, which is what keeps an approved-but-
     unmerged lane out of owner-close guidance. ``work_unit`` is the governed granularity the
     durable record declares (``leaf_issue`` / ``user_story``), or ``""`` when undeclared.
+
+    ``review_exemption`` is the LATEST typed ``codex_direct_edit`` exemption (Redmine #14539);
+    ``review_exempt`` is the derived "no independent review is owed *right now*" fact — the
+    exemption is in force AND no newer review round supersedes it. ``latest_gate_commit`` is the
+    commit the LATEST gate journal declares (``""`` when it declares none, or two different ones),
+    which is what lets a consumer check that the latest gate is about the same commit as the rest
+    of the evidence rather than merely existing.
     """
 
     latest_gate: str
@@ -625,6 +694,32 @@ class GateFacts:
         default_factory=IntegrationDispositionFacts
     )
     work_unit: str = ""
+    review_exemption: ReviewExemptionFacts = field(default_factory=ReviewExemptionFacts)
+    review_exempt: bool = False
+    latest_gate_commit: str = ""
+    #: Redmine #14695: the direct-owner no-change waiver, the record's zero-change verdict, the
+    #: derived "no review owed" fact the classifier consumes (valid + unsuperseded + zero change),
+    #: and its supersession-only half — carried so the retire reports the conjunct it ACTUALLY
+    #: failed rather than blaming a review round for a change-bearing record. Both derived here,
+    #: where the journal ids live, so glance and retire cannot differ (#14539 j#90137 F3).
+    review_waiver: NoChangeWaiverFacts = field(default_factory=NoChangeWaiverFacts)
+    zero_change: ZeroChangeFacts = field(default_factory=ZeroChangeFacts)
+    review_waived: bool = False
+    review_waiver_unsuperseded: bool = False
+    #: A waiver IS declared here but establishes nothing, so the retire refuses it (#14695 review
+    #: j#93807 F1). Keeps a waiver-bearing closed lane out of ``retire_ready``. Scoped to lanes
+    #: that CARRY a waiver: a closed no-commit lane without one projects ``retire_ready`` today
+    #: (measured control) and changing that is a different issue's call.
+    review_waiver_unsupported: bool = False
+    #: The NEWEST review round is unresolved and STAYS so past a later Close (#14695 j#93879 F1):
+    #: pending review means zero-close / zero-retire, and a Close is not a review resolution.
+    #: ``review_round_gate`` / ``review_round_conclusion`` carry that round's OWN typed identity so
+    #: the classifier can re-apply its ordinary rules to it rather than flattening every unresolved
+    #: outcome into one state (#14695 review j#94005 F2).
+    review_round_unresolved: bool = False
+    review_round_gate: str = ""
+    review_round_conclusion: str = ""
+    review_round_blocker: bool = False
 
 
 @dataclass(frozen=True)
@@ -634,6 +729,34 @@ class _RecognizedJournal:
     review_conclusion: str
     commit_bearing: bool
     blocker: bool = False  # an audit review that concluded ``blocker``
+    #: EVERY gate this journal recognized, not just the max-precedence one. A governed journal may
+    #: combine gates in one heading (``## Gate: Review Request + Close``), and ``gate`` keeps only
+    #: the most advanced of them — correct for "what state is the lane in", wrong for any question
+    #: about whether a PARTICULAR gate occurred. Asking the reduced value cost the review-round and
+    #: change-bearing facts of every combined journal (Redmine #14539 review j#91577 finding 1).
+    #: Defaults to empty so a directly-constructed instance stays usable; ``gates_or_gate`` reads
+    #: it with the single-gate fallback.
+    gates: frozenset = frozenset()
+    #: The single commit this journal declares, or ``""`` when it declares none or declares two
+    #: different ones. Used to bind the terminal retire's Close evidence to the commit the review
+    #: exemption's path coverage was proven for (Redmine #14539 review j#91577 finding 2).
+    commit: str = ""
+
+    @property
+    def gates_or_gate(self) -> frozenset:
+        """Every recognized gate, falling back to the reduced ``gate`` when unset (pure)."""
+        return self.gates or frozenset({self.gate})
+
+
+#: The recognized gates whose journal, when it declares a commit, ANNOUNCES A NEW TARGET COMMIT as
+#: an implementation result — so it declares a change scope even when it omits ``changed_paths``
+#: (Redmine #14539 review j#90289 R3-F1). ``close`` / ``owner_close_approval`` are deliberately
+#: absent: they also carry a commit, but they report on work already scoped, so treating them as
+#: declarations would erase the scope of the very work they close. Passed to
+#: :func:`...review_exemption.fold_declared_change_scope` so the gate vocabulary stays here.
+_CHANGE_BEARING_GATES: frozenset[str] = frozenset(
+    {GATE_IMPLEMENTATION_DONE, GATE_REVIEW_REQUEST}
+)
 
 
 def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[GateFacts]:
@@ -685,24 +808,49 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         if marker_review_gates:
             # F8: the structured review authority replaces a conflicting heading review gate.
             gates -= _MARKER_ESTABLISHED_GATES
-            # F10: an open review round is current, so a conflicting close / owner-close heading may
-            # not advance the lane past it (blocked stays — a stop is safe-side; impl_done stays —
-            # it is a sticky-fact gate below review).
-            gates -= _REVIEW_SUPERSEDES_PROGRESSION
             gates |= marker_review_gates
+            # F10 used to be applied HERE, unconditionally and before the conclusion was known.
+            # It now runs once below, after the outcome is resolved, for both the marker and the
+            # heading path (Redmine #14539 review j#91747 finding 1) — see there.
         marker_disposition, marker_conclusion, marker_blocker = _review_result_disposition(
             issue_markers, jid_s
         )
         if not gates:
             continue
-        top_gate = max(gates, key=lambda g: _GATE_PRECEDENCE.get(g, 0))
         if GATE_REVIEW in gates:
             conclusion, blocker = _review_outcome(
                 notes, review_qualifier, marker_disposition, marker_conclusion, marker_blocker
             )
         else:
             conclusion, blocker = REVIEW_PENDING, False
-        commit_bearing = bool(gates & _COMMIT_BEARING_GATES) and bool(_COMMIT_FIELD_RE.search(notes or ""))
+        # F10, in ONE place, for BOTH paths, and only once the outcome is known (Redmine #14539
+        # reviews j#91696 finding 1 and j#91747 finding 1). An open review round may not be
+        # advanced past by a conflicting close / owner-close heading.
+        #
+        # It used to be applied twice and wrongly on each side: the marker branch removed the
+        # progression gates unconditionally, BEFORE the conclusion was resolved, so a canonical
+        # ``conclusion=approved`` review lost its Close; the heading path did not apply it at all,
+        # so a heading-only ``Review Request + Close`` kept its Close and projected retire_ready.
+        # The two halves of the same record therefore disagreed depending only on whether a marker
+        # was present. Resolving the outcome first and asking once fixes both directions: an
+        # APPROVED review is not an open round and keeps advancing — the governed close-time
+        # combination — while request / changes_requested / blocker / pending suppress.
+        #
+        # ``gates`` cannot empty out here: the predicate is true only when ``review_request`` or
+        # ``review`` is present, and neither is in :data:`_REVIEW_SUPERSEDES_PROGRESSION`.
+        if _is_open_review_round(gates, conclusion):
+            gates -= _REVIEW_SUPERSEDES_PROGRESSION
+        top_gate = max(gates, key=lambda g: _GATE_PRECEDENCE.get(g, 0))
+        # The commit this gate journal declares, read with the exactly-one rule the exemption
+        # module uses (review j#91577 finding 3): a journal naming two different commits declares
+        # neither, so a safety fence downstream cannot bind to whichever came first.
+        declared_commits = {
+            m.group("value").strip().lower() for m in _COMMIT_FIELD_RE.finditer(notes or "")
+        }
+        # ``commit_bearing`` is unchanged — it asks whether a commit is declared at all, which two
+        # conflicting ones still satisfy. Only the identity used for binding falls back to "".
+        commit = next(iter(declared_commits)) if len(declared_commits) == 1 else ""
+        commit_bearing = bool(gates & _COMMIT_BEARING_GATES) and bool(declared_commits)
         recognized.append(
             _RecognizedJournal(
                 journal_id=jint,
@@ -710,13 +858,47 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
                 review_conclusion=conclusion,
                 commit_bearing=commit_bearing,
                 blocker=blocker,
+                gates=frozenset(gates),
+                commit=commit,
             )
         )
 
     if not recognized:
         return None
 
+    # Redmine #14539: the ``codex_direct_edit`` review exemption is a third issue-wide,
+    # latest-wins authority fact standing in its OWN journal (its heading is deliberately NOT in
+    # ``_HEADING_GATE`` — it is an authority declaration, never a lifecycle gate). Its path-coverage
+    # check needs to know which journals are CHANGE-BEARING gates, and gate recognition lives here,
+    # so the ids are computed from the recognized set and passed down rather than re-derived in the
+    # exemption module — one gate vocabulary, not two (review j#90289 R3-F1).
+    # Read from EVERY recognized gate of the journal, not the max-precedence reduction: a
+    # ``## Gate: Implementation Done + Close`` announces an implementation result, and reducing it
+    # to ``close`` made it declare nothing — so the PREVIOUS commit's scope stayed authoritative
+    # and the exemption was checked against it (review j#91577 finding 1). The ``close`` boundary
+    # is unchanged: a journal whose ONLY gate is ``close`` still declares nothing.
+    change_bearing_journals = [
+        str(r.journal_id) for r in recognized if r.gates_or_gate & _CHANGE_BEARING_GATES
+    ]
+    review_exemption = fold_review_exemption(
+        journals or (), change_bearing_journals=change_bearing_journals
+    )
+    # Redmine #14695: the no-change waiver is a FOURTH issue-wide, latest-wins authority fact of
+    # the same shape, and its zero-change carve-out reads the same change-bearing gate vocabulary
+    # — passed down from here for the same reason the exemption's is (one vocabulary, not two).
+    review_waiver = fold_no_change_review_waiver(journals or ())
+    zero_change = fold_zero_change_record(
+        journals or (), change_bearing_journals=change_bearing_journals
+    )
+
     latest = max(recognized, key=lambda r: r.journal_id)
+    # Computed ONCE and shared by both derived waiver facts: two calls would be two chances for
+    # the round vocabulary to be filtered differently.
+    (
+        round_ids, round_unresolved, round_gate, round_conclusion, round_blocker
+    ) = _review_round_state(recognized)
+    # Computed once: the derived fact and its negation-for-declared-waivers must agree.
+    waived = waived_now(review_waiver, zero_change, round_ids)
     return GateFacts(
         latest_gate=latest.gate,
         latest_gate_journal=str(latest.journal_id),
@@ -726,6 +908,27 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         blocker_recorded=(latest.gate == GATE_BLOCKED or latest.blocker),
         integration=integration,
         work_unit=work_unit,
+        review_exemption=review_exemption,
+        review_exempt=exemption_in_force_now(review_exemption, round_ids),
+        latest_gate_commit=latest.commit,
+        review_waiver=review_waiver,
+        zero_change=zero_change,
+        review_waived=waived,
+        review_waiver_unsuperseded=waiver_unsuperseded(review_waiver, round_ids),
+        # The DECLARATION-ordering fact, not the valid-waiver one (#14695 review j#93879 F2).
+        # ``waiver_unsuperseded`` requires the waiver to be VALID, so a CURRENT but malformed
+        # declaration answered False and the lane read as ready to close — while the terminal route
+        # refused the identical record. Ordering is about existence and supersession, never about
+        # validity; a current invalid declaration is exactly the case that must refuse.
+        # (#14695 review j#93856 F2 remains satisfied: a declaration a newer review round
+        # supersedes is no longer current, so an approved review still returns the lane to the
+        # ordinary projection.)
+        review_waiver_unsupported=waiver_declaration_current(review_waiver, round_ids)
+        and not waived,
+        review_round_unresolved=round_unresolved,
+        review_round_gate=round_gate,
+        review_round_conclusion=round_conclusion,
+        review_round_blocker=round_blocker,
     )
 
 
@@ -755,15 +958,31 @@ def lane_signal_from_gate_facts(
         # Redmine #14213: the TYPED disposition is what lets the classifier tell "integrated"
         # from "explicitly deferred / blocked" at the approved-review step.
         integration_disposition=facts.integration.validated().disposition,
+        # Redmine #14539: the derived exemption fact. The ordering authority (is a review round
+        # newer than the exemption?) is resolved in the fold, where the journal ids live, so the
+        # classifier stays a flat function over facts.
+        review_exempt=facts.review_exempt,
+        # Redmine #14695: the second no-review-owed authority, derived in the fold for the same
+        # reason — its supersession and zero-change conjuncts need the journal ids, so the
+        # classifier stays a flat function over facts and cannot reach a different conclusion
+        # from the terminal retire about the same record.
+        review_waived=facts.review_waived,
+        review_waiver_unsupported=facts.review_waiver_unsupported,
+        review_round_unresolved=facts.review_round_unresolved,
+        review_round_gate=facts.review_round_gate,
+        review_round_conclusion=facts.review_round_conclusion,
+        review_round_blocker=facts.review_round_blocker,
     )
 
 
 __all__ = (
+    "CANONICAL_GATE_TOKENS",
     "CANONICAL_REVIEW_CONCLUSION_LABEL",
     "CANONICAL_REVIEW_CONCLUSION_TOKENS",
     "CANONICAL_REVIEW_HEADING",
     "GateFacts",
     "REVIEW_OUTCOME_BLOCKER",
+    "canonical_gate_heading",
     "fold_issue_gate_facts",
     "lane_signal_from_gate_facts",
 )

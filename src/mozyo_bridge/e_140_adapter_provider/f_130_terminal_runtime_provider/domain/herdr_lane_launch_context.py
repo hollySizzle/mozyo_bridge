@@ -16,8 +16,10 @@ Authority model (kept enforced by what this type does and does NOT carry):
   proximity (disposition j#85650 P1).
 - **Absent is a legitimate state, not an error.** ``lane_kind is None`` means the
   caller has no durable kind fact (a legacy / bare launch); the launch path then
-  resolves placement geometry by ``lane_class`` — the byte-for-byte pre-#13647
-  fallback the issue's close condition fixes. A *present* value is always a
+  resolves placement geometry by ``lane_class`` — the fall-through the issue's close
+  condition fixes. That fall-through is unchanged, but what it lands on is not: an
+  undeclared lane class now resolves to the #14568 product default (``split: down``),
+  not to the pre-#13646 geometry. A *present* value is always a
   canonical :data:`~mozyo_bridge.core.state.lane_kind.LANE_KINDS` token or fails closed.
 - **Geometry / plan input only.** This context selects placement geometry (Tranche
   1) and — later — per-slot role→profile (Tranche 2). It is never promoted to an
@@ -26,7 +28,11 @@ Authority model (kept enforced by what this type does and does NOT carry):
 
 Pure: a frozen dataclass validated on construction; no I/O. Tranche 2 adds the
 per-slot role-profile axis (``source_anchor`` / ``slot_specs``); both default to
-absent, so a geometry-only or context-free launch stays byte-invariant.
+absent, so a geometry-only or context-free launch is byte-invariant **on the
+role-plan axis** — the plan is simply not built. That is not a claim about the
+launch as a whole: as stated above, a context-free launch still resolves its
+geometry through ``lane_class``, and an undeclared class lands on the #14568
+product default (``split: down``).
 """
 
 from __future__ import annotations
@@ -134,8 +140,10 @@ class LaneLaunchContext:
     #: several naming the same record) resolves. Empty for a geometry-only context.
     anchors: tuple[DecisionPointer, ...] = ()
     #: The per-slot role -> profile -> provider -> argv intents this launch must satisfy
-    #: (Tranche 2). Empty (the default) means the caller supplies no role-bearing plan and
-    #: the launch is byte-for-byte the pre-#13647 one.
+    #: (Tranche 2). Empty (the default) means the caller supplies no role-bearing plan, so
+    #: this axis contributes nothing — byte-for-byte the pre-#13647 role-plan handling, NOT
+    #: a byte-for-byte pre-#13647 launch (the geometry axis still resolves, and an
+    #: undeclared lane class lands on the #14568 product default ``split: down``).
     slot_specs: tuple[SlotLaunchSpec, ...] = ()
 
     def __post_init__(self) -> None:

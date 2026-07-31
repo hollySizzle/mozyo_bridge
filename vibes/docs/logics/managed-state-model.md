@@ -356,6 +356,216 @@ Table naming:
     - **launch 時の 2 authority と矛盾時の扱い** (`herdr-native-identity.md` §5.2): fresh launch は
       caller-supplied `LaneLaunchContext`、heal は本 field。両方あり **不一致**なら片方が stale なので
       launch は **zero side effect で fail-closed 拒否** (どちらかを黙って採用しない)。
+  - **hibernate liveness 境界 (resume の immutable timestamp 境界。世代証明ではない)**
+    (schema v8、#14477 / live evidence #14476 j#88614-j#88618)。追加 field `hibernated_at`。
+    semantics と「代替境界を与えない」理由の実装正本は `core/state/lane_hibernation_anchor.py`。
+    - **何を保存するか**: lane が `hibernated` へ入った **transition の時刻**。resume (#13682) は
+      各 slot の startup self-attestation (#13637) が **この時刻より厳密に後** に観測されたことを
+      要求する。**これは liveness 境界であり世代証明ではない** (#14477 review j#94531 R2-F1 /
+      disposition j#94544 A.3): locator は pane-id なので survivor も自分の pre-hibernate
+      attestation に一致し、かつ timestamp 自体も 3 vector (caller 供給 CAS stamp の backdate /
+      host clock 後退 / 自己申告 `observed_at`) で破れる。**clock 非依存の判別は下記
+      released-locator fence が担う**。
+    - **なぜ `updated_at` と分けるか**: `updated_at` は **全ての write が動かす** column である。
+      metadata-only な write が境界を前へ押し、その write 自身が直前に検証した live pair を
+      `stale_generation` に落とす。実測は `repair-pins` (#13879、declared-pin 補填 + revision /
+      decision anchor 更新のみで launch / close / resume / send を一切しない) が、まさに検証した
+      exact pair を resume 不能にし、glass-break しか残らなかった (#14476 j#88617-j#88618)。
+      責務分離が fix であり、gate の緩和ではない。
+    - **write するのは 1 event だけ**: `hibernated` へ入る disposition CAS のみが stamp する。
+      revision bump / decision anchor / declared-pin repair / release・replacement write /
+      reconcile phase は **触らない**。`active` へ戻る側 (resume rehydrate / recovery lane 昇格 /
+      `open_next_generation`) は **空へ clear** する (起きている lane に境界は存在しない)。
+      terminal (`superseded` / `retired`) は audit fact として保持する。
+    - **clear が fail-closed 方向である理由**: 将来 stamp しない writer が row を `hibernated` へ
+      戻した場合、古い境界が残っていれば threshold が過去に飛び **gate が緩む**。空なら境界不在
+      として refuse されるので、緩まない。
+    - **anchor が空の row に代替境界を与えない** (#14477 review j#94515 F1 / verdict j#94520)。
+      pre-v8 row は additive backup-first migration で **空** anchor を得る (`updated_at` から
+      back-fill **しない** — metadata write の stamp を immutable column へ焼き付けると、本 version
+      が除去する false `stale_generation` が恒久化する)。**読取側も `updated_at` を代用しない**。
+      - **理由**: `updated_at` は **単調ではない**。本 component の全 CAS は caller 供給の `now` を
+        受け、prior stamp 以上であることを検証する writer は 1 つも存在しない。よって backdated な
+        programmatic caller や wall clock の後退 (NTP step-back / host clock skew) で `updated_at`
+        は真の hibernation より **前** になりうる。実測 (j#94515 F1) では
+        `updated_at(19:40) < survivor attestation(19:50) < true hibernate(20:00)` が成立し、
+        **真の pre-hibernate survivor が admit され lane が active 化した**。
+      - 「`updated_at >= hibernated_at` だから fallback は常により厳しい」という以前の主張は
+        **撤回**する。この不等式が成立するのは **anchor を持つ row** = fallback を使わない row
+        だけであり、anchor が空の row には何も保証しない。
+      - **安全な代替は存在しない**: `created_at` は真の境界より更に前 (より弱い)、release
+        generation に timestamp column は無い、今後 monotonic invariant を強制しても **旧 build が
+        既に書いた row** には遡及できない。選択肢は「refuse」か「推測」であり、世代証明は推測して
+        はならない。
+      - **帰結 (運用上の機能後退として明示)**: pre-v8 build が hibernate した lane は、v8 の
+        hibernate transition を経るまで standard resume rail で resume **できない**。row の
+        **読取**は不変 (`get` / `records` / 非migrating read) であり、失われるのは freshness
+        **証明** のみ — その row について証明は元々存在しなかった。
+    - **現在時刻は使わない**: 「最近観測された」pane を通してしまい、世代証明の逆になる。
+      anchor を欠く row は `unavailable` として **freshness 半分を fail-closed** にする
+      (threshold 不在を「比較対象が無いので fresh」と読ませない。`evaluate_pair_attestation` は
+      空 threshold で freshness 比較を skip するため、caller 側で明示的に倒す必要がある)。
+    - **timestamp は liveness 境界であり、世代証明ではない** (#14477 review j#94531 R2-F1 /
+      coordinator disposition j#94544 A.3)。**どの clock を信じるかを変えても閉じない** vector が
+      3 つある: ① hibernate CAS の stamp は caller 供給 `now` で、prior stamp との比較を検証する
+      writer が 1 つも無いため backdate できる、② host wall clock の後退 (NTP step-back / skew) は
+      trusted clock でも同じ順序を生む、③ `observed_at` は attest する process 自身が書く。
+      実測 (j#94539): anchor を backdate すると true survivor が admit され lane が active 化した。
+    - **世代証明は clock 非依存の released-locator fence** (`core/state/lane_released_locator_fence.py`)。
+      hibernate の release は **閉じた exact locator** を `release_pins` に authority grade で残す。
+      survivor は tmux pane-id を保持するのでこの集合に入り、genuine relaunch は入らない。よって
+      上記 3 vector すべてに依存せず拒否できる。
+      - **証拠不在 / 判読不能 / 不完全は refuse** (A.2)。row だけでは「hibernate 時に process 0」と
+        「release 証拠を残さず survivor がいた」を区別できない。**証拠不在を fresh と推定しない**。
+        `process_release` が `released` に到達していない (never requested / in flight) 場合、pin が
+        判読不能な場合、released locator が observed slot 数を下回る場合はいずれも拒否する。
+        これは release 証拠を残さず hibernate した lane に対する **意図した機能後退**である。
+      - **完全性を pin の `role` で判定しない**。`release_pins` の role 語彙は caller 間で不統一
+        (lane role `gateway`/`worker` と provider 名が混在) なので、role 基準は誤判定する。
+        distinct locator 数で判定する。
+      - **pane-id 再利用による false refusal は安全方向として受容** (A.4)。tmux が pane-id を
+        再利用すると genuine relaunch が拒否され得る。typed detail に `released_locator_reuse` を
+        出すので、operator は真の survivor と切り分けられる。
+      - resume は **この fence と既存の attestation / provider / multiplicity / declared-pin fence
+        すべて**を満たしたときのみ可 (A.3 / A.6)。いずれも緩めない。
+      - **fence の権威は `release_pins` 単体ではない** (#14477 review j#94570 R3-F1 →
+        disposition j#94582 A″)。旧実装は locator 件数で「release が完全か」を判定していたが、
+        件数は完全性を証明しない: **別 locator 2 件を記録すれば count は充足し交差も起きず、
+        true survivor が admit される**ことを実測した。根本原因は `release_pins` が
+        **caller 供給**だったこと — timestamp と同型の欠陥である。
+  - **release generation observation (release が閉じた slot 集合の immutable 正本)**
+    (schema v9、#14477 disposition j#94582)。追加 field `release_observation`。実装正本は
+    `core/state/lane_release_observation.py` / `core/state/lane_release.py`。
+    - **何を保存するか**: release driver が live inventory から **1 度だけ列挙**した exact
+      observed slot snapshot。store は **この snapshot から release pins を単一導出**し、
+      caller から別値を受け取らない。raw `pins=` public API は **authority seam として残さず
+      fail-closed** (後方互換なし)。**拒否は typed domain error (`ReleaseObservationError`) で
+      あること**が契約で、arity error ではない: `observation` を required parameter にすると
+      literal legacy 呼出 (`pins=` のみ) が argument binding 段階の `TypeError` になり、seam が
+      説明を返せないまま落ちる (j#94707 R4-F2 が実測)。`observation` 省略も同じ typed error で
+      拒否する。
+    - **absent と complete-empty を literal に区別する**。`''` = **absent** (legacy / 未記録) は
+      「証拠が無い」であり resume は fail-closed。記録済みの **complete-empty**
+      (`{"v":1,"slots":[]}`) は「driver が見て live slot 0 だった」という **positive evidence**
+      で、resume は許可しうる。両者を「空」に畳むのが、本 issue の review chain が繰り返し
+      検出した「証拠不在を証拠と読む」誤りである。
+    - **writer gate と read gate の双方で完全一致を検証**する。observation と格納 pins が
+      食い違う row は proof に使えない (欠け = 未証明 slot、過剰 = 観測していない close の主張)。
+    - **generation 中は write-once**。metadata repair / decision / revision / outcome writer は
+      変更しない。新 release generation の開始時のみ exact replacement。`active` へ戻る際は
+      release 一式と共に clear される。**clear する writer は 3 経路**で、いずれも
+      `process_release` / `release_action_id` / `release_pins` / `release_observation` を
+      **同一 CAS で**落とす: `transition_disposition` の rehydrate / `supersede_and_activate` の
+      existing recovery promotion / `open_next_generation`。R4 review (j#94707 R4-F1) は、この
+      うち v9 field だけが 3 経路とも clear 対象から漏れていたことを検出した。
+    - **read gate は完了した generation の observation しか返さない**。`process_release` が
+      `released` でない row は、caller が何を検査しているかに関わらず component 境界で拒否する。
+      拒否理由は release 軸の状態ごとに**明示分岐**する (畳むと consumer が retry 可能な状態 /
+      invariant 違反 / 判定不能を区別できない。j#94727 R5-F1 / j#94738 R6-F1)。
+      - **この gate が分類規則を持たない state** →
+        **`release_observation_release_state_unknown`**。`process_release` は
+        `TEXT NOT NULL` で **CHECK 制約が無く**、row decoder も文字列を pass-through するので、
+        legacy / corrupted / 手編集 row は任意の値を持ちうる。これは **outcome-unknown** であり、
+        hibernate rail の既存 ruling (`release_state_unknown`、j#86776 R5-F5 / j#87226) と同じ扱い =
+        **決定的な分類へ畳まない**。3 つの規律がある (j#94750 R7-F1 / R7-F2)。
+        - 判定は **byte-exact** で行い trim しない
+          (`"released "` は normalize すると canonical になり、R7 以前は **proof として通っていた**。
+          closed vocabulary は格納値のまま比較する — `lane_kind` の j#85852 F1 と同じ規律)。
+        - 判定は **`RELEASE_STATES` への membership ではなく、gate 自身が規則を持つ token 集合**で
+          行う。R7 以前は「知っている state を拒否し、残りは `released` として fall-through」だった
+          ため、**vocabulary に第五 member を足すと proof を返した** (実測)。
+          **accepted-set への membership は、各 member に規則があることを保証しない。**
+        - state の判定は **observation の decode より前**に行う。R7 以前は decode が先だったので、
+          同じ unknown token が observation の形 (empty / malformed) に応じて `absent` /
+          `unreadable` と報告され、**state 固有の診断が別 field の形に乗っ取られていた**。
+      - survivor fence (`released_locator_verdict`) も **raw exact state を先に分類**し、
+        non-canonical はすべて同じ typed unknown を surface する (綴りで detail が変わらない)。
+        canonical な非 `released` state は従来どおり generic な `release_evidence_absent` を保つ。
+      - 同じ `process_release` を読む **hibernate supervisor enumeration も byte-exact** に分類する。
+        R7 以前は `.strip()` していたため `"released "` が terminal として消え、
+        **`" not_requested"` が redrive (actuation を伴う) path へ admit されていた** (j#94750 R7-F3)。
+      - **release driver も 4 canonical state の explicit rule** にする。R8 以前は `else` が
+        `released` を意味していたため、未分類の格納 state が **pane を 1 つも閉じずに
+        `released` を返し、hibernate の clean fully-actuated success として公開されていた**
+        (j#94778 R8-F1)。未分類値は **raw state を保持した typed refusal** (`release_state_unknown`)
+        とし、`HibernateOutcome.is_success` の completed-release 条件を満たさないようにする。
+      - **CAS policy predicate も byte-exact**。R8 以前は `release_transition_allowed()` /
+        `rehydrate_allowed()` が格納値を `norm()` していたため、padded `not_requested ` からの
+        `request_release` が **applied=True** になり、**格納値が canonical `requested` へ
+        書き換えられていた** (j#94778 R8-F2)。invalid な格納値が **canonical authority へ洗浄され**、
+        以後の byte-exact reader はその row を正当な canonical row として正しく信用してしまう。
+        read 側だけを exact にしても writer が塞がっていなければ意味がない。
+    - **原則: ingress は正規化してよい / 格納 authority の判定は正規化してはならない**
+      (j#94778)。caller から受け取る引数は trim してよいが、**row が既に保持している値**の権威判定を
+      trim すると、storage が持っていない canonical な事実を捏造することになる。
+      この原則は release 軸に限らない。**`replacement_state` 軸でも同型の実 write laundering を実測**
+      した (j#94805 R9-F3): padded `" not_requested"` から replacement generation が開き、
+      padded `"requested "` が `pending` へ進み、padded `"replaced "` が settled gate を通って
+      lane を `active` へ戻していた。`replacement_transition_allowed` /
+      `replacement_open_allowed` / `replacement_settled` / `disposition_transition_allowed` は
+      いずれも byte-exact。disposition については **実 CAS は先行する exact expected-state guard で
+      既に `unexpected_state` / zero-write 拒否**であり、pure predicate の契約整合と将来 reuse 対策
+      として修正した (実 laundering は再現していない)。
+    - **domain の非成功判定は public 境界の exit code と一致させる** (j#94805 R9-F1)。
+      `HibernateOutcome.is_success` が非成功と判定する executed outcome は、CLI も非 0 で終わる。
+      literal token を CLI 側で列挙すると domain から drift する (unknown / `requested` が exit 0 に
+      なっていた)。preflight-only は `executed=False` なので従来どおり exit 0。
+    - **格納 raw 値の text 表示は escape する / domain は raw を保持する** (j#94805 R9-F2)。
+      未分類 state をそのまま text へ埋めると **改行で偽の行を作れ、ANSI ESC も通る**ことを実測した。
+      canonical token はそのまま表示し、それ以外は可逆な quoted 表現で出す
+      (`render_release_state`)。JSON payload は raw を保持する (encoder が escape するため安全)。
+    - **同じ規律は `binding_kind` にも適用する** (j#94840 R10-F1)。census は
+      `norm(...binding_kind)` **19 site / 14 module**で、`declare_lane` の
+      `kind = norm(binding_kind)` **1 件だけが ingress**、残る **18 が stored-read** だった。
+      実測: 格納 `"issue "` の row が `backfill_active_binding` (revision 1→2) と
+      `open_next_generation` (generation 1→2) を通り、`record_matches_binding` の issue branch は
+      **`binding_kind` を一切見ずに** `project_gateway` row を issue binding として match していた。
+      18 site を共有述語 `stored_binding_kind_is()` (byte-exact) へ寄せ、issue branch に
+      canonical kind 要求を追加した。**byte-exact だけでは不十分**な site もある:
+      `open_next_generation` は分岐がどれも成立せず **fall-through して write に到達**していたので、
+      vocabulary 外の kind を **outright 拒否**する guard を足した (j#94750 R7-F1 と同じ形)。
+      **空文字も non-canonical** である (j#94992 R11-F1)。R11 では decoder の
+      `str(row[17] or BINDING_KIND_ISSUE)` を「pre-v5 legacy default の codec」と説明したが、
+      **これは実 migration と一致しない誤りだったので撤回する**: v4 row は `binding_kind` 列
+      **自体を持たず**、migration は `ADD COLUMN binding_kind TEXT NOT NULL DEFAULT 'issue'` で
+      **literal token を backfill** する (SQLite の ALTER 挙動を単独で実測済み)。したがって
+      **genuinely migrated row は `'issue'` を持ち、空文字は legacy 産物ではない**。
+      decoder は raw bytes を保持し、空文字は他の non-canonical 値と同じく fail-closed にする
+      (実測: 修正前は raw `''` が canonical へ昇格して `open_next_generation` が
+      **generation 1→2 で applied**、修正後は `unexpected_state` / zero-write)。
+    - 2 つの述語は責務が異なるので混同しない: `is_canonical_release_state()` =
+      **vocabulary に属する値か** (fence / hibernate enumeration / driver / CAS policy) /
+      `_CLASSIFIED_RELEASE_STATES` = **read gate が規則を持つ値か** (第五 member を proof へ
+      通さないため意図的に別集合。j#94750 R7-F1)。
+      - `requested` / `partial` → **`release_observation_generation_not_completed`**。
+        observation は**現 generation のもの**である (`record_release_outcome` は
+        `process_release` のみを進め observation を書き換えない)。未完了なだけであり、
+        `partial` はまだ slot を閉じうるので survivor proof にはならない。
+      - `not_requested` かつ observation が残存 → **`release_observation_stale_after_reset`**。
+        canonical `not_requested` **のみ**に予約する。
+        reset writer が clear するのでこの shape は到達不能であり、**reset invariant 違反**
+        (旧 build / 手編集 / reset を伴わない writer 追加) を名指しする。
+      reset writer が正しく clear していれば後者は生じないが、「caller が到達しないから残しても
+      安全」という前提は本 issue で 2 度撤回している (timestamp / caller 供給 pins) ため、
+      **到達可能性の前提を安全性の根拠にしない**。
+    - **live-zero でも generation を開く**。従来は「閉じる slot が無い」と early return して
+      何も記録しなかったが、それでは resume が「hibernate 時 process 0」と「survivor がいて
+      証拠が残らなかった」を区別できない。complete-empty を記録することでこれを検査可能な
+      事実にする。**その結果 live-zero hibernate の `process_release` は `released` へ到達する**
+      (従来 `not_requested`)。coordinator 承認: #14477 j#94596 item 1。
+    - **`released` は release command / generation の完了であり、process absence の正本ではない**
+      (j#94596 item 1)。actuation 0 件でも矛盾しない。**consumer は `released` 単独を deadness /
+      empty の証明へ昇格してはならない**。liveness の正本は引き続き live inventory である。
+      retire / reconcile の各 surface は `released` に加えて既存の fresh live-zero / foreign /
+      multiplicity / binding / revision fence を **連言し続ける**こと。complete-empty でそれらを
+      short-circuit しない (j#94596 item 2)。
+    - **CLI / JSON / docs は live-zero を事実どおり表現する** (j#94596 item 3):
+      「0 slot observed・0 close actuation・release generation completed」。「process を閉じた」と
+      誤読させる表現にしない。
+    - **残る trust boundary**: writer が **fabricated observation** を渡す余地は残る。今日の
+      「`pins=` ならどこでも暗黙に受理」から「唯一の監査可能な seam で明示的に主張」へ変わった
+      が、暗号的証明ではない。clock / locator 再利用にも依存しない正しい終点 (lane epoch を
+      attestation へ bind し strictly-newer を要求) は **#14756**。
   - **binding kind / lane generation / typed process pins** (schema v5、#13810 / Design Answer
     j#78386)。project-gateway 用の別 owner component は作らず、同一 `lane_lifecycle_records` row /
     同一 revision CAS を additive 拡張する (別 component にすると owner row と release/replacement
@@ -1435,6 +1645,46 @@ Downgrade は非破壊にする。古い CLI が新しい container `user_versio
 
 Partial migration は component 単位で resumable にする。rerun は complete 済み component を skip してよいが、
 authoritative component を黙って上書きしない。
+
+### test / probe は operator 共有 home を解決しない (#14477 j#94504)
+
+**home scope の authority store は複数 lane が同時に読む共有資源であり、test / probe / 診断が
+それを forward-migrate してはならない。** schema version を上げた branch の未 review WIP source で
+これを起こすと、**他の稼働 lane が全て read-fail-closed する** (`### schema version / migration` の
+downgrade-safe 契約により、古い reader は新しい component version を読めない)。実測: #14477 の
+v7→v8 bump は full suite 実行中に共有 `state.sqlite` を `2026-07-29T21:46:28Z` へ migrate し、
+reviewed v7 facade からの review_result delivery が `reader_upgrade_required` で zero-send になった
+(j#94504 / j#94516)。
+
+規則:
+
+- store は **必ず明示的な `home=` / `path=` を渡して**構築する。**無引数構築
+  (`LaneLifecycleStore()` 等) は `MOZYO_BRIDGE_HOME` / `~/.mozyo_bridge` を解決する**ため test /
+  probe では使わない。write は write-**migrating** gate を通るので、1 回の `declare_active` で
+  共有 component が migrate する。
+- `patch.dict(os.environ, ..., clear=True)` は `MOZYO_BRIDGE_HOME` を消し、解決先を
+  `~/.mozyo_bridge` へ落とす。env を消す test は home を **別途** temp へ固定する。
+- migration 自体を検証する test は temp isolated home 上で行う (backup / version stamp / byte
+  不変を含めて、そこで完結させる)。
+- hermeticity は「意図」ではなく **checked property** にする。store path が temp 配下であること、
+  解決される default home store path と一致しないことを test 自身が pin する
+  (実装例: `tests/regressions/test_issue_14477_repair_pins_resume_freshness_anchor.py`
+  `OperatorHomeHermeticityTest` — 無引数構築の不在は自 module の AST から導出して pin する)。
+- 診断で共有 store を読む必要がある場合は **read-only** で開く
+  (`sqlite3.connect("file:...?mode=ro", uri=True)`)。downgrade / raw repair / hand edit はしない。
+  - **`immutable=1` を付けてはならない** (#14477 review j#94531 R2-F3)。公式 URI 契約
+    (https://www.sqlite.org/uri.html) では `immutable` は「file が read-only media 上にあり
+    **elevated privilege を持つ別 process によってさえ変更されない**」ことの宣言であり、SQLite は
+    **file locking と change detection を全て skip** する。実際に変更される file へ設定すると
+    **incorrect query result / `SQLITE_CORRUPT`** を返し得る。home scope の authority store は
+    複数 lane / supervisor が並行更新する **mutable** store なので、この宣言は成立しない。
+    `mode=ro` は locking / change detection / WAL を維持するので、こちらを使う。
+  - **一貫した snapshot が必要な場合**は「読む前に snapshot を作る」。SQLite の
+    `VACUUM INTO '<dest>'` または backup API を使う。`state.sqlite` だけを `cp` する方法は
+    **WAL / `-shm` を取り残して不整合になり得る**ため snapshot として扱わない。
+  - **単発の file 読取 (size / mtime / hash) は transactional snapshot ではない**。並行書込み中は
+    torn read になり得るので、「変化していない」ことの根拠に使うときはこの限界を併記する。
+    「変更を防いだ」ことの証明は SQLite に依存しない層 (上記 kernel deny の negative proof) で採る。
 
 ### corruption quarantine / component repair
 

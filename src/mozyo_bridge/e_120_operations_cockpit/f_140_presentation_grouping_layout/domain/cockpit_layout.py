@@ -1734,8 +1734,10 @@ class LayoutColumn:
 
 
 def _read_uint(text: str, i: int) -> tuple[int, int]:
+    # ASCII decimal only, NOT `str.isdigit()`: `²` raises in `int()`, `１` silently reads 1;
+    # either now ends the run -> `int("")` -> `parse_window_layout`'s own None (#14753).
     start = i
-    while i < len(text) and text[i].isdigit():
+    while i < len(text) and "0" <= text[i] <= "9":
         i += 1
     return int(text[start:i]), i
 
@@ -1780,10 +1782,7 @@ def _parse_layout_cell(text: str, i: int) -> tuple[LayoutCell, int]:
     if i >= len(text) or text[i] != ",":
         raise ValueError(f"bad layout leaf at {i}: expected ',' before pane id")
     pane_num, i = _read_uint(text, i + 1)
-    return (
-        LayoutCell(width, height, x, y, f"%{pane_num}", None, ()),
-        i,
-    )
+    return LayoutCell(width, height, x, y, f"%{pane_num}", None, ()), i
 
 
 def parse_window_layout(layout: str) -> Optional[LayoutCell]:

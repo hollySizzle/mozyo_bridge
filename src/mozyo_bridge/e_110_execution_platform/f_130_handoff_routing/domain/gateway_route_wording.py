@@ -55,9 +55,36 @@ READER_UPGRADE_REQUIRED_NARRATIVE: str = (
 )
 
 
+#: ``DeliveryOutcome.next_action`` for an ``execution_root_outside_target_repo``
+#: outcome (Redmine #14249). The sender asserted a `--target-repo` AND a
+#: `--workdir` that resolves outside it, so the two halves of the execution root
+#: contradict each other. The owner is the SENDER: only the caller knows which of
+#: the two it meant, and both repairs are sender-side.
+EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NEXT_ACTION: str = (
+    "the resolved `--workdir` does not live under the asserted `--target-repo`, so "
+    "the delivery would name an execution root outside the repo the receiver was "
+    "gated into — refused before any injection (nothing typed, no Enter, no "
+    "delivery recorded). Pass a `--workdir` inside the target repo (a relative "
+    "`--workdir` resolves against `--target-repo`, so `.` is the target repo root), "
+    "or drop `--target-repo` if the execution root genuinely lives outside it."
+)
+
+#: ``DeliveryOutcome`` narrative for an ``execution_root_outside_target_repo`` outcome.
+EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE: str = (
+    "Execution-root containment fence (Redmine #14249): `--target-repo` asserted one "
+    "repo root while `--workdir` resolved outside it, so the delivery would have "
+    "pointed the receiver at an execution root beyond the lane it was gated into. "
+    "Distinct from `target_repo_mismatch` (there the target PANE failed the repo "
+    "gate); here the pane gate passed and the sender's own two flags disagree. "
+    "Handoff aborted before typing; no notification was typed."
+)
+
+
 __all__ = (
     "GATEWAY_ROUTE_BLOCKED_NEXT_ACTION",
     "GATEWAY_ROUTE_BLOCKED_NARRATIVE",
     "READER_UPGRADE_REQUIRED_NEXT_ACTION",
     "READER_UPGRADE_REQUIRED_NARRATIVE",
+    "EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NEXT_ACTION",
+    "EXECUTION_ROOT_OUTSIDE_TARGET_REPO_NARRATIVE",
 )

@@ -253,5 +253,237 @@ class RenderWorkflowEventMarkerTest(unittest.TestCase):
             render_workflow_event_marker("close")
 
 
+class QuotedMarkerIsNotAGateTest(unittest.TestCase):
+    """Redmine #14585: this reader used to accept a QUOTED marker as a durable gate event.
+
+    The proxy rail learned to tell a decision from a quotation of one (#14546); this reader — the
+    one ``workflow watch``, callback discovery and the ``workflow step`` anchor gate all go through
+    — did not, so the same defect was still live on the sibling parser. In #14577 j#90416 F1 an
+    inline-quoted marker in an older journal became a fresh lane's verified anchor.
+
+    Both directions are pinned: a quotation is not a gate, and a real top-level marker still is.
+    The full shape matrix lives in ``test_canonical_note_scan``; these pin that this reader is
+    actually wired to it, which is the thing that was missing.
+    """
+
+    GATE = "[mozyo:workflow-event:gate=review_request:head=" + "a" * 40 + "]"
+
+    def _gates(self, notes):
+        return tuple(m.gate for m in extract_markers_from_note("14585", "90416", notes))
+
+    def test_top_level_marker_is_still_a_gate(self):
+        self.assertEqual(self._gates(self.GATE), ("review_request",))
+
+    def test_inline_quoted_marker_is_not_a_gate(self):
+        self.assertEqual(self._gates("the marker to write is `%s`" % self.GATE), ())
+
+    def test_blockquoted_marker_is_not_a_gate(self):
+        self.assertEqual(self._gates("> " + self.GATE), ())
+
+    def test_fenced_marker_is_not_a_gate(self):
+        self.assertEqual(self._gates("```\n" + self.GATE + "\n```"), ())
+
+    def test_indented_code_marker_is_not_a_gate(self):
+        self.assertEqual(self._gates("    " + self.GATE), ())
+
+    def test_mismatched_delimiters_are_not_a_gate_either(self):
+        # #14584 j#91152 F1 reaching THIS reader: the shapes a boolean fence toggle and a
+        # one-backtick span let through are verbatim to every renderer, so they must be as
+        # invisible here as the four shapes above. Wiring, not grammar — the matrix is in
+        # ``test_canonical_note_scan.DelimiterIdentityTest``.
+        for label, note in (
+            ("two-backtick span", "``%s``" % self.GATE),
+            ("shorter run inside a longer fence", "````\n```\n%s\n````" % self.GATE),
+            ("tilde run inside a backtick fence", "```\n~~~\n%s\n```" % self.GATE),
+            ("backtick run inside a tilde fence", "~~~\n```\n%s\n~~~" % self.GATE),
+            ("run bearing an info string", "```\n```python\n%s\n```" % self.GATE),
+            ("backtick in the opener info string", "```a`b\n```\n%s\n```" % self.GATE),
+            ("unmatched backtick string", "``%s`" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ())
+
+    def test_block_level_quotation_is_not_a_gate_either(self):
+        # #14584 j#91194 F1-F3 reaching THIS reader: quotation that only a multi-LINE view can see.
+        # Each shape was confirmed with a real CommonMark renderer; the matrix is in
+        # ``test_canonical_note_scan.BlockStructureTest``.
+        for label, note in (
+            ("multi-line code span", "`start\n%s\nend`" % self.GATE),
+            ("multi-line two-backtick span", "``start\n%s\nend``" % self.GATE),
+            ("one space + tab indent", " \t%s" % self.GATE),
+            ("three spaces + tab indent", "   \t%s" % self.GATE),
+            ("blockquote lazy continuation", "> quoted grammar\n%s" % self.GATE),
+            ("lazy continuation two lines down", "> quoted\nstill quoted\n%s" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ())
+
+    def test_character_class_and_markup_quotation_is_not_a_gate_either(self):
+        # #14584 j#91406 F1-F3 reaching THIS reader: quotation that survives because Markdown's
+        # whitespace is narrower than Python's, because an indent inside a paragraph is not a code
+        # block, or because the quoting is raw HTML. Confirmed against a real renderer; the matrix
+        # is in ``test_canonical_note_scan``.
+        nbsp = "\u00a0"  # escape, not a literal: an invisible fixture degrades silently
+        for label, note in (
+            ("NBSP after a fence run", "```\n```%s\n%s\n```" % (nbsp, self.GATE)),
+            ("NBSP as a blank line", "> quoted\n%s\n%s" % (nbsp, self.GATE)),
+            ("NBSP in an interrupter", "> quoted\n#%shead\n%s" % (nbsp, self.GATE)),
+            ("bare carriage return", "> quoted\r#\thead\r%s" % self.GATE),
+            ("hanging indent in a span", "`start\n    cont\n%s\nend`" % self.GATE),
+            ("inline raw HTML code", "text <code>%s</code>" % self.GATE),
+            ("raw HTML pre block", "<pre>\n%s\n</pre>" % self.GATE),
+            ("raw HTML blockquote block", "<blockquote>\n%s\n</blockquote>" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ())
+
+    def test_markup_and_escaped_delimiters_are_not_a_gate_either(self):
+        # #14584 j#91593 F1-F3 reaching THIS reader. The comment / attribute shapes are the sharp
+        # ones: `pandoc -t plain` renders the marker as nothing at all, so an INVISIBLE string was
+        # becoming a durable gate event.
+        for label, note in (
+            ("html comment", "text <!-- %s --> text" % self.GATE),
+            ("attribute value", 'text <span title="%s">visible</span>' % self.GATE),
+            ("CDATA", "<![CDATA[\n%s\n]]>" % self.GATE),
+            ("nested quoting tags", "<blockquote>\n<blockquote>\nq\n</blockquote>\n%s\n</blockquote>" % self.GATE),
+            ("escaped backtick", "\\` x `%s`" % self.GATE),
+            ("link destination", "[text](%s)" % self.GATE),
+            ("link title", '[text](http://example.com "%s")' % self.GATE),
+            # #14584 j#91792: lexical triggers that are not links at all — a mask here
+            # hid a real <script> opener and the marker inside it became a gate.
+            ("]( trigger, not a link", "prose ]( <script> )\n\n%s\n</script>" % self.GATE),
+            ("][ trigger, not a link", "prose ][ <script> ]\n\n%s\n</script>" % self.GATE),
+            ("]: trigger, not a link", "prose ]: <script>\n\n%s\n</script>" % self.GATE),
+            ("![ trigger, not a link", "prose ![ <script> ]\n\n%s\n</script>" % self.GATE),
+            # #14584 j#91839: a URL is not prose, so a marker inside an autolink is no
+            # more a declaration than one inside [text](URL).
+            ("marker inside a URI autolink", "<https://example.test/%s>" % self.GATE),
+            ("marker inside a mailto autolink", "<mailto:a@x.test?s=%s>" % self.GATE),
+            # #14584 j#91863: the same bytes start an HTML block at the head of a line,
+            # and the block phase wins — so they must reach the raw-HTML rule.
+            ("html block type 2", "<!--a@b>\n%s" % self.GATE),
+            ("html block type 3", "<?a@b>\n%s" % self.GATE),
+            ("html block type 4", "<!A@b> %s" % self.GATE),
+            # #14584 j#91918: a list marker is a container prefix, so a block can open
+            # at the item content column too.
+            ("html block inside a list item", "- <!--a@b>\n  %s" % self.GATE),
+            ("html block inside an ordered item", "1. <?a@b>\n   %s" % self.GATE),
+            ("four columns after the marker", "-    <!--a@b>\n\n%s" % self.GATE),
+            ("ordered list at one interrupts", "prose\n1. <!--a@b>\n\n%s" % self.GATE),
+            # #14584 j#91997: the condition is the start NUMBER, so 01. interrupts too.
+            ("ordered list at one, padded", "prose\n01. <!--a@b>\n\n%s" % self.GATE),
+            ("definition title on the next line", '[foo]: /url\n  "%s"' % self.GATE),
+            ("paren inside a quoted title", '[text](url "a ) %s b")' % self.GATE),
+            ("image alt text", "![a %s b](img.png)" % self.GATE),
+            # #14584 j#91735: a narrow tail refusal erasing the markup that the
+            # note-wide one would have refused.
+            ("link tail hiding a later tag", "see [d](/u) <code>\nq\n\n%s" % self.GATE),
+            ("hanging indent hiding a later tag", "prose\n    <code>\n\n%s" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ())
+
+    def test_a_link_in_the_body_does_not_erase_the_gate(self):
+        # #14584 j#91761: reading rule E before the link pass made an angle destination or a
+        # tag-shaped title look like raw HTML, and the gate below it disappeared note-wide.
+        for label, note in (
+            ("angle destination", "see [docs](<https://example.com>)\n\n%s" % self.GATE),
+            ("reference definition", "[ref]: <https://example.com>\n\n%s" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ("review_request",))
+
+    def test_an_email_autolink_at_the_head_of_a_line_does_not_erase_the_gate(self):
+        # #14584 j#91898: `<!` opens an HTML block only before `--` or a letter. Treating every
+        # `<!` as one refused ordinary autolinks and the gate below them disappeared.
+        for label, note in (
+            ("<! then @", "<!@b>\n\n%s" % self.GATE),
+            ("<! then a digit", "<!1@b>\n\n%s" % self.GATE),
+            ("<! then a hyphen", "<!-@b>\n\n%s" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ("review_request",))
+
+    def test_paragraph_continuations_do_not_erase_the_gate(self):
+        # #14584 j#91954: a tab of hanging indent, and an ordered marker that cannot interrupt a
+        # paragraph, are both prose — neither opens a block.
+        for label, note in (
+            ("tab hanging indent", "prose\n\t<!--a@b>\n\n%s" % self.GATE),
+            ("ordered marker at two", "prose\n2. <!--a@b>\n\n%s" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ("review_request",))
+
+    def test_indented_code_inside_a_list_does_not_erase_the_gate(self):
+        # Five columns after the marker is code inside the item, not a block start (#14584 j#91938).
+        for label, note in (
+            ("five spaces", "-     <!--a@b>\n\n%s" % self.GATE),
+            ("two tabs", "-\t\t<!--a@b>\n\n%s" % self.GATE),
+            ("ordered, five spaces", "1.     <!--a@b>\n\n%s" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ("review_request",))
+
+    def test_an_autolink_inside_a_list_does_not_erase_the_gate(self):
+        # The other side of the container rule (#14584 j#91918): a list item holding an ordinary
+        # autolink is not a block start, and the gate below it stands.
+        self.assertEqual(self._gates("- <!@b>\n\n%s" % self.GATE), ("review_request",))
+        self.assertEqual(
+            self._gates("- <https://example.test/>\n\n%s" % self.GATE), ("review_request",)
+        )
+
+    def test_a_unicode_digit_prefix_does_not_erase_the_gate(self):
+        # #14584 j#92045: only ARABIC digits make an ordered list marker.
+        for label, note in (
+            ("Arabic-Indic one", "\u0661. <!--a@b>\n\n%s" % self.GATE),
+            ("fullwidth one", "\uff11. <!--a@b>\n\n%s" % self.GATE),
+            ("Devanagari one", "\u0967. <!--a@b>\n\n%s" % self.GATE),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._gates(note), ("review_request",))
+
+    def test_a_gate_recorded_above_the_markup_still_counts(self):
+        # The bound: refusing from where markup starts must not erase what came before it.
+        self.assertEqual(self._gates(self.GATE + "\n\nwe render <div> here"), ("review_request",))
+
+    def test_a_crlf_note_still_yields_its_gate(self):
+        # Redmine returns CRLF. If normalization were missing, the strict whitespace class above
+        # would stop every real fence closing and this reader would go blind.
+        self.assertEqual(self._gates("```\r\nq\r\n```\r\n" + self.GATE), ("review_request",))
+
+    def test_a_blank_line_still_releases_the_writers_own_voice(self):
+        # The paired positive for all three: one blank line away, the marker is a gate again.
+        self.assertEqual(self._gates("> quoted\n\n" + self.GATE), ("review_request",))
+
+    def test_a_matching_delimiter_still_releases_the_writers_own_voice(self):
+        # The paired positive: >= opener length closes, so this marker is NOT quoted.
+        self.assertEqual(self._gates("```\nquoted\n````\n" + self.GATE), ("review_request",))
+
+    def test_quotation_is_not_an_ambiguity_poison_either(self):
+        # The other half of the contract: a quoted marker must not merely be *refused*, it must be
+        # invisible. If it still counted as a second marker it would make the journal unusable —
+        # the failure mode the proxy rail hit when "2+ candidates" met a quotation (#14546).
+        note = self.GATE + "\n\nfor reference, the same token quoted: `%s`" % self.GATE
+        self.assertEqual(self._gates(note), ("review_request",))
+
+    def test_a_review_journal_discussing_the_contract_yields_no_gate(self):
+        note = (
+            "## Gate: review\n\n"
+            "- 指摘事項 [事実]: the producer must emit\n"
+            "```\n" + self.GATE + "\n```\n"
+            "- but the observed note carried `%s` instead\n" % self.GATE
+        )
+        self.assertEqual(self._gates(note), ())
+
+    def test_markers_from_source_is_quote_aware_end_to_end(self):
+        source = MappingRedmineJournalSource(
+            payload={
+                "issue": {"id": "14585"},
+                "journals": [{"id": 90416, "notes": "quoted: `%s`" % self.GATE}],
+            }
+        )
+        self.assertEqual(markers_from_source(source, "14585"), ())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -50,6 +50,24 @@ integration)。
 
 - 対象: 複数 module / 複数 bounded context をまたぐ **acceptance / workflow** の
   end-to-end 受入。operator / coordinator 視点の「通しで動く」を主張する。
+- **上の `/` は OR である (literal)。** 「複数 module をまたぐ」か「複数 bounded
+  context をまたぐ」かの**いずれか**を満たせば該当する。**単一 bounded context でも、
+  複数 module をまたぐ operator / coordinator 視点の通し受入なら scenarios である。**
+  根拠 [実測、base `dd62e957`、AST の import 解析]: `tests/scenarios/` 12 file が import
+  する `mozyo_bridge.e_*` から bounded context を導出すると、複数 context をまたぐ 3 /
+  単一 context のみ 6 / `e_*` context を持たない 3 であり、**12 file 中 9 file が複数
+  bounded context をまたいでいない**。repo が実際に採ってきた読みは OR である
+  (Redmine #14662 j#92449 裁定 3 / Review j#92458)。
+- **surface (実 filesystem / 実 subprocess に触れるか) は該当条件ではない。** 本 type が
+  課すのは後述の hermetic 要件だけであり、**実 FS に触れることは要求していない**
+  (根拠は本節の定義そのもの)。したがって **pure な test も scenarios になり得る**。
+  **surface で population を切ってから type を割り当てない。**
+  > 本判断の根拠は上記の定義であり、corpus 集計ではない。参考値として既存 12 file のうち
+  > **6 file は temp dir を作らない** [実測、base `dd62e957`] が、**この集計から「実 FS を
+  > 使わない」は導けない** — temp dir 検出は使用の**下限**であり、非発火は不使用の証明に
+  > ならない (実際 6 file はいずれも `Path(__file__).resolve()` 等で実 FS を叩く)。
+  > 同種の「下限の非発火から不使用を主張する」誤りは `### unit / integration 境界の既知の矛盾`
+  > でも禁じている。
 - cross-cutting なので **bounded context で細分しない**。context は filename /
   docstring に書く。
 - 例: turnkey e2e acceptance (`logic-turnkey-e2e-acceptance`)、cross-project
@@ -60,11 +78,47 @@ integration)。
 
 ### regressions
 
-- 対象: 過去に確定した defect の **再発防止 pin**。1 ファイル = 1 つの修正済み
+- 対象: 過去に確定した defect の **再発防止 pin**。**1 ファイル =** 1 つの修正済み
   症状 / Redmine issue に対応する characterization。
+- **判定の主語は file であって test method ではない** (Redmine #14662 j#92449 裁定 1-2 /
+  Review j#92458)。file 単位の連言 **R3-a ∧ R3-b ∧ R3-c** をすべて満たすときだけ本 type
+  に該当する:
+  - **R3-a**: その file が **単一の**修正済み症状 / **単一 Redmine issue** に対応する。
+    命名 `test_issue_<id>_*.py` がその宣言である。
+  - **R3-b**: file 内の **全 test** の主張が、その症状の **再来検出**であって、module の
+    公開 contract の主張ではない。
+  - **R3-c (grouping rule)**: file の `<id>` は **pin 対象の defect が修正された Redmine
+    issue** である。同一 issue で修正された defect を pin する test は同一 file に置く。
+    **journal id / finding id は file identity ではない。**
+  - 症状 / 主張が **混在する file は本 type に該当しない** → `## 配置決定木` の分岐 4 / 5
+    へ落ちる。
+- **R3-b と owning issue の特定は著者宣言であり、機械導出しない。** 本規則が一意にするのは
+  **基準**であって判定の機械化ではない (決定木の分岐 1 / 4 / 5 が概ね observable なのに
+  対し、分岐 2 と分岐 3 は *その test が存在する理由* を問う判断分岐である)。
+- **provenance anchor (docstring が持つ Redmine issue / journal / finding id) は
+  R3-a / R3-b / R3-c いずれの根拠にもしない。** anchor は repo 全体の普遍的な記録
+  convention であり、bucket 間の識別力を持たない [実測、base `dd62e957`: module docstring
+  に anchor を持つ率は unit 305/309・integration 114/120・regressions 96/98・
+  scenarios 12/12・flat 9/9 と **全 bucket で 95-100%**。method 単位でも、anchor を持つ
+  test の **54% が既に regressions 以外**にある。anchor の絶対件数は anchor 検出 regex に
+  依存するが (#14662 j#92449 は 247 件中 134 件、本 doc の再実測は 236 件中 128 件)、
+  **どちらでも 54%** である]。`## Anti-patterns` を読む。
 - cross-cutting なので **bounded context で細分しない**。
-- 命名: `test_issue_<id>_*.py` または `test_<症状>_regression.py`。docstring に
-  Redmine issue / 原因 commit を残す。
+- **命名 (normative な必要条件)**: `tests/regressions/` の file は (1) filename が `<id>`
+  を **1 つだけ**持ち (`test_issue_<id>_*.py`)、(2) **module docstring がその同じ `<id>`
+  を名指す**。docstring には原因 commit も残す。
+  **必要条件であって十分条件ではない** — 同じ命名の file は他 type にも存在し得るため、
+  命名だけでは分岐 3 は成立しない (現に `tests/unit/` に `test_issue_<id>_*.py` 命名の
+  **17 file** が存在する [実測、base `dd62e957`: #14219 が 14 / #14203 が 2 / #14150 が 1。
+  #14662 j#92449 はいずれも feature 実装 test と判定している]。disposition は同 journal の
+  backlog D = owner decision pending であり、本 doc は改名も許容も決めない)。
+  > 履歴: 旧版が併記していた `test_<症状>_regression.py` は `<id>` を持たず上記 (1) を
+  > 満たさないため **superseded** (該当する既存 file は無い)。現行 `tests/regressions/`
+  > 98 file はいずれも `test_issue_<id>_*.py` 命名で、うち **96 file が (1)(2) を満たす**。
+  > 残る 2 file (`test_issue_14203_pair_recovery_anchor_delivery.py` = module docstring
+  > なし / `test_issue_14203_recovered_worker_delivery.py` = `R18:` としか書かず `#14203`
+  > を名指さない) は **非適合であり、documented exception を grant しない**。disposition は
+  > #14662 j#92449 backlog C = coordinator の owner decision pending。
 - 新規機能の通常テストは regressions に置かない。あくまで「直したバグが戻らない」
   ことの番人。
 
@@ -222,22 +276,196 @@ python -m unittest discover -s tests -v
    (`test_` prefix を付けない)。終了。
 2. **複数 module / 複数 context をまたぐ通し受入 (workflow / acceptance) か?** →
    `tests/scenarios/`。終了。
+   `/` は **OR** であり、単一 bounded context でも複数 module をまたぐ operator 視点の
+   通し受入なら該当する。**実 FS / 実 subprocess に触れるかは該当条件ではない**
+   (`### scenarios`)。
 3. **修正済み defect の再発防止 pin か?** → `tests/regressions/`
    (`test_issue_<id>_*.py`)。終了。
+   判定は **file 単位**で **R3-a ∧ R3-b ∧ R3-c** (`### regressions`) を満たすときだけ
+   成立する。test method 単位の述語へ読み替えない。**provenance anchor は根拠にしない。**
 4. **単一 unit を隔離検証するか (collaborator は fake)?** →
    `tests/unit/<context>/`。`<context>` = subject の primary src module の
    bounded context。
 5. **それ以外 (複数の実 collaborator を hermetic に結線)** →
    `tests/integration/<context>/`。
 
+分岐 1 / 4 / 5 は概ね code から observable だが、**分岐 2 と分岐 3 は *その test が
+存在する理由* を問う判断分岐**であり、著者宣言で決める。observable でない述語を機械化
+しようとしないこと (Redmine #14662 j#92449 裁定 2)。
+
 一意性の tie-breaker:
 
 - unit / integration が複数 context に触れる場合、配置は **primary
   subject-under-test** (振る舞いを characterize している側) の context に従う。
   真に context 横断の受入なら integration ではなく scenario (分岐 2) に倒す。
+  (これは *十分条件* 側の記述であり、分岐 2 の `/` が OR であること (`### scenarios`) と
+  矛盾しない。)
 - unit vs integration は **実 collaborator の数**で決める (1 = unit、複数 =
-  integration)。
+  integration)。**この tie-breaker は下記 `### unit / integration 境界の既知の矛盾`
+  の対象であり、#14660 family scope では family 限定の literal rule が優先する。**
 - 破壊的 / 実 host / 実 network を要する受入は本 tests/ ではなく `smoke/**`。
+
+### unit / integration 境界の既知の矛盾と #14660 family 限定の解消
+
+**認定する矛盾 (Redmine #14662 j#92449 裁定 4 / Review j#92458)。** `### unit` は
+collaborator を「**subject-under-test 以外の**」と定義する。したがって **実 filesystem が
+唯一の非 subject collaborator である test** は、
+
+- 上の tie-breaker「実 collaborator が 1 = unit」では unit を指し、
+- `### unit`「I/O・sleep・実 subprocess を持たない」では unit を否定され、
+- `### integration`「**複数の**実 collaborator」にも入らない。
+
+**どの分岐にも一意に入らない。** この矛盾は本 doc に実在する。
+
+**#14660 family (legacy mirror test family) に限定した解消:**
+
+```text
+unit        : 実 外部 collaborator が 0 (subject は数えない)。
+              実 FS / 実 subprocess / sleep / 実 network を持たない。
+integration : 実 外部 collaborator が 1 以上で、hermetic (temp dir / in-memory /
+              fake client) に閉じる。
+```
+
+実 filesystem は実外部 collaborator として数える。これにより実 FS 単独ケースは 1 分岐に
+だけ入る。この family scope 内では tie-breaker「1 = unit」は本規則と両立せず、本規則が
+**置換**する (従属ではない)。**判定の正本は各 test を読むことであり、構文的検出器の出力
+ではない。**
+
+**scope の境界 (重要):**
+
+- 本 literal rule の scope は **#14660 family と、その family の新規配置に限る**。
+  `### unit` / `### integration` / 上の tie-breaker の **global 記述は変更していない**。
+- **global canonical rule への昇格は行っていない。** 昇格は完全な実 FS 使用 inventory の
+  取得方法を前提とする別 decision (#14662 j#92449 backlog B、coordinator / owner の
+  `owner decision pending`) が所有する。それが決まるまで rule scope は family のままである。
+- **既存 corpus への例外は grant しない。** 既存 corpus の本 rule への適合状況は**未測定**
+  である。実 FS 使用 file の構文的集計 (#14662 j#92449: unit 89/309・integration 77/120・
+  regressions 77/98・scenarios 6/12) は `tempfile` 系 API の検出のみによる**下限**であり、
+  かつ**検出器依存**である (検出 API 集合をわずかに広く取った再実測では integration が
+  78/120 になる。unit / regressions / scenarios は一致)。下限で例外集合を定義すると、
+  未検出の既存 file が後日 flag されたとき**新規違反か既存例外かを判定できない**。
+  `## #12490 migration contract` の documented exception は 4 file を exact path で列挙し
+  理由と解消条件を持つ形であり、**同型ではない**。したがって本 doc は既存 file への
+  exception を granted と書かない。
+
+## #14660 legacy mirror family 裁定 (Redmine #14662 R4)
+
+`tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_project_skill_mirror.py`
+(以下 **#14660 family**、127 test) の分割・移設に本 doc の決定木を適用した結果の裁定を固定する。
+これは **base `dd62e957` 時点の現行 path であって移設先ではない** — 127 件の行き先は本節の基準に
+基づく #14660 の分類で決まり、本 doc は先取りしない。正本は Redmine #14662
+Implementation Done **j#92449** (R4 裁定) / Review **j#92458** (承認、指摘 0)、coordinator
+intake は j#92461。上記 `### scenarios` / `### regressions` / `### unit / integration
+境界の既知の矛盾` / `## Anti-patterns` の改訂は同じ裁定の反映である。
+
+### 移設 hold と解除条件
+
+**本 doc の改訂 (T-P = Redmine #14664) が canonical doc へ land するまで、#14660 の配置
+matrix 確定と物理移設を開始しない。** 裁定 journal が approved になっただけでは開始しない。
+agent は catalog 経由で doc を読むため (central preset `### 回答前 Doc 解決`)、journal に
+裁定があっても doc が旧記述のままなら次の読者が同じ誤導出を再生産する。**本節が land した
+時点で T-P の条件は満たされる** (T-P 以外の resume 条件 — #14660 の park state と
+coordinator の resume 判断 — は #14660 / coordinator が所有する。本 doc は T-P だけを解く)。
+
+```text
+T0 (#14662 裁定)  →  T-P (本 doc 改訂 = #14664)  →  T1  →  {T2, T3, T5, T6}
+                                                     T3  →  T4
+```
+
+| 単位 | 所有 |
+| --- | --- |
+| T-P (本 doc の改訂) | #14664。`tests/**` / `src/**` に触れない doc-only |
+| 配置 matrix の確定 / Appendix A の訂正 | #14660 |
+| T1 / T5 / T6 (物理移設) | #14592 配下の各移設 Task |
+
+### family の配置基準 (適用時の要約)
+
+決定木の順序 (support > scenarios > regressions > unit > integration) を保つ。**各行の
+scope は同じではない**: scenarios 行と issue regression 行は上の **global 定義の要約**、
+shared support fake 行の閾値と pure unit / real-file integration 行の literal rule は
+**#14660 family 限定**である。
+
+| 分類 | 行き先 | 判定 |
+| --- | --- | --- |
+| shared support fake | `tests/support/` | test ではない fixture / helper / builder / fake で、**2 つ以上の移設先 test module** が使うもの。`test_` prefix を付けない。単一 module 専用は module-local |
+| scenarios | `tests/scenarios/` | 複数 module をまたぐ operator 視点の通し受入 (`### scenarios`。判断分岐 → 著者宣言)。単一 bounded context でも成立し、**実 FS の有無は問わない** |
+| issue regression | `tests/regressions/test_issue_<id>_*.py` | **R3-a ∧ R3-b ∧ R3-c** (`### regressions`。file 単位・著者宣言)。provenance anchor は根拠にしない。命名条件は必要条件 |
+| pure unit | `tests/unit/<context>/` | **実外部 collaborator 0** (subject は数えない。family scope の literal rule) |
+| real-file integration | `tests/integration/<context>/` | **実外部 collaborator 1 以上**で hermetic に閉じる (family scope の literal rule) |
+
+support の閾値 (2 module 以上) の根拠 [実測、base `dd62e957`、AST の import 解析]: 現行
+`tests/support/` の 7 file は **全て 2 つ以上の test module から import されて**おり
+(import 元が 1 module 以下の support file は存在しない)、consumer は unit 16 /
+regressions 14 / scenarios 7 / integration 6 file と **bucket をまたぐ**。
+
+分岐 2 / 分岐 3 は判断分岐なので、どの test が該当するかは **#14660 の著者宣言**とし、本
+裁定は基準のみを定める。**候補を特定の class に限定しない** — pure cluster も含め
+**全 127 件について分岐 2 を評価する**。127 件の per-test 割当は #14660 が所有する。
+
+### 移設の検算
+
+**無条件に使える検算は 1 本だけである:**
+
+```text
+unit + scenarios + regressions + integration = 127
+```
+
+決定木が各 test にちょうど 1 つの行き先を与えることから従う **partition の恒等式**であり、
+検出器にも surface にも依存しない (support へ抽出する fixture は test ではないので 127 の
+分配先にならない)。
+
+これを、移設前後で collected test 数が一致することの確認 (`## discovery / CI 方針` の移行契約と
+同型) と併せて使う。**恒久に残るのは count 一致を確認する command であって特定の数値ではない**:
+
+- **D1 (family focused)** = 本 family の test 数 **127**。family 内で閉じた定数であり、
+  上の partition 恒等式と同じ根拠を持つ。
+- **D2 (repository discovery)** = `unittest.defaultTestLoader.discover('tests').countTestCases()`。
+  **各物理移設 Task が自身の exact pre-move base で `N` を測り、post-move が同じ `N` である
+  ことを検証する**。`N` は family と無関係な test の増減でも動くため、**特定の数値を本 doc に
+  固定しない**。
+
+> **数値の出所と、裁定からの correction の明示。** #14662 j#92449 は D2 を `13,207` という
+> 数値ごと「移設後に残る恒久不変条件」と書いている。`13,207` は **#14660 characterization が
+> 自身の base で測った snapshot** (#14660 j#92381 / j#92393) であり、**本 doc の base
+> `dd62e957` で同じ command を実行した実測は `13,343`** である。数値を恒久不変条件として持つと
+> base が進むたびに偽陽性になるため、本 doc は不変条件を **「各 Task が自 base で測り一致を
+> 見る command」へ分離**する。これは j#92449 の literal に対する **policy correction** である
+> (裁定の意図 = 移設で test を落とさないこと、は変えていない)。
+
+**surface 集計は diagnostic であって acceptance invariant ではない** [出所: **#14660 Appendix A.2
+の構文的導出**。同 characterization の base での値であり、本 doc が実測した値ではない]:
+
+| surface | tests |
+| --- | ---: |
+| pure (FS 非依存) | 23 |
+| real tree | 96 |
+| subprocess | 8 |
+
+使い方: 「構文的検出器が `real_fs` / `subprocess` と分類した test が unit に置かれている」
+ことを見つけたら、**検出器の false positive か配置誤りのどちらかなので、どちらかを特定
+せよ**という *調査の trigger* とする。**reject 条件・上界・must としては使わない。**
+
+> **撤回済み:** 旧案の `unit ≤ 23` と `scenarios + integration ≤ 104` は **両方撤回**
+> されている。分岐 2 / 分岐 3 は分岐 4 / 5 より先に評価され surface を必要条件にしない
+> ため **pure からも scenarios / regressions が出る**し、`pure(真) ⊆ pure(構文的検出)` も
+> 保証されない。**正しい分類を reject し得る値を検算に使わない** (#14662 j#92449)。
+
+### 導出器 (#14660 Appendix A) の位置づけ
+
+#14660 の Appendix A に置かれた分類導出器は **migration-time artifact** であり、Appendix A
+に**据え置く** (`tests/support/` へ昇格しない)。理由: 導出器は移設前の単一 file を引数に
+取り、移設完了時点で subject が消えて実行不能になる — 恒久 gate に見せかけた一時 gate を
+CI に足さない。`### support` の定義 (test から import される共有 fixture) にも合わない。
+
+- drift window は「本裁定 → T1 / T5 完了」に限定し、その窓の drift 検出は各移設 Task の
+  完了条件とする。移設完了時に **superseded** と明記して retire する。
+- 移設後に残る恒久不変条件は **collected test 数の一致確認** であり、**script ではなく
+  command** である (D1 は family 定数、D2 は各移設 Task が自 base で測る。`### 移設の検算`)。
+- **構文的検出器 (Appendix A.2) は分岐 4 / 5 の候補抽出と上記 diagnostic trigger に有効で
+  あり、「実外部 collaborator が 0 か」の判定の正本ではない。** 判定は各 test を読んで行う。
+- 必須の訂正 (#14660 所有): 上記 `### regressions` の裁定により **A.3 の分岐 3 判定は
+  無効**であり、`### scenarios` の裁定により **A.3 が分岐 2 を評価していない**ことが顕在化
+  している。#14660 は A.3 に両方を明記するか、該当 arm を撤回する。
 
 ## #12490 migration contract (実施結果)
 
@@ -268,6 +496,16 @@ python -m unittest discover -s tests -v
 - サブディレクトリの `__init__.py` を省いて nested test を false green にする。
 - scenarios / regressions を context で細分し、横断テストの置き場を曖昧にする。
 - support に `test_*.py` を置いて helper を test として走らせる。
+- **provenance anchor (docstring が持つ Redmine issue / journal / finding id) を分岐 3 の
+  判定根拠にする** (anchor は全 bucket で 95-100% 発火する記録 convention であり、
+  分類器ではない。`### regressions`)。
+- **file 単位の規則 (分岐 3 / `### regressions`) を test method 単位の述語へ読み替える**
+  (誤適用の発生点。1 file 内に混在があれば file ごと分岐 4 / 5 へ落とす)。
+- **正本が結合子を定義していない列挙 (`複数 module / 複数 bounded context`) を、既存
+  corpus に当てずに AND / OR のどちらかへ決め打つ** (分岐 2 の `/` は OR。`### scenarios`)。
+- **surface (実 FS / 実 subprocess を使うか) で population を切ってから type を割り当てる**
+  (決定木は support > scenarios > regressions > unit > integration の順であり、分岐 2 と
+  分岐 3 は surface を必要条件にしない)。
 - private path / secret-shaped literal を support / fixtures に書く
   (`rule-public-private-boundary`)。
 - 実 network / 実 owner / 実 publish を unit / integration に持ち込む (smoke へ)。

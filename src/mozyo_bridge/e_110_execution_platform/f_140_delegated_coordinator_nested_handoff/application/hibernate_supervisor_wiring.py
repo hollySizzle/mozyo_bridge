@@ -49,8 +49,10 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
     RELEASE_NOT_REQUESTED,
+    RELEASE_PARTIAL,
     RELEASE_RELEASED,
-    RELEASE_STATES,
+    RELEASE_REQUESTED,
+    is_canonical_release_state,
 )
 from mozyo_bridge.core.state.lane_lifecycle_readonly import load_lane_lifecycle_readonly
 from mozyo_bridge.core.state.workflow_runtime_store import (
@@ -83,7 +85,10 @@ from ..domain.hibernate_evidence_marker import (
     parse_hibernate_evidence,
 )
 from ..domain.hibernate_issuer_policy import resolve_journal_issuer
-from ..domain.redmine_journal_source import RedmineJournalEntry, marker_fields_in_note
+from ..domain.redmine_journal_source import (
+    RedmineJournalEntry,
+    strict_gate_markers,
+)
 from .hibernate_lane_topology import (
     LaneTopologyObservation,
     _full_sha,
@@ -151,11 +156,16 @@ EntriesReader = Callable[[str], Optional[Sequence[RedmineJournalEntry]]]
 
 
 def _park_evidences(notes: str) -> "list[HibernateEvidence]":
-    """Every strictly-parseable park evidence in a note (canonical parser, no second grammar)."""
+    """Every strictly-parseable park evidence in a note (canonical parser, no second grammar).
+
+    "Strictly" now starts at the marker BODY (Redmine #14539 review j#91943 finding 1): the shared
+    reader refuses a body the canonical producer could not render — whitespace-contaminated, empty
+    component, missing ``=``, repeated key — before the evidence parser sees a clean-looking field
+    mapping. Only the workflow-event channel is authority; the handoff channel is a delivery
+    notification and declares no gate.
+    """
     found = []
-    for _channel, fields in marker_fields_in_note(notes or ""):
-        if str(fields.get("gate", "") or "").strip() != EVIDENCE_PARK_DECLARED:
-            continue
+    for fields in strict_gate_markers(notes, EVIDENCE_PARK_DECLARED):
         parsed = parse_hibernate_evidence(fields, kind=EVIDENCE_PARK_DECLARED)
         if isinstance(parsed, HibernateEvidence):
             found.append(parsed)
@@ -238,9 +248,12 @@ def read_dogfood_receipts(
         return {}
     claims: set[tuple[str, str]] = set()
     for entry in release_page:
-        for _channel, fields in marker_fields_in_note(entry.notes or ""):
-            if str(fields.get("gate", "") or "").strip() != DOGFOOD_RECEIPT_GATE:
-                continue
+        # The receipt is corroborating AUTHORITY, so it is read strictly (review j#91943 finding
+        # 1). The lenient fold accepted four bodies the canonical producer cannot emit — a
+        # whitespace-contaminated gate, a repeated ``source_issue`` resolved by last-write-wins,
+        # an unknown second gate alias, and a handoff-channel marker — each yielding a receipt
+        # byte-identical to the genuine one.
+        for fields in strict_gate_markers(entry.notes or "", DOGFOOD_RECEIPT_GATE):
             claimed_source = str(fields.get("source_issue", "") or "").strip()
             head = str(fields.get("head", "") or "").strip()
             if claimed_source and _full_sha(head):
@@ -304,7 +317,16 @@ def enumerate_hibernated_redrives(
             continue
         if not str(getattr(row, "issue_id", "") or "").strip():
             continue
-        release = str(getattr(row, "process_release", "") or "").strip()
+        # Byte-exact, NOT stripped (Redmine #14477 review j#94750 R7-F3). Stripping first let a
+        # padded storage value impersonate a canonical token: ``"released "`` was dropped as a
+        # completed generation and ``" not_requested"`` was admitted to the REDRIVE (mutating)
+        # path, both of which contradict this function's own contract that a non-canonical token
+        # is typed uncertain. ``process_release`` is unconstrained ``TEXT``, so the value is
+        # classified as stored — the shared predicate is the vocabulary's own.
+        release = str(getattr(row, "process_release", "") or "")
+        if not is_canonical_release_state(release):
+            unknown.append(row)  # non-canonical token -> typed uncertain (R5-F5 / R7-F3)
+            continue
         if release == RELEASE_RELEASED:
             continue  # terminal for the generation
         if release == RELEASE_NOT_REQUESTED:
@@ -313,10 +335,13 @@ def enumerate_hibernated_redrives(
                 continue  # confirmed no live slot -> terminal (processes already gone)
             redrives.append(row)  # live slot present, or unreadable inventory (fail-closed)
             continue
-        if release in RELEASE_STATES:  # requested / partial
+        if release in (RELEASE_REQUESTED, RELEASE_PARTIAL):
             redrives.append(row)
             continue
-        unknown.append(row)  # non-canonical token -> typed uncertain (R5-F5)
+        # Canonical, but a state this function has no rule for — a future vocabulary member must
+        # fail closed as uncertain rather than inherit a neighbouring state's handling, the same
+        # discipline review j#94750 R7-F1 imposed on the observation read gate.
+        unknown.append(row)
     return RedriveEnumeration(redrives=tuple(redrives), unknown_release=tuple(unknown))
 
 

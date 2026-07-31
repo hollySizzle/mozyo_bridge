@@ -8,6 +8,12 @@ external plugin API を公開する前に built-in adapter / provider 境界を�
 third-party extension contract、互換性保証を公開しない。目的は、core に残すべき
 最小 contract と、将来 adapter 化しやすい責務を分けることである。
 
+Herdr 0.7.5 が host 側で load する plugin は、mozyo-bridge の external provider
+plugin とは別である。Herdr plugin を Unit / Target / attention 等の presentation
+consumer として利用する境界、sublane UX intent、engine-first の順序は
+`herdr-plugin-presentation-consumer-boundary.md` を正本とする。Herdr-hosted plugin
+の存在を、本書が禁止する arbitrary code provider loading の解禁と読まない。
+
 ## Decision
 
 v0.8 の方針は **plugin system first** ではなく **built-in adapter boundary first**。
@@ -584,10 +590,21 @@ without inventing the machinery a real plugin system would need.
   `BUILTIN_CLI_MODULE_REGISTRY` in the exact pre-registry order, and exposes
   `compose_parser(sub, config)`.
 - `src/mozyo_bridge/application/cli_core.py` — the residual inline `build_parser()`
-  blocks (status/list, pane I/O, keys, init/doctor/sublane), moved verbatim into
+  blocks (status/list, pane I/O, keys, init/doctor), moved verbatim into
   four ordered registrars so the core command set composes through the registry
   like the feature families. `build_parser()` now only builds the root options
-  and calls `compose_parser(sub)`.
+  and calls `compose_parser(sub)`. The `sublane` and `herdr` command groups are
+  *not* core: their parsers live with the features that own them
+  (`f_140_delegated_coordinator_nested_handoff/application/cli_sublane_group.py`
+  and `f_130_terminal_runtime_provider/application/cli_herdr_group.py`), and the
+  `lifecycle` registrar composes each with one call, injecting the two shared
+  option helpers (`add_repo_option` / `_add_lifecycle_json`) so no feature module
+  imports back into the CLI core. That is the same feature-local parser
+  convention `cli_sublane_retire` / `cli_herdr_recovery` /
+  `cli_herdr_distribution` already follow; Redmine #14654 applied it to the two
+  remaining inline groups after the #13249 integration merge composed two green
+  branches into a 1007-line `cli_core` and tripped the module-health
+  `new_oversized` gate.
 
 ### Internal-only, by construction
 

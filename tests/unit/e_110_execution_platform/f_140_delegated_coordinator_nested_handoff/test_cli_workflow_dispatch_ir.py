@@ -136,5 +136,43 @@ class DispatchIrCliTest(unittest.TestCase):
         self.assertEqual(posted, [])  # never wrote
 
 
+class TargetRepoIdentityTest(unittest.TestCase):
+    """The route's ``--target-repo`` is a repo identity, not a string the operator happened to type.
+
+    Redmine #14659 (verdict j#92207 / authorization j#92210): the admission gate compares
+    ``Path(--target-repo).expanduser().resolve()``, and once ``--target-lane`` is explicit the herdr
+    route derives the target ``cwd`` from the same value. A relative ``.`` therefore names whatever
+    directory the coordinator's process was in — the same command means different repos from
+    different panes. Canonicalize at the CLI boundary; never string-match the gate into agreement.
+    """
+
+    def test_a_relative_target_repo_becomes_the_absolute_identity_the_gate_compares(self):
+        route = cli._route_from_args(_args(target_repo="."), "lane-a")
+        expected = str(Path(".").expanduser().resolve())
+        self.assertEqual(route.target_repo, expected)
+        self.assertTrue(Path(route.target_repo).is_absolute())
+
+    def test_the_auto_sentinel_is_not_a_path_and_survives(self):
+        # `auto` means "infer the root", so resolving it would invent a directory named 'auto'.
+        route = cli._route_from_args(_args(target_repo="auto"), "lane-a")
+        self.assertEqual(route.target_repo, "auto")
+
+    def test_an_empty_target_repo_stays_empty_so_the_dispatch_still_fails_closed(self):
+        # Resolving "" would yield the process cwd and silently satisfy `DispatchRoute.missing()`,
+        # turning a fail-closed input error into a dispatch aimed at wherever the caller stood.
+        route = cli._route_from_args(_args(target_repo=""), "lane-a")
+        self.assertEqual(route.target_repo, "")
+        self.assertIn("target_repo", route.missing())
+
+    def test_an_already_absolute_path_is_unchanged_in_identity(self):
+        here = str(Path(__file__).resolve().parent)
+        route = cli._route_from_args(_args(target_repo=here), "lane-a")
+        self.assertEqual(route.target_repo, here)
+
+    def test_the_lane_reaches_the_route_so_the_argv_can_carry_it(self):
+        route = cli._route_from_args(_args(), "lane-a")
+        self.assertEqual(route.lane, "lane-a")
+
+
 if __name__ == "__main__":
     unittest.main()

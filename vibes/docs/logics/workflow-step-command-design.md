@@ -255,27 +255,79 @@ fail-closed dead-end (`herdr_self_lane_unresolved`、`sublane create/start --exe
   - **非 default** lane + provider `claude` → `implementation_worker` (孫 worker);
   - **非 default** lane + provider `codex` → `delegated_coordinator` (sublane gateway / 子);
   - **default** lane (provider 不問) → fail-closed (`ambiguous_default_coordinator_role`);
+    ただしこれは **分類器** の挙動であり、durable role authority が当該 lane を解決する場合は
+    分類の前に authority が優先する。single-workspace の bare `mozyo` default pair が
+    `coordinator` を宣言して managed gateway transition を解決する経路の正本は
+    `spec-herdr-default-lane-workflow-role-authority` (#14546)。binding が無い default lane は
+    従来どおりここで fail-closed する;
   - unknown provider → fail-closed (`herdr_lane_role_unresolved`)。
   - registry `project_name` を role/scope authority にしない (display metadata、dir 名 default)。
-- **anchor gate (j#74748 F3 / j#74784 / j#74787)。** worker/gateway は **source-of-truth Redmine**
-  を authority として anchor を検証した場合のみ ready/no_op を返す。lane metadata も workflow
-  runtime store も **caller-supplied advisory projection** (任意 caller が書ける) であり authority
-  ではない: lane の **単一 non-retired lane-metadata record** が *candidate* issue を名指す
-  (cardinality 保持 — duplicate active / active+retired stale / missing / retired は fail-closed、
-  set 化しない)。その candidate issue の journal を既存 credential-gated `LiveRedmineJournalSource`
-  (daemon-trusted credential / redirect 拒否 / injected transport / redacted error) で read-only 取得し、
-  `markers_from_source` の **structured gate marker** (gate-bearing kind のみ、machine `[mozyo:…]`
-  token、prose 不可) から issue 一致の exact journal を得て `durable_anchor=redmine:issue=<id>:journal=<id>`
-  を verify する。credential 未設定 / transport 失敗 / issue-journal 不在 / gate marker 無し / issue
-  不一致は **fail-closed** (`herdr_anchor_unverified`、credential/URL は出力しない)。未検証 anchor で
-  ready を返さない。新 credential/network 実装は既存 port を再利用し重複させない。
-- **store↔Redmine issue-correlation (j#74810 F3c)。** caller-supplied advisory store が同 lane に
-  異なる `(issue, journal, gate)` を主張する場合は fail-closed (`herdr_anchor_store_mismatch`、store の
-  canonical `redmine:<issue>:<journal>` event を advisory cross-check として抽出)。さらに共通
-  `reconcile_step_with_store` は herdr の live-verified anchor issue (`live_anchor_issue`) と store の
-  overall pending action の `target_issue`/anchor を相関し、不一致 action は `store_aligned`/gate せず
-  fixed disposition `store_issue_mismatch` で不採用 (audit 反映、live outcome 不変)。tmux は
-  `live_anchor_issue=None` で byte 不変。
+- **anchor gate (j#74748 F3 / j#74784 / j#74787、#14586 で work anchor へ再定義)。** worker/gateway は
+  **source-of-truth Redmine** を authority として anchor を検証した場合のみ ready/no_op を返す。lane
+  metadata も workflow runtime store も **caller-supplied advisory projection** (任意 caller が書ける)
+  であり authority ではない: lane の **単一 non-retired lane-metadata record** が *candidate* issue を
+  名指す (cardinality 保持 — duplicate active / active+retired stale / missing / retired は
+  fail-closed、set 化しない)。その candidate issue の journal を既存 credential-gated
+  `LiveRedmineJournalSource` (daemon-trusted credential / redirect 拒否 / injected transport /
+  redacted error) で read-only 取得し、そこから **exact current work anchor** を解決して
+  `durable_anchor=redmine:issue=<id>:journal=<id>` を verify する。credential 未設定 / transport 失敗
+  は **fail-closed** (credential/URL は出力しない)。未検証 anchor で ready を返さない。新
+  credential/network 実装は既存 port を再利用し重複させない。
+- **lifecycle state decision と work anchor は別概念・別 field である (#14586)。** lane が Redmine を
+  指す pointer は 2 つあり、**同じものではない**:
+  - **lifecycle state decision** (`lane_lifecycle` の `decision_*`) — lane を現在の *state* にした
+    record。hibernate / resume / replacement / retire がそれぞれ 1 件書く。「なぜこの state か」に
+    答える;
+  - **current work anchor** — *いま この lane がやっている作業* を委譲した record。「何をやるのか」に
+    答える。
+
+  両者は一致することが多いので 1 つの field に見えるが、**重要な場面でこそ乖離する**: resume decision
+  は lane についての lifecycle 記録であって、何かをせよという指示ではない。したがって
+  **hibernate/resume decision を work anchor へ読み替えない**。`workflow step` は lifecycle row を
+  `lane_generation` を得るためだけに読み、`decision_journal` は読まない。
+- **work anchor の解決は dispatch marker との exact join である (#14586)。** anchor は
+  `[mozyo:workflow-event:kind=implementation_request:lane=<lane>:lane_generation=<n>]` の **owning
+  entry journal** であり、その marker だけが「どの lane の・どの incarnation に」委譲されたかを
+  述べる durable record だからである。join する 3 事実:
+  1. lane 自身の `(lane, lane_generation)` binding (durable lifecycle authority、active row かつ正の
+     generation のみ);
+  2. live Redmine record 上の **canonical** dispatch marker (`canonical_note_scan` の意味で canonical。
+     landing marker を引用した callback record は dispatch ではない — #14585);
+  3. その lane について record が開いている最新 round (supersede 検出)。
+
+  失敗は **すべて別 status** として名前を持つ: `work_anchor_unbound` (binding 無し) /
+  `work_anchor_missing` (0 件。legacy prose-only IR、引用のみもここ) / `work_anchor_foreign_lane`
+  (dispatch は在るが全て別 lane 宛) / `work_anchor_ambiguous` (2 件以上) /
+  `work_anchor_stale_generation` (record がより新しい round を開いている)。**stale は「0 件だったから」
+  ではなく単独で判定する** — 現 generation の anchor が綺麗に解決できても、round が更新されていれば
+  その作業は supersede されている。
+  ★**旧実装は heuristic だった**: exact な binding が無いため「issue 履歴の latest gate-bearing
+  marker」を work anchor として再導出していた。review round を経た issue では latest gate-bearing
+  marker は前 round の callback なので、fresh lane が自分の dispatch (#14577 R8 では j#90409) を失い、
+  R6 の callback journal を返した (#14577 j#90416 F2)。**「issue 上で最も新しいもの」は binding では
+  なく、issue が長生きするほど悪化する推測である。**
+  ★★**resolution は verification より狭い (意図的)。** recovery rail の
+  `is_exact_implementation_request_anchor` は caller が既に名指した anchor を*検証*するので、
+  canonical な歴史的 2 形 (workflow-event の `gate` / `kind`、および handoff marker) を受理する。
+  一方この resolver は誰も名指していない anchor を issue 全体から*探索*するため、canonical producer
+  の形 (`kind=implementation_request` + `lane` / `lane_generation`) のみを見る。名指し済み record の
+  照合は legacy 形を許してよいが、探索は許してはいけない — 受理する形が増えるほど、探索が黙って
+  着地しうる先が広がるからである。**運用上の帰結**: canonical dispatch marker を持たない
+  implementation request を記録した lane は work anchor を解決できない (fail-closed)。復旧は
+  coordinator が canonical marker を top-level・1 行で記録することであって、resolver が推測すること
+  ではない。
+- **store↔Redmine issue-correlation (j#74810 F3c、#14586 で照合次元を再定義)。** caller-supplied
+  advisory store が同 lane を **異なる issue** へ route する場合は fail-closed
+  (`herdr_anchor_store_mismatch`)。この cross-check が防ぐ drift は「store が lane を他人の ticket へ
+  向ける」ことであり、それは *issue 次元*の主張である。以前は `(issue, journal, gate)` の exact 一致を
+  要求していたが、#14586 で anchor が **dispatch record** になった以上、store の *gate event*
+  (lifecycle 観測) と anchor (work) を同値要求するのは **本 issue が除去した category error そのもの**
+  であり、かつ gate 履歴を持つ全 lane を fail-closed にしてしまう。anchor 自身の exactness は
+  source-of-truth Redmine 側で担保する。さらに共通 `reconcile_step_with_store` は herdr の
+  live-verified anchor issue (`live_anchor_issue`) と store の overall pending action の
+  `target_issue`/anchor を相関し、不一致 action は `store_aligned`/gate せず fixed disposition
+  `store_issue_mismatch` で不採用 (audit 反映、live outcome 不変)。tmux は `live_anchor_issue=None` で
+  byte 不変。
 - **same-lane worker liveness は cardinality (j#74749 F2 / j#74750)。** gateway は同一
   `(workspace, lane, claude)` の 0 / 1 / 2+ を保持し、2+ = ambiguous / locator 欠落 = fail-closed
   とし、重複 identity を silent target にしない。

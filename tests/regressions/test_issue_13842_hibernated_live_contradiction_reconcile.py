@@ -32,6 +32,9 @@ from __future__ import annotations
 
 # The build's current lifecycle schema version: these fixtures pin "a v5 store the
 # write gate forward-migrates to CURRENT", not a frozen target version number.
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    build_release_observation,
+)
 from mozyo_bridge.core.state.lane_lifecycle_schema import (
     LANE_LIFECYCLE_SCHEMA_VERSION,
 )
@@ -195,10 +198,10 @@ def _seed_hibernated_released(
         key,
         expected_revision=rec.revision,
         action_id="rel-1",
-        pins=[
+        observation=build_release_observation([
             ReleasePin("gateway", "codex-mzb1", "w1:p1"),
             ReleasePin("worker", "claude-mzb1", "w1:p2"),
-        ],
+        ]),
     )
     if release_target == RELEASE_REQUESTED:
         return
@@ -845,6 +848,10 @@ class ReconcileOrchestrationTests(unittest.TestCase):
             # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
             # or the shape is a NEWER table merely re-stamped to an old version.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
+            # v8 (Redmine #14477) added hibernated_at; a faithful pre-v8 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN hibernated_at")
+            # v9 (#14477 j#94582) added release_observation; a faithful pre-v9 rewind drops it.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1095,8 +1102,8 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         rec = store.get(key)
         store.request_release(
             key, expected_revision=rec.revision, action_id="rel-1",
-            pins=[ReleasePin("gateway", "codex-mzb1", "w1:p1"),
-                  ReleasePin("worker", "claude-mzb1", "w1:p2")],
+            observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w1:p1"),
+                  ReleasePin("worker", "claude-mzb1", "w1:p2")]),
         )
         rec = store.get(key)
         store.record_release_outcome(
@@ -1204,8 +1211,8 @@ class ReconcileOrchestrationTests(unittest.TestCase):
                 rec = store.get(key)
                 store.request_release(
                     key, expected_revision=rec.revision, action_id="rel-1",
-                    pins=[ReleasePin("gateway", "codex-mzb1", "w1:p1"),
-                          ReleasePin("worker", "claude-mzb1", "w1:p2")],
+                    observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w1:p1"),
+                          ReleasePin("worker", "claude-mzb1", "w1:p2")]),
                 )
                 rec = store.get(key)
                 store.record_release_outcome(

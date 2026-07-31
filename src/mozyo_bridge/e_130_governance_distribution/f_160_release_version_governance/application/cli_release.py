@@ -11,13 +11,15 @@ from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release import (
     cmd_release_bump,
     cmd_release_check_artifact,
-    cmd_release_check_drift,
     cmd_release_check_scaffold,
     cmd_release_check_tree,
     cmd_release_check_workflow,
     cmd_release_publish,
     cmd_release_workflow_runs,
     cmd_release_workflow_wait,
+)
+from mozyo_bridge.e_130_governance_distribution.f_160_release_version_governance.application.release_drift import (
+    cmd_release_check_drift,
 )
 
 

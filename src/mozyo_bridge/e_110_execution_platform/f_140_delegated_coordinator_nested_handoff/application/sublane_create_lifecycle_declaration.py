@@ -54,8 +54,11 @@ def declare_created_lane_lifecycle(
     resolved from durable governance at THIS create boundary — the one moment the fact is
     available without inference — stored generation-bound as the heal authority for lane-role
     pane placement. Empty means the caller has no durable kind fact: the row records no kind
-    and the launch path falls back to ``lane_class`` geometry, byte-for-byte pre-#13647. A
-    present non-canonical token is refused by the store before any write; here that refusal
+    and the launch path falls through to ``lane_class`` geometry. That fall-through is
+    byte-for-byte pre-#13647 **on the lane-kind axis**; the geometry it lands on is not the
+    pre-#13646 launch — since Redmine #14568 an undeclared lane class resolves to the product
+    default (``split: down``). A present non-canonical token is refused by the store before
+    any write; here that refusal
     is caught with the same best-effort contract as every other declare failure — the lane
     stays owner-unbound rather than the actuation breaking.
 

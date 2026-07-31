@@ -19,6 +19,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    build_release_observation,
+)
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     IdentityAttestationRecord,
     VERDICT_MISSING,
@@ -160,8 +163,9 @@ class SublaneResumeTest(unittest.TestCase):
     def _hibernated(self, store, *, released=False, declared_slots=()) -> None:
         """Declare active, then hibernate; optionally drive the release to `released`.
 
-        All hibernate-side writes are stamped ``HIBERNATE_AT`` so the row's ``updated_at``
-        is a deterministic freshness anchor (a fresh relaunch attests at ``FRESH_AT``).
+        All hibernate-side writes are stamped ``HIBERNATE_AT``, so the row's immutable
+        ``hibernated_at`` boundary (v8, Redmine #14477) — and its pre-v8 ``updated_at``
+        fallback — are both that deterministic value (a fresh relaunch attests at ``FRESH_AT``).
         """
         key = LaneLifecycleKey(WS, LANE)
         if declared_slots:
@@ -193,13 +197,22 @@ class SublaneResumeTest(unittest.TestCase):
                 key,
                 expected_revision=rec.revision,
                 action_id=f"hibernate:{LANE}",
-                pins=[
+                observation=build_release_observation([
+                    # Redmine #14477 (disposition j#94544 A): the released-locator fence needs
+                    # the release generation to cover EVERY slot it closed. One pin for a
+                    # two-slot pair is incomplete evidence and now fails closed, so the seed
+                    # records both — which is also what a real hibernate release records.
                     ReleasePin(
                         role="codex",
                         assigned_name=encode_assigned_name(WS, "codex", LANE),
-                        locator=f"{WS}:pOLD",
-                    )
-                ],
+                        locator=f"{WS}:pOLD_GW",
+                    ),
+                    ReleasePin(
+                        role="claude",
+                        assigned_name=encode_assigned_name(WS, "claude", LANE),
+                        locator=f"{WS}:pOLD_WK",
+                    ),
+                ]),
                 now=HIBERNATE_AT,
             )
             rec = store.get(key)
@@ -254,7 +267,9 @@ class SublaneResumeTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(tmp)
-            self._hibernated(store, released=False)
+            # released=True: the #14477 released-locator fence needs completed release
+            # evidence, and this test is about the commit-edge seam, not the fence.
+            self._hibernated(store, released=True)
             before = store.get(LaneLifecycleKey(WS, LANE))
             outcome = SublaneResumeUseCase(
                 ops=_fresh_pair_ops(), store=store, commit_authority=lambda: False,
@@ -275,7 +290,9 @@ class SublaneResumeTest(unittest.TestCase):
         # The positive control: the seam must not block a healthy resume.
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(tmp)
-            self._hibernated(store, released=False)
+            # released=True so the #14477 released-locator fence has complete evidence; a
+            # healthy resume must satisfy every fence, this one included.
+            self._hibernated(store, released=True)
             outcome = SublaneResumeUseCase(
                 ops=_fresh_pair_ops(), store=store, commit_authority=lambda: True,
             ).run(_request(), execute=True)
@@ -284,19 +301,29 @@ class SublaneResumeTest(unittest.TestCase):
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition, DISPOSITION_ACTIVE
             )
 
-    def test_resumes_when_hibernate_left_no_release(self) -> None:
-        # A lane hibernated with dead processes (process_release stays not_requested) still
-        # resumes once a fresh pair is relaunched.
+    def test_refuses_when_hibernate_left_no_release_evidence(self) -> None:
+        """A lane hibernated with NO release generation no longer resumes (Redmine #14477).
+
+        This inverts the previous expectation deliberately, under coordinator disposition
+        j#94544 A.2. The row cannot distinguish "no process existed at hibernate" from "a
+        survivor existed and no release evidence was recorded", and review j#94531 R2-F1 showed
+        the timestamp cannot separate them either. Absence of evidence is therefore not read as
+        freshness. The stated cost: such a lane needs a completed release generation before the
+        standard resume rail will admit it.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             store = self._store(tmp)
             self._hibernated(store, released=False)
             outcome = SublaneResumeUseCase(ops=_fresh_pair_ops(), store=store).run(
                 _request(), execute=True
             )
-            self.assertFalse(outcome.is_blocked)
+            self.assertTrue(outcome.is_blocked)
+            self.assertIn(
+                "release_evidence_absent", outcome.preflight.pair_attestation_detail
+            )
             self.assertEqual(
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
-                DISPOSITION_ACTIVE,
+                DISPOSITION_HIBERNATED,
             )
 
     def test_blocks_when_pair_not_both_slots_live(self) -> None:
@@ -484,13 +511,13 @@ class SublaneResumeTest(unittest.TestCase):
                 key,
                 expected_revision=rec.revision,
                 action_id=f"hibernate:{LANE}",
-                pins=[
+                observation=build_release_observation([
                     ReleasePin(
                         role="codex",
                         assigned_name=encode_assigned_name(WS, "codex", LANE),
                         locator=f"{WS}:p20",
                     )
-                ],
+                ]),
                 now=HIBERNATE_AT,
             )
             # A genuinely fresh pair is present — proving the ONLY blocker is the
@@ -500,8 +527,15 @@ class SublaneResumeTest(unittest.TestCase):
                 _request(), execute=True
             )
             self.assertTrue(outcome.is_blocked)
+            # Redmine #14477: an in-flight release is also INCOMPLETE release evidence, so the
+            # pair cannot be proven a post-release generation either. Both reasons are correct
+            # and both are asserted — the in-flight blocker is still named first.
             self.assertEqual(
-                outcome.preflight.blocked_reasons, (BLOCK_RELEASE_IN_FLIGHT,)
+                outcome.preflight.blocked_reasons,
+                (BLOCK_RELEASE_IN_FLIGHT, BLOCK_PAIR_ATTESTATION),
+            )
+            self.assertIn(
+                "release_evidence_absent", outcome.preflight.pair_attestation_detail
             )
             self.assertIsNone(outcome.transition)
             self.assertEqual(

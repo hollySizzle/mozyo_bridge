@@ -12,6 +12,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
+    build_release_observation,
+)
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
@@ -2233,7 +2236,7 @@ class A14PartialPreflightSurfaceTests(unittest.TestCase):
             store.request_release(
                 key, expected_revision=store.get(key).revision,
                 action_id=f"hibernate:{self.LANE}",
-                pins=[ReleasePin(role="codex", assigned_name=gw_name, locator=gw_old)],
+                observation=build_release_observation([ReleasePin(role="codex", assigned_name=gw_name, locator=gw_old)]),
             ).applied
         )
         self.assertTrue(

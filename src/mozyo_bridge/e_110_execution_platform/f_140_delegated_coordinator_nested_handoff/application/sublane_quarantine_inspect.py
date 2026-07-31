@@ -33,12 +33,24 @@ Design notes:
   leave this module, enforced by the shape of :class:`...domain.quarantine_approval.ApprovalFacts`.
   The composer body never crosses ``observe_composer_text``, and no path / hash / length / raw
   ANSI / credential is emitted.
+- **The inventory is read from the same trusted environment every other surface reads**
+  (Redmine #14259). ``env`` defaults to the process environment exactly like every sibling
+  live-ops record in this context, so a lane that ``mozyo-bridge status`` can enumerate is a
+  lane this command can resolve. It previously defaulted to ``None``, which the shared reader
+  dereferences — every invocation therefore died before reaching Herdr and reported the live
+  inventory as unreadable regardless of ``--repo``, herdr reachability, or what was running.
+- **A failed read says WHY, in a closed vocabulary** (Redmine #14259). The read failure is
+  classified by :func:`classify_inventory_read_failure` before it is collapsed into the
+  ``inventory_unreadable`` refusal, so a config / launcher / provider mismatch is
+  distinguishable from a defect in this tool. Only the token crosses the boundary — never the
+  exception message, which carries raw ``herdr`` stderr and absolute paths.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,12 +81,19 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     INVENTORY_UNREADABLE,
     PendingComposerClassification,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+    HerdrSessionStartError,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     AGENT_KEY_NAME,
     _agent_locator,
     _norm,
     _norm_lane,
     decode_assigned_name,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
+    TRANSPORT_FAILURE_REASONS,
+    TerminalTransportError,
 )
 
 #: The synthetic request fields the inspection uses to drive the #13763 inspector. The inspector
@@ -89,6 +108,69 @@ _INSPECTION_EPOCH = "1970-01-01T00:00:00+00:00"
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Why the managed inventory could not be read (Redmine #14259).
+#
+# The read used to collapse EVERY exception into the single ``inventory_unreadable`` detail.
+# That is what let #14259 survive a live dogfood: a defect in this tool (an ``AttributeError``
+# raised before Herdr was ever contacted) was reported with the same three words as a genuinely
+# unreachable backend, so the operator could not tell "your environment is misconfigured" from
+# "this command is broken", on either of the two lanes they tried.
+#
+# The tokens below name the ROOT cause from a closed vocabulary. The binary-resolution tokens
+# are REUSED from :data:`TRANSPORT_FAILURE_REASONS` rather than re-spelled here, so this surface
+# cannot drift into a second vocabulary for the same conditions.
+# ---------------------------------------------------------------------------
+
+#: The adapter refused the read for a reason outside binary resolution: the ``herdr`` command
+#: could not be spawned, timed out, exited non-zero, or answered with an unusable payload. The
+#: binary resolved, so this is a provider / launcher runtime failure rather than a config one.
+INVENTORY_READ_PROVIDER_COMMAND_FAILED = "provider_command_failed"
+#: The read raised something that is NOT an adapter refusal — i.e. a defect in mozyo-bridge
+#: itself. Never conflated with an environmental failure: that conflation IS Redmine #14259.
+INVENTORY_READ_INTERNAL_ERROR = "internal_error"
+
+#: The closed vocabulary :func:`classify_inventory_read_failure` draws from. Every member is a
+#: bare token: no message, no path, no stderr, no binary name.
+INVENTORY_READ_REASONS = frozenset(
+    set(TRANSPORT_FAILURE_REASONS)
+    | {INVENTORY_READ_PROVIDER_COMMAND_FAILED, INVENTORY_READ_INTERNAL_ERROR}
+)
+
+#: Bound on the ``__cause__`` walk below. A chain this deep is already pathological, and an
+#: unbounded walk would hang on a cyclic chain.
+_CAUSE_CHAIN_LIMIT = 10
+
+
+def classify_inventory_read_failure(exc: BaseException) -> str:
+    """The secret-safe token naming why the inventory read failed (pure).
+
+    Returns exactly one member of :data:`INVENTORY_READ_REASONS`. The exception's **message is
+    never read**: a non-zero ``herdr`` exit is re-raised carrying that process's raw stderr, and
+    a failed binary resolution names the absolute path it tried, so echoing either would leak
+    operator-private paths out of a surface whose whole contract is value non-exposure.
+
+    Binary-resolution failures reach this surface as a :class:`HerdrSessionStartError` wrapping
+    the original :class:`TerminalTransportError` — the wrap keeps the message but drops the
+    ``reason`` attribute, so the closed-vocabulary reason is recovered from the ``__cause__``
+    chain rather than re-derived by parsing text.
+    """
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    for _ in range(_CAUSE_CHAIN_LIMIT):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        reason = getattr(current, "reason", None)
+        if isinstance(reason, str) and reason in TRANSPORT_FAILURE_REASONS:
+            return reason
+        current = current.__cause__
+    if isinstance(exc, (HerdrSessionStartError, TerminalTransportError)):
+        # The adapter deliberately failed closed, just not during binary resolution.
+        return INVENTORY_READ_PROVIDER_COMMAND_FAILED
+    return INVENTORY_READ_INTERNAL_ERROR
 
 
 @dataclass(frozen=True)
@@ -176,7 +258,12 @@ class SublaneQuarantineInspectUseCase:
     #: Defaults to the existing snapshot subclass so the classification comes from the ONE
     #: #13763 read seam rather than a second implementation.
     ops_factory: Any = None
-    env: Optional[Mapping[str, str]] = field(default=None)
+    #: The trusted environment the inventory read resolves the herdr binary from. Defaults to
+    #: the process environment — the SAME default every sibling live-ops record in this context
+    #: uses, and the same environment ``mozyo-bridge status`` enumerates agents from, so the two
+    #: surfaces cannot disagree about whether the inventory is readable (Redmine #14259). Never
+    #: ``None``: the shared reader takes a ``Mapping`` and dereferences it directly.
+    env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
 
     def _rows(self) -> Sequence[Mapping[str, object]]:
         if self.rows_reader is not None:
@@ -231,12 +318,14 @@ class SublaneQuarantineInspectUseCase:
 
         try:
             rows = list(self._rows())
-        except Exception:  # noqa: BLE001 - an unreadable inventory proves nothing
+        except Exception as exc:  # noqa: BLE001 - an unreadable inventory proves nothing
+            # Still the same fail-closed refusal, but the detail now names WHY from a closed,
+            # secret-safe vocabulary instead of repeating the refusal back at the operator.
             return self._refuse(
                 request,
                 APPROVAL_INVENTORY_UNREADABLE,
                 facts=base,
-                detail="inventory_unreadable",
+                detail=classify_inventory_read_failure(exc),
             )
 
         matches = [
@@ -415,9 +504,13 @@ def register_sublane_quarantine_inspect_parser(sublane_sub: Any) -> None:
 
 
 __all__ = (
+    "INVENTORY_READ_INTERNAL_ERROR",
+    "INVENTORY_READ_PROVIDER_COMMAND_FAILED",
+    "INVENTORY_READ_REASONS",
     "QuarantineInspectRequest",
     "QuarantineInspectOutcome",
     "SublaneQuarantineInspectUseCase",
+    "classify_inventory_read_failure",
     "cmd_sublane_quarantine_inspect",
     "format_inspect_text",
     "register_sublane_quarantine_inspect_parser",

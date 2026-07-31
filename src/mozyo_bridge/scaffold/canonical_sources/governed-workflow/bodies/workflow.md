@@ -259,10 +259,15 @@ close:
     - 受け入れ確認
     - 指摘対応
     - 残留リスク
-    - review結果 (US では US-level audit)
+    - review結果 (US では US-level audit) または有効な review exemption
     - owner_close_approval (Review Gate とは別 journal)
     - commit_hash_record (origin 到達可能であること。local-only commit では close 不可: `### Commit Hash Origin 到達可能性`)
     - close判断
+  review_exemption:
+    - 対象 commit の全 changed path を覆う有効な `codex_direct_edit` gate があり、`follow_up_review: false` の場合
+    - coordinator-owned standalone policy / operations docs 変更で、実装 code に付随する docs 変更ではない場合
+    - exemption 根拠、対象 commit、verification を Implementation Done / Close journal から replay できること
+    - exemption を Review Gate approval または自己 review と表現しないこと
   task_close必須 (US 配下の Task / Test / Bug):
     - implementation_done journal (検証結果・残リスクを含む)
     - commit_hash_record (commit を伴う場合。origin 到達可能であること: `### Commit Hash Origin 到達可能性`)
@@ -274,6 +279,10 @@ codex_direct_edit:
   有効条件:
     必須: [role:実装者, direct_edit:true, allowed_paths, reason, follow_up_review]
     根拠: Redmine journal または owner 明示指示
+  follow_up_review:
+    default: false
+    false: 有効な direct edit は Codex が実装主体へ明示昇任した review exemption として扱い、別 auditor の Review Request / Review Gate を要求しない
+    true: owner が当該 direct edit に対する独立 review を明示要求した場合だけ使い、reviewer と理由を同 journal に記録する
   無効marker:
     - "着手:codex"
     - "実装完了:codex"
@@ -431,6 +440,10 @@ origin到達可能性:
 `.mozyo-bridge/docs/file_conventions.generated.yaml` をはじめとする generator 出力は **誰も手編集しない** (Claude / Codex / owner いずれも不可)。catalog を変更し、`mozyo-bridge docs generate-file-conventions` で再生成、`--check` で drift 確認の流れに乗せる。手編集された場合は generated 物を破棄し、catalog 起点で再生成する。
 
 direct edit を行った場合、適用した例外、ユーザー指示の引用、変更 files、verification、follow-up review 要否を Redmine journal に記録する。例外なき監査者の通常実装 (`着手:codex` / `実装完了:codex` / `担当:codex` / `codex対応`) は invalid marker として扱い、reopen + correction journal を起票する。ガードレール / docs / catalog scope での gate 不在 commit (例: chat の短い指示を根拠に Codex が `AGENTS.md` / `CLAUDE.md` / `.mozyo-bridge/rules/**` / `README.md` を直接 commit した場合) も同じ correction flow に乗せる。autonomous lane の path はこの correction の対象外だが、`codex_autonomous_edit` journal を欠いた commit は監査記録不足として follow-up correction journal を起票する。
+
+有効な `codex_direct_edit` は「監査者が実装した後に同じ監査者が自己 review する」経路ではなく、Codex を当該 scope の実装主体へ明示昇任し、既定で追加 review を免除する経路である。したがって `follow_up_review: false` の direct edit について、別 Codex session を形式的に立てたり、実装 actor 自身が Review Gate approval を記録したりしない。独立 review は owner が同 scope について `follow_up_review: true` を明示した場合だけ要求する。
+
+coordinator-owned standalone policy / operations docs の変更も既定で review exemption とする。これは path の拡張ではなく責務上の exemption であり、編集権限自体は引き続き Repo-Local Guardrail Autonomous Lane または有効な `codex_direct_edit` gate を必要とする。通常の Claude 実装 code、およびその code に付随して同じ受け入れ条件を説明する docs は従来どおり US-level audit の対象である。
 
 ### Codex Pre-Edit Classification Gate
 
@@ -806,13 +819,21 @@ impact resolver の推奨が fail-closed に `full` の場合は、full suite �
 
 ## Journal Templates
 
+### Gate Heading Canonical Literal
+
+durable gate journal の heading は canonical literal `## Gate: <gate>` に固定する。`<gate>` は `### Gate Schema` と本節の template が定義する gate token を **その綴りのまま (lower snake_case)** 書く。journal heading と structured marker (`gate=<gate>`) が同一 token の同一綴りを指すため、同じ gate に二つの綴りが生まれない。round・補足は gate token 本体へ埋め込まず、bounded qualifier (` — R3`)、trailing `(...)`、または body field へ置く。gate token を言い換えると workflow projection が anchor を失う。
+
+読取側 (`workflow glance` 等) は既存 journal を読み続けるために、case を畳んだ綴りと `_` を空白へ開いた綴り (例: `review_request` に対する `Review Request`) も同じ gate として受理する。これは **過去の記録を読むための alias contract であって、新規に書いてよい綴りではない**。alias を canonical と読み替えて綴りを増やさない。
+
+この canonical literal は本節を正本とする。配布 skill、role profile template、scaffold 生成物などの下流 instruction 面は本節の綴りに従い、独自の canonical literal を宣言しない。
+
 ```markdown
 ## Gate: codex_direct_edit
 - role: 実装者
 - direct_edit: true
 - allowed_paths:
 - reason:
-- follow_up_review:
+- follow_up_review: false (既定) | true (owner が独立 review を明示要求した場合。reviewer / 理由を併記)
 
 ## Gate: review_request (US-level audit request; Task-level は例外時のみ)
 - 対象US: #<us_id>

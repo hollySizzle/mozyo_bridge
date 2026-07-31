@@ -22,8 +22,10 @@ NOT do):
   name, ``MOZYO_AGENT_ROLE`` (a provider token), or a route / attestation / retire identity —
   those stay provider-token-bound, and nothing here writes or reads them.
 - roles are never *inferred*. A role is supplied by a caller that resolved it from durable
-  governance, or the plan is not built at all (the pre-#13647 launch, unchanged). A supplied
-  role that is not in the known vocabulary is a refusal, never a fallback.
+  governance, or the plan is not built at all (the pre-#13647 handling of this axis,
+  unchanged — the launch's geometry axis is unaffected either way and resolves through
+  ``lane_class``). A supplied role that is not in the known vocabulary is a refusal, never
+  a fallback.
 - the plan's provenance is a durable :class:`DecisionPointer` — the SAME anchor vocabulary
   the lifecycle authority record stores, not a parallel one. Zero anchors (unresolved) or
   more than one distinct anchor (ambiguous / contradicting governance) both refuse: the
@@ -400,7 +402,7 @@ def resolve_source_anchor(
 ) -> Optional[DecisionPointer]:
     """The ONE durable anchor this plan is resolved from, or fail closed.
 
-    ``()`` yields ``None`` when the caller builds no role-bearing plan (the pre-#13647
+    ``()`` yields ``None`` when the caller builds no role-bearing plan (the role-plan-free
     launch). With ``required=True`` — which is what a NON-EMPTY plan asks for — zero anchors
     is itself a refusal (review j#85859 F1): a plan that assigns governed responsibilities
     without naming the durable decision that assigned them is exactly the un-anchored role
@@ -497,8 +499,10 @@ def resolve_lane_launch_plan(
        positions is what "the plan accounts for exactly this pair" needs.
 
     ``slot_specs=()`` returns an empty plan (no roles, no anchor requirement, no
-    reconciliation): the launch is byte-for-byte the pre-#13647 one, so an unconfigured /
-    legacy caller is unaffected.
+    reconciliation): this axis is byte-for-byte the pre-#13647 one, so an unconfigured /
+    legacy caller is unaffected **by Tranche 2**. It is not a byte-for-byte pre-#13647
+    *launch* — the independent geometry axis still resolves, and since Redmine #14568 an
+    undeclared lane class lands on the product default (``split: down``).
 
     Division of labour (review j#85870): **structural** validation — is each field the type
     it claims to be, does the value own its sequences — happens in the value objects'

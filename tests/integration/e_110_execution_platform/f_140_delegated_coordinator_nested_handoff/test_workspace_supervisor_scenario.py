@@ -11,6 +11,9 @@ workspaces), with injected roster / Redmine source / sender so the scenario is h
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import sys
 import tempfile
@@ -151,15 +154,31 @@ class _RecordingTransport:
 
 
 class SupervisorWakeProducerE2ETest(unittest.TestCase):
-    """R1-F2 end-to-end: the canonical gate writer emits a local wake the supervisor consumes."""
+    """R1-F2 end-to-end: the canonical gate writer emits a local wake the supervisor consumes.
+
+    Workspace identity here must be the fixture's ``wsA``, never the checkout the suite happens to
+    run from (Redmine #14752). ``cli_workflow_callbacks._resolve_workspace_id`` reads the workspace
+    registry anchor of the resolved repo root FIRST and only falls back to ``MOZYO_WORKSPACE_ID``,
+    so on a registered checkout (one carrying ``.mozyo-bridge/workspace-anchor.json``) the ambient
+    anchor won and the wake was enqueued under the real workspace id. That precedence is the runtime
+    contract and is deliberately left untouched; the test instead pins ``MOZYO_REPO`` to an
+    anchor-less directory inside its own temp home, which is the documented repo-root override
+    (:func:`mozyo_bridge.shared.paths.resolve_repo_root`). With no anchor to read, resolution
+    reaches the env fallback and the fixture identity holds on any checkout.
+    """
 
     def setUp(self) -> None:
         self.home = Path(tempfile.mkdtemp())
+        # The wsA workspace's repo root: a real directory with no workspace anchor under it, so the
+        # anchor-first resolution finds nothing and falls through to MOZYO_WORKSPACE_ID.
+        self.repo_a = self.home / "repoA"
+        self.repo_a.mkdir()
         self._env = {}
-        for key in ("MOZYO_BRIDGE_HOME", "MOZYO_WORKSPACE_ID"):
+        for key in ("MOZYO_BRIDGE_HOME", "MOZYO_WORKSPACE_ID", "MOZYO_REPO"):
             self._env[key] = os.environ.get(key)
         os.environ["MOZYO_BRIDGE_HOME"] = str(self.home)
         os.environ["MOZYO_WORKSPACE_ID"] = "wsA"
+        os.environ["MOZYO_REPO"] = str(self.repo_a)
 
     def tearDown(self) -> None:
         for key, val in self._env.items():
@@ -180,7 +199,8 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
         # Force the credential-gated transport to a recording fake so the gate RECORDS; stub the
         # activation to a no-op so this test observes the enqueue deterministically (the activation
         # itself is covered by the full-chain test).
-        with mock.patch(
+        out = io.StringIO()  # keep the CLI's --json report out of the suite's terminal
+        with contextlib.redirect_stdout(out), mock.patch(
             "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
             "redmine_note_transport.redmine_delivery_transport_from_env",
             return_value=_RecordingTransport(),
@@ -191,6 +211,7 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
         ):
             rc = args.func(args)
         self.assertEqual(rc, 0)  # gate recorded
+        self.assertTrue(json.loads(out.getvalue())["recorded"])
         # The gate commit emitted a durable local wake for (wsA, 13683).
         pending = SupervisorWakeStore(home=self.home).pending()
         self.assertEqual([h.as_tuple() for h in pending], [("wsA", "13683")])
@@ -273,7 +294,7 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
             # supervisor over the same home, consuming the just-enqueued wake and delivering.
             WorkspaceCallbackSupervisor(
                 holder="superX", lease_store=lease_store, store=store, outbox=outbox,
-                workspaces_fn=lambda: [SupervisedWorkspace("wsA", str(self.home / "repoA"))],
+                workspaces_fn=lambda: [SupervisedWorkspace("wsA", str(self.repo_a))],
                 roster_fn=lambda ws: (("13683",), ""),
                 redmine_source_fn=lambda ws: MappingRedmineJournalSource(payload=_payload("13683")),
                 sender_fn=sender_fn,
@@ -289,7 +310,8 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
         )
         # gate emit -> records the gate -> enqueues the wake -> ACTIVATES the supervisor (the seam
         # is patched to run in-process; the test does not call run_once).
-        with mock.patch(
+        out = io.StringIO()  # keep the CLI's --json report out of the suite's terminal
+        with contextlib.redirect_stdout(out), mock.patch(
             "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
             "redmine_note_transport.redmine_delivery_transport_from_env",
             return_value=_RecordingTransport(),
@@ -299,6 +321,7 @@ class SupervisorWakeProducerE2ETest(unittest.TestCase):
             _activate,
         ):
             self.assertEqual(args.func(args), 0)
+        self.assertTrue(json.loads(out.getvalue())["recorded"])
 
         # The gate commit's activation drove the whole chain: durable wake -> activation -> event
         # supply. Delivery itself is fail-closed in Phase A because there is no live generation

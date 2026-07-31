@@ -200,38 +200,21 @@ def run_active_live_zero_retire(
     inventory read, and the active-bound-state CAS.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-        list_herdr_agent_rows,
         repo_backend_is_herdr,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
-        REASON_INVENTORY_UNREADABLE,
         REASON_NO_WORKTREE_ANCHOR,
-        REASON_PROVIDER_NOT_LAUNCHABLE,
-        REASON_PROVIDER_UNRESOLVED,
         REASON_WORKSPACE_UNRESOLVED,
-        expected_live_slots,
-        expected_slot_rows,
-        plan_herdr_retire_close,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_actuation import (  # noqa: E501
         attest_retire_target,
     )
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
-        WorkflowProviderUnresolved,
-        resolve_gateway_provider,
-        resolve_worker_provider,
-    )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
-        HerdrSessionStartError,
         herdr_workspace_segment,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
         derive_directory_lane_token,
         derive_lane_workspace_token,
-    )
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
-        SLOT_STALE,
-        classify_named_slot,
     )
 
     if not repo_backend_is_herdr(repo_root):
@@ -428,29 +411,19 @@ def _terminalize_under_exclusion(
     so the lock's scope is the function boundary — it is impossible to add a gate that
     accidentally runs outside the exclusion.
     """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-        list_herdr_agent_rows,
-    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
         REASON_INVENTORY_UNREADABLE,
-        REASON_PROVIDER_NOT_LAUNCHABLE,
         REASON_PROVIDER_UNRESOLVED,
         REASON_WORKSPACE_UNRESOLVED,
-        expected_live_slots,
-        expected_slot_rows,
-        plan_herdr_retire_close,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_live_zero_measurement import (  # noqa: E501
+        measure_live_zero,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
         WorkflowProviderUnresolved,
-        resolve_gateway_provider,
-        resolve_worker_provider,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
         HerdrSessionStartError,
-    )
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
-        SLOT_STALE,
-        classify_named_slot,
     )
     from mozyo_bridge.core.state.lane_lifecycle import (
         DISPOSITION_RETIRED,
@@ -496,19 +469,26 @@ def _terminalize_under_exclusion(
     # The live-zero read. With no release witness available this is the ONLY liveness authority,
     # so it runs BEFORE the idempotent already-retired success too: a persisted ``retired`` does
     # not prove the pair is currently gone.
+    #
+    # Redmine #14499: the four fences below (duplicate slot, live expected slot, locator-less
+    # expected row, foreign occupant — in that order) now live in the shared
+    # :func:`measure_live_zero`, because the #14499 unbound terminalizer must prove exactly the
+    # same thing and a second copy of this logic would drift from the reviewed original. The
+    # ordering, the refusal strings and the payload fields are unchanged; only the location is.
     try:
-        rows = list_herdr_agent_rows(os.environ)
+        measurement = measure_live_zero(
+            repo_root,
+            workspace_id=workspace_id,
+            lane_label=lane_label,
+            legacy_workspace_id=legacy_token,
+            env=os.environ,
+        )
     except HerdrSessionStartError as exc:
         return _blocked(
             REASON_INVENTORY_UNREADABLE,
             detail=f"live herdr inventory unreadable ({exc}); liveness cannot be measured",
             workspace_id=workspace_id,
             lane_id=lane_label,
-        )
-    try:
-        managed_roles = (
-            resolve_gateway_provider(str(repo_root)),
-            resolve_worker_provider(str(repo_root)),
         )
     except WorkflowProviderUnresolved as exc:
         return _blocked(
@@ -517,97 +497,14 @@ def _terminalize_under_exclusion(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-    from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_runtime import (  # noqa: E501
-        BUILTIN_AGENT_PROVIDER_SNAPSHOT,
-    )
-
-    if not all(BUILTIN_AGENT_PROVIDER_SNAPSHOT.is_launchable(p) for p in managed_roles):
+    if not measurement.proven:
         return _blocked(
-            REASON_PROVIDER_NOT_LAUNCHABLE,
-            detail=(
-                "the binding assigns a provider that is not mechanically launchable; the lane "
-                "unit's managed pair cannot be measured"
-            ),
+            measurement.reason,
+            detail=measurement.detail,
             workspace_id=workspace_id,
             lane_id=lane_label,
-        )
-    plan = plan_herdr_retire_close(
-        rows,
-        workspace_id=workspace_id,
-        lane_id=lane_label,
-        legacy_workspace_id=legacy_token,
-        managed_roles=managed_roles,
-    )
-    candidates = expected_slot_rows(rows, plan, managed_roles=managed_roles)
-    # Duplicate check FIRST: a duplicate carrying locators would otherwise report as an ordinary
-    # live_pair_present, naming the wrong problem. Keyed on the decoded canonical slot (NOT on
-    # role), so a shared unit and its legacy compatibility twin stay two legitimate slots.
-    seen_slots: dict[tuple[str, str, str], int] = {}
-    for found in candidates:
-        seen_slots[found.slot_key] = seen_slots.get(found.slot_key, 0) + 1
-    duplicates = sorted(
-        f"{role}@{ws}/{lane or '<default>'}"
-        for (ws, lane, role), count in seen_slots.items()
-        if count > 1
-    )
-    if duplicates:
-        return _blocked(
-            ACTIVE_RETIRE_DUPLICATE_INVENTORY,
-            detail=(
-                "the live inventory carries more than one row for the same canonical managed "
-                f"slot ({', '.join(duplicates)}); a herdr assigned name is unique by "
-                "construction, so the inventory is ambiguous and no measurement taken from it "
-                "can license a terminal write"
-            ),
-            workspace_id=workspace_id,
-            lane_id=lane_label,
-        )
-    live = expected_live_slots(rows, plan, managed_roles=managed_roles)
-    if live:
-        return _blocked(
-            ACTIVE_RETIRE_LIVE_PAIR_PRESENT,
-            detail=(
-                "the lane's expected managed slots are still live "
-                f"({', '.join(live)}); an active lane with a live pair is not this surface's "
-                "target — drain it through the ordinary guarded close"
-            ),
-            workspace_id=workspace_id,
-            lane_id=lane_label,
-            expected_live=live,
-            foreign_names=tuple(plan.foreign_names),
-        )
-    # A locator-less expected row is "cannot resolve", never "absent", unless the shared liveness
-    # contract positively calls it dead.
-    unresolved = sorted(
-        {
-            found.role
-            for found in candidates
-            if not found.locator and classify_named_slot(found.row) != SLOT_STALE
-        }
-    )
-    if unresolved:
-        return _blocked(
-            ACTIVE_RETIRE_EXPECTED_IDENTITY_UNRESOLVED,
-            detail=(
-                f"an expected managed slot ({', '.join(unresolved)}) has a row in the targeted "
-                "units but no locator, and the liveness contract does not positively call it "
-                "dead; that is absence of proof of liveness, not proof of absence"
-            ),
-            workspace_id=workspace_id,
-            lane_id=lane_label,
-            foreign_names=tuple(plan.foreign_names),
-        )
-    if plan.foreign_names:
-        return _blocked(
-            ACTIVE_RETIRE_FOREIGN_INVENTORY_PRESENT,
-            detail=(
-                "a foreign / unexpected provider occupies one of the lane's targeted units "
-                f"({', '.join(plan.foreign_names)}); terminalizing would record the lane "
-                "permanently gone while a real process is still running in it"
-            ),
-            workspace_id=workspace_id,
-            lane_id=lane_label,
-            foreign_names=tuple(plan.foreign_names),
+            expected_live=measurement.expected_live,
+            foreign_names=measurement.foreign_names,
         )
     # Only now is a persisted terminal state a verified success.
     if record.lane_disposition == DISPOSITION_RETIRED and record.issue_id == issue:

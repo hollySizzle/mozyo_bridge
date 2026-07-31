@@ -149,7 +149,8 @@ class HerdrSublaneActuatorOps:
     #: ``implementation``) the CREATING caller resolved from durable governance (Redmine
     #: #13647 T1b). Stored generation-bound on the lifecycle authority row at create, so a
     #: later heal resolves this lane's pane placement offline. Empty (every pre-#13647
-    #: caller) records no kind and keeps ``lane_class`` placement, byte-for-byte.
+    #: caller) records no kind, so the lane places by ``lane_class`` — which since Redmine
+    #: #14568 resolves an undeclared class to the product default (``split: down``).
     lane_kind: str = ""
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     runner: Optional[Runner] = None
@@ -337,6 +338,7 @@ class HerdrSublaneActuatorOps:
         startup_fence: "StartupTransactionFence | None" = None,
         admission_lock_held: bool = False,
         providers: "Sequence[str] | None" = None,
+        pair_order: "Sequence[str] | None" = None,
     ):
         """Run the production session composition and return its durable launch result.
 
@@ -353,6 +355,12 @@ class HerdrSublaneActuatorOps:
                     if providers is None
                     else tuple(providers)
                 ),
+                # Redmine #14569 R2-F1: when the caller shrank `providers` to one leg, the
+                # lane's stable `(gateway, worker)` order is the only thing that can still
+                # say which role the declared ratio's share belongs to. It is passed in
+                # already resolved — never re-resolved here, which would add a failure mode
+                # to a launch whose caller has proven the binding once already.
+                pair_order=tuple(pair_order) if pair_order else None,
                 lane_id=self.lane_label,
                 env=self.env,
                 runner=self.runner,
@@ -392,8 +400,10 @@ class HerdrSublaneActuatorOps:
         """This lane's caller-supplied :class:`LaneLaunchContext`, or ``None`` (#13647 T1b).
 
         Built from the create-time governance fact the coordinator asserted
-        (``sublane create --lane-kind``). No kind -> ``None``, so the launch keeps its
-        pre-#13647 ``lane_class`` geometry byte-for-byte; a heal of a lane whose row already
+        (``sublane create --lane-kind``). No kind -> ``None``, so the launch resolves its
+        geometry through the ``lane_class`` layer exactly as it did pre-#13647 — byte-for-byte
+        on THIS axis, but not a pre-#13646 launch: since Redmine #14568 an undeclared class
+        lands on the product default (``split: down``); a heal of a lane whose row already
         records a kind resolves it from that row instead (and a disagreement between the two
         is refused at the launch admission, never silently resolved).
         """
@@ -661,6 +671,7 @@ class HerdrSublaneActuatorOps:
                         if self.replacement_target_only and target_provider
                         else None
                     ),
+                    pair_order=managed_pair,
                 ),
                 target_only=self.replacement_target_only,
             )

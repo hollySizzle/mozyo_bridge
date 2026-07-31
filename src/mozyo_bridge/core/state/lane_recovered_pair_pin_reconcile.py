@@ -33,6 +33,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     norm,
     replacement_settled,
     validate_declared_slots,
+    stored_binding_kind_is,
 )
 from mozyo_bridge.core.state.lane_lifecycle_rows import (
     _locked_row,
@@ -120,7 +121,7 @@ class LaneRecoveredPairPinReconcileStore:
                 )
             if not (
                 current.lane_disposition == DISPOSITION_ACTIVE
-                and norm(current.binding_kind) == BINDING_KIND_ISSUE
+                and stored_binding_kind_is(current.binding_kind, BINDING_KIND_ISSUE)
                 and norm(current.issue_id) == issue
                 and not current.project_scope
                 and norm(current.worktree_identity) == worktree

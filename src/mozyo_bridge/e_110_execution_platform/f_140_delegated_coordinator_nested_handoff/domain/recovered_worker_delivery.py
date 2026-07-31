@@ -11,7 +11,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DISPATCH_KIND_IMPLEMENTATION_REQUEST,
     MARKER_CHANNEL_HANDOFF,
     MARKER_CHANNEL_WORKFLOW_EVENT,
-    marker_fields_in_note,
+    strict_marker_fields_in_note,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.recovery_anchor_delivery import (  # noqa: E501
     recovery_delivery_action_id,
@@ -99,9 +99,14 @@ def is_exact_implementation_request_anchor(
     ):
         return False
     matches = 0
-    for channel, fields in marker_fields_in_note(
-        _norm(getattr(entry, "notes", ""))
-    ):
+    # Effect-reaching: an exact work anchor gates target send readiness and redispatch, so an
+    # unreadable marker ANYWHERE in the note refuses the anchor (review j#92060 finding 3). Note
+    # this must refuse the whole note rather than skip the bad marker — skipping would make a note
+    # carrying one clean and one forged marker read exactly like a clean one.
+    scanned = strict_marker_fields_in_note(_norm(getattr(entry, "notes", "")))
+    if scanned is None:
+        return False
+    for channel, fields in scanned:
         kind = _norm(fields.get("kind"))
         gate = _norm(fields.get("gate"))
         if channel == MARKER_CHANNEL_WORKFLOW_EVENT:

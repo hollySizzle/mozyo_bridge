@@ -282,6 +282,22 @@ documents:
       - rule-project-agent-workflow
       - skill-workflow-reference
 
+  - id: spec-external-client-coordinator-proxy
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/external-client-coordinator-proxy.md
+    purpose: "attested lane agent ではない external coordinator client (operator shell / API caller) が、既に durable に確定した high-level action を live attested default coordinator へ一回だけ委譲する public rail の contract (Redmine #14546 / #14500)。workflow step の herdr_sender_identity_unresolved と sublane create --execute の missing_identity+sender_attestation はどちらも正しい停止だが第三の道が無く、残る前進手段が MOZYO_* 手動 export (identity 偽造) と raw pane 入力 (audit boundary 迂回) だけになっていた問題を解く。gate を緩めず、caller が主張できないものだけから action-time に authority を再導出する: workspace=repo checkout の registry anchor、role=repo-local durable role authority、provider=provider_binding、target=agent 自身の mzb1 assigned name decode、anchor=source-of-truth Redmine の structured gate marker (superseded は zero-send)、delivery=dedicated exactly-once fence。caller env を authority にせず fallback にもせず、cross-workspace を構造的に不可能にし、duplicate identity を ambiguity として zero-send する。fence は completed 後も同一 (issue, journal) の再委譲を duplicate として拒否し、journal 比較は数値で行う。委譲するのは decision であって実行 authority ではない。"
+    audit_role: external_client_coordinator_proxy_spec
+    related_document_refs:
+      - spec-herdr-default-lane-workflow-role-authority
+      - spec-herdr-native-identity
+      - logic-workflow-step-command-design
+      - logic-managed-state-model
+      - logic-project-scoped-workspace-identity
+      - logic-tmux-send-safety-contract
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
   - id: spec-conversational-onboarding-tool-contract
     type: spec
     status: active
@@ -558,6 +574,7 @@ documents:
     purpose: external plugin API 公開前に、ticket / presentation / terminal runtime / catalog / telemetry / release helper の built-in adapter 境界と v0.8 最初の候補を分類する設計正本。
     audit_role: plugin_ready_adapter_boundary_logic
     related_document_refs:
+      - logic-herdr-plugin-presentation-consumer-boundary
       - logic-ticket-system-neutral-orchestrator
       - logic-managed-state-model
       - logic-workspace-registry
@@ -570,6 +587,26 @@ documents:
       - logic-skill-distribution
       - logic-release-helper-contract
       - logic-fallback-retirement-ledger
+      - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-herdr-plugin-presentation-consumer-boundary
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/herdr-plugin-presentation-consumer-boundary.md
+    purpose: Herdr 0.7.5 pluginをmozyo-bridgeのexternal providerではなくpresentation consumerとして扱い、sublane UX intent、state ownership、safe customization、user-global plugin境界、engine-first実装順序を固定する設計正本。
+    audit_role: herdr_plugin_presentation_consumer_boundary_logic
+    related_document_refs:
+      - logic-plugin-ready-adapter-boundary
+      - logic-modular-config-driven-refactor
+      - logic-unit-target-model
+      - logic-unit-presentation-state-db
+      - logic-iterm-webviewer-presentation-boundary
+      - logic-pane-centric-cockpit-semantics
+      - logic-delegated-coordinator-cockpit-display
+      - logic-cockpit-attention-state
+      - logic-event-timeline-source
+      - spec-herdr-native-identity
       - rule-public-private-boundary
       - spec-project-map
 
@@ -801,6 +838,19 @@ documents:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: logic-herdr-pin-hook-distribution
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/herdr-pin-hook-distribution.md
+    purpose: "herdr backend swap の配布面 operator runbook (Redmine #13249)。supply-chain pin posture の生成/検証 (`herdr pin-posture`、offline / pinned-mirror、欠落スイッチ=herdr既定on=UNPINNED の fail-closed) と、session-resume 用 integration hook の explicit opt-in installer (`herdr integration-install`、既定 read-only PLAN の zero-mutation / 明示 --apply / snapshot-diff-rollback transaction / fail-closed reason 一覧 / credential 非接触 / trusted-env binary) の利用手順・安全境界を固定する。実 home apply・live herdr・download は本 issue gate 外。設計根拠は #13175 PoC E2/E3/E10。"
+    audit_role: herdr_pin_hook_distribution_logic
+    related_document_refs:
+      - spec-herdr-native-identity
+      - logic-plugin-ready-adapter-boundary
+      - logic-herdr-scenario-test-foundation
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-project-scoped-workspace-identity
     type: logic
     status: active
@@ -931,6 +981,7 @@ documents:
     purpose: Unit / Target projection の desired / presentation state を tracked static file ではなく DB current table で扱う To-Be schema 境界。registry / inventory / managed-events / live tmux / Redmine の責務分担を固定する。
     audit_role: unit_presentation_state_db_logic
     related_document_refs:
+      - logic-herdr-plugin-presentation-consumer-boundary
       - logic-unit-target-model
       - logic-managed-state-model
       - logic-session-inventory
@@ -1087,6 +1138,7 @@ documents:
     purpose: iTerm Toolbelt / WebViewer / private cockpit UI を mozyo-bridge の event・target・attention contract を読む presentation consumer として扱う責務分界。UI を正本にせず、private policy を OSS default に混入させない設計正本。
     audit_role: iterm_webviewer_presentation_boundary_logic
     related_document_refs:
+      - logic-herdr-plugin-presentation-consumer-boundary
       - logic-cockpit-web-ui
       - logic-event-timeline-source
       - logic-unit-target-model
@@ -1282,6 +1334,7 @@ documents:
     purpose: v0.9 line の modular / configuration-aware built-in composition 方針。module / provider / feature selection を設定駆動に寄せつつ、workflow authority / safety / credential 境界を設定で弱めないための設計正本。
     audit_role: modular_config_driven_refactor_logic
     related_document_refs:
+      - logic-herdr-plugin-presentation-consumer-boundary
       - logic-plugin-ready-adapter-boundary
       - logic-workspace-defaults-renderer
       - rule-project-agent-workflow
@@ -1350,6 +1403,22 @@ documents:
       - rule-public-private-boundary
       - rule-project-agent-workflow
       - spec-project-map
+      - skill-workflow-reference
+
+  - id: logic-legacy-mirror-failure-state-characterization
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/legacy-mirror-failure-state-characterization.md
+    purpose: "legacy project skill partial-mirror の同期障害を #14592 の状態ベース設計へ分離する前に、現行の観測可能な挙動を read-only に固定した characterization 正本 (Redmine #14660、親 #14592)。audit 機械 (rule A-F/P/W の評価順序・suppression・recovery precedence)、write 機械 (`_replace_one` の遷移表と staging cleanup ownership)、retention 機械 (`owned_descriptors` の 3 outcome channel と ledger occurrence 保存則) を実測から表で定義し、retry admissibility の収束/非収束を分ける。test 側は AST 導出 inventory で pure / real-file / boundary-injection / subprocess を分割し、#14592 の 6 invariant を pure unit / real-file integration / boundary injection / regression の各層へ一意に対応づける。source 行番号依存 3 件と private call order 依存 1 件の残置理由 (廃止不能な最小境界)、Hypothesis 非採用の根拠 (依存追加コスト・欠陥形状と生成器形状の不一致・網羅証明の喪失) と再開条件、behavior-preserving move と behavior change を分ける実装 Task 分割と changed-path ownership を持つ。"
+    audit_role: legacy_mirror_failure_state_characterization_logic
+    related_document_refs:
+      - logic-tests-placement-discovery-policy
+      - logic-refactor-split-strategy
+      - logic-module-health-gate
+      - logic-skill-distribution
+      - logic-object-oriented-architecture-policy
+      - spec-bounded-context-map
+      - rule-project-agent-workflow
       - skill-workflow-reference
 
   - id: logic-herdr-scenario-test-foundation
@@ -1504,6 +1573,45 @@ file_conventions:
       - logic-object-oriented-architecture-policy
       - skill-workflow-reference
 
+  - id: fc-legacy-mirror-sync
+    name: legacy project skill partial-mirror sync source and tests
+    patterns:
+      - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/legacy_mirror_sync.py
+      - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/owned_descriptors.py
+      - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/platform_capabilities.py
+      - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/domain/legacy_mirror_contract.py
+      # Exact current paths only. A directory glob over the feature pulled the
+      # characterisation into `test_plugin_marketplace.py` and
+      # `test_skill_workflow_guidance.py`, which have nothing to do with the
+      # mirror -- the noise the governance rule asks us to weigh before
+      # widening patterns. Redmine #14666 (T1 move-only) split the former
+      # 3,865-line `test_legacy_project_skill_mirror.py` into the ten modules
+      # below plus the shared tree fixture, per #14660 characterisation 5.5;
+      # each move task adds its own real paths here as part of finishing.
+      # Redmine #14684 (T6) added the shared fault schedule. Its consumers are
+      # the four modules that inject a fault, which is not the same set as the
+      # five with a non-zero `os_patch`: that column counts tests patching an
+      # `os` attribute, and the advertisement substitution in
+      # `test_issue_14651_capability_advertisement.py` is not an injected fault.
+      - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_contract.py
+      - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py
+      - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe.py
+      - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_fault_injection.py
+      - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_sync.py
+      - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_tracked_tree.py
+      - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_wrapper_guardrails.py
+      - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe_io.py
+      - tests/scenarios/test_legacy_mirror_wrapper_cli.py
+      - tests/regressions/test_issue_14580_reused_descriptor_number_close.py
+      - tests/regressions/test_issue_14651_capability_advertisement.py
+      - tests/support/legacy_mirror_fault_schedule.py
+      - tests/support/legacy_mirror_tree_fixture.py
+    severity: warn
+    document_refs:
+      - logic-legacy-mirror-failure-state-characterization
+      - logic-tests-placement-discovery-policy
+      - logic-skill-distribution
+
   - id: fc-workflow-contract-config
     name: ticketless/delegated workflow-contract bundle config source of truth
     patterns:
@@ -1616,27 +1724,58 @@ file_conventions:
     name: herdr default-lane durable workflow-role authority source
     patterns:
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_role_authority.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/lane_work_anchor.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/workflow_role_authority_source.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_step_herdr.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_workflow_step.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_forward_route.py
       - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_forward_send.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_role_authority.py
       - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/delivery_outcome_gate.py
       - src/mozyo_bridge/core/state/forward_outbox_fence.py
       - .mozyo-bridge/workflow-role-bindings.json
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_lane_work_anchor.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority_source.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_step_herdr.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_workflow_step_adapter.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_forward_route.py
       - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_forward_send.py
       - tests/unit/core/state/test_forward_outbox_fence.py
+      - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_cli_workflow_role_authority.py
+      - tests/regressions/test_issue_14500_default_coordinator_authority.py
     severity: block
     document_refs:
       - spec-herdr-default-lane-workflow-role-authority
       - logic-workflow-step-command-design
       - logic-ticketless-project-gateway-runtime-ux
       - spec-herdr-native-identity
+      - logic-managed-state-model
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
+  - id: fc-external-client-coordinator-proxy
+    name: external-client coordinator proxy delegation rail
+    patterns:
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/coordinator_proxy.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/coordinator_proxy_decision.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/canonical_note_scan.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/coordinator_proxy_send.py
+      - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_proxy.py
+      - src/mozyo_bridge/core/state/coordinator_proxy_fence.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_coordinator_proxy.py
+      - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_canonical_note_scan.py
+      - tests/unit/core/state/test_coordinator_proxy_fence.py
+      - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_coordinator_proxy_send.py
+      - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_cli_workflow_step_forward_leg.py
+      - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_proxy_ack_authority.py
+      - tests/regressions/test_issue_14667_proxy_send_strict_marker_fold.py
+    severity: block
+    document_refs:
+      - spec-external-client-coordinator-proxy
+      - spec-herdr-default-lane-workflow-role-authority
+      - spec-herdr-native-identity
+      - logic-workflow-step-command-design
       - logic-managed-state-model
       - rule-project-agent-workflow
       - skill-workflow-reference
@@ -1934,6 +2073,7 @@ file_conventions:
       - scripts/install_claude_skill.sh
       - scripts/install_codex_skill.sh
       - scripts/sync_plugin_skill.sh
+      - scripts/sync_legacy_project_skill.sh
       - .claude-plugin/**
       - plugins/mozyo-bridge-agent/.claude-plugin/**
       - plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/agents/**
@@ -1943,6 +2083,25 @@ file_conventions:
       - skill-project-map-reference
       - skill-safety-reference
       - rule-release-distribution
+
+  - id: fc-disposable-herdr-lifecycle
+    name: disposable Herdr instance lifecycle and shared-space live smoke actuation
+    patterns:
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_herdr_instance.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_endpoint_gate_evidence.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_shared_space_smoke.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_harness.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_observation.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_cli.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_disposable_herdr_instance.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_shared_space_smoke_cli.py
+      - tests/integration/e_140_adapter_provider/f_130_terminal_runtime_provider/test_disposable_shared_space_smoke.py
+    severity: block
+    document_refs:
+      - spec-herdr-native-identity
+      - skill-safety-reference
+      - rule-project-agent-workflow
+      - spec-project-map
 
   - id: fc-smoke-tests
     name: real tmux and distribution smoke checks

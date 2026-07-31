@@ -4,10 +4,15 @@
 or `/home/<name>/` literal in a tracked file, test fixtures included: a personal
 home path is a release blocker even where it only serves as an example.
 
-Redaction and mount-prefix tests still need a path of exactly that shape to prove
-the runtime strips or classifies it, so compose the shape here rather than
-writing the literal. The tracked bytes carry no home-path-shaped literal; the
-value handed to the code under test is exactly one.
+Tests that prove the runtime strips, refuses, or classifies such a path still
+need a value of exactly that shape — redaction, mount-prefix, producer-boundary
+vocabulary, home-containment — so compose the shape here rather than writing the
+literal. The tracked bytes carry no home-path-shaped literal; the value handed to
+the code under test is exactly one.
+
+`tests/integration/.../test_release_helpers.py` pins these composed values
+against the real `release check tree` command: the indirection is only a negative
+control while what comes out is still what that gate blocks (Redmine #14656).
 
 Fixtures whose home shape is incidental (an opaque doctor / parser path) use a
 neutral sentinel root instead and do not belong here.

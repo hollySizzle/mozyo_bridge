@@ -74,6 +74,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
+from mozyo_bridge.core.state.lane_hibernation_anchor import hibernation_anchor_on_transition
 from mozyo_bridge.core.state.lane_lifecycle_model import (
     BINDING_KIND_ISSUE,
     BINDING_KIND_PROJECT_GATEWAY,
@@ -129,6 +130,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     guard,
     norm,
     release_transition_allowed,
+    stored_binding_kind_is,
 )
 from mozyo_bridge.core.state.lane_kind import optional_lane_kind
 from mozyo_bridge.core.state.lane_lifecycle_schema import (
@@ -148,6 +150,8 @@ from mozyo_bridge.core.state.lane_lifecycle_rows import (
     _rollback,
     _utc_now,
 )
+from mozyo_bridge.core.state.lane_release import open_release_generation
+from mozyo_bridge.core.state.lane_release_observation import ReleaseObservation
 from mozyo_bridge.core.state.lane_lifecycle_readonly import (
     LaneLifecycleReader,
     LaneLifecycleReaderUpgradeRequired,
@@ -336,12 +340,12 @@ class LaneLifecycleStore:
         ``lane_kind`` (v7, Redmine #13647) is the delegation-geometry kind the CREATING
         caller resolved from durable governance (``coordinator`` / ``delegated_coordinator``
         / ``implementation``), written here so a later heal resolves the same lane-role pane
-        placement **offline**. Empty is the pre-#13647 default — no durable kind fact, so the
-        launch path falls back to ``lane_class`` geometry — while a present non-canonical
-        token fails closed (:class:`~mozyo_bridge.core.state.lane_kind.LaneKindError`) rather
-        than storing an off-vocabulary authority value. It is bound to THIS generation: no
-        transition rewrites it, and a governance change re-binds it on a new generation via
-        ``open_next_generation``.
+        placement **offline**. Empty declares no kind, so the launch falls through to
+        ``lane_class`` geometry, whose undeclared landing is #14568's product default
+        (``split: down``), not pre-#13646 — while a present non-canonical token fails closed
+        (:class:`~mozyo_bridge.core.state.lane_kind.LaneKindError`) rather than storing an
+        off-vocabulary authority value. It is bound to THIS generation: no transition rewrites
+        it, and a governance change re-binds it on a new generation via ``open_next_generation``.
 
         Refuses an existing lane (:data:`CAS_ALREADY_DECLARED`) — a re-declare must
         go through an explicit transition, never a silent overwrite (the
@@ -503,25 +507,27 @@ class LaneLifecycleStore:
             release = RELEASE_NOT_REQUESTED if rehydrating else current.process_release
             action = "" if rehydrating else current.release_action_id
             pins = "" if rehydrating else current.release_pins
-            replacement = (
-                REPLACEMENT_NOT_REQUESTED
-                if rehydrating
-                else current.replacement_state
-            )
+            # v9 (#14477 j#94707 R4-F1): the release OBSERVATION is part of the release set, so
+            # it clears with the rest of it. A rehydrated lane holding the previous generation's
+            # observation is the same defect shape as a retained ``reconcile_phase``: an old
+            # generation's evidence must never be readable as the current generation's authority.
+            observation = "" if rehydrating else current.release_observation
+            replacement = REPLACEMENT_NOT_REQUESTED if rehydrating else current.replacement_state
             replacement_action = "" if rehydrating else current.replacement_action_id
             replacement_pins = "" if rehydrating else current.replacement_pins
-            declared_slots = (
-                encoded_rehydrated_slots
-                if rehydrating and encoded_rehydrated_slots is not None
-                else current.declared_slots
-            )
+            # v8 (#14477): resume's freshness boundary moves ONLY here (lane_hibernation_anchor).
+            anchor = hibernation_anchor_on_transition(current.hibernated_at, target=target, stamp=stamp)
+            declared_slots = current.declared_slots
+            if rehydrating and encoded_rehydrated_slots is not None:
+                declared_slots = encoded_rehydrated_slots
             revision = current.revision + 1
             try:
                 conn.execute(
                     f"UPDATE {_TABLE} SET lane_disposition = ?, process_release = ?, "
-                    "release_action_id = ?, release_pins = ?, replacement_state = ?, "
+                    "release_action_id = ?, release_pins = ?, release_observation = ?, "
+                    "replacement_state = ?, "
                     "replacement_action_id = ?, replacement_pins = ?, declared_slots = ?, "
-                    "revision = ?, "
+                    "hibernated_at = ?, revision = ?, "
                     "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                     "updated_at = ? "
                     "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
@@ -530,10 +536,12 @@ class LaneLifecycleStore:
                         release,
                         action,
                         pins,
+                        observation,
                         replacement,
                         replacement_action,
                         replacement_pins,
                         declared_slots,
+                        anchor,
                         revision,
                         decision.source,
                         decision.issue_id,
@@ -701,9 +709,10 @@ class LaneLifecycleStore:
                     conn.execute(
                         f"UPDATE {_TABLE} SET issue_id = ?, lane_disposition = ?, "
                         "process_release = ?, release_action_id = ?, release_pins = ?, "
+                        "release_observation = ?, "
                         "replacement_state = ?, replacement_action_id = ?, "
-                        "replacement_pins = ?, revision = ?, decision_source = ?, decision_issue_id = ?, "
-                        "decision_journal = ?, "
+                        "replacement_pins = ?, hibernated_at = ?, revision = ?, "
+                        "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                         "updated_at = ? WHERE repo_workspace_id = ? AND lane_id = ? "
                         "AND revision = ?",
                         (
@@ -712,9 +721,20 @@ class LaneLifecycleStore:
                             RELEASE_NOT_REQUESTED,
                             "",
                             "",
+                            # v9 (#14477 j#94707 R4-F1): this UPDATE rewrites the INCOMING
+                            # recovery lane's own row, so what clears here is ITS prior release
+                            # cycle's observation — a lane going active carries no release
+                            # evidence, the same reason its own pins and action id clear above.
+                            # It stays the same lane_generation (only `revision` advances; a
+                            # re-incarnation is `open_next_generation`'s job), which is why the
+                            # stale evidence has to be cleared rather than outgrown.
+                            # Corrected per review j#94727 R5-F2 — the previous comment named the
+                            # superseded lane and a generation bump, and both were wrong.
+                            "",
                             REPLACEMENT_NOT_REQUESTED,
                             "",
                             "",
+                            "",  # v8 (#14477): a promoted lane is awake -> no boundary
                             revision,
                             decision.source,
                             decision.issue_id,
@@ -748,85 +768,33 @@ class LaneLifecycleStore:
         *,
         expected_revision: int,
         action_id: str,
-        pins: Iterable[ReleasePin],
+        observation: Optional["ReleaseObservation"] = None,
+        pins: Optional[Iterable[ReleasePin]] = None,
         now: Optional[str] = None,
     ) -> CasOutcome:
-        """Open a release generation, pinning the slots it is allowed to close.
+        """Open a release generation whose pins are DERIVED from the driver's observation.
 
-        Only a lane that has already left ``active`` may open one: a lane still
-        holding its work is never a release target. The pins are the *only* slots
-        this generation may ever close, and the actuator must re-verify each one
-        against the live inventory before closing it.
+        Thin delegator to :func:`...lane_release.open_release_generation`, which owns the release
+        axis and the Redmine #14477 j#94582 observation contract (a legacy ``pins=`` call is
+        refused there rather than honoured). The axis lives in its own module for the same reason
+        :mod:`...lane_replacement` does; the call signature is unchanged apart from the keyword.
+
+        ``observation`` defaults to ``None`` here for the same reason it does there (review j#94707
+        R4-F2): the *public* seam is this delegator, so if it kept ``observation`` required, a
+        literal legacy ``pins=`` call would die of ``TypeError`` at this boundary and never reach
+        the typed refusal. Both the legacy and the omitted shape are refused by
+        :func:`...lane_release.open_release_generation` as ``ReleaseObservationError``.
         """
-        action = norm(action_id)
-        if not action:
-            raise ValueError("a release generation requires a non-empty action id")
-        # Every pin must name a slot the actuator can actually re-resolve, and no slot
-        # may appear twice (R1-F4); an unusable pin is refused, never stored.
-        pinned = validate_release_pins(tuple(pins))
-        stamp = now or _utc_now()
-        conn = self._connect_write(key)
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            current = _locked_row(conn, key)
-            if current is None:
-                conn.execute("ROLLBACK")
-                return CasOutcome(applied=False, reason=CAS_NOT_FOUND)
-            if current.revision != expected_revision:
-                conn.execute("ROLLBACK")
-                return CasOutcome(
-                    applied=False,
-                    reason=CAS_STALE_REVISION,
-                    revision=current.revision,
-                )
-            if current.lane_disposition == DISPOSITION_ACTIVE:
-                conn.execute("ROLLBACK")
-                return CasOutcome(
-                    applied=False,
-                    reason=CAS_UNEXPECTED_STATE,
-                    revision=current.revision,
-                )
-            if not replacement_settled(current.replacement_state):
-                conn.execute("ROLLBACK")
-                return CasOutcome(
-                    applied=False,
-                    reason=CAS_FORBIDDEN_TRANSITION,
-                    revision=current.revision,
-                )
-            if not release_transition_allowed(
-                current.process_release, RELEASE_REQUESTED
-            ):
-                conn.execute("ROLLBACK")
-                return CasOutcome(
-                    applied=False,
-                    reason=CAS_FORBIDDEN_TRANSITION,
-                    revision=current.revision,
-                )
-            revision = current.revision + 1
-            conn.execute(
-                f"UPDATE {_TABLE} SET process_release = ?, release_action_id = ?, "
-                "release_pins = ?, revision = ?, updated_at = ? "
-                "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
-                (
-                    RELEASE_REQUESTED,
-                    action,
-                    encode_release_pins(pinned),
-                    revision,
-                    stamp,
-                    key.repo_workspace_id,
-                    key.lane_id,
-                    current.revision,
-                ),
-            )
-            conn.execute("COMMIT")
-            return CasOutcome(applied=True, reason=CAS_APPLIED, revision=revision)
-        except sqlite3.DatabaseError as exc:
-            _rollback(conn)
-            raise LaneLifecycleError(
-                f"lane release request failed ({type(exc).__name__}); fail closed"
-            ) from exc
-        finally:
-            conn.close()
+        return open_release_generation(
+            self,
+            key,
+            expected_revision=expected_revision,
+            action_id=action_id,
+            observation=observation,
+            pins=pins,
+            now=now,
+        )
+
 
     def record_release_outcome(
         self,

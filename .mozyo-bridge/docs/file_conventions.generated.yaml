@@ -53,6 +53,32 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: legacy project skill partial-mirror sync source and tests
+  patterns:
+  - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/legacy_mirror_sync.py
+  - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/owned_descriptors.py
+  - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/application/platform_capabilities.py
+  - src/mozyo_bridge/e_130_governance_distribution/f_150_skill_plugin_distribution/domain/legacy_mirror_contract.py
+  - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_contract.py
+  - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_owned_descriptor_teardown.py
+  - tests/unit/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe.py
+  - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_fault_injection.py
+  - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_sync.py
+  - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_tracked_tree.py
+  - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_legacy_mirror_wrapper_guardrails.py
+  - tests/integration/e_130_governance_distribution/f_150_skill_plugin_distribution/test_platform_capability_probe_io.py
+  - tests/scenarios/test_legacy_mirror_wrapper_cli.py
+  - tests/regressions/test_issue_14580_reused_descriptor_number_close.py
+  - tests/regressions/test_issue_14651_capability_advertisement.py
+  - tests/support/legacy_mirror_fault_schedule.py
+  - tests/support/legacy_mirror_tree_fixture.py
+  severity: warn
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/legacy-mirror-failure-state-characterization.md と @vibes/docs/logics/tests-placement-discovery-policy.md
+    と @vibes/docs/logics/skill-distribution.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: ticketless/delegated workflow-contract bundle config source of truth
   patterns:
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/workflow_contract_config.yaml
@@ -153,24 +179,52 @@ rules:
 - name: herdr default-lane durable workflow-role authority source
   patterns:
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_role_authority.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/lane_work_anchor.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/workflow_role_authority_source.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_step_herdr.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_workflow_step.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/workflow_forward_route.py
   - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/herdr_forward_send.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_role_authority.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/delivery_outcome_gate.py
   - src/mozyo_bridge/core/state/forward_outbox_fence.py
   - .mozyo-bridge/workflow-role-bindings.json
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_lane_work_anchor.py
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_role_authority_source.py
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_step_herdr.py
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_workflow_step_adapter.py
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_workflow_forward_route.py
   - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_herdr_forward_send.py
   - tests/unit/core/state/test_forward_outbox_fence.py
+  - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_cli_workflow_role_authority.py
+  - tests/regressions/test_issue_14500_default_coordinator_authority.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/specs/herdr-default-lane-workflow-role-authority.md と @vibes/docs/logics/workflow-step-command-design.md
     と @vibes/docs/logics/ticketless-project-gateway-runtime-ux.md と @vibes/docs/specs/herdr-native-identity.md と @vibes/docs/logics/managed-state-model.md
+    と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: external-client coordinator proxy delegation rail
+  patterns:
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/coordinator_proxy.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/coordinator_proxy_decision.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/canonical_note_scan.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/coordinator_proxy_send.py
+  - src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/cli_workflow_proxy.py
+  - src/mozyo_bridge/core/state/coordinator_proxy_fence.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_coordinator_proxy.py
+  - tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_canonical_note_scan.py
+  - tests/unit/core/state/test_coordinator_proxy_fence.py
+  - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_coordinator_proxy_send.py
+  - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_cli_workflow_step_forward_leg.py
+  - tests/integration/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_proxy_ack_authority.py
+  - tests/regressions/test_issue_14667_proxy_send_strict_marker_fold.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/external-client-coordinator-proxy.md と @vibes/docs/specs/herdr-default-lane-workflow-role-authority.md
+    と @vibes/docs/specs/herdr-native-identity.md と @vibes/docs/logics/workflow-step-command-design.md と @vibes/docs/logics/managed-state-model.md
     と @vibes/docs/rules/agent-workflow.md と @skills/mozyo-bridge-agent/references/workflow.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
@@ -447,12 +501,31 @@ rules:
   - scripts/install_claude_skill.sh
   - scripts/install_codex_skill.sh
   - scripts/sync_plugin_skill.sh
+  - scripts/sync_legacy_project_skill.sh
   - .claude-plugin/**
   - plugins/mozyo-bridge-agent/.claude-plugin/**
   - plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/agents/**
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/skill-distribution.md と @skills/mozyo-bridge-agent/references/project-map.md
     と @skills/mozyo-bridge-agent/references/safety.md と @vibes/docs/rules/release-distribution.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
+- name: disposable Herdr instance lifecycle and shared-space live smoke actuation
+  patterns:
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_herdr_instance.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_endpoint_gate_evidence.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_shared_space_smoke.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_harness.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_observation.py
+  - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_cli.py
+  - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_disposable_herdr_instance.py
+  - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_shared_space_smoke_cli.py
+  - tests/integration/e_140_adapter_provider/f_130_terminal_runtime_provider/test_disposable_shared_space_smoke.py
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/specs/herdr-native-identity.md と @skills/mozyo-bridge-agent/references/safety.md と
+    @vibes/docs/rules/agent-workflow.md と @vibes/docs/specs/project-map.md をよく確認し従うこと
 
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 

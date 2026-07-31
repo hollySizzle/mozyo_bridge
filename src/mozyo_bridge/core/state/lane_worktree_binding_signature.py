@@ -32,6 +32,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     norm,
     replacement_settled,
     validate_declared_slots,
+    stored_binding_kind_is,
 )
 
 # -- the closed signature vocabulary -------------------------------------------
@@ -112,7 +113,7 @@ def classify_repair_signature(record: Any, *, issue_id: str) -> str:
     """
     if getattr(record, "lane_disposition", "") != DISPOSITION_HIBERNATED:
         return SIGNATURE_NOT_HIBERNATED
-    if norm(getattr(record, "binding_kind", "")) != BINDING_KIND_ISSUE:
+    if not stored_binding_kind_is(getattr(record, "binding_kind", ""), BINDING_KIND_ISSUE):
         return SIGNATURE_BINDING_KIND
     if getattr(record, "issue_id", "") != norm(issue_id):
         return SIGNATURE_WRONG_ISSUE

@@ -121,7 +121,69 @@ def register_sublane_retire(
             "#13518 R2-F7 / R3-F2: assert (from the durable review journals) that the LATEST review "
             "generation is approved AND carries no unresolved blocking finding. Fail-closed when "
             "unset: the actual retire/integration no longer default-admits a stale approval. Ignored "
-            "when --review-generation-json is supplied (that MEASURES it at action-time)."
+            "when --review-generation-json or --review-exemption-json is supplied (those MEASURE "
+            "admissibility at action-time). Do NOT pass it for a review-exempt lane: there is no "
+            "review generation to be approved, so the assert would be false — use "
+            "--review-exemption-json instead (#14539)."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--review-exemption-json",
+        dest="review_exemption_json",
+        default=None,
+        help=(
+            "#14539: path to the issue's durable journals "
+            "{issue, journals:[{journal_id, notes}]}. When supplied, the retire RE-VERIFIES at "
+            "action-time that a `codex_direct_edit` gate with `follow_up_review: false` is in "
+            "force AND the issue records Close AND the integration disposition is complete — the "
+            "three facts that let a review-exempt lane pass the latest-generation fence without a "
+            "false --latest-generation-admissible assert. The observation's `issue` MUST literal "
+            "exact-match --issue (evidence from another issue never unlocks this fence), the gate's "
+            "`allowed_paths` must cover the record's declared changed_paths, and a review round "
+            "opened AFTER the exemption re-owes the review. Fail-closed on an unreadable / "
+            "malformed file or on any missing fact. The integration half is proved by the "
+            "lane-enveloped strict evidence on the CURRENT disposition journal, whose reviewed "
+            "source head must be the covered commit, whose envelope must match the retire "
+            "TARGET's own lifecycle row (workspace / lane / generation, measured from durable "
+            "state — never from a flag) and --integration-branch, and whose issuer must resolve "
+            "to the coordinator under the Hibernate Evidence Marker Contract; a legacy "
+            "lane-unbound note is valid for the glance but never auto-admits a retire."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--no-change-review-waiver",
+        dest="no_change_review_waiver",
+        action="store_true",
+        help=(
+            "#14695: re-verify at action-time that this lane produced NO repository change and "
+            "carries a direct-owner `no_change_review_waiver`. **THIS ROUTE CURRENTLY ADMITS "
+            "NOTHING** and always refuses with `waiver_writer_authority_unresolvable` (review "
+            "j#93776 finding 1): this record system cannot establish WHO wrote a journal — every "
+            "role posts under one source-system account and the issuer resolution is a policy "
+            "binding that takes no author input — so a lane worker could write its own waiver. "
+            "The issue's Acceptance sanctions this typed refusal until a writer/receipt authority "
+            "bound to an actual coordinator action is ruled on. Every other check below is live "
+            "and reports its own reason first, so this flag is still useful for diagnosing a "
+            "record; it just cannot unlock a retire. The intended contract, for when it can: "
+            "an investigation with no review generation because it changed nothing (#14613 "
+            "j#93256 / j#93262). Deliberately a bare opt-in and NOT a "
+            "JSON path: the issue's full journal history is read LIVE over the credential-gated "
+            "Redmine read, because this route's premise is NEGATIVE (no commit, no changed_paths, "
+            "no change-bearing gate, no integration disposition anywhere in the record) and a "
+            "caller-supplied file would satisfy a negative claim by omission alone. Admits only "
+            "when ALL of: one canonical `no_change_review_waiver` marker whose issue and whose "
+            "workspace/lane/lane_generation envelope exact-match the retire TARGET's own "
+            "lifecycle row (measured from durable state, never from a flag); its writer resolves "
+            "to the coordinator under the gate's own ruling; the latest gate is Close; no review "
+            "round is newer than the waiver; the record declares zero change; no recognized "
+            "durable fact names a hard carve-out surface (release / production verification / "
+            "credential / destructive / migration / external effect) and the gate inventory "
+            "actually resolved; --callbacks-drained; and the live repository still agrees — the "
+            "branch head literal-equals the waiver's head, the branch carries 0 commits over "
+            "--integration-branch, and the --worktree checkout is clean. Fail-closed on every "
+            "gap, including unconfigured credentials and an unmeasurable repository. Never pass "
+            "--latest-generation-admissible for such a lane: there is no review generation, so "
+            "the assert would be false."
         ),
     )
     sublane_retire.add_argument(
@@ -227,6 +289,55 @@ def register_sublane_retire(
             "worktree / branch. Duplicate replay is idempotent. Mutually exclusive with "
             "--execute, --migrate-hibernated-legacy, --reconcile-hibernated-live and "
             "--retire-hibernated-bound (passing more than one is a zero-write error)."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--retire-active-unbound-live-zero",
+        dest="retire_active_unbound_live_zero",
+        action="store_true",
+        help=(
+            "Redmine #14499: metadata-only TERMINAL retire for an ACTIVE row that records NO "
+            "canonical worktree binding (an empty worktree_identity) and whose managed pair is "
+            "already positively gone — the #14456 j#87973 shape no rail could converge: the "
+            "guarded close returns `worktree_binding_unverified` (nothing to attest), "
+            "--retire-active-live-zero refuses an EMPTY binding by construction, and "
+            "--migrate-hibernated-legacy / --reconcile-hibernated-live / "
+            "--retire-hibernated-bound all require a hibernated row. With no binding to attest "
+            "and no release witness, its identity fence is the caller-declared "
+            "--expect-lane-generation + --expect-lane-revision (both mandatory; read them from "
+            "`sublane reboot-audit`), so a lane re-incarnated between the read and the write "
+            "loses the CAS rather than being terminalized on a stale reading. Requires the "
+            "preflight to permit retirement AND the row to be active + issue-bound + owning "
+            "--issue + EMPTY-bound AND --branch integrated (literal ancestor, or a #14066 "
+            "patch_equivalent integration verified via --integration-journal), and takes the "
+            "same launch-exclusion lock and live-zero fences as #14242. --worktree is NOT "
+            "required and is never attested here (it is used only to widen the live-zero scan "
+            "to a pre-#13377 legacy twin unit). Launches / closes / resumes NO process; removes "
+            "no worktree, branch or commit. Duplicate replay is idempotent. Mutually exclusive "
+            "with every other retire intent (passing more than one is a zero-write error)."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--expect-lane-generation",
+        dest="expect_lane_generation",
+        type=int,
+        default=0,
+        help=(
+            "Redmine #14499: the exact positive lane_generation the caller measured the "
+            "live-zero read against. Mandatory with --retire-active-unbound-live-zero (it "
+            "replaces the worktree attestation that surface cannot perform); ignored by every "
+            "other intent."
+        ),
+    )
+    sublane_retire.add_argument(
+        "--expect-lane-revision",
+        dest="expect_lane_revision",
+        type=int,
+        default=0,
+        help=(
+            "Redmine #14499: the exact positive lifecycle revision the caller measured the "
+            "live-zero read against. Mandatory with --retire-active-unbound-live-zero; ignored "
+            "by every other intent."
         ),
     )
     sublane_retire.add_argument(

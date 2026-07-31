@@ -1,6 +1,6 @@
 """Who was allowed to write this evidence (Redmine #14219 T2b, R1-F2).
 
-The design ruling (#14219 j#85530 Q3) fixes one issuer per evidence kind: the review result comes
+The design ruling (#14219 j#85530 Q3) fixes one issuer per HIBERNATE-EVIDENCE kind: the review result comes
 from the same-lane reviewer / gateway, the integration / CI / dogfood records from the coordinator,
 the park declaration from the lane's own implementation worker. The producer originally derived the
 authority *provenance* from the marker's ``gate=`` alone, which means the marker asserted its own
@@ -56,7 +56,35 @@ from .hibernate_evidence_marker import (
 
 MARKER_GATE_REVIEW_RESULT = "review_result"
 
-# The closed issuer-role vocabulary (ruling j#85530 Q3).
+#: Redmine #14661: the guarded live-worker refresh's owner-approval gate (Design Answer j#92641).
+GATE_WORKER_REFRESH_OWNER_APPROVAL = "worker_refresh_owner_approval"
+
+#: Redmine #14695: the direct-owner review waiver for a no-change investigation (Design
+#: Consultation Answer j#93406). Its token is defined in :mod:`.no_change_review_waiver`; it is
+#: re-declared as a literal here rather than imported, because that module imports this one for
+#: the issuer vocabulary and a back-import would be a cycle. The two are pinned equal by a test.
+GATE_NO_CHANGE_REVIEW_WAIVER = "no_change_review_waiver"
+
+#: The ruling that decided the hibernate-evidence gates' writer contracts (Redmine #14219).
+HIBERNATE_EVIDENCE_RULING = "redmine:#14219:j#85530:Q3"
+#: The ruling that decided the worker-refresh owner-approval gate's writer contract.
+WORKER_REFRESH_APPROVAL_RULING = "redmine:#14661:j#92641"
+#: The ruling that decided the no-change review waiver gate's writer contract. It names THIS gate
+#: and decides its writer axis, which is what #14661 j#92715 requires of a ruling pointer: an
+#: anchor whose target is silent about the gate makes ``is_anchored`` pass while pointing at a
+#: record that could not have decided the binding.
+#:
+#: j#93412 is the AUTHORITATIVE answer and supersedes the earlier j#93406 on the same
+#: consultation (j#93404). Both named ``coordinator``, so the binding itself is unchanged; the
+#: pointer is the later one because that is the record a reader must land on to find the
+#: contract's full terms — j#93412 alone carries the hard carve-out and the live-measurement
+#: boundary. Pointing at the superseded answer would satisfy ``is_anchored`` while sending the
+#: reader to a record that does not state the contract in force, which is the same traceability
+#: defect j#92715 named.
+NO_CHANGE_REVIEW_WAIVER_RULING = "redmine:#14695:j#93412"
+
+# The closed issuer-role vocabulary (ruling j#85530 Q3; later gates reuse the vocabulary under
+# their own rulings — see _KIND_RULING).
 ISSUER_COORDINATOR = "coordinator"
 #: The same-lane reviewer / implementation gateway that writes the canonical Review Result.
 ISSUER_REVIEW_GATEWAY = "review_gateway"
@@ -79,15 +107,61 @@ _KIND_ISSUER = {
     EVIDENCE_REQUIRED_CI_GREEN: ISSUER_COORDINATOR,
     EVIDENCE_DOGFOOD_DELEGATED: ISSUER_COORDINATOR,
     EVIDENCE_PARK_DECLARED: ISSUER_LANE_WORKER,
+    # Redmine #14661 Design Answer j#92641: the guarded worker refresh's owner-approval gate.
+    # Its canonical writer is the COORDINATOR — the governed preset aggregates owner decisions
+    # at the coordinator role, which records the durable approval journal. The approval's
+    # provenance (that the owner, not the coordinator, decided) is a SEPARATE axis carried by
+    # the marker's ``approval_source=direct_owner``; conflating the two would either invent a
+    # runtime "owner" role this system has no durable resolution for, or let any same-account
+    # writer pass as the owner. Registered HERE rather than in a second map, because this is
+    # the single gate->role authority and a parallel table would drift from it.
+    GATE_WORKER_REFRESH_OWNER_APPROVAL: ISSUER_COORDINATOR,
+    # Redmine #14695 Design Consultation Answer j#93406: the no-change review waiver's canonical
+    # writer is likewise the COORDINATOR, and for the same two-axis reason. The governed preset
+    # aggregates owner decisions at the coordinator role, which records the durable journal; that
+    # the OWNER (not the coordinator) decided is the separate provenance axis the marker carries
+    # as ``approval_source=direct_owner``. The ruling names the conjunction explicitly: neither
+    # axis substitutes for the other, so a worker- or gateway-written record claiming
+    # ``direct_owner`` is not this authority, and a coordinator recording a standing-delegation
+    # approval is not either.
+    GATE_NO_CHANGE_REVIEW_WAIVER: ISSUER_COORDINATOR,
 }
 
+#: The ruling that decided each gate's writer contract. A gate's role and the RECORD that
+#: decided it are one fact, so they live together — Redmine #14661 j#92715 found the cost of
+#: splitting them: a new gate inherited a repo-wide pointer at #14219 j#85530 Q3, a ruling that
+#: says nothing about it, and the resulting anchor was non-empty (so ``is_anchored`` passed)
+#: while pointing at a record that could not have decided the binding. An anchor whose target is
+#: silent about the gate has not made the claim traceable.
+_KIND_RULING = {
+    MARKER_GATE_REVIEW_RESULT: HIBERNATE_EVIDENCE_RULING,
+    MARKER_GATE_INTEGRATION_DISPOSITION: HIBERNATE_EVIDENCE_RULING,
+    EVIDENCE_REQUIRED_CI_GREEN: HIBERNATE_EVIDENCE_RULING,
+    EVIDENCE_DOGFOOD_DELEGATED: HIBERNATE_EVIDENCE_RULING,
+    EVIDENCE_PARK_DECLARED: HIBERNATE_EVIDENCE_RULING,
+    GATE_WORKER_REFRESH_OWNER_APPROVAL: WORKER_REFRESH_APPROVAL_RULING,
+    GATE_NO_CHANGE_REVIEW_WAIVER: NO_CHANGE_REVIEW_WAIVER_RULING,
+}
+
+
 def contract_writer_role(gate: str) -> str:
-    """The ONE role the ruling names as ``gate``'s canonical writer (j#85530 Q3), else unknown.
+    """The ONE role the gate's own ruling names as its canonical writer, else unknown.
 
     The single gate->role authority: the issuer-policy resolution (Redmine #14219 T2c Fork A)
     reads it from here so no second mapping can drift from the producer's own expectation.
+    Which ruling decided each gate is :func:`contract_ruling_pointer`.
     """
     return _KIND_ISSUER.get(gate, ISSUER_UNKNOWN)
+
+
+def contract_ruling_pointer(gate: str) -> str:
+    """The durable record that DECIDED ``gate``'s writer contract, or ``""``. (pure)
+
+    Paired with :func:`contract_writer_role` so a resolved role always cites the ruling that
+    actually established it, rather than whichever ruling happened to found the policy module.
+    An unknown gate yields ``""``, which leaves the issuer unanchored and therefore refused.
+    """
+    return _KIND_RULING.get(gate, "")
 
 
 # Typed refusals (both are zero-actuation gaps, and they stay distinguishable: "we do not know who
@@ -243,6 +317,12 @@ def check_issuer(kind: str, issuer: ResolvedIssuer, *, envelope) -> "str | None"
 
 
 __all__ = [
+    "GATE_NO_CHANGE_REVIEW_WAIVER",
+    "GATE_WORKER_REFRESH_OWNER_APPROVAL",
+    "HIBERNATE_EVIDENCE_RULING",
+    "NO_CHANGE_REVIEW_WAIVER_RULING",
+    "WORKER_REFRESH_APPROVAL_RULING",
+    "contract_ruling_pointer",
     "ISSUER_COORDINATOR",
     "ResolvedIssuer",
     "ISSUER_LANE_WORKER",
